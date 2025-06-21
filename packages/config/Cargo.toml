@@ -1,0 +1,30 @@
+[package]
+authors     = { workspace = true }
+categories  = ["config", "development-tools"]
+description = "Configuration management for bmux terminal multiplexer"
+edition     = { workspace = true }
+keywords    = ["bmux", "config", "multiplexer", "terminal"]
+license     = { workspace = true }
+name        = "bmux_config"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+# Internal bmux packages
+bmux_event = { workspace = true }
+
+# External dependencies
+anyhow    = { workspace = true, features = ["std"] }
+dirs      = { workspace = true }
+serde     = { workspace = true, features = ["derive"] }
+thiserror = { workspace = true }
+toml      = { workspace = true, features = ["display", "parse"] }
+tracing   = { workspace = true, features = ["std"] }
+
+
+[features]
+# Default features
+default = []
+
+# Development features
+fail-on-warnings = []

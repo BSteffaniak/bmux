@@ -1,0 +1,36 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Client component for bmux terminal multiplexer"
+edition     = { workspace = true }
+keywords    = ["bmux", "client", "multiplexer", "terminal"]
+license     = { workspace = true }
+name        = "bmux_client"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+# Internal bmux packages
+bmux_config   = { workspace = true }
+bmux_event    = { workspace = true }
+bmux_session  = { workspace = true }
+bmux_terminal = { workspace = true }
+
+# External dependencies
+anyhow    = { workspace = true }
+crossterm = { workspace = true }
+serde     = { workspace = true, features = ["derive"], optional = true }
+thiserror = { workspace = true }
+tokio     = { workspace = true }
+tracing   = { workspace = true }
+
+
+[features]
+# Default features
+default = ["serde"]
+
+# Development features
+fail-on-warnings = []
+
+# Serialization features
+serde = ["bmux_session/serde", "bmux_terminal/serde", "dep:serde"]

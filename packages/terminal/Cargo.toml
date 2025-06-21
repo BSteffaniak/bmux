@@ -1,0 +1,35 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Terminal handling for bmux terminal multiplexer"
+edition     = { workspace = true }
+keywords    = ["bmux", "multiplexer", "pty", "terminal"]
+license     = { workspace = true }
+name        = "bmux_terminal"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+# Internal bmux packages
+bmux_event           = { workspace = true }
+bmux_session         = { workspace = true }
+bmux_terminal_models = { workspace = true }
+
+# External dependencies
+anyhow    = { workspace = true, features = ["std"] }
+crossterm = { workspace = true }
+serde     = { workspace = true, features = ["derive"], optional = true }
+thiserror = { workspace = true }
+tokio     = { workspace = true, features = ["rt", "sync"] }
+tracing   = { workspace = true, features = ["std"] }
+
+
+[features]
+# Default features
+default = ["serde"]
+
+# Development features
+fail-on-warnings = []
+
+# Serialization features
+serde = ["bmux_terminal_models/serde", "dep:serde"]

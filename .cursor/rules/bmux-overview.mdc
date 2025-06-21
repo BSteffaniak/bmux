@@ -1,0 +1,11 @@
+---
+description: "Comprehensive overview of bmux project architecture, components, and navigation guide"
+globs:
+  - "**/*"
+---
+
+# bmux Project Overview
+
+## What is bmux?
+
+bmux is a modern, terminal multiplexer written in Rust. It is designed to be flexible and extensible.

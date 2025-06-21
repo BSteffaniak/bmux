@@ -1,0 +1,59 @@
+[package]
+authors     = { workspace = true }
+categories  = ["command-line-utilities", "development-tools"]
+description = "A modern terminal multiplexer written in Rust"
+edition     = { workspace = true }
+keywords    = ["cli", "multiplexer", "session", "terminal", "tmux"]
+license     = { workspace = true }
+name        = "bmux"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+# Core packages (always available)
+bmux_config   = { workspace = true, optional = true }
+bmux_event    = { workspace = true, optional = true }
+bmux_session  = { workspace = true, optional = true }
+bmux_terminal = { workspace = true, optional = true }
+
+# Feature-gated packages
+bmux_cli     = { workspace = true, optional = true }
+bmux_client  = { workspace = true, optional = true }
+bmux_history = { workspace = true, optional = true }
+bmux_keybind = { workspace = true, optional = true }
+bmux_plugin  = { workspace = true, optional = true }
+bmux_search  = { workspace = true, optional = true }
+bmux_server  = { workspace = true, optional = true }
+
+[features]
+# Default features
+default = ["all"]
+
+# Development features
+fail-on-warnings = []
+
+# Feature groups
+all = [
+    "cli",
+    "client",
+    "core",
+    "history",
+    "keybind",
+    "plugin",
+    "search",
+    "server",
+]
+core = ["config", "event", "session", "terminal"]
+
+# Individual package features
+cli      = ["dep:bmux_cli"]
+client   = ["dep:bmux_client"]
+config   = ["dep:bmux_config"]
+event    = ["dep:bmux_event"]
+history  = ["dep:bmux_history"]
+keybind  = ["dep:bmux_keybind"]
+plugin   = ["dep:bmux_plugin"]
+search   = ["dep:bmux_search"]
+server   = ["dep:bmux_server"]
+session  = ["dep:bmux_session"]
+terminal = ["dep:bmux_terminal"]

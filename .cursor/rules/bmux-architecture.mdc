@@ -1,0 +1,109 @@
+description: "Architectural patterns, principles, and design decisions for bmux terminal multiplexer"
+---
+
+# bmux Architecture Patterns
+
+## Domain-Driven Design Principles
+
+### Package Organization by Domain
+
+bmux follows domain-driven design with packages organized by business responsibility, not technical layers:
+
+#### Core Domain Separation
+
+- **Models**: Pure data structures with no business logic
+- **Domain Logic**: Business rules and operations
+- **Infrastructure**: External system integrations
+
+#### Package Categories
+
+1. **Core Packages**: Main aggregator and CLI entry points
+2. **Domain Packages**: Business logic for sessions, terminals, events
+3. **Model Packages**: Data structures and types
+4. **Feature Packages**: Specific functionality (config, search, history)
+5. **Infrastructure Packages**: System integration (client, server, plugin)
+
+### Dependency Direction Rules
+
+- **Models** have no dependencies on other bmux packages
+- **Domain packages** can depend on their related models
+- **Infrastructure packages** can depend on domain and model packages
+- **No circular dependencies** between any packages
+- **Minimal coupling** between unrelated domains
+
+## Clean Architecture Implementation
+
+### Separation of Concerns
+
+Each package has a single, well-defined responsibility:
+
+```
+Models (Data)          Domain (Logic)         Infrastructure (I/O)
+┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
+│ session/models  │◄───│ session         │◄───│ client          │
+│ terminal/models │◄───│ terminal        │◄───│ server          │
+│ event/models    │◄───│ event           │◄───│ plugin          │
+└─────────────────┘    └─────────────────┘    └─────────────────┘
+```
+
+### Model Package Patterns
+
+- **Pure data structures**: No business logic or external dependencies
+- **Strong typing**: Use newtype patterns for IDs (SessionId, WindowId, etc.)
+- **Serialization ready**: Always include serde support
+- **Validation**: Basic validation only, complex rules in domain packages
+
+### Domain Package Patterns
+
+- **Business logic**: Core operations and domain rules
+- **Error handling**: Domain-specific error types with thiserror
+- **Interface design**: Clean public APIs that hide implementation details
+- **Async operations**: Use tokio for async operations where needed
+
+### Infrastructure Package Patterns
+
+- **External integration**: Handle system resources, network, file I/O
+- **Protocol implementation**: Client-server communication protocols
+- **Plugin interfaces**: Extensibility points for external functionality
+- **Configuration**: System configuration and environment handling
+
+## Code Quality Patterns
+
+### Clippy Configuration Standard
+
+Every package must include these exact clippy attributes:
+
+```rust
+#![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
+#![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
+#![allow(clippy::multiple_crate_versions)]
+#![allow(clippy::cargo_common_metadata)] // For internal packages only
+```
+
+### Error Handling Patterns
+
+- **#[must_use] attributes**: On all constructors and getter methods
+- **Comprehensive error docs**: Document all possible error conditions
+- **Bullet point format**: Use asterisks (*) for error documentation
+
+### Documentation Standards
+
+- **Public API documentation**: All public functions, structs, and enums
+- **Example usage**: Include examples for complex APIs
+- **Error conditions**: Document all possible failure modes
+- **Bullet points**: Use asterisks (*) not dashes (-) in documentation
+
+## Data Structure Patterns
+
+### Deterministic Collections
+
+- **Never use HashMap**: Always use BTreeMap for deterministic ordering
+- **Never use HashSet**: Always use BTreeSet for deterministic ordering
+- **Ordered keys**: All key types must implement Ord and PartialOrd
+- **Consistent iteration**: Ensure consistent iteration order across runs
+
+### Serialization Patterns
+
+- **SCREAMING_SNAKE_CASE**: Use for all serde rename attributes
+- **Consistent naming**: Use same naming convention across all types
+- **Optional serde**: Always make serde support optional via features

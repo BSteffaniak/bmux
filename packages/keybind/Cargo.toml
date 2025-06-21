@@ -1,0 +1,29 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Key binding system for bmux terminal multiplexer"
+edition     = { workspace = true }
+keywords    = ["bmux", "keybind", "modal", "terminal"]
+license     = { workspace = true }
+name        = "bmux_keybind"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+# Internal bmux packages
+bmux_config = { workspace = true }
+bmux_event  = { workspace = true }
+
+# External dependencies
+anyhow    = { workspace = true, features = ["std"] }
+crossterm = { workspace = true }
+serde     = { workspace = true, features = ["derive"], optional = true }
+thiserror = { workspace = true }
+tracing   = { workspace = true, features = ["std"] }
+
+[features]
+# Default features
+default = []
+
+# Development features
+fail-on-warnings = []
