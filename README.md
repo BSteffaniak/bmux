@@ -107,6 +107,20 @@ cargo install cargo-watch cargo-audit
 cargo watch -x 'run --bin bmux'
 ```
 
+### Nix + direnv Setup
+
+If you use Nix, bmux provides a flake-based development shell:
+
+```bash
+nix develop
+```
+
+To automatically load the shell when entering the repository:
+
+```bash
+direnv allow
+```
+
 ## 📄 License
 
 bmux is licensed under the [Mozilla Public License 2.0](LICENSE).
