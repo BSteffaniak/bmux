@@ -23,4 +23,4 @@ default = ["serde"]
 fail-on-warnings = []
 
 # Serialization features
-serde = ["dep:serde"]
+serde = ["bmux_session_models/serde", "dep:serde"]

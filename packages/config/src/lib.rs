@@ -188,9 +188,9 @@ pub enum BellAction {
 
 impl BmuxConfig {
     /// Load configuration from default location
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if the configuration file cannot be read or parsed.
     pub fn load() -> Result<Self> {
         let paths = ConfigPaths::default();
@@ -198,9 +198,9 @@ impl BmuxConfig {
     }
 
     /// Load configuration from a specific path
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if the configuration file cannot be read or parsed.
     pub fn load_from_path(path: &std::path::Path) -> Result<Self> {
         if !path.exists() {
@@ -223,9 +223,9 @@ impl BmuxConfig {
     }
 
     /// Save configuration to default location
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if the configuration file cannot be written.
     pub fn save(&self) -> Result<()> {
         let paths = ConfigPaths::default();
@@ -233,9 +233,9 @@ impl BmuxConfig {
     }
 
     /// Save configuration to a specific path
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if the configuration file cannot be written.
     pub fn save_to_path(&self, path: &std::path::Path) -> Result<()> {
         // Ensure parent directory exists
@@ -252,9 +252,9 @@ impl BmuxConfig {
     }
 
     /// Validate the configuration
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if any configuration values are invalid.
     pub fn validate(&self) -> Result<()> {
         // Validate scrollback limit

@@ -51,17 +51,17 @@ impl TerminalManager {
     }
 
     /// Create a new terminal instance
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if the terminal creation fails or if a terminal with the same pane ID already exists.
     pub fn create_terminal(&mut self, pane_id: PaneId, size: PaneSize) -> Result<()> {
         let terminal = TerminalInstance::new(pane_id, size);
-        
+
         if self.active_terminals.insert(pane_id, terminal).is_some() {
             warn!("Terminal already exists for pane: {}", pane_id);
         }
-        
+
         info!("Created terminal: {}", pane_id);
         Ok(())
     }
@@ -73,9 +73,9 @@ impl TerminalManager {
     }
 
     /// Resize a terminal
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if the terminal doesn't exist or if the resize operation fails.
     pub fn resize_terminal(&mut self, pane_id: &PaneId, new_size: PaneSize) -> Result<()> {
         if let Some(terminal) = self.active_terminals.get_mut(pane_id) {
@@ -89,9 +89,9 @@ impl TerminalManager {
     }
 
     /// Remove a terminal instance
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if the terminal doesn't exist.
     pub fn remove_terminal(&mut self, pane_id: &PaneId) -> Result<()> {
         if self.active_terminals.remove(pane_id).is_some() {

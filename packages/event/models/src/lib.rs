@@ -5,6 +5,7 @@
 
 use bmux_session_models::{ClientId, PaneId, SessionId, WindowId};
 use bmux_terminal_models::{PaneSize, SplitDirection};
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
 // ============================================================================
@@ -12,11 +13,12 @@ use serde::{Deserialize, Serialize};
 // ============================================================================
 
 /// Modes that bmux can operate in
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default)]
-#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "SCREAMING_SNAKE_CASE"))]
 pub enum Mode {
     #[default]
-    Normal,  // Default mode - no prefix keys needed
+    Normal, // Default mode - no prefix keys needed
     Insert,  // Terminal interaction mode
     Visual,  // Text selection mode
     Command, // Command entry mode
@@ -28,8 +30,8 @@ impl Mode {
     pub const fn can_transition_to(&self, target: Self) -> bool {
         match (self, target) {
             // All other modes can only go to Normal (except Visual->Command)
-            (Self::Insert | Self::Command, Self::Normal) 
-            | (Self::Visual, Self::Normal | Self::Command) 
+            (Self::Insert | Self::Command, Self::Normal)
+            | (Self::Visual, Self::Normal | Self::Command)
             | (Self::Normal, _) => true,
             _ => false,
         }
@@ -47,7 +49,8 @@ impl Mode {
 // Input Events
 // ============================================================================
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub enum KeyCode {
     // Letter keys
@@ -78,7 +81,8 @@ pub enum KeyCode {
     Insert,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 #[allow(clippy::struct_excessive_bools)]
 pub struct KeyModifiers {
     pub ctrl: bool,
@@ -87,7 +91,8 @@ pub struct KeyModifiers {
     pub super_key: bool, // Windows/Cmd key
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub struct KeyEvent {
     pub code: KeyCode,
@@ -133,7 +138,8 @@ impl KeyEvent {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub enum MouseButton {
     Left,
@@ -141,7 +147,8 @@ pub enum MouseButton {
     Middle,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub enum MouseEventType {
     Down,
@@ -153,7 +160,8 @@ pub enum MouseEventType {
     Scroll,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub struct MouseEvent {
     pub event_type: MouseEventType,
@@ -167,7 +175,8 @@ pub struct MouseEvent {
 // Events
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub enum SessionEvent {
     Created {
@@ -204,7 +213,8 @@ pub enum SessionEvent {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub enum WindowEvent {
     Created {
@@ -245,7 +255,8 @@ pub enum WindowEvent {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub enum PaneEvent {
     Created {
@@ -287,7 +298,8 @@ pub enum PaneEvent {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub enum ClientEvent {
     Connected {
@@ -322,7 +334,8 @@ pub enum ClientEvent {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub enum InputEvent {
     Key {
@@ -343,7 +356,8 @@ pub enum InputEvent {
     },
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub enum SystemEvent {
     ServerStarted,
@@ -359,7 +373,8 @@ pub enum SystemEvent {
 // Top-level Event enum
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub enum Event {
     Session(SessionEvent),

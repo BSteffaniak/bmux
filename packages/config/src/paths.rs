@@ -63,9 +63,9 @@ impl ConfigPaths {
     }
 
     /// Ensure all necessary directories exist
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if any directory cannot be created.
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         std::fs::create_dir_all(&self.config_dir)?;
@@ -82,19 +82,23 @@ impl ConfigPaths {
 impl Default for ConfigPaths {
     fn default() -> Self {
         let config_dir = dirs::config_dir().map_or_else(
-            || dirs::home_dir().map_or_else(
-                || PathBuf::from(".bmux"),
-                |d| d.join(".config").join("bmux")
-            ),
-            |d| d.join("bmux")
+            || {
+                dirs::home_dir().map_or_else(
+                    || PathBuf::from(".bmux"),
+                    |d| d.join(".config").join("bmux"),
+                )
+            },
+            |d| d.join("bmux"),
         );
 
         let data_dir = dirs::data_dir().map_or_else(
-            || dirs::home_dir().map_or_else(
-                || PathBuf::from(".bmux"),
-                |d| d.join(".local").join("share").join("bmux")
-            ),
-            |d| d.join("bmux")
+            || {
+                dirs::home_dir().map_or_else(
+                    || PathBuf::from(".bmux"),
+                    |d| d.join(".local").join("share").join("bmux"),
+                )
+            },
+            |d| d.join("bmux"),
         );
 
         let runtime_dir = if cfg!(unix) {

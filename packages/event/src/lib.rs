@@ -41,9 +41,9 @@ impl EventDispatcher {
     }
 
     /// Send an event
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if the event cannot be sent to subscribers.
     pub fn send_event(&self, event: Event) -> Result<()> {
         match self.event_sender.send(event) {
@@ -96,9 +96,9 @@ impl ModalSystem {
     }
 
     /// Attempt to transition to a new mode
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if the mode transition is not valid.
     pub fn transition_to(&mut self, new_mode: Mode) -> Result<()> {
         if self.current_mode.can_transition_to(new_mode) {
@@ -115,9 +115,9 @@ impl ModalSystem {
     }
 
     /// Handle a key event in the current mode
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// Returns an error if the key event handling fails or mode transition is invalid.
     pub fn handle_key_event(&mut self, key_event: &KeyEvent) -> Result<Option<Event>> {
         match self.current_mode {

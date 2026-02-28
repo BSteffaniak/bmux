@@ -3,6 +3,7 @@
 #![allow(clippy::multiple_crate_versions)]
 #![allow(clippy::cargo_common_metadata)] // Internal packages don't need README metadata
 
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use thiserror::Error;
@@ -12,7 +13,8 @@ use uuid::Uuid;
 // IDs
 // ============================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub struct SessionId(pub Uuid);
 
@@ -35,7 +37,8 @@ impl std::fmt::Display for SessionId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub struct WindowId(pub Uuid);
 
@@ -58,7 +61,8 @@ impl std::fmt::Display for WindowId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub struct PaneId(pub Uuid);
 
@@ -81,7 +85,8 @@ impl std::fmt::Display for PaneId {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub struct ClientId(pub Uuid);
 
@@ -166,7 +171,8 @@ pub enum ClientError {
 // Session Models
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub struct Session {
     pub id: SessionId,
@@ -255,7 +261,8 @@ impl Session {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub struct SessionInfo {
     pub id: SessionId,
@@ -283,7 +290,8 @@ impl From<&Session> for SessionInfo {
 // Client Models
 // ============================================================================
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub struct ClientInfo {
     pub id: ClientId,

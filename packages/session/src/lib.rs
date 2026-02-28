@@ -28,16 +28,17 @@ pub struct SessionManager {
 
 impl SessionManager {
     /// Create a new session manager
-    #[must_use] pub const fn new() -> Self {
+    #[must_use]
+    pub const fn new() -> Self {
         Self {
             sessions: BTreeMap::new(),
         }
     }
 
     /// Create a new session with an optional name
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// * Session creation fails
     pub fn create_session(&mut self, name: Option<String>) -> Result<SessionId> {
         let session = Session::new(name);
@@ -64,9 +65,9 @@ impl SessionManager {
     }
 
     /// Remove a session by ID
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// * Session not found
     pub fn remove_session(&mut self, session_id: &SessionId) -> Result<()> {
         if self.sessions.remove(session_id).is_some() {
@@ -77,7 +78,8 @@ impl SessionManager {
     }
 
     /// Get the number of active sessions
-    #[must_use] pub fn session_count(&self) -> usize {
+    #[must_use]
+    pub fn session_count(&self) -> usize {
         self.sessions.len()
     }
 }

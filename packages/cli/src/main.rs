@@ -178,9 +178,7 @@ fn execute_command(command: Commands, _config: BmuxConfig) -> Result<()> {
             Ok(())
         }
         Commands::Server { socket, foreground } => {
-            info!(
-                "Starting server: socket={socket:?}, foreground={foreground}"
-            );
+            info!("Starting server: socket={socket:?}, foreground={foreground}");
             start_server(socket, foreground);
             Ok(())
         }
@@ -212,11 +210,7 @@ fn create_new_session(session_name: Option<String>, _detach: bool) {
 }
 
 /// Attach to an existing session
-fn attach_to_session(
-    _target: Option<String>,
-    _independent: bool,
-    _follow_client: Option<String>,
-) {
+fn attach_to_session(_target: Option<String>, _independent: bool, _follow_client: Option<String>) {
     println!("Attaching to session...");
 
     // TODO: Implement actual session attachment

@@ -3,6 +3,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_session_models::{PaneId, WindowId};
+#[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -10,7 +11,8 @@ use std::collections::BTreeMap;
 // Terminal Models
 // ============================================================================
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub struct PaneSize {
     pub width: u16,
@@ -43,14 +45,16 @@ impl Default for PaneSize {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub enum SplitDirection {
     Horizontal,
     Vertical,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub enum PaneLayout {
     Single(PaneId),
@@ -67,11 +71,13 @@ pub enum PaneLayout {
 }
 
 impl PaneLayout {
-    #[must_use] pub const fn single(pane_id: PaneId) -> Self {
+    #[must_use]
+    pub const fn single(pane_id: PaneId) -> Self {
         Self::Single(pane_id)
     }
 
-    #[must_use] pub fn hsplit(top: Self, bottom: Self, ratio: f32) -> Self {
+    #[must_use]
+    pub fn hsplit(top: Self, bottom: Self, ratio: f32) -> Self {
         Self::HSplit {
             top: Box::new(top),
             bottom: Box::new(bottom),
@@ -79,7 +85,8 @@ impl PaneLayout {
         }
     }
 
-    #[must_use] pub fn vsplit(left: Self, right: Self, ratio: f32) -> Self {
+    #[must_use]
+    pub fn vsplit(left: Self, right: Self, ratio: f32) -> Self {
         Self::VSplit {
             left: Box::new(left),
             right: Box::new(right),
@@ -87,7 +94,8 @@ impl PaneLayout {
         }
     }
 
-    #[must_use] pub fn contains_pane(&self, pane_id: &PaneId) -> bool {
+    #[must_use]
+    pub fn contains_pane(&self, pane_id: &PaneId) -> bool {
         match self {
             Self::Single(id) => id == pane_id,
             Self::HSplit { top, bottom, .. } => {
@@ -99,7 +107,8 @@ impl PaneLayout {
         }
     }
 
-    #[must_use] pub fn collect_panes(&self) -> Vec<PaneId> {
+    #[must_use]
+    pub fn collect_panes(&self) -> Vec<PaneId> {
         match self {
             Self::Single(id) => vec![*id],
             Self::HSplit { top, bottom, .. } => {
@@ -116,7 +125,8 @@ impl PaneLayout {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub struct Pane {
     pub id: PaneId,
@@ -130,7 +140,8 @@ pub struct Pane {
 }
 
 impl Pane {
-    #[must_use] pub fn new(size: PaneSize) -> Self {
+    #[must_use]
+    pub fn new(size: PaneSize) -> Self {
         let now = std::time::SystemTime::now();
         Self {
             id: PaneId::new(),
@@ -144,17 +155,20 @@ impl Pane {
         }
     }
 
-    #[must_use] pub fn with_title(mut self, title: String) -> Self {
+    #[must_use]
+    pub fn with_title(mut self, title: String) -> Self {
         self.title = Some(title);
         self
     }
 
-    #[must_use] pub fn with_working_directory(mut self, working_directory: String) -> Self {
+    #[must_use]
+    pub fn with_working_directory(mut self, working_directory: String) -> Self {
         self.working_directory = Some(working_directory);
         self
     }
 
-    #[must_use] pub fn with_shell_command(mut self, shell_command: String) -> Self {
+    #[must_use]
+    pub fn with_shell_command(mut self, shell_command: String) -> Self {
         self.shell_command = Some(shell_command);
         self
     }
@@ -167,9 +181,9 @@ impl Pane {
     }
 
     /// Resize the pane to a new size
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// * Invalid dimensions (width or height is 0)
     pub fn resize(&mut self, new_size: PaneSize) -> Result<(), bmux_session_models::PaneError> {
         if !new_size.is_valid() {
@@ -189,7 +203,8 @@ impl Pane {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub struct Window {
     pub id: WindowId,
@@ -203,7 +218,8 @@ pub struct Window {
 }
 
 impl Window {
-    #[must_use] pub fn new(size: PaneSize, name: Option<String>) -> Self {
+    #[must_use]
+    pub fn new(size: PaneSize, name: Option<String>) -> Self {
         let now = std::time::SystemTime::now();
         let mut window = Self {
             id: WindowId::new(),
@@ -226,12 +242,14 @@ impl Window {
         window
     }
 
-    #[must_use] pub fn with_name(mut self, name: String) -> Self {
+    #[must_use]
+    pub fn with_name(mut self, name: String) -> Self {
         self.name = Some(name);
         self
     }
 
-    #[must_use] pub fn get_pane(&self, pane_id: &PaneId) -> Option<&Pane> {
+    #[must_use]
+    pub fn get_pane(&self, pane_id: &PaneId) -> Option<&Pane> {
         self.panes.get(pane_id)
     }
 
@@ -257,9 +275,9 @@ impl Window {
     }
 
     /// Set the active pane in this window
-    /// 
+    ///
     /// # Errors
-    /// 
+    ///
     /// * Pane not found in this window
     pub fn set_active_pane(
         &mut self,
@@ -365,7 +383,8 @@ impl Window {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
 pub struct WindowInfo {
     pub id: WindowId,
