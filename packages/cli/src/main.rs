@@ -5,111 +5,178 @@
 
 //! Main CLI application for bmux terminal multiplexer
 
-use anyhow::Result;
-use bmux_config::{BmuxConfig, ConfigPaths};
-use bmux_session::SessionId;
-use clap::{Parser, Subcommand};
-use tracing::info;
+use anyhow::{Context, Result};
+use clap::Parser;
+use crossterm::{
+    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
+    execute,
+    terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
+};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use std::io::{self, Read, Write};
+use std::process::ExitCode;
+use std::time::Duration;
+use tracing::{debug, info};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(name = "bmux")]
-#[command(about = "A modern terminal multiplexer written in Rust")]
+#[command(about = "A minimal fullscreen PTY runtime for bmux")]
 struct Cli {
-    #[command(subcommand)]
-    command: Option<Commands>,
-
-    /// Configuration file path
-    #[arg(short, long)]
-    config: Option<std::path::PathBuf>,
-
     /// Enable verbose logging
     #[arg(short, long)]
     verbose: bool,
+
+    /// Shell binary to launch inside the PTY
+    #[arg(long)]
+    shell: Option<String>,
 }
 
-#[derive(Subcommand)]
-enum Commands {
-    /// Start a new session or attach to existing one
-    #[command(alias = "new")]
-    NewSession {
-        /// Session name
-        #[arg(short, long)]
-        session: Option<String>,
+struct TerminalGuard;
 
-        /// Detach after creating
-        #[arg(short, long)]
-        detach: bool,
-    },
-
-    /// Attach to an existing session
-    #[command(alias = "a")]
-    Attach {
-        /// Session name or ID
-        #[arg(short, long)]
-        target: Option<String>,
-
-        /// Create independent view
-        #[arg(long)]
-        independent: bool,
-
-        /// Follow another client
-        #[arg(long)]
-        follow_client: Option<String>,
-    },
-
-    /// List all sessions
-    #[command(alias = "ls")]
-    List,
-
-    /// Kill a session
-    #[command(alias = "kill")]
-    KillSession {
-        /// Session name or ID
-        target: String,
-    },
-
-    /// Show server information
-    Info,
-
-    /// Start the bmux server
-    Server {
-        /// Server socket path
-        #[arg(short, long)]
-        socket: Option<std::path::PathBuf>,
-
-        /// Run in foreground
-        #[arg(short, long)]
-        foreground: bool,
-    },
+impl TerminalGuard {
+    fn activate() -> Result<Self> {
+        terminal::enable_raw_mode().context("failed to enable terminal raw mode")?;
+        execute!(io::stdout(), EnterAlternateScreen).context("failed to enter alternate screen")?;
+        Ok(Self)
+    }
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = terminal::disable_raw_mode();
+    }
+}
 
-    // Initialize logging
-    init_logging(cli.verbose);
-
-    // Load configuration
-    let config = load_config(cli.config.as_deref())?;
-
-    // Ensure config directories exist
-    let config_paths = ConfigPaths::default();
-    config_paths.ensure_dirs()?;
-
-    info!("Starting bmux terminal multiplexer");
-
-    match cli.command {
-        Some(command) => execute_command(command, config),
-        None => {
-            // Default behavior: try to attach to a session, or create a new one
-            default_action(config)
+fn main() -> ExitCode {
+    match run() {
+        Ok(code) => ExitCode::from(code),
+        Err(error) => {
+            eprintln!("bmux error: {error:#}");
+            ExitCode::from(1)
         }
     }
 }
 
-/// Initialize logging based on verbosity level
+fn run() -> Result<u8> {
+    let cli = Cli::parse();
+    init_logging(cli.verbose);
+
+    let shell = resolve_shell(cli.shell);
+    info!("Starting bmux fullscreen runtime");
+    info!("Launching shell: {shell}");
+
+    run_fullscreen_pty(&shell)
+}
+
+fn run_fullscreen_pty(shell: &str) -> Result<u8> {
+    let pty_system = native_pty_system();
+    let (cols, rows) = terminal::size().context("failed to read terminal size")?;
+    let pty_pair = pty_system
+        .openpty(PtySize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .context("failed to open PTY")?;
+
+    let command = CommandBuilder::new(shell);
+    let mut child = pty_pair
+        .slave
+        .spawn_command(command)
+        .context("failed to spawn shell in PTY")?;
+    drop(pty_pair.slave);
+
+    let mut pty_reader = pty_pair
+        .master
+        .try_clone_reader()
+        .context("failed to clone PTY reader")?;
+    let mut pty_writer = pty_pair
+        .master
+        .take_writer()
+        .context("failed to open PTY writer")?;
+
+    let _guard = TerminalGuard::activate()?;
+
+    let output_thread = std::thread::Builder::new()
+        .name("bmux-pty-output".to_string())
+        .spawn(move || -> Result<()> {
+            let mut buffer = [0_u8; 8192];
+            loop {
+                let bytes_read = pty_reader
+                    .read(&mut buffer)
+                    .context("failed reading from PTY")?;
+                if bytes_read == 0 {
+                    break;
+                }
+                io::stdout()
+                    .write_all(&buffer[..bytes_read])
+                    .context("failed writing PTY output")?;
+                io::stdout().flush().context("failed flushing PTY output")?;
+            }
+            Ok(())
+        })
+        .context("failed to spawn PTY output thread")?;
+
+    let mut exit_code = 0_u8;
+
+    loop {
+        if let Some(status) = child.try_wait().context("failed to poll shell status")? {
+            exit_code = exit_code_from_u32(status.exit_code());
+            break;
+        }
+
+        if !event::poll(Duration::from_millis(16)).context("failed to poll terminal events")? {
+            continue;
+        }
+
+        match event::read().context("failed to read terminal event")? {
+            Event::Key(key_event) => {
+                if matches!(key_event.kind, KeyEventKind::Release) {
+                    continue;
+                }
+
+                let bytes = encode_key_event(key_event);
+                if bytes.is_empty() {
+                    continue;
+                }
+
+                if pty_writer
+                    .write_all(&bytes)
+                    .and_then(|_| pty_writer.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Event::Resize(new_cols, new_rows) => {
+                debug!("Terminal resized to {new_cols}x{new_rows}");
+                pty_pair
+                    .master
+                    .resize(PtySize {
+                        rows: new_rows,
+                        cols: new_cols,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    })
+                    .context("failed to resize PTY")?;
+            }
+            _ => {}
+        }
+    }
+
+    child.wait().context("failed waiting for shell exit")?;
+
+    match output_thread.join() {
+        Ok(result) => result.context("PTY output thread failed")?,
+        Err(_) => return Err(anyhow::anyhow!("PTY output thread panicked")),
+    }
+
+    Ok(exit_code)
+}
+
 fn init_logging(verbose: bool) {
     #[cfg(feature = "logging")]
     {
@@ -119,133 +186,121 @@ fn init_logging(verbose: bool) {
             tracing::Level::INFO
         };
 
-        tracing_subscriber::fmt()
+        let _ = tracing_subscriber::fmt()
             .with_max_level(level)
             .with_target(false)
-            .init();
+            .try_init();
     }
 
     #[cfg(not(feature = "logging"))]
     {
-        let _ = verbose; // Silence unused variable warning
-        println!("Logging disabled - compile with --features logging to enable");
+        let _ = verbose;
     }
 }
 
-/// Load configuration from file or use defaults
-fn load_config(config_path: Option<&std::path::Path>) -> Result<BmuxConfig> {
-    let config = if let Some(path) = config_path {
-        BmuxConfig::load_from_path(path)?
+fn resolve_shell(cli_shell: Option<String>) -> String {
+    if let Some(shell) = cli_shell {
+        return shell;
+    }
+
+    if let Some(shell) = std::env::var_os("SHELL") {
+        return shell.to_string_lossy().into_owned();
+    }
+
+    if cfg!(windows) {
+        "cmd.exe".to_string()
     } else {
-        BmuxConfig::load()?
+        "/bin/sh".to_string()
+    }
+}
+
+fn exit_code_from_u32(code: u32) -> u8 {
+    match u8::try_from(code) {
+        Ok(valid_code) => valid_code,
+        Err(_) => u8::MAX,
+    }
+}
+
+fn encode_key_event(key_event: KeyEvent) -> Vec<u8> {
+    let mut bytes = Vec::new();
+
+    let mut push_escaped = |sequence: &[u8]| {
+        if key_event.modifiers.contains(KeyModifiers::ALT) {
+            bytes.push(0x1b);
+        }
+        bytes.extend_from_slice(sequence);
     };
 
-    info!("Configuration loaded successfully");
-    Ok(config)
+    match key_event.code {
+        KeyCode::Char(character) => {
+            if key_event.modifiers.contains(KeyModifiers::CONTROL) {
+                if let Some(control_byte) = control_character(character) {
+                    push_escaped(&[control_byte]);
+                    return bytes;
+                }
+            }
+
+            let mut utf8 = [0_u8; 4];
+            let encoded = character.encode_utf8(&mut utf8);
+            push_escaped(encoded.as_bytes());
+        }
+        KeyCode::Enter => push_escaped(b"\r"),
+        KeyCode::Tab => push_escaped(b"\t"),
+        KeyCode::BackTab => push_escaped(b"\x1b[Z"),
+        KeyCode::Backspace => push_escaped(&[0x7f]),
+        KeyCode::Delete => push_escaped(b"\x1b[3~"),
+        KeyCode::Insert => push_escaped(b"\x1b[2~"),
+        KeyCode::Esc => push_escaped(&[0x1b]),
+        KeyCode::Up => push_escaped(b"\x1b[A"),
+        KeyCode::Down => push_escaped(b"\x1b[B"),
+        KeyCode::Right => push_escaped(b"\x1b[C"),
+        KeyCode::Left => push_escaped(b"\x1b[D"),
+        KeyCode::Home => push_escaped(b"\x1b[H"),
+        KeyCode::End => push_escaped(b"\x1b[F"),
+        KeyCode::PageUp => push_escaped(b"\x1b[5~"),
+        KeyCode::PageDown => push_escaped(b"\x1b[6~"),
+        KeyCode::F(function_number) => {
+            if let Some(sequence) = function_key_sequence(function_number) {
+                push_escaped(sequence);
+            }
+        }
+        _ => {}
+    }
+
+    bytes
 }
 
-/// Execute a specific command
-#[allow(clippy::unnecessary_wraps)]
-fn execute_command(command: Commands, _config: BmuxConfig) -> Result<()> {
-    match command {
-        Commands::NewSession { session, detach } => {
-            info!("Creating new session: {:?}", session);
-            create_new_session(session, detach);
-            Ok(())
-        }
-        Commands::Attach {
-            target,
-            independent,
-            follow_client,
-        } => {
-            info!("Attaching to session: {:?}", target);
-            attach_to_session(target, independent, follow_client);
-            Ok(())
-        }
-        Commands::List => {
-            info!("Listing sessions");
-            list_sessions();
-            Ok(())
-        }
-        Commands::KillSession { target } => {
-            info!("Killing session: {target}");
-            kill_session(&target);
-            Ok(())
-        }
-        Commands::Info => {
-            info!("Showing server info");
-            show_server_info();
-            Ok(())
-        }
-        Commands::Server { socket, foreground } => {
-            info!("Starting server: socket={socket:?}, foreground={foreground}");
-            start_server(socket, foreground);
-            Ok(())
-        }
+fn control_character(character: char) -> Option<u8> {
+    if character.is_ascii_alphabetic() {
+        let lower = character.to_ascii_lowercase();
+        return Some((lower as u8) & 0x1f);
+    }
+
+    match character {
+        ' ' => Some(0),
+        '[' => Some(27),
+        '\\' => Some(28),
+        ']' => Some(29),
+        '^' => Some(30),
+        '_' => Some(31),
+        _ => None,
     }
 }
 
-/// Default action when no command is specified
-#[allow(clippy::unnecessary_wraps)]
-fn default_action(_config: BmuxConfig) -> Result<()> {
-    // Try to attach to the most recent session, or create a new one
-    info!("No command specified, trying default action");
-
-    // For now, just create a new session
-    create_new_session(None, false);
-    Ok(())
-}
-
-/// Create a new session
-fn create_new_session(session_name: Option<String>, _detach: bool) {
-    let session_name =
-        session_name.unwrap_or_else(|| format!("session-{}", SessionId::new().0.as_simple()));
-
-    println!("Creating new session: {session_name}");
-
-    // TODO: Implement actual session creation
-    // For now, just show what would happen
-    println!("Session '{session_name}' would be created here");
-    println!("This is where the terminal multiplexer would start!");
-}
-
-/// Attach to an existing session
-fn attach_to_session(_target: Option<String>, _independent: bool, _follow_client: Option<String>) {
-    println!("Attaching to session...");
-
-    // TODO: Implement actual session attachment
-    println!("Session attachment would happen here");
-}
-
-/// List all sessions
-fn list_sessions() {
-    println!("Active sessions:");
-
-    // TODO: Implement actual session listing
-    println!("  (No sessions currently running)");
-}
-
-/// Kill a session
-fn kill_session(target: &str) {
-    println!("Killing session: {target}");
-
-    // TODO: Implement actual session killing
-    println!("Session '{target}' would be killed here");
-}
-
-/// Show server information
-fn show_server_info() {
-    println!("bmux server information:");
-    println!("  Version: {}", env!("CARGO_PKG_VERSION"));
-    println!("  Status: Not implemented yet");
-
-    // TODO: Implement actual server info
-}
-
-/// Start the bmux server
-fn start_server(_socket: Option<std::path::PathBuf>, _foreground: bool) {
-    println!("Starting bmux server...");
-
-    // TODO: Implement actual server startup
-    println!("Server would start here");
+fn function_key_sequence(function_number: u8) -> Option<&'static [u8]> {
+    match function_number {
+        1 => Some(b"\x1bOP"),
+        2 => Some(b"\x1bOQ"),
+        3 => Some(b"\x1bOR"),
+        4 => Some(b"\x1bOS"),
+        5 => Some(b"\x1b[15~"),
+        6 => Some(b"\x1b[17~"),
+        7 => Some(b"\x1b[18~"),
+        8 => Some(b"\x1b[19~"),
+        9 => Some(b"\x1b[20~"),
+        10 => Some(b"\x1b[21~"),
+        11 => Some(b"\x1b[23~"),
+        12 => Some(b"\x1b[24~"),
+        _ => None,
+    }
 }
