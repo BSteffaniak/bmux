@@ -8,11 +8,10 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers},
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::{self, Read, Write};
 use std::process::ExitCode;
 use std::time::Duration;
@@ -100,6 +99,33 @@ fn run_fullscreen_pty(shell: &str) -> Result<u8> {
 
     let _guard = TerminalGuard::activate()?;
 
+    let _input_thread = std::thread::Builder::new()
+        .name("bmux-pty-input".to_string())
+        .spawn(move || -> Result<()> {
+            let mut stdin = io::stdin().lock();
+            let mut buffer = [0_u8; 8192];
+
+            loop {
+                let bytes_read = stdin
+                    .read(&mut buffer)
+                    .context("failed reading terminal input")?;
+                if bytes_read == 0 {
+                    break;
+                }
+
+                if pty_writer
+                    .write_all(&buffer[..bytes_read])
+                    .and_then(|_| pty_writer.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+
+            Ok(())
+        })
+        .context("failed to spawn PTY input thread")?;
+
     let output_thread = std::thread::Builder::new()
         .name("bmux-pty-output".to_string())
         .spawn(move || -> Result<()> {
@@ -120,52 +146,30 @@ fn run_fullscreen_pty(shell: &str) -> Result<u8> {
         })
         .context("failed to spawn PTY output thread")?;
 
-    let mut exit_code = 0_u8;
+    let mut last_size = (cols, rows);
 
-    loop {
+    let exit_code = loop {
         if let Some(status) = child.try_wait().context("failed to poll shell status")? {
-            exit_code = exit_code_from_u32(status.exit_code());
-            break;
+            break exit_code_from_u32(status.exit_code());
         }
 
-        if !event::poll(Duration::from_millis(16)).context("failed to poll terminal events")? {
-            continue;
+        let (new_cols, new_rows) = terminal::size().context("failed to read terminal size")?;
+        if (new_cols, new_rows) != last_size {
+            debug!("Terminal resized to {new_cols}x{new_rows}");
+            pty_pair
+                .master
+                .resize(PtySize {
+                    rows: new_rows,
+                    cols: new_cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .context("failed to resize PTY")?;
+            last_size = (new_cols, new_rows);
         }
 
-        match event::read().context("failed to read terminal event")? {
-            Event::Key(key_event) => {
-                if matches!(key_event.kind, KeyEventKind::Release) {
-                    continue;
-                }
-
-                let bytes = encode_key_event(key_event);
-                if bytes.is_empty() {
-                    continue;
-                }
-
-                if pty_writer
-                    .write_all(&bytes)
-                    .and_then(|_| pty_writer.flush())
-                    .is_err()
-                {
-                    break;
-                }
-            }
-            Event::Resize(new_cols, new_rows) => {
-                debug!("Terminal resized to {new_cols}x{new_rows}");
-                pty_pair
-                    .master
-                    .resize(PtySize {
-                        rows: new_rows,
-                        cols: new_cols,
-                        pixel_width: 0,
-                        pixel_height: 0,
-                    })
-                    .context("failed to resize PTY")?;
-            }
-            _ => {}
-        }
-    }
+        std::thread::sleep(Duration::from_millis(16));
+    };
 
     child.wait().context("failed waiting for shell exit")?;
 
@@ -218,89 +222,5 @@ fn exit_code_from_u32(code: u32) -> u8 {
     match u8::try_from(code) {
         Ok(valid_code) => valid_code,
         Err(_) => u8::MAX,
-    }
-}
-
-fn encode_key_event(key_event: KeyEvent) -> Vec<u8> {
-    let mut bytes = Vec::new();
-
-    let mut push_escaped = |sequence: &[u8]| {
-        if key_event.modifiers.contains(KeyModifiers::ALT) {
-            bytes.push(0x1b);
-        }
-        bytes.extend_from_slice(sequence);
-    };
-
-    match key_event.code {
-        KeyCode::Char(character) => {
-            if key_event.modifiers.contains(KeyModifiers::CONTROL) {
-                if let Some(control_byte) = control_character(character) {
-                    push_escaped(&[control_byte]);
-                    return bytes;
-                }
-            }
-
-            let mut utf8 = [0_u8; 4];
-            let encoded = character.encode_utf8(&mut utf8);
-            push_escaped(encoded.as_bytes());
-        }
-        KeyCode::Enter => push_escaped(b"\r"),
-        KeyCode::Tab => push_escaped(b"\t"),
-        KeyCode::BackTab => push_escaped(b"\x1b[Z"),
-        KeyCode::Backspace => push_escaped(&[0x7f]),
-        KeyCode::Delete => push_escaped(b"\x1b[3~"),
-        KeyCode::Insert => push_escaped(b"\x1b[2~"),
-        KeyCode::Esc => push_escaped(&[0x1b]),
-        KeyCode::Up => push_escaped(b"\x1b[A"),
-        KeyCode::Down => push_escaped(b"\x1b[B"),
-        KeyCode::Right => push_escaped(b"\x1b[C"),
-        KeyCode::Left => push_escaped(b"\x1b[D"),
-        KeyCode::Home => push_escaped(b"\x1b[H"),
-        KeyCode::End => push_escaped(b"\x1b[F"),
-        KeyCode::PageUp => push_escaped(b"\x1b[5~"),
-        KeyCode::PageDown => push_escaped(b"\x1b[6~"),
-        KeyCode::F(function_number) => {
-            if let Some(sequence) = function_key_sequence(function_number) {
-                push_escaped(sequence);
-            }
-        }
-        _ => {}
-    }
-
-    bytes
-}
-
-fn control_character(character: char) -> Option<u8> {
-    if character.is_ascii_alphabetic() {
-        let lower = character.to_ascii_lowercase();
-        return Some((lower as u8) & 0x1f);
-    }
-
-    match character {
-        ' ' => Some(0),
-        '[' => Some(27),
-        '\\' => Some(28),
-        ']' => Some(29),
-        '^' => Some(30),
-        '_' => Some(31),
-        _ => None,
-    }
-}
-
-fn function_key_sequence(function_number: u8) -> Option<&'static [u8]> {
-    match function_number {
-        1 => Some(b"\x1bOP"),
-        2 => Some(b"\x1bOQ"),
-        3 => Some(b"\x1bOR"),
-        4 => Some(b"\x1bOS"),
-        5 => Some(b"\x1b[15~"),
-        6 => Some(b"\x1b[17~"),
-        7 => Some(b"\x1b[18~"),
-        8 => Some(b"\x1b[19~"),
-        9 => Some(b"\x1b[20~"),
-        10 => Some(b"\x1b[21~"),
-        11 => Some(b"\x1b[23~"),
-        12 => Some(b"\x1b[24~"),
-        _ => None,
     }
 }
