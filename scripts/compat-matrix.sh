@@ -6,6 +6,12 @@ WORK_DIR="$(mktemp -d)"
 RESULTS_FILE="$WORK_DIR/results.tsv"
 HOME_DIR="$WORK_DIR/home"
 CONFIG_FILE=""
+TRACE_LIMIT="${BMUX_COMPAT_TRACE_LIMIT:-500}"
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "error: jq is required for compatibility assertions" >&2
+  exit 1
+fi
 
 cleanup() {
   if [[ "${BMUX_KEEP_COMPAT_TMP:-0}" == "1" ]]; then
@@ -35,11 +41,72 @@ write_config() {
   cat >"$CONFIG_FILE" <<EOF
 [general]
 scrollback_limit = 10000
+server_timeout = 5000
 
 [behavior]
 pane_term = "$pane_term"
 restore_last_layout = false
+protocol_trace_enabled = true
+protocol_trace_capacity = 2000
 EOF
+}
+
+expected_primary_da_for_profile() {
+  local profile="$1"
+  case "$profile" in
+    bmux|xterm|conservative)
+      printf '\033[?1;2c'
+      ;;
+    screen)
+      printf '\033[?64;1;2;6;9;15;18;21;22c'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+expected_secondary_da_for_profile() {
+  local profile="$1"
+  case "$profile" in
+    bmux)
+      printf '\033[>84;0;0c'
+      ;;
+    xterm)
+      printf '\033[>0;115;0c'
+      ;;
+    screen)
+      printf '\033[>83;40003;0c'
+      ;;
+    conservative)
+      printf '\033[>0;1000;0c'
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+profile_for_effective_term() {
+  local term="$1"
+  case "$term" in
+    bmux-256color)
+      printf 'bmux'
+      ;;
+    xterm-256color)
+      printf 'xterm'
+      ;;
+    screen-256color|tmux-256color)
+      printf 'screen'
+      ;;
+    *)
+      printf 'conservative'
+      ;;
+  esac
+}
+
+doctor_trace_json() {
+  cargo run -q -p bmux_cli -- terminal doctor --json --trace --trace-limit "$TRACE_LIMIT"
 }
 
 make_shell_wrapper() {
@@ -86,6 +153,7 @@ run_case() {
   local pane_term="$4"
   local wrapper
   local log_file="$WORK_DIR/${scenario}-${profile_name}.log"
+  local trace_json_file="$WORK_DIR/${scenario}-${profile_name}.trace.json"
 
   wrapper="$(make_shell_wrapper "$scenario" "$shell_bin")"
   write_config "$pane_term"
@@ -96,6 +164,13 @@ run_case() {
   if ! script -q "$log_file" sh -lc "(sleep 2; printf '\001q') | cargo run -q -p bmux_cli -- --shell '$wrapper' --no-alt-screen" >/dev/null 2>&1; then
     status="FAIL"
     notes="bmux command failed"
+  fi
+
+  if [[ "$status" == "PASS" ]]; then
+    if ! doctor_trace_json >"$trace_json_file"; then
+      status="FAIL"
+      notes="terminal doctor trace failed"
+    fi
   fi
 
   if [[ "$status" == "PASS" && "$scenario" == "fish" ]]; then
@@ -109,6 +184,40 @@ run_case() {
     if rg -q "failed to spawn shell in pane|failed reading pane PTY output|PTY output thread panicked" "$log_file"; then
       status="FAIL"
       notes="pane runtime error in log"
+    fi
+  fi
+
+  if [[ "$status" == "PASS" ]]; then
+    local protocol_profile
+    local effective_term
+    local expected_profile
+    local primary_da
+    local secondary_da
+    local expected_primary
+    local expected_secondary
+
+    protocol_profile="$(jq -r '.protocol_profile // empty' "$trace_json_file")"
+    effective_term="$(jq -r '.effective_pane_term // empty' "$trace_json_file")"
+    primary_da="$(jq -r '.primary_da_reply // empty' "$trace_json_file")"
+    secondary_da="$(jq -r '.secondary_da_reply // empty' "$trace_json_file")"
+
+    expected_profile="$(profile_for_effective_term "$effective_term")"
+    if [[ "$protocol_profile" != "$expected_profile" ]]; then
+      status="FAIL"
+      notes="bad_protocol_profile"
+    fi
+
+    if [[ "$status" == "PASS" ]]; then
+      expected_primary="$(expected_primary_da_for_profile "$protocol_profile")"
+      expected_secondary="$(expected_secondary_da_for_profile "$protocol_profile")"
+
+      if [[ "$primary_da" != "$expected_primary" ]]; then
+        status="FAIL"
+        notes="bad_primary_da_reply"
+      elif [[ "$secondary_da" != "$expected_secondary" ]]; then
+        status="FAIL"
+        notes="bad_secondary_da_reply"
+      fi
     fi
   fi
 
