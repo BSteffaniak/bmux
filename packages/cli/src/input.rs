@@ -512,10 +512,15 @@ fn key_event_to_stroke(key: &CrosstermKeyEvent) -> Option<KeyStroke> {
 
     let key_code = match key.code {
         CrosstermKeyCode::Char(c) => {
-            let normalized = if c.is_ascii_uppercase() {
-                shift = true;
+            let normalized = if c.is_ascii_alphabetic() {
+                if c.is_ascii_uppercase() {
+                    shift = true;
+                }
                 c.to_ascii_lowercase()
             } else {
+                // Symbol keys often arrive from crossterm with SHIFT set (e.g. '%' and '"').
+                // Bindings for literal symbols are stored without SHIFT, so we normalize them.
+                shift = false;
                 c
             };
             KeyCode::Char(normalized)
@@ -1456,6 +1461,29 @@ mod tests {
         assert_eq!(
             processor.process_terminal_event(key_event(KeyCode::Char('o'), KeyModifiers::NONE)),
             vec![RuntimeAction::FocusNext]
+        );
+    }
+
+    #[test]
+    fn terminal_event_symbol_split_bindings_work() {
+        let mut processor = InputProcessor::new(Keymap::default_runtime());
+
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            Vec::<RuntimeAction>::new()
+        );
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Char('%'), KeyModifiers::SHIFT)),
+            vec![RuntimeAction::SplitFocusedVertical]
+        );
+
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            Vec::<RuntimeAction>::new()
+        );
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Char('"'), KeyModifiers::SHIFT)),
+            vec![RuntimeAction::SplitFocusedHorizontal]
         );
     }
 }
