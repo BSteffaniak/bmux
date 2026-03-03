@@ -239,6 +239,7 @@ dependencies = [
  "bmux_ipc",
  "bmux_session",
  "bmux_terminal",
+ "portable-pty",
  "serde",
  "thiserror 2.0.12",
  "tokio",

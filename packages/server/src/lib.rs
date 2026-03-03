@@ -6,7 +6,7 @@
 //! Server component for bmux terminal multiplexer.
 
 use anyhow::{Context, Result};
-use bmux_config::ConfigPaths;
+use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
     AttachGrant, CURRENT_PROTOCOL_VERSION, Envelope, EnvelopeKind, ErrorCode, ErrorResponse,
@@ -14,7 +14,9 @@ use bmux_ipc::{
     SessionSummary, decode, encode,
 };
 use bmux_session::{ClientId, SessionId, SessionManager};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::BTreeMap;
+use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{mpsc, oneshot, watch};
@@ -26,14 +28,13 @@ const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
 
 /// Main server implementation.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct BmuxServer {
     endpoint: IpcEndpoint,
     state: Arc<ServerState>,
     shutdown_tx: watch::Sender<bool>,
 }
 
-#[derive(Debug)]
 struct ServerState {
     session_manager: Mutex<SessionManager>,
     session_runtimes: Mutex<SessionRuntimeManager>,
@@ -190,6 +191,26 @@ fn epoch_millis_now() -> u64 {
     now.as_millis() as u64
 }
 
+fn resolve_server_shell(config: &BmuxConfig) -> String {
+    if let Some(shell) = config.general.default_shell.as_ref()
+        && !shell.trim().is_empty()
+    {
+        return shell.clone();
+    }
+
+    if let Ok(shell) = std::env::var("SHELL")
+        && !shell.trim().is_empty()
+    {
+        return shell;
+    }
+
+    if cfg!(windows) {
+        "cmd.exe".to_string()
+    } else {
+        "/bin/sh".to_string()
+    }
+}
+
 async fn shutdown_runtime_handle(mut removed: RemovedRuntime) {
     if let Some(stop_tx) = removed.handle.stop_tx.take() {
         let _ = stop_tx.send(());
@@ -204,12 +225,11 @@ async fn shutdown_runtime_handle(mut removed: RemovedRuntime) {
     }
 }
 
-#[derive(Debug, Default)]
 struct SessionRuntimeManager {
     runtimes: BTreeMap<SessionId, SessionRuntimeHandle>,
+    shell: String,
 }
 
-#[derive(Debug)]
 struct SessionRuntimeHandle {
     stop_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
@@ -218,7 +238,6 @@ struct SessionRuntimeHandle {
     active_client: Option<ClientId>,
 }
 
-#[derive(Debug)]
 struct RemovedRuntime {
     session_id: SessionId,
     detached_client: Option<ClientId>,
@@ -234,6 +253,13 @@ enum SessionRuntimeError {
 }
 
 impl SessionRuntimeManager {
+    fn new(shell: String) -> Self {
+        Self {
+            runtimes: BTreeMap::new(),
+            shell,
+        }
+    }
+
     fn start_runtime(&mut self, session_id: SessionId) -> Result<()> {
         if self.runtimes.contains_key(&session_id) {
             anyhow::bail!("runtime already exists for session {}", session_id.0);
@@ -242,7 +268,59 @@ impl SessionRuntimeManager {
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (output_tx, output_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let shell = self.shell.clone();
         let task = tokio::spawn(async move {
+            let pty_system = native_pty_system();
+            let pty_pair = match pty_system.openpty(PtySize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            }) {
+                Ok(pair) => pair,
+                Err(_) => return,
+            };
+
+            let mut command = CommandBuilder::new(&shell);
+            command.env("TERM", "xterm-256color");
+            let mut child = match pty_pair.slave.spawn_command(command) {
+                Ok(child) => child,
+                Err(_) => return,
+            };
+            drop(pty_pair.slave);
+
+            let mut reader = match pty_pair.master.try_clone_reader() {
+                Ok(reader) => reader,
+                Err(_) => {
+                    let _ = child.kill();
+                    return;
+                }
+            };
+            let mut writer = match pty_pair.master.take_writer() {
+                Ok(writer) => writer,
+                Err(_) => {
+                    let _ = child.kill();
+                    return;
+                }
+            };
+
+            let reader_output = output_tx.clone();
+            let reader_thread = std::thread::Builder::new()
+                .name(format!("bmux-server-session-{}", session_id.0))
+                .spawn(move || {
+                    let mut buffer = [0_u8; 8192];
+                    loop {
+                        match reader.read(&mut buffer) {
+                            Ok(0) => break,
+                            Ok(bytes_read) => {
+                                let _ = reader_output.send(buffer[..bytes_read].to_vec());
+                            }
+                            Err(_) => break,
+                        }
+                    }
+                })
+                .ok();
+
             loop {
                 tokio::select! {
                     _ = &mut stop_rx => {
@@ -251,12 +329,21 @@ impl SessionRuntimeManager {
                     input = input_rx.recv() => {
                         match input {
                             Some(bytes) => {
-                                let _ = output_tx.send(bytes);
+                                if writer.write_all(&bytes).is_err() {
+                                    break;
+                                }
+                                let _ = writer.flush();
                             }
                             None => break,
                         }
                     }
                 }
+            }
+
+            let _ = child.kill();
+            let _ = child.wait();
+            if let Some(thread) = reader_thread {
+                let _ = thread.join();
             }
         });
 
@@ -401,12 +488,14 @@ impl BmuxServer {
     /// Create a server with an explicit endpoint.
     #[must_use]
     pub fn new(endpoint: IpcEndpoint) -> Self {
+        let config = BmuxConfig::load().unwrap_or_default();
+        let shell = resolve_server_shell(&config);
         let (shutdown_tx, _) = watch::channel(false);
         Self {
             endpoint,
             state: Arc::new(ServerState {
                 session_manager: Mutex::new(SessionManager::new()),
-                session_runtimes: Mutex::new(SessionRuntimeManager::default()),
+                session_runtimes: Mutex::new(SessionRuntimeManager::new(shell)),
                 attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
                 event_hub: Mutex::new(EventHub::new(1024)),
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,

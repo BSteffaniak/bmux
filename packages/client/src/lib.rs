@@ -402,17 +402,32 @@ mod tests {
             .expect("attach open should succeed");
         assert_eq!(attached_id, session_id);
 
+        let marker = format!("bmux-marker-{}", Uuid::new_v4());
+        let command = format!("printf '{marker}\\n'\\n");
         let bytes_sent = client
-            .attach_input(session_id, b"echo-me".to_vec())
+            .attach_input(session_id, command.as_bytes().to_vec())
             .await
             .expect("attach input should succeed");
-        assert_eq!(bytes_sent, 7);
+        assert_eq!(bytes_sent, command.len());
 
-        let output = client
-            .attach_output(session_id, 64)
-            .await
-            .expect("attach output should succeed");
-        assert_eq!(output, b"echo-me".to_vec());
+        let mut collected = Vec::new();
+        for _ in 0..20 {
+            let output = client
+                .attach_output(session_id, 4096)
+                .await
+                .expect("attach output should succeed");
+            if !output.is_empty() {
+                collected.extend_from_slice(&output);
+                if String::from_utf8_lossy(&collected).contains(&marker) {
+                    break;
+                }
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        assert!(
+            String::from_utf8_lossy(&collected).contains(&marker),
+            "expected marker in PTY output"
+        );
 
         let events = client
             .poll_events(10)
