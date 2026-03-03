@@ -95,7 +95,7 @@ pub struct AppearanceConfig {
 }
 
 /// Behavior configuration options
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct BehaviorConfig {
@@ -109,6 +109,21 @@ pub struct BehaviorConfig {
     pub automatic_rename: bool,
     /// Exit bmux when no sessions remain
     pub exit_empty: bool,
+    /// Restore and persist last local CLI runtime layout
+    pub restore_last_layout: bool,
+}
+
+impl Default for BehaviorConfig {
+    fn default() -> Self {
+        Self {
+            aggressive_resize: false,
+            visual_activity: false,
+            bell_action: BellAction::Any,
+            automatic_rename: false,
+            exit_empty: false,
+            restore_last_layout: true,
+        }
+    }
 }
 
 /// Multi-client specific configuration

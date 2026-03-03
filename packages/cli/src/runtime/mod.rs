@@ -22,6 +22,7 @@ use vt100::Parser as VtParser;
 mod commands;
 mod compositor;
 mod pane_runtime;
+mod persistence;
 mod status_message;
 use commands::process_input_events;
 use compositor::{RenderCache, RenderDebugState, render_frame};
@@ -29,6 +30,7 @@ use pane_runtime::{
     any_running_panes, first_running_pane_id, pane_is_running, refresh_exit_codes, resize_panes,
     spawn_pane, stop_pane_process,
 };
+use persistence::{load_persisted_runtime_state, save_persisted_runtime_state};
 use status_message::StatusMessage;
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -63,6 +65,11 @@ struct ReapExitedPanesResult {
     session_exit_code: Option<u8>,
 }
 
+struct RuntimeSettings {
+    keymap: crate::input::Keymap,
+    layout_persistence_enabled: bool,
+}
+
 pub(crate) fn run() -> Result<u8> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
@@ -72,7 +79,7 @@ pub(crate) fn run() -> Result<u8> {
     }
 
     let shell = resolve_shell(cli.shell);
-    let keymap = load_runtime_keymap();
+    let runtime_settings = load_runtime_settings();
     debug!("Starting bmux runtime");
     debug!("Launching shell: {shell}");
 
@@ -82,7 +89,7 @@ pub(crate) fn run() -> Result<u8> {
         cli.debug_render,
         cli.debug_render_log.as_deref(),
         cli.debug_render_log_format,
-        keymap,
+        runtime_settings,
     )
 }
 
@@ -100,45 +107,30 @@ fn run_two_pane_runtime(
     debug_render: bool,
     debug_render_log: Option<&Path>,
     debug_render_log_format: DebugRenderLogFormat,
-    keymap: crate::input::Keymap,
+    runtime_settings: RuntimeSettings,
 ) -> Result<u8> {
     let terminal_guard = TerminalGuard::activate(use_alt_screen, true)?;
 
     let (mut cols, mut rows) =
         crossterm::terminal::size().context("failed to read terminal size")?;
-    let mut layout_tree = LayoutTree::two_pane(PaneId(1), PaneId(2), SplitDirection::Vertical, 0.5);
-    let mut pane_rects = layout_tree.compute_rects(cols, rows);
-
     let startup_deadline = Instant::now() + STARTUP_ALT_SCREEN_GUARD_DURATION;
     let user_input_seen = Arc::new(AtomicBool::new(false));
     let shutdown_requested = Arc::new(AtomicBool::new(false));
-
-    let mut panes = BTreeMap::new();
-    panes.insert(
-        PaneId(1),
-        spawn_pane(
-            shell,
-            "left".to_string(),
-            pane_rects[&PaneId(1)].inner(),
-            startup_deadline,
-            Arc::clone(&user_input_seen),
-        )?,
-    );
-    panes.insert(
-        PaneId(2),
-        spawn_pane(
-            shell,
-            "right".to_string(),
-            pane_rects[&PaneId(2)].inner(),
-            startup_deadline,
-            Arc::clone(&user_input_seen),
-        )?,
-    );
+    let (mut layout_tree, mut panes) = initialize_runtime_state(
+        shell,
+        cols,
+        rows,
+        startup_deadline,
+        Arc::clone(&user_input_seen),
+        runtime_settings.layout_persistence_enabled,
+    )?;
+    let mut pane_rects = layout_tree.compute_rects(cols, rows);
+    let mut last_persisted_at = Instant::now();
 
     let (input_tx, input_rx) = mpsc::channel::<RuntimeAction>();
     let input_thread = spawn_input_thread(
         input_tx,
-        keymap,
+        runtime_settings.keymap,
         Arc::clone(&user_input_seen),
         Arc::clone(&shutdown_requested),
     )?;
@@ -154,8 +146,10 @@ fn run_two_pane_runtime(
     let mut render_cache = RenderCache::default();
     let mut render_debug =
         RenderDebugState::new(debug_render, debug_render_log, debug_render_log_format)?;
+    let mut persistence_dirty = true;
 
     let exit_code = loop {
+        let focused_before_input = focused_pane;
         if let Some(updated_tree) = process_input_events(
             &input_rx,
             &mut panes,
@@ -175,6 +169,11 @@ fn run_two_pane_runtime(
             resize_panes(&mut panes, &pane_rects)?;
             terminal_guard.refresh_layout(rows)?;
             force_redraw = true;
+            persistence_dirty = true;
+        }
+
+        if focused_pane != focused_before_input {
+            persistence_dirty = true;
         }
 
         if shutdown_requested.load(Ordering::Relaxed) && !kill_sent {
@@ -195,12 +194,14 @@ fn run_two_pane_runtime(
             resize_panes(&mut panes, &pane_rects)?;
             terminal_guard.refresh_layout(rows)?;
             force_redraw = true;
+            persistence_dirty = true;
         }
 
         if !panes.get(&focused_pane).is_some_and(pane_is_running) {
             if let Some(next_focus) = first_running_pane_id(&layout_tree.pane_order(), &panes) {
                 focused_pane = next_focus;
                 layout_tree.focused = focused_pane;
+                persistence_dirty = true;
             }
         }
 
@@ -241,6 +242,18 @@ fn run_two_pane_runtime(
             .values()
             .any(|pane| pane.state.dirty.swap(false, Ordering::Relaxed));
 
+        if runtime_settings.layout_persistence_enabled
+            && persistence_dirty
+            && last_persisted_at.elapsed() >= STATUS_REDRAW_INTERVAL
+        {
+            if let Err(error) = save_persisted_runtime_state(&layout_tree, &panes, focused_pane) {
+                eprintln!("bmux warning: failed to persist runtime layout ({error})");
+            } else {
+                persistence_dirty = false;
+                last_persisted_at = Instant::now();
+            }
+        }
+
         if force_redraw || pane_dirty || Instant::now() >= next_status_redraw {
             render_frame(
                 &panes,
@@ -262,6 +275,12 @@ fn run_two_pane_runtime(
         thread::sleep(FRAME_INTERVAL);
     };
 
+    if runtime_settings.layout_persistence_enabled
+        && let Err(error) = save_persisted_runtime_state(&layout_tree, &panes, focused_pane)
+    {
+        eprintln!("bmux warning: failed to persist runtime layout on shutdown ({error})");
+    }
+
     shutdown_requested.store(true, Ordering::Relaxed);
     if input_thread.is_finished() {
         match input_thread.join() {
@@ -277,6 +296,64 @@ fn run_two_pane_runtime(
     }
 
     Ok(exit_override.unwrap_or(exit_code))
+}
+
+fn initialize_runtime_state(
+    shell: &str,
+    cols: u16,
+    rows: u16,
+    startup_deadline: Instant,
+    user_input_seen: Arc<AtomicBool>,
+    persistence_enabled: bool,
+) -> Result<(LayoutTree, BTreeMap<PaneId, PaneRuntime>)> {
+    let restored = if persistence_enabled {
+        match load_persisted_runtime_state() {
+            Ok(state) => state,
+            Err(error) => {
+                eprintln!("bmux warning: failed loading persisted runtime layout ({error})");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let layout_tree = restored.as_ref().map_or_else(
+        || LayoutTree::two_pane(PaneId(1), PaneId(2), SplitDirection::Vertical, 0.5),
+        |state| state.layout_tree.clone(),
+    );
+    let pane_rects = layout_tree.compute_rects(cols, rows);
+    let pane_order = layout_tree.pane_order();
+
+    let mut panes = BTreeMap::new();
+    for pane_id in pane_order {
+        let (title, pane_shell) = if let Some(state) = restored.as_ref() {
+            if let Some(meta) = state.panes.get(&pane_id) {
+                (meta.title.clone(), meta.shell.clone())
+            } else {
+                (format!("pane-{}", pane_id.0), shell.to_string())
+            }
+        } else {
+            match pane_id.0 {
+                1 => ("left".to_string(), shell.to_string()),
+                2 => ("right".to_string(), shell.to_string()),
+                _ => (format!("pane-{}", pane_id.0), shell.to_string()),
+            }
+        };
+
+        panes.insert(
+            pane_id,
+            spawn_pane(
+                &pane_shell,
+                title,
+                pane_rects[&pane_id].inner(),
+                startup_deadline,
+                Arc::clone(&user_input_seen),
+            )?,
+        );
+    }
+
+    Ok((layout_tree, panes))
 }
 
 fn spawn_input_thread(
@@ -489,7 +566,7 @@ fn key_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     }
 }
 
-fn load_runtime_keymap() -> crate::input::Keymap {
+fn load_runtime_settings() -> RuntimeSettings {
     match BmuxConfig::load() {
         Ok(config) => match crate::input::Keymap::from_parts(
             &config.keybindings.prefix,
@@ -497,15 +574,24 @@ fn load_runtime_keymap() -> crate::input::Keymap {
             &config.keybindings.runtime,
             &config.keybindings.global,
         ) {
-            Ok(keymap) => keymap,
+            Ok(keymap) => RuntimeSettings {
+                keymap,
+                layout_persistence_enabled: config.behavior.restore_last_layout,
+            },
             Err(error) => {
                 eprintln!("bmux warning: invalid keymap config, using defaults ({error})");
-                crate::input::Keymap::default_runtime()
+                RuntimeSettings {
+                    keymap: crate::input::Keymap::default_runtime(),
+                    layout_persistence_enabled: config.behavior.restore_last_layout,
+                }
             }
         },
         Err(error) => {
             eprintln!("bmux warning: failed loading config, using default keymap ({error})");
-            crate::input::Keymap::default_runtime()
+            RuntimeSettings {
+                keymap: crate::input::Keymap::default_runtime(),
+                layout_persistence_enabled: BmuxConfig::default().behavior.restore_last_layout,
+            }
         }
     }
 }

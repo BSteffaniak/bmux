@@ -56,6 +56,12 @@ impl ConfigPaths {
         self.data_dir.join("logs")
     }
 
+    /// Get persisted local runtime state file path
+    #[must_use]
+    pub fn runtime_layout_state_file(&self) -> PathBuf {
+        self.data_dir.join("runtime").join("last-layout.json")
+    }
+
     /// Get the server socket path
     #[must_use]
     pub fn server_socket(&self) -> PathBuf {
