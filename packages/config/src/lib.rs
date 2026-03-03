@@ -341,22 +341,48 @@ impl BmuxConfig {
     }
 
     fn sanitize_invalid_values(&mut self) -> Vec<String> {
-        let defaults = GeneralConfig::default();
+        let general_defaults = GeneralConfig::default();
+        let keybind_defaults = KeyBindingConfig::default();
+        let behavior_defaults = BehaviorConfig::default();
         let mut repaired_fields = Vec::new();
 
         if self.general.scrollback_limit == 0 {
-            self.general.scrollback_limit = defaults.scrollback_limit;
+            self.general.scrollback_limit = general_defaults.scrollback_limit;
             repaired_fields.push(format!(
                 "general.scrollback_limit=0 -> {}",
-                defaults.scrollback_limit
+                general_defaults.scrollback_limit
             ));
         }
 
         if self.general.server_timeout == 0 {
-            self.general.server_timeout = defaults.server_timeout;
+            self.general.server_timeout = general_defaults.server_timeout;
             repaired_fields.push(format!(
                 "general.server_timeout=0 -> {}",
-                defaults.server_timeout
+                general_defaults.server_timeout
+            ));
+        }
+
+        if self.keybindings.prefix.trim().is_empty() {
+            self.keybindings.prefix = keybind_defaults.prefix.clone();
+            repaired_fields.push(format!(
+                "keybindings.prefix=<empty> -> {}",
+                keybind_defaults.prefix
+            ));
+        }
+
+        if self.keybindings.timeout_ms == 0 {
+            self.keybindings.timeout_ms = keybind_defaults.timeout_ms;
+            repaired_fields.push(format!(
+                "keybindings.timeout_ms=0 -> {}",
+                keybind_defaults.timeout_ms
+            ));
+        }
+
+        if self.behavior.protocol_trace_capacity == 0 {
+            self.behavior.protocol_trace_capacity = behavior_defaults.protocol_trace_capacity;
+            repaired_fields.push(format!(
+                "behavior.protocol_trace_capacity=0 -> {}",
+                behavior_defaults.protocol_trace_capacity
             ));
         }
 
@@ -410,6 +436,58 @@ mod tests {
             std::fs::read_to_string(&path).expect("failed reading persisted repaired config");
         assert!(persisted.contains("scrollback_limit = 10000"));
         assert!(persisted.contains("server_timeout = 5000"));
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn load_repairs_invalid_fields_and_keeps_valid_behavior_settings() {
+        let unique = format!(
+            "bmux-config-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before epoch")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).expect("failed to create temp test directory");
+        let path = dir.join("bmux.toml");
+
+        std::fs::write(
+            &path,
+            r#"[general]
+scrollback_limit = 0
+server_timeout = 5000
+
+[behavior]
+pane_term = "xterm-256color"
+protocol_trace_enabled = true
+protocol_trace_capacity = 0
+
+[keybindings]
+prefix = ""
+timeout_ms = 0
+"#,
+        )
+        .expect("failed writing invalid config fixture");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(config.general.scrollback_limit, 10_000);
+        assert_eq!(config.general.server_timeout, 5_000);
+        assert_eq!(config.keybindings.prefix, "ctrl+a");
+        assert_eq!(config.keybindings.timeout_ms, 400);
+        assert_eq!(config.behavior.pane_term, "xterm-256color");
+        assert!(config.behavior.protocol_trace_enabled);
+        assert_eq!(config.behavior.protocol_trace_capacity, 200);
+
+        let persisted =
+            std::fs::read_to_string(&path).expect("failed reading persisted repaired config");
+        assert!(persisted.contains("scrollback_limit = 10000"));
+        assert!(persisted.contains("prefix = \"ctrl+a\""));
+        assert!(persisted.contains("timeout_ms = 400"));
+        assert!(persisted.contains("protocol_trace_capacity = 200"));
+        assert!(persisted.contains("pane_term = \"xterm-256color\""));
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
     }
