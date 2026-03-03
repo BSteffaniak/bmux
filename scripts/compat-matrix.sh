@@ -19,6 +19,11 @@ Options:
   --scenario <name>   Run a single scenario (fish, vim, fzf, less) or all (default)
   --timeout-secs <n>  Per-case marker wait timeout in seconds (default: $BMUX_COMPAT_CASE_TIMEOUT_SECS or 12)
   -h, --help          Show this help message
+
+Examples:
+  ./scripts/compat-matrix.sh --help
+  ./scripts/compat-matrix.sh --scenario fish
+  ./scripts/compat-matrix.sh --scenario all --timeout-secs 20
 EOF
 }
 
