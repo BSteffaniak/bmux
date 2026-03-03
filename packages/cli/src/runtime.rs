@@ -1,11 +1,11 @@
-use crate::cli::Cli;
-use crate::pane::{compute_vertical_layout, Layout, Rect};
-use crate::pty::{extract_filtered_output, STARTUP_ALT_SCREEN_GUARD_DURATION};
+use crate::cli::{Cli, DebugRenderLogFormat};
+use crate::pane::{Layout, Rect, compute_vertical_layout};
+use crate::pty::{STARTUP_ALT_SCREEN_GUARD_DURATION, extract_filtered_output};
 use crate::status::{build_status_line, write_status_line};
 use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
 use clap::Parser;
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -84,12 +84,17 @@ struct RenderDebugState {
 struct RenderDebugLogger {
     file: std::fs::File,
     started_at: Instant,
+    format: DebugRenderLogFormat,
 }
 
 impl RenderDebugState {
-    fn new(enabled: bool, log_path: Option<&Path>) -> Result<Self> {
+    fn new(
+        enabled: bool,
+        log_path: Option<&Path>,
+        log_format: DebugRenderLogFormat,
+    ) -> Result<Self> {
         let logger = if let Some(path) = log_path {
-            Some(RenderDebugLogger::new(path)?)
+            Some(RenderDebugLogger::new(path, log_format)?)
         } else {
             None
         };
@@ -109,11 +114,7 @@ impl RenderDebugState {
     fn record_frame(&mut self, changed_lines: usize, status_updated: bool, border_updated: bool) {
         if let Some(logger) = self.logger.as_mut() {
             let elapsed_ms = logger.started_at.elapsed().as_millis();
-            let _ = writeln!(
-                logger.file,
-                "t={}ms frame changed_lines={} status_updated={} border_updated={}",
-                elapsed_ms, changed_lines, status_updated, border_updated
-            );
+            let _ = logger.write_frame(elapsed_ms, changed_lines, status_updated, border_updated);
         }
 
         if !self.enabled {
@@ -145,10 +146,12 @@ impl RenderDebugState {
 
             if let Some(logger) = self.logger.as_mut() {
                 let elapsed_ms = logger.started_at.elapsed().as_millis();
-                let _ = writeln!(
-                    logger.file,
-                    "t={}ms window fps={:.3} lines_per_frame={:.3} status_updates={} border_updates={}",
-                    elapsed_ms, fps, lines_per_frame, self.status_updates, self.border_updates
+                let _ = logger.write_window(
+                    elapsed_ms,
+                    fps,
+                    lines_per_frame,
+                    self.status_updates,
+                    self.border_updates,
                 );
             }
 
@@ -170,19 +173,73 @@ impl RenderDebugState {
 }
 
 impl RenderDebugLogger {
-    fn new(path: &Path) -> Result<Self> {
+    fn new(path: &Path, format: DebugRenderLogFormat) -> Result<Self> {
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(path)
             .with_context(|| format!("failed opening render debug log at {}", path.display()))?;
 
-        let _ = writeln!(file, "# bmux render debug log");
+        match format {
+            DebugRenderLogFormat::Text => {
+                let _ = writeln!(file, "# bmux render debug log");
+            }
+            DebugRenderLogFormat::Csv => {
+                let _ = writeln!(
+                    file,
+                    "event,t_ms,changed_lines,status_updated,border_updated,fps,lines_per_frame,status_updates,border_updates"
+                );
+            }
+        }
 
         Ok(Self {
             file,
             started_at: Instant::now(),
+            format,
         })
+    }
+
+    fn write_frame(
+        &mut self,
+        elapsed_ms: u128,
+        changed_lines: usize,
+        status_updated: bool,
+        border_updated: bool,
+    ) -> std::io::Result<()> {
+        match self.format {
+            DebugRenderLogFormat::Text => writeln!(
+                self.file,
+                "t={}ms frame changed_lines={} status_updated={} border_updated={}",
+                elapsed_ms, changed_lines, status_updated, border_updated
+            ),
+            DebugRenderLogFormat::Csv => writeln!(
+                self.file,
+                "frame,{},{},{},{},,,,",
+                elapsed_ms, changed_lines, status_updated, border_updated
+            ),
+        }
+    }
+
+    fn write_window(
+        &mut self,
+        elapsed_ms: u128,
+        fps: f64,
+        lines_per_frame: f64,
+        status_updates: u32,
+        border_updates: u32,
+    ) -> std::io::Result<()> {
+        match self.format {
+            DebugRenderLogFormat::Text => writeln!(
+                self.file,
+                "t={}ms window fps={:.3} lines_per_frame={:.3} status_updates={} border_updates={}",
+                elapsed_ms, fps, lines_per_frame, status_updates, border_updates
+            ),
+            DebugRenderLogFormat::Csv => writeln!(
+                self.file,
+                "window,{},,,,,{:.3},{:.3},{},{}",
+                elapsed_ms, fps, lines_per_frame, status_updates, border_updates
+            ),
+        }
     }
 }
 
@@ -199,6 +256,7 @@ pub(crate) fn run() -> Result<u8> {
         !cli.no_alt_screen,
         cli.debug_render,
         cli.debug_render_log.as_deref(),
+        cli.debug_render_log_format,
     )
 }
 
@@ -207,6 +265,7 @@ fn run_two_pane_runtime(
     use_alt_screen: bool,
     debug_render: bool,
     debug_render_log: Option<&Path>,
+    debug_render_log_format: DebugRenderLogFormat,
 ) -> Result<u8> {
     let terminal_guard = TerminalGuard::activate(use_alt_screen, true)?;
 
@@ -251,7 +310,8 @@ fn run_two_pane_runtime(
     let mut next_status_redraw = Instant::now() + STATUS_REDRAW_INTERVAL;
     let mut exit_override = None;
     let mut render_cache = RenderCache::default();
-    let mut render_debug = RenderDebugState::new(debug_render, debug_render_log)?;
+    let mut render_debug =
+        RenderDebugState::new(debug_render, debug_render_log, debug_render_log_format)?;
 
     let exit_code = loop {
         process_input_events(

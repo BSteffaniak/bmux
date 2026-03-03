@@ -1,4 +1,10 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum DebugRenderLogFormat {
+    Text,
+    Csv,
+}
 
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
@@ -24,6 +30,10 @@ pub(crate) struct Cli {
     /// Append render diagnostics to a log file
     #[arg(long, value_name = "PATH")]
     pub(crate) debug_render_log: Option<std::path::PathBuf>,
+
+    /// Render diagnostics log format
+    #[arg(long, value_enum, default_value_t = DebugRenderLogFormat::Text)]
+    pub(crate) debug_render_log_format: DebugRenderLogFormat,
 }
 
 #[cfg(test)]
@@ -56,6 +66,22 @@ mod tests {
         assert_eq!(
             cli.debug_render_log.as_deref(),
             Some(std::path::Path::new("render.log"))
+        );
+    }
+
+    #[test]
+    fn parses_debug_render_log_csv_format() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "--debug-render-log",
+            "render.log",
+            "--debug-render-log-format",
+            "csv",
+        ])
+        .expect("valid CLI args");
+        assert_eq!(
+            cli.debug_render_log_format,
+            super::DebugRenderLogFormat::Csv
         );
     }
 }
