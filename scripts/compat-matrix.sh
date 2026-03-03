@@ -109,6 +109,26 @@ doctor_trace_json() {
   cargo run -q -p bmux_cli -- terminal doctor --json --trace --trace-limit "$TRACE_LIMIT"
 }
 
+event_index() {
+  local trace_json_file="$1"
+  local name="$2"
+  local direction="$3"
+  jq -r --arg name "$name" --arg direction "$direction" '(.trace.events | to_entries | map(select(.value.name == $name and .value.direction == $direction)) | .[0].key) // -1' "$trace_json_file"
+}
+
+assert_query_reply_pair() {
+  local trace_json_file="$1"
+  local name="$2"
+  local query_index
+  local reply_index
+  query_index="$(event_index "$trace_json_file" "$name" "query")"
+  reply_index="$(event_index "$trace_json_file" "$name" "reply")"
+  if [[ "$query_index" -lt 0 || "$reply_index" -lt 0 || "$query_index" -ge "$reply_index" ]]; then
+    return 1
+  fi
+  return 0
+}
+
 make_shell_wrapper() {
   local scenario="$1"
   local shell_bin="$2"
@@ -126,6 +146,7 @@ EOF
       cat >"$wrapper" <<EOF
 #!/usr/bin/env bash
 printf "__SCENARIO_vim__\\n"
+printf '\\033[?25\$p\\033P\$qm\\033\\\\'
 "$shell_bin" -Nu NONE -n +qall!
 EOF
       ;;
@@ -133,6 +154,7 @@ EOF
       cat >"$wrapper" <<EOF
 #!/usr/bin/env bash
 printf "__SCENARIO_fzf__\\n"
+printf '\\033]10;?\\033\\\\\\033P+q5443;636f\\033\\\\'
 printf "alpha\\nbeta\\n" | "$shell_bin" --filter alpha >/dev/null
 EOF
       ;;
@@ -219,6 +241,37 @@ run_case() {
         notes="bad_secondary_da_reply"
       fi
     fi
+  fi
+
+  if [[ "$status" == "PASS" ]]; then
+    case "$scenario" in
+      fish)
+        if [[ "$profile_name" == "bmux" ]]; then
+          :
+        elif ! assert_query_reply_pair "$trace_json_file" "csi_primary_da"; then
+          status="FAIL"
+          notes="fish_missing_primary_da_pair"
+        fi
+        ;;
+      vim)
+        if ! assert_query_reply_pair "$trace_json_file" "csi_dec_mode_report"; then
+          status="FAIL"
+          notes="vim_missing_dec_mode_pair"
+        elif ! assert_query_reply_pair "$trace_json_file" "dcs_decrqss_query"; then
+          status="FAIL"
+          notes="vim_missing_decrqss_pair"
+        fi
+        ;;
+      fzf)
+        if ! assert_query_reply_pair "$trace_json_file" "osc_color_query"; then
+          status="FAIL"
+          notes="fzf_missing_osc_color_pair"
+        elif ! assert_query_reply_pair "$trace_json_file" "dcs_xtgettcap_query"; then
+          status="FAIL"
+          notes="fzf_missing_xtgettcap_pair"
+        fi
+        ;;
+    esac
   fi
 
   printf "%s\t%s\t%s\t%s\n" "$scenario" "$profile_name" "$status" "$notes" >>"$RESULTS_FILE"
