@@ -55,36 +55,40 @@ pub(super) fn process_input_events(
                             .as_ref()
                             .cloned()
                             .unwrap_or_else(|| layout_tree.clone());
-                        let next_direction = match updated_tree.direction() {
-                            SplitDirection::Vertical => SplitDirection::Horizontal,
-                            SplitDirection::Horizontal => SplitDirection::Vertical,
-                        };
-                        updated_tree.set_direction(next_direction);
-                        pending_tree_update = Some(updated_tree);
+                        if let Some(next_direction) = updated_tree.toggle_focused_split_direction()
+                        {
+                            pending_tree_update = Some(updated_tree);
 
-                        let label = match next_direction {
-                            SplitDirection::Vertical => "vertical",
-                            SplitDirection::Horizontal => "horizontal",
-                        };
-                        *status_message = Some(StatusMessage::new(format!("split: {label}")));
+                            let label = match next_direction {
+                                SplitDirection::Vertical => "vertical",
+                                SplitDirection::Horizontal => "horizontal",
+                            };
+                            *status_message = Some(StatusMessage::new(format!("split: {label}")));
+                        }
                     }
                     RuntimeAction::IncreaseSplit => {
                         let mut updated_tree = pending_tree_update
                             .as_ref()
                             .cloned()
                             .unwrap_or_else(|| layout_tree.clone());
-                        updated_tree
-                            .set_ratio((updated_tree.ratio() + SPLIT_RATIO_STEP).clamp(0.2, 0.8));
-                        pending_tree_update = Some(updated_tree);
+                        if updated_tree
+                            .adjust_focused_split_ratio(SPLIT_RATIO_STEP)
+                            .is_some()
+                        {
+                            pending_tree_update = Some(updated_tree);
+                        }
                     }
                     RuntimeAction::DecreaseSplit => {
                         let mut updated_tree = pending_tree_update
                             .as_ref()
                             .cloned()
                             .unwrap_or_else(|| layout_tree.clone());
-                        updated_tree
-                            .set_ratio((updated_tree.ratio() - SPLIT_RATIO_STEP).clamp(0.2, 0.8));
-                        pending_tree_update = Some(updated_tree);
+                        if updated_tree
+                            .adjust_focused_split_ratio(-SPLIT_RATIO_STEP)
+                            .is_some()
+                        {
+                            pending_tree_update = Some(updated_tree);
+                        }
                     }
                     RuntimeAction::SplitFocusedVertical | RuntimeAction::SplitFocusedHorizontal => {
                         let split_direction = match action {

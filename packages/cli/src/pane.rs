@@ -65,39 +65,16 @@ impl LayoutTree {
         }
     }
 
-    pub(crate) fn set_direction(&mut self, direction: SplitDirection) {
-        if let LayoutNode::Split {
-            direction: root_direction,
-            ..
-        } = &mut self.root
-        {
-            *root_direction = direction;
-        }
+    pub(crate) fn toggle_focused_split_direction(&mut self) -> Option<SplitDirection> {
+        let mut changed = None;
+        toggle_nearest_split_direction(&mut self.root, self.focused, &mut changed);
+        changed
     }
 
-    pub(crate) fn direction(&self) -> SplitDirection {
-        if let LayoutNode::Split { direction, .. } = &self.root {
-            *direction
-        } else {
-            SplitDirection::Vertical
-        }
-    }
-
-    pub(crate) fn set_ratio(&mut self, ratio: f32) {
-        if let LayoutNode::Split {
-            ratio: root_ratio, ..
-        } = &mut self.root
-        {
-            *root_ratio = ratio.clamp(0.2, 0.8);
-        }
-    }
-
-    pub(crate) fn ratio(&self) -> f32 {
-        if let LayoutNode::Split { ratio, .. } = &self.root {
-            *ratio
-        } else {
-            0.5
-        }
+    pub(crate) fn adjust_focused_split_ratio(&mut self, delta: f32) -> Option<f32> {
+        let mut updated = None;
+        adjust_nearest_split_ratio(&mut self.root, self.focused, delta, &mut updated);
+        updated
     }
 
     pub(crate) fn pane_order(&self) -> Vec<PaneId> {
@@ -182,6 +159,58 @@ fn replace_leaf(node: &mut LayoutNode, target: PaneId, replacement: LayoutNode) 
         LayoutNode::Split { first, second, .. } => {
             replace_leaf(first, target, replacement.clone())
                 || replace_leaf(second, target, replacement)
+        }
+    }
+}
+
+fn toggle_nearest_split_direction(
+    node: &mut LayoutNode,
+    target: PaneId,
+    changed: &mut Option<SplitDirection>,
+) -> bool {
+    match node {
+        LayoutNode::Leaf { pane_id } => *pane_id == target,
+        LayoutNode::Split {
+            direction,
+            first,
+            second,
+            ..
+        } => {
+            let contains = toggle_nearest_split_direction(first, target, changed)
+                || toggle_nearest_split_direction(second, target, changed);
+            if contains && changed.is_none() {
+                *direction = match *direction {
+                    SplitDirection::Vertical => SplitDirection::Horizontal,
+                    SplitDirection::Horizontal => SplitDirection::Vertical,
+                };
+                *changed = Some(*direction);
+            }
+            contains
+        }
+    }
+}
+
+fn adjust_nearest_split_ratio(
+    node: &mut LayoutNode,
+    target: PaneId,
+    delta: f32,
+    updated: &mut Option<f32>,
+) -> bool {
+    match node {
+        LayoutNode::Leaf { pane_id } => *pane_id == target,
+        LayoutNode::Split {
+            ratio,
+            first,
+            second,
+            ..
+        } => {
+            let contains = adjust_nearest_split_ratio(first, target, delta, updated)
+                || adjust_nearest_split_ratio(second, target, delta, updated);
+            if contains && updated.is_none() {
+                *ratio = (*ratio + delta).clamp(0.2, 0.8);
+                *updated = Some(*ratio);
+            }
+            contains
         }
     }
 }
@@ -308,5 +337,25 @@ mod tests {
         let removed = tree.remove_pane(PaneId(2));
         assert!(removed);
         assert_eq!(tree.pane_order(), vec![PaneId(1)]);
+    }
+
+    #[test]
+    fn toggle_updates_nearest_focused_split_only() {
+        let mut tree = LayoutTree::two_pane(PaneId(1), PaneId(2), SplitDirection::Vertical, 0.5);
+        tree.split_focused(SplitDirection::Horizontal, PaneId(3), 0.5);
+        tree.focused = PaneId(1);
+
+        let changed = tree.toggle_focused_split_direction();
+        assert_eq!(changed, Some(SplitDirection::Vertical));
+    }
+
+    #[test]
+    fn resize_updates_nearest_focused_split_ratio() {
+        let mut tree = LayoutTree::two_pane(PaneId(1), PaneId(2), SplitDirection::Vertical, 0.5);
+        tree.split_focused(SplitDirection::Horizontal, PaneId(3), 0.5);
+        tree.focused = PaneId(1);
+
+        let updated = tree.adjust_focused_split_ratio(0.1);
+        assert_eq!(updated, Some(0.6));
     }
 }
