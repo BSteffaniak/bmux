@@ -158,6 +158,23 @@ doctor_trace_json() {
   "$BMUX_BIN" terminal doctor --json --trace --trace-limit "$TRACE_LIMIT"
 }
 
+emit_quit_when_marker_or_timeout() {
+  local marker_file="$1"
+  local timeout_secs="$2"
+  local timeout_file="$3"
+  local start_secs="$SECONDS"
+
+  while [[ ! -f "$marker_file" ]]; do
+    if (( SECONDS - start_secs >= timeout_secs )); then
+      : >"$timeout_file"
+      break
+    fi
+    sleep 0.1
+  done
+
+  printf '\001q'
+}
+
 event_index() {
   local trace_json_file="$1"
   local name="$2"
@@ -257,23 +274,26 @@ run_case() {
   local vim_output_file="$WORK_DIR/${scenario}.vim.out"
   local fzf_output_file="$WORK_DIR/${scenario}.fzf.out"
   local less_input_file="$WORK_DIR/${scenario}.less.input"
+  local timeout_file="$WORK_DIR/${scenario}-${profile_name}.timeout"
 
   wrapper="$(make_shell_wrapper "$scenario" "$shell_bin")"
   write_config "$pane_term"
 
   rm -f "$flow_ok_file" "$vim_output_file" "$fzf_output_file" "$less_input_file"
+  rm -f "$timeout_file"
 
   local status="PASS"
   local notes="ok"
-  local quit_delay="2"
+  local case_timeout_secs="${BMUX_COMPAT_CASE_TIMEOUT_SECS:-12}"
 
-  if [[ "$scenario" == "fish" ]]; then
-    quit_delay="4"
-  fi
-
-  if ! script -q "$log_file" sh -lc "(sleep $quit_delay; printf '\001q') | '$BMUX_BIN' --shell '$wrapper' --no-alt-screen" >/dev/null 2>&1; then
+  if ! script -q "$log_file" "$BMUX_BIN" --shell "$wrapper" --no-alt-screen < <(emit_quit_when_marker_or_timeout "$flow_ok_file" "$case_timeout_secs" "$timeout_file") >/dev/null 2>&1; then
     status="FAIL"
     notes="bmux command failed"
+  fi
+
+  if [[ "$status" == "PASS" && -f "$timeout_file" ]]; then
+    status="FAIL"
+    notes="flow_marker_timeout"
   fi
 
   if [[ "$status" == "PASS" ]]; then
