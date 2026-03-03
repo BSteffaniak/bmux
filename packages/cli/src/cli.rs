@@ -46,6 +46,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: KeymapCommand,
     },
+    /// Layout state tools
+    Layout {
+        #[command(subcommand)]
+        command: LayoutCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -58,9 +63,15 @@ pub(crate) enum KeymapCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+pub(crate) enum LayoutCommand {
+    /// Clear persisted local runtime layout state
+    Clear,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, KeymapCommand};
+    use super::{Cli, Command, KeymapCommand, LayoutCommand};
     use clap::Parser;
 
     #[test]
@@ -124,5 +135,14 @@ mod tests {
             panic!("expected keymap subcommand");
         };
         assert!(matches!(command, KeymapCommand::Doctor { json: true }));
+    }
+
+    #[test]
+    fn parses_layout_clear_subcommand() {
+        let cli = Cli::try_parse_from(["bmux", "layout", "clear"]).expect("valid CLI args");
+        let Some(Command::Layout { command }) = cli.command else {
+            panic!("expected layout subcommand");
+        };
+        assert!(matches!(command, LayoutCommand::Clear));
     }
 }

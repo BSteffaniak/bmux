@@ -1,4 +1,4 @@
-use crate::cli::{Cli, Command, DebugRenderLogFormat, KeymapCommand};
+use crate::cli::{Cli, Command, DebugRenderLogFormat, KeymapCommand, LayoutCommand};
 use crate::input::{InputProcessor, RuntimeAction};
 use crate::pane::{LayoutTree, PaneId, SplitDirection};
 use crate::pty::STARTUP_ALT_SCREEN_GUARD_DURATION;
@@ -98,6 +98,25 @@ fn run_command(command: &Command) -> Result<u8> {
         Command::Keymap { command } => match command {
             KeymapCommand::Doctor { json } => run_keymap_doctor(*json),
         },
+        Command::Layout { command } => match command {
+            LayoutCommand::Clear => run_layout_clear(),
+        },
+    }
+}
+
+fn run_layout_clear() -> Result<u8> {
+    let path = bmux_config::ConfigPaths::default().runtime_layout_state_file();
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            println!("cleared persisted layout state at {}", path.display());
+            Ok(0)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!("no persisted layout state found at {}", path.display());
+            Ok(0)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("failed clearing persisted layout at {}", path.display())),
     }
 }
 
