@@ -126,7 +126,16 @@ pub(super) fn spawn_pane_process(
                     continue;
                 }
 
-                let reply = protocol_engine.process_output(&output);
+                let mut parser = state_for_thread
+                    .parser
+                    .lock()
+                    .expect("pane parser mutex poisoned");
+                parser.process(&output);
+                let cursor_pos = parser.screen().cursor_position();
+                state_for_thread.dirty.store(true, Ordering::Relaxed);
+                drop(parser);
+
+                let reply = protocol_engine.process_output(&output, cursor_pos);
                 if !reply.is_empty() {
                     let mut writer = writer_for_thread
                         .lock()
@@ -136,13 +145,6 @@ pub(super) fn spawn_pane_process(
                         .and_then(|_| writer.flush())
                         .context("failed writing terminal protocol reply to pane")?;
                 }
-
-                let mut parser = state_for_thread
-                    .parser
-                    .lock()
-                    .expect("pane parser mutex poisoned");
-                parser.process(&output);
-                state_for_thread.dirty.store(true, Ordering::Relaxed);
             }
 
             Ok(())
