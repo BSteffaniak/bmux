@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 pub mod frame;
+pub mod transport;
 
 /// Cross-platform local IPC endpoint.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
