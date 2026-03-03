@@ -5,9 +5,9 @@ use crate::pane::{LayoutTree, PaneId, Rect, SplitDirection};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 use std::time::Instant;
 
 const SPLIT_RATIO_STEP: f32 = 0.05;
@@ -220,4 +220,142 @@ fn next_pane_id(panes: &BTreeMap<PaneId, PaneRuntime>) -> PaneId {
         .unwrap_or(0)
         .saturating_add(1);
     PaneId(next)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::process_input_events;
+    use crate::input::RuntimeAction;
+    use crate::pane::{LayoutNode, LayoutTree, PaneId, SplitDirection};
+    use crate::runtime::{PaneRuntime, PaneState};
+    use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::mpsc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+    use vt100::Parser as VtParser;
+
+    fn make_pane(title: &str) -> PaneRuntime {
+        PaneRuntime {
+            title: title.to_string(),
+            shell: "/bin/sh".to_string(),
+            state: Arc::new(PaneState {
+                parser: Mutex::new(VtParser::new(10, 10, 100)),
+                dirty: AtomicBool::new(false),
+            }),
+            process: None,
+            closed: false,
+            exit_code: None,
+        }
+    }
+
+    #[test]
+    fn close_focused_removes_middle_pane_and_rebalances() {
+        let mut panes = BTreeMap::new();
+        panes.insert(PaneId(1), make_pane("pane-1"));
+        panes.insert(PaneId(2), make_pane("pane-2"));
+        panes.insert(PaneId(3), make_pane("pane-3"));
+
+        let mut layout = LayoutTree::two_pane(PaneId(1), PaneId(2), SplitDirection::Vertical, 0.5);
+        layout.focused = PaneId(2);
+        assert!(layout.split_focused(SplitDirection::Horizontal, PaneId(3), 0.5));
+
+        let mut focused = PaneId(2);
+        layout.focused = focused;
+        let pane_rects = layout.compute_rects(120, 40);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let mut force_redraw = false;
+        let mut exit_override = None;
+        let mut status_message = None;
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(RuntimeAction::CloseFocusedPane)
+            .expect("send close action");
+        drop(tx);
+
+        let updated = process_input_events(
+            &rx,
+            &mut panes,
+            &pane_rects,
+            &layout,
+            &mut focused,
+            &shutdown_requested,
+            &mut force_redraw,
+            &mut exit_override,
+            &mut status_message,
+            Instant::now(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("process input events")
+        .expect("tree updated by close");
+
+        assert!(force_redraw);
+        assert!(!panes.contains_key(&PaneId(2)));
+        assert_eq!(updated.pane_order(), vec![PaneId(1), PaneId(3)]);
+        assert_eq!(focused, PaneId(1));
+    }
+
+    #[test]
+    fn toggle_and_resize_affect_focused_subtree() {
+        let mut panes = BTreeMap::new();
+        panes.insert(PaneId(1), make_pane("pane-1"));
+        panes.insert(PaneId(2), make_pane("pane-2"));
+        panes.insert(PaneId(3), make_pane("pane-3"));
+
+        let mut layout = LayoutTree::two_pane(PaneId(1), PaneId(2), SplitDirection::Vertical, 0.5);
+        layout.focused = PaneId(2);
+        assert!(layout.split_focused(SplitDirection::Horizontal, PaneId(3), 0.5));
+
+        let mut focused = PaneId(3);
+        layout.focused = focused;
+        let pane_rects = layout.compute_rects(120, 40);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let mut force_redraw = false;
+        let mut exit_override = None;
+        let mut status_message = None;
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(RuntimeAction::ToggleSplitDirection)
+            .expect("send toggle");
+        tx.send(RuntimeAction::IncreaseSplit).expect("send resize");
+        drop(tx);
+
+        let updated = process_input_events(
+            &rx,
+            &mut panes,
+            &pane_rects,
+            &layout,
+            &mut focused,
+            &shutdown_requested,
+            &mut force_redraw,
+            &mut exit_override,
+            &mut status_message,
+            Instant::now(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("process input events")
+        .expect("tree updated by commands");
+
+        match updated.root {
+            LayoutNode::Split {
+                direction,
+                first,
+                second,
+                ..
+            } => {
+                assert_eq!(direction, SplitDirection::Vertical);
+                assert!(matches!(*first, LayoutNode::Leaf { pane_id: PaneId(1) }));
+                match *second {
+                    LayoutNode::Split {
+                        direction, ratio, ..
+                    } => {
+                        assert_eq!(direction, SplitDirection::Vertical);
+                        assert!((ratio - 0.55).abs() < 0.001);
+                    }
+                    _ => panic!("expected nested split"),
+                }
+            }
+            _ => panic!("expected split root"),
+        }
+    }
 }
