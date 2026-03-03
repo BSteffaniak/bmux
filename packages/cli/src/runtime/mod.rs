@@ -1,6 +1,6 @@
 use crate::cli::{Cli, Command, DebugRenderLogFormat, KeymapCommand};
 use crate::input::{InputProcessor, RuntimeAction};
-use crate::pane::compute_vertical_layout;
+use crate::pane::{SplitDirection, compute_layout};
 use crate::pty::STARTUP_ALT_SCREEN_GUARD_DURATION;
 use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
@@ -100,7 +100,8 @@ fn run_two_pane_runtime(
     let (mut cols, mut rows) =
         crossterm::terminal::size().context("failed to read terminal size")?;
     let mut split_ratio = 0.5_f32;
-    let mut layout = compute_vertical_layout(cols, rows, split_ratio);
+    let mut split_direction = SplitDirection::Vertical;
+    let mut layout = compute_layout(cols, rows, split_ratio, split_direction);
 
     let startup_deadline = Instant::now() + STARTUP_ALT_SCREEN_GUARD_DURATION;
     let user_input_seen = Arc::new(AtomicBool::new(false));
@@ -149,6 +150,7 @@ fn run_two_pane_runtime(
             &mut panes,
             &layout,
             &mut focused_pane,
+            &mut split_direction,
             &mut split_ratio,
             &shutdown_requested,
             &mut force_redraw,
@@ -190,7 +192,7 @@ fn run_two_pane_runtime(
         if (new_cols, new_rows) != (cols, rows) {
             cols = new_cols;
             rows = new_rows;
-            layout = compute_vertical_layout(cols, rows, split_ratio);
+            layout = compute_layout(cols, rows, split_ratio, split_direction);
             resize_panes(&mut panes, &layout)?;
             terminal_guard.refresh_layout(rows)?;
             force_redraw = true;
@@ -198,7 +200,7 @@ fn run_two_pane_runtime(
             debug!("Terminal resized to {cols}x{rows}");
         }
 
-        let layout_for_ratio = compute_vertical_layout(cols, rows, split_ratio);
+        let layout_for_ratio = compute_layout(cols, rows, split_ratio, split_direction);
         if layout_for_ratio != layout {
             layout = layout_for_ratio;
             resize_panes(&mut panes, &layout)?;

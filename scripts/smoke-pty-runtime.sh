@@ -43,7 +43,7 @@ run_keybind_case() {
 
   set +e
   script -q /dev/null \
-    sh -lc "printf '\\001x\\001r\\001o\\001+\\001-\\001?\\001q' | cargo run -q -p bmux_cli -- --shell '$shell_bin' --no-alt-screen" \
+    sh -lc "printf '\\001t\\001x\\001r\\001o\\001+\\001-\\001?\\001q' | cargo run -q -p bmux_cli -- --shell '$shell_bin' --no-alt-screen" \
     >/dev/null 2>&1
   local status=$?
   set -e

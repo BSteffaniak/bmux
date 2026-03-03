@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 pub(crate) enum RuntimeAction {
     Quit,
     FocusNext,
+    ToggleSplitDirection,
     IncreaseSplit,
     DecreaseSplit,
     RestartFocusedPane,
@@ -98,6 +99,7 @@ impl Keymap {
     pub(crate) fn default_runtime() -> Self {
         let mut runtime = BTreeMap::new();
         runtime.insert("o".to_string(), "focus_next_pane".to_string());
+        runtime.insert("t".to_string(), "toggle_split_direction".to_string());
         runtime.insert("plus".to_string(), "increase_split".to_string());
         runtime.insert("minus".to_string(), "decrease_split".to_string());
         runtime.insert("r".to_string(), "restart_focused_pane".to_string());
@@ -466,6 +468,7 @@ fn action_to_name(action: &RuntimeAction) -> &'static str {
     match action {
         RuntimeAction::Quit => "quit",
         RuntimeAction::FocusNext => "focus_next_pane",
+        RuntimeAction::ToggleSplitDirection => "toggle_split_direction",
         RuntimeAction::IncreaseSplit => "increase_split",
         RuntimeAction::DecreaseSplit => "decrease_split",
         RuntimeAction::RestartFocusedPane => "restart_focused_pane",
@@ -730,6 +733,7 @@ fn parse_action(value: &str) -> Result<RuntimeAction> {
     match value.trim().to_ascii_lowercase().as_str() {
         "quit" => Ok(RuntimeAction::Quit),
         "focus_next_pane" => Ok(RuntimeAction::FocusNext),
+        "toggle_split_direction" => Ok(RuntimeAction::ToggleSplitDirection),
         "increase_split" => Ok(RuntimeAction::IncreaseSplit),
         "decrease_split" => Ok(RuntimeAction::DecreaseSplit),
         "restart_focused_pane" => Ok(RuntimeAction::RestartFocusedPane),

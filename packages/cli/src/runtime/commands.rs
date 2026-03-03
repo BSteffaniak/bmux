@@ -3,7 +3,7 @@ use super::pane_runtime::{
 };
 use super::{PaneRuntime, SPLIT_RATIO_STEP, StatusMessage};
 use crate::input::RuntimeAction;
-use crate::pane::Layout;
+use crate::pane::{Layout, SplitDirection};
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::sync::Arc;
@@ -16,6 +16,7 @@ pub(super) fn process_input_events(
     panes: &mut [PaneRuntime],
     layout: &Layout,
     focused_pane: &mut usize,
+    split_direction: &mut SplitDirection,
     split_ratio: &mut f32,
     shutdown_requested: &Arc<AtomicBool>,
     force_redraw: &mut bool,
@@ -45,6 +46,17 @@ pub(super) fn process_input_events(
                     }
                     RuntimeAction::FocusNext => {
                         *focused_pane = next_focusable_pane_index(panes, *focused_pane);
+                    }
+                    RuntimeAction::ToggleSplitDirection => {
+                        *split_direction = match *split_direction {
+                            SplitDirection::Vertical => SplitDirection::Horizontal,
+                            SplitDirection::Horizontal => SplitDirection::Vertical,
+                        };
+                        let label = match *split_direction {
+                            SplitDirection::Vertical => "vertical",
+                            SplitDirection::Horizontal => "horizontal",
+                        };
+                        *status_message = Some(StatusMessage::new(format!("split: {label}")));
                     }
                     RuntimeAction::IncreaseSplit => {
                         *split_ratio = (*split_ratio + SPLIT_RATIO_STEP).clamp(0.2, 0.8);
@@ -98,7 +110,7 @@ pub(super) fn process_input_events(
                     }
                     RuntimeAction::ShowHelp => {
                         *status_message = Some(StatusMessage::new(
-                            "Ctrl-A: q quit | o focus | +/- resize | r restart | x close | ? help"
+                            "Ctrl-A: q quit | o focus | t toggle split | +/- resize | r restart | x close | ? help"
                                 .to_string(),
                         ));
                     }
