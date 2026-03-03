@@ -1,0 +1,8 @@
+# Fish startup protocol replay fixture
+PROFILE: xterm
+CHUNK: Welcome to fish
+CHUNK: \x1b[c
+CHUNK: \x1b[>c
+CHUNK: \x1b[?2004$p
+EXPECT_REPLY: \x1b[?1;2c\x1b[>0;115;0c\x1b[?2004;2$y
+EXPECT_RENDER_CONTAINS: Welcome to fish

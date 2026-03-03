@@ -1,9 +1,9 @@
-use super::{MIN_PANE_COLS, MIN_PANE_ROWS, PaneProcess, PaneRuntime, PaneState};
+use super::{PaneProcess, PaneRuntime, PaneState, MIN_PANE_COLS, MIN_PANE_ROWS};
 use crate::pane::{PaneId, Rect};
 use crate::pty::extract_filtered_output;
 use crate::runtime::terminal_protocol::{ProtocolProfile, TerminalProtocolEngine};
 use anyhow::{Context, Result};
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -288,6 +288,13 @@ mod tests {
     use crate::runtime::terminal_protocol::ProtocolProfile;
     use vt100::Parser as VtParser;
 
+    struct ReplayFixture {
+        profile: ProtocolProfile,
+        chunks: Vec<Vec<u8>>,
+        expected_reply: Vec<u8>,
+        expected_render_contains: String,
+    }
+
     fn process_chunks(profile: ProtocolProfile, chunks: &[&[u8]]) -> (String, Vec<u8>) {
         let mut parser = VtParser::new(10, 40, 100);
         let mut engine = TerminalProtocolEngine::new(profile);
@@ -300,6 +307,102 @@ mod tests {
         }
 
         (parser.screen().contents().to_string(), replies)
+    }
+
+    fn process_fixture(fixture: &ReplayFixture) -> (String, Vec<u8>) {
+        let chunks: Vec<&[u8]> = fixture.chunks.iter().map(Vec::as_slice).collect();
+        process_chunks(fixture.profile, &chunks)
+    }
+
+    fn parse_fixture(source: &str) -> ReplayFixture {
+        let mut profile = ProtocolProfile::Conservative;
+        let mut chunks = Vec::new();
+        let mut expected_reply = Vec::new();
+        let mut expected_render_contains = String::new();
+
+        for raw_line in source.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+
+            if let Some(value) = line.strip_prefix("PROFILE:") {
+                profile = match value.trim() {
+                    "bmux" => ProtocolProfile::Bmux,
+                    "xterm" => ProtocolProfile::Xterm,
+                    "screen" => ProtocolProfile::Screen,
+                    _ => ProtocolProfile::Conservative,
+                };
+                continue;
+            }
+
+            if let Some(value) = line.strip_prefix("CHUNK:") {
+                chunks.push(unescape(value.trim()));
+                continue;
+            }
+
+            if let Some(value) = line.strip_prefix("EXPECT_REPLY:") {
+                expected_reply = unescape(value.trim());
+                continue;
+            }
+
+            if let Some(value) = line.strip_prefix("EXPECT_RENDER_CONTAINS:") {
+                expected_render_contains = value.trim().to_string();
+            }
+        }
+
+        ReplayFixture {
+            profile,
+            chunks,
+            expected_reply,
+            expected_render_contains,
+        }
+    }
+
+    fn unescape(value: &str) -> Vec<u8> {
+        let mut out = Vec::new();
+        let bytes = value.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                match bytes[i + 1] {
+                    b'x' if i + 3 < bytes.len() => {
+                        let hi = bytes[i + 2] as char;
+                        let lo = bytes[i + 3] as char;
+                        let hex = format!("{hi}{lo}");
+                        if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                            out.push(byte);
+                            i += 4;
+                            continue;
+                        }
+                    }
+                    b'n' => {
+                        out.push(b'\n');
+                        i += 2;
+                        continue;
+                    }
+                    b'r' => {
+                        out.push(b'\r');
+                        i += 2;
+                        continue;
+                    }
+                    b't' => {
+                        out.push(b'\t');
+                        i += 2;
+                        continue;
+                    }
+                    b'\\' => {
+                        out.push(b'\\');
+                        i += 2;
+                        continue;
+                    }
+                    _ => {}
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        out
     }
 
     #[test]
@@ -322,5 +425,29 @@ mod tests {
 
         assert!(contents.contains("abcd"));
         assert_eq!(replies, b"\x1b[?25;1$y");
+    }
+
+    #[test]
+    fn replays_fish_startup_fixture() {
+        let fixture = parse_fixture(include_str!("fixtures/fish_startup.trace"));
+        let (contents, replies) = process_fixture(&fixture);
+        assert!(contents.contains(&fixture.expected_render_contains));
+        assert_eq!(replies, fixture.expected_reply);
+    }
+
+    #[test]
+    fn replays_vim_startup_fixture() {
+        let fixture = parse_fixture(include_str!("fixtures/vim_startup.trace"));
+        let (contents, replies) = process_fixture(&fixture);
+        assert!(contents.contains(&fixture.expected_render_contains));
+        assert_eq!(replies, fixture.expected_reply);
+    }
+
+    #[test]
+    fn replays_fzf_startup_fixture() {
+        let fixture = parse_fixture(include_str!("fixtures/fzf_startup.trace"));
+        let (contents, replies) = process_fixture(&fixture);
+        assert!(contents.contains(&fixture.expected_render_contains));
+        assert_eq!(replies, fixture.expected_reply);
     }
 }
