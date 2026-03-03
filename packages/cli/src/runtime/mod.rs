@@ -169,10 +169,19 @@ fn run_terminal_doctor(as_json: bool) -> Result<u8> {
             "effective_pane_term": effective.pane_term,
             "terminal_profile": terminal_profile_name(effective.profile),
             "supported_queries": supported_query_names(),
+            "fallback_chain": effective.fallback_chain,
             "terminfo_check": {
                 "attempted": effective.terminfo_checked,
                 "available": effective.terminfo_available,
             },
+            "terminfo_checks": effective
+                .terminfo_checks
+                .iter()
+                .map(|(term, available)| serde_json::json!({
+                    "term": term,
+                    "available": available,
+                }))
+                .collect::<Vec<_>>(),
             "warnings": effective.warnings,
         });
         println!(
@@ -191,6 +200,7 @@ fn run_terminal_doctor(as_json: bool) -> Result<u8> {
         terminal_profile_name(effective.profile)
     );
     println!("supported queries: {}", supported_query_names().join(", "));
+    println!("fallback chain: {}", effective.fallback_chain.join(" -> "));
     if effective.terminfo_checked {
         println!(
             "terminfo available: {}",
@@ -200,6 +210,16 @@ fn run_terminal_doctor(as_json: bool) -> Result<u8> {
                 "no"
             }
         );
+        for (term, available) in &effective.terminfo_checks {
+            println!(
+                "terminfo check {term}: {}",
+                match available {
+                    Some(true) => "yes",
+                    Some(false) => "no",
+                    None => "unknown",
+                }
+            );
+        }
     }
     for warning in effective.warnings {
         println!("warning: {warning}");
@@ -735,9 +755,18 @@ struct PaneTermResolution {
     warnings: Vec<String>,
     terminfo_checked: bool,
     terminfo_available: bool,
+    fallback_chain: Vec<String>,
+    terminfo_checks: Vec<(String, Option<bool>)>,
 }
 
 fn resolve_pane_term(configured: &str) -> PaneTermResolution {
+    resolve_pane_term_with_checker(configured, check_terminfo_available)
+}
+
+fn resolve_pane_term_with_checker<F>(configured: &str, mut checker: F) -> PaneTermResolution
+where
+    F: FnMut(&str) -> Option<bool>,
+{
     let configured_trimmed = configured.trim();
     let configured_normalized = if configured_trimmed.is_empty() {
         "bmux-256color".to_string()
@@ -750,17 +779,61 @@ fn resolve_pane_term(configured: &str) -> PaneTermResolution {
         warnings.push("behavior.pane_term is empty; falling back to bmux-256color".to_string());
     }
 
+    let fallback_chain = vec!["xterm-256color".to_string(), "screen-256color".to_string()];
+    let mut terminfo_checks = Vec::new();
     let mut pane_term = configured_normalized.clone();
-    let mut profile = profile_for_term(&pane_term);
 
-    let terminfo_check = check_terminfo_available(&pane_term);
-    if pane_term == "bmux-256color" && terminfo_check == Some(false) {
-        warnings.push(
-            "terminfo for bmux-256color not found; run scripts/install-terminfo.sh (falling back to xterm-256color)".to_string(),
-        );
-        pane_term = "xterm-256color".to_string();
-        profile = profile_for_term(&pane_term);
+    let configured_check = checker(&pane_term);
+    terminfo_checks.push((pane_term.clone(), configured_check));
+
+    if configured_check == Some(false) {
+        let mut selected_fallback = None;
+        for candidate in &fallback_chain {
+            if candidate == &pane_term {
+                continue;
+            }
+            let check = checker(candidate);
+            terminfo_checks.push((candidate.clone(), check));
+            if check == Some(true) {
+                selected_fallback = Some(candidate.clone());
+                break;
+            }
+        }
+
+        if let Some(fallback) = selected_fallback {
+            warnings.push(format!(
+                "pane TERM '{}' not installed; using '{}' (fallback chain: {})",
+                pane_term,
+                fallback,
+                fallback_chain.join(", ")
+            ));
+            if pane_term == "bmux-256color" {
+                warnings.push(
+                    "install bmux terminfo with scripts/install-terminfo.sh to use bmux-256color"
+                        .to_string(),
+                );
+            }
+            pane_term = fallback;
+        } else {
+            warnings.push(format!(
+                "pane TERM '{}' not installed and no fallback available (checked: {})",
+                pane_term,
+                fallback_chain.join(", ")
+            ));
+        }
+    } else if configured_check.is_none() {
+        warnings.push(format!(
+            "could not verify terminfo for pane TERM '{}'; continuing without fallback checks",
+            pane_term
+        ));
     }
+
+    let profile = profile_for_term(&pane_term);
+
+    let effective_terminfo_available = terminfo_checks
+        .iter()
+        .find_map(|(term, available)| (term == &pane_term).then_some(*available))
+        .flatten();
 
     if profile == TerminalProfile::Conservative {
         warnings.push(format!(
@@ -773,8 +846,12 @@ fn resolve_pane_term(configured: &str) -> PaneTermResolution {
         pane_term,
         profile,
         warnings,
-        terminfo_checked: terminfo_check.is_some(),
-        terminfo_available: terminfo_check.unwrap_or(false),
+        terminfo_checked: terminfo_checks
+            .iter()
+            .any(|(_, available)| available.is_some()),
+        terminfo_available: effective_terminfo_available.unwrap_or(false),
+        fallback_chain,
+        terminfo_checks,
     }
 }
 
@@ -964,7 +1041,7 @@ fn reap_exited_panes(
 mod tests {
     use super::{
         EventReader, PaneRuntime, PaneState, TerminalProfile, key_to_bytes, profile_for_term,
-        reap_exited_panes, run_event_input_loop_with_reader,
+        reap_exited_panes, resolve_pane_term_with_checker, run_event_input_loop_with_reader,
     };
     use crate::input::{InputProcessor, Keymap};
     use crate::pane::{LayoutNode, LayoutTree, PaneId, SplitDirection};
@@ -1127,6 +1204,45 @@ mod tests {
         assert_eq!(
             profile_for_term("weird-term"),
             TerminalProfile::Conservative
+        );
+    }
+
+    #[test]
+    fn pane_term_falls_back_to_xterm_then_screen() {
+        let resolved = resolve_pane_term_with_checker("bmux-256color", |term| match term {
+            "bmux-256color" => Some(false),
+            "xterm-256color" => Some(true),
+            "screen-256color" => Some(true),
+            _ => Some(false),
+        });
+
+        assert_eq!(resolved.pane_term, "xterm-256color");
+        assert_eq!(resolved.profile, TerminalProfile::Xterm256Color);
+    }
+
+    #[test]
+    fn pane_term_uses_screen_when_xterm_unavailable() {
+        let resolved = resolve_pane_term_with_checker("bmux-256color", |term| match term {
+            "bmux-256color" => Some(false),
+            "xterm-256color" => Some(false),
+            "screen-256color" => Some(true),
+            _ => Some(false),
+        });
+
+        assert_eq!(resolved.pane_term, "screen-256color");
+        assert_eq!(resolved.profile, TerminalProfile::Screen256Color);
+    }
+
+    #[test]
+    fn pane_term_keeps_configured_when_no_fallback_available() {
+        let resolved = resolve_pane_term_with_checker("bmux-256color", |_term| Some(false));
+
+        assert_eq!(resolved.pane_term, "bmux-256color");
+        assert!(
+            resolved
+                .warnings
+                .iter()
+                .any(|w| w.contains("no fallback available"))
         );
     }
 }
