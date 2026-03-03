@@ -190,6 +190,20 @@ fn epoch_millis_now() -> u64 {
     now.as_millis() as u64
 }
 
+async fn shutdown_runtime_handle(mut removed: RemovedRuntime) {
+    if let Some(stop_tx) = removed.handle.stop_tx.take() {
+        let _ = stop_tx.send(());
+    }
+
+    match tokio::time::timeout(Duration::from_millis(250), &mut removed.handle.task).await {
+        Ok(_) => {}
+        Err(_) => {
+            removed.handle.task.abort();
+            let _ = removed.handle.task.await;
+        }
+    }
+}
+
 #[derive(Debug, Default)]
 struct SessionRuntimeManager {
     runtimes: BTreeMap<SessionId, SessionRuntimeHandle>,
@@ -202,6 +216,13 @@ struct SessionRuntimeHandle {
     input_tx: mpsc::UnboundedSender<Vec<u8>>,
     output_rx: std::sync::Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
     active_client: Option<ClientId>,
+}
+
+#[derive(Debug)]
+struct RemovedRuntime {
+    session_id: SessionId,
+    detached_client: Option<ClientId>,
+    handle: SessionRuntimeHandle,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,19 +273,28 @@ impl SessionRuntimeManager {
         Ok(())
     }
 
-    fn stop_runtime(&mut self, session_id: SessionId) -> Result<()> {
-        let mut runtime = self
+    fn remove_runtime(&mut self, session_id: SessionId) -> Result<RemovedRuntime> {
+        let runtime = self
             .runtimes
             .remove(&session_id)
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
 
-        if let Some(stop_tx) = runtime.stop_tx.take() {
-            let _ = stop_tx.send(());
-        }
+        Ok(RemovedRuntime {
+            session_id,
+            detached_client: runtime.active_client,
+            handle: runtime,
+        })
+    }
 
-        runtime.task.abort();
-
-        Ok(())
+    fn remove_all_runtimes(&mut self) -> Vec<RemovedRuntime> {
+        std::mem::take(&mut self.runtimes)
+            .into_iter()
+            .map(|(session_id, runtime)| RemovedRuntime {
+                session_id,
+                detached_client: runtime.active_client,
+                handle: runtime,
+            })
+            .collect()
     }
 
     fn begin_attach(&mut self, session_id: SessionId, client_id: ClientId) -> Result<(), SessionRuntimeError> {
@@ -354,15 +384,6 @@ impl SessionRuntimeManager {
         }
 
         Ok(output)
-    }
-
-    fn stop_all_runtimes(&mut self) {
-        for (_, mut runtime) in std::mem::take(&mut self.runtimes) {
-            if let Some(stop_tx) = runtime.stop_tx.take() {
-                let _ = stop_tx.send(());
-            }
-            runtime.task.abort();
-        }
     }
 
     #[cfg(test)]
@@ -466,8 +487,24 @@ impl BmuxServer {
             }
         }
 
-        if let Ok(mut runtime_manager) = self.state.session_runtimes.lock() {
-            runtime_manager.stop_all_runtimes();
+        let removed_runtimes = if let Ok(mut runtime_manager) = self.state.session_runtimes.lock() {
+            runtime_manager.remove_all_runtimes()
+        } else {
+            Vec::new()
+        };
+        for removed_runtime in removed_runtimes {
+            if removed_runtime.detached_client.is_some() {
+                let _ = emit_event(
+                    &self.state,
+                    Event::ClientDetached {
+                        id: removed_runtime.session_id.0,
+                    },
+                );
+            }
+            shutdown_runtime_handle(removed_runtime).await;
+        }
+        if let Ok(mut session_manager) = self.state.session_manager.lock() {
+            *session_manager = SessionManager::new();
         }
         let _ = emit_event(&self.state, Event::ServerStopping);
         if let Ok(mut attach_tokens) = self.state.attach_tokens.lock() {
@@ -674,39 +711,49 @@ async fn handle_request(
             Response::Ok(ResponsePayload::SessionList { sessions })
         }
         Request::KillSession { selector } => {
-            let mut manager = state
-                .session_manager
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            let Some(session_id) = resolve_session_id(&manager, &selector) else {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session not found for selector {selector:?}"),
-                }));
+            let (session_id, removed_runtime) = {
+                let mut manager = state
+                    .session_manager
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                let Some(session_id) = resolve_session_id(&manager, &selector) else {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::NotFound,
+                        message: format!("session not found for selector {selector:?}"),
+                    }));
+                };
+
+                if manager.remove_session(&session_id).is_err() {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::Internal,
+                        message: format!("failed removing session {}", session_id.0),
+                    }));
+                }
+                if *attached_session == Some(session_id) {
+                    *attached_session = None;
+                }
+                drop(manager);
+
+                let mut runtime_manager = state
+                    .session_runtimes
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+                let removed_runtime = match runtime_manager.remove_runtime(session_id) {
+                    Ok(removed) => removed,
+                    Err(error) => {
+                        return Ok(Response::Err(ErrorResponse {
+                            code: ErrorCode::Internal,
+                            message: format!("failed stopping session runtime: {error:#}"),
+                        }));
+                    }
+                };
+                (session_id, removed_runtime)
             };
 
-            if manager.remove_session(&session_id).is_err() {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::Internal,
-                    message: format!("failed removing session {}", session_id.0),
-                }));
+            if removed_runtime.detached_client.is_some() {
+                emit_event(state, Event::ClientDetached { id: session_id.0 })?;
             }
-            if *attached_session == Some(session_id) {
-                *attached_session = None;
-            }
-
-            drop(manager);
-            let mut runtime_manager = state
-                .session_runtimes
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-            if let Err(error) = runtime_manager.stop_runtime(session_id) {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::Internal,
-                    message: format!("failed stopping session runtime: {error:#}"),
-                }));
-            }
-            drop(runtime_manager);
+            shutdown_runtime_handle(removed_runtime).await;
 
             let mut attach_tokens = state
                 .attach_tokens
@@ -1509,6 +1556,80 @@ mod tests {
         assert!(detached_idx < removed_idx);
 
         stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_stop_while_attached_cleans_runtime_state() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut client = connect_and_handshake(&endpoint).await;
+
+        let created = send_request(
+            &mut client,
+            90,
+            Request::NewSession {
+                name: Some("stop-attached".to_string()),
+            },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected create response: {other:?}"),
+        };
+
+        let grant = match send_request(
+            &mut client,
+            91,
+            Request::Attach {
+                selector: SessionSelector::ById(session_id),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::Attached { grant }) => grant,
+            other => panic!("unexpected attach response: {other:?}"),
+        };
+        let opened = send_request(
+            &mut client,
+            92,
+            Request::AttachOpen {
+                session_id,
+                attach_token: grant.attach_token,
+            },
+        )
+        .await;
+        assert_eq!(opened, Response::Ok(ResponsePayload::AttachReady { session_id }));
+
+        let stopper = connect_and_handshake(&endpoint).await;
+        let mut stopper = stopper;
+        let stopped = send_request(&mut stopper, 93, Request::ServerStop).await;
+        assert_eq!(stopped, Response::Ok(ResponsePayload::ServerStopping));
+
+        server_task
+            .await
+            .expect("server task should join")
+            .expect("server should stop cleanly");
+
+        {
+            let runtime_manager = server
+                .state
+                .session_runtimes
+                .lock()
+                .expect("runtime manager lock should succeed");
+            assert_eq!(runtime_manager.runtime_count(), 0);
+        }
+        {
+            let session_manager = server
+                .state
+                .session_manager
+                .lock()
+                .expect("session manager lock should succeed");
+            assert_eq!(session_manager.session_count(), 0);
+        }
+
+        if socket_path.exists() {
+            std::fs::remove_file(&socket_path).expect("socket cleanup should succeed");
+        }
     }
 
     #[cfg(unix)]
