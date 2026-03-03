@@ -260,9 +260,14 @@ fn run_two_pane_runtime(
         thread::sleep(FRAME_INTERVAL);
     };
 
-    match input_thread.join() {
-        Ok(result) => result.context("PTY input thread failed")?,
-        Err(_) => return Err(anyhow::anyhow!("PTY input thread panicked")),
+    shutdown_requested.store(true, Ordering::Relaxed);
+    if input_thread.is_finished() {
+        match input_thread.join() {
+            Ok(result) => result.context("PTY input thread failed")?,
+            Err(_) => return Err(anyhow::anyhow!("PTY input thread panicked")),
+        }
+    } else {
+        debug!("Input thread still blocked on stdin; skipping join during shutdown");
     }
 
     for pane in panes.values_mut() {
