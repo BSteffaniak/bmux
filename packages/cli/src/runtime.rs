@@ -1,13 +1,13 @@
 use crate::cli::{Cli, Command, DebugRenderLogFormat, KeymapCommand};
 use crate::input::{InputProcessor, RuntimeAction};
-use crate::pane::{compute_vertical_layout, Layout, Rect};
-use crate::pty::{extract_filtered_output, STARTUP_ALT_SCREEN_GUARD_DURATION};
+use crate::pane::{Layout, Rect, compute_vertical_layout};
+use crate::pty::{STARTUP_ALT_SCREEN_GUARD_DURATION, extract_filtered_output};
 use crate::status::{build_status_line, write_status_line};
 use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
 use bmux_config::BmuxConfig;
 use clap::Parser;
-use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -280,7 +280,7 @@ pub(crate) fn run() -> Result<u8> {
 fn run_command(command: &Command) -> Result<u8> {
     match command {
         Command::Keymap { command } => match command {
-            KeymapCommand::Doctor => run_keymap_doctor(),
+            KeymapCommand::Doctor { json } => run_keymap_doctor(*json),
         },
     }
 }
@@ -1274,7 +1274,7 @@ fn load_runtime_keymap() -> crate::input::Keymap {
     }
 }
 
-fn run_keymap_doctor() -> Result<u8> {
+fn run_keymap_doctor(as_json: bool) -> Result<u8> {
     let config = match BmuxConfig::load() {
         Ok(config) => config,
         Err(error) => {
@@ -1289,6 +1289,38 @@ fn run_keymap_doctor() -> Result<u8> {
         &config.keybindings.global,
     )
     .context("failed to compile keymap")?;
+
+    let report = keymap.doctor_report();
+
+    if as_json {
+        let payload = serde_json::json!({
+            "prefix": config.keybindings.prefix,
+            "timeout_ms": config.keybindings.timeout_ms,
+            "global": report
+                .global
+                .iter()
+                .map(|binding| serde_json::json!({
+                    "chord": binding.chord,
+                    "action": binding.action,
+                }))
+                .collect::<Vec<_>>(),
+            "runtime": report
+                .runtime
+                .iter()
+                .map(|binding| serde_json::json!({
+                    "chord": binding.chord,
+                    "action": binding.action,
+                }))
+                .collect::<Vec<_>>(),
+            "overlaps": report.overlaps,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .context("failed to encode keymap doctor json")?
+        );
+        return Ok(0);
+    }
 
     println!("bmux keymap doctor");
     println!("prefix: {}", config.keybindings.prefix);

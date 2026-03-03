@@ -51,7 +51,11 @@ pub(crate) enum Command {
 #[derive(Debug, Subcommand)]
 pub(crate) enum KeymapCommand {
     /// Print compiled keymap and overlap diagnostics
-    Doctor,
+    Doctor {
+        /// Print diagnostics as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[cfg(test)]
@@ -109,6 +113,16 @@ mod tests {
         let Some(Command::Keymap { command }) = cli.command else {
             panic!("expected keymap subcommand");
         };
-        assert!(matches!(command, KeymapCommand::Doctor));
+        assert!(matches!(command, KeymapCommand::Doctor { json: false }));
+    }
+
+    #[test]
+    fn parses_keymap_doctor_json_flag() {
+        let cli =
+            Cli::try_parse_from(["bmux", "keymap", "doctor", "--json"]).expect("valid CLI args");
+        let Some(Command::Keymap { command }) = cli.command else {
+            panic!("expected keymap subcommand");
+        };
+        assert!(matches!(command, KeymapCommand::Doctor { json: true }));
     }
 }

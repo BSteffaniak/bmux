@@ -59,6 +59,19 @@ pub(crate) struct Keymap {
 }
 
 #[derive(Debug, Clone)]
+pub(crate) struct DoctorBinding {
+    pub(crate) chord: String,
+    pub(crate) action: String,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct KeymapDoctorReport {
+    pub(crate) global: Vec<DoctorBinding>,
+    pub(crate) runtime: Vec<DoctorBinding>,
+    pub(crate) overlaps: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
 struct DecodedStroke {
     stroke: KeyStroke,
     raw: Vec<u8>,
@@ -152,45 +165,63 @@ impl Keymap {
     }
 
     pub(crate) fn doctor_lines(&self) -> Vec<String> {
+        let report = self.doctor_report();
         let mut lines = Vec::new();
 
         lines.push("Global bindings:".to_string());
-        if self.global_bindings.is_empty() {
+        if report.global.is_empty() {
             lines.push("  (none)".to_string());
         } else {
-            for binding in &self.global_bindings {
-                lines.push(format!(
-                    "  {} -> {}",
-                    chord_to_string(&binding.chord),
-                    action_to_name(&binding.action)
-                ));
+            for binding in &report.global {
+                lines.push(format!("  {} -> {}", binding.chord, binding.action));
             }
         }
 
         lines.push("Runtime bindings (prefix applied):".to_string());
-        if self.runtime_bindings.is_empty() {
+        if report.runtime.is_empty() {
             lines.push("  (none)".to_string());
         } else {
-            for binding in &self.runtime_bindings {
-                lines.push(format!(
-                    "  {} -> {}",
-                    chord_to_string(&binding.chord),
-                    action_to_name(&binding.action)
-                ));
+            for binding in &report.runtime {
+                lines.push(format!("  {} -> {}", binding.chord, binding.action));
             }
         }
 
-        let overlaps = self.overlap_warnings();
-        if overlaps.is_empty() {
+        if report.overlaps.is_empty() {
             lines.push("Overlaps: none".to_string());
         } else {
             lines.push("Overlaps (longest match wins):".to_string());
-            for overlap in overlaps {
+            for overlap in &report.overlaps {
                 lines.push(format!("  - {overlap}"));
             }
         }
 
         lines
+    }
+
+    pub(crate) fn doctor_report(&self) -> KeymapDoctorReport {
+        let global = self
+            .global_bindings
+            .iter()
+            .map(|binding| DoctorBinding {
+                chord: chord_to_string(&binding.chord),
+                action: action_to_name(&binding.action).to_string(),
+            })
+            .collect();
+
+        let runtime = self
+            .runtime_bindings
+            .iter()
+            .map(|binding| DoctorBinding {
+                chord: chord_to_string(&binding.chord),
+                action: action_to_name(&binding.action).to_string(),
+            })
+            .collect();
+
+        KeymapDoctorReport {
+            global,
+            runtime,
+            overlaps: self.overlap_warnings(),
+        }
     }
 
     fn overlap_warnings(&self) -> Vec<String> {
