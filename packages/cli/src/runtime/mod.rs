@@ -593,12 +593,34 @@ fn run_two_pane_runtime(
         }
 
         let scroll_status_suffix = if scroll_state.active {
-            let offset = scroll_state
-                .offsets
+            let (offset, total) = panes
                 .get(&focused_pane)
-                .copied()
-                .unwrap_or(0);
-            Some(format!("SCROLL +{offset}"))
+                .map(|pane| {
+                    let mut parser = pane
+                        .state
+                        .parser
+                        .lock()
+                        .expect("pane parser mutex poisoned");
+                    let offset = parser.screen().scrollback();
+                    parser.screen_mut().set_scrollback(usize::MAX);
+                    let total = parser.screen().scrollback();
+                    parser.screen_mut().set_scrollback(offset);
+                    (offset, total)
+                })
+                .or_else(|| {
+                    scroll_state
+                        .offsets
+                        .get(&focused_pane)
+                        .copied()
+                        .map(|offset| (offset, offset))
+                })
+                .unwrap_or((0, 0));
+
+            Some(format_scroll_mode_suffix(
+                offset,
+                total,
+                selection_status_suffix(&scroll_state, focused_pane),
+            ))
         } else {
             None
         };
@@ -669,6 +691,40 @@ fn run_two_pane_runtime(
     }
 
     Ok(exit_override.unwrap_or(exit_code))
+}
+
+fn selection_status_suffix(scroll_state: &ScrollState, focused_pane: PaneId) -> Option<String> {
+    let (anchor, cursor) = scroll_state
+        .selection_anchors
+        .get(&focused_pane)
+        .zip(scroll_state.cursors.get(&focused_pane))?;
+
+    let (start, end) = if anchor <= cursor {
+        (*anchor, *cursor)
+    } else {
+        (*cursor, *anchor)
+    };
+
+    Some(format!(
+        "SELECT r{}:c{} -> r{}:c{}",
+        start.0.saturating_add(1),
+        start.1.saturating_add(1),
+        end.0.saturating_add(1),
+        end.1.saturating_add(1)
+    ))
+}
+
+fn format_scroll_mode_suffix(
+    offset: usize,
+    total: usize,
+    selection_suffix: Option<String>,
+) -> String {
+    let mut status = format!("SCROLL {offset}/{total}");
+    if let Some(selection) = selection_suffix {
+        status.push_str(" | ");
+        status.push_str(&selection);
+    }
+    status
 }
 
 fn initialize_runtime_state(
@@ -1455,10 +1511,11 @@ fn reap_exited_panes(
 #[cfg(test)]
 mod tests {
     use super::{
-        EventReader, PaneRuntime, PaneState, ProtocolDirection, ProtocolTraceEvent,
-        TerminalProfile, TraceFamily, filter_trace_events, load_runtime_settings,
-        merged_runtime_keybindings, profile_for_term, protocol_profile_for_terminal_profile,
-        reap_exited_panes, resolve_pane_term_with_checker, run_event_input_loop_with_reader,
+        EventReader, PaneRuntime, PaneState, ProtocolDirection, ProtocolTraceEvent, ScrollState,
+        TerminalProfile, TraceFamily, filter_trace_events, format_scroll_mode_suffix,
+        load_runtime_settings, merged_runtime_keybindings, profile_for_term,
+        protocol_profile_for_terminal_profile, reap_exited_panes, resolve_pane_term_with_checker,
+        run_event_input_loop_with_reader, selection_status_suffix,
     };
     use crate::input::{InputProcessor, Keymap};
     use crate::pane::{LayoutNode, LayoutTree, PaneId, SplitDirection};
@@ -1671,6 +1728,23 @@ mod tests {
             Some(&"split_focused_vertical".to_string())
         );
         assert_eq!(runtime.get("["), Some(&"enter_scroll_mode".to_string()));
+    }
+
+    #[test]
+    fn scroll_mode_suffix_includes_position_and_total() {
+        let suffix = format_scroll_mode_suffix(0, 3_000, None);
+        assert_eq!(suffix, "SCROLL 0/3000");
+    }
+
+    #[test]
+    fn selection_suffix_uses_ordered_one_based_coordinates() {
+        let mut scroll_state = ScrollState::default();
+        let pane_id = PaneId(7);
+        scroll_state.selection_anchors.insert(pane_id, (10, 20));
+        scroll_state.cursors.insert(pane_id, (2, 4));
+
+        let suffix = selection_status_suffix(&scroll_state, pane_id);
+        assert_eq!(suffix.as_deref(), Some("SELECT r3:c5 -> r11:c21"));
     }
 
     #[test]
