@@ -63,7 +63,7 @@ pub struct BmuxConfig {
 }
 
 /// General configuration options
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GeneralConfig {
     /// Default mode when starting bmux
@@ -76,6 +76,18 @@ pub struct GeneralConfig {
     pub scrollback_limit: usize,
     /// Server socket timeout in milliseconds
     pub server_timeout: u64,
+}
+
+impl Default for GeneralConfig {
+    fn default() -> Self {
+        Self {
+            default_mode: Mode::Normal,
+            mouse_support: true,
+            default_shell: None,
+            scrollback_limit: 10_000,
+            server_timeout: 5_000,
+        }
+    }
 }
 
 /// Appearance configuration options
@@ -238,9 +250,23 @@ impl BmuxConfig {
             error: e.to_string(),
         })?;
 
-        let config: Self = toml::from_str(&contents).map_err(|e| ConfigError::ParseError {
+        let mut config: Self = toml::from_str(&contents).map_err(|e| ConfigError::ParseError {
             error: e.to_string(),
         })?;
+
+        let repaired_fields = config.sanitize_invalid_values();
+        if !repaired_fields.is_empty() {
+            for warning in &repaired_fields {
+                eprintln!("bmux warning: repaired invalid config value {warning}");
+            }
+
+            if let Err(error) = config.save_to_path(path) {
+                eprintln!(
+                    "bmux warning: failed to persist repaired config at {} ({error})",
+                    path.display()
+                );
+            }
+        }
 
         config.validate()?;
         Ok(config)
@@ -314,10 +340,77 @@ impl BmuxConfig {
         Ok(())
     }
 
+    fn sanitize_invalid_values(&mut self) -> Vec<String> {
+        let defaults = GeneralConfig::default();
+        let mut repaired_fields = Vec::new();
+
+        if self.general.scrollback_limit == 0 {
+            self.general.scrollback_limit = defaults.scrollback_limit;
+            repaired_fields.push(format!(
+                "general.scrollback_limit=0 -> {}",
+                defaults.scrollback_limit
+            ));
+        }
+
+        if self.general.server_timeout == 0 {
+            self.general.server_timeout = defaults.server_timeout;
+            repaired_fields.push(format!(
+                "general.server_timeout=0 -> {}",
+                defaults.server_timeout
+            ));
+        }
+
+        repaired_fields
+    }
+
     /// Merge another configuration into this one
     pub fn merge(&mut self, other: Self) {
         // This is a simple merge that overwrites values
         // In a real implementation, you might want more sophisticated merging
         *self = other;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BmuxConfig;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn default_config_is_valid() {
+        let config = BmuxConfig::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn load_repairs_zero_general_limits_and_persists() {
+        let unique = format!(
+            "bmux-config-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before epoch")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).expect("failed to create temp test directory");
+        let path = dir.join("bmux.toml");
+
+        std::fs::write(
+            &path,
+            "[general]\nscrollback_limit = 0\nserver_timeout = 0\n",
+        )
+        .expect("failed writing invalid config fixture");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(config.general.scrollback_limit, 10_000);
+        assert_eq!(config.general.server_timeout, 5_000);
+
+        let persisted =
+            std::fs::read_to_string(&path).expect("failed reading persisted repaired config");
+        assert!(persisted.contains("scrollback_limit = 10000"));
+        assert!(persisted.contains("server_timeout = 5000"));
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
     }
 }
