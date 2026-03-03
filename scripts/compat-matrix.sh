@@ -139,6 +139,9 @@ make_shell_wrapper() {
   local scenario="$1"
   local shell_bin="$2"
   local wrapper="$WORK_DIR/${scenario}.sh"
+  local flow_ok_file="$WORK_DIR/${scenario}.flow.ok"
+  local vim_output_file="$WORK_DIR/${scenario}.vim.out"
+  local fzf_output_file="$WORK_DIR/${scenario}.fzf.out"
 
   case "$scenario" in
     fish)
@@ -147,6 +150,8 @@ make_shell_wrapper() {
 printf "__SCENARIO_fish__\\n"
 # Emit an explicit DA probe so transcript assertions are deterministic
 printf '\\033[c'
+"$shell_bin" -ic 'echo __FISH_CMD_OK__' 2>/dev/null || true
+printf "ok" >"$flow_ok_file"
 exec "$shell_bin"
 EOF
       ;;
@@ -155,7 +160,11 @@ EOF
 #!/usr/bin/env bash
 printf "__SCENARIO_vim__\\n"
 printf '\\033[?25\$p\\033P\$qm\\033\\\\'
-"$shell_bin" -Nu NONE -n +qall!
+"$shell_bin" -Nu NONE -n -Es "$vim_output_file" -c "call setline(1, ['hello from bmux'])" -c "write!" -c "qall!" >/dev/null 2>&1 || true
+if [[ -f "$vim_output_file" ]] && rg -q "hello from bmux" "$vim_output_file"; then
+  printf "__VIM_WRITE_OK__\\n"
+  printf "ok" >"$flow_ok_file"
+fi
 EOF
       ;;
     fzf)
@@ -163,7 +172,12 @@ EOF
 #!/usr/bin/env bash
 printf "__SCENARIO_fzf__\\n"
 printf '\\033]10;?\\033\\\\\\033P+q5443;636f\\033\\\\'
-printf "alpha\\nbeta\\n" | "$shell_bin" --filter alpha >/dev/null
+printf "alpha\\nbeta\\ngamma\\n" | "$shell_bin" --filter a >/dev/null 2>&1 || true
+printf "alpha\\nbeta\\ngamma\\n" | "$shell_bin" --filter alpha >"$fzf_output_file" 2>/dev/null || true
+if [[ -f "$fzf_output_file" ]] && rg -q "^alpha$" "$fzf_output_file"; then
+  printf "__FZF_SELECT_OK__\\n"
+  printf "ok" >"$flow_ok_file"
+fi
 EOF
       ;;
     *)
@@ -184,9 +198,14 @@ run_case() {
   local wrapper
   local log_file="$WORK_DIR/${scenario}-${profile_name}.log"
   local trace_json_file="$WORK_DIR/${scenario}-${profile_name}.trace.json"
+  local flow_ok_file="$WORK_DIR/${scenario}.flow.ok"
+  local vim_output_file="$WORK_DIR/${scenario}.vim.out"
+  local fzf_output_file="$WORK_DIR/${scenario}.fzf.out"
 
   wrapper="$(make_shell_wrapper "$scenario" "$shell_bin")"
   write_config "$pane_term"
+
+  rm -f "$flow_ok_file" "$vim_output_file" "$fzf_output_file"
 
   local status="PASS"
   local notes="ok"
@@ -215,6 +234,29 @@ run_case() {
       status="FAIL"
       notes="pane runtime error in log"
     fi
+  fi
+
+  if [[ "$status" == "PASS" ]]; then
+    case "$scenario" in
+      fish)
+        if [[ ! -f "$flow_ok_file" ]]; then
+          status="FAIL"
+          notes="fish_command_flow_missing"
+        fi
+        ;;
+      vim)
+        if [[ ! -f "$flow_ok_file" ]] || [[ ! -f "$vim_output_file" ]]; then
+          status="FAIL"
+          notes="vim_edit_flow_missing"
+        fi
+        ;;
+      fzf)
+        if [[ ! -f "$flow_ok_file" ]] || [[ ! -f "$fzf_output_file" ]]; then
+          status="FAIL"
+          notes="fzf_filter_select_flow_missing"
+        fi
+        ;;
+    esac
   fi
 
   if [[ "$status" == "PASS" ]]; then
