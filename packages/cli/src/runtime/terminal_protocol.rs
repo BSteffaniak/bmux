@@ -771,6 +771,36 @@ mod tests {
         let dcs_reply = engine.process_output(b"\x1bP$qm\x1b\\", (0, 0));
         assert_eq!(dcs_reply, b"\x1bP1$r0m\x1b\\");
     }
+
+    #[test]
+    fn deterministic_noise_stream_does_not_break_parser_recovery() {
+        fn next_u32(state: &mut u64) -> u32 {
+            *state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (*state >> 32) as u32
+        }
+
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
+        let mut seed = 0x5eed_1234_abcd_9876_u64;
+
+        for _ in 0..256 {
+            let len = (next_u32(&mut seed) % 96 + 1) as usize;
+            let mut chunk = Vec::with_capacity(len);
+            for _ in 0..len {
+                chunk.push((next_u32(&mut seed) & 0xff) as u8);
+            }
+
+            let replies = engine.process_output(&chunk, (0, 0));
+            assert!(
+                replies.len() <= len.saturating_mul(32),
+                "unexpectedly large reply burst for random chunk"
+            );
+        }
+
+        let reply = engine.process_output(b"\x1b[c", (0, 0));
+        assert_eq!(reply, b"\x1b[?1;2c");
+    }
 }
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
