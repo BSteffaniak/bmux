@@ -281,3 +281,46 @@ pub(super) fn resize_panes(
 
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::TerminalProtocolEngine;
+    use crate::runtime::terminal_protocol::ProtocolProfile;
+    use vt100::Parser as VtParser;
+
+    fn process_chunks(profile: ProtocolProfile, chunks: &[&[u8]]) -> (String, Vec<u8>) {
+        let mut parser = VtParser::new(10, 40, 100);
+        let mut engine = TerminalProtocolEngine::new(profile);
+        let mut replies = Vec::new();
+
+        for chunk in chunks {
+            parser.process(chunk);
+            let cursor = parser.screen().cursor_position();
+            replies.extend(engine.process_output(chunk, cursor));
+        }
+
+        (parser.screen().contents().to_string(), replies)
+    }
+
+    #[test]
+    fn mixed_output_and_queries_keeps_rendered_text_contiguous() {
+        let (contents, replies) = process_chunks(
+            ProtocolProfile::Xterm,
+            &[b"hello ", b"\x1b[5n", b"world", b"\x1b[>c"],
+        );
+
+        assert!(contents.contains("hello world"));
+        assert_eq!(replies, b"\x1b[0n\x1b[>0;115;0c");
+    }
+
+    #[test]
+    fn split_query_sequences_preserve_text_and_reply_once() {
+        let (contents, replies) = process_chunks(
+            ProtocolProfile::Screen,
+            &[b"ab", b"\x1b", b"[", b"?25$p", b"cd"],
+        );
+
+        assert!(contents.contains("abcd"));
+        assert_eq!(replies, b"\x1b[?25;1$y");
+    }
+}
