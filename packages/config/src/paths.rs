@@ -82,6 +82,20 @@ impl ConfigPaths {
         self.runtime_dir.join("server.sock")
     }
 
+    /// Get the server named pipe path for Windows transports.
+    ///
+    /// The value is deterministic and user-scoped so multiple users on the same
+    /// machine do not collide.
+    #[must_use]
+    pub fn server_named_pipe(&self) -> String {
+        let user_raw = std::env::var("USER")
+            .or_else(|_| std::env::var("USERNAME"))
+            .unwrap_or_else(|_| "unknown".to_string());
+        let user = sanitize_endpoint_component(&user_raw);
+        let runtime_hash = stable_fnv1a64(self.runtime_dir.to_string_lossy().as_bytes());
+        format!(r"\\.\pipe\bmux-{user}-{runtime_hash:016x}")
+    }
+
     /// Ensure all necessary directories exist
     ///
     /// # Errors
@@ -96,6 +110,101 @@ impl ConfigPaths {
         std::fs::create_dir_all(self.logs_dir())?;
         std::fs::create_dir_all(self.config_dir.join("themes"))?;
         Ok(())
+    }
+}
+
+fn sanitize_endpoint_component(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            output.push(ch);
+        } else {
+            output.push('-');
+        }
+    }
+
+    let trimmed = output.trim_matches('-');
+    if trimmed.is_empty() {
+        "unknown".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn stable_fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{stable_fnv1a64, ConfigPaths};
+    use std::path::PathBuf;
+
+    #[test]
+    fn server_socket_uses_runtime_dir() {
+        let paths = ConfigPaths::new(
+            PathBuf::from("/config"),
+            PathBuf::from("/runtime"),
+            PathBuf::from("/data"),
+        );
+        assert_eq!(paths.server_socket(), PathBuf::from("/runtime/server.sock"));
+    }
+
+    #[test]
+    fn server_named_pipe_is_stable_for_same_runtime() {
+        let paths = ConfigPaths::new(
+            PathBuf::from("/config"),
+            PathBuf::from("/runtime/path"),
+            PathBuf::from("/data"),
+        );
+        assert_eq!(paths.server_named_pipe(), paths.server_named_pipe());
+    }
+
+    #[test]
+    fn server_named_pipe_changes_with_runtime_dir() {
+        let a = ConfigPaths::new(
+            PathBuf::from("/config"),
+            PathBuf::from("/runtime/a"),
+            PathBuf::from("/data"),
+        );
+        let b = ConfigPaths::new(
+            PathBuf::from("/config"),
+            PathBuf::from("/runtime/b"),
+            PathBuf::from("/data"),
+        );
+        assert_ne!(a.server_named_pipe(), b.server_named_pipe());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn server_named_pipe_uses_windows_pipe_prefix() {
+        let paths = ConfigPaths::new(
+            PathBuf::from("C:/config"),
+            PathBuf::from("C:/runtime"),
+            PathBuf::from("C:/data"),
+        );
+        assert!(paths.server_named_pipe().starts_with(r"\\.\pipe\"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_socket_file_name_is_server_sock() {
+        let paths = ConfigPaths::new(
+            PathBuf::from("/config"),
+            PathBuf::from("/runtime"),
+            PathBuf::from("/data"),
+        );
+        assert!(paths.server_socket().ends_with("server.sock"));
+    }
+
+    #[test]
+    fn hash_fnv1a_known_vector() {
+        assert_eq!(stable_fnv1a64(b"bmux"), 0xbb09969bbc2c17fd);
     }
 }
 

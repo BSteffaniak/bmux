@@ -5,9 +5,50 @@
 //! Cross-platform IPC protocol models for bmux.
 
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 pub mod frame;
+
+/// Cross-platform local IPC endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "transport", content = "address", rename_all = "snake_case")]
+pub enum IpcEndpoint {
+    UnixSocket(PathBuf),
+    WindowsNamedPipe(String),
+}
+
+impl IpcEndpoint {
+    /// Construct a Unix domain socket endpoint.
+    #[must_use]
+    pub fn unix_socket(path: impl Into<PathBuf>) -> Self {
+        Self::UnixSocket(path.into())
+    }
+
+    /// Construct a Windows named pipe endpoint.
+    #[must_use]
+    pub fn windows_named_pipe(name: impl Into<String>) -> Self {
+        Self::WindowsNamedPipe(name.into())
+    }
+
+    /// Return the Unix socket path when this endpoint uses Unix sockets.
+    #[must_use]
+    pub fn as_unix_socket(&self) -> Option<&Path> {
+        match self {
+            Self::UnixSocket(path) => Some(path.as_path()),
+            Self::WindowsNamedPipe(_) => None,
+        }
+    }
+
+    /// Return the Windows named pipe when this endpoint uses named pipes.
+    #[must_use]
+    pub fn as_windows_named_pipe(&self) -> Option<&str> {
+        match self {
+            Self::UnixSocket(_) => None,
+            Self::WindowsNamedPipe(name) => Some(name.as_str()),
+        }
+    }
+}
 
 /// Current IPC protocol version.
 pub const CURRENT_PROTOCOL_VERSION: u16 = 1;
@@ -181,9 +222,10 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        decode, encode, Envelope, EnvelopeKind, ErrorCode, Event, ProtocolVersion, Request,
-        Response, ResponsePayload, SessionSelector, SessionSummary,
+        decode, encode, Envelope, EnvelopeKind, ErrorCode, Event, IpcEndpoint, ProtocolVersion,
+        Request, Response, ResponsePayload, SessionSelector, SessionSummary,
     };
+    use std::path::Path;
     use uuid::Uuid;
 
     #[test]
@@ -255,5 +297,39 @@ mod tests {
         let bytes = encode(&code).expect("error code should encode");
         let decoded: ErrorCode = decode(&bytes).expect("error code should decode");
         assert_eq!(decoded, code);
+    }
+
+    #[test]
+    fn endpoint_helpers_report_correct_transport() {
+        let unix_endpoint = IpcEndpoint::unix_socket("/tmp/bmux.sock");
+        assert_eq!(
+            unix_endpoint.as_unix_socket(),
+            Some(Path::new("/tmp/bmux.sock"))
+        );
+        assert_eq!(unix_endpoint.as_windows_named_pipe(), None);
+
+        let pipe_endpoint = IpcEndpoint::windows_named_pipe(r"\\.\pipe\bmux-test");
+        assert_eq!(pipe_endpoint.as_unix_socket(), None);
+        assert_eq!(
+            pipe_endpoint.as_windows_named_pipe(),
+            Some(r"\\.\pipe\bmux-test")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_endpoint_exposes_socket_path() {
+        let endpoint = IpcEndpoint::unix_socket("/tmp/bmux.sock");
+        assert_eq!(endpoint.as_unix_socket(), Some(Path::new("/tmp/bmux.sock")));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_endpoint_exposes_pipe_name() {
+        let endpoint = IpcEndpoint::windows_named_pipe(r"\\.\pipe\bmux-test");
+        assert_eq!(
+            endpoint.as_windows_named_pipe(),
+            Some(r"\\.\pipe\bmux-test")
+        );
     }
 }
