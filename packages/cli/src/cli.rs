@@ -88,6 +88,15 @@ pub(crate) enum TerminalCommand {
         #[arg(long, default_value_t = 50)]
         trace_limit: usize,
     },
+    /// Install bmux-256color terminfo entry
+    InstallTerminfo {
+        /// Proceed without interactive confirmation
+        #[arg(long)]
+        yes: bool,
+        /// Check installability/status without installing
+        #[arg(long)]
+        check: bool,
+    },
 }
 
 #[cfg(test)]
@@ -220,6 +229,22 @@ mod tests {
                 json: false,
                 trace: true,
                 trace_limit: 25
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_terminal_install_terminfo_flags() {
+        let cli = Cli::try_parse_from(["bmux", "terminal", "install-terminfo", "--yes", "--check"])
+            .expect("valid CLI args");
+        let Some(Command::Terminal { command }) = cli.command else {
+            panic!("expected terminal subcommand");
+        };
+        assert!(matches!(
+            command,
+            TerminalCommand::InstallTerminfo {
+                yes: true,
+                check: true
             }
         ));
     }

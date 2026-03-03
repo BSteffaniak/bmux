@@ -6,7 +6,7 @@ use crate::pane::{LayoutTree, PaneId, SplitDirection};
 use crate::pty::STARTUP_ALT_SCREEN_GUARD_DURATION;
 use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
-use bmux_config::BmuxConfig;
+use bmux_config::{BmuxConfig, TerminfoAutoInstall};
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use portable_pty::{Child, MasterPty};
@@ -85,6 +85,11 @@ struct RuntimeSettings {
     warnings: Vec<String>,
 }
 
+struct RuntimeOptions {
+    terminfo_auto_install: TerminfoAutoInstall,
+    terminfo_prompt_cooldown_days: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalProfile {
     Bmux256Color,
@@ -101,8 +106,22 @@ pub(crate) fn run() -> Result<u8> {
         return run_command(command);
     }
 
+    let config = match BmuxConfig::load() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!("bmux warning: failed loading config, using defaults ({error})");
+            BmuxConfig::default()
+        }
+    };
+
     let shell = resolve_shell(cli.shell);
-    let runtime_settings = load_runtime_settings();
+    let runtime_settings = load_runtime_settings(&config);
+    let runtime_options = RuntimeOptions {
+        terminfo_auto_install: config.behavior.terminfo_auto_install,
+        terminfo_prompt_cooldown_days: config.behavior.terminfo_prompt_cooldown_days.max(1),
+    };
+
+    let runtime_settings = maybe_install_terminfo_on_startup(runtime_settings, &runtime_options)?;
     debug!("Starting bmux runtime");
     debug!("Launching shell: {shell}");
     debug!(
@@ -139,6 +158,9 @@ fn run_command(command: &Command) -> Result<u8> {
                 trace,
                 trace_limit,
             } => run_terminal_doctor(*json, *trace, *trace_limit),
+            TerminalCommand::InstallTerminfo { yes, check } => {
+                run_terminal_install_terminfo(*yes, *check)
+            }
         },
     }
 }
@@ -159,6 +181,52 @@ fn run_layout_clear() -> Result<u8> {
     }
 }
 
+fn run_terminal_install_terminfo(yes: bool, check_only: bool) -> Result<u8> {
+    let configured = BmuxConfig::load()
+        .map(|cfg| cfg.behavior.pane_term)
+        .unwrap_or_else(|_| "bmux-256color".to_string());
+    let is_installed = check_terminfo_available("bmux-256color") == Some(true);
+
+    if check_only {
+        if is_installed {
+            println!("bmux-256color terminfo is installed");
+            return Ok(0);
+        }
+        println!("bmux-256color terminfo is not installed");
+        return Ok(1);
+    }
+
+    if is_installed {
+        println!("bmux-256color terminfo is already installed");
+        return Ok(0);
+    }
+
+    if !yes && io::stdin().is_terminal() {
+        println!("bmux-256color terminfo is missing.");
+        println!("Install now? [Y/n]");
+        let mut answer = String::new();
+        io::stdin()
+            .read_line(&mut answer)
+            .context("failed reading install confirmation")?;
+        let trimmed = answer.trim().to_ascii_lowercase();
+        if trimmed == "n" || trimmed == "no" {
+            println!("skipped terminfo installation");
+            return Ok(0);
+        }
+    }
+
+    install_bmux_terminfo()?;
+    if check_terminfo_available("bmux-256color") == Some(true) {
+        println!("installed terminfo entry: bmux-256color");
+        if configured != "bmux-256color" {
+            println!("note: current config pane_term is '{configured}'");
+        }
+        Ok(0)
+    } else {
+        anyhow::bail!("terminfo install completed but bmux-256color is still unavailable")
+    }
+}
+
 fn run_terminal_doctor(as_json: bool, include_trace: bool, trace_limit: usize) -> Result<u8> {
     let config = match BmuxConfig::load() {
         Ok(config) => config,
@@ -173,6 +241,7 @@ fn run_terminal_doctor(as_json: bool, include_trace: bool, trace_limit: usize) -
     let configured_term = config.behavior.pane_term.clone();
     let effective = resolve_pane_term(&configured_term);
     let protocol_profile = protocol_profile_for_terminal_profile(effective.profile);
+    let last_declined_prompt_epoch_secs = last_prompt_decline_epoch_secs();
     let trace_events = if include_trace {
         load_protocol_trace(trace_limit)?
     } else {
@@ -202,6 +271,11 @@ fn run_terminal_doctor(as_json: bool, include_trace: bool, trace_limit: usize) -
                 }))
                 .collect::<Vec<_>>(),
             "warnings": effective.warnings,
+            "terminfo_auto_install": {
+                "policy": terminfo_auto_install_name(config.behavior.terminfo_auto_install),
+                "prompt_cooldown_days": config.behavior.terminfo_prompt_cooldown_days,
+                "last_declined_prompt_epoch_secs": last_declined_prompt_epoch_secs,
+            },
             "trace": if include_trace {
                 serde_json::json!({
                     "events": trace_events,
@@ -238,6 +312,14 @@ fn run_terminal_doctor(as_json: bool, include_trace: bool, trace_limit: usize) -
         "secondary DA reply: {}",
         String::from_utf8_lossy(secondary_da_for_profile(protocol_profile))
     );
+    println!(
+        "terminfo auto-install policy: {} (cooldown {} days)",
+        terminfo_auto_install_name(config.behavior.terminfo_auto_install),
+        config.behavior.terminfo_prompt_cooldown_days
+    );
+    if let Some(epoch) = last_declined_prompt_epoch_secs {
+        println!("last declined terminfo prompt (epoch secs): {epoch}");
+    }
     println!("supported queries: {}", supported_query_names().join(", "));
     println!("fallback chain: {}", effective.fallback_chain.join(" -> "));
     if effective.terminfo_checked {
@@ -801,15 +883,7 @@ fn key_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     }
 }
 
-fn load_runtime_settings() -> RuntimeSettings {
-    let config = match BmuxConfig::load() {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("bmux warning: failed loading config, using defaults ({error})");
-            BmuxConfig::default()
-        }
-    };
-
+fn load_runtime_settings(config: &BmuxConfig) -> RuntimeSettings {
     let keymap = match crate::input::Keymap::from_parts(
         &config.keybindings.prefix,
         config.keybindings.timeout_ms,
@@ -888,6 +962,148 @@ fn load_protocol_trace(limit: usize) -> Result<Vec<ProtocolTraceEvent>> {
     }
     let start = file.events.len().saturating_sub(limit);
     Ok(file.events.into_iter().skip(start).collect())
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize, Default)]
+struct TerminfoPromptStateFile {
+    last_declined_epoch_secs: Option<u64>,
+}
+
+fn maybe_install_terminfo_on_startup(
+    mut runtime_settings: RuntimeSettings,
+    runtime_options: &RuntimeOptions,
+) -> Result<RuntimeSettings> {
+    if runtime_settings.configured_pane_term != "bmux-256color" {
+        return Ok(runtime_settings);
+    }
+    if runtime_settings.pane_term == "bmux-256color" {
+        return Ok(runtime_settings);
+    }
+
+    match runtime_options.terminfo_auto_install {
+        TerminfoAutoInstall::Never => return Ok(runtime_settings),
+        TerminfoAutoInstall::Always => {
+            if let Err(error) = install_bmux_terminfo() {
+                eprintln!("bmux warning: failed auto-installing terminfo ({error})");
+                return Ok(runtime_settings);
+            }
+        }
+        TerminfoAutoInstall::Ask => {
+            if !io::stdin().is_terminal() {
+                return Ok(runtime_settings);
+            }
+
+            if !prompt_allowed_by_cooldown(runtime_options.terminfo_prompt_cooldown_days)? {
+                return Ok(runtime_settings);
+            }
+
+            println!(
+                "bmux terminfo 'bmux-256color' is missing; install now for better compatibility? [Y/n]"
+            );
+            let mut answer = String::new();
+            io::stdin()
+                .read_line(&mut answer)
+                .context("failed reading terminfo install prompt")?;
+            let trimmed = answer.trim().to_ascii_lowercase();
+            if trimmed == "n" || trimmed == "no" {
+                persist_prompt_decline_now()?;
+                return Ok(runtime_settings);
+            }
+
+            if let Err(error) = install_bmux_terminfo() {
+                eprintln!("bmux warning: failed installing terminfo ({error})");
+                return Ok(runtime_settings);
+            }
+        }
+    }
+
+    if check_terminfo_available("bmux-256color") == Some(true) {
+        let resolved = resolve_pane_term("bmux-256color");
+        runtime_settings.pane_term = resolved.pane_term;
+        runtime_settings.terminal_profile = resolved.profile;
+        runtime_settings.protocol_profile =
+            protocol_profile_for_terminal_profile(runtime_settings.terminal_profile);
+        runtime_settings.warnings = resolved.warnings;
+    }
+
+    Ok(runtime_settings)
+}
+
+fn prompt_allowed_by_cooldown(cooldown_days: u64) -> Result<bool> {
+    let path = bmux_config::ConfigPaths::default().terminfo_prompt_state_file();
+    if !path.exists() {
+        return Ok(true);
+    }
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("failed reading terminfo prompt state at {}", path.display()))?;
+    let state: TerminfoPromptStateFile = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed parsing terminfo prompt state at {}", path.display()))?;
+    let Some(last) = state.last_declined_epoch_secs else {
+        return Ok(true);
+    };
+    let now = unix_now_secs();
+    let cooldown = cooldown_days.saturating_mul(24 * 60 * 60);
+    Ok(now.saturating_sub(last) >= cooldown)
+}
+
+fn persist_prompt_decline_now() -> Result<()> {
+    let path = bmux_config::ConfigPaths::default().terminfo_prompt_state_file();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed creating prompt state dir at {}", parent.display()))?;
+    }
+    let state = TerminfoPromptStateFile {
+        last_declined_epoch_secs: Some(unix_now_secs()),
+    };
+    let payload = serde_json::to_vec_pretty(&state).context("failed encoding prompt state")?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, payload)
+        .with_context(|| format!("failed writing prompt state tmp at {}", tmp.display()))?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("failed replacing prompt state at {}", path.display()))?;
+    Ok(())
+}
+
+fn install_bmux_terminfo() -> Result<()> {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../terminfo/bmux-256color.terminfo");
+    if !source.exists() {
+        anyhow::bail!("terminfo source file not found at {}", source.display());
+    }
+
+    let output = ProcessCommand::new("tic")
+        .arg("-x")
+        .arg(&source)
+        .output()
+        .context("failed to execute tic")?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "tic failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+fn unix_now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |dur| dur.as_secs())
+}
+
+fn terminfo_auto_install_name(policy: TerminfoAutoInstall) -> &'static str {
+    match policy {
+        TerminfoAutoInstall::Ask => "ask",
+        TerminfoAutoInstall::Always => "always",
+        TerminfoAutoInstall::Never => "never",
+    }
+}
+
+fn last_prompt_decline_epoch_secs() -> Option<u64> {
+    let path = bmux_config::ConfigPaths::default().terminfo_prompt_state_file();
+    let bytes = std::fs::read(path).ok()?;
+    let state: TerminfoPromptStateFile = serde_json::from_slice(&bytes).ok()?;
+    state.last_declined_epoch_secs
 }
 
 struct PaneTermResolution {

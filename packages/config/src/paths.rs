@@ -68,6 +68,14 @@ impl ConfigPaths {
         self.data_dir.join("runtime").join("protocol-trace.json")
     }
 
+    /// Get persisted terminfo prompt state file path
+    #[must_use]
+    pub fn terminfo_prompt_state_file(&self) -> PathBuf {
+        self.data_dir
+            .join("runtime")
+            .join("terminfo-prompt-state.json")
+    }
+
     /// Get the server socket path
     #[must_use]
     pub fn server_socket(&self) -> PathBuf {

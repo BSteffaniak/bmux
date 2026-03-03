@@ -129,6 +129,10 @@ pub struct BehaviorConfig {
     pub protocol_trace_enabled: bool,
     /// Maximum in-memory protocol trace events to retain
     pub protocol_trace_capacity: usize,
+    /// Auto-install policy for bmux terminfo when missing
+    pub terminfo_auto_install: TerminfoAutoInstall,
+    /// Cooldown before prompting again after declining install
+    pub terminfo_prompt_cooldown_days: u64,
 }
 
 impl Default for BehaviorConfig {
@@ -143,8 +147,19 @@ impl Default for BehaviorConfig {
             pane_term: "bmux-256color".to_string(),
             protocol_trace_enabled: false,
             protocol_trace_capacity: 200,
+            terminfo_auto_install: TerminfoAutoInstall::Ask,
+            terminfo_prompt_cooldown_days: 7,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminfoAutoInstall {
+    #[default]
+    Ask,
+    Always,
+    Never,
 }
 
 /// Multi-client specific configuration
