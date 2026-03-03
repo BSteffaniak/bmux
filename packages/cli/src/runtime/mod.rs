@@ -519,6 +519,7 @@ fn key_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
     let modifiers = key.modifiers;
     let ctrl = modifiers.contains(KeyModifiers::CONTROL);
     let alt = modifiers.contains(KeyModifiers::ALT);
+    let shift = modifiers.contains(KeyModifiers::SHIFT);
 
     let mut out = Vec::new();
 
@@ -564,10 +565,26 @@ fn key_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
             Some(out)
         }
         KeyCode::Esc => Some(vec![0x1b]),
-        KeyCode::Up => Some(vec![0x1b, b'[', b'A']),
-        KeyCode::Down => Some(vec![0x1b, b'[', b'B']),
-        KeyCode::Right => Some(vec![0x1b, b'[', b'C']),
-        KeyCode::Left => Some(vec![0x1b, b'[', b'D']),
+        KeyCode::Up => Some(if shift {
+            vec![0x1b, b'[', b'1', b';', b'2', b'A']
+        } else {
+            vec![0x1b, b'[', b'A']
+        }),
+        KeyCode::Down => Some(if shift {
+            vec![0x1b, b'[', b'1', b';', b'2', b'B']
+        } else {
+            vec![0x1b, b'[', b'B']
+        }),
+        KeyCode::Right => Some(if shift {
+            vec![0x1b, b'[', b'1', b';', b'2', b'C']
+        } else {
+            vec![0x1b, b'[', b'C']
+        }),
+        KeyCode::Left => Some(if shift {
+            vec![0x1b, b'[', b'1', b';', b'2', b'D']
+        } else {
+            vec![0x1b, b'[', b'D']
+        }),
         KeyCode::Home => Some(vec![0x1b, b'[', b'H']),
         KeyCode::End => Some(vec![0x1b, b'[', b'F']),
         KeyCode::PageUp => Some(vec![0x1b, b'[', b'5', b'~']),
@@ -877,6 +894,21 @@ mod tests {
         };
 
         assert_eq!(key_to_bytes(key), Some(vec![0x1b, b'[', b'A']));
+    }
+
+    #[test]
+    fn key_to_bytes_encodes_shift_arrow_sequences() {
+        let key = KeyEvent {
+            code: KeyCode::Left,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+
+        assert_eq!(
+            key_to_bytes(key),
+            Some(vec![0x1b, b'[', b'1', b';', b'2', b'D'])
+        );
     }
 
     #[test]

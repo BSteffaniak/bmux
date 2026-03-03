@@ -125,6 +125,10 @@ impl Keymap {
         runtime.insert("shift+l".to_string(), "resize_right".to_string());
         runtime.insert("shift+k".to_string(), "resize_up".to_string());
         runtime.insert("shift+j".to_string(), "resize_down".to_string());
+        runtime.insert("shift+arrow_left".to_string(), "resize_left".to_string());
+        runtime.insert("shift+arrow_right".to_string(), "resize_right".to_string());
+        runtime.insert("shift+arrow_up".to_string(), "resize_up".to_string());
+        runtime.insert("shift+arrow_down".to_string(), "resize_down".to_string());
         runtime.insert("r".to_string(), "restart_focused_pane".to_string());
         runtime.insert("x".to_string(), "close_focused_pane".to_string());
         runtime.insert("?".to_string(), "show_help".to_string());
@@ -626,6 +630,34 @@ fn decode_escape_sequence(bytes: &[u8]) -> Option<(DecodedStroke, usize)> {
         (b"\x1b[B", KeyStroke::simple(KeyCode::ArrowDown)),
         (b"\x1b[C", KeyStroke::simple(KeyCode::ArrowRight)),
         (b"\x1b[D", KeyStroke::simple(KeyCode::ArrowLeft)),
+        (
+            b"\x1b[1;2A",
+            KeyStroke {
+                shift: true,
+                ..KeyStroke::simple(KeyCode::ArrowUp)
+            },
+        ),
+        (
+            b"\x1b[1;2B",
+            KeyStroke {
+                shift: true,
+                ..KeyStroke::simple(KeyCode::ArrowDown)
+            },
+        ),
+        (
+            b"\x1b[1;2C",
+            KeyStroke {
+                shift: true,
+                ..KeyStroke::simple(KeyCode::ArrowRight)
+            },
+        ),
+        (
+            b"\x1b[1;2D",
+            KeyStroke {
+                shift: true,
+                ..KeyStroke::simple(KeyCode::ArrowLeft)
+            },
+        ),
         (b"\x1b[H", KeyStroke::simple(KeyCode::Home)),
         (b"\x1b[F", KeyStroke::simple(KeyCode::End)),
         (b"\x1b[2~", KeyStroke::simple(KeyCode::Insert)),
@@ -868,6 +900,22 @@ mod tests {
         );
         assert_eq!(
             processor.process_chunk(&[0x01, b'J']),
+            vec![RuntimeAction::ResizeDown]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, 0x1b, b'[', b'1', b';', b'2', b'D']),
+            vec![RuntimeAction::ResizeLeft]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, 0x1b, b'[', b'1', b';', b'2', b'C']),
+            vec![RuntimeAction::ResizeRight]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, 0x1b, b'[', b'1', b';', b'2', b'A']),
+            vec![RuntimeAction::ResizeUp]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, 0x1b, b'[', b'1', b';', b'2', b'B']),
             vec![RuntimeAction::ResizeDown]
         );
     }

@@ -68,6 +68,10 @@ fn default_runtime_bindings() -> BTreeMap<String, String> {
     bindings.insert("shift+l".to_string(), "resize_right".to_string());
     bindings.insert("shift+k".to_string(), "resize_up".to_string());
     bindings.insert("shift+j".to_string(), "resize_down".to_string());
+    bindings.insert("shift+arrow_left".to_string(), "resize_left".to_string());
+    bindings.insert("shift+arrow_right".to_string(), "resize_right".to_string());
+    bindings.insert("shift+arrow_up".to_string(), "resize_up".to_string());
+    bindings.insert("shift+arrow_down".to_string(), "resize_down".to_string());
     bindings.insert("r".to_string(), "restart_focused_pane".to_string());
     bindings.insert("x".to_string(), "close_focused_pane".to_string());
     bindings.insert("?".to_string(), "show_help".to_string());
