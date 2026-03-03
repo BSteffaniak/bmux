@@ -1,6 +1,4 @@
-use super::pane_runtime::{
-    next_focusable_pane_id, pane_is_running, spawn_pane_process, stop_pane_process,
-};
+use super::pane_runtime::{next_focusable_pane_id, spawn_pane_process, stop_pane_process};
 use super::{PaneRuntime, StatusMessage};
 use crate::input::RuntimeAction;
 use crate::pane::{LayoutTree, PaneId, Rect, SplitDirection};
@@ -88,6 +86,58 @@ pub(super) fn process_input_events(
                             .set_ratio((updated_tree.ratio() - SPLIT_RATIO_STEP).clamp(0.2, 0.8));
                         pending_tree_update = Some(updated_tree);
                     }
+                    RuntimeAction::SplitFocusedVertical | RuntimeAction::SplitFocusedHorizontal => {
+                        let split_direction = match action {
+                            RuntimeAction::SplitFocusedVertical => SplitDirection::Vertical,
+                            RuntimeAction::SplitFocusedHorizontal => SplitDirection::Horizontal,
+                            _ => unreachable!(),
+                        };
+
+                        let mut updated_tree = pending_tree_update
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or_else(|| layout_tree.clone());
+
+                        let new_pane_id = next_pane_id(panes);
+                        let pane_title = format!("pane-{}", new_pane_id.0);
+
+                        if let Some(active_pane) = panes.get(focused_pane) {
+                            let pane_inner = pane_rects
+                                .get(focused_pane)
+                                .map(|rect| rect.inner())
+                                .unwrap_or_default();
+
+                            panes.insert(
+                                new_pane_id,
+                                super::pane_runtime::spawn_pane(
+                                    &active_pane.shell,
+                                    pane_title.clone(),
+                                    pane_inner,
+                                    startup_deadline,
+                                    Arc::clone(&user_input_seen),
+                                )?,
+                            );
+
+                            if updated_tree.split_focused(split_direction, new_pane_id, 0.5) {
+                                *focused_pane = new_pane_id;
+                                pending_tree_update = Some(updated_tree);
+                                let label = match split_direction {
+                                    SplitDirection::Vertical => "vertical",
+                                    SplitDirection::Horizontal => "horizontal",
+                                };
+                                *status_message = Some(StatusMessage::new(format!(
+                                    "split {label}: {pane_title}"
+                                )));
+                            } else {
+                                if let Some(mut pane) = panes.remove(&new_pane_id) {
+                                    stop_pane_process(&mut pane, true)?;
+                                }
+                                *status_message = Some(StatusMessage::new(
+                                    "failed to split focused pane".to_string(),
+                                ));
+                            }
+                        }
+                    }
                     RuntimeAction::RestartFocusedPane => {
                         if let Some(rect) = pane_rects.get(focused_pane) {
                             let pane_inner = rect.inner();
@@ -112,28 +162,33 @@ pub(super) fn process_input_events(
                         }
                     }
                     RuntimeAction::CloseFocusedPane => {
-                        let running_count =
-                            panes.values().filter(|pane| pane_is_running(pane)).count();
-                        if running_count <= 1 {
-                            *status_message = Some(StatusMessage::new(
-                                "cannot close the last running pane".to_string(),
-                            ));
-                        } else if let Some(pane) = panes.get_mut(focused_pane) {
-                            let closed_title = pane.title.clone();
-                            stop_pane_process(pane, true)?;
-                            pane.closed = true;
-                            pane.exit_code = None;
-                            pane.state.dirty.store(true, Ordering::Relaxed);
-                            *status_message =
-                                Some(StatusMessage::new(format!("pane '{closed_title}' closed")));
-                        }
+                        let mut updated_tree = pending_tree_update
+                            .as_ref()
+                            .cloned()
+                            .unwrap_or_else(|| layout_tree.clone());
 
-                        *focused_pane =
-                            next_focusable_pane_id(&layout_tree.pane_order(), panes, *focused_pane);
+                        if updated_tree.pane_order().len() <= 1 {
+                            *status_message =
+                                Some(StatusMessage::new("cannot close the last pane".to_string()));
+                        } else {
+                            let closing_pane = *focused_pane;
+                            if updated_tree.remove_pane(closing_pane) {
+                                if let Some(mut pane) = panes.remove(&closing_pane) {
+                                    let closed_title = pane.title.clone();
+                                    stop_pane_process(&mut pane, true)?;
+                                    *status_message = Some(StatusMessage::new(format!(
+                                        "pane '{closed_title}' closed"
+                                    )));
+                                }
+
+                                *focused_pane = updated_tree.focused;
+                                pending_tree_update = Some(updated_tree);
+                            }
+                        }
                     }
                     RuntimeAction::ShowHelp => {
                         *status_message = Some(StatusMessage::new(
-                            "Ctrl-A: q quit | o focus | t toggle split | +/- resize | r restart | x close | ? help"
+                            "Ctrl-A: q quit | o focus | t toggle layout | % split-v | \" split-h | +/- resize | r restart | x close | ? help"
                                 .to_string(),
                         ));
                     }
@@ -155,4 +210,14 @@ pub(super) fn process_input_events(
     }
 
     Ok(pending_tree_update)
+}
+
+fn next_pane_id(panes: &BTreeMap<PaneId, PaneRuntime>) -> PaneId {
+    let next = panes
+        .keys()
+        .map(|pane_id| pane_id.0)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1);
+    PaneId(next)
 }

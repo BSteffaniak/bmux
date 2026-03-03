@@ -7,6 +7,8 @@ pub(crate) enum RuntimeAction {
     Quit,
     FocusNext,
     ToggleSplitDirection,
+    SplitFocusedVertical,
+    SplitFocusedHorizontal,
     IncreaseSplit,
     DecreaseSplit,
     RestartFocusedPane,
@@ -100,6 +102,8 @@ impl Keymap {
         let mut runtime = BTreeMap::new();
         runtime.insert("o".to_string(), "focus_next_pane".to_string());
         runtime.insert("t".to_string(), "toggle_split_direction".to_string());
+        runtime.insert("%".to_string(), "split_focused_vertical".to_string());
+        runtime.insert("\"".to_string(), "split_focused_horizontal".to_string());
         runtime.insert("plus".to_string(), "increase_split".to_string());
         runtime.insert("minus".to_string(), "decrease_split".to_string());
         runtime.insert("r".to_string(), "restart_focused_pane".to_string());
@@ -469,6 +473,8 @@ fn action_to_name(action: &RuntimeAction) -> &'static str {
         RuntimeAction::Quit => "quit",
         RuntimeAction::FocusNext => "focus_next_pane",
         RuntimeAction::ToggleSplitDirection => "toggle_split_direction",
+        RuntimeAction::SplitFocusedVertical => "split_focused_vertical",
+        RuntimeAction::SplitFocusedHorizontal => "split_focused_horizontal",
         RuntimeAction::IncreaseSplit => "increase_split",
         RuntimeAction::DecreaseSplit => "decrease_split",
         RuntimeAction::RestartFocusedPane => "restart_focused_pane",
@@ -734,6 +740,8 @@ fn parse_action(value: &str) -> Result<RuntimeAction> {
         "quit" => Ok(RuntimeAction::Quit),
         "focus_next_pane" => Ok(RuntimeAction::FocusNext),
         "toggle_split_direction" => Ok(RuntimeAction::ToggleSplitDirection),
+        "split_focused_vertical" => Ok(RuntimeAction::SplitFocusedVertical),
+        "split_focused_horizontal" => Ok(RuntimeAction::SplitFocusedHorizontal),
         "increase_split" => Ok(RuntimeAction::IncreaseSplit),
         "decrease_split" => Ok(RuntimeAction::DecreaseSplit),
         "restart_focused_pane" => Ok(RuntimeAction::RestartFocusedPane),

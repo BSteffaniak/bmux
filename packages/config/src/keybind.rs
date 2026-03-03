@@ -52,6 +52,8 @@ fn default_runtime_bindings() -> BTreeMap<String, String> {
     let mut bindings = BTreeMap::new();
     bindings.insert("o".to_string(), "focus_next_pane".to_string());
     bindings.insert("t".to_string(), "toggle_split_direction".to_string());
+    bindings.insert("%".to_string(), "split_focused_vertical".to_string());
+    bindings.insert("\"".to_string(), "split_focused_horizontal".to_string());
     bindings.insert("plus".to_string(), "increase_split".to_string());
     bindings.insert("minus".to_string(), "decrease_split".to_string());
     bindings.insert("r".to_string(), "restart_focused_pane".to_string());

@@ -118,6 +118,45 @@ impl LayoutTree {
         compute_node_rects(&self.root, root_rect, &mut rects);
         rects
     }
+
+    pub(crate) fn split_focused(
+        &mut self,
+        direction: SplitDirection,
+        new_pane_id: PaneId,
+        ratio: f32,
+    ) -> bool {
+        let focused = self.focused;
+        let replacement = LayoutNode::Split {
+            direction,
+            ratio: ratio.clamp(0.2, 0.8),
+            first: Box::new(LayoutNode::Leaf { pane_id: focused }),
+            second: Box::new(LayoutNode::Leaf {
+                pane_id: new_pane_id,
+            }),
+        };
+
+        if replace_leaf(&mut self.root, focused, replacement) {
+            self.focused = new_pane_id;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn remove_pane(&mut self, pane_id: PaneId) -> bool {
+        let removed = remove_leaf(&mut self.root, pane_id);
+        if !removed {
+            return false;
+        }
+
+        if self.focused == pane_id {
+            if let Some(next_focus) = self.pane_order().first().copied() {
+                self.focused = next_focus;
+            }
+        }
+
+        true
+    }
 }
 
 fn collect_pane_ids(node: &LayoutNode, out: &mut Vec<PaneId>) {
@@ -127,6 +166,46 @@ fn collect_pane_ids(node: &LayoutNode, out: &mut Vec<PaneId>) {
             collect_pane_ids(first, out);
             collect_pane_ids(second, out);
         }
+    }
+}
+
+fn replace_leaf(node: &mut LayoutNode, target: PaneId, replacement: LayoutNode) -> bool {
+    match node {
+        LayoutNode::Leaf { pane_id } => {
+            if *pane_id == target {
+                *node = replacement;
+                true
+            } else {
+                false
+            }
+        }
+        LayoutNode::Split { first, second, .. } => {
+            replace_leaf(first, target, replacement.clone())
+                || replace_leaf(second, target, replacement)
+        }
+    }
+}
+
+fn remove_leaf(node: &mut LayoutNode, target: PaneId) -> bool {
+    match node {
+        LayoutNode::Leaf { pane_id } => *pane_id == target,
+        LayoutNode::Split { first, second, .. } => match (&**first, &**second) {
+            (LayoutNode::Leaf { pane_id }, _) if *pane_id == target => {
+                *node = (*second.clone()).clone();
+                true
+            }
+            (_, LayoutNode::Leaf { pane_id }) if *pane_id == target => {
+                *node = (*first.clone()).clone();
+                true
+            }
+            _ => {
+                if remove_leaf(first, target) {
+                    true
+                } else {
+                    remove_leaf(second, target)
+                }
+            }
+        },
     }
 }
 
@@ -210,5 +289,24 @@ mod tests {
         let top = rects[&PaneId(1)];
         let bottom = rects[&PaneId(2)];
         assert_eq!(bottom.y, top.y + top.height);
+    }
+
+    #[test]
+    fn split_focused_adds_new_leaf_and_focuses_it() {
+        let mut tree = LayoutTree::two_pane(PaneId(1), PaneId(2), SplitDirection::Vertical, 0.5);
+        tree.focused = PaneId(1);
+        let added = tree.split_focused(SplitDirection::Horizontal, PaneId(3), 0.5);
+        assert!(added);
+        let order = tree.pane_order();
+        assert!(order.contains(&PaneId(3)));
+        assert_eq!(tree.focused, PaneId(3));
+    }
+
+    #[test]
+    fn remove_pane_rebalances_tree() {
+        let mut tree = LayoutTree::two_pane(PaneId(1), PaneId(2), SplitDirection::Vertical, 0.5);
+        let removed = tree.remove_pane(PaneId(2));
+        assert!(removed);
+        assert_eq!(tree.pane_order(), vec![PaneId(1)]);
     }
 }
