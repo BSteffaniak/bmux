@@ -95,10 +95,10 @@ struct DecodedStroke {
     raw: Vec<u8>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 enum InputEvent {
     Key(DecodedStroke),
+    #[allow(dead_code)]
     RawBytes(Vec<u8>),
 }
 
@@ -316,7 +316,18 @@ impl InputProcessor {
             self.resolve_pending(&mut actions, true);
         }
 
-        for event in self.decoder.feed_events(bytes) {
+        let events = self.decoder.feed_events(bytes);
+        actions.extend(self.process_input_events(events));
+        actions
+    }
+
+    fn process_input_events<I>(&mut self, events: I) -> Vec<RuntimeAction>
+    where
+        I: IntoIterator<Item = InputEvent>,
+    {
+        let mut actions = Vec::new();
+
+        for event in events {
             match event {
                 InputEvent::Key(decoded) => {
                     if self.pending.is_none() {
@@ -327,7 +338,6 @@ impl InputProcessor {
                     } else if let Some(pending) = &mut self.pending {
                         pending.decoded.push(decoded);
                     }
-
                     self.resolve_pending(&mut actions, false);
                 }
                 InputEvent::RawBytes(raw) => {
@@ -339,7 +349,6 @@ impl InputProcessor {
         }
 
         self.sync_scroll_mode(&actions);
-
         actions
     }
 
@@ -934,7 +943,7 @@ impl KeyStroke {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputProcessor, Keymap, RuntimeAction};
+    use super::{InputEvent, InputProcessor, Keymap, RuntimeAction};
     use std::collections::BTreeMap;
     use std::thread;
     use std::time::Duration;
@@ -1183,5 +1192,12 @@ mod tests {
                 RuntimeAction::ForwardToPane(vec![b'i'])
             ]
         );
+    }
+
+    #[test]
+    fn raw_bytes_events_bypass_keymap_matching() {
+        let mut processor = InputProcessor::new(Keymap::default_runtime());
+        let actions = processor.process_input_events(vec![InputEvent::RawBytes(vec![0x01, b'o'])]);
+        assert_eq!(actions, vec![RuntimeAction::ForwardToPane(vec![0x01, b'o'])]);
     }
 }
