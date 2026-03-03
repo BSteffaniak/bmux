@@ -848,11 +848,12 @@ fn run_stream_input_loop(
 }
 
 fn load_runtime_settings(config: &BmuxConfig) -> RuntimeSettings {
+    let (runtime_bindings, global_bindings) = merged_runtime_keybindings(config);
     let keymap = match crate::input::Keymap::from_parts(
         &config.keybindings.prefix,
         config.keybindings.timeout_ms,
-        &config.keybindings.runtime,
-        &config.keybindings.global,
+        &runtime_bindings,
+        &global_bindings,
     ) {
         Ok(keymap) => keymap,
         Err(error) => {
@@ -877,6 +878,21 @@ fn load_runtime_settings(config: &BmuxConfig) -> RuntimeSettings {
         configured_pane_term,
         warnings: pane_term_resolution.warnings,
     }
+}
+
+fn merged_runtime_keybindings(
+    config: &BmuxConfig,
+) -> (
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+) {
+    let mut runtime = BmuxConfig::default().keybindings.runtime;
+    runtime.extend(config.keybindings.runtime.clone());
+
+    let mut global = BmuxConfig::default().keybindings.global;
+    global.extend(config.keybindings.global.clone());
+
+    (runtime, global)
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -1263,11 +1279,12 @@ fn run_keymap_doctor(as_json: bool) -> Result<u8> {
             BmuxConfig::default()
         }
     };
+    let (runtime_bindings, global_bindings) = merged_runtime_keybindings(&config);
     let keymap = crate::input::Keymap::from_parts(
         &config.keybindings.prefix,
         config.keybindings.timeout_ms,
-        &config.keybindings.runtime,
-        &config.keybindings.global,
+        &runtime_bindings,
+        &global_bindings,
     )
     .context("failed to compile keymap")?;
 
@@ -1418,9 +1435,9 @@ fn reap_exited_panes(
 mod tests {
     use super::{
         EventReader, PaneRuntime, PaneState, ProtocolDirection, ProtocolTraceEvent,
-        TerminalProfile, TraceFamily, filter_trace_events, load_runtime_settings, profile_for_term,
-        protocol_profile_for_terminal_profile, reap_exited_panes, resolve_pane_term_with_checker,
-        run_event_input_loop_with_reader,
+        TerminalProfile, TraceFamily, filter_trace_events, load_runtime_settings,
+        merged_runtime_keybindings, profile_for_term, protocol_profile_for_terminal_profile,
+        reap_exited_panes, resolve_pane_term_with_checker, run_event_input_loop_with_reader,
     };
     use crate::input::{InputProcessor, Keymap};
     use crate::pane::{LayoutNode, LayoutTree, PaneId, SplitDirection};
@@ -1614,6 +1631,25 @@ mod tests {
 
         let settings = load_runtime_settings(&config);
         assert_eq!(settings.scrollback_limit, 4_321);
+    }
+
+    #[test]
+    fn runtime_keybindings_deep_merge_defaults_and_overrides() {
+        let mut config = BmuxConfig::default();
+        config.keybindings.runtime.clear();
+        config
+            .keybindings
+            .runtime
+            .insert("o".to_string(), "quit".to_string());
+
+        let (runtime, _global) = merged_runtime_keybindings(&config);
+
+        assert_eq!(runtime.get("o"), Some(&"quit".to_string()));
+        assert_eq!(
+            runtime.get("%"),
+            Some(&"split_focused_vertical".to_string())
+        );
+        assert_eq!(runtime.get("["), Some(&"enter_scroll_mode".to_string()));
     }
 
     #[test]
