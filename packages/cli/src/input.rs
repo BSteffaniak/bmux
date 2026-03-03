@@ -1,4 +1,7 @@
 use anyhow::{Result, anyhow, bail};
+use crossterm::event::{
+    Event, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent, KeyEventKind, KeyModifiers,
+};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -321,6 +324,13 @@ impl InputProcessor {
         actions
     }
 
+    pub(crate) fn process_terminal_event(&mut self, event: Event) -> Vec<RuntimeAction> {
+        let Some(input_event) = crossterm_event_to_input_event(event) else {
+            return Vec::new();
+        };
+        self.process_input_events(std::iter::once(input_event))
+    }
+
     fn process_input_events<I>(&mut self, events: I) -> Vec<RuntimeAction>
     where
         I: IntoIterator<Item = InputEvent>,
@@ -468,6 +478,153 @@ impl InputProcessor {
                 _ => {}
             }
         }
+    }
+}
+
+fn crossterm_event_to_input_event(event: Event) -> Option<InputEvent> {
+    match event {
+        Event::Key(key) => key_event_to_input_event(&key),
+        _ => None,
+    }
+}
+
+fn key_event_to_input_event(key: &CrosstermKeyEvent) -> Option<InputEvent> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+
+    let stroke = key_event_to_stroke(key)?;
+    let raw = key_event_to_bytes(key)?;
+    Some(InputEvent::Key(DecodedStroke { stroke, raw }))
+}
+
+fn key_event_to_stroke(key: &CrosstermKeyEvent) -> Option<KeyStroke> {
+    let modifiers = key.modifiers;
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    let alt = modifiers.contains(KeyModifiers::ALT);
+    let mut shift = modifiers.contains(KeyModifiers::SHIFT);
+    let super_key = modifiers.contains(KeyModifiers::SUPER);
+
+    let key_code = match key.code {
+        CrosstermKeyCode::Char(c) => {
+            let normalized = if c.is_ascii_uppercase() {
+                shift = true;
+                c.to_ascii_lowercase()
+            } else {
+                c
+            };
+            KeyCode::Char(normalized)
+        }
+        CrosstermKeyCode::Enter => KeyCode::Enter,
+        CrosstermKeyCode::Tab => KeyCode::Tab,
+        CrosstermKeyCode::Backspace => KeyCode::Backspace,
+        CrosstermKeyCode::Esc => KeyCode::Escape,
+        CrosstermKeyCode::Up => KeyCode::ArrowUp,
+        CrosstermKeyCode::Down => KeyCode::ArrowDown,
+        CrosstermKeyCode::Left => KeyCode::ArrowLeft,
+        CrosstermKeyCode::Right => KeyCode::ArrowRight,
+        CrosstermKeyCode::Home => KeyCode::Home,
+        CrosstermKeyCode::End => KeyCode::End,
+        CrosstermKeyCode::PageUp => KeyCode::PageUp,
+        CrosstermKeyCode::PageDown => KeyCode::PageDown,
+        CrosstermKeyCode::Insert => KeyCode::Insert,
+        CrosstermKeyCode::Delete => KeyCode::Delete,
+        CrosstermKeyCode::F(number) => KeyCode::Function(number),
+        _ => return None,
+    };
+
+    Some(KeyStroke {
+        ctrl,
+        alt,
+        shift,
+        super_key,
+        key: key_code,
+    })
+}
+
+fn key_event_to_bytes(key: &CrosstermKeyEvent) -> Option<Vec<u8>> {
+    let modifiers = key.modifiers;
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    let alt = modifiers.contains(KeyModifiers::ALT);
+    let shift = modifiers.contains(KeyModifiers::SHIFT);
+
+    let mut out = Vec::new();
+    let mut push_alt = || {
+        if alt {
+            out.push(0x1b);
+        }
+    };
+
+    match key.code {
+        CrosstermKeyCode::Char(c) => {
+            if ctrl {
+                let lower = c.to_ascii_lowercase();
+                if lower.is_ascii_lowercase() {
+                    push_alt();
+                    out.push((lower as u8 - b'a') + 1);
+                    return Some(out);
+                }
+            }
+
+            push_alt();
+            if c.is_ascii() {
+                out.push(c as u8);
+            } else {
+                let mut buf = [0_u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+            Some(out)
+        }
+        CrosstermKeyCode::Enter => {
+            push_alt();
+            out.push(b'\r');
+            Some(out)
+        }
+        CrosstermKeyCode::Tab => {
+            push_alt();
+            out.push(b'\t');
+            Some(out)
+        }
+        CrosstermKeyCode::Backspace => {
+            push_alt();
+            out.push(0x7f);
+            Some(out)
+        }
+        CrosstermKeyCode::Esc => Some(vec![0x1b]),
+        CrosstermKeyCode::Up => Some(if shift {
+            vec![0x1b, b'[', b'1', b';', b'2', b'A']
+        } else {
+            vec![0x1b, b'[', b'A']
+        }),
+        CrosstermKeyCode::Down => Some(if shift {
+            vec![0x1b, b'[', b'1', b';', b'2', b'B']
+        } else {
+            vec![0x1b, b'[', b'B']
+        }),
+        CrosstermKeyCode::Right => Some(if shift {
+            vec![0x1b, b'[', b'1', b';', b'2', b'C']
+        } else {
+            vec![0x1b, b'[', b'C']
+        }),
+        CrosstermKeyCode::Left => Some(if shift {
+            vec![0x1b, b'[', b'1', b';', b'2', b'D']
+        } else {
+            vec![0x1b, b'[', b'D']
+        }),
+        CrosstermKeyCode::Home => Some(vec![0x1b, b'[', b'H']),
+        CrosstermKeyCode::End => Some(vec![0x1b, b'[', b'F']),
+        CrosstermKeyCode::PageUp => Some(vec![0x1b, b'[', b'5', b'~']),
+        CrosstermKeyCode::PageDown => Some(vec![0x1b, b'[', b'6', b'~']),
+        CrosstermKeyCode::Insert => Some(vec![0x1b, b'[', b'2', b'~']),
+        CrosstermKeyCode::Delete => Some(vec![0x1b, b'[', b'3', b'~']),
+        CrosstermKeyCode::F(number) => match number {
+            1 => Some(vec![0x1b, b'O', b'P']),
+            2 => Some(vec![0x1b, b'O', b'Q']),
+            3 => Some(vec![0x1b, b'O', b'R']),
+            4 => Some(vec![0x1b, b'O', b'S']),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -944,6 +1101,7 @@ impl KeyStroke {
 #[cfg(test)]
 mod tests {
     use super::{InputEvent, InputProcessor, Keymap, RuntimeAction};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::collections::BTreeMap;
     use std::thread;
     use std::time::Duration;
@@ -1198,6 +1356,59 @@ mod tests {
     fn raw_bytes_events_bypass_keymap_matching() {
         let mut processor = InputProcessor::new(Keymap::default_runtime());
         let actions = processor.process_input_events(vec![InputEvent::RawBytes(vec![0x01, b'o'])]);
-        assert_eq!(actions, vec![RuntimeAction::ForwardToPane(vec![0x01, b'o'])]);
+        assert_eq!(
+            actions,
+            vec![RuntimeAction::ForwardToPane(vec![0x01, b'o'])]
+        );
+    }
+
+    #[test]
+    fn terminal_event_adapter_encodes_ctrl_characters() {
+        let mut processor = InputProcessor::new(Keymap::default_runtime());
+        let event = Event::Key(KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+
+        assert_eq!(
+            processor.process_terminal_event(event),
+            vec![RuntimeAction::ForwardToPane(vec![0x03])]
+        );
+    }
+
+    #[test]
+    fn terminal_event_adapter_encodes_arrow_sequences() {
+        let mut processor = InputProcessor::new(Keymap::default_runtime());
+        let event = Event::Key(KeyEvent {
+            code: KeyCode::Up,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+
+        assert_eq!(
+            processor.process_terminal_event(event),
+            vec![RuntimeAction::ForwardToPane(vec![0x1b, b'[', b'A'])]
+        );
+    }
+
+    #[test]
+    fn terminal_event_adapter_encodes_shift_arrow_sequences() {
+        let mut processor = InputProcessor::new(Keymap::default_runtime());
+        let event = Event::Key(KeyEvent {
+            code: KeyCode::Left,
+            modifiers: KeyModifiers::SHIFT,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        });
+
+        assert_eq!(
+            processor.process_terminal_event(event),
+            vec![RuntimeAction::ForwardToPane(vec![
+                0x1b, b'[', b'1', b';', b'2', b'D'
+            ])]
+        );
     }
 }

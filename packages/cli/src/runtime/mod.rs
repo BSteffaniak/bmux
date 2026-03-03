@@ -8,7 +8,7 @@ use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
 use bmux_config::{BmuxConfig, TerminfoAutoInstall};
 use clap::Parser;
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event};
 use portable_pty::{Child, MasterPty};
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Read, Write};
@@ -804,9 +804,10 @@ fn run_event_input_loop_with_reader<R: EventReader>(
             continue;
         }
 
-        if let Some(bytes) = event_to_bytes(reader.read()?) {
+        let actions = processor.process_terminal_event(reader.read()?);
+        if !actions.is_empty() {
             user_input_seen.store(true, Ordering::Relaxed);
-            for action in processor.process_chunk(&bytes) {
+            for action in actions {
                 let _ = input_tx.send(action);
             }
         }
@@ -844,104 +845,6 @@ fn run_stream_input_loop(
     }
 
     Ok(())
-}
-
-fn event_to_bytes(event: Event) -> Option<Vec<u8>> {
-    match event {
-        Event::Key(key) => key_to_bytes(key),
-        _ => None,
-    }
-}
-
-fn key_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
-    if key.kind == KeyEventKind::Release {
-        return None;
-    }
-
-    let modifiers = key.modifiers;
-    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
-    let alt = modifiers.contains(KeyModifiers::ALT);
-    let shift = modifiers.contains(KeyModifiers::SHIFT);
-
-    let mut out = Vec::new();
-
-    let mut push_alt = || {
-        if alt {
-            out.push(0x1b);
-        }
-    };
-
-    match key.code {
-        KeyCode::Char(c) => {
-            if ctrl {
-                let lower = c.to_ascii_lowercase();
-                if lower.is_ascii_lowercase() {
-                    push_alt();
-                    out.push((lower as u8 - b'a') + 1);
-                    return Some(out);
-                }
-            }
-
-            push_alt();
-            if c.is_ascii() {
-                out.push(c as u8);
-            } else {
-                let mut buf = [0_u8; 4];
-                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-            }
-            Some(out)
-        }
-        KeyCode::Enter => {
-            push_alt();
-            out.push(b'\r');
-            Some(out)
-        }
-        KeyCode::Tab => {
-            push_alt();
-            out.push(b'\t');
-            Some(out)
-        }
-        KeyCode::Backspace => {
-            push_alt();
-            out.push(0x7f);
-            Some(out)
-        }
-        KeyCode::Esc => Some(vec![0x1b]),
-        KeyCode::Up => Some(if shift {
-            vec![0x1b, b'[', b'1', b';', b'2', b'A']
-        } else {
-            vec![0x1b, b'[', b'A']
-        }),
-        KeyCode::Down => Some(if shift {
-            vec![0x1b, b'[', b'1', b';', b'2', b'B']
-        } else {
-            vec![0x1b, b'[', b'B']
-        }),
-        KeyCode::Right => Some(if shift {
-            vec![0x1b, b'[', b'1', b';', b'2', b'C']
-        } else {
-            vec![0x1b, b'[', b'C']
-        }),
-        KeyCode::Left => Some(if shift {
-            vec![0x1b, b'[', b'1', b';', b'2', b'D']
-        } else {
-            vec![0x1b, b'[', b'D']
-        }),
-        KeyCode::Home => Some(vec![0x1b, b'[', b'H']),
-        KeyCode::End => Some(vec![0x1b, b'[', b'F']),
-        KeyCode::PageUp => Some(vec![0x1b, b'[', b'5', b'~']),
-        KeyCode::PageDown => Some(vec![0x1b, b'[', b'6', b'~']),
-        KeyCode::Insert => Some(vec![0x1b, b'[', b'2', b'~']),
-        KeyCode::Delete => Some(vec![0x1b, b'[', b'3', b'~']),
-        KeyCode::F(n) => match n {
-            1 => Some(vec![0x1b, b'O', b'P']),
-            2 => Some(vec![0x1b, b'O', b'Q']),
-            3 => Some(vec![0x1b, b'O', b'R']),
-            4 => Some(vec![0x1b, b'O', b'S']),
-            _ => None,
-        },
-        _ => None,
-    }
 }
 
 fn load_runtime_settings(config: &BmuxConfig) -> RuntimeSettings {
@@ -1515,14 +1418,14 @@ fn reap_exited_panes(
 mod tests {
     use super::{
         EventReader, PaneRuntime, PaneState, ProtocolDirection, ProtocolTraceEvent,
-        TerminalProfile, TraceFamily, filter_trace_events, key_to_bytes, load_runtime_settings,
-        profile_for_term, protocol_profile_for_terminal_profile, reap_exited_panes,
-        resolve_pane_term_with_checker, run_event_input_loop_with_reader,
+        TerminalProfile, TraceFamily, filter_trace_events, load_runtime_settings, profile_for_term,
+        protocol_profile_for_terminal_profile, reap_exited_panes, resolve_pane_term_with_checker,
+        run_event_input_loop_with_reader,
     };
     use crate::input::{InputProcessor, Keymap};
     use crate::pane::{LayoutNode, LayoutTree, PaneId, SplitDirection};
     use bmux_config::BmuxConfig;
-    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use crossterm::event::Event;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
@@ -1593,45 +1496,6 @@ mod tests {
         assert!(result.removed_any);
         assert_eq!(result.session_exit_code, Some(42));
         assert!(panes.is_empty());
-    }
-
-    #[test]
-    fn key_to_bytes_encodes_ctrl_characters() {
-        let key = KeyEvent {
-            code: KeyCode::Char('c'),
-            modifiers: KeyModifiers::CONTROL,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        };
-
-        assert_eq!(key_to_bytes(key), Some(vec![0x03]));
-    }
-
-    #[test]
-    fn key_to_bytes_encodes_arrow_sequences() {
-        let key = KeyEvent {
-            code: KeyCode::Up,
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        };
-
-        assert_eq!(key_to_bytes(key), Some(vec![0x1b, b'[', b'A']));
-    }
-
-    #[test]
-    fn key_to_bytes_encodes_shift_arrow_sequences() {
-        let key = KeyEvent {
-            code: KeyCode::Left,
-            modifiers: KeyModifiers::SHIFT,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        };
-
-        assert_eq!(
-            key_to_bytes(key),
-            Some(vec![0x1b, b'[', b'1', b';', b'2', b'D'])
-        );
     }
 
     #[test]
