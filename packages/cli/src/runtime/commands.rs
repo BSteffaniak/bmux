@@ -6,9 +6,9 @@ use crate::pane::{LayoutTree, PaneId, Rect, ResizeDirection, SplitDirection};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
 use std::time::Instant;
 
 const SPLIT_RATIO_STEP: f32 = 0.05;
@@ -454,7 +454,7 @@ fn axis_overlap(a_start: i32, a_end: i32, b_start: i32, b_end: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{focus_in_direction, process_input_events, FocusDirection, ProtocolProfile};
+    use super::{FocusDirection, ProtocolProfile, focus_in_direction, process_input_events};
     use crate::input::RuntimeAction;
     use crate::pane::{LayoutNode, LayoutTree, PaneId, Rect, SplitDirection};
     use crate::runtime::{PaneRuntime, PaneState};

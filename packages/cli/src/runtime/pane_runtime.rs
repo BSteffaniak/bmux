@@ -1,9 +1,9 @@
-use super::{PaneProcess, PaneRuntime, PaneState, MIN_PANE_COLS, MIN_PANE_ROWS};
+use super::{MIN_PANE_COLS, MIN_PANE_ROWS, PaneProcess, PaneRuntime, PaneState};
 use crate::pane::{PaneId, Rect};
 use crate::pty::extract_filtered_output;
 use crate::runtime::terminal_protocol::{ProtocolProfile, TerminalProtocolEngine};
 use anyhow::{Context, Result};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};

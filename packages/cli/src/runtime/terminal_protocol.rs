@@ -90,6 +90,7 @@ pub(super) fn supported_query_names() -> &'static [&'static str] {
         "csi_secondary_da",
         "csi_dsr_status_report",
         "csi_dsr_cursor_position",
+        "csi_dec_mode_report",
     ]
 }
 
@@ -103,7 +104,54 @@ fn csi_query_reply(
         b">c" => Some(secondary_da_response(profile).to_vec()),
         b"5n" => Some(b"\x1b[0n".to_vec()),
         b"6n" => Some(dsr_cursor_response(cursor_pos)),
+        _ if sequence.starts_with(b"?") && sequence.ends_with(b"$p") => {
+            dec_mode_report_response(sequence, profile)
+        }
         _ => None,
+    }
+}
+
+fn dec_mode_report_response(sequence: &[u8], profile: ProtocolProfile) -> Option<Vec<u8>> {
+    let mode_bytes = &sequence[1..sequence.len().saturating_sub(2)];
+    let mode = std::str::from_utf8(mode_bytes).ok()?.parse::<u16>().ok()?;
+    let status = dec_mode_status(profile, mode);
+    Some(format!("\x1b[?{mode};{status}$y").into_bytes())
+}
+
+fn dec_mode_status(profile: ProtocolProfile, mode: u16) -> u8 {
+    match profile {
+        ProtocolProfile::Bmux => match mode {
+            1 => 2,
+            7 => 1,
+            25 => 1,
+            1000 => 2,
+            1002 => 2,
+            1006 => 2,
+            1049 => 2,
+            _ => 0,
+        },
+        ProtocolProfile::Xterm => match mode {
+            1 => 2,
+            7 => 1,
+            25 => 1,
+            1000 => 2,
+            1002 => 2,
+            1006 => 2,
+            1049 => 2,
+            _ => 0,
+        },
+        ProtocolProfile::Screen => match mode {
+            1 => 2,
+            7 => 1,
+            25 => 1,
+            1049 => 2,
+            _ => 0,
+        },
+        ProtocolProfile::Conservative => match mode {
+            7 => 1,
+            25 => 1,
+            _ => 0,
+        },
     }
 }
 
@@ -204,6 +252,46 @@ mod tests {
         assert_eq!(
             screen.process_output(b"\x1b[>c", (0, 0)),
             b"\x1b[>83;40003;0c"
+        );
+    }
+
+    #[test]
+    fn replies_to_dec_mode_report_query() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
+        let reply = engine.process_output(b"\x1b[?25$p", (0, 0));
+        assert_eq!(reply, b"\x1b[?25;1$y");
+    }
+
+    #[test]
+    fn dec_mode_report_is_profile_gated() {
+        let mut xterm = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
+        let mut conservative = TerminalProtocolEngine::new(ProtocolProfile::Conservative);
+
+        assert_eq!(
+            xterm.process_output(b"\x1b[?1006$p", (0, 0)),
+            b"\x1b[?1006;2$y"
+        );
+        assert_eq!(
+            conservative.process_output(b"\x1b[?1006$p", (0, 0)),
+            b"\x1b[?1006;0$y"
+        );
+    }
+
+    #[test]
+    fn profile_golden_responses_for_common_queries() {
+        let mut bmux = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        let mut xterm = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
+        let mut screen = TerminalProtocolEngine::new(ProtocolProfile::Screen);
+
+        let bmux_reply = bmux.process_output(b"\x1b[c\x1b[>c\x1b[?25$p", (0, 0));
+        let xterm_reply = xterm.process_output(b"\x1b[c\x1b[>c\x1b[?25$p", (0, 0));
+        let screen_reply = screen.process_output(b"\x1b[c\x1b[>c\x1b[?25$p", (0, 0));
+
+        assert_eq!(bmux_reply, b"\x1b[?1;2c\x1b[>84;0;0c\x1b[?25;1$y");
+        assert_eq!(xterm_reply, b"\x1b[?1;2c\x1b[>0;115;0c\x1b[?25;1$y");
+        assert_eq!(
+            screen_reply,
+            b"\x1b[?64;1;2;6;9;15;18;21;22c\x1b[>83;40003;0c\x1b[?25;1$y"
         );
     }
 }

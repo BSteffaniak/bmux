@@ -207,7 +207,10 @@ fn run_terminal_doctor(as_json: bool) -> Result<u8> {
         "terminal profile: {}",
         terminal_profile_name(effective.profile)
     );
-    println!("protocol profile: {}", protocol_profile_name(protocol_profile));
+    println!(
+        "protocol profile: {}",
+        protocol_profile_name(protocol_profile)
+    );
     println!(
         "primary DA reply: {}",
         String::from_utf8_lossy(primary_da_for_profile(protocol_profile))
@@ -1073,8 +1076,8 @@ fn reap_exited_panes(
 mod tests {
     use super::{
         EventReader, PaneRuntime, PaneState, TerminalProfile, key_to_bytes, profile_for_term,
-        protocol_profile_for_terminal_profile, reap_exited_panes,
-        resolve_pane_term_with_checker, run_event_input_loop_with_reader,
+        protocol_profile_for_terminal_profile, reap_exited_panes, resolve_pane_term_with_checker,
+        run_event_input_loop_with_reader,
     };
     use crate::input::{InputProcessor, Keymap};
     use crate::pane::{LayoutNode, LayoutTree, PaneId, SplitDirection};
