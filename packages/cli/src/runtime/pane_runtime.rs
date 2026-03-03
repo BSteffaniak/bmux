@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Instant;
-use tracing::debug;
 use vt100::Parser as VtParser;
 
 pub(super) fn spawn_pane(
@@ -138,12 +137,7 @@ pub(super) fn spawn_pane_process(
                 let startup_guard_active =
                     !user_input_seen.load(Ordering::Relaxed) && Instant::now() < startup_deadline;
 
-                let (output, dropped_exit_sequence) =
-                    extract_filtered_output(&mut pending, startup_guard_active);
-
-                if dropped_exit_sequence {
-                    debug!("Dropped startup alt-screen exit sequence from pane output");
-                }
+                let output = extract_filtered_output(&mut pending, startup_guard_active);
 
                 if output.is_empty() {
                     continue;
