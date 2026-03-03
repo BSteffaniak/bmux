@@ -56,6 +56,11 @@ struct PaneProcess {
     output_thread: Option<thread::JoinHandle<Result<()>>>,
 }
 
+struct ReapExitedPanesResult {
+    removed_any: bool,
+    session_exit_code: Option<u8>,
+}
+
 pub(crate) fn run() -> Result<u8> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
@@ -179,6 +184,17 @@ fn run_two_pane_runtime(
         }
 
         refresh_exit_codes(&mut panes)?;
+        let reap_result = reap_exited_panes(&mut panes, &mut layout_tree, &mut focused_pane);
+        if let Some(code) = reap_result.session_exit_code {
+            break code;
+        }
+        if reap_result.removed_any {
+            pane_rects = layout_tree.compute_rects(cols, rows);
+            resize_panes(&mut panes, &pane_rects)?;
+            terminal_guard.refresh_layout(rows)?;
+            force_redraw = true;
+        }
+
         if !panes.get(&focused_pane).is_some_and(pane_is_running) {
             if let Some(next_focus) = first_running_pane_id(&layout_tree.pane_order(), &panes) {
                 focused_pane = next_focus;
@@ -427,5 +443,113 @@ fn exit_code_from_u32(code: u32) -> u8 {
     match u8::try_from(code) {
         Ok(valid_code) => valid_code,
         Err(_) => u8::MAX,
+    }
+}
+
+fn reap_exited_panes(
+    panes: &mut BTreeMap<PaneId, PaneRuntime>,
+    layout_tree: &mut LayoutTree,
+    focused_pane: &mut PaneId,
+) -> ReapExitedPanesResult {
+    let exited: Vec<(PaneId, u8)> = panes
+        .iter()
+        .filter_map(|(pane_id, pane)| {
+            if pane.process.is_none() {
+                pane.exit_code.map(|code| (*pane_id, code))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if exited.is_empty() {
+        return ReapExitedPanesResult {
+            removed_any: false,
+            session_exit_code: None,
+        };
+    }
+
+    let mut last_exit_code = None;
+    for (pane_id, exit_code) in exited {
+        let _ = panes.remove(&pane_id);
+        let _ = layout_tree.remove_pane(pane_id);
+        last_exit_code = Some(exit_code);
+    }
+
+    if panes.is_empty() {
+        return ReapExitedPanesResult {
+            removed_any: true,
+            session_exit_code: Some(last_exit_code.unwrap_or(0)),
+        };
+    }
+
+    if !panes.contains_key(focused_pane) {
+        if let Some(next_focus) = layout_tree.pane_order().first().copied() {
+            *focused_pane = next_focus;
+            layout_tree.focused = next_focus;
+        }
+    }
+
+    ReapExitedPanesResult {
+        removed_any: true,
+        session_exit_code: None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PaneRuntime, PaneState, reap_exited_panes};
+    use crate::pane::{LayoutNode, LayoutTree, PaneId, SplitDirection};
+    use std::collections::BTreeMap;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Arc, Mutex};
+    use vt100::Parser as VtParser;
+
+    fn make_inactive_pane(exit_code: Option<u8>) -> PaneRuntime {
+        PaneRuntime {
+            title: "pane".to_string(),
+            shell: "/bin/sh".to_string(),
+            state: Arc::new(PaneState {
+                parser: Mutex::new(VtParser::new(10, 10, 100)),
+                dirty: AtomicBool::new(false),
+            }),
+            process: None,
+            closed: false,
+            exit_code,
+        }
+    }
+
+    #[test]
+    fn reaps_exited_pane_and_moves_focus() {
+        let mut panes = BTreeMap::new();
+        panes.insert(PaneId(1), make_inactive_pane(Some(7)));
+        panes.insert(PaneId(2), make_inactive_pane(None));
+
+        let mut tree = LayoutTree::two_pane(PaneId(1), PaneId(2), SplitDirection::Vertical, 0.5);
+        let mut focused = PaneId(1);
+
+        let result = reap_exited_panes(&mut panes, &mut tree, &mut focused);
+        assert!(result.removed_any);
+        assert_eq!(result.session_exit_code, None);
+        assert!(!panes.contains_key(&PaneId(1)));
+        assert_eq!(tree.pane_order(), vec![PaneId(2)]);
+        assert_eq!(focused, PaneId(2));
+    }
+
+    #[test]
+    fn returns_last_exit_code_when_final_pane_exits() {
+        let mut panes = BTreeMap::new();
+        panes.insert(PaneId(1), make_inactive_pane(Some(42)));
+
+        let mut tree = LayoutTree {
+            root: LayoutNode::Leaf { pane_id: PaneId(1) },
+            focused: PaneId(1),
+        };
+        let mut focused = PaneId(1);
+
+        let result = reap_exited_panes(&mut panes, &mut tree, &mut focused);
+        assert!(result.removed_any);
+        assert_eq!(result.session_exit_code, Some(42));
+        assert!(panes.is_empty());
     }
 }
