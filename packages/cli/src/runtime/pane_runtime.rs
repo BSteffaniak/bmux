@@ -1,8 +1,8 @@
-use super::{PaneProcess, PaneRuntime, PaneState, MIN_PANE_COLS, MIN_PANE_ROWS};
+use super::{MIN_PANE_COLS, MIN_PANE_ROWS, PaneProcess, PaneRuntime, PaneState};
 use crate::pane::{Layout, Rect};
 use crate::pty::extract_filtered_output;
 use anyhow::{Context, Result};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
