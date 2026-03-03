@@ -6,6 +6,7 @@ use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
 use clap::Parser;
 use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
+use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,11 +78,23 @@ struct RenderDebugState {
     status_updates: u32,
     border_updates: u32,
     snapshot: String,
+    logger: Option<RenderDebugLogger>,
+}
+
+struct RenderDebugLogger {
+    file: std::fs::File,
+    started_at: Instant,
 }
 
 impl RenderDebugState {
-    fn new(enabled: bool) -> Self {
-        Self {
+    fn new(enabled: bool, log_path: Option<&Path>) -> Result<Self> {
+        let logger = if let Some(path) = log_path {
+            Some(RenderDebugLogger::new(path)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
             enabled,
             window_start: Instant::now(),
             frames: 0,
@@ -89,10 +102,20 @@ impl RenderDebugState {
             status_updates: 0,
             border_updates: 0,
             snapshot: String::new(),
-        }
+            logger,
+        })
     }
 
     fn record_frame(&mut self, changed_lines: usize, status_updated: bool, border_updated: bool) {
+        if let Some(logger) = self.logger.as_mut() {
+            let elapsed_ms = logger.started_at.elapsed().as_millis();
+            let _ = writeln!(
+                logger.file,
+                "t={}ms frame changed_lines={} status_updated={} border_updated={}",
+                elapsed_ms, changed_lines, status_updated, border_updated
+            );
+        }
+
         if !self.enabled {
             return;
         }
@@ -120,6 +143,15 @@ impl RenderDebugState {
                 self.status_updates, self.border_updates
             );
 
+            if let Some(logger) = self.logger.as_mut() {
+                let elapsed_ms = logger.started_at.elapsed().as_millis();
+                let _ = writeln!(
+                    logger.file,
+                    "t={}ms window fps={:.3} lines_per_frame={:.3} status_updates={} border_updates={}",
+                    elapsed_ms, fps, lines_per_frame, self.status_updates, self.border_updates
+                );
+            }
+
             self.frames = 0;
             self.changed_lines = 0;
             self.status_updates = 0;
@@ -137,6 +169,23 @@ impl RenderDebugState {
     }
 }
 
+impl RenderDebugLogger {
+    fn new(path: &Path) -> Result<Self> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .with_context(|| format!("failed opening render debug log at {}", path.display()))?;
+
+        let _ = writeln!(file, "# bmux render debug log");
+
+        Ok(Self {
+            file,
+            started_at: Instant::now(),
+        })
+    }
+}
+
 pub(crate) fn run() -> Result<u8> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
@@ -145,10 +194,20 @@ pub(crate) fn run() -> Result<u8> {
     debug!("Starting bmux runtime");
     debug!("Launching shell: {shell}");
 
-    run_two_pane_runtime(&shell, !cli.no_alt_screen, cli.debug_render)
+    run_two_pane_runtime(
+        &shell,
+        !cli.no_alt_screen,
+        cli.debug_render,
+        cli.debug_render_log.as_deref(),
+    )
 }
 
-fn run_two_pane_runtime(shell: &str, use_alt_screen: bool, debug_render: bool) -> Result<u8> {
+fn run_two_pane_runtime(
+    shell: &str,
+    use_alt_screen: bool,
+    debug_render: bool,
+    debug_render_log: Option<&Path>,
+) -> Result<u8> {
     let terminal_guard = TerminalGuard::activate(use_alt_screen, true)?;
 
     let (mut cols, mut rows) =
@@ -192,7 +251,7 @@ fn run_two_pane_runtime(shell: &str, use_alt_screen: bool, debug_render: bool) -
     let mut next_status_redraw = Instant::now() + STATUS_REDRAW_INTERVAL;
     let mut exit_override = None;
     let mut render_cache = RenderCache::default();
-    let mut render_debug = RenderDebugState::new(debug_render);
+    let mut render_debug = RenderDebugState::new(debug_render, debug_render_log)?;
 
     let exit_code = loop {
         process_input_events(

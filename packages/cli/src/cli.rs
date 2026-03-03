@@ -20,6 +20,10 @@ pub(crate) struct Cli {
     /// Show live render diagnostics in status bar
     #[arg(long)]
     pub(crate) debug_render: bool,
+
+    /// Append render diagnostics to a log file
+    #[arg(long, value_name = "PATH")]
+    pub(crate) debug_render_log: Option<std::path::PathBuf>,
 }
 
 #[cfg(test)]
@@ -43,5 +47,15 @@ mod tests {
     fn parses_debug_render_flag() {
         let cli = Cli::try_parse_from(["bmux", "--debug-render"]).expect("valid CLI args");
         assert!(cli.debug_render);
+    }
+
+    #[test]
+    fn parses_debug_render_log_flag() {
+        let cli = Cli::try_parse_from(["bmux", "--debug-render-log", "render.log"])
+            .expect("valid CLI args");
+        assert_eq!(
+            cli.debug_render_log.as_deref(),
+            Some(std::path::Path::new("render.log"))
+        );
     }
 }
