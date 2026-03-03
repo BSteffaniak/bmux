@@ -12,7 +12,8 @@ use bmux_config::{BmuxConfig, TerminfoAutoInstall};
 use bmux_ipc::SessionSelector;
 use bmux_server::BmuxServer;
 use clap::Parser;
-use crossterm::event::{self, Event};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use portable_pty::{Child, MasterPty};
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Read, Write};
@@ -54,6 +55,7 @@ const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_STATUS_TIMEOUT: Duration = Duration::from_millis(1000);
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_millis(5000);
+const ATTACH_IO_POLL_INTERVAL: Duration = Duration::from_millis(15);
 const MIN_PANE_ROWS: u16 = 2;
 const MIN_PANE_COLS: u16 = 2;
 
@@ -414,36 +416,153 @@ fn run_session_attach(target: &str) -> Result<u8> {
     println!("attached to session: {attached_id}");
     println!("press Ctrl-D to detach");
 
-    let mut stdin = io::stdin();
+    let _raw_mode = RawModeGuard::enable().context("failed to enable raw mode for attach")?;
     let mut stdout = io::stdout();
-    let mut buffer = [0_u8; 4096];
 
     loop {
-        let bytes_read = stdin
-            .read(&mut buffer)
-            .context("failed reading attach input")?;
-        if bytes_read == 0 {
-            break;
+        if event::poll(ATTACH_IO_POLL_INTERVAL).context("failed polling terminal events")? {
+            let event = event::read().context("failed reading terminal event")?;
+            match attach_event_action(&event)? {
+                AttachEventAction::Detach => break,
+                AttachEventAction::Send(bytes) => {
+                    runtime
+                        .block_on(client.attach_input(attached_id, bytes))
+                        .map_err(map_attach_client_error)?;
+                }
+                AttachEventAction::Ignore => {}
+            }
         }
-
-        runtime
-            .block_on(client.attach_input(attached_id, buffer[..bytes_read].to_vec()))
-            .map_err(map_attach_client_error)?;
 
         let output = runtime
             .block_on(client.attach_output(attached_id, 64 * 1024))
             .map_err(map_attach_client_error)?;
-        if !output.is_empty() {
-            stdout
-                .write_all(&output)
-                .context("failed writing attach output")?;
-            stdout.flush().context("failed flushing attach output")?;
+        if output.is_empty() {
+            continue;
         }
+        stdout
+            .write_all(&output)
+            .context("failed writing attach output")?;
+        stdout.flush().context("failed flushing attach output")?;
     }
 
     let _ = runtime.block_on(client.detach());
     println!("detached");
     Ok(0)
+}
+
+enum AttachEventAction {
+    Send(Vec<u8>),
+    Detach,
+    Ignore,
+}
+
+struct RawModeGuard;
+
+impl RawModeGuard {
+    fn enable() -> Result<Self> {
+        enable_raw_mode().context("failed enabling raw mode")?;
+        Ok(Self)
+    }
+}
+
+impl Drop for RawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+fn attach_event_action(event: &Event) -> Result<AttachEventAction> {
+    match event {
+        Event::Key(key) => attach_key_event_action(key),
+        Event::Resize(_, _) | Event::Mouse(_) | Event::FocusGained | Event::FocusLost => {
+            Ok(AttachEventAction::Ignore)
+        }
+    }
+}
+
+fn attach_key_event_action(key: &KeyEvent) -> Result<AttachEventAction> {
+    if key.kind != KeyEventKind::Press {
+        return Ok(AttachEventAction::Ignore);
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('d')) {
+        return Ok(AttachEventAction::Detach);
+    }
+
+    match key_event_to_bytes(key) {
+        Some(bytes) => Ok(AttachEventAction::Send(bytes)),
+        None => Ok(AttachEventAction::Ignore),
+    }
+}
+
+fn key_event_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
+    let modifiers = key.modifiers;
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    let alt = modifiers.contains(KeyModifiers::ALT);
+    let shift = modifiers.contains(KeyModifiers::SHIFT);
+
+    let mut out = Vec::new();
+    if alt {
+        out.push(0x1b);
+    }
+
+    match key.code {
+        KeyCode::Char(c) => {
+            if ctrl {
+                let lower = c.to_ascii_lowercase();
+                if lower.is_ascii_lowercase() {
+                    out.push((lower as u8 - b'a') + 1);
+                    return Some(out);
+                }
+            }
+
+            if c.is_ascii() {
+                out.push(c as u8);
+            } else {
+                let mut buf = [0_u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+            Some(out)
+        }
+        KeyCode::Enter => Some(vec![b'\r']),
+        KeyCode::Tab => Some(vec![b'\t']),
+        KeyCode::Backspace => Some(vec![0x7f]),
+        KeyCode::Esc => Some(vec![0x1b]),
+        KeyCode::Up => Some(if shift {
+            vec![0x1b, b'[', b'1', b';', b'2', b'A']
+        } else {
+            vec![0x1b, b'[', b'A']
+        }),
+        KeyCode::Down => Some(if shift {
+            vec![0x1b, b'[', b'1', b';', b'2', b'B']
+        } else {
+            vec![0x1b, b'[', b'B']
+        }),
+        KeyCode::Right => Some(if shift {
+            vec![0x1b, b'[', b'1', b';', b'2', b'C']
+        } else {
+            vec![0x1b, b'[', b'C']
+        }),
+        KeyCode::Left => Some(if shift {
+            vec![0x1b, b'[', b'1', b';', b'2', b'D']
+        } else {
+            vec![0x1b, b'[', b'D']
+        }),
+        KeyCode::Home => Some(vec![0x1b, b'[', b'H']),
+        KeyCode::End => Some(vec![0x1b, b'[', b'F']),
+        KeyCode::PageUp => Some(vec![0x1b, b'[', b'5', b'~']),
+        KeyCode::PageDown => Some(vec![0x1b, b'[', b'6', b'~']),
+        KeyCode::Insert => Some(vec![0x1b, b'[', b'2', b'~']),
+        KeyCode::Delete => Some(vec![0x1b, b'[', b'3', b'~']),
+        KeyCode::F(number) => match number {
+            1 => Some(vec![0x1b, b'O', b'P']),
+            2 => Some(vec![0x1b, b'O', b'Q']),
+            3 => Some(vec![0x1b, b'O', b'R']),
+            4 => Some(vec![0x1b, b'O', b'S']),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn map_attach_client_error(error: ClientError) -> anyhow::Error {
@@ -2031,7 +2150,10 @@ mod tests {
     use crate::pane::{LayoutNode, LayoutTree, PaneId, SplitDirection};
     use bmux_config::BmuxConfig;
     use bmux_ipc::ErrorCode;
-    use crossterm::event::Event;
+    use crossterm::event::{
+        Event, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
+        KeyEventKind as CrosstermKeyEventKind, KeyModifiers,
+    };
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
@@ -2341,5 +2463,27 @@ mod tests {
             }),
             "client_detached"
         );
+    }
+
+    #[test]
+    fn attach_key_event_action_detaches_on_ctrl_d() {
+        let action = super::attach_key_event_action(&CrosstermKeyEvent::new_with_kind(
+            CrosstermKeyCode::Char('d'),
+            KeyModifiers::CONTROL,
+            CrosstermKeyEventKind::Press,
+        ))
+        .expect("attach key action should parse");
+        assert!(matches!(action, super::AttachEventAction::Detach));
+    }
+
+    #[test]
+    fn attach_key_event_action_encodes_char_input() {
+        let action = super::attach_key_event_action(&CrosstermKeyEvent::new_with_kind(
+            CrosstermKeyCode::Char('x'),
+            KeyModifiers::NONE,
+            CrosstermKeyEventKind::Press,
+        ))
+        .expect("attach key action should parse");
+        assert!(matches!(action, super::AttachEventAction::Send(bytes) if bytes == b"x"));
     }
 }
