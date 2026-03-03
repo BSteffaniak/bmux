@@ -6,6 +6,10 @@ use std::time::{Duration, Instant};
 pub(crate) enum RuntimeAction {
     Quit,
     FocusNext,
+    FocusLeft,
+    FocusRight,
+    FocusUp,
+    FocusDown,
     ToggleSplitDirection,
     SplitFocusedVertical,
     SplitFocusedHorizontal,
@@ -100,6 +104,10 @@ impl Keymap {
     pub(crate) fn default_runtime() -> Self {
         let mut runtime = BTreeMap::new();
         runtime.insert("o".to_string(), "focus_next_pane".to_string());
+        runtime.insert("h".to_string(), "focus_left_pane".to_string());
+        runtime.insert("l".to_string(), "focus_right_pane".to_string());
+        runtime.insert("k".to_string(), "focus_up_pane".to_string());
+        runtime.insert("j".to_string(), "focus_down_pane".to_string());
         runtime.insert("t".to_string(), "toggle_split_direction".to_string());
         runtime.insert("%".to_string(), "split_focused_vertical".to_string());
         runtime.insert("\"".to_string(), "split_focused_horizontal".to_string());
@@ -471,6 +479,10 @@ fn action_to_name(action: &RuntimeAction) -> &'static str {
     match action {
         RuntimeAction::Quit => "quit",
         RuntimeAction::FocusNext => "focus_next_pane",
+        RuntimeAction::FocusLeft => "focus_left_pane",
+        RuntimeAction::FocusRight => "focus_right_pane",
+        RuntimeAction::FocusUp => "focus_up_pane",
+        RuntimeAction::FocusDown => "focus_down_pane",
         RuntimeAction::ToggleSplitDirection => "toggle_split_direction",
         RuntimeAction::SplitFocusedVertical => "split_focused_vertical",
         RuntimeAction::SplitFocusedHorizontal => "split_focused_horizontal",
@@ -737,6 +749,10 @@ fn parse_action(value: &str) -> Result<RuntimeAction> {
     match value.trim().to_ascii_lowercase().as_str() {
         "quit" => Ok(RuntimeAction::Quit),
         "focus_next_pane" => Ok(RuntimeAction::FocusNext),
+        "focus_left_pane" => Ok(RuntimeAction::FocusLeft),
+        "focus_right_pane" => Ok(RuntimeAction::FocusRight),
+        "focus_up_pane" => Ok(RuntimeAction::FocusUp),
+        "focus_down_pane" => Ok(RuntimeAction::FocusDown),
         "toggle_split_direction" => Ok(RuntimeAction::ToggleSplitDirection),
         "split_focused_vertical" => Ok(RuntimeAction::SplitFocusedVertical),
         "split_focused_horizontal" => Ok(RuntimeAction::SplitFocusedHorizontal),
@@ -773,6 +789,27 @@ mod tests {
         let mut processor = InputProcessor::new(Keymap::default_runtime());
         let actions = processor.process_chunk(&[0x01, b'r']);
         assert_eq!(actions, vec![RuntimeAction::RestartFocusedPane]);
+    }
+
+    #[test]
+    fn maps_default_directional_focus_commands() {
+        let mut processor = InputProcessor::new(Keymap::default_runtime());
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'h']),
+            vec![RuntimeAction::FocusLeft]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'j']),
+            vec![RuntimeAction::FocusDown]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'k']),
+            vec![RuntimeAction::FocusUp]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'l']),
+            vec![RuntimeAction::FocusRight]
+        );
     }
 
     #[test]

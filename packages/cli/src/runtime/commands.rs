@@ -5,12 +5,20 @@ use crate::pane::{LayoutTree, PaneId, Rect, SplitDirection};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::Arc;
 use std::time::Instant;
 
 const SPLIT_RATIO_STEP: f32 = 0.05;
+
+#[derive(Clone, Copy)]
+enum FocusDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
 
 pub(super) fn process_input_events(
     input_rx: &Receiver<RuntimeAction>,
@@ -49,6 +57,38 @@ pub(super) fn process_input_events(
                     RuntimeAction::FocusNext => {
                         *focused_pane =
                             next_focusable_pane_id(&layout_tree.pane_order(), panes, *focused_pane);
+                    }
+                    RuntimeAction::FocusLeft => {
+                        *focused_pane = focus_in_direction(
+                            *focused_pane,
+                            panes,
+                            pane_rects,
+                            FocusDirection::Left,
+                        );
+                    }
+                    RuntimeAction::FocusRight => {
+                        *focused_pane = focus_in_direction(
+                            *focused_pane,
+                            panes,
+                            pane_rects,
+                            FocusDirection::Right,
+                        );
+                    }
+                    RuntimeAction::FocusUp => {
+                        *focused_pane = focus_in_direction(
+                            *focused_pane,
+                            panes,
+                            pane_rects,
+                            FocusDirection::Up,
+                        );
+                    }
+                    RuntimeAction::FocusDown => {
+                        *focused_pane = focus_in_direction(
+                            *focused_pane,
+                            panes,
+                            pane_rects,
+                            FocusDirection::Down,
+                        );
                     }
                     RuntimeAction::ToggleSplitDirection => {
                         let mut updated_tree = pending_tree_update
@@ -192,7 +232,7 @@ pub(super) fn process_input_events(
                     }
                     RuntimeAction::ShowHelp => {
                         *status_message = Some(StatusMessage::new(
-                            "Ctrl-A: q quit | o focus | t toggle layout | % split-v | \" split-h | +/- resize | r restart | x close | ? help"
+                            "Ctrl-A: q quit | o cycle | h/j/k/l focus | t toggle layout | % split-v | \" split-h | +/- resize | r restart | x close | ? help"
                                 .to_string(),
                         ));
                     }
@@ -220,6 +260,120 @@ fn next_pane_id(panes: &BTreeMap<PaneId, PaneRuntime>) -> PaneId {
         .unwrap_or(0)
         .saturating_add(1);
     PaneId(next)
+}
+
+fn focus_in_direction(
+    current: PaneId,
+    panes: &BTreeMap<PaneId, PaneRuntime>,
+    pane_rects: &BTreeMap<PaneId, Rect>,
+    direction: FocusDirection,
+) -> PaneId {
+    let Some(current_rect) = pane_rects.get(&current).copied() else {
+        return current;
+    };
+
+    let mut best: Option<(i32, i32, i32, PaneId)> = None;
+
+    for (pane_id, rect) in pane_rects {
+        if *pane_id == current || !panes.contains_key(pane_id) {
+            continue;
+        }
+
+        let (primary_distance, overlap_penalty, center_distance) =
+            directional_metrics(current_rect, *rect, direction);
+        let Some(primary) = primary_distance else {
+            continue;
+        };
+        let candidate = (primary, overlap_penalty, center_distance, *pane_id);
+
+        if best.is_none_or(|existing| candidate < existing) {
+            best = Some(candidate);
+        }
+    }
+
+    best.map(|value| value.3).unwrap_or(current)
+}
+
+fn directional_metrics(
+    current: Rect,
+    candidate: Rect,
+    direction: FocusDirection,
+) -> (Option<i32>, i32, i32) {
+    let current_left = i32::from(current.x);
+    let current_top = i32::from(current.y);
+    let current_right = i32::from(current.x.saturating_add(current.width.saturating_sub(1)));
+    let current_bottom = i32::from(current.y.saturating_add(current.height.saturating_sub(1)));
+
+    let candidate_left = i32::from(candidate.x);
+    let candidate_top = i32::from(candidate.y);
+    let candidate_right = i32::from(
+        candidate
+            .x
+            .saturating_add(candidate.width.saturating_sub(1)),
+    );
+    let candidate_bottom = i32::from(
+        candidate
+            .y
+            .saturating_add(candidate.height.saturating_sub(1)),
+    );
+
+    let current_center_x = (current_left + current_right) / 2;
+    let current_center_y = (current_top + current_bottom) / 2;
+    let candidate_center_x = (candidate_left + candidate_right) / 2;
+    let candidate_center_y = (candidate_top + candidate_bottom) / 2;
+
+    match direction {
+        FocusDirection::Left => {
+            if candidate_right >= current_left {
+                return (None, i32::MAX, i32::MAX);
+            }
+            let primary = current_left - candidate_right;
+            let overlap =
+                axis_overlap(current_top, current_bottom, candidate_top, candidate_bottom);
+            let overlap_penalty = -overlap;
+            let center_distance = (current_center_y - candidate_center_y).abs();
+            (Some(primary), overlap_penalty, center_distance)
+        }
+        FocusDirection::Right => {
+            if candidate_left <= current_right {
+                return (None, i32::MAX, i32::MAX);
+            }
+            let primary = candidate_left - current_right;
+            let overlap =
+                axis_overlap(current_top, current_bottom, candidate_top, candidate_bottom);
+            let overlap_penalty = -overlap;
+            let center_distance = (current_center_y - candidate_center_y).abs();
+            (Some(primary), overlap_penalty, center_distance)
+        }
+        FocusDirection::Up => {
+            if candidate_bottom >= current_top {
+                return (None, i32::MAX, i32::MAX);
+            }
+            let primary = current_top - candidate_bottom;
+            let overlap =
+                axis_overlap(current_left, current_right, candidate_left, candidate_right);
+            let overlap_penalty = -overlap;
+            let center_distance = (current_center_x - candidate_center_x).abs();
+            (Some(primary), overlap_penalty, center_distance)
+        }
+        FocusDirection::Down => {
+            if candidate_top <= current_bottom {
+                return (None, i32::MAX, i32::MAX);
+            }
+            let primary = candidate_top - current_bottom;
+            let overlap =
+                axis_overlap(current_left, current_right, candidate_left, candidate_right);
+            let overlap_penalty = -overlap;
+            let center_distance = (current_center_x - candidate_center_x).abs();
+            (Some(primary), overlap_penalty, center_distance)
+        }
+    }
+}
+
+fn axis_overlap(a_start: i32, a_end: i32, b_start: i32, b_end: i32) -> i32 {
+    let start = a_start.max(b_start);
+    let end = a_end.min(b_end);
+    (end - start + 1).max(0)
 }
 
 #[cfg(test)]
@@ -357,5 +511,48 @@ mod tests {
             }
             _ => panic!("expected split root"),
         }
+    }
+
+    #[test]
+    fn directional_focus_moves_to_adjacent_pane() {
+        let mut panes = BTreeMap::new();
+        panes.insert(PaneId(1), make_pane("pane-1"));
+        panes.insert(PaneId(2), make_pane("pane-2"));
+        panes.insert(PaneId(3), make_pane("pane-3"));
+
+        let mut layout = LayoutTree::two_pane(PaneId(1), PaneId(2), SplitDirection::Vertical, 0.5);
+        layout.focused = PaneId(2);
+        assert!(layout.split_focused(SplitDirection::Horizontal, PaneId(3), 0.5));
+
+        let mut focused = PaneId(3);
+        layout.focused = focused;
+        let pane_rects = layout.compute_rects(120, 40);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let mut force_redraw = false;
+        let mut exit_override = None;
+        let mut status_message = None;
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(RuntimeAction::FocusLeft).expect("send left");
+        tx.send(RuntimeAction::FocusRight).expect("send right");
+        tx.send(RuntimeAction::FocusUp).expect("send up");
+        drop(tx);
+
+        let _ = process_input_events(
+            &rx,
+            &mut panes,
+            &pane_rects,
+            &layout,
+            &mut focused,
+            &shutdown_requested,
+            &mut force_redraw,
+            &mut exit_override,
+            &mut status_message,
+            Instant::now(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("process input events");
+
+        assert_eq!(focused, PaneId(2));
     }
 }
