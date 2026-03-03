@@ -1,11 +1,11 @@
 use crate::cli::Cli;
-use crate::pane::{Layout, Rect, compute_vertical_layout};
-use crate::pty::{STARTUP_ALT_SCREEN_GUARD_DURATION, extract_filtered_output};
+use crate::pane::{compute_vertical_layout, Layout, Rect};
+use crate::pty::{extract_filtered_output, STARTUP_ALT_SCREEN_GUARD_DURATION};
 use crate::status::{build_status_line, write_status_line};
 use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
 use clap::Parser;
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -69,6 +69,74 @@ struct PaneRenderData {
     lines: Vec<String>,
 }
 
+struct RenderDebugState {
+    enabled: bool,
+    window_start: Instant,
+    frames: u32,
+    changed_lines: usize,
+    status_updates: u32,
+    border_updates: u32,
+    snapshot: String,
+}
+
+impl RenderDebugState {
+    fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            window_start: Instant::now(),
+            frames: 0,
+            changed_lines: 0,
+            status_updates: 0,
+            border_updates: 0,
+            snapshot: String::new(),
+        }
+    }
+
+    fn record_frame(&mut self, changed_lines: usize, status_updated: bool, border_updated: bool) {
+        if !self.enabled {
+            return;
+        }
+
+        self.frames = self.frames.saturating_add(1);
+        self.changed_lines = self.changed_lines.saturating_add(changed_lines);
+        if status_updated {
+            self.status_updates = self.status_updates.saturating_add(1);
+        }
+        if border_updated {
+            self.border_updates = self.border_updates.saturating_add(1);
+        }
+
+        let elapsed = self.window_start.elapsed();
+        if elapsed >= Duration::from_millis(500) {
+            let fps = f64::from(self.frames) / elapsed.as_secs_f64();
+            let lines_per_frame = if self.frames == 0 {
+                0.0
+            } else {
+                self.changed_lines as f64 / f64::from(self.frames)
+            };
+
+            self.snapshot = format!(
+                "render: {fps:.1}fps | lines/frame: {lines_per_frame:.1} | status: {} | borders: {}",
+                self.status_updates, self.border_updates
+            );
+
+            self.frames = 0;
+            self.changed_lines = 0;
+            self.status_updates = 0;
+            self.border_updates = 0;
+            self.window_start = Instant::now();
+        }
+    }
+
+    fn snapshot(&self) -> Option<&str> {
+        if self.enabled {
+            Some(&self.snapshot)
+        } else {
+            None
+        }
+    }
+}
+
 pub(crate) fn run() -> Result<u8> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
@@ -77,10 +145,10 @@ pub(crate) fn run() -> Result<u8> {
     debug!("Starting bmux runtime");
     debug!("Launching shell: {shell}");
 
-    run_two_pane_runtime(&shell, !cli.no_alt_screen)
+    run_two_pane_runtime(&shell, !cli.no_alt_screen, cli.debug_render)
 }
 
-fn run_two_pane_runtime(shell: &str, use_alt_screen: bool) -> Result<u8> {
+fn run_two_pane_runtime(shell: &str, use_alt_screen: bool, debug_render: bool) -> Result<u8> {
     let terminal_guard = TerminalGuard::activate(use_alt_screen, true)?;
 
     let (mut cols, mut rows) =
@@ -124,6 +192,7 @@ fn run_two_pane_runtime(shell: &str, use_alt_screen: bool) -> Result<u8> {
     let mut next_status_redraw = Instant::now() + STATUS_REDRAW_INTERVAL;
     let mut exit_override = None;
     let mut render_cache = RenderCache::default();
+    let mut render_debug = RenderDebugState::new(debug_render);
 
     let exit_code = loop {
         process_input_events(
@@ -184,6 +253,7 @@ fn run_two_pane_runtime(shell: &str, use_alt_screen: bool) -> Result<u8> {
                 focused_pane,
                 force_redraw,
                 &mut render_cache,
+                &mut render_debug,
             )?;
             force_redraw = false;
             next_status_redraw = Instant::now() + STATUS_REDRAW_INTERVAL;
@@ -500,8 +570,16 @@ fn render_frame(
     focused_pane: usize,
     full_redraw: bool,
     render_cache: &mut RenderCache,
+    render_debug: &mut RenderDebugState,
 ) -> Result<()> {
-    let status_line = build_status_line(shell_name, cwd, cols, rows, focused_pane);
+    let status_line = build_status_line(
+        shell_name,
+        cwd,
+        cols,
+        rows,
+        focused_pane,
+        render_debug.snapshot(),
+    );
     let left_data = collect_pane_render_data(&panes[0], layout.left, focused_pane == 0);
     let right_data = collect_pane_render_data(&panes[1], layout.right, focused_pane == 1);
     let pane_data = [left_data, right_data];
@@ -545,8 +623,9 @@ fn render_frame(
         )?;
     }
 
+    let mut changed_line_count = 0_usize;
     for pane_index in 0..2 {
-        draw_changed_lines(
+        changed_line_count += draw_changed_lines(
             &mut stdout,
             &pane_data[pane_index],
             &render_cache.pane_lines[pane_index],
@@ -584,6 +663,7 @@ fn render_frame(
     render_cache.pane_rects = [pane_data[0].rect, pane_data[1].rect];
     render_cache.pane_titles = [pane_data[0].title.clone(), pane_data[1].title.clone()];
     render_cache.pane_lines = [pane_data[0].lines.clone(), pane_data[1].lines.clone()];
+    render_debug.record_frame(changed_line_count, status_changed, border_changed);
 
     Ok(())
 }
@@ -636,15 +716,17 @@ fn draw_changed_lines(
     pane: &PaneRenderData,
     previous: &[String],
     force: bool,
-) -> Result<()> {
+) -> Result<usize> {
     let inner = pane.rect.inner();
     if inner.width == 0 || inner.height == 0 {
-        return Ok(());
+        return Ok(0);
     }
 
+    let mut changed = 0_usize;
+
     for (row_index, line) in pane.lines.iter().enumerate() {
-        let changed = force || previous.get(row_index) != Some(line);
-        if !changed {
+        let line_changed = force || previous.get(row_index) != Some(line);
+        if !line_changed {
             continue;
         }
 
@@ -652,9 +734,10 @@ fn draw_changed_lines(
             .y
             .saturating_add(u16::try_from(row_index).unwrap_or(0));
         write_at(stdout, inner.x, y, line)?;
+        changed += 1;
     }
 
-    Ok(())
+    Ok(changed)
 }
 
 fn draw_rect_border(stdout: &mut io::Stdout, rect: Rect, color: &str, title: &str) -> Result<()> {

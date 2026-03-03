@@ -7,13 +7,21 @@ pub(crate) fn build_status_line(
     cols: u16,
     rows: u16,
     focused_pane: usize,
+    debug_suffix: Option<&str>,
 ) -> String {
     let focused_label = if focused_pane == 0 { "left" } else { "right" };
 
-    format!(
+    let mut status = format!(
         " bmux | shell: {shell_name} | cwd: {} | size: {cols}x{rows} | focus: {focused_label} | Ctrl-A o switch | Ctrl-A +/- resize | Ctrl-A q quit ",
         cwd.display()
-    )
+    );
+
+    if let Some(suffix) = debug_suffix {
+        status.push_str(" | ");
+        status.push_str(suffix);
+    }
+
+    status
 }
 
 pub(crate) fn write_status_line(status_line: &str, cols: u16) -> io::Result<()> {

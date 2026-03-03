@@ -16,6 +16,10 @@ pub(crate) struct Cli {
     /// Disable alternate screen mode (debug fallback)
     #[arg(long)]
     pub(crate) no_alt_screen: bool,
+
+    /// Show live render diagnostics in status bar
+    #[arg(long)]
+    pub(crate) debug_render: bool,
 }
 
 #[cfg(test)]
@@ -33,5 +37,11 @@ mod tests {
     fn parses_shell_flag() {
         let cli = Cli::try_parse_from(["bmux", "--shell", "/bin/sh"]).expect("valid CLI args");
         assert_eq!(cli.shell.as_deref(), Some("/bin/sh"));
+    }
+
+    #[test]
+    fn parses_debug_render_flag() {
+        let cli = Cli::try_parse_from(["bmux", "--debug-render"]).expect("valid CLI args");
+        assert!(cli.debug_render);
     }
 }
