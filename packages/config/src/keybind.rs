@@ -55,6 +55,10 @@ fn default_runtime_bindings() -> BTreeMap<String, String> {
     bindings.insert("l".to_string(), "focus_right_pane".to_string());
     bindings.insert("k".to_string(), "focus_up_pane".to_string());
     bindings.insert("j".to_string(), "focus_down_pane".to_string());
+    bindings.insert("arrow_left".to_string(), "focus_left_pane".to_string());
+    bindings.insert("arrow_right".to_string(), "focus_right_pane".to_string());
+    bindings.insert("arrow_up".to_string(), "focus_up_pane".to_string());
+    bindings.insert("arrow_down".to_string(), "focus_down_pane".to_string());
     bindings.insert("t".to_string(), "toggle_split_direction".to_string());
     bindings.insert("%".to_string(), "split_focused_vertical".to_string());
     bindings.insert("\"".to_string(), "split_focused_horizontal".to_string());

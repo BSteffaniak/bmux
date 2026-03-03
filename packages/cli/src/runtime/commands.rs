@@ -232,7 +232,7 @@ pub(super) fn process_input_events(
                     }
                     RuntimeAction::ShowHelp => {
                         *status_message = Some(StatusMessage::new(
-                            "Ctrl-A: q quit | o cycle | h/j/k/l focus | t toggle layout | % split-v | \" split-h | +/- resize | r restart | x close | ? help"
+                            "Ctrl-A: q quit | o cycle | h/j/k/l or arrows focus | t toggle layout | % split-v | \" split-h | +/- resize | r restart | x close | ? help"
                                 .to_string(),
                         ));
                     }
@@ -378,9 +378,9 @@ fn axis_overlap(a_start: i32, a_end: i32, b_start: i32, b_end: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::process_input_events;
+    use super::{FocusDirection, focus_in_direction, process_input_events};
     use crate::input::RuntimeAction;
-    use crate::pane::{LayoutNode, LayoutTree, PaneId, SplitDirection};
+    use crate::pane::{LayoutNode, LayoutTree, PaneId, Rect, SplitDirection};
     use crate::runtime::{PaneRuntime, PaneState};
     use std::collections::BTreeMap;
     use std::sync::atomic::AtomicBool;
@@ -554,5 +554,85 @@ mod tests {
         .expect("process input events");
 
         assert_eq!(focused, PaneId(2));
+    }
+
+    #[test]
+    fn directional_focus_prefers_axis_overlap_before_center_distance() {
+        let mut panes = BTreeMap::new();
+        panes.insert(PaneId(1), make_pane("current"));
+        panes.insert(PaneId(2), make_pane("left-overlap"));
+        panes.insert(PaneId(3), make_pane("left-no-overlap"));
+
+        let mut rects = BTreeMap::new();
+        rects.insert(
+            PaneId(1),
+            Rect {
+                x: 50,
+                y: 10,
+                width: 10,
+                height: 10,
+            },
+        );
+        rects.insert(
+            PaneId(2),
+            Rect {
+                x: 40,
+                y: 11,
+                width: 10,
+                height: 10,
+            },
+        );
+        rects.insert(
+            PaneId(3),
+            Rect {
+                x: 40,
+                y: 40,
+                width: 10,
+                height: 10,
+            },
+        );
+
+        let next = focus_in_direction(PaneId(1), &panes, &rects, FocusDirection::Left);
+        assert_eq!(next, PaneId(2));
+    }
+
+    #[test]
+    fn directional_focus_uses_center_distance_as_tiebreaker() {
+        let mut panes = BTreeMap::new();
+        panes.insert(PaneId(1), make_pane("current"));
+        panes.insert(PaneId(2), make_pane("down-near"));
+        panes.insert(PaneId(3), make_pane("down-far"));
+
+        let mut rects = BTreeMap::new();
+        rects.insert(
+            PaneId(1),
+            Rect {
+                x: 10,
+                y: 10,
+                width: 10,
+                height: 10,
+            },
+        );
+        rects.insert(
+            PaneId(2),
+            Rect {
+                x: 8,
+                y: 20,
+                width: 10,
+                height: 10,
+            },
+        );
+        rects.insert(
+            PaneId(3),
+            Rect {
+                x: 40,
+                y: 20,
+                width: 10,
+                height: 10,
+            },
+        );
+
+        let next = focus_in_direction(PaneId(1), &panes, &rects, FocusDirection::Down);
+        assert_eq!(next, PaneId(2));
     }
 }

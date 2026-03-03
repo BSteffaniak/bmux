@@ -108,6 +108,10 @@ impl Keymap {
         runtime.insert("l".to_string(), "focus_right_pane".to_string());
         runtime.insert("k".to_string(), "focus_up_pane".to_string());
         runtime.insert("j".to_string(), "focus_down_pane".to_string());
+        runtime.insert("arrow_left".to_string(), "focus_left_pane".to_string());
+        runtime.insert("arrow_right".to_string(), "focus_right_pane".to_string());
+        runtime.insert("arrow_up".to_string(), "focus_up_pane".to_string());
+        runtime.insert("arrow_down".to_string(), "focus_down_pane".to_string());
         runtime.insert("t".to_string(), "toggle_split_direction".to_string());
         runtime.insert("%".to_string(), "split_focused_vertical".to_string());
         runtime.insert("\"".to_string(), "split_focused_horizontal".to_string());
@@ -809,6 +813,22 @@ mod tests {
         assert_eq!(
             processor.process_chunk(&[0x01, b'l']),
             vec![RuntimeAction::FocusRight]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, 0x1b, b'[', b'D']),
+            vec![RuntimeAction::FocusLeft]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, 0x1b, b'[', b'C']),
+            vec![RuntimeAction::FocusRight]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, 0x1b, b'[', b'A']),
+            vec![RuntimeAction::FocusUp]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, 0x1b, b'[', b'B']),
+            vec![RuntimeAction::FocusDown]
         );
     }
 
