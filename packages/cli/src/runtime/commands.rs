@@ -1,6 +1,6 @@
 use super::pane_runtime::{next_focusable_pane_id, spawn_pane_process, stop_pane_process};
 use super::terminal_protocol::{ProtocolProfile, SharedProtocolTraceBuffer};
-use super::{PaneRuntime, StatusMessage};
+use super::{PaneRuntime, ScrollState, StatusMessage};
 use crate::input::RuntimeAction;
 use crate::pane::{LayoutTree, PaneId, Rect, ResizeDirection, SplitDirection};
 use anyhow::{Context, Result};
@@ -31,8 +31,10 @@ pub(super) fn process_input_events(
     force_redraw: &mut bool,
     exit_override: &mut Option<u8>,
     status_message: &mut Option<StatusMessage>,
+    scroll_state: &mut ScrollState,
     startup_deadline: Instant,
     user_input_seen: Arc<AtomicBool>,
+    scrollback_limit: usize,
     pane_term: &str,
     protocol_profile: ProtocolProfile,
     protocol_trace: Option<SharedProtocolTraceBuffer>,
@@ -42,6 +44,9 @@ pub(super) fn process_input_events(
     loop {
         match input_rx.try_recv() {
             Ok(RuntimeAction::ForwardToPane(bytes)) => {
+                if scroll_state.active {
+                    continue;
+                }
                 if let Some(active_pane) = panes.get_mut(focused_pane) {
                     if let Some(process) = active_pane.process.as_mut() {
                         let mut writer = process
@@ -207,6 +212,7 @@ pub(super) fn process_input_events(
                                 super::pane_runtime::spawn_pane(
                                     new_pane_id,
                                     &active_pane.shell,
+                                    scrollback_limit,
                                     pane_term,
                                     protocol_profile,
                                     pane_title.clone(),
@@ -244,6 +250,7 @@ pub(super) fn process_input_events(
                                 stop_pane_process(pane, true)?;
                                 pane.process = Some(spawn_pane_process(
                                     &pane.shell,
+                                    scrollback_limit,
                                     pane_term,
                                     protocol_profile,
                                     *focused_pane,
@@ -257,6 +264,7 @@ pub(super) fn process_input_events(
                                 pane.closed = false;
                                 pane.exit_code = None;
                                 pane.state.dirty.store(true, Ordering::Relaxed);
+                                scroll_state.offsets.remove(focused_pane);
                                 *status_message = Some(StatusMessage::new(format!(
                                     "pane '{}' restarted",
                                     pane.title
@@ -279,6 +287,7 @@ pub(super) fn process_input_events(
                                 if let Some(mut pane) = panes.remove(&closing_pane) {
                                     let closed_title = pane.title.clone();
                                     stop_pane_process(&mut pane, true)?;
+                                    scroll_state.offsets.remove(&closing_pane);
                                     *status_message = Some(StatusMessage::new(format!(
                                         "pane '{closed_title}' closed"
                                     )));
@@ -291,9 +300,51 @@ pub(super) fn process_input_events(
                     }
                     RuntimeAction::ShowHelp => {
                         *status_message = Some(StatusMessage::new(
-                            "Ctrl-A: q quit | o cycle | h/j/k/l or arrows focus | H/J/K/L directional resize | t toggle layout | % split-v | \" split-h | +/- resize | r restart | x close | ? help"
+                            "Ctrl-A: q quit | o cycle | h/j/k/l or arrows focus | H/J/K/L directional resize | t toggle layout | % split-v | \" split-h | +/- resize | [ scroll mode | ] exit scroll | Ctrl-Y/Ctrl-E line | PgUp/PgDn page | g/G top/bottom | r restart | x close | ? help"
                                 .to_string(),
                         ));
+                    }
+                    RuntimeAction::EnterScrollMode => {
+                        scroll_state.active = true;
+                        if let Some(active_pane) = panes.get_mut(focused_pane) {
+                            let parser = active_pane
+                                .state
+                                .parser
+                                .lock()
+                                .expect("pane parser mutex poisoned");
+                            let offset = parser.screen().scrollback();
+                            scroll_state.offsets.insert(*focused_pane, offset);
+                            active_pane.state.dirty.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    RuntimeAction::ExitScrollMode => {
+                        scroll_state.active = false;
+                        scroll_state.offsets.clear();
+                        for pane in panes.values_mut() {
+                            let mut parser = pane
+                                .state
+                                .parser
+                                .lock()
+                                .expect("pane parser mutex poisoned");
+                            parser.screen_mut().set_scrollback(0);
+                            pane.state.dirty.store(true, Ordering::Relaxed);
+                        }
+                    }
+                    RuntimeAction::ScrollUpLine
+                    | RuntimeAction::ScrollDownLine
+                    | RuntimeAction::ScrollUpPage
+                    | RuntimeAction::ScrollDownPage
+                    | RuntimeAction::ScrollTop
+                    | RuntimeAction::ScrollBottom => {
+                        if scroll_state.active {
+                            apply_scrollback_action(
+                                action,
+                                *focused_pane,
+                                panes,
+                                pane_rects,
+                                scroll_state,
+                            );
+                        }
                     }
                     RuntimeAction::ForwardToPane(_) => unreachable!(),
                 }
@@ -341,6 +392,42 @@ fn apply_directional_resize(
             "no {axis} split found for directional resize"
         )));
     }
+}
+
+fn apply_scrollback_action(
+    action: RuntimeAction,
+    focused_pane: PaneId,
+    panes: &mut BTreeMap<PaneId, PaneRuntime>,
+    pane_rects: &BTreeMap<PaneId, Rect>,
+    scroll_state: &mut ScrollState,
+) {
+    let Some(active_pane) = panes.get_mut(&focused_pane) else {
+        return;
+    };
+    let page_step = pane_rects
+        .get(&focused_pane)
+        .map(|rect| usize::from(rect.inner().height.saturating_sub(1)).max(1))
+        .unwrap_or(10);
+
+    let mut parser = active_pane
+        .state
+        .parser
+        .lock()
+        .expect("pane parser mutex poisoned");
+    let current = parser.screen().scrollback();
+    let requested = match action {
+        RuntimeAction::ScrollUpLine => current.saturating_add(1),
+        RuntimeAction::ScrollDownLine => current.saturating_sub(1),
+        RuntimeAction::ScrollUpPage => current.saturating_add(page_step),
+        RuntimeAction::ScrollDownPage => current.saturating_sub(page_step),
+        RuntimeAction::ScrollTop => usize::MAX,
+        RuntimeAction::ScrollBottom => 0,
+        _ => current,
+    };
+    parser.screen_mut().set_scrollback(requested);
+    let applied = parser.screen().scrollback();
+    scroll_state.offsets.insert(focused_pane, applied);
+    active_pane.state.dirty.store(true, Ordering::Relaxed);
 }
 
 fn focus_in_direction(
@@ -459,7 +546,9 @@ fn axis_overlap(a_start: i32, a_end: i32, b_start: i32, b_end: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{FocusDirection, ProtocolProfile, focus_in_direction, process_input_events};
+    use super::{
+        FocusDirection, ProtocolProfile, ScrollState, focus_in_direction, process_input_events,
+    };
     use crate::input::RuntimeAction;
     use crate::pane::{LayoutNode, LayoutTree, PaneId, Rect, SplitDirection};
     use crate::runtime::{PaneRuntime, PaneState};
@@ -484,6 +573,17 @@ mod tests {
         }
     }
 
+    fn feed_lines(pane: &PaneRuntime, lines: usize) {
+        let mut parser = pane
+            .state
+            .parser
+            .lock()
+            .expect("pane parser mutex poisoned");
+        for index in 0..lines {
+            parser.process(format!("line-{index}\r\n").as_bytes());
+        }
+    }
+
     #[test]
     fn close_focused_removes_middle_pane_and_rebalances() {
         let mut panes = BTreeMap::new();
@@ -502,6 +602,7 @@ mod tests {
         let mut force_redraw = false;
         let mut exit_override = None;
         let mut status_message = None;
+        let mut scroll_state = ScrollState::default();
 
         let (tx, rx) = mpsc::channel();
         tx.send(RuntimeAction::CloseFocusedPane)
@@ -518,8 +619,10 @@ mod tests {
             &mut force_redraw,
             &mut exit_override,
             &mut status_message,
+            &mut scroll_state,
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
+            10_000,
             "bmux-256color",
             ProtocolProfile::Conservative,
             None,
@@ -551,6 +654,7 @@ mod tests {
         let mut force_redraw = false;
         let mut exit_override = None;
         let mut status_message = None;
+        let mut scroll_state = ScrollState::default();
 
         let (tx, rx) = mpsc::channel();
         tx.send(RuntimeAction::ToggleSplitDirection)
@@ -568,8 +672,10 @@ mod tests {
             &mut force_redraw,
             &mut exit_override,
             &mut status_message,
+            &mut scroll_state,
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
+            10_000,
             "bmux-256color",
             ProtocolProfile::Conservative,
             None,
@@ -618,6 +724,7 @@ mod tests {
         let mut force_redraw = false;
         let mut exit_override = None;
         let mut status_message = None;
+        let mut scroll_state = ScrollState::default();
 
         let (tx, rx) = mpsc::channel();
         tx.send(RuntimeAction::FocusLeft).expect("send left");
@@ -635,8 +742,10 @@ mod tests {
             &mut force_redraw,
             &mut exit_override,
             &mut status_message,
+            &mut scroll_state,
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
+            10_000,
             "bmux-256color",
             ProtocolProfile::Conservative,
             None,
@@ -744,6 +853,7 @@ mod tests {
         let mut force_redraw = false;
         let mut exit_override = None;
         let mut status_message = None;
+        let mut scroll_state = ScrollState::default();
 
         let (tx, rx) = mpsc::channel();
         tx.send(RuntimeAction::ResizeUp).expect("send resize up");
@@ -759,8 +869,10 @@ mod tests {
             &mut force_redraw,
             &mut exit_override,
             &mut status_message,
+            &mut scroll_state,
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
+            10_000,
             "bmux-256color",
             ProtocolProfile::Conservative,
             None,
@@ -792,6 +904,7 @@ mod tests {
         let mut force_redraw = false;
         let mut exit_override = None;
         let mut status_message = None;
+        let mut scroll_state = ScrollState::default();
 
         let (tx, rx) = mpsc::channel();
         tx.send(RuntimeAction::ResizeUp).expect("send resize up");
@@ -807,8 +920,10 @@ mod tests {
             &mut force_redraw,
             &mut exit_override,
             &mut status_message,
+            &mut scroll_state,
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
+            10_000,
             "bmux-256color",
             ProtocolProfile::Conservative,
             None,
@@ -818,5 +933,83 @@ mod tests {
         assert!(updated.is_none());
         let message = status_message.expect("status should explain no-op");
         assert!(message.text.contains("no horizontal split"));
+    }
+
+    #[test]
+    fn scroll_mode_preserves_offsets_per_pane_across_focus_changes() {
+        let mut panes = BTreeMap::new();
+        panes.insert(PaneId(1), make_pane("pane-1"));
+        panes.insert(PaneId(2), make_pane("pane-2"));
+        feed_lines(panes.get(&PaneId(1)).expect("pane 1 exists"), 80);
+        feed_lines(panes.get(&PaneId(2)).expect("pane 2 exists"), 80);
+
+        let mut layout = LayoutTree::two_pane(PaneId(1), PaneId(2), SplitDirection::Vertical, 0.5);
+        let mut focused = PaneId(1);
+        layout.focused = focused;
+        let pane_rects = layout.compute_rects(120, 40);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let mut force_redraw = false;
+        let mut exit_override = None;
+        let mut status_message = None;
+        let mut scroll_state = ScrollState::default();
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(RuntimeAction::EnterScrollMode)
+            .expect("send enter scroll mode");
+        tx.send(RuntimeAction::ScrollUpPage)
+            .expect("send page up pane 1");
+        tx.send(RuntimeAction::FocusRight)
+            .expect("send focus right");
+        tx.send(RuntimeAction::ScrollUpLine)
+            .expect("send line up pane 2");
+        tx.send(RuntimeAction::FocusLeft).expect("send focus left");
+        drop(tx);
+
+        let updated = process_input_events(
+            &rx,
+            &mut panes,
+            &pane_rects,
+            &layout,
+            &mut focused,
+            &shutdown_requested,
+            &mut force_redraw,
+            &mut exit_override,
+            &mut status_message,
+            &mut scroll_state,
+            Instant::now(),
+            Arc::new(AtomicBool::new(false)),
+            10_000,
+            "bmux-256color",
+            ProtocolProfile::Conservative,
+            None,
+        )
+        .expect("process input events");
+
+        assert!(updated.is_none());
+        assert_eq!(focused, PaneId(1));
+        assert!(scroll_state.active);
+        assert!(scroll_state.offsets.get(&PaneId(1)).copied().unwrap_or(0) > 0);
+        assert!(scroll_state.offsets.get(&PaneId(2)).copied().unwrap_or(0) > 0);
+
+        let pane_one_offset = panes
+            .get(&PaneId(1))
+            .expect("pane 1 exists")
+            .state
+            .parser
+            .lock()
+            .expect("pane parser mutex poisoned")
+            .screen()
+            .scrollback();
+        let pane_two_offset = panes
+            .get(&PaneId(2))
+            .expect("pane 2 exists")
+            .state
+            .parser
+            .lock()
+            .expect("pane parser mutex poisoned")
+            .screen()
+            .scrollback();
+        assert!(pane_one_offset > 0);
+        assert!(pane_two_offset > 0);
     }
 }

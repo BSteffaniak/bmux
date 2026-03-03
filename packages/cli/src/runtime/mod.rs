@@ -77,6 +77,7 @@ struct ReapExitedPanesResult {
 struct RuntimeSettings {
     keymap: crate::input::Keymap,
     layout_persistence_enabled: bool,
+    scrollback_limit: usize,
     pane_term: String,
     terminal_profile: TerminalProfile,
     protocol_profile: ProtocolProfile,
@@ -84,6 +85,12 @@ struct RuntimeSettings {
     protocol_trace_capacity: usize,
     configured_pane_term: String,
     warnings: Vec<String>,
+}
+
+#[derive(Default)]
+struct ScrollState {
+    active: bool,
+    offsets: BTreeMap<PaneId, usize>,
 }
 
 struct RuntimeOptions {
@@ -429,6 +436,7 @@ fn run_two_pane_runtime(
     };
     let (mut layout_tree, mut panes) = initialize_runtime_state(
         shell,
+        runtime_settings.scrollback_limit,
         &runtime_settings.pane_term,
         runtime_settings.protocol_profile,
         cols,
@@ -460,6 +468,7 @@ fn run_two_pane_runtime(
     let mut render_cache = RenderCache::default();
     let mut render_debug =
         RenderDebugState::new(debug_render, debug_render_log, debug_render_log_format)?;
+    let mut scroll_state = ScrollState::default();
     let mut persistence_dirty = true;
 
     let exit_code = loop {
@@ -474,8 +483,10 @@ fn run_two_pane_runtime(
             &mut force_redraw,
             &mut exit_override,
             &mut status_message,
+            &mut scroll_state,
             startup_deadline,
             Arc::clone(&user_input_seen),
+            runtime_settings.scrollback_limit,
             &runtime_settings.pane_term,
             runtime_settings.protocol_profile,
             protocol_trace.clone(),
@@ -505,6 +516,12 @@ fn run_two_pane_runtime(
         let reap_result = reap_exited_panes(&mut panes, &mut layout_tree, &mut focused_pane);
         if let Some(code) = reap_result.session_exit_code {
             break code;
+        }
+        scroll_state
+            .offsets
+            .retain(|pane_id, _| panes.contains_key(pane_id));
+        if panes.is_empty() {
+            scroll_state.active = false;
         }
         if reap_result.removed_any {
             pane_rects = layout_tree.compute_rects(cols, rows);
@@ -571,6 +588,17 @@ fn run_two_pane_runtime(
             }
         }
 
+        let scroll_status_suffix = if scroll_state.active {
+            let offset = scroll_state
+                .offsets
+                .get(&focused_pane)
+                .copied()
+                .unwrap_or(0);
+            Some(format!("SCROLL +{offset}"))
+        } else {
+            None
+        };
+
         if force_redraw || pane_dirty || Instant::now() >= next_status_redraw {
             render_frame(
                 &panes,
@@ -580,6 +608,7 @@ fn run_two_pane_runtime(
                 shell_name,
                 &cwd,
                 focused_pane,
+                scroll_status_suffix.as_deref(),
                 status_message.as_ref().map(|message| message.text.as_str()),
                 force_redraw,
                 &mut render_cache,
@@ -623,6 +652,7 @@ fn run_two_pane_runtime(
 
 fn initialize_runtime_state(
     shell: &str,
+    scrollback_limit: usize,
     pane_term: &str,
     protocol_profile: ProtocolProfile,
     cols: u16,
@@ -672,6 +702,7 @@ fn initialize_runtime_state(
             spawn_pane(
                 pane_id,
                 &pane_shell,
+                scrollback_limit,
                 pane_term,
                 protocol_profile,
                 title,
@@ -934,6 +965,7 @@ fn load_runtime_settings(config: &BmuxConfig) -> RuntimeSettings {
     RuntimeSettings {
         keymap,
         layout_persistence_enabled: config.behavior.restore_last_layout,
+        scrollback_limit: config.general.scrollback_limit,
         pane_term: pane_term_resolution.pane_term,
         terminal_profile: pane_term_resolution.profile,
         protocol_profile,
@@ -1483,12 +1515,13 @@ fn reap_exited_panes(
 mod tests {
     use super::{
         EventReader, PaneRuntime, PaneState, ProtocolDirection, ProtocolTraceEvent,
-        TerminalProfile, TraceFamily, filter_trace_events, key_to_bytes, profile_for_term,
-        protocol_profile_for_terminal_profile, reap_exited_panes, resolve_pane_term_with_checker,
-        run_event_input_loop_with_reader,
+        TerminalProfile, TraceFamily, filter_trace_events, key_to_bytes, load_runtime_settings,
+        profile_for_term, protocol_profile_for_terminal_profile, reap_exited_panes,
+        resolve_pane_term_with_checker, run_event_input_loop_with_reader,
     };
     use crate::input::{InputProcessor, Keymap};
     use crate::pane::{LayoutNode, LayoutTree, PaneId, SplitDirection};
+    use bmux_config::BmuxConfig;
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -1708,6 +1741,15 @@ mod tests {
             protocol_profile_for_terminal_profile(TerminalProfile::Conservative),
             super::ProtocolProfile::Conservative
         );
+    }
+
+    #[test]
+    fn runtime_settings_uses_configured_scrollback_limit() {
+        let mut config = BmuxConfig::default();
+        config.general.scrollback_limit = 4_321;
+
+        let settings = load_runtime_settings(&config);
+        assert_eq!(settings.scrollback_limit, 4_321);
     }
 
     #[test]

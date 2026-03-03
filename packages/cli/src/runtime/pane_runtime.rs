@@ -18,6 +18,7 @@ use vt100::Parser as VtParser;
 pub(super) fn spawn_pane(
     pane_id: PaneId,
     shell: &str,
+    scrollback_limit: usize,
     pane_term: &str,
     protocol_profile: ProtocolProfile,
     title: String,
@@ -30,7 +31,7 @@ pub(super) fn spawn_pane(
         parser: Mutex::new(VtParser::new(
             pane_inner.height.max(MIN_PANE_ROWS),
             pane_inner.width.max(MIN_PANE_COLS),
-            10_000,
+            scrollback_limit,
         )),
         dirty: AtomicBool::new(true),
     });
@@ -40,6 +41,7 @@ pub(super) fn spawn_pane(
         shell: shell.to_string(),
         process: Some(spawn_pane_process(
             shell,
+            scrollback_limit,
             pane_term,
             protocol_profile,
             pane_id,
@@ -58,6 +60,7 @@ pub(super) fn spawn_pane(
 
 pub(super) fn spawn_pane_process(
     shell: &str,
+    scrollback_limit: usize,
     pane_term: &str,
     protocol_profile: ProtocolProfile,
     pane_id: PaneId,
@@ -88,6 +91,11 @@ pub(super) fn spawn_pane_process(
 
     {
         let mut parser = state.parser.lock().expect("pane parser mutex poisoned");
+        *parser = VtParser::new(
+            pane_inner.height.max(MIN_PANE_ROWS),
+            pane_inner.width.max(MIN_PANE_COLS),
+            scrollback_limit,
+        );
         parser.screen_mut().set_size(
             pane_inner.height.max(MIN_PANE_ROWS),
             pane_inner.width.max(MIN_PANE_COLS),

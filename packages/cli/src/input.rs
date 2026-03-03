@@ -22,6 +22,14 @@ pub(crate) enum RuntimeAction {
     RestartFocusedPane,
     CloseFocusedPane,
     ShowHelp,
+    EnterScrollMode,
+    ExitScrollMode,
+    ScrollUpLine,
+    ScrollDownLine,
+    ScrollUpPage,
+    ScrollDownPage,
+    ScrollTop,
+    ScrollBottom,
     ForwardToPane(Vec<u8>),
 }
 
@@ -132,6 +140,14 @@ impl Keymap {
         runtime.insert("r".to_string(), "restart_focused_pane".to_string());
         runtime.insert("x".to_string(), "close_focused_pane".to_string());
         runtime.insert("?".to_string(), "show_help".to_string());
+        runtime.insert("[".to_string(), "enter_scroll_mode".to_string());
+        runtime.insert("]".to_string(), "exit_scroll_mode".to_string());
+        runtime.insert("ctrl+y".to_string(), "scroll_up_line".to_string());
+        runtime.insert("ctrl+e".to_string(), "scroll_down_line".to_string());
+        runtime.insert("page_up".to_string(), "scroll_up_page".to_string());
+        runtime.insert("page_down".to_string(), "scroll_down_page".to_string());
+        runtime.insert("g".to_string(), "scroll_top".to_string());
+        runtime.insert("shift+g".to_string(), "scroll_bottom".to_string());
         runtime.insert("q".to_string(), "quit".to_string());
 
         let global = BTreeMap::new();
@@ -511,6 +527,14 @@ fn action_to_name(action: &RuntimeAction) -> &'static str {
         RuntimeAction::RestartFocusedPane => "restart_focused_pane",
         RuntimeAction::CloseFocusedPane => "close_focused_pane",
         RuntimeAction::ShowHelp => "show_help",
+        RuntimeAction::EnterScrollMode => "enter_scroll_mode",
+        RuntimeAction::ExitScrollMode => "exit_scroll_mode",
+        RuntimeAction::ScrollUpLine => "scroll_up_line",
+        RuntimeAction::ScrollDownLine => "scroll_down_line",
+        RuntimeAction::ScrollUpPage => "scroll_up_page",
+        RuntimeAction::ScrollDownPage => "scroll_down_page",
+        RuntimeAction::ScrollTop => "scroll_top",
+        RuntimeAction::ScrollBottom => "scroll_bottom",
         RuntimeAction::ForwardToPane(_) => "forward_to_pane",
     }
 }
@@ -820,6 +844,14 @@ fn parse_action(value: &str) -> Result<RuntimeAction> {
         "restart_focused_pane" => Ok(RuntimeAction::RestartFocusedPane),
         "close_focused_pane" => Ok(RuntimeAction::CloseFocusedPane),
         "show_help" => Ok(RuntimeAction::ShowHelp),
+        "enter_scroll_mode" => Ok(RuntimeAction::EnterScrollMode),
+        "exit_scroll_mode" => Ok(RuntimeAction::ExitScrollMode),
+        "scroll_up_line" => Ok(RuntimeAction::ScrollUpLine),
+        "scroll_down_line" => Ok(RuntimeAction::ScrollDownLine),
+        "scroll_up_page" => Ok(RuntimeAction::ScrollUpPage),
+        "scroll_down_page" => Ok(RuntimeAction::ScrollDownPage),
+        "scroll_top" => Ok(RuntimeAction::ScrollTop),
+        "scroll_bottom" => Ok(RuntimeAction::ScrollBottom),
         unknown => bail!("unknown keymap action '{unknown}'"),
     }
 }
@@ -848,6 +880,43 @@ mod tests {
         let mut processor = InputProcessor::new(Keymap::default_runtime());
         let actions = processor.process_chunk(&[0x01, b'r']);
         assert_eq!(actions, vec![RuntimeAction::RestartFocusedPane]);
+    }
+
+    #[test]
+    fn maps_default_scrollback_commands() {
+        let mut processor = InputProcessor::new(Keymap::default_runtime());
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'[']),
+            vec![RuntimeAction::EnterScrollMode]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, b']']),
+            vec![RuntimeAction::ExitScrollMode]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, 0x19]),
+            vec![RuntimeAction::ScrollUpLine]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, 0x05]),
+            vec![RuntimeAction::ScrollDownLine]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, 0x1b, b'[', b'5', b'~']),
+            vec![RuntimeAction::ScrollUpPage]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, 0x1b, b'[', b'6', b'~']),
+            vec![RuntimeAction::ScrollDownPage]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'g']),
+            vec![RuntimeAction::ScrollTop]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'G']),
+            vec![RuntimeAction::ScrollBottom]
+        );
     }
 
     #[test]

@@ -75,6 +75,14 @@ fn default_runtime_bindings() -> BTreeMap<String, String> {
     bindings.insert("r".to_string(), "restart_focused_pane".to_string());
     bindings.insert("x".to_string(), "close_focused_pane".to_string());
     bindings.insert("?".to_string(), "show_help".to_string());
+    bindings.insert("[".to_string(), "enter_scroll_mode".to_string());
+    bindings.insert("]".to_string(), "exit_scroll_mode".to_string());
+    bindings.insert("ctrl+y".to_string(), "scroll_up_line".to_string());
+    bindings.insert("ctrl+e".to_string(), "scroll_down_line".to_string());
+    bindings.insert("page_up".to_string(), "scroll_up_page".to_string());
+    bindings.insert("page_down".to_string(), "scroll_down_page".to_string());
+    bindings.insert("g".to_string(), "scroll_top".to_string());
+    bindings.insert("shift+g".to_string(), "scroll_bottom".to_string());
     bindings.insert("q".to_string(), "quit".to_string());
     bindings
 }

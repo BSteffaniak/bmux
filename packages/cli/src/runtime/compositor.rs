@@ -220,17 +220,27 @@ pub(super) fn render_frame(
     shell_name: &str,
     cwd: &Path,
     focused_pane: PaneId,
+    mode_suffix: Option<&str>,
     status_message: Option<&str>,
     full_redraw: bool,
     render_cache: &mut RenderCache,
     render_debug: &mut RenderDebugState,
 ) -> Result<()> {
     let debug_snapshot = render_debug.snapshot();
-    let status_suffix = match (status_message, debug_snapshot) {
-        (Some(message), Some(debug)) => Some(format!("{message} | {debug}")),
-        (Some(message), None) => Some(message.to_string()),
-        (None, Some(debug)) => Some(debug.to_string()),
-        (None, None) => None,
+    let mut status_parts = Vec::new();
+    if let Some(mode) = mode_suffix {
+        status_parts.push(mode.to_string());
+    }
+    if let Some(message) = status_message {
+        status_parts.push(message.to_string());
+    }
+    if let Some(debug) = debug_snapshot {
+        status_parts.push(debug.to_string());
+    }
+    let status_suffix = if status_parts.is_empty() {
+        None
+    } else {
+        Some(status_parts.join(" | "))
     };
 
     let mut pane_data = Vec::new();
