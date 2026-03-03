@@ -50,6 +50,8 @@ use terminal_protocol::{
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STATUS_REDRAW_INTERVAL: Duration = Duration::from_millis(200);
+const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(200);
+const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_STATUS_TIMEOUT: Duration = Duration::from_millis(1000);
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_millis(5000);
 const MIN_PANE_ROWS: u16 = 2;
@@ -205,6 +207,12 @@ fn run_command(command: &Command) -> Result<u8> {
 }
 
 fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8> {
+    cleanup_stale_pid_file()?;
+    if server_is_running()? {
+        println!("bmux server is already running");
+        return Ok(1);
+    }
+
     if daemon && !foreground_internal {
         let executable = std::env::current_exe().context("failed to resolve bmux executable path")?;
         let mut child = ProcessCommand::new(executable);
@@ -217,6 +225,13 @@ fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8> {
             .stderr(Stdio::null());
         let child = child.spawn().context("failed to spawn background server")?;
         write_server_pid_file(child.id())?;
+
+        if !wait_for_server_running(SERVER_START_TIMEOUT)? {
+            let _ = try_kill_pid(child.id());
+            let _ = remove_server_pid_file();
+            anyhow::bail!("background server did not become ready before timeout")
+        }
+
         println!("bmux server started in daemon mode (pid {})", child.id());
         return Ok(0);
     }
@@ -230,20 +245,11 @@ fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8> {
 }
 
 fn run_server_status() -> Result<u8> {
-    let status = run_async(async {
-        match tokio::time::timeout(
-            SERVER_STATUS_TIMEOUT,
-            BmuxClient::connect_default("bmux-cli-status"),
-        )
-        .await
-        {
-            Ok(Ok(mut client)) => client.server_status().await.map(Some).map_err(Into::into),
-            Ok(Err(_)) | Err(_) => Ok(None),
-        }
-    })?;
+    cleanup_stale_pid_file()?;
+    let status = probe_server_running()?;
 
     match status {
-        Some(true) => {
+        true => {
             println!("bmux server is running");
             Ok(0)
         }
@@ -255,22 +261,17 @@ fn run_server_status() -> Result<u8> {
 }
 
 fn run_server_stop() -> Result<u8> {
+    cleanup_stale_pid_file()?;
     let graceful_stopped = run_async(async {
-        match tokio::time::timeout(SERVER_STOP_TIMEOUT, BmuxClient::connect_default("bmux-cli-stop")).await {
+        match tokio::time::timeout(
+            SERVER_STOP_TIMEOUT,
+            BmuxClient::connect_default("bmux-cli-stop"),
+        )
+        .await
+        {
             Ok(Ok(mut client)) => {
                 client.stop_server().await.map_err(anyhow::Error::from)?;
-                for _ in 0..20 {
-                    let reconnect = tokio::time::timeout(
-                        SERVER_STATUS_TIMEOUT,
-                        BmuxClient::connect_default("bmux-cli-stop-check"),
-                    )
-                    .await;
-                    if reconnect.is_err() || matches!(reconnect, Ok(Err(_))) {
-                        return Ok(true);
-                    }
-                    tokio::time::sleep(Duration::from_millis(250)).await;
-                }
-                Ok(false)
+                wait_until_server_stopped(SERVER_STOP_TIMEOUT).await
             }
             Ok(Err(_)) | Err(_) => Ok(false),
         }
@@ -284,9 +285,13 @@ fn run_server_stop() -> Result<u8> {
 
     if let Some(pid) = read_server_pid_file()? {
         if try_kill_pid(pid)? {
-            println!("bmux server stop fallback succeeded (pid {pid})");
+            if wait_for_process_exit(pid, SERVER_STOP_TIMEOUT)? {
+                println!("bmux server stop fallback succeeded (pid {pid})");
+                let _ = remove_server_pid_file();
+                return Ok(0);
+            }
+        } else if !is_pid_running(pid)? {
             let _ = remove_server_pid_file();
-            return Ok(0);
         }
     }
 
@@ -394,8 +399,81 @@ where
     runtime.block_on(future)
 }
 
+fn server_is_running() -> Result<bool> {
+    probe_server_running()
+}
+
+fn probe_server_running() -> Result<bool> {
+    run_async(async {
+        let connect = tokio::time::timeout(
+            SERVER_STATUS_TIMEOUT,
+            BmuxClient::connect_default("bmux-cli-status"),
+        )
+        .await;
+
+        let mut client = match connect {
+            Ok(Ok(client)) => client,
+            Ok(Err(_)) | Err(_) => return Ok(false),
+        };
+
+        match tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.server_status()).await {
+            Ok(Ok(running)) => Ok(running),
+            Ok(Err(_)) | Err(_) => Ok(false),
+        }
+    })
+}
+
+fn wait_for_server_running(timeout: Duration) -> Result<bool> {
+    run_async(async {
+        let deadline = Instant::now() + timeout;
+        while Instant::now() < deadline {
+            let connect = tokio::time::timeout(
+                SERVER_STATUS_TIMEOUT,
+                BmuxClient::connect_default("bmux-cli-start-wait"),
+            )
+            .await;
+            if let Ok(Ok(mut client)) = connect
+                && let Ok(Ok(true)) =
+                    tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.server_status()).await
+            {
+                return Ok(true);
+            }
+            tokio::time::sleep(SERVER_POLL_INTERVAL).await;
+        }
+        Ok(false)
+    })
+}
+
+async fn wait_until_server_stopped(timeout: Duration) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let reconnect = tokio::time::timeout(
+            SERVER_STATUS_TIMEOUT,
+            BmuxClient::connect_default("bmux-cli-stop-check"),
+        )
+        .await;
+        if reconnect.is_err() || matches!(reconnect, Ok(Err(_))) {
+            return Ok(true);
+        }
+        tokio::time::sleep(SERVER_POLL_INTERVAL).await;
+    }
+
+    Ok(false)
+}
+
+fn wait_for_process_exit(pid: u32, timeout: Duration) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if !is_pid_running(pid)? {
+            return Ok(true);
+        }
+        std::thread::sleep(SERVER_POLL_INTERVAL);
+    }
+    Ok(!is_pid_running(pid)?)
+}
+
 fn server_pid_file_path() -> PathBuf {
-    bmux_config::ConfigPaths::default().runtime_dir.join("server.pid")
+    bmux_config::ConfigPaths::default().server_pid_file()
 }
 
 fn write_server_pid_file(pid: u32) -> Result<()> {
@@ -419,11 +497,13 @@ fn read_server_pid_file() -> Result<Option<u32>> {
         }
     };
 
-    let pid = content
-        .trim()
-        .parse::<u32>()
-        .with_context(|| format!("invalid pid file content at {}", path.display()))?;
-    Ok(Some(pid))
+    match parse_pid_content(&content) {
+        Some(pid) => Ok(Some(pid)),
+        None => {
+            let _ = remove_server_pid_file();
+            Ok(None)
+        }
+    }
 }
 
 fn remove_server_pid_file() -> Result<()> {
@@ -463,6 +543,57 @@ fn try_kill_pid(pid: u32) -> Result<bool> {
             .context("failed to execute taskkill command")?;
         return Ok(status.success());
     }
+}
+
+fn is_pid_running(pid: u32) -> Result<bool> {
+    if pid == 0 {
+        return Ok(false);
+    }
+
+    #[cfg(unix)]
+    {
+        let status = ProcessCommand::new("kill")
+            .arg("-0")
+            .arg(pid.to_string())
+            .status()
+            .context("failed to execute kill -0 command")?;
+        return Ok(status.success());
+    }
+
+    #[cfg(windows)]
+    {
+        let filter = format!("PID eq {pid}");
+        let output = ProcessCommand::new("tasklist")
+            .arg("/FI")
+            .arg(filter)
+            .output()
+            .context("failed to execute tasklist command")?;
+        if !output.status.success() {
+            return Ok(false);
+        }
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        return Ok(stdout.lines().any(|line| line.contains(&pid.to_string())));
+    }
+}
+
+fn cleanup_stale_pid_file() -> Result<()> {
+    let Some(pid) = read_server_pid_file()? else {
+        return Ok(());
+    };
+
+    if !is_pid_running(pid)? && !probe_server_running()? {
+        remove_server_pid_file()?;
+    }
+
+    Ok(())
+}
+
+fn parse_pid_content(content: &str) -> Option<u32> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed.parse::<u32>().ok().filter(|pid| *pid > 0)
 }
 
 fn run_layout_clear() -> Result<u8> {
@@ -1801,7 +1932,7 @@ mod tests {
     use super::{
         EventReader, PaneRuntime, PaneState, ProtocolDirection, ProtocolTraceEvent, ScrollState,
         TerminalProfile, TraceFamily, filter_trace_events, format_scroll_mode_suffix,
-        load_runtime_settings, merged_runtime_keybindings, profile_for_term,
+        load_runtime_settings, merged_runtime_keybindings, parse_pid_content, profile_for_term,
         protocol_profile_for_terminal_profile, reap_exited_panes, resolve_pane_term_with_checker,
         run_event_input_loop_with_reader, selection_status_suffix,
     };
@@ -2079,5 +2210,17 @@ mod tests {
         let both = filter_trace_events(&events, Some(TraceFamily::Csi), Some(2), 50);
         assert_eq!(both.len(), 1);
         assert_eq!(both[0].timestamp_ms, 3);
+    }
+
+    #[test]
+    fn parse_pid_content_accepts_positive_pid() {
+        assert_eq!(parse_pid_content("123\n"), Some(123));
+    }
+
+    #[test]
+    fn parse_pid_content_rejects_invalid_values() {
+        assert_eq!(parse_pid_content(""), None);
+        assert_eq!(parse_pid_content("0"), None);
+        assert_eq!(parse_pid_content("abc"), None);
     }
 }

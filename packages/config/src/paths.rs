@@ -82,6 +82,12 @@ impl ConfigPaths {
         self.runtime_dir.join("server.sock")
     }
 
+    /// Get the server pid file path.
+    #[must_use]
+    pub fn server_pid_file(&self) -> PathBuf {
+        self.runtime_dir.join("server.pid")
+    }
+
     /// Get the server named pipe path for Windows transports.
     ///
     /// The value is deterministic and user-scoped so multiple users on the same
@@ -153,6 +159,19 @@ mod tests {
             PathBuf::from("/data"),
         );
         assert_eq!(paths.server_socket(), PathBuf::from("/runtime/server.sock"));
+    }
+
+    #[test]
+    fn server_pid_file_uses_runtime_dir() {
+        let paths = ConfigPaths::new(
+            PathBuf::from("/config"),
+            PathBuf::from("/runtime"),
+            PathBuf::from("/data"),
+        );
+        assert_eq!(
+            paths.server_pid_file(),
+            PathBuf::from("/runtime/server.pid")
+        );
     }
 
     #[test]
