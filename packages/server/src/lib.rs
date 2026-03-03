@@ -14,9 +14,11 @@ use bmux_ipc::{
     encode,
 };
 use bmux_session::{ClientId, SessionId, SessionManager};
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
+use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -32,7 +34,85 @@ pub struct BmuxServer {
 #[derive(Debug)]
 struct ServerState {
     session_manager: Mutex<SessionManager>,
+    session_runtimes: Mutex<SessionRuntimeManager>,
     handshake_timeout: Duration,
+}
+
+#[derive(Debug, Default)]
+struct SessionRuntimeManager {
+    runtimes: BTreeMap<SessionId, SessionRuntimeHandle>,
+}
+
+#[derive(Debug)]
+struct SessionRuntimeHandle {
+    stop_tx: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+}
+
+impl SessionRuntimeManager {
+    fn start_runtime(&mut self, session_id: SessionId) -> Result<()> {
+        if self.runtimes.contains_key(&session_id) {
+            anyhow::bail!("runtime already exists for session {}", session_id.0);
+        }
+
+        let (stop_tx, mut stop_rx) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let mut heartbeat = tokio::time::interval(Duration::from_secs(60));
+            loop {
+                tokio::select! {
+                    _ = &mut stop_rx => {
+                        break;
+                    }
+                    _ = heartbeat.tick() => {
+                        // Keep runtime task alive until attach bridge is added.
+                    }
+                }
+            }
+        });
+
+        self.runtimes.insert(
+            session_id,
+            SessionRuntimeHandle {
+                stop_tx: Some(stop_tx),
+                task,
+            },
+        );
+        Ok(())
+    }
+
+    fn stop_runtime(&mut self, session_id: SessionId) -> Result<()> {
+        let mut runtime = self
+            .runtimes
+            .remove(&session_id)
+            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+
+        if let Some(stop_tx) = runtime.stop_tx.take() {
+            let _ = stop_tx.send(());
+        }
+
+        runtime.task.abort();
+
+        Ok(())
+    }
+
+    fn stop_all_runtimes(&mut self) {
+        for (_, mut runtime) in std::mem::take(&mut self.runtimes) {
+            if let Some(stop_tx) = runtime.stop_tx.take() {
+                let _ = stop_tx.send(());
+            }
+            runtime.task.abort();
+        }
+    }
+
+    #[cfg(test)]
+    fn runtime_count(&self) -> usize {
+        self.runtimes.len()
+    }
+
+    #[cfg(test)]
+    fn has_runtime(&self, session_id: SessionId) -> bool {
+        self.runtimes.contains_key(&session_id)
+    }
 }
 
 impl BmuxServer {
@@ -44,6 +124,7 @@ impl BmuxServer {
             endpoint,
             state: Arc::new(ServerState {
                 session_manager: Mutex::new(SessionManager::new()),
+                session_runtimes: Mutex::new(SessionRuntimeManager::default()),
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             }),
             shutdown_tx,
@@ -119,6 +200,10 @@ impl BmuxServer {
                     }
                 }
             }
+        }
+
+        if let Ok(mut runtime_manager) = self.state.session_runtimes.lock() {
+            runtime_manager.stop_all_runtimes();
         }
 
         Ok(())
@@ -207,7 +292,8 @@ async fn handle_connection(
             client_id,
             &mut attached_session,
             request,
-        )?;
+        )
+        .await?;
         send_response(&mut stream, envelope.request_id, response).await?;
     }
 
@@ -216,18 +302,13 @@ async fn handle_connection(
     Ok(())
 }
 
-fn handle_request(
+async fn handle_request(
     state: &Arc<ServerState>,
     shutdown_tx: &watch::Sender<bool>,
     client_id: ClientId,
     attached_session: &mut Option<SessionId>,
     request: Request,
 ) -> Result<Response> {
-    let mut manager = state
-        .session_manager
-        .lock()
-        .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-
     let response = match request {
         Request::Hello { .. } => Response::Err(ErrorResponse {
             code: ErrorCode::InvalidRequest,
@@ -240,6 +321,10 @@ fn handle_request(
             Response::Ok(ResponsePayload::ServerStopping)
         }
         Request::NewSession { name } => {
+            let mut manager = state
+                .session_manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
             if let Some(requested_name) = name.as_deref()
                 && manager
                     .list_sessions()
@@ -253,10 +338,31 @@ fn handle_request(
             }
 
             match manager.create_session(name.clone()) {
-                Ok(session_id) => Response::Ok(ResponsePayload::SessionCreated {
-                    id: session_id.0,
-                    name,
-                }),
+                Ok(session_id) => {
+                    drop(manager);
+
+                    let mut runtime_manager = state
+                        .session_runtimes
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+                    if let Err(error) = runtime_manager.start_runtime(session_id) {
+                        drop(runtime_manager);
+                        let mut rollback_manager = state
+                            .session_manager
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                        let _ = rollback_manager.remove_session(&session_id);
+                        return Ok(Response::Err(ErrorResponse {
+                            code: ErrorCode::Internal,
+                            message: format!("failed creating session runtime: {error:#}"),
+                        }));
+                    }
+
+                    Response::Ok(ResponsePayload::SessionCreated {
+                        id: session_id.0,
+                        name,
+                    })
+                }
                 Err(error) => Response::Err(ErrorResponse {
                     code: ErrorCode::Internal,
                     message: format!("failed creating session: {error:#}"),
@@ -264,6 +370,10 @@ fn handle_request(
             }
         }
         Request::ListSessions => {
+            let manager = state
+                .session_manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
             let sessions = manager
                 .list_sessions()
                 .into_iter()
@@ -277,6 +387,10 @@ fn handle_request(
             Response::Ok(ResponsePayload::SessionList { sessions })
         }
         Request::KillSession { selector } => {
+            let mut manager = state
+                .session_manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
             let Some(session_id) = resolve_session_id(&manager, &selector) else {
                 return Ok(Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
@@ -293,9 +407,26 @@ fn handle_request(
             if *attached_session == Some(session_id) {
                 *attached_session = None;
             }
+
+            drop(manager);
+            let mut runtime_manager = state
+                .session_runtimes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+            if let Err(error) = runtime_manager.stop_runtime(session_id) {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::Internal,
+                    message: format!("failed stopping session runtime: {error:#}"),
+                }));
+            }
+
             Response::Ok(ResponsePayload::SessionKilled { id: session_id.0 })
         }
         Request::Attach { selector } => {
+            let mut manager = state
+                .session_manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
             let Some(next_session_id) = resolve_session_id(&manager, &selector) else {
                 return Ok(Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
@@ -325,6 +456,10 @@ fn handle_request(
             }
         }
         Request::Detach => {
+            let mut manager = state
+                .session_manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
             if let Some(current_session_id) = attached_session.take()
                 && let Some(session) = manager.get_session_mut(&current_session_id)
             {
@@ -418,6 +553,7 @@ mod tests {
         Envelope, EnvelopeKind, ErrorCode, ErrorResponse, IpcEndpoint, ProtocolVersion, Request,
         Response, ResponsePayload, SessionSelector, decode, encode,
     };
+    use bmux_session::SessionId;
     use std::path::Path;
     use std::time::Duration;
     use tokio::time::sleep;
@@ -540,6 +676,16 @@ mod tests {
             other => panic!("unexpected new-session response: {other:?}"),
         };
 
+        {
+            let runtime_manager = server
+                .state
+                .session_runtimes
+                .lock()
+                .expect("runtime manager lock should succeed");
+            assert_eq!(runtime_manager.runtime_count(), 1);
+            assert!(runtime_manager.has_runtime(SessionId(created_id)));
+        }
+
         let listed = send_request(&mut client, 11, Request::ListSessions).await;
         match listed {
             Response::Ok(ResponsePayload::SessionList { sessions }) => {
@@ -608,6 +754,16 @@ mod tests {
                 sessions: Vec::new(),
             })
         );
+
+        {
+            let runtime_manager = server
+                .state
+                .session_runtimes
+                .lock()
+                .expect("runtime manager lock should succeed");
+            assert_eq!(runtime_manager.runtime_count(), 0);
+            assert!(!runtime_manager.has_runtime(SessionId(session_id)));
+        }
 
         stop_server(server, server_task, &socket_path).await;
     }
