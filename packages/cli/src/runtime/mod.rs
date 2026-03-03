@@ -293,8 +293,14 @@ fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
         bmux_client::ServerEvent::ServerStopping => "server_stopping",
         bmux_client::ServerEvent::SessionCreated { .. } => "session_created",
         bmux_client::ServerEvent::SessionRemoved { .. } => "session_removed",
+        bmux_client::ServerEvent::WindowCreated { .. } => "window_created",
+        bmux_client::ServerEvent::WindowRemoved { .. } => "window_removed",
+        bmux_client::ServerEvent::WindowSwitched { .. } => "window_switched",
         bmux_client::ServerEvent::ClientAttached { .. } => "client_attached",
         bmux_client::ServerEvent::ClientDetached { .. } => "client_detached",
+        bmux_client::ServerEvent::FollowStarted { .. } => "follow_started",
+        bmux_client::ServerEvent::FollowStopped { .. } => "follow_stopped",
+        bmux_client::ServerEvent::FollowTargetGone { .. } => "follow_target_gone",
     }
 }
 

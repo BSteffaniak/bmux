@@ -110,6 +110,14 @@ pub enum SessionSelector {
     ByName(String),
 }
 
+/// Window selector accepted by commands and protocol requests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WindowSelector {
+    ById(Uuid),
+    ByName(String),
+    Active,
+}
+
 /// Request payload variants for client/server IPC.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -124,10 +132,30 @@ pub enum Request {
     NewSession {
         name: Option<String>,
     },
+    NewWindow {
+        session: Option<SessionSelector>,
+        name: Option<String>,
+    },
     ListSessions,
+    ListWindows {
+        session: Option<SessionSelector>,
+    },
     KillSession {
         selector: SessionSelector,
     },
+    KillWindow {
+        session: Option<SessionSelector>,
+        target: WindowSelector,
+    },
+    SwitchWindow {
+        session: Option<SessionSelector>,
+        target: WindowSelector,
+    },
+    FollowClient {
+        target_client_id: Uuid,
+        global: bool,
+    },
+    Unfollow,
     Attach {
         selector: SessionSelector,
     },
@@ -167,6 +195,15 @@ pub struct SessionSummary {
     pub client_count: usize,
 }
 
+/// Summary returned when listing windows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WindowSummary {
+    pub id: Uuid,
+    pub session_id: Uuid,
+    pub name: Option<String>,
+    pub active: bool,
+}
+
 /// Successful response payload variants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -174,8 +211,22 @@ pub enum ResponsePayload {
     Pong,
     ServerStatus { running: bool },
     SessionCreated { id: Uuid, name: Option<String> },
+    WindowCreated {
+        id: Uuid,
+        session_id: Uuid,
+        name: Option<String>,
+    },
     SessionList { sessions: Vec<SessionSummary> },
+    WindowList { windows: Vec<WindowSummary> },
     SessionKilled { id: Uuid },
+    WindowKilled { id: Uuid, session_id: Uuid },
+    WindowSwitched { id: Uuid, session_id: Uuid },
+    FollowStarted {
+        follower_client_id: Uuid,
+        leader_client_id: Uuid,
+        global: bool,
+    },
+    FollowStopped { follower_client_id: Uuid },
     Attached { grant: AttachGrant },
     AttachReady { session_id: Uuid },
     AttachInputAccepted { bytes: usize },
@@ -221,8 +272,34 @@ pub enum Event {
     ServerStopping,
     SessionCreated { id: Uuid, name: Option<String> },
     SessionRemoved { id: Uuid },
+    WindowCreated {
+        id: Uuid,
+        session_id: Uuid,
+        name: Option<String>,
+    },
+    WindowRemoved {
+        id: Uuid,
+        session_id: Uuid,
+    },
+    WindowSwitched {
+        id: Uuid,
+        session_id: Uuid,
+        by_client_id: Uuid,
+    },
     ClientAttached { id: Uuid },
     ClientDetached { id: Uuid },
+    FollowStarted {
+        follower_client_id: Uuid,
+        leader_client_id: Uuid,
+        global: bool,
+    },
+    FollowStopped {
+        follower_client_id: Uuid,
+    },
+    FollowTargetGone {
+        follower_client_id: Uuid,
+        former_leader_client_id: Uuid,
+    },
 }
 
 /// Serialize any protocol message using postcard.

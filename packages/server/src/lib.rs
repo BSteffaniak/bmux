@@ -782,6 +782,13 @@ async fn handle_request(
                 }),
             }
         }
+        Request::NewWindow { .. }
+        | Request::ListWindows { .. }
+        | Request::KillWindow { .. }
+        | Request::SwitchWindow { .. } => Response::Err(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: "window operations not implemented yet".to_string(),
+        }),
         Request::ListSessions => {
             let manager = state
                 .session_manager
@@ -854,6 +861,10 @@ async fn handle_request(
 
             Response::Ok(ResponsePayload::SessionKilled { id: session_id.0 })
         }
+        Request::FollowClient { .. } | Request::Unfollow => Response::Err(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: "follow operations not implemented yet".to_string(),
+        }),
         Request::Attach { selector } => {
             let mut manager = state
                 .session_manager
