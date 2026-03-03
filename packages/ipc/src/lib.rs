@@ -135,6 +135,14 @@ pub enum Request {
         session_id: Uuid,
         attach_token: Uuid,
     },
+    AttachInput {
+        session_id: Uuid,
+        data: Vec<u8>,
+    },
+    AttachOutput {
+        session_id: Uuid,
+        max_bytes: usize,
+    },
     Detach,
 }
 
@@ -166,6 +174,8 @@ pub enum ResponsePayload {
     SessionKilled { id: Uuid },
     Attached { grant: AttachGrant },
     AttachReady { session_id: Uuid },
+    AttachInputAccepted { bytes: usize },
+    AttachOutput { data: Vec<u8> },
     Detached,
     ServerStopping,
 }

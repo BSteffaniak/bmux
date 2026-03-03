@@ -17,7 +17,7 @@ use bmux_session::{ClientId, SessionId, SessionManager};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -141,6 +141,17 @@ struct SessionRuntimeManager {
 struct SessionRuntimeHandle {
     stop_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
+    input_tx: mpsc::UnboundedSender<Vec<u8>>,
+    output_rx: std::sync::Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
+    active_client: Option<ClientId>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SessionRuntimeError {
+    NotFound,
+    AlreadyAttached,
+    NotAttached,
+    Closed,
 }
 
 impl SessionRuntimeManager {
@@ -150,15 +161,21 @@ impl SessionRuntimeManager {
         }
 
         let (stop_tx, mut stop_rx) = oneshot::channel();
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (output_tx, output_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let task = tokio::spawn(async move {
-            let mut heartbeat = tokio::time::interval(Duration::from_secs(60));
             loop {
                 tokio::select! {
                     _ = &mut stop_rx => {
                         break;
                     }
-                    _ = heartbeat.tick() => {
-                        // Keep runtime task alive until attach bridge is added.
+                    input = input_rx.recv() => {
+                        match input {
+                            Some(bytes) => {
+                                let _ = output_tx.send(bytes);
+                            }
+                            None => break,
+                        }
                     }
                 }
             }
@@ -169,6 +186,9 @@ impl SessionRuntimeManager {
             SessionRuntimeHandle {
                 stop_tx: Some(stop_tx),
                 task,
+                input_tx,
+                output_rx: std::sync::Mutex::new(output_rx),
+                active_client: None,
             },
         );
         Ok(())
@@ -187,6 +207,95 @@ impl SessionRuntimeManager {
         runtime.task.abort();
 
         Ok(())
+    }
+
+    fn begin_attach(&mut self, session_id: SessionId, client_id: ClientId) -> Result<(), SessionRuntimeError> {
+        let runtime = self
+            .runtimes
+            .get_mut(&session_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+
+        match runtime.active_client {
+            Some(active) if active != client_id => Err(SessionRuntimeError::AlreadyAttached),
+            _ => {
+                runtime.active_client = Some(client_id);
+                Ok(())
+            }
+        }
+    }
+
+    fn end_attach(&mut self, session_id: SessionId, client_id: ClientId) {
+        if let Some(runtime) = self.runtimes.get_mut(&session_id)
+            && runtime.active_client == Some(client_id)
+        {
+            runtime.active_client = None;
+        }
+    }
+
+    fn write_input(
+        &mut self,
+        session_id: SessionId,
+        client_id: ClientId,
+        data: Vec<u8>,
+    ) -> Result<usize, SessionRuntimeError> {
+        let runtime = self
+            .runtimes
+            .get_mut(&session_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+
+        if runtime.active_client != Some(client_id) {
+            return Err(SessionRuntimeError::NotAttached);
+        }
+
+        let bytes = data.len();
+        runtime
+            .input_tx
+            .send(data)
+            .map_err(|_| SessionRuntimeError::Closed)?;
+        Ok(bytes)
+    }
+
+    fn read_output(
+        &mut self,
+        session_id: SessionId,
+        client_id: ClientId,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, SessionRuntimeError> {
+        let runtime = self
+            .runtimes
+            .get_mut(&session_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+
+        if runtime.active_client != Some(client_id) {
+            return Err(SessionRuntimeError::NotAttached);
+        }
+
+        let mut receiver = runtime
+            .output_rx
+            .lock()
+            .map_err(|_| SessionRuntimeError::Closed)?;
+        let mut output = Vec::new();
+        let limit = max_bytes.max(1);
+
+        while output.len() < limit {
+            match receiver.try_recv() {
+                Ok(chunk) => {
+                    let remaining = limit - output.len();
+                    if chunk.len() <= remaining {
+                        output.extend_from_slice(&chunk);
+                    } else {
+                        output.extend_from_slice(&chunk[..remaining]);
+                        break;
+                    }
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                    return Err(SessionRuntimeError::Closed);
+                }
+            }
+        }
+
+        Ok(output)
     }
 
     fn stop_all_runtimes(&mut self) {
@@ -588,9 +697,32 @@ async fn handle_request(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
             match attach_tokens.consume(session_id, attach_token) {
-                Ok(()) => Response::Ok(ResponsePayload::AttachReady {
-                    session_id: session_id.0,
-                }),
+                Ok(()) => {
+                    drop(attach_tokens);
+                    let mut runtime_manager = state
+                        .session_runtimes
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+                    match runtime_manager.begin_attach(session_id, client_id) {
+                        Ok(()) => Response::Ok(ResponsePayload::AttachReady {
+                            session_id: session_id.0,
+                        }),
+                        Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
+                            code: ErrorCode::NotFound,
+                            message: format!("session runtime not found: {}", session_id.0),
+                        }),
+                        Err(SessionRuntimeError::AlreadyAttached) => Response::Err(ErrorResponse {
+                            code: ErrorCode::AlreadyExists,
+                            message: "session already has an attached client".to_string(),
+                        }),
+                        Err(SessionRuntimeError::NotAttached | SessionRuntimeError::Closed) => {
+                            Response::Err(ErrorResponse {
+                                code: ErrorCode::Internal,
+                                message: "failed opening attach stream".to_string(),
+                            })
+                        }
+                    }
+                }
                 Err(AttachTokenValidationError::NotFound) => Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
                     message: "attach token not found".to_string(),
@@ -605,15 +737,74 @@ async fn handle_request(
                 }),
             }
         }
+        Request::AttachInput { session_id, data } => {
+            let mut runtime_manager = state
+                .session_runtimes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+            match runtime_manager.write_input(SessionId(session_id), client_id, data) {
+                Ok(bytes) => Response::Ok(ResponsePayload::AttachInputAccepted { bytes }),
+                Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!("session runtime not found: {session_id}"),
+                }),
+                Err(SessionRuntimeError::NotAttached) => Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "client is not attached to session runtime".to_string(),
+                }),
+                Err(SessionRuntimeError::AlreadyAttached | SessionRuntimeError::Closed) => {
+                    Response::Err(ErrorResponse {
+                        code: ErrorCode::Internal,
+                        message: "failed writing attach input".to_string(),
+                    })
+                }
+            }
+        }
+        Request::AttachOutput {
+            session_id,
+            max_bytes,
+        } => {
+            let mut runtime_manager = state
+                .session_runtimes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+            match runtime_manager.read_output(SessionId(session_id), client_id, max_bytes) {
+                Ok(data) => Response::Ok(ResponsePayload::AttachOutput { data }),
+                Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!("session runtime not found: {session_id}"),
+                }),
+                Err(SessionRuntimeError::NotAttached) => Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "client is not attached to session runtime".to_string(),
+                }),
+                Err(SessionRuntimeError::AlreadyAttached | SessionRuntimeError::Closed) => {
+                    Response::Err(ErrorResponse {
+                        code: ErrorCode::Internal,
+                        message: "failed reading attach output".to_string(),
+                    })
+                }
+            }
+        }
         Request::Detach => {
             let mut manager = state
                 .session_manager
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            if let Some(current_session_id) = attached_session.take()
+            let current_session_id = attached_session.take();
+            if let Some(current_session_id) = current_session_id
                 && let Some(session) = manager.get_session_mut(&current_session_id)
             {
                 session.remove_client(&client_id);
+            }
+            drop(manager);
+
+            if let Some(current_session_id) = current_session_id {
+                let mut runtime_manager = state
+                    .session_runtimes
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+                runtime_manager.end_attach(current_session_id, client_id);
             }
             Response::Ok(ResponsePayload::Detached)
         }
@@ -638,6 +829,13 @@ fn detach_client_if_attached(
     if let Some(session) = manager.get_session_mut(&session_id) {
         session.remove_client(&client_id);
     }
+    drop(manager);
+
+    let mut runtime_manager = state
+        .session_runtimes
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+    runtime_manager.end_attach(session_id, client_id);
 
     Ok(())
 }
@@ -931,6 +1129,168 @@ mod tests {
             assert_eq!(runtime_manager.runtime_count(), 0);
             assert!(!runtime_manager.has_runtime(SessionId(session_id)));
         }
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn rejects_second_active_attach_for_same_session() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut client_a = connect_and_handshake(&endpoint).await;
+        let mut client_b = connect_and_handshake(&endpoint).await;
+
+        let created = send_request(
+            &mut client_a,
+            60,
+            Request::NewSession {
+                name: Some("single-attach".to_string()),
+            },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected create response: {other:?}"),
+        };
+
+        let grant_a = match send_request(
+            &mut client_a,
+            61,
+            Request::Attach {
+                selector: SessionSelector::ById(session_id),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::Attached { grant }) => grant,
+            other => panic!("unexpected attach response for client a: {other:?}"),
+        };
+        let open_a = send_request(
+            &mut client_a,
+            62,
+            Request::AttachOpen {
+                session_id,
+                attach_token: grant_a.attach_token,
+            },
+        )
+        .await;
+        assert_eq!(
+            open_a,
+            Response::Ok(ResponsePayload::AttachReady { session_id })
+        );
+
+        let grant_b = match send_request(
+            &mut client_b,
+            63,
+            Request::Attach {
+                selector: SessionSelector::ById(session_id),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::Attached { grant }) => grant,
+            other => panic!("unexpected attach response for client b: {other:?}"),
+        };
+        let open_b = send_request(
+            &mut client_b,
+            64,
+            Request::AttachOpen {
+                session_id,
+                attach_token: grant_b.attach_token,
+            },
+        )
+        .await;
+        assert!(matches!(
+            open_b,
+            Response::Err(ErrorResponse {
+                code: ErrorCode::AlreadyExists,
+                ..
+            })
+        ));
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detach_keeps_runtime_alive_and_allows_reattach() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut client = connect_and_handshake(&endpoint).await;
+
+        let created = send_request(
+            &mut client,
+            70,
+            Request::NewSession {
+                name: Some("reattach".to_string()),
+            },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected create response: {other:?}"),
+        };
+
+        let grant = match send_request(
+            &mut client,
+            71,
+            Request::Attach {
+                selector: SessionSelector::ById(session_id),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::Attached { grant }) => grant,
+            other => panic!("unexpected attach response: {other:?}"),
+        };
+        let open = send_request(
+            &mut client,
+            72,
+            Request::AttachOpen {
+                session_id,
+                attach_token: grant.attach_token,
+            },
+        )
+        .await;
+        assert_eq!(open, Response::Ok(ResponsePayload::AttachReady { session_id }));
+
+        let detached = send_request(&mut client, 73, Request::Detach).await;
+        assert_eq!(detached, Response::Ok(ResponsePayload::Detached));
+
+        {
+            let runtime_manager = server
+                .state
+                .session_runtimes
+                .lock()
+                .expect("runtime manager lock should succeed");
+            assert_eq!(runtime_manager.runtime_count(), 1);
+            assert!(runtime_manager.has_runtime(SessionId(session_id)));
+        }
+
+        let regrant = match send_request(
+            &mut client,
+            74,
+            Request::Attach {
+                selector: SessionSelector::ById(session_id),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::Attached { grant }) => grant,
+            other => panic!("unexpected reattach grant response: {other:?}"),
+        };
+        let reopen = send_request(
+            &mut client,
+            75,
+            Request::AttachOpen {
+                session_id,
+                attach_token: regrant.attach_token,
+            },
+        )
+        .await;
+        assert_eq!(
+            reopen,
+            Response::Ok(ResponsePayload::AttachReady { session_id })
+        );
 
         stop_server(server, server_task, &socket_path).await;
     }

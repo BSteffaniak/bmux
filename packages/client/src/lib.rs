@@ -228,6 +228,43 @@ impl BmuxClient {
         }
     }
 
+    /// Send bytes to an attached session runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn attach_input(&mut self, session_id: Uuid, data: Vec<u8>) -> Result<usize> {
+        match self
+            .request(Request::AttachInput { session_id, data })
+            .await?
+        {
+            ResponsePayload::AttachInputAccepted { bytes } => Ok(bytes),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attach input accepted response",
+            )),
+        }
+    }
+
+    /// Read bytes from an attached session runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn attach_output(&mut self, session_id: Uuid, max_bytes: usize) -> Result<Vec<u8>> {
+        match self
+            .request(Request::AttachOutput {
+                session_id,
+                max_bytes,
+            })
+            .await?
+        {
+            ResponsePayload::AttachOutput { data } => Ok(data),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attach output response",
+            )),
+        }
+    }
+
     async fn request(&mut self, request: Request) -> Result<ResponsePayload> {
         let request_id = self.take_request_id();
         let payload = encode(&request)?;
@@ -332,6 +369,18 @@ mod tests {
             .await
             .expect("attach open should succeed");
         assert_eq!(attached_id, session_id);
+
+        let bytes_sent = client
+            .attach_input(session_id, b"echo-me".to_vec())
+            .await
+            .expect("attach input should succeed");
+        assert_eq!(bytes_sent, 7);
+
+        let output = client
+            .attach_output(session_id, 64)
+            .await
+            .expect("attach output should succeed");
+        assert_eq!(output, b"echo-me".to_vec());
 
         client.detach().await.expect("detach should succeed");
 
