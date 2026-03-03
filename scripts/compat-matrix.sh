@@ -8,6 +8,49 @@ HOME_DIR="$WORK_DIR/home"
 CONFIG_FILE=""
 TRACE_LIMIT="${BMUX_COMPAT_TRACE_LIMIT:-500}"
 BMUX_BIN="$ROOT_DIR/target/debug/bmux"
+SCENARIO_FILTER="all"
+
+usage() {
+  cat <<'EOF'
+Usage: ./scripts/compat-matrix.sh [--scenario fish|vim|fzf|all]
+
+Options:
+  --scenario <name>   Run a single scenario (fish, vim, fzf) or all (default)
+  -h, --help          Show this help message
+EOF
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --scenario)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --scenario requires a value" >&2
+        usage
+        exit 1
+      fi
+      SCENARIO_FILTER="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "error: unknown argument '$1'" >&2
+      usage
+      exit 1
+      ;;
+  esac
+done
+
+case "$SCENARIO_FILTER" in
+  all|fish|vim|fzf)
+    ;;
+  *)
+    echo "error: invalid scenario '$SCENARIO_FILTER' (expected fish|vim|fzf|all)" >&2
+    exit 1
+    ;;
+esac
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "error: jq is required for compatibility assertions" >&2
@@ -337,22 +380,28 @@ run_matrix_for_scenario() {
 
 echo -e "scenario\tprofile\tstatus\tnotes" >"$RESULTS_FILE"
 
-if command -v fish >/dev/null 2>&1; then
-  run_matrix_for_scenario "fish" "$(command -v fish)"
-else
-  echo -e "fish\tall\tSKIP\tfish not installed" >>"$RESULTS_FILE"
+if [[ "$SCENARIO_FILTER" == "all" || "$SCENARIO_FILTER" == "fish" ]]; then
+  if command -v fish >/dev/null 2>&1; then
+    run_matrix_for_scenario "fish" "$(command -v fish)"
+  else
+    echo -e "fish\tall\tSKIP\tfish not installed" >>"$RESULTS_FILE"
+  fi
 fi
 
-if command -v vim >/dev/null 2>&1; then
-  run_matrix_for_scenario "vim" "$(command -v vim)"
-else
-  echo -e "vim\tall\tSKIP\tvim not installed" >>"$RESULTS_FILE"
+if [[ "$SCENARIO_FILTER" == "all" || "$SCENARIO_FILTER" == "vim" ]]; then
+  if command -v vim >/dev/null 2>&1; then
+    run_matrix_for_scenario "vim" "$(command -v vim)"
+  else
+    echo -e "vim\tall\tSKIP\tvim not installed" >>"$RESULTS_FILE"
+  fi
 fi
 
-if command -v fzf >/dev/null 2>&1; then
-  run_matrix_for_scenario "fzf" "$(command -v fzf)"
-else
-  echo -e "fzf\tall\tSKIP\tfzf not installed" >>"$RESULTS_FILE"
+if [[ "$SCENARIO_FILTER" == "all" || "$SCENARIO_FILTER" == "fzf" ]]; then
+  if command -v fzf >/dev/null 2>&1; then
+    run_matrix_for_scenario "fzf" "$(command -v fzf)"
+  else
+    echo -e "fzf\tall\tSKIP\tfzf not installed" >>"$RESULTS_FILE"
+  fi
 fi
 
 printf "Compatibility Matrix\n"
