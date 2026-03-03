@@ -7,9 +7,15 @@ RESULTS_FILE="$WORK_DIR/results.tsv"
 HOME_DIR="$WORK_DIR/home"
 CONFIG_FILE=""
 TRACE_LIMIT="${BMUX_COMPAT_TRACE_LIMIT:-500}"
+BMUX_BIN="$ROOT_DIR/target/debug/bmux"
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "error: jq is required for compatibility assertions" >&2
+  exit 1
+fi
+
+if ! cargo build -q -p bmux_cli >/dev/null 2>&1; then
+  echo "error: failed to build bmux_cli before matrix run" >&2
   exit 1
 fi
 
@@ -106,7 +112,7 @@ profile_for_effective_term() {
 }
 
 doctor_trace_json() {
-  cargo run -q -p bmux_cli -- terminal doctor --json --trace --trace-limit "$TRACE_LIMIT"
+  "$BMUX_BIN" terminal doctor --json --trace --trace-limit "$TRACE_LIMIT"
 }
 
 event_index() {
@@ -139,6 +145,8 @@ make_shell_wrapper() {
       cat >"$wrapper" <<EOF
 #!/usr/bin/env bash
 printf "__SCENARIO_fish__\\n"
+# Emit an explicit DA probe so transcript assertions are deterministic
+printf '\\033[c'
 exec "$shell_bin"
 EOF
       ;;
@@ -183,7 +191,7 @@ run_case() {
   local status="PASS"
   local notes="ok"
 
-  if ! script -q "$log_file" sh -lc "(sleep 2; printf '\001q') | cargo run -q -p bmux_cli -- --shell '$wrapper' --no-alt-screen" >/dev/null 2>&1; then
+  if ! script -q "$log_file" sh -lc "(sleep 2; printf '\001q') | '$BMUX_BIN' --shell '$wrapper' --no-alt-screen" >/dev/null 2>&1; then
     status="FAIL"
     notes="bmux command failed"
   fi
@@ -246,9 +254,7 @@ run_case() {
   if [[ "$status" == "PASS" ]]; then
     case "$scenario" in
       fish)
-        if [[ "$profile_name" == "bmux" ]]; then
-          :
-        elif ! assert_query_reply_pair "$trace_json_file" "csi_primary_da"; then
+        if ! assert_query_reply_pair "$trace_json_file" "csi_primary_da"; then
           status="FAIL"
           notes="fish_missing_primary_da_pair"
         fi
