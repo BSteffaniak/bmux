@@ -250,6 +250,9 @@ fn run_server_status() -> Result<u8> {
 
     match status {
         true => {
+            if let Some(event_name) = latest_server_event_name()? {
+                println!("latest server event: {event_name}");
+            }
             println!("bmux server is running");
             Ok(0)
         }
@@ -257,6 +260,39 @@ fn run_server_status() -> Result<u8> {
             println!("bmux server is not running");
             Ok(1)
         }
+    }
+}
+
+fn latest_server_event_name() -> Result<Option<&'static str>> {
+    run_async(async {
+        let connect = tokio::time::timeout(
+            SERVER_STATUS_TIMEOUT,
+            BmuxClient::connect_default("bmux-cli-status-events"),
+        )
+        .await;
+
+        let mut client = match connect {
+            Ok(Ok(client)) => client,
+            Ok(Err(_)) | Err(_) => return Ok(None),
+        };
+
+        let _ = tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.subscribe_events()).await;
+        let events = match tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.poll_events(1)).await {
+            Ok(Ok(events)) => events,
+            Ok(Err(_)) | Err(_) => return Ok(None),
+        };
+        Ok(events.last().map(server_event_name))
+    })
+}
+
+fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
+    match event {
+        bmux_client::ServerEvent::ServerStarted => "server_started",
+        bmux_client::ServerEvent::ServerStopping => "server_stopping",
+        bmux_client::ServerEvent::SessionCreated { .. } => "session_created",
+        bmux_client::ServerEvent::SessionRemoved { .. } => "session_removed",
+        bmux_client::ServerEvent::ClientAttached { .. } => "client_attached",
+        bmux_client::ServerEvent::ClientDetached { .. } => "client_detached",
     }
 }
 
@@ -2290,6 +2326,20 @@ mod tests {
             error
                 .to_string()
                 .contains("session already has an active attached client")
+        );
+    }
+
+    #[test]
+    fn server_event_name_maps_known_variants() {
+        assert_eq!(
+            super::server_event_name(&bmux_client::ServerEvent::ServerStarted),
+            "server_started"
+        );
+        assert_eq!(
+            super::server_event_name(&bmux_client::ServerEvent::ClientDetached {
+                id: uuid::Uuid::new_v4()
+            }),
+            "client_detached"
         );
     }
 }

@@ -143,6 +143,10 @@ pub enum Request {
         session_id: Uuid,
         max_bytes: usize,
     },
+    SubscribeEvents,
+    PollEvents {
+        max_events: usize,
+    },
     Detach,
 }
 
@@ -176,6 +180,8 @@ pub enum ResponsePayload {
     AttachReady { session_id: Uuid },
     AttachInputAccepted { bytes: usize },
     AttachOutput { data: Vec<u8> },
+    EventsSubscribed,
+    EventBatch { events: Vec<Event> },
     Detached,
     ServerStopping,
 }

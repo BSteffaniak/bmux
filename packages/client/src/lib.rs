@@ -11,6 +11,7 @@ use bmux_ipc::{
     AttachGrant, Envelope, EnvelopeKind, ErrorCode, IpcEndpoint, ProtocolVersion, Request,
     Response, ResponsePayload, SessionSelector, SessionSummary, decode, encode,
 };
+pub use bmux_ipc::Event as ServerEvent;
 use std::time::Duration;
 use thiserror::Error;
 use tracing::debug;
@@ -265,6 +266,32 @@ impl BmuxClient {
         }
     }
 
+    /// Subscribe this client to server lifecycle events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn subscribe_events(&mut self) -> Result<()> {
+        match self.request(Request::SubscribeEvents).await? {
+            ResponsePayload::EventsSubscribed => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected events subscribed response",
+            )),
+        }
+    }
+
+    /// Poll server lifecycle events for this client subscription.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn poll_events(&mut self, max_events: usize) -> Result<Vec<ServerEvent>> {
+        match self.request(Request::PollEvents { max_events }).await? {
+            ResponsePayload::EventBatch { events } => Ok(events),
+            _ => Err(ClientError::UnexpectedResponse("expected event batch response")),
+        }
+    }
+
     async fn request(&mut self, request: Request) -> Result<ResponsePayload> {
         let request_id = self.take_request_id();
         let payload = encode(&request)?;
@@ -328,7 +355,7 @@ fn endpoint_from_paths(paths: &ConfigPaths) -> IpcEndpoint {
 
 #[cfg(test)]
 mod tests {
-    use super::BmuxClient;
+    use super::{BmuxClient, ServerEvent};
     use bmux_ipc::{IpcEndpoint, SessionSelector};
     use bmux_server::BmuxServer;
     use std::path::PathBuf;
@@ -351,6 +378,11 @@ mod tests {
             .new_session(Some("dev".to_string()))
             .await
             .expect("new-session should succeed");
+
+        client
+            .subscribe_events()
+            .await
+            .expect("event subscribe should succeed");
 
         let sessions = client
             .list_sessions()
@@ -381,6 +413,17 @@ mod tests {
             .await
             .expect("attach output should succeed");
         assert_eq!(output, b"echo-me".to_vec());
+
+        let events = client
+            .poll_events(10)
+            .await
+            .expect("event poll should succeed");
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ServerEvent::ClientAttached { id } if *id == session_id
+            )
+        }));
 
         client.detach().await.expect("detach should succeed");
 

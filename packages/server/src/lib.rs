@@ -10,7 +10,7 @@ use bmux_config::ConfigPaths;
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
     AttachGrant, CURRENT_PROTOCOL_VERSION, Envelope, EnvelopeKind, ErrorCode, ErrorResponse,
-    IpcEndpoint, ProtocolVersion, Request, Response, ResponsePayload, SessionSelector,
+    Event, IpcEndpoint, ProtocolVersion, Request, Response, ResponsePayload, SessionSelector,
     SessionSummary, decode, encode,
 };
 use bmux_session::{ClientId, SessionId, SessionManager};
@@ -38,7 +38,65 @@ struct ServerState {
     session_manager: Mutex<SessionManager>,
     session_runtimes: Mutex<SessionRuntimeManager>,
     attach_tokens: Mutex<AttachTokenManager>,
+    event_hub: Mutex<EventHub>,
     handshake_timeout: Duration,
+}
+
+#[derive(Debug)]
+struct EventHub {
+    events: Vec<EventRecord>,
+    subscribers: BTreeMap<ClientId, usize>,
+    max_events: usize,
+}
+
+#[derive(Debug, Clone)]
+struct EventRecord {
+    event: Event,
+}
+
+impl EventHub {
+    fn new(max_events: usize) -> Self {
+        Self {
+            events: Vec::new(),
+            subscribers: BTreeMap::new(),
+            max_events,
+        }
+    }
+
+    fn emit(&mut self, event: Event) {
+        self.events.push(EventRecord { event });
+        if self.events.len() > self.max_events {
+            let dropped = self.events.len() - self.max_events;
+            self.events.drain(..dropped);
+            for cursor in self.subscribers.values_mut() {
+                *cursor = cursor.saturating_sub(dropped);
+            }
+        }
+    }
+
+    fn subscribe(&mut self, client_id: ClientId) {
+        let start = self.events.len().saturating_sub(32);
+        self.subscribers.insert(client_id, start);
+    }
+
+    fn unsubscribe(&mut self, client_id: ClientId) {
+        self.subscribers.remove(&client_id);
+    }
+
+    fn poll(&mut self, client_id: ClientId, max_events: usize) -> Option<Vec<Event>> {
+        let cursor = self.subscribers.get_mut(&client_id)?;
+        let start = *cursor;
+        let count = max_events.max(1);
+        let events = self
+            .events
+            .iter()
+            .skip(start)
+            .take(count)
+            .map(|record| record.event.clone())
+            .collect::<Vec<_>>();
+        *cursor = start + events.len();
+        Some(events)
+    }
 }
 
 #[derive(Debug)]
@@ -329,6 +387,7 @@ impl BmuxServer {
                 session_manager: Mutex::new(SessionManager::new()),
                 session_runtimes: Mutex::new(SessionRuntimeManager::default()),
                 attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
+                event_hub: Mutex::new(EventHub::new(1024)),
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             }),
             shutdown_tx,
@@ -374,6 +433,7 @@ impl BmuxServer {
             .await
             .with_context(|| format!("failed binding server endpoint {:?}", self.endpoint))?;
         info!("bmux server listening on {:?}", self.endpoint);
+        emit_event(&self.state, Event::ServerStarted)?;
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         loop {
@@ -409,6 +469,7 @@ impl BmuxServer {
         if let Ok(mut runtime_manager) = self.state.session_runtimes.lock() {
             runtime_manager.stop_all_runtimes();
         }
+        let _ = emit_event(&self.state, Event::ServerStopping);
         if let Ok(mut attach_tokens) = self.state.attach_tokens.lock() {
             attach_tokens.clear();
         }
@@ -505,7 +566,26 @@ async fn handle_connection(
     }
 
     detach_client_if_attached(&state, client_id, &mut attached_session)?;
+    unsubscribe_events(&state, client_id)?;
 
+    Ok(())
+}
+
+fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
+    let mut hub = state
+        .event_hub
+        .lock()
+        .map_err(|_| anyhow::anyhow!("event hub lock poisoned"))?;
+    hub.emit(event);
+    Ok(())
+}
+
+fn unsubscribe_events(state: &Arc<ServerState>, client_id: ClientId) -> Result<()> {
+    let mut hub = state
+        .event_hub
+        .lock()
+        .map_err(|_| anyhow::anyhow!("event hub lock poisoned"))?;
+    hub.unsubscribe(client_id);
     Ok(())
 }
 
@@ -633,6 +713,8 @@ async fn handle_request(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
             attach_tokens.remove_for_session(session_id);
+
+            emit_event(state, Event::SessionRemoved { id: session_id.0 })?;
 
             Response::Ok(ResponsePayload::SessionKilled { id: session_id.0 })
         }
@@ -805,10 +887,50 @@ async fn handle_request(
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
                 runtime_manager.end_attach(current_session_id, client_id);
+                emit_event(
+                    state,
+                    Event::ClientDetached {
+                        id: current_session_id.0,
+                    },
+                )?;
             }
             Response::Ok(ResponsePayload::Detached)
         }
+        Request::SubscribeEvents => {
+            let mut hub = state
+                .event_hub
+                .lock()
+                .map_err(|_| anyhow::anyhow!("event hub lock poisoned"))?;
+            hub.subscribe(client_id);
+            Response::Ok(ResponsePayload::EventsSubscribed)
+        }
+        Request::PollEvents { max_events } => {
+            let mut hub = state
+                .event_hub
+                .lock()
+                .map_err(|_| anyhow::anyhow!("event hub lock poisoned"))?;
+            match hub.poll(client_id, max_events) {
+                Some(events) => Response::Ok(ResponsePayload::EventBatch { events }),
+                None => Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "event subscription not found for client".to_string(),
+                }),
+            }
+        }
     };
+
+    if let Response::Ok(ResponsePayload::SessionCreated { id, name }) = &response {
+        emit_event(
+            state,
+            Event::SessionCreated {
+                id: *id,
+                name: name.clone(),
+            },
+        )?;
+    }
+    if let Response::Ok(ResponsePayload::AttachReady { session_id }) = &response {
+        emit_event(state, Event::ClientAttached { id: *session_id })?;
+    }
 
     Ok(response)
 }
@@ -836,6 +958,9 @@ fn detach_client_if_attached(
         .lock()
         .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
     runtime_manager.end_attach(session_id, client_id);
+    drop(runtime_manager);
+
+    emit_event(state, Event::ClientDetached { id: session_id.0 })?;
 
     Ok(())
 }
@@ -898,8 +1023,8 @@ mod tests {
     use super::BmuxServer;
     use bmux_ipc::transport::LocalIpcStream;
     use bmux_ipc::{
-        Envelope, EnvelopeKind, ErrorCode, ErrorResponse, IpcEndpoint, ProtocolVersion, Request,
-        Response, ResponsePayload, SessionSelector, decode, encode,
+        Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, ProtocolVersion,
+        Request, Response, ResponsePayload, SessionSelector, decode, encode,
     };
     use bmux_session::SessionId;
     use std::path::Path;
@@ -1291,6 +1416,97 @@ mod tests {
             reopen,
             Response::Ok(ResponsePayload::AttachReady { session_id })
         );
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn event_subscription_reports_lifecycle_order() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut client = connect_and_handshake(&endpoint).await;
+
+        let subscribed = send_request(&mut client, 80, Request::SubscribeEvents).await;
+        assert_eq!(subscribed, Response::Ok(ResponsePayload::EventsSubscribed));
+
+        let created = send_request(
+            &mut client,
+            81,
+            Request::NewSession {
+                name: Some("events".to_string()),
+            },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected create response: {other:?}"),
+        };
+
+        let grant = match send_request(
+            &mut client,
+            82,
+            Request::Attach {
+                selector: SessionSelector::ById(session_id),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::Attached { grant }) => grant,
+            other => panic!("unexpected attach response: {other:?}"),
+        };
+        let opened = send_request(
+            &mut client,
+            83,
+            Request::AttachOpen {
+                session_id,
+                attach_token: grant.attach_token,
+            },
+        )
+        .await;
+        assert_eq!(opened, Response::Ok(ResponsePayload::AttachReady { session_id }));
+
+        let detached = send_request(&mut client, 84, Request::Detach).await;
+        assert_eq!(detached, Response::Ok(ResponsePayload::Detached));
+
+        let killed = send_request(
+            &mut client,
+            85,
+            Request::KillSession {
+                selector: SessionSelector::ById(session_id),
+            },
+        )
+        .await;
+        assert_eq!(
+            killed,
+            Response::Ok(ResponsePayload::SessionKilled { id: session_id })
+        );
+
+        let events = send_request(&mut client, 86, Request::PollEvents { max_events: 10 }).await;
+        let events = match events {
+            Response::Ok(ResponsePayload::EventBatch { events }) => events,
+            other => panic!("unexpected events response: {other:?}"),
+        };
+
+        let created_idx = events
+            .iter()
+            .position(|event| matches!(event, Event::SessionCreated { id, .. } if *id == session_id))
+            .expect("session_created event should exist");
+        let attached_idx = events
+            .iter()
+            .position(|event| matches!(event, Event::ClientAttached { id } if *id == session_id))
+            .expect("client_attached event should exist");
+        let detached_idx = events
+            .iter()
+            .position(|event| matches!(event, Event::ClientDetached { id } if *id == session_id))
+            .expect("client_detached event should exist");
+        let removed_idx = events
+            .iter()
+            .position(|event| matches!(event, Event::SessionRemoved { id } if *id == session_id))
+            .expect("session_removed event should exist");
+
+        assert!(created_idx < attached_idx);
+        assert!(attached_idx < detached_idx);
+        assert!(detached_idx < removed_idx);
 
         stop_server(server, server_task, &socket_path).await;
     }
