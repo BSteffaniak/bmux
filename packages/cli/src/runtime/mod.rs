@@ -323,17 +323,50 @@ fn run_event_input_loop(
     user_input_seen: &Arc<AtomicBool>,
     processor: &mut InputProcessor,
 ) -> Result<()> {
+    let mut reader = CrosstermEventReader;
+    run_event_input_loop_with_reader(
+        &mut reader,
+        input_tx,
+        shutdown_requested,
+        user_input_seen,
+        processor,
+    )
+}
+
+trait EventReader {
+    fn poll(&mut self, timeout: Duration) -> Result<bool>;
+    fn read(&mut self) -> Result<Event>;
+}
+
+struct CrosstermEventReader;
+
+impl EventReader for CrosstermEventReader {
+    fn poll(&mut self, timeout: Duration) -> Result<bool> {
+        event::poll(timeout).context("failed polling terminal input")
+    }
+
+    fn read(&mut self) -> Result<Event> {
+        event::read().context("failed reading terminal event")
+    }
+}
+
+fn run_event_input_loop_with_reader<R: EventReader>(
+    reader: &mut R,
+    input_tx: &Sender<RuntimeAction>,
+    shutdown_requested: &Arc<AtomicBool>,
+    user_input_seen: &Arc<AtomicBool>,
+    processor: &mut InputProcessor,
+) -> Result<()> {
     loop {
         if shutdown_requested.load(Ordering::Relaxed) {
             break;
         }
 
-        if !event::poll(INPUT_POLL_INTERVAL).context("failed polling terminal input")? {
+        if !reader.poll(INPUT_POLL_INTERVAL)? {
             continue;
         }
 
-        let event = event::read().context("failed reading terminal event")?;
-        if let Some(bytes) = event_to_bytes(event) {
+        if let Some(bytes) = event_to_bytes(reader.read()?) {
             user_input_seen.store(true, Ordering::Relaxed);
             for action in processor.process_chunk(&bytes) {
                 let _ = input_tx.send(action);
@@ -638,13 +671,36 @@ fn reap_exited_panes(
 
 #[cfg(test)]
 mod tests {
-    use super::{PaneRuntime, PaneState, key_to_bytes, reap_exited_panes};
+    use super::{
+        EventReader, PaneRuntime, PaneState, key_to_bytes, reap_exited_panes,
+        run_event_input_loop_with_reader,
+    };
+    use crate::input::{InputProcessor, Keymap};
     use crate::pane::{LayoutNode, LayoutTree, PaneId, SplitDirection};
-    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::collections::BTreeMap;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::mpsc;
     use std::sync::{Arc, Mutex};
+    use std::time::Duration;
     use vt100::Parser as VtParser;
+
+    struct MockEventReader {
+        poll_calls: usize,
+        shutdown_requested: Arc<AtomicBool>,
+    }
+
+    impl EventReader for MockEventReader {
+        fn poll(&mut self, _timeout: Duration) -> anyhow::Result<bool> {
+            self.poll_calls += 1;
+            self.shutdown_requested.store(true, Ordering::Relaxed);
+            Ok(false)
+        }
+
+        fn read(&mut self) -> anyhow::Result<Event> {
+            panic!("read should not be called when poll returns false");
+        }
+    }
 
     fn make_inactive_pane(exit_code: Option<u8>) -> PaneRuntime {
         PaneRuntime {
@@ -716,5 +772,31 @@ mod tests {
         };
 
         assert_eq!(key_to_bytes(key), Some(vec![0x1b, b'[', b'A']));
+    }
+
+    #[test]
+    fn event_loop_observes_shutdown_without_blocking() {
+        let (tx, rx) = mpsc::channel();
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let user_input_seen = Arc::new(AtomicBool::new(false));
+        let mut processor = InputProcessor::new(Keymap::default_runtime());
+        let mut reader = MockEventReader {
+            poll_calls: 0,
+            shutdown_requested: Arc::clone(&shutdown_requested),
+        };
+
+        run_event_input_loop_with_reader(
+            &mut reader,
+            &tx,
+            &shutdown_requested,
+            &user_input_seen,
+            &mut processor,
+        )
+        .expect("event loop should exit cleanly");
+
+        assert_eq!(reader.poll_calls, 1);
+        assert!(shutdown_requested.load(Ordering::Relaxed));
+        assert!(!user_input_seen.load(Ordering::Relaxed));
+        assert!(rx.try_recv().is_err());
     }
 }
