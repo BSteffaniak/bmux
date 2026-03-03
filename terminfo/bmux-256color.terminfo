@@ -1,0 +1,2 @@
+bmux-256color|bmux terminal multiplexer 256-color,
+    use=xterm-256color,

@@ -41,10 +41,13 @@ pub(super) fn process_input_events(
             Ok(RuntimeAction::ForwardToPane(bytes)) => {
                 if let Some(active_pane) = panes.get_mut(focused_pane) {
                     if let Some(process) = active_pane.process.as_mut() {
-                        process
+                        let mut writer = process
                             .writer
+                            .lock()
+                            .expect("pane PTY writer mutex poisoned");
+                        writer
                             .write_all(&bytes)
-                            .and_then(|_| process.writer.flush())
+                            .and_then(|_| writer.flush())
                             .context("failed writing input to pane")?;
                     }
                 }

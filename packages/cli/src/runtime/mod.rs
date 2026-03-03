@@ -27,6 +27,7 @@ mod compositor;
 mod pane_runtime;
 mod persistence;
 mod status_message;
+mod terminal_protocol;
 use commands::process_input_events;
 use compositor::{RenderCache, RenderDebugState, render_frame};
 use pane_runtime::{
@@ -35,6 +36,7 @@ use pane_runtime::{
 };
 use persistence::{load_persisted_runtime_state, save_persisted_runtime_state};
 use status_message::StatusMessage;
+use terminal_protocol::supported_query_names;
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -58,7 +60,7 @@ struct PaneRuntime {
 
 struct PaneProcess {
     master: Box<dyn MasterPty + Send>,
-    writer: Box<dyn Write + Send>,
+    writer: Arc<Mutex<Box<dyn Write + Send>>>,
     child: Box<dyn Child + Send>,
     output_thread: Option<thread::JoinHandle<Result<()>>>,
 }
@@ -166,6 +168,7 @@ fn run_terminal_doctor(as_json: bool) -> Result<u8> {
             "configured_pane_term": configured_term,
             "effective_pane_term": effective.pane_term,
             "terminal_profile": terminal_profile_name(effective.profile),
+            "supported_queries": supported_query_names(),
             "terminfo_check": {
                 "attempted": effective.terminfo_checked,
                 "available": effective.terminfo_available,
@@ -187,6 +190,7 @@ fn run_terminal_doctor(as_json: bool) -> Result<u8> {
         "terminal profile: {}",
         terminal_profile_name(effective.profile)
     );
+    println!("supported queries: {}", supported_query_names().join(", "));
     if effective.terminfo_checked {
         println!(
             "terminfo available: {}",
@@ -752,7 +756,7 @@ fn resolve_pane_term(configured: &str) -> PaneTermResolution {
     let terminfo_check = check_terminfo_available(&pane_term);
     if pane_term == "bmux-256color" && terminfo_check == Some(false) {
         warnings.push(
-            "terminfo for bmux-256color not found; falling back to xterm-256color".to_string(),
+            "terminfo for bmux-256color not found; run scripts/install-terminfo.sh (falling back to xterm-256color)".to_string(),
         );
         pane_term = "xterm-256color".to_string();
         profile = profile_for_term(&pane_term);
@@ -960,8 +964,7 @@ fn reap_exited_panes(
 mod tests {
     use super::{
         EventReader, PaneRuntime, PaneState, TerminalProfile, key_to_bytes, profile_for_term,
-        reap_exited_panes,
-        run_event_input_loop_with_reader,
+        reap_exited_panes, run_event_input_loop_with_reader,
     };
     use crate::input::{InputProcessor, Keymap};
     use crate::pane::{LayoutNode, LayoutTree, PaneId, SplitDirection};
@@ -1105,7 +1108,10 @@ mod tests {
 
     #[test]
     fn pane_term_profile_mapping_is_stable() {
-        assert_eq!(profile_for_term("bmux-256color"), TerminalProfile::Bmux256Color);
+        assert_eq!(
+            profile_for_term("bmux-256color"),
+            TerminalProfile::Bmux256Color
+        );
         assert_eq!(
             profile_for_term("screen-256color"),
             TerminalProfile::Screen256Color
@@ -1118,6 +1124,9 @@ mod tests {
             profile_for_term("xterm-256color"),
             TerminalProfile::Xterm256Color
         );
-        assert_eq!(profile_for_term("weird-term"), TerminalProfile::Conservative);
+        assert_eq!(
+            profile_for_term("weird-term"),
+            TerminalProfile::Conservative
+        );
     }
 }

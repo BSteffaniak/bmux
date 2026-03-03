@@ -1,10 +1,11 @@
 use super::{MIN_PANE_COLS, MIN_PANE_ROWS, PaneProcess, PaneRuntime, PaneState};
 use crate::pane::{PaneId, Rect};
 use crate::pty::extract_filtered_output;
+use crate::runtime::terminal_protocol::TerminalProtocolEngine;
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::BTreeMap;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -91,13 +92,16 @@ pub(super) fn spawn_pane_process(
         .master
         .take_writer()
         .context("failed to open pane PTY writer")?;
+    let writer = Arc::new(Mutex::new(writer));
 
     let state_for_thread = Arc::clone(&state);
+    let writer_for_thread = Arc::clone(&writer);
     let output_thread = thread::Builder::new()
         .name(format!("bmux-pane-output-{title}"))
         .spawn(move || -> Result<()> {
             let mut buffer = [0_u8; 8192];
             let mut pending = Vec::new();
+            let mut protocol_engine = TerminalProtocolEngine::default();
 
             loop {
                 let bytes_read = reader
@@ -120,6 +124,17 @@ pub(super) fn spawn_pane_process(
 
                 if output.is_empty() {
                     continue;
+                }
+
+                let reply = protocol_engine.process_output(&output);
+                if !reply.is_empty() {
+                    let mut writer = writer_for_thread
+                        .lock()
+                        .expect("pane PTY writer mutex poisoned");
+                    writer
+                        .write_all(&reply)
+                        .and_then(|_| writer.flush())
+                        .context("failed writing terminal protocol reply to pane")?;
                 }
 
                 let mut parser = state_for_thread
