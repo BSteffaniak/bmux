@@ -6,6 +6,7 @@ use crate::pane::{LayoutTree, PaneId, Rect, ResizeDirection, SplitDirection};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::io::Write;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
@@ -32,6 +33,7 @@ pub(super) fn process_input_events(
     exit_override: &mut Option<u8>,
     status_message: &mut Option<StatusMessage>,
     scroll_state: &mut ScrollState,
+    internal_clipboard: &mut Option<String>,
     startup_deadline: Instant,
     user_input_seen: Arc<AtomicBool>,
     scrollback_limit: usize,
@@ -300,7 +302,7 @@ pub(super) fn process_input_events(
                     }
                     RuntimeAction::ShowHelp => {
                         *status_message = Some(StatusMessage::new(
-                            "Ctrl-A: q quit | o cycle | h/j/k/l or arrows focus | H/J/K/L directional resize | t toggle layout | % split-v | \" split-h | +/- resize | [ scroll mode | Esc (or ]) exit scroll | arrows/Ctrl-Y/Ctrl-E line | PgUp/PgDn page | g/G top/bottom | r restart | x close | ? help"
+                            "Ctrl-A: q quit | o cycle | h/j/k/l or arrows focus | H/J/K/L directional resize | t toggle layout | % split-v | \" split-h | +/- resize | [ scroll mode | Esc (or ]) exit scroll | arrows/Ctrl-Y/Ctrl-E line | PgUp/PgDn page | g/G top/bottom | y copy view | r restart | x close | ? help"
                                 .to_string(),
                         ));
                     }
@@ -317,7 +319,7 @@ pub(super) fn process_input_events(
                             active_pane.state.dirty.store(true, Ordering::Relaxed);
                         }
                         *status_message = Some(StatusMessage::new(
-                            "scroll mode: arrows/Ctrl-Y/Ctrl-E line, PgUp/PgDn page, g/G top/bottom, Esc exit"
+                            "scroll mode: arrows/Ctrl-Y/Ctrl-E line, PgUp/PgDn page, g/G top/bottom, y copy, Esc exit"
                                 .to_string(),
                         ));
                     }
@@ -350,6 +352,36 @@ pub(super) fn process_input_events(
                                 pane_rects,
                                 scroll_state,
                             );
+                        }
+                    }
+                    RuntimeAction::CopyScrollback => {
+                        if scroll_state.active {
+                            if let Some(active_pane) = panes.get_mut(focused_pane) {
+                                let parser = active_pane
+                                    .state
+                                    .parser
+                                    .lock()
+                                    .expect("pane parser mutex poisoned");
+                                let text = parser.screen().contents();
+                                drop(parser);
+
+                                if text.is_empty() {
+                                    *status_message = Some(StatusMessage::new(
+                                        "nothing to copy in current pane view".to_string(),
+                                    ));
+                                } else if copy_to_system_clipboard(&text) {
+                                    *status_message = Some(StatusMessage::new(format!(
+                                        "copied {} chars to system clipboard",
+                                        text.chars().count()
+                                    )));
+                                } else {
+                                    *internal_clipboard = Some(text.clone());
+                                    *status_message = Some(StatusMessage::new(format!(
+                                        "system clipboard unavailable; copied {} chars to internal buffer",
+                                        text.chars().count()
+                                    )));
+                                }
+                            }
                         }
                     }
                     RuntimeAction::ForwardToPane(_) => unreachable!(),
@@ -434,6 +466,53 @@ fn apply_scrollback_action(
     let applied = parser.screen().scrollback();
     scroll_state.offsets.insert(focused_pane, applied);
     active_pane.state.dirty.store(true, Ordering::Relaxed);
+}
+
+fn copy_to_system_clipboard(contents: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        if run_clipboard_command("pbcopy", &[], contents) {
+            return true;
+        }
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        if run_clipboard_command("wl-copy", &[], contents) {
+            return true;
+        }
+        if run_clipboard_command("xclip", &["-selection", "clipboard"], contents) {
+            return true;
+        }
+        if run_clipboard_command("xsel", &["--clipboard", "--input"], contents) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn run_clipboard_command(command: &str, args: &[&str], contents: &str) -> bool {
+    let mut child = match ProcessCommand::new(command)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return false,
+    };
+
+    if let Some(mut stdin) = child.stdin.take() {
+        if stdin.write_all(contents.as_bytes()).is_err() {
+            let _ = child.kill();
+            let _ = child.wait();
+            return false;
+        }
+    }
+
+    child.wait().is_ok_and(|status| status.success())
 }
 
 fn focus_in_direction(
@@ -609,6 +688,7 @@ mod tests {
         let mut exit_override = None;
         let mut status_message = None;
         let mut scroll_state = ScrollState::default();
+        let mut internal_clipboard = None;
 
         let (tx, rx) = mpsc::channel();
         tx.send(RuntimeAction::CloseFocusedPane)
@@ -626,6 +706,7 @@ mod tests {
             &mut exit_override,
             &mut status_message,
             &mut scroll_state,
+            &mut internal_clipboard,
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
             10_000,
@@ -661,6 +742,7 @@ mod tests {
         let mut exit_override = None;
         let mut status_message = None;
         let mut scroll_state = ScrollState::default();
+        let mut internal_clipboard = None;
 
         let (tx, rx) = mpsc::channel();
         tx.send(RuntimeAction::ToggleSplitDirection)
@@ -679,6 +761,7 @@ mod tests {
             &mut exit_override,
             &mut status_message,
             &mut scroll_state,
+            &mut internal_clipboard,
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
             10_000,
@@ -731,6 +814,7 @@ mod tests {
         let mut exit_override = None;
         let mut status_message = None;
         let mut scroll_state = ScrollState::default();
+        let mut internal_clipboard = None;
 
         let (tx, rx) = mpsc::channel();
         tx.send(RuntimeAction::FocusLeft).expect("send left");
@@ -749,6 +833,7 @@ mod tests {
             &mut exit_override,
             &mut status_message,
             &mut scroll_state,
+            &mut internal_clipboard,
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
             10_000,
@@ -860,6 +945,7 @@ mod tests {
         let mut exit_override = None;
         let mut status_message = None;
         let mut scroll_state = ScrollState::default();
+        let mut internal_clipboard = None;
 
         let (tx, rx) = mpsc::channel();
         tx.send(RuntimeAction::ResizeUp).expect("send resize up");
@@ -876,6 +962,7 @@ mod tests {
             &mut exit_override,
             &mut status_message,
             &mut scroll_state,
+            &mut internal_clipboard,
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
             10_000,
@@ -911,6 +998,7 @@ mod tests {
         let mut exit_override = None;
         let mut status_message = None;
         let mut scroll_state = ScrollState::default();
+        let mut internal_clipboard = None;
 
         let (tx, rx) = mpsc::channel();
         tx.send(RuntimeAction::ResizeUp).expect("send resize up");
@@ -927,6 +1015,7 @@ mod tests {
             &mut exit_override,
             &mut status_message,
             &mut scroll_state,
+            &mut internal_clipboard,
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
             10_000,
@@ -958,6 +1047,7 @@ mod tests {
         let mut exit_override = None;
         let mut status_message = None;
         let mut scroll_state = ScrollState::default();
+        let mut internal_clipboard = None;
 
         let (tx, rx) = mpsc::channel();
         tx.send(RuntimeAction::EnterScrollMode)
@@ -982,6 +1072,7 @@ mod tests {
             &mut exit_override,
             &mut status_message,
             &mut scroll_state,
+            &mut internal_clipboard,
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
             10_000,

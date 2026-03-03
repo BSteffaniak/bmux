@@ -83,6 +83,7 @@ fn default_runtime_bindings() -> BTreeMap<String, String> {
     bindings.insert("page_down".to_string(), "scroll_down_page".to_string());
     bindings.insert("g".to_string(), "scroll_top".to_string());
     bindings.insert("shift+g".to_string(), "scroll_bottom".to_string());
+    bindings.insert("y".to_string(), "copy_scrollback".to_string());
     bindings.insert("q".to_string(), "quit".to_string());
     bindings
 }

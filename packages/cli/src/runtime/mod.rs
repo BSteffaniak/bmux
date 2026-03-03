@@ -469,6 +469,7 @@ fn run_two_pane_runtime(
     let mut render_debug =
         RenderDebugState::new(debug_render, debug_render_log, debug_render_log_format)?;
     let mut scroll_state = ScrollState::default();
+    let mut internal_clipboard: Option<String> = None;
     let mut persistence_dirty = true;
 
     let exit_code = loop {
@@ -484,6 +485,7 @@ fn run_two_pane_runtime(
             &mut exit_override,
             &mut status_message,
             &mut scroll_state,
+            &mut internal_clipboard,
             startup_deadline,
             Arc::clone(&user_input_seen),
             runtime_settings.scrollback_limit,

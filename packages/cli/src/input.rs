@@ -33,6 +33,7 @@ pub(crate) enum RuntimeAction {
     ScrollDownPage,
     ScrollTop,
     ScrollBottom,
+    CopyScrollback,
     ForwardToPane(Vec<u8>),
 }
 
@@ -159,6 +160,7 @@ impl Keymap {
         runtime.insert("page_down".to_string(), "scroll_down_page".to_string());
         runtime.insert("g".to_string(), "scroll_top".to_string());
         runtime.insert("shift+g".to_string(), "scroll_bottom".to_string());
+        runtime.insert("y".to_string(), "copy_scrollback".to_string());
         runtime.insert("q".to_string(), "quit".to_string());
 
         let global = BTreeMap::new();
@@ -750,6 +752,7 @@ fn action_to_name(action: &RuntimeAction) -> &'static str {
         RuntimeAction::ScrollDownPage => "scroll_down_page",
         RuntimeAction::ScrollTop => "scroll_top",
         RuntimeAction::ScrollBottom => "scroll_bottom",
+        RuntimeAction::CopyScrollback => "copy_scrollback",
         RuntimeAction::ForwardToPane(_) => "forward_to_pane",
     }
 }
@@ -769,6 +772,7 @@ fn scroll_mode_action(stroke: KeyStroke) -> Option<RuntimeAction> {
         (false, true, KeyCode::Char('g')) => Some(RuntimeAction::ScrollBottom),
         (true, false, KeyCode::Char('y')) => Some(RuntimeAction::ScrollUpLine),
         (true, false, KeyCode::Char('e')) => Some(RuntimeAction::ScrollDownLine),
+        (false, false, KeyCode::Char('y')) => Some(RuntimeAction::CopyScrollback),
         _ => None,
     }
 }
@@ -1092,6 +1096,7 @@ fn parse_action(value: &str) -> Result<RuntimeAction> {
         "scroll_down_page" => Ok(RuntimeAction::ScrollDownPage),
         "scroll_top" => Ok(RuntimeAction::ScrollTop),
         "scroll_bottom" => Ok(RuntimeAction::ScrollBottom),
+        "copy_scrollback" => Ok(RuntimeAction::CopyScrollback),
         unknown => bail!("unknown keymap action '{unknown}'"),
     }
 }
@@ -1167,6 +1172,10 @@ mod tests {
             processor.process_chunk(&[0x01, b'G']),
             vec![RuntimeAction::ScrollBottom]
         );
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'y']),
+            vec![RuntimeAction::CopyScrollback]
+        );
     }
 
     #[test]
@@ -1192,6 +1201,10 @@ mod tests {
         assert_eq!(
             processor.process_chunk(&[b'G']),
             vec![RuntimeAction::ScrollBottom]
+        );
+        assert_eq!(
+            processor.process_chunk(&[b'y']),
+            vec![RuntimeAction::CopyScrollback]
         );
         assert_eq!(
             processor.process_chunk(&[0x1b]),
