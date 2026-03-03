@@ -36,7 +36,10 @@ use pane_runtime::{
 };
 use persistence::{load_persisted_runtime_state, save_persisted_runtime_state};
 use status_message::StatusMessage;
-use terminal_protocol::supported_query_names;
+use terminal_protocol::{
+    ProtocolProfile, primary_da_for_profile, protocol_profile_name, secondary_da_for_profile,
+    supported_query_names,
+};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -75,6 +78,7 @@ struct RuntimeSettings {
     layout_persistence_enabled: bool,
     pane_term: String,
     terminal_profile: TerminalProfile,
+    protocol_profile: ProtocolProfile,
     configured_pane_term: String,
     warnings: Vec<String>,
 }
@@ -162,12 +166,16 @@ fn run_terminal_doctor(as_json: bool) -> Result<u8> {
 
     let configured_term = config.behavior.pane_term.clone();
     let effective = resolve_pane_term(&configured_term);
+    let protocol_profile = protocol_profile_for_terminal_profile(effective.profile);
 
     if as_json {
         let payload = serde_json::json!({
             "configured_pane_term": configured_term,
             "effective_pane_term": effective.pane_term,
             "terminal_profile": terminal_profile_name(effective.profile),
+            "protocol_profile": protocol_profile_name(protocol_profile),
+            "primary_da_reply": String::from_utf8_lossy(primary_da_for_profile(protocol_profile)),
+            "secondary_da_reply": String::from_utf8_lossy(secondary_da_for_profile(protocol_profile)),
             "supported_queries": supported_query_names(),
             "fallback_chain": effective.fallback_chain,
             "terminfo_check": {
@@ -198,6 +206,15 @@ fn run_terminal_doctor(as_json: bool) -> Result<u8> {
     println!(
         "terminal profile: {}",
         terminal_profile_name(effective.profile)
+    );
+    println!("protocol profile: {}", protocol_profile_name(protocol_profile));
+    println!(
+        "primary DA reply: {}",
+        String::from_utf8_lossy(primary_da_for_profile(protocol_profile))
+    );
+    println!(
+        "secondary DA reply: {}",
+        String::from_utf8_lossy(secondary_da_for_profile(protocol_profile))
     );
     println!("supported queries: {}", supported_query_names().join(", "));
     println!("fallback chain: {}", effective.fallback_chain.join(" -> "));
@@ -246,6 +263,7 @@ fn run_two_pane_runtime(
     let (mut layout_tree, mut panes) = initialize_runtime_state(
         shell,
         &runtime_settings.pane_term,
+        runtime_settings.protocol_profile,
         cols,
         rows,
         startup_deadline,
@@ -291,6 +309,7 @@ fn run_two_pane_runtime(
             startup_deadline,
             Arc::clone(&user_input_seen),
             &runtime_settings.pane_term,
+            runtime_settings.protocol_profile,
         )? {
             layout_tree = updated_tree;
             layout_tree.focused = focused_pane;
@@ -430,6 +449,7 @@ fn run_two_pane_runtime(
 fn initialize_runtime_state(
     shell: &str,
     pane_term: &str,
+    protocol_profile: ProtocolProfile,
     cols: u16,
     rows: u16,
     startup_deadline: Instant,
@@ -476,6 +496,7 @@ fn initialize_runtime_state(
             spawn_pane(
                 &pane_shell,
                 pane_term,
+                protocol_profile,
                 title,
                 pane_rects[&pane_id].inner(),
                 startup_deadline,
@@ -738,12 +759,14 @@ fn load_runtime_settings() -> RuntimeSettings {
 
     let configured_pane_term = config.behavior.pane_term.clone();
     let pane_term_resolution = resolve_pane_term(&configured_pane_term);
+    let protocol_profile = protocol_profile_for_terminal_profile(pane_term_resolution.profile);
 
     RuntimeSettings {
         keymap,
         layout_persistence_enabled: config.behavior.restore_last_layout,
         pane_term: pane_term_resolution.pane_term,
         terminal_profile: pane_term_resolution.profile,
+        protocol_profile,
         configured_pane_term,
         warnings: pane_term_resolution.warnings,
     }
@@ -870,6 +893,15 @@ fn terminal_profile_name(profile: TerminalProfile) -> &'static str {
         TerminalProfile::Screen256Color => "screen-256color-compatible",
         TerminalProfile::Xterm256Color => "xterm-256color-compatible",
         TerminalProfile::Conservative => "conservative",
+    }
+}
+
+fn protocol_profile_for_terminal_profile(profile: TerminalProfile) -> ProtocolProfile {
+    match profile {
+        TerminalProfile::Bmux256Color => ProtocolProfile::Bmux,
+        TerminalProfile::Screen256Color => ProtocolProfile::Screen,
+        TerminalProfile::Xterm256Color => ProtocolProfile::Xterm,
+        TerminalProfile::Conservative => ProtocolProfile::Conservative,
     }
 }
 
@@ -1041,7 +1073,8 @@ fn reap_exited_panes(
 mod tests {
     use super::{
         EventReader, PaneRuntime, PaneState, TerminalProfile, key_to_bytes, profile_for_term,
-        reap_exited_panes, resolve_pane_term_with_checker, run_event_input_loop_with_reader,
+        protocol_profile_for_terminal_profile, reap_exited_panes,
+        resolve_pane_term_with_checker, run_event_input_loop_with_reader,
     };
     use crate::input::{InputProcessor, Keymap};
     use crate::pane::{LayoutNode, LayoutTree, PaneId, SplitDirection};
@@ -1243,6 +1276,26 @@ mod tests {
                 .warnings
                 .iter()
                 .any(|w| w.contains("no fallback available"))
+        );
+    }
+
+    #[test]
+    fn protocol_profile_mapping_is_stable() {
+        assert_eq!(
+            protocol_profile_for_terminal_profile(TerminalProfile::Bmux256Color),
+            super::ProtocolProfile::Bmux
+        );
+        assert_eq!(
+            protocol_profile_for_terminal_profile(TerminalProfile::Xterm256Color),
+            super::ProtocolProfile::Xterm
+        );
+        assert_eq!(
+            protocol_profile_for_terminal_profile(TerminalProfile::Screen256Color),
+            super::ProtocolProfile::Screen
+        );
+        assert_eq!(
+            protocol_profile_for_terminal_profile(TerminalProfile::Conservative),
+            super::ProtocolProfile::Conservative
         );
     }
 }

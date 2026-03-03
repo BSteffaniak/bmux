@@ -1,13 +1,14 @@
 use super::pane_runtime::{next_focusable_pane_id, spawn_pane_process, stop_pane_process};
+use super::terminal_protocol::ProtocolProfile;
 use super::{PaneRuntime, StatusMessage};
 use crate::input::RuntimeAction;
 use crate::pane::{LayoutTree, PaneId, Rect, ResizeDirection, SplitDirection};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::io::Write;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
+use std::sync::Arc;
 use std::time::Instant;
 
 const SPLIT_RATIO_STEP: f32 = 0.05;
@@ -33,6 +34,7 @@ pub(super) fn process_input_events(
     startup_deadline: Instant,
     user_input_seen: Arc<AtomicBool>,
     pane_term: &str,
+    protocol_profile: ProtocolProfile,
 ) -> Result<Option<LayoutTree>> {
     let mut pending_tree_update = None;
 
@@ -204,6 +206,7 @@ pub(super) fn process_input_events(
                                 super::pane_runtime::spawn_pane(
                                     &active_pane.shell,
                                     pane_term,
+                                    protocol_profile,
                                     pane_title.clone(),
                                     pane_inner,
                                     startup_deadline,
@@ -239,6 +242,7 @@ pub(super) fn process_input_events(
                                 pane.process = Some(spawn_pane_process(
                                     &pane.shell,
                                     pane_term,
+                                    protocol_profile,
                                     pane.title.clone(),
                                     pane_inner,
                                     startup_deadline,
@@ -450,7 +454,7 @@ fn axis_overlap(a_start: i32, a_end: i32, b_start: i32, b_end: i32) -> i32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{FocusDirection, focus_in_direction, process_input_events};
+    use super::{focus_in_direction, process_input_events, FocusDirection, ProtocolProfile};
     use crate::input::RuntimeAction;
     use crate::pane::{LayoutNode, LayoutTree, PaneId, Rect, SplitDirection};
     use crate::runtime::{PaneRuntime, PaneState};
@@ -512,6 +516,7 @@ mod tests {
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
             "bmux-256color",
+            ProtocolProfile::Conservative,
         )
         .expect("process input events")
         .expect("tree updated by close");
@@ -560,6 +565,7 @@ mod tests {
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
             "bmux-256color",
+            ProtocolProfile::Conservative,
         )
         .expect("process input events")
         .expect("tree updated by commands");
@@ -625,6 +631,7 @@ mod tests {
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
             "bmux-256color",
+            ProtocolProfile::Conservative,
         )
         .expect("process input events");
 
@@ -747,6 +754,7 @@ mod tests {
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
             "bmux-256color",
+            ProtocolProfile::Conservative,
         )
         .expect("process input events")
         .expect("tree updated by directional resize");
@@ -793,6 +801,7 @@ mod tests {
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
             "bmux-256color",
+            ProtocolProfile::Conservative,
         )
         .expect("process input events");
 

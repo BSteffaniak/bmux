@@ -1,9 +1,9 @@
-use super::{MIN_PANE_COLS, MIN_PANE_ROWS, PaneProcess, PaneRuntime, PaneState};
+use super::{PaneProcess, PaneRuntime, PaneState, MIN_PANE_COLS, MIN_PANE_ROWS};
 use crate::pane::{PaneId, Rect};
 use crate::pty::extract_filtered_output;
-use crate::runtime::terminal_protocol::TerminalProtocolEngine;
+use crate::runtime::terminal_protocol::{ProtocolProfile, TerminalProtocolEngine};
 use anyhow::{Context, Result};
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -16,6 +16,7 @@ use vt100::Parser as VtParser;
 pub(super) fn spawn_pane(
     shell: &str,
     pane_term: &str,
+    protocol_profile: ProtocolProfile,
     title: String,
     pane_inner: Rect,
     startup_deadline: Instant,
@@ -36,6 +37,7 @@ pub(super) fn spawn_pane(
         process: Some(spawn_pane_process(
             shell,
             pane_term,
+            protocol_profile,
             title,
             pane_inner,
             startup_deadline,
@@ -51,6 +53,7 @@ pub(super) fn spawn_pane(
 pub(super) fn spawn_pane_process(
     shell: &str,
     pane_term: &str,
+    protocol_profile: ProtocolProfile,
     title: String,
     pane_inner: Rect,
     startup_deadline: Instant,
@@ -101,7 +104,7 @@ pub(super) fn spawn_pane_process(
         .spawn(move || -> Result<()> {
             let mut buffer = [0_u8; 8192];
             let mut pending = Vec::new();
-            let mut protocol_engine = TerminalProtocolEngine::default();
+            let mut protocol_engine = TerminalProtocolEngine::new(protocol_profile);
 
             loop {
                 let bytes_read = reader
