@@ -1,19 +1,22 @@
 use crate::cli::{
-    Cli, Command, DebugRenderLogFormat, KeymapCommand, LayoutCommand, TerminalCommand, TraceFamily,
+    Cli, Command, DebugRenderLogFormat, KeymapCommand, LayoutCommand, ServerCommand,
+    TerminalCommand, TraceFamily,
 };
 use crate::input::{InputProcessor, RuntimeAction};
 use crate::pane::{LayoutTree, PaneId, SplitDirection};
 use crate::pty::STARTUP_ALT_SCREEN_GUARD_DURATION;
 use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
+use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, TerminfoAutoInstall};
+use bmux_server::BmuxServer;
 use clap::Parser;
 use crossterm::event::{self, Event};
 use portable_pty::{Child, MasterPty};
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command as ProcessCommand;
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
@@ -45,6 +48,8 @@ use terminal_protocol::{
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STATUS_REDRAW_INTERVAL: Duration = Duration::from_millis(200);
+const SERVER_STATUS_TIMEOUT: Duration = Duration::from_millis(1000);
+const SERVER_STOP_TIMEOUT: Duration = Duration::from_millis(5000);
 const MIN_PANE_ROWS: u16 = 2;
 const MIN_PANE_COLS: u16 = 2;
 
@@ -156,6 +161,14 @@ pub(crate) fn run() -> Result<u8> {
 
 fn run_command(command: &Command) -> Result<u8> {
     match command {
+        Command::Server { command } => match command {
+            ServerCommand::Start {
+                daemon,
+                foreground_internal,
+            } => run_server_start(*daemon, *foreground_internal),
+            ServerCommand::Status => run_server_status(),
+            ServerCommand::Stop => run_server_stop(),
+        },
         Command::Keymap { command } => match command {
             KeymapCommand::Doctor { json } => run_keymap_doctor(*json),
         },
@@ -174,6 +187,178 @@ fn run_command(command: &Command) -> Result<u8> {
                 run_terminal_install_terminfo(*yes, *check)
             }
         },
+    }
+}
+
+fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8> {
+    if daemon && !foreground_internal {
+        let executable = std::env::current_exe().context("failed to resolve bmux executable path")?;
+        let mut child = ProcessCommand::new(executable);
+        child
+            .arg("server")
+            .arg("start")
+            .arg("--foreground-internal")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let child = child.spawn().context("failed to spawn background server")?;
+        write_server_pid_file(child.id())?;
+        println!("bmux server started in daemon mode (pid {})", child.id());
+        return Ok(0);
+    }
+
+    let server = BmuxServer::from_default_paths();
+    write_server_pid_file(std::process::id())?;
+    let run_result = run_async(async move { server.run().await });
+    let _ = remove_server_pid_file();
+    run_result?;
+    Ok(0)
+}
+
+fn run_server_status() -> Result<u8> {
+    let status = run_async(async {
+        match tokio::time::timeout(
+            SERVER_STATUS_TIMEOUT,
+            BmuxClient::connect_default("bmux-cli-status"),
+        )
+        .await
+        {
+            Ok(Ok(mut client)) => client.server_status().await.map(Some).map_err(Into::into),
+            Ok(Err(_)) | Err(_) => Ok(None),
+        }
+    })?;
+
+    match status {
+        Some(true) => {
+            println!("bmux server is running");
+            Ok(0)
+        }
+        _ => {
+            println!("bmux server is not running");
+            Ok(1)
+        }
+    }
+}
+
+fn run_server_stop() -> Result<u8> {
+    let graceful_stopped = run_async(async {
+        match tokio::time::timeout(SERVER_STOP_TIMEOUT, BmuxClient::connect_default("bmux-cli-stop")).await {
+            Ok(Ok(mut client)) => {
+                client.stop_server().await.map_err(anyhow::Error::from)?;
+                for _ in 0..20 {
+                    let reconnect = tokio::time::timeout(
+                        SERVER_STATUS_TIMEOUT,
+                        BmuxClient::connect_default("bmux-cli-stop-check"),
+                    )
+                    .await;
+                    if reconnect.is_err() || matches!(reconnect, Ok(Err(_))) {
+                        return Ok(true);
+                    }
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                }
+                Ok(false)
+            }
+            Ok(Err(_)) | Err(_) => Ok(false),
+        }
+    })?;
+
+    if graceful_stopped {
+        println!("bmux server stopped gracefully");
+        let _ = remove_server_pid_file();
+        return Ok(0);
+    }
+
+    if let Some(pid) = read_server_pid_file()? {
+        if try_kill_pid(pid)? {
+            println!("bmux server stop fallback succeeded (pid {pid})");
+            let _ = remove_server_pid_file();
+            return Ok(0);
+        }
+    }
+
+    println!("bmux server is not running");
+    Ok(1)
+}
+
+fn run_async<F, T>(future: F) -> Result<T>
+where
+    F: std::future::Future<Output = Result<T>>,
+{
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+    runtime.block_on(future)
+}
+
+fn server_pid_file_path() -> PathBuf {
+    bmux_config::ConfigPaths::default().runtime_dir.join("server.pid")
+}
+
+fn write_server_pid_file(pid: u32) -> Result<()> {
+    let path = server_pid_file_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed creating runtime dir {}", parent.display()))?;
+    }
+    std::fs::write(&path, pid.to_string())
+        .with_context(|| format!("failed writing pid file {}", path.display()))
+}
+
+fn read_server_pid_file() -> Result<Option<u32>> {
+    let path = server_pid_file_path();
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed reading pid file {}", path.display()));
+        }
+    };
+
+    let pid = content
+        .trim()
+        .parse::<u32>()
+        .with_context(|| format!("invalid pid file content at {}", path.display()))?;
+    Ok(Some(pid))
+}
+
+fn remove_server_pid_file() -> Result<()> {
+    let path = server_pid_file_path();
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => {
+            Err(error).with_context(|| format!("failed removing pid file {}", path.display()))
+        }
+    }
+}
+
+fn try_kill_pid(pid: u32) -> Result<bool> {
+    if pid == 0 {
+        return Ok(false);
+    }
+
+    #[cfg(unix)]
+    {
+        let status = ProcessCommand::new("kill")
+            .arg("-TERM")
+            .arg(pid.to_string())
+            .status()
+            .context("failed to execute kill command")?;
+        return Ok(status.success());
+    }
+
+    #[cfg(windows)]
+    {
+        let status = ProcessCommand::new("taskkill")
+            .arg("/PID")
+            .arg(pid.to_string())
+            .arg("/T")
+            .arg("/F")
+            .status()
+            .context("failed to execute taskkill command")?;
+        return Ok(status.success());
     }
 }
 

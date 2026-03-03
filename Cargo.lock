@@ -90,8 +90,10 @@ name = "bmux_cli"
 version = "0.0.1-alpha.0"
 dependencies = [
  "anyhow",
+ "bmux_client",
  "bmux_config",
  "bmux_event",
+ "bmux_server",
  "bmux_session",
  "bmux_terminal",
  "clap",

@@ -48,6 +48,11 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Server lifecycle and status tools
+    Server {
+        #[command(subcommand)]
+        command: ServerCommand,
+    },
     /// Keymap tools and diagnostics
     Keymap {
         #[command(subcommand)]
@@ -63,6 +68,23 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: TerminalCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ServerCommand {
+    /// Start local bmux server
+    Start {
+        /// Run server in background daemon mode
+        #[arg(long)]
+        daemon: bool,
+        /// Internal flag used by daemon launcher
+        #[arg(long, hide = true)]
+        foreground_internal: bool,
+    },
+    /// Check server status
+    Status,
+    /// Request graceful server shutdown
+    Stop,
 }
 
 #[derive(Debug, Subcommand)]
@@ -114,7 +136,9 @@ pub(crate) enum TerminalCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, KeymapCommand, LayoutCommand, TerminalCommand, TraceFamily};
+    use super::{
+        Cli, Command, KeymapCommand, LayoutCommand, ServerCommand, TerminalCommand, TraceFamily,
+    };
     use clap::Parser;
 
     #[test]
@@ -187,6 +211,55 @@ mod tests {
             panic!("expected layout subcommand");
         };
         assert!(matches!(command, LayoutCommand::Clear));
+    }
+
+    #[test]
+    fn parses_server_start_default_foreground() {
+        let cli = Cli::try_parse_from(["bmux", "server", "start"]).expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Start {
+                daemon: false,
+                foreground_internal: false
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_server_start_daemon_flag() {
+        let cli =
+            Cli::try_parse_from(["bmux", "server", "start", "--daemon"]).expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Start {
+                daemon: true,
+                foreground_internal: false
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_server_status_subcommand() {
+        let cli = Cli::try_parse_from(["bmux", "server", "status"]).expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(command, ServerCommand::Status));
+    }
+
+    #[test]
+    fn parses_server_stop_subcommand() {
+        let cli = Cli::try_parse_from(["bmux", "server", "stop"]).expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(command, ServerCommand::Stop));
     }
 
     #[test]
