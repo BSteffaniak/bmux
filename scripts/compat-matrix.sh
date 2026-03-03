@@ -9,6 +9,7 @@ CONFIG_FILE=""
 TRACE_LIMIT="${BMUX_COMPAT_TRACE_LIMIT:-500}"
 BMUX_BIN="$ROOT_DIR/target/debug/bmux"
 SCENARIO_FILTER="all"
+CASE_TIMEOUT_SECS="${BMUX_COMPAT_CASE_TIMEOUT_SECS:-12}"
 
 usage() {
   cat <<'EOF'
@@ -16,6 +17,7 @@ Usage: ./scripts/compat-matrix.sh [--scenario fish|vim|fzf|less|all]
 
 Options:
   --scenario <name>   Run a single scenario (fish, vim, fzf, less) or all (default)
+  --timeout-secs <n>  Per-case marker wait timeout in seconds (default: $BMUX_COMPAT_CASE_TIMEOUT_SECS or 12)
   -h, --help          Show this help message
 EOF
 }
@@ -29,6 +31,15 @@ while [[ $# -gt 0 ]]; do
         exit 1
       fi
       SCENARIO_FILTER="$2"
+      shift 2
+      ;;
+    --timeout-secs)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --timeout-secs requires a value" >&2
+        usage
+        exit 1
+      fi
+      CASE_TIMEOUT_SECS="$2"
       shift 2
       ;;
     -h|--help)
@@ -51,6 +62,11 @@ case "$SCENARIO_FILTER" in
     exit 1
     ;;
 esac
+
+if [[ ! "$CASE_TIMEOUT_SECS" =~ ^[0-9]+$ ]] || [[ "$CASE_TIMEOUT_SECS" -lt 1 ]]; then
+  echo "error: invalid --timeout-secs '$CASE_TIMEOUT_SECS' (expected positive integer)" >&2
+  exit 1
+fi
 
 if ! command -v jq >/dev/null 2>&1; then
   echo "error: jq is required for compatibility assertions" >&2
@@ -284,9 +300,8 @@ run_case() {
 
   local status="PASS"
   local notes="ok"
-  local case_timeout_secs="${BMUX_COMPAT_CASE_TIMEOUT_SECS:-12}"
 
-  if ! script -q "$log_file" "$BMUX_BIN" --shell "$wrapper" --no-alt-screen < <(emit_quit_when_marker_or_timeout "$flow_ok_file" "$case_timeout_secs" "$timeout_file") >/dev/null 2>&1; then
+  if ! script -q "$log_file" "$BMUX_BIN" --shell "$wrapper" --no-alt-screen < <(emit_quit_when_marker_or_timeout "$flow_ok_file" "$CASE_TIMEOUT_SECS" "$timeout_file") >/dev/null 2>&1; then
     status="FAIL"
     notes="bmux command failed"
   fi
