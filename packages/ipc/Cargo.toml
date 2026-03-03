@@ -1,0 +1,22 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Cross-platform IPC protocol models for bmux"
+edition     = { workspace = true }
+keywords    = ["bmux", "ipc", "multiplexer", "protocol", "terminal"]
+license     = { workspace = true }
+name        = "bmux_ipc"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+postcard = { workspace = true, features = ["alloc"] }
+serde    = { workspace = true, features = ["derive", "std"] }
+uuid     = { workspace = true, features = ["serde", "std", "v4"] }
+
+[features]
+# Default features
+default = []
+
+# Development features
+fail-on-warnings = []
