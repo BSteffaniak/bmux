@@ -1111,6 +1111,15 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    fn key_event(code: KeyCode, modifiers: KeyModifiers) -> Event {
+        Event::Key(KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        })
+    }
+
     #[test]
     fn maps_default_prefix_commands() {
         let mut processor = InputProcessor::new(Keymap::default_runtime());
@@ -1370,12 +1379,7 @@ mod tests {
     #[test]
     fn terminal_event_adapter_encodes_ctrl_characters() {
         let mut processor = InputProcessor::new(Keymap::default_runtime());
-        let event = Event::Key(KeyEvent {
-            code: KeyCode::Char('c'),
-            modifiers: KeyModifiers::CONTROL,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        });
+        let event = key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
 
         assert_eq!(
             processor.process_terminal_event(event),
@@ -1386,12 +1390,7 @@ mod tests {
     #[test]
     fn terminal_event_adapter_encodes_arrow_sequences() {
         let mut processor = InputProcessor::new(Keymap::default_runtime());
-        let event = Event::Key(KeyEvent {
-            code: KeyCode::Up,
-            modifiers: KeyModifiers::NONE,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        });
+        let event = key_event(KeyCode::Up, KeyModifiers::NONE);
 
         assert_eq!(
             processor.process_terminal_event(event),
@@ -1402,18 +1401,61 @@ mod tests {
     #[test]
     fn terminal_event_adapter_encodes_shift_arrow_sequences() {
         let mut processor = InputProcessor::new(Keymap::default_runtime());
-        let event = Event::Key(KeyEvent {
-            code: KeyCode::Left,
-            modifiers: KeyModifiers::SHIFT,
-            kind: KeyEventKind::Press,
-            state: KeyEventState::NONE,
-        });
+        let event = key_event(KeyCode::Left, KeyModifiers::SHIFT);
 
         assert_eq!(
             processor.process_terminal_event(event),
             vec![RuntimeAction::ForwardToPane(vec![
                 0x1b, b'[', b'1', b';', b'2', b'D'
             ])]
+        );
+    }
+
+    #[test]
+    fn terminal_events_drive_scroll_mode_navigation() {
+        let mut processor = InputProcessor::new(Keymap::default_runtime());
+
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            Vec::<RuntimeAction>::new()
+        );
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Char('['), KeyModifiers::NONE)),
+            vec![RuntimeAction::EnterScrollMode]
+        );
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::PageUp, KeyModifiers::NONE)),
+            vec![RuntimeAction::ScrollUpPage]
+        );
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Up, KeyModifiers::NONE)),
+            vec![RuntimeAction::ScrollUpLine]
+        );
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Char('G'), KeyModifiers::SHIFT)),
+            vec![RuntimeAction::ScrollBottom]
+        );
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Esc, KeyModifiers::NONE)),
+            vec![RuntimeAction::ExitScrollMode]
+        );
+    }
+
+    #[test]
+    fn scroll_mode_keeps_prefix_pane_shortcuts() {
+        let mut processor = InputProcessor::new(Keymap::default_runtime());
+
+        let _ =
+            processor.process_terminal_event(key_event(KeyCode::Char('a'), KeyModifiers::CONTROL));
+        let _ = processor.process_terminal_event(key_event(KeyCode::Char('['), KeyModifiers::NONE));
+
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            Vec::<RuntimeAction>::new()
+        );
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Char('o'), KeyModifiers::NONE)),
+            vec![RuntimeAction::FocusNext]
         );
     }
 }
