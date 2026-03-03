@@ -300,7 +300,7 @@ pub(super) fn process_input_events(
                     }
                     RuntimeAction::ShowHelp => {
                         *status_message = Some(StatusMessage::new(
-                            "Ctrl-A: q quit | o cycle | h/j/k/l or arrows focus | H/J/K/L directional resize | t toggle layout | % split-v | \" split-h | +/- resize | [ scroll mode | ] exit scroll | Ctrl-Y/Ctrl-E line | PgUp/PgDn page | g/G top/bottom | r restart | x close | ? help"
+                            "Ctrl-A: q quit | o cycle | h/j/k/l or arrows focus | H/J/K/L directional resize | t toggle layout | % split-v | \" split-h | +/- resize | [ scroll mode | Esc (or ]) exit scroll | arrows/Ctrl-Y/Ctrl-E line | PgUp/PgDn page | g/G top/bottom | r restart | x close | ? help"
                                 .to_string(),
                         ));
                     }
@@ -316,6 +316,10 @@ pub(super) fn process_input_events(
                             scroll_state.offsets.insert(*focused_pane, offset);
                             active_pane.state.dirty.store(true, Ordering::Relaxed);
                         }
+                        *status_message = Some(StatusMessage::new(
+                            "scroll mode: arrows/Ctrl-Y/Ctrl-E line, PgUp/PgDn page, g/G top/bottom, Esc exit"
+                                .to_string(),
+                        ));
                     }
                     RuntimeAction::ExitScrollMode => {
                         scroll_state.active = false;
@@ -329,6 +333,8 @@ pub(super) fn process_input_events(
                             parser.screen_mut().set_scrollback(0);
                             pane.state.dirty.store(true, Ordering::Relaxed);
                         }
+                        *status_message =
+                            Some(StatusMessage::new("scroll mode exited".to_string()));
                     }
                     RuntimeAction::ScrollUpLine
                     | RuntimeAction::ScrollDownLine
