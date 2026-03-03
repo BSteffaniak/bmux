@@ -12,10 +12,10 @@ SCENARIO_FILTER="all"
 
 usage() {
   cat <<'EOF'
-Usage: ./scripts/compat-matrix.sh [--scenario fish|vim|fzf|all]
+Usage: ./scripts/compat-matrix.sh [--scenario fish|vim|fzf|less|all]
 
 Options:
-  --scenario <name>   Run a single scenario (fish, vim, fzf) or all (default)
+  --scenario <name>   Run a single scenario (fish, vim, fzf, less) or all (default)
   -h, --help          Show this help message
 EOF
 }
@@ -44,10 +44,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "$SCENARIO_FILTER" in
-  all|fish|vim|fzf)
+  all|fish|vim|fzf|less)
     ;;
   *)
-    echo "error: invalid scenario '$SCENARIO_FILTER' (expected fish|vim|fzf|all)" >&2
+    echo "error: invalid scenario '$SCENARIO_FILTER' (expected fish|vim|fzf|less|all)" >&2
     exit 1
     ;;
 esac
@@ -185,6 +185,7 @@ make_shell_wrapper() {
   local flow_ok_file="$WORK_DIR/${scenario}.flow.ok"
   local vim_output_file="$WORK_DIR/${scenario}.vim.out"
   local fzf_output_file="$WORK_DIR/${scenario}.fzf.out"
+  local less_input_file="$WORK_DIR/${scenario}.less.input"
 
   case "$scenario" in
     fish)
@@ -202,7 +203,7 @@ EOF
       cat >"$wrapper" <<EOF
 #!/usr/bin/env bash
 printf "__SCENARIO_vim__\\n"
-printf '\\033[?25\$p\\033P\$qm\\033\\\\'
+printf '\\033[?25\\044p\\033P\\044qm\\033\\\\'
 "$shell_bin" -Nu NONE -n -Es "$vim_output_file" -c "call setline(1, ['hello from bmux'])" -c "write!" -c "qall!" >/dev/null 2>&1 || true
 if [[ -f "$vim_output_file" ]] && rg -q "hello from bmux" "$vim_output_file"; then
   printf "__VIM_WRITE_OK__\\n"
@@ -219,6 +220,17 @@ printf "alpha\\nbeta\\ngamma\\n" | "$shell_bin" --filter a >/dev/null 2>&1 || tr
 printf "alpha\\nbeta\\ngamma\\n" | "$shell_bin" --filter alpha >"$fzf_output_file" 2>/dev/null || true
 if [[ -f "$fzf_output_file" ]] && rg -q "^alpha$" "$fzf_output_file"; then
   printf "__FZF_SELECT_OK__\\n"
+  printf "ok" >"$flow_ok_file"
+fi
+EOF
+      ;;
+    less)
+      cat >"$wrapper" <<EOF
+#!/usr/bin/env bash
+printf "__SCENARIO_less__\\n"
+printf '\\033[c\\033[?25\\044p'
+printf "alpha\\nbeta\\ngamma\\n" >"$less_input_file"
+if LESS= LESSOPEN= LC_ALL=C "$shell_bin" -FX "$less_input_file" >/dev/null 2>&1; then
   printf "ok" >"$flow_ok_file"
 fi
 EOF
@@ -244,16 +256,22 @@ run_case() {
   local flow_ok_file="$WORK_DIR/${scenario}.flow.ok"
   local vim_output_file="$WORK_DIR/${scenario}.vim.out"
   local fzf_output_file="$WORK_DIR/${scenario}.fzf.out"
+  local less_input_file="$WORK_DIR/${scenario}.less.input"
 
   wrapper="$(make_shell_wrapper "$scenario" "$shell_bin")"
   write_config "$pane_term"
 
-  rm -f "$flow_ok_file" "$vim_output_file" "$fzf_output_file"
+  rm -f "$flow_ok_file" "$vim_output_file" "$fzf_output_file" "$less_input_file"
 
   local status="PASS"
   local notes="ok"
+  local quit_delay="2"
 
-  if ! script -q "$log_file" sh -lc "(sleep 2; printf '\001q') | '$BMUX_BIN' --shell '$wrapper' --no-alt-screen" >/dev/null 2>&1; then
+  if [[ "$scenario" == "fish" ]]; then
+    quit_delay="4"
+  fi
+
+  if ! script -q "$log_file" sh -lc "(sleep $quit_delay; printf '\001q') | '$BMUX_BIN' --shell '$wrapper' --no-alt-screen" >/dev/null 2>&1; then
     status="FAIL"
     notes="bmux command failed"
   fi
@@ -297,6 +315,12 @@ run_case() {
         if [[ ! -f "$flow_ok_file" ]] || [[ ! -f "$fzf_output_file" ]]; then
           status="FAIL"
           notes="fzf_filter_select_flow_missing"
+        fi
+        ;;
+      less)
+        if [[ ! -f "$flow_ok_file" ]] || [[ ! -f "$less_input_file" ]]; then
+          status="FAIL"
+          notes="less_pager_flow_missing"
         fi
         ;;
     esac
@@ -362,6 +386,15 @@ run_case() {
           notes="fzf_missing_xtgettcap_pair"
         fi
         ;;
+      less)
+        if ! assert_query_reply_pair "$trace_json_file" "csi_primary_da"; then
+          status="FAIL"
+          notes="less_missing_primary_da_pair"
+        elif ! assert_query_reply_pair "$trace_json_file" "csi_dec_mode_report"; then
+          status="FAIL"
+          notes="less_missing_dec_mode_pair"
+        fi
+        ;;
     esac
   fi
 
@@ -401,6 +434,14 @@ if [[ "$SCENARIO_FILTER" == "all" || "$SCENARIO_FILTER" == "fzf" ]]; then
     run_matrix_for_scenario "fzf" "$(command -v fzf)"
   else
     echo -e "fzf\tall\tSKIP\tfzf not installed" >>"$RESULTS_FILE"
+  fi
+fi
+
+if [[ "$SCENARIO_FILTER" == "all" || "$SCENARIO_FILTER" == "less" ]]; then
+  if command -v less >/dev/null 2>&1; then
+    run_matrix_for_scenario "less" "$(command -v less)"
+  else
+    echo -e "less\tall\tSKIP\tless not installed" >>"$RESULTS_FILE"
   fi
 fi
 

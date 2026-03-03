@@ -1,0 +1,8 @@
+# less startup protocol replay fixture
+PROFILE: xterm
+CHUNK: less>
+CHUNK: \x1b[c
+CHUNK: \x1b[?25$p
+CHUNK: \x1b[6n
+EXPECT_REPLY: \x1b[?1;2c\x1b[?25;1$y\x1b[1;6R
+EXPECT_RENDER_CONTAINS: less>

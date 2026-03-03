@@ -1,11 +1,11 @@
-use super::{MIN_PANE_COLS, MIN_PANE_ROWS, PaneProcess, PaneRuntime, PaneState};
+use super::{PaneProcess, PaneRuntime, PaneState, MIN_PANE_COLS, MIN_PANE_ROWS};
 use crate::pane::{PaneId, Rect};
 use crate::pty::extract_filtered_output;
 use crate::runtime::terminal_protocol::{
     ProtocolProfile, SharedProtocolTraceBuffer, TerminalProtocolEngine,
 };
 use anyhow::{Context, Result};
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -460,6 +460,14 @@ mod tests {
     #[test]
     fn replays_fzf_startup_fixture() {
         let fixture = parse_fixture(include_str!("fixtures/fzf_startup.trace"));
+        let (contents, replies) = process_fixture(&fixture);
+        assert!(contents.contains(&fixture.expected_render_contains));
+        assert_eq!(replies, fixture.expected_reply);
+    }
+
+    #[test]
+    fn replays_less_startup_fixture() {
+        let fixture = parse_fixture(include_str!("fixtures/less_startup.trace"));
         let (contents, replies) = process_fixture(&fixture);
         assert!(contents.contains(&fixture.expected_render_contains));
         assert_eq!(replies, fixture.expected_reply);
