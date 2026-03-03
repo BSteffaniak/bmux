@@ -1247,6 +1247,7 @@ fn load_runtime_keymap() -> crate::input::Keymap {
             &config.keybindings.prefix,
             config.keybindings.timeout_ms,
             &config.keybindings.runtime,
+            &config.keybindings.global,
         ) {
             Ok(keymap) => keymap,
             Err(error) => {

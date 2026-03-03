@@ -1,4 +1,4 @@
-use anyhow::{anyhow, bail, Result};
+use anyhow::{Result, anyhow, bail};
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
@@ -54,10 +54,11 @@ struct KeyBinding {
 #[derive(Debug, Clone)]
 pub(crate) struct Keymap {
     timeout: Duration,
-    bindings: Vec<KeyBinding>,
+    global_bindings: Vec<KeyBinding>,
+    runtime_bindings: Vec<KeyBinding>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct DecodedStroke {
     stroke: KeyStroke,
     raw: Vec<u8>,
@@ -71,72 +72,83 @@ struct ByteDecoder {
 pub(crate) struct InputProcessor {
     keymap: Keymap,
     decoder: ByteDecoder,
-    pending_chord: Option<PendingChord>,
+    pending: Option<PendingChord>,
 }
 
 #[derive(Debug)]
 struct PendingChord {
     started_at: Instant,
-    strokes: Vec<KeyStroke>,
-    raw_bytes: Vec<u8>,
+    decoded: Vec<DecodedStroke>,
 }
 
 impl Keymap {
     pub(crate) fn default_runtime() -> Self {
-        let mut bindings = BTreeMap::new();
-        bindings.insert("o".to_string(), "focus_next_pane".to_string());
-        bindings.insert("plus".to_string(), "increase_split".to_string());
-        bindings.insert("minus".to_string(), "decrease_split".to_string());
-        bindings.insert("r".to_string(), "restart_focused_pane".to_string());
-        bindings.insert("x".to_string(), "close_focused_pane".to_string());
-        bindings.insert("?".to_string(), "show_help".to_string());
-        bindings.insert("q".to_string(), "quit".to_string());
+        let mut runtime = BTreeMap::new();
+        runtime.insert("o".to_string(), "focus_next_pane".to_string());
+        runtime.insert("plus".to_string(), "increase_split".to_string());
+        runtime.insert("minus".to_string(), "decrease_split".to_string());
+        runtime.insert("r".to_string(), "restart_focused_pane".to_string());
+        runtime.insert("x".to_string(), "close_focused_pane".to_string());
+        runtime.insert("?".to_string(), "show_help".to_string());
+        runtime.insert("q".to_string(), "quit".to_string());
 
-        Self::from_parts("ctrl+a", 400, &bindings).expect("default keymap must be valid")
+        let global = BTreeMap::new();
+        Self::from_parts("ctrl+a", 400, &runtime, &global).expect("default keymap must be valid")
     }
 
     pub(crate) fn from_parts(
         prefix: &str,
         timeout_ms: u64,
-        bindings: &BTreeMap<String, String>,
+        runtime: &BTreeMap<String, String>,
+        global: &BTreeMap<String, String>,
     ) -> Result<Self> {
         if timeout_ms < 50 || timeout_ms > 5_000 {
             bail!("keymap timeout_ms must be between 50 and 5000");
         }
 
         let prefix_stroke = parse_stroke(prefix)?;
-        let mut compiled = Vec::new();
+        let mut runtime_bindings = Vec::new();
+        let mut global_bindings = Vec::new();
 
-        for (binding, action_name) in bindings {
+        for (binding, action_name) in runtime {
             let mut chord = vec![prefix_stroke];
-            let mut parsed = parse_chord(binding)?;
-            chord.append(&mut parsed);
-
-            let action = parse_action(action_name)?;
-            compiled.push(KeyBinding { chord, action });
+            chord.extend(parse_chord(binding)?);
+            runtime_bindings.push(KeyBinding {
+                chord,
+                action: parse_action(action_name)?,
+            });
         }
 
-        for i in 0..compiled.len() {
-            for j in (i + 1)..compiled.len() {
-                if compiled[i].chord == compiled[j].chord {
-                    bail!("duplicate key binding chord detected");
-                }
-
-                let a = &compiled[i].chord;
-                let b = &compiled[j].chord;
-                if a.len() <= b.len() && b.starts_with(a) {
-                    bail!("ambiguous key bindings: one chord is a prefix of another");
-                }
-                if b.len() <= a.len() && a.starts_with(b) {
-                    bail!("ambiguous key bindings: one chord is a prefix of another");
-                }
-            }
+        for (binding, action_name) in global {
+            global_bindings.push(KeyBinding {
+                chord: parse_chord(binding)?,
+                action: parse_action(action_name)?,
+            });
         }
+
+        validate_no_duplicate_chords(&runtime_bindings, "runtime")?;
+        validate_no_duplicate_chords(&global_bindings, "global")?;
 
         Ok(Self {
             timeout: Duration::from_millis(timeout_ms),
-            bindings: compiled,
+            global_bindings,
+            runtime_bindings,
         })
+    }
+
+    fn exact_action(&self, strokes: &[KeyStroke]) -> Option<RuntimeAction> {
+        find_exact(&self.global_bindings, strokes)
+            .or_else(|| find_exact(&self.runtime_bindings, strokes))
+    }
+
+    fn has_longer_match(&self, strokes: &[KeyStroke]) -> bool {
+        has_longer_prefix(&self.global_bindings, strokes)
+            || has_longer_prefix(&self.runtime_bindings, strokes)
+    }
+
+    fn has_any_prefix(&self, strokes: &[KeyStroke]) -> bool {
+        has_any_prefix(&self.global_bindings, strokes)
+            || has_any_prefix(&self.runtime_bindings, strokes)
     }
 }
 
@@ -145,94 +157,130 @@ impl InputProcessor {
         Self {
             keymap,
             decoder: ByteDecoder::default(),
-            pending_chord: None,
+            pending: None,
         }
     }
 
     pub(crate) fn process_chunk(&mut self, bytes: &[u8]) -> Vec<RuntimeAction> {
         let mut actions = Vec::new();
 
-        if let Some(flushed) = self.flush_timeout() {
-            actions.push(RuntimeAction::ForwardToPane(flushed));
+        if self.pending_timed_out() {
+            self.resolve_pending(&mut actions, true);
         }
 
         for decoded in self.decoder.feed(bytes) {
-            self.handle_decoded_stroke(decoded, &mut actions);
+            if self.pending.is_none() {
+                self.pending = Some(PendingChord {
+                    started_at: Instant::now(),
+                    decoded: vec![decoded],
+                });
+            } else if let Some(pending) = &mut self.pending {
+                pending.decoded.push(decoded);
+            }
+
+            self.resolve_pending(&mut actions, false);
         }
 
         actions
     }
 
     pub(crate) fn finish(&mut self) -> Option<RuntimeAction> {
-        if let Some(flushed) = self.flush_timeout() {
-            return Some(RuntimeAction::ForwardToPane(flushed));
+        self.resolve_pending(&mut Vec::new(), true);
+
+        if let Some(bytes) = self.pending.take().map(pending_bytes) {
+            if !bytes.is_empty() {
+                return Some(RuntimeAction::ForwardToPane(bytes));
+            }
         }
 
-        if let Some(bytes) = self.pending_chord.take().map(|pending| pending.raw_bytes) {
-            return Some(RuntimeAction::ForwardToPane(bytes));
-        }
-
-        let remainder = self.decoder.take_pending();
-        if remainder.is_empty() {
+        let tail = self.decoder.take_pending();
+        if tail.is_empty() {
             None
         } else {
-            Some(RuntimeAction::ForwardToPane(remainder))
+            Some(RuntimeAction::ForwardToPane(tail))
         }
     }
 
-    fn flush_timeout(&mut self) -> Option<Vec<u8>> {
-        let pending = self.pending_chord.as_ref()?;
-        if pending.started_at.elapsed() < self.keymap.timeout {
-            return None;
-        }
-
-        self.pending_chord.take().map(|value| value.raw_bytes)
+    fn pending_timed_out(&self) -> bool {
+        self.pending
+            .as_ref()
+            .is_some_and(|pending| pending.started_at.elapsed() >= self.keymap.timeout)
     }
 
-    fn handle_decoded_stroke(&mut self, decoded: DecodedStroke, actions: &mut Vec<RuntimeAction>) {
-        if let Some(pending) = &mut self.pending_chord {
-            pending.strokes.push(decoded.stroke);
-            pending.raw_bytes.extend_from_slice(&decoded.raw);
+    fn resolve_pending(&mut self, actions: &mut Vec<RuntimeAction>, force_timeout: bool) {
+        loop {
+            let Some(pending) = &self.pending else {
+                break;
+            };
 
-            if let Some(action) = exact_match(&self.keymap.bindings, &pending.strokes) {
+            let strokes: Vec<KeyStroke> = pending.decoded.iter().map(|item| item.stroke).collect();
+            let exact = self.keymap.exact_action(&strokes);
+            let longer = self.keymap.has_longer_match(&strokes);
+            let any_prefix = self.keymap.has_any_prefix(&strokes);
+
+            if let Some(action) = exact {
+                if longer && !force_timeout {
+                    break;
+                }
                 actions.push(action);
-                self.pending_chord = None;
-                return;
+                self.pending = None;
+                continue;
             }
 
-            if is_prefix_match(&self.keymap.bindings, &pending.strokes) {
-                return;
+            if any_prefix {
+                break;
             }
 
-            if let Some(flushed) = self.pending_chord.take().map(|value| value.raw_bytes) {
-                actions.push(RuntimeAction::ForwardToPane(flushed));
-            }
-            return;
-        }
-
-        if let Some(action) = exact_match(&self.keymap.bindings, &[decoded.stroke]) {
-            if is_prefix_match(&self.keymap.bindings, &[decoded.stroke]) {
-                self.pending_chord = Some(PendingChord {
+            let pending_len = strokes.len();
+            if let Some((matched_len, action)) =
+                self.best_exact_prefix_len(pending_len.saturating_sub(1))
+            {
+                let remainder = self.consume_prefix(matched_len);
+                actions.push(action);
+                if remainder.is_empty() {
+                    self.pending = None;
+                    continue;
+                }
+                self.pending = Some(PendingChord {
                     started_at: Instant::now(),
-                    strokes: vec![decoded.stroke],
-                    raw_bytes: decoded.raw,
+                    decoded: remainder,
                 });
-            } else {
-                actions.push(action);
+                continue;
             }
-            return;
+
+            if let Some(raw) = self.pending.take().map(pending_bytes) {
+                actions.push(RuntimeAction::ForwardToPane(raw));
+            }
+            break;
+        }
+    }
+
+    fn best_exact_prefix_len(&self, max_len: usize) -> Option<(usize, RuntimeAction)> {
+        let pending = self.pending.as_ref()?;
+        for len in (1..=max_len).rev() {
+            let strokes: Vec<KeyStroke> = pending
+                .decoded
+                .iter()
+                .take(len)
+                .map(|item| item.stroke)
+                .collect();
+            if let Some(action) = self.keymap.exact_action(&strokes) {
+                return Some((len, action));
+            }
+        }
+        None
+    }
+
+    fn consume_prefix(&mut self, len: usize) -> Vec<DecodedStroke> {
+        let Some(pending) = &mut self.pending else {
+            return Vec::new();
+        };
+
+        if len >= pending.decoded.len() {
+            return Vec::new();
         }
 
-        if is_prefix_match(&self.keymap.bindings, &[decoded.stroke]) {
-            self.pending_chord = Some(PendingChord {
-                started_at: Instant::now(),
-                strokes: vec![decoded.stroke],
-                raw_bytes: decoded.raw,
-            });
-            return;
-        }
-
-        actions.push(RuntimeAction::ForwardToPane(decoded.raw));
+        pending.decoded.split_off(len)
     }
 }
 
@@ -242,11 +290,11 @@ impl ByteDecoder {
         let mut decoded = Vec::new();
 
         loop {
-            let Some((event, consumed)) = decode_one(&self.pending) else {
+            let Some((stroke, consumed)) = decode_one(&self.pending) else {
                 break;
             };
             self.pending.drain(0..consumed);
-            decoded.push(event);
+            decoded.push(stroke);
         }
 
         decoded
@@ -255,6 +303,44 @@ impl ByteDecoder {
     fn take_pending(&mut self) -> Vec<u8> {
         std::mem::take(&mut self.pending)
     }
+}
+
+fn validate_no_duplicate_chords(bindings: &[KeyBinding], scope: &str) -> Result<()> {
+    for i in 0..bindings.len() {
+        for j in (i + 1)..bindings.len() {
+            if bindings[i].chord == bindings[j].chord {
+                bail!("duplicate {scope} key binding chord detected");
+            }
+        }
+    }
+    Ok(())
+}
+
+fn pending_bytes(pending: PendingChord) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for decoded in pending.decoded {
+        bytes.extend_from_slice(&decoded.raw);
+    }
+    bytes
+}
+
+fn find_exact(bindings: &[KeyBinding], strokes: &[KeyStroke]) -> Option<RuntimeAction> {
+    bindings
+        .iter()
+        .find(|binding| binding.chord == strokes)
+        .map(|binding| binding.action.clone())
+}
+
+fn has_any_prefix(bindings: &[KeyBinding], strokes: &[KeyStroke]) -> bool {
+    bindings
+        .iter()
+        .any(|binding| binding.chord.starts_with(strokes))
+}
+
+fn has_longer_prefix(bindings: &[KeyBinding], strokes: &[KeyStroke]) -> bool {
+    bindings
+        .iter()
+        .any(|binding| binding.chord.len() > strokes.len() && binding.chord.starts_with(strokes))
 }
 
 fn decode_one(bytes: &[u8]) -> Option<(DecodedStroke, usize)> {
@@ -280,10 +366,10 @@ fn decode_one(bytes: &[u8]) -> Option<(DecodedStroke, usize)> {
         return None;
     }
 
-    let mut inner = decode_single(second);
-    inner.stroke.alt = true;
-    inner.raw = vec![0x1b, second];
-    Some((inner, 2))
+    let mut decoded = decode_single(second);
+    decoded.stroke.alt = true;
+    decoded.raw = vec![0x1b, second];
+    Some((decoded, 2))
 }
 
 fn decode_single(byte: u8) -> DecodedStroke {
@@ -302,10 +388,7 @@ fn decode_single(byte: u8) -> DecodedStroke {
                 key: KeyCode::Char(character),
             }
         }
-        _ => {
-            let character = char::from(byte);
-            KeyStroke::simple(KeyCode::Char(character))
-        }
+        _ => KeyStroke::simple(KeyCode::Char(char::from(byte))),
     };
 
     DecodedStroke {
@@ -315,28 +398,35 @@ fn decode_single(byte: u8) -> DecodedStroke {
 }
 
 fn decode_escape_sequence(bytes: &[u8]) -> Option<(DecodedStroke, usize)> {
-    let sequences: &[(&[u8], KeyCode)] = &[
-        (b"\x1b[A", KeyCode::ArrowUp),
-        (b"\x1b[B", KeyCode::ArrowDown),
-        (b"\x1b[C", KeyCode::ArrowRight),
-        (b"\x1b[D", KeyCode::ArrowLeft),
-        (b"\x1b[H", KeyCode::Home),
-        (b"\x1b[F", KeyCode::End),
-        (b"\x1b[2~", KeyCode::Insert),
-        (b"\x1b[3~", KeyCode::Delete),
-        (b"\x1b[5~", KeyCode::PageUp),
-        (b"\x1b[6~", KeyCode::PageDown),
-        (b"\x1bOP", KeyCode::Function(1)),
-        (b"\x1bOQ", KeyCode::Function(2)),
-        (b"\x1bOR", KeyCode::Function(3)),
-        (b"\x1bOS", KeyCode::Function(4)),
+    let sequences: &[(&[u8], KeyStroke)] = &[
+        (b"\x1b[A", KeyStroke::simple(KeyCode::ArrowUp)),
+        (b"\x1b[B", KeyStroke::simple(KeyCode::ArrowDown)),
+        (b"\x1b[C", KeyStroke::simple(KeyCode::ArrowRight)),
+        (b"\x1b[D", KeyStroke::simple(KeyCode::ArrowLeft)),
+        (b"\x1b[H", KeyStroke::simple(KeyCode::Home)),
+        (b"\x1b[F", KeyStroke::simple(KeyCode::End)),
+        (b"\x1b[2~", KeyStroke::simple(KeyCode::Insert)),
+        (b"\x1b[3~", KeyStroke::simple(KeyCode::Delete)),
+        (b"\x1b[5~", KeyStroke::simple(KeyCode::PageUp)),
+        (b"\x1b[6~", KeyStroke::simple(KeyCode::PageDown)),
+        (
+            b"\x1b[Z",
+            KeyStroke {
+                shift: true,
+                ..KeyStroke::simple(KeyCode::Tab)
+            },
+        ),
+        (b"\x1bOP", KeyStroke::simple(KeyCode::Function(1))),
+        (b"\x1bOQ", KeyStroke::simple(KeyCode::Function(2))),
+        (b"\x1bOR", KeyStroke::simple(KeyCode::Function(3))),
+        (b"\x1bOS", KeyStroke::simple(KeyCode::Function(4))),
     ];
 
-    for (pattern, key) in sequences {
+    for (pattern, stroke) in sequences {
         if bytes.starts_with(pattern) {
             return Some((
                 DecodedStroke {
-                    stroke: KeyStroke::simple(*key),
+                    stroke: *stroke,
                     raw: pattern.to_vec(),
                 },
                 pattern.len(),
@@ -402,13 +492,12 @@ fn parse_stroke(value: &str) -> Result<KeyStroke> {
         }
     }
 
-    let key = parse_key_token(tokens[tokens.len() - 1])?;
     Ok(KeyStroke {
         ctrl,
         alt,
         shift,
         super_key,
-        key,
+        key: parse_key_token(tokens[tokens.len() - 1])?,
     })
 }
 
@@ -469,19 +558,6 @@ fn parse_action(value: &str) -> Result<RuntimeAction> {
     }
 }
 
-fn exact_match(bindings: &[KeyBinding], strokes: &[KeyStroke]) -> Option<RuntimeAction> {
-    bindings
-        .iter()
-        .find(|binding| binding.chord == strokes)
-        .map(|binding| binding.action.clone())
-}
-
-fn is_prefix_match(bindings: &[KeyBinding], strokes: &[KeyStroke]) -> bool {
-    bindings
-        .iter()
-        .any(|binding| binding.chord.starts_with(strokes))
-}
-
 impl KeyStroke {
     const fn simple(key: KeyCode) -> Self {
         Self {
@@ -498,6 +574,8 @@ impl KeyStroke {
 mod tests {
     use super::{InputProcessor, Keymap, RuntimeAction};
     use std::collections::BTreeMap;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn maps_default_prefix_commands() {
@@ -507,39 +585,104 @@ mod tests {
     }
 
     #[test]
-    fn forwards_unknown_prefix_combo() {
-        let mut processor = InputProcessor::new(Keymap::default_runtime());
-        let actions = processor.process_chunk(&[0x01, b'z']);
+    fn supports_literal_alias_plus_minus() {
+        let mut runtime = BTreeMap::new();
+        runtime.insert("+".to_string(), "increase_split".to_string());
+        runtime.insert("minus".to_string(), "decrease_split".to_string());
+        let keymap =
+            Keymap::from_parts("ctrl+a", 400, &runtime, &BTreeMap::new()).expect("valid keymap");
+
+        let mut processor = InputProcessor::new(keymap);
         assert_eq!(
-            actions,
-            vec![RuntimeAction::ForwardToPane(vec![0x01, b'z'])]
+            processor.process_chunk(&[0x01, b'+']),
+            vec![RuntimeAction::IncreaseSplit]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'-']),
+            vec![RuntimeAction::DecreaseSplit]
         );
     }
 
     #[test]
-    fn supports_literal_alias_plus_minus() {
-        let mut bindings = BTreeMap::new();
-        bindings.insert("+".to_string(), "increase_split".to_string());
-        bindings.insert("minus".to_string(), "decrease_split".to_string());
-
-        let keymap = Keymap::from_parts("ctrl+a", 400, &bindings).expect("valid keymap");
+    fn supports_configurable_prefix() {
+        let mut runtime = BTreeMap::new();
+        runtime.insert("o".to_string(), "focus_next_pane".to_string());
+        let keymap =
+            Keymap::from_parts("ctrl+b", 400, &runtime, &BTreeMap::new()).expect("valid keymap");
         let mut processor = InputProcessor::new(keymap);
 
-        let plus = processor.process_chunk(&[0x01, b'+']);
-        assert_eq!(plus, vec![RuntimeAction::IncreaseSplit]);
-
-        let minus = processor.process_chunk(&[0x01, b'-']);
-        assert_eq!(minus, vec![RuntimeAction::DecreaseSplit]);
+        assert_eq!(
+            processor.process_chunk(&[0x02, b'o']),
+            vec![RuntimeAction::FocusNext]
+        );
     }
 
     #[test]
-    fn supports_configurable_prefix() {
-        let mut bindings = BTreeMap::new();
-        bindings.insert("o".to_string(), "focus_next_pane".to_string());
-        let keymap = Keymap::from_parts("ctrl+b", 400, &bindings).expect("valid keymap");
+    fn longest_match_wins_with_timeout() {
+        let mut runtime = BTreeMap::new();
+        runtime.insert("w".to_string(), "show_help".to_string());
+        runtime.insert("w o".to_string(), "focus_next_pane".to_string());
+        let keymap =
+            Keymap::from_parts("ctrl+a", 80, &runtime, &BTreeMap::new()).expect("valid keymap");
         let mut processor = InputProcessor::new(keymap);
 
-        let actions = processor.process_chunk(&[0x02, b'o']);
-        assert_eq!(actions, vec![RuntimeAction::FocusNext]);
+        assert!(processor.process_chunk(&[0x01, b'w']).is_empty());
+        assert_eq!(
+            processor.process_chunk(&[b'o']),
+            vec![RuntimeAction::FocusNext]
+        );
+    }
+
+    #[test]
+    fn timeout_falls_back_to_shorter_match() {
+        let mut runtime = BTreeMap::new();
+        runtime.insert("w".to_string(), "show_help".to_string());
+        runtime.insert("w o".to_string(), "focus_next_pane".to_string());
+        let keymap =
+            Keymap::from_parts("ctrl+a", 50, &runtime, &BTreeMap::new()).expect("valid keymap");
+        let mut processor = InputProcessor::new(keymap);
+
+        assert!(processor.process_chunk(&[0x01, b'w']).is_empty());
+        thread::sleep(Duration::from_millis(70));
+        assert_eq!(processor.process_chunk(&[]), vec![RuntimeAction::ShowHelp]);
+    }
+
+    #[test]
+    fn global_binding_works_without_prefix() {
+        let mut global = BTreeMap::new();
+        global.insert("ctrl+q".to_string(), "quit".to_string());
+        let keymap =
+            Keymap::from_parts("ctrl+a", 400, &BTreeMap::new(), &global).expect("valid keymap");
+        let mut processor = InputProcessor::new(keymap);
+
+        assert_eq!(processor.process_chunk(&[0x11]), vec![RuntimeAction::Quit]);
+    }
+
+    #[test]
+    fn global_precedence_over_runtime() {
+        let mut global = BTreeMap::new();
+        global.insert("ctrl+a o".to_string(), "quit".to_string());
+        let mut runtime = BTreeMap::new();
+        runtime.insert("o".to_string(), "focus_next_pane".to_string());
+
+        let keymap = Keymap::from_parts("ctrl+a", 400, &runtime, &global).expect("valid keymap");
+        let mut processor = InputProcessor::new(keymap);
+
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'o']),
+            vec![RuntimeAction::Quit]
+        );
+    }
+
+    #[test]
+    fn forwards_unmatched_bytes() {
+        let mut processor = InputProcessor::new(Keymap::default_runtime());
+        assert_eq!(
+            processor.process_chunk(&[b'h', b'i']),
+            vec![
+                RuntimeAction::ForwardToPane(vec![b'h']),
+                RuntimeAction::ForwardToPane(vec![b'i'])
+            ]
+        );
     }
 }

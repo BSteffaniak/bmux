@@ -17,6 +17,8 @@ pub struct KeyBindingConfig {
     pub timeout_ms: u64,
     /// Runtime action bindings after prefix
     pub runtime: BTreeMap<String, String>,
+    /// Global runtime action bindings (no prefix required)
+    pub global: BTreeMap<String, String>,
     /// Normal mode key bindings
     pub normal: BTreeMap<String, String>,
     /// Insert mode key bindings (usually just Escape)
@@ -33,12 +35,17 @@ impl Default for KeyBindingConfig {
             prefix: "ctrl+a".to_string(),
             timeout_ms: 400,
             runtime: default_runtime_bindings(),
+            global: default_global_runtime_bindings(),
             normal: default_normal_bindings(),
             insert: default_insert_bindings(),
             visual: default_visual_bindings(),
             command: default_command_bindings(),
         }
     }
+}
+
+fn default_global_runtime_bindings() -> BTreeMap<String, String> {
+    BTreeMap::new()
 }
 
 fn default_runtime_bindings() -> BTreeMap<String, String> {
