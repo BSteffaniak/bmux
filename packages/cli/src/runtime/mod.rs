@@ -29,7 +29,7 @@ mod persistence;
 mod status_message;
 mod terminal_protocol;
 use commands::process_input_events;
-use compositor::{RenderCache, RenderDebugState, render_frame};
+use compositor::{RenderCache, RenderDebugState, SelectionOverlay, render_frame};
 use pane_runtime::{
     any_running_panes, first_running_pane_id, pane_is_running, refresh_exit_codes, resize_panes,
     spawn_pane, stop_pane_process,
@@ -91,6 +91,8 @@ struct RuntimeSettings {
 struct ScrollState {
     active: bool,
     offsets: BTreeMap<PaneId, usize>,
+    cursors: BTreeMap<PaneId, (u16, u16)>,
+    selection_anchors: BTreeMap<PaneId, (u16, u16)>,
 }
 
 struct RuntimeOptions {
@@ -601,6 +603,22 @@ fn run_two_pane_runtime(
             None
         };
 
+        let selection_overlay = if scroll_state.active {
+            scroll_state
+                .selection_anchors
+                .get(&focused_pane)
+                .zip(scroll_state.cursors.get(&focused_pane))
+                .map(|(anchor, cursor)| SelectionOverlay {
+                    pane_id: focused_pane,
+                    start_row: anchor.0,
+                    start_col: anchor.1,
+                    end_row: cursor.0,
+                    end_col: cursor.1,
+                })
+        } else {
+            None
+        };
+
         if force_redraw || pane_dirty || Instant::now() >= next_status_redraw {
             render_frame(
                 &panes,
@@ -610,6 +628,7 @@ fn run_two_pane_runtime(
                 shell_name,
                 &cwd,
                 focused_pane,
+                selection_overlay,
                 scroll_status_suffix.as_deref(),
                 status_message.as_ref().map(|message| message.text.as_str()),
                 force_redraw,

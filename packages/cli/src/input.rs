@@ -33,6 +33,11 @@ pub(crate) enum RuntimeAction {
     ScrollDownPage,
     ScrollTop,
     ScrollBottom,
+    BeginSelection,
+    MoveCursorLeft,
+    MoveCursorRight,
+    MoveCursorUp,
+    MoveCursorDown,
     CopyScrollback,
     ForwardToPane(Vec<u8>),
 }
@@ -160,6 +165,7 @@ impl Keymap {
         runtime.insert("page_down".to_string(), "scroll_down_page".to_string());
         runtime.insert("g".to_string(), "scroll_top".to_string());
         runtime.insert("shift+g".to_string(), "scroll_bottom".to_string());
+        runtime.insert("v".to_string(), "begin_selection".to_string());
         runtime.insert("y".to_string(), "copy_scrollback".to_string());
         runtime.insert("q".to_string(), "quit".to_string());
 
@@ -752,6 +758,11 @@ fn action_to_name(action: &RuntimeAction) -> &'static str {
         RuntimeAction::ScrollDownPage => "scroll_down_page",
         RuntimeAction::ScrollTop => "scroll_top",
         RuntimeAction::ScrollBottom => "scroll_bottom",
+        RuntimeAction::BeginSelection => "begin_selection",
+        RuntimeAction::MoveCursorLeft => "move_cursor_left",
+        RuntimeAction::MoveCursorRight => "move_cursor_right",
+        RuntimeAction::MoveCursorUp => "move_cursor_up",
+        RuntimeAction::MoveCursorDown => "move_cursor_down",
         RuntimeAction::CopyScrollback => "copy_scrollback",
         RuntimeAction::ForwardToPane(_) => "forward_to_pane",
     }
@@ -770,6 +781,11 @@ fn scroll_mode_action(stroke: KeyStroke) -> Option<RuntimeAction> {
         (false, false, KeyCode::PageDown) => Some(RuntimeAction::ScrollDownPage),
         (false, false, KeyCode::Char('g')) => Some(RuntimeAction::ScrollTop),
         (false, true, KeyCode::Char('g')) => Some(RuntimeAction::ScrollBottom),
+        (false, false, KeyCode::Char('v')) => Some(RuntimeAction::BeginSelection),
+        (false, false, KeyCode::Char('h')) => Some(RuntimeAction::MoveCursorLeft),
+        (false, false, KeyCode::Char('l')) => Some(RuntimeAction::MoveCursorRight),
+        (false, false, KeyCode::Char('k')) => Some(RuntimeAction::MoveCursorUp),
+        (false, false, KeyCode::Char('j')) => Some(RuntimeAction::MoveCursorDown),
         (true, false, KeyCode::Char('y')) => Some(RuntimeAction::ScrollUpLine),
         (true, false, KeyCode::Char('e')) => Some(RuntimeAction::ScrollDownLine),
         (false, false, KeyCode::Char('y')) => Some(RuntimeAction::CopyScrollback),
@@ -1096,6 +1112,11 @@ fn parse_action(value: &str) -> Result<RuntimeAction> {
         "scroll_down_page" => Ok(RuntimeAction::ScrollDownPage),
         "scroll_top" => Ok(RuntimeAction::ScrollTop),
         "scroll_bottom" => Ok(RuntimeAction::ScrollBottom),
+        "begin_selection" => Ok(RuntimeAction::BeginSelection),
+        "move_cursor_left" => Ok(RuntimeAction::MoveCursorLeft),
+        "move_cursor_right" => Ok(RuntimeAction::MoveCursorRight),
+        "move_cursor_up" => Ok(RuntimeAction::MoveCursorUp),
+        "move_cursor_down" => Ok(RuntimeAction::MoveCursorDown),
         "copy_scrollback" => Ok(RuntimeAction::CopyScrollback),
         unknown => bail!("unknown keymap action '{unknown}'"),
     }
@@ -1173,6 +1194,10 @@ mod tests {
             vec![RuntimeAction::ScrollBottom]
         );
         assert_eq!(
+            processor.process_chunk(&[0x01, b'v']),
+            vec![RuntimeAction::BeginSelection]
+        );
+        assert_eq!(
             processor.process_chunk(&[0x01, b'y']),
             vec![RuntimeAction::CopyScrollback]
         );
@@ -1201,6 +1226,26 @@ mod tests {
         assert_eq!(
             processor.process_chunk(&[b'G']),
             vec![RuntimeAction::ScrollBottom]
+        );
+        assert_eq!(
+            processor.process_chunk(&[b'v']),
+            vec![RuntimeAction::BeginSelection]
+        );
+        assert_eq!(
+            processor.process_chunk(&[b'h']),
+            vec![RuntimeAction::MoveCursorLeft]
+        );
+        assert_eq!(
+            processor.process_chunk(&[b'j']),
+            vec![RuntimeAction::MoveCursorDown]
+        );
+        assert_eq!(
+            processor.process_chunk(&[b'k']),
+            vec![RuntimeAction::MoveCursorUp]
+        );
+        assert_eq!(
+            processor.process_chunk(&[b'l']),
+            vec![RuntimeAction::MoveCursorRight]
         );
         assert_eq!(
             processor.process_chunk(&[b'y']),

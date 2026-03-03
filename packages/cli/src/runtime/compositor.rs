@@ -28,6 +28,15 @@ struct PaneRenderData {
     lines: Vec<Vec<u8>>,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct SelectionOverlay {
+    pub(super) pane_id: PaneId,
+    pub(super) start_row: u16,
+    pub(super) start_col: u16,
+    pub(super) end_row: u16,
+    pub(super) end_col: u16,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct CellStyle {
     fg: Color,
@@ -220,6 +229,7 @@ pub(super) fn render_frame(
     shell_name: &str,
     cwd: &Path,
     focused_pane: PaneId,
+    selection: Option<SelectionOverlay>,
     mode_suffix: Option<&str>,
     status_message: Option<&str>,
     full_redraw: bool,
@@ -251,6 +261,7 @@ pub(super) fn render_frame(
                 pane,
                 *rect,
                 *pane_id == focused_pane,
+                selection.filter(|overlay| overlay.pane_id == *pane_id),
             ));
         }
     }
@@ -365,6 +376,7 @@ fn collect_pane_render_data(
     pane: &PaneRuntime,
     rect: Rect,
     focused: bool,
+    selection: Option<SelectionOverlay>,
 ) -> PaneRenderData {
     let inner = rect.inner();
     let title = if pane.closed {
@@ -421,7 +433,7 @@ fn collect_pane_render_data(
         .expect("pane parser mutex poisoned");
     let screen = parser.screen();
     for row_index in 0..inner.height {
-        lines.push(render_screen_row(screen, row_index, inner.width));
+        lines.push(render_screen_row(screen, row_index, inner.width, selection));
     }
 
     PaneRenderData {
@@ -432,7 +444,12 @@ fn collect_pane_render_data(
     }
 }
 
-fn render_screen_row(screen: &Screen, row: u16, width: u16) -> Vec<u8> {
+fn render_screen_row(
+    screen: &Screen,
+    row: u16,
+    width: u16,
+    selection: Option<SelectionOverlay>,
+) -> Vec<u8> {
     let mut output = Vec::with_capacity(usize::from(width) * 4);
     let mut current_style = CellStyle::default();
     let mut col = 0_u16;
@@ -452,7 +469,7 @@ fn render_screen_row(screen: &Screen, row: u16, width: u16) -> Vec<u8> {
             continue;
         }
 
-        let style = CellStyle {
+        let mut style = CellStyle {
             fg: cell.fgcolor(),
             bg: cell.bgcolor(),
             bold: cell.bold(),
@@ -461,6 +478,12 @@ fn render_screen_row(screen: &Screen, row: u16, width: u16) -> Vec<u8> {
             underline: cell.underline(),
             inverse: cell.inverse(),
         };
+
+        if let Some(selection) = selection {
+            if cell_in_selection(row, col, selection) {
+                style.inverse = !style.inverse;
+            }
+        }
 
         push_style_diff(&mut output, current_style, style);
         current_style = style;
@@ -481,6 +504,43 @@ fn render_screen_row(screen: &Screen, row: u16, width: u16) -> Vec<u8> {
 
     push_style_diff(&mut output, current_style, CellStyle::default());
     output
+}
+
+fn cell_in_selection(row: u16, col: u16, selection: SelectionOverlay) -> bool {
+    let (start_row, start_col, end_row, end_col) =
+        if (selection.start_row, selection.start_col) <= (selection.end_row, selection.end_col) {
+            (
+                selection.start_row,
+                selection.start_col,
+                selection.end_row,
+                selection.end_col,
+            )
+        } else {
+            (
+                selection.end_row,
+                selection.end_col,
+                selection.start_row,
+                selection.start_col,
+            )
+        };
+
+    if row < start_row || row > end_row {
+        return false;
+    }
+
+    if start_row == end_row {
+        return row == start_row && col >= start_col && col <= end_col;
+    }
+
+    if row == start_row {
+        return col >= start_col;
+    }
+
+    if row == end_row {
+        return col <= end_col;
+    }
+
+    true
 }
 
 fn push_style_diff(output: &mut Vec<u8>, previous: CellStyle, next: CellStyle) {
@@ -696,7 +756,7 @@ mod tests {
         let mut parser = Parser::new(2, 20, 0);
         parser.process(b"\x1b[31mred\x1b[0m text\x1b[K");
 
-        let row = render_screen_row(parser.screen(), 0, 20);
+        let row = render_screen_row(parser.screen(), 0, 20, None);
         let rendered = String::from_utf8(row).expect("valid utf8 row output");
 
         assert!(rendered.contains("red"));

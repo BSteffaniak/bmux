@@ -315,17 +315,46 @@ pub(super) fn process_input_events(
                                 .lock()
                                 .expect("pane parser mutex poisoned");
                             let offset = parser.screen().scrollback();
+                            let (cursor_row, cursor_col) = parser.screen().cursor_position();
                             scroll_state.offsets.insert(*focused_pane, offset);
+                            let (max_row, max_col) = pane_rects
+                                .get(focused_pane)
+                                .map(|rect| {
+                                    (
+                                        rect.inner().height.saturating_sub(1),
+                                        rect.inner().width.saturating_sub(1),
+                                    )
+                                })
+                                .unwrap_or((0, 0));
+                            scroll_state.cursors.insert(
+                                *focused_pane,
+                                (cursor_row.min(max_row), cursor_col.min(max_col)),
+                            );
                             active_pane.state.dirty.store(true, Ordering::Relaxed);
                         }
                         *status_message = Some(StatusMessage::new(
-                            "scroll mode: arrows/Ctrl-Y/Ctrl-E line, PgUp/PgDn page, g/G top/bottom, y copy, Esc exit"
+                            "scroll mode: arrows/Ctrl-Y/Ctrl-E line, PgUp/PgDn page, g/G top/bottom, v select, y copy, Esc exit"
                                 .to_string(),
                         ));
                     }
                     RuntimeAction::ExitScrollMode => {
+                        if scroll_state
+                            .selection_anchors
+                            .remove(focused_pane)
+                            .is_some()
+                        {
+                            *status_message =
+                                Some(StatusMessage::new("selection cancelled".to_string()));
+                            if let Some(active_pane) = panes.get_mut(focused_pane) {
+                                active_pane.state.dirty.store(true, Ordering::Relaxed);
+                            }
+                            continue;
+                        }
+
                         scroll_state.active = false;
                         scroll_state.offsets.clear();
+                        scroll_state.cursors.clear();
+                        scroll_state.selection_anchors.clear();
                         for pane in panes.values_mut() {
                             let mut parser = pane
                                 .state
@@ -354,6 +383,38 @@ pub(super) fn process_input_events(
                             );
                         }
                     }
+                    RuntimeAction::BeginSelection => {
+                        if scroll_state.active {
+                            let cursor = scroll_state
+                                .cursors
+                                .get(focused_pane)
+                                .copied()
+                                .or_else(|| pane_rects.get(focused_pane).map(|_| (0, 0)));
+                            if let Some(cursor) = cursor {
+                                scroll_state.selection_anchors.insert(*focused_pane, cursor);
+                                if let Some(active_pane) = panes.get_mut(focused_pane) {
+                                    active_pane.state.dirty.store(true, Ordering::Relaxed);
+                                }
+                                *status_message = Some(StatusMessage::new(
+                                    "selection started (move with h/j/k/l)".to_string(),
+                                ));
+                            }
+                        }
+                    }
+                    RuntimeAction::MoveCursorLeft
+                    | RuntimeAction::MoveCursorRight
+                    | RuntimeAction::MoveCursorUp
+                    | RuntimeAction::MoveCursorDown => {
+                        if scroll_state.active {
+                            move_selection_cursor(
+                                action,
+                                *focused_pane,
+                                pane_rects,
+                                panes,
+                                scroll_state,
+                            );
+                        }
+                    }
                     RuntimeAction::CopyScrollback => {
                         if scroll_state.active {
                             if let Some(active_pane) = panes.get_mut(focused_pane) {
@@ -362,7 +423,25 @@ pub(super) fn process_input_events(
                                     .parser
                                     .lock()
                                     .expect("pane parser mutex poisoned");
-                                let text = parser.screen().contents();
+                                let text = if let Some(anchor) =
+                                    scroll_state.selection_anchors.get(focused_pane).copied()
+                                {
+                                    let cursor = scroll_state
+                                        .cursors
+                                        .get(focused_pane)
+                                        .copied()
+                                        .unwrap_or(anchor);
+                                    let (start_row, start_col, end_row, end_col) =
+                                        ordered_range(anchor, cursor);
+                                    parser.screen().contents_between(
+                                        start_row,
+                                        start_col,
+                                        end_row,
+                                        end_col.saturating_add(1),
+                                    )
+                                } else {
+                                    parser.screen().contents()
+                                };
                                 drop(parser);
 
                                 if text.is_empty() {
@@ -370,21 +449,28 @@ pub(super) fn process_input_events(
                                         "nothing to copy in current pane view".to_string(),
                                     ));
                                 } else if copy_to_system_clipboard(&text) {
+                                    scroll_state.selection_anchors.remove(focused_pane);
                                     *status_message = Some(StatusMessage::new(format!(
                                         "copied {} chars to system clipboard",
                                         text.chars().count()
                                     )));
                                 } else {
                                     *internal_clipboard = Some(text.clone());
+                                    scroll_state.selection_anchors.remove(focused_pane);
                                     *status_message = Some(StatusMessage::new(format!(
                                         "system clipboard unavailable; copied {} chars to internal buffer",
                                         text.chars().count()
                                     )));
                                 }
+                                active_pane.state.dirty.store(true, Ordering::Relaxed);
                             }
                         }
                     }
                     RuntimeAction::ForwardToPane(_) => unreachable!(),
+                }
+
+                if scroll_state.active {
+                    ensure_scroll_cursor(*focused_pane, panes, pane_rects, scroll_state);
                 }
 
                 *force_redraw = true;
@@ -466,6 +552,74 @@ fn apply_scrollback_action(
     let applied = parser.screen().scrollback();
     scroll_state.offsets.insert(focused_pane, applied);
     active_pane.state.dirty.store(true, Ordering::Relaxed);
+}
+
+fn move_selection_cursor(
+    action: RuntimeAction,
+    focused_pane: PaneId,
+    pane_rects: &BTreeMap<PaneId, Rect>,
+    panes: &mut BTreeMap<PaneId, PaneRuntime>,
+    scroll_state: &mut ScrollState,
+) {
+    let Some(rect) = pane_rects.get(&focused_pane) else {
+        return;
+    };
+
+    let max_row = rect.inner().height.saturating_sub(1);
+    let max_col = rect.inner().width.saturating_sub(1);
+    let entry = scroll_state.cursors.entry(focused_pane).or_insert((0, 0));
+    match action {
+        RuntimeAction::MoveCursorLeft => entry.1 = entry.1.saturating_sub(1),
+        RuntimeAction::MoveCursorRight => entry.1 = entry.1.saturating_add(1).min(max_col),
+        RuntimeAction::MoveCursorUp => entry.0 = entry.0.saturating_sub(1),
+        RuntimeAction::MoveCursorDown => entry.0 = entry.0.saturating_add(1).min(max_row),
+        _ => {}
+    }
+
+    if let Some(active_pane) = panes.get_mut(&focused_pane) {
+        active_pane.state.dirty.store(true, Ordering::Relaxed);
+    }
+}
+
+fn ordered_range(start: (u16, u16), end: (u16, u16)) -> (u16, u16, u16, u16) {
+    if start <= end {
+        (start.0, start.1, end.0, end.1)
+    } else {
+        (end.0, end.1, start.0, start.1)
+    }
+}
+
+fn ensure_scroll_cursor(
+    focused_pane: PaneId,
+    panes: &mut BTreeMap<PaneId, PaneRuntime>,
+    pane_rects: &BTreeMap<PaneId, Rect>,
+    scroll_state: &mut ScrollState,
+) {
+    if scroll_state.cursors.contains_key(&focused_pane) {
+        return;
+    }
+    let Some(active_pane) = panes.get_mut(&focused_pane) else {
+        return;
+    };
+    let Some(rect) = pane_rects.get(&focused_pane) else {
+        return;
+    };
+
+    let parser = active_pane
+        .state
+        .parser
+        .lock()
+        .expect("pane parser mutex poisoned");
+    let (row, col) = parser.screen().cursor_position();
+    drop(parser);
+
+    scroll_state.cursors.insert(
+        focused_pane,
+        (
+            row.min(rect.inner().height.saturating_sub(1)),
+            col.min(rect.inner().width.saturating_sub(1)),
+        ),
+    );
 }
 
 fn copy_to_system_clipboard(contents: &str) -> bool {
