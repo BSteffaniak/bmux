@@ -1,8 +1,9 @@
 use super::PaneRuntime;
 use crate::cli::DebugRenderLogFormat;
-use crate::pane::{Layout, Rect};
+use crate::pane::{PaneId, Rect};
 use crate::status::{build_status_line, write_status_line};
 use anyhow::{Context, Result};
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::Path;
@@ -14,13 +15,14 @@ use vt100::{Color, Screen};
 pub(super) struct RenderCache {
     initialized: bool,
     status_line: String,
-    pane_rects: [Rect; 2],
-    pane_titles: [String; 2],
-    focused_pane: usize,
-    pane_lines: [Vec<Vec<u8>>; 2],
+    pane_rects: BTreeMap<PaneId, Rect>,
+    pane_titles: BTreeMap<PaneId, String>,
+    focused_pane: Option<PaneId>,
+    pane_lines: BTreeMap<PaneId, Vec<Vec<u8>>>,
 }
 
 struct PaneRenderData {
+    pane_id: PaneId,
     rect: Rect,
     title: String,
     lines: Vec<Vec<u8>>,
@@ -211,13 +213,13 @@ impl RenderDebugLogger {
 }
 
 pub(super) fn render_frame(
-    panes: &[PaneRuntime],
-    layout: &Layout,
+    panes: &BTreeMap<PaneId, PaneRuntime>,
+    pane_rects: &BTreeMap<PaneId, Rect>,
     cols: u16,
     rows: u16,
     shell_name: &str,
     cwd: &Path,
-    focused_pane: usize,
+    focused_pane: PaneId,
     status_message: Option<&str>,
     full_redraw: bool,
     render_cache: &mut RenderCache,
@@ -231,17 +233,30 @@ pub(super) fn render_frame(
         (None, None) => None,
     };
 
+    let mut pane_data = Vec::new();
+    for (pane_id, rect) in pane_rects {
+        if let Some(pane) = panes.get(pane_id) {
+            pane_data.push(collect_pane_render_data(
+                *pane_id,
+                pane,
+                *rect,
+                *pane_id == focused_pane,
+            ));
+        }
+    }
+    let focused_index = pane_data
+        .iter()
+        .position(|pane| pane.pane_id == focused_pane)
+        .unwrap_or(0);
+
     let status_line = build_status_line(
         shell_name,
         cwd,
         cols,
         rows,
-        focused_pane,
+        focused_index,
         status_suffix.as_deref(),
     );
-    let left_data = collect_pane_render_data(&panes[0], layout.left, focused_pane == 0);
-    let right_data = collect_pane_render_data(&panes[1], layout.right, focused_pane == 1);
-    let pane_data = [left_data, right_data];
 
     let mut stdout = io::stdout();
     write!(stdout, "\x1b[?25l").context("failed hiding cursor")?;
@@ -255,55 +270,53 @@ pub(super) fn render_frame(
 
     let border_changed = full_redraw
         || !render_cache.initialized
-        || render_cache.focused_pane != focused_pane
-        || render_cache.pane_rects != [pane_data[0].rect, pane_data[1].rect]
-        || render_cache.pane_titles != [pane_data[0].title.clone(), pane_data[1].title.clone()];
+        || render_cache.focused_pane != Some(focused_pane)
+        || render_cache.pane_rects != *pane_rects
+        || pane_data
+            .iter()
+            .any(|pane| render_cache.pane_titles.get(&pane.pane_id) != Some(&pane.title));
 
     if border_changed {
         clear_body_region(&mut stdout, cols, rows)?;
     }
 
     let mut changed_line_count = 0_usize;
-    for pane_index in 0..2 {
+    for pane in &pane_data {
         changed_line_count += draw_changed_lines(
             &mut stdout,
-            &pane_data[pane_index],
-            &render_cache.pane_lines[pane_index],
+            pane,
+            render_cache
+                .pane_lines
+                .get(&pane.pane_id)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
             full_redraw || border_changed,
         )?;
     }
 
     if border_changed || changed_line_count > 0 {
-        draw_rect_border(
-            &mut stdout,
-            pane_data[0].rect,
-            if focused_pane == 0 {
-                "\x1b[36m"
-            } else {
-                "\x1b[90m"
-            },
-            &pane_data[0].title,
-        )?;
-        draw_rect_border(
-            &mut stdout,
-            pane_data[1].rect,
-            if focused_pane == 1 {
-                "\x1b[36m"
-            } else {
-                "\x1b[90m"
-            },
-            &pane_data[1].title,
-        )?;
+        for pane in &pane_data {
+            draw_rect_border(
+                &mut stdout,
+                pane.rect,
+                if pane.pane_id == focused_pane {
+                    "\x1b[36m"
+                } else {
+                    "\x1b[90m"
+                },
+                &pane.title,
+            )?;
+        }
     }
 
-    let focused_rect = if focused_pane == 0 {
-        layout.left.inner()
-    } else {
-        layout.right.inner()
-    };
+    let focused_rect = pane_rects
+        .get(&focused_pane)
+        .copied()
+        .unwrap_or_default()
+        .inner();
 
     let cursor_pos = {
-        let parser = panes[focused_pane]
+        let parser = panes[&focused_pane]
             .state
             .parser
             .lock()
@@ -322,16 +335,27 @@ pub(super) fn render_frame(
     stdout.flush().context("failed flushing rendered frame")?;
 
     render_cache.initialized = true;
-    render_cache.focused_pane = focused_pane;
-    render_cache.pane_rects = [pane_data[0].rect, pane_data[1].rect];
-    render_cache.pane_titles = [pane_data[0].title.clone(), pane_data[1].title.clone()];
-    render_cache.pane_lines = [pane_data[0].lines.clone(), pane_data[1].lines.clone()];
+    render_cache.focused_pane = Some(focused_pane);
+    render_cache.pane_rects = pane_rects.clone();
+    render_cache.pane_titles = pane_data
+        .iter()
+        .map(|pane| (pane.pane_id, pane.title.clone()))
+        .collect();
+    render_cache.pane_lines = pane_data
+        .iter()
+        .map(|pane| (pane.pane_id, pane.lines.clone()))
+        .collect();
     render_debug.record_frame(changed_line_count, status_changed, border_changed);
 
     Ok(())
 }
 
-fn collect_pane_render_data(pane: &PaneRuntime, rect: Rect, focused: bool) -> PaneRenderData {
+fn collect_pane_render_data(
+    pane_id: PaneId,
+    pane: &PaneRuntime,
+    rect: Rect,
+    focused: bool,
+) -> PaneRenderData {
     let inner = rect.inner();
     let title = if pane.closed {
         format!(" {} [closed] ", pane.title)
@@ -344,7 +368,12 @@ fn collect_pane_render_data(pane: &PaneRuntime, rect: Rect, focused: bool) -> Pa
     let mut lines = Vec::new();
 
     if inner.width == 0 || inner.height == 0 {
-        return PaneRenderData { rect, title, lines };
+        return PaneRenderData {
+            pane_id,
+            rect,
+            title,
+            lines,
+        };
     }
 
     if pane.closed {
@@ -353,7 +382,12 @@ fn collect_pane_render_data(pane: &PaneRuntime, rect: Rect, focused: bool) -> Pa
         for _ in 1..inner.height {
             lines.push(vec![b' '; usize::from(inner.width)]);
         }
-        return PaneRenderData { rect, title, lines };
+        return PaneRenderData {
+            pane_id,
+            rect,
+            title,
+            lines,
+        };
     }
 
     if let Some(code) = pane.exit_code {
@@ -362,7 +396,12 @@ fn collect_pane_render_data(pane: &PaneRuntime, rect: Rect, focused: bool) -> Pa
         for _ in 1..inner.height {
             lines.push(vec![b' '; usize::from(inner.width)]);
         }
-        return PaneRenderData { rect, title, lines };
+        return PaneRenderData {
+            pane_id,
+            rect,
+            title,
+            lines,
+        };
     }
 
     let parser = pane
@@ -375,7 +414,12 @@ fn collect_pane_render_data(pane: &PaneRuntime, rect: Rect, focused: bool) -> Pa
         lines.push(render_screen_row(screen, row_index, inner.width));
     }
 
-    PaneRenderData { rect, title, lines }
+    PaneRenderData {
+        pane_id,
+        rect,
+        title,
+        lines,
+    }
 }
 
 fn render_screen_row(screen: &Screen, row: u16, width: u16) -> Vec<u8> {

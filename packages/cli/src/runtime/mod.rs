@@ -1,12 +1,13 @@
 use crate::cli::{Cli, Command, DebugRenderLogFormat, KeymapCommand};
 use crate::input::{InputProcessor, RuntimeAction};
-use crate::pane::{SplitDirection, compute_layout};
+use crate::pane::{LayoutTree, PaneId, SplitDirection};
 use crate::pty::STARTUP_ALT_SCREEN_GUARD_DURATION;
 use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
 use bmux_config::BmuxConfig;
 use clap::Parser;
 use portable_pty::{Child, MasterPty};
+use std::collections::BTreeMap;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,14 +25,13 @@ mod status_message;
 use commands::process_input_events;
 use compositor::{RenderCache, RenderDebugState, render_frame};
 use pane_runtime::{
-    any_running_panes, first_running_pane_index, pane_is_running, refresh_exit_codes, resize_panes,
+    any_running_panes, first_running_pane_id, pane_is_running, refresh_exit_codes, resize_panes,
     spawn_pane, stop_pane_process,
 };
 use status_message::StatusMessage;
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const STATUS_REDRAW_INTERVAL: Duration = Duration::from_millis(200);
-const SPLIT_RATIO_STEP: f32 = 0.05;
 const MIN_PANE_ROWS: u16 = 2;
 const MIN_PANE_COLS: u16 = 2;
 
@@ -99,30 +99,34 @@ fn run_two_pane_runtime(
 
     let (mut cols, mut rows) =
         crossterm::terminal::size().context("failed to read terminal size")?;
-    let mut split_ratio = 0.5_f32;
-    let mut split_direction = SplitDirection::Vertical;
-    let mut layout = compute_layout(cols, rows, split_ratio, split_direction);
+    let mut layout_tree = LayoutTree::two_pane(PaneId(1), PaneId(2), SplitDirection::Vertical, 0.5);
+    let mut pane_rects = layout_tree.compute_rects(cols, rows);
 
     let startup_deadline = Instant::now() + STARTUP_ALT_SCREEN_GUARD_DURATION;
     let user_input_seen = Arc::new(AtomicBool::new(false));
     let shutdown_requested = Arc::new(AtomicBool::new(false));
 
-    let mut panes = vec![
+    let mut panes = BTreeMap::new();
+    panes.insert(
+        PaneId(1),
         spawn_pane(
             shell,
             "left".to_string(),
-            layout.left.inner(),
+            pane_rects[&PaneId(1)].inner(),
             startup_deadline,
             Arc::clone(&user_input_seen),
         )?,
+    );
+    panes.insert(
+        PaneId(2),
         spawn_pane(
             shell,
             "right".to_string(),
-            layout.right.inner(),
+            pane_rects[&PaneId(2)].inner(),
             startup_deadline,
             Arc::clone(&user_input_seen),
         )?,
-    ];
+    );
 
     let (input_tx, input_rx) = mpsc::channel::<RuntimeAction>();
     let input_thread = spawn_input_thread(
@@ -134,7 +138,7 @@ fn run_two_pane_runtime(
 
     let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("?"));
     let shell_name = shell_name(shell);
-    let mut focused_pane = 0_usize;
+    let mut focused_pane = layout_tree.focused;
     let mut force_redraw = true;
     let mut kill_sent = false;
     let mut next_status_redraw = Instant::now() + STATUS_REDRAW_INTERVAL;
@@ -145,33 +149,40 @@ fn run_two_pane_runtime(
         RenderDebugState::new(debug_render, debug_render_log, debug_render_log_format)?;
 
     let exit_code = loop {
-        process_input_events(
+        if let Some(updated_tree) = process_input_events(
             &input_rx,
             &mut panes,
-            &layout,
+            &pane_rects,
+            &layout_tree,
             &mut focused_pane,
-            &mut split_direction,
-            &mut split_ratio,
             &shutdown_requested,
             &mut force_redraw,
             &mut exit_override,
             &mut status_message,
             startup_deadline,
             Arc::clone(&user_input_seen),
-        )?;
+        )? {
+            layout_tree = updated_tree;
+            layout_tree.focused = focused_pane;
+            pane_rects = layout_tree.compute_rects(cols, rows);
+            resize_panes(&mut panes, &pane_rects)?;
+            terminal_guard.refresh_layout(rows)?;
+            force_redraw = true;
+        }
 
         if shutdown_requested.load(Ordering::Relaxed) && !kill_sent {
             debug!("Terminating pane shells");
-            for pane in &mut panes {
+            for pane in panes.values_mut() {
                 stop_pane_process(pane, true)?;
             }
             kill_sent = true;
         }
 
         refresh_exit_codes(&mut panes)?;
-        if focused_pane >= panes.len() || !pane_is_running(&panes[focused_pane]) {
-            if let Some(next_focus) = first_running_pane_index(&panes) {
+        if !panes.get(&focused_pane).is_some_and(pane_is_running) {
+            if let Some(next_focus) = first_running_pane_id(&layout_tree.pane_order(), &panes) {
                 focused_pane = next_focus;
+                layout_tree.focused = focused_pane;
             }
         }
 
@@ -192,30 +203,30 @@ fn run_two_pane_runtime(
         if (new_cols, new_rows) != (cols, rows) {
             cols = new_cols;
             rows = new_rows;
-            layout = compute_layout(cols, rows, split_ratio, split_direction);
-            resize_panes(&mut panes, &layout)?;
+            pane_rects = layout_tree.compute_rects(cols, rows);
+            resize_panes(&mut panes, &pane_rects)?;
             terminal_guard.refresh_layout(rows)?;
             force_redraw = true;
             next_status_redraw = Instant::now() + STATUS_REDRAW_INTERVAL;
             debug!("Terminal resized to {cols}x{rows}");
         }
 
-        let layout_for_ratio = compute_layout(cols, rows, split_ratio, split_direction);
-        if layout_for_ratio != layout {
-            layout = layout_for_ratio;
-            resize_panes(&mut panes, &layout)?;
+        let layout_for_ratio = layout_tree.compute_rects(cols, rows);
+        if layout_for_ratio != pane_rects {
+            pane_rects = layout_for_ratio;
+            resize_panes(&mut panes, &pane_rects)?;
             terminal_guard.refresh_layout(rows)?;
             force_redraw = true;
         }
 
         let pane_dirty = panes
-            .iter()
+            .values()
             .any(|pane| pane.state.dirty.swap(false, Ordering::Relaxed));
 
         if force_redraw || pane_dirty || Instant::now() >= next_status_redraw {
             render_frame(
                 &panes,
-                &layout,
+                &pane_rects,
                 cols,
                 rows,
                 shell_name,
@@ -238,7 +249,7 @@ fn run_two_pane_runtime(
         Err(_) => return Err(anyhow::anyhow!("PTY input thread panicked")),
     }
 
-    for pane in &mut panes {
+    for pane in panes.values_mut() {
         stop_pane_process(pane, false)?;
     }
 

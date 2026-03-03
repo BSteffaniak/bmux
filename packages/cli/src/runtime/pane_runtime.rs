@@ -1,8 +1,9 @@
 use super::{MIN_PANE_COLS, MIN_PANE_ROWS, PaneProcess, PaneRuntime, PaneState};
-use crate::pane::{Layout, Rect};
+use crate::pane::{PaneId, Rect};
 use crate::pty::extract_filtered_output;
 use anyhow::{Context, Result};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use std::collections::BTreeMap;
 use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -137,8 +138,8 @@ pub(super) fn spawn_pane_process(
     })
 }
 
-pub(super) fn refresh_exit_codes(panes: &mut [PaneRuntime]) -> Result<()> {
-    for pane in panes.iter_mut() {
+pub(super) fn refresh_exit_codes(panes: &mut BTreeMap<PaneId, PaneRuntime>) -> Result<()> {
+    for pane in panes.values_mut() {
         let Some(process) = pane.process.as_mut() else {
             continue;
         };
@@ -181,40 +182,61 @@ pub(super) fn pane_is_running(pane: &PaneRuntime) -> bool {
     pane.process.is_some()
 }
 
-pub(super) fn any_running_panes(panes: &[PaneRuntime]) -> bool {
-    panes.iter().any(pane_is_running)
+pub(super) fn any_running_panes(panes: &BTreeMap<PaneId, PaneRuntime>) -> bool {
+    panes.values().any(pane_is_running)
 }
 
-pub(super) fn first_running_pane_index(panes: &[PaneRuntime]) -> Option<usize> {
-    panes.iter().position(pane_is_running)
+pub(super) fn first_running_pane_id(
+    pane_order: &[PaneId],
+    panes: &BTreeMap<PaneId, PaneRuntime>,
+) -> Option<PaneId> {
+    pane_order
+        .iter()
+        .find(|pane_id| panes.get(pane_id).is_some_and(pane_is_running))
+        .copied()
 }
 
-pub(super) fn next_focusable_pane_index(panes: &[PaneRuntime], current: usize) -> usize {
-    if panes.is_empty() {
-        return 0;
+pub(super) fn next_focusable_pane_id(
+    pane_order: &[PaneId],
+    panes: &BTreeMap<PaneId, PaneRuntime>,
+    current: PaneId,
+) -> PaneId {
+    if pane_order.is_empty() {
+        return current;
     }
 
-    for offset in 1..=panes.len() {
-        let index = (current + offset) % panes.len();
-        if pane_is_running(&panes[index]) {
-            return index;
+    let current_index = pane_order
+        .iter()
+        .position(|pane_id| *pane_id == current)
+        .unwrap_or(0);
+
+    for offset in 1..=pane_order.len() {
+        let index = (current_index + offset) % pane_order.len();
+        let candidate = pane_order[index];
+        if panes.get(&candidate).is_some_and(pane_is_running) {
+            return candidate;
         }
     }
 
-    current.min(panes.len() - 1)
+    current
 }
 
-pub(super) fn resize_panes(panes: &mut [PaneRuntime], layout: &Layout) -> Result<()> {
-    for (pane, rect) in panes
-        .iter_mut()
-        .zip([layout.left.inner(), layout.right.inner()])
-    {
+pub(super) fn resize_panes(
+    panes: &mut BTreeMap<PaneId, PaneRuntime>,
+    pane_rects: &BTreeMap<PaneId, Rect>,
+) -> Result<()> {
+    for (pane_id, pane) in panes.iter_mut() {
+        let Some(rect) = pane_rects.get(pane_id) else {
+            continue;
+        };
+        let inner = rect.inner();
+
         if let Some(process) = pane.process.as_mut() {
             process
                 .master
                 .resize(PtySize {
-                    rows: rect.height.max(MIN_PANE_ROWS),
-                    cols: rect.width.max(MIN_PANE_COLS),
+                    rows: inner.height.max(MIN_PANE_ROWS),
+                    cols: inner.width.max(MIN_PANE_COLS),
                     pixel_width: 0,
                     pixel_height: 0,
                 })
@@ -227,8 +249,8 @@ pub(super) fn resize_panes(panes: &mut [PaneRuntime], layout: &Layout) -> Result
             .lock()
             .expect("pane parser mutex poisoned");
         parser.screen_mut().set_size(
-            rect.height.max(MIN_PANE_ROWS),
-            rect.width.max(MIN_PANE_COLS),
+            inner.height.max(MIN_PANE_ROWS),
+            inner.width.max(MIN_PANE_COLS),
         );
         pane.state.dirty.store(true, Ordering::Relaxed);
     }
