@@ -61,13 +61,13 @@ struct RenderCache {
     pane_rects: [Rect; 2],
     pane_titles: [String; 2],
     focused_pane: usize,
-    pane_lines: [Vec<String>; 2],
+    pane_lines: [Vec<Vec<u8>>; 2],
 }
 
 struct PaneRenderData {
     rect: Rect,
     title: String,
-    lines: Vec<String>,
+    lines: Vec<Vec<u8>>,
 }
 
 struct RenderDebugState {
@@ -803,9 +803,9 @@ fn collect_pane_render_data(pane: &PaneRuntime, rect: Rect, focused: bool) -> Pa
 
     if let Some(code) = pane.exit_code {
         let message = format!("[{} exited: {code}]", pane.title);
-        lines.push(pad_or_truncate(&message, usize::from(inner.width)));
+        lines.push(pad_or_truncate(&message, usize::from(inner.width)).into_bytes());
         for _ in 1..inner.height {
-            lines.push(" ".repeat(usize::from(inner.width)));
+            lines.push(vec![b' '; usize::from(inner.width)]);
         }
         return PaneRenderData { rect, title, lines };
     }
@@ -816,15 +816,15 @@ fn collect_pane_render_data(pane: &PaneRuntime, rect: Rect, focused: bool) -> Pa
         .lock()
         .expect("pane parser mutex poisoned");
     let screen = parser.screen();
-    for (row_index, row_text) in screen.rows(0, inner.width).enumerate() {
+    for (row_index, row_text) in screen.rows_formatted(0, inner.width).enumerate() {
         if row_index >= usize::from(inner.height) {
             break;
         }
-        lines.push(pad_or_truncate(&row_text, usize::from(inner.width)));
+        lines.push(row_text);
     }
 
     while lines.len() < usize::from(inner.height) {
-        lines.push(" ".repeat(usize::from(inner.width)));
+        lines.push(vec![b' '; usize::from(inner.width)]);
     }
 
     PaneRenderData { rect, title, lines }
@@ -833,7 +833,7 @@ fn collect_pane_render_data(pane: &PaneRuntime, rect: Rect, focused: bool) -> Pa
 fn draw_changed_lines(
     stdout: &mut io::Stdout,
     pane: &PaneRenderData,
-    previous: &[String],
+    previous: &[Vec<u8>],
     force: bool,
 ) -> Result<usize> {
     let inner = pane.rect.inner();
@@ -852,7 +852,7 @@ fn draw_changed_lines(
         let y = inner
             .y
             .saturating_add(u16::try_from(row_index).unwrap_or(0));
-        write_at(stdout, inner.x, y, line)?;
+        write_at_bytes(stdout, inner.x, y, line)?;
         changed += 1;
     }
 
@@ -898,6 +898,14 @@ fn draw_rect_border(stdout: &mut io::Stdout, rect: Rect, color: &str, title: &st
 
 fn write_at(stdout: &mut io::Stdout, x: u16, y: u16, text: &str) -> Result<()> {
     write!(stdout, "\x1b[{y};{x}H{text}").context("failed writing terminal content")
+}
+
+fn write_at_bytes(stdout: &mut io::Stdout, x: u16, y: u16, bytes: &[u8]) -> Result<()> {
+    write!(stdout, "\x1b[{y};{x}H").context("failed moving cursor for bytes")?;
+    stdout
+        .write_all(bytes)
+        .context("failed writing terminal byte content")?;
+    write!(stdout, "\x1b[0m").context("failed resetting terminal attributes")
 }
 
 fn pad_or_truncate(text: &str, width: usize) -> String {
