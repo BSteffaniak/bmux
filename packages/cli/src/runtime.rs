@@ -53,6 +53,22 @@ struct PaneRuntime {
     exit_code: Option<u8>,
 }
 
+#[derive(Default)]
+struct RenderCache {
+    initialized: bool,
+    status_line: String,
+    pane_rects: [Rect; 2],
+    pane_titles: [String; 2],
+    focused_pane: usize,
+    pane_lines: [Vec<String>; 2],
+}
+
+struct PaneRenderData {
+    rect: Rect,
+    title: String,
+    lines: Vec<String>,
+}
+
 pub(crate) fn run() -> Result<u8> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
@@ -107,6 +123,7 @@ fn run_two_pane_runtime(shell: &str, use_alt_screen: bool) -> Result<u8> {
     let mut kill_sent = false;
     let mut next_status_redraw = Instant::now() + STATUS_REDRAW_INTERVAL;
     let mut exit_override = None;
+    let mut render_cache = RenderCache::default();
 
     let exit_code = loop {
         process_input_events(
@@ -157,7 +174,17 @@ fn run_two_pane_runtime(shell: &str, use_alt_screen: bool) -> Result<u8> {
             .any(|pane| pane.state.dirty.swap(false, Ordering::Relaxed));
 
         if force_redraw || pane_dirty || Instant::now() >= next_status_redraw {
-            render_frame(&panes, &layout, cols, rows, shell_name, &cwd, focused_pane)?;
+            render_frame(
+                &panes,
+                &layout,
+                cols,
+                rows,
+                shell_name,
+                &cwd,
+                focused_pane,
+                force_redraw,
+                &mut render_cache,
+            )?;
             force_redraw = false;
             next_status_redraw = Instant::now() + STATUS_REDRAW_INTERVAL;
         }
@@ -471,15 +498,61 @@ fn render_frame(
     shell_name: &str,
     cwd: &Path,
     focused_pane: usize,
+    full_redraw: bool,
+    render_cache: &mut RenderCache,
 ) -> Result<()> {
     let status_line = build_status_line(shell_name, cwd, cols, rows, focused_pane);
-    write_status_line(&status_line, cols).context("failed drawing status line")?;
+    let left_data = collect_pane_render_data(&panes[0], layout.left, focused_pane == 0);
+    let right_data = collect_pane_render_data(&panes[1], layout.right, focused_pane == 1);
+    let pane_data = [left_data, right_data];
 
     let mut stdout = io::stdout();
     write!(stdout, "\x1b[?25l").context("failed hiding cursor")?;
 
-    draw_pane(&mut stdout, &panes[0], layout.left, focused_pane == 0)?;
-    draw_pane(&mut stdout, &panes[1], layout.right, focused_pane == 1)?;
+    let status_changed =
+        full_redraw || !render_cache.initialized || render_cache.status_line != status_line;
+    if status_changed {
+        write_status_line(&status_line, cols).context("failed drawing status line")?;
+        render_cache.status_line = status_line;
+    }
+
+    let border_changed = full_redraw
+        || !render_cache.initialized
+        || render_cache.focused_pane != focused_pane
+        || render_cache.pane_rects != [pane_data[0].rect, pane_data[1].rect]
+        || render_cache.pane_titles != [pane_data[0].title.clone(), pane_data[1].title.clone()];
+
+    if border_changed {
+        draw_rect_border(
+            &mut stdout,
+            pane_data[0].rect,
+            if focused_pane == 0 {
+                "\x1b[36m"
+            } else {
+                "\x1b[90m"
+            },
+            &pane_data[0].title,
+        )?;
+        draw_rect_border(
+            &mut stdout,
+            pane_data[1].rect,
+            if focused_pane == 1 {
+                "\x1b[36m"
+            } else {
+                "\x1b[90m"
+            },
+            &pane_data[1].title,
+        )?;
+    }
+
+    for pane_index in 0..2 {
+        draw_changed_lines(
+            &mut stdout,
+            &pane_data[pane_index],
+            &render_cache.pane_lines[pane_index],
+            full_redraw || border_changed,
+        )?;
+    }
 
     let focused_rect = if focused_pane == 0 {
         layout.left.inner()
@@ -506,36 +579,36 @@ fn render_frame(
     write!(stdout, "\x1b[?25h\x1b[{cursor_row};{cursor_col}H").context("failed setting cursor")?;
     stdout.flush().context("failed flushing rendered frame")?;
 
+    render_cache.initialized = true;
+    render_cache.focused_pane = focused_pane;
+    render_cache.pane_rects = [pane_data[0].rect, pane_data[1].rect];
+    render_cache.pane_titles = [pane_data[0].title.clone(), pane_data[1].title.clone()];
+    render_cache.pane_lines = [pane_data[0].lines.clone(), pane_data[1].lines.clone()];
+
     Ok(())
 }
 
-fn draw_pane(stdout: &mut io::Stdout, pane: &PaneRuntime, rect: Rect, focused: bool) -> Result<()> {
-    if rect.width == 0 || rect.height == 0 {
-        return Ok(());
-    }
-
-    let border_color = if focused { "\x1b[36m" } else { "\x1b[90m" };
+fn collect_pane_render_data(pane: &PaneRuntime, rect: Rect, focused: bool) -> PaneRenderData {
+    let inner = rect.inner();
     let title = if let Some(code) = pane.exit_code {
         format!(" {} [exited {code}] ", pane.title)
     } else {
-        format!(" {} {} ", pane.title, if focused { "*" } else { "" })
+        format!(" {}{} ", pane.title, if focused { " *" } else { "" })
     };
-    draw_rect_border(stdout, rect, border_color, &title)?;
 
-    let inner = rect.inner();
+    let mut lines = Vec::new();
+
     if inner.width == 0 || inner.height == 0 {
-        return Ok(());
+        return PaneRenderData { rect, title, lines };
     }
 
     if let Some(code) = pane.exit_code {
         let message = format!("[{} exited: {code}]", pane.title);
-        write_at(
-            stdout,
-            inner.x,
-            inner.y,
-            &pad_or_truncate(&message, usize::from(inner.width)),
-        )?;
-        return Ok(());
+        lines.push(pad_or_truncate(&message, usize::from(inner.width)));
+        for _ in 1..inner.height {
+            lines.push(" ".repeat(usize::from(inner.width)));
+        }
+        return PaneRenderData { rect, title, lines };
     }
 
     let parser = pane
@@ -548,16 +621,37 @@ fn draw_pane(stdout: &mut io::Stdout, pane: &PaneRuntime, rect: Rect, focused: b
         if row_index >= usize::from(inner.height) {
             break;
         }
+        lines.push(pad_or_truncate(&row_text, usize::from(inner.width)));
+    }
+
+    while lines.len() < usize::from(inner.height) {
+        lines.push(" ".repeat(usize::from(inner.width)));
+    }
+
+    PaneRenderData { rect, title, lines }
+}
+
+fn draw_changed_lines(
+    stdout: &mut io::Stdout,
+    pane: &PaneRenderData,
+    previous: &[String],
+    force: bool,
+) -> Result<()> {
+    let inner = pane.rect.inner();
+    if inner.width == 0 || inner.height == 0 {
+        return Ok(());
+    }
+
+    for (row_index, line) in pane.lines.iter().enumerate() {
+        let changed = force || previous.get(row_index) != Some(line);
+        if !changed {
+            continue;
+        }
 
         let y = inner
             .y
             .saturating_add(u16::try_from(row_index).unwrap_or(0));
-        write_at(
-            stdout,
-            inner.x,
-            y,
-            &pad_or_truncate(&row_text, usize::from(inner.width)),
-        )?;
+        write_at(stdout, inner.x, y, line)?;
     }
 
     Ok(())
