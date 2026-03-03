@@ -228,12 +228,14 @@ dependencies = [
  "anyhow",
  "bmux_config",
  "bmux_event",
+ "bmux_ipc",
  "bmux_session",
  "bmux_terminal",
  "serde",
  "thiserror 2.0.12",
  "tokio",
  "tracing",
+ "uuid",
 ]
 
 [[package]]

@@ -13,6 +13,7 @@ version     = { workspace = true }
 # Internal bmux packages
 bmux_config   = { workspace = true }
 bmux_event    = { workspace = true }
+bmux_ipc      = { workspace = true }
 bmux_session  = { workspace = true }
 bmux_terminal = { workspace = true }
 
@@ -20,8 +21,9 @@ bmux_terminal = { workspace = true }
 anyhow    = { workspace = true, features = ["std"] }
 serde     = { workspace = true, features = ["derive"], optional = true }
 thiserror = { workspace = true }
-tokio     = { workspace = true, features = ["net", "rt", "sync"] }
+tokio     = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tracing   = { workspace = true, features = ["std"] }
+uuid      = { workspace = true, features = ["std", "v4"] }
 
 
 [features]
