@@ -779,6 +779,8 @@ fn scroll_mode_action(stroke: KeyStroke) -> Option<RuntimeAction> {
         (false, false, KeyCode::ArrowDown) => Some(RuntimeAction::ScrollDownLine),
         (false, false, KeyCode::PageUp) => Some(RuntimeAction::ScrollUpPage),
         (false, false, KeyCode::PageDown) => Some(RuntimeAction::ScrollDownPage),
+        (false, false, KeyCode::ArrowLeft) => Some(RuntimeAction::MoveCursorLeft),
+        (false, false, KeyCode::ArrowRight) => Some(RuntimeAction::MoveCursorRight),
         (false, false, KeyCode::Char('g')) => Some(RuntimeAction::ScrollTop),
         (false, true, KeyCode::Char('g')) => Some(RuntimeAction::ScrollBottom),
         (false, false, KeyCode::Char('v')) => Some(RuntimeAction::BeginSelection),
@@ -1218,6 +1220,14 @@ mod tests {
         assert_eq!(
             processor.process_chunk(&[0x1b, b'[', b'A']),
             vec![RuntimeAction::ScrollUpLine]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x1b, b'[', b'D']),
+            vec![RuntimeAction::MoveCursorLeft]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x1b, b'[', b'C']),
+            vec![RuntimeAction::MoveCursorRight]
         );
         assert_eq!(
             processor.process_chunk(&[b'g']),

@@ -374,13 +374,23 @@ pub(super) fn process_input_events(
                     | RuntimeAction::ScrollTop
                     | RuntimeAction::ScrollBottom => {
                         if scroll_state.active {
-                            apply_scrollback_action(
-                                action,
-                                *focused_pane,
-                                panes,
-                                pane_rects,
-                                scroll_state,
-                            );
+                            if scroll_state.selection_anchors.contains_key(focused_pane) {
+                                apply_selection_scroll_action(
+                                    action,
+                                    *focused_pane,
+                                    panes,
+                                    pane_rects,
+                                    scroll_state,
+                                );
+                            } else {
+                                apply_scrollback_action(
+                                    action,
+                                    *focused_pane,
+                                    panes,
+                                    pane_rects,
+                                    scroll_state,
+                                );
+                            }
                         }
                     }
                     RuntimeAction::BeginSelection => {
@@ -552,6 +562,129 @@ fn apply_scrollback_action(
     let applied = parser.screen().scrollback();
     scroll_state.offsets.insert(focused_pane, applied);
     active_pane.state.dirty.store(true, Ordering::Relaxed);
+}
+
+fn apply_selection_scroll_action(
+    action: RuntimeAction,
+    focused_pane: PaneId,
+    panes: &mut BTreeMap<PaneId, PaneRuntime>,
+    pane_rects: &BTreeMap<PaneId, Rect>,
+    scroll_state: &mut ScrollState,
+) {
+    let Some(rect) = pane_rects.get(&focused_pane) else {
+        return;
+    };
+    let max_row = rect.inner().height.saturating_sub(1);
+
+    match action {
+        RuntimeAction::ScrollUpLine => {
+            let at_top = scroll_state
+                .cursors
+                .get(&focused_pane)
+                .map_or(true, |cursor| cursor.0 == 0);
+            if at_top {
+                apply_scrollback_action(
+                    RuntimeAction::ScrollUpLine,
+                    focused_pane,
+                    panes,
+                    pane_rects,
+                    scroll_state,
+                );
+            } else {
+                move_selection_cursor(
+                    RuntimeAction::MoveCursorUp,
+                    focused_pane,
+                    pane_rects,
+                    panes,
+                    scroll_state,
+                );
+            }
+        }
+        RuntimeAction::ScrollDownLine => {
+            let at_bottom = scroll_state
+                .cursors
+                .get(&focused_pane)
+                .map_or(true, |cursor| cursor.0 >= max_row);
+            if at_bottom {
+                apply_scrollback_action(
+                    RuntimeAction::ScrollDownLine,
+                    focused_pane,
+                    panes,
+                    pane_rects,
+                    scroll_state,
+                );
+            } else {
+                move_selection_cursor(
+                    RuntimeAction::MoveCursorDown,
+                    focused_pane,
+                    pane_rects,
+                    panes,
+                    scroll_state,
+                );
+            }
+        }
+        RuntimeAction::ScrollUpPage => {
+            apply_scrollback_action(
+                RuntimeAction::ScrollUpPage,
+                focused_pane,
+                panes,
+                pane_rects,
+                scroll_state,
+            );
+            if let Some(cursor) = scroll_state.cursors.get_mut(&focused_pane) {
+                cursor.0 = 0;
+            }
+            if let Some(active_pane) = panes.get_mut(&focused_pane) {
+                active_pane.state.dirty.store(true, Ordering::Relaxed);
+            }
+        }
+        RuntimeAction::ScrollDownPage => {
+            apply_scrollback_action(
+                RuntimeAction::ScrollDownPage,
+                focused_pane,
+                panes,
+                pane_rects,
+                scroll_state,
+            );
+            if let Some(cursor) = scroll_state.cursors.get_mut(&focused_pane) {
+                cursor.0 = max_row;
+            }
+            if let Some(active_pane) = panes.get_mut(&focused_pane) {
+                active_pane.state.dirty.store(true, Ordering::Relaxed);
+            }
+        }
+        RuntimeAction::ScrollTop => {
+            apply_scrollback_action(
+                RuntimeAction::ScrollTop,
+                focused_pane,
+                panes,
+                pane_rects,
+                scroll_state,
+            );
+            if let Some(cursor) = scroll_state.cursors.get_mut(&focused_pane) {
+                cursor.0 = 0;
+            }
+            if let Some(active_pane) = panes.get_mut(&focused_pane) {
+                active_pane.state.dirty.store(true, Ordering::Relaxed);
+            }
+        }
+        RuntimeAction::ScrollBottom => {
+            apply_scrollback_action(
+                RuntimeAction::ScrollBottom,
+                focused_pane,
+                panes,
+                pane_rects,
+                scroll_state,
+            );
+            if let Some(cursor) = scroll_state.cursors.get_mut(&focused_pane) {
+                cursor.0 = max_row;
+            }
+            if let Some(active_pane) = panes.get_mut(&focused_pane) {
+                active_pane.state.dirty.store(true, Ordering::Relaxed);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn move_selection_cursor(
@@ -1262,5 +1395,69 @@ mod tests {
             .scrollback();
         assert!(pane_one_offset > 0);
         assert!(pane_two_offset > 0);
+    }
+
+    #[test]
+    fn selection_scroll_actions_move_cursor_with_page_keys() {
+        let mut panes = BTreeMap::new();
+        panes.insert(PaneId(1), make_pane("pane-1"));
+        panes.insert(PaneId(2), make_pane("pane-2"));
+        feed_lines(panes.get(&PaneId(1)).expect("pane 1 exists"), 200);
+
+        let mut layout = LayoutTree::two_pane(PaneId(1), PaneId(2), SplitDirection::Vertical, 0.5);
+        let mut focused = PaneId(1);
+        layout.focused = focused;
+        let pane_rects = layout.compute_rects(120, 40);
+        let max_row = pane_rects
+            .get(&PaneId(1))
+            .expect("pane rect exists")
+            .inner()
+            .height
+            .saturating_sub(1);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let mut force_redraw = false;
+        let mut exit_override = None;
+        let mut status_message = None;
+        let mut scroll_state = ScrollState::default();
+        let mut internal_clipboard = None;
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(RuntimeAction::EnterScrollMode)
+            .expect("send enter scroll mode");
+        tx.send(RuntimeAction::BeginSelection)
+            .expect("send begin selection");
+        tx.send(RuntimeAction::ScrollUpPage)
+            .expect("send scroll up page");
+        tx.send(RuntimeAction::ScrollDownPage)
+            .expect("send scroll down page");
+        drop(tx);
+
+        let updated = process_input_events(
+            &rx,
+            &mut panes,
+            &pane_rects,
+            &layout,
+            &mut focused,
+            &shutdown_requested,
+            &mut force_redraw,
+            &mut exit_override,
+            &mut status_message,
+            &mut scroll_state,
+            &mut internal_clipboard,
+            Instant::now(),
+            Arc::new(AtomicBool::new(false)),
+            10_000,
+            "bmux-256color",
+            ProtocolProfile::Conservative,
+            None,
+        )
+        .expect("process input events");
+
+        assert!(updated.is_none());
+        assert!(scroll_state.selection_anchors.contains_key(&PaneId(1)));
+        assert_eq!(
+            scroll_state.cursors.get(&PaneId(1)).map(|(row, _col)| *row),
+            Some(max_row)
+        );
     }
 }
