@@ -95,6 +95,13 @@ struct DecodedStroke {
     raw: Vec<u8>,
 }
 
+#[allow(dead_code)]
+#[derive(Debug, Clone)]
+enum InputEvent {
+    Key(DecodedStroke),
+    RawBytes(Vec<u8>),
+}
+
 #[derive(Debug, Default)]
 struct ByteDecoder {
     pending: Vec<u8>,
@@ -104,6 +111,7 @@ pub(crate) struct InputProcessor {
     keymap: Keymap,
     decoder: ByteDecoder,
     pending: Option<PendingChord>,
+    scroll_mode: bool,
 }
 
 #[derive(Debug)]
@@ -297,6 +305,7 @@ impl InputProcessor {
             keymap,
             decoder: ByteDecoder::default(),
             pending: None,
+            scroll_mode: false,
         }
     }
 
@@ -307,18 +316,29 @@ impl InputProcessor {
             self.resolve_pending(&mut actions, true);
         }
 
-        for decoded in self.decoder.feed(bytes) {
-            if self.pending.is_none() {
-                self.pending = Some(PendingChord {
-                    started_at: Instant::now(),
-                    decoded: vec![decoded],
-                });
-            } else if let Some(pending) = &mut self.pending {
-                pending.decoded.push(decoded);
-            }
+        for event in self.decoder.feed_events(bytes) {
+            match event {
+                InputEvent::Key(decoded) => {
+                    if self.pending.is_none() {
+                        self.pending = Some(PendingChord {
+                            started_at: Instant::now(),
+                            decoded: vec![decoded],
+                        });
+                    } else if let Some(pending) = &mut self.pending {
+                        pending.decoded.push(decoded);
+                    }
 
-            self.resolve_pending(&mut actions, false);
+                    self.resolve_pending(&mut actions, false);
+                }
+                InputEvent::RawBytes(raw) => {
+                    if !raw.is_empty() {
+                        actions.push(RuntimeAction::ForwardToPane(raw));
+                    }
+                }
+            }
         }
+
+        self.sync_scroll_mode(&actions);
 
         actions
     }
@@ -368,6 +388,15 @@ impl InputProcessor {
 
             if any_prefix {
                 break;
+            }
+
+            if self.scroll_mode
+                && strokes.len() == 1
+                && let Some(action) = scroll_mode_action(strokes[0])
+            {
+                actions.push(action);
+                self.pending = None;
+                continue;
             }
 
             let pending_len = strokes.len();
@@ -421,22 +450,32 @@ impl InputProcessor {
 
         pending.decoded.split_off(len)
     }
+
+    fn sync_scroll_mode(&mut self, actions: &[RuntimeAction]) {
+        for action in actions {
+            match action {
+                RuntimeAction::EnterScrollMode => self.scroll_mode = true,
+                RuntimeAction::ExitScrollMode => self.scroll_mode = false,
+                _ => {}
+            }
+        }
+    }
 }
 
 impl ByteDecoder {
-    fn feed(&mut self, bytes: &[u8]) -> Vec<DecodedStroke> {
+    fn feed_events(&mut self, bytes: &[u8]) -> Vec<InputEvent> {
         self.pending.extend_from_slice(bytes);
-        let mut decoded = Vec::new();
+        let mut events = Vec::new();
 
         loop {
             let Some((stroke, consumed)) = decode_one(&self.pending) else {
                 break;
             };
             self.pending.drain(0..consumed);
-            decoded.push(stroke);
+            events.push(InputEvent::Key(stroke));
         }
 
-        decoded
+        events
     }
 
     fn take_pending(&mut self) -> Vec<u8> {
@@ -539,6 +578,25 @@ fn action_to_name(action: &RuntimeAction) -> &'static str {
     }
 }
 
+fn scroll_mode_action(stroke: KeyStroke) -> Option<RuntimeAction> {
+    if stroke.alt || stroke.super_key {
+        return None;
+    }
+
+    match (stroke.ctrl, stroke.shift, stroke.key) {
+        (false, false, KeyCode::Escape) => Some(RuntimeAction::ExitScrollMode),
+        (false, false, KeyCode::ArrowUp) => Some(RuntimeAction::ScrollUpLine),
+        (false, false, KeyCode::ArrowDown) => Some(RuntimeAction::ScrollDownLine),
+        (false, false, KeyCode::PageUp) => Some(RuntimeAction::ScrollUpPage),
+        (false, false, KeyCode::PageDown) => Some(RuntimeAction::ScrollDownPage),
+        (false, false, KeyCode::Char('g')) => Some(RuntimeAction::ScrollTop),
+        (false, true, KeyCode::Char('g')) => Some(RuntimeAction::ScrollBottom),
+        (true, false, KeyCode::Char('y')) => Some(RuntimeAction::ScrollUpLine),
+        (true, false, KeyCode::Char('e')) => Some(RuntimeAction::ScrollDownLine),
+        _ => None,
+    }
+}
+
 fn chord_to_string(chord: &[KeyStroke]) -> String {
     chord
         .iter()
@@ -598,7 +656,13 @@ fn decode_one(bytes: &[u8]) -> Option<(DecodedStroke, usize)> {
     }
 
     if bytes.len() == 1 {
-        return None;
+        return Some((
+            DecodedStroke {
+                stroke: KeyStroke::simple(KeyCode::Escape),
+                raw: vec![0x1b],
+            },
+            1,
+        ));
     }
 
     if let Some((stroke, consumed)) = decode_escape_sequence(bytes) {
@@ -916,6 +980,36 @@ mod tests {
         assert_eq!(
             processor.process_chunk(&[0x01, b'G']),
             vec![RuntimeAction::ScrollBottom]
+        );
+    }
+
+    #[test]
+    fn scroll_mode_accepts_unprefixed_navigation_keys() {
+        let mut processor = InputProcessor::new(Keymap::default_runtime());
+
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'[']),
+            vec![RuntimeAction::EnterScrollMode]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x1b, b'[', b'5', b'~']),
+            vec![RuntimeAction::ScrollUpPage]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x1b, b'[', b'A']),
+            vec![RuntimeAction::ScrollUpLine]
+        );
+        assert_eq!(
+            processor.process_chunk(&[b'g']),
+            vec![RuntimeAction::ScrollTop]
+        );
+        assert_eq!(
+            processor.process_chunk(&[b'G']),
+            vec![RuntimeAction::ScrollBottom]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x1b]),
+            vec![RuntimeAction::ExitScrollMode]
         );
     }
 
