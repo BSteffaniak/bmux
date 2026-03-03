@@ -164,13 +164,13 @@ pub(crate) fn run() -> Result<u8> {
 fn run_command(command: &Command) -> Result<u8> {
     match command {
         Command::NewSession { name } => run_session_new(name.clone()),
-        Command::ListSessions => run_session_list(),
+        Command::ListSessions { json } => run_session_list(*json),
         Command::KillSession { target } => run_session_kill(target),
         Command::Attach { target } => run_session_attach(target),
         Command::Detach => run_session_detach(),
         Command::Session { command } => match command {
             SessionCommand::New { name } => run_session_new(name.clone()),
-            SessionCommand::List => run_session_list(),
+            SessionCommand::List { json } => run_session_list(*json),
             SessionCommand::Kill { target } => run_session_kill(target),
             SessionCommand::Attach { target } => run_session_attach(target),
             SessionCommand::Detach => run_session_detach(),
@@ -305,13 +305,21 @@ fn run_session_new(name: Option<String>) -> Result<u8> {
     Ok(0)
 }
 
-fn run_session_list() -> Result<u8> {
+fn run_session_list(as_json: bool) -> Result<u8> {
     let sessions = run_async(async {
         let mut client = BmuxClient::connect_default("bmux-cli-list-sessions")
             .await
             .map_err(anyhow::Error::from)?;
         client.list_sessions().await.map_err(anyhow::Error::from)
     })?;
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&sessions).context("failed to encode sessions json")?
+        );
+        return Ok(0);
+    }
 
     if sessions.is_empty() {
         println!("no sessions");

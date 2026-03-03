@@ -54,7 +54,11 @@ pub(crate) enum Command {
         name: Option<String>,
     },
     /// List active sessions
-    ListSessions,
+    ListSessions {
+        /// Print sessions as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Kill a session by name or UUID
     KillSession {
         /// Session name or UUID
@@ -102,7 +106,11 @@ pub(crate) enum SessionCommand {
         name: Option<String>,
     },
     /// List active sessions
-    List,
+    List {
+        /// Print sessions as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Kill a session by name or UUID
     Kill {
         /// Session name or UUID
@@ -322,7 +330,19 @@ mod tests {
     #[test]
     fn parses_top_level_list_sessions_command() {
         let cli = Cli::try_parse_from(["bmux", "list-sessions"]).expect("valid CLI args");
-        assert!(matches!(cli.command, Some(Command::ListSessions)));
+        assert!(matches!(
+            cli.command,
+            Some(Command::ListSessions { json: false })
+        ));
+    }
+
+    #[test]
+    fn parses_top_level_list_sessions_json_flag() {
+        let cli = Cli::try_parse_from(["bmux", "list-sessions", "--json"]).expect("valid CLI args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::ListSessions { json: true })
+        ));
     }
 
     #[test]
@@ -367,7 +387,17 @@ mod tests {
         let Some(Command::Session { command }) = cli.command else {
             panic!("expected session command");
         };
-        assert!(matches!(command, SessionCommand::List));
+        assert!(matches!(command, SessionCommand::List { json: false }));
+    }
+
+    #[test]
+    fn parses_grouped_session_list_json_flag() {
+        let cli =
+            Cli::try_parse_from(["bmux", "session", "list", "--json"]).expect("valid CLI args");
+        let Some(Command::Session { command }) = cli.command else {
+            panic!("expected session command");
+        };
+        assert!(matches!(command, SessionCommand::List { json: true }));
     }
 
     #[test]
