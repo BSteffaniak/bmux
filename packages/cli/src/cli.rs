@@ -6,6 +6,13 @@ pub(crate) enum DebugRenderLogFormat {
     Csv,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum TraceFamily {
+    Csi,
+    Osc,
+    Dcs,
+}
+
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(name = "bmux")]
@@ -87,6 +94,12 @@ pub(crate) enum TerminalCommand {
         /// Limit number of trace events shown
         #[arg(long, default_value_t = 50)]
         trace_limit: usize,
+        /// Filter trace events by protocol family
+        #[arg(long, value_enum)]
+        trace_family: Option<TraceFamily>,
+        /// Filter trace events by pane id
+        #[arg(long)]
+        trace_pane: Option<u16>,
     },
     /// Install bmux-256color terminfo entry
     InstallTerminfo {
@@ -101,7 +114,7 @@ pub(crate) enum TerminalCommand {
 
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, KeymapCommand, LayoutCommand, TerminalCommand};
+    use super::{Cli, Command, KeymapCommand, LayoutCommand, TerminalCommand, TraceFamily};
     use clap::Parser;
 
     #[test]
@@ -187,7 +200,9 @@ mod tests {
             TerminalCommand::Doctor {
                 json: false,
                 trace: false,
-                trace_limit: 50
+                trace_limit: 50,
+                trace_family: None,
+                trace_pane: None
             }
         ));
     }
@@ -204,7 +219,9 @@ mod tests {
             TerminalCommand::Doctor {
                 json: true,
                 trace: false,
-                trace_limit: 50
+                trace_limit: 50,
+                trace_family: None,
+                trace_pane: None
             }
         ));
     }
@@ -228,7 +245,37 @@ mod tests {
             TerminalCommand::Doctor {
                 json: false,
                 trace: true,
-                trace_limit: 25
+                trace_limit: 25,
+                trace_family: None,
+                trace_pane: None
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_terminal_doctor_trace_filters() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "terminal",
+            "doctor",
+            "--trace",
+            "--trace-family",
+            "csi",
+            "--trace-pane",
+            "2",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Terminal { command }) = cli.command else {
+            panic!("expected terminal subcommand");
+        };
+        assert!(matches!(
+            command,
+            TerminalCommand::Doctor {
+                json: false,
+                trace: true,
+                trace_limit: 50,
+                trace_family: Some(TraceFamily::Csi),
+                trace_pane: Some(2)
             }
         ));
     }

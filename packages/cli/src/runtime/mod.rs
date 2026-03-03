@@ -1,5 +1,5 @@
 use crate::cli::{
-    Cli, Command, DebugRenderLogFormat, KeymapCommand, LayoutCommand, TerminalCommand,
+    Cli, Command, DebugRenderLogFormat, KeymapCommand, LayoutCommand, TerminalCommand, TraceFamily,
 };
 use crate::input::{InputProcessor, RuntimeAction};
 use crate::pane::{LayoutTree, PaneId, SplitDirection};
@@ -37,8 +37,9 @@ use pane_runtime::{
 use persistence::{load_persisted_runtime_state, save_persisted_runtime_state};
 use status_message::StatusMessage;
 use terminal_protocol::{
-    ProtocolProfile, ProtocolTraceBuffer, ProtocolTraceEvent, SharedProtocolTraceBuffer,
-    primary_da_for_profile, protocol_profile_name, secondary_da_for_profile, supported_query_names,
+    ProtocolDirection, ProtocolProfile, ProtocolTraceBuffer, ProtocolTraceEvent,
+    SharedProtocolTraceBuffer, primary_da_for_profile, protocol_profile_name,
+    secondary_da_for_profile, supported_query_names,
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -157,7 +158,9 @@ fn run_command(command: &Command) -> Result<u8> {
                 json,
                 trace,
                 trace_limit,
-            } => run_terminal_doctor(*json, *trace, *trace_limit),
+                trace_family,
+                trace_pane,
+            } => run_terminal_doctor(*json, *trace, *trace_limit, *trace_family, *trace_pane),
             TerminalCommand::InstallTerminfo { yes, check } => {
                 run_terminal_install_terminfo(*yes, *check)
             }
@@ -227,7 +230,13 @@ fn run_terminal_install_terminfo(yes: bool, check_only: bool) -> Result<u8> {
     }
 }
 
-fn run_terminal_doctor(as_json: bool, include_trace: bool, trace_limit: usize) -> Result<u8> {
+fn run_terminal_doctor(
+    as_json: bool,
+    include_trace: bool,
+    trace_limit: usize,
+    trace_family: Option<TraceFamily>,
+    trace_pane: Option<u16>,
+) -> Result<u8> {
     let config = match BmuxConfig::load() {
         Ok(config) => config,
         Err(error) => {
@@ -242,11 +251,13 @@ fn run_terminal_doctor(as_json: bool, include_trace: bool, trace_limit: usize) -
     let effective = resolve_pane_term(&configured_term);
     let protocol_profile = protocol_profile_for_terminal_profile(effective.profile);
     let last_declined_prompt_epoch_secs = last_prompt_decline_epoch_secs();
-    let trace_events = if include_trace {
-        load_protocol_trace(trace_limit)?
+    let trace_data = if include_trace {
+        load_protocol_trace(10_000)?
     } else {
-        Vec::new()
+        ProtocolTraceData::default()
     };
+    let trace_events =
+        filter_trace_events(&trace_data.events, trace_family, trace_pane, trace_limit);
 
     if as_json {
         let payload = serde_json::json!({
@@ -280,6 +291,11 @@ fn run_terminal_doctor(as_json: bool, include_trace: bool, trace_limit: usize) -
                 serde_json::json!({
                     "events": trace_events,
                     "limit": trace_limit,
+                    "dropped": trace_data.dropped,
+                    "applied_filters": {
+                        "family": trace_family.map(trace_family_name),
+                        "pane": trace_pane,
+                    },
                 })
             } else {
                 serde_json::Value::Null
@@ -348,10 +364,24 @@ fn run_terminal_doctor(as_json: bool, include_trace: bool, trace_limit: usize) -
 
     if include_trace {
         println!("trace events (latest {}):", trace_limit);
-        if trace_events.is_empty() {
+        println!("trace dropped events: {}", trace_data.dropped);
+        if trace_family.is_some() || trace_pane.is_some() {
             println!(
-                "  (no events found; enable behavior.protocol_trace_enabled and run a session)"
+                "trace filters: family={} pane={}",
+                trace_family.map(trace_family_name).unwrap_or("any"),
+                trace_pane
+                    .map(|pane| pane.to_string())
+                    .unwrap_or_else(|| "any".to_string())
             );
+        }
+        if trace_events.is_empty() {
+            if trace_data.events.is_empty() {
+                println!(
+                    "  (no events found; enable behavior.protocol_trace_enabled and run a session)"
+                );
+            } else {
+                println!("  (no events matched active filters)");
+            }
         }
         for event in trace_events {
             let pane = event
@@ -364,8 +394,8 @@ fn run_terminal_doctor(as_json: bool, include_trace: bool, trace_limit: usize) -
                 event.family,
                 event.name,
                 match event.direction {
-                    terminal_protocol::ProtocolDirection::Query => "query",
-                    terminal_protocol::ProtocolDirection::Reply => "reply",
+                    ProtocolDirection::Query => "query",
+                    ProtocolDirection::Reply => "reply",
                 },
                 event.decoded.replace('\u{1b}', "<ESC>")
             );
@@ -920,6 +950,12 @@ struct ProtocolTraceFile {
     events: Vec<ProtocolTraceEvent>,
 }
 
+#[derive(Debug, Default)]
+struct ProtocolTraceData {
+    dropped: usize,
+    events: Vec<ProtocolTraceEvent>,
+}
+
 fn save_protocol_trace(trace: &SharedProtocolTraceBuffer) -> Result<()> {
     let path = bmux_config::ConfigPaths::default().protocol_trace_file();
     if let Some(parent) = path.parent() {
@@ -948,20 +984,60 @@ fn save_protocol_trace(trace: &SharedProtocolTraceBuffer) -> Result<()> {
     Ok(())
 }
 
-fn load_protocol_trace(limit: usize) -> Result<Vec<ProtocolTraceEvent>> {
+fn load_protocol_trace(limit: usize) -> Result<ProtocolTraceData> {
     let path = bmux_config::ConfigPaths::default().protocol_trace_file();
     if !path.exists() {
-        return Ok(Vec::new());
+        return Ok(ProtocolTraceData::default());
     }
     let bytes = std::fs::read(&path)
         .with_context(|| format!("failed reading protocol trace file at {}", path.display()))?;
     let file: ProtocolTraceFile = serde_json::from_slice(&bytes)
         .with_context(|| format!("failed parsing protocol trace file at {}", path.display()))?;
     if limit == 0 || file.events.len() <= limit {
-        return Ok(file.events);
+        return Ok(ProtocolTraceData {
+            dropped: file.dropped,
+            events: file.events,
+        });
     }
     let start = file.events.len().saturating_sub(limit);
-    Ok(file.events.into_iter().skip(start).collect())
+    Ok(ProtocolTraceData {
+        dropped: file.dropped,
+        events: file.events.into_iter().skip(start).collect(),
+    })
+}
+
+fn filter_trace_events(
+    events: &[ProtocolTraceEvent],
+    family: Option<TraceFamily>,
+    pane: Option<u16>,
+    limit: usize,
+) -> Vec<ProtocolTraceEvent> {
+    let mut filtered: Vec<ProtocolTraceEvent> = events
+        .iter()
+        .filter(|event| {
+            let family_matches = family
+                .map(|value| event.family == trace_family_name(value))
+                .unwrap_or(true);
+            let pane_matches = pane
+                .map(|value| event.pane_id == Some(value))
+                .unwrap_or(true);
+            family_matches && pane_matches
+        })
+        .cloned()
+        .collect();
+    if limit > 0 && filtered.len() > limit {
+        let start = filtered.len().saturating_sub(limit);
+        filtered = filtered.split_off(start);
+    }
+    filtered
+}
+
+fn trace_family_name(family: TraceFamily) -> &'static str {
+    match family {
+        TraceFamily::Csi => "csi",
+        TraceFamily::Osc => "osc",
+        TraceFamily::Dcs => "dcs",
+    }
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize, Default)]
@@ -1406,7 +1482,8 @@ fn reap_exited_panes(
 #[cfg(test)]
 mod tests {
     use super::{
-        EventReader, PaneRuntime, PaneState, TerminalProfile, key_to_bytes, profile_for_term,
+        EventReader, PaneRuntime, PaneState, ProtocolDirection, ProtocolTraceEvent,
+        TerminalProfile, TraceFamily, filter_trace_events, key_to_bytes, profile_for_term,
         protocol_profile_for_terminal_profile, reap_exited_panes, resolve_pane_term_with_checker,
         run_event_input_loop_with_reader,
     };
@@ -1631,5 +1708,51 @@ mod tests {
             protocol_profile_for_terminal_profile(TerminalProfile::Conservative),
             super::ProtocolProfile::Conservative
         );
+    }
+
+    #[test]
+    fn trace_filtering_applies_family_and_pane_constraints() {
+        let events = vec![
+            ProtocolTraceEvent {
+                timestamp_ms: 1,
+                pane_id: Some(1),
+                profile: "xterm".to_string(),
+                family: "csi".to_string(),
+                name: "csi_primary_da".to_string(),
+                direction: ProtocolDirection::Query,
+                raw_hex: "1b5b63".to_string(),
+                decoded: "\u{1b}[c".to_string(),
+            },
+            ProtocolTraceEvent {
+                timestamp_ms: 2,
+                pane_id: Some(2),
+                profile: "xterm".to_string(),
+                family: "osc".to_string(),
+                name: "osc_color_query".to_string(),
+                direction: ProtocolDirection::Reply,
+                raw_hex: "1b5d31303b3f".to_string(),
+                decoded: "...".to_string(),
+            },
+            ProtocolTraceEvent {
+                timestamp_ms: 3,
+                pane_id: Some(2),
+                profile: "xterm".to_string(),
+                family: "csi".to_string(),
+                name: "csi_primary_da".to_string(),
+                direction: ProtocolDirection::Reply,
+                raw_hex: "1b5b3f313b3263".to_string(),
+                decoded: "...".to_string(),
+            },
+        ];
+
+        let by_family = filter_trace_events(&events, Some(TraceFamily::Csi), None, 50);
+        assert_eq!(by_family.len(), 2);
+
+        let by_pane = filter_trace_events(&events, None, Some(2), 50);
+        assert_eq!(by_pane.len(), 2);
+
+        let both = filter_trace_events(&events, Some(TraceFamily::Csi), Some(2), 50);
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].timestamp_ms, 3);
     }
 }
