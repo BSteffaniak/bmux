@@ -5,6 +5,7 @@ use crate::pty::{STARTUP_ALT_SCREEN_GUARD_DURATION, extract_filtered_output};
 use crate::status::{build_status_line, write_status_line};
 use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
+use bmux_config::BmuxConfig;
 use clap::Parser;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
 use std::fs::OpenOptions;
@@ -258,6 +259,7 @@ pub(crate) fn run() -> Result<u8> {
     init_logging(cli.verbose);
 
     let shell = resolve_shell(cli.shell);
+    let keymap = load_runtime_keymap();
     debug!("Starting bmux runtime");
     debug!("Launching shell: {shell}");
 
@@ -267,6 +269,7 @@ pub(crate) fn run() -> Result<u8> {
         cli.debug_render,
         cli.debug_render_log.as_deref(),
         cli.debug_render_log_format,
+        keymap,
     )
 }
 
@@ -276,6 +279,7 @@ fn run_two_pane_runtime(
     debug_render: bool,
     debug_render_log: Option<&Path>,
     debug_render_log_format: DebugRenderLogFormat,
+    keymap: crate::input::Keymap,
 ) -> Result<u8> {
     let terminal_guard = TerminalGuard::activate(use_alt_screen, true)?;
 
@@ -308,6 +312,7 @@ fn run_two_pane_runtime(
     let (input_tx, input_rx) = mpsc::channel::<RuntimeAction>();
     let input_thread = spawn_input_thread(
         input_tx,
+        keymap,
         Arc::clone(&user_input_seen),
         Arc::clone(&shutdown_requested),
     )?;
@@ -552,6 +557,7 @@ fn spawn_pane_process(
 
 fn spawn_input_thread(
     input_tx: Sender<RuntimeAction>,
+    keymap: crate::input::Keymap,
     user_input_seen: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
 ) -> Result<thread::JoinHandle<Result<()>>> {
@@ -560,7 +566,7 @@ fn spawn_input_thread(
         .spawn(move || -> Result<()> {
             let mut stdin = io::stdin().lock();
             let mut buffer = [0_u8; 8192];
-            let mut processor = InputProcessor::new();
+            let mut processor = InputProcessor::new(keymap);
 
             loop {
                 if shutdown_requested.load(Ordering::Relaxed) {
@@ -1232,6 +1238,26 @@ mod tests {
         assert!(rendered.contains("\x1b["));
         assert!(!rendered.contains("\x1b[K"));
         assert!(!rendered.contains("\x1b[2K"));
+    }
+}
+
+fn load_runtime_keymap() -> crate::input::Keymap {
+    match BmuxConfig::load() {
+        Ok(config) => match crate::input::Keymap::from_parts(
+            &config.keybindings.prefix,
+            config.keybindings.timeout_ms,
+            &config.keybindings.runtime,
+        ) {
+            Ok(keymap) => keymap,
+            Err(error) => {
+                eprintln!("bmux warning: invalid keymap config, using defaults ({error})");
+                crate::input::Keymap::default_runtime()
+            }
+        },
+        Err(error) => {
+            eprintln!("bmux warning: failed loading config, using default keymap ({error})");
+            crate::input::Keymap::default_runtime()
+        }
     }
 }
 

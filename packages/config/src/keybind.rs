@@ -11,6 +11,12 @@ use std::collections::BTreeMap;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KeyBindingConfig {
+    /// Prefix key used for runtime key chords (e.g. "ctrl+a")
+    pub prefix: String,
+    /// Timeout for multi-stroke chord resolution
+    pub timeout_ms: u64,
+    /// Runtime action bindings after prefix
+    pub runtime: BTreeMap<String, String>,
     /// Normal mode key bindings
     pub normal: BTreeMap<String, String>,
     /// Insert mode key bindings (usually just Escape)
@@ -24,12 +30,27 @@ pub struct KeyBindingConfig {
 impl Default for KeyBindingConfig {
     fn default() -> Self {
         Self {
+            prefix: "ctrl+a".to_string(),
+            timeout_ms: 400,
+            runtime: default_runtime_bindings(),
             normal: default_normal_bindings(),
             insert: default_insert_bindings(),
             visual: default_visual_bindings(),
             command: default_command_bindings(),
         }
     }
+}
+
+fn default_runtime_bindings() -> BTreeMap<String, String> {
+    let mut bindings = BTreeMap::new();
+    bindings.insert("o".to_string(), "focus_next_pane".to_string());
+    bindings.insert("plus".to_string(), "increase_split".to_string());
+    bindings.insert("minus".to_string(), "decrease_split".to_string());
+    bindings.insert("r".to_string(), "restart_focused_pane".to_string());
+    bindings.insert("x".to_string(), "close_focused_pane".to_string());
+    bindings.insert("?".to_string(), "show_help".to_string());
+    bindings.insert("q".to_string(), "quit".to_string());
+    bindings
 }
 
 impl KeyBindingConfig {

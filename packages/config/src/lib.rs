@@ -273,6 +273,20 @@ impl BmuxConfig {
             });
         }
 
+        if self.keybindings.prefix.trim().is_empty() {
+            return Err(ConfigError::InvalidValue {
+                field: "keybindings.prefix".to_string(),
+                value: self.keybindings.prefix.clone(),
+            });
+        }
+
+        if self.keybindings.timeout_ms == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "keybindings.timeout_ms".to_string(),
+                value: "0".to_string(),
+            });
+        }
+
         Ok(())
     }
 
