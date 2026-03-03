@@ -1,9 +1,11 @@
-use super::{PaneProcess, PaneRuntime, PaneState, MIN_PANE_COLS, MIN_PANE_ROWS};
+use super::{MIN_PANE_COLS, MIN_PANE_ROWS, PaneProcess, PaneRuntime, PaneState};
 use crate::pane::{PaneId, Rect};
 use crate::pty::extract_filtered_output;
-use crate::runtime::terminal_protocol::{ProtocolProfile, TerminalProtocolEngine};
+use crate::runtime::terminal_protocol::{
+    ProtocolProfile, SharedProtocolTraceBuffer, TerminalProtocolEngine,
+};
 use anyhow::{Context, Result};
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +16,7 @@ use tracing::debug;
 use vt100::Parser as VtParser;
 
 pub(super) fn spawn_pane(
+    pane_id: PaneId,
     shell: &str,
     pane_term: &str,
     protocol_profile: ProtocolProfile,
@@ -21,6 +24,7 @@ pub(super) fn spawn_pane(
     pane_inner: Rect,
     startup_deadline: Instant,
     user_input_seen: Arc<AtomicBool>,
+    protocol_trace: Option<SharedProtocolTraceBuffer>,
 ) -> Result<PaneRuntime> {
     let state = Arc::new(PaneState {
         parser: Mutex::new(VtParser::new(
@@ -38,11 +42,13 @@ pub(super) fn spawn_pane(
             shell,
             pane_term,
             protocol_profile,
+            pane_id,
             title,
             pane_inner,
             startup_deadline,
             user_input_seen,
             Arc::clone(&state),
+            protocol_trace,
         )?),
         state,
         closed: false,
@@ -54,11 +60,13 @@ pub(super) fn spawn_pane_process(
     shell: &str,
     pane_term: &str,
     protocol_profile: ProtocolProfile,
+    pane_id: PaneId,
     title: String,
     pane_inner: Rect,
     startup_deadline: Instant,
     user_input_seen: Arc<AtomicBool>,
     state: Arc<PaneState>,
+    protocol_trace: Option<SharedProtocolTraceBuffer>,
 ) -> Result<PaneProcess> {
     let pty_system = native_pty_system();
     let pty_pair = pty_system
@@ -104,7 +112,11 @@ pub(super) fn spawn_pane_process(
         .spawn(move || -> Result<()> {
             let mut buffer = [0_u8; 8192];
             let mut pending = Vec::new();
-            let mut protocol_engine = TerminalProtocolEngine::new(protocol_profile);
+            let mut protocol_engine = if let Some(trace) = protocol_trace {
+                TerminalProtocolEngine::with_trace(protocol_profile, pane_id.0, trace)
+            } else {
+                TerminalProtocolEngine::new(protocol_profile)
+            };
 
             loop {
                 let bytes_read = reader

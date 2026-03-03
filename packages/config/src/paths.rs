@@ -62,6 +62,12 @@ impl ConfigPaths {
         self.data_dir.join("runtime").join("last-layout.json")
     }
 
+    /// Get persisted protocol trace file path
+    #[must_use]
+    pub fn protocol_trace_file(&self) -> PathBuf {
+        self.data_dir.join("runtime").join("protocol-trace.json")
+    }
+
     /// Get the server socket path
     #[must_use]
     pub fn server_socket(&self) -> PathBuf {

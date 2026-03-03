@@ -81,6 +81,12 @@ pub(crate) enum TerminalCommand {
         /// Print diagnostics as JSON
         #[arg(long)]
         json: bool,
+        /// Include recent protocol trace events
+        #[arg(long)]
+        trace: bool,
+        /// Limit number of trace events shown
+        #[arg(long, default_value_t = 50)]
+        trace_limit: usize,
     },
 }
 
@@ -167,7 +173,14 @@ mod tests {
         let Some(Command::Terminal { command }) = cli.command else {
             panic!("expected terminal subcommand");
         };
-        assert!(matches!(command, TerminalCommand::Doctor { json: false }));
+        assert!(matches!(
+            command,
+            TerminalCommand::Doctor {
+                json: false,
+                trace: false,
+                trace_limit: 50
+            }
+        ));
     }
 
     #[test]
@@ -177,6 +190,37 @@ mod tests {
         let Some(Command::Terminal { command }) = cli.command else {
             panic!("expected terminal subcommand");
         };
-        assert!(matches!(command, TerminalCommand::Doctor { json: true }));
+        assert!(matches!(
+            command,
+            TerminalCommand::Doctor {
+                json: true,
+                trace: false,
+                trace_limit: 50
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_terminal_doctor_trace_flags() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "terminal",
+            "doctor",
+            "--trace",
+            "--trace-limit",
+            "25",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Terminal { command }) = cli.command else {
+            panic!("expected terminal subcommand");
+        };
+        assert!(matches!(
+            command,
+            TerminalCommand::Doctor {
+                json: false,
+                trace: true,
+                trace_limit: 25
+            }
+        ));
     }
 }

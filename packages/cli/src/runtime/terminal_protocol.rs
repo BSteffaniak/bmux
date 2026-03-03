@@ -17,6 +17,65 @@ pub(super) enum ProtocolProfile {
     Conservative,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum ProtocolDirection {
+    Query,
+    Reply,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(super) struct ProtocolTraceEvent {
+    pub(super) timestamp_ms: u128,
+    pub(super) pane_id: Option<u16>,
+    pub(super) profile: String,
+    pub(super) family: String,
+    pub(super) name: String,
+    pub(super) direction: ProtocolDirection,
+    pub(super) raw_hex: String,
+    pub(super) decoded: String,
+}
+
+#[derive(Debug, Default)]
+pub(super) struct ProtocolTraceBuffer {
+    capacity: usize,
+    dropped: usize,
+    events: VecDeque<ProtocolTraceEvent>,
+}
+
+impl ProtocolTraceBuffer {
+    pub(super) fn with_capacity(capacity: usize) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            dropped: 0,
+            events: VecDeque::new(),
+        }
+    }
+
+    fn push(&mut self, event: ProtocolTraceEvent) {
+        if self.events.len() == self.capacity {
+            let _ = self.events.pop_front();
+            self.dropped = self.dropped.saturating_add(1);
+        }
+        self.events.push_back(event);
+    }
+
+    pub(super) fn snapshot(&self, limit: usize) -> Vec<ProtocolTraceEvent> {
+        if limit == 0 {
+            return Vec::new();
+        }
+        let len = self.events.len();
+        let start = len.saturating_sub(limit);
+        self.events.iter().skip(start).cloned().collect()
+    }
+
+    pub(super) fn dropped(&self) -> usize {
+        self.dropped
+    }
+}
+
+pub(super) type SharedProtocolTraceBuffer = Arc<Mutex<ProtocolTraceBuffer>>;
+
 #[derive(Debug)]
 pub(super) struct TerminalProtocolEngine {
     state: ParseState,
@@ -24,6 +83,8 @@ pub(super) struct TerminalProtocolEngine {
     osc_buffer: Vec<u8>,
     dcs_buffer: Vec<u8>,
     profile: ProtocolProfile,
+    pane_id: Option<u16>,
+    trace: Option<SharedProtocolTraceBuffer>,
 }
 
 impl TerminalProtocolEngine {
@@ -34,7 +95,20 @@ impl TerminalProtocolEngine {
             osc_buffer: Vec::new(),
             dcs_buffer: Vec::new(),
             profile,
+            pane_id: None,
+            trace: None,
         }
+    }
+
+    pub(super) fn with_trace(
+        profile: ProtocolProfile,
+        pane_id: u16,
+        trace: SharedProtocolTraceBuffer,
+    ) -> Self {
+        let mut this = Self::new(profile);
+        this.pane_id = Some(pane_id);
+        this.trace = Some(trace);
+        this
     }
 
     pub(super) fn process_output(&mut self, bytes: &[u8], cursor_pos: (u16, u16)) -> Vec<u8> {
@@ -73,9 +147,16 @@ impl TerminalProtocolEngine {
                     self.csi_buffer.push(*byte);
 
                     if byte.is_ascii_alphabetic() {
-                        if let Some(reply) =
+                        if let Some((name, reply)) =
                             csi_query_reply(&self.csi_buffer, cursor_pos, self.profile)
                         {
+                            self.trace_event(
+                                "csi",
+                                name,
+                                ProtocolDirection::Query,
+                                &self.csi_buffer,
+                            );
+                            self.trace_event("csi", name, ProtocolDirection::Reply, &reply);
                             replies.extend_from_slice(&reply);
                         }
                         self.state = ParseState::Ground;
@@ -87,7 +168,15 @@ impl TerminalProtocolEngine {
                 }
                 ParseState::Osc => {
                     if *byte == 0x07 {
-                        if let Some(reply) = osc_query_reply(&self.osc_buffer, self.profile) {
+                        if let Some((name, reply)) = osc_query_reply(&self.osc_buffer, self.profile)
+                        {
+                            self.trace_event(
+                                "osc",
+                                name,
+                                ProtocolDirection::Query,
+                                &self.osc_buffer,
+                            );
+                            self.trace_event("osc", name, ProtocolDirection::Reply, &reply);
                             replies.extend_from_slice(&reply);
                         }
                         self.state = ParseState::Ground;
@@ -104,7 +193,15 @@ impl TerminalProtocolEngine {
                 }
                 ParseState::OscEsc => {
                     if *byte == b'\\' {
-                        if let Some(reply) = osc_query_reply(&self.osc_buffer, self.profile) {
+                        if let Some((name, reply)) = osc_query_reply(&self.osc_buffer, self.profile)
+                        {
+                            self.trace_event(
+                                "osc",
+                                name,
+                                ProtocolDirection::Query,
+                                &self.osc_buffer,
+                            );
+                            self.trace_event("osc", name, ProtocolDirection::Reply, &reply);
                             replies.extend_from_slice(&reply);
                         }
                         self.state = ParseState::Ground;
@@ -132,7 +229,15 @@ impl TerminalProtocolEngine {
                 }
                 ParseState::DcsEsc => {
                     if *byte == b'\\' {
-                        if let Some(reply) = dcs_query_reply(&self.dcs_buffer, self.profile) {
+                        if let Some((name, reply)) = dcs_query_reply(&self.dcs_buffer, self.profile)
+                        {
+                            self.trace_event(
+                                "dcs",
+                                name,
+                                ProtocolDirection::Query,
+                                &self.dcs_buffer,
+                            );
+                            self.trace_event("dcs", name, ProtocolDirection::Reply, &reply);
                             replies.extend_from_slice(&reply);
                         }
                         self.state = ParseState::Ground;
@@ -151,6 +256,31 @@ impl TerminalProtocolEngine {
         }
 
         replies
+    }
+
+    fn trace_event(&self, family: &str, name: &str, direction: ProtocolDirection, bytes: &[u8]) {
+        let Some(trace) = &self.trace else {
+            return;
+        };
+        let event = ProtocolTraceEvent {
+            timestamp_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |dur| dur.as_millis()),
+            pane_id: self.pane_id,
+            profile: protocol_profile_name(self.profile).to_string(),
+            family: family.to_string(),
+            name: name.to_string(),
+            direction,
+            raw_hex: bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<Vec<_>>()
+                .join(""),
+            decoded: String::from_utf8_lossy(bytes).into_owned(),
+        };
+        if let Ok(mut guard) = trace.lock() {
+            guard.push(event);
+        }
     }
 }
 
@@ -179,16 +309,19 @@ fn csi_query_reply(
     sequence: &[u8],
     cursor_pos: (u16, u16),
     profile: ProtocolProfile,
-) -> Option<Vec<u8>> {
+) -> Option<(&'static str, Vec<u8>)> {
     match sequence {
-        b"c" | b"0c" => Some(primary_da_response(profile).to_vec()),
-        b">c" => Some(secondary_da_response(profile).to_vec()),
-        b"5n" => Some(b"\x1b[0n".to_vec()),
-        b"6n" => Some(dsr_cursor_response(cursor_pos)),
-        b"?5n" => Some(b"\x1b[?0n".to_vec()),
-        b"?6n" => Some(dec_dsr_cursor_response(cursor_pos)),
+        b"c" | b"0c" => Some(("csi_primary_da", primary_da_response(profile).to_vec())),
+        b">c" => Some(("csi_secondary_da", secondary_da_response(profile).to_vec())),
+        b"5n" => Some(("csi_dsr_status_report", b"\x1b[0n".to_vec())),
+        b"6n" => Some(("csi_dsr_cursor_position", dsr_cursor_response(cursor_pos))),
+        b"?5n" => Some(("csi_dec_dsr_status_report", b"\x1b[?0n".to_vec())),
+        b"?6n" => Some((
+            "csi_dec_dsr_cursor_position",
+            dec_dsr_cursor_response(cursor_pos),
+        )),
         _ if sequence.starts_with(b"?") && sequence.ends_with(b"$p") => {
-            dec_mode_report_response(sequence, profile)
+            dec_mode_report_response(sequence, profile).map(|reply| ("csi_dec_mode_report", reply))
         }
         _ => None,
     }
@@ -259,12 +392,18 @@ fn dec_mode_status(profile: ProtocolProfile, mode: u16) -> u8 {
     }
 }
 
-fn osc_query_reply(sequence: &[u8], profile: ProtocolProfile) -> Option<Vec<u8>> {
+fn osc_query_reply(sequence: &[u8], profile: ProtocolProfile) -> Option<(&'static str, Vec<u8>)> {
     if sequence == b"10;?" {
-        return Some(format!("\x1b]10;{}\x1b\\", osc_foreground_color(profile)).into_bytes());
+        return Some((
+            "osc_color_query",
+            format!("\x1b]10;{}\x1b\\", osc_foreground_color(profile)).into_bytes(),
+        ));
     }
     if sequence == b"11;?" {
-        return Some(format!("\x1b]11;{}\x1b\\", osc_background_color(profile)).into_bytes());
+        return Some((
+            "osc_color_query",
+            format!("\x1b]11;{}\x1b\\", osc_background_color(profile)).into_bytes(),
+        ));
     }
     None
 }
@@ -287,12 +426,12 @@ fn osc_background_color(profile: ProtocolProfile) -> &'static str {
     }
 }
 
-fn dcs_query_reply(sequence: &[u8], profile: ProtocolProfile) -> Option<Vec<u8>> {
+fn dcs_query_reply(sequence: &[u8], profile: ProtocolProfile) -> Option<(&'static str, Vec<u8>)> {
     if let Some(hex_keys) = sequence.strip_prefix(b"+q") {
-        return Some(xtgettcap_reply(hex_keys, profile));
+        return Some(("dcs_xtgettcap_query", xtgettcap_reply(hex_keys, profile)));
     }
     if let Some(request) = sequence.strip_prefix(b"$q") {
-        return Some(decrqss_reply(request));
+        return Some(("dcs_decrqss_query", decrqss_reply(request)));
     }
     None
 }
@@ -392,7 +531,8 @@ fn dec_dsr_cursor_response(cursor_pos: (u16, u16)) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProtocolProfile, TerminalProtocolEngine};
+    use super::{ProtocolDirection, ProtocolProfile, ProtocolTraceBuffer, TerminalProtocolEngine};
+    use std::sync::{Arc, Mutex};
 
     #[test]
     fn replies_to_primary_da_query() {
@@ -532,4 +672,64 @@ mod tests {
         let reply = engine.process_output(b"\x1bP$qm\x1b\\", (0, 0));
         assert_eq!(reply, b"\x1bP1$r0m\x1b\\");
     }
+
+    #[test]
+    fn trace_records_query_and_reply_events() {
+        let trace = Arc::new(Mutex::new(ProtocolTraceBuffer::with_capacity(8)));
+        let mut engine =
+            TerminalProtocolEngine::with_trace(ProtocolProfile::Xterm, 7, trace.clone());
+        let _ = engine.process_output(b"\x1b[c", (0, 0));
+
+        let events = trace.lock().expect("trace mutex poisoned").snapshot(10);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].pane_id, Some(7));
+        assert_eq!(events[0].direction, ProtocolDirection::Query);
+        assert_eq!(events[1].direction, ProtocolDirection::Reply);
+        assert_eq!(events[0].name, "csi_primary_da");
+    }
+
+    #[test]
+    fn trace_buffer_drops_oldest_when_capacity_exceeded() {
+        let mut trace = ProtocolTraceBuffer::with_capacity(2);
+        trace.push(super::ProtocolTraceEvent {
+            timestamp_ms: 1,
+            pane_id: Some(1),
+            profile: "xterm".to_string(),
+            family: "csi".to_string(),
+            name: "a".to_string(),
+            direction: ProtocolDirection::Query,
+            raw_hex: "61".to_string(),
+            decoded: "a".to_string(),
+        });
+        trace.push(super::ProtocolTraceEvent {
+            timestamp_ms: 2,
+            pane_id: Some(1),
+            profile: "xterm".to_string(),
+            family: "csi".to_string(),
+            name: "b".to_string(),
+            direction: ProtocolDirection::Query,
+            raw_hex: "62".to_string(),
+            decoded: "b".to_string(),
+        });
+        trace.push(super::ProtocolTraceEvent {
+            timestamp_ms: 3,
+            pane_id: Some(1),
+            profile: "xterm".to_string(),
+            family: "csi".to_string(),
+            name: "c".to_string(),
+            direction: ProtocolDirection::Query,
+            raw_hex: "63".to_string(),
+            decoded: "c".to_string(),
+        });
+
+        let events = trace.snapshot(10);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].name, "b");
+        assert_eq!(events[1].name, "c");
+        assert_eq!(trace.dropped(), 1);
+    }
 }
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};

@@ -113,6 +113,10 @@ pub struct BehaviorConfig {
     pub restore_last_layout: bool,
     /// Terminal type to expose to pane processes as TERM
     pub pane_term: String,
+    /// Enable protocol query/reply tracing in runtime
+    pub protocol_trace_enabled: bool,
+    /// Maximum in-memory protocol trace events to retain
+    pub protocol_trace_capacity: usize,
 }
 
 impl Default for BehaviorConfig {
@@ -125,6 +129,8 @@ impl Default for BehaviorConfig {
             exit_empty: false,
             restore_last_layout: true,
             pane_term: "bmux-256color".to_string(),
+            protocol_trace_enabled: false,
+            protocol_trace_capacity: 200,
         }
     }
 }

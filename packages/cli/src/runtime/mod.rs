@@ -37,8 +37,8 @@ use pane_runtime::{
 use persistence::{load_persisted_runtime_state, save_persisted_runtime_state};
 use status_message::StatusMessage;
 use terminal_protocol::{
-    ProtocolProfile, primary_da_for_profile, protocol_profile_name, secondary_da_for_profile,
-    supported_query_names,
+    ProtocolProfile, ProtocolTraceBuffer, ProtocolTraceEvent, SharedProtocolTraceBuffer,
+    primary_da_for_profile, protocol_profile_name, secondary_da_for_profile, supported_query_names,
 };
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -79,6 +79,8 @@ struct RuntimeSettings {
     pane_term: String,
     terminal_profile: TerminalProfile,
     protocol_profile: ProtocolProfile,
+    protocol_trace_enabled: bool,
+    protocol_trace_capacity: usize,
     configured_pane_term: String,
     warnings: Vec<String>,
 }
@@ -132,7 +134,11 @@ fn run_command(command: &Command) -> Result<u8> {
             LayoutCommand::Clear => run_layout_clear(),
         },
         Command::Terminal { command } => match command {
-            TerminalCommand::Doctor { json } => run_terminal_doctor(*json),
+            TerminalCommand::Doctor {
+                json,
+                trace,
+                trace_limit,
+            } => run_terminal_doctor(*json, *trace, *trace_limit),
         },
     }
 }
@@ -153,7 +159,7 @@ fn run_layout_clear() -> Result<u8> {
     }
 }
 
-fn run_terminal_doctor(as_json: bool) -> Result<u8> {
+fn run_terminal_doctor(as_json: bool, include_trace: bool, trace_limit: usize) -> Result<u8> {
     let config = match BmuxConfig::load() {
         Ok(config) => config,
         Err(error) => {
@@ -167,6 +173,11 @@ fn run_terminal_doctor(as_json: bool) -> Result<u8> {
     let configured_term = config.behavior.pane_term.clone();
     let effective = resolve_pane_term(&configured_term);
     let protocol_profile = protocol_profile_for_terminal_profile(effective.profile);
+    let trace_events = if include_trace {
+        load_protocol_trace(trace_limit)?
+    } else {
+        Vec::new()
+    };
 
     if as_json {
         let payload = serde_json::json!({
@@ -191,6 +202,14 @@ fn run_terminal_doctor(as_json: bool) -> Result<u8> {
                 }))
                 .collect::<Vec<_>>(),
             "warnings": effective.warnings,
+            "trace": if include_trace {
+                serde_json::json!({
+                    "events": trace_events,
+                    "limit": trace_limit,
+                })
+            } else {
+                serde_json::Value::Null
+            },
         });
         println!(
             "{}",
@@ -245,6 +264,32 @@ fn run_terminal_doctor(as_json: bool) -> Result<u8> {
         println!("warning: {warning}");
     }
 
+    if include_trace {
+        println!("trace events (latest {}):", trace_limit);
+        if trace_events.is_empty() {
+            println!(
+                "  (no events found; enable behavior.protocol_trace_enabled and run a session)"
+            );
+        }
+        for event in trace_events {
+            let pane = event
+                .pane_id
+                .map_or_else(|| "-".to_string(), |id| id.to_string());
+            println!(
+                "  [{}] pane={} {}:{} {} {}",
+                event.timestamp_ms,
+                pane,
+                event.family,
+                event.name,
+                match event.direction {
+                    terminal_protocol::ProtocolDirection::Query => "query",
+                    terminal_protocol::ProtocolDirection::Reply => "reply",
+                },
+                event.decoded.replace('\u{1b}', "<ESC>")
+            );
+        }
+    }
+
     Ok(0)
 }
 
@@ -263,6 +308,13 @@ fn run_two_pane_runtime(
     let startup_deadline = Instant::now() + STARTUP_ALT_SCREEN_GUARD_DURATION;
     let user_input_seen = Arc::new(AtomicBool::new(false));
     let shutdown_requested = Arc::new(AtomicBool::new(false));
+    let protocol_trace = if runtime_settings.protocol_trace_enabled {
+        Some(Arc::new(Mutex::new(ProtocolTraceBuffer::with_capacity(
+            runtime_settings.protocol_trace_capacity,
+        ))))
+    } else {
+        None
+    };
     let (mut layout_tree, mut panes) = initialize_runtime_state(
         shell,
         &runtime_settings.pane_term,
@@ -272,6 +324,7 @@ fn run_two_pane_runtime(
         startup_deadline,
         Arc::clone(&user_input_seen),
         runtime_settings.layout_persistence_enabled,
+        protocol_trace.clone(),
     )?;
     let mut pane_rects = layout_tree.compute_rects(cols, rows);
     let mut last_persisted_at = Instant::now();
@@ -313,6 +366,7 @@ fn run_two_pane_runtime(
             Arc::clone(&user_input_seen),
             &runtime_settings.pane_term,
             runtime_settings.protocol_profile,
+            protocol_trace.clone(),
         )? {
             layout_tree = updated_tree;
             layout_tree.focused = focused_pane;
@@ -432,6 +486,12 @@ fn run_two_pane_runtime(
         eprintln!("bmux warning: failed to persist runtime layout on shutdown ({error})");
     }
 
+    if let Some(trace) = &protocol_trace
+        && let Err(error) = save_protocol_trace(trace)
+    {
+        eprintln!("bmux warning: failed persisting protocol trace ({error})");
+    }
+
     shutdown_requested.store(true, Ordering::Relaxed);
     if input_thread.is_finished() {
         match input_thread.join() {
@@ -458,6 +518,7 @@ fn initialize_runtime_state(
     startup_deadline: Instant,
     user_input_seen: Arc<AtomicBool>,
     persistence_enabled: bool,
+    protocol_trace: Option<SharedProtocolTraceBuffer>,
 ) -> Result<(LayoutTree, BTreeMap<PaneId, PaneRuntime>)> {
     let restored = if persistence_enabled {
         match load_persisted_runtime_state() {
@@ -497,6 +558,7 @@ fn initialize_runtime_state(
         panes.insert(
             pane_id,
             spawn_pane(
+                pane_id,
                 &pane_shell,
                 pane_term,
                 protocol_profile,
@@ -504,6 +566,7 @@ fn initialize_runtime_state(
                 pane_rects[&pane_id].inner(),
                 startup_deadline,
                 Arc::clone(&user_input_seen),
+                protocol_trace.clone(),
             )?,
         );
     }
@@ -770,9 +833,61 @@ fn load_runtime_settings() -> RuntimeSettings {
         pane_term: pane_term_resolution.pane_term,
         terminal_profile: pane_term_resolution.profile,
         protocol_profile,
+        protocol_trace_enabled: config.behavior.protocol_trace_enabled,
+        protocol_trace_capacity: config.behavior.protocol_trace_capacity.clamp(16, 10_000),
         configured_pane_term,
         warnings: pane_term_resolution.warnings,
     }
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct ProtocolTraceFile {
+    dropped: usize,
+    events: Vec<ProtocolTraceEvent>,
+}
+
+fn save_protocol_trace(trace: &SharedProtocolTraceBuffer) -> Result<()> {
+    let path = bmux_config::ConfigPaths::default().protocol_trace_file();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("failed creating protocol trace dir at {}", parent.display())
+        })?;
+    }
+    let (snapshot, dropped) = {
+        let guard = trace.lock().expect("protocol trace mutex poisoned");
+        (guard.snapshot(10_000), guard.dropped())
+    };
+    let payload = ProtocolTraceFile {
+        dropped,
+        events: snapshot,
+    };
+    let bytes = serde_json::to_vec_pretty(&payload).context("failed encoding protocol trace")?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes).with_context(|| {
+        format!(
+            "failed writing protocol trace tmp file at {}",
+            tmp.display()
+        )
+    })?;
+    std::fs::rename(&tmp, &path)
+        .with_context(|| format!("failed replacing protocol trace file at {}", path.display()))?;
+    Ok(())
+}
+
+fn load_protocol_trace(limit: usize) -> Result<Vec<ProtocolTraceEvent>> {
+    let path = bmux_config::ConfigPaths::default().protocol_trace_file();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("failed reading protocol trace file at {}", path.display()))?;
+    let file: ProtocolTraceFile = serde_json::from_slice(&bytes)
+        .with_context(|| format!("failed parsing protocol trace file at {}", path.display()))?;
+    if limit == 0 || file.events.len() <= limit {
+        return Ok(file.events);
+    }
+    let start = file.events.len().saturating_sub(limit);
+    Ok(file.events.into_iter().skip(start).collect())
 }
 
 struct PaneTermResolution {

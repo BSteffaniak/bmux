@@ -1,5 +1,5 @@
 use super::pane_runtime::{next_focusable_pane_id, spawn_pane_process, stop_pane_process};
-use super::terminal_protocol::ProtocolProfile;
+use super::terminal_protocol::{ProtocolProfile, SharedProtocolTraceBuffer};
 use super::{PaneRuntime, StatusMessage};
 use crate::input::RuntimeAction;
 use crate::pane::{LayoutTree, PaneId, Rect, ResizeDirection, SplitDirection};
@@ -35,6 +35,7 @@ pub(super) fn process_input_events(
     user_input_seen: Arc<AtomicBool>,
     pane_term: &str,
     protocol_profile: ProtocolProfile,
+    protocol_trace: Option<SharedProtocolTraceBuffer>,
 ) -> Result<Option<LayoutTree>> {
     let mut pending_tree_update = None;
 
@@ -204,6 +205,7 @@ pub(super) fn process_input_events(
                             panes.insert(
                                 new_pane_id,
                                 super::pane_runtime::spawn_pane(
+                                    new_pane_id,
                                     &active_pane.shell,
                                     pane_term,
                                     protocol_profile,
@@ -211,6 +213,7 @@ pub(super) fn process_input_events(
                                     pane_inner,
                                     startup_deadline,
                                     Arc::clone(&user_input_seen),
+                                    protocol_trace.clone(),
                                 )?,
                             );
 
@@ -243,11 +246,13 @@ pub(super) fn process_input_events(
                                     &pane.shell,
                                     pane_term,
                                     protocol_profile,
+                                    *focused_pane,
                                     pane.title.clone(),
                                     pane_inner,
                                     startup_deadline,
                                     Arc::clone(&user_input_seen),
                                     Arc::clone(&pane.state),
+                                    protocol_trace.clone(),
                                 )?);
                                 pane.closed = false;
                                 pane.exit_code = None;
@@ -517,6 +522,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             "bmux-256color",
             ProtocolProfile::Conservative,
+            None,
         )
         .expect("process input events")
         .expect("tree updated by close");
@@ -566,6 +572,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             "bmux-256color",
             ProtocolProfile::Conservative,
+            None,
         )
         .expect("process input events")
         .expect("tree updated by commands");
@@ -632,6 +639,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             "bmux-256color",
             ProtocolProfile::Conservative,
+            None,
         )
         .expect("process input events");
 
@@ -755,6 +763,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             "bmux-256color",
             ProtocolProfile::Conservative,
+            None,
         )
         .expect("process input events")
         .expect("tree updated by directional resize");
@@ -802,6 +811,7 @@ mod tests {
             Arc::new(AtomicBool::new(false)),
             "bmux-256color",
             ProtocolProfile::Conservative,
+            None,
         )
         .expect("process input events");
 
