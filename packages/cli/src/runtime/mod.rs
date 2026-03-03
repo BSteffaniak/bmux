@@ -7,7 +7,7 @@ use crate::pane::{LayoutTree, PaneId, SplitDirection};
 use crate::pty::STARTUP_ALT_SCREEN_GUARD_DURATION;
 use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
-use bmux_client::BmuxClient;
+use bmux_client::{BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, TerminfoAutoInstall};
 use bmux_ipc::SessionSelector;
 use bmux_server::BmuxServer;
@@ -360,14 +360,67 @@ fn run_session_kill(target: &str) -> Result<u8> {
 
 fn run_session_attach(target: &str) -> Result<u8> {
     let selector = parse_session_selector(target);
-    let attached_id = run_async(async {
-        let mut client = BmuxClient::connect_default("bmux-cli-attach")
-            .await
-            .map_err(anyhow::Error::from)?;
-        client.attach(selector).await.map_err(anyhow::Error::from)
-    })?;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("failed to build tokio runtime")?;
+
+    let mut client = runtime
+        .block_on(BmuxClient::connect_default("bmux-cli-attach"))
+        .map_err(map_attach_client_error)?;
+    let grant = runtime
+        .block_on(client.attach_grant(selector))
+        .map_err(map_attach_client_error)?;
+    let attached_id = runtime
+        .block_on(client.open_attach_stream(&grant))
+        .map_err(map_attach_client_error)?;
+
     println!("attached to session: {attached_id}");
+    println!("press Ctrl-D to detach");
+
+    let mut stdin = io::stdin();
+    let mut stdout = io::stdout();
+    let mut buffer = [0_u8; 4096];
+
+    loop {
+        let bytes_read = stdin
+            .read(&mut buffer)
+            .context("failed reading attach input")?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        runtime
+            .block_on(client.attach_input(attached_id, buffer[..bytes_read].to_vec()))
+            .map_err(map_attach_client_error)?;
+
+        let output = runtime
+            .block_on(client.attach_output(attached_id, 64 * 1024))
+            .map_err(map_attach_client_error)?;
+        if !output.is_empty() {
+            stdout
+                .write_all(&output)
+                .context("failed writing attach output")?;
+            stdout.flush().context("failed flushing attach output")?;
+        }
+    }
+
+    let _ = runtime.block_on(client.detach());
+    println!("detached");
     Ok(0)
+}
+
+fn map_attach_client_error(error: ClientError) -> anyhow::Error {
+    match error {
+        ClientError::ServerError { code, message } => match code {
+            bmux_ipc::ErrorCode::AlreadyExists => {
+                anyhow::anyhow!("attach failed: session already has an active attached client")
+            }
+            bmux_ipc::ErrorCode::NotFound => anyhow::anyhow!("attach failed: {message}"),
+            _ => anyhow::anyhow!("attach failed: {message}"),
+        },
+        other => anyhow::Error::from(other),
+    }
 }
 
 fn run_session_detach() -> Result<u8> {
@@ -1932,13 +1985,16 @@ mod tests {
     use super::{
         EventReader, PaneRuntime, PaneState, ProtocolDirection, ProtocolTraceEvent, ScrollState,
         TerminalProfile, TraceFamily, filter_trace_events, format_scroll_mode_suffix,
-        load_runtime_settings, merged_runtime_keybindings, parse_pid_content, profile_for_term,
-        protocol_profile_for_terminal_profile, reap_exited_panes, resolve_pane_term_with_checker,
-        run_event_input_loop_with_reader, selection_status_suffix,
+        load_runtime_settings, map_attach_client_error, merged_runtime_keybindings,
+        parse_pid_content, profile_for_term, protocol_profile_for_terminal_profile,
+        reap_exited_panes, resolve_pane_term_with_checker, run_event_input_loop_with_reader,
+        selection_status_suffix,
     };
+    use bmux_client::ClientError;
     use crate::input::{InputProcessor, Keymap};
     use crate::pane::{LayoutNode, LayoutTree, PaneId, SplitDirection};
     use bmux_config::BmuxConfig;
+    use bmux_ipc::ErrorCode;
     use crossterm::event::Event;
     use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2222,5 +2278,18 @@ mod tests {
         assert_eq!(parse_pid_content(""), None);
         assert_eq!(parse_pid_content("0"), None);
         assert_eq!(parse_pid_content("abc"), None);
+    }
+
+    #[test]
+    fn map_attach_client_error_formats_busy_session() {
+        let error = map_attach_client_error(ClientError::ServerError {
+            code: ErrorCode::AlreadyExists,
+            message: "session busy".to_string(),
+        });
+        assert!(
+            error
+                .to_string()
+                .contains("session already has an active attached client")
+        );
     }
 }
