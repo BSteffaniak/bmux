@@ -312,7 +312,12 @@ impl InputProcessor {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn process_chunk(&mut self, bytes: &[u8]) -> Vec<RuntimeAction> {
+        self.process_stream_bytes(bytes)
+    }
+
+    pub(crate) fn process_stream_bytes(&mut self, bytes: &[u8]) -> Vec<RuntimeAction> {
         let mut actions = Vec::new();
 
         if self.pending_timed_out() {

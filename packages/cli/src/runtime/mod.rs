@@ -839,7 +839,7 @@ fn run_stream_input_loop(
         }
 
         user_input_seen.store(true, Ordering::Relaxed);
-        for action in processor.process_chunk(&buffer[..bytes_read]) {
+        for action in processor.process_stream_bytes(&buffer[..bytes_read]) {
             let _ = input_tx.send(action);
         }
     }
