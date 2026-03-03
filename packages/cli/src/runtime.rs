@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use tracing::debug;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use vt100::Parser as VtParser;
+use vt100::{Color, Screen};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const STATUS_REDRAW_INTERVAL: Duration = Duration::from_millis(200);
@@ -68,6 +69,17 @@ struct PaneRenderData {
     rect: Rect,
     title: String,
     lines: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CellStyle {
+    fg: Color,
+    bg: Color,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    inverse: bool,
 }
 
 struct RenderDebugState {
@@ -719,7 +731,17 @@ fn render_frame(
         || render_cache.pane_rects != [pane_data[0].rect, pane_data[1].rect]
         || render_cache.pane_titles != [pane_data[0].title.clone(), pane_data[1].title.clone()];
 
-    if border_changed {
+    let mut changed_line_count = 0_usize;
+    for pane_index in 0..2 {
+        changed_line_count += draw_changed_lines(
+            &mut stdout,
+            &pane_data[pane_index],
+            &render_cache.pane_lines[pane_index],
+            full_redraw || border_changed,
+        )?;
+    }
+
+    if border_changed || changed_line_count > 0 {
         draw_rect_border(
             &mut stdout,
             pane_data[0].rect,
@@ -739,16 +761,6 @@ fn render_frame(
                 "\x1b[90m"
             },
             &pane_data[1].title,
-        )?;
-    }
-
-    let mut changed_line_count = 0_usize;
-    for pane_index in 0..2 {
-        changed_line_count += draw_changed_lines(
-            &mut stdout,
-            &pane_data[pane_index],
-            &render_cache.pane_lines[pane_index],
-            full_redraw || border_changed,
         )?;
     }
 
@@ -816,18 +828,139 @@ fn collect_pane_render_data(pane: &PaneRuntime, rect: Rect, focused: bool) -> Pa
         .lock()
         .expect("pane parser mutex poisoned");
     let screen = parser.screen();
-    for (row_index, row_text) in screen.rows_formatted(0, inner.width).enumerate() {
-        if row_index >= usize::from(inner.height) {
-            break;
-        }
-        lines.push(row_text);
-    }
-
-    while lines.len() < usize::from(inner.height) {
-        lines.push(vec![b' '; usize::from(inner.width)]);
+    for row_index in 0..inner.height {
+        lines.push(render_screen_row(screen, row_index, inner.width));
     }
 
     PaneRenderData { rect, title, lines }
+}
+
+fn render_screen_row(screen: &Screen, row: u16, width: u16) -> Vec<u8> {
+    let mut output = Vec::with_capacity(usize::from(width) * 4);
+    let mut current_style = CellStyle::default();
+    let mut col = 0_u16;
+
+    while col < width {
+        let remaining = width - col;
+        let Some(cell) = screen.cell(row, col) else {
+            push_style_diff(&mut output, current_style, CellStyle::default());
+            output.push(b' ');
+            current_style = CellStyle::default();
+            col += 1;
+            continue;
+        };
+
+        if cell.is_wide_continuation() {
+            col += 1;
+            continue;
+        }
+
+        let style = CellStyle {
+            fg: cell.fgcolor(),
+            bg: cell.bgcolor(),
+            bold: cell.bold(),
+            dim: cell.dim(),
+            italic: cell.italic(),
+            underline: cell.underline(),
+            inverse: cell.inverse(),
+        };
+
+        push_style_diff(&mut output, current_style, style);
+        current_style = style;
+
+        if cell.has_contents() {
+            if cell.is_wide() && remaining < 2 {
+                output.push(b' ');
+                col += 1;
+            } else {
+                output.extend_from_slice(cell.contents().as_bytes());
+                col += if cell.is_wide() { 2 } else { 1 };
+            }
+        } else {
+            output.push(b' ');
+            col += 1;
+        }
+    }
+
+    push_style_diff(&mut output, current_style, CellStyle::default());
+    output
+}
+
+fn push_style_diff(output: &mut Vec<u8>, previous: CellStyle, next: CellStyle) {
+    if previous == next {
+        return;
+    }
+
+    output.extend_from_slice(b"\x1b[0m");
+
+    let mut codes = Vec::new();
+    if next.bold {
+        codes.push("1".to_string());
+    }
+    if next.dim {
+        codes.push("2".to_string());
+    }
+    if next.italic {
+        codes.push("3".to_string());
+    }
+    if next.underline {
+        codes.push("4".to_string());
+    }
+    if next.inverse {
+        codes.push("7".to_string());
+    }
+
+    push_color_code(&mut codes, next.fg, true);
+    push_color_code(&mut codes, next.bg, false);
+
+    if codes.is_empty() {
+        return;
+    }
+
+    output.extend_from_slice(b"\x1b[");
+    output.extend_from_slice(codes.join(";").as_bytes());
+    output.push(b'm');
+}
+
+fn push_color_code(codes: &mut Vec<String>, color: Color, foreground: bool) {
+    match color {
+        Color::Default => {
+            codes.push(if foreground {
+                "39".to_string()
+            } else {
+                "49".to_string()
+            });
+        }
+        Color::Idx(value) => {
+            let base = if foreground { 30_u8 } else { 40_u8 };
+            let bright_base = if foreground { 90_u8 } else { 100_u8 };
+
+            if value <= 7 {
+                codes.push((base + value).to_string());
+            } else if value <= 15 {
+                codes.push((bright_base + (value - 8)).to_string());
+            } else {
+                if foreground {
+                    codes.push("38".to_string());
+                } else {
+                    codes.push("48".to_string());
+                }
+                codes.push("5".to_string());
+                codes.push(value.to_string());
+            }
+        }
+        Color::Rgb(red, green, blue) => {
+            if foreground {
+                codes.push("38".to_string());
+            } else {
+                codes.push("48".to_string());
+            }
+            codes.push("2".to_string());
+            codes.push(red.to_string());
+            codes.push(green.to_string());
+            codes.push(blue.to_string());
+        }
+    }
 }
 
 fn draw_changed_lines(
@@ -871,20 +1004,14 @@ fn draw_rect_border(stdout: &mut io::Stdout, rect: Rect, color: &str, title: &st
         title_inner.push_str(&"-".repeat(inner_width - title_w));
     }
     let top = format!("+{title_inner}+");
-    let middle = format!(
-        "|{}|",
-        " ".repeat(usize::from(rect.width.saturating_sub(2)))
-    );
     let bottom = top.clone();
+    let right_x = rect.x.saturating_add(rect.width.saturating_sub(1));
 
     write_at(stdout, rect.x, rect.y, &format!("{color}{top}\x1b[0m"))?;
     for offset in 1..rect.height.saturating_sub(1) {
-        write_at(
-            stdout,
-            rect.x,
-            rect.y.saturating_add(offset),
-            &format!("{color}{middle}\x1b[0m"),
-        )?;
+        let y = rect.y.saturating_add(offset);
+        write_at(stdout, rect.x, y, &format!("{color}|\x1b[0m"))?;
+        write_at(stdout, right_x, y, &format!("{color}|\x1b[0m"))?;
     }
     write_at(
         stdout,
@@ -944,13 +1071,28 @@ fn fit_to_width(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::pad_or_truncate;
+    use super::{pad_or_truncate, render_screen_row};
     use unicode_width::UnicodeWidthStr;
+    use vt100::Parser;
 
     #[test]
     fn pad_or_truncate_handles_wide_characters() {
         let rendered = pad_or_truncate("a界b", 4);
         assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 4);
+    }
+
+    #[test]
+    fn row_renderer_keeps_colors_without_erase_controls() {
+        let mut parser = Parser::new(2, 20, 0);
+        parser.process(b"\x1b[31mred\x1b[0m text\x1b[K");
+
+        let row = render_screen_row(parser.screen(), 0, 20);
+        let rendered = String::from_utf8(row).expect("valid utf8 row output");
+
+        assert!(rendered.contains("red"));
+        assert!(rendered.contains("\x1b["));
+        assert!(!rendered.contains("\x1b[K"));
+        assert!(!rendered.contains("\x1b[2K"));
     }
 }
 
