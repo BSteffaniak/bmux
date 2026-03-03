@@ -131,7 +131,19 @@ pub enum Request {
     Attach {
         selector: SessionSelector,
     },
+    AttachOpen {
+        session_id: Uuid,
+        attach_token: Uuid,
+    },
     Detach,
+}
+
+/// Attach grant returned by attach control-plane request.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachGrant {
+    pub session_id: Uuid,
+    pub attach_token: Uuid,
+    pub expires_at_epoch_ms: u64,
 }
 
 /// Summary returned when listing sessions.
@@ -152,7 +164,8 @@ pub enum ResponsePayload {
     SessionCreated { id: Uuid, name: Option<String> },
     SessionList { sessions: Vec<SessionSummary> },
     SessionKilled { id: Uuid },
-    Attached { id: Uuid },
+    Attached { grant: AttachGrant },
+    AttachReady { session_id: Uuid },
     Detached,
     ServerStopping,
 }

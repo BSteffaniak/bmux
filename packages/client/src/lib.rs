@@ -8,8 +8,8 @@
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcStream};
 use bmux_ipc::{
-    Envelope, EnvelopeKind, ErrorCode, IpcEndpoint, ProtocolVersion, Request, Response,
-    ResponsePayload, SessionSelector, SessionSummary, decode, encode,
+    AttachGrant, Envelope, EnvelopeKind, ErrorCode, IpcEndpoint, ProtocolVersion, Request,
+    Response, ResponsePayload, SessionSelector, SessionSummary, decode, encode,
 };
 use std::time::Duration;
 use thiserror::Error;
@@ -182,9 +182,37 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn attach(&mut self, selector: SessionSelector) -> Result<Uuid> {
+        let grant = self.attach_grant(selector).await?;
+        Ok(grant.session_id)
+    }
+
+    /// Request attach grant token for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn attach_grant(&mut self, selector: SessionSelector) -> Result<AttachGrant> {
         match self.request(Request::Attach { selector }).await? {
-            ResponsePayload::Attached { id } => Ok(id),
+            ResponsePayload::Attached { grant } => Ok(grant),
             _ => Err(ClientError::UnexpectedResponse("expected attached response")),
+        }
+    }
+
+    /// Validate and consume attach grant token.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn open_attach_stream(&mut self, grant: &AttachGrant) -> Result<Uuid> {
+        match self
+            .request(Request::AttachOpen {
+                session_id: grant.session_id,
+                attach_token: grant.attach_token,
+            })
+            .await?
+        {
+            ResponsePayload::AttachReady { session_id } => Ok(session_id),
+            _ => Err(ClientError::UnexpectedResponse("expected attach ready response")),
         }
     }
 
@@ -295,10 +323,14 @@ mod tests {
         assert_eq!(sessions[0].id, session_id);
         assert_eq!(sessions[0].name.as_deref(), Some("dev"));
 
-        let attached_id = client
-            .attach(SessionSelector::ByName("dev".to_string()))
+        let grant = client
+            .attach_grant(SessionSelector::ByName("dev".to_string()))
             .await
             .expect("attach should succeed");
+        let attached_id = client
+            .open_attach_stream(&grant)
+            .await
+            .expect("attach open should succeed");
         assert_eq!(attached_id, session_id);
 
         client.detach().await.expect("detach should succeed");

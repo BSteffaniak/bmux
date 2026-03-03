@@ -9,19 +9,21 @@ use anyhow::{Context, Result};
 use bmux_config::ConfigPaths;
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
-    CURRENT_PROTOCOL_VERSION, Envelope, EnvelopeKind, ErrorCode, ErrorResponse, IpcEndpoint,
-    ProtocolVersion, Request, Response, ResponsePayload, SessionSelector, SessionSummary, decode,
-    encode,
+    AttachGrant, CURRENT_PROTOCOL_VERSION, Envelope, EnvelopeKind, ErrorCode, ErrorResponse,
+    IpcEndpoint, ProtocolVersion, Request, Response, ResponsePayload, SessionSelector,
+    SessionSummary, decode, encode,
 };
 use bmux_session::{ClientId, SessionId, SessionManager};
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
+use uuid::Uuid;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
 
 /// Main server implementation.
 #[derive(Debug, Clone)]
@@ -35,7 +37,99 @@ pub struct BmuxServer {
 struct ServerState {
     session_manager: Mutex<SessionManager>,
     session_runtimes: Mutex<SessionRuntimeManager>,
+    attach_tokens: Mutex<AttachTokenManager>,
     handshake_timeout: Duration,
+}
+
+#[derive(Debug)]
+struct AttachTokenManager {
+    ttl: Duration,
+    tokens: BTreeMap<Uuid, AttachTokenEntry>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AttachTokenEntry {
+    session_id: SessionId,
+    expires_at: Instant,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachTokenValidationError {
+    NotFound,
+    Expired,
+    SessionMismatch,
+}
+
+impl AttachTokenManager {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            tokens: BTreeMap::new(),
+        }
+    }
+
+    fn issue(&mut self, session_id: SessionId) -> AttachGrant {
+        self.prune_expired();
+
+        let attach_token = Uuid::new_v4();
+        let expires_at = Instant::now() + self.ttl;
+        let expires_at_epoch_ms = epoch_millis_now().saturating_add(self.ttl.as_millis() as u64);
+        self.tokens.insert(
+            attach_token,
+            AttachTokenEntry {
+                session_id,
+                expires_at,
+            },
+        );
+
+        AttachGrant {
+            session_id: session_id.0,
+            attach_token,
+            expires_at_epoch_ms,
+        }
+    }
+
+    fn consume(
+        &mut self,
+        session_id: SessionId,
+        attach_token: Uuid,
+    ) -> std::result::Result<(), AttachTokenValidationError> {
+        let Some(entry) = self.tokens.get(&attach_token).copied() else {
+            return Err(AttachTokenValidationError::NotFound);
+        };
+        if entry.expires_at <= Instant::now() {
+            self.tokens.remove(&attach_token);
+            return Err(AttachTokenValidationError::Expired);
+        }
+        if entry.session_id != session_id {
+            return Err(AttachTokenValidationError::SessionMismatch);
+        }
+
+        self.tokens.remove(&attach_token);
+
+        Ok(())
+    }
+
+    fn remove_for_session(&mut self, session_id: SessionId) {
+        self.tokens.retain(|_, entry| entry.session_id != session_id);
+    }
+
+    fn clear(&mut self) {
+        self.tokens.clear();
+    }
+
+    fn prune_expired(&mut self) {
+        let now = Instant::now();
+        self.tokens.retain(|_, entry| entry.expires_at > now);
+    }
+
+}
+
+fn epoch_millis_now() -> u64 {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    now.as_millis() as u64
 }
 
 #[derive(Debug, Default)]
@@ -125,6 +219,7 @@ impl BmuxServer {
             state: Arc::new(ServerState {
                 session_manager: Mutex::new(SessionManager::new()),
                 session_runtimes: Mutex::new(SessionRuntimeManager::default()),
+                attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             }),
             shutdown_tx,
@@ -204,6 +299,9 @@ impl BmuxServer {
 
         if let Ok(mut runtime_manager) = self.state.session_runtimes.lock() {
             runtime_manager.stop_all_runtimes();
+        }
+        if let Ok(mut attach_tokens) = self.state.attach_tokens.lock() {
+            attach_tokens.clear();
         }
 
         Ok(())
@@ -419,6 +517,13 @@ async fn handle_request(
                     message: format!("failed stopping session runtime: {error:#}"),
                 }));
             }
+            drop(runtime_manager);
+
+            let mut attach_tokens = state
+                .attach_tokens
+                .lock()
+                .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
+            attach_tokens.remove_for_session(session_id);
 
             Response::Ok(ResponsePayload::SessionKilled { id: session_id.0 })
         }
@@ -445,13 +550,58 @@ async fn handle_request(
                 Some(session) => {
                     session.add_client(client_id);
                     *attached_session = Some(next_session_id);
-                    Response::Ok(ResponsePayload::Attached {
-                        id: next_session_id.0,
-                    })
+                    drop(manager);
+
+                    let mut attach_tokens = state
+                        .attach_tokens
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
+                    let grant = attach_tokens.issue(next_session_id);
+                    Response::Ok(ResponsePayload::Attached { grant })
                 }
                 None => Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
                     message: format!("session not found: {}", next_session_id.0),
+                }),
+            }
+        }
+        Request::AttachOpen {
+            session_id,
+            attach_token,
+        } => {
+            let session_id = SessionId(session_id);
+
+            let manager = state
+                .session_manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+            if manager.get_session(&session_id).is_none() {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!("session not found: {}", session_id.0),
+                }));
+            }
+            drop(manager);
+
+            let mut attach_tokens = state
+                .attach_tokens
+                .lock()
+                .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
+            match attach_tokens.consume(session_id, attach_token) {
+                Ok(()) => Response::Ok(ResponsePayload::AttachReady {
+                    session_id: session_id.0,
+                }),
+                Err(AttachTokenValidationError::NotFound) => Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: "attach token not found".to_string(),
+                }),
+                Err(AttachTokenValidationError::Expired) => Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "attach token expired".to_string(),
+                }),
+                Err(AttachTokenValidationError::SessionMismatch) => Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "attach token does not match requested session".to_string(),
                 }),
             }
         }
@@ -726,9 +876,26 @@ mod tests {
             },
         )
         .await;
+        let grant = match attached {
+            Response::Ok(ResponsePayload::Attached { grant }) => {
+                assert_eq!(grant.session_id, session_id);
+                grant
+            }
+            other => panic!("unexpected attach response: {other:?}"),
+        };
+
+        let attach_open = send_request(
+            &mut client,
+            211,
+            Request::AttachOpen {
+                session_id,
+                attach_token: grant.attach_token,
+            },
+        )
+        .await;
         assert_eq!(
-            attached,
-            Response::Ok(ResponsePayload::Attached { id: session_id })
+            attach_open,
+            Response::Ok(ResponsePayload::AttachReady { session_id })
         );
 
         let detached = send_request(&mut client, 22, Request::Detach).await;
@@ -764,6 +931,106 @@ mod tests {
             assert_eq!(runtime_manager.runtime_count(), 0);
             assert!(!runtime_manager.has_runtime(SessionId(session_id)));
         }
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attach_open_rejects_invalid_token() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut client = connect_and_handshake(&endpoint).await;
+
+        let created = send_request(
+            &mut client,
+            40,
+            Request::NewSession {
+                name: Some("bad-token".to_string()),
+            },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected create response: {other:?}"),
+        };
+
+        let response = send_request(
+            &mut client,
+            41,
+            Request::AttachOpen {
+                session_id,
+                attach_token: Uuid::new_v4(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            response,
+            Response::Err(ErrorResponse {
+                code: ErrorCode::NotFound,
+                ..
+            })
+        ));
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attach_open_rejects_expired_token() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut client = connect_and_handshake(&endpoint).await;
+
+        let created = send_request(
+            &mut client,
+            50,
+            Request::NewSession {
+                name: Some("exp-token".to_string()),
+            },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected create response: {other:?}"),
+        };
+
+        let attached = send_request(
+            &mut client,
+            51,
+            Request::Attach {
+                selector: SessionSelector::ById(session_id),
+            },
+        )
+        .await;
+        let grant = match attached {
+            Response::Ok(ResponsePayload::Attached { grant }) => grant,
+            other => panic!("unexpected attach response: {other:?}"),
+        };
+
+        {
+            let mut token_manager = server
+                .state
+                .attach_tokens
+                .lock()
+                .expect("attach token manager lock should succeed");
+            force_expire_attach_token(&mut token_manager, grant.attach_token);
+        }
+
+        let response = send_request(
+            &mut client,
+            52,
+            Request::AttachOpen {
+                session_id,
+                attach_token: grant.attach_token,
+            },
+        )
+        .await;
+        assert!(matches!(
+            response,
+            Response::Err(ErrorResponse {
+                code: ErrorCode::InvalidRequest,
+                ..
+            })
+        ));
 
         stop_server(server, server_task, &socket_path).await;
     }
@@ -869,6 +1136,12 @@ mod tests {
             .expect("server should shut down cleanly");
         if socket_path.exists() {
             std::fs::remove_file(socket_path).expect("socket cleanup should succeed");
+        }
+    }
+
+    fn force_expire_attach_token(token_manager: &mut super::AttachTokenManager, token: Uuid) {
+        if let Some(entry) = token_manager.tokens.get_mut(&token) {
+            entry.expires_at = std::time::Instant::now() - Duration::from_millis(1);
         }
     }
 }
