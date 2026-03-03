@@ -10,8 +10,9 @@
 ## ✅ Current Status
 
 - **Development Infrastructure**: Modular architecture with strict code quality standards
-- **Foundation**: Core packages and development patterns established
-- **Next Phase**: Implementing core terminal multiplexer functionality
+- **Local IPC Foundation**: Versioned client/server protocol with cross-platform endpoint abstraction
+- **CLI Server Management**: Foreground/daemon server lifecycle commands with graceful stop + fallback
+- **Session Command Surface**: Top-level and grouped session commands are available
 
 ## 🚀 Key (planned) Features
 
@@ -82,6 +83,47 @@ cargo fmt
 ```
 
 ## 🛠️ Development
+
+## 🧭 Current CLI Workflow
+
+The current CLI supports both top-level and grouped session commands with identical behavior.
+
+```bash
+# Start server in foreground (default)
+bmux server start
+
+# Start server in background daemon mode
+bmux server start --daemon
+
+# Check server status and stop gracefully
+bmux server status
+bmux server stop
+
+# Create/list/attach/kill sessions (top-level)
+bmux new-session dev
+bmux list-sessions
+bmux list-sessions --json
+bmux attach dev
+bmux kill-session dev
+
+# Same operations via grouped aliases
+bmux session new dev
+bmux session list
+bmux session list --json
+bmux session attach dev
+bmux session kill dev
+bmux session detach
+```
+
+`list-sessions --json` and `session list --json` output a bare JSON array.
+
+### Server stop behavior
+
+`bmux server stop` uses graceful IPC shutdown first. If that times out, it falls back to PID-based termination.
+
+### Troubleshooting stale PID state
+
+If daemon startup/stop was interrupted, stale PID state can remain under the runtime directory (`$XDG_RUNTIME_DIR/bmux/server.pid` on most Linux setups, or temp-dir based equivalents). The CLI auto-cleans stale PID files when it can prove the process is gone, but you can remove the file manually if needed.
 
 ### Building from Source
 
