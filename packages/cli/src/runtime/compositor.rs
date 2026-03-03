@@ -259,6 +259,10 @@ pub(super) fn render_frame(
         || render_cache.pane_rects != [pane_data[0].rect, pane_data[1].rect]
         || render_cache.pane_titles != [pane_data[0].title.clone(), pane_data[1].title.clone()];
 
+    if border_changed {
+        clear_body_region(&mut stdout, cols, rows)?;
+    }
+
     let mut changed_line_count = 0_usize;
     for pane_index in 0..2 {
         changed_line_count += draw_changed_lines(
@@ -558,6 +562,19 @@ fn draw_rect_border(stdout: &mut io::Stdout, rect: Rect, color: &str, title: &st
         rect.y.saturating_add(rect.height.saturating_sub(1)),
         &format!("{color}{bottom}\x1b[0m"),
     )?;
+
+    Ok(())
+}
+
+fn clear_body_region(stdout: &mut io::Stdout, cols: u16, rows: u16) -> Result<()> {
+    if rows <= 1 || cols == 0 {
+        return Ok(());
+    }
+
+    let blank = " ".repeat(usize::from(cols));
+    for row in 2..=rows {
+        write_at(stdout, 1, row, &blank)?;
+    }
 
     Ok(())
 }
