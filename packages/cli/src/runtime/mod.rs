@@ -1,6 +1,6 @@
 use crate::cli::{Cli, Command, DebugRenderLogFormat, KeymapCommand};
 use crate::input::{InputProcessor, RuntimeAction};
-use crate::pane::{Layout, compute_vertical_layout};
+use crate::pane::compute_vertical_layout;
 use crate::pty::STARTUP_ALT_SCREEN_GUARD_DURATION;
 use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
@@ -10,27 +10,30 @@ use portable_pty::{Child, MasterPty};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::debug;
 use vt100::Parser as VtParser;
 
+mod commands;
 mod compositor;
 mod pane_runtime;
+mod status_message;
+use commands::process_input_events;
 use compositor::{RenderCache, RenderDebugState, render_frame};
 use pane_runtime::{
-    any_running_panes, first_running_pane_index, next_focusable_pane_index, pane_is_running,
-    refresh_exit_codes, resize_panes, spawn_pane, spawn_pane_process, stop_pane_process,
+    any_running_panes, first_running_pane_index, pane_is_running, refresh_exit_codes, resize_panes,
+    spawn_pane, stop_pane_process,
 };
+use status_message::StatusMessage;
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const STATUS_REDRAW_INTERVAL: Duration = Duration::from_millis(200);
 const SPLIT_RATIO_STEP: f32 = 0.05;
 const MIN_PANE_ROWS: u16 = 2;
 const MIN_PANE_COLS: u16 = 2;
-const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(3);
 
 struct PaneState {
     parser: Mutex<VtParser>,
@@ -51,11 +54,6 @@ struct PaneProcess {
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send>,
     output_thread: Option<thread::JoinHandle<Result<()>>>,
-}
-
-struct StatusMessage {
-    text: String,
-    expires_at: Instant,
 }
 
 pub(crate) fn run() -> Result<u8> {
@@ -181,7 +179,7 @@ fn run_two_pane_runtime(
 
         if status_message
             .as_ref()
-            .is_some_and(|message| Instant::now() >= message.expires_at)
+            .is_some_and(status_message::is_expired)
         {
             status_message = None;
             force_redraw = true;
@@ -287,124 +285,6 @@ fn spawn_input_thread(
         .context("failed to spawn PTY input thread")?;
 
     Ok(input_thread)
-}
-
-fn process_input_events(
-    input_rx: &Receiver<RuntimeAction>,
-    panes: &mut [PaneRuntime],
-    layout: &Layout,
-    focused_pane: &mut usize,
-    split_ratio: &mut f32,
-    shutdown_requested: &Arc<AtomicBool>,
-    force_redraw: &mut bool,
-    exit_override: &mut Option<u8>,
-    status_message: &mut Option<StatusMessage>,
-    startup_deadline: Instant,
-    user_input_seen: Arc<AtomicBool>,
-) -> Result<()> {
-    loop {
-        match input_rx.try_recv() {
-            Ok(RuntimeAction::ForwardToPane(bytes)) => {
-                if let Some(active_pane) = panes.get_mut(*focused_pane) {
-                    if let Some(process) = active_pane.process.as_mut() {
-                        process
-                            .writer
-                            .write_all(&bytes)
-                            .and_then(|_| process.writer.flush())
-                            .context("failed writing input to pane")?;
-                    }
-                }
-            }
-            Ok(action) => {
-                match action {
-                    RuntimeAction::Quit => {
-                        shutdown_requested.store(true, Ordering::Relaxed);
-                        *exit_override = Some(0);
-                    }
-                    RuntimeAction::FocusNext => {
-                        *focused_pane = next_focusable_pane_index(panes, *focused_pane);
-                    }
-                    RuntimeAction::IncreaseSplit => {
-                        *split_ratio = (*split_ratio + SPLIT_RATIO_STEP).clamp(0.2, 0.8);
-                    }
-                    RuntimeAction::DecreaseSplit => {
-                        *split_ratio = (*split_ratio - SPLIT_RATIO_STEP).clamp(0.2, 0.8);
-                    }
-                    RuntimeAction::RestartFocusedPane => {
-                        let pane_inner = if *focused_pane == 0 {
-                            layout.left.inner()
-                        } else {
-                            layout.right.inner()
-                        };
-                        if let Some(pane) = panes.get_mut(*focused_pane) {
-                            stop_pane_process(pane, true)?;
-                            pane.process = Some(spawn_pane_process(
-                                &pane.shell,
-                                pane.title.clone(),
-                                pane_inner,
-                                startup_deadline,
-                                Arc::clone(&user_input_seen),
-                                Arc::clone(&pane.state),
-                            )?);
-                            pane.closed = false;
-                            pane.exit_code = None;
-                            pane.state.dirty.store(true, Ordering::Relaxed);
-                            *status_message = Some(new_status_message(format!(
-                                "pane '{}' restarted",
-                                pane.title
-                            )));
-                        }
-                    }
-                    RuntimeAction::CloseFocusedPane => {
-                        let running_count =
-                            panes.iter().filter(|pane| pane_is_running(pane)).count();
-                        if running_count <= 1 {
-                            *status_message = Some(new_status_message(
-                                "cannot close the last running pane".to_string(),
-                            ));
-                        } else if let Some(pane) = panes.get_mut(*focused_pane) {
-                            let closed_title = pane.title.clone();
-                            stop_pane_process(pane, true)?;
-                            pane.closed = true;
-                            pane.exit_code = None;
-                            pane.state.dirty.store(true, Ordering::Relaxed);
-                            *status_message =
-                                Some(new_status_message(format!("pane '{closed_title}' closed")));
-                        }
-
-                        *focused_pane = next_focusable_pane_index(panes, *focused_pane);
-                    }
-                    RuntimeAction::ShowHelp => {
-                        *status_message = Some(new_status_message(
-                            "Ctrl-A: q quit | o focus | +/- resize | r restart | x close | ? help"
-                                .to_string(),
-                        ));
-                    }
-                    RuntimeAction::Eof => {
-                        shutdown_requested.store(true, Ordering::Relaxed);
-                        *exit_override = Some(0);
-                    }
-                    RuntimeAction::ForwardToPane(_) => unreachable!(),
-                }
-
-                *force_redraw = true;
-            }
-            Err(mpsc::TryRecvError::Empty) => break,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                shutdown_requested.store(true, Ordering::Relaxed);
-                break;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn new_status_message(text: String) -> StatusMessage {
-    StatusMessage {
-        text,
-        expires_at: Instant::now() + STATUS_MESSAGE_TTL,
-    }
 }
 
 fn load_runtime_keymap() -> crate::input::Keymap {
