@@ -15,7 +15,6 @@ pub(crate) enum RuntimeAction {
     CloseFocusedPane,
     ShowHelp,
     ForwardToPane(Vec<u8>),
-    Eof,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -481,7 +480,6 @@ fn action_to_name(action: &RuntimeAction) -> &'static str {
         RuntimeAction::CloseFocusedPane => "close_focused_pane",
         RuntimeAction::ShowHelp => "show_help",
         RuntimeAction::ForwardToPane(_) => "forward_to_pane",
-        RuntimeAction::Eof => "eof",
     }
 }
 

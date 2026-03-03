@@ -6,9 +6,10 @@ use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
 use bmux_config::BmuxConfig;
 use clap::Parser;
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use portable_pty::{Child, MasterPty};
 use std::collections::BTreeMap;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -31,6 +32,7 @@ use pane_runtime::{
 use status_message::StatusMessage;
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const STATUS_REDRAW_INTERVAL: Duration = Duration::from_millis(200);
 const MIN_PANE_ROWS: u16 = 2;
 const MIN_PANE_COLS: u16 = 2;
@@ -286,32 +288,26 @@ fn spawn_input_thread(
     let input_thread = thread::Builder::new()
         .name("bmux-pty-input".to_string())
         .spawn(move || -> Result<()> {
-            let mut stdin = io::stdin().lock();
-            let mut buffer = [0_u8; 8192];
             let mut processor = InputProcessor::new(keymap);
 
-            loop {
-                if shutdown_requested.load(Ordering::Relaxed) {
-                    break;
-                }
+            if io::stdin().is_terminal() {
+                run_event_input_loop(
+                    &input_tx,
+                    &shutdown_requested,
+                    &user_input_seen,
+                    &mut processor,
+                )?;
+            } else {
+                run_stream_input_loop(
+                    &input_tx,
+                    &shutdown_requested,
+                    &user_input_seen,
+                    &mut processor,
+                )?;
+            }
 
-                let bytes_read = stdin
-                    .read(&mut buffer)
-                    .context("failed reading terminal input")?;
-
-                if bytes_read == 0 {
-                    if let Some(trailing_action) = processor.finish() {
-                        let _ = input_tx.send(trailing_action);
-                    }
-                    let _ = input_tx.send(RuntimeAction::Eof);
-                    break;
-                }
-
-                user_input_seen.store(true, Ordering::Relaxed);
-
-                for action in processor.process_chunk(&buffer[..bytes_read]) {
-                    let _ = input_tx.send(action);
-                }
+            if let Some(trailing_action) = processor.finish() {
+                let _ = input_tx.send(trailing_action);
             }
 
             Ok(())
@@ -319,6 +315,145 @@ fn spawn_input_thread(
         .context("failed to spawn PTY input thread")?;
 
     Ok(input_thread)
+}
+
+fn run_event_input_loop(
+    input_tx: &Sender<RuntimeAction>,
+    shutdown_requested: &Arc<AtomicBool>,
+    user_input_seen: &Arc<AtomicBool>,
+    processor: &mut InputProcessor,
+) -> Result<()> {
+    loop {
+        if shutdown_requested.load(Ordering::Relaxed) {
+            break;
+        }
+
+        if !event::poll(INPUT_POLL_INTERVAL).context("failed polling terminal input")? {
+            continue;
+        }
+
+        let event = event::read().context("failed reading terminal event")?;
+        if let Some(bytes) = event_to_bytes(event) {
+            user_input_seen.store(true, Ordering::Relaxed);
+            for action in processor.process_chunk(&bytes) {
+                let _ = input_tx.send(action);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn run_stream_input_loop(
+    input_tx: &Sender<RuntimeAction>,
+    shutdown_requested: &Arc<AtomicBool>,
+    user_input_seen: &Arc<AtomicBool>,
+    processor: &mut InputProcessor,
+) -> Result<()> {
+    let mut stdin = io::stdin().lock();
+    let mut buffer = [0_u8; 8192];
+
+    loop {
+        if shutdown_requested.load(Ordering::Relaxed) {
+            break;
+        }
+
+        let bytes_read = stdin
+            .read(&mut buffer)
+            .context("failed reading terminal input")?;
+
+        if bytes_read == 0 {
+            break;
+        }
+
+        user_input_seen.store(true, Ordering::Relaxed);
+        for action in processor.process_chunk(&buffer[..bytes_read]) {
+            let _ = input_tx.send(action);
+        }
+    }
+
+    Ok(())
+}
+
+fn event_to_bytes(event: Event) -> Option<Vec<u8>> {
+    match event {
+        Event::Key(key) => key_to_bytes(key),
+        _ => None,
+    }
+}
+
+fn key_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
+    if key.kind == KeyEventKind::Release {
+        return None;
+    }
+
+    let modifiers = key.modifiers;
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    let alt = modifiers.contains(KeyModifiers::ALT);
+
+    let mut out = Vec::new();
+
+    let mut push_alt = || {
+        if alt {
+            out.push(0x1b);
+        }
+    };
+
+    match key.code {
+        KeyCode::Char(c) => {
+            if ctrl {
+                let lower = c.to_ascii_lowercase();
+                if lower.is_ascii_lowercase() {
+                    push_alt();
+                    out.push((lower as u8 - b'a') + 1);
+                    return Some(out);
+                }
+            }
+
+            push_alt();
+            if c.is_ascii() {
+                out.push(c as u8);
+            } else {
+                let mut buf = [0_u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+            Some(out)
+        }
+        KeyCode::Enter => {
+            push_alt();
+            out.push(b'\r');
+            Some(out)
+        }
+        KeyCode::Tab => {
+            push_alt();
+            out.push(b'\t');
+            Some(out)
+        }
+        KeyCode::Backspace => {
+            push_alt();
+            out.push(0x7f);
+            Some(out)
+        }
+        KeyCode::Esc => Some(vec![0x1b]),
+        KeyCode::Up => Some(vec![0x1b, b'[', b'A']),
+        KeyCode::Down => Some(vec![0x1b, b'[', b'B']),
+        KeyCode::Right => Some(vec![0x1b, b'[', b'C']),
+        KeyCode::Left => Some(vec![0x1b, b'[', b'D']),
+        KeyCode::Home => Some(vec![0x1b, b'[', b'H']),
+        KeyCode::End => Some(vec![0x1b, b'[', b'F']),
+        KeyCode::PageUp => Some(vec![0x1b, b'[', b'5', b'~']),
+        KeyCode::PageDown => Some(vec![0x1b, b'[', b'6', b'~']),
+        KeyCode::Insert => Some(vec![0x1b, b'[', b'2', b'~']),
+        KeyCode::Delete => Some(vec![0x1b, b'[', b'3', b'~']),
+        KeyCode::F(n) => match n {
+            1 => Some(vec![0x1b, b'O', b'P']),
+            2 => Some(vec![0x1b, b'O', b'Q']),
+            3 => Some(vec![0x1b, b'O', b'R']),
+            4 => Some(vec![0x1b, b'O', b'S']),
+            _ => None,
+        },
+        _ => None,
+    }
 }
 
 fn load_runtime_keymap() -> crate::input::Keymap {
@@ -503,8 +638,9 @@ fn reap_exited_panes(
 
 #[cfg(test)]
 mod tests {
-    use super::{PaneRuntime, PaneState, reap_exited_panes};
+    use super::{PaneRuntime, PaneState, key_to_bytes, reap_exited_panes};
     use crate::pane::{LayoutNode, LayoutTree, PaneId, SplitDirection};
+    use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::collections::BTreeMap;
     use std::sync::atomic::AtomicBool;
     use std::sync::{Arc, Mutex};
@@ -556,5 +692,29 @@ mod tests {
         assert!(result.removed_any);
         assert_eq!(result.session_exit_code, Some(42));
         assert!(panes.is_empty());
+    }
+
+    #[test]
+    fn key_to_bytes_encodes_ctrl_characters() {
+        let key = KeyEvent {
+            code: KeyCode::Char('c'),
+            modifiers: KeyModifiers::CONTROL,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+
+        assert_eq!(key_to_bytes(key), Some(vec![0x03]));
+    }
+
+    #[test]
+    fn key_to_bytes_encodes_arrow_sequences() {
+        let key = KeyEvent {
+            code: KeyCode::Up,
+            modifiers: KeyModifiers::NONE,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+
+        assert_eq!(key_to_bytes(key), Some(vec![0x1b, b'[', b'A']));
     }
 }

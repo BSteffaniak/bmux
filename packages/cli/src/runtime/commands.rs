@@ -196,10 +196,6 @@ pub(super) fn process_input_events(
                                 .to_string(),
                         ));
                     }
-                    RuntimeAction::Eof => {
-                        shutdown_requested.store(true, Ordering::Relaxed);
-                        *exit_override = Some(0);
-                    }
                     RuntimeAction::ForwardToPane(_) => unreachable!(),
                 }
 
