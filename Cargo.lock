@@ -93,6 +93,7 @@ dependencies = [
  "bmux_client",
  "bmux_config",
  "bmux_event",
+ "bmux_ipc",
  "bmux_server",
  "bmux_session",
  "bmux_terminal",
@@ -105,6 +106,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-width",
+ "uuid",
  "vt100",
 ]
 

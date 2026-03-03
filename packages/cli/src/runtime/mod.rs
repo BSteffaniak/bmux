@@ -1,6 +1,6 @@
 use crate::cli::{
     Cli, Command, DebugRenderLogFormat, KeymapCommand, LayoutCommand, ServerCommand,
-    TerminalCommand, TraceFamily,
+    SessionCommand, TerminalCommand, TraceFamily,
 };
 use crate::input::{InputProcessor, RuntimeAction};
 use crate::pane::{LayoutTree, PaneId, SplitDirection};
@@ -9,6 +9,7 @@ use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
 use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, TerminfoAutoInstall};
+use bmux_ipc::SessionSelector;
 use bmux_server::BmuxServer;
 use clap::Parser;
 use crossterm::event::{self, Event};
@@ -24,6 +25,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use tracing::debug;
 use vt100::Parser as VtParser;
+use uuid::Uuid;
 
 mod commands;
 mod compositor;
@@ -161,6 +163,18 @@ pub(crate) fn run() -> Result<u8> {
 
 fn run_command(command: &Command) -> Result<u8> {
     match command {
+        Command::NewSession { name } => run_session_new(name.clone()),
+        Command::ListSessions => run_session_list(),
+        Command::KillSession { target } => run_session_kill(target),
+        Command::Attach { target } => run_session_attach(target),
+        Command::Detach => run_session_detach(),
+        Command::Session { command } => match command {
+            SessionCommand::New { name } => run_session_new(name.clone()),
+            SessionCommand::List => run_session_list(),
+            SessionCommand::Kill { target } => run_session_kill(target),
+            SessionCommand::Attach { target } => run_session_attach(target),
+            SessionCommand::Detach => run_session_detach(),
+        },
         Command::Server { command } => match command {
             ServerCommand::Start {
                 daemon,
@@ -278,6 +292,87 @@ fn run_server_stop() -> Result<u8> {
 
     println!("bmux server is not running");
     Ok(1)
+}
+
+fn run_session_new(name: Option<String>) -> Result<u8> {
+    let session_id = run_async(async {
+        let mut client = BmuxClient::connect_default("bmux-cli-new-session")
+            .await
+            .map_err(anyhow::Error::from)?;
+        client.new_session(name).await.map_err(anyhow::Error::from)
+    })?;
+    println!("created session: {session_id}");
+    Ok(0)
+}
+
+fn run_session_list() -> Result<u8> {
+    let sessions = run_async(async {
+        let mut client = BmuxClient::connect_default("bmux-cli-list-sessions")
+            .await
+            .map_err(anyhow::Error::from)?;
+        client.list_sessions().await.map_err(anyhow::Error::from)
+    })?;
+
+    if sessions.is_empty() {
+        println!("no sessions");
+        return Ok(0);
+    }
+
+    println!("ID                                   NAME            WINDOWS CLIENTS");
+    for session in sessions {
+        let name = session.name.unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<36} {:<15} {:<7} {}",
+            session.id, name, session.window_count, session.client_count
+        );
+    }
+
+    Ok(0)
+}
+
+fn run_session_kill(target: &str) -> Result<u8> {
+    let selector = parse_session_selector(target);
+    let killed_id = run_async(async {
+        let mut client = BmuxClient::connect_default("bmux-cli-kill-session")
+            .await
+            .map_err(anyhow::Error::from)?;
+        client
+            .kill_session(selector)
+            .await
+            .map_err(anyhow::Error::from)
+    })?;
+    println!("killed session: {killed_id}");
+    Ok(0)
+}
+
+fn run_session_attach(target: &str) -> Result<u8> {
+    let selector = parse_session_selector(target);
+    let attached_id = run_async(async {
+        let mut client = BmuxClient::connect_default("bmux-cli-attach")
+            .await
+            .map_err(anyhow::Error::from)?;
+        client.attach(selector).await.map_err(anyhow::Error::from)
+    })?;
+    println!("attached to session: {attached_id}");
+    Ok(0)
+}
+
+fn run_session_detach() -> Result<u8> {
+    run_async(async {
+        let mut client = BmuxClient::connect_default("bmux-cli-detach")
+            .await
+            .map_err(anyhow::Error::from)?;
+        client.detach().await.map_err(anyhow::Error::from)
+    })?;
+    println!("detached");
+    Ok(0)
+}
+
+fn parse_session_selector(target: &str) -> SessionSelector {
+    match Uuid::parse_str(target) {
+        Ok(id) => SessionSelector::ById(id),
+        Err(_) => SessionSelector::ByName(target.to_string()),
+    }
 }
 
 fn run_async<F, T>(future: F) -> Result<T>

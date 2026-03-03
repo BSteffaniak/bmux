@@ -48,6 +48,30 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Create a new session
+    NewSession {
+        /// Optional session name
+        name: Option<String>,
+    },
+    /// List active sessions
+    ListSessions,
+    /// Kill a session by name or UUID
+    KillSession {
+        /// Session name or UUID
+        target: String,
+    },
+    /// Attach to a session by name or UUID
+    Attach {
+        /// Session name or UUID
+        target: String,
+    },
+    /// Detach from the current session
+    Detach,
+    /// Session management commands
+    Session {
+        #[command(subcommand)]
+        command: SessionCommand,
+    },
     /// Server lifecycle and status tools
     Server {
         #[command(subcommand)]
@@ -68,6 +92,29 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: TerminalCommand,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum SessionCommand {
+    /// Create a new session
+    New {
+        /// Optional session name
+        name: Option<String>,
+    },
+    /// List active sessions
+    List,
+    /// Kill a session by name or UUID
+    Kill {
+        /// Session name or UUID
+        target: String,
+    },
+    /// Attach to a session by name or UUID
+    Attach {
+        /// Session name or UUID
+        target: String,
+    },
+    /// Detach from the current session
+    Detach,
 }
 
 #[derive(Debug, Subcommand)]
@@ -137,7 +184,8 @@ pub(crate) enum TerminalCommand {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, KeymapCommand, LayoutCommand, ServerCommand, TerminalCommand, TraceFamily,
+        Cli, Command, KeymapCommand, LayoutCommand, ServerCommand, SessionCommand, TerminalCommand,
+        TraceFamily,
     };
     use clap::Parser;
 
@@ -260,6 +308,100 @@ mod tests {
             panic!("expected server subcommand");
         };
         assert!(matches!(command, ServerCommand::Stop));
+    }
+
+    #[test]
+    fn parses_top_level_new_session_command() {
+        let cli = Cli::try_parse_from(["bmux", "new-session", "dev"]).expect("valid CLI args");
+        let Some(Command::NewSession { name }) = cli.command else {
+            panic!("expected new-session command");
+        };
+        assert_eq!(name.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn parses_top_level_list_sessions_command() {
+        let cli = Cli::try_parse_from(["bmux", "list-sessions"]).expect("valid CLI args");
+        assert!(matches!(cli.command, Some(Command::ListSessions)));
+    }
+
+    #[test]
+    fn parses_top_level_kill_session_command() {
+        let cli = Cli::try_parse_from(["bmux", "kill-session", "dev"]).expect("valid CLI args");
+        let Some(Command::KillSession { target }) = cli.command else {
+            panic!("expected kill-session command");
+        };
+        assert_eq!(target, "dev");
+    }
+
+    #[test]
+    fn parses_top_level_attach_command() {
+        let cli = Cli::try_parse_from(["bmux", "attach", "dev"]).expect("valid CLI args");
+        let Some(Command::Attach { target }) = cli.command else {
+            panic!("expected attach command");
+        };
+        assert_eq!(target, "dev");
+    }
+
+    #[test]
+    fn parses_top_level_detach_command() {
+        let cli = Cli::try_parse_from(["bmux", "detach"]).expect("valid CLI args");
+        assert!(matches!(cli.command, Some(Command::Detach)));
+    }
+
+    #[test]
+    fn parses_grouped_session_new_command() {
+        let cli = Cli::try_parse_from(["bmux", "session", "new", "dev"]).expect("valid CLI args");
+        let Some(Command::Session { command }) = cli.command else {
+            panic!("expected session command");
+        };
+        assert!(matches!(
+            command,
+            SessionCommand::New { name: Some(ref name) } if name == "dev"
+        ));
+    }
+
+    #[test]
+    fn parses_grouped_session_list_command() {
+        let cli = Cli::try_parse_from(["bmux", "session", "list"]).expect("valid CLI args");
+        let Some(Command::Session { command }) = cli.command else {
+            panic!("expected session command");
+        };
+        assert!(matches!(command, SessionCommand::List));
+    }
+
+    #[test]
+    fn parses_grouped_session_kill_command() {
+        let cli = Cli::try_parse_from(["bmux", "session", "kill", "dev"]).expect("valid CLI args");
+        let Some(Command::Session { command }) = cli.command else {
+            panic!("expected session command");
+        };
+        assert!(matches!(
+            command,
+            SessionCommand::Kill { target } if target == "dev"
+        ));
+    }
+
+    #[test]
+    fn parses_grouped_session_attach_command() {
+        let cli =
+            Cli::try_parse_from(["bmux", "session", "attach", "dev"]).expect("valid CLI args");
+        let Some(Command::Session { command }) = cli.command else {
+            panic!("expected session command");
+        };
+        assert!(matches!(
+            command,
+            SessionCommand::Attach { target } if target == "dev"
+        ));
+    }
+
+    #[test]
+    fn parses_grouped_session_detach_command() {
+        let cli = Cli::try_parse_from(["bmux", "session", "detach"]).expect("valid CLI args");
+        let Some(Command::Session { command }) = cli.command else {
+            panic!("expected session command");
+        };
+        assert!(matches!(command, SessionCommand::Detach));
     }
 
     #[test]
