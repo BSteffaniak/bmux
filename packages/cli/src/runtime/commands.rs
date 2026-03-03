@@ -32,6 +32,7 @@ pub(super) fn process_input_events(
     status_message: &mut Option<StatusMessage>,
     startup_deadline: Instant,
     user_input_seen: Arc<AtomicBool>,
+    pane_term: &str,
 ) -> Result<Option<LayoutTree>> {
     let mut pending_tree_update = None;
 
@@ -199,6 +200,7 @@ pub(super) fn process_input_events(
                                 new_pane_id,
                                 super::pane_runtime::spawn_pane(
                                     &active_pane.shell,
+                                    pane_term,
                                     pane_title.clone(),
                                     pane_inner,
                                     startup_deadline,
@@ -233,6 +235,7 @@ pub(super) fn process_input_events(
                                 stop_pane_process(pane, true)?;
                                 pane.process = Some(spawn_pane_process(
                                     &pane.shell,
+                                    pane_term,
                                     pane.title.clone(),
                                     pane_inner,
                                     startup_deadline,
@@ -505,6 +508,7 @@ mod tests {
             &mut status_message,
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
+            "bmux-256color",
         )
         .expect("process input events")
         .expect("tree updated by close");
@@ -552,6 +556,7 @@ mod tests {
             &mut status_message,
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
+            "bmux-256color",
         )
         .expect("process input events")
         .expect("tree updated by commands");
@@ -616,6 +621,7 @@ mod tests {
             &mut status_message,
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
+            "bmux-256color",
         )
         .expect("process input events");
 
@@ -737,6 +743,7 @@ mod tests {
             &mut status_message,
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
+            "bmux-256color",
         )
         .expect("process input events")
         .expect("tree updated by directional resize");
@@ -782,6 +789,7 @@ mod tests {
             &mut status_message,
             Instant::now(),
             Arc::new(AtomicBool::new(false)),
+            "bmux-256color",
         )
         .expect("process input events");
 

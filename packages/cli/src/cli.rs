@@ -51,6 +51,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: LayoutCommand,
     },
+    /// Terminal capability tools and diagnostics
+    Terminal {
+        #[command(subcommand)]
+        command: TerminalCommand,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -69,9 +74,19 @@ pub(crate) enum LayoutCommand {
     Clear,
 }
 
+#[derive(Debug, Subcommand)]
+pub(crate) enum TerminalCommand {
+    /// Show terminal capability profile used for panes
+    Doctor {
+        /// Print diagnostics as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Command, KeymapCommand, LayoutCommand};
+    use super::{Cli, Command, KeymapCommand, LayoutCommand, TerminalCommand};
     use clap::Parser;
 
     #[test]
@@ -144,5 +159,24 @@ mod tests {
             panic!("expected layout subcommand");
         };
         assert!(matches!(command, LayoutCommand::Clear));
+    }
+
+    #[test]
+    fn parses_terminal_doctor_subcommand() {
+        let cli = Cli::try_parse_from(["bmux", "terminal", "doctor"]).expect("valid CLI args");
+        let Some(Command::Terminal { command }) = cli.command else {
+            panic!("expected terminal subcommand");
+        };
+        assert!(matches!(command, TerminalCommand::Doctor { json: false }));
+    }
+
+    #[test]
+    fn parses_terminal_doctor_json_flag() {
+        let cli =
+            Cli::try_parse_from(["bmux", "terminal", "doctor", "--json"]).expect("valid CLI args");
+        let Some(Command::Terminal { command }) = cli.command else {
+            panic!("expected terminal subcommand");
+        };
+        assert!(matches!(command, TerminalCommand::Doctor { json: true }));
     }
 }

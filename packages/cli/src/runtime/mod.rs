@@ -1,4 +1,6 @@
-use crate::cli::{Cli, Command, DebugRenderLogFormat, KeymapCommand, LayoutCommand};
+use crate::cli::{
+    Cli, Command, DebugRenderLogFormat, KeymapCommand, LayoutCommand, TerminalCommand,
+};
 use crate::input::{InputProcessor, RuntimeAction};
 use crate::pane::{LayoutTree, PaneId, SplitDirection};
 use crate::pty::STARTUP_ALT_SCREEN_GUARD_DURATION;
@@ -11,6 +13,7 @@ use portable_pty::{Child, MasterPty};
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
@@ -68,6 +71,18 @@ struct ReapExitedPanesResult {
 struct RuntimeSettings {
     keymap: crate::input::Keymap,
     layout_persistence_enabled: bool,
+    pane_term: String,
+    terminal_profile: TerminalProfile,
+    configured_pane_term: String,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TerminalProfile {
+    Bmux256Color,
+    Screen256Color,
+    Xterm256Color,
+    Conservative,
 }
 
 pub(crate) fn run() -> Result<u8> {
@@ -82,6 +97,15 @@ pub(crate) fn run() -> Result<u8> {
     let runtime_settings = load_runtime_settings();
     debug!("Starting bmux runtime");
     debug!("Launching shell: {shell}");
+    debug!(
+        "Pane TERM configured='{}' effective='{}' profile='{}'",
+        runtime_settings.configured_pane_term,
+        runtime_settings.pane_term,
+        terminal_profile_name(runtime_settings.terminal_profile)
+    );
+    for warning in &runtime_settings.warnings {
+        eprintln!("bmux warning: {warning}");
+    }
 
     run_two_pane_runtime(
         &shell,
@@ -100,6 +124,9 @@ fn run_command(command: &Command) -> Result<u8> {
         },
         Command::Layout { command } => match command {
             LayoutCommand::Clear => run_layout_clear(),
+        },
+        Command::Terminal { command } => match command {
+            TerminalCommand::Doctor { json } => run_terminal_doctor(*json),
         },
     }
 }
@@ -120,6 +147,63 @@ fn run_layout_clear() -> Result<u8> {
     }
 }
 
+fn run_terminal_doctor(as_json: bool) -> Result<u8> {
+    let config = match BmuxConfig::load() {
+        Ok(config) => config,
+        Err(error) => {
+            println!(
+                "bmux terminal doctor warning: failed to load config ({error}); using defaults"
+            );
+            BmuxConfig::default()
+        }
+    };
+
+    let configured_term = config.behavior.pane_term.clone();
+    let effective = resolve_pane_term(&configured_term);
+
+    if as_json {
+        let payload = serde_json::json!({
+            "configured_pane_term": configured_term,
+            "effective_pane_term": effective.pane_term,
+            "terminal_profile": terminal_profile_name(effective.profile),
+            "terminfo_check": {
+                "attempted": effective.terminfo_checked,
+                "available": effective.terminfo_available,
+            },
+            "warnings": effective.warnings,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .context("failed to encode terminal doctor json")?
+        );
+        return Ok(0);
+    }
+
+    println!("bmux terminal doctor");
+    println!("configured pane TERM: {configured_term}");
+    println!("effective pane TERM: {}", effective.pane_term);
+    println!(
+        "terminal profile: {}",
+        terminal_profile_name(effective.profile)
+    );
+    if effective.terminfo_checked {
+        println!(
+            "terminfo available: {}",
+            if effective.terminfo_available {
+                "yes"
+            } else {
+                "no"
+            }
+        );
+    }
+    for warning in effective.warnings {
+        println!("warning: {warning}");
+    }
+
+    Ok(0)
+}
+
 fn run_two_pane_runtime(
     shell: &str,
     use_alt_screen: bool,
@@ -137,6 +221,7 @@ fn run_two_pane_runtime(
     let shutdown_requested = Arc::new(AtomicBool::new(false));
     let (mut layout_tree, mut panes) = initialize_runtime_state(
         shell,
+        &runtime_settings.pane_term,
         cols,
         rows,
         startup_deadline,
@@ -181,6 +266,7 @@ fn run_two_pane_runtime(
             &mut status_message,
             startup_deadline,
             Arc::clone(&user_input_seen),
+            &runtime_settings.pane_term,
         )? {
             layout_tree = updated_tree;
             layout_tree.focused = focused_pane;
@@ -319,6 +405,7 @@ fn run_two_pane_runtime(
 
 fn initialize_runtime_state(
     shell: &str,
+    pane_term: &str,
     cols: u16,
     rows: u16,
     startup_deadline: Instant,
@@ -364,6 +451,7 @@ fn initialize_runtime_state(
             pane_id,
             spawn_pane(
                 &pane_shell,
+                pane_term,
                 title,
                 pane_rects[&pane_id].inner(),
                 startup_deadline,
@@ -603,33 +691,110 @@ fn key_to_bytes(key: KeyEvent) -> Option<Vec<u8>> {
 }
 
 fn load_runtime_settings() -> RuntimeSettings {
-    match BmuxConfig::load() {
-        Ok(config) => match crate::input::Keymap::from_parts(
-            &config.keybindings.prefix,
-            config.keybindings.timeout_ms,
-            &config.keybindings.runtime,
-            &config.keybindings.global,
-        ) {
-            Ok(keymap) => RuntimeSettings {
-                keymap,
-                layout_persistence_enabled: config.behavior.restore_last_layout,
-            },
-            Err(error) => {
-                eprintln!("bmux warning: invalid keymap config, using defaults ({error})");
-                RuntimeSettings {
-                    keymap: crate::input::Keymap::default_runtime(),
-                    layout_persistence_enabled: config.behavior.restore_last_layout,
-                }
-            }
-        },
+    let config = match BmuxConfig::load() {
+        Ok(config) => config,
         Err(error) => {
-            eprintln!("bmux warning: failed loading config, using default keymap ({error})");
-            RuntimeSettings {
-                keymap: crate::input::Keymap::default_runtime(),
-                layout_persistence_enabled: BmuxConfig::default().behavior.restore_last_layout,
-            }
+            eprintln!("bmux warning: failed loading config, using defaults ({error})");
+            BmuxConfig::default()
         }
+    };
+
+    let keymap = match crate::input::Keymap::from_parts(
+        &config.keybindings.prefix,
+        config.keybindings.timeout_ms,
+        &config.keybindings.runtime,
+        &config.keybindings.global,
+    ) {
+        Ok(keymap) => keymap,
+        Err(error) => {
+            eprintln!("bmux warning: invalid keymap config, using defaults ({error})");
+            crate::input::Keymap::default_runtime()
+        }
+    };
+
+    let configured_pane_term = config.behavior.pane_term.clone();
+    let pane_term_resolution = resolve_pane_term(&configured_pane_term);
+
+    RuntimeSettings {
+        keymap,
+        layout_persistence_enabled: config.behavior.restore_last_layout,
+        pane_term: pane_term_resolution.pane_term,
+        terminal_profile: pane_term_resolution.profile,
+        configured_pane_term,
+        warnings: pane_term_resolution.warnings,
     }
+}
+
+struct PaneTermResolution {
+    pane_term: String,
+    profile: TerminalProfile,
+    warnings: Vec<String>,
+    terminfo_checked: bool,
+    terminfo_available: bool,
+}
+
+fn resolve_pane_term(configured: &str) -> PaneTermResolution {
+    let configured_trimmed = configured.trim();
+    let configured_normalized = if configured_trimmed.is_empty() {
+        "bmux-256color".to_string()
+    } else {
+        configured_trimmed.to_string()
+    };
+
+    let mut warnings = Vec::new();
+    if configured_trimmed.is_empty() {
+        warnings.push("behavior.pane_term is empty; falling back to bmux-256color".to_string());
+    }
+
+    let mut pane_term = configured_normalized.clone();
+    let mut profile = profile_for_term(&pane_term);
+
+    let terminfo_check = check_terminfo_available(&pane_term);
+    if pane_term == "bmux-256color" && terminfo_check == Some(false) {
+        warnings.push(
+            "terminfo for bmux-256color not found; falling back to xterm-256color".to_string(),
+        );
+        pane_term = "xterm-256color".to_string();
+        profile = profile_for_term(&pane_term);
+    }
+
+    if profile == TerminalProfile::Conservative {
+        warnings.push(format!(
+            "pane TERM '{}' uses conservative capability profile; compatibility depends on host terminfo",
+            pane_term
+        ));
+    }
+
+    PaneTermResolution {
+        pane_term,
+        profile,
+        warnings,
+        terminfo_checked: terminfo_check.is_some(),
+        terminfo_available: terminfo_check.unwrap_or(false),
+    }
+}
+
+fn profile_for_term(term: &str) -> TerminalProfile {
+    match term {
+        "bmux-256color" => TerminalProfile::Bmux256Color,
+        "screen-256color" | "tmux-256color" => TerminalProfile::Screen256Color,
+        "xterm-256color" => TerminalProfile::Xterm256Color,
+        _ => TerminalProfile::Conservative,
+    }
+}
+
+fn terminal_profile_name(profile: TerminalProfile) -> &'static str {
+    match profile {
+        TerminalProfile::Bmux256Color => "bmux-256color",
+        TerminalProfile::Screen256Color => "screen-256color-compatible",
+        TerminalProfile::Xterm256Color => "xterm-256color-compatible",
+        TerminalProfile::Conservative => "conservative",
+    }
+}
+
+fn check_terminfo_available(term: &str) -> Option<bool> {
+    let output = ProcessCommand::new("infocmp").arg(term).output().ok()?;
+    Some(output.status.success())
 }
 
 fn run_keymap_doctor(as_json: bool) -> Result<u8> {
@@ -794,7 +959,8 @@ fn reap_exited_panes(
 #[cfg(test)]
 mod tests {
     use super::{
-        EventReader, PaneRuntime, PaneState, key_to_bytes, reap_exited_panes,
+        EventReader, PaneRuntime, PaneState, TerminalProfile, key_to_bytes, profile_for_term,
+        reap_exited_panes,
         run_event_input_loop_with_reader,
     };
     use crate::input::{InputProcessor, Keymap};
@@ -935,5 +1101,23 @@ mod tests {
         assert!(shutdown_requested.load(Ordering::Relaxed));
         assert!(!user_input_seen.load(Ordering::Relaxed));
         assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn pane_term_profile_mapping_is_stable() {
+        assert_eq!(profile_for_term("bmux-256color"), TerminalProfile::Bmux256Color);
+        assert_eq!(
+            profile_for_term("screen-256color"),
+            TerminalProfile::Screen256Color
+        );
+        assert_eq!(
+            profile_for_term("tmux-256color"),
+            TerminalProfile::Screen256Color
+        );
+        assert_eq!(
+            profile_for_term("xterm-256color"),
+            TerminalProfile::Xterm256Color
+        );
+        assert_eq!(profile_for_term("weird-term"), TerminalProfile::Conservative);
     }
 }

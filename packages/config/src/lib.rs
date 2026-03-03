@@ -111,6 +111,8 @@ pub struct BehaviorConfig {
     pub exit_empty: bool,
     /// Restore and persist last local CLI runtime layout
     pub restore_last_layout: bool,
+    /// Terminal type to expose to pane processes as TERM
+    pub pane_term: String,
 }
 
 impl Default for BehaviorConfig {
@@ -122,6 +124,7 @@ impl Default for BehaviorConfig {
             automatic_rename: false,
             exit_empty: false,
             restore_last_layout: true,
+            pane_term: "bmux-256color".to_string(),
         }
     }
 }

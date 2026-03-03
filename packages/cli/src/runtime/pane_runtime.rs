@@ -14,6 +14,7 @@ use vt100::Parser as VtParser;
 
 pub(super) fn spawn_pane(
     shell: &str,
+    pane_term: &str,
     title: String,
     pane_inner: Rect,
     startup_deadline: Instant,
@@ -33,6 +34,7 @@ pub(super) fn spawn_pane(
         shell: shell.to_string(),
         process: Some(spawn_pane_process(
             shell,
+            pane_term,
             title,
             pane_inner,
             startup_deadline,
@@ -47,6 +49,7 @@ pub(super) fn spawn_pane(
 
 pub(super) fn spawn_pane_process(
     shell: &str,
+    pane_term: &str,
     title: String,
     pane_inner: Rect,
     startup_deadline: Instant,
@@ -63,7 +66,8 @@ pub(super) fn spawn_pane_process(
         })
         .context("failed to open pane PTY")?;
 
-    let command = CommandBuilder::new(shell);
+    let mut command = CommandBuilder::new(shell);
+    command.env("TERM", pane_term);
     let child = pty_pair
         .slave
         .spawn_command(command)
