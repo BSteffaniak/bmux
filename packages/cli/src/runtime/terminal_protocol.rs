@@ -90,6 +90,8 @@ pub(super) fn supported_query_names() -> &'static [&'static str] {
         "csi_secondary_da",
         "csi_dsr_status_report",
         "csi_dsr_cursor_position",
+        "csi_dec_dsr_status_report",
+        "csi_dec_dsr_cursor_position",
         "csi_dec_mode_report",
     ]
 }
@@ -104,6 +106,8 @@ fn csi_query_reply(
         b">c" => Some(secondary_da_response(profile).to_vec()),
         b"5n" => Some(b"\x1b[0n".to_vec()),
         b"6n" => Some(dsr_cursor_response(cursor_pos)),
+        b"?5n" => Some(b"\x1b[?0n".to_vec()),
+        b"?6n" => Some(dec_dsr_cursor_response(cursor_pos)),
         _ if sequence.starts_with(b"?") && sequence.ends_with(b"$p") => {
             dec_mode_report_response(sequence, profile)
         }
@@ -113,9 +117,26 @@ fn csi_query_reply(
 
 fn dec_mode_report_response(sequence: &[u8], profile: ProtocolProfile) -> Option<Vec<u8>> {
     let mode_bytes = &sequence[1..sequence.len().saturating_sub(2)];
-    let mode = std::str::from_utf8(mode_bytes).ok()?.parse::<u16>().ok()?;
-    let status = dec_mode_status(profile, mode);
-    Some(format!("\x1b[?{mode};{status}$y").into_bytes())
+    let modes = parse_mode_list(mode_bytes)?;
+
+    let mut out = Vec::new();
+    for mode in modes {
+        let status = dec_mode_status(profile, mode);
+        out.extend_from_slice(format!("\x1b[?{mode};{status}$y").as_bytes());
+    }
+    Some(out)
+}
+
+fn parse_mode_list(bytes: &[u8]) -> Option<Vec<u16>> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut out = Vec::new();
+    for token in text.split(';') {
+        if token.is_empty() {
+            continue;
+        }
+        out.push(token.parse::<u16>().ok()?);
+    }
+    (!out.is_empty()).then_some(out)
 }
 
 fn dec_mode_status(profile: ProtocolProfile, mode: u16) -> u8 {
@@ -196,6 +217,12 @@ fn dsr_cursor_response(cursor_pos: (u16, u16)) -> Vec<u8> {
     format!("\x1b[{row};{col}R").into_bytes()
 }
 
+fn dec_dsr_cursor_response(cursor_pos: (u16, u16)) -> Vec<u8> {
+    let row = u32::from(cursor_pos.0).saturating_add(1);
+    let col = u32::from(cursor_pos.1).saturating_add(1);
+    format!("\x1b[?{row};{col}R").into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ProtocolProfile, TerminalProtocolEngine};
@@ -244,6 +271,20 @@ mod tests {
     }
 
     #[test]
+    fn replies_to_dec_dsr_status_query() {
+        let mut engine = TerminalProtocolEngine::default();
+        let reply = engine.process_output(b"\x1b[?5n", (0, 0));
+        assert_eq!(reply, b"\x1b[?0n");
+    }
+
+    #[test]
+    fn replies_to_dec_dsr_cursor_query() {
+        let mut engine = TerminalProtocolEngine::default();
+        let reply = engine.process_output(b"\x1b[?6n", (2, 3));
+        assert_eq!(reply, b"\x1b[?3;4R");
+    }
+
+    #[test]
     fn profile_specific_da_replies_vary() {
         let mut xterm = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
         let mut screen = TerminalProtocolEngine::new(ProtocolProfile::Screen);
@@ -260,6 +301,13 @@ mod tests {
         let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
         let reply = engine.process_output(b"\x1b[?25$p", (0, 0));
         assert_eq!(reply, b"\x1b[?25;1$y");
+    }
+
+    #[test]
+    fn replies_to_multi_mode_report_query() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
+        let reply = engine.process_output(b"\x1b[?25;1006$p", (0, 0));
+        assert_eq!(reply, b"\x1b[?25;1$y\x1b[?1006;2$y");
     }
 
     #[test]
