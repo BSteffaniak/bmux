@@ -15,6 +15,10 @@ pub(crate) enum RuntimeAction {
     SplitFocusedHorizontal,
     IncreaseSplit,
     DecreaseSplit,
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
     RestartFocusedPane,
     CloseFocusedPane,
     ShowHelp,
@@ -117,6 +121,10 @@ impl Keymap {
         runtime.insert("\"".to_string(), "split_focused_horizontal".to_string());
         runtime.insert("plus".to_string(), "increase_split".to_string());
         runtime.insert("minus".to_string(), "decrease_split".to_string());
+        runtime.insert("shift+h".to_string(), "resize_left".to_string());
+        runtime.insert("shift+l".to_string(), "resize_right".to_string());
+        runtime.insert("shift+k".to_string(), "resize_up".to_string());
+        runtime.insert("shift+j".to_string(), "resize_down".to_string());
         runtime.insert("r".to_string(), "restart_focused_pane".to_string());
         runtime.insert("x".to_string(), "close_focused_pane".to_string());
         runtime.insert("?".to_string(), "show_help".to_string());
@@ -492,6 +500,10 @@ fn action_to_name(action: &RuntimeAction) -> &'static str {
         RuntimeAction::SplitFocusedHorizontal => "split_focused_horizontal",
         RuntimeAction::IncreaseSplit => "increase_split",
         RuntimeAction::DecreaseSplit => "decrease_split",
+        RuntimeAction::ResizeLeft => "resize_left",
+        RuntimeAction::ResizeRight => "resize_right",
+        RuntimeAction::ResizeUp => "resize_up",
+        RuntimeAction::ResizeDown => "resize_down",
         RuntimeAction::RestartFocusedPane => "restart_focused_pane",
         RuntimeAction::CloseFocusedPane => "close_focused_pane",
         RuntimeAction::ShowHelp => "show_help",
@@ -592,6 +604,13 @@ fn decode_single(byte: u8) -> DecodedStroke {
                 key: KeyCode::Char(character),
             }
         }
+        b'A'..=b'Z' => KeyStroke {
+            ctrl: false,
+            alt: false,
+            shift: true,
+            super_key: false,
+            key: KeyCode::Char(char::from(byte).to_ascii_lowercase()),
+        },
         _ => KeyStroke::simple(KeyCode::Char(char::from(byte))),
     };
 
@@ -762,6 +781,10 @@ fn parse_action(value: &str) -> Result<RuntimeAction> {
         "split_focused_horizontal" => Ok(RuntimeAction::SplitFocusedHorizontal),
         "increase_split" => Ok(RuntimeAction::IncreaseSplit),
         "decrease_split" => Ok(RuntimeAction::DecreaseSplit),
+        "resize_left" => Ok(RuntimeAction::ResizeLeft),
+        "resize_right" => Ok(RuntimeAction::ResizeRight),
+        "resize_up" => Ok(RuntimeAction::ResizeUp),
+        "resize_down" => Ok(RuntimeAction::ResizeDown),
         "restart_focused_pane" => Ok(RuntimeAction::RestartFocusedPane),
         "close_focused_pane" => Ok(RuntimeAction::CloseFocusedPane),
         "show_help" => Ok(RuntimeAction::ShowHelp),
@@ -829,6 +852,23 @@ mod tests {
         assert_eq!(
             processor.process_chunk(&[0x01, 0x1b, b'[', b'B']),
             vec![RuntimeAction::FocusDown]
+        );
+
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'H']),
+            vec![RuntimeAction::ResizeLeft]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'L']),
+            vec![RuntimeAction::ResizeRight]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'K']),
+            vec![RuntimeAction::ResizeUp]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'J']),
+            vec![RuntimeAction::ResizeDown]
         );
     }
 

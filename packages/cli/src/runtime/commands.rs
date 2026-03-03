@@ -1,7 +1,7 @@
 use super::pane_runtime::{next_focusable_pane_id, spawn_pane_process, stop_pane_process};
 use super::{PaneRuntime, StatusMessage};
 use crate::input::RuntimeAction;
-use crate::pane::{LayoutTree, PaneId, Rect, SplitDirection};
+use crate::pane::{LayoutTree, PaneId, Rect, ResizeDirection, SplitDirection};
 use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -130,6 +130,50 @@ pub(super) fn process_input_events(
                             pending_tree_update = Some(updated_tree);
                         }
                     }
+                    RuntimeAction::ResizeLeft => {
+                        apply_directional_resize(
+                            pending_tree_update
+                                .as_ref()
+                                .cloned()
+                                .unwrap_or_else(|| layout_tree.clone()),
+                            ResizeDirection::Left,
+                            &mut pending_tree_update,
+                            status_message,
+                        );
+                    }
+                    RuntimeAction::ResizeRight => {
+                        apply_directional_resize(
+                            pending_tree_update
+                                .as_ref()
+                                .cloned()
+                                .unwrap_or_else(|| layout_tree.clone()),
+                            ResizeDirection::Right,
+                            &mut pending_tree_update,
+                            status_message,
+                        );
+                    }
+                    RuntimeAction::ResizeUp => {
+                        apply_directional_resize(
+                            pending_tree_update
+                                .as_ref()
+                                .cloned()
+                                .unwrap_or_else(|| layout_tree.clone()),
+                            ResizeDirection::Up,
+                            &mut pending_tree_update,
+                            status_message,
+                        );
+                    }
+                    RuntimeAction::ResizeDown => {
+                        apply_directional_resize(
+                            pending_tree_update
+                                .as_ref()
+                                .cloned()
+                                .unwrap_or_else(|| layout_tree.clone()),
+                            ResizeDirection::Down,
+                            &mut pending_tree_update,
+                            status_message,
+                        );
+                    }
                     RuntimeAction::SplitFocusedVertical | RuntimeAction::SplitFocusedHorizontal => {
                         let split_direction = match action {
                             RuntimeAction::SplitFocusedVertical => SplitDirection::Vertical,
@@ -232,7 +276,7 @@ pub(super) fn process_input_events(
                     }
                     RuntimeAction::ShowHelp => {
                         *status_message = Some(StatusMessage::new(
-                            "Ctrl-A: q quit | o cycle | h/j/k/l or arrows focus | t toggle layout | % split-v | \" split-h | +/- resize | r restart | x close | ? help"
+                            "Ctrl-A: q quit | o cycle | h/j/k/l or arrows focus | H/J/K/L directional resize | t toggle layout | % split-v | \" split-h | +/- resize | r restart | x close | ? help"
                                 .to_string(),
                         ));
                     }
@@ -260,6 +304,28 @@ fn next_pane_id(panes: &BTreeMap<PaneId, PaneRuntime>) -> PaneId {
         .unwrap_or(0)
         .saturating_add(1);
     PaneId(next)
+}
+
+fn apply_directional_resize(
+    mut updated_tree: LayoutTree,
+    direction: ResizeDirection,
+    pending_tree_update: &mut Option<LayoutTree>,
+    status_message: &mut Option<StatusMessage>,
+) {
+    if updated_tree
+        .adjust_focused_split_toward(direction, SPLIT_RATIO_STEP)
+        .is_some()
+    {
+        *pending_tree_update = Some(updated_tree);
+    } else {
+        let axis = match direction {
+            ResizeDirection::Left | ResizeDirection::Right => "vertical",
+            ResizeDirection::Up | ResizeDirection::Down => "horizontal",
+        };
+        *status_message = Some(StatusMessage::new(format!(
+            "no {axis} split found for directional resize"
+        )));
+    }
 }
 
 fn focus_in_direction(
@@ -634,5 +700,93 @@ mod tests {
 
         let next = focus_in_direction(PaneId(1), &panes, &rects, FocusDirection::Down);
         assert_eq!(next, PaneId(2));
+    }
+
+    #[test]
+    fn directional_resize_updates_matching_split() {
+        let mut panes = BTreeMap::new();
+        panes.insert(PaneId(1), make_pane("pane-1"));
+        panes.insert(PaneId(2), make_pane("pane-2"));
+        panes.insert(PaneId(3), make_pane("pane-3"));
+
+        let mut layout = LayoutTree::two_pane(PaneId(1), PaneId(2), SplitDirection::Vertical, 0.5);
+        layout.focused = PaneId(2);
+        assert!(layout.split_focused(SplitDirection::Horizontal, PaneId(3), 0.5));
+
+        let mut focused = PaneId(3);
+        layout.focused = focused;
+        let pane_rects = layout.compute_rects(120, 40);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let mut force_redraw = false;
+        let mut exit_override = None;
+        let mut status_message = None;
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(RuntimeAction::ResizeUp).expect("send resize up");
+        drop(tx);
+
+        let updated = process_input_events(
+            &rx,
+            &mut panes,
+            &pane_rects,
+            &layout,
+            &mut focused,
+            &shutdown_requested,
+            &mut force_redraw,
+            &mut exit_override,
+            &mut status_message,
+            Instant::now(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("process input events")
+        .expect("tree updated by directional resize");
+
+        match updated.root {
+            LayoutNode::Split { second, .. } => match *second {
+                LayoutNode::Split { ratio, .. } => assert!((ratio - 0.45).abs() < 0.001),
+                _ => panic!("expected nested split"),
+            },
+            _ => panic!("expected root split"),
+        }
+        assert!(status_message.is_none());
+    }
+
+    #[test]
+    fn directional_resize_reports_noop_when_axis_missing() {
+        let mut panes = BTreeMap::new();
+        panes.insert(PaneId(1), make_pane("pane-1"));
+        panes.insert(PaneId(2), make_pane("pane-2"));
+
+        let mut layout = LayoutTree::two_pane(PaneId(1), PaneId(2), SplitDirection::Vertical, 0.5);
+        let mut focused = PaneId(1);
+        layout.focused = focused;
+        let pane_rects = layout.compute_rects(120, 40);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let mut force_redraw = false;
+        let mut exit_override = None;
+        let mut status_message = None;
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(RuntimeAction::ResizeUp).expect("send resize up");
+        drop(tx);
+
+        let updated = process_input_events(
+            &rx,
+            &mut panes,
+            &pane_rects,
+            &layout,
+            &mut focused,
+            &shutdown_requested,
+            &mut force_redraw,
+            &mut exit_override,
+            &mut status_message,
+            Instant::now(),
+            Arc::new(AtomicBool::new(false)),
+        )
+        .expect("process input events");
+
+        assert!(updated.is_none());
+        let message = status_message.expect("status should explain no-op");
+        assert!(message.text.contains("no horizontal split"));
     }
 }

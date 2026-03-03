@@ -28,6 +28,14 @@ pub(crate) enum SplitDirection {
     Horizontal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResizeDirection {
+    Left,
+    Right,
+    Up,
+    Down,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum LayoutNode {
     Leaf {
@@ -74,6 +82,16 @@ impl LayoutTree {
     pub(crate) fn adjust_focused_split_ratio(&mut self, delta: f32) -> Option<f32> {
         let mut updated = None;
         adjust_nearest_split_ratio(&mut self.root, self.focused, delta, &mut updated);
+        updated
+    }
+
+    pub(crate) fn adjust_focused_split_toward(
+        &mut self,
+        direction: ResizeDirection,
+        step: f32,
+    ) -> Option<f32> {
+        let mut updated = None;
+        adjust_nearest_split_toward(&mut self.root, self.focused, direction, step, &mut updated);
         updated
     }
 
@@ -215,6 +233,71 @@ fn adjust_nearest_split_ratio(
     }
 }
 
+fn adjust_nearest_split_toward(
+    node: &mut LayoutNode,
+    target: PaneId,
+    direction: ResizeDirection,
+    step: f32,
+    updated: &mut Option<f32>,
+) -> bool {
+    match node {
+        LayoutNode::Leaf { pane_id } => *pane_id == target,
+        LayoutNode::Split {
+            direction: split_direction,
+            ratio,
+            first,
+            second,
+        } => {
+            let in_first = adjust_nearest_split_toward(first, target, direction, step, updated);
+            let in_second = if in_first {
+                false
+            } else {
+                adjust_nearest_split_toward(second, target, direction, step, updated)
+            };
+            let contains = in_first || in_second;
+            if contains && updated.is_none() {
+                let delta = match (*split_direction, direction) {
+                    (SplitDirection::Vertical, ResizeDirection::Left) => {
+                        if in_first {
+                            step
+                        } else {
+                            -step
+                        }
+                    }
+                    (SplitDirection::Vertical, ResizeDirection::Right) => {
+                        if in_first {
+                            -step
+                        } else {
+                            step
+                        }
+                    }
+                    (SplitDirection::Horizontal, ResizeDirection::Up) => {
+                        if in_first {
+                            step
+                        } else {
+                            -step
+                        }
+                    }
+                    (SplitDirection::Horizontal, ResizeDirection::Down) => {
+                        if in_first {
+                            -step
+                        } else {
+                            step
+                        }
+                    }
+                    _ => 0.0,
+                };
+
+                if delta != 0.0 {
+                    *ratio = (*ratio + delta).clamp(0.2, 0.8);
+                    *updated = Some(*ratio);
+                }
+            }
+            contains
+        }
+    }
+}
+
 fn remove_leaf(node: &mut LayoutNode, target: PaneId) -> bool {
     match node {
         LayoutNode::Leaf { pane_id } => *pane_id == target,
@@ -301,7 +384,7 @@ fn compute_node_rects(node: &LayoutNode, rect: Rect, out: &mut BTreeMap<PaneId, 
 
 #[cfg(test)]
 mod tests {
-    use super::{LayoutTree, PaneId, SplitDirection};
+    use super::{LayoutTree, PaneId, ResizeDirection, SplitDirection};
 
     #[test]
     fn computes_two_pane_vertical_rects() {
@@ -357,5 +440,25 @@ mod tests {
 
         let updated = tree.adjust_focused_split_ratio(0.1);
         assert_eq!(updated, Some(0.6));
+    }
+
+    #[test]
+    fn directional_resize_updates_matching_axis_split() {
+        let mut tree = LayoutTree::two_pane(PaneId(1), PaneId(2), SplitDirection::Vertical, 0.5);
+        tree.focused = PaneId(2);
+        assert!(tree.split_focused(SplitDirection::Horizontal, PaneId(3), 0.5));
+        tree.focused = PaneId(3);
+
+        let updated = tree.adjust_focused_split_toward(ResizeDirection::Up, 0.05);
+        assert_eq!(updated, Some(0.45));
+    }
+
+    #[test]
+    fn directional_resize_noops_when_axis_missing() {
+        let mut tree = LayoutTree::two_pane(PaneId(1), PaneId(2), SplitDirection::Vertical, 0.5);
+        tree.focused = PaneId(1);
+
+        let updated = tree.adjust_focused_split_toward(ResizeDirection::Up, 0.05);
+        assert_eq!(updated, None);
     }
 }
