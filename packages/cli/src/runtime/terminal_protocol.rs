@@ -207,13 +207,8 @@ impl TerminalProtocolEngine {
                         self.state = ParseState::Ground;
                         self.osc_buffer.clear();
                     } else {
-                        self.osc_buffer.push(0x1b);
-                        self.osc_buffer.push(*byte);
-                        self.state = ParseState::Osc;
-                        if self.osc_buffer.len() > 512 {
-                            self.state = ParseState::Ground;
-                            self.osc_buffer.clear();
-                        }
+                        self.state = ParseState::Ground;
+                        self.osc_buffer.clear();
                     }
                 }
                 ParseState::Dcs => {
@@ -243,13 +238,8 @@ impl TerminalProtocolEngine {
                         self.state = ParseState::Ground;
                         self.dcs_buffer.clear();
                     } else {
-                        self.dcs_buffer.push(0x1b);
-                        self.dcs_buffer.push(*byte);
-                        self.state = ParseState::Dcs;
-                        if self.dcs_buffer.len() > 512 {
-                            self.state = ParseState::Ground;
-                            self.dcs_buffer.clear();
-                        }
+                        self.state = ParseState::Ground;
+                        self.dcs_buffer.clear();
                     }
                 }
             }
@@ -727,6 +717,59 @@ mod tests {
         assert_eq!(events[0].name, "b");
         assert_eq!(events[1].name, "c");
         assert_eq!(trace.dropped(), 1);
+    }
+
+    #[test]
+    fn malformed_incomplete_sequences_do_not_emit_replies() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
+
+        assert!(engine.process_output(b"\x1b", (0, 0)).is_empty());
+        assert!(engine.process_output(b"[", (0, 0)).is_empty());
+        assert!(engine.process_output(b"?25$", (0, 0)).is_empty());
+        assert!(engine.process_output(b"\x1b]10;?", (0, 0)).is_empty());
+        assert!(engine.process_output(b"\x1bP+q5443", (0, 0)).is_empty());
+    }
+
+    #[test]
+    fn parser_recovers_after_malformed_sequences() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
+
+        let _ = engine.process_output(b"\x1b[?999999999999999999999999999999999999p", (0, 0));
+        let _ = engine.process_output(b"\x1b]10;?abcdefghijklmnopqrstuvwxyz\x1bx", (0, 0));
+        let _ = engine.process_output(b"\x1bP+q5443abcdefghijklmnopqrstuvwxyz\x1by", (0, 0));
+
+        let reply = engine.process_output(b"\x1b[c", (0, 0));
+        assert_eq!(reply, b"\x1b[?1;2c");
+    }
+
+    #[test]
+    fn overlong_osc_and_dcs_sequences_are_dropped_and_recover() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
+
+        let mut long_osc = vec![0x1b, b']'];
+        long_osc.extend(std::iter::repeat_n(b'a', 700));
+        assert!(engine.process_output(&long_osc, (0, 0)).is_empty());
+
+        let mut long_dcs = vec![0x1b, b'P'];
+        long_dcs.extend(std::iter::repeat_n(b'b', 700));
+        assert!(engine.process_output(&long_dcs, (0, 0)).is_empty());
+
+        let reply = engine.process_output(b"\x1b[>c", (0, 0));
+        assert_eq!(reply, b"\x1b[>0;115;0c");
+    }
+
+    #[test]
+    fn escaped_non_st_in_osc_and_dcs_does_not_break_recovery() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
+
+        let _ = engine.process_output(b"\x1b]10;?\x1bx", (0, 0));
+        let _ = engine.process_output(b"\x1bP+q5443\x1by", (0, 0));
+
+        let osc_reply = engine.process_output(b"\x1b]10;?\x1b\\", (0, 0));
+        assert_eq!(osc_reply, b"\x1b]10;rgb:ffff/ffff/ffff\x1b\\");
+
+        let dcs_reply = engine.process_output(b"\x1bP$qm\x1b\\", (0, 0));
+        assert_eq!(dcs_reply, b"\x1bP1$r0m\x1b\\");
     }
 }
 use serde::{Deserialize, Serialize};
