@@ -1,0 +1,49 @@
+name: Rust
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  linux:
+    name: Linux tests
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo test workspace
+        run: cargo test --workspace
+
+      - name: Cargo check workspace
+        run: cargo check --workspace
+
+  windows-compile:
+    name: Windows compile checks
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo check bmux_ipc
+        run: cargo check -p bmux_ipc
+
+      - name: Cargo check bmux_server
+        run: cargo check -p bmux_server
+
+      - name: Cargo check bmux_client
+        run: cargo check -p bmux_client
+
+      - name: Cargo check bmux_cli
+        run: cargo check -p bmux_cli
