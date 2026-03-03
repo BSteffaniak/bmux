@@ -2,20 +2,41 @@ use crate::frame::{FrameDecodeError, FrameEncodeError, decode_frame_exact, encod
 use crate::{Envelope, IpcEndpoint};
 use std::path::Path;
 use thiserror::Error;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+
+#[cfg(windows)]
+use tokio::net::windows::named_pipe::{
+    ClientOptions, NamedPipeClient, NamedPipeServer, ServerOptions,
+};
 
 /// Local IPC listener abstraction.
 #[derive(Debug)]
 pub struct LocalIpcListener {
+    inner: ListenerInner,
+}
+
+#[derive(Debug)]
+enum ListenerInner {
     #[cfg(unix)]
-    inner: tokio::net::UnixListener,
+    Unix(tokio::net::UnixListener),
+    #[cfg(windows)]
+    WindowsNamedPipe { pipe_name: String },
 }
 
 /// Local IPC stream abstraction.
 #[derive(Debug)]
 pub struct LocalIpcStream {
+    inner: StreamInner,
+}
+
+#[derive(Debug)]
+enum StreamInner {
     #[cfg(unix)]
-    inner: tokio::net::UnixStream,
+    Unix(tokio::net::UnixStream),
+    #[cfg(windows)]
+    WindowsServer(NamedPipeServer),
+    #[cfg(windows)]
+    WindowsClient(NamedPipeClient),
 }
 
 /// Errors returned by local IPC transport operations.
@@ -44,16 +65,24 @@ impl LocalIpcListener {
             if let IpcEndpoint::UnixSocket(path) = endpoint {
                 prepare_unix_socket_path(path)?;
                 let listener = tokio::net::UnixListener::bind(path)?;
-                return Ok(Self { inner: listener });
+                return Ok(Self {
+                    inner: ListenerInner::Unix(listener),
+                });
             }
-            return Err(IpcTransportError::UnsupportedEndpoint);
         }
 
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            let _ = endpoint;
-            Err(IpcTransportError::UnsupportedEndpoint)
+            if let IpcEndpoint::WindowsNamedPipe(pipe_name) = endpoint {
+                return Ok(Self {
+                    inner: ListenerInner::WindowsNamedPipe {
+                        pipe_name: pipe_name.clone(),
+                    },
+                });
+            }
         }
+
+        Err(IpcTransportError::UnsupportedEndpoint)
     }
 
     /// Accept an incoming local connection.
@@ -62,15 +91,22 @@ impl LocalIpcListener {
     ///
     /// Returns an error when accepting fails.
     pub async fn accept(&self) -> Result<LocalIpcStream, IpcTransportError> {
-        #[cfg(unix)]
-        {
-            let (stream, _) = self.inner.accept().await?;
-            return Ok(LocalIpcStream { inner: stream });
-        }
-
-        #[cfg(not(unix))]
-        {
-            Err(IpcTransportError::UnsupportedEndpoint)
+        match &self.inner {
+            #[cfg(unix)]
+            ListenerInner::Unix(listener) => {
+                let (stream, _) = listener.accept().await?;
+                Ok(LocalIpcStream {
+                    inner: StreamInner::Unix(stream),
+                })
+            }
+            #[cfg(windows)]
+            ListenerInner::WindowsNamedPipe { pipe_name } => {
+                let server = ServerOptions::new().create(pipe_name)?;
+                server.connect().await?;
+                Ok(LocalIpcStream {
+                    inner: StreamInner::WindowsServer(server),
+                })
+            }
         }
     }
 }
@@ -87,16 +123,23 @@ impl LocalIpcStream {
         {
             if let IpcEndpoint::UnixSocket(path) = endpoint {
                 let stream = tokio::net::UnixStream::connect(path).await?;
-                return Ok(Self { inner: stream });
+                return Ok(Self {
+                    inner: StreamInner::Unix(stream),
+                });
             }
-            return Err(IpcTransportError::UnsupportedEndpoint);
         }
 
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         {
-            let _ = endpoint;
-            Err(IpcTransportError::UnsupportedEndpoint)
+            if let IpcEndpoint::WindowsNamedPipe(pipe_name) = endpoint {
+                let stream = ClientOptions::new().open(pipe_name)?;
+                return Ok(Self {
+                    inner: StreamInner::WindowsClient(stream),
+                });
+            }
         }
+
+        Err(IpcTransportError::UnsupportedEndpoint)
     }
 
     /// Send a single framed envelope.
@@ -107,17 +150,13 @@ impl LocalIpcStream {
     pub async fn send_envelope(&mut self, envelope: &Envelope) -> Result<(), IpcTransportError> {
         let frame = encode_frame(envelope)?;
 
-        #[cfg(unix)]
-        {
-            self.inner.write_all(&frame).await?;
-            self.inner.flush().await?;
-            return Ok(());
-        }
-
-        #[cfg(not(unix))]
-        {
-            let _ = frame;
-            Err(IpcTransportError::UnsupportedEndpoint)
+        match &mut self.inner {
+            #[cfg(unix)]
+            StreamInner::Unix(stream) => write_frame(stream, &frame).await,
+            #[cfg(windows)]
+            StreamInner::WindowsServer(stream) => write_frame(stream, &frame).await,
+            #[cfg(windows)]
+            StreamInner::WindowsClient(stream) => write_frame(stream, &frame).await,
         }
     }
 
@@ -127,24 +166,39 @@ impl LocalIpcStream {
     ///
     /// Returns an error if frame reads fail or the frame is invalid.
     pub async fn recv_envelope(&mut self) -> Result<Envelope, IpcTransportError> {
-        #[cfg(unix)]
-        {
-            let mut len_bytes = [0_u8; 4];
-            self.inner.read_exact(&mut len_bytes).await?;
-            let payload_len = u32::from_le_bytes(len_bytes) as usize;
-            let mut frame = Vec::with_capacity(4 + payload_len);
-            frame.extend_from_slice(&len_bytes);
-            frame.resize(4 + payload_len, 0);
-            self.inner.read_exact(&mut frame[4..]).await?;
-            let envelope = decode_frame_exact(&frame)?;
-            return Ok(envelope);
-        }
-
-        #[cfg(not(unix))]
-        {
-            Err(IpcTransportError::UnsupportedEndpoint)
+        match &mut self.inner {
+            #[cfg(unix)]
+            StreamInner::Unix(stream) => read_frame(stream).await,
+            #[cfg(windows)]
+            StreamInner::WindowsServer(stream) => read_frame(stream).await,
+            #[cfg(windows)]
+            StreamInner::WindowsClient(stream) => read_frame(stream).await,
         }
     }
+}
+
+async fn write_frame<T>(stream: &mut T, frame: &[u8]) -> Result<(), IpcTransportError>
+where
+    T: AsyncWrite + Unpin,
+{
+    stream.write_all(frame).await?;
+    stream.flush().await?;
+    Ok(())
+}
+
+async fn read_frame<T>(stream: &mut T) -> Result<Envelope, IpcTransportError>
+where
+    T: AsyncRead + Unpin,
+{
+    let mut len_bytes = [0_u8; 4];
+    stream.read_exact(&mut len_bytes).await?;
+    let payload_len = u32::from_le_bytes(len_bytes) as usize;
+    let mut frame = Vec::with_capacity(4 + payload_len);
+    frame.extend_from_slice(&len_bytes);
+    frame.resize(4 + payload_len, 0);
+    stream.read_exact(&mut frame[4..]).await?;
+    let envelope = decode_frame_exact(&frame)?;
+    Ok(envelope)
 }
 
 #[cfg(unix)]
@@ -216,7 +270,12 @@ mod tests {
 
     #[tokio::test]
     async fn connect_rejects_wrong_transport_for_platform() {
+        #[cfg(unix)]
         let endpoint = IpcEndpoint::windows_named_pipe(r"\\.\pipe\bmux-test");
+
+        #[cfg(windows)]
+        let endpoint = IpcEndpoint::unix_socket(std::env::temp_dir().join("bmux-test.sock"));
+
         let result = LocalIpcStream::connect(&endpoint).await;
         assert!(matches!(result, Err(IpcTransportError::UnsupportedEndpoint)));
     }
