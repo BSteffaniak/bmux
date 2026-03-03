@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::debug;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use vt100::Parser as VtParser;
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
@@ -475,7 +476,7 @@ fn render_frame(
     write_status_line(&status_line, cols).context("failed drawing status line")?;
 
     let mut stdout = io::stdout();
-    write!(stdout, "\x1b[2;1H\x1b[J").context("failed clearing pane area")?;
+    write!(stdout, "\x1b[?25l").context("failed hiding cursor")?;
 
     draw_pane(&mut stdout, &panes[0], layout.left, focused_pane == 0)?;
     draw_pane(&mut stdout, &panes[1], layout.right, focused_pane == 1)?;
@@ -514,7 +515,12 @@ fn draw_pane(stdout: &mut io::Stdout, pane: &PaneRuntime, rect: Rect, focused: b
     }
 
     let border_color = if focused { "\x1b[36m" } else { "\x1b[90m" };
-    draw_rect_border(stdout, rect, border_color)?;
+    let title = if let Some(code) = pane.exit_code {
+        format!(" {} [exited {code}] ", pane.title)
+    } else {
+        format!(" {} {} ", pane.title, if focused { "*" } else { "" })
+    };
+    draw_rect_border(stdout, rect, border_color, &title)?;
 
     let inner = rect.inner();
     if inner.width == 0 || inner.height == 0 {
@@ -557,15 +563,18 @@ fn draw_pane(stdout: &mut io::Stdout, pane: &PaneRuntime, rect: Rect, focused: b
     Ok(())
 }
 
-fn draw_rect_border(stdout: &mut io::Stdout, rect: Rect, color: &str) -> Result<()> {
+fn draw_rect_border(stdout: &mut io::Stdout, rect: Rect, color: &str, title: &str) -> Result<()> {
     if rect.width < 2 || rect.height < 2 {
         return Ok(());
     }
 
-    let top = format!(
-        "+{}+",
-        "-".repeat(usize::from(rect.width.saturating_sub(2)))
-    );
+    let inner_width = usize::from(rect.width.saturating_sub(2));
+    let mut title_inner = fit_to_width(title, inner_width);
+    let title_w = UnicodeWidthStr::width(title_inner.as_str());
+    if title_w < inner_width {
+        title_inner.push_str(&"-".repeat(inner_width - title_w));
+    }
+    let top = format!("+{title_inner}+");
     let middle = format!(
         "|{}|",
         " ".repeat(usize::from(rect.width.saturating_sub(2)))
@@ -596,14 +605,49 @@ fn write_at(stdout: &mut io::Stdout, x: u16, y: u16, text: &str) -> Result<()> {
 }
 
 fn pad_or_truncate(text: &str, width: usize) -> String {
-    let mut rendered = text.to_string();
-    if rendered.len() > width {
-        rendered.truncate(width);
-        return rendered;
+    let mut rendered = fit_to_width(text, width);
+    let current_width = UnicodeWidthStr::width(rendered.as_str());
+    if current_width < width {
+        rendered.push_str(&" ".repeat(width.saturating_sub(current_width)));
     }
 
-    rendered.push_str(&" ".repeat(width.saturating_sub(rendered.len())));
     rendered
+}
+
+fn fit_to_width(text: &str, width: usize) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let mut rendered = String::new();
+    let mut used = 0_usize;
+    for character in text.chars() {
+        let char_width = UnicodeWidthChar::width(character).unwrap_or(0);
+        if char_width == 0 {
+            continue;
+        }
+
+        if used + char_width > width {
+            break;
+        }
+
+        rendered.push(character);
+        used += char_width;
+    }
+
+    rendered
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pad_or_truncate;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn pad_or_truncate_handles_wide_characters() {
+        let rendered = pad_or_truncate("a界b", 4);
+        assert_eq!(UnicodeWidthStr::width(rendered.as_str()), 4);
+    }
 }
 
 fn init_logging(verbose: bool) {
