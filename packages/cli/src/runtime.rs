@@ -1,4 +1,5 @@
 use crate::cli::{Cli, DebugRenderLogFormat};
+use crate::input::{InputProcessor, RuntimeAction};
 use crate::pane::{Layout, Rect, compute_vertical_layout};
 use crate::pty::{STARTUP_ALT_SCREEN_GUARD_DURATION, extract_filtered_output};
 use crate::status::{build_status_line, write_status_line};
@@ -21,24 +22,10 @@ use vt100::{Color, Screen};
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(16);
 const STATUS_REDRAW_INTERVAL: Duration = Duration::from_millis(200);
-const EXIT_KEY_PREFIX: u8 = 0x01;
 const SPLIT_RATIO_STEP: f32 = 0.05;
 const MIN_PANE_ROWS: u16 = 2;
 const MIN_PANE_COLS: u16 = 2;
-
-#[derive(Debug, Clone, Copy)]
-enum InputCommand {
-    Quit,
-    FocusNext,
-    IncreaseSplit,
-    DecreaseSplit,
-}
-
-enum InputEvent {
-    Data(Vec<u8>),
-    Command(InputCommand),
-    Eof,
-}
+const STATUS_MESSAGE_TTL: Duration = Duration::from_secs(3);
 
 struct PaneState {
     parser: Mutex<VtParser>,
@@ -47,12 +34,23 @@ struct PaneState {
 
 struct PaneRuntime {
     title: String,
+    shell: String,
     state: Arc<PaneState>,
+    process: Option<PaneProcess>,
+    closed: bool,
+    exit_code: Option<u8>,
+}
+
+struct PaneProcess {
     master: Box<dyn MasterPty + Send>,
     writer: Box<dyn Write + Send>,
     child: Box<dyn Child + Send>,
     output_thread: Option<thread::JoinHandle<Result<()>>>,
-    exit_code: Option<u8>,
+}
+
+struct StatusMessage {
+    text: String,
+    expires_at: Instant,
 }
 
 #[derive(Default)]
@@ -307,7 +305,7 @@ fn run_two_pane_runtime(
         )?,
     ];
 
-    let (input_tx, input_rx) = mpsc::channel::<InputEvent>();
+    let (input_tx, input_rx) = mpsc::channel::<RuntimeAction>();
     let input_thread = spawn_input_thread(
         input_tx,
         Arc::clone(&user_input_seen),
@@ -321,6 +319,7 @@ fn run_two_pane_runtime(
     let mut kill_sent = false;
     let mut next_status_redraw = Instant::now() + STATUS_REDRAW_INTERVAL;
     let mut exit_override = None;
+    let mut status_message: Option<StatusMessage> = None;
     let mut render_cache = RenderCache::default();
     let mut render_debug =
         RenderDebugState::new(debug_render, debug_render_log, debug_render_log_format)?;
@@ -329,23 +328,42 @@ fn run_two_pane_runtime(
         process_input_events(
             &input_rx,
             &mut panes,
+            &layout,
             &mut focused_pane,
             &mut split_ratio,
             &shutdown_requested,
             &mut force_redraw,
             &mut exit_override,
+            &mut status_message,
+            startup_deadline,
+            Arc::clone(&user_input_seen),
         )?;
 
         if shutdown_requested.load(Ordering::Relaxed) && !kill_sent {
             debug!("Terminating pane shells");
             for pane in &mut panes {
-                let _ = pane.child.kill();
+                stop_pane_process(pane, true)?;
             }
             kill_sent = true;
         }
 
-        if refresh_exit_codes(&mut panes)? {
-            break panes.first().and_then(|pane| pane.exit_code).unwrap_or(0);
+        refresh_exit_codes(&mut panes)?;
+        if focused_pane >= panes.len() || !pane_is_running(&panes[focused_pane]) {
+            if let Some(next_focus) = first_running_pane_index(&panes) {
+                focused_pane = next_focus;
+            }
+        }
+
+        if shutdown_requested.load(Ordering::Relaxed) && !any_running_panes(&panes) {
+            break exit_override.unwrap_or(0);
+        }
+
+        if status_message
+            .as_ref()
+            .is_some_and(|message| Instant::now() >= message.expires_at)
+        {
+            status_message = None;
+            force_redraw = true;
         }
 
         let (new_cols, new_rows) =
@@ -382,6 +400,7 @@ fn run_two_pane_runtime(
                 shell_name,
                 &cwd,
                 focused_pane,
+                status_message.as_ref().map(|message| message.text.as_str()),
                 force_redraw,
                 &mut render_cache,
                 &mut render_debug,
@@ -399,13 +418,7 @@ fn run_two_pane_runtime(
     }
 
     for pane in &mut panes {
-        let _ = pane.child.wait();
-        if let Some(output_thread) = pane.output_thread.take() {
-            match output_thread.join() {
-                Ok(result) => result.context("PTY output thread failed")?,
-                Err(_) => return Err(anyhow::anyhow!("PTY output thread panicked")),
-            }
-        }
+        stop_pane_process(pane, false)?;
     }
 
     Ok(exit_override.unwrap_or(exit_code))
@@ -418,6 +431,40 @@ fn spawn_pane(
     startup_deadline: Instant,
     user_input_seen: Arc<AtomicBool>,
 ) -> Result<PaneRuntime> {
+    let state = Arc::new(PaneState {
+        parser: Mutex::new(VtParser::new(
+            pane_inner.height.max(MIN_PANE_ROWS),
+            pane_inner.width.max(MIN_PANE_COLS),
+            10_000,
+        )),
+        dirty: AtomicBool::new(true),
+    });
+
+    Ok(PaneRuntime {
+        title: title.clone(),
+        shell: shell.to_string(),
+        process: Some(spawn_pane_process(
+            shell,
+            title,
+            pane_inner,
+            startup_deadline,
+            user_input_seen,
+            Arc::clone(&state),
+        )?),
+        state,
+        closed: false,
+        exit_code: None,
+    })
+}
+
+fn spawn_pane_process(
+    shell: &str,
+    title: String,
+    pane_inner: Rect,
+    startup_deadline: Instant,
+    user_input_seen: Arc<AtomicBool>,
+    state: Arc<PaneState>,
+) -> Result<PaneProcess> {
     let pty_system = native_pty_system();
     let pty_pair = pty_system
         .openpty(PtySize {
@@ -435,6 +482,15 @@ fn spawn_pane(
         .context("failed to spawn shell in pane")?;
     drop(pty_pair.slave);
 
+    {
+        let mut parser = state.parser.lock().expect("pane parser mutex poisoned");
+        parser.screen_mut().set_size(
+            pane_inner.height.max(MIN_PANE_ROWS),
+            pane_inner.width.max(MIN_PANE_COLS),
+        );
+    }
+    state.dirty.store(true, Ordering::Relaxed);
+
     let mut reader = pty_pair
         .master
         .try_clone_reader()
@@ -443,15 +499,6 @@ fn spawn_pane(
         .master
         .take_writer()
         .context("failed to open pane PTY writer")?;
-
-    let state = Arc::new(PaneState {
-        parser: Mutex::new(VtParser::new(
-            pane_inner.height.max(MIN_PANE_ROWS),
-            pane_inner.width.max(MIN_PANE_COLS),
-            10_000,
-        )),
-        dirty: AtomicBool::new(true),
-    });
 
     let state_for_thread = Arc::clone(&state);
     let output_thread = thread::Builder::new()
@@ -495,19 +542,16 @@ fn spawn_pane(
         })
         .context("failed to spawn pane output thread")?;
 
-    Ok(PaneRuntime {
-        title,
-        state,
+    Ok(PaneProcess {
         master: pty_pair.master,
         writer,
         child,
         output_thread: Some(output_thread),
-        exit_code: None,
     })
 }
 
 fn spawn_input_thread(
-    input_tx: Sender<InputEvent>,
+    input_tx: Sender<RuntimeAction>,
     user_input_seen: Arc<AtomicBool>,
     shutdown_requested: Arc<AtomicBool>,
 ) -> Result<thread::JoinHandle<Result<()>>> {
@@ -516,7 +560,7 @@ fn spawn_input_thread(
         .spawn(move || -> Result<()> {
             let mut stdin = io::stdin().lock();
             let mut buffer = [0_u8; 8192];
-            let mut prefix_pending = false;
+            let mut processor = InputProcessor::new();
 
             loop {
                 if shutdown_requested.load(Ordering::Relaxed) {
@@ -528,57 +572,17 @@ fn spawn_input_thread(
                     .context("failed reading terminal input")?;
 
                 if bytes_read == 0 {
-                    let _ = input_tx.send(InputEvent::Eof);
+                    if let Some(trailing_action) = processor.finish() {
+                        let _ = input_tx.send(trailing_action);
+                    }
+                    let _ = input_tx.send(RuntimeAction::Eof);
                     break;
                 }
 
                 user_input_seen.store(true, Ordering::Relaxed);
 
-                let mut forwarded = Vec::with_capacity(bytes_read + 1);
-                for byte in &buffer[..bytes_read] {
-                    if prefix_pending {
-                        prefix_pending = false;
-                        match *byte {
-                            b'q' | b'Q' => {
-                                let _ = input_tx.send(InputEvent::Command(InputCommand::Quit));
-                                continue;
-                            }
-                            b'o' | b'O' => {
-                                let _ = input_tx.send(InputEvent::Command(InputCommand::FocusNext));
-                                continue;
-                            }
-                            b'+' => {
-                                let _ =
-                                    input_tx.send(InputEvent::Command(InputCommand::IncreaseSplit));
-                                continue;
-                            }
-                            b'-' => {
-                                let _ =
-                                    input_tx.send(InputEvent::Command(InputCommand::DecreaseSplit));
-                                continue;
-                            }
-                            EXIT_KEY_PREFIX => {
-                                forwarded.push(EXIT_KEY_PREFIX);
-                                continue;
-                            }
-                            _ => {
-                                forwarded.push(EXIT_KEY_PREFIX);
-                                forwarded.push(*byte);
-                                continue;
-                            }
-                        }
-                    }
-
-                    if *byte == EXIT_KEY_PREFIX {
-                        prefix_pending = true;
-                        continue;
-                    }
-
-                    forwarded.push(*byte);
-                }
-
-                if !forwarded.is_empty() {
-                    let _ = input_tx.send(InputEvent::Data(forwarded));
+                for action in processor.process_chunk(&buffer[..bytes_read]) {
+                    let _ = input_tx.send(action);
                 }
             }
 
@@ -590,48 +594,104 @@ fn spawn_input_thread(
 }
 
 fn process_input_events(
-    input_rx: &Receiver<InputEvent>,
+    input_rx: &Receiver<RuntimeAction>,
     panes: &mut [PaneRuntime],
+    layout: &Layout,
     focused_pane: &mut usize,
     split_ratio: &mut f32,
     shutdown_requested: &Arc<AtomicBool>,
     force_redraw: &mut bool,
     exit_override: &mut Option<u8>,
+    status_message: &mut Option<StatusMessage>,
+    startup_deadline: Instant,
+    user_input_seen: Arc<AtomicBool>,
 ) -> Result<()> {
     loop {
         match input_rx.try_recv() {
-            Ok(InputEvent::Data(bytes)) => {
-                if let Some(pane) = panes.get_mut(*focused_pane) {
-                    pane.writer
-                        .write_all(&bytes)
-                        .and_then(|_| pane.writer.flush())
-                        .context("failed writing input to pane")?;
+            Ok(RuntimeAction::ForwardToPane(bytes)) => {
+                if let Some(active_pane) = panes.get_mut(*focused_pane) {
+                    if let Some(process) = active_pane.process.as_mut() {
+                        process
+                            .writer
+                            .write_all(&bytes)
+                            .and_then(|_| process.writer.flush())
+                            .context("failed writing input to pane")?;
+                    }
                 }
             }
-            Ok(InputEvent::Command(command)) => {
-                match command {
-                    InputCommand::Quit => shutdown_requested.store(true, Ordering::Relaxed),
-                    InputCommand::FocusNext => {
-                        *focused_pane = (*focused_pane + 1) % panes.len().max(1);
+            Ok(action) => {
+                match action {
+                    RuntimeAction::Quit => {
+                        shutdown_requested.store(true, Ordering::Relaxed);
+                        *exit_override = Some(0);
                     }
-                    InputCommand::IncreaseSplit => {
+                    RuntimeAction::FocusNext => {
+                        *focused_pane = next_focusable_pane_index(panes, *focused_pane);
+                    }
+                    RuntimeAction::IncreaseSplit => {
                         *split_ratio = (*split_ratio + SPLIT_RATIO_STEP).clamp(0.2, 0.8);
                     }
-                    InputCommand::DecreaseSplit => {
+                    RuntimeAction::DecreaseSplit => {
                         *split_ratio = (*split_ratio - SPLIT_RATIO_STEP).clamp(0.2, 0.8);
                     }
+                    RuntimeAction::RestartFocusedPane => {
+                        let pane_inner = if *focused_pane == 0 {
+                            layout.left.inner()
+                        } else {
+                            layout.right.inner()
+                        };
+                        if let Some(pane) = panes.get_mut(*focused_pane) {
+                            stop_pane_process(pane, true)?;
+                            pane.process = Some(spawn_pane_process(
+                                &pane.shell,
+                                pane.title.clone(),
+                                pane_inner,
+                                startup_deadline,
+                                Arc::clone(&user_input_seen),
+                                Arc::clone(&pane.state),
+                            )?);
+                            pane.closed = false;
+                            pane.exit_code = None;
+                            pane.state.dirty.store(true, Ordering::Relaxed);
+                            *status_message = Some(new_status_message(format!(
+                                "pane '{}' restarted",
+                                pane.title
+                            )));
+                        }
+                    }
+                    RuntimeAction::CloseFocusedPane => {
+                        let running_count =
+                            panes.iter().filter(|pane| pane_is_running(pane)).count();
+                        if running_count <= 1 {
+                            *status_message = Some(new_status_message(
+                                "cannot close the last running pane".to_string(),
+                            ));
+                        } else if let Some(pane) = panes.get_mut(*focused_pane) {
+                            let closed_title = pane.title.clone();
+                            stop_pane_process(pane, true)?;
+                            pane.closed = true;
+                            pane.exit_code = None;
+                            pane.state.dirty.store(true, Ordering::Relaxed);
+                            *status_message =
+                                Some(new_status_message(format!("pane '{closed_title}' closed")));
+                        }
+
+                        *focused_pane = next_focusable_pane_index(panes, *focused_pane);
+                    }
+                    RuntimeAction::ShowHelp => {
+                        *status_message = Some(new_status_message(
+                            "Ctrl-A: q quit | o focus | +/- resize | r restart | x close | ? help"
+                                .to_string(),
+                        ));
+                    }
+                    RuntimeAction::Eof => {
+                        shutdown_requested.store(true, Ordering::Relaxed);
+                        *exit_override = Some(0);
+                    }
+                    RuntimeAction::ForwardToPane(_) => unreachable!(),
                 }
 
                 *force_redraw = true;
-
-                if matches!(command, InputCommand::Quit) {
-                    *exit_override = Some(0);
-                }
-            }
-            Ok(InputEvent::Eof) => {
-                shutdown_requested.store(true, Ordering::Relaxed);
-                *force_redraw = true;
-                *exit_override = Some(0);
             }
             Err(mpsc::TryRecvError::Empty) => break,
             Err(mpsc::TryRecvError::Disconnected) => {
@@ -644,22 +704,78 @@ fn process_input_events(
     Ok(())
 }
 
-fn refresh_exit_codes(panes: &mut [PaneRuntime]) -> Result<bool> {
+fn refresh_exit_codes(panes: &mut [PaneRuntime]) -> Result<()> {
     for pane in panes.iter_mut() {
-        if pane.exit_code.is_some() {
+        let Some(process) = pane.process.as_mut() else {
             continue;
-        }
+        };
 
-        if let Some(status) = pane
+        if let Some(status) = process
             .child
             .try_wait()
             .context("failed to poll pane shell status")?
         {
             pane.exit_code = Some(exit_code_from_u32(status.exit_code()));
+            stop_pane_process(pane, false)?;
+            pane.closed = false;
+            pane.state.dirty.store(true, Ordering::Relaxed);
         }
     }
 
-    Ok(panes.iter().all(|pane| pane.exit_code.is_some()))
+    Ok(())
+}
+
+fn stop_pane_process(pane: &mut PaneRuntime, kill: bool) -> Result<()> {
+    if let Some(mut process) = pane.process.take() {
+        if kill {
+            let _ = process.child.kill();
+        }
+
+        let _ = process.child.wait();
+
+        if let Some(output_thread) = process.output_thread.take() {
+            match output_thread.join() {
+                Ok(result) => result.context("PTY output thread failed")?,
+                Err(_) => return Err(anyhow::anyhow!("PTY output thread panicked")),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn pane_is_running(pane: &PaneRuntime) -> bool {
+    pane.process.is_some()
+}
+
+fn any_running_panes(panes: &[PaneRuntime]) -> bool {
+    panes.iter().any(pane_is_running)
+}
+
+fn first_running_pane_index(panes: &[PaneRuntime]) -> Option<usize> {
+    panes.iter().position(pane_is_running)
+}
+
+fn next_focusable_pane_index(panes: &[PaneRuntime], current: usize) -> usize {
+    if panes.is_empty() {
+        return 0;
+    }
+
+    for offset in 1..=panes.len() {
+        let index = (current + offset) % panes.len();
+        if pane_is_running(&panes[index]) {
+            return index;
+        }
+    }
+
+    current.min(panes.len() - 1)
+}
+
+fn new_status_message(text: String) -> StatusMessage {
+    StatusMessage {
+        text,
+        expires_at: Instant::now() + STATUS_MESSAGE_TTL,
+    }
 }
 
 fn resize_panes(panes: &mut [PaneRuntime], layout: &Layout) -> Result<()> {
@@ -667,14 +783,17 @@ fn resize_panes(panes: &mut [PaneRuntime], layout: &Layout) -> Result<()> {
         .iter_mut()
         .zip([layout.left.inner(), layout.right.inner()])
     {
-        pane.master
-            .resize(PtySize {
-                rows: rect.height.max(MIN_PANE_ROWS),
-                cols: rect.width.max(MIN_PANE_COLS),
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .context("failed to resize pane PTY")?;
+        if let Some(process) = pane.process.as_mut() {
+            process
+                .master
+                .resize(PtySize {
+                    rows: rect.height.max(MIN_PANE_ROWS),
+                    cols: rect.width.max(MIN_PANE_COLS),
+                    pixel_width: 0,
+                    pixel_height: 0,
+                })
+                .context("failed to resize pane PTY")?;
+        }
 
         let mut parser = pane
             .state
@@ -699,17 +818,26 @@ fn render_frame(
     shell_name: &str,
     cwd: &Path,
     focused_pane: usize,
+    status_message: Option<&str>,
     full_redraw: bool,
     render_cache: &mut RenderCache,
     render_debug: &mut RenderDebugState,
 ) -> Result<()> {
+    let debug_snapshot = render_debug.snapshot();
+    let status_suffix = match (status_message, debug_snapshot) {
+        (Some(message), Some(debug)) => Some(format!("{message} | {debug}")),
+        (Some(message), None) => Some(message.to_string()),
+        (None, Some(debug)) => Some(debug.to_string()),
+        (None, None) => None,
+    };
+
     let status_line = build_status_line(
         shell_name,
         cwd,
         cols,
         rows,
         focused_pane,
-        render_debug.snapshot(),
+        status_suffix.as_deref(),
     );
     let left_data = collect_pane_render_data(&panes[0], layout.left, focused_pane == 0);
     let right_data = collect_pane_render_data(&panes[1], layout.right, focused_pane == 1);
@@ -801,7 +929,9 @@ fn render_frame(
 
 fn collect_pane_render_data(pane: &PaneRuntime, rect: Rect, focused: bool) -> PaneRenderData {
     let inner = rect.inner();
-    let title = if let Some(code) = pane.exit_code {
+    let title = if pane.closed {
+        format!(" {} [closed] ", pane.title)
+    } else if let Some(code) = pane.exit_code {
         format!(" {} [exited {code}] ", pane.title)
     } else {
         format!(" {}{} ", pane.title, if focused { " *" } else { "" })
@@ -813,8 +943,17 @@ fn collect_pane_render_data(pane: &PaneRuntime, rect: Rect, focused: bool) -> Pa
         return PaneRenderData { rect, title, lines };
     }
 
+    if pane.closed {
+        let message = "pane closed | Ctrl-A r restart".to_string();
+        lines.push(pad_or_truncate(&message, usize::from(inner.width)).into_bytes());
+        for _ in 1..inner.height {
+            lines.push(vec![b' '; usize::from(inner.width)]);
+        }
+        return PaneRenderData { rect, title, lines };
+    }
+
     if let Some(code) = pane.exit_code {
-        let message = format!("[{} exited: {code}]", pane.title);
+        let message = format!("pane exited ({code}) | Ctrl-A r restart");
         lines.push(pad_or_truncate(&message, usize::from(inner.width)).into_bytes());
         for _ in 1..inner.height {
             lines.push(vec![b' '; usize::from(inner.width)]);
