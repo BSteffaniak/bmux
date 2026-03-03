@@ -7,6 +7,8 @@
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use uuid::Uuid;
 
+pub mod frame;
+
 /// Current IPC protocol version.
 pub const CURRENT_PROTOCOL_VERSION: u16 = 1;
 

@@ -175,6 +175,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "postcard",
  "serde",
+ "thiserror 2.0.12",
  "uuid",
 ]
 
