@@ -80,7 +80,7 @@ pub(crate) fn compute_horizontal_layout(cols: u16, rows: u16, ratio: f32) -> Lay
     let body_rows = rows.saturating_sub(1).max(3);
     let usable_cols = cols.max(3);
 
-    let split_rows = body_rows.saturating_sub(1);
+    let split_rows = body_rows;
     let clamped_ratio = ratio.clamp(0.2, 0.8);
 
     let mut top_height = ((f32::from(split_rows) * clamped_ratio).round()) as u16;
@@ -96,7 +96,7 @@ pub(crate) fn compute_horizontal_layout(cols: u16, rows: u16, ratio: f32) -> Lay
 
     let right = Rect {
         x: 1,
-        y: top_height.saturating_add(3),
+        y: top_height.saturating_add(2),
         width: usable_cols,
         height: bottom_height,
     };
@@ -105,14 +105,14 @@ pub(crate) fn compute_horizontal_layout(cols: u16, rows: u16, ratio: f32) -> Lay
         left,
         right,
         divider_x: 0,
-        divider_y: top_height.saturating_add(2),
+        divider_y: top_height.saturating_add(1),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        SplitDirection, compute_horizontal_layout, compute_layout, compute_vertical_layout,
+        compute_horizontal_layout, compute_layout, compute_vertical_layout, SplitDirection,
     };
 
     #[test]
@@ -137,6 +137,7 @@ mod tests {
         assert_eq!(layout.right.width, 120);
         assert!(layout.left.height > 0);
         assert!(layout.right.height > 0);
+        assert_eq!(layout.right.y, layout.left.y + layout.left.height);
     }
 
     #[test]
