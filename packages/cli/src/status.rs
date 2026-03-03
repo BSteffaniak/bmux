@@ -1,9 +1,17 @@
 use std::io::{self, Write};
 use std::path::Path;
 
-pub(crate) fn build_status_line(shell_name: &str, cwd: &Path, cols: u16, rows: u16) -> String {
+pub(crate) fn build_status_line(
+    shell_name: &str,
+    cwd: &Path,
+    cols: u16,
+    rows: u16,
+    focused_pane: usize,
+) -> String {
+    let focused_label = if focused_pane == 0 { "left" } else { "right" };
+
     format!(
-        " bmux | shell: {shell_name} | cwd: {} | size: {cols}x{rows} | Ctrl-A q quit ",
+        " bmux | shell: {shell_name} | cwd: {} | size: {cols}x{rows} | focus: {focused_label} | Ctrl-A o switch | Ctrl-A +/- resize | Ctrl-A q quit ",
         cwd.display()
     )
 }
