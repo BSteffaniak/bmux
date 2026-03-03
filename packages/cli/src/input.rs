@@ -150,6 +150,69 @@ impl Keymap {
         has_any_prefix(&self.global_bindings, strokes)
             || has_any_prefix(&self.runtime_bindings, strokes)
     }
+
+    pub(crate) fn doctor_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+
+        lines.push("Global bindings:".to_string());
+        if self.global_bindings.is_empty() {
+            lines.push("  (none)".to_string());
+        } else {
+            for binding in &self.global_bindings {
+                lines.push(format!(
+                    "  {} -> {}",
+                    chord_to_string(&binding.chord),
+                    action_to_name(&binding.action)
+                ));
+            }
+        }
+
+        lines.push("Runtime bindings (prefix applied):".to_string());
+        if self.runtime_bindings.is_empty() {
+            lines.push("  (none)".to_string());
+        } else {
+            for binding in &self.runtime_bindings {
+                lines.push(format!(
+                    "  {} -> {}",
+                    chord_to_string(&binding.chord),
+                    action_to_name(&binding.action)
+                ));
+            }
+        }
+
+        let overlaps = self.overlap_warnings();
+        if overlaps.is_empty() {
+            lines.push("Overlaps: none".to_string());
+        } else {
+            lines.push("Overlaps (longest match wins):".to_string());
+            for overlap in overlaps {
+                lines.push(format!("  - {overlap}"));
+            }
+        }
+
+        lines
+    }
+
+    fn overlap_warnings(&self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        warnings.extend(find_overlaps(&self.runtime_bindings, "runtime"));
+        warnings.extend(find_overlaps(&self.global_bindings, "global"));
+
+        for global in &self.global_bindings {
+            for runtime in &self.runtime_bindings {
+                if global.chord == runtime.chord {
+                    warnings.push(format!(
+                        "global '{}' overrides runtime '{}'",
+                        chord_to_string(&global.chord),
+                        chord_to_string(&runtime.chord)
+                    ));
+                }
+            }
+        }
+
+        warnings
+    }
 }
 
 impl InputProcessor {
@@ -341,6 +404,93 @@ fn has_longer_prefix(bindings: &[KeyBinding], strokes: &[KeyStroke]) -> bool {
     bindings
         .iter()
         .any(|binding| binding.chord.len() > strokes.len() && binding.chord.starts_with(strokes))
+}
+
+fn find_overlaps(bindings: &[KeyBinding], label: &str) -> Vec<String> {
+    let mut warnings = Vec::new();
+    for i in 0..bindings.len() {
+        for j in (i + 1)..bindings.len() {
+            let a = &bindings[i].chord;
+            let b = &bindings[j].chord;
+            if a.len() < b.len() && b.starts_with(a) {
+                warnings.push(format!(
+                    "{label} '{}' is prefix of '{}'",
+                    chord_to_string(a),
+                    chord_to_string(b)
+                ));
+            }
+            if b.len() < a.len() && a.starts_with(b) {
+                warnings.push(format!(
+                    "{label} '{}' is prefix of '{}'",
+                    chord_to_string(b),
+                    chord_to_string(a)
+                ));
+            }
+        }
+    }
+    warnings
+}
+
+fn action_to_name(action: &RuntimeAction) -> &'static str {
+    match action {
+        RuntimeAction::Quit => "quit",
+        RuntimeAction::FocusNext => "focus_next_pane",
+        RuntimeAction::IncreaseSplit => "increase_split",
+        RuntimeAction::DecreaseSplit => "decrease_split",
+        RuntimeAction::RestartFocusedPane => "restart_focused_pane",
+        RuntimeAction::CloseFocusedPane => "close_focused_pane",
+        RuntimeAction::ShowHelp => "show_help",
+        RuntimeAction::ForwardToPane(_) => "forward_to_pane",
+        RuntimeAction::Eof => "eof",
+    }
+}
+
+fn chord_to_string(chord: &[KeyStroke]) -> String {
+    chord
+        .iter()
+        .map(stroke_to_string)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn stroke_to_string(stroke: &KeyStroke) -> String {
+    let mut parts = Vec::new();
+    if stroke.ctrl {
+        parts.push("ctrl".to_string());
+    }
+    if stroke.alt {
+        parts.push("alt".to_string());
+    }
+    if stroke.shift {
+        parts.push("shift".to_string());
+    }
+    if stroke.super_key {
+        parts.push("super".to_string());
+    }
+
+    let key = match stroke.key {
+        KeyCode::Char('+') => "plus".to_string(),
+        KeyCode::Char('-') => "minus".to_string(),
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Enter => "enter".to_string(),
+        KeyCode::Escape => "escape".to_string(),
+        KeyCode::Tab => "tab".to_string(),
+        KeyCode::Backspace => "backspace".to_string(),
+        KeyCode::Space => "space".to_string(),
+        KeyCode::ArrowUp => "arrow_up".to_string(),
+        KeyCode::ArrowDown => "arrow_down".to_string(),
+        KeyCode::ArrowLeft => "arrow_left".to_string(),
+        KeyCode::ArrowRight => "arrow_right".to_string(),
+        KeyCode::Home => "home".to_string(),
+        KeyCode::End => "end".to_string(),
+        KeyCode::PageUp => "page_up".to_string(),
+        KeyCode::PageDown => "page_down".to_string(),
+        KeyCode::Insert => "insert".to_string(),
+        KeyCode::Delete => "delete".to_string(),
+        KeyCode::Function(n) => format!("f{n}"),
+    };
+    parts.push(key);
+    parts.join("+")
 }
 
 fn decode_one(bytes: &[u8]) -> Option<(DecodedStroke, usize)> {

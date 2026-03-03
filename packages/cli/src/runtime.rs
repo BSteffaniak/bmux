@@ -1,13 +1,13 @@
-use crate::cli::{Cli, DebugRenderLogFormat};
+use crate::cli::{Cli, Command, DebugRenderLogFormat, KeymapCommand};
 use crate::input::{InputProcessor, RuntimeAction};
-use crate::pane::{Layout, Rect, compute_vertical_layout};
-use crate::pty::{STARTUP_ALT_SCREEN_GUARD_DURATION, extract_filtered_output};
+use crate::pane::{compute_vertical_layout, Layout, Rect};
+use crate::pty::{extract_filtered_output, STARTUP_ALT_SCREEN_GUARD_DURATION};
 use crate::status::{build_status_line, write_status_line};
 use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
 use bmux_config::BmuxConfig;
 use clap::Parser;
-use portable_pty::{Child, CommandBuilder, MasterPty, PtySize, native_pty_system};
+use portable_pty::{native_pty_system, Child, CommandBuilder, MasterPty, PtySize};
 use std::fs::OpenOptions;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -258,6 +258,10 @@ pub(crate) fn run() -> Result<u8> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
 
+    if let Some(command) = &cli.command {
+        return run_command(command);
+    }
+
     let shell = resolve_shell(cli.shell);
     let keymap = load_runtime_keymap();
     debug!("Starting bmux runtime");
@@ -271,6 +275,14 @@ pub(crate) fn run() -> Result<u8> {
         cli.debug_render_log_format,
         keymap,
     )
+}
+
+fn run_command(command: &Command) -> Result<u8> {
+    match command {
+        Command::Keymap { command } => match command {
+            KeymapCommand::Doctor => run_keymap_doctor(),
+        },
+    }
 }
 
 fn run_two_pane_runtime(
@@ -1260,6 +1272,32 @@ fn load_runtime_keymap() -> crate::input::Keymap {
             crate::input::Keymap::default_runtime()
         }
     }
+}
+
+fn run_keymap_doctor() -> Result<u8> {
+    let config = match BmuxConfig::load() {
+        Ok(config) => config,
+        Err(error) => {
+            println!("bmux keymap doctor warning: failed to load config ({error}); using defaults");
+            BmuxConfig::default()
+        }
+    };
+    let keymap = crate::input::Keymap::from_parts(
+        &config.keybindings.prefix,
+        config.keybindings.timeout_ms,
+        &config.keybindings.runtime,
+        &config.keybindings.global,
+    )
+    .context("failed to compile keymap")?;
+
+    println!("bmux keymap doctor");
+    println!("prefix: {}", config.keybindings.prefix);
+    println!("timeout_ms: {}", config.keybindings.timeout_ms);
+    for line in keymap.doctor_lines() {
+        println!("{line}");
+    }
+
+    Ok(0)
 }
 
 fn init_logging(verbose: bool) {

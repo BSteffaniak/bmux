@@ -1,4 +1,4 @@
-use clap::{Parser, ValueEnum};
+use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub(crate) enum DebugRenderLogFormat {
@@ -11,6 +11,9 @@ pub(crate) enum DebugRenderLogFormat {
 #[command(name = "bmux")]
 #[command(about = "A minimal fullscreen PTY runtime for bmux")]
 pub(crate) struct Cli {
+    #[command(subcommand)]
+    pub(crate) command: Option<Command>,
+
     /// Enable verbose logging
     #[arg(short, long)]
     pub(crate) verbose: bool,
@@ -36,9 +39,24 @@ pub(crate) struct Cli {
     pub(crate) debug_render_log_format: DebugRenderLogFormat,
 }
 
+#[derive(Debug, Subcommand)]
+pub(crate) enum Command {
+    /// Keymap tools and diagnostics
+    Keymap {
+        #[command(subcommand)]
+        command: KeymapCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum KeymapCommand {
+    /// Print compiled keymap and overlap diagnostics
+    Doctor,
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Cli;
+    use super::{Cli, Command, KeymapCommand};
     use clap::Parser;
 
     #[test]
@@ -83,5 +101,14 @@ mod tests {
             cli.debug_render_log_format,
             super::DebugRenderLogFormat::Csv
         );
+    }
+
+    #[test]
+    fn parses_keymap_doctor_subcommand() {
+        let cli = Cli::try_parse_from(["bmux", "keymap", "doctor"]).expect("valid CLI args");
+        let Some(Command::Keymap { command }) = cli.command else {
+            panic!("expected keymap subcommand");
+        };
+        assert!(matches!(command, KeymapCommand::Doctor));
     }
 }
