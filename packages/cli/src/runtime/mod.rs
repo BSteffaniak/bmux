@@ -62,6 +62,7 @@ const SERVER_STOP_TIMEOUT: Duration = Duration::from_millis(5000);
 const ATTACH_IO_POLL_INTERVAL: Duration = Duration::from_millis(15);
 const MIN_PANE_ROWS: u16 = 2;
 const MIN_PANE_COLS: u16 = 2;
+const QUIT_CONFIRM_PROMPT: &str = "destroy persisted state and quit? [y/N]";
 
 struct PaneState {
     parser: Mutex<VtParser>,
@@ -2227,9 +2228,10 @@ fn run_two_pane_runtime(
             break exit_override.unwrap_or(0);
         }
 
-        if status_message
-            .as_ref()
-            .is_some_and(status_message::is_expired)
+        if !pending_destroy_confirm
+            && status_message
+                .as_ref()
+                .is_some_and(status_message::is_expired)
         {
             status_message = None;
             force_redraw = true;
@@ -2349,6 +2351,7 @@ fn run_two_pane_runtime(
                 selection_overlay,
                 scroll_status_suffix.as_deref(),
                 status_message.as_ref().map(|message| message.text.as_str()),
+                pending_destroy_confirm.then_some(QUIT_CONFIRM_PROMPT),
                 force_redraw,
                 &mut render_cache,
                 &mut render_debug,

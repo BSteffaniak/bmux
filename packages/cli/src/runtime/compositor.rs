@@ -241,6 +241,7 @@ pub(super) fn render_frame(
     selection: Option<SelectionOverlay>,
     mode_suffix: Option<&str>,
     status_message: Option<&str>,
+    confirmation_prompt: Option<&str>,
     full_redraw: bool,
     render_cache: &mut RenderCache,
     render_debug: &mut RenderDebugState,
@@ -280,14 +281,18 @@ pub(super) fn render_frame(
         .position(|pane| pane.pane_id == focused_pane)
         .unwrap_or(0);
 
-    let status_line = build_status_line(
-        shell_name,
-        cwd,
-        cols,
-        rows,
-        focused_index,
-        status_suffix.as_deref(),
-    );
+    let status_line = if let Some(prompt) = confirmation_prompt {
+        format!(" bmux | {prompt} ")
+    } else {
+        build_status_line(
+            shell_name,
+            cwd,
+            cols,
+            rows,
+            focused_index,
+            status_suffix.as_deref(),
+        )
+    };
 
     let mut stdout = io::stdout();
     write!(stdout, "\x1b[?25l").context("failed hiding cursor")?;
