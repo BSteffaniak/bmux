@@ -327,6 +327,7 @@ fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
         bmux_client::ServerEvent::FollowStarted { .. } => "follow_started",
         bmux_client::ServerEvent::FollowStopped { .. } => "follow_stopped",
         bmux_client::ServerEvent::FollowTargetGone { .. } => "follow_target_gone",
+        bmux_client::ServerEvent::FollowTargetChanged { .. } => "follow_target_changed",
     }
 }
 

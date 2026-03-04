@@ -21,6 +21,13 @@ use uuid::Uuid;
 /// Result type for client operations.
 pub type Result<T> = std::result::Result<T, ClientError>;
 
+/// Details returned when opening an attach stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AttachOpenInfo {
+    pub session_id: Uuid,
+    pub can_write: bool,
+}
+
 /// Typed client errors.
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -334,6 +341,16 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn open_attach_stream(&mut self, grant: &AttachGrant) -> Result<Uuid> {
+        let info = self.open_attach_stream_info(grant).await?;
+        Ok(info.session_id)
+    }
+
+    /// Validate and consume attach grant token and return role metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn open_attach_stream_info(&mut self, grant: &AttachGrant) -> Result<AttachOpenInfo> {
         match self
             .request(Request::AttachOpen {
                 session_id: grant.session_id,
@@ -341,7 +358,13 @@ impl BmuxClient {
             })
             .await?
         {
-            ResponsePayload::AttachReady { session_id } => Ok(session_id),
+            ResponsePayload::AttachReady {
+                session_id,
+                can_write,
+            } => Ok(AttachOpenInfo {
+                session_id,
+                can_write,
+            }),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected attach ready response",
             )),

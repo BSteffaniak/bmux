@@ -268,6 +268,7 @@ pub enum ResponsePayload {
     },
     AttachReady {
         session_id: Uuid,
+        can_write: bool,
     },
     AttachInputAccepted {
         bytes: usize,
@@ -354,6 +355,11 @@ pub enum Event {
     FollowTargetGone {
         follower_client_id: Uuid,
         former_leader_client_id: Uuid,
+    },
+    FollowTargetChanged {
+        follower_client_id: Uuid,
+        leader_client_id: Uuid,
+        session_id: Uuid,
     },
 }
 

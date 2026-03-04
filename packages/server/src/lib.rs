@@ -199,6 +199,13 @@ struct FollowEntry {
     global: bool,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct FollowTargetUpdate {
+    follower_client_id: ClientId,
+    leader_client_id: ClientId,
+    session_id: SessionId,
+}
+
 #[derive(Debug, Default)]
 struct FollowState {
     connected_clients: std::collections::BTreeSet<ClientId>,
@@ -253,7 +260,7 @@ impl FollowState {
         follower_client_id: ClientId,
         leader_client_id: ClientId,
         global: bool,
-    ) -> std::result::Result<(), &'static str> {
+    ) -> std::result::Result<Option<SessionId>, &'static str> {
         if follower_client_id == leader_client_id {
             return Err("cannot follow self");
         }
@@ -277,9 +284,10 @@ impl FollowState {
         {
             self.selected_sessions
                 .insert(follower_client_id, leader_selected);
+            return Ok(leader_selected);
         }
 
-        Ok(())
+        Ok(None)
     }
 
     fn stop_follow(&mut self, follower_client_id: ClientId) -> bool {
@@ -290,7 +298,7 @@ impl FollowState {
         &mut self,
         leader_client_id: ClientId,
         selected_session: Option<SessionId>,
-    ) {
+    ) -> Vec<FollowTargetUpdate> {
         let followers = self
             .follows
             .iter()
@@ -299,11 +307,24 @@ impl FollowState {
             })
             .collect::<Vec<_>>();
 
+        let mut updates = Vec::new();
         for follower_id in followers {
             if self.connected_clients.contains(&follower_id) {
+                let previous = self.selected_sessions.get(&follower_id).copied().flatten();
                 self.selected_sessions.insert(follower_id, selected_session);
+                if let Some(session_id) = selected_session
+                    && previous != Some(session_id)
+                {
+                    updates.push(FollowTargetUpdate {
+                        follower_client_id: follower_id,
+                        leader_client_id,
+                        session_id,
+                    });
+                }
             }
         }
+
+        updates
     }
 
     fn list_clients(&self) -> Vec<ClientSummary> {
@@ -770,7 +791,7 @@ impl SessionRuntimeManager {
         &mut self,
         session_id: SessionId,
         client_id: ClientId,
-    ) -> Result<(), SessionRuntimeError> {
+    ) -> Result<bool, SessionRuntimeError> {
         let runtime = self
             .runtimes
             .get_mut(&session_id)
@@ -787,7 +808,7 @@ impl SessionRuntimeManager {
                 .map_err(|_| SessionRuntimeError::Closed)?;
             output.register_client_at_tail(client_id);
         }
-        Ok(())
+        Ok(runtime.input_owner == Some(client_id))
     }
 
     fn end_attach(&mut self, session_id: SessionId, client_id: ClientId) {
@@ -1159,12 +1180,26 @@ fn persist_selected_session(
     client_id: ClientId,
     selected_session: Option<SessionId>,
 ) -> Result<()> {
-    let mut follow_state = state
-        .follow_state
-        .lock()
-        .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
-    follow_state.set_selected_session(client_id, selected_session);
-    follow_state.sync_followers_from_leader(client_id, selected_session);
+    let updates = {
+        let mut follow_state = state
+            .follow_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
+        follow_state.set_selected_session(client_id, selected_session);
+        follow_state.sync_followers_from_leader(client_id, selected_session)
+    };
+
+    for update in updates {
+        emit_event(
+            state,
+            Event::FollowTargetChanged {
+                follower_client_id: update.follower_client_id.0,
+                leader_client_id: update.leader_client_id.0,
+                session_id: update.session_id.0,
+            },
+        )?;
+    }
+
     Ok(())
 }
 
@@ -1205,7 +1240,7 @@ fn clear_selected_session_for_all(
         follow_state.selected_sessions.insert(*client_id, None);
     }
     for client_id in affected_clients {
-        follow_state.sync_followers_from_leader(client_id, None);
+        let _ = follow_state.sync_followers_from_leader(client_id, None);
     }
 
     Ok(())
@@ -1613,24 +1648,24 @@ async fn handle_request(
             global,
         } => {
             let leader_client_id = ClientId(target_client_id);
-            {
+            let initial_target_session = {
                 let mut follow_state = state
                     .follow_state
                     .lock()
                     .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
-                if let Err(reason) = follow_state.start_follow(client_id, leader_client_id, global)
-                {
-                    return Ok(Response::Err(ErrorResponse {
-                        code: ErrorCode::InvalidRequest,
-                        message: reason.to_string(),
-                    }));
+                match follow_state.start_follow(client_id, leader_client_id, global) {
+                    Ok(initial) => initial,
+                    Err(reason) => {
+                        return Ok(Response::Err(ErrorResponse {
+                            code: ErrorCode::InvalidRequest,
+                            message: reason.to_string(),
+                        }));
+                    }
                 }
+            };
 
-                if global
-                    && let Some(leader_selected) = follow_state.selected_session(leader_client_id)
-                {
-                    *attached_session = leader_selected;
-                }
+            if global {
+                *attached_session = initial_target_session;
             }
 
             emit_event(
@@ -1641,6 +1676,17 @@ async fn handle_request(
                     global,
                 },
             )?;
+
+            if let Some(session_id) = initial_target_session {
+                emit_event(
+                    state,
+                    Event::FollowTargetChanged {
+                        follower_client_id: client_id.0,
+                        leader_client_id: leader_client_id.0,
+                        session_id: session_id.0,
+                    },
+                )?;
+            }
 
             Response::Ok(ResponsePayload::FollowStarted {
                 follower_client_id: client_id.0,
@@ -1739,8 +1785,9 @@ async fn handle_request(
                         .lock()
                         .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
                     match runtime_manager.begin_attach(session_id, client_id) {
-                        Ok(()) => Response::Ok(ResponsePayload::AttachReady {
+                        Ok(can_write) => Response::Ok(ResponsePayload::AttachReady {
                             session_id: session_id.0,
+                            can_write,
                         }),
                         Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
                             code: ErrorCode::NotFound,
@@ -1897,7 +1944,7 @@ async fn handle_request(
             },
         )?;
     }
-    if let Response::Ok(ResponsePayload::AttachReady { session_id }) = &response {
+    if let Response::Ok(ResponsePayload::AttachReady { session_id, .. }) = &response {
         emit_event(state, Event::ClientAttached { id: *session_id })?;
     }
 
@@ -2487,7 +2534,10 @@ mod tests {
         .await;
         assert_eq!(
             attach_open,
-            Response::Ok(ResponsePayload::AttachReady { session_id })
+            Response::Ok(ResponsePayload::AttachReady {
+                session_id,
+                can_write: true,
+            })
         );
 
         let detached = send_request(&mut client, 22, Request::Detach).await;
@@ -2570,7 +2620,10 @@ mod tests {
         .await;
         assert_eq!(
             open_a,
-            Response::Ok(ResponsePayload::AttachReady { session_id })
+            Response::Ok(ResponsePayload::AttachReady {
+                session_id,
+                can_write: true,
+            })
         );
 
         let grant_b = match send_request(
@@ -2596,7 +2649,10 @@ mod tests {
         .await;
         assert_eq!(
             open_b,
-            Response::Ok(ResponsePayload::AttachReady { session_id })
+            Response::Ok(ResponsePayload::AttachReady {
+                session_id,
+                can_write: false,
+            })
         );
 
         let owner_write = send_request(
@@ -2680,7 +2736,10 @@ mod tests {
         .await;
         assert_eq!(
             open,
-            Response::Ok(ResponsePayload::AttachReady { session_id })
+            Response::Ok(ResponsePayload::AttachReady {
+                session_id,
+                can_write: true,
+            })
         );
 
         let detached = send_request(&mut client, 73, Request::Detach).await;
@@ -2719,7 +2778,10 @@ mod tests {
         .await;
         assert_eq!(
             reopen,
-            Response::Ok(ResponsePayload::AttachReady { session_id })
+            Response::Ok(ResponsePayload::AttachReady {
+                session_id,
+                can_write: true,
+            })
         );
 
         stop_server(server, server_task, &socket_path).await;
@@ -2798,7 +2860,10 @@ mod tests {
         .await;
         assert_eq!(
             opened,
-            Response::Ok(ResponsePayload::AttachReady { session_id })
+            Response::Ok(ResponsePayload::AttachReady {
+                session_id,
+                can_write: true,
+            })
         );
 
         let switched_primary = send_request(
@@ -2976,7 +3041,10 @@ mod tests {
         .await;
         assert_eq!(
             opened,
-            Response::Ok(ResponsePayload::AttachReady { session_id })
+            Response::Ok(ResponsePayload::AttachReady {
+                session_id,
+                can_write: true,
+            })
         );
 
         let switched_primary = send_request(
@@ -3069,7 +3137,10 @@ mod tests {
         .await;
         assert_eq!(
             reopened,
-            Response::Ok(ResponsePayload::AttachReady { session_id })
+            Response::Ok(ResponsePayload::AttachReady {
+                session_id,
+                can_write: true,
+            })
         );
 
         let print_output = send_request(
@@ -3136,7 +3207,10 @@ mod tests {
         .await;
         assert_eq!(
             opened,
-            Response::Ok(ResponsePayload::AttachReady { session_id })
+            Response::Ok(ResponsePayload::AttachReady {
+                session_id,
+                can_write: true,
+            })
         );
 
         let detached = send_request(&mut client, 84, Request::Detach).await;
@@ -3288,6 +3362,7 @@ mod tests {
             opened,
             Response::Ok(ResponsePayload::AttachReady {
                 session_id: alpha_session,
+                can_write: true,
             })
         );
 
@@ -3356,6 +3431,15 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, Event::FollowStarted { global: true, .. }))
         );
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                Event::FollowTargetChanged {
+                    session_id,
+                    ..
+                } if *session_id == beta_session
+            )
+        }));
         assert!(
             events
                 .iter()
@@ -3459,7 +3543,10 @@ mod tests {
         .await;
         assert_eq!(
             opened,
-            Response::Ok(ResponsePayload::AttachReady { session_id })
+            Response::Ok(ResponsePayload::AttachReady {
+                session_id,
+                can_write: true,
+            })
         );
 
         let stopper = connect_and_handshake(&endpoint).await;
