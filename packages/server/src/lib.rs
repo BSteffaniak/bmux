@@ -17,6 +17,10 @@ use bmux_ipc::{
     WindowSummary, decode, encode,
 };
 use bmux_session::{ClientId, SessionId, SessionManager, WindowId};
+use persistence::{
+    ClientSelectedSessionSnapshotV1, FollowEdgeSnapshotV1, RoleAssignmentSnapshotV1,
+    SessionSnapshotV1, SnapshotManager, SnapshotV1, WindowSnapshotV1,
+};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
@@ -30,6 +34,7 @@ use uuid::Uuid;
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
 const MAX_WINDOW_OUTPUT_BUFFER_BYTES: usize = 1_048_576;
+const SNAPSHOT_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(300);
 
 /// Main server implementation.
 #[derive(Clone)]
@@ -45,8 +50,37 @@ struct ServerState {
     attach_tokens: Mutex<AttachTokenManager>,
     follow_state: Mutex<FollowState>,
     permission_state: Mutex<PermissionState>,
+    snapshot_runtime: Mutex<SnapshotRuntime>,
     event_hub: Mutex<EventHub>,
     handshake_timeout: Duration,
+}
+
+#[derive(Debug)]
+struct SnapshotRuntime {
+    manager: Option<SnapshotManager>,
+    dirty: bool,
+    last_marked_at: Option<Instant>,
+    debounce_interval: Duration,
+}
+
+impl SnapshotRuntime {
+    fn disabled() -> Self {
+        Self {
+            manager: None,
+            dirty: false,
+            last_marked_at: None,
+            debounce_interval: SNAPSHOT_DEBOUNCE_INTERVAL,
+        }
+    }
+
+    fn with_manager(manager: SnapshotManager) -> Self {
+        Self {
+            manager: Some(manager),
+            dirty: false,
+            last_marked_at: None,
+            debounce_interval: SNAPSHOT_DEBOUNCE_INTERVAL,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -1081,9 +1115,12 @@ fn window_not_found_in_session_message(
 }
 
 impl BmuxServer {
-    /// Create a server with an explicit endpoint.
-    #[must_use]
-    pub fn new(endpoint: IpcEndpoint) -> Self {
+    fn new_with_snapshot(endpoint: IpcEndpoint, snapshot_manager: Option<SnapshotManager>) -> Self {
+        let snapshot_runtime = match snapshot_manager {
+            Some(manager) => SnapshotRuntime::with_manager(manager),
+            None => SnapshotRuntime::disabled(),
+        };
+
         let config = BmuxConfig::load().unwrap_or_default();
         let shell = resolve_server_shell(&config);
         let (shutdown_tx, _) = watch::channel(false);
@@ -1095,11 +1132,18 @@ impl BmuxServer {
                 attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
                 follow_state: Mutex::new(FollowState::default()),
                 permission_state: Mutex::new(PermissionState::default()),
+                snapshot_runtime: Mutex::new(snapshot_runtime),
                 event_hub: Mutex::new(EventHub::new(1024)),
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             }),
             shutdown_tx,
         }
+    }
+
+    /// Create a server with an explicit endpoint.
+    #[must_use]
+    pub fn new(endpoint: IpcEndpoint) -> Self {
+        Self::new_with_snapshot(endpoint, None)
     }
 
     /// Create a server with endpoint derived from config paths.
@@ -1111,7 +1155,8 @@ impl BmuxServer {
         #[cfg(windows)]
         let endpoint = IpcEndpoint::windows_named_pipe(paths.server_named_pipe());
 
-        Self::new(endpoint)
+        let snapshot_manager = SnapshotManager::from_paths(paths);
+        Self::new_with_snapshot(endpoint, Some(snapshot_manager))
     }
 
     /// Create a server using default bmux config paths.
@@ -1173,6 +1218,8 @@ impl BmuxServer {
                 }
             }
         }
+
+        let _ = maybe_flush_snapshot(&self.state, true);
 
         let removed_runtimes = if let Ok(mut runtime_manager) = self.state.session_runtimes.lock() {
             runtime_manager.remove_all_runtimes()
@@ -1310,6 +1357,8 @@ async fn handle_connection(
     )?;
     disconnect_follow_state(&state, client_id)?;
     rebalance_owner_roles_after_disconnect(&state, client_id)?;
+    mark_snapshot_dirty(&state)?;
+    maybe_flush_snapshot(&state, false)?;
     unsubscribe_events(&state, client_id)?;
 
     Ok(())
@@ -1494,6 +1543,165 @@ fn rebalance_owner_roles_after_disconnect(
     }
 
     Ok(())
+}
+
+fn mark_snapshot_dirty(state: &Arc<ServerState>) -> Result<()> {
+    let mut runtime = state
+        .snapshot_runtime
+        .lock()
+        .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
+    if runtime.manager.is_some() {
+        runtime.dirty = true;
+        runtime.last_marked_at = Some(Instant::now());
+    }
+    Ok(())
+}
+
+fn maybe_flush_snapshot(state: &Arc<ServerState>, force: bool) -> Result<()> {
+    let manager = {
+        let mut runtime = state
+            .snapshot_runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
+
+        let should_flush = if force {
+            runtime.dirty
+        } else {
+            runtime.dirty
+                && runtime
+                    .last_marked_at
+                    .is_some_and(|last| last.elapsed() >= runtime.debounce_interval)
+        };
+
+        if !should_flush {
+            return Ok(());
+        }
+
+        runtime.dirty = false;
+        runtime.last_marked_at = None;
+        runtime.manager.clone()
+    };
+
+    let Some(manager) = manager else {
+        return Ok(());
+    };
+
+    let snapshot = build_snapshot(state)?;
+    if let Err(error) = manager.write_snapshot(&snapshot) {
+        warn!("failed writing server snapshot: {error}");
+        let mut runtime = state
+            .snapshot_runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
+        runtime.dirty = true;
+        runtime.last_marked_at = Some(Instant::now());
+    }
+
+    Ok(())
+}
+
+fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV1> {
+    let sessions = {
+        let manager = state
+            .session_manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+        manager.list_sessions()
+    };
+
+    let session_snapshots = {
+        let manager = state
+            .session_manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+        let runtime_manager = state
+            .session_runtimes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+
+        sessions
+            .iter()
+            .map(|session_info| {
+                let windows = runtime_manager
+                    .list_windows(session_info.id)
+                    .unwrap_or_default();
+                let active_window_id = windows.iter().find(|w| w.active).map(|w| w.id.0);
+                let window_snapshots = windows
+                    .into_iter()
+                    .map(|window| WindowSnapshotV1 {
+                        id: window.id.0,
+                        name: window.name,
+                    })
+                    .collect::<Vec<_>>();
+
+                let name = manager
+                    .get_session(&session_info.id)
+                    .and_then(|session| session.name.clone());
+
+                SessionSnapshotV1 {
+                    id: session_info.id.0,
+                    name,
+                    windows: window_snapshots,
+                    active_window_id,
+                }
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let roles = {
+        let permission_state = state
+            .permission_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
+        permission_state
+            .roles
+            .iter()
+            .flat_map(|(session_id, assignments)| {
+                assignments
+                    .iter()
+                    .map(|(client_id, role)| RoleAssignmentSnapshotV1 {
+                        session_id: session_id.0,
+                        client_id: client_id.0,
+                        role: *role,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>()
+    };
+
+    let (follows, selected_sessions) = {
+        let follow_state = state
+            .follow_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
+        let follows = follow_state
+            .follows
+            .iter()
+            .map(|(follower_id, entry)| FollowEdgeSnapshotV1 {
+                follower_client_id: follower_id.0,
+                leader_client_id: entry.leader_client_id.0,
+                global: entry.global,
+            })
+            .collect::<Vec<_>>();
+
+        let selected_sessions = follow_state
+            .selected_sessions
+            .iter()
+            .map(|(client_id, selected)| ClientSelectedSessionSnapshotV1 {
+                client_id: client_id.0,
+                session_id: selected.map(|session| session.0),
+            })
+            .collect::<Vec<_>>();
+
+        (follows, selected_sessions)
+    };
+
+    Ok(SnapshotV1 {
+        sessions: session_snapshots,
+        roles,
+        follows,
+        selected_sessions,
+    })
 }
 
 async fn handle_request(
@@ -2432,7 +2640,31 @@ async fn handle_request(
         emit_event(state, Event::ClientAttached { id: *session_id })?;
     }
 
+    if response_requires_snapshot(&response) {
+        mark_snapshot_dirty(state)?;
+        maybe_flush_snapshot(state, false)?;
+    }
+
     Ok(response)
+}
+
+fn response_requires_snapshot(response: &Response) -> bool {
+    matches!(
+        response,
+        Response::Ok(
+            ResponsePayload::SessionCreated { .. }
+                | ResponsePayload::WindowCreated { .. }
+                | ResponsePayload::WindowKilled { .. }
+                | ResponsePayload::WindowSwitched { .. }
+                | ResponsePayload::SessionKilled { .. }
+                | ResponsePayload::RoleGranted { .. }
+                | ResponsePayload::RoleRevoked { .. }
+                | ResponsePayload::FollowStarted { .. }
+                | ResponsePayload::FollowStopped { .. }
+                | ResponsePayload::Attached { .. }
+                | ResponsePayload::Detached
+        )
+    )
 }
 
 fn detach_client_state_on_disconnect(

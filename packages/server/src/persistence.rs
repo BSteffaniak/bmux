@@ -126,7 +126,16 @@ impl SnapshotManager {
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(&self.path, encoded)?;
+
+        let mut temp_path = self.path.clone();
+        let temp_name = match self.path.file_name() {
+            Some(name) => format!("{}.tmp", name.to_string_lossy()),
+            None => "server-snapshot.tmp".to_string(),
+        };
+        temp_path.set_file_name(temp_name);
+
+        std::fs::write(&temp_path, encoded)?;
+        std::fs::rename(&temp_path, &self.path)?;
         Ok(())
     }
 
