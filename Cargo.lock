@@ -97,6 +97,7 @@ dependencies = [
  "bmux_server",
  "bmux_session",
  "bmux_terminal",
+ "bmux_terminal_protocol",
  "clap",
  "crossterm",
  "portable-pty",
@@ -239,6 +240,7 @@ dependencies = [
  "bmux_ipc",
  "bmux_session",
  "bmux_terminal",
+ "bmux_terminal_protocol",
  "portable-pty",
  "serde",
  "serde_json",
@@ -291,6 +293,13 @@ dependencies = [
  "bmux_session_models",
  "serde",
  "thiserror 2.0.12",
+]
+
+[[package]]
+name = "bmux_terminal_protocol"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "serde",
 ]
 
 [[package]]

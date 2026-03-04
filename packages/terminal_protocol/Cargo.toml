@@ -1,0 +1,17 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Shared terminal query/reply protocol engine for bmux"
+edition     = { workspace = true }
+keywords    = ["bmux", "compatibility", "protocol", "terminal"]
+license     = { workspace = true }
+name        = "bmux_terminal_protocol"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
+
+[features]
+default          = []
+fail-on-warnings = []

@@ -171,7 +171,33 @@ async fn resolve_default_attach_target() -> Result<String> {
         return Ok(name);
     }
 
-    let mut sorted = sessions;
+    let client_id = client.whoami().await.map_err(map_cli_client_error)?;
+    let mut writable_sessions = Vec::new();
+    for session in &sessions {
+        let permissions = client
+            .list_permissions(SessionSelector::ById(session.id))
+            .await
+            .map_err(map_cli_client_error)?;
+        let role = permissions
+            .iter()
+            .find(|permission| permission.client_id == client_id)
+            .map(|permission| permission.role)
+            .unwrap_or(SessionRole::Observer);
+        if role == SessionRole::Owner || role == SessionRole::Writer {
+            writable_sessions.push(session.clone());
+        }
+    }
+
+    if writable_sessions.is_empty() {
+        let name = next_default_session_name(&sessions);
+        let _ = client
+            .new_session(Some(name.clone()))
+            .await
+            .map_err(map_cli_client_error)?;
+        return Ok(name);
+    }
+
+    let mut sorted = writable_sessions;
     sorted.sort_by(|left, right| {
         let left_key = left.name.as_deref().unwrap_or("");
         let right_key = right.name.as_deref().unwrap_or("");

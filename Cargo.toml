@@ -16,6 +16,7 @@ members = [
     "packages/session/models",
     "packages/terminal",
     "packages/terminal/models",
+    "packages/terminal_protocol",
 ]
 
 resolver = "2"
@@ -59,22 +60,23 @@ version    = "0.0.1-alpha.0"
 
 [workspace.dependencies]
 # Internal bmux packages
-bmux                 = { version = "0.0.1-alpha.0", default-features = false, path = "packages/bmux" }
-bmux_cli             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli" }
-bmux_client          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/client" }
-bmux_config          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }
-bmux_event           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event" }
-bmux_event_models    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event/models" }
-bmux_history         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/history" }
-bmux_ipc             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ipc" }
-bmux_keybind         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/keybind" }
-bmux_plugin          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
-bmux_search          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/search" }
-bmux_server          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
-bmux_session         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }
-bmux_session_models  = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session/models" }
-bmux_terminal        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal" }
-bmux_terminal_models = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal/models" }
+bmux                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/bmux" }
+bmux_cli               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli" }
+bmux_client            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/client" }
+bmux_config            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }
+bmux_event             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event" }
+bmux_event_models      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event/models" }
+bmux_history           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/history" }
+bmux_ipc               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ipc" }
+bmux_keybind           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/keybind" }
+bmux_plugin            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
+bmux_search            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/search" }
+bmux_server            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
+bmux_session           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }
+bmux_session_models    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session/models" }
+bmux_terminal          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal" }
+bmux_terminal_models   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal/models" }
+bmux_terminal_protocol = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal_protocol" }
 
 # External dependencies
 anyhow = { version = "1.0.98", default-features = false }

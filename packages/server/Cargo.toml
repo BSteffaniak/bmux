@@ -11,11 +11,12 @@ version     = { workspace = true }
 
 [dependencies]
 # Internal bmux packages
-bmux_config   = { workspace = true }
-bmux_event    = { workspace = true }
-bmux_ipc      = { workspace = true }
-bmux_session  = { workspace = true }
-bmux_terminal = { workspace = true }
+bmux_config            = { workspace = true }
+bmux_event             = { workspace = true }
+bmux_ipc               = { workspace = true }
+bmux_session           = { workspace = true }
+bmux_terminal          = { workspace = true }
+bmux_terminal_protocol = { workspace = true }
 
 # External dependencies
 anyhow       = { workspace = true, features = ["std"] }

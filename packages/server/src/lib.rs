@@ -17,6 +17,7 @@ use bmux_ipc::{
     WindowSelector, WindowSummary, decode, encode,
 };
 use bmux_session::{ClientId, Session, SessionId, SessionManager, WindowId};
+use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
 use persistence::{
     ClientSelectedSessionSnapshotV1, FollowEdgeSnapshotV1, RoleAssignmentSnapshotV1,
     SessionSnapshotV1, SnapshotManager, SnapshotV1, WindowSnapshotV1,
@@ -546,6 +547,15 @@ fn resolve_server_shell(config: &BmuxConfig) -> String {
     }
 }
 
+fn resolve_server_pane_term(config: &BmuxConfig) -> String {
+    let configured = config.behavior.pane_term.trim();
+    if configured.is_empty() {
+        "xterm-256color".to_string()
+    } else {
+        configured.to_string()
+    }
+}
+
 async fn shutdown_runtime_handle(removed: RemovedRuntime) {
     for window in removed.handle.windows.into_values() {
         shutdown_window_handle(window).await;
@@ -569,6 +579,8 @@ async fn shutdown_window_handle(mut window: WindowRuntimeHandle) {
 struct SessionRuntimeManager {
     runtimes: BTreeMap<SessionId, SessionRuntimeHandle>,
     shell: String,
+    pane_term: String,
+    protocol_profile: ProtocolProfile,
 }
 
 struct SessionRuntimeHandle {
@@ -691,10 +703,12 @@ enum SessionRuntimeError {
 }
 
 impl SessionRuntimeManager {
-    fn new(shell: String) -> Self {
+    fn new(shell: String, pane_term: String, protocol_profile: ProtocolProfile) -> Self {
         Self {
             runtimes: BTreeMap::new(),
             shell,
+            pane_term,
+            protocol_profile,
         }
     }
 
@@ -764,6 +778,8 @@ impl SessionRuntimeManager {
             MAX_WINDOW_OUTPUT_BUFFER_BYTES,
         )));
         let shell = self.shell.clone();
+        let pane_term = self.pane_term.clone();
+        let protocol_profile = self.protocol_profile;
         let window_id = id.unwrap_or_else(bmux_session::WindowId::new);
         let output_buffer_for_reader = Arc::clone(&output_buffer);
         let task = tokio::spawn(async move {
@@ -779,7 +795,7 @@ impl SessionRuntimeManager {
             };
 
             let mut command = CommandBuilder::new(&shell);
-            command.env("TERM", "xterm-256color");
+            command.env("TERM", &pane_term);
             let mut child = match pty_pair.slave.spawn_command(command) {
                 Ok(child) => child,
                 Err(_) => return,
@@ -793,27 +809,43 @@ impl SessionRuntimeManager {
                     return;
                 }
             };
-            let mut writer = match pty_pair.master.take_writer() {
+            let writer = match pty_pair.master.take_writer() {
                 Ok(writer) => writer,
                 Err(_) => {
                     let _ = child.kill();
                     return;
                 }
             };
+            let writer = Arc::new(std::sync::Mutex::new(writer));
 
             let reader_output = Arc::clone(&output_buffer_for_reader);
+            let writer_for_reader = Arc::clone(&writer);
             let reader_thread = std::thread::Builder::new()
                 .name(format!("bmux-server-window-{}", window_id.0))
                 .spawn(move || {
                     let mut buffer = [0_u8; 8192];
+                    let mut protocol_engine = TerminalProtocolEngine::new(protocol_profile);
                     loop {
                         match reader.read(&mut buffer) {
                             Ok(0) => break,
                             Ok(bytes_read) => {
+                                let chunk = &buffer[..bytes_read];
                                 if let Ok(mut output) = reader_output.lock() {
-                                    output.push_chunk(&buffer[..bytes_read]);
+                                    output.push_chunk(chunk);
                                 } else {
                                     break;
+                                }
+
+                                let reply = protocol_engine.process_output(chunk, (0, 0));
+                                if !reply.is_empty() {
+                                    if let Ok(mut writer) = writer_for_reader.lock() {
+                                        if writer.write_all(&reply).is_err() {
+                                            break;
+                                        }
+                                        let _ = writer.flush();
+                                    } else {
+                                        break;
+                                    }
                                 }
                             }
                             Err(_) => break,
@@ -830,10 +862,13 @@ impl SessionRuntimeManager {
                     input = input_rx.recv() => {
                         match input {
                             Some(bytes) => {
-                                if writer.write_all(&bytes).is_err() {
+                                if let Ok(mut writer) = writer.lock()
+                                    && writer.write_all(&bytes).is_ok()
+                                {
+                                    let _ = writer.flush();
+                                } else {
                                     break;
                                 }
-                                let _ = writer.flush();
                             }
                             None => break,
                         }
@@ -1179,12 +1214,18 @@ impl BmuxServer {
 
         let config = BmuxConfig::load().unwrap_or_default();
         let shell = resolve_server_shell(&config);
+        let pane_term = resolve_server_pane_term(&config);
+        let protocol_profile = protocol_profile_for_term(&pane_term);
         let (shutdown_tx, _) = watch::channel(false);
         Self {
             endpoint,
             state: Arc::new(ServerState {
                 session_manager: Mutex::new(SessionManager::new()),
-                session_runtimes: Mutex::new(SessionRuntimeManager::new(shell)),
+                session_runtimes: Mutex::new(SessionRuntimeManager::new(
+                    shell,
+                    pane_term,
+                    protocol_profile,
+                )),
                 attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
                 follow_state: Mutex::new(FollowState::default()),
                 permission_state: Mutex::new(PermissionState::default()),
