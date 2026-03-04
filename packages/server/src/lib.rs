@@ -15,7 +15,7 @@ use bmux_ipc::{
 };
 use bmux_session::{ClientId, SessionId, SessionManager, WindowId};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -378,7 +378,8 @@ struct SessionRuntimeHandle {
     windows: BTreeMap<bmux_session::WindowId, WindowRuntimeHandle>,
     active_window: bmux_session::WindowId,
     next_auto_window_number: u32,
-    active_client: Option<ClientId>,
+    attached_clients: BTreeSet<ClientId>,
+    input_owner: Option<ClientId>,
 }
 
 struct WindowRuntimeHandle {
@@ -392,7 +393,7 @@ struct WindowRuntimeHandle {
 
 struct RemovedRuntime {
     session_id: SessionId,
-    detached_client: Option<ClientId>,
+    had_attached_clients: bool,
     handle: SessionRuntimeHandle,
 }
 
@@ -418,8 +419,8 @@ enum WindowSelection {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SessionRuntimeError {
     NotFound,
-    AlreadyAttached,
     NotAttached,
+    ReadOnly,
     Closed,
 }
 
@@ -447,7 +448,8 @@ impl SessionRuntimeManager {
                 windows,
                 active_window: first_window_id,
                 next_auto_window_number: 2,
-                active_client: None,
+                attached_clients: BTreeSet::new(),
+                input_owner: None,
             },
         );
         Ok(())
@@ -670,7 +672,7 @@ impl SessionRuntimeManager {
 
         Ok(RemovedRuntime {
             session_id,
-            detached_client: runtime.active_client,
+            had_attached_clients: !runtime.attached_clients.is_empty(),
             handle: runtime,
         })
     }
@@ -680,7 +682,7 @@ impl SessionRuntimeManager {
             .into_iter()
             .map(|(session_id, runtime)| RemovedRuntime {
                 session_id,
-                detached_client: runtime.active_client,
+                had_attached_clients: !runtime.attached_clients.is_empty(),
                 handle: runtime,
             })
             .collect()
@@ -696,20 +698,19 @@ impl SessionRuntimeManager {
             .get_mut(&session_id)
             .ok_or(SessionRuntimeError::NotFound)?;
 
-        match runtime.active_client {
-            Some(active) if active != client_id => Err(SessionRuntimeError::AlreadyAttached),
-            _ => {
-                runtime.active_client = Some(client_id);
-                Ok(())
-            }
+        runtime.attached_clients.insert(client_id);
+        if runtime.input_owner.is_none() {
+            runtime.input_owner = Some(client_id);
         }
+        Ok(())
     }
 
     fn end_attach(&mut self, session_id: SessionId, client_id: ClientId) {
-        if let Some(runtime) = self.runtimes.get_mut(&session_id)
-            && runtime.active_client == Some(client_id)
-        {
-            runtime.active_client = None;
+        if let Some(runtime) = self.runtimes.get_mut(&session_id) {
+            let removed = runtime.attached_clients.remove(&client_id);
+            if removed && runtime.input_owner == Some(client_id) {
+                runtime.input_owner = runtime.attached_clients.iter().next().copied();
+            }
         }
     }
 
@@ -724,8 +725,11 @@ impl SessionRuntimeManager {
             .get_mut(&session_id)
             .ok_or(SessionRuntimeError::NotFound)?;
 
-        if runtime.active_client != Some(client_id) {
+        if !runtime.attached_clients.contains(&client_id) {
             return Err(SessionRuntimeError::NotAttached);
+        }
+        if runtime.input_owner != Some(client_id) {
+            return Err(SessionRuntimeError::ReadOnly);
         }
 
         let window = runtime
@@ -752,7 +756,7 @@ impl SessionRuntimeManager {
             .get_mut(&session_id)
             .ok_or(SessionRuntimeError::NotFound)?;
 
-        if runtime.active_client != Some(client_id) {
+        if !runtime.attached_clients.contains(&client_id) {
             return Err(SessionRuntimeError::NotAttached);
         }
 
@@ -922,7 +926,7 @@ impl BmuxServer {
             Vec::new()
         };
         for removed_runtime in removed_runtimes {
-            if removed_runtime.detached_client.is_some() {
+            if removed_runtime.had_attached_clients {
                 let _ = emit_event(
                     &self.state,
                     Event::ClientDetached {
@@ -1355,7 +1359,7 @@ async fn handle_request(
             )?;
 
             if let Some(removed_session) = session_removed {
-                if removed_session.detached_client.is_some() {
+                if removed_session.had_attached_clients {
                     emit_event(
                         state,
                         Event::ClientDetached {
@@ -1515,7 +1519,7 @@ async fn handle_request(
                 (session_id, removed_runtime)
             };
 
-            if removed_runtime.detached_client.is_some() {
+            if removed_runtime.had_attached_clients {
                 emit_event(state, Event::ClientDetached { id: session_id.0 })?;
             }
             shutdown_runtime_handle(removed_runtime).await;
@@ -1671,16 +1675,14 @@ async fn handle_request(
                             code: ErrorCode::NotFound,
                             message: format!("session runtime not found: {}", session_id.0),
                         }),
-                        Err(SessionRuntimeError::AlreadyAttached) => Response::Err(ErrorResponse {
-                            code: ErrorCode::AlreadyExists,
-                            message: "session already has an attached client".to_string(),
+                        Err(
+                            SessionRuntimeError::NotAttached
+                            | SessionRuntimeError::ReadOnly
+                            | SessionRuntimeError::Closed,
+                        ) => Response::Err(ErrorResponse {
+                            code: ErrorCode::Internal,
+                            message: "failed opening attach stream".to_string(),
                         }),
-                        Err(SessionRuntimeError::NotAttached | SessionRuntimeError::Closed) => {
-                            Response::Err(ErrorResponse {
-                                code: ErrorCode::Internal,
-                                message: "failed opening attach stream".to_string(),
-                            })
-                        }
                     }
                 }
                 Err(AttachTokenValidationError::NotFound) => Response::Err(ErrorResponse {
@@ -1712,12 +1714,14 @@ async fn handle_request(
                     code: ErrorCode::InvalidRequest,
                     message: "client is not attached to session runtime".to_string(),
                 }),
-                Err(SessionRuntimeError::AlreadyAttached | SessionRuntimeError::Closed) => {
-                    Response::Err(ErrorResponse {
-                        code: ErrorCode::Internal,
-                        message: "failed writing attach input".to_string(),
-                    })
-                }
+                Err(SessionRuntimeError::ReadOnly) => Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "client is attached read-only for this session runtime".to_string(),
+                }),
+                Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
+                    code: ErrorCode::Internal,
+                    message: "failed writing attach input".to_string(),
+                }),
             }
         }
         Request::AttachOutput {
@@ -1738,7 +1742,7 @@ async fn handle_request(
                     code: ErrorCode::InvalidRequest,
                     message: "client is not attached to session runtime".to_string(),
                 }),
-                Err(SessionRuntimeError::AlreadyAttached | SessionRuntimeError::Closed) => {
+                Err(SessionRuntimeError::ReadOnly | SessionRuntimeError::Closed) => {
                     Response::Err(ErrorResponse {
                         code: ErrorCode::Internal,
                         message: "failed reading attach output".to_string(),
@@ -2454,7 +2458,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn rejects_second_active_attach_for_same_session() {
+    async fn allows_second_attach_for_same_session_with_read_only_input() {
         let (server, endpoint, socket_path, server_task) = start_server().await;
         let mut client_a = connect_and_handshake(&endpoint).await;
         let mut client_b = connect_and_handshake(&endpoint).await;
@@ -2519,10 +2523,38 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(
+        assert_eq!(
             open_b,
+            Response::Ok(ResponsePayload::AttachReady { session_id })
+        );
+
+        let owner_write = send_request(
+            &mut client_a,
+            65,
+            Request::AttachInput {
+                session_id,
+                data: b"printf 'owner-ok\\n'\n".to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            owner_write,
+            Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
+        ));
+
+        let follower_write = send_request(
+            &mut client_b,
+            66,
+            Request::AttachInput {
+                session_id,
+                data: b"printf 'follower-write'\n".to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            follower_write,
             Response::Err(ErrorResponse {
-                code: ErrorCode::AlreadyExists,
+                code: ErrorCode::InvalidRequest,
                 ..
             })
         ));

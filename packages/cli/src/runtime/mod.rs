@@ -9,7 +9,7 @@ use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
 use bmux_client::{BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, TerminfoAutoInstall};
-use bmux_ipc::{transport::IpcTransportError, SessionSelector, WindowSelector};
+use bmux_ipc::{SessionSelector, WindowSelector, transport::IpcTransportError};
 use bmux_server::BmuxServer;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -2397,8 +2397,7 @@ mod tests {
         EventReader, PaneRuntime, PaneState, ProtocolDirection, ProtocolTraceEvent, ScrollState,
         TerminalProfile, TraceFamily, cursor_status_suffix, filter_trace_events,
         format_scroll_mode_suffix, load_runtime_settings, map_attach_client_error,
-        map_cli_client_error,
-        merged_runtime_keybindings, parse_pid_content, profile_for_term,
+        map_cli_client_error, merged_runtime_keybindings, parse_pid_content, profile_for_term,
         protocol_profile_for_terminal_profile, reap_exited_panes, resolve_pane_term_with_checker,
         run_event_input_loop_with_reader, selection_status_suffix,
     };
