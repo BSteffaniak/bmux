@@ -422,6 +422,8 @@ fn run_client_list(as_json: bool) -> Result<u8> {
         let clients = client.list_clients().await.map_err(anyhow::Error::from)?;
         Ok::<(Uuid, Vec<bmux_ipc::ClientSummary>), anyhow::Error>((self_id, clients))
     })?;
+    let mut clients = clients;
+    clients.sort_by_key(|client| (client.id != self_id, client.id));
 
     if as_json {
         println!(
