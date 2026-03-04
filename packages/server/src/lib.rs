@@ -39,6 +39,7 @@ struct ServerState {
     session_manager: Mutex<SessionManager>,
     session_runtimes: Mutex<SessionRuntimeManager>,
     attach_tokens: Mutex<AttachTokenManager>,
+    follow_state: Mutex<FollowState>,
     event_hub: Mutex<EventHub>,
     handshake_timeout: Duration,
 }
@@ -189,6 +190,120 @@ fn epoch_millis_now() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
     now.as_millis() as u64
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FollowEntry {
+    leader_client_id: ClientId,
+    global: bool,
+}
+
+#[derive(Debug, Default)]
+struct FollowState {
+    connected_clients: std::collections::BTreeSet<ClientId>,
+    selected_sessions: BTreeMap<ClientId, Option<SessionId>>,
+    follows: BTreeMap<ClientId, FollowEntry>,
+}
+
+impl FollowState {
+    fn connect_client(&mut self, client_id: ClientId) {
+        self.connected_clients.insert(client_id);
+        self.selected_sessions.entry(client_id).or_insert(None);
+    }
+
+    fn disconnect_client(&mut self, client_id: ClientId) -> Vec<Event> {
+        self.connected_clients.remove(&client_id);
+        self.selected_sessions.remove(&client_id);
+        self.follows.remove(&client_id);
+
+        let impacted_followers = self
+            .follows
+            .iter()
+            .filter_map(|(follower_id, entry)| {
+                (entry.leader_client_id == client_id).then_some(*follower_id)
+            })
+            .collect::<Vec<_>>();
+
+        impacted_followers
+            .into_iter()
+            .filter_map(|follower_id| {
+                self.follows
+                    .remove(&follower_id)
+                    .map(|entry| Event::FollowTargetGone {
+                        follower_client_id: follower_id.0,
+                        former_leader_client_id: entry.leader_client_id.0,
+                    })
+            })
+            .collect()
+    }
+
+    fn set_selected_session(&mut self, client_id: ClientId, session_id: Option<SessionId>) {
+        if self.connected_clients.contains(&client_id) {
+            self.selected_sessions.insert(client_id, session_id);
+        }
+    }
+
+    fn selected_session(&self, client_id: ClientId) -> Option<Option<SessionId>> {
+        self.selected_sessions.get(&client_id).copied()
+    }
+
+    fn start_follow(
+        &mut self,
+        follower_client_id: ClientId,
+        leader_client_id: ClientId,
+        global: bool,
+    ) -> std::result::Result<(), &'static str> {
+        if follower_client_id == leader_client_id {
+            return Err("cannot follow self");
+        }
+        if !self.connected_clients.contains(&leader_client_id) {
+            return Err("target client not connected");
+        }
+        if !self.connected_clients.contains(&follower_client_id) {
+            return Err("follower client not connected");
+        }
+
+        self.follows.insert(
+            follower_client_id,
+            FollowEntry {
+                leader_client_id,
+                global,
+            },
+        );
+
+        if global
+            && let Some(leader_selected) = self.selected_sessions.get(&leader_client_id).copied()
+        {
+            self.selected_sessions
+                .insert(follower_client_id, leader_selected);
+        }
+
+        Ok(())
+    }
+
+    fn stop_follow(&mut self, follower_client_id: ClientId) -> bool {
+        self.follows.remove(&follower_client_id).is_some()
+    }
+
+    fn sync_followers_from_leader(
+        &mut self,
+        leader_client_id: ClientId,
+        selected_session: Option<SessionId>,
+    ) {
+        let followers = self
+            .follows
+            .iter()
+            .filter_map(|(follower_id, entry)| {
+                (entry.leader_client_id == leader_client_id && entry.global).then_some(*follower_id)
+            })
+            .collect::<Vec<_>>();
+
+        for follower_id in followers {
+            if self.connected_clients.contains(&follower_id) {
+                self.selected_sessions.insert(follower_id, selected_session);
+            }
+        }
+    }
 }
 
 fn resolve_server_shell(config: &BmuxConfig) -> String {
@@ -698,6 +813,7 @@ impl BmuxServer {
                 session_manager: Mutex::new(SessionManager::new()),
                 session_runtimes: Mutex::new(SessionRuntimeManager::new(shell)),
                 attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
+                follow_state: Mutex::new(FollowState::default()),
                 event_hub: Mutex::new(EventHub::new(1024)),
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             }),
@@ -856,6 +972,14 @@ async fn handle_connection(
         }
     }
 
+    {
+        let mut follow_state = state
+            .follow_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
+        follow_state.connect_client(client_id);
+    }
+
     loop {
         let envelope = match stream.recv_envelope().await {
             Ok(envelope) => envelope,
@@ -893,6 +1017,7 @@ async fn handle_connection(
     }
 
     detach_client_if_attached(&state, client_id, &mut attached_session)?;
+    disconnect_follow_state(&state, client_id)?;
     unsubscribe_events(&state, client_id)?;
 
     Ok(())
@@ -916,6 +1041,78 @@ fn unsubscribe_events(state: &Arc<ServerState>, client_id: ClientId) -> Result<(
     Ok(())
 }
 
+fn sync_attached_session_from_follow_state(
+    state: &Arc<ServerState>,
+    client_id: ClientId,
+    attached_session: &mut Option<SessionId>,
+) -> Result<()> {
+    let follow_state = state
+        .follow_state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
+    if let Some(selected_session) = follow_state.selected_session(client_id) {
+        *attached_session = selected_session;
+    }
+    Ok(())
+}
+
+fn persist_selected_session(
+    state: &Arc<ServerState>,
+    client_id: ClientId,
+    selected_session: Option<SessionId>,
+) -> Result<()> {
+    let mut follow_state = state
+        .follow_state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
+    follow_state.set_selected_session(client_id, selected_session);
+    follow_state.sync_followers_from_leader(client_id, selected_session);
+    Ok(())
+}
+
+fn disconnect_follow_state(state: &Arc<ServerState>, client_id: ClientId) -> Result<()> {
+    let events = {
+        let mut follow_state = state
+            .follow_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
+        follow_state.disconnect_client(client_id)
+    };
+
+    for event in events {
+        emit_event(state, event)?;
+    }
+
+    Ok(())
+}
+
+fn clear_selected_session_for_all(
+    state: &Arc<ServerState>,
+    removed_session_id: SessionId,
+) -> Result<()> {
+    let mut follow_state = state
+        .follow_state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
+
+    let affected_clients = follow_state
+        .selected_sessions
+        .iter()
+        .filter_map(|(client_id, selected)| {
+            (*selected == Some(removed_session_id)).then_some(*client_id)
+        })
+        .collect::<Vec<_>>();
+
+    for client_id in &affected_clients {
+        follow_state.selected_sessions.insert(*client_id, None);
+    }
+    for client_id in affected_clients {
+        follow_state.sync_followers_from_leader(client_id, None);
+    }
+
+    Ok(())
+}
+
 async fn handle_request(
     state: &Arc<ServerState>,
     shutdown_tx: &watch::Sender<bool>,
@@ -923,6 +1120,8 @@ async fn handle_request(
     attached_session: &mut Option<SessionId>,
     request: Request,
 ) -> Result<Response> {
+    sync_attached_session_from_follow_state(state, client_id, attached_session)?;
+
     let response = match request {
         Request::Hello { .. } => Response::Err(ErrorResponse {
             code: ErrorCode::InvalidRequest,
@@ -1149,6 +1348,7 @@ async fn handle_request(
                 let _ = manager.remove_session(&removed_window_session_id);
                 if *attached_session == Some(removed_window_session_id) {
                     *attached_session = None;
+                    persist_selected_session(state, client_id, None)?;
                 }
 
                 let mut attach_tokens = state
@@ -1156,6 +1356,9 @@ async fn handle_request(
                     .lock()
                     .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
                 attach_tokens.remove_for_session(removed_window_session_id);
+                drop(attach_tokens);
+
+                clear_selected_session_for_all(state, removed_window_session_id)?;
 
                 emit_event(
                     state,
@@ -1260,6 +1463,7 @@ async fn handle_request(
                 }
                 if *attached_session == Some(session_id) {
                     *attached_session = None;
+                    persist_selected_session(state, client_id, None)?;
                 }
                 drop(manager);
 
@@ -1289,15 +1493,76 @@ async fn handle_request(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
             attach_tokens.remove_for_session(session_id);
+            drop(attach_tokens);
+
+            clear_selected_session_for_all(state, session_id)?;
 
             emit_event(state, Event::SessionRemoved { id: session_id.0 })?;
 
             Response::Ok(ResponsePayload::SessionKilled { id: session_id.0 })
         }
-        Request::FollowClient { .. } | Request::Unfollow => Response::Err(ErrorResponse {
-            code: ErrorCode::InvalidRequest,
-            message: "follow operations not implemented yet".to_string(),
-        }),
+        Request::FollowClient {
+            target_client_id,
+            global,
+        } => {
+            let leader_client_id = ClientId(target_client_id);
+            {
+                let mut follow_state = state
+                    .follow_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
+                if let Err(reason) = follow_state.start_follow(client_id, leader_client_id, global)
+                {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::InvalidRequest,
+                        message: reason.to_string(),
+                    }));
+                }
+
+                if global
+                    && let Some(leader_selected) = follow_state.selected_session(leader_client_id)
+                {
+                    *attached_session = leader_selected;
+                }
+            }
+
+            emit_event(
+                state,
+                Event::FollowStarted {
+                    follower_client_id: client_id.0,
+                    leader_client_id: leader_client_id.0,
+                    global,
+                },
+            )?;
+
+            Response::Ok(ResponsePayload::FollowStarted {
+                follower_client_id: client_id.0,
+                leader_client_id: leader_client_id.0,
+                global,
+            })
+        }
+        Request::Unfollow => {
+            let removed = {
+                let mut follow_state = state
+                    .follow_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
+                follow_state.stop_follow(client_id)
+            };
+
+            if removed {
+                emit_event(
+                    state,
+                    Event::FollowStopped {
+                        follower_client_id: client_id.0,
+                    },
+                )?;
+            }
+
+            Response::Ok(ResponsePayload::FollowStopped {
+                follower_client_id: client_id.0,
+            })
+        }
         Request::Attach { selector } => {
             let mut manager = state
                 .session_manager
@@ -1321,6 +1586,7 @@ async fn handle_request(
                 Some(session) => {
                     session.add_client(client_id);
                     *attached_session = Some(next_session_id);
+                    persist_selected_session(state, client_id, *attached_session)?;
                     drop(manager);
 
                     let mut attach_tokens = state
@@ -1474,6 +1740,7 @@ async fn handle_request(
                     },
                 )?;
             }
+            persist_selected_session(state, client_id, None)?;
             Response::Ok(ResponsePayload::Detached)
         }
         Request::SubscribeEvents => {
@@ -2685,6 +2952,236 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn global_follow_updates_control_plane_without_rebinding_attach_stream() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut leader = connect_and_handshake(&endpoint).await;
+        let mut follower = connect_and_handshake(&endpoint).await;
+
+        let subscribed = send_request(&mut follower, 500, Request::SubscribeEvents).await;
+        assert_eq!(subscribed, Response::Ok(ResponsePayload::EventsSubscribed));
+
+        let alpha_session = match send_request(
+            &mut leader,
+            501,
+            Request::NewSession {
+                name: Some("leader-alpha".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected alpha session response: {other:?}"),
+        };
+        let beta_session = match send_request(
+            &mut leader,
+            502,
+            Request::NewSession {
+                name: Some("leader-beta".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected beta session response: {other:?}"),
+        };
+
+        let leader_attached_alpha = send_request(
+            &mut leader,
+            503,
+            Request::Attach {
+                selector: SessionSelector::ById(alpha_session),
+            },
+        )
+        .await;
+        assert!(matches!(
+            leader_attached_alpha,
+            Response::Ok(ResponsePayload::Attached { .. })
+        ));
+
+        let leader_client_id =
+            discover_client_id_from_window_switch(&mut follower, &mut leader, alpha_session, 1500)
+                .await;
+
+        let follow_started = send_request(
+            &mut follower,
+            504,
+            Request::FollowClient {
+                target_client_id: leader_client_id,
+                global: true,
+            },
+        )
+        .await;
+        assert!(matches!(
+            follow_started,
+            Response::Ok(ResponsePayload::FollowStarted { global: true, .. })
+        ));
+
+        let follower_windows_alpha =
+            send_request(&mut follower, 505, Request::ListWindows { session: None }).await;
+        match follower_windows_alpha {
+            Response::Ok(ResponsePayload::WindowList { windows }) => {
+                assert_eq!(windows.len(), 1);
+                assert_eq!(windows[0].session_id, alpha_session);
+            }
+            other => panic!("unexpected follower windows(alpha) response: {other:?}"),
+        }
+
+        let grant = match send_request(
+            &mut follower,
+            506,
+            Request::Attach {
+                selector: SessionSelector::ById(alpha_session),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::Attached { grant }) => grant,
+            other => panic!("unexpected follower attach response: {other:?}"),
+        };
+        let opened = send_request(
+            &mut follower,
+            507,
+            Request::AttachOpen {
+                session_id: alpha_session,
+                attach_token: grant.attach_token,
+            },
+        )
+        .await;
+        assert_eq!(
+            opened,
+            Response::Ok(ResponsePayload::AttachReady {
+                session_id: alpha_session,
+            })
+        );
+
+        let set_marker = send_request(
+            &mut follower,
+            508,
+            Request::AttachInput {
+                session_id: alpha_session,
+                data: b"export BMUX_FOLLOW_STREAM=ok\n".to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            set_marker,
+            Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
+        ));
+
+        let leader_attached_beta = send_request(
+            &mut leader,
+            509,
+            Request::Attach {
+                selector: SessionSelector::ById(beta_session),
+            },
+        )
+        .await;
+        assert!(matches!(
+            leader_attached_beta,
+            Response::Ok(ResponsePayload::Attached { .. })
+        ));
+
+        let follower_windows_beta =
+            send_request(&mut follower, 510, Request::ListWindows { session: None }).await;
+        match follower_windows_beta {
+            Response::Ok(ResponsePayload::WindowList { windows }) => {
+                assert_eq!(windows.len(), 1);
+                assert_eq!(windows[0].session_id, beta_session);
+            }
+            other => panic!("unexpected follower windows(beta) response: {other:?}"),
+        }
+
+        let print_stream = send_request(
+            &mut follower,
+            511,
+            Request::AttachInput {
+                session_id: alpha_session,
+                data: b"printf 'FS=[%s]\\n' \"$BMUX_FOLLOW_STREAM\"\n".to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            print_stream,
+            Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
+        ));
+        let output = collect_attach_output_until(&mut follower, alpha_session, "FS=[ok]", 20).await;
+        assert!(output.contains("FS=[ok]"));
+
+        let unfollowed = send_request(&mut follower, 512, Request::Unfollow).await;
+        assert!(matches!(
+            unfollowed,
+            Response::Ok(ResponsePayload::FollowStopped { .. })
+        ));
+
+        let events = poll_events_collect(&mut follower, 513, 10, 4).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::FollowStarted { global: true, .. }))
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::FollowStopped { .. }))
+        );
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn leader_disconnect_emits_follow_target_gone() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut leader = connect_and_handshake(&endpoint).await;
+        let mut follower = connect_and_handshake(&endpoint).await;
+
+        let subscribed = send_request(&mut follower, 540, Request::SubscribeEvents).await;
+        assert_eq!(subscribed, Response::Ok(ResponsePayload::EventsSubscribed));
+
+        let session_id = match send_request(
+            &mut leader,
+            541,
+            Request::NewSession {
+                name: Some("follow-disconnect".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected session create response: {other:?}"),
+        };
+        let leader_client_id =
+            discover_client_id_from_window_switch(&mut follower, &mut leader, session_id, 1600)
+                .await;
+
+        let follow_started = send_request(
+            &mut follower,
+            542,
+            Request::FollowClient {
+                target_client_id: leader_client_id,
+                global: false,
+            },
+        )
+        .await;
+        assert!(matches!(
+            follow_started,
+            Response::Ok(ResponsePayload::FollowStarted { global: false, .. })
+        ));
+
+        drop(leader);
+
+        let events = poll_events_collect(&mut follower, 543, 10, 8).await;
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::FollowTargetGone { .. }))
+        );
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn server_stop_while_attached_cleans_runtime_state() {
         let (server, endpoint, socket_path, server_task) = start_server().await;
         let mut client = connect_and_handshake(&endpoint).await;
@@ -2950,6 +3447,69 @@ mod tests {
             .expect("request reply should be received");
         assert_eq!(reply.request_id, request_id);
         decode(&reply.payload).expect("response decode should succeed")
+    }
+
+    #[cfg(unix)]
+    async fn poll_events_collect(
+        client: &mut LocalIpcStream,
+        request_id_base: u64,
+        max_events: usize,
+        attempts: usize,
+    ) -> Vec<Event> {
+        let mut all_events = Vec::new();
+        for idx in 0..attempts.max(1) {
+            let response = send_request(
+                client,
+                request_id_base + idx as u64,
+                Request::PollEvents { max_events },
+            )
+            .await;
+            if let Response::Ok(ResponsePayload::EventBatch { events }) = response
+                && !events.is_empty()
+            {
+                all_events.extend(events);
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        all_events
+    }
+
+    #[cfg(unix)]
+    async fn discover_client_id_from_window_switch(
+        observer: &mut LocalIpcStream,
+        actor: &mut LocalIpcStream,
+        session_id: Uuid,
+        request_id_base: u64,
+    ) -> Uuid {
+        let switched = send_request(
+            actor,
+            request_id_base,
+            Request::SwitchWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                target: WindowSelector::Active,
+            },
+        )
+        .await;
+        assert!(matches!(
+            switched,
+            Response::Ok(ResponsePayload::WindowSwitched {
+                session_id: switched_session,
+                ..
+            }) if switched_session == session_id
+        ));
+
+        let events = poll_events_collect(observer, request_id_base + 1, 10, 6).await;
+        events
+            .iter()
+            .find_map(|event| match event {
+                Event::WindowSwitched {
+                    session_id: switched_session,
+                    by_client_id,
+                    ..
+                } if *switched_session == session_id => Some(*by_client_id),
+                _ => None,
+            })
+            .expect("window switched event with client id should exist")
     }
 
     #[cfg(unix)]

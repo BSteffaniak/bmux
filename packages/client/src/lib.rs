@@ -634,6 +634,83 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn client_follow_and_unfollow_succeeds() {
+        let (server_task, socket_path, endpoint) = start_server().await;
+        let mut leader = BmuxClient::connect(&endpoint, Duration::from_secs(2), "leader-test")
+            .await
+            .expect("leader should connect");
+        let mut follower = BmuxClient::connect(&endpoint, Duration::from_secs(2), "follower-test")
+            .await
+            .expect("follower should connect");
+
+        follower
+            .subscribe_events()
+            .await
+            .expect("event subscribe should succeed");
+
+        let session_id = leader
+            .new_session(Some("follow-leader".to_string()))
+            .await
+            .expect("leader session should be created");
+
+        let windows = leader
+            .list_windows(Some(SessionSelector::ById(session_id)))
+            .await
+            .expect("leader windows should list");
+        let active_window = windows
+            .iter()
+            .find(|window| window.active)
+            .expect("active window should exist")
+            .id;
+
+        leader
+            .switch_window(
+                Some(SessionSelector::ById(session_id)),
+                WindowSelector::ById(active_window),
+            )
+            .await
+            .expect("window switch should succeed");
+
+        let mut leader_client_id = None;
+        for _ in 0..6 {
+            let events = follower
+                .poll_events(10)
+                .await
+                .expect("event poll should succeed");
+            leader_client_id = events.into_iter().find_map(|event| match event {
+                ServerEvent::WindowSwitched {
+                    session_id: switched_session,
+                    by_client_id,
+                    ..
+                } if switched_session == session_id => Some(by_client_id),
+                _ => None,
+            });
+            if leader_client_id.is_some() {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        let leader_client_id = leader_client_id.expect("leader client id should be observed");
+
+        follower
+            .follow_client(leader_client_id, true)
+            .await
+            .expect("follow should succeed");
+        follower.unfollow().await.expect("unfollow should succeed");
+
+        leader.stop_server().await.expect("stop should succeed");
+        server_task
+            .await
+            .expect("server task should join")
+            .expect("server should stop cleanly");
+
+        if socket_path.exists() {
+            std::fs::remove_file(&socket_path).expect("socket cleanup should succeed");
+        }
+    }
+
+    #[cfg(unix)]
     async fn start_server() -> (
         tokio::task::JoinHandle<anyhow::Result<()>>,
         PathBuf,
