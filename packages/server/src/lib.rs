@@ -3588,6 +3588,242 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn rapid_leader_session_switches_emit_multiple_follow_target_changes() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut leader = connect_and_handshake(&endpoint).await;
+        let mut follower = connect_and_handshake(&endpoint).await;
+
+        let subscribed = send_request(&mut follower, 580, Request::SubscribeEvents).await;
+        assert_eq!(subscribed, Response::Ok(ResponsePayload::EventsSubscribed));
+
+        let alpha = match send_request(
+            &mut leader,
+            581,
+            Request::NewSession {
+                name: Some("rapid-alpha".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected alpha create response: {other:?}"),
+        };
+        let beta = match send_request(
+            &mut leader,
+            582,
+            Request::NewSession {
+                name: Some("rapid-beta".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected beta create response: {other:?}"),
+        };
+
+        let attached_alpha = send_request(
+            &mut leader,
+            583,
+            Request::Attach {
+                selector: SessionSelector::ById(alpha),
+            },
+        )
+        .await;
+        assert!(matches!(
+            attached_alpha,
+            Response::Ok(ResponsePayload::Attached { .. })
+        ));
+
+        let leader_client_id = match send_request(&mut leader, 584, Request::ListClients).await {
+            Response::Ok(ResponsePayload::ClientList { clients }) => clients
+                .into_iter()
+                .find(|client| client.selected_session_id == Some(alpha))
+                .map(|client| client.id)
+                .expect("leader client should be listed"),
+            other => panic!("unexpected client list response: {other:?}"),
+        };
+
+        let follow_started = send_request(
+            &mut follower,
+            585,
+            Request::FollowClient {
+                target_client_id: leader_client_id,
+                global: true,
+            },
+        )
+        .await;
+        assert!(matches!(
+            follow_started,
+            Response::Ok(ResponsePayload::FollowStarted { global: true, .. })
+        ));
+
+        let attached_beta = send_request(
+            &mut leader,
+            586,
+            Request::Attach {
+                selector: SessionSelector::ById(beta),
+            },
+        )
+        .await;
+        assert!(matches!(
+            attached_beta,
+            Response::Ok(ResponsePayload::Attached { .. })
+        ));
+
+        let attached_alpha_again = send_request(
+            &mut leader,
+            587,
+            Request::Attach {
+                selector: SessionSelector::ById(alpha),
+            },
+        )
+        .await;
+        assert!(matches!(
+            attached_alpha_again,
+            Response::Ok(ResponsePayload::Attached { .. })
+        ));
+
+        let events = poll_events_collect(&mut follower, 588, 32, 10).await;
+        let target_change_sessions = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::FollowTargetChanged {
+                    leader_client_id: event_leader,
+                    session_id,
+                    ..
+                } if *event_leader == leader_client_id => Some(*session_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert!(target_change_sessions.contains(&alpha));
+        assert!(target_change_sessions.contains(&beta));
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn detach_uses_active_stream_session_when_follow_updates_selected_session() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut leader = connect_and_handshake(&endpoint).await;
+        let mut follower = connect_and_handshake(&endpoint).await;
+
+        let alpha = match send_request(
+            &mut leader,
+            620,
+            Request::NewSession {
+                name: Some("detach-alpha".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected alpha create response: {other:?}"),
+        };
+        let beta = match send_request(
+            &mut leader,
+            621,
+            Request::NewSession {
+                name: Some("detach-beta".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected beta create response: {other:?}"),
+        };
+
+        let _ = send_request(
+            &mut leader,
+            622,
+            Request::Attach {
+                selector: SessionSelector::ById(alpha),
+            },
+        )
+        .await;
+        let leader_client_id = match send_request(&mut leader, 623, Request::ListClients).await {
+            Response::Ok(ResponsePayload::ClientList { clients }) => clients
+                .into_iter()
+                .find(|client| client.selected_session_id == Some(alpha))
+                .map(|client| client.id)
+                .expect("leader client should be listed"),
+            other => panic!("unexpected client list response: {other:?}"),
+        };
+
+        let _ = send_request(
+            &mut follower,
+            624,
+            Request::FollowClient {
+                target_client_id: leader_client_id,
+                global: true,
+            },
+        )
+        .await;
+
+        let follower_grant_alpha = match send_request(
+            &mut follower,
+            625,
+            Request::Attach {
+                selector: SessionSelector::ById(alpha),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::Attached { grant }) => grant,
+            other => panic!("unexpected follower attach response: {other:?}"),
+        };
+        let follower_open_alpha = send_request(
+            &mut follower,
+            626,
+            Request::AttachOpen {
+                session_id: alpha,
+                attach_token: follower_grant_alpha.attach_token,
+            },
+        )
+        .await;
+        assert!(matches!(
+            follower_open_alpha,
+            Response::Ok(ResponsePayload::AttachReady {
+                session_id,
+                ..
+            }) if session_id == alpha
+        ));
+
+        let _ = send_request(
+            &mut leader,
+            627,
+            Request::Attach {
+                selector: SessionSelector::ById(beta),
+            },
+        )
+        .await;
+
+        let detached = send_request(&mut follower, 628, Request::Detach).await;
+        assert_eq!(detached, Response::Ok(ResponsePayload::Detached));
+
+        let output_after_detach = send_request(
+            &mut follower,
+            629,
+            Request::AttachOutput {
+                session_id: alpha,
+                max_bytes: 1024,
+            },
+        )
+        .await;
+        assert!(matches!(
+            output_after_detach,
+            Response::Err(ErrorResponse {
+                code: ErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn server_stop_while_attached_cleans_runtime_state() {
         let (server, endpoint, socket_path, server_task) = start_server().await;
         let mut client = connect_and_handshake(&endpoint).await;

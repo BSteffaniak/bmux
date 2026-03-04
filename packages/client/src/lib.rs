@@ -733,6 +733,55 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn open_attach_stream_info_reports_read_only_for_secondary_attacher() {
+        let (server_task, socket_path, endpoint) = start_server().await;
+        let mut owner = BmuxClient::connect(&endpoint, Duration::from_secs(2), "owner-test")
+            .await
+            .expect("owner should connect");
+        let mut observer = BmuxClient::connect(&endpoint, Duration::from_secs(2), "observer-test")
+            .await
+            .expect("observer should connect");
+
+        let session_id = owner
+            .new_session(Some("attach-role".to_string()))
+            .await
+            .expect("session should be created");
+
+        let owner_grant = owner
+            .attach_grant(SessionSelector::ById(session_id))
+            .await
+            .expect("owner grant should succeed");
+        let owner_info = owner
+            .open_attach_stream_info(&owner_grant)
+            .await
+            .expect("owner open should succeed");
+        assert_eq!(owner_info.session_id, session_id);
+        assert!(owner_info.can_write);
+
+        let observer_grant = observer
+            .attach_grant(SessionSelector::ById(session_id))
+            .await
+            .expect("observer grant should succeed");
+        let observer_info = observer
+            .open_attach_stream_info(&observer_grant)
+            .await
+            .expect("observer open should succeed");
+        assert_eq!(observer_info.session_id, session_id);
+        assert!(!observer_info.can_write);
+
+        owner.stop_server().await.expect("stop should succeed");
+        server_task
+            .await
+            .expect("server task should join")
+            .expect("server should stop cleanly");
+
+        if socket_path.exists() {
+            std::fs::remove_file(&socket_path).expect("socket cleanup should succeed");
+        }
+    }
+
+    #[cfg(unix)]
     async fn start_server() -> (
         tokio::task::JoinHandle<anyhow::Result<()>>,
         PathBuf,
