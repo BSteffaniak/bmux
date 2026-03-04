@@ -195,7 +195,7 @@ emit_quit_when_marker_or_timeout() {
     sleep 0.1
   done
 
-  printf '\004'
+  printf '\001d'
 }
 
 event_index() {

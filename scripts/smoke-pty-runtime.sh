@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 KEEP_SMOKE_STATE="${KEEP_SMOKE_STATE:-0}"
+SMOKE_TIMEOUT_SECS="${SMOKE_TIMEOUT_SECS:-25}"
 declare -a SMOKE_SANDBOXES=()
 
 create_sandbox() {
@@ -27,6 +28,28 @@ cleanup_sandboxes() {
 
 trap cleanup_sandboxes EXIT
 
+run_with_timeout() {
+  local timeout_secs="$1"
+  shift
+
+  "$@" &
+  local cmd_pid=$!
+
+  (
+    sleep "$timeout_secs"
+    kill -TERM "$cmd_pid" >/dev/null 2>&1 || true
+    sleep 1
+    kill -KILL "$cmd_pid" >/dev/null 2>&1 || true
+  ) &
+  local watchdog_pid=$!
+
+  wait "$cmd_pid"
+  local status=$?
+  kill "$watchdog_pid" >/dev/null 2>&1 || true
+  wait "$watchdog_pid" 2>/dev/null || true
+  return "$status"
+}
+
 if ! command -v script >/dev/null 2>&1; then
   echo "skip: 'script' command not found"
   exit 0
@@ -45,14 +68,13 @@ run_case() {
 
   sandbox="$(create_sandbox)"
   set +e
-  XDG_CONFIG_HOME="$sandbox/config" \
-    XDG_DATA_HOME="$sandbox/data" \
-    XDG_RUNTIME_DIR="$sandbox/runtime" \
-    TMPDIR="$sandbox/tmp" \
-    SHELL="$shell_bin" \
-    script -q /dev/null cargo run -q -p bmux_cli -- \
-    <<< $'\004' \
-    >/dev/null 2>&1
+  run_with_timeout "$SMOKE_TIMEOUT_SECS" bash -lc "
+    set -euo pipefail
+    (
+      sleep 1
+      printf '\\001d'
+    ) | XDG_CONFIG_HOME=\"$sandbox/config\" XDG_DATA_HOME=\"$sandbox/data\" XDG_RUNTIME_DIR=\"$sandbox/runtime\" TMPDIR=\"$sandbox/tmp\" SHELL=\"$shell_bin\" script -q /dev/null cargo run -q -p bmux_cli -- >/dev/null 2>&1
+  "
   local status=$?
   set -e
 
@@ -75,14 +97,15 @@ run_keybind_case() {
 
   sandbox="$(create_sandbox)"
   set +e
-  XDG_CONFIG_HOME="$sandbox/config" \
-    XDG_DATA_HOME="$sandbox/data" \
-    XDG_RUNTIME_DIR="$sandbox/runtime" \
-    TMPDIR="$sandbox/tmp" \
-    SHELL="$shell_bin" \
-    script -q /dev/null cargo run -q -p bmux_cli -- \
-    <<< $'\001t\004' \
-    >/dev/null 2>&1
+  run_with_timeout "$SMOKE_TIMEOUT_SECS" bash -lc "
+    set -euo pipefail
+    (
+      sleep 1
+      printf '\\001t'
+      sleep 0.2
+      printf '\\001d'
+    ) | XDG_CONFIG_HOME=\"$sandbox/config\" XDG_DATA_HOME=\"$sandbox/data\" XDG_RUNTIME_DIR=\"$sandbox/runtime\" TMPDIR=\"$sandbox/tmp\" SHELL=\"$shell_bin\" script -q /dev/null cargo run -q -p bmux_cli -- >/dev/null 2>&1
+  "
   local status=$?
   set -e
 

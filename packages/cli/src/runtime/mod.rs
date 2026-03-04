@@ -140,8 +140,12 @@ pub(crate) async fn run() -> Result<u8> {
 
 async fn run_default_server_attach() -> Result<u8> {
     ensure_server_running_for_default_attach().await?;
-    let target = resolve_default_attach_target().await?;
-    run_session_attach(Some(&target), None, false).await
+    let mut client = BmuxClient::connect_default("bmux-cli-default-attach")
+        .await
+        .map_err(map_cli_client_error)?;
+    let target = resolve_default_attach_target(&mut client).await?;
+    let target = target.to_string();
+    run_session_attach_with_client(client, Some(target.as_str()), None, false).await
 }
 
 async fn ensure_server_running_for_default_attach() -> Result<()> {
@@ -156,19 +160,16 @@ async fn ensure_server_running_for_default_attach() -> Result<()> {
     Ok(())
 }
 
-async fn resolve_default_attach_target() -> Result<String> {
-    let mut client = BmuxClient::connect_default("bmux-cli-default-attach")
-        .await
-        .map_err(map_cli_client_error)?;
+async fn resolve_default_attach_target(client: &mut BmuxClient) -> Result<Uuid> {
     let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
 
     if sessions.is_empty() {
         let name = next_default_session_name(&sessions);
-        let _ = client
+        let id = client
             .new_session(Some(name.clone()))
             .await
             .map_err(map_cli_client_error)?;
-        return Ok(name);
+        return Ok(id);
     }
 
     let client_id = client.whoami().await.map_err(map_cli_client_error)?;
@@ -190,11 +191,11 @@ async fn resolve_default_attach_target() -> Result<String> {
 
     if writable_sessions.is_empty() {
         let name = next_default_session_name(&sessions);
-        let _ = client
+        let id = client
             .new_session(Some(name.clone()))
             .await
             .map_err(map_cli_client_error)?;
-        return Ok(name);
+        return Ok(id);
     }
 
     let mut sorted = writable_sessions;
@@ -208,7 +209,7 @@ async fn resolve_default_attach_target() -> Result<String> {
         .into_iter()
         .next()
         .expect("non-empty sessions should have first entry");
-    Ok(session.name.unwrap_or_else(|| session.id.to_string()))
+    Ok(session.id)
 }
 
 fn next_default_session_name(sessions: &[SessionSummary]) -> String {
@@ -755,6 +756,18 @@ async fn run_session_attach(
     follow: Option<&str>,
     global: bool,
 ) -> Result<u8> {
+    let client = BmuxClient::connect_default("bmux-cli-attach")
+        .await
+        .map_err(map_attach_client_error)?;
+    run_session_attach_with_client(client, target, follow, global).await
+}
+
+async fn run_session_attach_with_client(
+    mut client: BmuxClient,
+    target: Option<&str>,
+    follow: Option<&str>,
+    global: bool,
+) -> Result<u8> {
     if target.is_none() && follow.is_none() {
         anyhow::bail!("attach requires a session target or --follow <client-uuid>");
     }
@@ -777,10 +790,6 @@ async fn run_session_attach(
         }
     };
     let mut attach_input_processor = InputProcessor::new(attach_keymap_from_config(&attach_config));
-
-    let mut client = BmuxClient::connect_default("bmux-cli-attach")
-        .await
-        .map_err(map_attach_client_error)?;
 
     if let Some(leader_client_id) = follow_target_id {
         client
@@ -838,7 +847,7 @@ async fn run_session_attach(
     if !can_write {
         println!("read-only attach: input disabled");
     }
-    println!("press Ctrl-D to detach");
+    println!("press Ctrl-A d to detach");
 
     let _raw_mode = RawModeGuard::enable().context("failed to enable raw mode for attach")?;
 
@@ -1172,7 +1181,7 @@ async fn redraw_attach_status_line(
         }
     });
     let hint = match ui_mode {
-        AttachUiMode::Normal => "Ctrl-T window mode | Ctrl-D detach",
+        AttachUiMode::Normal => "Ctrl-T window mode | Ctrl-A d detach",
         AttachUiMode::Window => "h/l prev/next | 1-9 goto | n new | x close | Esc/Enter exit",
     };
 
@@ -1313,7 +1322,8 @@ fn inject_attach_global_defaults(global: &mut std::collections::BTreeMap<String,
 fn is_attach_keymap_action(action: &str) -> bool {
     matches!(
         action.trim().to_ascii_lowercase().as_str(),
-        "new_window"
+        "detach"
+            | "new_window"
             | "new_session"
             | "enter_window_mode"
             | "exit_mode"
@@ -1422,14 +1432,11 @@ fn attach_key_event_actions(
         return Ok(vec![AttachEventAction::Ignore]);
     }
 
-    if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('d')) {
-        return Ok(vec![AttachEventAction::Detach]);
-    }
-
     let actions = attach_input_processor.process_terminal_event(Event::Key(key.clone()));
     Ok(actions
         .into_iter()
         .map(|action| match action {
+            RuntimeAction::Detach => AttachEventAction::Detach,
             RuntimeAction::ForwardToPane(bytes) => {
                 if ui_mode == AttachUiMode::Window {
                     AttachEventAction::Ignore
@@ -3651,7 +3658,35 @@ mod tests {
     }
 
     #[test]
-    fn attach_key_event_action_detaches_on_ctrl_d() {
+    fn attach_key_event_action_detaches_on_prefix_d() {
+        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
+        let _ = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+
+        let actions = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('d'),
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], super::AttachEventAction::Detach));
+    }
+
+    #[test]
+    fn attach_key_event_action_ctrl_d_forwards_to_pane() {
         let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
         let actions = super::attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
@@ -3664,7 +3699,9 @@ mod tests {
         )
         .expect("attach key action should parse");
         assert_eq!(actions.len(), 1);
-        assert!(matches!(actions[0], super::AttachEventAction::Detach));
+        assert!(
+            matches!(actions[0], super::AttachEventAction::Send(ref bytes) if bytes == &[0x04])
+        );
     }
 
     #[test]
