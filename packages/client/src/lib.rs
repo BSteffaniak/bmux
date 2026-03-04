@@ -9,7 +9,8 @@ use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcStream};
 use bmux_ipc::{
     AttachGrant, Envelope, EnvelopeKind, ErrorCode, IpcEndpoint, ProtocolVersion, Request,
-    Response, ResponsePayload, SessionSelector, SessionSummary, decode, encode,
+    Response, ResponsePayload, SessionSelector, SessionSummary, WindowSelector, WindowSummary,
+    decode, encode,
 };
 pub use bmux_ipc::Event as ServerEvent;
 use std::time::Duration;
@@ -174,6 +175,92 @@ impl BmuxClient {
         match self.request(Request::KillSession { selector }).await? {
             ResponsePayload::SessionKilled { id } => Ok(id),
             _ => Err(ClientError::UnexpectedResponse("expected session killed")),
+        }
+    }
+
+    /// Create a new window in a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn new_window(&mut self, session: Option<SessionSelector>, name: Option<String>) -> Result<Uuid> {
+        match self.request(Request::NewWindow { session, name }).await? {
+            ResponsePayload::WindowCreated { id, .. } => Ok(id),
+            _ => Err(ClientError::UnexpectedResponse("expected window created")),
+        }
+    }
+
+    /// List windows in a session. If `session` is `None`, uses attached session context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn list_windows(&mut self, session: Option<SessionSelector>) -> Result<Vec<WindowSummary>> {
+        match self.request(Request::ListWindows { session }).await? {
+            ResponsePayload::WindowList { windows } => Ok(windows),
+            _ => Err(ClientError::UnexpectedResponse("expected window list")),
+        }
+    }
+
+    /// Kill a window selected by id/name/active.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn kill_window(
+        &mut self,
+        session: Option<SessionSelector>,
+        target: WindowSelector,
+    ) -> Result<Uuid> {
+        match self.request(Request::KillWindow { session, target }).await? {
+            ResponsePayload::WindowKilled { id, .. } => Ok(id),
+            _ => Err(ClientError::UnexpectedResponse("expected window killed")),
+        }
+    }
+
+    /// Switch active window selected by id/name/active.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn switch_window(
+        &mut self,
+        session: Option<SessionSelector>,
+        target: WindowSelector,
+    ) -> Result<Uuid> {
+        match self.request(Request::SwitchWindow { session, target }).await? {
+            ResponsePayload::WindowSwitched { id, .. } => Ok(id),
+            _ => Err(ClientError::UnexpectedResponse("expected window switched")),
+        }
+    }
+
+    /// Follow another client's active session focus.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn follow_client(&mut self, target_client_id: Uuid, global: bool) -> Result<()> {
+        match self
+            .request(Request::FollowClient {
+                target_client_id,
+                global,
+            })
+            .await?
+        {
+            ResponsePayload::FollowStarted { .. } => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse("expected follow started")),
+        }
+    }
+
+    /// Stop following any current follow target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn unfollow(&mut self) -> Result<()> {
+        match self.request(Request::Unfollow).await? {
+            ResponsePayload::FollowStopped { .. } => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse("expected follow stopped")),
         }
     }
 
@@ -356,7 +443,7 @@ fn endpoint_from_paths(paths: &ConfigPaths) -> IpcEndpoint {
 #[cfg(test)]
 mod tests {
     use super::{BmuxClient, ServerEvent};
-    use bmux_ipc::{IpcEndpoint, SessionSelector};
+    use bmux_ipc::{IpcEndpoint, SessionSelector, WindowSelector};
     use bmux_server::BmuxServer;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -391,6 +478,61 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, session_id);
         assert_eq!(sessions[0].name.as_deref(), Some("dev"));
+
+        let initial_windows = client
+            .list_windows(Some(SessionSelector::ById(session_id)))
+            .await
+            .expect("list windows should succeed");
+        assert_eq!(initial_windows.len(), 1);
+        let primary_window = initial_windows
+            .iter()
+            .find(|window| window.active)
+            .expect("expected active window")
+            .id;
+
+        let secondary_window = client
+            .new_window(
+                Some(SessionSelector::ById(session_id)),
+                Some("secondary".to_string()),
+            )
+            .await
+            .expect("new window should succeed");
+
+        let switched = client
+            .switch_window(
+                Some(SessionSelector::ById(session_id)),
+                WindowSelector::ById(secondary_window),
+            )
+            .await
+            .expect("switch window should succeed");
+        assert_eq!(switched, secondary_window);
+
+        let windows_after_switch = client
+            .list_windows(Some(SessionSelector::ById(session_id)))
+            .await
+            .expect("list windows after switch should succeed");
+        assert_eq!(windows_after_switch.len(), 2);
+        assert!(windows_after_switch
+            .iter()
+            .any(|window| window.id == secondary_window && window.active));
+
+        let removed = client
+            .kill_window(
+                Some(SessionSelector::ById(session_id)),
+                WindowSelector::ById(secondary_window),
+            )
+            .await
+            .expect("kill window should succeed");
+        assert_eq!(removed, secondary_window);
+
+        let windows_after_kill = client
+            .list_windows(Some(SessionSelector::ById(session_id)))
+            .await
+            .expect("list windows after kill should succeed");
+        assert_eq!(windows_after_kill.len(), 1);
+        assert!(windows_after_kill
+            .iter()
+            .any(|window| window.id == primary_window && window.active));
 
         let grant = client
             .attach_grant(SessionSelector::ByName("dev".to_string()))

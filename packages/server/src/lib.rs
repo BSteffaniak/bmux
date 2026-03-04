@@ -2213,6 +2213,362 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn attach_io_routes_through_active_window() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut client = connect_and_handshake(&endpoint).await;
+
+        let created = send_request(
+            &mut client,
+            300,
+            Request::NewSession {
+                name: Some("window-routing".to_string()),
+            },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected session create response: {other:?}"),
+        };
+
+        let listed = send_request(
+            &mut client,
+            301,
+            Request::ListWindows {
+                session: Some(SessionSelector::ById(session_id)),
+            },
+        )
+        .await;
+        let primary_window = match listed {
+            Response::Ok(ResponsePayload::WindowList { windows }) => windows
+                .iter()
+                .find(|window| window.active)
+                .map(|window| window.id)
+                .expect("expected active initial window"),
+            other => panic!("unexpected window list response: {other:?}"),
+        };
+
+        let secondary_window = match send_request(
+            &mut client,
+            302,
+            Request::NewWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                name: Some("secondary".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::WindowCreated { id, .. }) => id,
+            other => panic!("unexpected new window response: {other:?}"),
+        };
+
+        let grant = match send_request(
+            &mut client,
+            303,
+            Request::Attach {
+                selector: SessionSelector::ById(session_id),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::Attached { grant }) => grant,
+            other => panic!("unexpected attach response: {other:?}"),
+        };
+        let opened = send_request(
+            &mut client,
+            304,
+            Request::AttachOpen {
+                session_id,
+                attach_token: grant.attach_token,
+            },
+        )
+        .await;
+        assert_eq!(opened, Response::Ok(ResponsePayload::AttachReady { session_id }));
+
+        let switched_primary = send_request(
+            &mut client,
+            305,
+            Request::SwitchWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                target: WindowSelector::ById(primary_window),
+            },
+        )
+        .await;
+        assert_eq!(
+            switched_primary,
+            Response::Ok(ResponsePayload::WindowSwitched {
+                id: primary_window,
+                session_id,
+            })
+        );
+
+        let export_primary = send_request(
+            &mut client,
+            306,
+            Request::AttachInput {
+                session_id,
+                data: b"export BMUX_WINDOW_ROUTE=one\n".to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            export_primary,
+            Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
+        ));
+        let _ = collect_attach_output_until(&mut client, session_id, "one", 5).await;
+
+        let switched_secondary = send_request(
+            &mut client,
+            307,
+            Request::SwitchWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                target: WindowSelector::ById(secondary_window),
+            },
+        )
+        .await;
+        assert_eq!(
+            switched_secondary,
+            Response::Ok(ResponsePayload::WindowSwitched {
+                id: secondary_window,
+                session_id,
+            })
+        );
+
+        let print_secondary = send_request(
+            &mut client,
+            308,
+            Request::AttachInput {
+                session_id,
+                data: b"printf 'W2=[%s]\\n' \"$BMUX_WINDOW_ROUTE\"\n".to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            print_secondary,
+            Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
+        ));
+        let second_output = collect_attach_output_until(&mut client, session_id, "W2=[]", 20).await;
+        assert!(second_output.contains("W2=[]"));
+
+        let switched_back = send_request(
+            &mut client,
+            309,
+            Request::SwitchWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                target: WindowSelector::ById(primary_window),
+            },
+        )
+        .await;
+        assert_eq!(
+            switched_back,
+            Response::Ok(ResponsePayload::WindowSwitched {
+                id: primary_window,
+                session_id,
+            })
+        );
+
+        let print_primary = send_request(
+            &mut client,
+            310,
+            Request::AttachInput {
+                session_id,
+                data: b"printf 'W1=[%s]\\n' \"$BMUX_WINDOW_ROUTE\"\n".to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            print_primary,
+            Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
+        ));
+        let first_output = collect_attach_output_until(&mut client, session_id, "W1=[one]", 20).await;
+        assert!(first_output.contains("W1=[one]"));
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn reattach_uses_current_active_window() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut client = connect_and_handshake(&endpoint).await;
+
+        let created = send_request(
+            &mut client,
+            320,
+            Request::NewSession {
+                name: Some("reattach-window".to_string()),
+            },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected session create response: {other:?}"),
+        };
+
+        let listed = send_request(
+            &mut client,
+            321,
+            Request::ListWindows {
+                session: Some(SessionSelector::ById(session_id)),
+            },
+        )
+        .await;
+        let primary_window = match listed {
+            Response::Ok(ResponsePayload::WindowList { windows }) => windows
+                .iter()
+                .find(|window| window.active)
+                .map(|window| window.id)
+                .expect("expected active initial window"),
+            other => panic!("unexpected window list response: {other:?}"),
+        };
+
+        let secondary_window = match send_request(
+            &mut client,
+            322,
+            Request::NewWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                name: Some("secondary".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::WindowCreated { id, .. }) => id,
+            other => panic!("unexpected new window response: {other:?}"),
+        };
+
+        let grant = match send_request(
+            &mut client,
+            323,
+            Request::Attach {
+                selector: SessionSelector::ById(session_id),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::Attached { grant }) => grant,
+            other => panic!("unexpected attach response: {other:?}"),
+        };
+        let opened = send_request(
+            &mut client,
+            324,
+            Request::AttachOpen {
+                session_id,
+                attach_token: grant.attach_token,
+            },
+        )
+        .await;
+        assert_eq!(opened, Response::Ok(ResponsePayload::AttachReady { session_id }));
+
+        let switched_primary = send_request(
+            &mut client,
+            325,
+            Request::SwitchWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                target: WindowSelector::ById(primary_window),
+            },
+        )
+        .await;
+        assert_eq!(
+            switched_primary,
+            Response::Ok(ResponsePayload::WindowSwitched {
+                id: primary_window,
+                session_id,
+            })
+        );
+
+        let export_primary = send_request(
+            &mut client,
+            326,
+            Request::AttachInput {
+                session_id,
+                data: b"export BMUX_REATTACH=one\n".to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            export_primary,
+            Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
+        ));
+        let _ = collect_attach_output_until(&mut client, session_id, "one", 5).await;
+
+        let switched_secondary = send_request(
+            &mut client,
+            327,
+            Request::SwitchWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                target: WindowSelector::ById(secondary_window),
+            },
+        )
+        .await;
+        assert_eq!(
+            switched_secondary,
+            Response::Ok(ResponsePayload::WindowSwitched {
+                id: secondary_window,
+                session_id,
+            })
+        );
+
+        let export_secondary = send_request(
+            &mut client,
+            328,
+            Request::AttachInput {
+                session_id,
+                data: b"export BMUX_REATTACH=two\n".to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            export_secondary,
+            Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
+        ));
+        let _ = collect_attach_output_until(&mut client, session_id, "two", 5).await;
+
+        let detached = send_request(&mut client, 329, Request::Detach).await;
+        assert_eq!(detached, Response::Ok(ResponsePayload::Detached));
+
+        let regrant = match send_request(
+            &mut client,
+            330,
+            Request::Attach {
+                selector: SessionSelector::ById(session_id),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::Attached { grant }) => grant,
+            other => panic!("unexpected reattach grant response: {other:?}"),
+        };
+        let reopened = send_request(
+            &mut client,
+            331,
+            Request::AttachOpen {
+                session_id,
+                attach_token: regrant.attach_token,
+            },
+        )
+        .await;
+        assert_eq!(reopened, Response::Ok(ResponsePayload::AttachReady { session_id }));
+
+        let print_output = send_request(
+            &mut client,
+            332,
+            Request::AttachInput {
+                session_id,
+                data: b"printf 'RA=[%s]\\n' \"$BMUX_REATTACH\"\n".to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            print_output,
+            Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
+        ));
+        let output = collect_attach_output_until(&mut client, session_id, "RA=[two]", 20).await;
+        assert!(output.contains("RA=[two]"));
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn event_subscription_reports_lifecycle_order() {
         let (server, endpoint, socket_path, server_task) = start_server().await;
         let mut client = connect_and_handshake(&endpoint).await;
@@ -2562,6 +2918,40 @@ mod tests {
             .expect("request reply should be received");
         assert_eq!(reply.request_id, request_id);
         decode(&reply.payload).expect("response decode should succeed")
+    }
+
+    #[cfg(unix)]
+    async fn collect_attach_output_until(
+        client: &mut LocalIpcStream,
+        session_id: uuid::Uuid,
+        needle: &str,
+        attempts: usize,
+    ) -> String {
+        let mut collected = String::new();
+        let mut idx = 0usize;
+        let max_attempts = attempts.max(1).saturating_mul(10);
+        while idx < max_attempts {
+            let response = send_request(
+                client,
+                4000 + idx as u64,
+                Request::AttachOutput {
+                    session_id,
+                    max_bytes: 8192,
+                },
+            )
+            .await;
+            if let Response::Ok(ResponsePayload::AttachOutput { data }) = response
+                && !data.is_empty()
+            {
+                collected.push_str(&String::from_utf8_lossy(&data));
+                if collected.contains(needle) {
+                    break;
+                }
+            }
+            idx += 1;
+            sleep(Duration::from_millis(25)).await;
+        }
+        collected
     }
 
     #[cfg(unix)]
