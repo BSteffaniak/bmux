@@ -1046,7 +1046,8 @@ async fn handle_connection(
     mut stream: LocalIpcStream,
 ) -> Result<()> {
     let client_id = ClientId::new();
-    let mut attached_session: Option<SessionId> = None;
+    let mut selected_session: Option<SessionId> = None;
+    let mut attached_stream_session: Option<SessionId> = None;
 
     let first_envelope = tokio::time::timeout(state.handshake_timeout, stream.recv_envelope())
         .await
@@ -1128,14 +1129,20 @@ async fn handle_connection(
             &state,
             &shutdown_tx,
             client_id,
-            &mut attached_session,
+            &mut selected_session,
+            &mut attached_stream_session,
             request,
         )
         .await?;
         send_response(&mut stream, envelope.request_id, response).await?;
     }
 
-    detach_client_if_attached(&state, client_id, &mut attached_session)?;
+    detach_client_state_on_disconnect(
+        &state,
+        client_id,
+        &mut selected_session,
+        &mut attached_stream_session,
+    )?;
     disconnect_follow_state(&state, client_id)?;
     unsubscribe_events(&state, client_id)?;
 
@@ -1160,18 +1167,48 @@ fn unsubscribe_events(state: &Arc<ServerState>, client_id: ClientId) -> Result<(
     Ok(())
 }
 
-fn sync_attached_session_from_follow_state(
+fn sync_selected_session_from_follow_state(
     state: &Arc<ServerState>,
     client_id: ClientId,
-    attached_session: &mut Option<SessionId>,
+    selected_session: &mut Option<SessionId>,
 ) -> Result<()> {
     let follow_state = state
         .follow_state
         .lock()
         .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
-    if let Some(selected_session) = follow_state.selected_session(client_id) {
-        *attached_session = selected_session;
+    if let Some(follow_selected_session) = follow_state.selected_session(client_id) {
+        *selected_session = follow_selected_session;
     }
+    Ok(())
+}
+
+fn reconcile_selected_session_membership(
+    state: &Arc<ServerState>,
+    client_id: ClientId,
+    previous: Option<SessionId>,
+    next: Option<SessionId>,
+) -> Result<()> {
+    if previous == next {
+        return Ok(());
+    }
+
+    let mut manager = state
+        .session_manager
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+
+    if let Some(previous_session) = previous
+        && let Some(session) = manager.get_session_mut(&previous_session)
+    {
+        session.remove_client(&client_id);
+    }
+
+    if let Some(next_session) = next
+        && let Some(session) = manager.get_session_mut(&next_session)
+    {
+        session.add_client(client_id);
+    }
+
     Ok(())
 }
 
@@ -1250,10 +1287,18 @@ async fn handle_request(
     state: &Arc<ServerState>,
     shutdown_tx: &watch::Sender<bool>,
     client_id: ClientId,
-    attached_session: &mut Option<SessionId>,
+    selected_session: &mut Option<SessionId>,
+    attached_stream_session: &mut Option<SessionId>,
     request: Request,
 ) -> Result<Response> {
-    sync_attached_session_from_follow_state(state, client_id, attached_session)?;
+    let previous_selected_session = *selected_session;
+    sync_selected_session_from_follow_state(state, client_id, selected_session)?;
+    reconcile_selected_session_membership(
+        state,
+        client_id,
+        previous_selected_session,
+        *selected_session,
+    )?;
 
     let response = match request {
         Request::Hello { .. } => Response::Err(ErrorResponse {
@@ -1337,7 +1382,7 @@ async fn handle_request(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
             let session_id =
-                match resolve_window_request_session_id(&manager, &session, attached_session) {
+                match resolve_window_request_session_id(&manager, &session, selected_session) {
                     Ok(session_id) => session_id,
                     Err(response) => return Ok(Response::Err(response)),
                 };
@@ -1378,7 +1423,7 @@ async fn handle_request(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
             let session_id =
-                match resolve_window_request_session_id(&manager, &session, attached_session) {
+                match resolve_window_request_session_id(&manager, &session, selected_session) {
                     Ok(session_id) => session_id,
                     Err(response) => return Ok(Response::Err(response)),
                 };
@@ -1416,7 +1461,7 @@ async fn handle_request(
                     .session_manager
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                match resolve_window_request_session_id(&manager, &session, attached_session) {
+                match resolve_window_request_session_id(&manager, &session, selected_session) {
                     Ok(session_id) => session_id,
                     Err(response) => return Ok(Response::Err(response)),
                 }
@@ -1480,9 +1525,12 @@ async fn handle_request(
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
                 let _ = manager.remove_session(&removed_window_session_id);
-                if *attached_session == Some(removed_window_session_id) {
-                    *attached_session = None;
+                if *selected_session == Some(removed_window_session_id) {
+                    *selected_session = None;
                     persist_selected_session(state, client_id, None)?;
+                }
+                if *attached_stream_session == Some(removed_window_session_id) {
+                    *attached_stream_session = None;
                 }
 
                 let mut attach_tokens = state
@@ -1513,7 +1561,7 @@ async fn handle_request(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
             let session_id =
-                match resolve_window_request_session_id(&manager, &session, attached_session) {
+                match resolve_window_request_session_id(&manager, &session, selected_session) {
                     Ok(session_id) => session_id,
                     Err(response) => return Ok(Response::Err(response)),
                 };
@@ -1603,9 +1651,12 @@ async fn handle_request(
                         message: format!("failed removing session {}", session_id.0),
                     }));
                 }
-                if *attached_session == Some(session_id) {
-                    *attached_session = None;
+                if *selected_session == Some(session_id) {
+                    *selected_session = None;
                     persist_selected_session(state, client_id, None)?;
+                }
+                if *attached_stream_session == Some(session_id) {
+                    *attached_stream_session = None;
                 }
                 drop(manager);
 
@@ -1665,7 +1716,14 @@ async fn handle_request(
             };
 
             if global {
-                *attached_session = initial_target_session;
+                let previous_selected = *selected_session;
+                *selected_session = initial_target_session;
+                reconcile_selected_session_membership(
+                    state,
+                    client_id,
+                    previous_selected,
+                    *selected_session,
+                )?;
             }
 
             emit_event(
@@ -1728,7 +1786,7 @@ async fn handle_request(
                 }));
             };
 
-            if let Some(previous_session_id) = attached_session.take()
+            if let Some(previous_session_id) = selected_session.take()
                 && previous_session_id != next_session_id
                 && let Some(previous) = manager.get_session_mut(&previous_session_id)
             {
@@ -1738,8 +1796,8 @@ async fn handle_request(
             match manager.get_session_mut(&next_session_id) {
                 Some(session) => {
                     session.add_client(client_id);
-                    *attached_session = Some(next_session_id);
-                    persist_selected_session(state, client_id, *attached_session)?;
+                    *selected_session = Some(next_session_id);
+                    persist_selected_session(state, client_id, *selected_session)?;
                     drop(manager);
 
                     let mut attach_tokens = state
@@ -1784,11 +1842,25 @@ async fn handle_request(
                         .session_runtimes
                         .lock()
                         .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+                    if let Some(previous_stream_session) = *attached_stream_session
+                        && previous_stream_session != session_id
+                    {
+                        runtime_manager.end_attach(previous_stream_session, client_id);
+                        emit_event(
+                            state,
+                            Event::ClientDetached {
+                                id: previous_stream_session.0,
+                            },
+                        )?;
+                    }
                     match runtime_manager.begin_attach(session_id, client_id) {
-                        Ok(can_write) => Response::Ok(ResponsePayload::AttachReady {
-                            session_id: session_id.0,
-                            can_write,
-                        }),
+                        Ok(can_write) => {
+                            *attached_stream_session = Some(session_id);
+                            Response::Ok(ResponsePayload::AttachReady {
+                                session_id: session_id.0,
+                                can_write,
+                            })
+                        }
                         Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
                             code: ErrorCode::NotFound,
                             message: format!("session runtime not found: {}", session_id.0),
@@ -1873,24 +1945,24 @@ async fn handle_request(
                 .session_manager
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            let current_session_id = attached_session.take();
-            if let Some(current_session_id) = current_session_id
-                && let Some(session) = manager.get_session_mut(&current_session_id)
+            let previous_selected_session = selected_session.take();
+            if let Some(current_selected_session) = previous_selected_session
+                && let Some(session) = manager.get_session_mut(&current_selected_session)
             {
                 session.remove_client(&client_id);
             }
             drop(manager);
 
-            if let Some(current_session_id) = current_session_id {
+            if let Some(current_stream_session) = attached_stream_session.take() {
                 let mut runtime_manager = state
                     .session_runtimes
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                runtime_manager.end_attach(current_session_id, client_id);
+                runtime_manager.end_attach(current_stream_session, client_id);
                 emit_event(
                     state,
                     Event::ClientDetached {
-                        id: current_session_id.0,
+                        id: current_stream_session.0,
                     },
                 )?;
             }
@@ -1951,32 +2023,45 @@ async fn handle_request(
     Ok(response)
 }
 
-fn detach_client_if_attached(
+fn detach_client_state_on_disconnect(
     state: &Arc<ServerState>,
     client_id: ClientId,
-    attached_session: &mut Option<SessionId>,
+    selected_session: &mut Option<SessionId>,
+    attached_stream_session: &mut Option<SessionId>,
 ) -> Result<()> {
-    let Some(session_id) = attached_session.take() else {
+    let previous_selected = selected_session.take();
+    let previous_stream = attached_stream_session.take();
+
+    if previous_selected.is_none() && previous_stream.is_none() {
         return Ok(());
-    };
+    }
 
     let mut manager = state
         .session_manager
         .lock()
         .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-    if let Some(session) = manager.get_session_mut(&session_id) {
+    if let Some(session_id) = previous_selected
+        && let Some(session) = manager.get_session_mut(&session_id)
+    {
         session.remove_client(&client_id);
     }
     drop(manager);
 
-    let mut runtime_manager = state
-        .session_runtimes
-        .lock()
-        .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-    runtime_manager.end_attach(session_id, client_id);
-    drop(runtime_manager);
+    if let Some(stream_session_id) = previous_stream {
+        let mut runtime_manager = state
+            .session_runtimes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+        runtime_manager.end_attach(stream_session_id, client_id);
+        drop(runtime_manager);
 
-    emit_event(state, Event::ClientDetached { id: session_id.0 })?;
+        emit_event(
+            state,
+            Event::ClientDetached {
+                id: stream_session_id.0,
+            },
+        )?;
+    }
 
     Ok(())
 }
@@ -1998,7 +2083,7 @@ fn resolve_session_id(manager: &SessionManager, selector: &SessionSelector) -> O
 fn resolve_window_request_session_id(
     manager: &SessionManager,
     selector: &Option<SessionSelector>,
-    attached_session: &Option<SessionId>,
+    selected_session: &Option<SessionId>,
 ) -> std::result::Result<SessionId, ErrorResponse> {
     if let Some(selector) = selector {
         return resolve_session_id(manager, selector).ok_or_else(|| ErrorResponse {
@@ -2007,8 +2092,8 @@ fn resolve_window_request_session_id(
         });
     }
 
-    if let Some(attached) = attached_session {
-        return Ok(*attached);
+    if let Some(selected) = selected_session {
+        return Ok(*selected);
     }
 
     let sessions = manager.list_sessions();
