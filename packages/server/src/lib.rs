@@ -11,7 +11,8 @@ use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
     AttachGrant, CURRENT_PROTOCOL_VERSION, ClientSummary, Envelope, EnvelopeKind, ErrorCode,
     ErrorResponse, Event, IpcEndpoint, ProtocolVersion, Request, Response, ResponsePayload,
-    SessionSelector, SessionSummary, WindowSelector, WindowSummary, decode, encode,
+    SessionPermissionSummary, SessionRole, SessionSelector, SessionSummary, WindowSelector,
+    WindowSummary, decode, encode,
 };
 use bmux_session::{ClientId, SessionId, SessionManager, WindowId};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -41,6 +42,7 @@ struct ServerState {
     session_runtimes: Mutex<SessionRuntimeManager>,
     attach_tokens: Mutex<AttachTokenManager>,
     follow_state: Mutex<FollowState>,
+    permission_state: Mutex<PermissionState>,
     event_hub: Mutex<EventHub>,
     handshake_timeout: Duration,
 }
@@ -211,6 +213,59 @@ struct FollowState {
     connected_clients: std::collections::BTreeSet<ClientId>,
     selected_sessions: BTreeMap<ClientId, Option<SessionId>>,
     follows: BTreeMap<ClientId, FollowEntry>,
+}
+
+#[derive(Debug, Default)]
+struct PermissionState {
+    roles: BTreeMap<SessionId, BTreeMap<ClientId, SessionRole>>,
+}
+
+impl PermissionState {
+    fn ensure_owner(&mut self, session_id: SessionId, owner_client_id: ClientId) {
+        let session_roles = self.roles.entry(session_id).or_default();
+        session_roles.insert(owner_client_id, SessionRole::Owner);
+    }
+
+    fn role_for(&self, session_id: SessionId, client_id: ClientId) -> SessionRole {
+        self.roles
+            .get(&session_id)
+            .and_then(|session_roles| session_roles.get(&client_id).copied())
+            .unwrap_or(SessionRole::Observer)
+    }
+
+    fn set_role(&mut self, session_id: SessionId, client_id: ClientId, role: SessionRole) {
+        let session_roles = self.roles.entry(session_id).or_default();
+        session_roles.insert(client_id, role);
+    }
+
+    fn clear_to_observer(&mut self, session_id: SessionId, client_id: ClientId) {
+        if let Some(session_roles) = self.roles.get_mut(&session_id) {
+            session_roles.remove(&client_id);
+        }
+    }
+
+    fn remove_session(&mut self, session_id: SessionId) {
+        self.roles.remove(&session_id);
+    }
+
+    fn is_owner(&self, session_id: SessionId, client_id: ClientId) -> bool {
+        self.role_for(session_id, client_id) == SessionRole::Owner
+    }
+
+    fn list_permissions(&self, session_id: SessionId) -> Vec<SessionPermissionSummary> {
+        self.roles
+            .get(&session_id)
+            .map(|session_roles| {
+                session_roles
+                    .iter()
+                    .map(|(client_id, role)| SessionPermissionSummary {
+                        client_id: client_id.0,
+                        role: *role,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    }
 }
 
 impl FollowState {
@@ -402,7 +457,6 @@ struct SessionRuntimeHandle {
     active_window: bmux_session::WindowId,
     next_auto_window_number: u32,
     attached_clients: BTreeSet<ClientId>,
-    input_owner: Option<ClientId>,
 }
 
 struct WindowRuntimeHandle {
@@ -513,7 +567,6 @@ enum WindowSelection {
 enum SessionRuntimeError {
     NotFound,
     NotAttached,
-    ReadOnly,
     Closed,
 }
 
@@ -542,7 +595,6 @@ impl SessionRuntimeManager {
                 active_window: first_window_id,
                 next_auto_window_number: 2,
                 attached_clients: BTreeSet::new(),
-                input_owner: None,
             },
         );
         Ok(())
@@ -792,16 +844,13 @@ impl SessionRuntimeManager {
         &mut self,
         session_id: SessionId,
         client_id: ClientId,
-    ) -> Result<bool, SessionRuntimeError> {
+    ) -> Result<(), SessionRuntimeError> {
         let runtime = self
             .runtimes
             .get_mut(&session_id)
             .ok_or(SessionRuntimeError::NotFound)?;
 
         runtime.attached_clients.insert(client_id);
-        if runtime.input_owner.is_none() {
-            runtime.input_owner = Some(client_id);
-        }
         for window in runtime.windows.values_mut() {
             let mut output = window
                 .output_buffer
@@ -809,15 +858,12 @@ impl SessionRuntimeManager {
                 .map_err(|_| SessionRuntimeError::Closed)?;
             output.register_client_at_tail(client_id);
         }
-        Ok(runtime.input_owner == Some(client_id))
+        Ok(())
     }
 
     fn end_attach(&mut self, session_id: SessionId, client_id: ClientId) {
         if let Some(runtime) = self.runtimes.get_mut(&session_id) {
             let removed = runtime.attached_clients.remove(&client_id);
-            if removed && runtime.input_owner == Some(client_id) {
-                runtime.input_owner = runtime.attached_clients.iter().next().copied();
-            }
             if removed {
                 for window in runtime.windows.values_mut() {
                     if let Ok(mut output) = window.output_buffer.lock() {
@@ -841,9 +887,6 @@ impl SessionRuntimeManager {
 
         if !runtime.attached_clients.contains(&client_id) {
             return Err(SessionRuntimeError::NotAttached);
-        }
-        if runtime.input_owner != Some(client_id) {
-            return Err(SessionRuntimeError::ReadOnly);
         }
 
         let window = runtime
@@ -934,6 +977,7 @@ impl BmuxServer {
                 session_runtimes: Mutex::new(SessionRuntimeManager::new(shell)),
                 attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
                 follow_state: Mutex::new(FollowState::default()),
+                permission_state: Mutex::new(PermissionState::default()),
                 event_hub: Mutex::new(EventHub::new(1024)),
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             }),
@@ -1031,6 +1075,9 @@ impl BmuxServer {
         }
         if let Ok(mut session_manager) = self.state.session_manager.lock() {
             *session_manager = SessionManager::new();
+        }
+        if let Ok(mut permission_state) = self.state.permission_state.lock() {
+            *permission_state = PermissionState::default();
         }
         let _ = emit_event(&self.state, Event::ServerStopping);
         if let Ok(mut attach_tokens) = self.state.attach_tokens.lock() {
@@ -1365,6 +1412,13 @@ async fn handle_request(
                             session_model.add_window(window_id);
                         }
                     }
+                    drop(manager);
+
+                    let mut permission_state = state
+                        .permission_state
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
+                    permission_state.ensure_owner(session_id, client_id);
 
                     Response::Ok(ResponsePayload::SessionCreated {
                         id: session_id.0,
@@ -1388,6 +1442,10 @@ async fn handle_request(
                     Err(response) => return Ok(Response::Err(response)),
                 };
             drop(manager);
+
+            if let Err(response) = ensure_owner_for_session(state, session_id, client_id) {
+                return Ok(Response::Err(response));
+            }
 
             let mut runtime_manager = state
                 .session_runtimes
@@ -1468,6 +1526,10 @@ async fn handle_request(
                 }
             };
 
+            if let Err(response) = ensure_owner_for_session(state, session_id, client_id) {
+                return Ok(Response::Err(response));
+            }
+
             let selection = window_selection_from_selector(target);
             let removed_window = {
                 let mut runtime_manager = state
@@ -1543,6 +1605,13 @@ async fn handle_request(
 
                 clear_selected_session_for_all(state, removed_window_session_id)?;
 
+                let mut permission_state = state
+                    .permission_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
+                permission_state.remove_session(removed_window_session_id);
+                drop(permission_state);
+
                 emit_event(
                     state,
                     Event::SessionRemoved {
@@ -1566,6 +1635,9 @@ async fn handle_request(
                     Ok(session_id) => session_id,
                     Err(response) => return Ok(Response::Err(response)),
                 };
+            if let Err(response) = ensure_owner_for_session(state, session_id, client_id) {
+                return Ok(Response::Err(response));
+            }
             let selection = window_selection_from_selector(target);
 
             let mut runtime_manager = state
@@ -1630,15 +1702,147 @@ async fn handle_request(
                 .follow_state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
-            let clients = follow_state.list_clients();
+            let permission_state = state
+                .permission_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
+            let clients = follow_state
+                .list_clients()
+                .into_iter()
+                .map(|mut client| {
+                    client.session_role = client.selected_session_id.map(|session_id| {
+                        permission_state.role_for(SessionId(session_id), ClientId(client.id))
+                    });
+                    client
+                })
+                .collect::<Vec<_>>();
             Response::Ok(ResponsePayload::ClientList { clients })
         }
-        Request::ListPermissions { .. }
-        | Request::GrantRole { .. }
-        | Request::RevokeRole { .. } => Response::Err(ErrorResponse {
-            code: ErrorCode::InvalidRequest,
-            message: "permission operations not implemented yet".to_string(),
-        }),
+        Request::ListPermissions { session } => {
+            let manager = state
+                .session_manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+            let Some(session_id) = resolve_session_id(&manager, &session) else {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!("session not found for selector {session:?}"),
+                }));
+            };
+            drop(manager);
+
+            let permission_state = state
+                .permission_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
+            let permissions = permission_state.list_permissions(session_id);
+            Response::Ok(ResponsePayload::PermissionsList {
+                session_id: session_id.0,
+                permissions,
+            })
+        }
+        Request::GrantRole {
+            session,
+            client_id: target_client_id,
+            role,
+        } => {
+            let manager = state
+                .session_manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+            let Some(session_id) = resolve_session_id(&manager, &session) else {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!("session not found for selector {session:?}"),
+                }));
+            };
+            drop(manager);
+
+            if let Err(response) = ensure_owner_for_session(state, session_id, client_id) {
+                return Ok(Response::Err(response));
+            }
+
+            let target_client_id = ClientId(target_client_id);
+            if role == SessionRole::Owner && target_client_id != client_id {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "owner transfer will be implemented in a follow-up change".to_string(),
+                }));
+            }
+
+            let mut permission_state = state
+                .permission_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
+            permission_state.set_role(session_id, target_client_id, role);
+            drop(permission_state);
+
+            emit_event(
+                state,
+                Event::RoleChanged {
+                    session_id: session_id.0,
+                    client_id: target_client_id.0,
+                    role,
+                    by_client_id: client_id.0,
+                },
+            )?;
+
+            Response::Ok(ResponsePayload::RoleGranted {
+                session_id: session_id.0,
+                client_id: target_client_id.0,
+                role,
+            })
+        }
+        Request::RevokeRole {
+            session,
+            client_id: target_client_id,
+        } => {
+            let manager = state
+                .session_manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+            let Some(session_id) = resolve_session_id(&manager, &session) else {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!("session not found for selector {session:?}"),
+                }));
+            };
+            drop(manager);
+
+            if let Err(response) = ensure_owner_for_session(state, session_id, client_id) {
+                return Ok(Response::Err(response));
+            }
+
+            let target_client_id = ClientId(target_client_id);
+            let mut permission_state = state
+                .permission_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
+            if permission_state.role_for(session_id, target_client_id) == SessionRole::Owner {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "cannot revoke the current owner role".to_string(),
+                }));
+            }
+            permission_state.clear_to_observer(session_id, target_client_id);
+            drop(permission_state);
+
+            emit_event(
+                state,
+                Event::RoleChanged {
+                    session_id: session_id.0,
+                    client_id: target_client_id.0,
+                    role: SessionRole::Observer,
+                    by_client_id: client_id.0,
+                },
+            )?;
+
+            Response::Ok(ResponsePayload::RoleRevoked {
+                session_id: session_id.0,
+                client_id: target_client_id.0,
+                role: SessionRole::Observer,
+            })
+        }
         Request::KillSession { selector } => {
             let (session_id, removed_runtime) = {
                 let mut manager = state
@@ -1651,6 +1855,10 @@ async fn handle_request(
                         message: format!("session not found for selector {selector:?}"),
                     }));
                 };
+
+                if let Err(response) = ensure_owner_for_session(state, session_id, client_id) {
+                    return Ok(Response::Err(response));
+                }
 
                 if manager.remove_session(&session_id).is_err() {
                     return Ok(Response::Err(ErrorResponse {
@@ -1696,6 +1904,13 @@ async fn handle_request(
             drop(attach_tokens);
 
             clear_selected_session_for_all(state, session_id)?;
+
+            let mut permission_state = state
+                .permission_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
+            permission_state.remove_session(session_id);
+            drop(permission_state);
 
             emit_event(state, Event::SessionRemoved { id: session_id.0 })?;
 
@@ -1860,8 +2075,18 @@ async fn handle_request(
                             },
                         )?;
                     }
+                    let can_write = {
+                        let permission_state = state
+                            .permission_state
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
+                        matches!(
+                            permission_state.role_for(session_id, client_id),
+                            SessionRole::Owner | SessionRole::Writer
+                        )
+                    };
                     match runtime_manager.begin_attach(session_id, client_id) {
-                        Ok(can_write) => {
+                        Ok(()) => {
                             *attached_stream_session = Some(session_id);
                             Response::Ok(ResponsePayload::AttachReady {
                                 session_id: session_id.0,
@@ -1872,14 +2097,12 @@ async fn handle_request(
                             code: ErrorCode::NotFound,
                             message: format!("session runtime not found: {}", session_id.0),
                         }),
-                        Err(
-                            SessionRuntimeError::NotAttached
-                            | SessionRuntimeError::ReadOnly
-                            | SessionRuntimeError::Closed,
-                        ) => Response::Err(ErrorResponse {
-                            code: ErrorCode::Internal,
-                            message: "failed opening attach stream".to_string(),
-                        }),
+                        Err(SessionRuntimeError::NotAttached | SessionRuntimeError::Closed) => {
+                            Response::Err(ErrorResponse {
+                                code: ErrorCode::Internal,
+                                message: "failed opening attach stream".to_string(),
+                            })
+                        }
                     }
                 }
                 Err(AttachTokenValidationError::NotFound) => Response::Err(ErrorResponse {
@@ -1897,23 +2120,34 @@ async fn handle_request(
             }
         }
         Request::AttachInput { session_id, data } => {
+            let session_id = SessionId(session_id);
+            let role = {
+                let permission_state = state
+                    .permission_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
+                permission_state.role_for(session_id, client_id)
+            };
+            if role == SessionRole::Observer {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "attach input denied: observer role is read-only".to_string(),
+                }));
+            }
+
             let mut runtime_manager = state
                 .session_runtimes
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-            match runtime_manager.write_input(SessionId(session_id), client_id, data) {
+            match runtime_manager.write_input(session_id, client_id, data) {
                 Ok(bytes) => Response::Ok(ResponsePayload::AttachInputAccepted { bytes }),
                 Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
-                    message: format!("session runtime not found: {session_id}"),
+                    message: format!("session runtime not found: {}", session_id.0),
                 }),
                 Err(SessionRuntimeError::NotAttached) => Response::Err(ErrorResponse {
                     code: ErrorCode::InvalidRequest,
                     message: "client is not attached to session runtime".to_string(),
-                }),
-                Err(SessionRuntimeError::ReadOnly) => Response::Err(ErrorResponse {
-                    code: ErrorCode::InvalidRequest,
-                    message: "client is attached read-only for this session runtime".to_string(),
                 }),
                 Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
                     code: ErrorCode::Internal,
@@ -1939,12 +2173,10 @@ async fn handle_request(
                     code: ErrorCode::InvalidRequest,
                     message: "client is not attached to session runtime".to_string(),
                 }),
-                Err(SessionRuntimeError::ReadOnly | SessionRuntimeError::Closed) => {
-                    Response::Err(ErrorResponse {
-                        code: ErrorCode::Internal,
-                        message: "failed reading attach output".to_string(),
-                    })
-                }
+                Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
+                    code: ErrorCode::Internal,
+                    message: "failed reading attach output".to_string(),
+                }),
             }
         }
         Request::Detach => {
@@ -2114,6 +2346,26 @@ fn resolve_window_request_session_id(
     })
 }
 
+fn ensure_owner_for_session(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    client_id: ClientId,
+) -> std::result::Result<(), ErrorResponse> {
+    let permission_state = state.permission_state.lock().map_err(|_| ErrorResponse {
+        code: ErrorCode::Internal,
+        message: "permission state lock poisoned".to_string(),
+    })?;
+
+    if permission_state.is_owner(session_id, client_id) {
+        Ok(())
+    } else {
+        Err(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: "owner role required for this operation".to_string(),
+        })
+    }
+}
+
 fn window_selection_from_selector(selector: WindowSelector) -> WindowSelection {
     match selector {
         WindowSelector::ById(id) => WindowSelection::Id(WindowId(id)),
@@ -2167,7 +2419,8 @@ mod tests {
     use bmux_ipc::transport::LocalIpcStream;
     use bmux_ipc::{
         Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, ProtocolVersion,
-        Request, Response, ResponsePayload, SessionSelector, WindowSelector, decode, encode,
+        Request, Response, ResponsePayload, SessionRole, SessionSelector, WindowSelector, decode,
+        encode,
     };
     use bmux_session::SessionId;
     use std::path::Path;
@@ -2408,6 +2661,168 @@ mod tests {
         assert_eq!(follower_entry.following_client_id, Some(leader_client_id));
         assert!(follower_entry.following_global);
         assert_eq!(follower_entry.selected_session_id, Some(session_id));
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_owner_cannot_mutate_session_or_windows() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut owner = connect_and_handshake(&endpoint).await;
+        let mut observer = connect_and_handshake(&endpoint).await;
+
+        let session_id = match send_request(
+            &mut owner,
+            130,
+            Request::NewSession {
+                name: Some("owner-only".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected create session response: {other:?}"),
+        };
+
+        let switch_attempt = send_request(
+            &mut observer,
+            131,
+            Request::SwitchWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                target: WindowSelector::Active,
+            },
+        )
+        .await;
+        assert!(matches!(
+            switch_attempt,
+            Response::Err(ErrorResponse {
+                code: ErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+
+        let kill_attempt = send_request(
+            &mut observer,
+            132,
+            Request::KillSession {
+                selector: SessionSelector::ById(session_id),
+            },
+        )
+        .await;
+        assert!(matches!(
+            kill_attempt,
+            Response::Err(ErrorResponse {
+                code: ErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn grant_writer_role_allows_attach_input() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut owner = connect_and_handshake(&endpoint).await;
+        let mut writer = connect_and_handshake(&endpoint).await;
+
+        let session_id = match send_request(
+            &mut owner,
+            140,
+            Request::NewSession {
+                name: Some("writer-role".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected create session response: {other:?}"),
+        };
+
+        let writer_client_id = match send_request(&mut writer, 141, Request::WhoAmI).await {
+            Response::Ok(ResponsePayload::ClientIdentity { id }) => id,
+            other => panic!("unexpected whoami response: {other:?}"),
+        };
+
+        let granted = send_request(
+            &mut owner,
+            142,
+            Request::GrantRole {
+                session: SessionSelector::ById(session_id),
+                client_id: writer_client_id,
+                role: SessionRole::Writer,
+            },
+        )
+        .await;
+        assert!(matches!(
+            granted,
+            Response::Ok(ResponsePayload::RoleGranted {
+                role: SessionRole::Writer,
+                ..
+            })
+        ));
+
+        let writer_grant = match send_request(
+            &mut writer,
+            143,
+            Request::Attach {
+                selector: SessionSelector::ById(session_id),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::Attached { grant }) => grant,
+            other => panic!("unexpected attach response: {other:?}"),
+        };
+        let writer_open = send_request(
+            &mut writer,
+            144,
+            Request::AttachOpen {
+                session_id,
+                attach_token: writer_grant.attach_token,
+            },
+        )
+        .await;
+        assert!(matches!(
+            writer_open,
+            Response::Ok(ResponsePayload::AttachReady {
+                session_id: opened_session,
+                can_write: true,
+            }) if opened_session == session_id
+        ));
+
+        let writer_input = send_request(
+            &mut writer,
+            145,
+            Request::AttachInput {
+                session_id,
+                data: b"printf 'writer-role-ok\\n'\n".to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            writer_input,
+            Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
+        ));
+
+        let listed_permissions = send_request(
+            &mut owner,
+            146,
+            Request::ListPermissions {
+                session: SessionSelector::ById(session_id),
+            },
+        )
+        .await;
+        match listed_permissions {
+            Response::Ok(ResponsePayload::PermissionsList { permissions, .. }) => {
+                assert!(permissions.iter().any(|entry| {
+                    entry.client_id == writer_client_id && entry.role == SessionRole::Writer
+                }));
+            }
+            other => panic!("unexpected permissions list response: {other:?}"),
+        }
 
         stop_server(server, server_task, &socket_path).await;
     }
@@ -3428,6 +3843,28 @@ mod tests {
             }
             other => panic!("unexpected follower windows(alpha) response: {other:?}"),
         }
+
+        let follower_client_id = match send_request(&mut follower, 5051, Request::WhoAmI).await {
+            Response::Ok(ResponsePayload::ClientIdentity { id }) => id,
+            other => panic!("unexpected follower whoami response: {other:?}"),
+        };
+        let grant_writer = send_request(
+            &mut leader,
+            5052,
+            Request::GrantRole {
+                session: SessionSelector::ById(alpha_session),
+                client_id: follower_client_id,
+                role: SessionRole::Writer,
+            },
+        )
+        .await;
+        assert!(matches!(
+            grant_writer,
+            Response::Ok(ResponsePayload::RoleGranted {
+                role: SessionRole::Writer,
+                ..
+            })
+        ));
 
         let grant = match send_request(
             &mut follower,
