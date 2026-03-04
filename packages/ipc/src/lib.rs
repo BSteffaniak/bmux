@@ -118,6 +118,15 @@ pub enum WindowSelector {
     Active,
 }
 
+/// Session role used for collaborative permission controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionRole {
+    Owner,
+    Writer,
+    Observer,
+}
+
 /// Request payload variants for client/server IPC.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -139,8 +148,20 @@ pub enum Request {
     },
     ListSessions,
     ListClients,
+    ListPermissions {
+        session: SessionSelector,
+    },
     ListWindows {
         session: Option<SessionSelector>,
+    },
+    GrantRole {
+        session: SessionSelector,
+        client_id: Uuid,
+        role: SessionRole,
+    },
+    RevokeRole {
+        session: SessionSelector,
+        client_id: Uuid,
     },
     KillSession {
         selector: SessionSelector,
@@ -213,6 +234,14 @@ pub struct ClientSummary {
     pub selected_session_id: Option<Uuid>,
     pub following_client_id: Option<Uuid>,
     pub following_global: bool,
+    pub session_role: Option<SessionRole>,
+}
+
+/// Permission assignment summary for one client in a session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionPermissionSummary {
+    pub client_id: Uuid,
+    pub role: SessionRole,
 }
 
 /// Successful response payload variants.
@@ -241,6 +270,10 @@ pub enum ResponsePayload {
     ClientList {
         clients: Vec<ClientSummary>,
     },
+    PermissionsList {
+        session_id: Uuid,
+        permissions: Vec<SessionPermissionSummary>,
+    },
     WindowList {
         windows: Vec<WindowSummary>,
     },
@@ -262,6 +295,16 @@ pub enum ResponsePayload {
     },
     FollowStopped {
         follower_client_id: Uuid,
+    },
+    RoleGranted {
+        session_id: Uuid,
+        client_id: Uuid,
+        role: SessionRole,
+    },
+    RoleRevoked {
+        session_id: Uuid,
+        client_id: Uuid,
+        role: SessionRole,
     },
     Attached {
         grant: AttachGrant,
@@ -361,6 +404,12 @@ pub enum Event {
         leader_client_id: Uuid,
         session_id: Uuid,
     },
+    RoleChanged {
+        session_id: Uuid,
+        client_id: Uuid,
+        role: SessionRole,
+        by_client_id: Uuid,
+    },
 }
 
 /// Serialize any protocol message using postcard.
@@ -391,7 +440,8 @@ where
 mod tests {
     use super::{
         Envelope, EnvelopeKind, ErrorCode, Event, IpcEndpoint, ProtocolVersion, Request, Response,
-        ResponsePayload, SessionSelector, SessionSummary, decode, encode,
+        ResponsePayload, SessionPermissionSummary, SessionRole, SessionSelector, SessionSummary,
+        decode, encode,
     };
     use std::path::Path;
     use uuid::Uuid;
@@ -465,6 +515,41 @@ mod tests {
         let bytes = encode(&code).expect("error code should encode");
         let decoded: ErrorCode = decode(&bytes).expect("error code should decode");
         assert_eq!(decoded, code);
+    }
+
+    #[test]
+    fn session_role_serializes_roundtrip() {
+        let role = SessionRole::Writer;
+        let bytes = encode(&role).expect("session role should encode");
+        let decoded: SessionRole = decode(&bytes).expect("session role should decode");
+        assert_eq!(decoded, role);
+    }
+
+    #[test]
+    fn serializes_permissions_response_roundtrip() {
+        let response = Response::Ok(ResponsePayload::PermissionsList {
+            session_id: Uuid::new_v4(),
+            permissions: vec![SessionPermissionSummary {
+                client_id: Uuid::new_v4(),
+                role: SessionRole::Owner,
+            }],
+        });
+        let bytes = encode(&response).expect("permissions response should encode");
+        let decoded: Response = decode(&bytes).expect("permissions response should decode");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn serializes_role_changed_event_roundtrip() {
+        let event = Event::RoleChanged {
+            session_id: Uuid::new_v4(),
+            client_id: Uuid::new_v4(),
+            role: SessionRole::Observer,
+            by_client_id: Uuid::new_v4(),
+        };
+        let bytes = encode(&event).expect("role changed event should encode");
+        let decoded: Event = decode(&bytes).expect("role changed event should decode");
+        assert_eq!(decoded, event);
     }
 
     #[test]

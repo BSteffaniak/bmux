@@ -345,6 +345,7 @@ impl FollowState {
                     selected_session_id,
                     following_client_id,
                     following_global,
+                    session_role: None,
                 }
             })
             .collect()
@@ -1632,6 +1633,12 @@ async fn handle_request(
             let clients = follow_state.list_clients();
             Response::Ok(ResponsePayload::ClientList { clients })
         }
+        Request::ListPermissions { .. }
+        | Request::GrantRole { .. }
+        | Request::RevokeRole { .. } => Response::Err(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: "permission operations not implemented yet".to_string(),
+        }),
         Request::KillSession { selector } => {
             let (session_id, removed_runtime) = {
                 let mut manager = state
