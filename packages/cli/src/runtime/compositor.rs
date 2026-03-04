@@ -37,6 +37,13 @@ pub(super) struct SelectionOverlay {
     pub(super) end_col: u16,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(super) struct CursorOverlay {
+    pub(super) pane_id: PaneId,
+    pub(super) row: u16,
+    pub(super) col: u16,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct CellStyle {
     fg: Color,
@@ -229,6 +236,8 @@ pub(super) fn render_frame(
     shell_name: &str,
     cwd: &Path,
     focused_pane: PaneId,
+    show_terminal_cursor: bool,
+    cursor: Option<CursorOverlay>,
     selection: Option<SelectionOverlay>,
     mode_suffix: Option<&str>,
     status_message: Option<&str>,
@@ -261,6 +270,7 @@ pub(super) fn render_frame(
                 pane,
                 *rect,
                 *pane_id == focused_pane,
+                cursor.filter(|overlay| overlay.pane_id == *pane_id),
                 selection.filter(|overlay| overlay.pane_id == *pane_id),
             ));
         }
@@ -330,29 +340,32 @@ pub(super) fn render_frame(
         }
     }
 
-    let focused_rect = pane_rects
-        .get(&focused_pane)
-        .copied()
-        .unwrap_or_default()
-        .inner();
+    if show_terminal_cursor {
+        let focused_rect = pane_rects
+            .get(&focused_pane)
+            .copied()
+            .unwrap_or_default()
+            .inner();
 
-    let cursor_pos = {
-        let parser = panes[&focused_pane]
-            .state
-            .parser
-            .lock()
-            .expect("pane parser mutex poisoned");
-        parser.screen().cursor_position()
-    };
+        let cursor_pos = {
+            let parser = panes[&focused_pane]
+                .state
+                .parser
+                .lock()
+                .expect("pane parser mutex poisoned");
+            parser.screen().cursor_position()
+        };
 
-    let cursor_row = focused_rect
-        .y
-        .saturating_add(cursor_pos.0.min(focused_rect.height.saturating_sub(1)));
-    let cursor_col = focused_rect
-        .x
-        .saturating_add(cursor_pos.1.min(focused_rect.width.saturating_sub(1)));
+        let cursor_row = focused_rect
+            .y
+            .saturating_add(cursor_pos.0.min(focused_rect.height.saturating_sub(1)));
+        let cursor_col = focused_rect
+            .x
+            .saturating_add(cursor_pos.1.min(focused_rect.width.saturating_sub(1)));
 
-    write!(stdout, "\x1b[?25h\x1b[{cursor_row};{cursor_col}H").context("failed setting cursor")?;
+        write!(stdout, "\x1b[?25h\x1b[{cursor_row};{cursor_col}H")
+            .context("failed setting cursor")?;
+    }
     stdout.flush().context("failed flushing rendered frame")?;
 
     render_cache.initialized = true;
@@ -376,6 +389,7 @@ fn collect_pane_render_data(
     pane: &PaneRuntime,
     rect: Rect,
     focused: bool,
+    cursor: Option<CursorOverlay>,
     selection: Option<SelectionOverlay>,
 ) -> PaneRenderData {
     let inner = rect.inner();
@@ -433,7 +447,13 @@ fn collect_pane_render_data(
         .expect("pane parser mutex poisoned");
     let screen = parser.screen();
     for row_index in 0..inner.height {
-        lines.push(render_screen_row(screen, row_index, inner.width, selection));
+        lines.push(render_screen_row(
+            screen,
+            row_index,
+            inner.width,
+            cursor,
+            selection,
+        ));
     }
 
     PaneRenderData {
@@ -448,6 +468,7 @@ fn render_screen_row(
     screen: &Screen,
     row: u16,
     width: u16,
+    cursor: Option<CursorOverlay>,
     selection: Option<SelectionOverlay>,
 ) -> Vec<u8> {
     let mut output = Vec::with_capacity(usize::from(width) * 4);
@@ -482,6 +503,13 @@ fn render_screen_row(
         if let Some(selection) = selection {
             if cell_in_selection(row, col, selection) {
                 style.inverse = !style.inverse;
+            }
+        }
+
+        if let Some(cursor) = cursor {
+            if row == cursor.row && col == cursor.col {
+                style.inverse = true;
+                style.underline = true;
             }
         }
 
@@ -741,7 +769,8 @@ fn fit_to_width(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{pad_or_truncate, render_screen_row};
+    use super::{CursorOverlay, pad_or_truncate, render_screen_row};
+    use crate::pane::PaneId;
     use unicode_width::UnicodeWidthStr;
     use vt100::Parser;
 
@@ -756,12 +785,35 @@ mod tests {
         let mut parser = Parser::new(2, 20, 0);
         parser.process(b"\x1b[31mred\x1b[0m text\x1b[K");
 
-        let row = render_screen_row(parser.screen(), 0, 20, None);
+        let row = render_screen_row(parser.screen(), 0, 20, None, None);
         let rendered = String::from_utf8(row).expect("valid utf8 row output");
 
         assert!(rendered.contains("red"));
         assert!(rendered.contains("\x1b["));
         assert!(!rendered.contains("\x1b[K"));
         assert!(!rendered.contains("\x1b[2K"));
+    }
+
+    #[test]
+    fn row_renderer_draws_visible_cursor_overlay() {
+        let mut parser = Parser::new(2, 20, 0);
+        parser.process(b"hello world");
+
+        let row = render_screen_row(
+            parser.screen(),
+            0,
+            20,
+            Some(CursorOverlay {
+                pane_id: PaneId(1),
+                row: 0,
+                col: 0,
+            }),
+            None,
+        );
+        let rendered = String::from_utf8(row).expect("valid utf8 row output");
+
+        assert!(rendered.contains("\x1b["));
+        assert!(rendered.contains("4;"));
+        assert!(rendered.contains("7;"));
     }
 }

@@ -700,13 +700,54 @@ fn move_selection_cursor(
 
     let max_row = rect.inner().height.saturating_sub(1);
     let max_col = rect.inner().width.saturating_sub(1);
-    let entry = scroll_state.cursors.entry(focused_pane).or_insert((0, 0));
+    let (mut row, mut col) = scroll_state
+        .cursors
+        .get(&focused_pane)
+        .copied()
+        .unwrap_or((0, 0));
+    let mut changed_cursor = false;
     match action {
-        RuntimeAction::MoveCursorLeft => entry.1 = entry.1.saturating_sub(1),
-        RuntimeAction::MoveCursorRight => entry.1 = entry.1.saturating_add(1).min(max_col),
-        RuntimeAction::MoveCursorUp => entry.0 = entry.0.saturating_sub(1),
-        RuntimeAction::MoveCursorDown => entry.0 = entry.0.saturating_add(1).min(max_row),
+        RuntimeAction::MoveCursorLeft => {
+            col = col.saturating_sub(1);
+            changed_cursor = true;
+        }
+        RuntimeAction::MoveCursorRight => {
+            col = col.saturating_add(1).min(max_col);
+            changed_cursor = true;
+        }
+        RuntimeAction::MoveCursorUp => {
+            if row == 0 {
+                apply_scrollback_action(
+                    RuntimeAction::ScrollUpLine,
+                    focused_pane,
+                    panes,
+                    pane_rects,
+                    scroll_state,
+                );
+            } else {
+                row = row.saturating_sub(1);
+                changed_cursor = true;
+            }
+        }
+        RuntimeAction::MoveCursorDown => {
+            if row >= max_row {
+                apply_scrollback_action(
+                    RuntimeAction::ScrollDownLine,
+                    focused_pane,
+                    panes,
+                    pane_rects,
+                    scroll_state,
+                );
+            } else {
+                row = row.saturating_add(1).min(max_row);
+                changed_cursor = true;
+            }
+        }
         _ => {}
+    }
+
+    if changed_cursor {
+        scroll_state.cursors.insert(focused_pane, (row, col));
     }
 
     if let Some(active_pane) = panes.get_mut(&focused_pane) {
@@ -1459,5 +1500,60 @@ mod tests {
             scroll_state.cursors.get(&PaneId(1)).map(|(row, _col)| *row),
             Some(max_row)
         );
+    }
+
+    #[test]
+    fn move_cursor_up_prefers_viewport_before_scrolling() {
+        let mut panes = BTreeMap::new();
+        panes.insert(PaneId(1), make_pane("pane-1"));
+        panes.insert(PaneId(2), make_pane("pane-2"));
+        feed_lines(panes.get(&PaneId(1)).expect("pane 1 exists"), 200);
+
+        let mut layout = LayoutTree::two_pane(PaneId(1), PaneId(2), SplitDirection::Vertical, 0.5);
+        let mut focused = PaneId(1);
+        layout.focused = focused;
+        let pane_rects = layout.compute_rects(120, 40);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let mut force_redraw = false;
+        let mut exit_override = None;
+        let mut status_message = None;
+        let mut scroll_state = ScrollState::default();
+        let mut internal_clipboard = None;
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(RuntimeAction::EnterScrollMode)
+            .expect("send enter scroll mode");
+        tx.send(RuntimeAction::ScrollUpPage)
+            .expect("scroll up to create offset");
+        for _ in 0..80 {
+            tx.send(RuntimeAction::MoveCursorUp)
+                .expect("move cursor up until top and then scroll");
+        }
+        drop(tx);
+
+        let _ = process_input_events(
+            &rx,
+            &mut panes,
+            &pane_rects,
+            &layout,
+            &mut focused,
+            &shutdown_requested,
+            &mut force_redraw,
+            &mut exit_override,
+            &mut status_message,
+            &mut scroll_state,
+            &mut internal_clipboard,
+            Instant::now(),
+            Arc::new(AtomicBool::new(false)),
+            10_000,
+            "bmux-256color",
+            ProtocolProfile::Conservative,
+            None,
+        )
+        .expect("process input events");
+
+        assert!(scroll_state.active);
+        assert_eq!(scroll_state.cursors.get(&PaneId(1)).copied(), Some((0, 0)));
+        assert!(scroll_state.offsets.get(&PaneId(1)).copied().unwrap_or(0) > 0);
     }
 }

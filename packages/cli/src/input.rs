@@ -405,6 +405,16 @@ impl InputProcessor {
             };
 
             let strokes: Vec<KeyStroke> = pending.decoded.iter().map(|item| item.stroke).collect();
+
+            if self.scroll_mode
+                && strokes.len() == 1
+                && let Some(action) = scroll_mode_action(strokes[0])
+            {
+                actions.push(action);
+                self.pending = None;
+                continue;
+            }
+
             let exact = self.keymap.exact_action(&strokes);
             let longer = self.keymap.has_longer_match(&strokes);
             let any_prefix = self.keymap.has_any_prefix(&strokes);
@@ -420,15 +430,6 @@ impl InputProcessor {
 
             if any_prefix {
                 break;
-            }
-
-            if self.scroll_mode
-                && strokes.len() == 1
-                && let Some(action) = scroll_mode_action(strokes[0])
-            {
-                actions.push(action);
-                self.pending = None;
-                continue;
             }
 
             let pending_len = strokes.len();
@@ -775,8 +776,8 @@ fn scroll_mode_action(stroke: KeyStroke) -> Option<RuntimeAction> {
 
     match (stroke.ctrl, stroke.shift, stroke.key) {
         (false, false, KeyCode::Escape) => Some(RuntimeAction::ExitScrollMode),
-        (false, false, KeyCode::ArrowUp) => Some(RuntimeAction::ScrollUpLine),
-        (false, false, KeyCode::ArrowDown) => Some(RuntimeAction::ScrollDownLine),
+        (false, false, KeyCode::ArrowUp) => Some(RuntimeAction::MoveCursorUp),
+        (false, false, KeyCode::ArrowDown) => Some(RuntimeAction::MoveCursorDown),
         (false, false, KeyCode::PageUp) => Some(RuntimeAction::ScrollUpPage),
         (false, false, KeyCode::PageDown) => Some(RuntimeAction::ScrollDownPage),
         (false, false, KeyCode::ArrowLeft) => Some(RuntimeAction::MoveCursorLeft),
@@ -1219,7 +1220,7 @@ mod tests {
         );
         assert_eq!(
             processor.process_chunk(&[0x1b, b'[', b'A']),
-            vec![RuntimeAction::ScrollUpLine]
+            vec![RuntimeAction::MoveCursorUp]
         );
         assert_eq!(
             processor.process_chunk(&[0x1b, b'[', b'D']),
@@ -1502,7 +1503,7 @@ mod tests {
         );
         assert_eq!(
             processor.process_terminal_event(key_event(KeyCode::Up, KeyModifiers::NONE)),
-            vec![RuntimeAction::ScrollUpLine]
+            vec![RuntimeAction::MoveCursorUp]
         );
         assert_eq!(
             processor.process_terminal_event(key_event(KeyCode::Char('G'), KeyModifiers::SHIFT)),
@@ -1529,6 +1530,11 @@ mod tests {
         assert_eq!(
             processor.process_terminal_event(key_event(KeyCode::Char('o'), KeyModifiers::NONE)),
             vec![RuntimeAction::FocusNext]
+        );
+
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Char('h'), KeyModifiers::NONE)),
+            vec![RuntimeAction::MoveCursorLeft]
         );
     }
 

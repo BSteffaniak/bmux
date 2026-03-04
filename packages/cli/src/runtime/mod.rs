@@ -35,7 +35,7 @@ mod persistence;
 mod status_message;
 mod terminal_protocol;
 use commands::process_input_events;
-use compositor::{RenderCache, RenderDebugState, SelectionOverlay, render_frame};
+use compositor::{CursorOverlay, RenderCache, RenderDebugState, SelectionOverlay, render_frame};
 use pane_runtime::{
     any_running_panes, first_running_pane_id, pane_is_running, refresh_exit_codes, resize_panes,
     spawn_pane, stop_pane_process,
@@ -1460,6 +1460,7 @@ fn run_two_pane_runtime(
             Some(format_scroll_mode_suffix(
                 offset,
                 total,
+                cursor_status_suffix(&scroll_state, focused_pane),
                 selection_status_suffix(&scroll_state, focused_pane),
             ))
         } else {
@@ -1482,6 +1483,19 @@ fn run_two_pane_runtime(
             None
         };
 
+        let cursor_overlay = if scroll_state.active {
+            scroll_state
+                .cursors
+                .get(&focused_pane)
+                .map(|cursor| CursorOverlay {
+                    pane_id: focused_pane,
+                    row: cursor.0,
+                    col: cursor.1,
+                })
+        } else {
+            None
+        };
+
         if force_redraw || pane_dirty || Instant::now() >= next_status_redraw {
             render_frame(
                 &panes,
@@ -1491,6 +1505,8 @@ fn run_two_pane_runtime(
                 shell_name,
                 &cwd,
                 focused_pane,
+                !scroll_state.active,
+                cursor_overlay,
                 selection_overlay,
                 scroll_status_suffix.as_deref(),
                 status_message.as_ref().map(|message| message.text.as_str()),
@@ -1555,12 +1571,26 @@ fn selection_status_suffix(scroll_state: &ScrollState, focused_pane: PaneId) -> 
     ))
 }
 
+fn cursor_status_suffix(scroll_state: &ScrollState, focused_pane: PaneId) -> Option<String> {
+    let (row, col) = scroll_state.cursors.get(&focused_pane).copied()?;
+    Some(format!(
+        "CURSOR r{}:c{}",
+        row.saturating_add(1),
+        col.saturating_add(1)
+    ))
+}
+
 fn format_scroll_mode_suffix(
     offset: usize,
     total: usize,
+    cursor_suffix: Option<String>,
     selection_suffix: Option<String>,
 ) -> String {
     let mut status = format!("SCROLL {offset}/{total}");
+    if let Some(cursor) = cursor_suffix {
+        status.push_str(" | ");
+        status.push_str(&cursor);
+    }
     if let Some(selection) = selection_suffix {
         status.push_str(" | ");
         status.push_str(&selection);
@@ -2353,11 +2383,11 @@ fn reap_exited_panes(
 mod tests {
     use super::{
         EventReader, PaneRuntime, PaneState, ProtocolDirection, ProtocolTraceEvent, ScrollState,
-        TerminalProfile, TraceFamily, filter_trace_events, format_scroll_mode_suffix,
-        load_runtime_settings, map_attach_client_error, merged_runtime_keybindings,
-        parse_pid_content, profile_for_term, protocol_profile_for_terminal_profile,
-        reap_exited_panes, resolve_pane_term_with_checker, run_event_input_loop_with_reader,
-        selection_status_suffix,
+        TerminalProfile, TraceFamily, cursor_status_suffix, filter_trace_events,
+        format_scroll_mode_suffix, load_runtime_settings, map_attach_client_error,
+        merged_runtime_keybindings, parse_pid_content, profile_for_term,
+        protocol_profile_for_terminal_profile, reap_exited_panes, resolve_pane_term_with_checker,
+        run_event_input_loop_with_reader, selection_status_suffix,
     };
     use crate::input::{InputProcessor, Keymap};
     use crate::pane::{LayoutNode, LayoutTree, PaneId, SplitDirection};
@@ -2579,8 +2609,8 @@ mod tests {
 
     #[test]
     fn scroll_mode_suffix_includes_position_and_total() {
-        let suffix = format_scroll_mode_suffix(0, 3_000, None);
-        assert_eq!(suffix, "SCROLL 0/3000");
+        let suffix = format_scroll_mode_suffix(0, 3_000, Some("CURSOR r1:c1".to_string()), None);
+        assert_eq!(suffix, "SCROLL 0/3000 | CURSOR r1:c1");
     }
 
     #[test]
@@ -2592,6 +2622,16 @@ mod tests {
 
         let suffix = selection_status_suffix(&scroll_state, pane_id);
         assert_eq!(suffix.as_deref(), Some("SELECT r3:c5 -> r11:c21"));
+    }
+
+    #[test]
+    fn cursor_suffix_uses_one_based_coordinates() {
+        let mut scroll_state = ScrollState::default();
+        let pane_id = PaneId(11);
+        scroll_state.cursors.insert(pane_id, (3, 8));
+
+        let suffix = cursor_status_suffix(&scroll_state, pane_id);
+        assert_eq!(suffix.as_deref(), Some("CURSOR r4:c9"));
     }
 
     #[test]
