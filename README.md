@@ -143,6 +143,8 @@ bmux session unfollow
 
 All list commands with `--json` output a bare JSON array.
 
+Role policy: `owner` controls session/window mutations and role changes, `writer` can send attach input, and `observer` is read-only.
+
 ### Server stop behavior
 
 `bmux server stop` uses graceful IPC shutdown first. If that times out, it falls back to PID-based termination.

@@ -3112,6 +3112,442 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn rapid_grant_revoke_toggles_attach_input_permissions() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut owner = connect_and_handshake(&endpoint).await;
+        let mut member = connect_and_handshake(&endpoint).await;
+
+        let session_id = match send_request(
+            &mut owner,
+            190,
+            Request::NewSession {
+                name: Some("rapid-role-toggle".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected create response: {other:?}"),
+        };
+
+        let member_id = match send_request(&mut member, 191, Request::WhoAmI).await {
+            Response::Ok(ResponsePayload::ClientIdentity { id }) => id,
+            other => panic!("unexpected whoami response: {other:?}"),
+        };
+
+        let grant = match send_request(
+            &mut member,
+            192,
+            Request::Attach {
+                selector: SessionSelector::ById(session_id),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::Attached { grant }) => grant,
+            other => panic!("unexpected attach response: {other:?}"),
+        };
+        let opened = send_request(
+            &mut member,
+            193,
+            Request::AttachOpen {
+                session_id,
+                attach_token: grant.attach_token,
+            },
+        )
+        .await;
+        assert!(matches!(
+            opened,
+            Response::Ok(ResponsePayload::AttachReady {
+                session_id: opened_session,
+                can_write: false,
+            }) if opened_session == session_id
+        ));
+
+        for idx in 0..3u64 {
+            let grant_writer = send_request(
+                &mut owner,
+                194 + idx * 3,
+                Request::GrantRole {
+                    session: SessionSelector::ById(session_id),
+                    client_id: member_id,
+                    role: SessionRole::Writer,
+                },
+            )
+            .await;
+            assert!(matches!(
+                grant_writer,
+                Response::Ok(ResponsePayload::RoleGranted {
+                    role: SessionRole::Writer,
+                    ..
+                })
+            ));
+
+            let writer_input = send_request(
+                &mut member,
+                195 + idx * 3,
+                Request::AttachInput {
+                    session_id,
+                    data: b"printf 'writer-allowed\\n'\n".to_vec(),
+                },
+            )
+            .await;
+            assert!(matches!(
+                writer_input,
+                Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
+            ));
+
+            let revoke = send_request(
+                &mut owner,
+                196 + idx * 3,
+                Request::RevokeRole {
+                    session: SessionSelector::ById(session_id),
+                    client_id: member_id,
+                },
+            )
+            .await;
+            assert!(matches!(
+                revoke,
+                Response::Ok(ResponsePayload::RoleRevoked {
+                    role: SessionRole::Observer,
+                    ..
+                })
+            ));
+
+            let denied_input = send_request(
+                &mut member,
+                197 + idx * 3,
+                Request::AttachInput {
+                    session_id,
+                    data: b"printf 'writer-denied\\n'\n".to_vec(),
+                },
+            )
+            .await;
+            assert!(matches!(
+                denied_input,
+                Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    ..
+                })
+            ));
+        }
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owner_transfer_during_follow_attach_preserves_control_rules() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut owner = connect_and_handshake(&endpoint).await;
+        let mut successor = connect_and_handshake(&endpoint).await;
+
+        let session_id = match send_request(
+            &mut owner,
+            230,
+            Request::NewSession {
+                name: Some("follow-transfer".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected create response: {other:?}"),
+        };
+
+        let successor_id = match send_request(&mut successor, 231, Request::WhoAmI).await {
+            Response::Ok(ResponsePayload::ClientIdentity { id }) => id,
+            other => panic!("unexpected whoami response: {other:?}"),
+        };
+
+        let follow_started = send_request(
+            &mut successor,
+            232,
+            Request::FollowClient {
+                target_client_id: match send_request(&mut owner, 233, Request::WhoAmI).await {
+                    Response::Ok(ResponsePayload::ClientIdentity { id }) => id,
+                    other => panic!("unexpected owner whoami response: {other:?}"),
+                },
+                global: true,
+            },
+        )
+        .await;
+        assert!(matches!(
+            follow_started,
+            Response::Ok(ResponsePayload::FollowStarted { global: true, .. })
+        ));
+
+        let owner_attach = send_request(
+            &mut owner,
+            234,
+            Request::Attach {
+                selector: SessionSelector::ById(session_id),
+            },
+        )
+        .await;
+        assert!(matches!(
+            owner_attach,
+            Response::Ok(ResponsePayload::Attached { .. })
+        ));
+
+        let successor_grant = match send_request(
+            &mut successor,
+            235,
+            Request::Attach {
+                selector: SessionSelector::ById(session_id),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::Attached { grant }) => grant,
+            other => panic!("unexpected successor attach response: {other:?}"),
+        };
+        let successor_open = send_request(
+            &mut successor,
+            236,
+            Request::AttachOpen {
+                session_id,
+                attach_token: successor_grant.attach_token,
+            },
+        )
+        .await;
+        assert!(matches!(
+            successor_open,
+            Response::Ok(ResponsePayload::AttachReady {
+                session_id: opened_session,
+                can_write: false,
+            }) if opened_session == session_id
+        ));
+
+        let transfer = send_request(
+            &mut owner,
+            237,
+            Request::GrantRole {
+                session: SessionSelector::ById(session_id),
+                client_id: successor_id,
+                role: SessionRole::Owner,
+            },
+        )
+        .await;
+        assert!(matches!(
+            transfer,
+            Response::Ok(ResponsePayload::RoleGranted {
+                role: SessionRole::Owner,
+                ..
+            })
+        ));
+
+        let old_owner_mutation = send_request(
+            &mut owner,
+            238,
+            Request::NewWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                name: Some("old-owner-blocked".to_string()),
+            },
+        )
+        .await;
+        assert!(matches!(
+            old_owner_mutation,
+            Response::Err(ErrorResponse {
+                code: ErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+
+        let new_owner_mutation = send_request(
+            &mut successor,
+            239,
+            Request::NewWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                name: Some("new-owner-allowed".to_string()),
+            },
+        )
+        .await;
+        assert!(matches!(
+            new_owner_mutation,
+            Response::Ok(ResponsePayload::WindowCreated {
+                session_id: created_session,
+                ..
+            }) if created_session == session_id
+        ));
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn observer_remains_read_only_across_follow_target_changes() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut leader = connect_and_handshake(&endpoint).await;
+        let mut observer = connect_and_handshake(&endpoint).await;
+
+        let alpha = match send_request(
+            &mut leader,
+            260,
+            Request::NewSession {
+                name: Some("observer-alpha".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected alpha create response: {other:?}"),
+        };
+        let beta = match send_request(
+            &mut leader,
+            261,
+            Request::NewSession {
+                name: Some("observer-beta".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected beta create response: {other:?}"),
+        };
+
+        let leader_id = match send_request(&mut leader, 262, Request::WhoAmI).await {
+            Response::Ok(ResponsePayload::ClientIdentity { id }) => id,
+            other => panic!("unexpected leader whoami response: {other:?}"),
+        };
+
+        let leader_attach_alpha = send_request(
+            &mut leader,
+            263,
+            Request::Attach {
+                selector: SessionSelector::ById(alpha),
+            },
+        )
+        .await;
+        assert!(matches!(
+            leader_attach_alpha,
+            Response::Ok(ResponsePayload::Attached { .. })
+        ));
+
+        let observer_follow = send_request(
+            &mut observer,
+            264,
+            Request::FollowClient {
+                target_client_id: leader_id,
+                global: true,
+            },
+        )
+        .await;
+        assert!(matches!(
+            observer_follow,
+            Response::Ok(ResponsePayload::FollowStarted { global: true, .. })
+        ));
+
+        let observer_alpha_grant = match send_request(
+            &mut observer,
+            265,
+            Request::Attach {
+                selector: SessionSelector::ById(alpha),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::Attached { grant }) => grant,
+            other => panic!("unexpected observer attach response: {other:?}"),
+        };
+        let observer_alpha_open = send_request(
+            &mut observer,
+            266,
+            Request::AttachOpen {
+                session_id: alpha,
+                attach_token: observer_alpha_grant.attach_token,
+            },
+        )
+        .await;
+        assert!(matches!(
+            observer_alpha_open,
+            Response::Ok(ResponsePayload::AttachReady {
+                session_id: opened_session,
+                can_write: false,
+            }) if opened_session == alpha
+        ));
+
+        let observer_alpha_input = send_request(
+            &mut observer,
+            267,
+            Request::AttachInput {
+                session_id: alpha,
+                data: b"printf 'observer-alpha'\n".to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            observer_alpha_input,
+            Response::Err(ErrorResponse {
+                code: ErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+
+        let leader_attach_beta = send_request(
+            &mut leader,
+            268,
+            Request::Attach {
+                selector: SessionSelector::ById(beta),
+            },
+        )
+        .await;
+        assert!(matches!(
+            leader_attach_beta,
+            Response::Ok(ResponsePayload::Attached { .. })
+        ));
+
+        let observer_beta_grant = match send_request(
+            &mut observer,
+            269,
+            Request::Attach {
+                selector: SessionSelector::ById(beta),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::Attached { grant }) => grant,
+            other => panic!("unexpected observer beta attach response: {other:?}"),
+        };
+        let observer_beta_open = send_request(
+            &mut observer,
+            270,
+            Request::AttachOpen {
+                session_id: beta,
+                attach_token: observer_beta_grant.attach_token,
+            },
+        )
+        .await;
+        assert!(matches!(
+            observer_beta_open,
+            Response::Ok(ResponsePayload::AttachReady {
+                session_id: opened_session,
+                can_write: false,
+            }) if opened_session == beta
+        ));
+
+        let observer_beta_input = send_request(
+            &mut observer,
+            271,
+            Request::AttachInput {
+                session_id: beta,
+                data: b"printf 'observer-beta'\n".to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            observer_beta_input,
+            Response::Err(ErrorResponse {
+                code: ErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn window_lifecycle_supports_create_list_switch_and_kill() {
         let (server, endpoint, socket_path, server_task) = start_server().await;
         let mut client = connect_and_handshake(&endpoint).await;

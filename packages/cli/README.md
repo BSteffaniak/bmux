@@ -146,6 +146,12 @@ bmux session grant --session dev --client 550e8400-e29b-41d4-a716-446655440000 -
 bmux session revoke --session dev --client 550e8400-e29b-41d4-a716-446655440000
 ```
 
+Role policy:
+
+- `owner`: can mutate session/window state and manage roles
+- `writer`: can send attach input only
+- `observer`: read-only attach
+
 ## JSON Output
 
 `--json` is supported on list commands:
