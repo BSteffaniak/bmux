@@ -1219,14 +1219,38 @@ impl BmuxServer {
     ///
     /// Returns an error if binding or accept-loop operations fail.
     pub async fn run(&self) -> Result<()> {
-        let listener = LocalIpcListener::bind(&self.endpoint)
-            .await
-            .with_context(|| format!("failed binding server endpoint {:?}", self.endpoint))?;
+        self.run_impl(None).await
+    }
 
-        restore_snapshot_if_present(&self.state)?;
+    async fn run_impl(
+        &self,
+        mut ready_tx: Option<oneshot::Sender<std::result::Result<(), String>>>,
+    ) -> Result<()> {
+        let listener = match LocalIpcListener::bind(&self.endpoint)
+            .await
+            .with_context(|| format!("failed binding server endpoint {:?}", self.endpoint))
+        {
+            Ok(listener) => listener,
+            Err(error) => {
+                if let Some(tx) = ready_tx.take() {
+                    let _ = tx.send(Err(format!("{error:#}")));
+                }
+                return Err(error);
+            }
+        };
+
+        if let Err(error) = restore_snapshot_if_present(&self.state) {
+            if let Some(tx) = ready_tx.take() {
+                let _ = tx.send(Err(format!("{error:#}")));
+            }
+            return Err(error);
+        }
 
         info!("bmux server listening on {:?}", self.endpoint);
         emit_event(&self.state, Event::ServerStarted)?;
+        if let Some(tx) = ready_tx.take() {
+            let _ = tx.send(Ok(()));
+        }
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
         loop {
@@ -1289,6 +1313,14 @@ impl BmuxServer {
         }
 
         Ok(())
+    }
+
+    #[cfg(test)]
+    async fn run_with_ready(
+        &self,
+        ready_tx: oneshot::Sender<std::result::Result<(), String>>,
+    ) -> Result<()> {
+        self.run_impl(Some(ready_tx)).await
     }
 }
 
@@ -3052,8 +3084,27 @@ mod tests {
     use bmux_session::{SessionId, SessionManager};
     use std::path::Path;
     use std::time::Duration;
+    use tokio::sync::oneshot;
     use tokio::time::sleep;
     use uuid::Uuid;
+
+    const TEST_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
+
+    #[cfg(unix)]
+    async fn spawn_server_with_ready(
+        server: BmuxServer,
+    ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let server_clone = server.clone();
+        let server_task = tokio::spawn(async move { server_clone.run_with_ready(ready_tx).await });
+        match tokio::time::timeout(TEST_STARTUP_TIMEOUT, ready_rx).await {
+            Ok(Ok(Ok(()))) => {}
+            Ok(Ok(Err(error))) => panic!("server failed to start: {error}"),
+            Ok(Err(_)) => panic!("server ready channel dropped before startup"),
+            Err(_) => panic!("timed out waiting for server startup"),
+        }
+        server_task
+    }
 
     #[test]
     fn resolve_session_id_prefers_exact_name_before_uuid_fallbacks() {
@@ -3140,9 +3191,7 @@ mod tests {
         let endpoint = IpcEndpoint::unix_socket(&socket_path);
         let server = BmuxServer::new(endpoint.clone());
 
-        let server_clone = server.clone();
-        let server_task = tokio::spawn(async move { server_clone.run().await });
-        wait_for_server(&endpoint).await;
+        let server_task = spawn_server_with_ready(server.clone()).await;
 
         let mut client = LocalIpcStream::connect(&endpoint)
             .await
@@ -3186,9 +3235,7 @@ mod tests {
         let endpoint = IpcEndpoint::unix_socket(&socket_path);
         let server = BmuxServer::new(endpoint.clone());
 
-        let server_clone = server.clone();
-        let server_task = tokio::spawn(async move { server_clone.run().await });
-        wait_for_server(&endpoint).await;
+        let server_task = spawn_server_with_ready(server.clone()).await;
 
         let mut client = LocalIpcStream::connect(&endpoint)
             .await
@@ -6017,12 +6064,7 @@ mod tests {
         paths.ensure_dirs().expect("paths should be created");
 
         let endpoint = IpcEndpoint::unix_socket(paths.server_socket());
-        let server = BmuxServer::from_config_paths(&paths);
-        let server_task = tokio::spawn({
-            let server = server.clone();
-            async move { server.run().await }
-        });
-        wait_for_server(&endpoint).await;
+        let (_server, server_task) = start_server_from_paths(&paths).await;
 
         let mut owner = connect_and_handshake(&endpoint).await;
         let mut member = connect_and_handshake(&endpoint).await;
@@ -6085,28 +6127,7 @@ mod tests {
             std::fs::remove_file(paths.server_socket()).expect("socket cleanup should succeed");
         }
 
-        let restored_server = BmuxServer::from_config_paths(&paths);
-        let restored_task = tokio::spawn({
-            let server = restored_server.clone();
-            async move { server.run().await }
-        });
-        let mut started = false;
-        for _ in 0..200 {
-            if LocalIpcStream::connect(&endpoint).await.is_ok() {
-                started = true;
-                break;
-            }
-            if restored_task.is_finished() {
-                break;
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
-        if !started {
-            let result = restored_task
-                .await
-                .expect("restored server task should join for diagnostics");
-            panic!("restored server failed to start: {result:?}");
-        }
+        let (_restored_server, restored_task) = start_server_from_paths(&paths).await;
 
         let mut restored_client = connect_and_handshake(&endpoint).await;
         let sessions = send_request(&mut restored_client, 305, Request::ListSessions).await;
@@ -6157,17 +6178,6 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn wait_for_server(endpoint: &IpcEndpoint) {
-        for _ in 0..200 {
-            if LocalIpcStream::connect(endpoint).await.is_ok() {
-                return;
-            }
-            sleep(Duration::from_millis(20)).await;
-        }
-        panic!("server did not start in time");
-    }
-
-    #[cfg(unix)]
     async fn start_server() -> (
         BmuxServer,
         IpcEndpoint,
@@ -6177,10 +6187,17 @@ mod tests {
         let socket_path = std::env::temp_dir().join(format!("bmux-server-{}.sock", Uuid::new_v4()));
         let endpoint = IpcEndpoint::unix_socket(&socket_path);
         let server = BmuxServer::new(endpoint.clone());
-        let server_clone = server.clone();
-        let server_task = tokio::spawn(async move { server_clone.run().await });
-        wait_for_server(&endpoint).await;
+        let server_task = spawn_server_with_ready(server.clone()).await;
         (server, endpoint, socket_path, server_task)
+    }
+
+    #[cfg(unix)]
+    async fn start_server_from_paths(
+        paths: &ConfigPaths,
+    ) -> (BmuxServer, tokio::task::JoinHandle<anyhow::Result<()>>) {
+        let server = BmuxServer::from_config_paths(paths);
+        let server_task = spawn_server_with_ready(server.clone()).await;
+        (server, server_task)
     }
 
     #[cfg(unix)]
