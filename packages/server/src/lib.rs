@@ -266,6 +266,70 @@ impl PermissionState {
             })
             .unwrap_or_default()
     }
+
+    fn rebalance_after_disconnect(
+        &mut self,
+        disconnected_client_id: ClientId,
+        connected_clients: &BTreeSet<ClientId>,
+        session_clients: &BTreeMap<SessionId, BTreeSet<ClientId>>,
+    ) -> Vec<Event> {
+        let mut events = Vec::new();
+
+        for (session_id, roles) in &mut self.roles {
+            let disconnected_role = roles.get(&disconnected_client_id).copied();
+
+            if disconnected_role == Some(SessionRole::Owner) {
+                let writer_candidate = roles
+                    .iter()
+                    .filter_map(|(client_id, role)| {
+                        (*client_id != disconnected_client_id
+                            && *role == SessionRole::Writer
+                            && connected_clients.contains(client_id))
+                        .then_some(*client_id)
+                    })
+                    .next();
+
+                let observer_candidate = roles
+                    .iter()
+                    .filter_map(|(client_id, role)| {
+                        (*client_id != disconnected_client_id
+                            && *role == SessionRole::Observer
+                            && connected_clients.contains(client_id))
+                        .then_some(*client_id)
+                    })
+                    .next();
+
+                let implicit_observer_candidate =
+                    session_clients.get(session_id).and_then(|clients| {
+                        clients
+                            .iter()
+                            .find(|client_id| {
+                                **client_id != disconnected_client_id
+                                    && connected_clients.contains(client_id)
+                            })
+                            .copied()
+                    });
+
+                if let Some(next_owner) = writer_candidate
+                    .or(observer_candidate)
+                    .or(implicit_observer_candidate)
+                {
+                    roles.insert(next_owner, SessionRole::Owner);
+                    roles.remove(&disconnected_client_id);
+                    events.push(Event::RoleChanged {
+                        session_id: session_id.0,
+                        client_id: next_owner.0,
+                        role: SessionRole::Owner,
+                        by_client_id: disconnected_client_id.0,
+                    });
+                }
+            } else {
+                roles.remove(&disconnected_client_id);
+            }
+        }
+
+        events
+    }
 }
 
 impl FollowState {
@@ -1192,6 +1256,7 @@ async fn handle_connection(
         &mut attached_stream_session,
     )?;
     disconnect_follow_state(&state, client_id)?;
+    rebalance_owner_roles_after_disconnect(&state, client_id)?;
     unsubscribe_events(&state, client_id)?;
 
     Ok(())
@@ -1326,6 +1391,53 @@ fn clear_selected_session_for_all(
     }
     for client_id in affected_clients {
         let _ = follow_state.sync_followers_from_leader(client_id, None);
+    }
+
+    Ok(())
+}
+
+fn rebalance_owner_roles_after_disconnect(
+    state: &Arc<ServerState>,
+    disconnected_client_id: ClientId,
+) -> Result<()> {
+    let connected_clients = {
+        let follow_state = state
+            .follow_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
+        follow_state.connected_clients.clone()
+    };
+
+    let session_clients = {
+        let manager = state
+            .session_manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+        manager
+            .list_sessions()
+            .into_iter()
+            .filter_map(|summary| {
+                manager
+                    .get_session(&summary.id)
+                    .map(|session| (summary.id, session.clients.clone()))
+            })
+            .collect::<BTreeMap<SessionId, BTreeSet<ClientId>>>()
+    };
+
+    let role_change_events = {
+        let mut permission_state = state
+            .permission_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
+        permission_state.rebalance_after_disconnect(
+            disconnected_client_id,
+            &connected_clients,
+            &session_clients,
+        )
+    };
+
+    for event in role_change_events {
+        emit_event(state, event)?;
     }
 
     Ok(())
@@ -1763,18 +1875,15 @@ async fn handle_request(
             }
 
             let target_client_id = ClientId(target_client_id);
-            if role == SessionRole::Owner && target_client_id != client_id {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::InvalidRequest,
-                    message: "owner transfer will be implemented in a follow-up change".to_string(),
-                }));
-            }
 
             let mut permission_state = state
                 .permission_state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
             permission_state.set_role(session_id, target_client_id, role);
+            if role == SessionRole::Owner && target_client_id != client_id {
+                permission_state.clear_to_observer(session_id, client_id);
+            }
             drop(permission_state);
 
             emit_event(
@@ -1786,6 +1895,17 @@ async fn handle_request(
                     by_client_id: client_id.0,
                 },
             )?;
+            if role == SessionRole::Owner && target_client_id != client_id {
+                emit_event(
+                    state,
+                    Event::RoleChanged {
+                        session_id: session_id.0,
+                        client_id: client_id.0,
+                        role: SessionRole::Observer,
+                        by_client_id: client_id.0,
+                    },
+                )?;
+            }
 
             Response::Ok(ResponsePayload::RoleGranted {
                 session_id: session_id.0,
@@ -2823,6 +2943,169 @@ mod tests {
             }
             other => panic!("unexpected permissions list response: {other:?}"),
         }
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owner_transfer_allows_new_owner_mutations() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut owner = connect_and_handshake(&endpoint).await;
+        let mut successor = connect_and_handshake(&endpoint).await;
+
+        let session_id = match send_request(
+            &mut owner,
+            170,
+            Request::NewSession {
+                name: Some("owner-transfer".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected create response: {other:?}"),
+        };
+
+        let successor_id = match send_request(&mut successor, 171, Request::WhoAmI).await {
+            Response::Ok(ResponsePayload::ClientIdentity { id }) => id,
+            other => panic!("unexpected whoami response: {other:?}"),
+        };
+
+        let transferred = send_request(
+            &mut owner,
+            172,
+            Request::GrantRole {
+                session: SessionSelector::ById(session_id),
+                client_id: successor_id,
+                role: SessionRole::Owner,
+            },
+        )
+        .await;
+        assert!(matches!(
+            transferred,
+            Response::Ok(ResponsePayload::RoleGranted {
+                role: SessionRole::Owner,
+                ..
+            })
+        ));
+
+        let old_owner_mutation = send_request(
+            &mut owner,
+            173,
+            Request::NewWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                name: Some("should-fail".to_string()),
+            },
+        )
+        .await;
+        assert!(matches!(
+            old_owner_mutation,
+            Response::Err(ErrorResponse {
+                code: ErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+
+        let new_owner_mutation = send_request(
+            &mut successor,
+            174,
+            Request::NewWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                name: Some("allowed".to_string()),
+            },
+        )
+        .await;
+        assert!(matches!(
+            new_owner_mutation,
+            Response::Ok(ResponsePayload::WindowCreated {
+                session_id: created_session,
+                ..
+            }) if created_session == session_id
+        ));
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn owner_disconnect_promotes_writer() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut owner = connect_and_handshake(&endpoint).await;
+        let mut writer = connect_and_handshake(&endpoint).await;
+
+        let session_id = match send_request(
+            &mut owner,
+            180,
+            Request::NewSession {
+                name: Some("owner-disconnect".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected create response: {other:?}"),
+        };
+
+        let writer_id = match send_request(&mut writer, 181, Request::WhoAmI).await {
+            Response::Ok(ResponsePayload::ClientIdentity { id }) => id,
+            other => panic!("unexpected whoami response: {other:?}"),
+        };
+
+        let granted = send_request(
+            &mut owner,
+            182,
+            Request::GrantRole {
+                session: SessionSelector::ById(session_id),
+                client_id: writer_id,
+                role: SessionRole::Writer,
+            },
+        )
+        .await;
+        assert!(matches!(
+            granted,
+            Response::Ok(ResponsePayload::RoleGranted {
+                role: SessionRole::Writer,
+                ..
+            })
+        ));
+
+        drop(owner);
+        sleep(Duration::from_millis(50)).await;
+
+        let listed = send_request(
+            &mut writer,
+            183,
+            Request::ListPermissions {
+                session: SessionSelector::ById(session_id),
+            },
+        )
+        .await;
+        match listed {
+            Response::Ok(ResponsePayload::PermissionsList { permissions, .. }) => {
+                assert!(permissions.iter().any(|entry| {
+                    entry.client_id == writer_id && entry.role == SessionRole::Owner
+                }));
+            }
+            other => panic!("unexpected permissions list response: {other:?}"),
+        }
+
+        let mutation = send_request(
+            &mut writer,
+            184,
+            Request::NewWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                name: Some("post-promotion".to_string()),
+            },
+        )
+        .await;
+        assert!(matches!(
+            mutation,
+            Response::Ok(ResponsePayload::WindowCreated {
+                session_id: created_session,
+                ..
+            }) if created_session == session_id
+        ));
 
         stop_server(server, server_task, &socket_path).await;
     }
