@@ -770,7 +770,6 @@ async fn run_session_attach(
     println!("press Ctrl-D to detach");
 
     let _raw_mode = RawModeGuard::enable().context("failed to enable raw mode for attach")?;
-    let mut stdout = io::stdout();
 
     loop {
         if follow_target_id.is_some() {
@@ -811,8 +810,7 @@ async fn run_session_attach(
             }
         }
 
-        if event::poll(ATTACH_IO_POLL_INTERVAL).context("failed polling terminal events")? {
-            let event = event::read().context("failed reading terminal event")?;
+        if let Some(event) = poll_attach_terminal_event(ATTACH_IO_POLL_INTERVAL).await? {
             match attach_event_action(&event)? {
                 AttachEventAction::Detach => break,
                 AttachEventAction::Send(bytes) => {
@@ -834,10 +832,7 @@ async fn run_session_attach(
         if output.is_empty() {
             continue;
         }
-        stdout
-            .write_all(&output)
-            .context("failed writing attach output")?;
-        stdout.flush().context("failed flushing attach output")?;
+        write_attach_output(output).await?;
     }
 
     let _ = client.detach().await;
@@ -889,6 +884,31 @@ impl Drop for RawModeGuard {
     fn drop(&mut self) {
         let _ = disable_raw_mode();
     }
+}
+
+async fn poll_attach_terminal_event(timeout: Duration) -> Result<Option<Event>> {
+    tokio::task::spawn_blocking(move || {
+        if event::poll(timeout).context("failed polling terminal events")? {
+            let event = event::read().context("failed reading terminal event")?;
+            return Ok(Some(event));
+        }
+
+        Ok(None)
+    })
+    .await
+    .context("failed to join terminal event task")?
+}
+
+async fn write_attach_output(output: Vec<u8>) -> Result<()> {
+    tokio::task::spawn_blocking(move || {
+        let mut stdout = io::stdout();
+        stdout
+            .write_all(&output)
+            .context("failed writing attach output")?;
+        stdout.flush().context("failed flushing attach output")
+    })
+    .await
+    .context("failed to join attach output task")?
 }
 
 fn attach_event_action(event: &Event) -> Result<AttachEventAction> {
