@@ -170,7 +170,11 @@ fn run_command(command: &Command) -> Result<u8> {
         Command::NewSession { name } => run_session_new(name.clone()),
         Command::ListSessions { json } => run_session_list(*json),
         Command::ListClients { json } => run_client_list(*json),
-        Command::Permissions { session, json } => run_permissions_list(session, *json),
+        Command::Permissions {
+            session,
+            json,
+            watch,
+        } => run_permissions_list(session, *json, *watch),
         Command::Grant {
             session,
             client,
@@ -197,7 +201,11 @@ fn run_command(command: &Command) -> Result<u8> {
             SessionCommand::New { name } => run_session_new(name.clone()),
             SessionCommand::List { json } => run_session_list(*json),
             SessionCommand::Clients { json } => run_client_list(*json),
-            SessionCommand::Permissions { session, json } => run_permissions_list(session, *json),
+            SessionCommand::Permissions {
+                session,
+                json,
+                watch,
+            } => run_permissions_list(session, *json, *watch),
             SessionCommand::Grant {
                 session,
                 client,
@@ -487,8 +495,35 @@ fn run_client_list(as_json: bool) -> Result<u8> {
     Ok(0)
 }
 
-fn run_permissions_list(session: &str, as_json: bool) -> Result<u8> {
+fn run_permissions_list(session: &str, as_json: bool, watch: bool) -> Result<u8> {
     let selector = parse_session_selector(session);
+
+    if watch {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed to build tokio runtime")?;
+        let mut client = runtime
+            .block_on(BmuxClient::connect_default("bmux-cli-watch-permissions"))
+            .map_err(map_cli_client_error)?;
+
+        println!("watching permissions for session '{session}' (Ctrl-C to stop)");
+        let mut last_permissions: Option<Vec<bmux_ipc::SessionPermissionSummary>> = None;
+
+        loop {
+            let permissions = runtime
+                .block_on(client.list_permissions(selector.clone()))
+                .map_err(map_cli_client_error)?;
+
+            if last_permissions.as_ref() != Some(&permissions) {
+                render_permissions_table(&permissions);
+                last_permissions = Some(permissions);
+            }
+
+            std::thread::sleep(Duration::from_millis(500));
+        }
+    }
+
     let permissions = run_async(async {
         let mut client = BmuxClient::connect_default("bmux-cli-list-permissions")
             .await
@@ -508,9 +543,15 @@ fn run_permissions_list(session: &str, as_json: bool) -> Result<u8> {
         return Ok(0);
     }
 
+    render_permissions_table(&permissions);
+
+    Ok(0)
+}
+
+fn render_permissions_table(permissions: &[bmux_ipc::SessionPermissionSummary]) {
     if permissions.is_empty() {
         println!("no explicit role assignments");
-        return Ok(0);
+        return;
     }
 
     println!("CLIENT_ID                            ROLE");
@@ -521,8 +562,6 @@ fn run_permissions_list(session: &str, as_json: bool) -> Result<u8> {
             session_role_label(permission.role)
         );
     }
-
-    Ok(0)
 }
 
 fn run_grant_role(session: &str, client: &str, role: RoleValue) -> Result<u8> {

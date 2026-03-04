@@ -46,6 +46,7 @@ bmux list-clients
 bmux list-clients --json
 bmux permissions --session dev
 bmux permissions --session dev --json
+bmux permissions --session dev --watch
 bmux grant --session dev --client 550e8400-e29b-41d4-a716-446655440000 --role writer
 bmux revoke --session dev --client 550e8400-e29b-41d4-a716-446655440000
 bmux list-sessions --json
@@ -61,6 +62,7 @@ bmux session clients
 bmux session clients --json
 bmux session permissions --session dev
 bmux session permissions --session dev --json
+bmux session permissions --session dev --watch
 bmux session grant --session dev --client 550e8400-e29b-41d4-a716-446655440000 --role writer
 bmux session revoke --session dev --client 550e8400-e29b-41d4-a716-446655440000
 bmux session list --json
@@ -136,12 +138,14 @@ Top-level and grouped forms are exact aliases.
 # top-level
 bmux permissions --session dev
 bmux permissions --session dev --json
+bmux permissions --session dev --watch
 bmux grant --session dev --client 550e8400-e29b-41d4-a716-446655440000 --role writer
 bmux revoke --session dev --client 550e8400-e29b-41d4-a716-446655440000
 
 # grouped aliases
 bmux session permissions --session dev
 bmux session permissions --session dev --json
+bmux session permissions --session dev --watch
 bmux session grant --session dev --client 550e8400-e29b-41d4-a716-446655440000 --role writer
 bmux session revoke --session dev --client 550e8400-e29b-41d4-a716-446655440000
 ```

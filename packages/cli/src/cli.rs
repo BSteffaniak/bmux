@@ -80,6 +80,9 @@ pub(crate) enum Command {
         /// Print permissions as JSON
         #[arg(long)]
         json: bool,
+        /// Keep watching permission changes until interrupted
+        #[arg(long, conflicts_with = "json")]
+        watch: bool,
     },
     /// Grant a role to a client in a session
     Grant {
@@ -223,6 +226,9 @@ pub(crate) enum SessionCommand {
         /// Print permissions as JSON
         #[arg(long)]
         json: bool,
+        /// Keep watching permission changes until interrupted
+        #[arg(long, conflicts_with = "json")]
+        watch: bool,
     },
     /// Grant a role to a client in a session
     Grant {
@@ -692,7 +698,22 @@ mod tests {
             cli.command,
             Some(Command::Permissions {
                 session,
-                json: false
+                json: false,
+                watch: false
+            }) if session == "dev"
+        ));
+    }
+
+    #[test]
+    fn parses_top_level_permissions_watch_command() {
+        let cli = Cli::try_parse_from(["bmux", "permissions", "--session", "dev", "--watch"])
+            .expect("valid CLI args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Permissions {
+                session,
+                json: false,
+                watch: true
             }) if session == "dev"
         ));
     }
@@ -768,7 +789,32 @@ mod tests {
             command,
             SessionCommand::Permissions {
                 session,
-                json: false
+                json: false,
+                watch: false
+            } if session == "dev"
+        ));
+    }
+
+    #[test]
+    fn parses_grouped_session_permissions_watch_command() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "session",
+            "permissions",
+            "--session",
+            "dev",
+            "--watch",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Session { command }) = cli.command else {
+            panic!("expected session command");
+        };
+        assert!(matches!(
+            command,
+            SessionCommand::Permissions {
+                session,
+                json: false,
+                watch: true
             } if session == "dev"
         ));
     }
