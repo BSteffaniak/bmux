@@ -10,8 +10,8 @@ pub use bmux_ipc::Event as ServerEvent;
 use bmux_ipc::transport::{IpcTransportError, LocalIpcStream};
 use bmux_ipc::{
     AttachGrant, ClientSummary, Envelope, EnvelopeKind, ErrorCode, IpcEndpoint, ProtocolVersion,
-    Request, Response, ResponsePayload, SessionSelector, SessionSummary, WindowSelector,
-    WindowSummary, decode, encode,
+    Request, Response, ResponsePayload, SessionPermissionSummary, SessionRole, SessionSelector,
+    SessionSummary, WindowSelector, WindowSummary, decode, encode,
 };
 use std::time::Duration;
 use thiserror::Error;
@@ -197,6 +197,60 @@ impl BmuxClient {
         match self.request(Request::ListClients).await? {
             ResponsePayload::ClientList { clients } => Ok(clients),
             _ => Err(ClientError::UnexpectedResponse("expected client list")),
+        }
+    }
+
+    /// List explicit role assignments for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn list_permissions(
+        &mut self,
+        session: SessionSelector,
+    ) -> Result<Vec<SessionPermissionSummary>> {
+        match self.request(Request::ListPermissions { session }).await? {
+            ResponsePayload::PermissionsList { permissions, .. } => Ok(permissions),
+            _ => Err(ClientError::UnexpectedResponse("expected permissions list")),
+        }
+    }
+
+    /// Grant a role to a client within a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn grant_role(
+        &mut self,
+        session: SessionSelector,
+        client_id: Uuid,
+        role: SessionRole,
+    ) -> Result<()> {
+        match self
+            .request(Request::GrantRole {
+                session,
+                client_id,
+                role,
+            })
+            .await?
+        {
+            ResponsePayload::RoleGranted { .. } => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse("expected role granted")),
+        }
+    }
+
+    /// Revoke a client's explicit role assignment (fallback to observer).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn revoke_role(&mut self, session: SessionSelector, client_id: Uuid) -> Result<()> {
+        match self
+            .request(Request::RevokeRole { session, client_id })
+            .await?
+        {
+            ResponsePayload::RoleRevoked { .. } => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse("expected role revoked")),
         }
     }
 
@@ -511,7 +565,7 @@ fn endpoint_from_paths(paths: &ConfigPaths) -> IpcEndpoint {
 #[cfg(test)]
 mod tests {
     use super::{BmuxClient, ServerEvent};
-    use bmux_ipc::{IpcEndpoint, SessionSelector, WindowSelector};
+    use bmux_ipc::{IpcEndpoint, SessionRole, SessionSelector, WindowSelector};
     use bmux_server::BmuxServer;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -769,6 +823,89 @@ mod tests {
             .expect("observer open should succeed");
         assert_eq!(observer_info.session_id, session_id);
         assert!(!observer_info.can_write);
+
+        owner.stop_server().await.expect("stop should succeed");
+        server_task
+            .await
+            .expect("server task should join")
+            .expect("server should stop cleanly");
+
+        if socket_path.exists() {
+            std::fs::remove_file(&socket_path).expect("socket cleanup should succeed");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn client_can_grant_list_and_revoke_roles() {
+        let (server_task, socket_path, endpoint) = start_server().await;
+        let mut owner = BmuxClient::connect(&endpoint, Duration::from_secs(2), "owner-perm")
+            .await
+            .expect("owner should connect");
+        let mut member = BmuxClient::connect(&endpoint, Duration::from_secs(2), "member-perm")
+            .await
+            .expect("member should connect");
+
+        let session_id = owner
+            .new_session(Some("perm-session".to_string()))
+            .await
+            .expect("session should be created");
+        owner
+            .subscribe_events()
+            .await
+            .expect("owner event subscribe should succeed");
+
+        let member_id = member.whoami().await.expect("member whoami should succeed");
+        owner
+            .grant_role(
+                SessionSelector::ById(session_id),
+                member_id,
+                SessionRole::Writer,
+            )
+            .await
+            .expect("grant role should succeed");
+
+        let permissions = owner
+            .list_permissions(SessionSelector::ById(session_id))
+            .await
+            .expect("list permissions should succeed");
+        assert!(
+            permissions
+                .iter()
+                .any(|entry| entry.client_id == member_id && entry.role == SessionRole::Writer)
+        );
+
+        owner
+            .revoke_role(SessionSelector::ById(session_id), member_id)
+            .await
+            .expect("revoke role should succeed");
+
+        let events = owner
+            .poll_events(20)
+            .await
+            .expect("poll role events should succeed");
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ServerEvent::RoleChanged {
+                    session_id: changed_session,
+                    client_id: changed_client,
+                    role: SessionRole::Writer,
+                    ..
+                } if *changed_session == session_id && *changed_client == member_id
+            )
+        }));
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                ServerEvent::RoleChanged {
+                    session_id: changed_session,
+                    client_id: changed_client,
+                    role: SessionRole::Observer,
+                    ..
+                } if *changed_session == session_id && *changed_client == member_id
+            )
+        }));
 
         owner.stop_server().await.expect("stop should succeed");
         server_task
