@@ -363,8 +363,10 @@ pub(super) fn render_frame(
             .x
             .saturating_add(cursor_pos.1.min(focused_rect.width.saturating_sub(1)));
 
-        write!(stdout, "\x1b[?25h\x1b[{cursor_row};{cursor_col}H")
-            .context("failed setting cursor")?;
+        if let Some(control) = terminal_cursor_control(show_terminal_cursor, cursor_row, cursor_col)
+        {
+            write!(stdout, "{control}").context("failed setting cursor")?;
+        }
     }
     stdout.flush().context("failed flushing rendered frame")?;
 
@@ -382,6 +384,18 @@ pub(super) fn render_frame(
     render_debug.record_frame(changed_line_count, status_changed, border_changed);
 
     Ok(())
+}
+
+fn terminal_cursor_control(
+    show_terminal_cursor: bool,
+    cursor_row: u16,
+    cursor_col: u16,
+) -> Option<String> {
+    if !show_terminal_cursor {
+        return None;
+    }
+
+    Some(format!("\x1b[?25h\x1b[{cursor_row};{cursor_col}H"))
 }
 
 fn collect_pane_render_data(
@@ -769,7 +783,7 @@ fn fit_to_width(text: &str, width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{CursorOverlay, pad_or_truncate, render_screen_row};
+    use super::{CursorOverlay, pad_or_truncate, render_screen_row, terminal_cursor_control};
     use crate::pane::PaneId;
     use unicode_width::UnicodeWidthStr;
     use vt100::Parser;
@@ -815,5 +829,18 @@ mod tests {
         assert!(rendered.contains("\x1b["));
         assert!(rendered.contains("4;"));
         assert!(rendered.contains("7;"));
+    }
+
+    #[test]
+    fn terminal_cursor_control_omits_show_sequence_when_hidden() {
+        let control = terminal_cursor_control(false, 4, 9);
+        assert!(control.is_none());
+    }
+
+    #[test]
+    fn terminal_cursor_control_includes_show_sequence_when_enabled() {
+        let control = terminal_cursor_control(true, 4, 9).expect("cursor control should exist");
+        assert!(control.contains("\x1b[?25h"));
+        assert!(control.contains("\x1b[4;9H"));
     }
 }
