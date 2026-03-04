@@ -5,6 +5,8 @@
 
 //! Server component for bmux terminal multiplexer.
 
+mod persistence;
+
 use anyhow::{Context, Result};
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
@@ -820,7 +822,10 @@ impl SessionRuntimeManager {
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
         let lookup_selector = selector.clone();
         let window_id = resolve_window_id_from_selector(session, selector).ok_or_else(|| {
-            anyhow::anyhow!(window_not_found_in_session_message(&lookup_selector, session_id))
+            anyhow::anyhow!(window_not_found_in_session_message(
+                &lookup_selector,
+                session_id
+            ))
         })?;
         session.active_window = window_id;
         Ok(window_id)
@@ -1035,9 +1040,11 @@ fn resolve_window_id_from_selector(
                 return Some(window.id);
             }
 
-            if let Some(window) = session.windows.values().find(|window| {
-                window.id.to_string().eq_ignore_ascii_case(&value)
-            }) {
+            if let Some(window) = session
+                .windows
+                .values()
+                .find(|window| window.id.to_string().eq_ignore_ascii_case(&value))
+            {
                 return Some(window.id);
             }
 
@@ -1057,7 +1064,10 @@ fn resolve_window_id_from_selector(
     }
 }
 
-fn window_not_found_in_session_message(selector: &WindowSelection, session_id: SessionId) -> String {
+fn window_not_found_in_session_message(
+    selector: &WindowSelection,
+    session_id: SessionId,
+) -> String {
     match selector {
         WindowSelection::Name(_) => format!(
             "window not found in session {} for selector {selector:?} (lookup order: exact name -> exact UUID -> UUID prefix)",
@@ -2643,10 +2653,8 @@ mod tests {
             .create_session(None)
             .expect("session should be created");
 
-        let resolved = resolve_session_id(
-            &manager,
-            &SessionSelector::ByName(session_id.to_string()),
-        );
+        let resolved =
+            resolve_session_id(&manager, &SessionSelector::ByName(session_id.to_string()));
         assert_eq!(resolved, Some(session_id));
     }
 

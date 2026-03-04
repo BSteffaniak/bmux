@@ -20,7 +20,8 @@ bmux_terminal = { workspace = true }
 # External dependencies
 anyhow       = { workspace = true, features = ["std"] }
 portable-pty = { workspace = true }
-serde        = { workspace = true, features = ["derive"], optional = true }
+serde        = { workspace = true, features = ["derive"] }
+serde_json   = { workspace = true, features = ["std"] }
 thiserror    = { workspace = true }
 tokio        = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tracing      = { workspace = true, features = ["std"] }
@@ -35,4 +36,4 @@ default = []
 fail-on-warnings = []
 
 # Serialization features
-serde = ["dep:serde"]
+serde = []
