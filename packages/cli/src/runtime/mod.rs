@@ -9,7 +9,7 @@ use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
 use bmux_client::{BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, TerminfoAutoInstall};
-use bmux_ipc::{SessionSelector, WindowSelector};
+use bmux_ipc::{transport::IpcTransportError, SessionSelector, WindowSelector};
 use bmux_server::BmuxServer;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -340,7 +340,7 @@ fn run_server_stop() -> Result<u8> {
         .await
         {
             Ok(Ok(mut client)) => {
-                client.stop_server().await.map_err(anyhow::Error::from)?;
+                client.stop_server().await.map_err(map_cli_client_error)?;
                 wait_until_server_stopped(SERVER_STOP_TIMEOUT).await
             }
             Ok(Err(_)) | Err(_) => Ok(false),
@@ -373,8 +373,8 @@ fn run_session_new(name: Option<String>) -> Result<u8> {
     let session_id = run_async(async {
         let mut client = BmuxClient::connect_default("bmux-cli-new-session")
             .await
-            .map_err(anyhow::Error::from)?;
-        client.new_session(name).await.map_err(anyhow::Error::from)
+            .map_err(map_cli_client_error)?;
+        client.new_session(name).await.map_err(map_cli_client_error)
     })?;
     println!("created session: {session_id}");
     Ok(0)
@@ -384,8 +384,8 @@ fn run_session_list(as_json: bool) -> Result<u8> {
     let sessions = run_async(async {
         let mut client = BmuxClient::connect_default("bmux-cli-list-sessions")
             .await
-            .map_err(anyhow::Error::from)?;
-        client.list_sessions().await.map_err(anyhow::Error::from)
+            .map_err(map_cli_client_error)?;
+        client.list_sessions().await.map_err(map_cli_client_error)
     })?;
 
     if as_json {
@@ -417,9 +417,9 @@ fn run_client_list(as_json: bool) -> Result<u8> {
     let (self_id, clients) = run_async(async {
         let mut client = BmuxClient::connect_default("bmux-cli-list-clients")
             .await
-            .map_err(anyhow::Error::from)?;
-        let self_id = client.whoami().await.map_err(anyhow::Error::from)?;
-        let clients = client.list_clients().await.map_err(anyhow::Error::from)?;
+            .map_err(map_cli_client_error)?;
+        let self_id = client.whoami().await.map_err(map_cli_client_error)?;
+        let clients = client.list_clients().await.map_err(map_cli_client_error)?;
         Ok::<(Uuid, Vec<bmux_ipc::ClientSummary>), anyhow::Error>((self_id, clients))
     })?;
     let mut clients = clients;
@@ -466,11 +466,11 @@ fn run_session_kill(target: &str) -> Result<u8> {
     let killed_id = run_async(async {
         let mut client = BmuxClient::connect_default("bmux-cli-kill-session")
             .await
-            .map_err(anyhow::Error::from)?;
+            .map_err(map_cli_client_error)?;
         client
             .kill_session(selector)
             .await
-            .map_err(anyhow::Error::from)
+            .map_err(map_cli_client_error)
     })?;
     println!("killed session: {killed_id}");
     Ok(0)
@@ -654,16 +654,28 @@ fn map_attach_client_error(error: ClientError) -> anyhow::Error {
             bmux_ipc::ErrorCode::NotFound => anyhow::anyhow!("attach failed: {message}"),
             _ => anyhow::anyhow!("attach failed: {message}"),
         },
-        other => anyhow::Error::from(other),
+        other => map_cli_client_error(other),
     }
+}
+
+fn map_cli_client_error(error: ClientError) -> anyhow::Error {
+    if let ClientError::Transport(IpcTransportError::Io(io_error)) = &error
+        && io_error.kind() == std::io::ErrorKind::NotFound
+    {
+        return anyhow::anyhow!(
+            "bmux server is not running (IPC socket not found).\nRun `bmux server start --daemon`.\nTroubleshooting: if the server is running in another shell, ensure both processes use the same runtime directory (`XDG_RUNTIME_DIR`/`TMPDIR`)."
+        );
+    }
+
+    anyhow::Error::from(error)
 }
 
 fn run_session_detach() -> Result<u8> {
     run_async(async {
         let mut client = BmuxClient::connect_default("bmux-cli-detach")
             .await
-            .map_err(anyhow::Error::from)?;
-        client.detach().await.map_err(anyhow::Error::from)
+            .map_err(map_cli_client_error)?;
+        client.detach().await.map_err(map_cli_client_error)
     })?;
     println!("detached");
     Ok(0)
@@ -674,11 +686,11 @@ fn run_follow(target_client_id: &str, global: bool) -> Result<u8> {
     run_async(async {
         let mut client = BmuxClient::connect_default("bmux-cli-follow")
             .await
-            .map_err(anyhow::Error::from)?;
+            .map_err(map_cli_client_error)?;
         client
             .follow_client(target_client_id, global)
             .await
-            .map_err(anyhow::Error::from)
+            .map_err(map_cli_client_error)
     })?;
     println!(
         "following client: {}{}",
@@ -692,8 +704,8 @@ fn run_unfollow() -> Result<u8> {
     run_async(async {
         let mut client = BmuxClient::connect_default("bmux-cli-unfollow")
             .await
-            .map_err(anyhow::Error::from)?;
-        client.unfollow().await.map_err(anyhow::Error::from)
+            .map_err(map_cli_client_error)?;
+        client.unfollow().await.map_err(map_cli_client_error)
     })?;
     println!("follow stopped");
     Ok(0)
@@ -704,11 +716,11 @@ fn run_window_new(session: Option<&String>, name: Option<String>) -> Result<u8> 
     let window_id = run_async(async {
         let mut client = BmuxClient::connect_default("bmux-cli-new-window")
             .await
-            .map_err(anyhow::Error::from)?;
+            .map_err(map_cli_client_error)?;
         client
             .new_window(session_selector, name)
             .await
-            .map_err(anyhow::Error::from)
+            .map_err(map_cli_client_error)
     })?;
     println!("created window: {window_id}");
     Ok(0)
@@ -719,11 +731,11 @@ fn run_window_list(session: Option<&String>, as_json: bool) -> Result<u8> {
     let windows = run_async(async {
         let mut client = BmuxClient::connect_default("bmux-cli-list-windows")
             .await
-            .map_err(anyhow::Error::from)?;
+            .map_err(map_cli_client_error)?;
         client
             .list_windows(session_selector)
             .await
-            .map_err(anyhow::Error::from)
+            .map_err(map_cli_client_error)
     })?;
 
     if as_json {
@@ -762,11 +774,11 @@ fn run_window_kill(target: &str, session: Option<&String>) -> Result<u8> {
     let window_id = run_async(async {
         let mut client = BmuxClient::connect_default("bmux-cli-kill-window")
             .await
-            .map_err(anyhow::Error::from)?;
+            .map_err(map_cli_client_error)?;
         client
             .kill_window(session_selector, window_selector)
             .await
-            .map_err(anyhow::Error::from)
+            .map_err(map_cli_client_error)
     })?;
     println!("killed window: {window_id}");
     Ok(0)
@@ -778,11 +790,11 @@ fn run_window_switch(target: &str, session: Option<&String>) -> Result<u8> {
     let window_id = run_async(async {
         let mut client = BmuxClient::connect_default("bmux-cli-switch-window")
             .await
-            .map_err(anyhow::Error::from)?;
+            .map_err(map_cli_client_error)?;
         client
             .switch_window(session_selector, window_selector)
             .await
-            .map_err(anyhow::Error::from)
+            .map_err(map_cli_client_error)
     })?;
     println!("active window: {window_id}");
     Ok(0)
@@ -2385,6 +2397,7 @@ mod tests {
         EventReader, PaneRuntime, PaneState, ProtocolDirection, ProtocolTraceEvent, ScrollState,
         TerminalProfile, TraceFamily, cursor_status_suffix, filter_trace_events,
         format_scroll_mode_suffix, load_runtime_settings, map_attach_client_error,
+        map_cli_client_error,
         merged_runtime_keybindings, parse_pid_content, profile_for_term,
         protocol_profile_for_terminal_profile, reap_exited_panes, resolve_pane_term_with_checker,
         run_event_input_loop_with_reader, selection_status_suffix,
@@ -2394,6 +2407,7 @@ mod tests {
     use bmux_client::ClientError;
     use bmux_config::BmuxConfig;
     use bmux_ipc::ErrorCode;
+    use bmux_ipc::transport::IpcTransportError;
     use crossterm::event::{
         Event, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
         KeyEventKind as CrosstermKeyEventKind, KeyModifiers,
@@ -2703,6 +2717,30 @@ mod tests {
                 .to_string()
                 .contains("session already has an active attached client")
         );
+    }
+
+    #[test]
+    fn map_cli_client_error_formats_transport_not_found() {
+        let error = map_cli_client_error(ClientError::Transport(IpcTransportError::Io(
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        )));
+        let message = error.to_string();
+
+        assert!(message.contains("bmux server is not running"));
+        assert!(message.contains("bmux server start --daemon"));
+        assert!(message.contains("XDG_RUNTIME_DIR"));
+        assert!(message.contains("TMPDIR"));
+    }
+
+    #[test]
+    fn map_cli_client_error_keeps_non_not_found_errors() {
+        let error = map_cli_client_error(ClientError::Transport(IpcTransportError::Io(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        )));
+        let message = error.to_string();
+
+        assert!(message.contains("transport error"));
+        assert!(!message.contains("bmux server is not running"));
     }
 
     #[test]
