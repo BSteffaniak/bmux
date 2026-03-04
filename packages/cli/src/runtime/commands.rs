@@ -486,6 +486,24 @@ pub(super) fn process_input_events(
                             }
                         }
                     }
+                    RuntimeAction::EnterWindowMode
+                    | RuntimeAction::ExitMode
+                    | RuntimeAction::WindowPrev
+                    | RuntimeAction::WindowNext
+                    | RuntimeAction::WindowGoto1
+                    | RuntimeAction::WindowGoto2
+                    | RuntimeAction::WindowGoto3
+                    | RuntimeAction::WindowGoto4
+                    | RuntimeAction::WindowGoto5
+                    | RuntimeAction::WindowGoto6
+                    | RuntimeAction::WindowGoto7
+                    | RuntimeAction::WindowGoto8
+                    | RuntimeAction::WindowGoto9
+                    | RuntimeAction::WindowClose => {
+                        *status_message = Some(StatusMessage::new(
+                            "window-mode actions are only available in attach mode".to_string(),
+                        ));
+                    }
                     RuntimeAction::ForwardToPane(_) => unreachable!(),
                 }
 

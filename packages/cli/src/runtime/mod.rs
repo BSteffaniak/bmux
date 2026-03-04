@@ -5,6 +5,7 @@ use crate::cli::{
 use crate::input::{InputProcessor, RuntimeAction};
 use crate::pane::{LayoutTree, PaneId, SplitDirection};
 use crate::pty::STARTUP_ALT_SCREEN_GUARD_DURATION;
+use crate::status::{AttachTab, build_attach_status_line, write_status_line};
 use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
 use bmux_client::{BmuxClient, ClientError};
@@ -13,6 +14,7 @@ use bmux_ipc::{SessionRole, SessionSelector, WindowSelector, transport::IpcTrans
 use bmux_server::BmuxServer;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::terminal;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use portable_pty::{Child, MasterPty};
 use std::collections::BTreeMap;
@@ -774,6 +776,9 @@ async fn run_session_attach(
 
     let mut attached_id = attach_info.session_id;
     let mut can_write = attach_info.can_write;
+    let mut ui_mode = AttachUiMode::Normal;
+    let mut status_needs_redraw = true;
+    let mut last_status_redraw = Instant::now();
 
     if !can_write {
         println!("read-only attach: input disabled");
@@ -805,6 +810,8 @@ async fn run_session_attach(
                             .map_err(map_attach_client_error)?;
                         attached_id = attach_info.session_id;
                         can_write = attach_info.can_write;
+                        ui_mode = AttachUiMode::Normal;
+                        status_needs_redraw = true;
                         println!("follow handoff -> session {attached_id}");
                         if !can_write {
                             println!("read-only attach: input disabled");
@@ -823,7 +830,8 @@ async fn run_session_attach(
 
         if let Some(event) = poll_attach_terminal_event(ATTACH_IO_POLL_INTERVAL).await? {
             let mut detach_requested = false;
-            for attach_action in attach_event_actions(&event, &mut attach_input_processor)? {
+            for attach_action in attach_event_actions(&event, &mut attach_input_processor, ui_mode)?
+            {
                 match attach_action {
                     AttachEventAction::Detach => {
                         detach_requested = true;
@@ -847,7 +855,26 @@ async fn run_session_attach(
                         .await
                         {
                             println!("attach action failed: {}", map_attach_client_error(error));
+                        } else {
+                            status_needs_redraw = true;
                         }
+                    }
+                    AttachEventAction::Ui(action) => {
+                        if let Err(error) = handle_attach_ui_action(
+                            &mut client,
+                            action,
+                            &mut attached_id,
+                            &mut can_write,
+                            &mut ui_mode,
+                        )
+                        .await
+                        {
+                            println!("attach action failed: {}", map_attach_client_error(error));
+                        }
+                        status_needs_redraw = true;
+                    }
+                    AttachEventAction::Redraw => {
+                        status_needs_redraw = true;
                     }
                     AttachEventAction::Ignore => {}
                 }
@@ -862,10 +889,25 @@ async fn run_session_attach(
             .attach_output(attached_id, 64 * 1024)
             .await
             .map_err(map_attach_client_error)?;
-        if output.is_empty() {
-            continue;
+        if !output.is_empty() {
+            write_attach_output(output).await?;
+            status_needs_redraw = true;
         }
-        write_attach_output(output).await?;
+
+        if status_needs_redraw || last_status_redraw.elapsed() >= STATUS_REDRAW_INTERVAL {
+            redraw_attach_status_line(
+                &mut client,
+                attached_id,
+                can_write,
+                ui_mode,
+                follow_target_id,
+                global,
+            )
+            .await
+            .map_err(map_attach_client_error)?;
+            status_needs_redraw = false;
+            last_status_redraw = Instant::now();
+        }
     }
 
     let _ = client.detach().await;
@@ -884,9 +926,14 @@ async fn handle_attach_runtime_action(
 ) -> std::result::Result<(), ClientError> {
     match action {
         RuntimeAction::NewWindow => {
-            let window_id = client.new_window(None, None).await?;
+            let window_id = client
+                .new_window(Some(SessionSelector::ById(*attached_id)), None)
+                .await?;
             let active_window_id = client
-                .switch_window(None, WindowSelector::ById(window_id))
+                .switch_window(
+                    Some(SessionSelector::ById(*attached_id)),
+                    WindowSelector::ById(window_id),
+                )
                 .await?;
             println!("created window: {window_id}");
             println!("switched to window: {active_window_id}");
@@ -908,6 +955,197 @@ async fn handle_attach_runtime_action(
     }
 
     Ok(())
+}
+
+async fn handle_attach_ui_action(
+    client: &mut BmuxClient,
+    action: RuntimeAction,
+    attached_id: &mut Uuid,
+    can_write: &mut bool,
+    ui_mode: &mut AttachUiMode,
+) -> std::result::Result<(), ClientError> {
+    match action {
+        RuntimeAction::EnterWindowMode => {
+            *ui_mode = AttachUiMode::Window;
+        }
+        RuntimeAction::ExitMode => {
+            *ui_mode = AttachUiMode::Normal;
+        }
+        RuntimeAction::WindowPrev => {
+            switch_attach_window_relative(client, *attached_id, -1).await?;
+        }
+        RuntimeAction::WindowNext => {
+            switch_attach_window_relative(client, *attached_id, 1).await?;
+        }
+        RuntimeAction::WindowGoto1 => switch_attach_window_index(client, *attached_id, 0).await?,
+        RuntimeAction::WindowGoto2 => switch_attach_window_index(client, *attached_id, 1).await?,
+        RuntimeAction::WindowGoto3 => switch_attach_window_index(client, *attached_id, 2).await?,
+        RuntimeAction::WindowGoto4 => switch_attach_window_index(client, *attached_id, 3).await?,
+        RuntimeAction::WindowGoto5 => switch_attach_window_index(client, *attached_id, 4).await?,
+        RuntimeAction::WindowGoto6 => switch_attach_window_index(client, *attached_id, 5).await?,
+        RuntimeAction::WindowGoto7 => switch_attach_window_index(client, *attached_id, 6).await?,
+        RuntimeAction::WindowGoto8 => switch_attach_window_index(client, *attached_id, 7).await?,
+        RuntimeAction::WindowGoto9 => switch_attach_window_index(client, *attached_id, 8).await?,
+        RuntimeAction::WindowClose => {
+            let _ = client
+                .kill_window(
+                    Some(SessionSelector::ById(*attached_id)),
+                    WindowSelector::Active,
+                )
+                .await?;
+        }
+        RuntimeAction::NewWindow | RuntimeAction::NewSession => {
+            handle_attach_runtime_action(client, action, attached_id, can_write).await?;
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+async fn switch_attach_window_relative(
+    client: &mut BmuxClient,
+    session_id: Uuid,
+    step: isize,
+) -> std::result::Result<(), ClientError> {
+    let windows = ordered_session_windows(client, session_id).await?;
+    if windows.is_empty() {
+        return Ok(());
+    }
+
+    let current_index = windows.iter().position(|window| window.active).unwrap_or(0);
+    let len = windows.len() as isize;
+    let mut target_index = current_index as isize + step;
+    while target_index < 0 {
+        target_index += len;
+    }
+    target_index %= len;
+
+    let target_window_id = windows[target_index as usize].id;
+    let _ = client
+        .switch_window(
+            Some(SessionSelector::ById(session_id)),
+            WindowSelector::ById(target_window_id),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn switch_attach_window_index(
+    client: &mut BmuxClient,
+    session_id: Uuid,
+    target_index: usize,
+) -> std::result::Result<(), ClientError> {
+    let windows = ordered_session_windows(client, session_id).await?;
+    let Some(target) = windows.get(target_index) else {
+        return Ok(());
+    };
+
+    let _ = client
+        .switch_window(
+            Some(SessionSelector::ById(session_id)),
+            WindowSelector::ById(target.id),
+        )
+        .await?;
+    Ok(())
+}
+
+async fn ordered_session_windows(
+    client: &mut BmuxClient,
+    session_id: Uuid,
+) -> std::result::Result<Vec<bmux_ipc::WindowSummary>, ClientError> {
+    let mut windows = client
+        .list_windows(Some(SessionSelector::ById(session_id)))
+        .await?;
+    windows.sort_by_key(|window| window.id);
+    Ok(windows)
+}
+
+async fn redraw_attach_status_line(
+    client: &mut BmuxClient,
+    session_id: Uuid,
+    can_write: bool,
+    ui_mode: AttachUiMode,
+    follow_target_id: Option<Uuid>,
+    follow_global: bool,
+) -> std::result::Result<(), ClientError> {
+    let (cols, _) = terminal::size().unwrap_or((0, 0));
+    if cols == 0 {
+        return Ok(());
+    }
+
+    let tabs = build_attach_tabs(client, session_id).await?;
+    let session_label = resolve_attach_session_label(client, session_id).await?;
+    let mode_label = match ui_mode {
+        AttachUiMode::Normal => "NORMAL",
+        AttachUiMode::Window => "WINDOW",
+    };
+    let role_label = if can_write { "write" } else { "read-only" };
+    let follow_label = follow_target_id.map(|id| {
+        if follow_global {
+            format!("following {} (global)", short_uuid(id))
+        } else {
+            format!("following {}", short_uuid(id))
+        }
+    });
+    let hint = match ui_mode {
+        AttachUiMode::Normal => "Ctrl-T window mode | Ctrl-D detach",
+        AttachUiMode::Window => "h/l prev/next | 1-9 goto | n new | x close | Esc/Enter exit",
+    };
+
+    let status_line = build_attach_status_line(
+        &session_label,
+        &tabs,
+        mode_label,
+        role_label,
+        follow_label.as_deref(),
+        hint,
+    );
+
+    write_status_line(&status_line, cols).map_err(|error| {
+        ClientError::Transport(IpcTransportError::Io(io::Error::new(
+            error.kind(),
+            format!("failed writing attach status line: {error}"),
+        )))
+    })
+}
+
+async fn build_attach_tabs(
+    client: &mut BmuxClient,
+    session_id: Uuid,
+) -> std::result::Result<Vec<AttachTab>, ClientError> {
+    let windows = ordered_session_windows(client, session_id).await?;
+    Ok(windows
+        .into_iter()
+        .enumerate()
+        .map(|(index, window)| AttachTab {
+            index: index + 1,
+            title: window
+                .name
+                .unwrap_or_else(|| format!("window-{}", short_uuid(window.id))),
+            active: window.active,
+        })
+        .collect())
+}
+
+async fn resolve_attach_session_label(
+    client: &mut BmuxClient,
+    session_id: Uuid,
+) -> std::result::Result<String, ClientError> {
+    let sessions = client.list_sessions().await?;
+    Ok(sessions
+        .into_iter()
+        .find(|session| session.id == session_id)
+        .map(|session| {
+            session
+                .name
+                .unwrap_or_else(|| format!("session-{}", short_uuid(session.id)))
+        })
+        .unwrap_or_else(|| format!("session-{}", short_uuid(session_id))))
+}
+
+fn short_uuid(id: Uuid) -> String {
+    id.to_string().chars().take(8).collect()
 }
 
 async fn resolve_follow_target_session(
@@ -957,13 +1195,57 @@ fn filtered_attach_keybindings(
     let (mut runtime, mut global) = merged_runtime_keybindings(config);
     runtime.retain(|_, action| is_attach_keymap_action(action));
     global.retain(|_, action| is_attach_keymap_action(action));
+
+    inject_attach_global_defaults(&mut global);
     (runtime, global)
+}
+
+fn inject_attach_global_defaults(global: &mut std::collections::BTreeMap<String, String>) {
+    let defaults = [
+        ("ctrl+t", "enter_window_mode"),
+        ("escape", "exit_mode"),
+        ("enter", "exit_mode"),
+        ("h", "window_prev"),
+        ("l", "window_next"),
+        ("1", "window_goto_1"),
+        ("2", "window_goto_2"),
+        ("3", "window_goto_3"),
+        ("4", "window_goto_4"),
+        ("5", "window_goto_5"),
+        ("6", "window_goto_6"),
+        ("7", "window_goto_7"),
+        ("8", "window_goto_8"),
+        ("9", "window_goto_9"),
+        ("x", "window_close"),
+        ("n", "new_window"),
+    ];
+
+    for (key, action) in defaults {
+        global
+            .entry(key.to_string())
+            .or_insert_with(|| action.to_string());
+    }
 }
 
 fn is_attach_keymap_action(action: &str) -> bool {
     matches!(
         action.trim().to_ascii_lowercase().as_str(),
-        "new_window" | "new_session"
+        "new_window"
+            | "new_session"
+            | "enter_window_mode"
+            | "exit_mode"
+            | "window_prev"
+            | "window_next"
+            | "window_goto_1"
+            | "window_goto_2"
+            | "window_goto_3"
+            | "window_goto_4"
+            | "window_goto_5"
+            | "window_goto_6"
+            | "window_goto_7"
+            | "window_goto_8"
+            | "window_goto_9"
+            | "window_close"
     )
 }
 
@@ -982,8 +1264,16 @@ fn default_attach_keymap() -> crate::input::Keymap {
 enum AttachEventAction {
     Send(Vec<u8>),
     Runtime(RuntimeAction),
+    Ui(RuntimeAction),
+    Redraw,
     Detach,
     Ignore,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachUiMode {
+    Normal,
+    Window,
 }
 
 struct RawModeGuard;
@@ -1029,10 +1319,12 @@ async fn write_attach_output(output: Vec<u8>) -> Result<()> {
 fn attach_event_actions(
     event: &Event,
     attach_input_processor: &mut InputProcessor,
+    ui_mode: AttachUiMode,
 ) -> Result<Vec<AttachEventAction>> {
     match event {
-        Event::Key(key) => attach_key_event_actions(key, attach_input_processor),
-        Event::Resize(_, _) | Event::Mouse(_) | Event::FocusGained | Event::FocusLost => {
+        Event::Key(key) => attach_key_event_actions(key, attach_input_processor, ui_mode),
+        Event::Resize(_, _) => Ok(vec![AttachEventAction::Redraw]),
+        Event::Mouse(_) | Event::FocusGained | Event::FocusLost => {
             Ok(vec![AttachEventAction::Ignore])
         }
     }
@@ -1041,6 +1333,7 @@ fn attach_event_actions(
 fn attach_key_event_actions(
     key: &KeyEvent,
     attach_input_processor: &mut InputProcessor,
+    ui_mode: AttachUiMode,
 ) -> Result<Vec<AttachEventAction>> {
     if key.kind != KeyEventKind::Press {
         return Ok(vec![AttachEventAction::Ignore]);
@@ -1054,13 +1347,91 @@ fn attach_key_event_actions(
     Ok(actions
         .into_iter()
         .map(|action| match action {
-            RuntimeAction::ForwardToPane(bytes) => AttachEventAction::Send(bytes),
+            RuntimeAction::ForwardToPane(bytes) => {
+                if ui_mode == AttachUiMode::Window {
+                    AttachEventAction::Ignore
+                } else {
+                    AttachEventAction::Send(bytes)
+                }
+            }
             RuntimeAction::NewWindow | RuntimeAction::NewSession => {
                 AttachEventAction::Runtime(action)
+            }
+            RuntimeAction::EnterWindowMode
+            | RuntimeAction::ExitMode
+            | RuntimeAction::WindowPrev
+            | RuntimeAction::WindowNext
+            | RuntimeAction::WindowGoto1
+            | RuntimeAction::WindowGoto2
+            | RuntimeAction::WindowGoto3
+            | RuntimeAction::WindowGoto4
+            | RuntimeAction::WindowGoto5
+            | RuntimeAction::WindowGoto6
+            | RuntimeAction::WindowGoto7
+            | RuntimeAction::WindowGoto8
+            | RuntimeAction::WindowGoto9
+            | RuntimeAction::WindowClose => {
+                if ui_mode == AttachUiMode::Normal
+                    && !matches!(action, RuntimeAction::EnterWindowMode)
+                {
+                    attach_key_event_to_bytes(key)
+                        .map(AttachEventAction::Send)
+                        .unwrap_or(AttachEventAction::Ignore)
+                } else {
+                    AttachEventAction::Ui(action)
+                }
             }
             _ => AttachEventAction::Ignore,
         })
         .collect())
+}
+
+fn attach_key_event_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
+    let modifiers = key.modifiers;
+    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+    let alt = modifiers.contains(KeyModifiers::ALT);
+
+    let mut out = Vec::new();
+    if alt {
+        out.push(0x1b);
+    }
+
+    match key.code {
+        KeyCode::Char(c) => {
+            if ctrl {
+                let lower = c.to_ascii_lowercase();
+                if lower.is_ascii_lowercase() {
+                    out.push((lower as u8 - b'a') + 1);
+                    return Some(out);
+                }
+            }
+            if c.is_ascii() {
+                out.push(c as u8);
+            } else {
+                let mut buf = [0_u8; 4];
+                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+            }
+            Some(out)
+        }
+        KeyCode::Enter => {
+            out.push(b'\r');
+            Some(out)
+        }
+        KeyCode::Tab => {
+            out.push(b'\t');
+            Some(out)
+        }
+        KeyCode::Backspace => {
+            out.push(0x7f);
+            Some(out)
+        }
+        KeyCode::Esc => Some(vec![0x1b]),
+        KeyCode::Up => Some(vec![0x1b, b'[', b'A']),
+        KeyCode::Down => Some(vec![0x1b, b'[', b'B']),
+        KeyCode::Right => Some(vec![0x1b, b'[', b'C']),
+        KeyCode::Left => Some(vec![0x1b, b'[', b'D']),
+        _ => None,
+    }
 }
 
 fn map_attach_client_error(error: ClientError) -> anyhow::Error {
@@ -3179,6 +3550,7 @@ mod tests {
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
+            super::AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         assert_eq!(actions.len(), 1);
@@ -3195,6 +3567,7 @@ mod tests {
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
+            super::AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         assert_eq!(actions.len(), 1);
@@ -3202,7 +3575,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_key_event_action_maps_tmux_style_defaults() {
+    fn attach_key_event_action_maps_prefixed_runtime_defaults() {
         let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
 
         let prefix = super::attach_key_event_actions(
@@ -3212,6 +3585,7 @@ mod tests {
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
+            super::AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         assert!(prefix.is_empty());
@@ -3223,6 +3597,7 @@ mod tests {
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
+            super::AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         assert!(matches!(
@@ -3239,6 +3614,7 @@ mod tests {
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
+            super::AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         let new_session = super::attach_key_event_actions(
@@ -3248,10 +3624,98 @@ mod tests {
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
+            super::AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         assert!(matches!(
             new_session.first(),
+            Some(super::AttachEventAction::Runtime(
+                crate::input::RuntimeAction::NewSession
+            ))
+        ));
+    }
+
+    #[test]
+    fn attach_key_event_action_enters_window_mode_with_ctrl_t() {
+        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
+        let actions = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('t'),
+                KeyModifiers::CONTROL,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+
+        assert!(matches!(
+            actions.first(),
+            Some(super::AttachEventAction::Ui(
+                crate::input::RuntimeAction::EnterWindowMode
+            ))
+        ));
+    }
+
+    #[test]
+    fn attach_key_event_action_routes_h_as_ui_only_in_window_mode() {
+        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
+
+        let normal_actions = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('h'),
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+        assert!(matches!(
+            normal_actions.first(),
+            Some(super::AttachEventAction::Send(bytes)) if bytes.as_slice() == b"h"
+        ));
+
+        let window_actions = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('h'),
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Window,
+        )
+        .expect("attach key action should parse");
+        assert!(matches!(
+            window_actions.first(),
+            Some(super::AttachEventAction::Ui(
+                crate::input::RuntimeAction::WindowPrev
+            ))
+        ));
+    }
+
+    #[test]
+    fn attach_keybindings_allow_global_override_of_default_window_mode_key() {
+        let mut config = BmuxConfig::default();
+        config
+            .keybindings
+            .global
+            .insert("ctrl+t".to_string(), "new_session".to_string());
+
+        let mut processor = InputProcessor::new(attach_keymap_from_config(&config));
+        let actions = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('t'),
+                KeyModifiers::CONTROL,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+
+        assert!(matches!(
+            actions.first(),
             Some(super::AttachEventAction::Runtime(
                 crate::input::RuntimeAction::NewSession
             ))

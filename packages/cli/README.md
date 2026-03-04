@@ -86,6 +86,12 @@ Attach also supports follow mode:
 - `bmux attach --follow <client-uuid>`
 - `bmux attach --follow <client-uuid> --global`
 
+Attach UI defaults (user-overridable via keybindings):
+
+- `Ctrl-D`: detach
+- `Ctrl-T`: enter window mode
+- window mode: `h/l` previous/next window (wrap), `1..9` jump to index, `n` new window, `x` close active window, `Esc`/`Enter` exit window mode
+
 ## Window Commands
 
 Top-level and grouped forms are exact aliases.
