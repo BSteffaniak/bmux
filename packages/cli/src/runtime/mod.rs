@@ -334,6 +334,15 @@ fn run_server_status() -> Result<u8> {
                         "missing"
                     }
                 );
+                if let Some(last_write) = status.snapshot.last_write_epoch_ms {
+                    println!("snapshot last write (ms): {last_write}");
+                }
+                if let Some(last_restore) = status.snapshot.last_restore_epoch_ms {
+                    println!("snapshot last restore (ms): {last_restore}");
+                }
+                if let Some(error) = status.snapshot.last_restore_error.as_ref() {
+                    println!("snapshot last error: {error}");
+                }
             }
             println!("bmux server is running");
             Ok(0)

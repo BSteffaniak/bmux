@@ -153,6 +153,7 @@ Role policy: `owner` controls session/window mutations and role changes, `writer
 ### Server stop behavior
 
 `bmux server stop` uses graceful IPC shutdown first. If that times out, it falls back to PID-based termination.
+`bmux server restore --yes` applies replace semantics: current in-memory server state is cleared and replaced from snapshot.
 
 ### Troubleshooting stale PID state
 

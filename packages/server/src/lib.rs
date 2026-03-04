@@ -6424,6 +6424,127 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_apply_replaces_current_state() {
+        let suffix = Uuid::new_v4().to_string();
+        let root = std::path::PathBuf::from(format!("/tmp/bmxr-{}", &suffix[..8]));
+        let paths = ConfigPaths::new(root.join("config"), root.join("runtime"), root.join("data"));
+        paths.ensure_dirs().expect("paths should be created");
+
+        let endpoint = IpcEndpoint::unix_socket(paths.server_socket());
+        let (_server, server_task) = start_server_from_paths(&paths).await;
+
+        let mut client = connect_and_handshake(&endpoint).await;
+        let baseline_id = match send_request(
+            &mut client,
+            340,
+            Request::NewSession {
+                name: Some("baseline".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected baseline create response: {other:?}"),
+        };
+
+        let saved = send_request(&mut client, 341, Request::ServerSave).await;
+        assert!(matches!(
+            saved,
+            Response::Ok(ResponsePayload::ServerSnapshotSaved { .. })
+        ));
+
+        let transient_id = match send_request(
+            &mut client,
+            342,
+            Request::NewSession {
+                name: Some("transient".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected transient create response: {other:?}"),
+        };
+
+        let restored = send_request(&mut client, 343, Request::ServerRestoreApply).await;
+        assert!(matches!(
+            restored,
+            Response::Ok(ResponsePayload::ServerSnapshotRestored { sessions, .. }) if sessions >= 1
+        ));
+
+        let sessions = send_request(&mut client, 344, Request::ListSessions).await;
+        let sessions = match sessions {
+            Response::Ok(ResponsePayload::SessionList { sessions }) => sessions,
+            other => panic!("unexpected session list response: {other:?}"),
+        };
+        assert!(sessions.iter().any(|session| session.id == baseline_id));
+        assert!(!sessions.iter().any(|session| session.id == transient_id));
+
+        let stopped = send_request(&mut client, 345, Request::ServerStop).await;
+        assert_eq!(stopped, Response::Ok(ResponsePayload::ServerStopping));
+        server_task
+            .await
+            .expect("server task should join")
+            .expect("server should stop cleanly");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_dry_run_reports_checksum_failure() {
+        let suffix = Uuid::new_v4().to_string();
+        let root = std::path::PathBuf::from(format!("/tmp/bmxr-{}", &suffix[..8]));
+        let paths = ConfigPaths::new(root.join("config"), root.join("runtime"), root.join("data"));
+        paths.ensure_dirs().expect("paths should be created");
+
+        let endpoint = IpcEndpoint::unix_socket(paths.server_socket());
+        let (_server, server_task) = start_server_from_paths(&paths).await;
+        let mut client = connect_and_handshake(&endpoint).await;
+
+        let _ = send_request(
+            &mut client,
+            350,
+            Request::NewSession {
+                name: Some("checksum".to_string()),
+            },
+        )
+        .await;
+        let saved = send_request(&mut client, 351, Request::ServerSave).await;
+        let snapshot_path = match saved {
+            Response::Ok(ResponsePayload::ServerSnapshotSaved { path: Some(path) }) => path,
+            other => panic!("unexpected save response: {other:?}"),
+        };
+
+        let mut payload: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&snapshot_path).expect("snapshot file should exist"),
+        )
+        .expect("snapshot json should decode");
+        let checksum = payload["checksum"]
+            .as_u64()
+            .expect("checksum field should be u64");
+        payload["checksum"] = serde_json::json!(checksum.wrapping_add(1));
+        std::fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&payload).expect("snapshot json should encode"),
+        )
+        .expect("tampered snapshot should write");
+
+        let dry_run = send_request(&mut client, 352, Request::ServerRestoreDryRun).await;
+        assert!(matches!(
+            dry_run,
+            Response::Ok(ResponsePayload::ServerSnapshotRestoreDryRun { ok: false, message })
+                if message.contains("checksum")
+        ));
+
+        let stopped = send_request(&mut client, 353, Request::ServerStop).await;
+        assert_eq!(stopped, Response::Ok(ResponsePayload::ServerStopping));
+        server_task
+            .await
+            .expect("server task should join")
+            .expect("server should stop cleanly");
+    }
+
+    #[cfg(unix)]
     async fn start_server() -> (
         BmuxServer,
         IpcEndpoint,

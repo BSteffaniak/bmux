@@ -36,6 +36,7 @@ Shutdown behavior:
 
 - `bmux server stop` tries graceful IPC shutdown first.
 - If graceful shutdown times out, CLI falls back to PID-based termination.
+- `bmux server restore --yes` replaces the current in-memory server state with the persisted snapshot.
 
 ## Session Commands
 
