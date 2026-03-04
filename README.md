@@ -88,6 +88,12 @@ cargo fmt
 
 The current CLI supports both top-level and grouped session commands with identical behavior.
 
+Running `bmux` with no subcommand is server-backed by default:
+
+- starts the server automatically (daemon mode) if needed
+- reuses an existing session when available
+- creates `session-1` (or next `session-N`) when no sessions exist, then attaches
+
 ```bash
 # Start server in foreground (default)
 bmux server start

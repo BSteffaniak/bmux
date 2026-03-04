@@ -1,6 +1,6 @@
 use crate::cli::{
-    Cli, Command, DebugRenderLogFormat, KeymapCommand, LayoutCommand, RoleValue, ServerCommand,
-    SessionCommand, TerminalCommand, TraceFamily, WindowCommand,
+    Cli, Command, DebugRenderLogFormat, KeymapCommand, RoleValue, ServerCommand, SessionCommand,
+    TerminalCommand, TraceFamily, WindowCommand,
 };
 use crate::input::{InputProcessor, RuntimeAction};
 use crate::pane::{LayoutTree, PaneId, SplitDirection};
@@ -10,7 +10,9 @@ use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
 use bmux_client::{BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, TerminfoAutoInstall};
-use bmux_ipc::{SessionRole, SessionSelector, WindowSelector, transport::IpcTransportError};
+use bmux_ipc::{
+    SessionRole, SessionSelector, SessionSummary, WindowSelector, transport::IpcTransportError,
+};
 use bmux_server::BmuxServer;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -133,42 +135,68 @@ pub(crate) async fn run() -> Result<u8> {
         return run_command(command).await;
     }
 
-    let config = match BmuxConfig::load() {
-        Ok(config) => config,
-        Err(error) => {
-            eprintln!("bmux warning: failed loading config, using defaults ({error})");
-            BmuxConfig::default()
-        }
-    };
+    run_default_server_attach().await
+}
 
-    let shell = resolve_shell(cli.shell);
-    let runtime_settings = load_runtime_settings(&config);
-    let runtime_options = RuntimeOptions {
-        terminfo_auto_install: config.behavior.terminfo_auto_install,
-        terminfo_prompt_cooldown_days: config.behavior.terminfo_prompt_cooldown_days.max(1),
-    };
+async fn run_default_server_attach() -> Result<u8> {
+    ensure_server_running_for_default_attach().await?;
+    let target = resolve_default_attach_target().await?;
+    run_session_attach(Some(&target), None, false).await
+}
 
-    let runtime_settings = maybe_install_terminfo_on_startup(runtime_settings, &runtime_options)?;
-    debug!("Starting bmux runtime");
-    debug!("Launching shell: {shell}");
-    debug!(
-        "Pane TERM configured='{}' effective='{}' profile='{}'",
-        runtime_settings.configured_pane_term,
-        runtime_settings.pane_term,
-        terminal_profile_name(runtime_settings.terminal_profile)
-    );
-    for warning in &runtime_settings.warnings {
-        eprintln!("bmux warning: {warning}");
+async fn ensure_server_running_for_default_attach() -> Result<()> {
+    if server_is_running().await? {
+        return Ok(());
     }
 
-    run_two_pane_runtime(
-        &shell,
-        !cli.no_alt_screen,
-        cli.debug_render,
-        cli.debug_render_log.as_deref(),
-        cli.debug_render_log_format,
-        runtime_settings,
-    )
+    let _ = run_server_start(true, false).await?;
+    if !server_is_running().await? {
+        anyhow::bail!("bmux server failed to start for default attach")
+    }
+    Ok(())
+}
+
+async fn resolve_default_attach_target() -> Result<String> {
+    let mut client = BmuxClient::connect_default("bmux-cli-default-attach")
+        .await
+        .map_err(map_cli_client_error)?;
+    let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
+
+    if sessions.is_empty() {
+        let name = next_default_session_name(&sessions);
+        let _ = client
+            .new_session(Some(name.clone()))
+            .await
+            .map_err(map_cli_client_error)?;
+        return Ok(name);
+    }
+
+    let mut sorted = sessions;
+    sorted.sort_by(|left, right| {
+        let left_key = left.name.as_deref().unwrap_or("");
+        let right_key = right.name.as_deref().unwrap_or("");
+        left_key.cmp(right_key).then_with(|| left.id.cmp(&right.id))
+    });
+
+    let session = sorted
+        .into_iter()
+        .next()
+        .expect("non-empty sessions should have first entry");
+    Ok(session.name.unwrap_or_else(|| session.id.to_string()))
+}
+
+fn next_default_session_name(sessions: &[SessionSummary]) -> String {
+    let mut next = 1_u32;
+    loop {
+        let candidate = format!("session-{next}");
+        if sessions
+            .iter()
+            .all(|session| session.name.as_deref() != Some(candidate.as_str()))
+        {
+            return candidate;
+        }
+        next = next.saturating_add(1);
+    }
 }
 
 async fn run_command(command: &Command) -> Result<u8> {
@@ -259,9 +287,6 @@ async fn run_command(command: &Command) -> Result<u8> {
         },
         Command::Keymap { command } => match command {
             KeymapCommand::Doctor { json } => run_keymap_doctor(*json),
-        },
-        Command::Layout { command } => match command {
-            LayoutCommand::Clear => run_layout_clear(),
         },
         Command::Terminal { command } => match command {
             TerminalCommand::Doctor {

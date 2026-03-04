@@ -15,6 +15,12 @@ Command-line interface for bmux terminal multiplexer.
 - Alias-compatible command forms (top-level and grouped)
 - Runtime/terminal diagnostics (`keymap doctor`, `terminal doctor`)
 
+Default launch behavior:
+
+- Running `bmux` with no subcommand now uses the server path only.
+- If the server is not running, bmux starts it in daemon mode.
+- If no session exists, bmux creates `session-1` (or the next available `session-N`) and attaches.
+
 ## Server Commands
 
 ```bash

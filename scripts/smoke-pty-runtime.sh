@@ -49,8 +49,9 @@ run_case() {
     XDG_DATA_HOME="$sandbox/data" \
     XDG_RUNTIME_DIR="$sandbox/runtime" \
     TMPDIR="$sandbox/tmp" \
-    script -q /dev/null \
-    sh -lc "printf '\\001q' | cargo run -q -p bmux_cli -- --shell '$shell_bin' --no-alt-screen" \
+    SHELL="$shell_bin" \
+    script -q /dev/null cargo run -q -p bmux_cli -- \
+    <<< $'\004' \
     >/dev/null 2>&1
   local status=$?
   set -e
@@ -78,14 +79,15 @@ run_keybind_case() {
     XDG_DATA_HOME="$sandbox/data" \
     XDG_RUNTIME_DIR="$sandbox/runtime" \
     TMPDIR="$sandbox/tmp" \
-    script -q /dev/null \
-    sh -lc "printf '\\001t\\001x\\001r\\001o\\001+\\001-\\001?\\001q' | cargo run -q -p bmux_cli -- --shell '$shell_bin' --no-alt-screen" \
+    SHELL="$shell_bin" \
+    script -q /dev/null cargo run -q -p bmux_cli -- \
+    <<< $'\001t\004' \
     >/dev/null 2>&1
   local status=$?
   set -e
 
   if [[ $status -ne 0 ]]; then
-    echo "fail: keybind smoke expected clean Ctrl-A q exit, got ${status}"
+    echo "fail: keybind smoke expected clean attach detach, got ${status}"
     return 1
   fi
 
