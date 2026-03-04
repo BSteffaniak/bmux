@@ -176,12 +176,22 @@ fn run_command(command: &Command) -> Result<u8> {
         Command::ListWindows { session, json } => run_window_list(session.as_ref(), *json),
         Command::KillWindow { target, session } => run_window_kill(target, session.as_ref()),
         Command::SwitchWindow { target, session } => run_window_switch(target, session.as_ref()),
+        Command::Follow {
+            target_client_id,
+            global,
+        } => run_follow(target_client_id, *global),
+        Command::Unfollow => run_unfollow(),
         Command::Session { command } => match command {
             SessionCommand::New { name } => run_session_new(name.clone()),
             SessionCommand::List { json } => run_session_list(*json),
             SessionCommand::Kill { target } => run_session_kill(target),
             SessionCommand::Attach { target } => run_session_attach(target),
             SessionCommand::Detach => run_session_detach(),
+            SessionCommand::Follow {
+                target_client_id,
+                global,
+            } => run_follow(target_client_id, *global),
+            SessionCommand::Unfollow => run_unfollow(),
         },
         Command::Window { command } => match command {
             WindowCommand::New { session, name } => run_window_new(session.as_ref(), name.clone()),
@@ -609,6 +619,36 @@ fn run_session_detach() -> Result<u8> {
     Ok(0)
 }
 
+fn run_follow(target_client_id: &str, global: bool) -> Result<u8> {
+    let target_client_id = parse_uuid_value(target_client_id, "target client id")?;
+    run_async(async {
+        let mut client = BmuxClient::connect_default("bmux-cli-follow")
+            .await
+            .map_err(anyhow::Error::from)?;
+        client
+            .follow_client(target_client_id, global)
+            .await
+            .map_err(anyhow::Error::from)
+    })?;
+    println!(
+        "following client: {}{}",
+        target_client_id,
+        if global { " (global)" } else { "" }
+    );
+    Ok(0)
+}
+
+fn run_unfollow() -> Result<u8> {
+    run_async(async {
+        let mut client = BmuxClient::connect_default("bmux-cli-unfollow")
+            .await
+            .map_err(anyhow::Error::from)?;
+        client.unfollow().await.map_err(anyhow::Error::from)
+    })?;
+    println!("follow stopped");
+    Ok(0)
+}
+
 fn run_window_new(session: Option<&String>, name: Option<String>) -> Result<u8> {
     let session_selector = session.map(|target| parse_session_selector(target));
     let window_id = run_async(async {
@@ -714,6 +754,10 @@ fn parse_window_selector(target: &str) -> WindowSelector {
         Ok(id) => WindowSelector::ById(id),
         Err(_) => WindowSelector::ByName(target.to_string()),
     }
+}
+
+fn parse_uuid_value(value: &str, label: &str) -> Result<Uuid> {
+    Uuid::parse_str(value).with_context(|| format!("{label} must be a UUID, got '{value}'"))
 }
 
 fn run_async<F, T>(future: F) -> Result<T>

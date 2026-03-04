@@ -106,6 +106,16 @@ bmux list-sessions --json
 bmux attach dev
 bmux kill-session dev
 
+# Window lifecycle (top-level)
+bmux new-window --session dev --name editor
+bmux list-windows --session dev
+bmux switch-window active --session dev
+bmux kill-window active --session dev
+
+# Follow controls (top-level)
+bmux follow 550e8400-e29b-41d4-a716-446655440000 --global
+bmux unfollow
+
 # Same operations via grouped aliases
 bmux session new dev
 bmux session list
@@ -113,6 +123,12 @@ bmux session list --json
 bmux session attach dev
 bmux session kill dev
 bmux session detach
+bmux window new --session dev --name editor
+bmux window list --session dev
+bmux window switch active --session dev
+bmux window kill active --session dev
+bmux session follow 550e8400-e29b-41d4-a716-446655440000 --global
+bmux session unfollow
 ```
 
 `list-sessions --json` and `session list --json` output a bare JSON array.

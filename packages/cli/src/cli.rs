@@ -105,6 +105,16 @@ pub(crate) enum Command {
         #[arg(long)]
         session: Option<String>,
     },
+    /// Follow another client's active target
+    Follow {
+        /// Target client UUID to follow
+        target_client_id: String,
+        /// Keep following across target session switches
+        #[arg(long)]
+        global: bool,
+    },
+    /// Stop following a client
+    Unfollow,
     /// Session management commands
     Session {
         #[command(subcommand)]
@@ -162,6 +172,16 @@ pub(crate) enum SessionCommand {
     },
     /// Detach from the current session
     Detach,
+    /// Follow another client's active target
+    Follow {
+        /// Target client UUID to follow
+        target_client_id: String,
+        /// Keep following across target session switches
+        #[arg(long)]
+        global: bool,
+    },
+    /// Stop following a client
+    Unfollow,
 }
 
 #[derive(Debug, Subcommand)]
@@ -554,6 +574,61 @@ mod tests {
             panic!("expected session command");
         };
         assert!(matches!(command, SessionCommand::Detach));
+    }
+
+    #[test]
+    fn parses_top_level_follow_command() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "follow",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--global",
+        ])
+        .expect("valid CLI args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Follow {
+                ref target_client_id,
+                global: true
+            }) if target_client_id == "550e8400-e29b-41d4-a716-446655440000"
+        ));
+    }
+
+    #[test]
+    fn parses_top_level_unfollow_command() {
+        let cli = Cli::try_parse_from(["bmux", "unfollow"]).expect("valid CLI args");
+        assert!(matches!(cli.command, Some(Command::Unfollow)));
+    }
+
+    #[test]
+    fn parses_grouped_session_follow_command() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "session",
+            "follow",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--global",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Session { command }) = cli.command else {
+            panic!("expected session command");
+        };
+        assert!(matches!(
+            command,
+            SessionCommand::Follow {
+                ref target_client_id,
+                global: true
+            } if target_client_id == "550e8400-e29b-41d4-a716-446655440000"
+        ));
+    }
+
+    #[test]
+    fn parses_grouped_session_unfollow_command() {
+        let cli = Cli::try_parse_from(["bmux", "session", "unfollow"]).expect("valid CLI args");
+        let Some(Command::Session { command }) = cli.command else {
+            panic!("expected session command");
+        };
+        assert!(matches!(command, SessionCommand::Unfollow));
     }
 
     #[test]

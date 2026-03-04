@@ -9,6 +9,7 @@ Command-line interface for bmux terminal multiplexer.
 - Local server lifecycle commands (`start`, `status`, `stop`)
 - Session lifecycle commands (new/list/attach/detach/kill)
 - Window lifecycle commands (new/list/switch/kill)
+- Client follow controls (follow/unfollow)
 - Alias-compatible command forms (top-level and grouped)
 - Runtime/terminal diagnostics (`keymap doctor`, `terminal doctor`)
 
@@ -85,6 +86,24 @@ Window target values for `switch`/`kill` support:
 - `active`
 
 When `--session` is omitted, window commands use the currently attached session context.
+
+## Follow Commands
+
+Top-level and grouped forms are exact aliases.
+
+```bash
+# top-level
+bmux follow 550e8400-e29b-41d4-a716-446655440000
+bmux follow 550e8400-e29b-41d4-a716-446655440000 --global
+bmux unfollow
+
+# grouped aliases
+bmux session follow 550e8400-e29b-41d4-a716-446655440000
+bmux session follow 550e8400-e29b-41d4-a716-446655440000 --global
+bmux session unfollow
+```
+
+`follow` target must be a client UUID.
 
 ## JSON Output
 
