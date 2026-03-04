@@ -13,8 +13,9 @@ mod terminal;
 
 use std::process::ExitCode;
 
-fn main() -> ExitCode {
-    match runtime::run() {
+#[tokio::main]
+async fn main() -> ExitCode {
+    match runtime::run().await {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
             eprintln!("bmux error: {error}");

@@ -119,12 +119,12 @@ enum TerminalProfile {
     Conservative,
 }
 
-pub(crate) fn run() -> Result<u8> {
+pub(crate) async fn run() -> Result<u8> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
 
     if let Some(command) = &cli.command {
-        return run_command(command);
+        return run_command(command).await;
     }
 
     let config = match BmuxConfig::load() {
@@ -165,83 +165,91 @@ pub(crate) fn run() -> Result<u8> {
     )
 }
 
-fn run_command(command: &Command) -> Result<u8> {
+async fn run_command(command: &Command) -> Result<u8> {
     match command {
-        Command::NewSession { name } => run_session_new(name.clone()),
-        Command::ListSessions { json } => run_session_list(*json),
-        Command::ListClients { json } => run_client_list(*json),
+        Command::NewSession { name } => run_session_new(name.clone()).await,
+        Command::ListSessions { json } => run_session_list(*json).await,
+        Command::ListClients { json } => run_client_list(*json).await,
         Command::Permissions {
             session,
             json,
             watch,
-        } => run_permissions_list(session, *json, *watch),
+        } => run_permissions_list(session, *json, *watch).await,
         Command::Grant {
             session,
             client,
             role,
-        } => run_grant_role(session, client, *role),
-        Command::Revoke { session, client } => run_revoke_role(session, client),
-        Command::KillSession { target } => run_session_kill(target),
+        } => run_grant_role(session, client, *role).await,
+        Command::Revoke { session, client } => run_revoke_role(session, client).await,
+        Command::KillSession { target } => run_session_kill(target).await,
         Command::Attach {
             target,
             follow,
             global,
-        } => run_session_attach(target.as_deref(), follow.as_deref(), *global),
-        Command::Detach => run_session_detach(),
-        Command::NewWindow { session, name } => run_window_new(session.as_ref(), name.clone()),
-        Command::ListWindows { session, json } => run_window_list(session.as_ref(), *json),
-        Command::KillWindow { target, session } => run_window_kill(target, session.as_ref()),
-        Command::SwitchWindow { target, session } => run_window_switch(target, session.as_ref()),
+        } => run_session_attach(target.as_deref(), follow.as_deref(), *global).await,
+        Command::Detach => run_session_detach().await,
+        Command::NewWindow { session, name } => {
+            run_window_new(session.as_ref(), name.clone()).await
+        }
+        Command::ListWindows { session, json } => run_window_list(session.as_ref(), *json).await,
+        Command::KillWindow { target, session } => run_window_kill(target, session.as_ref()).await,
+        Command::SwitchWindow { target, session } => {
+            run_window_switch(target, session.as_ref()).await
+        }
         Command::Follow {
             target_client_id,
             global,
-        } => run_follow(target_client_id, *global),
-        Command::Unfollow => run_unfollow(),
+        } => run_follow(target_client_id, *global).await,
+        Command::Unfollow => run_unfollow().await,
         Command::Session { command } => match command {
-            SessionCommand::New { name } => run_session_new(name.clone()),
-            SessionCommand::List { json } => run_session_list(*json),
-            SessionCommand::Clients { json } => run_client_list(*json),
+            SessionCommand::New { name } => run_session_new(name.clone()).await,
+            SessionCommand::List { json } => run_session_list(*json).await,
+            SessionCommand::Clients { json } => run_client_list(*json).await,
             SessionCommand::Permissions {
                 session,
                 json,
                 watch,
-            } => run_permissions_list(session, *json, *watch),
+            } => run_permissions_list(session, *json, *watch).await,
             SessionCommand::Grant {
                 session,
                 client,
                 role,
-            } => run_grant_role(session, client, *role),
-            SessionCommand::Revoke { session, client } => run_revoke_role(session, client),
-            SessionCommand::Kill { target } => run_session_kill(target),
+            } => run_grant_role(session, client, *role).await,
+            SessionCommand::Revoke { session, client } => run_revoke_role(session, client).await,
+            SessionCommand::Kill { target } => run_session_kill(target).await,
             SessionCommand::Attach {
                 target,
                 follow,
                 global,
-            } => run_session_attach(target.as_deref(), follow.as_deref(), *global),
-            SessionCommand::Detach => run_session_detach(),
+            } => run_session_attach(target.as_deref(), follow.as_deref(), *global).await,
+            SessionCommand::Detach => run_session_detach().await,
             SessionCommand::Follow {
                 target_client_id,
                 global,
-            } => run_follow(target_client_id, *global),
-            SessionCommand::Unfollow => run_unfollow(),
+            } => run_follow(target_client_id, *global).await,
+            SessionCommand::Unfollow => run_unfollow().await,
         },
         Command::Window { command } => match command {
-            WindowCommand::New { session, name } => run_window_new(session.as_ref(), name.clone()),
-            WindowCommand::List { session, json } => run_window_list(session.as_ref(), *json),
-            WindowCommand::Kill { target, session } => run_window_kill(target, session.as_ref()),
+            WindowCommand::New { session, name } => {
+                run_window_new(session.as_ref(), name.clone()).await
+            }
+            WindowCommand::List { session, json } => run_window_list(session.as_ref(), *json).await,
+            WindowCommand::Kill { target, session } => {
+                run_window_kill(target, session.as_ref()).await
+            }
             WindowCommand::Switch { target, session } => {
-                run_window_switch(target, session.as_ref())
+                run_window_switch(target, session.as_ref()).await
             }
         },
         Command::Server { command } => match command {
             ServerCommand::Start {
                 daemon,
                 foreground_internal,
-            } => run_server_start(*daemon, *foreground_internal),
-            ServerCommand::Status => run_server_status(),
-            ServerCommand::Save => run_server_save(),
-            ServerCommand::Restore { dry_run, yes } => run_server_restore(*dry_run, *yes),
-            ServerCommand::Stop => run_server_stop(),
+            } => run_server_start(*daemon, *foreground_internal).await,
+            ServerCommand::Status => run_server_status().await,
+            ServerCommand::Save => run_server_save().await,
+            ServerCommand::Restore { dry_run, yes } => run_server_restore(*dry_run, *yes).await,
+            ServerCommand::Stop => run_server_stop().await,
         },
         Command::Keymap { command } => match command {
             KeymapCommand::Doctor { json } => run_keymap_doctor(*json),
@@ -264,9 +272,9 @@ fn run_command(command: &Command) -> Result<u8> {
     }
 }
 
-fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8> {
-    cleanup_stale_pid_file()?;
-    if server_is_running()? {
+async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8> {
+    cleanup_stale_pid_file().await?;
+    if server_is_running().await? {
         println!("bmux server is already running");
         return Ok(1);
     }
@@ -285,7 +293,7 @@ fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8> {
         let child = child.spawn().context("failed to spawn background server")?;
         write_server_pid_file(child.id())?;
 
-        if !wait_for_server_running(SERVER_START_TIMEOUT)? {
+        if !wait_for_server_running(SERVER_START_TIMEOUT).await? {
             let _ = try_kill_pid(child.id());
             let _ = remove_server_pid_file();
             anyhow::bail!("background server did not become ready before timeout")
@@ -297,19 +305,19 @@ fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8> {
 
     let server = BmuxServer::from_default_paths();
     write_server_pid_file(std::process::id())?;
-    let run_result = run_async(async move { server.run().await });
+    let run_result = server.run().await;
     let _ = remove_server_pid_file();
     run_result?;
     Ok(0)
 }
 
-fn run_server_status() -> Result<u8> {
-    cleanup_stale_pid_file()?;
-    let status = fetch_server_status()?;
+async fn run_server_status() -> Result<u8> {
+    cleanup_stale_pid_file().await?;
+    let status = fetch_server_status().await?;
 
     match status {
         Some(status) if status.running => {
-            if let Some(event_name) = latest_server_event_name()? {
+            if let Some(event_name) = latest_server_event_name().await? {
                 println!("latest server event: {event_name}");
             }
             println!(
@@ -354,14 +362,12 @@ fn run_server_status() -> Result<u8> {
     }
 }
 
-fn run_server_save() -> Result<u8> {
-    cleanup_stale_pid_file()?;
-    let path = run_async(async {
-        let mut client = BmuxClient::connect_default("bmux-cli-server-save")
-            .await
-            .map_err(map_cli_client_error)?;
-        client.server_save().await.map_err(map_cli_client_error)
-    })?;
+async fn run_server_save() -> Result<u8> {
+    cleanup_stale_pid_file().await?;
+    let mut client = BmuxClient::connect_default("bmux-cli-server-save")
+        .await
+        .map_err(map_cli_client_error)?;
+    let path = client.server_save().await.map_err(map_cli_client_error)?;
 
     match path {
         Some(path) => println!("snapshot saved: {path}"),
@@ -370,22 +376,20 @@ fn run_server_save() -> Result<u8> {
     Ok(0)
 }
 
-fn run_server_restore(dry_run: bool, yes: bool) -> Result<u8> {
+async fn run_server_restore(dry_run: bool, yes: bool) -> Result<u8> {
     if !dry_run && !yes {
         anyhow::bail!("server restore requires either --dry-run or --yes");
     }
-    cleanup_stale_pid_file()?;
+    cleanup_stale_pid_file().await?;
 
     if dry_run {
-        let (ok, message) = run_async(async {
-            let mut client = BmuxClient::connect_default("bmux-cli-server-restore-dry-run")
-                .await
-                .map_err(map_cli_client_error)?;
-            client
-                .server_restore_dry_run()
-                .await
-                .map_err(map_cli_client_error)
-        })?;
+        let mut client = BmuxClient::connect_default("bmux-cli-server-restore-dry-run")
+            .await
+            .map_err(map_cli_client_error)?;
+        let (ok, message) = client
+            .server_restore_dry_run()
+            .await
+            .map_err(map_cli_client_error)?;
 
         if ok {
             println!("restore dry-run: OK - {message}");
@@ -395,15 +399,13 @@ fn run_server_restore(dry_run: bool, yes: bool) -> Result<u8> {
         return Ok(1);
     }
 
-    let summary = run_async(async {
-        let mut client = BmuxClient::connect_default("bmux-cli-server-restore-apply")
-            .await
-            .map_err(map_cli_client_error)?;
-        client
-            .server_restore_apply()
-            .await
-            .map_err(map_cli_client_error)
-    })?;
+    let mut client = BmuxClient::connect_default("bmux-cli-server-restore-apply")
+        .await
+        .map_err(map_cli_client_error)?;
+    let summary = client
+        .server_restore_apply()
+        .await
+        .map_err(map_cli_client_error)?;
 
     println!(
         "restore applied: sessions={}, windows={}, roles={}, follows={}, selected_sessions={}",
@@ -416,27 +418,24 @@ fn run_server_restore(dry_run: bool, yes: bool) -> Result<u8> {
     Ok(0)
 }
 
-fn latest_server_event_name() -> Result<Option<&'static str>> {
-    run_async(async {
-        let connect = tokio::time::timeout(
-            SERVER_STATUS_TIMEOUT,
-            BmuxClient::connect_default("bmux-cli-status-events"),
-        )
-        .await;
+async fn latest_server_event_name() -> Result<Option<&'static str>> {
+    let connect = tokio::time::timeout(
+        SERVER_STATUS_TIMEOUT,
+        BmuxClient::connect_default("bmux-cli-status-events"),
+    )
+    .await;
 
-        let mut client = match connect {
-            Ok(Ok(client)) => client,
-            Ok(Err(_)) | Err(_) => return Ok(None),
-        };
+    let mut client = match connect {
+        Ok(Ok(client)) => client,
+        Ok(Err(_)) | Err(_) => return Ok(None),
+    };
 
-        let _ = tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.subscribe_events()).await;
-        let events = match tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.poll_events(1)).await
-        {
-            Ok(Ok(events)) => events,
-            Ok(Err(_)) | Err(_) => return Ok(None),
-        };
-        Ok(events.last().map(server_event_name))
-    })
+    let _ = tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.subscribe_events()).await;
+    let events = match tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.poll_events(1)).await {
+        Ok(Ok(events)) => events,
+        Ok(Err(_)) | Err(_) => return Ok(None),
+    };
+    Ok(events.last().map(server_event_name))
 }
 
 fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
@@ -458,22 +457,20 @@ fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
     }
 }
 
-fn run_server_stop() -> Result<u8> {
-    cleanup_stale_pid_file()?;
-    let graceful_stopped = run_async(async {
-        match tokio::time::timeout(
-            SERVER_STOP_TIMEOUT,
-            BmuxClient::connect_default("bmux-cli-stop"),
-        )
-        .await
-        {
-            Ok(Ok(mut client)) => {
-                client.stop_server().await.map_err(map_cli_client_error)?;
-                wait_until_server_stopped(SERVER_STOP_TIMEOUT).await
-            }
-            Ok(Err(_)) | Err(_) => Ok(false),
+async fn run_server_stop() -> Result<u8> {
+    cleanup_stale_pid_file().await?;
+    let graceful_stopped = match tokio::time::timeout(
+        SERVER_STOP_TIMEOUT,
+        BmuxClient::connect_default("bmux-cli-stop"),
+    )
+    .await
+    {
+        Ok(Ok(mut client)) => {
+            client.stop_server().await.map_err(map_cli_client_error)?;
+            wait_until_server_stopped(SERVER_STOP_TIMEOUT).await?
         }
-    })?;
+        Ok(Err(_)) | Err(_) => false,
+    };
 
     if graceful_stopped {
         println!("bmux server stopped gracefully");
@@ -497,24 +494,23 @@ fn run_server_stop() -> Result<u8> {
     Ok(1)
 }
 
-fn run_session_new(name: Option<String>) -> Result<u8> {
-    let session_id = run_async(async {
-        let mut client = BmuxClient::connect_default("bmux-cli-new-session")
-            .await
-            .map_err(map_cli_client_error)?;
-        client.new_session(name).await.map_err(map_cli_client_error)
-    })?;
+async fn run_session_new(name: Option<String>) -> Result<u8> {
+    let mut client = BmuxClient::connect_default("bmux-cli-new-session")
+        .await
+        .map_err(map_cli_client_error)?;
+    let session_id = client
+        .new_session(name)
+        .await
+        .map_err(map_cli_client_error)?;
     println!("created session: {session_id}");
     Ok(0)
 }
 
-fn run_session_list(as_json: bool) -> Result<u8> {
-    let sessions = run_async(async {
-        let mut client = BmuxClient::connect_default("bmux-cli-list-sessions")
-            .await
-            .map_err(map_cli_client_error)?;
-        client.list_sessions().await.map_err(map_cli_client_error)
-    })?;
+async fn run_session_list(as_json: bool) -> Result<u8> {
+    let mut client = BmuxClient::connect_default("bmux-cli-list-sessions")
+        .await
+        .map_err(map_cli_client_error)?;
+    let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
 
     if as_json {
         println!(
@@ -541,15 +537,12 @@ fn run_session_list(as_json: bool) -> Result<u8> {
     Ok(0)
 }
 
-fn run_client_list(as_json: bool) -> Result<u8> {
-    let (self_id, clients) = run_async(async {
-        let mut client = BmuxClient::connect_default("bmux-cli-list-clients")
-            .await
-            .map_err(map_cli_client_error)?;
-        let self_id = client.whoami().await.map_err(map_cli_client_error)?;
-        let clients = client.list_clients().await.map_err(map_cli_client_error)?;
-        Ok::<(Uuid, Vec<bmux_ipc::ClientSummary>), anyhow::Error>((self_id, clients))
-    })?;
+async fn run_client_list(as_json: bool) -> Result<u8> {
+    let mut client = BmuxClient::connect_default("bmux-cli-list-clients")
+        .await
+        .map_err(map_cli_client_error)?;
+    let self_id = client.whoami().await.map_err(map_cli_client_error)?;
+    let clients = client.list_clients().await.map_err(map_cli_client_error)?;
     let mut clients = clients;
     clients.sort_by_key(|client| (client.id != self_id, client.id));
 
@@ -591,24 +584,21 @@ fn run_client_list(as_json: bool) -> Result<u8> {
     Ok(0)
 }
 
-fn run_permissions_list(session: &str, as_json: bool, watch: bool) -> Result<u8> {
+async fn run_permissions_list(session: &str, as_json: bool, watch: bool) -> Result<u8> {
     let selector = parse_session_selector(session);
 
     if watch {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .context("failed to build tokio runtime")?;
-        let mut client = runtime
-            .block_on(BmuxClient::connect_default("bmux-cli-watch-permissions"))
+        let mut client = BmuxClient::connect_default("bmux-cli-watch-permissions")
+            .await
             .map_err(map_cli_client_error)?;
 
         println!("watching permissions for session '{session}' (Ctrl-C to stop)");
         let mut last_permissions: Option<Vec<bmux_ipc::SessionPermissionSummary>> = None;
 
         loop {
-            let permissions = runtime
-                .block_on(client.list_permissions(selector.clone()))
+            let permissions = client
+                .list_permissions(selector.clone())
+                .await
                 .map_err(map_cli_client_error)?;
 
             if last_permissions.as_ref() != Some(&permissions) {
@@ -616,19 +606,17 @@ fn run_permissions_list(session: &str, as_json: bool, watch: bool) -> Result<u8>
                 last_permissions = Some(permissions);
             }
 
-            std::thread::sleep(Duration::from_millis(500));
+            tokio::time::sleep(Duration::from_millis(500)).await;
         }
     }
 
-    let permissions = run_async(async {
-        let mut client = BmuxClient::connect_default("bmux-cli-list-permissions")
-            .await
-            .map_err(map_cli_client_error)?;
-        client
-            .list_permissions(selector)
-            .await
-            .map_err(map_cli_client_error)
-    })?;
+    let mut client = BmuxClient::connect_default("bmux-cli-list-permissions")
+        .await
+        .map_err(map_cli_client_error)?;
+    let permissions = client
+        .list_permissions(selector)
+        .await
+        .map_err(map_cli_client_error)?;
 
     if as_json {
         println!(
@@ -660,17 +648,15 @@ fn render_permissions_table(permissions: &[bmux_ipc::SessionPermissionSummary]) 
     }
 }
 
-fn run_grant_role(session: &str, client: &str, role: RoleValue) -> Result<u8> {
+async fn run_grant_role(session: &str, client: &str, role: RoleValue) -> Result<u8> {
     let selector = parse_session_selector(session);
     let client_id = parse_uuid_value(client, "client id")?;
-    run_async(async {
-        let mut api = BmuxClient::connect_default("bmux-cli-grant-role")
-            .await
-            .map_err(map_cli_client_error)?;
-        api.grant_role(selector, client_id, session_role_from_value(role))
-            .await
-            .map_err(map_cli_client_error)
-    })?;
+    let mut api = BmuxClient::connect_default("bmux-cli-grant-role")
+        .await
+        .map_err(map_cli_client_error)?;
+    api.grant_role(selector, client_id, session_role_from_value(role))
+        .await
+        .map_err(map_cli_client_error)?;
 
     println!(
         "granted role {} to client {}",
@@ -680,38 +666,38 @@ fn run_grant_role(session: &str, client: &str, role: RoleValue) -> Result<u8> {
     Ok(0)
 }
 
-fn run_revoke_role(session: &str, client: &str) -> Result<u8> {
+async fn run_revoke_role(session: &str, client: &str) -> Result<u8> {
     let selector = parse_session_selector(session);
     let client_id = parse_uuid_value(client, "client id")?;
-    run_async(async {
-        let mut api = BmuxClient::connect_default("bmux-cli-revoke-role")
-            .await
-            .map_err(map_cli_client_error)?;
-        api.revoke_role(selector, client_id)
-            .await
-            .map_err(map_cli_client_error)
-    })?;
+    let mut api = BmuxClient::connect_default("bmux-cli-revoke-role")
+        .await
+        .map_err(map_cli_client_error)?;
+    api.revoke_role(selector, client_id)
+        .await
+        .map_err(map_cli_client_error)?;
 
     println!("revoked explicit role for client {client_id}");
     Ok(0)
 }
 
-fn run_session_kill(target: &str) -> Result<u8> {
+async fn run_session_kill(target: &str) -> Result<u8> {
     let selector = parse_session_selector(target);
-    let killed_id = run_async(async {
-        let mut client = BmuxClient::connect_default("bmux-cli-kill-session")
-            .await
-            .map_err(map_cli_client_error)?;
-        client
-            .kill_session(selector)
-            .await
-            .map_err(map_cli_client_error)
-    })?;
+    let mut client = BmuxClient::connect_default("bmux-cli-kill-session")
+        .await
+        .map_err(map_cli_client_error)?;
+    let killed_id = client
+        .kill_session(selector)
+        .await
+        .map_err(map_cli_client_error)?;
     println!("killed session: {killed_id}");
     Ok(0)
 }
 
-fn run_session_attach(target: Option<&str>, follow: Option<&str>, global: bool) -> Result<u8> {
+async fn run_session_attach(
+    target: Option<&str>,
+    follow: Option<&str>,
+    global: bool,
+) -> Result<u8> {
     if target.is_none() && follow.is_none() {
         anyhow::bail!("attach requires a session target or --follow <client-uuid>");
     }
@@ -724,48 +710,43 @@ fn run_session_attach(target: Option<&str>, follow: Option<&str>, global: bool) 
         None => None,
     };
 
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to build tokio runtime")?;
-
-    let mut client = runtime
-        .block_on(BmuxClient::connect_default("bmux-cli-attach"))
+    let mut client = BmuxClient::connect_default("bmux-cli-attach")
+        .await
         .map_err(map_attach_client_error)?;
 
     if let Some(leader_client_id) = follow_target_id {
-        runtime
-            .block_on(client.subscribe_events())
+        client
+            .subscribe_events()
+            .await
             .map_err(map_attach_client_error)?;
-        runtime
-            .block_on(client.follow_client(leader_client_id, global))
+        client
+            .follow_client(leader_client_id, global)
+            .await
             .map_err(map_attach_client_error)?;
     }
 
     let self_client_id = if follow_target_id.is_some() {
-        Some(
-            runtime
-                .block_on(client.whoami())
-                .map_err(map_attach_client_error)?,
-        )
+        Some(client.whoami().await.map_err(map_attach_client_error)?)
     } else {
         None
     };
 
     let mut attach_info = if let Some(leader_client_id) = follow_target_id {
-        let target_session = runtime
-            .block_on(resolve_follow_target_session(&mut client, leader_client_id))
+        let target_session = resolve_follow_target_session(&mut client, leader_client_id)
+            .await
             .map_err(map_attach_client_error)?;
-        runtime
-            .block_on(open_attach_for_session(&mut client, target_session))
+        open_attach_for_session(&mut client, target_session)
+            .await
             .map_err(map_attach_client_error)?
     } else {
         let target = target.expect("target is present when not follow");
-        let grant = runtime
-            .block_on(client.attach_grant(parse_session_selector(target)))
+        let grant = client
+            .attach_grant(parse_session_selector(target))
+            .await
             .map_err(map_attach_client_error)?;
-        runtime
-            .block_on(client.open_attach_stream_info(&grant))
+        client
+            .open_attach_stream_info(&grant)
+            .await
             .map_err(map_attach_client_error)?
     };
 
@@ -793,8 +774,9 @@ fn run_session_attach(target: Option<&str>, follow: Option<&str>, global: bool) 
 
     loop {
         if follow_target_id.is_some() {
-            let events = runtime
-                .block_on(client.poll_events(16))
+            let events = client
+                .poll_events(16)
+                .await
                 .map_err(map_attach_client_error)?;
             for server_event in events {
                 match server_event {
@@ -808,8 +790,8 @@ fn run_session_attach(target: Option<&str>, follow: Option<&str>, global: bool) 
                         {
                             continue;
                         }
-                        attach_info = runtime
-                            .block_on(open_attach_for_session(&mut client, session_id))
+                        attach_info = open_attach_for_session(&mut client, session_id)
+                            .await
                             .map_err(map_attach_client_error)?;
                         attached_id = attach_info.session_id;
                         can_write = attach_info.can_write;
@@ -835,8 +817,9 @@ fn run_session_attach(target: Option<&str>, follow: Option<&str>, global: bool) 
                 AttachEventAction::Detach => break,
                 AttachEventAction::Send(bytes) => {
                     if can_write {
-                        runtime
-                            .block_on(client.attach_input(attached_id, bytes))
+                        client
+                            .attach_input(attached_id, bytes)
+                            .await
                             .map_err(map_attach_client_error)?;
                     }
                 }
@@ -844,8 +827,9 @@ fn run_session_attach(target: Option<&str>, follow: Option<&str>, global: bool) 
             }
         }
 
-        let output = runtime
-            .block_on(client.attach_output(attached_id, 64 * 1024))
+        let output = client
+            .attach_output(attached_id, 64 * 1024)
+            .await
             .map_err(map_attach_client_error)?;
         if output.is_empty() {
             continue;
@@ -856,9 +840,9 @@ fn run_session_attach(target: Option<&str>, follow: Option<&str>, global: bool) 
         stdout.flush().context("failed flushing attach output")?;
     }
 
-    let _ = runtime.block_on(client.detach());
+    let _ = client.detach().await;
     if follow_target_id.is_some() {
-        let _ = runtime.block_on(client.unfollow());
+        let _ = client.unfollow().await;
     }
     println!("detached");
     Ok(0)
@@ -1026,28 +1010,24 @@ fn map_cli_client_error(error: ClientError) -> anyhow::Error {
     anyhow::Error::from(error)
 }
 
-fn run_session_detach() -> Result<u8> {
-    run_async(async {
-        let mut client = BmuxClient::connect_default("bmux-cli-detach")
-            .await
-            .map_err(map_cli_client_error)?;
-        client.detach().await.map_err(map_cli_client_error)
-    })?;
+async fn run_session_detach() -> Result<u8> {
+    let mut client = BmuxClient::connect_default("bmux-cli-detach")
+        .await
+        .map_err(map_cli_client_error)?;
+    client.detach().await.map_err(map_cli_client_error)?;
     println!("detached");
     Ok(0)
 }
 
-fn run_follow(target_client_id: &str, global: bool) -> Result<u8> {
+async fn run_follow(target_client_id: &str, global: bool) -> Result<u8> {
     let target_client_id = parse_uuid_value(target_client_id, "target client id")?;
-    run_async(async {
-        let mut client = BmuxClient::connect_default("bmux-cli-follow")
-            .await
-            .map_err(map_cli_client_error)?;
-        client
-            .follow_client(target_client_id, global)
-            .await
-            .map_err(map_cli_client_error)
-    })?;
+    let mut client = BmuxClient::connect_default("bmux-cli-follow")
+        .await
+        .map_err(map_cli_client_error)?;
+    client
+        .follow_client(target_client_id, global)
+        .await
+        .map_err(map_cli_client_error)?;
     println!(
         "following client: {}{}",
         target_client_id,
@@ -1056,43 +1036,37 @@ fn run_follow(target_client_id: &str, global: bool) -> Result<u8> {
     Ok(0)
 }
 
-fn run_unfollow() -> Result<u8> {
-    run_async(async {
-        let mut client = BmuxClient::connect_default("bmux-cli-unfollow")
-            .await
-            .map_err(map_cli_client_error)?;
-        client.unfollow().await.map_err(map_cli_client_error)
-    })?;
+async fn run_unfollow() -> Result<u8> {
+    let mut client = BmuxClient::connect_default("bmux-cli-unfollow")
+        .await
+        .map_err(map_cli_client_error)?;
+    client.unfollow().await.map_err(map_cli_client_error)?;
     println!("follow stopped");
     Ok(0)
 }
 
-fn run_window_new(session: Option<&String>, name: Option<String>) -> Result<u8> {
+async fn run_window_new(session: Option<&String>, name: Option<String>) -> Result<u8> {
     let session_selector = session.map(|target| parse_session_selector(target));
-    let window_id = run_async(async {
-        let mut client = BmuxClient::connect_default("bmux-cli-new-window")
-            .await
-            .map_err(map_cli_client_error)?;
-        client
-            .new_window(session_selector, name)
-            .await
-            .map_err(map_cli_client_error)
-    })?;
+    let mut client = BmuxClient::connect_default("bmux-cli-new-window")
+        .await
+        .map_err(map_cli_client_error)?;
+    let window_id = client
+        .new_window(session_selector, name)
+        .await
+        .map_err(map_cli_client_error)?;
     println!("created window: {window_id}");
     Ok(0)
 }
 
-fn run_window_list(session: Option<&String>, as_json: bool) -> Result<u8> {
+async fn run_window_list(session: Option<&String>, as_json: bool) -> Result<u8> {
     let session_selector = session.map(|target| parse_session_selector(target));
-    let windows = run_async(async {
-        let mut client = BmuxClient::connect_default("bmux-cli-list-windows")
-            .await
-            .map_err(map_cli_client_error)?;
-        client
-            .list_windows(session_selector)
-            .await
-            .map_err(map_cli_client_error)
-    })?;
+    let mut client = BmuxClient::connect_default("bmux-cli-list-windows")
+        .await
+        .map_err(map_cli_client_error)?;
+    let windows = client
+        .list_windows(session_selector)
+        .await
+        .map_err(map_cli_client_error)?;
 
     if as_json {
         println!(
@@ -1124,34 +1098,30 @@ fn run_window_list(session: Option<&String>, as_json: bool) -> Result<u8> {
     Ok(0)
 }
 
-fn run_window_kill(target: &str, session: Option<&String>) -> Result<u8> {
+async fn run_window_kill(target: &str, session: Option<&String>) -> Result<u8> {
     let session_selector = session.map(|value| parse_session_selector(value));
     let window_selector = parse_window_selector(target);
-    let window_id = run_async(async {
-        let mut client = BmuxClient::connect_default("bmux-cli-kill-window")
-            .await
-            .map_err(map_cli_client_error)?;
-        client
-            .kill_window(session_selector, window_selector)
-            .await
-            .map_err(map_cli_client_error)
-    })?;
+    let mut client = BmuxClient::connect_default("bmux-cli-kill-window")
+        .await
+        .map_err(map_cli_client_error)?;
+    let window_id = client
+        .kill_window(session_selector, window_selector)
+        .await
+        .map_err(map_cli_client_error)?;
     println!("killed window: {window_id}");
     Ok(0)
 }
 
-fn run_window_switch(target: &str, session: Option<&String>) -> Result<u8> {
+async fn run_window_switch(target: &str, session: Option<&String>) -> Result<u8> {
     let session_selector = session.map(|value| parse_session_selector(value));
     let window_selector = parse_window_selector(target);
-    let window_id = run_async(async {
-        let mut client = BmuxClient::connect_default("bmux-cli-switch-window")
-            .await
-            .map_err(map_cli_client_error)?;
-        client
-            .switch_window(session_selector, window_selector)
-            .await
-            .map_err(map_cli_client_error)
-    })?;
+    let mut client = BmuxClient::connect_default("bmux-cli-switch-window")
+        .await
+        .map_err(map_cli_client_error)?;
+    let window_id = client
+        .switch_window(session_selector, window_selector)
+        .await
+        .map_err(map_cli_client_error)?;
     println!("active window: {window_id}");
     Ok(0)
 }
@@ -1194,65 +1164,52 @@ fn session_role_label(role: SessionRole) -> &'static str {
     }
 }
 
-fn run_async<F, T>(future: F) -> Result<T>
-where
-    F: std::future::Future<Output = Result<T>>,
-{
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .context("failed to build tokio runtime")?;
-    runtime.block_on(future)
+async fn server_is_running() -> Result<bool> {
+    probe_server_running().await
 }
 
-fn server_is_running() -> Result<bool> {
-    probe_server_running()
+async fn probe_server_running() -> Result<bool> {
+    Ok(fetch_server_status()
+        .await?
+        .is_some_and(|status| status.running))
 }
 
-fn probe_server_running() -> Result<bool> {
-    Ok(fetch_server_status()?.is_some_and(|status| status.running))
+async fn fetch_server_status() -> Result<Option<bmux_client::ServerStatusInfo>> {
+    let connect = tokio::time::timeout(
+        SERVER_STATUS_TIMEOUT,
+        BmuxClient::connect_default("bmux-cli-status"),
+    )
+    .await;
+
+    let mut client = match connect {
+        Ok(Ok(client)) => client,
+        Ok(Err(_)) | Err(_) => return Ok(None),
+    };
+
+    match tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.server_status()).await {
+        Ok(Ok(status)) => Ok(Some(status)),
+        Ok(Err(_)) | Err(_) => Ok(None),
+    }
 }
 
-fn fetch_server_status() -> Result<Option<bmux_client::ServerStatusInfo>> {
-    run_async(async {
+async fn wait_for_server_running(timeout: Duration) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
         let connect = tokio::time::timeout(
             SERVER_STATUS_TIMEOUT,
-            BmuxClient::connect_default("bmux-cli-status"),
+            BmuxClient::connect_default("bmux-cli-start-wait"),
         )
         .await;
-
-        let mut client = match connect {
-            Ok(Ok(client)) => client,
-            Ok(Err(_)) | Err(_) => return Ok(None),
-        };
-
-        match tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.server_status()).await {
-            Ok(Ok(status)) => Ok(Some(status)),
-            Ok(Err(_)) | Err(_) => Ok(None),
+        if let Ok(Ok(mut client)) = connect
+            && let Ok(Ok(status)) =
+                tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.server_status()).await
+            && status.running
+        {
+            return Ok(true);
         }
-    })
-}
-
-fn wait_for_server_running(timeout: Duration) -> Result<bool> {
-    run_async(async {
-        let deadline = Instant::now() + timeout;
-        while Instant::now() < deadline {
-            let connect = tokio::time::timeout(
-                SERVER_STATUS_TIMEOUT,
-                BmuxClient::connect_default("bmux-cli-start-wait"),
-            )
-            .await;
-            if let Ok(Ok(mut client)) = connect
-                && let Ok(Ok(status)) =
-                    tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.server_status()).await
-                && status.running
-            {
-                return Ok(true);
-            }
-            tokio::time::sleep(SERVER_POLL_INTERVAL).await;
-        }
-        Ok(false)
-    })
+        tokio::time::sleep(SERVER_POLL_INTERVAL).await;
+    }
+    Ok(false)
 }
 
 async fn wait_until_server_stopped(timeout: Duration) -> Result<bool> {
@@ -1387,12 +1344,12 @@ fn is_pid_running(pid: u32) -> Result<bool> {
     }
 }
 
-fn cleanup_stale_pid_file() -> Result<()> {
+async fn cleanup_stale_pid_file() -> Result<()> {
     let Some(pid) = read_server_pid_file()? else {
         return Ok(());
     };
 
-    if !is_pid_running(pid)? && !probe_server_running()? {
+    if !is_pid_running(pid)? && !probe_server_running().await? {
         remove_server_pid_file()?;
     }
 
