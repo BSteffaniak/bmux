@@ -1057,8 +1057,36 @@ async fn ordered_session_windows(
     let mut windows = client
         .list_windows(Some(SessionSelector::ById(session_id)))
         .await?;
-    windows.sort_by_key(|window| window.id);
+    sort_attach_windows(&mut windows);
     Ok(windows)
+}
+
+fn sort_attach_windows(windows: &mut [bmux_ipc::WindowSummary]) {
+    windows.sort_by(|left, right| {
+        let left_rank = window_sort_rank(left);
+        let right_rank = window_sort_rank(right);
+        left_rank
+            .cmp(&right_rank)
+            .then_with(|| left.id.cmp(&right.id))
+    });
+}
+
+fn window_sort_rank(window: &bmux_ipc::WindowSummary) -> (u8, u32, String) {
+    if let Some(index) = window.name.as_deref().and_then(parse_window_auto_index) {
+        return (0, index, String::new());
+    }
+
+    let normalized = window
+        .name
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    (1, u32::MAX, normalized)
+}
+
+fn parse_window_auto_index(name: &str) -> Option<u32> {
+    let suffix = name.strip_prefix("window-")?;
+    suffix.parse::<u32>().ok()
 }
 
 async fn redraw_attach_status_line(
@@ -3720,5 +3748,50 @@ mod tests {
                 crate::input::RuntimeAction::NewSession
             ))
         ));
+    }
+
+    #[test]
+    fn sort_attach_windows_prefers_window_number_then_name() {
+        let mut windows = vec![
+            bmux_ipc::WindowSummary {
+                id: uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000003")
+                    .expect("valid uuid"),
+                session_id: uuid::Uuid::nil(),
+                name: Some("editor".to_string()),
+                active: false,
+            },
+            bmux_ipc::WindowSummary {
+                id: uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001")
+                    .expect("valid uuid"),
+                session_id: uuid::Uuid::nil(),
+                name: Some("window-10".to_string()),
+                active: false,
+            },
+            bmux_ipc::WindowSummary {
+                id: uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002")
+                    .expect("valid uuid"),
+                session_id: uuid::Uuid::nil(),
+                name: Some("window-2".to_string()),
+                active: true,
+            },
+            bmux_ipc::WindowSummary {
+                id: uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000004")
+                    .expect("valid uuid"),
+                session_id: uuid::Uuid::nil(),
+                name: Some("zeta".to_string()),
+                active: false,
+            },
+        ];
+
+        super::sort_attach_windows(&mut windows);
+
+        let ordered_names: Vec<String> = windows
+            .into_iter()
+            .map(|window| window.name.unwrap_or_default())
+            .collect();
+        assert_eq!(
+            ordered_names,
+            vec!["window-2", "window-10", "editor", "zeta"]
+        );
     }
 }
