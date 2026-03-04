@@ -5,11 +5,8 @@
 
 mod cli;
 mod input;
-mod pane;
-mod pty;
 mod runtime;
 mod status;
-mod terminal;
 
 use std::process::ExitCode;
 
