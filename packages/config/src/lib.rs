@@ -123,6 +123,8 @@ pub struct BehaviorConfig {
     pub exit_empty: bool,
     /// Restore and persist last local CLI runtime layout
     pub restore_last_layout: bool,
+    /// Confirm before destructive quit that clears persisted local runtime state
+    pub confirm_quit_destroy: bool,
     /// Terminal type to expose to pane processes as TERM
     pub pane_term: String,
     /// Enable protocol query/reply tracing in runtime
@@ -144,6 +146,7 @@ impl Default for BehaviorConfig {
             automatic_rename: false,
             exit_empty: false,
             restore_last_layout: true,
+            confirm_quit_destroy: true,
             pane_term: "bmux-256color".to_string(),
             protocol_trace_enabled: false,
             protocol_trace_capacity: 200,

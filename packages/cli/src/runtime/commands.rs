@@ -29,6 +29,10 @@ pub(super) fn process_input_events(
     layout_tree: &LayoutTree,
     focused_pane: &mut PaneId,
     shutdown_requested: &Arc<AtomicBool>,
+    confirm_quit_destroy: bool,
+    pending_destroy_confirm: &mut bool,
+    destroy_state_requested: &mut bool,
+    detach_requested: &mut bool,
     force_redraw: &mut bool,
     exit_override: &mut Option<u8>,
     status_message: &mut Option<StatusMessage>,
@@ -46,6 +50,24 @@ pub(super) fn process_input_events(
     loop {
         match input_rx.try_recv() {
             Ok(RuntimeAction::ForwardToPane(bytes)) => {
+                if *pending_destroy_confirm {
+                    let confirmed = bytes
+                        .first()
+                        .is_some_and(|value| matches!(value, b'y' | b'Y'));
+                    if confirmed {
+                        *pending_destroy_confirm = false;
+                        *destroy_state_requested = true;
+                        shutdown_requested.store(true, Ordering::Relaxed);
+                        *exit_override = Some(0);
+                        *status_message = Some(StatusMessage::new(
+                            "quitting and clearing persisted state".to_string(),
+                        ));
+                    } else {
+                        *pending_destroy_confirm = false;
+                        *status_message = Some(StatusMessage::new("quit cancelled".to_string()));
+                    }
+                    continue;
+                }
                 if scroll_state.active {
                     continue;
                 }
@@ -64,9 +86,24 @@ pub(super) fn process_input_events(
             }
             Ok(action) => {
                 match action {
-                    RuntimeAction::Quit => {
+                    RuntimeAction::Detach => {
+                        *pending_destroy_confirm = false;
+                        *detach_requested = true;
                         shutdown_requested.store(true, Ordering::Relaxed);
                         *exit_override = Some(0);
+                    }
+                    RuntimeAction::Quit => {
+                        if confirm_quit_destroy {
+                            *pending_destroy_confirm = true;
+                            *status_message = Some(StatusMessage::new(
+                                "destroy persisted state and quit? [y/N]".to_string(),
+                            ));
+                        } else {
+                            *pending_destroy_confirm = false;
+                            *destroy_state_requested = true;
+                            shutdown_requested.store(true, Ordering::Relaxed);
+                            *exit_override = Some(0);
+                        }
                     }
                     RuntimeAction::NewWindow => {
                         *status_message = Some(StatusMessage::new(
@@ -312,7 +349,7 @@ pub(super) fn process_input_events(
                     }
                     RuntimeAction::ShowHelp => {
                         *status_message = Some(StatusMessage::new(
-                            "Ctrl-A: c new window | C new session | q quit | o cycle | h/j/k/l or arrows focus | H/J/K/L directional resize | t toggle layout | % split-v | \" split-h | +/- resize | [ scroll mode | Esc (or ]) exit scroll | arrows/Ctrl-Y/Ctrl-E line | PgUp/PgDn page | g/G top/bottom | y copy view | r restart | x close | ? help"
+                            "Ctrl-A: c new window | C new session | d detach(save) | q quit(destroy) | o cycle | h/j/k/l or arrows focus | H/J/K/L directional resize | t toggle layout | % split-v | \" split-h | +/- resize | [ scroll mode | Esc (or ]) exit scroll | arrows/Ctrl-Y/Ctrl-E line | PgUp/PgDn page | g/G top/bottom | y copy view | r restart | x close | ? help"
                                 .to_string(),
                         ));
                     }
@@ -1025,6 +1062,54 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn process_input_events_for_test(
+        input_rx: &mpsc::Receiver<RuntimeAction>,
+        panes: &mut BTreeMap<PaneId, PaneRuntime>,
+        pane_rects: &BTreeMap<PaneId, Rect>,
+        layout_tree: &LayoutTree,
+        focused_pane: &mut PaneId,
+        shutdown_requested: &Arc<AtomicBool>,
+        force_redraw: &mut bool,
+        exit_override: &mut Option<u8>,
+        status_message: &mut Option<super::StatusMessage>,
+        scroll_state: &mut ScrollState,
+        internal_clipboard: &mut Option<String>,
+        startup_deadline: Instant,
+        user_input_seen: Arc<AtomicBool>,
+        scrollback_limit: usize,
+        pane_term: &str,
+        protocol_profile: ProtocolProfile,
+        protocol_trace: Option<super::SharedProtocolTraceBuffer>,
+    ) -> anyhow::Result<Option<LayoutTree>> {
+        let mut pending_destroy_confirm = false;
+        let mut destroy_state_requested = false;
+        let mut detach_requested = false;
+        process_input_events(
+            input_rx,
+            panes,
+            pane_rects,
+            layout_tree,
+            focused_pane,
+            shutdown_requested,
+            true,
+            &mut pending_destroy_confirm,
+            &mut destroy_state_requested,
+            &mut detach_requested,
+            force_redraw,
+            exit_override,
+            status_message,
+            scroll_state,
+            internal_clipboard,
+            startup_deadline,
+            user_input_seen,
+            scrollback_limit,
+            pane_term,
+            protocol_profile,
+            protocol_trace,
+        )
+    }
+
     #[test]
     fn close_focused_removes_middle_pane_and_rebalances() {
         let mut panes = BTreeMap::new();
@@ -1051,7 +1136,7 @@ mod tests {
             .expect("send close action");
         drop(tx);
 
-        let updated = process_input_events(
+        let updated = process_input_events_for_test(
             &rx,
             &mut panes,
             &pane_rects,
@@ -1106,7 +1191,7 @@ mod tests {
         tx.send(RuntimeAction::IncreaseSplit).expect("send resize");
         drop(tx);
 
-        let updated = process_input_events(
+        let updated = process_input_events_for_test(
             &rx,
             &mut panes,
             &pane_rects,
@@ -1178,7 +1263,7 @@ mod tests {
         tx.send(RuntimeAction::FocusUp).expect("send up");
         drop(tx);
 
-        let _ = process_input_events(
+        let _ = process_input_events_for_test(
             &rx,
             &mut panes,
             &pane_rects,
@@ -1307,7 +1392,7 @@ mod tests {
         tx.send(RuntimeAction::ResizeUp).expect("send resize up");
         drop(tx);
 
-        let updated = process_input_events(
+        let updated = process_input_events_for_test(
             &rx,
             &mut panes,
             &pane_rects,
@@ -1360,7 +1445,7 @@ mod tests {
         tx.send(RuntimeAction::ResizeUp).expect("send resize up");
         drop(tx);
 
-        let updated = process_input_events(
+        let updated = process_input_events_for_test(
             &rx,
             &mut panes,
             &pane_rects,
@@ -1417,7 +1502,7 @@ mod tests {
         tx.send(RuntimeAction::FocusLeft).expect("send focus left");
         drop(tx);
 
-        let updated = process_input_events(
+        let updated = process_input_events_for_test(
             &rx,
             &mut panes,
             &pane_rects,
@@ -1501,7 +1586,7 @@ mod tests {
             .expect("send scroll down page");
         drop(tx);
 
-        let updated = process_input_events(
+        let updated = process_input_events_for_test(
             &rx,
             &mut panes,
             &pane_rects,
@@ -1559,7 +1644,7 @@ mod tests {
         }
         drop(tx);
 
-        let _ = process_input_events(
+        let _ = process_input_events_for_test(
             &rx,
             &mut panes,
             &pane_rects,
@@ -1583,5 +1668,119 @@ mod tests {
         assert!(scroll_state.active);
         assert_eq!(scroll_state.cursors.get(&PaneId(1)).copied(), Some((0, 0)));
         assert!(scroll_state.offsets.get(&PaneId(1)).copied().unwrap_or(0) > 0);
+    }
+
+    #[test]
+    fn quit_prompts_for_confirmation_when_enabled() {
+        let mut panes = BTreeMap::new();
+        panes.insert(PaneId(1), make_pane("pane-1"));
+        panes.insert(PaneId(2), make_pane("pane-2"));
+
+        let mut layout = LayoutTree::two_pane(PaneId(1), PaneId(2), SplitDirection::Vertical, 0.5);
+        let mut focused = PaneId(1);
+        layout.focused = focused;
+        let pane_rects = layout.compute_rects(120, 40);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let mut force_redraw = false;
+        let mut exit_override = None;
+        let mut status_message = None;
+        let mut scroll_state = ScrollState::default();
+        let mut internal_clipboard = None;
+        let mut pending_destroy_confirm = false;
+        let mut destroy_state_requested = false;
+        let mut detach_requested = false;
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(RuntimeAction::Quit).expect("send quit action");
+
+        let _ = process_input_events(
+            &rx,
+            &mut panes,
+            &pane_rects,
+            &layout,
+            &mut focused,
+            &shutdown_requested,
+            true,
+            &mut pending_destroy_confirm,
+            &mut destroy_state_requested,
+            &mut detach_requested,
+            &mut force_redraw,
+            &mut exit_override,
+            &mut status_message,
+            &mut scroll_state,
+            &mut internal_clipboard,
+            Instant::now(),
+            Arc::new(AtomicBool::new(false)),
+            10_000,
+            "bmux-256color",
+            ProtocolProfile::Conservative,
+            None,
+        )
+        .expect("process input events");
+
+        assert!(!shutdown_requested.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(pending_destroy_confirm);
+        assert!(!destroy_state_requested);
+        assert_eq!(
+            status_message.map(|msg| msg.text),
+            Some("destroy persisted state and quit? [y/N]".to_string())
+        );
+    }
+
+    #[test]
+    fn quit_confirmation_accepts_y_and_sets_destroy_flag() {
+        let mut panes = BTreeMap::new();
+        panes.insert(PaneId(1), make_pane("pane-1"));
+        panes.insert(PaneId(2), make_pane("pane-2"));
+
+        let mut layout = LayoutTree::two_pane(PaneId(1), PaneId(2), SplitDirection::Vertical, 0.5);
+        let mut focused = PaneId(1);
+        layout.focused = focused;
+        let pane_rects = layout.compute_rects(120, 40);
+        let shutdown_requested = Arc::new(AtomicBool::new(false));
+        let mut force_redraw = false;
+        let mut exit_override = None;
+        let mut status_message = None;
+        let mut scroll_state = ScrollState::default();
+        let mut internal_clipboard = None;
+        let mut pending_destroy_confirm = false;
+        let mut destroy_state_requested = false;
+        let mut detach_requested = false;
+
+        let (tx, rx) = mpsc::channel();
+        tx.send(RuntimeAction::Quit).expect("send quit action");
+        tx.send(RuntimeAction::ForwardToPane(vec![b'y']))
+            .expect("send confirmation byte");
+        drop(tx);
+
+        let _ = process_input_events(
+            &rx,
+            &mut panes,
+            &pane_rects,
+            &layout,
+            &mut focused,
+            &shutdown_requested,
+            true,
+            &mut pending_destroy_confirm,
+            &mut destroy_state_requested,
+            &mut detach_requested,
+            &mut force_redraw,
+            &mut exit_override,
+            &mut status_message,
+            &mut scroll_state,
+            &mut internal_clipboard,
+            Instant::now(),
+            Arc::new(AtomicBool::new(false)),
+            10_000,
+            "bmux-256color",
+            ProtocolProfile::Conservative,
+            None,
+        )
+        .expect("process input events");
+
+        assert!(shutdown_requested.load(std::sync::atomic::Ordering::Relaxed));
+        assert!(!pending_destroy_confirm);
+        assert!(destroy_state_requested);
+        assert_eq!(exit_override, Some(0));
     }
 }

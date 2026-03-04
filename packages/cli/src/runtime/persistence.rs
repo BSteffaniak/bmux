@@ -157,7 +157,7 @@ pub(super) fn save_persisted_runtime_state(
 
     let pane_order = layout_tree.pane_order();
     if pane_order.is_empty() {
-        return Ok(());
+        return clear_persisted_runtime_state();
     }
 
     let state_file = RuntimeStateFile {
@@ -188,6 +188,20 @@ pub(super) fn save_persisted_runtime_state(
         .with_context(|| format!("failed replacing runtime state file at {}", path.display()))?;
 
     Ok(())
+}
+
+pub(super) fn clear_persisted_runtime_state() -> Result<()> {
+    let path = ConfigPaths::default().runtime_layout_state_file();
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "failed clearing persisted runtime state at {}",
+                path.display()
+            )
+        }),
+    }
 }
 
 fn serialize_layout_node(node: &LayoutNode) -> PersistedLayoutNode {

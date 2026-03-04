@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeAction {
     Quit,
+    Detach,
     NewWindow,
     NewSession,
     FocusNext,
@@ -185,6 +186,7 @@ impl Keymap {
         runtime.insert("shift+g".to_string(), "scroll_bottom".to_string());
         runtime.insert("v".to_string(), "begin_selection".to_string());
         runtime.insert("y".to_string(), "copy_scrollback".to_string());
+        runtime.insert("d".to_string(), "detach".to_string());
         runtime.insert("q".to_string(), "quit".to_string());
 
         let global = BTreeMap::new();
@@ -752,6 +754,7 @@ fn find_overlaps(bindings: &[KeyBinding], label: &str) -> Vec<String> {
 fn action_to_name(action: &RuntimeAction) -> &'static str {
     match action {
         RuntimeAction::Quit => "quit",
+        RuntimeAction::Detach => "detach",
         RuntimeAction::NewWindow => "new_window",
         RuntimeAction::NewSession => "new_session",
         RuntimeAction::FocusNext => "focus_next_pane",
@@ -1123,7 +1126,8 @@ fn parse_key_token(value: &str) -> Result<KeyCode> {
 
 fn parse_action(value: &str) -> Result<RuntimeAction> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "quit" => Ok(RuntimeAction::Quit),
+        "quit" | "quit_destroy" => Ok(RuntimeAction::Quit),
+        "detach" => Ok(RuntimeAction::Detach),
         "new_window" => Ok(RuntimeAction::NewWindow),
         "new_session" => Ok(RuntimeAction::NewSession),
         "focus_next_pane" => Ok(RuntimeAction::FocusNext),
@@ -1216,6 +1220,14 @@ mod tests {
         assert_eq!(
             processor.process_chunk(&[0x01, b'C']),
             vec![RuntimeAction::NewSession]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'd']),
+            vec![RuntimeAction::Detach]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'q']),
+            vec![RuntimeAction::Quit]
         );
     }
 

@@ -87,6 +87,7 @@ fn default_runtime_bindings() -> BTreeMap<String, String> {
     bindings.insert("shift+g".to_string(), "scroll_bottom".to_string());
     bindings.insert("v".to_string(), "begin_selection".to_string());
     bindings.insert("y".to_string(), "copy_scrollback".to_string());
+    bindings.insert("d".to_string(), "detach".to_string());
     bindings.insert("q".to_string(), "quit".to_string());
     bindings
 }

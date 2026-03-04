@@ -18,7 +18,7 @@ pub(crate) fn build_status_line(
     let focused_label = if focused_pane == 0 { "left" } else { "right" };
 
     let mut status = format!(
-        " bmux | shell: {shell_name} | cwd: {} | size: {cols}x{rows} | focus: {focused_label} | Ctrl-A o switch | Ctrl-A [ scroll | Ctrl-A ? help | Ctrl-A q quit ",
+        " bmux | shell: {shell_name} | cwd: {} | size: {cols}x{rows} | focus: {focused_label} | Ctrl-A o switch | Ctrl-A [ scroll | Ctrl-A d detach | Ctrl-A q quit | Ctrl-A ? help ",
         cwd.display()
     );
 

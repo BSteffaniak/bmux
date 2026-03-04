@@ -42,7 +42,9 @@ use pane_runtime::{
     any_running_panes, first_running_pane_id, pane_is_running, refresh_exit_codes, resize_panes,
     spawn_pane, stop_pane_process,
 };
-use persistence::{load_persisted_runtime_state, save_persisted_runtime_state};
+use persistence::{
+    clear_persisted_runtime_state, load_persisted_runtime_state, save_persisted_runtime_state,
+};
 use status_message::StatusMessage;
 use terminal_protocol::{
     ProtocolDirection, ProtocolProfile, ProtocolTraceBuffer, ProtocolTraceEvent,
@@ -90,6 +92,7 @@ struct ReapExitedPanesResult {
 struct RuntimeSettings {
     keymap: crate::input::Keymap,
     layout_persistence_enabled: bool,
+    confirm_quit_destroy: bool,
     scrollback_limit: usize,
     pane_term: String,
     terminal_profile: TerminalProfile,
@@ -2137,6 +2140,9 @@ fn run_two_pane_runtime(
     let mut scroll_state = ScrollState::default();
     let mut internal_clipboard: Option<String> = None;
     let mut persistence_dirty = true;
+    let mut pending_destroy_confirm = false;
+    let mut destroy_state_requested = false;
+    let mut detach_requested = false;
 
     let exit_code = loop {
         let focused_before_input = focused_pane;
@@ -2147,6 +2153,10 @@ fn run_two_pane_runtime(
             &layout_tree,
             &mut focused_pane,
             &shutdown_requested,
+            runtime_settings.confirm_quit_destroy,
+            &mut pending_destroy_confirm,
+            &mut destroy_state_requested,
+            &mut detach_requested,
             &mut force_redraw,
             &mut exit_override,
             &mut status_message,
@@ -2173,6 +2183,12 @@ fn run_two_pane_runtime(
         }
 
         if shutdown_requested.load(Ordering::Relaxed) && !kill_sent {
+            if runtime_settings.layout_persistence_enabled && detach_requested {
+                if let Err(error) = save_persisted_runtime_state(&layout_tree, &panes, focused_pane)
+                {
+                    eprintln!("bmux warning: failed persisting layout before detach ({error})");
+                }
+            }
             debug!("Terminating pane shells");
             for pane in panes.values_mut() {
                 stop_pane_process(pane, true)?;
@@ -2344,10 +2360,21 @@ fn run_two_pane_runtime(
         thread::sleep(FRAME_INTERVAL);
     };
 
-    if runtime_settings.layout_persistence_enabled
-        && let Err(error) = save_persisted_runtime_state(&layout_tree, &panes, focused_pane)
-    {
-        eprintln!("bmux warning: failed to persist runtime layout on shutdown ({error})");
+    if runtime_settings.layout_persistence_enabled {
+        let persistence_result = if destroy_state_requested {
+            clear_persisted_runtime_state()
+        } else if detach_requested {
+            Ok(())
+        } else if panes.is_empty() {
+            clear_persisted_runtime_state()
+        } else {
+            save_persisted_runtime_state(&layout_tree, &panes, focused_pane)
+        };
+        if let Err(error) = persistence_result {
+            eprintln!(
+                "bmux warning: failed to update runtime layout persistence on shutdown ({error})"
+            );
+        }
     }
 
     if let Some(trace) = &protocol_trace
@@ -2640,6 +2667,7 @@ fn load_runtime_settings(config: &BmuxConfig) -> RuntimeSettings {
     RuntimeSettings {
         keymap,
         layout_persistence_enabled: config.behavior.restore_last_layout,
+        confirm_quit_destroy: config.behavior.confirm_quit_destroy,
         scrollback_limit: config.general.scrollback_limit,
         pane_term: pane_term_resolution.pane_term,
         terminal_profile: pane_term_resolution.profile,
