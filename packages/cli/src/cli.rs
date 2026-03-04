@@ -13,6 +13,13 @@ pub(crate) enum TraceFamily {
     Dcs,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub(crate) enum RoleValue {
+    Owner,
+    Writer,
+    Observer,
+}
+
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(name = "bmux")]
@@ -64,6 +71,36 @@ pub(crate) enum Command {
         /// Print clients as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// List explicit role assignments for a session
+    Permissions {
+        /// Session name or UUID
+        #[arg(long)]
+        session: String,
+        /// Print permissions as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Grant a role to a client in a session
+    Grant {
+        /// Session name or UUID
+        #[arg(long)]
+        session: String,
+        /// Target client UUID
+        #[arg(long)]
+        client: String,
+        /// Role to grant
+        #[arg(long, value_enum)]
+        role: RoleValue,
+    },
+    /// Revoke explicit role from a client in a session
+    Revoke {
+        /// Session name or UUID
+        #[arg(long)]
+        session: String,
+        /// Target client UUID
+        #[arg(long)]
+        client: String,
     },
     /// Kill a session by name or UUID
     KillSession {
@@ -177,6 +214,36 @@ pub(crate) enum SessionCommand {
         /// Print clients as JSON
         #[arg(long)]
         json: bool,
+    },
+    /// List explicit role assignments for a session
+    Permissions {
+        /// Session name or UUID
+        #[arg(long)]
+        session: String,
+        /// Print permissions as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Grant a role to a client in a session
+    Grant {
+        /// Session name or UUID
+        #[arg(long)]
+        session: String,
+        /// Target client UUID
+        #[arg(long)]
+        client: String,
+        /// Role to grant
+        #[arg(long, value_enum)]
+        role: RoleValue,
+    },
+    /// Revoke explicit role from a client in a session
+    Revoke {
+        /// Session name or UUID
+        #[arg(long)]
+        session: String,
+        /// Target client UUID
+        #[arg(long)]
+        client: String,
     },
     /// Kill a session by name or UUID
     Kill {
@@ -313,8 +380,8 @@ pub(crate) enum TerminalCommand {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, KeymapCommand, LayoutCommand, ServerCommand, SessionCommand, TerminalCommand,
-        TraceFamily, WindowCommand,
+        Cli, Command, KeymapCommand, LayoutCommand, RoleValue, ServerCommand, SessionCommand,
+        TerminalCommand, TraceFamily, WindowCommand,
     };
     use clap::Parser;
 
@@ -618,6 +685,60 @@ mod tests {
     }
 
     #[test]
+    fn parses_top_level_permissions_command() {
+        let cli = Cli::try_parse_from(["bmux", "permissions", "--session", "dev"])
+            .expect("valid CLI args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Permissions {
+                session,
+                json: false
+            }) if session == "dev"
+        ));
+    }
+
+    #[test]
+    fn parses_top_level_grant_command() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "grant",
+            "--session",
+            "dev",
+            "--client",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--role",
+            "writer",
+        ])
+        .expect("valid CLI args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Grant {
+                session,
+                client,
+                role: RoleValue::Writer
+            }) if session == "dev" && client == "550e8400-e29b-41d4-a716-446655440000"
+        ));
+    }
+
+    #[test]
+    fn parses_top_level_revoke_command() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "revoke",
+            "--session",
+            "dev",
+            "--client",
+            "550e8400-e29b-41d4-a716-446655440000",
+        ])
+        .expect("valid CLI args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::Revoke { session, client })
+                if session == "dev" && client == "550e8400-e29b-41d4-a716-446655440000"
+        ));
+    }
+
+    #[test]
     fn parses_grouped_session_clients_command() {
         let cli = Cli::try_parse_from(["bmux", "session", "clients"]).expect("valid CLI args");
         let Some(Command::Session { command }) = cli.command else {
@@ -634,6 +755,71 @@ mod tests {
             panic!("expected session command");
         };
         assert!(matches!(command, SessionCommand::Clients { json: true }));
+    }
+
+    #[test]
+    fn parses_grouped_session_permissions_command() {
+        let cli = Cli::try_parse_from(["bmux", "session", "permissions", "--session", "dev"])
+            .expect("valid CLI args");
+        let Some(Command::Session { command }) = cli.command else {
+            panic!("expected session command");
+        };
+        assert!(matches!(
+            command,
+            SessionCommand::Permissions {
+                session,
+                json: false
+            } if session == "dev"
+        ));
+    }
+
+    #[test]
+    fn parses_grouped_session_grant_command() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "session",
+            "grant",
+            "--session",
+            "dev",
+            "--client",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--role",
+            "observer",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Session { command }) = cli.command else {
+            panic!("expected session command");
+        };
+        assert!(matches!(
+            command,
+            SessionCommand::Grant {
+                session,
+                client,
+                role: RoleValue::Observer
+            } if session == "dev" && client == "550e8400-e29b-41d4-a716-446655440000"
+        ));
+    }
+
+    #[test]
+    fn parses_grouped_session_revoke_command() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "session",
+            "revoke",
+            "--session",
+            "dev",
+            "--client",
+            "550e8400-e29b-41d4-a716-446655440000",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Session { command }) = cli.command else {
+            panic!("expected session command");
+        };
+        assert!(matches!(
+            command,
+            SessionCommand::Revoke { session, client }
+                if session == "dev" && client == "550e8400-e29b-41d4-a716-446655440000"
+        ));
     }
 
     #[test]

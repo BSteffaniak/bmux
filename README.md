@@ -115,6 +115,9 @@ bmux kill-window active --session dev
 
 # Follow controls (top-level)
 bmux list-clients
+bmux permissions --session dev
+bmux grant --session dev --client 550e8400-e29b-41d4-a716-446655440000 --role writer
+bmux revoke --session dev --client 550e8400-e29b-41d4-a716-446655440000
 bmux follow 550e8400-e29b-41d4-a716-446655440000 --global
 bmux unfollow
 
@@ -131,6 +134,9 @@ bmux window list --session dev
 bmux window switch active --session dev
 bmux window kill active --session dev
 bmux session clients
+bmux session permissions --session dev
+bmux session grant --session dev --client 550e8400-e29b-41d4-a716-446655440000 --role writer
+bmux session revoke --session dev --client 550e8400-e29b-41d4-a716-446655440000
 bmux session follow 550e8400-e29b-41d4-a716-446655440000 --global
 bmux session unfollow
 ```

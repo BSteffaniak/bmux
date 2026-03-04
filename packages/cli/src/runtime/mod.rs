@@ -1,5 +1,5 @@
 use crate::cli::{
-    Cli, Command, DebugRenderLogFormat, KeymapCommand, LayoutCommand, ServerCommand,
+    Cli, Command, DebugRenderLogFormat, KeymapCommand, LayoutCommand, RoleValue, ServerCommand,
     SessionCommand, TerminalCommand, TraceFamily, WindowCommand,
 };
 use crate::input::{InputProcessor, RuntimeAction};
@@ -9,7 +9,7 @@ use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
 use bmux_client::{BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, TerminfoAutoInstall};
-use bmux_ipc::{SessionSelector, WindowSelector, transport::IpcTransportError};
+use bmux_ipc::{SessionRole, SessionSelector, WindowSelector, transport::IpcTransportError};
 use bmux_server::BmuxServer;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -170,6 +170,13 @@ fn run_command(command: &Command) -> Result<u8> {
         Command::NewSession { name } => run_session_new(name.clone()),
         Command::ListSessions { json } => run_session_list(*json),
         Command::ListClients { json } => run_client_list(*json),
+        Command::Permissions { session, json } => run_permissions_list(session, *json),
+        Command::Grant {
+            session,
+            client,
+            role,
+        } => run_grant_role(session, client, *role),
+        Command::Revoke { session, client } => run_revoke_role(session, client),
         Command::KillSession { target } => run_session_kill(target),
         Command::Attach {
             target,
@@ -190,6 +197,13 @@ fn run_command(command: &Command) -> Result<u8> {
             SessionCommand::New { name } => run_session_new(name.clone()),
             SessionCommand::List { json } => run_session_list(*json),
             SessionCommand::Clients { json } => run_client_list(*json),
+            SessionCommand::Permissions { session, json } => run_permissions_list(session, *json),
+            SessionCommand::Grant {
+                session,
+                client,
+                role,
+            } => run_grant_role(session, client, *role),
+            SessionCommand::Revoke { session, client } => run_revoke_role(session, client),
             SessionCommand::Kill { target } => run_session_kill(target),
             SessionCommand::Attach {
                 target,
@@ -449,9 +463,10 @@ fn run_client_list(as_json: bool) -> Result<u8> {
     }
 
     println!(
-        "ID                                   SELF SELECTED_SESSION                     FOLLOWING_CLIENT                     GLOBAL"
+        "ID                                   SELF ROLE      SELECTED_SESSION                     FOLLOWING_CLIENT                     GLOBAL"
     );
     for client in clients {
+        let role = client.session_role.map_or("-", session_role_label);
         let selected_session = client
             .selected_session_id
             .map_or_else(|| "-".to_string(), |id| id.to_string());
@@ -459,15 +474,90 @@ fn run_client_list(as_json: bool) -> Result<u8> {
             .following_client_id
             .map_or_else(|| "-".to_string(), |id| id.to_string());
         println!(
-            "{:<36} {:<4} {:<36} {:<36} {}",
+            "{:<36} {:<4} {:<9} {:<36} {:<36} {}",
             client.id,
             if client.id == self_id { "yes" } else { "no" },
+            role,
             selected_session,
             following_client,
             if client.following_global { "yes" } else { "no" }
         );
     }
 
+    Ok(0)
+}
+
+fn run_permissions_list(session: &str, as_json: bool) -> Result<u8> {
+    let selector = parse_session_selector(session);
+    let permissions = run_async(async {
+        let mut client = BmuxClient::connect_default("bmux-cli-list-permissions")
+            .await
+            .map_err(map_cli_client_error)?;
+        client
+            .list_permissions(selector)
+            .await
+            .map_err(map_cli_client_error)
+    })?;
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&permissions)
+                .context("failed to encode permissions json")?
+        );
+        return Ok(0);
+    }
+
+    if permissions.is_empty() {
+        println!("no explicit role assignments");
+        return Ok(0);
+    }
+
+    println!("CLIENT_ID                            ROLE");
+    for permission in permissions {
+        println!(
+            "{:<36} {}",
+            permission.client_id,
+            session_role_label(permission.role)
+        );
+    }
+
+    Ok(0)
+}
+
+fn run_grant_role(session: &str, client: &str, role: RoleValue) -> Result<u8> {
+    let selector = parse_session_selector(session);
+    let client_id = parse_uuid_value(client, "client id")?;
+    run_async(async {
+        let mut api = BmuxClient::connect_default("bmux-cli-grant-role")
+            .await
+            .map_err(map_cli_client_error)?;
+        api.grant_role(selector, client_id, session_role_from_value(role))
+            .await
+            .map_err(map_cli_client_error)
+    })?;
+
+    println!(
+        "granted role {} to client {}",
+        session_role_label(session_role_from_value(role)),
+        client_id
+    );
+    Ok(0)
+}
+
+fn run_revoke_role(session: &str, client: &str) -> Result<u8> {
+    let selector = parse_session_selector(session);
+    let client_id = parse_uuid_value(client, "client id")?;
+    run_async(async {
+        let mut api = BmuxClient::connect_default("bmux-cli-revoke-role")
+            .await
+            .map_err(map_cli_client_error)?;
+        api.revoke_role(selector, client_id)
+            .await
+            .map_err(map_cli_client_error)
+    })?;
+
+    println!("revoked explicit role for client {client_id}");
     Ok(0)
 }
 
@@ -951,6 +1041,22 @@ fn parse_window_selector(target: &str) -> WindowSelector {
 
 fn parse_uuid_value(value: &str, label: &str) -> Result<Uuid> {
     Uuid::parse_str(value).with_context(|| format!("{label} must be a UUID, got '{value}'"))
+}
+
+fn session_role_from_value(role: RoleValue) -> SessionRole {
+    match role {
+        RoleValue::Owner => SessionRole::Owner,
+        RoleValue::Writer => SessionRole::Writer,
+        RoleValue::Observer => SessionRole::Observer,
+    }
+}
+
+fn session_role_label(role: SessionRole) -> &'static str {
+    match role {
+        SessionRole::Owner => "owner",
+        SessionRole::Writer => "writer",
+        SessionRole::Observer => "observer",
+    }
 }
 
 fn run_async<F, T>(future: F) -> Result<T>

@@ -9,6 +9,7 @@ Command-line interface for bmux terminal multiplexer.
 - Local server lifecycle commands (`start`, `status`, `stop`)
 - Session lifecycle commands (new/list/attach/detach/kill)
 - Client listing command (list-clients / session clients)
+- Session role controls (permissions/grant/revoke)
 - Window lifecycle commands (new/list/switch/kill)
 - Client follow controls (follow/unfollow)
 - Alias-compatible command forms (top-level and grouped)
@@ -43,6 +44,10 @@ bmux new-session dev
 bmux list-sessions
 bmux list-clients
 bmux list-clients --json
+bmux permissions --session dev
+bmux permissions --session dev --json
+bmux grant --session dev --client 550e8400-e29b-41d4-a716-446655440000 --role writer
+bmux revoke --session dev --client 550e8400-e29b-41d4-a716-446655440000
 bmux list-sessions --json
 bmux attach dev
 bmux attach --follow 550e8400-e29b-41d4-a716-446655440000 --global
@@ -54,6 +59,10 @@ bmux session new dev
 bmux session list
 bmux session clients
 bmux session clients --json
+bmux session permissions --session dev
+bmux session permissions --session dev --json
+bmux session grant --session dev --client 550e8400-e29b-41d4-a716-446655440000 --role writer
+bmux session revoke --session dev --client 550e8400-e29b-41d4-a716-446655440000
 bmux session list --json
 bmux session attach dev
 bmux session attach --follow 550e8400-e29b-41d4-a716-446655440000 --global
@@ -119,6 +128,24 @@ bmux session unfollow
 
 `follow` target must be a client UUID.
 
+## Permission Commands
+
+Top-level and grouped forms are exact aliases.
+
+```bash
+# top-level
+bmux permissions --session dev
+bmux permissions --session dev --json
+bmux grant --session dev --client 550e8400-e29b-41d4-a716-446655440000 --role writer
+bmux revoke --session dev --client 550e8400-e29b-41d4-a716-446655440000
+
+# grouped aliases
+bmux session permissions --session dev
+bmux session permissions --session dev --json
+bmux session grant --session dev --client 550e8400-e29b-41d4-a716-446655440000 --role writer
+bmux session revoke --session dev --client 550e8400-e29b-41d4-a716-446655440000
+```
+
 ## JSON Output
 
 `--json` is supported on list commands:
@@ -127,6 +154,8 @@ bmux session unfollow
 - `bmux session list --json`
 - `bmux list-clients --json`
 - `bmux session clients --json`
+- `bmux permissions --session <name|uuid> --json`
+- `bmux session permissions --session <name|uuid> --json`
 - `bmux list-windows --json`
 - `bmux window list --json`
 
