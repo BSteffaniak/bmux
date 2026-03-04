@@ -11,9 +11,9 @@ use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
     AttachGrant, CURRENT_PROTOCOL_VERSION, Envelope, EnvelopeKind, ErrorCode, ErrorResponse,
     Event, IpcEndpoint, ProtocolVersion, Request, Response, ResponsePayload, SessionSelector,
-    SessionSummary, decode, encode,
+    SessionSummary, WindowSelector, WindowSummary, decode, encode,
 };
-use bmux_session::{ClientId, SessionId, SessionManager};
+use bmux_session::{ClientId, SessionId, SessionManager, WindowId};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -211,16 +211,22 @@ fn resolve_server_shell(config: &BmuxConfig) -> String {
     }
 }
 
-async fn shutdown_runtime_handle(mut removed: RemovedRuntime) {
-    if let Some(stop_tx) = removed.handle.stop_tx.take() {
+async fn shutdown_runtime_handle(removed: RemovedRuntime) {
+    for window in removed.handle.windows.into_values() {
+        shutdown_window_handle(window).await;
+    }
+}
+
+async fn shutdown_window_handle(mut window: WindowRuntimeHandle) {
+    if let Some(stop_tx) = window.stop_tx.take() {
         let _ = stop_tx.send(());
     }
 
-    match tokio::time::timeout(Duration::from_millis(250), &mut removed.handle.task).await {
+    match tokio::time::timeout(Duration::from_millis(250), &mut window.task).await {
         Ok(_) => {}
         Err(_) => {
-            removed.handle.task.abort();
-            let _ = removed.handle.task.await;
+            window.task.abort();
+            let _ = window.task.await;
         }
     }
 }
@@ -231,17 +237,44 @@ struct SessionRuntimeManager {
 }
 
 struct SessionRuntimeHandle {
+    windows: BTreeMap<bmux_session::WindowId, WindowRuntimeHandle>,
+    active_window: bmux_session::WindowId,
+    next_auto_window_number: u32,
+    active_client: Option<ClientId>,
+}
+
+struct WindowRuntimeHandle {
+    id: bmux_session::WindowId,
+    name: Option<String>,
     stop_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
     input_tx: mpsc::UnboundedSender<Vec<u8>>,
     output_rx: std::sync::Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
-    active_client: Option<ClientId>,
 }
 
 struct RemovedRuntime {
     session_id: SessionId,
     detached_client: Option<ClientId>,
     handle: SessionRuntimeHandle,
+}
+
+struct RemovedWindowRuntime {
+    session_id: SessionId,
+    window_id: bmux_session::WindowId,
+    handle: WindowRuntimeHandle,
+    session_removed: Option<RemovedRuntime>,
+}
+
+struct WindowRuntimeSummary {
+    id: bmux_session::WindowId,
+    name: Option<String>,
+    active: bool,
+}
+
+enum WindowSelection {
+    Active,
+    Id(bmux_session::WindowId),
+    Name(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -265,10 +298,29 @@ impl SessionRuntimeManager {
             anyhow::bail!("runtime already exists for session {}", session_id.0);
         }
 
+        let first_window = self.spawn_window_runtime(Some("window-1".to_string()))?;
+        let first_window_id = first_window.id;
+        let mut windows = BTreeMap::new();
+        windows.insert(first_window.id, first_window);
+
+        self.runtimes.insert(
+            session_id,
+            SessionRuntimeHandle {
+                windows,
+                active_window: first_window_id,
+                next_auto_window_number: 2,
+                active_client: None,
+            },
+        );
+        Ok(())
+    }
+
+    fn spawn_window_runtime(&self, name: Option<String>) -> Result<WindowRuntimeHandle> {
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let (output_tx, output_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let shell = self.shell.clone();
+        let window_id = bmux_session::WindowId::new();
         let task = tokio::spawn(async move {
             let pty_system = native_pty_system();
             let pty_pair = match pty_system.openpty(PtySize {
@@ -306,7 +358,7 @@ impl SessionRuntimeManager {
 
             let reader_output = output_tx.clone();
             let reader_thread = std::thread::Builder::new()
-                .name(format!("bmux-server-session-{}", session_id.0))
+                .name(format!("bmux-server-window-{}", window_id.0))
                 .spawn(move || {
                     let mut buffer = [0_u8; 8192];
                     loop {
@@ -347,17 +399,129 @@ impl SessionRuntimeManager {
             }
         });
 
-        self.runtimes.insert(
+        Ok(WindowRuntimeHandle {
+            id: window_id,
+            name,
+            stop_tx: Some(stop_tx),
+            task,
+            input_tx,
+            output_rx: std::sync::Mutex::new(output_rx),
+        })
+    }
+
+    fn new_window(
+        &mut self,
+        session_id: SessionId,
+        name: Option<String>,
+    ) -> Result<(bmux_session::WindowId, Option<String>)> {
+        let resolved_name = if let Some(name) = name {
+            Some(name)
+        } else {
+            let session = self
+                .runtimes
+                .get(&session_id)
+                .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+            Some(format!("window-{}", session.next_auto_window_number))
+        };
+        let window = self.spawn_window_runtime(resolved_name.clone())?;
+        let window_id = window.id;
+
+        let session = self
+            .runtimes
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        session.windows.insert(window_id, window);
+        session.next_auto_window_number = session.next_auto_window_number.saturating_add(1);
+        Ok((window_id, resolved_name))
+    }
+
+    fn list_windows(&self, session_id: SessionId) -> Result<Vec<WindowRuntimeSummary>> {
+        let session = self
+            .runtimes
+            .get(&session_id)
+            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+
+        Ok(session
+            .windows
+            .values()
+            .map(|window| WindowRuntimeSummary {
+                id: window.id,
+                name: window.name.clone(),
+                active: window.id == session.active_window,
+            })
+            .collect())
+    }
+
+    fn switch_window(
+        &mut self,
+        session_id: SessionId,
+        selector: WindowSelection,
+    ) -> Result<bmux_session::WindowId> {
+        let session = self
+            .runtimes
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        let window_id = resolve_window_id_from_selector(session, selector)
+            .ok_or_else(|| anyhow::anyhow!("window not found in session {}", session_id.0))?;
+        session.active_window = window_id;
+        Ok(window_id)
+    }
+
+    fn kill_window(
+        &mut self,
+        session_id: SessionId,
+        selector: WindowSelection,
+    ) -> Result<RemovedWindowRuntime> {
+        let (window_id, is_last_window) = {
+            let session = self
+                .runtimes
+                .get_mut(&session_id)
+                .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+            let Some(window_id) = resolve_window_id_from_selector(session, selector) else {
+                anyhow::bail!("window not found in session {}", session_id.0);
+            };
+            let is_last_window = session.windows.len() == 1;
+            if !is_last_window && session.active_window == window_id {
+                let next_active = session
+                    .windows
+                    .keys()
+                    .copied()
+                    .find(|id| *id != window_id)
+                    .ok_or_else(|| anyhow::anyhow!("failed selecting next active window"))?;
+                session.active_window = next_active;
+            }
+            (window_id, is_last_window)
+        };
+
+        if is_last_window {
+            let mut removed_session = self.remove_runtime(session_id)?;
+            let window = removed_session
+                .handle
+                .windows
+                .remove(&window_id)
+                .ok_or_else(|| anyhow::anyhow!("window missing during session removal"))?;
+            return Ok(RemovedWindowRuntime {
+                session_id,
+                window_id,
+                handle: window,
+                session_removed: Some(removed_session),
+            });
+        }
+
+        let session = self
+            .runtimes
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        let window = session
+            .windows
+            .remove(&window_id)
+            .ok_or_else(|| anyhow::anyhow!("window not found in session {}", session_id.0))?;
+        Ok(RemovedWindowRuntime {
             session_id,
-            SessionRuntimeHandle {
-                stop_tx: Some(stop_tx),
-                task,
-                input_tx,
-                output_rx: std::sync::Mutex::new(output_rx),
-                active_client: None,
-            },
-        );
-        Ok(())
+            window_id,
+            handle: window,
+            session_removed: None,
+        })
     }
 
     fn remove_runtime(&mut self, session_id: SessionId) -> Result<RemovedRuntime> {
@@ -422,8 +586,13 @@ impl SessionRuntimeManager {
             return Err(SessionRuntimeError::NotAttached);
         }
 
+        let window = runtime
+            .windows
+            .get_mut(&runtime.active_window)
+            .ok_or(SessionRuntimeError::NotFound)?;
+
         let bytes = data.len();
-        runtime
+        window
             .input_tx
             .send(data)
             .map_err(|_| SessionRuntimeError::Closed)?;
@@ -445,7 +614,12 @@ impl SessionRuntimeManager {
             return Err(SessionRuntimeError::NotAttached);
         }
 
-        let mut receiver = runtime
+        let window = runtime
+            .windows
+            .get_mut(&runtime.active_window)
+            .ok_or(SessionRuntimeError::NotFound)?;
+
+        let mut receiver = window
             .output_rx
             .lock()
             .map_err(|_| SessionRuntimeError::Closed)?;
@@ -481,6 +655,29 @@ impl SessionRuntimeManager {
     #[cfg(test)]
     fn has_runtime(&self, session_id: SessionId) -> bool {
         self.runtimes.contains_key(&session_id)
+    }
+
+    #[cfg(test)]
+    fn window_count(&self, session_id: SessionId) -> usize {
+        self.runtimes
+            .get(&session_id)
+            .map(|runtime| runtime.windows.len())
+            .unwrap_or(0)
+    }
+}
+
+fn resolve_window_id_from_selector(
+    session: &SessionRuntimeHandle,
+    selector: WindowSelection,
+) -> Option<bmux_session::WindowId> {
+    match selector {
+        WindowSelection::Active => Some(session.active_window),
+        WindowSelection::Id(id) => session.windows.contains_key(&id).then_some(id),
+        WindowSelection::Name(name) => session
+            .windows
+            .values()
+            .find(|window| window.name.as_deref() == Some(name.as_str()))
+            .map(|window| window.id),
     }
 }
 
@@ -770,6 +967,21 @@ async fn handle_request(
                             message: format!("failed creating session runtime: {error:#}"),
                         }));
                     }
+                    let initial_window_ids = runtime_manager
+                        .list_windows(session_id)
+                        .map(|windows| windows.into_iter().map(|w| w.id).collect::<Vec<_>>())
+                        .unwrap_or_default();
+                    drop(runtime_manager);
+
+                    let mut manager = state
+                        .session_manager
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                    if let Some(session_model) = manager.get_session_mut(&session_id) {
+                        for window_id in initial_window_ids {
+                            session_model.add_window(window_id);
+                        }
+                    }
 
                     Response::Ok(ResponsePayload::SessionCreated {
                         id: session_id.0,
@@ -782,25 +994,242 @@ async fn handle_request(
                 }),
             }
         }
-        Request::NewWindow { .. }
-        | Request::ListWindows { .. }
-        | Request::KillWindow { .. }
-        | Request::SwitchWindow { .. } => Response::Err(ErrorResponse {
-            code: ErrorCode::InvalidRequest,
-            message: "window operations not implemented yet".to_string(),
-        }),
+        Request::NewWindow { session, name } => {
+            let manager = state
+                .session_manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+            let session_id = match resolve_window_request_session_id(&manager, &session, attached_session)
+            {
+                Ok(session_id) => session_id,
+                Err(response) => return Ok(Response::Err(response)),
+            };
+            drop(manager);
+
+            let mut runtime_manager = state
+                .session_runtimes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+            let (window_id, resolved_name) = match runtime_manager.new_window(session_id, name) {
+                Ok(created) => created,
+                Err(error) => {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::Internal,
+                        message: format!("failed creating window runtime: {error:#}"),
+                    }));
+                }
+            };
+            drop(runtime_manager);
+
+            let mut manager = state
+                .session_manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+            if let Some(session_model) = manager.get_session_mut(&session_id) {
+                session_model.add_window(window_id);
+            }
+
+            Response::Ok(ResponsePayload::WindowCreated {
+                id: window_id.0,
+                session_id: session_id.0,
+                name: resolved_name,
+            })
+        }
+        Request::ListWindows { session } => {
+            let manager = state
+                .session_manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+            let session_id = match resolve_window_request_session_id(&manager, &session, attached_session)
+            {
+                Ok(session_id) => session_id,
+                Err(response) => return Ok(Response::Err(response)),
+            };
+            drop(manager);
+
+            let runtime_manager = state
+                .session_runtimes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+            let windows = match runtime_manager.list_windows(session_id) {
+                Ok(windows) => windows,
+                Err(error) => {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::NotFound,
+                        message: format!("failed listing windows: {error:#}"),
+                    }));
+                }
+            };
+
+            Response::Ok(ResponsePayload::WindowList {
+                windows: windows
+                    .into_iter()
+                    .map(|window| WindowSummary {
+                        id: window.id.0,
+                        session_id: session_id.0,
+                        name: window.name,
+                        active: window.active,
+                    })
+                    .collect(),
+            })
+        }
+        Request::KillWindow { session, target } => {
+            let session_id = {
+                let manager = state
+                    .session_manager
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                match resolve_window_request_session_id(&manager, &session, attached_session) {
+                    Ok(session_id) => session_id,
+                    Err(response) => return Ok(Response::Err(response)),
+                }
+            };
+
+            let selection = window_selection_from_selector(target);
+            let removed_window = {
+                let mut runtime_manager = state
+                    .session_runtimes
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+                match runtime_manager.kill_window(session_id, selection) {
+                    Ok(removed) => removed,
+                    Err(error) => {
+                        return Ok(Response::Err(ErrorResponse {
+                            code: ErrorCode::NotFound,
+                            message: format!("failed killing window: {error:#}"),
+                        }));
+                    }
+                }
+            };
+
+            let removed_window_session_id = removed_window.session_id;
+            let removed_window_id = removed_window.window_id;
+            let removed_window_handle = removed_window.handle;
+            let session_removed = removed_window.session_removed;
+
+            shutdown_window_handle(removed_window_handle).await;
+
+            {
+                let mut manager = state
+                    .session_manager
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                if let Some(session_model) = manager.get_session_mut(&removed_window_session_id) {
+                    session_model.remove_window(&removed_window_id);
+                }
+            }
+
+            emit_event(
+                state,
+                Event::WindowRemoved {
+                    id: removed_window_id.0,
+                    session_id: removed_window_session_id.0,
+                },
+            )?;
+
+            if let Some(removed_session) = session_removed {
+                if removed_session.detached_client.is_some() {
+                    emit_event(
+                        state,
+                        Event::ClientDetached {
+                            id: removed_window_session_id.0,
+                        },
+                    )?;
+                }
+                shutdown_runtime_handle(removed_session).await;
+
+                let mut manager = state
+                    .session_manager
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                let _ = manager.remove_session(&removed_window_session_id);
+                if *attached_session == Some(removed_window_session_id) {
+                    *attached_session = None;
+                }
+
+                let mut attach_tokens = state
+                    .attach_tokens
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
+                attach_tokens.remove_for_session(removed_window_session_id);
+
+                emit_event(
+                    state,
+                    Event::SessionRemoved {
+                        id: removed_window_session_id.0,
+                    },
+                )?;
+            }
+
+            Response::Ok(ResponsePayload::WindowKilled {
+                id: removed_window_id.0,
+                session_id: removed_window_session_id.0,
+            })
+        }
+        Request::SwitchWindow { session, target } => {
+            let mut manager = state
+                .session_manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+            let session_id = match resolve_window_request_session_id(&manager, &session, attached_session)
+            {
+                Ok(session_id) => session_id,
+                Err(response) => return Ok(Response::Err(response)),
+            };
+            let selection = window_selection_from_selector(target);
+
+            let mut runtime_manager = state
+                .session_runtimes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+            let switched_id = match runtime_manager.switch_window(session_id, selection) {
+                Ok(window_id) => window_id,
+                Err(error) => {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::NotFound,
+                        message: format!("failed switching window: {error:#}"),
+                    }));
+                }
+            };
+            drop(runtime_manager);
+
+            if let Some(session_model) = manager.get_session_mut(&session_id) {
+                let _ = session_model.set_active_window(switched_id);
+            }
+
+            emit_event(
+                state,
+                Event::WindowSwitched {
+                    id: switched_id.0,
+                    session_id: session_id.0,
+                    by_client_id: client_id.0,
+                },
+            )?;
+
+            Response::Ok(ResponsePayload::WindowSwitched {
+                id: switched_id.0,
+                session_id: session_id.0,
+            })
+        }
         Request::ListSessions => {
             let manager = state
                 .session_manager
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+            let runtime_manager = state
+                .session_runtimes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
             let sessions = manager
                 .list_sessions()
                 .into_iter()
                 .map(|session| SessionSummary {
                     id: session.id.0,
                     name: session.name,
-                    window_count: session.window_count,
+                    window_count: runtime_manager
+                        .list_windows(session.id)
+                        .map(|windows| windows.len())
+                        .unwrap_or(session.window_count),
                     client_count: session.client_count,
                 })
                 .collect::<Vec<_>>();
@@ -1075,6 +1504,21 @@ async fn handle_request(
             },
         )?;
     }
+    if let Response::Ok(ResponsePayload::WindowCreated {
+        id,
+        session_id,
+        name,
+    }) = &response
+    {
+        emit_event(
+            state,
+            Event::WindowCreated {
+                id: *id,
+                session_id: *session_id,
+                name: name.clone(),
+            },
+        )?;
+    }
     if let Response::Ok(ResponsePayload::AttachReady { session_id }) = &response {
         emit_event(state, Event::ClientAttached { id: *session_id })?;
     }
@@ -1126,6 +1570,41 @@ fn resolve_session_id(manager: &SessionManager, selector: &SessionSelector) -> O
     }
 }
 
+fn resolve_window_request_session_id(
+    manager: &SessionManager,
+    selector: &Option<SessionSelector>,
+    attached_session: &Option<SessionId>,
+) -> std::result::Result<SessionId, ErrorResponse> {
+    if let Some(selector) = selector {
+        return resolve_session_id(manager, selector).ok_or_else(|| ErrorResponse {
+            code: ErrorCode::NotFound,
+            message: format!("session not found for selector {selector:?}"),
+        });
+    }
+
+    if let Some(attached) = attached_session {
+        return Ok(*attached);
+    }
+
+    let sessions = manager.list_sessions();
+    if sessions.len() == 1 {
+        return Ok(sessions[0].id);
+    }
+
+    Err(ErrorResponse {
+        code: ErrorCode::InvalidRequest,
+        message: "session selector is required when no attached session is active".to_string(),
+    })
+}
+
+fn window_selection_from_selector(selector: WindowSelector) -> WindowSelection {
+    match selector {
+        WindowSelector::ById(id) => WindowSelection::Id(WindowId(id)),
+        WindowSelector::ByName(name) => WindowSelection::Name(name),
+        WindowSelector::Active => WindowSelection::Active,
+    }
+}
+
 fn parse_request(envelope: &Envelope) -> Result<Request> {
     if envelope.kind != EnvelopeKind::Request {
         anyhow::bail!("expected request envelope kind")
@@ -1171,7 +1650,7 @@ mod tests {
     use bmux_ipc::transport::LocalIpcStream;
     use bmux_ipc::{
         Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, ProtocolVersion,
-        Request, Response, ResponsePayload, SessionSelector, decode, encode,
+        Request, Response, ResponsePayload, SessionSelector, WindowSelector, decode, encode,
     };
     use bmux_session::SessionId;
     use std::path::Path;
@@ -1314,6 +1793,171 @@ mod tests {
                 assert_eq!(sessions[0].name.as_deref(), Some("dev"));
             }
             other => panic!("unexpected list response: {other:?}"),
+        }
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn window_lifecycle_supports_create_list_switch_and_kill() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut client = connect_and_handshake(&endpoint).await;
+
+        let created = send_request(
+            &mut client,
+            12,
+            Request::NewSession {
+                name: Some("windows".to_string()),
+            },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected create session response: {other:?}"),
+        };
+
+        let created_window = send_request(
+            &mut client,
+            13,
+            Request::NewWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                name: Some("logs".to_string()),
+            },
+        )
+        .await;
+        let logs_window_id = match created_window {
+            Response::Ok(ResponsePayload::WindowCreated {
+                id,
+                session_id: sid,
+                ..
+            }) => {
+                assert_eq!(sid, session_id);
+                id
+            }
+            other => panic!("unexpected create window response: {other:?}"),
+        };
+
+        let listed = send_request(
+            &mut client,
+            14,
+            Request::ListWindows {
+                session: Some(SessionSelector::ById(session_id)),
+            },
+        )
+        .await;
+        let windows = match listed {
+            Response::Ok(ResponsePayload::WindowList { windows }) => windows,
+            other => panic!("unexpected list windows response: {other:?}"),
+        };
+        assert_eq!(windows.len(), 2);
+
+        let switched = send_request(
+            &mut client,
+            15,
+            Request::SwitchWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                target: WindowSelector::ById(logs_window_id),
+            },
+        )
+        .await;
+        assert_eq!(
+            switched,
+            Response::Ok(ResponsePayload::WindowSwitched {
+                id: logs_window_id,
+                session_id,
+            })
+        );
+
+        let killed = send_request(
+            &mut client,
+            16,
+            Request::KillWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                target: WindowSelector::ById(logs_window_id),
+            },
+        )
+        .await;
+        assert_eq!(
+            killed,
+            Response::Ok(ResponsePayload::WindowKilled {
+                id: logs_window_id,
+                session_id,
+            })
+        );
+
+        {
+            let runtime_manager = server
+                .state
+                .session_runtimes
+                .lock()
+                .expect("runtime manager lock should succeed");
+            assert_eq!(runtime_manager.window_count(SessionId(session_id)), 1);
+        }
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn killing_last_window_removes_session() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut client = connect_and_handshake(&endpoint).await;
+
+        let created = send_request(
+            &mut client,
+            17,
+            Request::NewSession {
+                name: Some("single-window".to_string()),
+            },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected create response: {other:?}"),
+        };
+
+        let listed = send_request(
+            &mut client,
+            18,
+            Request::ListWindows {
+                session: Some(SessionSelector::ById(session_id)),
+            },
+        )
+        .await;
+        let window_id = match listed {
+            Response::Ok(ResponsePayload::WindowList { windows }) if windows.len() == 1 => {
+                windows[0].id
+            }
+            other => panic!("unexpected initial window list: {other:?}"),
+        };
+
+        let killed = send_request(
+            &mut client,
+            19,
+            Request::KillWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                target: WindowSelector::ById(window_id),
+            },
+        )
+        .await;
+        assert!(matches!(killed, Response::Ok(ResponsePayload::WindowKilled { .. })));
+
+        let listed_sessions = send_request(&mut client, 20, Request::ListSessions).await;
+        assert_eq!(
+            listed_sessions,
+            Response::Ok(ResponsePayload::SessionList {
+                sessions: Vec::new(),
+            })
+        );
+
+        {
+            let runtime_manager = server
+                .state
+                .session_runtimes
+                .lock()
+                .expect("runtime manager lock should succeed");
+            assert_eq!(runtime_manager.runtime_count(), 0);
         }
 
         stop_server(server, server_task, &socket_path).await;
