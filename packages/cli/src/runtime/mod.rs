@@ -169,6 +169,7 @@ fn run_command(command: &Command) -> Result<u8> {
     match command {
         Command::NewSession { name } => run_session_new(name.clone()),
         Command::ListSessions { json } => run_session_list(*json),
+        Command::ListClients { json } => run_client_list(*json),
         Command::KillSession { target } => run_session_kill(target),
         Command::Attach { target } => run_session_attach(target),
         Command::Detach => run_session_detach(),
@@ -184,6 +185,7 @@ fn run_command(command: &Command) -> Result<u8> {
         Command::Session { command } => match command {
             SessionCommand::New { name } => run_session_new(name.clone()),
             SessionCommand::List { json } => run_session_list(*json),
+            SessionCommand::Clients { json } => run_client_list(*json),
             SessionCommand::Kill { target } => run_session_kill(target),
             SessionCommand::Attach { target } => run_session_attach(target),
             SessionCommand::Detach => run_session_detach(),
@@ -405,6 +407,49 @@ fn run_session_list(as_json: bool) -> Result<u8> {
         println!(
             "{:<36} {:<15} {:<7} {}",
             session.id, name, session.window_count, session.client_count
+        );
+    }
+
+    Ok(0)
+}
+
+fn run_client_list(as_json: bool) -> Result<u8> {
+    let clients = run_async(async {
+        let mut client = BmuxClient::connect_default("bmux-cli-list-clients")
+            .await
+            .map_err(anyhow::Error::from)?;
+        client.list_clients().await.map_err(anyhow::Error::from)
+    })?;
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&clients).context("failed to encode clients json")?
+        );
+        return Ok(0);
+    }
+
+    if clients.is_empty() {
+        println!("no clients");
+        return Ok(0);
+    }
+
+    println!(
+        "ID                                   SELECTED_SESSION                     FOLLOWING_CLIENT                     GLOBAL"
+    );
+    for client in clients {
+        let selected_session = client
+            .selected_session_id
+            .map_or_else(|| "-".to_string(), |id| id.to_string());
+        let following_client = client
+            .following_client_id
+            .map_or_else(|| "-".to_string(), |id| id.to_string());
+        println!(
+            "{:<36} {:<36} {:<36} {}",
+            client.id,
+            selected_session,
+            following_client,
+            if client.following_global { "yes" } else { "no" }
         );
     }
 

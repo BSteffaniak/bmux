@@ -9,9 +9,9 @@ use anyhow::{Context, Result};
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
-    AttachGrant, CURRENT_PROTOCOL_VERSION, Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event,
-    IpcEndpoint, ProtocolVersion, Request, Response, ResponsePayload, SessionSelector,
-    SessionSummary, WindowSelector, WindowSummary, decode, encode,
+    AttachGrant, CURRENT_PROTOCOL_VERSION, ClientSummary, Envelope, EnvelopeKind, ErrorCode,
+    ErrorResponse, Event, IpcEndpoint, ProtocolVersion, Request, Response, ResponsePayload,
+    SessionSelector, SessionSummary, WindowSelector, WindowSummary, decode, encode,
 };
 use bmux_session::{ClientId, SessionId, SessionManager, WindowId};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
@@ -303,6 +303,29 @@ impl FollowState {
                 self.selected_sessions.insert(follower_id, selected_session);
             }
         }
+    }
+
+    fn list_clients(&self) -> Vec<ClientSummary> {
+        self.connected_clients
+            .iter()
+            .map(|client_id| {
+                let selected_session_id = self
+                    .selected_sessions
+                    .get(client_id)
+                    .and_then(|selected| selected.map(|session_id| session_id.0));
+                let (following_client_id, following_global) =
+                    self.follows.get(client_id).map_or((None, false), |entry| {
+                        (Some(entry.leader_client_id.0), entry.global)
+                    });
+
+                ClientSummary {
+                    id: client_id.0,
+                    selected_session_id,
+                    following_client_id,
+                    following_global,
+                }
+            })
+            .collect()
     }
 }
 
@@ -1442,6 +1465,14 @@ async fn handle_request(
                 .collect::<Vec<_>>();
             Response::Ok(ResponsePayload::SessionList { sessions })
         }
+        Request::ListClients => {
+            let follow_state = state
+                .follow_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
+            let clients = follow_state.list_clients();
+            Response::Ok(ResponsePayload::ClientList { clients })
+        }
         Request::KillSession { selector } => {
             let (session_id, removed_runtime) = {
                 let mut manager = state
@@ -2065,6 +2096,103 @@ mod tests {
             }
             other => panic!("unexpected list response: {other:?}"),
         }
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_clients_reports_connected_clients() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut client_a = connect_and_handshake(&endpoint).await;
+        let mut client_b = connect_and_handshake(&endpoint).await;
+
+        let listed = send_request(&mut client_a, 110, Request::ListClients).await;
+        let clients = match listed {
+            Response::Ok(ResponsePayload::ClientList { clients }) => clients,
+            other => panic!("unexpected list clients response: {other:?}"),
+        };
+        assert_eq!(clients.len(), 2);
+        assert!(
+            clients
+                .iter()
+                .all(|client| client.following_client_id.is_none())
+        );
+        assert!(clients.iter().all(|client| !client.following_global));
+
+        let listed_from_b = send_request(&mut client_b, 111, Request::ListClients).await;
+        let clients_from_b = match listed_from_b {
+            Response::Ok(ResponsePayload::ClientList { clients }) => clients,
+            other => panic!("unexpected list clients response: {other:?}"),
+        };
+        assert_eq!(clients_from_b.len(), 2);
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn list_clients_reports_follow_relationships() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut leader = connect_and_handshake(&endpoint).await;
+        let mut follower = connect_and_handshake(&endpoint).await;
+
+        let session_id = match send_request(
+            &mut leader,
+            120,
+            Request::NewSession {
+                name: Some("clients-follow".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected create session response: {other:?}"),
+        };
+        let _ = send_request(
+            &mut leader,
+            121,
+            Request::Attach {
+                selector: SessionSelector::ById(session_id),
+            },
+        )
+        .await;
+
+        let leader_client_id = match send_request(&mut leader, 122, Request::ListClients).await {
+            Response::Ok(ResponsePayload::ClientList { clients }) => clients
+                .into_iter()
+                .find(|client| client.selected_session_id == Some(session_id))
+                .map(|client| client.id)
+                .expect("leader client should be listed"),
+            other => panic!("unexpected list clients response: {other:?}"),
+        };
+
+        let followed = send_request(
+            &mut follower,
+            123,
+            Request::FollowClient {
+                target_client_id: leader_client_id,
+                global: true,
+            },
+        )
+        .await;
+        assert!(matches!(
+            followed,
+            Response::Ok(ResponsePayload::FollowStarted { global: true, .. })
+        ));
+
+        let listed = send_request(&mut follower, 124, Request::ListClients).await;
+        let clients = match listed {
+            Response::Ok(ResponsePayload::ClientList { clients }) => clients,
+            other => panic!("unexpected list clients response: {other:?}"),
+        };
+        let follower_entry = clients
+            .iter()
+            .find(|client| client.id != leader_client_id)
+            .expect("follower client should be listed");
+        assert_eq!(follower_entry.following_client_id, Some(leader_client_id));
+        assert!(follower_entry.following_global);
+        assert_eq!(follower_entry.selected_session_id, Some(session_id));
 
         stop_server(server, server_task, &socket_path).await;
     }

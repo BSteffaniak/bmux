@@ -9,9 +9,9 @@ use bmux_config::{BmuxConfig, ConfigPaths};
 pub use bmux_ipc::Event as ServerEvent;
 use bmux_ipc::transport::{IpcTransportError, LocalIpcStream};
 use bmux_ipc::{
-    AttachGrant, Envelope, EnvelopeKind, ErrorCode, IpcEndpoint, ProtocolVersion, Request,
-    Response, ResponsePayload, SessionSelector, SessionSummary, WindowSelector, WindowSummary,
-    decode, encode,
+    AttachGrant, ClientSummary, Envelope, EnvelopeKind, ErrorCode, IpcEndpoint, ProtocolVersion,
+    Request, Response, ResponsePayload, SessionSelector, SessionSummary, WindowSelector,
+    WindowSummary, decode, encode,
 };
 use std::time::Duration;
 use thiserror::Error;
@@ -166,6 +166,18 @@ impl BmuxClient {
         match self.request(Request::ListSessions).await? {
             ResponsePayload::SessionList { sessions } => Ok(sessions),
             _ => Err(ClientError::UnexpectedResponse("expected session list")),
+        }
+    }
+
+    /// List currently connected clients.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn list_clients(&mut self) -> Result<Vec<ClientSummary>> {
+        match self.request(Request::ListClients).await? {
+            ResponsePayload::ClientList { clients } => Ok(clients),
+            _ => Err(ClientError::UnexpectedResponse("expected client list")),
         }
     }
 
@@ -654,44 +666,19 @@ mod tests {
             .await
             .expect("leader session should be created");
 
-        let windows = leader
-            .list_windows(Some(SessionSelector::ById(session_id)))
-            .await
-            .expect("leader windows should list");
-        let active_window = windows
-            .iter()
-            .find(|window| window.active)
-            .expect("active window should exist")
-            .id;
-
         leader
-            .switch_window(
-                Some(SessionSelector::ById(session_id)),
-                WindowSelector::ById(active_window),
-            )
+            .attach_grant(SessionSelector::ById(session_id))
             .await
-            .expect("window switch should succeed");
+            .expect("leader attach grant should succeed");
 
-        let mut leader_client_id = None;
-        for _ in 0..6 {
-            let events = follower
-                .poll_events(10)
-                .await
-                .expect("event poll should succeed");
-            leader_client_id = events.into_iter().find_map(|event| match event {
-                ServerEvent::WindowSwitched {
-                    session_id: switched_session,
-                    by_client_id,
-                    ..
-                } if switched_session == session_id => Some(by_client_id),
-                _ => None,
-            });
-            if leader_client_id.is_some() {
-                break;
-            }
-            sleep(Duration::from_millis(25)).await;
-        }
-        let leader_client_id = leader_client_id.expect("leader client id should be observed");
+        let leader_client_id = leader
+            .list_clients()
+            .await
+            .expect("list clients should succeed")
+            .into_iter()
+            .find(|client| client.selected_session_id == Some(session_id))
+            .map(|client| client.id)
+            .expect("leader client id should be listed");
 
         follower
             .follow_client(leader_client_id, true)

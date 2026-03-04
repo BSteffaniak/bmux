@@ -8,6 +8,7 @@ Command-line interface for bmux terminal multiplexer.
 
 - Local server lifecycle commands (`start`, `status`, `stop`)
 - Session lifecycle commands (new/list/attach/detach/kill)
+- Client listing command (list-clients / session clients)
 - Window lifecycle commands (new/list/switch/kill)
 - Client follow controls (follow/unfollow)
 - Alias-compatible command forms (top-level and grouped)
@@ -40,6 +41,8 @@ Top-level and grouped forms are exact aliases.
 # top-level
 bmux new-session dev
 bmux list-sessions
+bmux list-clients
+bmux list-clients --json
 bmux list-sessions --json
 bmux attach dev
 bmux detach
@@ -48,6 +51,8 @@ bmux kill-session dev
 # grouped aliases
 bmux session new dev
 bmux session list
+bmux session clients
+bmux session clients --json
 bmux session list --json
 bmux session attach dev
 bmux session detach
@@ -93,11 +98,13 @@ Top-level and grouped forms are exact aliases.
 
 ```bash
 # top-level
+bmux list-clients
 bmux follow 550e8400-e29b-41d4-a716-446655440000
 bmux follow 550e8400-e29b-41d4-a716-446655440000 --global
 bmux unfollow
 
 # grouped aliases
+bmux session clients
 bmux session follow 550e8400-e29b-41d4-a716-446655440000
 bmux session follow 550e8400-e29b-41d4-a716-446655440000 --global
 bmux session unfollow
@@ -111,6 +118,8 @@ bmux session unfollow
 
 - `bmux list-sessions --json`
 - `bmux session list --json`
+- `bmux list-clients --json`
+- `bmux session clients --json`
 - `bmux list-windows --json`
 - `bmux window list --json`
 

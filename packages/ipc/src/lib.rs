@@ -137,6 +137,7 @@ pub enum Request {
         name: Option<String>,
     },
     ListSessions,
+    ListClients,
     ListWindows {
         session: Option<SessionSelector>,
     },
@@ -204,6 +205,15 @@ pub struct WindowSummary {
     pub active: bool,
 }
 
+/// Summary returned when listing connected clients.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientSummary {
+    pub id: Uuid,
+    pub selected_session_id: Option<Uuid>,
+    pub following_client_id: Option<Uuid>,
+    pub following_global: bool,
+}
+
 /// Successful response payload variants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -223,6 +233,9 @@ pub enum ResponsePayload {
     },
     SessionList {
         sessions: Vec<SessionSummary>,
+    },
+    ClientList {
+        clients: Vec<ClientSummary>,
     },
     WindowList {
         windows: Vec<WindowSummary>,

@@ -113,6 +113,7 @@ bmux switch-window active --session dev
 bmux kill-window active --session dev
 
 # Follow controls (top-level)
+bmux list-clients
 bmux follow 550e8400-e29b-41d4-a716-446655440000 --global
 bmux unfollow
 
@@ -127,11 +128,12 @@ bmux window new --session dev --name editor
 bmux window list --session dev
 bmux window switch active --session dev
 bmux window kill active --session dev
+bmux session clients
 bmux session follow 550e8400-e29b-41d4-a716-446655440000 --global
 bmux session unfollow
 ```
 
-`list-sessions --json` and `session list --json` output a bare JSON array.
+All list commands with `--json` output a bare JSON array.
 
 ### Server stop behavior
 

@@ -59,6 +59,12 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// List connected clients
+    ListClients {
+        /// Print clients as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Kill a session by name or UUID
     KillSession {
         /// Session name or UUID
@@ -157,6 +163,12 @@ pub(crate) enum SessionCommand {
     /// List active sessions
     List {
         /// Print sessions as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List connected clients
+    Clients {
+        /// Print clients as JSON
         #[arg(long)]
         json: bool,
     },
@@ -540,6 +552,43 @@ mod tests {
             panic!("expected session command");
         };
         assert!(matches!(command, SessionCommand::List { json: true }));
+    }
+
+    #[test]
+    fn parses_top_level_list_clients_command() {
+        let cli = Cli::try_parse_from(["bmux", "list-clients"]).expect("valid CLI args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::ListClients { json: false })
+        ));
+    }
+
+    #[test]
+    fn parses_top_level_list_clients_json_flag() {
+        let cli = Cli::try_parse_from(["bmux", "list-clients", "--json"]).expect("valid CLI args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::ListClients { json: true })
+        ));
+    }
+
+    #[test]
+    fn parses_grouped_session_clients_command() {
+        let cli = Cli::try_parse_from(["bmux", "session", "clients"]).expect("valid CLI args");
+        let Some(Command::Session { command }) = cli.command else {
+            panic!("expected session command");
+        };
+        assert!(matches!(command, SessionCommand::Clients { json: false }));
+    }
+
+    #[test]
+    fn parses_grouped_session_clients_json_flag() {
+        let cli =
+            Cli::try_parse_from(["bmux", "session", "clients", "--json"]).expect("valid CLI args");
+        let Some(Command::Session { command }) = cli.command else {
+            panic!("expected session command");
+        };
+        assert!(matches!(command, SessionCommand::Clients { json: true }));
     }
 
     #[test]
