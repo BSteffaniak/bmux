@@ -71,10 +71,49 @@ pub(crate) enum Command {
     },
     /// Detach from the current session
     Detach,
+    /// Create a new window in a session
+    NewWindow {
+        /// Optional session name or UUID (uses attached session when omitted)
+        #[arg(long)]
+        session: Option<String>,
+        /// Optional window name
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List windows for a session
+    ListWindows {
+        /// Optional session name or UUID (uses attached session when omitted)
+        #[arg(long)]
+        session: Option<String>,
+        /// Print windows as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Kill a window by name, UUID, or `active`
+    KillWindow {
+        /// Window name, UUID, or `active`
+        target: String,
+        /// Optional session name or UUID (uses attached session when omitted)
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Switch active window by name, UUID, or `active`
+    SwitchWindow {
+        /// Window name, UUID, or `active`
+        target: String,
+        /// Optional session name or UUID (uses attached session when omitted)
+        #[arg(long)]
+        session: Option<String>,
+    },
     /// Session management commands
     Session {
         #[command(subcommand)]
         command: SessionCommand,
+    },
+    /// Window management commands
+    Window {
+        #[command(subcommand)]
+        command: WindowCommand,
     },
     /// Server lifecycle and status tools
     Server {
@@ -123,6 +162,44 @@ pub(crate) enum SessionCommand {
     },
     /// Detach from the current session
     Detach,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum WindowCommand {
+    /// Create a new window in a session
+    New {
+        /// Optional session name or UUID (uses attached session when omitted)
+        #[arg(long)]
+        session: Option<String>,
+        /// Optional window name
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// List windows for a session
+    List {
+        /// Optional session name or UUID (uses attached session when omitted)
+        #[arg(long)]
+        session: Option<String>,
+        /// Print windows as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Kill a window by name, UUID, or `active`
+    Kill {
+        /// Window name, UUID, or `active`
+        target: String,
+        /// Optional session name or UUID (uses attached session when omitted)
+        #[arg(long)]
+        session: Option<String>,
+    },
+    /// Switch active window by name, UUID, or `active`
+    Switch {
+        /// Window name, UUID, or `active`
+        target: String,
+        /// Optional session name or UUID (uses attached session when omitted)
+        #[arg(long)]
+        session: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -193,7 +270,7 @@ pub(crate) enum TerminalCommand {
 mod tests {
     use super::{
         Cli, Command, KeymapCommand, LayoutCommand, ServerCommand, SessionCommand, TerminalCommand,
-        TraceFamily,
+        TraceFamily, WindowCommand,
     };
     use clap::Parser;
 
@@ -370,6 +447,51 @@ mod tests {
     }
 
     #[test]
+    fn parses_top_level_new_window_command() {
+        let cli =
+            Cli::try_parse_from(["bmux", "new-window", "--name", "editor", "--session", "dev"])
+                .expect("valid CLI args");
+        let Some(Command::NewWindow { session, name }) = cli.command else {
+            panic!("expected new-window command");
+        };
+        assert_eq!(session.as_deref(), Some("dev"));
+        assert_eq!(name.as_deref(), Some("editor"));
+    }
+
+    #[test]
+    fn parses_top_level_list_windows_json_flag() {
+        let cli = Cli::try_parse_from(["bmux", "list-windows", "--json"]).expect("valid CLI args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::ListWindows {
+                session: None,
+                json: true
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_top_level_kill_window_command() {
+        let cli = Cli::try_parse_from(["bmux", "kill-window", "active", "--session", "dev"])
+            .expect("valid CLI args");
+        let Some(Command::KillWindow { target, session }) = cli.command else {
+            panic!("expected kill-window command");
+        };
+        assert_eq!(target, "active");
+        assert_eq!(session.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn parses_top_level_switch_window_command() {
+        let cli = Cli::try_parse_from(["bmux", "switch-window", "editor"]).expect("valid CLI args");
+        let Some(Command::SwitchWindow { target, session }) = cli.command else {
+            panic!("expected switch-window command");
+        };
+        assert_eq!(target, "editor");
+        assert_eq!(session, None);
+    }
+
+    #[test]
     fn parses_grouped_session_new_command() {
         let cli = Cli::try_parse_from(["bmux", "session", "new", "dev"]).expect("valid CLI args");
         let Some(Command::Session { command }) = cli.command else {
@@ -432,6 +554,74 @@ mod tests {
             panic!("expected session command");
         };
         assert!(matches!(command, SessionCommand::Detach));
+    }
+
+    #[test]
+    fn parses_grouped_window_new_command() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "window",
+            "new",
+            "--session",
+            "dev",
+            "--name",
+            "editor",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Window { command }) = cli.command else {
+            panic!("expected window command");
+        };
+        assert!(matches!(
+            command,
+            WindowCommand::New {
+                session: Some(ref session),
+                name: Some(ref name)
+            } if session == "dev" && name == "editor"
+        ));
+    }
+
+    #[test]
+    fn parses_grouped_window_list_command() {
+        let cli = Cli::try_parse_from(["bmux", "window", "list"]).expect("valid CLI args");
+        let Some(Command::Window { command }) = cli.command else {
+            panic!("expected window command");
+        };
+        assert!(matches!(
+            command,
+            WindowCommand::List {
+                session: None,
+                json: false
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_grouped_window_kill_command() {
+        let cli = Cli::try_parse_from(["bmux", "window", "kill", "active", "--session", "dev"])
+            .expect("valid CLI args");
+        let Some(Command::Window { command }) = cli.command else {
+            panic!("expected window command");
+        };
+        assert!(matches!(
+            command,
+            WindowCommand::Kill {
+                target,
+                session: Some(ref session)
+            } if target == "active" && session == "dev"
+        ));
+    }
+
+    #[test]
+    fn parses_grouped_window_switch_command() {
+        let cli =
+            Cli::try_parse_from(["bmux", "window", "switch", "main"]).expect("valid CLI args");
+        let Some(Command::Window { command }) = cli.command else {
+            panic!("expected window command");
+        };
+        assert!(matches!(
+            command,
+            WindowCommand::Switch { target, session: None } if target == "main"
+        ));
     }
 
     #[test]

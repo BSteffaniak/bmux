@@ -277,6 +277,9 @@ mod tests {
         let endpoint = IpcEndpoint::unix_socket(std::env::temp_dir().join("bmux-test.sock"));
 
         let result = LocalIpcStream::connect(&endpoint).await;
-        assert!(matches!(result, Err(IpcTransportError::UnsupportedEndpoint)));
+        assert!(matches!(
+            result,
+            Err(IpcTransportError::UnsupportedEndpoint)
+        ));
     }
 }

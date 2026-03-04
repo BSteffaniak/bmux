@@ -6,13 +6,13 @@
 //! Client component for bmux terminal multiplexer.
 
 use bmux_config::{BmuxConfig, ConfigPaths};
+pub use bmux_ipc::Event as ServerEvent;
 use bmux_ipc::transport::{IpcTransportError, LocalIpcStream};
 use bmux_ipc::{
     AttachGrant, Envelope, EnvelopeKind, ErrorCode, IpcEndpoint, ProtocolVersion, Request,
     Response, ResponsePayload, SessionSelector, SessionSummary, WindowSelector, WindowSummary,
     decode, encode,
 };
-pub use bmux_ipc::Event as ServerEvent;
 use std::time::Duration;
 use thiserror::Error;
 use tracing::debug;
@@ -91,7 +91,10 @@ impl BmuxClient {
     /// # Errors
     ///
     /// Returns an error if connection or handshake fails.
-    pub async fn connect_with_paths(paths: &ConfigPaths, client_name: impl Into<String>) -> Result<Self> {
+    pub async fn connect_with_paths(
+        paths: &ConfigPaths,
+        client_name: impl Into<String>,
+    ) -> Result<Self> {
         let timeout = Duration::from_millis(BmuxConfig::load()?.general.server_timeout.max(1));
         let endpoint = endpoint_from_paths(paths);
         Self::connect(&endpoint, timeout, client_name).await
@@ -183,7 +186,11 @@ impl BmuxClient {
     /// # Errors
     ///
     /// Returns an error if request or response validation fails.
-    pub async fn new_window(&mut self, session: Option<SessionSelector>, name: Option<String>) -> Result<Uuid> {
+    pub async fn new_window(
+        &mut self,
+        session: Option<SessionSelector>,
+        name: Option<String>,
+    ) -> Result<Uuid> {
         match self.request(Request::NewWindow { session, name }).await? {
             ResponsePayload::WindowCreated { id, .. } => Ok(id),
             _ => Err(ClientError::UnexpectedResponse("expected window created")),
@@ -195,7 +202,10 @@ impl BmuxClient {
     /// # Errors
     ///
     /// Returns an error if request or response validation fails.
-    pub async fn list_windows(&mut self, session: Option<SessionSelector>) -> Result<Vec<WindowSummary>> {
+    pub async fn list_windows(
+        &mut self,
+        session: Option<SessionSelector>,
+    ) -> Result<Vec<WindowSummary>> {
         match self.request(Request::ListWindows { session }).await? {
             ResponsePayload::WindowList { windows } => Ok(windows),
             _ => Err(ClientError::UnexpectedResponse("expected window list")),
@@ -212,7 +222,10 @@ impl BmuxClient {
         session: Option<SessionSelector>,
         target: WindowSelector,
     ) -> Result<Uuid> {
-        match self.request(Request::KillWindow { session, target }).await? {
+        match self
+            .request(Request::KillWindow { session, target })
+            .await?
+        {
             ResponsePayload::WindowKilled { id, .. } => Ok(id),
             _ => Err(ClientError::UnexpectedResponse("expected window killed")),
         }
@@ -228,7 +241,10 @@ impl BmuxClient {
         session: Option<SessionSelector>,
         target: WindowSelector,
     ) -> Result<Uuid> {
-        match self.request(Request::SwitchWindow { session, target }).await? {
+        match self
+            .request(Request::SwitchWindow { session, target })
+            .await?
+        {
             ResponsePayload::WindowSwitched { id, .. } => Ok(id),
             _ => Err(ClientError::UnexpectedResponse("expected window switched")),
         }
@@ -282,7 +298,9 @@ impl BmuxClient {
     pub async fn attach_grant(&mut self, selector: SessionSelector) -> Result<AttachGrant> {
         match self.request(Request::Attach { selector }).await? {
             ResponsePayload::Attached { grant } => Ok(grant),
-            _ => Err(ClientError::UnexpectedResponse("expected attached response")),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attached response",
+            )),
         }
     }
 
@@ -300,7 +318,9 @@ impl BmuxClient {
             .await?
         {
             ResponsePayload::AttachReady { session_id } => Ok(session_id),
-            _ => Err(ClientError::UnexpectedResponse("expected attach ready response")),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attach ready response",
+            )),
         }
     }
 
@@ -312,7 +332,9 @@ impl BmuxClient {
     pub async fn detach(&mut self) -> Result<()> {
         match self.request(Request::Detach).await? {
             ResponsePayload::Detached => Ok(()),
-            _ => Err(ClientError::UnexpectedResponse("expected detached response")),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected detached response",
+            )),
         }
     }
 
@@ -375,7 +397,9 @@ impl BmuxClient {
     pub async fn poll_events(&mut self, max_events: usize) -> Result<Vec<ServerEvent>> {
         match self.request(Request::PollEvents { max_events }).await? {
             ResponsePayload::EventBatch { events } => Ok(events),
-            _ => Err(ClientError::UnexpectedResponse("expected event batch response")),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected event batch response",
+            )),
         }
     }
 
@@ -409,10 +433,7 @@ impl BmuxClient {
         match response {
             Response::Ok(payload) => Ok(payload),
             Response::Err(error) => {
-                debug!(
-                    "server returned error {:?}: {}",
-                    error.code, error.message
-                );
+                debug!("server returned error {:?}: {}", error.code, error.message);
                 Err(ClientError::ServerError {
                     code: error.code,
                     message: error.message,
@@ -512,9 +533,11 @@ mod tests {
             .await
             .expect("list windows after switch should succeed");
         assert_eq!(windows_after_switch.len(), 2);
-        assert!(windows_after_switch
-            .iter()
-            .any(|window| window.id == secondary_window && window.active));
+        assert!(
+            windows_after_switch
+                .iter()
+                .any(|window| window.id == secondary_window && window.active)
+        );
 
         let removed = client
             .kill_window(
@@ -530,9 +553,11 @@ mod tests {
             .await
             .expect("list windows after kill should succeed");
         assert_eq!(windows_after_kill.len(), 1);
-        assert!(windows_after_kill
-            .iter()
-            .any(|window| window.id == primary_window && window.active));
+        assert!(
+            windows_after_kill
+                .iter()
+                .any(|window| window.id == primary_window && window.active)
+        );
 
         let grant = client
             .attach_grant(SessionSelector::ByName("dev".to_string()))
@@ -589,11 +614,13 @@ mod tests {
             .await
             .expect("kill should succeed");
         assert_eq!(killed_id, session_id);
-        assert!(client
-            .list_sessions()
-            .await
-            .expect("list after kill should succeed")
-            .is_empty());
+        assert!(
+            client
+                .list_sessions()
+                .await
+                .expect("list after kill should succeed")
+                .is_empty()
+        );
 
         client.stop_server().await.expect("stop should succeed");
         server_task

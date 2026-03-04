@@ -1,4 +1,4 @@
-use crate::{decode, encode, Envelope, ProtocolVersion};
+use crate::{Envelope, ProtocolVersion, decode, encode};
 use thiserror::Error;
 
 const FRAME_LEN_BYTES: usize = 4;
@@ -139,10 +139,10 @@ fn decode_envelope_payload(payload: &[u8]) -> Result<Envelope, FrameDecodeError>
 #[cfg(test)]
 mod tests {
     use super::{
-        decode_frame_exact, encode_frame, try_decode_frame, FrameDecodeError,
-        MAX_FRAME_PAYLOAD_SIZE,
+        FrameDecodeError, MAX_FRAME_PAYLOAD_SIZE, decode_frame_exact, encode_frame,
+        try_decode_frame,
     };
-    use crate::{encode, Envelope, EnvelopeKind, ProtocolVersion, Request};
+    use crate::{Envelope, EnvelopeKind, ProtocolVersion, Request, encode};
 
     #[test]
     fn frame_roundtrip_exact() {

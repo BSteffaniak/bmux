@@ -9,8 +9,8 @@ use anyhow::{Context, Result};
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
-    AttachGrant, CURRENT_PROTOCOL_VERSION, Envelope, EnvelopeKind, ErrorCode, ErrorResponse,
-    Event, IpcEndpoint, ProtocolVersion, Request, Response, ResponsePayload, SessionSelector,
+    AttachGrant, CURRENT_PROTOCOL_VERSION, Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event,
+    IpcEndpoint, ProtocolVersion, Request, Response, ResponsePayload, SessionSelector,
     SessionSummary, WindowSelector, WindowSummary, decode, encode,
 };
 use bmux_session::{ClientId, SessionId, SessionManager, WindowId};
@@ -170,7 +170,8 @@ impl AttachTokenManager {
     }
 
     fn remove_for_session(&mut self, session_id: SessionId) {
-        self.tokens.retain(|_, entry| entry.session_id != session_id);
+        self.tokens
+            .retain(|_, entry| entry.session_id != session_id);
     }
 
     fn clear(&mut self) {
@@ -181,7 +182,6 @@ impl AttachTokenManager {
         let now = Instant::now();
         self.tokens.retain(|_, entry| entry.expires_at > now);
     }
-
 }
 
 fn epoch_millis_now() -> u64 {
@@ -548,7 +548,11 @@ impl SessionRuntimeManager {
             .collect()
     }
 
-    fn begin_attach(&mut self, session_id: SessionId, client_id: ClientId) -> Result<(), SessionRuntimeError> {
+    fn begin_attach(
+        &mut self,
+        session_id: SessionId,
+        client_id: ClientId,
+    ) -> Result<(), SessionRuntimeError> {
         let runtime = self
             .runtimes
             .get_mut(&session_id)
@@ -999,11 +1003,11 @@ async fn handle_request(
                 .session_manager
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            let session_id = match resolve_window_request_session_id(&manager, &session, attached_session)
-            {
-                Ok(session_id) => session_id,
-                Err(response) => return Ok(Response::Err(response)),
-            };
+            let session_id =
+                match resolve_window_request_session_id(&manager, &session, attached_session) {
+                    Ok(session_id) => session_id,
+                    Err(response) => return Ok(Response::Err(response)),
+                };
             drop(manager);
 
             let mut runtime_manager = state
@@ -1040,11 +1044,11 @@ async fn handle_request(
                 .session_manager
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            let session_id = match resolve_window_request_session_id(&manager, &session, attached_session)
-            {
-                Ok(session_id) => session_id,
-                Err(response) => return Ok(Response::Err(response)),
-            };
+            let session_id =
+                match resolve_window_request_session_id(&manager, &session, attached_session) {
+                    Ok(session_id) => session_id,
+                    Err(response) => return Ok(Response::Err(response)),
+                };
             drop(manager);
 
             let runtime_manager = state
@@ -1171,11 +1175,11 @@ async fn handle_request(
                 .session_manager
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            let session_id = match resolve_window_request_session_id(&manager, &session, attached_session)
-            {
-                Ok(session_id) => session_id,
-                Err(response) => return Ok(Response::Err(response)),
-            };
+            let session_id =
+                match resolve_window_request_session_id(&manager, &session, attached_session) {
+                    Ok(session_id) => session_id,
+                    Err(response) => return Ok(Response::Err(response)),
+                };
             let selection = window_selection_from_selector(target);
 
             let mut runtime_manager = state
@@ -1941,7 +1945,10 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(killed, Response::Ok(ResponsePayload::WindowKilled { .. })));
+        assert!(matches!(
+            killed,
+            Response::Ok(ResponsePayload::WindowKilled { .. })
+        ));
 
         let listed_sessions = send_request(&mut client, 20, Request::ListSessions).await;
         assert_eq!(
@@ -2167,7 +2174,10 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(open, Response::Ok(ResponsePayload::AttachReady { session_id }));
+        assert_eq!(
+            open,
+            Response::Ok(ResponsePayload::AttachReady { session_id })
+        );
 
         let detached = send_request(&mut client, 73, Request::Detach).await;
         assert_eq!(detached, Response::Ok(ResponsePayload::Detached));
@@ -2282,7 +2292,10 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(opened, Response::Ok(ResponsePayload::AttachReady { session_id }));
+        assert_eq!(
+            opened,
+            Response::Ok(ResponsePayload::AttachReady { session_id })
+        );
 
         let switched_primary = send_request(
             &mut client,
@@ -2379,7 +2392,8 @@ mod tests {
             print_primary,
             Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
         ));
-        let first_output = collect_attach_output_until(&mut client, session_id, "W1=[one]", 20).await;
+        let first_output =
+            collect_attach_output_until(&mut client, session_id, "W1=[one]", 20).await;
         assert!(first_output.contains("W1=[one]"));
 
         stop_server(server, server_task, &socket_path).await;
@@ -2456,7 +2470,10 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(opened, Response::Ok(ResponsePayload::AttachReady { session_id }));
+        assert_eq!(
+            opened,
+            Response::Ok(ResponsePayload::AttachReady { session_id })
+        );
 
         let switched_primary = send_request(
             &mut client,
@@ -2546,7 +2563,10 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(reopened, Response::Ok(ResponsePayload::AttachReady { session_id }));
+        assert_eq!(
+            reopened,
+            Response::Ok(ResponsePayload::AttachReady { session_id })
+        );
 
         let print_output = send_request(
             &mut client,
@@ -2610,7 +2630,10 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(opened, Response::Ok(ResponsePayload::AttachReady { session_id }));
+        assert_eq!(
+            opened,
+            Response::Ok(ResponsePayload::AttachReady { session_id })
+        );
 
         let detached = send_request(&mut client, 84, Request::Detach).await;
         assert_eq!(detached, Response::Ok(ResponsePayload::Detached));
@@ -2636,7 +2659,9 @@ mod tests {
 
         let created_idx = events
             .iter()
-            .position(|event| matches!(event, Event::SessionCreated { id, .. } if *id == session_id))
+            .position(
+                |event| matches!(event, Event::SessionCreated { id, .. } if *id == session_id),
+            )
             .expect("session_created event should exist");
         let attached_idx = events
             .iter()
@@ -2698,7 +2723,10 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(opened, Response::Ok(ResponsePayload::AttachReady { session_id }));
+        assert_eq!(
+            opened,
+            Response::Ok(ResponsePayload::AttachReady { session_id })
+        );
 
         let stopper = connect_and_handshake(&endpoint).await;
         let mut stopper = stopper;
@@ -2905,7 +2933,11 @@ mod tests {
     }
 
     #[cfg(unix)]
-    async fn send_request(client: &mut LocalIpcStream, request_id: u64, request: Request) -> Response {
+    async fn send_request(
+        client: &mut LocalIpcStream,
+        request_id: u64,
+        request: Request,
+    ) -> Response {
         let payload = encode(&request).expect("request should encode");
         let envelope = Envelope::new(request_id, EnvelopeKind::Request, payload);
         client

@@ -8,6 +8,7 @@ Command-line interface for bmux terminal multiplexer.
 
 - Local server lifecycle commands (`start`, `status`, `stop`)
 - Session lifecycle commands (new/list/attach/detach/kill)
+- Window lifecycle commands (new/list/switch/kill)
 - Alias-compatible command forms (top-level and grouped)
 - Runtime/terminal diagnostics (`keymap doctor`, `terminal doctor`)
 
@@ -57,12 +58,42 @@ Session target values for `attach`/`kill` support both:
 - session name
 - session UUID
 
+## Window Commands
+
+Top-level and grouped forms are exact aliases.
+
+```bash
+# top-level
+bmux new-window --session dev --name editor
+bmux list-windows --session dev
+bmux list-windows --session dev --json
+bmux switch-window active --session dev
+bmux kill-window active --session dev
+
+# grouped aliases
+bmux window new --session dev --name editor
+bmux window list --session dev
+bmux window list --session dev --json
+bmux window switch active --session dev
+bmux window kill active --session dev
+```
+
+Window target values for `switch`/`kill` support:
+
+- window name
+- window UUID
+- `active`
+
+When `--session` is omitted, window commands use the currently attached session context.
+
 ## JSON Output
 
-`--json` is supported on session list commands:
+`--json` is supported on list commands:
 
 - `bmux list-sessions --json`
 - `bmux session list --json`
+- `bmux list-windows --json`
+- `bmux window list --json`
 
 Output format is a bare JSON array.
 

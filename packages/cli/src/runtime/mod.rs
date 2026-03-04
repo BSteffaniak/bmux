@@ -1,6 +1,6 @@
 use crate::cli::{
     Cli, Command, DebugRenderLogFormat, KeymapCommand, LayoutCommand, ServerCommand,
-    SessionCommand, TerminalCommand, TraceFamily,
+    SessionCommand, TerminalCommand, TraceFamily, WindowCommand,
 };
 use crate::input::{InputProcessor, RuntimeAction};
 use crate::pane::{LayoutTree, PaneId, SplitDirection};
@@ -9,7 +9,7 @@ use crate::terminal::TerminalGuard;
 use anyhow::{Context, Result};
 use bmux_client::{BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, TerminfoAutoInstall};
-use bmux_ipc::SessionSelector;
+use bmux_ipc::{SessionSelector, WindowSelector};
 use bmux_server::BmuxServer;
 use clap::Parser;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::debug;
-use vt100::Parser as VtParser;
 use uuid::Uuid;
+use vt100::Parser as VtParser;
 
 mod commands;
 mod compositor;
@@ -172,12 +172,24 @@ fn run_command(command: &Command) -> Result<u8> {
         Command::KillSession { target } => run_session_kill(target),
         Command::Attach { target } => run_session_attach(target),
         Command::Detach => run_session_detach(),
+        Command::NewWindow { session, name } => run_window_new(session.as_ref(), name.clone()),
+        Command::ListWindows { session, json } => run_window_list(session.as_ref(), *json),
+        Command::KillWindow { target, session } => run_window_kill(target, session.as_ref()),
+        Command::SwitchWindow { target, session } => run_window_switch(target, session.as_ref()),
         Command::Session { command } => match command {
             SessionCommand::New { name } => run_session_new(name.clone()),
             SessionCommand::List { json } => run_session_list(*json),
             SessionCommand::Kill { target } => run_session_kill(target),
             SessionCommand::Attach { target } => run_session_attach(target),
             SessionCommand::Detach => run_session_detach(),
+        },
+        Command::Window { command } => match command {
+            WindowCommand::New { session, name } => run_window_new(session.as_ref(), name.clone()),
+            WindowCommand::List { session, json } => run_window_list(session.as_ref(), *json),
+            WindowCommand::Kill { target, session } => run_window_kill(target, session.as_ref()),
+            WindowCommand::Switch { target, session } => {
+                run_window_switch(target, session.as_ref())
+            }
         },
         Command::Server { command } => match command {
             ServerCommand::Start {
@@ -216,7 +228,8 @@ fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8> {
     }
 
     if daemon && !foreground_internal {
-        let executable = std::env::current_exe().context("failed to resolve bmux executable path")?;
+        let executable =
+            std::env::current_exe().context("failed to resolve bmux executable path")?;
         let mut child = ProcessCommand::new(executable);
         child
             .arg("server")
@@ -279,7 +292,8 @@ fn latest_server_event_name() -> Result<Option<&'static str>> {
         };
 
         let _ = tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.subscribe_events()).await;
-        let events = match tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.poll_events(1)).await {
+        let events = match tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.poll_events(1)).await
+        {
             Ok(Ok(events)) => events,
             Ok(Err(_)) | Err(_) => return Ok(None),
         };
@@ -595,10 +609,110 @@ fn run_session_detach() -> Result<u8> {
     Ok(0)
 }
 
+fn run_window_new(session: Option<&String>, name: Option<String>) -> Result<u8> {
+    let session_selector = session.map(|target| parse_session_selector(target));
+    let window_id = run_async(async {
+        let mut client = BmuxClient::connect_default("bmux-cli-new-window")
+            .await
+            .map_err(anyhow::Error::from)?;
+        client
+            .new_window(session_selector, name)
+            .await
+            .map_err(anyhow::Error::from)
+    })?;
+    println!("created window: {window_id}");
+    Ok(0)
+}
+
+fn run_window_list(session: Option<&String>, as_json: bool) -> Result<u8> {
+    let session_selector = session.map(|target| parse_session_selector(target));
+    let windows = run_async(async {
+        let mut client = BmuxClient::connect_default("bmux-cli-list-windows")
+            .await
+            .map_err(anyhow::Error::from)?;
+        client
+            .list_windows(session_selector)
+            .await
+            .map_err(anyhow::Error::from)
+    })?;
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&windows).context("failed to encode windows json")?
+        );
+        return Ok(0);
+    }
+
+    if windows.is_empty() {
+        println!("no windows");
+        return Ok(0);
+    }
+
+    println!(
+        "ID                                   SESSION                              NAME            ACTIVE"
+    );
+    for window in windows {
+        let name = window.name.unwrap_or_else(|| "-".to_string());
+        println!(
+            "{:<36} {:<36} {:<15} {}",
+            window.id,
+            window.session_id,
+            name,
+            if window.active { "yes" } else { "no" }
+        );
+    }
+
+    Ok(0)
+}
+
+fn run_window_kill(target: &str, session: Option<&String>) -> Result<u8> {
+    let session_selector = session.map(|value| parse_session_selector(value));
+    let window_selector = parse_window_selector(target);
+    let window_id = run_async(async {
+        let mut client = BmuxClient::connect_default("bmux-cli-kill-window")
+            .await
+            .map_err(anyhow::Error::from)?;
+        client
+            .kill_window(session_selector, window_selector)
+            .await
+            .map_err(anyhow::Error::from)
+    })?;
+    println!("killed window: {window_id}");
+    Ok(0)
+}
+
+fn run_window_switch(target: &str, session: Option<&String>) -> Result<u8> {
+    let session_selector = session.map(|value| parse_session_selector(value));
+    let window_selector = parse_window_selector(target);
+    let window_id = run_async(async {
+        let mut client = BmuxClient::connect_default("bmux-cli-switch-window")
+            .await
+            .map_err(anyhow::Error::from)?;
+        client
+            .switch_window(session_selector, window_selector)
+            .await
+            .map_err(anyhow::Error::from)
+    })?;
+    println!("active window: {window_id}");
+    Ok(0)
+}
+
 fn parse_session_selector(target: &str) -> SessionSelector {
     match Uuid::parse_str(target) {
         Ok(id) => SessionSelector::ById(id),
         Err(_) => SessionSelector::ByName(target.to_string()),
+    }
+}
+
+fn parse_window_selector(target: &str) -> WindowSelector {
+    if target.eq_ignore_ascii_case("active") {
+        return WindowSelector::Active;
+    }
+
+    match Uuid::parse_str(target) {
+        Ok(id) => WindowSelector::ById(id),
+        Err(_) => WindowSelector::ByName(target.to_string()),
     }
 }
 
@@ -2151,9 +2265,9 @@ mod tests {
         reap_exited_panes, resolve_pane_term_with_checker, run_event_input_loop_with_reader,
         selection_status_suffix,
     };
-    use bmux_client::ClientError;
     use crate::input::{InputProcessor, Keymap};
     use crate::pane::{LayoutNode, LayoutTree, PaneId, SplitDirection};
+    use bmux_client::ClientError;
     use bmux_config::BmuxConfig;
     use bmux_ipc::ErrorCode;
     use crossterm::event::{

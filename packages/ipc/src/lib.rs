@@ -4,7 +4,7 @@
 
 //! Cross-platform IPC protocol models for bmux.
 
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -209,30 +209,59 @@ pub struct WindowSummary {
 #[serde(rename_all = "snake_case")]
 pub enum ResponsePayload {
     Pong,
-    ServerStatus { running: bool },
-    SessionCreated { id: Uuid, name: Option<String> },
+    ServerStatus {
+        running: bool,
+    },
+    SessionCreated {
+        id: Uuid,
+        name: Option<String>,
+    },
     WindowCreated {
         id: Uuid,
         session_id: Uuid,
         name: Option<String>,
     },
-    SessionList { sessions: Vec<SessionSummary> },
-    WindowList { windows: Vec<WindowSummary> },
-    SessionKilled { id: Uuid },
-    WindowKilled { id: Uuid, session_id: Uuid },
-    WindowSwitched { id: Uuid, session_id: Uuid },
+    SessionList {
+        sessions: Vec<SessionSummary>,
+    },
+    WindowList {
+        windows: Vec<WindowSummary>,
+    },
+    SessionKilled {
+        id: Uuid,
+    },
+    WindowKilled {
+        id: Uuid,
+        session_id: Uuid,
+    },
+    WindowSwitched {
+        id: Uuid,
+        session_id: Uuid,
+    },
     FollowStarted {
         follower_client_id: Uuid,
         leader_client_id: Uuid,
         global: bool,
     },
-    FollowStopped { follower_client_id: Uuid },
-    Attached { grant: AttachGrant },
-    AttachReady { session_id: Uuid },
-    AttachInputAccepted { bytes: usize },
-    AttachOutput { data: Vec<u8> },
+    FollowStopped {
+        follower_client_id: Uuid,
+    },
+    Attached {
+        grant: AttachGrant,
+    },
+    AttachReady {
+        session_id: Uuid,
+    },
+    AttachInputAccepted {
+        bytes: usize,
+    },
+    AttachOutput {
+        data: Vec<u8>,
+    },
     EventsSubscribed,
-    EventBatch { events: Vec<Event> },
+    EventBatch {
+        events: Vec<Event>,
+    },
     Detached,
     ServerStopping,
 }
@@ -270,8 +299,13 @@ pub enum Response {
 pub enum Event {
     ServerStarted,
     ServerStopping,
-    SessionCreated { id: Uuid, name: Option<String> },
-    SessionRemoved { id: Uuid },
+    SessionCreated {
+        id: Uuid,
+        name: Option<String>,
+    },
+    SessionRemoved {
+        id: Uuid,
+    },
     WindowCreated {
         id: Uuid,
         session_id: Uuid,
@@ -286,8 +320,12 @@ pub enum Event {
         session_id: Uuid,
         by_client_id: Uuid,
     },
-    ClientAttached { id: Uuid },
-    ClientDetached { id: Uuid },
+    ClientAttached {
+        id: Uuid,
+    },
+    ClientDetached {
+        id: Uuid,
+    },
     FollowStarted {
         follower_client_id: Uuid,
         leader_client_id: Uuid,
@@ -329,8 +367,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        decode, encode, Envelope, EnvelopeKind, ErrorCode, Event, IpcEndpoint, ProtocolVersion,
-        Request, Response, ResponsePayload, SessionSelector, SessionSummary,
+        Envelope, EnvelopeKind, ErrorCode, Event, IpcEndpoint, ProtocolVersion, Request, Response,
+        ResponsePayload, SessionSelector, SessionSummary, decode, encode,
     };
     use std::path::Path;
     use uuid::Uuid;

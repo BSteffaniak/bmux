@@ -148,7 +148,7 @@ fn stable_fnv1a64(bytes: &[u8]) -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{stable_fnv1a64, ConfigPaths};
+    use super::{ConfigPaths, stable_fnv1a64};
     use std::path::PathBuf;
 
     #[test]
