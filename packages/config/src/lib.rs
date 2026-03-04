@@ -255,10 +255,7 @@ impl BmuxConfig {
     /// Returns an error if the configuration file cannot be read or parsed.
     pub fn load_from_path(path: &std::path::Path) -> Result<Self> {
         if !path.exists() {
-            // Create a default config file if it doesn't exist
-            let default_config = Self::default();
-            default_config.save_to_path(path)?;
-            return Ok(default_config);
+            return Ok(Self::default());
         }
 
         let contents = std::fs::read_to_string(path).map_err(|e| ConfigError::ReadError {
@@ -273,13 +270,6 @@ impl BmuxConfig {
         if !repaired_fields.is_empty() {
             for warning in &repaired_fields {
                 eprintln!("bmux warning: repaired invalid config value {warning}");
-            }
-
-            if let Err(error) = config.save_to_path(path) {
-                eprintln!(
-                    "bmux warning: failed to persist repaired config at {} ({error})",
-                    path.display()
-                );
             }
         }
 
@@ -424,7 +414,42 @@ mod tests {
     }
 
     #[test]
-    fn load_repairs_zero_general_limits_and_persists() {
+    fn load_missing_file_returns_defaults_without_creating_file() {
+        let unique = format!(
+            "bmux-config-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system time before epoch")
+                .as_nanos()
+        );
+        let dir = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&dir).expect("failed to create temp test directory");
+        let path = dir.join("bmux.toml");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading missing config");
+        let defaults = BmuxConfig::default();
+
+        assert!(!path.exists());
+        assert_eq!(
+            config.general.scrollback_limit,
+            defaults.general.scrollback_limit
+        );
+        assert_eq!(
+            config.general.server_timeout,
+            defaults.general.server_timeout
+        );
+        assert_eq!(config.keybindings.prefix, defaults.keybindings.prefix);
+        assert_eq!(
+            config.keybindings.timeout_ms,
+            defaults.keybindings.timeout_ms
+        );
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn load_repairs_zero_general_limits_without_persisting() {
         let unique = format!(
             "bmux-config-test-{}-{}",
             std::process::id(),
@@ -447,16 +472,15 @@ mod tests {
         assert_eq!(config.general.scrollback_limit, 10_000);
         assert_eq!(config.general.server_timeout, 5_000);
 
-        let persisted =
-            std::fs::read_to_string(&path).expect("failed reading persisted repaired config");
-        assert!(persisted.contains("scrollback_limit = 10000"));
-        assert!(persisted.contains("server_timeout = 5000"));
+        let persisted = std::fs::read_to_string(&path).expect("failed reading config file");
+        assert!(persisted.contains("scrollback_limit = 0"));
+        assert!(persisted.contains("server_timeout = 0"));
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
     }
 
     #[test]
-    fn load_repairs_invalid_fields_and_keeps_valid_behavior_settings() {
+    fn load_repairs_invalid_fields_and_keeps_valid_behavior_settings_without_persisting() {
         let unique = format!(
             "bmux-config-test-{}-{}",
             std::process::id(),
@@ -496,12 +520,11 @@ timeout_ms = 0
         assert!(config.behavior.protocol_trace_enabled);
         assert_eq!(config.behavior.protocol_trace_capacity, 200);
 
-        let persisted =
-            std::fs::read_to_string(&path).expect("failed reading persisted repaired config");
-        assert!(persisted.contains("scrollback_limit = 10000"));
-        assert!(persisted.contains("prefix = \"ctrl+a\""));
-        assert!(persisted.contains("timeout_ms = 400"));
-        assert!(persisted.contains("protocol_trace_capacity = 200"));
+        let persisted = std::fs::read_to_string(&path).expect("failed reading config file");
+        assert!(persisted.contains("scrollback_limit = 0"));
+        assert!(persisted.contains("prefix = \"\""));
+        assert!(persisted.contains("timeout_ms = 0"));
+        assert!(persisted.contains("protocol_trace_capacity = 0"));
         assert!(persisted.contains("pane_term = \"xterm-256color\""));
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
