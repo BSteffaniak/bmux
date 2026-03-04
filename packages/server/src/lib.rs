@@ -1838,7 +1838,7 @@ async fn handle_request(
             let Some(session_id) = resolve_session_id(&manager, &session) else {
                 return Ok(Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
-                    message: format!("session not found for selector {session:?}"),
+                    message: session_not_found_message(&session),
                 }));
             };
             drop(manager);
@@ -1865,7 +1865,7 @@ async fn handle_request(
             let Some(session_id) = resolve_session_id(&manager, &session) else {
                 return Ok(Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
-                    message: format!("session not found for selector {session:?}"),
+                    message: session_not_found_message(&session),
                 }));
             };
             drop(manager);
@@ -1924,7 +1924,7 @@ async fn handle_request(
             let Some(session_id) = resolve_session_id(&manager, &session) else {
                 return Ok(Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
-                    message: format!("session not found for selector {session:?}"),
+                    message: session_not_found_message(&session),
                 }));
             };
             drop(manager);
@@ -1972,7 +1972,7 @@ async fn handle_request(
                 let Some(session_id) = resolve_session_id(&manager, &selector) else {
                     return Ok(Response::Err(ErrorResponse {
                         code: ErrorCode::NotFound,
-                        message: format!("session not found for selector {selector:?}"),
+                        message: session_not_found_message(&selector),
                     }));
                 };
 
@@ -2124,7 +2124,7 @@ async fn handle_request(
             let Some(next_session_id) = resolve_session_id(&manager, &selector) else {
                 return Ok(Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
-                    message: format!("session not found for selector {selector:?}"),
+                    message: session_not_found_message(&selector),
                 }));
             };
 
@@ -2431,12 +2431,42 @@ fn resolve_session_id(manager: &SessionManager, selector: &SessionSelector) -> O
             let session_id = SessionId(*raw_id);
             manager.get_session(&session_id).map(|_| session_id)
         }
-        SessionSelector::ByName(name) => manager
-            .list_sessions()
-            .into_iter()
-            .find(|session| session.name.as_deref() == Some(name.as_str()))
-            .map(|session| session.id),
+        SessionSelector::ByName(value) => {
+            let sessions = manager.list_sessions();
+
+            if let Some(session) = sessions
+                .iter()
+                .find(|session| session.name.as_deref() == Some(value.as_str()))
+            {
+                return Some(session.id);
+            }
+
+            if let Some(session) = sessions
+                .iter()
+                .find(|session| session.id.to_string().eq_ignore_ascii_case(value))
+            {
+                return Some(session.id);
+            }
+
+            let value_lower = value.to_ascii_lowercase();
+            sessions
+                .iter()
+                .find(|session| {
+                    session
+                        .id
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .starts_with(&value_lower)
+                })
+                .map(|session| session.id)
+        }
     }
+}
+
+fn session_not_found_message(selector: &SessionSelector) -> String {
+    format!(
+        "session not found for selector {selector:?} (lookup order: exact name -> exact UUID -> UUID prefix)"
+    )
 }
 
 fn resolve_window_request_session_id(
@@ -2447,7 +2477,7 @@ fn resolve_window_request_session_id(
     if let Some(selector) = selector {
         return resolve_session_id(manager, selector).ok_or_else(|| ErrorResponse {
             code: ErrorCode::NotFound,
-            message: format!("session not found for selector {selector:?}"),
+            message: session_not_found_message(selector),
         });
     }
 
@@ -2535,18 +2565,98 @@ async fn send_response(
 
 #[cfg(test)]
 mod tests {
-    use super::BmuxServer;
+    use super::{BmuxServer, resolve_session_id};
     use bmux_ipc::transport::LocalIpcStream;
     use bmux_ipc::{
         Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, ProtocolVersion,
         Request, Response, ResponsePayload, SessionRole, SessionSelector, WindowSelector, decode,
         encode,
     };
-    use bmux_session::SessionId;
+    use bmux_session::{SessionId, SessionManager};
     use std::path::Path;
     use std::time::Duration;
     use tokio::time::sleep;
     use uuid::Uuid;
+
+    #[test]
+    fn resolve_session_id_prefers_exact_name_before_uuid_fallbacks() {
+        let mut manager = SessionManager::new();
+        let prefix_source = manager
+            .create_session(None)
+            .expect("session should be created");
+        let selector_value = prefix_source.to_string()[..2].to_string();
+        let named = manager
+            .create_session(Some(selector_value.clone()))
+            .expect("named session should be created");
+
+        let resolved = resolve_session_id(&manager, &SessionSelector::ByName(selector_value));
+        assert_eq!(resolved, Some(named));
+    }
+
+    #[test]
+    fn resolve_session_id_matches_exact_uuid_string() {
+        let mut manager = SessionManager::new();
+        let session_id = manager
+            .create_session(None)
+            .expect("session should be created");
+
+        let resolved = resolve_session_id(
+            &manager,
+            &SessionSelector::ByName(session_id.to_string()),
+        );
+        assert_eq!(resolved, Some(session_id));
+    }
+
+    #[test]
+    fn resolve_session_id_allows_short_unique_prefixes_without_minimum() {
+        let mut manager = SessionManager::new();
+        let session_id = manager
+            .create_session(None)
+            .expect("session should be created");
+
+        let prefix = session_id.to_string()[..1].to_string();
+        let resolved = resolve_session_id(&manager, &SessionSelector::ByName(prefix));
+        assert_eq!(resolved, Some(session_id));
+    }
+
+    #[test]
+    fn resolve_session_id_picks_first_match_for_ambiguous_prefix() {
+        let mut manager = SessionManager::new();
+        let mut selector = None;
+
+        for _ in 0..512 {
+            let _ = manager
+                .create_session(None)
+                .expect("session should be created");
+
+            let sessions = manager.list_sessions();
+            for nibble in "0123456789abcdef".chars() {
+                let matches = sessions
+                    .iter()
+                    .filter(|session| session.id.to_string().starts_with(nibble))
+                    .collect::<Vec<_>>();
+                if matches.len() >= 2 {
+                    selector = Some(nibble.to_string());
+                    break;
+                }
+            }
+
+            if selector.is_some() {
+                break;
+            }
+        }
+
+        let selector = selector.expect("expected to find an ambiguous prefix");
+        let expected_first = manager
+            .list_sessions()
+            .into_iter()
+            .find(|session| session.id.to_string().starts_with(&selector))
+            .map(|session| session.id)
+            .expect("expected at least one matching session");
+
+        let resolved = resolve_session_id(&manager, &SessionSelector::ByName(selector));
+        assert_eq!(resolved, Some(expected_first));
+    }
 
     #[cfg(unix)]
     #[tokio::test]
