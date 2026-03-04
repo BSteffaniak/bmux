@@ -171,7 +171,11 @@ fn run_command(command: &Command) -> Result<u8> {
         Command::ListSessions { json } => run_session_list(*json),
         Command::ListClients { json } => run_client_list(*json),
         Command::KillSession { target } => run_session_kill(target),
-        Command::Attach { target } => run_session_attach(target),
+        Command::Attach {
+            target,
+            follow,
+            global,
+        } => run_session_attach(target.as_deref(), follow.as_deref(), *global),
         Command::Detach => run_session_detach(),
         Command::NewWindow { session, name } => run_window_new(session.as_ref(), name.clone()),
         Command::ListWindows { session, json } => run_window_list(session.as_ref(), *json),
@@ -187,7 +191,11 @@ fn run_command(command: &Command) -> Result<u8> {
             SessionCommand::List { json } => run_session_list(*json),
             SessionCommand::Clients { json } => run_client_list(*json),
             SessionCommand::Kill { target } => run_session_kill(target),
-            SessionCommand::Attach { target } => run_session_attach(target),
+            SessionCommand::Attach {
+                target,
+                follow,
+                global,
+            } => run_session_attach(target.as_deref(), follow.as_deref(), *global),
             SessionCommand::Detach => run_session_detach(),
             SessionCommand::Follow {
                 target_client_id,
@@ -477,8 +485,19 @@ fn run_session_kill(target: &str) -> Result<u8> {
     Ok(0)
 }
 
-fn run_session_attach(target: &str) -> Result<u8> {
-    let selector = parse_session_selector(target);
+fn run_session_attach(target: Option<&str>, follow: Option<&str>, global: bool) -> Result<u8> {
+    if target.is_none() && follow.is_none() {
+        anyhow::bail!("attach requires a session target or --follow <client-uuid>");
+    }
+    if target.is_some() && follow.is_some() {
+        anyhow::bail!("attach accepts either a session target or --follow, not both");
+    }
+
+    let follow_target_id = match follow {
+        Some(follow_target) => Some(parse_uuid_value(follow_target, "follow target client id")?),
+        None => None,
+    };
+
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -487,28 +506,113 @@ fn run_session_attach(target: &str) -> Result<u8> {
     let mut client = runtime
         .block_on(BmuxClient::connect_default("bmux-cli-attach"))
         .map_err(map_attach_client_error)?;
-    let grant = runtime
-        .block_on(client.attach_grant(selector))
-        .map_err(map_attach_client_error)?;
-    let attached_id = runtime
-        .block_on(client.open_attach_stream(&grant))
-        .map_err(map_attach_client_error)?;
 
-    println!("attached to session: {attached_id}");
+    if let Some(leader_client_id) = follow_target_id {
+        runtime
+            .block_on(client.subscribe_events())
+            .map_err(map_attach_client_error)?;
+        runtime
+            .block_on(client.follow_client(leader_client_id, global))
+            .map_err(map_attach_client_error)?;
+    }
+
+    let self_client_id = if follow_target_id.is_some() {
+        Some(
+            runtime
+                .block_on(client.whoami())
+                .map_err(map_attach_client_error)?,
+        )
+    } else {
+        None
+    };
+
+    let mut attach_info = if let Some(leader_client_id) = follow_target_id {
+        let target_session = runtime
+            .block_on(resolve_follow_target_session(&mut client, leader_client_id))
+            .map_err(map_attach_client_error)?;
+        runtime
+            .block_on(open_attach_for_session(&mut client, target_session))
+            .map_err(map_attach_client_error)?
+    } else {
+        let target = target.expect("target is present when not follow");
+        let grant = runtime
+            .block_on(client.attach_grant(parse_session_selector(target)))
+            .map_err(map_attach_client_error)?;
+        runtime
+            .block_on(client.open_attach_stream_info(&grant))
+            .map_err(map_attach_client_error)?
+    };
+
+    if let Some(leader_client_id) = follow_target_id {
+        println!(
+            "attached to session: {} (following {}{})",
+            attach_info.session_id,
+            leader_client_id,
+            if global { ", global" } else { "" }
+        );
+    } else {
+        println!("attached to session: {}", attach_info.session_id);
+    }
+
+    let mut attached_id = attach_info.session_id;
+    let mut can_write = attach_info.can_write;
+
+    if !can_write {
+        println!("read-only attach: input disabled");
+    }
     println!("press Ctrl-D to detach");
 
     let _raw_mode = RawModeGuard::enable().context("failed to enable raw mode for attach")?;
     let mut stdout = io::stdout();
 
     loop {
+        if follow_target_id.is_some() {
+            let events = runtime
+                .block_on(client.poll_events(16))
+                .map_err(map_attach_client_error)?;
+            for server_event in events {
+                match server_event {
+                    bmux_client::ServerEvent::FollowTargetChanged {
+                        follower_client_id,
+                        leader_client_id,
+                        session_id,
+                    } => {
+                        if Some(leader_client_id) != follow_target_id
+                            || Some(follower_client_id) != self_client_id
+                        {
+                            continue;
+                        }
+                        attach_info = runtime
+                            .block_on(open_attach_for_session(&mut client, session_id))
+                            .map_err(map_attach_client_error)?;
+                        attached_id = attach_info.session_id;
+                        can_write = attach_info.can_write;
+                        println!("follow handoff -> session {attached_id}");
+                        if !can_write {
+                            println!("read-only attach: input disabled");
+                        }
+                    }
+                    bmux_client::ServerEvent::FollowTargetGone {
+                        former_leader_client_id,
+                        ..
+                    } if Some(former_leader_client_id) == follow_target_id => {
+                        println!("follow target disconnected; staying on current session");
+                    }
+                    _ => {}
+                }
+            }
+        }
+
         if event::poll(ATTACH_IO_POLL_INTERVAL).context("failed polling terminal events")? {
             let event = event::read().context("failed reading terminal event")?;
             match attach_event_action(&event)? {
                 AttachEventAction::Detach => break,
                 AttachEventAction::Send(bytes) => {
-                    runtime
-                        .block_on(client.attach_input(attached_id, bytes))
-                        .map_err(map_attach_client_error)?;
+                    if can_write {
+                        runtime
+                            .block_on(client.attach_input(attached_id, bytes))
+                            .map_err(map_attach_client_error)?;
+                    }
                 }
                 AttachEventAction::Ignore => {}
             }
@@ -527,8 +631,33 @@ fn run_session_attach(target: &str) -> Result<u8> {
     }
 
     let _ = runtime.block_on(client.detach());
+    if follow_target_id.is_some() {
+        let _ = runtime.block_on(client.unfollow());
+    }
     println!("detached");
     Ok(0)
+}
+
+async fn resolve_follow_target_session(
+    client: &mut BmuxClient,
+    leader_client_id: Uuid,
+) -> std::result::Result<Uuid, ClientError> {
+    let clients = client.list_clients().await?;
+    clients
+        .into_iter()
+        .find(|entry| entry.id == leader_client_id)
+        .and_then(|entry| entry.selected_session_id)
+        .ok_or_else(|| ClientError::UnexpectedResponse("follow target has no selected session"))
+}
+
+async fn open_attach_for_session(
+    client: &mut BmuxClient,
+    session_id: Uuid,
+) -> std::result::Result<bmux_client::AttachOpenInfo, ClientError> {
+    let grant = client
+        .attach_grant(SessionSelector::ById(session_id))
+        .await?;
+    client.open_attach_stream_info(&grant).await
 }
 
 enum AttachEventAction {

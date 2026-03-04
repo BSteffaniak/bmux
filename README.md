@@ -104,6 +104,7 @@ bmux new-session dev
 bmux list-sessions
 bmux list-sessions --json
 bmux attach dev
+bmux attach --follow 550e8400-e29b-41d4-a716-446655440000 --global
 bmux kill-session dev
 
 # Window lifecycle (top-level)
@@ -122,6 +123,7 @@ bmux session new dev
 bmux session list
 bmux session list --json
 bmux session attach dev
+bmux session attach --follow 550e8400-e29b-41d4-a716-446655440000 --global
 bmux session kill dev
 bmux session detach
 bmux window new --session dev --name editor

@@ -45,6 +45,7 @@ bmux list-clients
 bmux list-clients --json
 bmux list-sessions --json
 bmux attach dev
+bmux attach --follow 550e8400-e29b-41d4-a716-446655440000 --global
 bmux detach
 bmux kill-session dev
 
@@ -55,6 +56,7 @@ bmux session clients
 bmux session clients --json
 bmux session list --json
 bmux session attach dev
+bmux session attach --follow 550e8400-e29b-41d4-a716-446655440000 --global
 bmux session detach
 bmux session kill dev
 ```
@@ -63,6 +65,11 @@ Session target values for `attach`/`kill` support both:
 
 - session name
 - session UUID
+
+Attach also supports follow mode:
+
+- `bmux attach --follow <client-uuid>`
+- `bmux attach --follow <client-uuid> --global`
 
 ## Window Commands
 

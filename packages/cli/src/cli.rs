@@ -73,7 +73,13 @@ pub(crate) enum Command {
     /// Attach to a session by name or UUID
     Attach {
         /// Session name or UUID
-        target: String,
+        target: Option<String>,
+        /// Follow target client UUID and attach to its selected session
+        #[arg(long)]
+        follow: Option<String>,
+        /// Keep following across target session switches (requires --follow)
+        #[arg(long, requires = "follow")]
+        global: bool,
     },
     /// Detach from the current session
     Detach,
@@ -180,7 +186,13 @@ pub(crate) enum SessionCommand {
     /// Attach to a session by name or UUID
     Attach {
         /// Session name or UUID
-        target: String,
+        target: Option<String>,
+        /// Follow target client UUID and attach to its selected session
+        #[arg(long)]
+        follow: Option<String>,
+        /// Keep following across target session switches (requires --follow)
+        #[arg(long, requires = "follow")]
+        global: bool,
     },
     /// Detach from the current session
     Detach,
@@ -466,10 +478,43 @@ mod tests {
     #[test]
     fn parses_top_level_attach_command() {
         let cli = Cli::try_parse_from(["bmux", "attach", "dev"]).expect("valid CLI args");
-        let Some(Command::Attach { target }) = cli.command else {
+        let Some(Command::Attach {
+            target,
+            follow,
+            global,
+        }) = cli.command
+        else {
             panic!("expected attach command");
         };
-        assert_eq!(target, "dev");
+        assert_eq!(target.as_deref(), Some("dev"));
+        assert_eq!(follow, None);
+        assert!(!global);
+    }
+
+    #[test]
+    fn parses_top_level_attach_follow_command() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "attach",
+            "--follow",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--global",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Attach {
+            target,
+            follow,
+            global,
+        }) = cli.command
+        else {
+            panic!("expected attach command");
+        };
+        assert_eq!(target, None);
+        assert_eq!(
+            follow.as_deref(),
+            Some("550e8400-e29b-41d4-a716-446655440000")
+        );
+        assert!(global);
     }
 
     #[test]
@@ -612,7 +657,35 @@ mod tests {
         };
         assert!(matches!(
             command,
-            SessionCommand::Attach { target } if target == "dev"
+            SessionCommand::Attach {
+                target: Some(target),
+                follow: None,
+                global: false
+            } if target == "dev"
+        ));
+    }
+
+    #[test]
+    fn parses_grouped_session_attach_follow_command() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "session",
+            "attach",
+            "--follow",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--global",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Session { command }) = cli.command else {
+            panic!("expected session command");
+        };
+        assert!(matches!(
+            command,
+            SessionCommand::Attach {
+                target: None,
+                follow: Some(ref follow),
+                global: true
+            } if follow == "550e8400-e29b-41d4-a716-446655440000"
         ));
     }
 
