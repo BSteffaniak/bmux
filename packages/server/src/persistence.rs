@@ -2,6 +2,7 @@ use bmux_config::ConfigPaths;
 use bmux_ipc::SessionRole;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
@@ -53,6 +54,7 @@ pub(crate) struct ClientSelectedSessionSnapshotV1 {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SnapshotEnvelopeV1 {
     version: u32,
+    checksum: u64,
     snapshot: SnapshotV1,
 }
 
@@ -96,8 +98,10 @@ impl SnapshotManager {
 
     pub(crate) fn encode_snapshot(snapshot: &SnapshotV1) -> Result<Vec<u8>, SnapshotError> {
         validate_snapshot(snapshot)?;
+        let checksum = snapshot_checksum(snapshot).map_err(SnapshotError::Encode)?;
         let envelope = SnapshotEnvelopeV1 {
             version: SNAPSHOT_VERSION_V1,
+            checksum,
             snapshot: snapshot.clone(),
         };
         serde_json::to_vec_pretty(&envelope).map_err(SnapshotError::Encode)
@@ -107,6 +111,13 @@ impl SnapshotManager {
         let envelope: SnapshotEnvelopeV1 = serde_json::from_slice(bytes)?;
         if envelope.version != SNAPSHOT_VERSION_V1 {
             return Err(SnapshotError::UnsupportedVersion(envelope.version));
+        }
+        let expected_checksum =
+            snapshot_checksum(&envelope.snapshot).map_err(SnapshotError::Encode)?;
+        if expected_checksum != envelope.checksum {
+            return Err(SnapshotError::Validation(
+                "snapshot checksum mismatch".to_string(),
+            ));
         }
         validate_snapshot(&envelope.snapshot)?;
         Ok(envelope.snapshot)
@@ -125,8 +136,19 @@ impl SnapshotManager {
         };
         temp_path.set_file_name(temp_name);
 
-        std::fs::write(&temp_path, encoded)?;
+        let mut temp_file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&temp_path)?;
+        temp_file.write_all(&encoded)?;
+        temp_file.sync_all()?;
         std::fs::rename(&temp_path, &self.path)?;
+        if let Some(parent) = self.path.parent()
+            && let Ok(parent_dir) = std::fs::File::open(parent)
+        {
+            let _ = parent_dir.sync_all();
+        }
         Ok(())
     }
 
@@ -134,6 +156,33 @@ impl SnapshotManager {
         let bytes = std::fs::read(&self.path)?;
         Self::decode_snapshot(&bytes)
     }
+
+    pub(crate) fn cleanup_temp_file(&self) -> Result<(), SnapshotError> {
+        let mut temp_path = self.path.clone();
+        let temp_name = match self.path.file_name() {
+            Some(name) => format!("{}.tmp", name.to_string_lossy()),
+            None => "server-snapshot.tmp".to_string(),
+        };
+        temp_path.set_file_name(temp_name);
+        if temp_path.exists() {
+            std::fs::remove_file(temp_path)?;
+        }
+        Ok(())
+    }
+}
+
+fn snapshot_checksum(snapshot: &SnapshotV1) -> Result<u64, serde_json::Error> {
+    let bytes = serde_json::to_vec(snapshot)?;
+    Ok(fnv1a64(&bytes))
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn validate_snapshot(snapshot: &SnapshotV1) -> Result<(), SnapshotError> {
@@ -260,6 +309,7 @@ mod tests {
     fn decode_rejects_unknown_version() {
         let payload = serde_json::json!({
             "version": 999,
+            "checksum": 0,
             "snapshot": {
                 "sessions": [],
                 "roles": [],
@@ -275,28 +325,38 @@ mod tests {
 
     #[test]
     fn decode_rejects_invalid_references() {
-        let session_id = Uuid::new_v4();
-        let payload = serde_json::json!({
-            "version": 1,
-            "snapshot": {
-                "sessions": [
-                    {
-                        "id": session_id,
-                        "name": null,
-                        "windows": [],
-                        "active_window_id": null
-                    }
-                ],
-                "roles": [],
-                "follows": [],
-                "selected_sessions": [
-                    {
-                        "client_id": Uuid::new_v4(),
-                        "session_id": Uuid::new_v4()
-                    }
-                ]
+        let snapshot = SnapshotV1 {
+            sessions: vec![SessionSnapshotV1 {
+                id: Uuid::new_v4(),
+                name: Some("valid".to_string()),
+                windows: vec![WindowSnapshotV1 {
+                    id: Uuid::new_v4(),
+                    name: Some("w1".to_string()),
+                }],
+                active_window_id: None,
+            }],
+            roles: vec![],
+            follows: vec![],
+            selected_sessions: vec![],
+        };
+        let encoded = SnapshotManager::encode_snapshot(&snapshot).expect("snapshot should encode");
+        let mut payload: serde_json::Value =
+            serde_json::from_slice(&encoded).expect("payload should decode");
+        let bogus_session_id = Uuid::new_v4().to_string();
+        payload["snapshot"]["selected_sessions"] = serde_json::json!([{
+            "client_id": Uuid::new_v4(),
+            "session_id": bogus_session_id,
+        }]);
+        let snapshot_bytes = serde_json::to_vec(&payload["snapshot"]).expect("snapshot bytes");
+        let checksum = {
+            let mut hash = 0xcbf29ce484222325u64;
+            for byte in snapshot_bytes {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100000001b3);
             }
-        });
+            hash
+        };
+        payload["checksum"] = serde_json::json!(checksum);
 
         let bytes = serde_json::to_vec(&payload).expect("json should encode");
         let error = SnapshotManager::decode_snapshot(&bytes).expect_err("should reject references");

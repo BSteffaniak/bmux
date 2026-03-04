@@ -26,7 +26,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
@@ -51,6 +51,7 @@ struct ServerState {
     follow_state: Mutex<FollowState>,
     permission_state: Mutex<PermissionState>,
     snapshot_runtime: Mutex<SnapshotRuntime>,
+    operation_lock: AsyncMutex<()>,
     event_hub: Mutex<EventHub>,
     handshake_timeout: Duration,
 }
@@ -1188,6 +1189,7 @@ impl BmuxServer {
                 follow_state: Mutex::new(FollowState::default()),
                 permission_state: Mutex::new(PermissionState::default()),
                 snapshot_runtime: Mutex::new(snapshot_runtime),
+                operation_lock: AsyncMutex::new(()),
                 event_hub: Mutex::new(EventHub::new(1024)),
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             }),
@@ -1843,6 +1845,10 @@ fn restore_snapshot_if_present(state: &Arc<ServerState>) -> Result<()> {
         return Ok(());
     };
 
+    if let Err(error) = snapshot_manager.cleanup_temp_file() {
+        warn!("failed cleaning stale snapshot temp file: {error}");
+    }
+
     if !snapshot_manager.path().exists() {
         return Ok(());
     }
@@ -2060,6 +2066,12 @@ async fn handle_request(
     attached_stream_session: &mut Option<SessionId>,
     request: Request,
 ) -> Result<Response> {
+    let _operation_guard = if request_requires_exclusive(&request) {
+        Some(state.operation_lock.lock().await)
+    } else {
+        None
+    };
+
     let previous_selected_session = *selected_session;
     sync_selected_session_from_follow_state(state, client_id, selected_session)?;
     reconcile_selected_session_membership(
@@ -3081,6 +3093,28 @@ async fn handle_request(
     }
 
     Ok(response)
+}
+
+fn request_requires_exclusive(request: &Request) -> bool {
+    matches!(
+        request,
+        Request::ServerSave
+            | Request::ServerStop
+            | Request::ServerRestoreApply
+            | Request::NewSession { .. }
+            | Request::NewWindow { .. }
+            | Request::GrantRole { .. }
+            | Request::RevokeRole { .. }
+            | Request::KillSession { .. }
+            | Request::KillWindow { .. }
+            | Request::SwitchWindow { .. }
+            | Request::FollowClient { .. }
+            | Request::Unfollow
+            | Request::Attach { .. }
+            | Request::AttachOpen { .. }
+            | Request::AttachInput { .. }
+            | Request::Detach
+    )
 }
 
 fn response_requires_snapshot(response: &Response) -> bool {
