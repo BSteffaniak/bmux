@@ -19,8 +19,8 @@ use bmux_ipc::{
 use bmux_session::{ClientId, Session, SessionId, SessionManager, WindowId};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
 use persistence::{
-    ClientSelectedSessionSnapshotV1, FollowEdgeSnapshotV1, RoleAssignmentSnapshotV1,
-    SessionSnapshotV1, SnapshotManager, SnapshotV1, WindowSnapshotV1,
+    ClientSelectedSessionSnapshotV2, FollowEdgeSnapshotV2, PaneSnapshotV2,
+    RoleAssignmentSnapshotV2, SessionSnapshotV2, SnapshotManager, SnapshotV2, WindowSnapshotV2,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -593,10 +593,18 @@ struct SessionRuntimeHandle {
 struct WindowRuntimeHandle {
     id: bmux_session::WindowId,
     name: Option<String>,
+    pane: PaneRuntimeMeta,
     stop_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
     input_tx: mpsc::UnboundedSender<Vec<u8>>,
     output_buffer: Arc<std::sync::Mutex<OutputFanoutBuffer>>,
+}
+
+#[derive(Debug, Clone)]
+struct PaneRuntimeMeta {
+    id: Uuid,
+    name: Option<String>,
+    shell: String,
 }
 
 struct OutputFanoutBuffer {
@@ -685,7 +693,16 @@ struct RemovedWindowRuntime {
 struct WindowRuntimeSummary {
     id: bmux_session::WindowId,
     name: Option<String>,
+    pane: PaneRuntimeMeta,
     active: bool,
+}
+
+#[derive(Debug, Clone)]
+struct RestoreWindowRuntimeSpec {
+    id: bmux_session::WindowId,
+    name: Option<String>,
+    pane: PaneRuntimeMeta,
+    focused_pane_id: Uuid,
 }
 
 #[derive(Debug, Clone)]
@@ -717,7 +734,13 @@ impl SessionRuntimeManager {
             anyhow::bail!("runtime already exists for session {}", session_id.0);
         }
 
-        let first_window = self.spawn_window_runtime(None, Some("window-1".to_string()))?;
+        let first_window = self.spawn_window_runtime(
+            None,
+            Some("window-1".to_string()),
+            None,
+            Some("pane-1".to_string()),
+            None,
+        )?;
         let first_window_id = first_window.id;
         let mut windows = BTreeMap::new();
         windows.insert(first_window.id, first_window);
@@ -737,7 +760,7 @@ impl SessionRuntimeManager {
     fn restore_runtime(
         &mut self,
         session_id: SessionId,
-        windows: Vec<(bmux_session::WindowId, Option<String>)>,
+        windows: Vec<RestoreWindowRuntimeSpec>,
         active_window: bmux_session::WindowId,
     ) -> Result<()> {
         if self.runtimes.contains_key(&session_id) {
@@ -745,9 +768,18 @@ impl SessionRuntimeManager {
         }
 
         let mut runtime_windows = BTreeMap::new();
-        for (window_id, window_name) in windows {
-            let handle = self.spawn_window_runtime(Some(window_id), window_name)?;
-            runtime_windows.insert(window_id, handle);
+        for window in windows {
+            if window.focused_pane_id != window.pane.id {
+                anyhow::bail!("focused pane missing from restored runtime window");
+            }
+            let handle = self.spawn_window_runtime(
+                Some(window.id),
+                window.name,
+                Some(window.pane.id),
+                window.pane.name,
+                Some(window.pane.shell),
+            )?;
+            runtime_windows.insert(window.id, handle);
         }
 
         if !runtime_windows.contains_key(&active_window) {
@@ -771,16 +803,24 @@ impl SessionRuntimeManager {
         &self,
         id: Option<bmux_session::WindowId>,
         name: Option<String>,
+        pane_id: Option<Uuid>,
+        pane_name: Option<String>,
+        pane_shell: Option<String>,
     ) -> Result<WindowRuntimeHandle> {
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let output_buffer = Arc::new(std::sync::Mutex::new(OutputFanoutBuffer::new(
             MAX_WINDOW_OUTPUT_BUFFER_BYTES,
         )));
-        let shell = self.shell.clone();
+        let shell = pane_shell.unwrap_or_else(|| self.shell.clone());
         let pane_term = self.pane_term.clone();
         let protocol_profile = self.protocol_profile;
         let window_id = id.unwrap_or_else(bmux_session::WindowId::new);
+        let pane = PaneRuntimeMeta {
+            id: pane_id.unwrap_or(window_id.0),
+            name: pane_name,
+            shell: shell.clone(),
+        };
         let output_buffer_for_reader = Arc::clone(&output_buffer);
         let task = tokio::spawn(async move {
             let pty_system = native_pty_system();
@@ -886,6 +926,7 @@ impl SessionRuntimeManager {
         Ok(WindowRuntimeHandle {
             id: window_id,
             name,
+            pane,
             stop_tx: Some(stop_tx),
             task,
             input_tx,
@@ -907,7 +948,13 @@ impl SessionRuntimeManager {
                 .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
             Some(format!("window-{}", session.next_auto_window_number))
         };
-        let window = self.spawn_window_runtime(None, resolved_name.clone())?;
+        let window = self.spawn_window_runtime(
+            None,
+            resolved_name.clone(),
+            None,
+            Some("pane-1".to_string()),
+            None,
+        )?;
         let window_id = window.id;
 
         let session = self
@@ -931,6 +978,7 @@ impl SessionRuntimeManager {
             .map(|window| WindowRuntimeSummary {
                 id: window.id,
                 name: window.name.clone(),
+                pane: window.pane.clone(),
                 active: window.id == session.active_window,
             })
             .collect())
@@ -1770,7 +1818,7 @@ fn snapshot_status(state: &Arc<ServerState>) -> Result<ServerSnapshotStatus> {
     })
 }
 
-fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV1> {
+fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV2> {
     let sessions = {
         let manager = state
             .session_manager
@@ -1798,9 +1846,15 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV1> {
                 let active_window_id = windows.iter().find(|w| w.active).map(|w| w.id.0);
                 let window_snapshots = windows
                     .into_iter()
-                    .map(|window| WindowSnapshotV1 {
+                    .map(|window| WindowSnapshotV2 {
                         id: window.id.0,
                         name: window.name,
+                        panes: vec![PaneSnapshotV2 {
+                            id: window.pane.id,
+                            name: window.pane.name,
+                            shell: window.pane.shell,
+                        }],
+                        focused_pane_id: Some(window.pane.id),
                     })
                     .collect::<Vec<_>>();
 
@@ -1808,7 +1862,7 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV1> {
                     .get_session(&session_info.id)
                     .and_then(|session| session.name.clone());
 
-                SessionSnapshotV1 {
+                SessionSnapshotV2 {
                     id: session_info.id.0,
                     name,
                     windows: window_snapshots,
@@ -1829,7 +1883,7 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV1> {
             .flat_map(|(session_id, assignments)| {
                 assignments
                     .iter()
-                    .map(|(client_id, role)| RoleAssignmentSnapshotV1 {
+                    .map(|(client_id, role)| RoleAssignmentSnapshotV2 {
                         session_id: session_id.0,
                         client_id: client_id.0,
                         role: *role,
@@ -1847,7 +1901,7 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV1> {
         let follows = follow_state
             .follows
             .iter()
-            .map(|(follower_id, entry)| FollowEdgeSnapshotV1 {
+            .map(|(follower_id, entry)| FollowEdgeSnapshotV2 {
                 follower_client_id: follower_id.0,
                 leader_client_id: entry.leader_client_id.0,
                 global: entry.global,
@@ -1857,7 +1911,7 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV1> {
         let selected_sessions = follow_state
             .selected_sessions
             .iter()
-            .map(|(client_id, selected)| ClientSelectedSessionSnapshotV1 {
+            .map(|(client_id, selected)| ClientSelectedSessionSnapshotV2 {
                 client_id: client_id.0,
                 session_id: selected.map(|session| session.0),
             })
@@ -1866,7 +1920,7 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV1> {
         (follows, selected_sessions)
     };
 
-    Ok(SnapshotV1 {
+    Ok(SnapshotV2 {
         sessions: session_snapshots,
         roles,
         follows,
@@ -1923,7 +1977,7 @@ fn restore_snapshot_if_present(state: &Arc<ServerState>) -> Result<()> {
     Ok(())
 }
 
-fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV1) -> Result<RestoreSummary> {
+fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV2) -> Result<RestoreSummary> {
     let mut summary = RestoreSummary::default();
 
     {
@@ -1972,7 +2026,23 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV1) -> Resu
             let runtime_windows = session_snapshot
                 .windows
                 .iter()
-                .map(|window| (WindowId(window.id), window.name.clone()))
+                .map(|window| {
+                    let pane = window
+                        .panes
+                        .first()
+                        .cloned()
+                        .expect("snapshot validation ensures pane exists");
+                    RestoreWindowRuntimeSpec {
+                        id: WindowId(window.id),
+                        name: window.name.clone(),
+                        pane: PaneRuntimeMeta {
+                            id: pane.id,
+                            name: pane.name,
+                            shell: pane.shell,
+                        },
+                        focused_pane_id: window.focused_pane_id.unwrap_or(pane.id),
+                    }
+                })
                 .collect::<Vec<_>>();
 
             if let Err(error) =
@@ -2053,7 +2123,7 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV1) -> Resu
 
 async fn restore_snapshot_replace(
     state: &Arc<ServerState>,
-    snapshot: SnapshotV1,
+    snapshot: SnapshotV2,
 ) -> Result<RestoreSummary> {
     let removed_runtimes = {
         let mut runtime_manager = state
