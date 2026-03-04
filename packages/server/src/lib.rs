@@ -621,6 +621,7 @@ struct WindowRuntimeSummary {
     active: bool,
 }
 
+#[derive(Debug, Clone)]
 enum WindowSelection {
     Active,
     Id(bmux_session::WindowId),
@@ -817,8 +818,10 @@ impl SessionRuntimeManager {
             .runtimes
             .get_mut(&session_id)
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
-        let window_id = resolve_window_id_from_selector(session, selector)
-            .ok_or_else(|| anyhow::anyhow!("window not found in session {}", session_id.0))?;
+        let lookup_selector = selector.clone();
+        let window_id = resolve_window_id_from_selector(session, selector).ok_or_else(|| {
+            anyhow::anyhow!(window_not_found_in_session_message(&lookup_selector, session_id))
+        })?;
         session.active_window = window_id;
         Ok(window_id)
     }
@@ -833,8 +836,12 @@ impl SessionRuntimeManager {
                 .runtimes
                 .get_mut(&session_id)
                 .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+            let lookup_selector = selector.clone();
             let Some(window_id) = resolve_window_id_from_selector(session, selector) else {
-                anyhow::bail!("window not found in session {}", session_id.0);
+                anyhow::bail!(
+                    "{}",
+                    window_not_found_in_session_message(&lookup_selector, session_id)
+                );
             };
             let is_last_window = session.windows.len() == 1;
             if !is_last_window && session.active_window == window_id {
@@ -1019,11 +1026,47 @@ fn resolve_window_id_from_selector(
     match selector {
         WindowSelection::Active => Some(session.active_window),
         WindowSelection::Id(id) => session.windows.contains_key(&id).then_some(id),
-        WindowSelection::Name(name) => session
-            .windows
-            .values()
-            .find(|window| window.name.as_deref() == Some(name.as_str()))
-            .map(|window| window.id),
+        WindowSelection::Name(value) => {
+            if let Some(window) = session
+                .windows
+                .values()
+                .find(|window| window.name.as_deref() == Some(value.as_str()))
+            {
+                return Some(window.id);
+            }
+
+            if let Some(window) = session.windows.values().find(|window| {
+                window.id.to_string().eq_ignore_ascii_case(&value)
+            }) {
+                return Some(window.id);
+            }
+
+            let value_lower = value.to_ascii_lowercase();
+            session
+                .windows
+                .values()
+                .find(|window| {
+                    window
+                        .id
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .starts_with(&value_lower)
+                })
+                .map(|window| window.id)
+        }
+    }
+}
+
+fn window_not_found_in_session_message(selector: &WindowSelection, session_id: SessionId) -> String {
+    match selector {
+        WindowSelection::Name(_) => format!(
+            "window not found in session {} for selector {selector:?} (lookup order: exact name -> exact UUID -> UUID prefix)",
+            session_id.0
+        ),
+        _ => format!(
+            "window not found in session {} for selector {selector:?}",
+            session_id.0
+        ),
     }
 }
 
@@ -3751,6 +3794,246 @@ mod tests {
                 .lock()
                 .expect("runtime manager lock should succeed");
             assert_eq!(runtime_manager.window_count(SessionId(session_id)), 1);
+        }
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn switch_window_accepts_uuid_prefix_via_name_selector() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut client = connect_and_handshake(&endpoint).await;
+
+        let created = send_request(
+            &mut client,
+            50,
+            Request::NewSession {
+                name: Some("window-prefix".to_string()),
+            },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected create session response: {other:?}"),
+        };
+
+        let created_window = send_request(
+            &mut client,
+            51,
+            Request::NewWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                name: Some("logs".to_string()),
+            },
+        )
+        .await;
+        let logs_window_id = match created_window {
+            Response::Ok(ResponsePayload::WindowCreated { id, .. }) => id,
+            other => panic!("unexpected create window response: {other:?}"),
+        };
+
+        let prefix = logs_window_id.to_string()[..2].to_string();
+        let switched = send_request(
+            &mut client,
+            52,
+            Request::SwitchWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                target: WindowSelector::ByName(prefix),
+            },
+        )
+        .await;
+        assert_eq!(
+            switched,
+            Response::Ok(ResponsePayload::WindowSwitched {
+                id: logs_window_id,
+                session_id,
+            })
+        );
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn switch_window_name_selector_prefers_exact_name() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut client = connect_and_handshake(&endpoint).await;
+
+        let created = send_request(
+            &mut client,
+            53,
+            Request::NewSession {
+                name: Some("window-name-priority".to_string()),
+            },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected create session response: {other:?}"),
+        };
+
+        let source_window = send_request(
+            &mut client,
+            54,
+            Request::NewWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                name: Some("source".to_string()),
+            },
+        )
+        .await;
+        let source_window_id = match source_window {
+            Response::Ok(ResponsePayload::WindowCreated { id, .. }) => id,
+            other => panic!("unexpected source window response: {other:?}"),
+        };
+        let selector_value = source_window_id.to_string()[..2].to_string();
+
+        let named_window = send_request(
+            &mut client,
+            55,
+            Request::NewWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                name: Some(selector_value.clone()),
+            },
+        )
+        .await;
+        let named_window_id = match named_window {
+            Response::Ok(ResponsePayload::WindowCreated { id, .. }) => id,
+            other => panic!("unexpected named window response: {other:?}"),
+        };
+
+        let switched = send_request(
+            &mut client,
+            56,
+            Request::SwitchWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                target: WindowSelector::ByName(selector_value),
+            },
+        )
+        .await;
+        assert_eq!(
+            switched,
+            Response::Ok(ResponsePayload::WindowSwitched {
+                id: named_window_id,
+                session_id,
+            })
+        );
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn switch_window_empty_prefix_picks_first_match_deterministically() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut client = connect_and_handshake(&endpoint).await;
+
+        let created = send_request(
+            &mut client,
+            57,
+            Request::NewSession {
+                name: Some("window-prefix-order".to_string()),
+            },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected create session response: {other:?}"),
+        };
+
+        let _ = send_request(
+            &mut client,
+            58,
+            Request::NewWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                name: Some("alpha".to_string()),
+            },
+        )
+        .await;
+        let _ = send_request(
+            &mut client,
+            59,
+            Request::NewWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                name: Some("beta".to_string()),
+            },
+        )
+        .await;
+
+        let listed = send_request(
+            &mut client,
+            60,
+            Request::ListWindows {
+                session: Some(SessionSelector::ById(session_id)),
+            },
+        )
+        .await;
+        let expected_first = match listed {
+            Response::Ok(ResponsePayload::WindowList { windows }) => windows
+                .first()
+                .map(|window| window.id)
+                .expect("expected at least one window"),
+            other => panic!("unexpected list windows response: {other:?}"),
+        };
+
+        let switched = send_request(
+            &mut client,
+            61,
+            Request::SwitchWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                target: WindowSelector::ByName(String::new()),
+            },
+        )
+        .await;
+        assert_eq!(
+            switched,
+            Response::Ok(ResponsePayload::WindowSwitched {
+                id: expected_first,
+                session_id,
+            })
+        );
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn switch_window_name_not_found_includes_lookup_chain() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut client = connect_and_handshake(&endpoint).await;
+
+        let created = send_request(
+            &mut client,
+            62,
+            Request::NewSession {
+                name: Some("window-not-found-chain".to_string()),
+            },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected create session response: {other:?}"),
+        };
+
+        let switched = send_request(
+            &mut client,
+            63,
+            Request::SwitchWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                target: WindowSelector::ByName("does-not-exist".to_string()),
+            },
+        )
+        .await;
+        match switched {
+            Response::Err(ErrorResponse {
+                code: ErrorCode::NotFound,
+                message,
+            }) => {
+                assert!(message.contains("lookup order"));
+                assert!(message.contains("exact name"));
+                assert!(message.contains("exact UUID"));
+                assert!(message.contains("UUID prefix"));
+            }
+            other => panic!("unexpected switch response: {other:?}"),
         }
 
         stop_server(server, server_task, &socket_path).await;
