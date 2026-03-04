@@ -414,11 +414,13 @@ fn run_session_list(as_json: bool) -> Result<u8> {
 }
 
 fn run_client_list(as_json: bool) -> Result<u8> {
-    let clients = run_async(async {
+    let (self_id, clients) = run_async(async {
         let mut client = BmuxClient::connect_default("bmux-cli-list-clients")
             .await
             .map_err(anyhow::Error::from)?;
-        client.list_clients().await.map_err(anyhow::Error::from)
+        let self_id = client.whoami().await.map_err(anyhow::Error::from)?;
+        let clients = client.list_clients().await.map_err(anyhow::Error::from)?;
+        Ok::<(Uuid, Vec<bmux_ipc::ClientSummary>), anyhow::Error>((self_id, clients))
     })?;
 
     if as_json {
@@ -435,7 +437,7 @@ fn run_client_list(as_json: bool) -> Result<u8> {
     }
 
     println!(
-        "ID                                   SELECTED_SESSION                     FOLLOWING_CLIENT                     GLOBAL"
+        "ID                                   SELF SELECTED_SESSION                     FOLLOWING_CLIENT                     GLOBAL"
     );
     for client in clients {
         let selected_session = client
@@ -445,8 +447,9 @@ fn run_client_list(as_json: bool) -> Result<u8> {
             .following_client_id
             .map_or_else(|| "-".to_string(), |id| id.to_string());
         println!(
-            "{:<36} {:<36} {:<36} {}",
+            "{:<36} {:<4} {:<36} {:<36} {}",
             client.id,
+            if client.id == self_id { "yes" } else { "no" },
             selected_session,
             following_client,
             if client.following_global { "yes" } else { "no" }

@@ -127,6 +127,7 @@ pub enum Request {
         client_name: String,
     },
     Ping,
+    WhoAmI,
     ServerStatus,
     ServerStop,
     NewSession {
@@ -219,6 +220,9 @@ pub struct ClientSummary {
 #[serde(rename_all = "snake_case")]
 pub enum ResponsePayload {
     Pong,
+    ClientIdentity {
+        id: Uuid,
+    },
     ServerStatus {
         running: bool,
     },

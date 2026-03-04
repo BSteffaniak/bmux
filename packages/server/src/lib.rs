@@ -1151,6 +1151,7 @@ async fn handle_request(
             message: "hello request is only valid during handshake".to_string(),
         }),
         Request::Ping => Response::Ok(ResponsePayload::Pong),
+        Request::WhoAmI => Response::Ok(ResponsePayload::ClientIdentity { id: client_id.0 }),
         Request::ServerStatus => Response::Ok(ResponsePayload::ServerStatus { running: true }),
         Request::ServerStop => {
             let _ = shutdown_tx.send(true);

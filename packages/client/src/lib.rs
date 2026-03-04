@@ -121,6 +121,18 @@ impl BmuxClient {
         }
     }
 
+    /// Return the server-assigned client UUID for this connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn whoami(&mut self) -> Result<Uuid> {
+        match self.request(Request::WhoAmI).await? {
+            ResponsePayload::ClientIdentity { id } => Ok(id),
+            _ => Err(ClientError::UnexpectedResponse("expected client identity")),
+        }
+    }
+
     /// Retrieve server status.
     ///
     /// # Errors
