@@ -8,7 +8,6 @@ use uuid::Uuid;
 
 const SNAPSHOT_VERSION_V1: u32 = 1;
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SnapshotV1 {
     pub sessions: Vec<SessionSnapshotV1>,
@@ -17,7 +16,6 @@ pub(crate) struct SnapshotV1 {
     pub selected_sessions: Vec<ClientSelectedSessionSnapshotV1>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SessionSnapshotV1 {
     pub id: Uuid,
@@ -26,14 +24,12 @@ pub(crate) struct SessionSnapshotV1 {
     pub active_window_id: Option<Uuid>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct WindowSnapshotV1 {
     pub id: Uuid,
     pub name: Option<String>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct RoleAssignmentSnapshotV1 {
     pub session_id: Uuid,
@@ -41,7 +37,6 @@ pub(crate) struct RoleAssignmentSnapshotV1 {
     pub role: SessionRole,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct FollowEdgeSnapshotV1 {
     pub follower_client_id: Uuid,
@@ -49,21 +44,18 @@ pub(crate) struct FollowEdgeSnapshotV1 {
     pub global: bool,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ClientSelectedSessionSnapshotV1 {
     pub client_id: Uuid,
     pub session_id: Option<Uuid>,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SnapshotEnvelopeV1 {
     version: u32,
     snapshot: SnapshotV1,
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Error)]
 pub(crate) enum SnapshotError {
     #[error("snapshot io error: {0}")]
@@ -76,13 +68,11 @@ pub(crate) enum SnapshotError {
     Validation(String),
 }
 
-#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) struct SnapshotManager {
     path: PathBuf,
 }
 
-#[allow(dead_code)]
 impl SnapshotManager {
     pub(crate) fn from_paths(paths: &ConfigPaths) -> Self {
         Self {
@@ -94,6 +84,7 @@ impl SnapshotManager {
     }
 
     #[must_use]
+    #[allow(dead_code)]
     pub(crate) fn from_path(path: PathBuf) -> Self {
         Self { path }
     }
@@ -145,7 +136,6 @@ impl SnapshotManager {
     }
 }
 
-#[allow(dead_code)]
 fn validate_snapshot(snapshot: &SnapshotV1) -> Result<(), SnapshotError> {
     let mut session_ids = BTreeSet::new();
     let mut all_window_ids = BTreeSet::new();

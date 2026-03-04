@@ -47,6 +47,20 @@ impl SessionManager {
         Ok(id)
     }
 
+    /// Insert a preconstructed session (used by restore paths).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a session with the same id already exists.
+    pub fn insert_session(&mut self, session: Session) -> Result<()> {
+        let id = session.id;
+        if self.sessions.contains_key(&id) {
+            return Err(anyhow::anyhow!("Session already exists: {id}"));
+        }
+        self.sessions.insert(id, session);
+        Ok(())
+    }
+
     /// Get a reference to a session by ID
     #[must_use]
     pub fn get_session(&self, session_id: &SessionId) -> Option<&Session> {

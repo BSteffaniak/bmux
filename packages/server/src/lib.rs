@@ -16,7 +16,7 @@ use bmux_ipc::{
     SessionPermissionSummary, SessionRole, SessionSelector, SessionSummary, WindowSelector,
     WindowSummary, decode, encode,
 };
-use bmux_session::{ClientId, SessionId, SessionManager, WindowId};
+use bmux_session::{ClientId, Session, SessionId, SessionManager, WindowId};
 use persistence::{
     ClientSelectedSessionSnapshotV1, FollowEdgeSnapshotV1, RoleAssignmentSnapshotV1,
     SessionSnapshotV1, SnapshotManager, SnapshotV1, WindowSnapshotV1,
@@ -684,7 +684,7 @@ impl SessionRuntimeManager {
             anyhow::bail!("runtime already exists for session {}", session_id.0);
         }
 
-        let first_window = self.spawn_window_runtime(Some("window-1".to_string()))?;
+        let first_window = self.spawn_window_runtime(None, Some("window-1".to_string()))?;
         let first_window_id = first_window.id;
         let mut windows = BTreeMap::new();
         windows.insert(first_window.id, first_window);
@@ -701,14 +701,51 @@ impl SessionRuntimeManager {
         Ok(())
     }
 
-    fn spawn_window_runtime(&self, name: Option<String>) -> Result<WindowRuntimeHandle> {
+    fn restore_runtime(
+        &mut self,
+        session_id: SessionId,
+        windows: Vec<(bmux_session::WindowId, Option<String>)>,
+        active_window: bmux_session::WindowId,
+    ) -> Result<()> {
+        if self.runtimes.contains_key(&session_id) {
+            anyhow::bail!("runtime already exists for session {}", session_id.0);
+        }
+
+        let mut runtime_windows = BTreeMap::new();
+        for (window_id, window_name) in windows {
+            let handle = self.spawn_window_runtime(Some(window_id), window_name)?;
+            runtime_windows.insert(window_id, handle);
+        }
+
+        if !runtime_windows.contains_key(&active_window) {
+            anyhow::bail!("active window missing from restore runtime");
+        }
+
+        self.runtimes.insert(
+            session_id,
+            SessionRuntimeHandle {
+                windows: runtime_windows,
+                active_window,
+                next_auto_window_number: 2,
+                attached_clients: BTreeSet::new(),
+            },
+        );
+
+        Ok(())
+    }
+
+    fn spawn_window_runtime(
+        &self,
+        id: Option<bmux_session::WindowId>,
+        name: Option<String>,
+    ) -> Result<WindowRuntimeHandle> {
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let output_buffer = Arc::new(std::sync::Mutex::new(OutputFanoutBuffer::new(
             MAX_WINDOW_OUTPUT_BUFFER_BYTES,
         )));
         let shell = self.shell.clone();
-        let window_id = bmux_session::WindowId::new();
+        let window_id = id.unwrap_or_else(bmux_session::WindowId::new);
         let output_buffer_for_reader = Arc::clone(&output_buffer);
         let task = tokio::spawn(async move {
             let pty_system = native_pty_system();
@@ -816,7 +853,7 @@ impl SessionRuntimeManager {
                 .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
             Some(format!("window-{}", session.next_auto_window_number))
         };
-        let window = self.spawn_window_runtime(resolved_name.clone())?;
+        let window = self.spawn_window_runtime(None, resolved_name.clone())?;
         let window_id = window.id;
 
         let session = self
@@ -1185,6 +1222,9 @@ impl BmuxServer {
         let listener = LocalIpcListener::bind(&self.endpoint)
             .await
             .with_context(|| format!("failed binding server endpoint {:?}", self.endpoint))?;
+
+        restore_snapshot_if_present(&self.state)?;
+
         info!("bmux server listening on {:?}", self.endpoint);
         emit_event(&self.state, Event::ServerStarted)?;
 
@@ -1702,6 +1742,157 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV1> {
         follows,
         selected_sessions,
     })
+}
+
+fn restore_snapshot_if_present(state: &Arc<ServerState>) -> Result<()> {
+    let manager = {
+        let runtime = state
+            .snapshot_runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
+        runtime.manager.clone()
+    };
+    let Some(snapshot_manager) = manager else {
+        return Ok(());
+    };
+
+    if !snapshot_manager.path().exists() {
+        return Ok(());
+    }
+
+    let snapshot = match snapshot_manager.read_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            warn!("failed reading snapshot; starting clean: {error}");
+            return Ok(());
+        }
+    };
+
+    {
+        let mut session_manager = state
+            .session_manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+        let mut runtime_manager = state
+            .session_runtimes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+
+        for session_snapshot in &snapshot.sessions {
+            if session_snapshot.windows.is_empty() {
+                warn!(
+                    "skipping snapshot session {}: no windows to restore",
+                    session_snapshot.id
+                );
+                continue;
+            }
+
+            let session_id = SessionId(session_snapshot.id);
+            let mut session = Session::new(session_snapshot.name.clone());
+            session.id = session_id;
+            for window_snapshot in &session_snapshot.windows {
+                session.add_window(WindowId(window_snapshot.id));
+            }
+
+            if let Some(active_window_id) = session_snapshot.active_window_id {
+                let _ = session.set_active_window(WindowId(active_window_id));
+            }
+
+            if let Err(error) = session_manager.insert_session(session) {
+                warn!(
+                    "skipping snapshot session {} insertion failure: {error}",
+                    session_snapshot.id
+                );
+                continue;
+            }
+
+            let active_window = session_snapshot
+                .active_window_id
+                .or_else(|| session_snapshot.windows.first().map(|window| window.id))
+                .map(WindowId)
+                .expect("windows non-empty implies active fallback");
+            let runtime_windows = session_snapshot
+                .windows
+                .iter()
+                .map(|window| (WindowId(window.id), window.name.clone()))
+                .collect::<Vec<_>>();
+
+            if let Err(error) =
+                runtime_manager.restore_runtime(session_id, runtime_windows, active_window)
+            {
+                warn!(
+                    "failed restoring runtime for session {}: {error}",
+                    session_snapshot.id
+                );
+                let _ = session_manager.remove_session(&session_id);
+            }
+        }
+    }
+
+    {
+        let mut permission_state = state
+            .permission_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
+        permission_state.roles.clear();
+
+        let session_manager = state
+            .session_manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+        for role in &snapshot.roles {
+            let session_id = SessionId(role.session_id);
+            if session_manager.get_session(&session_id).is_some() {
+                permission_state.set_role(session_id, ClientId(role.client_id), role.role);
+            }
+        }
+    }
+
+    {
+        let mut follow_state = state
+            .follow_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
+        follow_state.follows.clear();
+        follow_state.selected_sessions.clear();
+
+        let session_manager = state
+            .session_manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+
+        for selected in &snapshot.selected_sessions {
+            let selected_session = selected.session_id.map(SessionId);
+            if selected_session
+                .is_none_or(|session_id| session_manager.get_session(&session_id).is_some())
+            {
+                follow_state
+                    .selected_sessions
+                    .insert(ClientId(selected.client_id), selected_session);
+            }
+        }
+
+        for follow in &snapshot.follows {
+            follow_state.follows.insert(
+                ClientId(follow.follower_client_id),
+                FollowEntry {
+                    leader_client_id: ClientId(follow.leader_client_id),
+                    global: follow.global,
+                },
+            );
+        }
+    }
+
+    {
+        let mut runtime = state
+            .snapshot_runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
+        runtime.dirty = false;
+        runtime.last_marked_at = None;
+    }
+
+    Ok(())
 }
 
 async fn handle_request(
@@ -2851,6 +3042,7 @@ async fn send_response(
 #[cfg(test)]
 mod tests {
     use super::{BmuxServer, resolve_session_id};
+    use bmux_config::ConfigPaths;
     use bmux_ipc::transport::LocalIpcStream;
     use bmux_ipc::{
         Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, ProtocolVersion,
@@ -5817,8 +6009,156 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn restores_sessions_windows_and_roles_from_snapshot() {
+        let suffix = Uuid::new_v4().to_string();
+        let root = std::path::PathBuf::from(format!("/tmp/bmxr-{}", &suffix[..8]));
+        let paths = ConfigPaths::new(root.join("config"), root.join("runtime"), root.join("data"));
+        paths.ensure_dirs().expect("paths should be created");
+
+        let endpoint = IpcEndpoint::unix_socket(paths.server_socket());
+        let server = BmuxServer::from_config_paths(&paths);
+        let server_task = tokio::spawn({
+            let server = server.clone();
+            async move { server.run().await }
+        });
+        wait_for_server(&endpoint).await;
+
+        let mut owner = connect_and_handshake(&endpoint).await;
+        let mut member = connect_and_handshake(&endpoint).await;
+
+        let session_id = match send_request(
+            &mut owner,
+            300,
+            Request::NewSession {
+                name: Some("persisted".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected session create response: {other:?}"),
+        };
+
+        let window_id = match send_request(
+            &mut owner,
+            301,
+            Request::NewWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                name: Some("extra".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::WindowCreated { id, .. }) => id,
+            other => panic!("unexpected window create response: {other:?}"),
+        };
+
+        let member_id = match send_request(&mut member, 302, Request::WhoAmI).await {
+            Response::Ok(ResponsePayload::ClientIdentity { id }) => id,
+            other => panic!("unexpected whoami response: {other:?}"),
+        };
+
+        let granted = send_request(
+            &mut owner,
+            303,
+            Request::GrantRole {
+                session: SessionSelector::ById(session_id),
+                client_id: member_id,
+                role: SessionRole::Writer,
+            },
+        )
+        .await;
+        assert!(matches!(
+            granted,
+            Response::Ok(ResponsePayload::RoleGranted { .. })
+        ));
+
+        let stopped = send_request(&mut owner, 304, Request::ServerStop).await;
+        assert_eq!(stopped, Response::Ok(ResponsePayload::ServerStopping));
+        server_task
+            .await
+            .expect("server task should join")
+            .expect("server should stop cleanly");
+
+        if Path::new(paths.server_socket().as_path()).exists() {
+            std::fs::remove_file(paths.server_socket()).expect("socket cleanup should succeed");
+        }
+
+        let restored_server = BmuxServer::from_config_paths(&paths);
+        let restored_task = tokio::spawn({
+            let server = restored_server.clone();
+            async move { server.run().await }
+        });
+        let mut started = false;
+        for _ in 0..200 {
+            if LocalIpcStream::connect(&endpoint).await.is_ok() {
+                started = true;
+                break;
+            }
+            if restored_task.is_finished() {
+                break;
+            }
+            sleep(Duration::from_millis(20)).await;
+        }
+        if !started {
+            let result = restored_task
+                .await
+                .expect("restored server task should join for diagnostics");
+            panic!("restored server failed to start: {result:?}");
+        }
+
+        let mut restored_client = connect_and_handshake(&endpoint).await;
+        let sessions = send_request(&mut restored_client, 305, Request::ListSessions).await;
+        let restored = match sessions {
+            Response::Ok(ResponsePayload::SessionList { sessions }) => sessions,
+            other => panic!("unexpected list sessions response: {other:?}"),
+        };
+        assert!(restored.iter().any(|s| s.id == session_id));
+
+        let windows = send_request(
+            &mut restored_client,
+            306,
+            Request::ListWindows {
+                session: Some(SessionSelector::ById(session_id)),
+            },
+        )
+        .await;
+        match windows {
+            Response::Ok(ResponsePayload::WindowList { windows }) => {
+                assert!(windows.iter().any(|window| window.id == window_id));
+            }
+            other => panic!("unexpected list windows response: {other:?}"),
+        }
+
+        let permissions = send_request(
+            &mut restored_client,
+            307,
+            Request::ListPermissions {
+                session: SessionSelector::ById(session_id),
+            },
+        )
+        .await;
+        match permissions {
+            Response::Ok(ResponsePayload::PermissionsList { permissions, .. }) => {
+                assert!(permissions.iter().any(|entry| {
+                    entry.client_id == member_id && entry.role == SessionRole::Writer
+                }));
+            }
+            other => panic!("unexpected list permissions response: {other:?}"),
+        }
+
+        let stop_restored = send_request(&mut restored_client, 308, Request::ServerStop).await;
+        assert_eq!(stop_restored, Response::Ok(ResponsePayload::ServerStopping));
+        restored_task
+            .await
+            .expect("restored server task should join")
+            .expect("restored server should stop cleanly");
+    }
+
+    #[cfg(unix)]
     async fn wait_for_server(endpoint: &IpcEndpoint) {
-        for _ in 0..50 {
+        for _ in 0..200 {
             if LocalIpcStream::connect(endpoint).await.is_ok() {
                 return;
             }
