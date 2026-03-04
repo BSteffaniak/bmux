@@ -15,7 +15,7 @@ use bmux_ipc::{
 };
 use bmux_session::{ClientId, SessionId, SessionManager, WindowId};
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,6 +26,7 @@ use uuid::Uuid;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
+const MAX_WINDOW_OUTPUT_BUFFER_BYTES: usize = 1_048_576;
 
 /// Main server implementation.
 #[derive(Clone)]
@@ -388,7 +389,77 @@ struct WindowRuntimeHandle {
     stop_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
     input_tx: mpsc::UnboundedSender<Vec<u8>>,
-    output_rx: std::sync::Mutex<mpsc::UnboundedReceiver<Vec<u8>>>,
+    output_buffer: Arc<std::sync::Mutex<OutputFanoutBuffer>>,
+}
+
+struct OutputFanoutBuffer {
+    max_bytes: usize,
+    start_offset: u64,
+    data: VecDeque<u8>,
+    cursors: BTreeMap<ClientId, u64>,
+}
+
+impl OutputFanoutBuffer {
+    fn new(max_bytes: usize) -> Self {
+        Self {
+            max_bytes: max_bytes.max(1),
+            start_offset: 0,
+            data: VecDeque::new(),
+            cursors: BTreeMap::new(),
+        }
+    }
+
+    fn end_offset(&self) -> u64 {
+        self.start_offset + self.data.len() as u64
+    }
+
+    fn register_client_at_tail(&mut self, client_id: ClientId) {
+        self.cursors.insert(client_id, self.end_offset());
+    }
+
+    fn unregister_client(&mut self, client_id: ClientId) {
+        self.cursors.remove(&client_id);
+    }
+
+    fn push_chunk(&mut self, chunk: &[u8]) {
+        self.data.extend(chunk.iter().copied());
+        while self.data.len() > self.max_bytes {
+            let _ = self.data.pop_front();
+            self.start_offset = self.start_offset.saturating_add(1);
+        }
+
+        for cursor in self.cursors.values_mut() {
+            if *cursor < self.start_offset {
+                *cursor = self.start_offset;
+            }
+        }
+    }
+
+    fn read_for_client(&mut self, client_id: ClientId, max_bytes: usize) -> Vec<u8> {
+        let limit = max_bytes.max(1);
+        let end = self.end_offset();
+        let cursor = self.cursors.entry(client_id).or_insert(end);
+        if *cursor < self.start_offset {
+            *cursor = self.start_offset;
+        }
+
+        let available = end.saturating_sub(*cursor) as usize;
+        if available == 0 {
+            return Vec::new();
+        }
+
+        let to_read = available.min(limit);
+        let start_index = (*cursor - self.start_offset) as usize;
+        let output = self
+            .data
+            .iter()
+            .skip(start_index)
+            .take(to_read)
+            .copied()
+            .collect::<Vec<_>>();
+        *cursor = cursor.saturating_add(output.len() as u64);
+        output
+    }
 }
 
 struct RemovedRuntime {
@@ -458,9 +529,12 @@ impl SessionRuntimeManager {
     fn spawn_window_runtime(&self, name: Option<String>) -> Result<WindowRuntimeHandle> {
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-        let (output_tx, output_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let output_buffer = Arc::new(std::sync::Mutex::new(OutputFanoutBuffer::new(
+            MAX_WINDOW_OUTPUT_BUFFER_BYTES,
+        )));
         let shell = self.shell.clone();
         let window_id = bmux_session::WindowId::new();
+        let output_buffer_for_reader = Arc::clone(&output_buffer);
         let task = tokio::spawn(async move {
             let pty_system = native_pty_system();
             let pty_pair = match pty_system.openpty(PtySize {
@@ -496,7 +570,7 @@ impl SessionRuntimeManager {
                 }
             };
 
-            let reader_output = output_tx.clone();
+            let reader_output = Arc::clone(&output_buffer_for_reader);
             let reader_thread = std::thread::Builder::new()
                 .name(format!("bmux-server-window-{}", window_id.0))
                 .spawn(move || {
@@ -505,7 +579,11 @@ impl SessionRuntimeManager {
                         match reader.read(&mut buffer) {
                             Ok(0) => break,
                             Ok(bytes_read) => {
-                                let _ = reader_output.send(buffer[..bytes_read].to_vec());
+                                if let Ok(mut output) = reader_output.lock() {
+                                    output.push_chunk(&buffer[..bytes_read]);
+                                } else {
+                                    break;
+                                }
                             }
                             Err(_) => break,
                         }
@@ -545,7 +623,7 @@ impl SessionRuntimeManager {
             stop_tx: Some(stop_tx),
             task,
             input_tx,
-            output_rx: std::sync::Mutex::new(output_rx),
+            output_buffer,
         })
     }
 
@@ -702,6 +780,13 @@ impl SessionRuntimeManager {
         if runtime.input_owner.is_none() {
             runtime.input_owner = Some(client_id);
         }
+        for window in runtime.windows.values_mut() {
+            let mut output = window
+                .output_buffer
+                .lock()
+                .map_err(|_| SessionRuntimeError::Closed)?;
+            output.register_client_at_tail(client_id);
+        }
         Ok(())
     }
 
@@ -710,6 +795,13 @@ impl SessionRuntimeManager {
             let removed = runtime.attached_clients.remove(&client_id);
             if removed && runtime.input_owner == Some(client_id) {
                 runtime.input_owner = runtime.attached_clients.iter().next().copied();
+            }
+            if removed {
+                for window in runtime.windows.values_mut() {
+                    if let Ok(mut output) = window.output_buffer.lock() {
+                        output.unregister_client(client_id);
+                    }
+                }
             }
         }
     }
@@ -765,32 +857,11 @@ impl SessionRuntimeManager {
             .get_mut(&runtime.active_window)
             .ok_or(SessionRuntimeError::NotFound)?;
 
-        let mut receiver = window
-            .output_rx
+        let mut output = window
+            .output_buffer
             .lock()
             .map_err(|_| SessionRuntimeError::Closed)?;
-        let mut output = Vec::new();
-        let limit = max_bytes.max(1);
-
-        while output.len() < limit {
-            match receiver.try_recv() {
-                Ok(chunk) => {
-                    let remaining = limit - output.len();
-                    if chunk.len() <= remaining {
-                        output.extend_from_slice(&chunk);
-                    } else {
-                        output.extend_from_slice(&chunk[..remaining]);
-                        break;
-                    }
-                }
-                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
-                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
-                    return Err(SessionRuntimeError::Closed);
-                }
-            }
-        }
-
-        Ok(output)
+        Ok(output.read_for_client(client_id, max_bytes))
     }
 
     #[cfg(test)]
@@ -2541,6 +2612,11 @@ mod tests {
             owner_write,
             Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
         ));
+
+        let output_a = collect_attach_output_until(&mut client_a, session_id, "owner-ok", 20).await;
+        assert!(output_a.contains("owner-ok"));
+        let output_b = collect_attach_output_until(&mut client_b, session_id, "owner-ok", 20).await;
+        assert!(output_b.contains("owner-ok"));
 
         let follower_write = send_request(
             &mut client_b,
