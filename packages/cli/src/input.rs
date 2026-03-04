@@ -8,6 +8,8 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RuntimeAction {
     Quit,
+    NewWindow,
+    NewSession,
     FocusNext,
     FocusLeft,
     FocusRight,
@@ -132,6 +134,8 @@ struct PendingChord {
 impl Keymap {
     pub(crate) fn default_runtime() -> Self {
         let mut runtime = BTreeMap::new();
+        runtime.insert("c".to_string(), "new_window".to_string());
+        runtime.insert("shift+c".to_string(), "new_session".to_string());
         runtime.insert("o".to_string(), "focus_next_pane".to_string());
         runtime.insert("h".to_string(), "focus_left_pane".to_string());
         runtime.insert("l".to_string(), "focus_right_pane".to_string());
@@ -734,6 +738,8 @@ fn find_overlaps(bindings: &[KeyBinding], label: &str) -> Vec<String> {
 fn action_to_name(action: &RuntimeAction) -> &'static str {
     match action {
         RuntimeAction::Quit => "quit",
+        RuntimeAction::NewWindow => "new_window",
+        RuntimeAction::NewSession => "new_session",
         RuntimeAction::FocusNext => "focus_next_pane",
         RuntimeAction::FocusLeft => "focus_left_pane",
         RuntimeAction::FocusRight => "focus_right_pane",
@@ -1090,6 +1096,8 @@ fn parse_key_token(value: &str) -> Result<KeyCode> {
 fn parse_action(value: &str) -> Result<RuntimeAction> {
     match value.trim().to_ascii_lowercase().as_str() {
         "quit" => Ok(RuntimeAction::Quit),
+        "new_window" => Ok(RuntimeAction::NewWindow),
+        "new_session" => Ok(RuntimeAction::NewSession),
         "focus_next_pane" => Ok(RuntimeAction::FocusNext),
         "focus_left_pane" => Ok(RuntimeAction::FocusLeft),
         "focus_right_pane" => Ok(RuntimeAction::FocusRight),
@@ -1159,6 +1167,14 @@ mod tests {
         let mut processor = InputProcessor::new(Keymap::default_runtime());
         let actions = processor.process_chunk(&[0x01, b'r']);
         assert_eq!(actions, vec![RuntimeAction::RestartFocusedPane]);
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'c']),
+            vec![RuntimeAction::NewWindow]
+        );
+        assert_eq!(
+            processor.process_chunk(&[0x01, b'C']),
+            vec![RuntimeAction::NewSession]
+        );
     }
 
     #[test]

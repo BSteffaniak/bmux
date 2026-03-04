@@ -710,6 +710,17 @@ async fn run_session_attach(
         None => None,
     };
 
+    let attach_config = match BmuxConfig::load() {
+        Ok(config) => config,
+        Err(error) => {
+            eprintln!(
+                "bmux warning: failed loading config for attach keymap, using defaults ({error})"
+            );
+            BmuxConfig::default()
+        }
+    };
+    let mut attach_input_processor = InputProcessor::new(attach_keymap_from_config(&attach_config));
+
     let mut client = BmuxClient::connect_default("bmux-cli-attach")
         .await
         .map_err(map_attach_client_error)?;
@@ -811,17 +822,39 @@ async fn run_session_attach(
         }
 
         if let Some(event) = poll_attach_terminal_event(ATTACH_IO_POLL_INTERVAL).await? {
-            match attach_event_action(&event)? {
-                AttachEventAction::Detach => break,
-                AttachEventAction::Send(bytes) => {
-                    if can_write {
-                        client
-                            .attach_input(attached_id, bytes)
-                            .await
-                            .map_err(map_attach_client_error)?;
+            let mut detach_requested = false;
+            for attach_action in attach_event_actions(&event, &mut attach_input_processor)? {
+                match attach_action {
+                    AttachEventAction::Detach => {
+                        detach_requested = true;
+                        break;
                     }
+                    AttachEventAction::Send(bytes) => {
+                        if can_write {
+                            client
+                                .attach_input(attached_id, bytes)
+                                .await
+                                .map_err(map_attach_client_error)?;
+                        }
+                    }
+                    AttachEventAction::Runtime(action) => {
+                        if let Err(error) = handle_attach_runtime_action(
+                            &mut client,
+                            action,
+                            &mut attached_id,
+                            &mut can_write,
+                        )
+                        .await
+                        {
+                            println!("attach action failed: {}", map_attach_client_error(error));
+                        }
+                    }
+                    AttachEventAction::Ignore => {}
                 }
-                AttachEventAction::Ignore => {}
+            }
+
+            if detach_requested {
+                break;
             }
         }
 
@@ -841,6 +874,40 @@ async fn run_session_attach(
     }
     println!("detached");
     Ok(0)
+}
+
+async fn handle_attach_runtime_action(
+    client: &mut BmuxClient,
+    action: RuntimeAction,
+    attached_id: &mut Uuid,
+    can_write: &mut bool,
+) -> std::result::Result<(), ClientError> {
+    match action {
+        RuntimeAction::NewWindow => {
+            let window_id = client.new_window(None, None).await?;
+            let active_window_id = client
+                .switch_window(None, WindowSelector::ById(window_id))
+                .await?;
+            println!("created window: {window_id}");
+            println!("switched to window: {active_window_id}");
+        }
+        RuntimeAction::NewSession => {
+            let session_id = client.new_session(None).await?;
+            let attach_info = open_attach_for_session(client, session_id).await?;
+            *attached_id = attach_info.session_id;
+            *can_write = attach_info.can_write;
+            println!(
+                "created and switched to session: {}",
+                attach_info.session_id
+            );
+            if !*can_write {
+                println!("read-only attach: input disabled");
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
 }
 
 async fn resolve_follow_target_session(
@@ -865,8 +932,56 @@ async fn open_attach_for_session(
     client.open_attach_stream_info(&grant).await
 }
 
+fn attach_keymap_from_config(config: &BmuxConfig) -> crate::input::Keymap {
+    let (runtime_bindings, global_bindings) = filtered_attach_keybindings(config);
+    match crate::input::Keymap::from_parts(
+        &config.keybindings.prefix,
+        config.keybindings.timeout_ms,
+        &runtime_bindings,
+        &global_bindings,
+    ) {
+        Ok(keymap) => keymap,
+        Err(error) => {
+            eprintln!("bmux warning: invalid attach keymap config, using defaults ({error})");
+            default_attach_keymap()
+        }
+    }
+}
+
+fn filtered_attach_keybindings(
+    config: &BmuxConfig,
+) -> (
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+) {
+    let (mut runtime, mut global) = merged_runtime_keybindings(config);
+    runtime.retain(|_, action| is_attach_keymap_action(action));
+    global.retain(|_, action| is_attach_keymap_action(action));
+    (runtime, global)
+}
+
+fn is_attach_keymap_action(action: &str) -> bool {
+    matches!(
+        action.trim().to_ascii_lowercase().as_str(),
+        "new_window" | "new_session"
+    )
+}
+
+fn default_attach_keymap() -> crate::input::Keymap {
+    let defaults = BmuxConfig::default();
+    let (runtime_bindings, global_bindings) = filtered_attach_keybindings(&defaults);
+    crate::input::Keymap::from_parts(
+        &defaults.keybindings.prefix,
+        defaults.keybindings.timeout_ms,
+        &runtime_bindings,
+        &global_bindings,
+    )
+    .expect("default attach keymap must be valid")
+}
+
 enum AttachEventAction {
     Send(Vec<u8>),
+    Runtime(RuntimeAction),
     Detach,
     Ignore,
 }
@@ -911,98 +1026,41 @@ async fn write_attach_output(output: Vec<u8>) -> Result<()> {
     .context("failed to join attach output task")?
 }
 
-fn attach_event_action(event: &Event) -> Result<AttachEventAction> {
+fn attach_event_actions(
+    event: &Event,
+    attach_input_processor: &mut InputProcessor,
+) -> Result<Vec<AttachEventAction>> {
     match event {
-        Event::Key(key) => attach_key_event_action(key),
+        Event::Key(key) => attach_key_event_actions(key, attach_input_processor),
         Event::Resize(_, _) | Event::Mouse(_) | Event::FocusGained | Event::FocusLost => {
-            Ok(AttachEventAction::Ignore)
+            Ok(vec![AttachEventAction::Ignore])
         }
     }
 }
 
-fn attach_key_event_action(key: &KeyEvent) -> Result<AttachEventAction> {
+fn attach_key_event_actions(
+    key: &KeyEvent,
+    attach_input_processor: &mut InputProcessor,
+) -> Result<Vec<AttachEventAction>> {
     if key.kind != KeyEventKind::Press {
-        return Ok(AttachEventAction::Ignore);
+        return Ok(vec![AttachEventAction::Ignore]);
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('d')) {
-        return Ok(AttachEventAction::Detach);
+        return Ok(vec![AttachEventAction::Detach]);
     }
 
-    match key_event_to_bytes(key) {
-        Some(bytes) => Ok(AttachEventAction::Send(bytes)),
-        None => Ok(AttachEventAction::Ignore),
-    }
-}
-
-fn key_event_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
-    let modifiers = key.modifiers;
-    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
-    let alt = modifiers.contains(KeyModifiers::ALT);
-    let shift = modifiers.contains(KeyModifiers::SHIFT);
-
-    let mut out = Vec::new();
-    if alt {
-        out.push(0x1b);
-    }
-
-    match key.code {
-        KeyCode::Char(c) => {
-            if ctrl {
-                let lower = c.to_ascii_lowercase();
-                if lower.is_ascii_lowercase() {
-                    out.push((lower as u8 - b'a') + 1);
-                    return Some(out);
-                }
+    let actions = attach_input_processor.process_terminal_event(Event::Key(key.clone()));
+    Ok(actions
+        .into_iter()
+        .map(|action| match action {
+            RuntimeAction::ForwardToPane(bytes) => AttachEventAction::Send(bytes),
+            RuntimeAction::NewWindow | RuntimeAction::NewSession => {
+                AttachEventAction::Runtime(action)
             }
-
-            if c.is_ascii() {
-                out.push(c as u8);
-            } else {
-                let mut buf = [0_u8; 4];
-                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-            }
-            Some(out)
-        }
-        KeyCode::Enter => Some(vec![b'\r']),
-        KeyCode::Tab => Some(vec![b'\t']),
-        KeyCode::Backspace => Some(vec![0x7f]),
-        KeyCode::Esc => Some(vec![0x1b]),
-        KeyCode::Up => Some(if shift {
-            vec![0x1b, b'[', b'1', b';', b'2', b'A']
-        } else {
-            vec![0x1b, b'[', b'A']
-        }),
-        KeyCode::Down => Some(if shift {
-            vec![0x1b, b'[', b'1', b';', b'2', b'B']
-        } else {
-            vec![0x1b, b'[', b'B']
-        }),
-        KeyCode::Right => Some(if shift {
-            vec![0x1b, b'[', b'1', b';', b'2', b'C']
-        } else {
-            vec![0x1b, b'[', b'C']
-        }),
-        KeyCode::Left => Some(if shift {
-            vec![0x1b, b'[', b'1', b';', b'2', b'D']
-        } else {
-            vec![0x1b, b'[', b'D']
-        }),
-        KeyCode::Home => Some(vec![0x1b, b'[', b'H']),
-        KeyCode::End => Some(vec![0x1b, b'[', b'F']),
-        KeyCode::PageUp => Some(vec![0x1b, b'[', b'5', b'~']),
-        KeyCode::PageDown => Some(vec![0x1b, b'[', b'6', b'~']),
-        KeyCode::Insert => Some(vec![0x1b, b'[', b'2', b'~']),
-        KeyCode::Delete => Some(vec![0x1b, b'[', b'3', b'~']),
-        KeyCode::F(number) => match number {
-            1 => Some(vec![0x1b, b'O', b'P']),
-            2 => Some(vec![0x1b, b'O', b'Q']),
-            3 => Some(vec![0x1b, b'O', b'R']),
-            4 => Some(vec![0x1b, b'O', b'S']),
-            _ => None,
-        },
-        _ => None,
-    }
+            _ => AttachEventAction::Ignore,
+        })
+        .collect())
 }
 
 fn map_attach_client_error(error: ClientError) -> anyhow::Error {
@@ -2749,11 +2807,12 @@ fn reap_exited_panes(
 mod tests {
     use super::{
         EventReader, PaneRuntime, PaneState, ProtocolDirection, ProtocolTraceEvent, ScrollState,
-        TerminalProfile, TraceFamily, cursor_status_suffix, filter_trace_events,
-        format_scroll_mode_suffix, load_runtime_settings, map_attach_client_error,
-        map_cli_client_error, merged_runtime_keybindings, parse_pid_content, profile_for_term,
-        protocol_profile_for_terminal_profile, reap_exited_panes, resolve_pane_term_with_checker,
-        run_event_input_loop_with_reader, selection_status_suffix,
+        TerminalProfile, TraceFamily, attach_keymap_from_config, cursor_status_suffix,
+        filter_trace_events, format_scroll_mode_suffix, load_runtime_settings,
+        map_attach_client_error, map_cli_client_error, merged_runtime_keybindings,
+        parse_pid_content, profile_for_term, protocol_profile_for_terminal_profile,
+        reap_exited_panes, resolve_pane_term_with_checker, run_event_input_loop_with_reader,
+        selection_status_suffix,
     };
     use crate::input::{InputProcessor, Keymap};
     use crate::pane::{LayoutNode, LayoutTree, PaneId, SplitDirection};
@@ -3112,23 +3171,90 @@ mod tests {
 
     #[test]
     fn attach_key_event_action_detaches_on_ctrl_d() {
-        let action = super::attach_key_event_action(&CrosstermKeyEvent::new_with_kind(
-            CrosstermKeyCode::Char('d'),
-            KeyModifiers::CONTROL,
-            CrosstermKeyEventKind::Press,
-        ))
+        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
+        let actions = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('d'),
+                KeyModifiers::CONTROL,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+        )
         .expect("attach key action should parse");
-        assert!(matches!(action, super::AttachEventAction::Detach));
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], super::AttachEventAction::Detach));
     }
 
     #[test]
     fn attach_key_event_action_encodes_char_input() {
-        let action = super::attach_key_event_action(&CrosstermKeyEvent::new_with_kind(
-            CrosstermKeyCode::Char('x'),
-            KeyModifiers::NONE,
-            CrosstermKeyEventKind::Press,
-        ))
+        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
+        let actions = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('x'),
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+        )
         .expect("attach key action should parse");
-        assert!(matches!(action, super::AttachEventAction::Send(bytes) if bytes == b"x"));
+        assert_eq!(actions.len(), 1);
+        assert!(matches!(actions[0], super::AttachEventAction::Send(ref bytes) if bytes == b"x"));
+    }
+
+    #[test]
+    fn attach_key_event_action_maps_tmux_style_defaults() {
+        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
+
+        let prefix = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+        )
+        .expect("attach key action should parse");
+        assert!(prefix.is_empty());
+
+        let new_window = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('c'),
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+        )
+        .expect("attach key action should parse");
+        assert!(matches!(
+            new_window.first(),
+            Some(super::AttachEventAction::Runtime(
+                crate::input::RuntimeAction::NewWindow
+            ))
+        ));
+
+        let _ = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+        )
+        .expect("attach key action should parse");
+        let new_session = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('C'),
+                KeyModifiers::SHIFT,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+        )
+        .expect("attach key action should parse");
+        assert!(matches!(
+            new_session.first(),
+            Some(super::AttachEventAction::Runtime(
+                crate::input::RuntimeAction::NewSession
+            ))
+        ));
     }
 }

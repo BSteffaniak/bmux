@@ -68,6 +68,16 @@ pub(super) fn process_input_events(
                         shutdown_requested.store(true, Ordering::Relaxed);
                         *exit_override = Some(0);
                     }
+                    RuntimeAction::NewWindow => {
+                        *status_message = Some(StatusMessage::new(
+                            "new window is only available in attach mode".to_string(),
+                        ));
+                    }
+                    RuntimeAction::NewSession => {
+                        *status_message = Some(StatusMessage::new(
+                            "new session is only available in attach mode".to_string(),
+                        ));
+                    }
                     RuntimeAction::FocusNext => {
                         *focused_pane =
                             next_focusable_pane_id(&layout_tree.pane_order(), panes, *focused_pane);
@@ -302,7 +312,7 @@ pub(super) fn process_input_events(
                     }
                     RuntimeAction::ShowHelp => {
                         *status_message = Some(StatusMessage::new(
-                            "Ctrl-A: q quit | o cycle | h/j/k/l or arrows focus | H/J/K/L directional resize | t toggle layout | % split-v | \" split-h | +/- resize | [ scroll mode | Esc (or ]) exit scroll | arrows/Ctrl-Y/Ctrl-E line | PgUp/PgDn page | g/G top/bottom | y copy view | r restart | x close | ? help"
+                            "Ctrl-A: c new window | C new session | q quit | o cycle | h/j/k/l or arrows focus | H/J/K/L directional resize | t toggle layout | % split-v | \" split-h | +/- resize | [ scroll mode | Esc (or ]) exit scroll | arrows/Ctrl-Y/Ctrl-E line | PgUp/PgDn page | g/G top/bottom | y copy view | r restart | x close | ? help"
                                 .to_string(),
                         ));
                     }

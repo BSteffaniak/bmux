@@ -50,6 +50,8 @@ fn default_global_runtime_bindings() -> BTreeMap<String, String> {
 
 fn default_runtime_bindings() -> BTreeMap<String, String> {
     let mut bindings = BTreeMap::new();
+    bindings.insert("c".to_string(), "new_window".to_string());
+    bindings.insert("shift+c".to_string(), "new_session".to_string());
     bindings.insert("o".to_string(), "focus_next_pane".to_string());
     bindings.insert("h".to_string(), "focus_left_pane".to_string());
     bindings.insert("l".to_string(), "focus_right_pane".to_string());
