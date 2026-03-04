@@ -332,6 +332,14 @@ pub(crate) enum ServerCommand {
     },
     /// Check server status
     Status,
+    /// Trigger immediate server snapshot save
+    Save,
+    /// Validate persisted snapshot without applying restore
+    Restore {
+        /// Only validate snapshot readability and schema
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Request graceful server shutdown
     Stop,
 }
@@ -501,6 +509,25 @@ mod tests {
             panic!("expected server subcommand");
         };
         assert!(matches!(command, ServerCommand::Status));
+    }
+
+    #[test]
+    fn parses_server_save_subcommand() {
+        let cli = Cli::try_parse_from(["bmux", "server", "save"]).expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(command, ServerCommand::Save));
+    }
+
+    #[test]
+    fn parses_server_restore_dry_run_subcommand() {
+        let cli = Cli::try_parse_from(["bmux", "server", "restore", "--dry-run"])
+            .expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(command, ServerCommand::Restore { dry_run: true }));
     }
 
     #[test]

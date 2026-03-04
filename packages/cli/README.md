@@ -26,6 +26,8 @@ bmux server start --daemon
 
 # status and graceful shutdown
 bmux server status
+bmux server save
+bmux server restore --dry-run
 bmux server stop
 ```
 

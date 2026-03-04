@@ -239,6 +239,8 @@ fn run_command(command: &Command) -> Result<u8> {
                 foreground_internal,
             } => run_server_start(*daemon, *foreground_internal),
             ServerCommand::Status => run_server_status(),
+            ServerCommand::Save => run_server_save(),
+            ServerCommand::Restore { dry_run } => run_server_restore(*dry_run),
             ServerCommand::Stop => run_server_stop(),
         },
         Command::Keymap { command } => match command {
@@ -303,12 +305,35 @@ fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8> {
 
 fn run_server_status() -> Result<u8> {
     cleanup_stale_pid_file()?;
-    let status = probe_server_running()?;
+    let status = fetch_server_status()?;
 
     match status {
-        true => {
+        Some(status) if status.running => {
             if let Some(event_name) = latest_server_event_name()? {
                 println!("latest server event: {event_name}");
+            }
+            println!(
+                "snapshot: {}{}",
+                if status.snapshot.enabled {
+                    "enabled"
+                } else {
+                    "disabled"
+                },
+                status
+                    .snapshot
+                    .path
+                    .as_ref()
+                    .map_or(String::new(), |path| format!(" ({path})"))
+            );
+            if status.snapshot.enabled {
+                println!(
+                    "snapshot file: {}",
+                    if status.snapshot.snapshot_exists {
+                        "present"
+                    } else {
+                        "missing"
+                    }
+                );
             }
             println!("bmux server is running");
             Ok(0)
@@ -317,6 +342,46 @@ fn run_server_status() -> Result<u8> {
             println!("bmux server is not running");
             Ok(1)
         }
+    }
+}
+
+fn run_server_save() -> Result<u8> {
+    cleanup_stale_pid_file()?;
+    let path = run_async(async {
+        let mut client = BmuxClient::connect_default("bmux-cli-server-save")
+            .await
+            .map_err(map_cli_client_error)?;
+        client.server_save().await.map_err(map_cli_client_error)
+    })?;
+
+    match path {
+        Some(path) => println!("snapshot saved: {path}"),
+        None => println!("snapshot save requested"),
+    }
+    Ok(0)
+}
+
+fn run_server_restore(dry_run: bool) -> Result<u8> {
+    if !dry_run {
+        anyhow::bail!("server restore currently supports only --dry-run");
+    }
+    cleanup_stale_pid_file()?;
+    let (ok, message) = run_async(async {
+        let mut client = BmuxClient::connect_default("bmux-cli-server-restore-dry-run")
+            .await
+            .map_err(map_cli_client_error)?;
+        client
+            .server_restore_dry_run()
+            .await
+            .map_err(map_cli_client_error)
+    })?;
+
+    if ok {
+        println!("restore dry-run: OK - {message}");
+        Ok(0)
+    } else {
+        println!("restore dry-run: FAIL - {message}");
+        Ok(1)
     }
 }
 
@@ -1114,6 +1179,10 @@ fn server_is_running() -> Result<bool> {
 }
 
 fn probe_server_running() -> Result<bool> {
+    Ok(fetch_server_status()?.is_some_and(|status| status.running))
+}
+
+fn fetch_server_status() -> Result<Option<bmux_client::ServerStatusInfo>> {
     run_async(async {
         let connect = tokio::time::timeout(
             SERVER_STATUS_TIMEOUT,
@@ -1123,12 +1192,12 @@ fn probe_server_running() -> Result<bool> {
 
         let mut client = match connect {
             Ok(Ok(client)) => client,
-            Ok(Err(_)) | Err(_) => return Ok(false),
+            Ok(Err(_)) | Err(_) => return Ok(None),
         };
 
         match tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.server_status()).await {
-            Ok(Ok(running)) => Ok(running),
-            Ok(Err(_)) | Err(_) => Ok(false),
+            Ok(Ok(status)) => Ok(Some(status)),
+            Ok(Err(_)) | Err(_) => Ok(None),
         }
     })
 }
@@ -1143,8 +1212,9 @@ fn wait_for_server_running(timeout: Duration) -> Result<bool> {
             )
             .await;
             if let Ok(Ok(mut client)) = connect
-                && let Ok(Ok(true)) =
+                && let Ok(Ok(status)) =
                     tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.server_status()).await
+                && status.running
             {
                 return Ok(true);
             }

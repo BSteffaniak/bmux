@@ -138,6 +138,8 @@ pub enum Request {
     Ping,
     WhoAmI,
     ServerStatus,
+    ServerSave,
+    ServerRestoreDryRun,
     ServerStop,
     NewSession {
         name: Option<String>,
@@ -244,6 +246,17 @@ pub struct SessionPermissionSummary {
     pub role: SessionRole,
 }
 
+/// Snapshot persistence status returned by server-status.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerSnapshotStatus {
+    pub enabled: bool,
+    pub path: Option<String>,
+    pub snapshot_exists: bool,
+    pub last_write_epoch_ms: Option<u64>,
+    pub last_restore_epoch_ms: Option<u64>,
+    pub last_restore_error: Option<String>,
+}
+
 /// Successful response payload variants.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -254,6 +267,14 @@ pub enum ResponsePayload {
     },
     ServerStatus {
         running: bool,
+        snapshot: ServerSnapshotStatus,
+    },
+    ServerSnapshotSaved {
+        path: Option<String>,
+    },
+    ServerSnapshotRestoreDryRun {
+        ok: bool,
+        message: String,
     },
     SessionCreated {
         id: Uuid,

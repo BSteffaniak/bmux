@@ -10,8 +10,8 @@ pub use bmux_ipc::Event as ServerEvent;
 use bmux_ipc::transport::{IpcTransportError, LocalIpcStream};
 use bmux_ipc::{
     AttachGrant, ClientSummary, Envelope, EnvelopeKind, ErrorCode, IpcEndpoint, ProtocolVersion,
-    Request, Response, ResponsePayload, SessionPermissionSummary, SessionRole, SessionSelector,
-    SessionSummary, WindowSelector, WindowSummary, decode, encode,
+    Request, Response, ResponsePayload, ServerSnapshotStatus, SessionPermissionSummary,
+    SessionRole, SessionSelector, SessionSummary, WindowSelector, WindowSummary, decode, encode,
 };
 use std::time::Duration;
 use thiserror::Error;
@@ -26,6 +26,13 @@ pub type Result<T> = std::result::Result<T, ClientError>;
 pub struct AttachOpenInfo {
     pub session_id: Uuid,
     pub can_write: bool,
+}
+
+/// Server status details returned by status RPC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerStatusInfo {
+    pub running: bool,
+    pub snapshot: ServerSnapshotStatus,
 }
 
 /// Typed client errors.
@@ -86,7 +93,7 @@ impl BmuxClient {
             .await?;
 
         match hello_response {
-            ResponsePayload::ServerStatus { running: true } => Ok(client),
+            ResponsePayload::ServerStatus { running: true, .. } => Ok(client),
             _ => Err(ClientError::UnexpectedResponse(
                 "handshake expected running server status",
             )),
@@ -145,10 +152,40 @@ impl BmuxClient {
     /// # Errors
     ///
     /// Returns an error if request or response validation fails.
-    pub async fn server_status(&mut self) -> Result<bool> {
+    pub async fn server_status(&mut self) -> Result<ServerStatusInfo> {
         match self.request(Request::ServerStatus).await? {
-            ResponsePayload::ServerStatus { running } => Ok(running),
+            ResponsePayload::ServerStatus { running, snapshot } => {
+                Ok(ServerStatusInfo { running, snapshot })
+            }
             _ => Err(ClientError::UnexpectedResponse("expected server status")),
+        }
+    }
+
+    /// Trigger immediate server snapshot save.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn server_save(&mut self) -> Result<Option<String>> {
+        match self.request(Request::ServerSave).await? {
+            ResponsePayload::ServerSnapshotSaved { path } => Ok(path),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected server snapshot saved",
+            )),
+        }
+    }
+
+    /// Validate snapshot readability and schema without mutating runtime state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn server_restore_dry_run(&mut self) -> Result<(bool, String)> {
+        match self.request(Request::ServerRestoreDryRun).await? {
+            ResponsePayload::ServerSnapshotRestoreDryRun { ok, message } => Ok((ok, message)),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected server snapshot restore dry-run",
+            )),
         }
     }
 
@@ -581,7 +618,13 @@ mod tests {
             .expect("client should connect");
 
         client.ping().await.expect("ping should pass");
-        assert!(client.server_status().await.expect("status should succeed"));
+        assert!(
+            client
+                .server_status()
+                .await
+                .expect("status should succeed")
+                .running
+        );
 
         let session_id = client
             .new_session(Some("dev".to_string()))

@@ -13,8 +13,8 @@ use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
     AttachGrant, CURRENT_PROTOCOL_VERSION, ClientSummary, Envelope, EnvelopeKind, ErrorCode,
     ErrorResponse, Event, IpcEndpoint, ProtocolVersion, Request, Response, ResponsePayload,
-    SessionPermissionSummary, SessionRole, SessionSelector, SessionSummary, WindowSelector,
-    WindowSummary, decode, encode,
+    ServerSnapshotStatus, SessionPermissionSummary, SessionRole, SessionSelector, SessionSummary,
+    WindowSelector, WindowSummary, decode, encode,
 };
 use bmux_session::{ClientId, Session, SessionId, SessionManager, WindowId};
 use persistence::{
@@ -61,6 +61,9 @@ struct SnapshotRuntime {
     dirty: bool,
     last_marked_at: Option<Instant>,
     debounce_interval: Duration,
+    last_write_epoch_ms: Option<u64>,
+    last_restore_epoch_ms: Option<u64>,
+    last_restore_error: Option<String>,
 }
 
 impl SnapshotRuntime {
@@ -70,6 +73,9 @@ impl SnapshotRuntime {
             dirty: false,
             last_marked_at: None,
             debounce_interval: SNAPSHOT_DEBOUNCE_INTERVAL,
+            last_write_epoch_ms: None,
+            last_restore_epoch_ms: None,
+            last_restore_error: None,
         }
     }
 
@@ -79,6 +85,9 @@ impl SnapshotRuntime {
             dirty: false,
             last_marked_at: None,
             debounce_interval: SNAPSHOT_DEBOUNCE_INTERVAL,
+            last_write_epoch_ms: None,
+            last_restore_epoch_ms: None,
+            last_restore_error: None,
         }
     }
 }
@@ -1357,10 +1366,14 @@ async fn handle_connection(
                 return Ok(());
             }
             debug!("accepted client handshake: {client_name}");
+            let snapshot = snapshot_status(&state)?;
             send_ok(
                 &mut stream,
                 first_envelope.request_id,
-                ResponsePayload::ServerStatus { running: true },
+                ResponsePayload::ServerStatus {
+                    running: true,
+                    snapshot,
+                },
             )
             .await?;
         }
@@ -1667,9 +1680,42 @@ fn maybe_flush_snapshot(state: &Arc<ServerState>, force: bool) -> Result<()> {
             .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
         runtime.dirty = true;
         runtime.last_marked_at = Some(Instant::now());
+        runtime.last_restore_error = Some(format!("snapshot write failed: {error}"));
+    } else {
+        let mut runtime = state
+            .snapshot_runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
+        runtime.last_write_epoch_ms = Some(epoch_millis_now());
+        runtime.last_restore_error = None;
     }
 
     Ok(())
+}
+
+fn snapshot_status(state: &Arc<ServerState>) -> Result<ServerSnapshotStatus> {
+    let runtime = state
+        .snapshot_runtime
+        .lock()
+        .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
+
+    let path = runtime
+        .manager
+        .as_ref()
+        .map(|manager| manager.path().to_string_lossy().to_string());
+    let snapshot_exists = runtime
+        .manager
+        .as_ref()
+        .is_some_and(|manager| manager.path().exists());
+
+    Ok(ServerSnapshotStatus {
+        enabled: runtime.manager.is_some(),
+        path,
+        snapshot_exists,
+        last_write_epoch_ms: runtime.last_write_epoch_ms,
+        last_restore_epoch_ms: runtime.last_restore_epoch_ms,
+        last_restore_error: runtime.last_restore_error.clone(),
+    })
 }
 
 fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV1> {
@@ -1796,6 +1842,11 @@ fn restore_snapshot_if_present(state: &Arc<ServerState>) -> Result<()> {
         Ok(snapshot) => snapshot,
         Err(error) => {
             warn!("failed reading snapshot; starting clean: {error}");
+            let mut runtime = state
+                .snapshot_runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
+            runtime.last_restore_error = Some(format!("{error}"));
             return Ok(());
         }
     };
@@ -1922,6 +1973,8 @@ fn restore_snapshot_if_present(state: &Arc<ServerState>) -> Result<()> {
             .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
         runtime.dirty = false;
         runtime.last_marked_at = None;
+        runtime.last_restore_epoch_ms = Some(epoch_millis_now());
+        runtime.last_restore_error = None;
     }
 
     Ok(())
@@ -1951,7 +2004,49 @@ async fn handle_request(
         }),
         Request::Ping => Response::Ok(ResponsePayload::Pong),
         Request::WhoAmI => Response::Ok(ResponsePayload::ClientIdentity { id: client_id.0 }),
-        Request::ServerStatus => Response::Ok(ResponsePayload::ServerStatus { running: true }),
+        Request::ServerStatus => {
+            let snapshot = snapshot_status(state)?;
+            Response::Ok(ResponsePayload::ServerStatus {
+                running: true,
+                snapshot,
+            })
+        }
+        Request::ServerSave => {
+            mark_snapshot_dirty(state)?;
+            maybe_flush_snapshot(state, true)?;
+            let status = snapshot_status(state)?;
+            Response::Ok(ResponsePayload::ServerSnapshotSaved { path: status.path })
+        }
+        Request::ServerRestoreDryRun => {
+            let snapshot_runtime = state
+                .snapshot_runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
+            let Some(manager) = snapshot_runtime.manager.clone() else {
+                return Ok(Response::Ok(ResponsePayload::ServerSnapshotRestoreDryRun {
+                    ok: false,
+                    message: "snapshot persistence is disabled".to_string(),
+                }));
+            };
+            drop(snapshot_runtime);
+
+            match manager.read_snapshot() {
+                Ok(snapshot) => Response::Ok(ResponsePayload::ServerSnapshotRestoreDryRun {
+                    ok: true,
+                    message: format!(
+                        "snapshot is valid (sessions={}, roles={}, follows={}, selected={})",
+                        snapshot.sessions.len(),
+                        snapshot.roles.len(),
+                        snapshot.follows.len(),
+                        snapshot.selected_sessions.len()
+                    ),
+                }),
+                Err(error) => Response::Ok(ResponsePayload::ServerSnapshotRestoreDryRun {
+                    ok: false,
+                    message: format!("snapshot dry-run failed: {error}"),
+                }),
+            }
+        }
         Request::ServerStop => {
             let _ = shutdown_tx.send(true);
             Response::Ok(ResponsePayload::ServerStopping)
@@ -3213,10 +3308,10 @@ mod tests {
             .expect("hello reply should be received");
         let response: Response = decode(&reply.payload).expect("response should decode");
         assert_eq!(reply.request_id, 1);
-        assert_eq!(
+        assert!(matches!(
             response,
-            Response::Ok(ResponsePayload::ServerStatus { running: true })
-        );
+            Response::Ok(ResponsePayload::ServerStatus { running: true, .. })
+        ));
 
         server.request_shutdown();
         server_task
@@ -6220,10 +6315,10 @@ mod tests {
             .await
             .expect("hello reply should be received");
         let response: Response = decode(&reply.payload).expect("response should decode");
-        assert_eq!(
+        assert!(matches!(
             response,
-            Response::Ok(ResponsePayload::ServerStatus { running: true })
-        );
+            Response::Ok(ResponsePayload::ServerStatus { running: true, .. })
+        ));
         client
     }
 
