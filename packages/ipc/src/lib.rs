@@ -140,6 +140,7 @@ pub enum Request {
     ServerStatus,
     ServerSave,
     ServerRestoreDryRun,
+    ServerRestoreApply,
     ServerStop,
     NewSession {
         name: Option<String>,
@@ -275,6 +276,13 @@ pub enum ResponsePayload {
     ServerSnapshotRestoreDryRun {
         ok: bool,
         message: String,
+    },
+    ServerSnapshotRestored {
+        sessions: usize,
+        windows: usize,
+        roles: usize,
+        follows: usize,
+        selected_sessions: usize,
     },
     SessionCreated {
         id: Uuid,

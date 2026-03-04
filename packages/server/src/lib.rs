@@ -66,6 +66,15 @@ struct SnapshotRuntime {
     last_restore_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct RestoreSummary {
+    sessions: usize,
+    windows: usize,
+    roles: usize,
+    follows: usize,
+    selected_sessions: usize,
+}
+
 impl SnapshotRuntime {
     fn disabled() -> Self {
         Self {
@@ -1851,6 +1860,25 @@ fn restore_snapshot_if_present(state: &Arc<ServerState>) -> Result<()> {
         }
     };
 
+    let _ = apply_snapshot_state(state, &snapshot)?;
+
+    {
+        let mut runtime = state
+            .snapshot_runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
+        runtime.dirty = false;
+        runtime.last_marked_at = None;
+        runtime.last_restore_epoch_ms = Some(epoch_millis_now());
+        runtime.last_restore_error = None;
+    }
+
+    Ok(())
+}
+
+fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV1) -> Result<RestoreSummary> {
+    let mut summary = RestoreSummary::default();
+
     {
         let mut session_manager = state
             .session_manager
@@ -1908,7 +1936,11 @@ fn restore_snapshot_if_present(state: &Arc<ServerState>) -> Result<()> {
                     session_snapshot.id
                 );
                 let _ = session_manager.remove_session(&session_id);
+                continue;
             }
+
+            summary.sessions += 1;
+            summary.windows += session_snapshot.windows.len();
         }
     }
 
@@ -1927,6 +1959,7 @@ fn restore_snapshot_if_present(state: &Arc<ServerState>) -> Result<()> {
             let session_id = SessionId(role.session_id);
             if session_manager.get_session(&session_id).is_some() {
                 permission_state.set_role(session_id, ClientId(role.client_id), role.role);
+                summary.roles += 1;
             }
         }
     }
@@ -1952,6 +1985,7 @@ fn restore_snapshot_if_present(state: &Arc<ServerState>) -> Result<()> {
                 follow_state
                     .selected_sessions
                     .insert(ClientId(selected.client_id), selected_session);
+                summary.selected_sessions += 1;
             }
         }
 
@@ -1963,21 +1997,59 @@ fn restore_snapshot_if_present(state: &Arc<ServerState>) -> Result<()> {
                     global: follow.global,
                 },
             );
+            summary.follows += 1;
         }
     }
 
-    {
-        let mut runtime = state
-            .snapshot_runtime
+    Ok(summary)
+}
+
+async fn restore_snapshot_replace(
+    state: &Arc<ServerState>,
+    snapshot: SnapshotV1,
+) -> Result<RestoreSummary> {
+    let removed_runtimes = {
+        let mut runtime_manager = state
+            .session_runtimes
             .lock()
-            .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
-        runtime.dirty = false;
-        runtime.last_marked_at = None;
-        runtime.last_restore_epoch_ms = Some(epoch_millis_now());
-        runtime.last_restore_error = None;
+            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+        runtime_manager.remove_all_runtimes()
+    };
+    for removed_runtime in removed_runtimes {
+        shutdown_runtime_handle(removed_runtime).await;
     }
 
-    Ok(())
+    {
+        let mut session_manager = state
+            .session_manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+        *session_manager = SessionManager::new();
+    }
+    {
+        let mut permission_state = state
+            .permission_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
+        *permission_state = PermissionState::default();
+    }
+    {
+        let mut follow_state = state
+            .follow_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
+        follow_state.follows.clear();
+        follow_state.selected_sessions.clear();
+    }
+    {
+        let mut attach_tokens = state
+            .attach_tokens
+            .lock()
+            .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
+        attach_tokens.clear();
+    }
+
+    apply_snapshot_state(state, &snapshot)
 }
 
 async fn handle_request(
@@ -2046,6 +2118,51 @@ async fn handle_request(
                     message: format!("snapshot dry-run failed: {error}"),
                 }),
             }
+        }
+        Request::ServerRestoreApply => {
+            let manager = {
+                let snapshot_runtime = state
+                    .snapshot_runtime
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
+                snapshot_runtime.manager.clone()
+            };
+            let Some(manager) = manager else {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "snapshot persistence is disabled".to_string(),
+                }));
+            };
+
+            let snapshot = match manager.read_snapshot() {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::InvalidRequest,
+                        message: format!("snapshot restore failed: {error}"),
+                    }));
+                }
+            };
+
+            let summary = restore_snapshot_replace(state, snapshot).await?;
+            {
+                let mut runtime = state
+                    .snapshot_runtime
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
+                runtime.last_restore_epoch_ms = Some(epoch_millis_now());
+                runtime.last_restore_error = None;
+                runtime.dirty = false;
+                runtime.last_marked_at = None;
+            }
+
+            Response::Ok(ResponsePayload::ServerSnapshotRestored {
+                sessions: summary.sessions,
+                windows: summary.windows,
+                roles: summary.roles,
+                follows: summary.follows,
+                selected_sessions: summary.selected_sessions,
+            })
         }
         Request::ServerStop => {
             let _ = shutdown_tx.send(true);

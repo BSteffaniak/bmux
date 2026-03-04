@@ -339,6 +339,9 @@ pub(crate) enum ServerCommand {
         /// Only validate snapshot readability and schema
         #[arg(long)]
         dry_run: bool,
+        /// Confirm replace-restore of current in-memory server state
+        #[arg(long, conflicts_with = "dry_run")]
+        yes: bool,
     },
     /// Request graceful server shutdown
     Stop,
@@ -527,7 +530,29 @@ mod tests {
         let Some(Command::Server { command }) = cli.command else {
             panic!("expected server subcommand");
         };
-        assert!(matches!(command, ServerCommand::Restore { dry_run: true }));
+        assert!(matches!(
+            command,
+            ServerCommand::Restore {
+                dry_run: true,
+                yes: false
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_server_restore_yes_subcommand() {
+        let cli =
+            Cli::try_parse_from(["bmux", "server", "restore", "--yes"]).expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Restore {
+                dry_run: false,
+                yes: true
+            }
+        ));
     }
 
     #[test]

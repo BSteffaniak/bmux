@@ -240,7 +240,7 @@ fn run_command(command: &Command) -> Result<u8> {
             } => run_server_start(*daemon, *foreground_internal),
             ServerCommand::Status => run_server_status(),
             ServerCommand::Save => run_server_save(),
-            ServerCommand::Restore { dry_run } => run_server_restore(*dry_run),
+            ServerCommand::Restore { dry_run, yes } => run_server_restore(*dry_run, *yes),
             ServerCommand::Stop => run_server_stop(),
         },
         Command::Keymap { command } => match command {
@@ -361,28 +361,50 @@ fn run_server_save() -> Result<u8> {
     Ok(0)
 }
 
-fn run_server_restore(dry_run: bool) -> Result<u8> {
-    if !dry_run {
-        anyhow::bail!("server restore currently supports only --dry-run");
+fn run_server_restore(dry_run: bool, yes: bool) -> Result<u8> {
+    if !dry_run && !yes {
+        anyhow::bail!("server restore requires either --dry-run or --yes");
     }
     cleanup_stale_pid_file()?;
-    let (ok, message) = run_async(async {
-        let mut client = BmuxClient::connect_default("bmux-cli-server-restore-dry-run")
+
+    if dry_run {
+        let (ok, message) = run_async(async {
+            let mut client = BmuxClient::connect_default("bmux-cli-server-restore-dry-run")
+                .await
+                .map_err(map_cli_client_error)?;
+            client
+                .server_restore_dry_run()
+                .await
+                .map_err(map_cli_client_error)
+        })?;
+
+        if ok {
+            println!("restore dry-run: OK - {message}");
+            return Ok(0);
+        }
+        println!("restore dry-run: FAIL - {message}");
+        return Ok(1);
+    }
+
+    let summary = run_async(async {
+        let mut client = BmuxClient::connect_default("bmux-cli-server-restore-apply")
             .await
             .map_err(map_cli_client_error)?;
         client
-            .server_restore_dry_run()
+            .server_restore_apply()
             .await
             .map_err(map_cli_client_error)
     })?;
 
-    if ok {
-        println!("restore dry-run: OK - {message}");
-        Ok(0)
-    } else {
-        println!("restore dry-run: FAIL - {message}");
-        Ok(1)
-    }
+    println!(
+        "restore applied: sessions={}, windows={}, roles={}, follows={}, selected_sessions={}",
+        summary.sessions,
+        summary.windows,
+        summary.roles,
+        summary.follows,
+        summary.selected_sessions
+    );
+    Ok(0)
 }
 
 fn latest_server_event_name() -> Result<Option<&'static str>> {

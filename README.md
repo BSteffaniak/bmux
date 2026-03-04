@@ -99,6 +99,7 @@ bmux server start --daemon
 bmux server status
 bmux server save
 bmux server restore --dry-run
+bmux server restore --yes
 bmux server stop
 
 # Create/list/attach/kill sessions (top-level)

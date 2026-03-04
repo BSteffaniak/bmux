@@ -35,6 +35,16 @@ pub struct ServerStatusInfo {
     pub snapshot: ServerSnapshotStatus,
 }
 
+/// Summary returned by apply-restore operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ServerRestoreSummary {
+    pub sessions: usize,
+    pub windows: usize,
+    pub roles: usize,
+    pub follows: usize,
+    pub selected_sessions: usize,
+}
+
 /// Typed client errors.
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -185,6 +195,32 @@ impl BmuxClient {
             ResponsePayload::ServerSnapshotRestoreDryRun { ok, message } => Ok((ok, message)),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected server snapshot restore dry-run",
+            )),
+        }
+    }
+
+    /// Apply snapshot restore, replacing current in-memory server state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn server_restore_apply(&mut self) -> Result<ServerRestoreSummary> {
+        match self.request(Request::ServerRestoreApply).await? {
+            ResponsePayload::ServerSnapshotRestored {
+                sessions,
+                windows,
+                roles,
+                follows,
+                selected_sessions,
+            } => Ok(ServerRestoreSummary {
+                sessions,
+                windows,
+                roles,
+                follows,
+                selected_sessions,
+            }),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected server snapshot restored",
             )),
         }
     }
