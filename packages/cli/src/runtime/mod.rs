@@ -20,7 +20,7 @@ use crossterm::style::Print;
 use crossterm::terminal;
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
@@ -1026,6 +1026,7 @@ async fn run_session_attach_with_client(
         let mut frame_needs_render = view_state.dirty.status_needs_redraw;
 
         if view_state.dirty.layout_needs_refresh || view_state.cached_layout_state.is_none() {
+            let previous_layout = view_state.cached_layout_state.clone();
             let layout_state = match client.attach_layout(view_state.attached_id).await {
                 Ok(state) => state,
                 Err(error) if is_attach_stream_closed_error(&error) => {
@@ -1036,6 +1037,24 @@ async fn run_session_attach_with_client(
             };
             if view_state.cached_layout_state.as_ref() != Some(&layout_state) {
                 frame_needs_render = true;
+                let mut pane_ids = Vec::new();
+                collect_pane_ids(&layout_state.layout_root, &mut pane_ids);
+                for pane_id in pane_ids {
+                    view_state.dirty.pane_dirty_ids.insert(pane_id);
+                }
+                match previous_layout {
+                    None => {
+                        view_state.dirty.full_pane_redraw = true;
+                    }
+                    Some(previous) => {
+                        if previous.layout_root != layout_state.layout_root {
+                            view_state.dirty.full_pane_redraw = true;
+                        } else if previous.focused_pane_id != layout_state.focused_pane_id {
+                            view_state.dirty.pane_dirty_ids.insert(previous.focused_pane_id);
+                            view_state.dirty.pane_dirty_ids.insert(layout_state.focused_pane_id);
+                        }
+                    }
+                }
                 view_state.cached_layout_state = Some(layout_state);
             }
             view_state.dirty.layout_needs_refresh = false;
@@ -1069,6 +1088,7 @@ async fn run_session_attach_with_client(
             }
             let buffer = view_state.pane_buffers.entry(chunk.pane_id).or_default();
             append_pane_output(buffer, &chunk.data);
+            view_state.dirty.pane_dirty_ids.insert(chunk.pane_id);
             frame_needs_render = true;
         }
 
@@ -1465,9 +1485,14 @@ async fn render_attach_frame(
         &layout_state.layout_root,
         layout_state.focused_pane_id,
         &mut view_state.pane_buffers,
+        &view_state.dirty.pane_dirty_ids,
+        view_state.dirty.full_pane_redraw,
     )?;
     apply_attach_cursor_state(&mut stdout, cursor_state)?;
-    stdout.flush().context("failed flushing attach frame")
+    stdout.flush().context("failed flushing attach frame")?;
+    view_state.dirty.full_pane_redraw = false;
+    view_state.dirty.pane_dirty_ids.clear();
+    Ok(())
 }
 
 async fn build_attach_tabs(
@@ -1692,10 +1717,12 @@ enum AttachExitReason {
     Quit,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct AttachDirtyFlags {
     status_needs_redraw: bool,
     layout_needs_refresh: bool,
+    pane_dirty_ids: BTreeSet<Uuid>,
+    full_pane_redraw: bool,
 }
 
 impl Default for AttachDirtyFlags {
@@ -1703,6 +1730,8 @@ impl Default for AttachDirtyFlags {
         Self {
             status_needs_redraw: true,
             layout_needs_refresh: true,
+            pane_dirty_ids: BTreeSet::new(),
+            full_pane_redraw: true,
         }
     }
 }
@@ -1861,6 +1890,7 @@ async fn handle_attach_server_event(
             view_state.ui_mode = AttachUiMode::Normal;
             view_state.dirty.status_needs_redraw = true;
             view_state.dirty.layout_needs_refresh = true;
+            view_state.dirty.full_pane_redraw = true;
             println!("follow handoff -> session {}", view_state.attached_id);
             if !view_state.can_write {
                 println!("read-only attach: input disabled");
@@ -1951,6 +1981,7 @@ async fn handle_attach_terminal_event(
                 } else {
                     view_state.dirty.status_needs_redraw = true;
                     view_state.dirty.layout_needs_refresh = true;
+                    view_state.dirty.full_pane_redraw = true;
                 }
             }
             AttachEventAction::Ui(action) => {
@@ -1971,12 +2002,14 @@ async fn handle_attach_terminal_event(
                     println!("attach action failed: {}", map_attach_client_error(error));
                 } else {
                     view_state.dirty.layout_needs_refresh = true;
+                    view_state.dirty.full_pane_redraw = true;
                 }
                 view_state.dirty.status_needs_redraw = true;
             }
             AttachEventAction::Redraw => {
                 view_state.dirty.status_needs_redraw = true;
                 view_state.dirty.layout_needs_refresh = true;
+                view_state.dirty.full_pane_redraw = true;
             }
             AttachEventAction::Ignore => {}
         }
@@ -2154,6 +2187,8 @@ fn render_attach_panes(
     layout: &PaneLayoutNode,
     focused_pane_id: Uuid,
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+    dirty_pane_ids: &BTreeSet<Uuid>,
+    full_pane_redraw: bool,
 ) -> Result<Option<AttachCursorState>> {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
     if cols == 0 || rows <= 1 {
@@ -2172,36 +2207,42 @@ fn render_attach_panes(
     collect_layout_rects(layout, root, &mut rects);
 
     let mut cursor_state = None;
-    for y in 1..rows {
-        queue!(stdout, MoveTo(0, y), Print(" ".repeat(usize::from(cols))))
-            .context("failed clearing attach pane row")?;
+    if full_pane_redraw {
+        for y in 1..rows {
+            queue!(stdout, MoveTo(0, y), Print(" ".repeat(usize::from(cols))))
+                .context("failed clearing attach pane row")?;
+        }
     }
 
     for (pane_id, rect) in rects {
         if rect.w < 2 || rect.h < 2 {
             continue;
         }
+        let should_draw = full_pane_redraw || dirty_pane_ids.contains(&pane_id);
         let focus = pane_id == focused_pane_id;
-        let hch = if focus { '=' } else { '-' };
-        let top = draw_box_line(usize::from(rect.w), '+', hch, '+');
-        let bottom = draw_box_line(usize::from(rect.w), '+', hch, '+');
-        queue!(stdout, MoveTo(rect.x, rect.y), Print(top)).context("failed drawing pane top")?;
-        queue!(
-            stdout,
-            MoveTo(rect.x, rect.y.saturating_add(rect.h.saturating_sub(1))),
-            Print(bottom)
-        )
-        .context("failed drawing pane bottom")?;
-
-        for y in rect.y.saturating_add(1)..rect.y.saturating_add(rect.h.saturating_sub(1)) {
-            queue!(stdout, MoveTo(rect.x, y), Print("|"))
-                .context("failed drawing pane left border")?;
+        if should_draw {
+            let hch = if focus { '=' } else { '-' };
+            let top = draw_box_line(usize::from(rect.w), '+', hch, '+');
+            let bottom = draw_box_line(usize::from(rect.w), '+', hch, '+');
+            queue!(stdout, MoveTo(rect.x, rect.y), Print(top))
+                .context("failed drawing pane top")?;
             queue!(
                 stdout,
-                MoveTo(rect.x.saturating_add(rect.w.saturating_sub(1)), y),
-                Print("|")
+                MoveTo(rect.x, rect.y.saturating_add(rect.h.saturating_sub(1))),
+                Print(bottom)
             )
-            .context("failed drawing pane right border")?;
+            .context("failed drawing pane bottom")?;
+
+            for y in rect.y.saturating_add(1)..rect.y.saturating_add(rect.h.saturating_sub(1)) {
+                queue!(stdout, MoveTo(rect.x, y), Print("|"))
+                    .context("failed drawing pane left border")?;
+                queue!(
+                    stdout,
+                    MoveTo(rect.x.saturating_add(rect.w.saturating_sub(1)), y),
+                    Print("|")
+                )
+                .context("failed drawing pane right border")?;
+            }
         }
 
         let inner_w_u16 = rect.w.saturating_sub(2);
@@ -2223,6 +2264,9 @@ fn render_attach_panes(
                     y: rect.y.saturating_add(1).saturating_add(cursor_row),
                     visible: !screen.hide_cursor(),
                 });
+            }
+            if !should_draw {
+                continue;
             }
             for row in 0..inner_h {
                 let y = rect.y.saturating_add(1 + row as u16);
@@ -2279,7 +2323,7 @@ fn render_attach_panes(
                 queue!(stdout, MoveTo(rect.x.saturating_add(1), y), Print(line))
                     .context("failed drawing pane content")?;
             }
-        } else {
+        } else if should_draw {
             for row in 0..inner_h {
                 let y = rect.y.saturating_add(1 + row as u16);
                 queue!(
