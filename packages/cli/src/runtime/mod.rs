@@ -273,7 +273,7 @@ async fn run_command(command: &Command) -> Result<u8> {
                 daemon,
                 foreground_internal,
             } => run_server_start(*daemon, *foreground_internal).await,
-            ServerCommand::Status => run_server_status().await,
+            ServerCommand::Status { json } => run_server_status(*json).await,
             ServerCommand::Save => run_server_save().await,
             ServerCommand::Restore { dry_run, yes } => run_server_restore(*dry_run, *yes).await,
             ServerCommand::Stop => run_server_stop().await,
@@ -337,11 +337,56 @@ async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8>
     Ok(0)
 }
 
-async fn run_server_status() -> Result<u8> {
+#[derive(Debug, serde::Serialize)]
+struct ServerStatusJsonPayload {
+    running: bool,
+    latest_server_event: Option<String>,
+    snapshot: Option<bmux_ipc::ServerSnapshotStatus>,
+    server_metadata: Option<ServerRuntimeMetadata>,
+    cli_build: Option<String>,
+    stale_build: bool,
+    stale_warning: Option<String>,
+}
+
+async fn run_server_status(as_json: bool) -> Result<u8> {
     cleanup_stale_pid_file().await?;
     let status = fetch_server_status().await?;
     let metadata = read_server_runtime_metadata()?;
     let current_build_id = current_cli_build_id().ok();
+    let stale_warning = metadata.as_ref().and_then(|entry| {
+        current_build_id
+            .as_ref()
+            .filter(|build| entry.build_id != **build)
+            .map(|build| {
+                format!(
+                    "running server build ({}) differs from current CLI build ({}); restart with `bmux server stop`",
+                    entry.build_id, build
+                )
+            })
+    });
+    let stale_build = stale_warning.is_some();
+
+    if as_json {
+        let latest_event = if matches!(status, Some(ref s) if s.running) {
+            latest_server_event_name().await?.map(str::to_string)
+        } else {
+            None
+        };
+        let payload = ServerStatusJsonPayload {
+            running: matches!(status, Some(ref s) if s.running),
+            latest_server_event: latest_event,
+            snapshot: status.map(|entry| entry.snapshot),
+            server_metadata: metadata,
+            cli_build: current_build_id,
+            stale_build,
+            stale_warning,
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload).context("failed encoding server status json")?
+        );
+        return Ok(if payload.running { 0 } else { 1 });
+    }
 
     match status {
         Some(status) if status.running => {
@@ -359,12 +404,8 @@ async fn run_server_status() -> Result<u8> {
             }
             if let Some(build_id) = current_build_id.as_ref() {
                 println!("cli build: {build_id}");
-                if let Some(metadata) = metadata.as_ref()
-                    && metadata.build_id != *build_id
-                {
-                    println!(
-                        "warning: running server build differs from current CLI build; restart with `bmux server stop` then rerun"
-                    );
+                if let Some(warning) = stale_warning.as_ref() {
+                    println!("warning: {warning}");
                 }
             }
             println!(

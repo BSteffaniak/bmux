@@ -348,7 +348,11 @@ pub(crate) enum ServerCommand {
         foreground_internal: bool,
     },
     /// Check server status
-    Status,
+    Status {
+        /// Print server status as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Trigger immediate server snapshot save
     Save,
     /// Validate persisted snapshot without applying restore
@@ -469,7 +473,17 @@ mod tests {
         let Some(Command::Server { command }) = cli.command else {
             panic!("expected server subcommand");
         };
-        assert!(matches!(command, ServerCommand::Status));
+        assert!(matches!(command, ServerCommand::Status { json: false }));
+    }
+
+    #[test]
+    fn parses_server_status_json_flag() {
+        let cli =
+            Cli::try_parse_from(["bmux", "server", "status", "--json"]).expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(command, ServerCommand::Status { json: true }));
     }
 
     #[test]
