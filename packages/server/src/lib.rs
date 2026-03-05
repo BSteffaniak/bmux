@@ -4534,12 +4534,7 @@ async fn handle_request(
                     .session_runtimes
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                runtime_manager.read_pane_output_batch(
-                    session_id,
-                    client_id,
-                    &pane_ids,
-                    max_bytes,
-                )
+                runtime_manager.read_pane_output_batch(session_id, client_id, &pane_ids, max_bytes)
             };
             match chunks {
                 Ok(chunks) => Response::Ok(ResponsePayload::AttachPaneOutputBatch { chunks }),

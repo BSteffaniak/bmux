@@ -2,7 +2,7 @@ use crate::cli::{
     Cli, Command, KeymapCommand, RoleValue, ServerCommand, SessionCommand, TerminalCommand,
     TraceFamily, WindowCommand,
 };
-use crate::input::{InputProcessor, RuntimeAction};
+use crate::input::{InputProcessor, Keymap, RuntimeAction};
 use crate::status::{AttachTab, build_attach_status_line};
 use anyhow::{Context, Result};
 use bmux_client::{AttachLayoutState, BmuxClient, ClientError};
@@ -853,7 +853,8 @@ async fn run_session_attach_with_client(
             BmuxConfig::default()
         }
     };
-    let mut attach_input_processor = InputProcessor::new(attach_keymap_from_config(&attach_config));
+    let attach_keymap = attach_keymap_from_config(&attach_config);
+    let mut attach_input_processor = InputProcessor::new(attach_keymap.clone());
 
     if let Some(leader_client_id) = follow_target_id {
         client
@@ -915,7 +916,11 @@ async fn run_session_attach_with_client(
     if !can_write {
         println!("read-only attach: input disabled");
     }
-    println!("press Ctrl-A d to detach");
+    if let Some(detach_key) = attach_keymap.primary_binding_for_action(&RuntimeAction::Detach) {
+        println!("press {detach_key} to detach");
+    } else {
+        println!("detach is unbound in current keymap");
+    }
     client
         .subscribe_events()
         .await
@@ -1046,7 +1051,10 @@ async fn run_session_attach_with_client(
                             )
                             .await
                             {
-                                println!("attach action failed: {}", map_attach_client_error(error));
+                                println!(
+                                    "attach action failed: {}",
+                                    map_attach_client_error(error)
+                                );
                             } else {
                                 status_needs_redraw = true;
                                 layout_needs_refresh = true;
@@ -1067,7 +1075,10 @@ async fn run_session_attach_with_client(
                             )
                             .await
                             {
-                                println!("attach action failed: {}", map_attach_client_error(error));
+                                println!(
+                                    "attach action failed: {}",
+                                    map_attach_client_error(error)
+                                );
                             } else {
                                 layout_needs_refresh = true;
                             }
@@ -1146,6 +1157,7 @@ async fn run_session_attach_with_client(
                     follow_target_id,
                     global,
                     quit_confirmation_pending,
+                    &attach_keymap,
                 )
                 .await
                 .map_err(map_attach_client_error)?,
@@ -1416,6 +1428,7 @@ async fn build_attach_status_line_for_draw(
     follow_target_id: Option<Uuid>,
     follow_global: bool,
     quit_confirmation_pending: bool,
+    keymap: &Keymap,
 ) -> std::result::Result<String, ClientError> {
     let (cols, _) = terminal::size().unwrap_or((0, 0));
     if cols == 0 {
@@ -1437,12 +1450,9 @@ async fn build_attach_status_line_for_draw(
         }
     });
     let hint = if quit_confirmation_pending {
-        "Quit session and all panes? [y/N]"
+        "Quit session and all panes? [y/N]".to_string()
     } else {
-        match ui_mode {
-            AttachUiMode::Normal => "Ctrl-T window mode | Ctrl-A d detach | Ctrl-A q quit",
-            AttachUiMode::Window => "h/l prev/next | 1-9 goto | n new | x close | Esc/Enter exit",
-        }
+        attach_mode_hint(ui_mode, keymap)
     };
 
     let status_line = build_attach_status_line(
@@ -1451,7 +1461,7 @@ async fn build_attach_status_line_for_draw(
         mode_label,
         role_label,
         follow_label.as_deref(),
-        hint,
+        &hint,
     );
 
     Ok(format_status_line_for_width(&status_line, cols))
@@ -1466,6 +1476,34 @@ fn format_status_line_for_width(status_line: &str, cols: u16) -> String {
         rendered.push_str(&" ".repeat(width - rendered.len()));
     }
     rendered
+}
+
+fn attach_mode_hint(ui_mode: AttachUiMode, keymap: &Keymap) -> String {
+    match ui_mode {
+        AttachUiMode::Normal => {
+            let window_mode = key_hint_or_unbound(keymap, RuntimeAction::EnterWindowMode);
+            let detach = key_hint_or_unbound(keymap, RuntimeAction::Detach);
+            let quit = key_hint_or_unbound(keymap, RuntimeAction::Quit);
+            format!("{window_mode} window mode | {detach} detach | {quit} quit")
+        }
+        AttachUiMode::Window => {
+            let prev = key_hint_or_unbound(keymap, RuntimeAction::WindowPrev);
+            let next = key_hint_or_unbound(keymap, RuntimeAction::WindowNext);
+            let goto_one = key_hint_or_unbound(keymap, RuntimeAction::WindowGoto1);
+            let new_window = key_hint_or_unbound(keymap, RuntimeAction::NewWindow);
+            let close = key_hint_or_unbound(keymap, RuntimeAction::WindowClose);
+            let exit = key_hint_or_unbound(keymap, RuntimeAction::ExitMode);
+            format!(
+                "{prev}/{next} prev/next | {goto_one} goto-1 | {new_window} new | {close} close | {exit} exit"
+            )
+        }
+    }
+}
+
+fn key_hint_or_unbound(keymap: &Keymap, action: RuntimeAction) -> String {
+    keymap
+        .primary_binding_for_action(&action)
+        .unwrap_or_else(|| "unbound".to_string())
 }
 
 fn queue_attach_status_line(stdout: &mut io::Stdout, status_line: &str) -> Result<()> {
@@ -2555,8 +2593,12 @@ fn server_runtime_metadata_file_path() -> PathBuf {
 
 fn current_cli_build_id() -> Result<String> {
     let executable = std::env::current_exe().context("failed resolving current executable")?;
-    let metadata = std::fs::metadata(&executable)
-        .with_context(|| format!("failed reading executable metadata {}", executable.display()))?;
+    let metadata = std::fs::metadata(&executable).with_context(|| {
+        format!(
+            "failed reading executable metadata {}",
+            executable.display()
+        )
+    })?;
     let modified = metadata
         .modified()
         .ok()
@@ -2585,7 +2627,8 @@ fn write_server_runtime_metadata(pid: u32) -> Result<()> {
             .with_context(|| format!("failed creating runtime dir {}", parent.display()))?;
     }
     let metadata = current_server_runtime_metadata(pid)?;
-    let payload = serde_json::to_vec_pretty(&metadata).context("failed encoding server metadata")?;
+    let payload =
+        serde_json::to_vec_pretty(&metadata).context("failed encoding server metadata")?;
     std::fs::write(&path, payload)
         .with_context(|| format!("failed writing server metadata file {}", path.display()))
 }
@@ -2596,8 +2639,9 @@ fn read_server_runtime_metadata() -> Result<Option<ServerRuntimeMetadata>> {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(error) => {
-            return Err(error)
-                .with_context(|| format!("failed reading server metadata file {}", path.display()));
+            return Err(error).with_context(|| {
+                format!("failed reading server metadata file {}", path.display())
+            });
         }
     };
     let metadata = serde_json::from_slice::<ServerRuntimeMetadata>(&bytes).with_context(|| {
@@ -3312,16 +3356,15 @@ mod tests {
         map_cli_client_error, merged_runtime_keybindings, parse_pid_content, profile_for_term,
         protocol_profile_for_terminal_profile, resolve_pane_term_with_checker,
     };
-    use crate::input::{InputProcessor, Keymap};
+    use crate::input::InputProcessor;
     use bmux_client::ClientError;
     use bmux_config::BmuxConfig;
     use bmux_ipc::ErrorCode;
     use bmux_ipc::transport::IpcTransportError;
     use crossterm::event::{
-        Event, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
+        KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
         KeyEventKind as CrosstermKeyEventKind, KeyModifiers,
     };
-    use std::collections::BTreeMap;
 
     #[test]
     fn pane_term_profile_mapping_is_stable() {
@@ -3798,6 +3841,98 @@ mod tests {
                 crate::input::RuntimeAction::NewSession
             ))
         ));
+    }
+
+    #[test]
+    fn attach_mode_hint_reflects_remapped_normal_mode_keys() {
+        let mut config = BmuxConfig::default();
+        config
+            .keybindings
+            .runtime
+            .insert("d".to_string(), "quit".to_string());
+        config
+            .keybindings
+            .global
+            .insert("ctrl+t".to_string(), "new_session".to_string());
+        config
+            .keybindings
+            .runtime
+            .insert("z".to_string(), "detach".to_string());
+        config
+            .keybindings
+            .global
+            .insert("ctrl+w".to_string(), "enter_window_mode".to_string());
+
+        let keymap = attach_keymap_from_config(&config);
+        let hint = super::attach_mode_hint(super::AttachUiMode::Normal, &keymap);
+        assert!(hint.contains("Ctrl-W window mode"));
+        assert!(hint.contains("Ctrl-A z detach"));
+        assert!(hint.contains("Ctrl-A d quit"));
+    }
+
+    #[test]
+    fn attach_mode_hint_reflects_window_mode_overrides() {
+        let mut config = BmuxConfig::default();
+        config
+            .keybindings
+            .global
+            .insert("h".to_string(), "new_session".to_string());
+        config
+            .keybindings
+            .global
+            .insert("l".to_string(), "new_session".to_string());
+        config
+            .keybindings
+            .global
+            .insert("1".to_string(), "new_session".to_string());
+        config
+            .keybindings
+            .global
+            .insert("n".to_string(), "new_session".to_string());
+        config
+            .keybindings
+            .global
+            .insert("x".to_string(), "new_session".to_string());
+        config
+            .keybindings
+            .global
+            .insert("escape".to_string(), "new_session".to_string());
+        config
+            .keybindings
+            .global
+            .insert("enter".to_string(), "new_session".to_string());
+        config
+            .keybindings
+            .global
+            .insert("u".to_string(), "window_prev".to_string());
+        config
+            .keybindings
+            .global
+            .insert("i".to_string(), "window_next".to_string());
+        config
+            .keybindings
+            .global
+            .insert("0".to_string(), "window_goto_1".to_string());
+        config
+            .keybindings
+            .global
+            .insert("m".to_string(), "new_window".to_string());
+        config
+            .keybindings
+            .global
+            .insert("k".to_string(), "window_close".to_string());
+        config
+            .keybindings
+            .global
+            .insert("ctrl+g".to_string(), "exit_mode".to_string());
+
+        let keymap = attach_keymap_from_config(&config);
+        let hint = super::attach_mode_hint(super::AttachUiMode::Window, &keymap);
+        assert!(hint.contains("u/i prev/next"));
+        assert!(hint.contains("0 goto-1"));
+        assert!(hint.contains("m new"));
+        assert!(hint.contains("k close"));
+        assert!(hint.contains("Ctrl-G exit"));
     }
 
     #[test]

@@ -308,6 +308,29 @@ impl Keymap {
         }
     }
 
+    pub(crate) fn primary_binding_for_action(&self, action: &RuntimeAction) -> Option<String> {
+        let mut best: Option<(usize, u8, String)> = None;
+
+        for (scope_rank, bindings) in [
+            (0_u8, &self.global_bindings),
+            (1_u8, &self.runtime_bindings),
+        ] {
+            for binding in bindings {
+                if &binding.action != action {
+                    continue;
+                }
+
+                let display = display_chord(&binding.chord);
+                let candidate = (binding.chord.len(), scope_rank, display.clone());
+                if best.as_ref().is_none_or(|current| candidate < *current) {
+                    best = Some(candidate);
+                }
+            }
+        }
+
+        best.map(|(_, _, display)| display)
+    }
+
     fn overlap_warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
 
@@ -847,6 +870,65 @@ fn chord_to_string(chord: &[KeyStroke]) -> String {
         .join(" ")
 }
 
+fn display_chord(chord: &[KeyStroke]) -> String {
+    chord
+        .iter()
+        .map(display_stroke)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn display_stroke(stroke: &KeyStroke) -> String {
+    let uppercase_shift_char = matches!(stroke.key, KeyCode::Char(c) if c.is_ascii_alphabetic())
+        && stroke.shift
+        && !stroke.ctrl
+        && !stroke.alt
+        && !stroke.super_key;
+    let uppercase_modified_char = matches!(stroke.key, KeyCode::Char(c) if c.is_ascii_alphabetic())
+        && (stroke.ctrl || stroke.alt || stroke.super_key);
+
+    let mut parts = Vec::new();
+    if stroke.ctrl {
+        parts.push("Ctrl".to_string());
+    }
+    if stroke.alt {
+        parts.push("Alt".to_string());
+    }
+    if stroke.super_key {
+        parts.push("Super".to_string());
+    }
+    if stroke.shift && !uppercase_shift_char {
+        parts.push("Shift".to_string());
+    }
+
+    let key = match stroke.key {
+        KeyCode::Char('+') => "+".to_string(),
+        KeyCode::Char('-') => "-".to_string(),
+        KeyCode::Char(c) if uppercase_shift_char || uppercase_modified_char => {
+            c.to_ascii_uppercase().to_string()
+        }
+        KeyCode::Char(c) => c.to_string(),
+        KeyCode::Enter => "Enter".to_string(),
+        KeyCode::Escape => "Esc".to_string(),
+        KeyCode::Tab => "Tab".to_string(),
+        KeyCode::Backspace => "Backspace".to_string(),
+        KeyCode::Space => "Space".to_string(),
+        KeyCode::ArrowUp => "Up".to_string(),
+        KeyCode::ArrowDown => "Down".to_string(),
+        KeyCode::ArrowLeft => "Left".to_string(),
+        KeyCode::ArrowRight => "Right".to_string(),
+        KeyCode::Home => "Home".to_string(),
+        KeyCode::End => "End".to_string(),
+        KeyCode::PageUp => "PgUp".to_string(),
+        KeyCode::PageDown => "PgDn".to_string(),
+        KeyCode::Insert => "Insert".to_string(),
+        KeyCode::Delete => "Delete".to_string(),
+        KeyCode::Function(n) => format!("F{n}"),
+    };
+    parts.push(key);
+    parts.join("-")
+}
+
 fn stroke_to_string(stroke: &KeyStroke) -> String {
     let mut parts = Vec::new();
     if stroke.ctrl {
@@ -1239,6 +1321,43 @@ mod tests {
             processor.process_chunk(&[0x01, b'q']),
             vec![RuntimeAction::Quit]
         );
+    }
+
+    #[test]
+    fn primary_binding_displays_shifted_letter_as_uppercase() {
+        let keymap = Keymap::default_runtime();
+        let binding = keymap
+            .primary_binding_for_action(&RuntimeAction::NewSession)
+            .expect("new_session should be bound by default");
+        assert_eq!(binding, "Ctrl-A C");
+    }
+
+    #[test]
+    fn primary_binding_prefers_global_when_length_ties() {
+        let mut runtime = BTreeMap::new();
+        runtime.insert("w".to_string(), "show_help".to_string());
+        let mut global = BTreeMap::new();
+        global.insert("ctrl+b w".to_string(), "show_help".to_string());
+
+        let keymap = Keymap::from_parts("ctrl+a", 400, &runtime, &global).expect("valid keymap");
+        let binding = keymap
+            .primary_binding_for_action(&RuntimeAction::ShowHelp)
+            .expect("show_help should be bound");
+        assert_eq!(binding, "Ctrl-B w");
+    }
+
+    #[test]
+    fn primary_binding_prefers_shortest_chord() {
+        let mut runtime = BTreeMap::new();
+        runtime.insert("q".to_string(), "quit".to_string());
+        runtime.insert("w q".to_string(), "quit".to_string());
+
+        let keymap =
+            Keymap::from_parts("ctrl+a", 400, &runtime, &BTreeMap::new()).expect("valid keymap");
+        let binding = keymap
+            .primary_binding_for_action(&RuntimeAction::Quit)
+            .expect("quit should be bound");
+        assert_eq!(binding, "Ctrl-A q");
     }
 
     #[test]

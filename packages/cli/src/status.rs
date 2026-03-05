@@ -1,3 +1,4 @@
+use crate::input::{Keymap, RuntimeAction};
 use std::io::{self, Write};
 use std::path::Path;
 
@@ -13,12 +14,18 @@ pub(crate) fn build_status_line(
     cols: u16,
     rows: u16,
     focused_pane: usize,
+    keymap: &Keymap,
     debug_suffix: Option<&str>,
 ) -> String {
     let focused_label = if focused_pane == 0 { "left" } else { "right" };
+    let switch_hint = key_hint_or_unbound(keymap, RuntimeAction::FocusNext);
+    let scroll_hint = key_hint_or_unbound(keymap, RuntimeAction::EnterScrollMode);
+    let detach_hint = key_hint_or_unbound(keymap, RuntimeAction::Detach);
+    let quit_hint = key_hint_or_unbound(keymap, RuntimeAction::Quit);
+    let help_hint = key_hint_or_unbound(keymap, RuntimeAction::ShowHelp);
 
     let mut status = format!(
-        " bmux | shell: {shell_name} | cwd: {} | size: {cols}x{rows} | focus: {focused_label} | Ctrl-A o switch | Ctrl-A [ scroll | Ctrl-A d detach | Ctrl-A q quit | Ctrl-A ? help ",
+        " bmux | shell: {shell_name} | cwd: {} | size: {cols}x{rows} | focus: {focused_label} | {switch_hint} switch | {scroll_hint} scroll | {detach_hint} detach | {quit_hint} quit | {help_hint} help ",
         cwd.display()
     );
 
@@ -28,6 +35,12 @@ pub(crate) fn build_status_line(
     }
 
     status
+}
+
+fn key_hint_or_unbound(keymap: &Keymap, action: RuntimeAction) -> String {
+    keymap
+        .primary_binding_for_action(&action)
+        .unwrap_or_else(|| "unbound".to_string())
 }
 
 pub(crate) fn write_status_line(status_line: &str, cols: u16) -> io::Result<()> {
