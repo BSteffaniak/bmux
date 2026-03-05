@@ -201,18 +201,22 @@ pub enum Request {
     },
     SplitPane {
         session: Option<SessionSelector>,
+        target: Option<PaneSelector>,
         direction: PaneSplitDirection,
     },
     FocusPane {
         session: Option<SessionSelector>,
-        direction: PaneFocusDirection,
+        target: Option<PaneSelector>,
+        direction: Option<PaneFocusDirection>,
     },
     ResizePane {
         session: Option<SessionSelector>,
+        target: Option<PaneSelector>,
         delta: i16,
     },
     ClosePane {
         session: Option<SessionSelector>,
+        target: Option<PaneSelector>,
     },
     ListPanes {
         session: Option<SessionSelector>,

@@ -10,7 +10,8 @@ pub use bmux_ipc::Event as ServerEvent;
 use bmux_ipc::transport::{IpcTransportError, LocalIpcStream};
 use bmux_ipc::{
     AttachGrant, ClientSummary, Envelope, EnvelopeKind, ErrorCode, IpcEndpoint, PaneFocusDirection,
-    PaneSplitDirection, PaneSummary, ProtocolVersion, Request, Response, ResponsePayload,
+    PaneSelector, PaneSplitDirection, PaneSummary, ProtocolVersion, Request, Response,
+    ResponsePayload,
     ServerSnapshotStatus, SessionPermissionSummary, SessionRole, SessionSelector, SessionSummary,
     WindowSelector, WindowSummary, decode, encode,
 };
@@ -415,7 +416,30 @@ impl BmuxClient {
         direction: PaneSplitDirection,
     ) -> Result<Uuid> {
         match self
-            .request(Request::SplitPane { session, direction })
+            .request(Request::SplitPane {
+                session,
+                target: None,
+                direction,
+            })
+            .await?
+        {
+            ResponsePayload::PaneSplit { id, .. } => Ok(id),
+            _ => Err(ClientError::UnexpectedResponse("expected pane split")),
+        }
+    }
+
+    pub async fn split_pane_target(
+        &mut self,
+        session: Option<SessionSelector>,
+        target: PaneSelector,
+        direction: PaneSplitDirection,
+    ) -> Result<Uuid> {
+        match self
+            .request(Request::SplitPane {
+                session,
+                target: Some(target),
+                direction,
+            })
             .await?
         {
             ResponsePayload::PaneSplit { id, .. } => Ok(id),
@@ -429,7 +453,29 @@ impl BmuxClient {
         direction: PaneFocusDirection,
     ) -> Result<Uuid> {
         match self
-            .request(Request::FocusPane { session, direction })
+            .request(Request::FocusPane {
+                session,
+                target: None,
+                direction: Some(direction),
+            })
+            .await?
+        {
+            ResponsePayload::PaneFocused { id, .. } => Ok(id),
+            _ => Err(ClientError::UnexpectedResponse("expected pane focused")),
+        }
+    }
+
+    pub async fn focus_pane_target(
+        &mut self,
+        session: Option<SessionSelector>,
+        target: PaneSelector,
+    ) -> Result<Uuid> {
+        match self
+            .request(Request::FocusPane {
+                session,
+                target: Some(target),
+                direction: None,
+            })
             .await?
         {
             ResponsePayload::PaneFocused { id, .. } => Ok(id),
@@ -442,14 +488,63 @@ impl BmuxClient {
         session: Option<SessionSelector>,
         delta: i16,
     ) -> Result<()> {
-        match self.request(Request::ResizePane { session, delta }).await? {
+        match self
+            .request(Request::ResizePane {
+                session,
+                target: None,
+                delta,
+            })
+            .await?
+        {
+            ResponsePayload::PaneResized { .. } => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse("expected pane resized")),
+        }
+    }
+
+    pub async fn resize_pane_target(
+        &mut self,
+        session: Option<SessionSelector>,
+        target: PaneSelector,
+        delta: i16,
+    ) -> Result<()> {
+        match self
+            .request(Request::ResizePane {
+                session,
+                target: Some(target),
+                delta,
+            })
+            .await?
+        {
             ResponsePayload::PaneResized { .. } => Ok(()),
             _ => Err(ClientError::UnexpectedResponse("expected pane resized")),
         }
     }
 
     pub async fn close_pane(&mut self, session: Option<SessionSelector>) -> Result<()> {
-        match self.request(Request::ClosePane { session }).await? {
+        match self
+            .request(Request::ClosePane {
+                session,
+                target: None,
+            })
+            .await?
+        {
+            ResponsePayload::PaneClosed { .. } => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse("expected pane closed")),
+        }
+    }
+
+    pub async fn close_pane_target(
+        &mut self,
+        session: Option<SessionSelector>,
+        target: PaneSelector,
+    ) -> Result<()> {
+        match self
+            .request(Request::ClosePane {
+                session,
+                target: Some(target),
+            })
+            .await?
+        {
             ResponsePayload::PaneClosed { .. } => Ok(()),
             _ => Err(ClientError::UnexpectedResponse("expected pane closed")),
         }
@@ -695,7 +790,10 @@ fn endpoint_from_paths(paths: &ConfigPaths) -> IpcEndpoint {
 #[cfg(test)]
 mod tests {
     use super::{BmuxClient, ServerEvent};
-    use bmux_ipc::{IpcEndpoint, SessionRole, SessionSelector, WindowSelector};
+    use bmux_ipc::{
+        IpcEndpoint, PaneFocusDirection, PaneSelector, PaneSplitDirection, SessionRole,
+        SessionSelector, WindowSelector,
+    };
     use bmux_server::BmuxServer;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -1044,6 +1142,80 @@ mod tests {
         }));
 
         owner.stop_server().await.expect("stop should succeed");
+        server_task
+            .await
+            .expect("server task should join")
+            .expect("server should stop cleanly");
+
+        if socket_path.exists() {
+            std::fs::remove_file(&socket_path).expect("socket cleanup should succeed");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn client_pane_selector_operations_target_active_index_and_id() {
+        let (server_task, socket_path, endpoint) = start_server().await;
+        let mut client = BmuxClient::connect(&endpoint, Duration::from_secs(2), "pane-selector")
+            .await
+            .expect("client should connect");
+
+        let session_id = client
+            .new_session(Some("pane-session".to_string()))
+            .await
+            .expect("session should be created");
+        let session = Some(SessionSelector::ById(session_id));
+
+        let second_pane = client
+            .split_pane(session.clone(), PaneSplitDirection::Vertical)
+            .await
+            .expect("split active pane should succeed");
+        let third_pane = client
+            .split_pane_target(
+                session.clone(),
+                PaneSelector::ByIndex(1),
+                PaneSplitDirection::Horizontal,
+            )
+            .await
+            .expect("split indexed pane should succeed");
+
+        let panes = client
+            .list_panes(session.clone())
+            .await
+            .expect("list panes should succeed");
+        assert_eq!(panes.len(), 3);
+        assert!(panes.iter().any(|pane| pane.id == second_pane));
+        assert!(panes.iter().any(|pane| pane.id == third_pane && pane.focused));
+
+        let focused_by_id = client
+            .focus_pane_target(session.clone(), PaneSelector::ById(second_pane))
+            .await
+            .expect("focus by id should succeed");
+        assert_eq!(focused_by_id, second_pane);
+
+        let focused_prev = client
+            .focus_pane(session.clone(), PaneFocusDirection::Prev)
+            .await
+            .expect("focus by direction should succeed");
+        assert_ne!(focused_prev, second_pane);
+
+        client
+            .resize_pane_target(session.clone(), PaneSelector::ByIndex(1), 1)
+            .await
+            .expect("resize by index should succeed");
+        client
+            .close_pane_target(session.clone(), PaneSelector::ById(third_pane))
+            .await
+            .expect("close by id should succeed");
+
+        let panes_after_close = client
+            .list_panes(session)
+            .await
+            .expect("list panes after close should succeed");
+        assert_eq!(panes_after_close.len(), 2);
+        assert!(!panes_after_close.iter().any(|pane| pane.id == third_pane));
+
+        client.stop_server().await.expect("stop should succeed");
         server_task
             .await
             .expect("server task should join")
