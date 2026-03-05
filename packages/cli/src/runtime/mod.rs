@@ -70,6 +70,7 @@ pub(crate) async fn run() -> Result<u8> {
 
 async fn run_default_server_attach() -> Result<u8> {
     ensure_server_running_for_default_attach().await?;
+    warn_stale_server_build_on_default_attach()?;
     let mut client = BmuxClient::connect_default("bmux-cli-default-attach")
         .await
         .map_err(map_cli_client_error)?;
@@ -80,13 +81,25 @@ async fn run_default_server_attach() -> Result<u8> {
 
 async fn ensure_server_running_for_default_attach() -> Result<()> {
     if server_is_running().await? {
-        maybe_warn_stale_server_build()?;
         return Ok(());
     }
 
     let _ = run_server_start(true, false).await?;
     if !server_is_running().await? {
         anyhow::bail!("bmux server failed to start for default attach")
+    }
+    Ok(())
+}
+
+fn warn_stale_server_build_on_default_attach() -> Result<()> {
+    let Some(metadata) = read_server_runtime_metadata()? else {
+        return Ok(());
+    };
+    let current_build = current_cli_build_id()?;
+    if metadata.build_id != current_build {
+        eprintln!(
+            "bmux warning: running server build differs from current CLI build; restart with `bmux server stop`"
+        );
     }
     Ok(())
 }
@@ -2563,20 +2576,6 @@ fn remove_server_runtime_metadata_file() -> Result<()> {
         Err(error) => Err(error)
             .with_context(|| format!("failed removing server metadata file {}", path.display())),
     }
-}
-
-fn maybe_warn_stale_server_build() -> Result<()> {
-    let Some(metadata) = read_server_runtime_metadata()? else {
-        return Ok(());
-    };
-    let current_build = current_cli_build_id()?;
-    if metadata.build_id != current_build {
-        eprintln!(
-            "bmux warning: running server build ({}) differs from current CLI build ({}); restart with `bmux server stop`",
-            metadata.build_id, current_build
-        );
-    }
-    Ok(())
 }
 
 fn write_server_pid_file(pid: u32) -> Result<()> {
