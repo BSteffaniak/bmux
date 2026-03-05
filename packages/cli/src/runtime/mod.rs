@@ -1040,7 +1040,7 @@ async fn run_session_attach_with_client(
         }
         view_state.dirty.layout_needs_refresh = false;
 
-        let Some(layout_state) = view_state.cached_layout_state.as_ref() else {
+        let Some(layout_state) = view_state.cached_layout_state.clone() else {
             continue;
         };
 
@@ -1075,37 +1075,15 @@ async fn run_session_attach_with_client(
             continue;
         }
 
-        if view_state.dirty.status_needs_redraw {
-            view_state.cached_status_line = Some(
-                build_attach_status_line_for_draw(
-                    &mut client,
-                    view_state.attached_id,
-                    view_state.can_write,
-                    view_state.ui_mode,
-                    follow_target_id,
-                    global,
-                    view_state.quit_confirmation_pending,
-                    &attach_keymap,
-                )
-                .await
-                .map_err(map_attach_client_error)?,
-            );
-            view_state.dirty.status_needs_redraw = false;
-        }
-
-        let mut stdout = io::stdout();
-        queue!(stdout, Hide).context("failed queuing hide cursor for attach frame")?;
-        if let Some(status_line) = view_state.cached_status_line.as_deref() {
-            queue_attach_status_line(&mut stdout, status_line)?;
-        }
-        let cursor_state = render_attach_panes(
-            &mut stdout,
-            &layout_state.layout_root,
-            layout_state.focused_pane_id,
-            &mut view_state.pane_buffers,
-        )?;
-        apply_attach_cursor_state(&mut stdout, cursor_state)?;
-        stdout.flush().context("failed flushing attach frame")?;
+        render_attach_frame(
+            &mut client,
+            &mut view_state,
+            &layout_state,
+            follow_target_id,
+            global,
+            &attach_keymap,
+        )
+        .await?;
     }
 
     drop(raw_mode_guard);
@@ -1448,6 +1426,47 @@ fn queue_attach_status_line(stdout: &mut io::Stdout, status_line: &str) -> Resul
         Print("\x1b[0m")
     )
     .context("failed queuing attach status line")
+}
+
+async fn render_attach_frame(
+    client: &mut BmuxClient,
+    view_state: &mut AttachViewState,
+    layout_state: &AttachLayoutState,
+    follow_target_id: Option<Uuid>,
+    follow_global: bool,
+    keymap: &crate::input::Keymap,
+) -> Result<()> {
+    if view_state.dirty.status_needs_redraw {
+        view_state.cached_status_line = Some(
+            build_attach_status_line_for_draw(
+                client,
+                view_state.attached_id,
+                view_state.can_write,
+                view_state.ui_mode,
+                follow_target_id,
+                follow_global,
+                view_state.quit_confirmation_pending,
+                keymap,
+            )
+            .await
+            .map_err(map_attach_client_error)?,
+        );
+        view_state.dirty.status_needs_redraw = false;
+    }
+
+    let mut stdout = io::stdout();
+    queue!(stdout, Hide).context("failed queuing hide cursor for attach frame")?;
+    if let Some(status_line) = view_state.cached_status_line.as_deref() {
+        queue_attach_status_line(&mut stdout, status_line)?;
+    }
+    let cursor_state = render_attach_panes(
+        &mut stdout,
+        &layout_state.layout_root,
+        layout_state.focused_pane_id,
+        &mut view_state.pane_buffers,
+    )?;
+    apply_attach_cursor_state(&mut stdout, cursor_state)?;
+    stdout.flush().context("failed flushing attach frame")
 }
 
 async fn build_attach_tabs(
