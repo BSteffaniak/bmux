@@ -1479,12 +1479,35 @@ fn filtered_attach_keybindings(
     std::collections::BTreeMap<String, String>,
     std::collections::BTreeMap<String, String>,
 ) {
-    let (mut runtime, mut global) = merged_runtime_keybindings(config);
-    runtime.retain(|_, action| is_attach_keymap_action(action));
-    global.retain(|_, action| is_attach_keymap_action(action));
+    let (runtime, global) = merged_runtime_keybindings(config);
+    let mut runtime = normalize_attach_keybindings(runtime, "runtime");
+    let mut global = normalize_attach_keybindings(global, "global");
 
     inject_attach_global_defaults(&mut global);
     (runtime, global)
+}
+
+fn normalize_attach_keybindings(
+    bindings: std::collections::BTreeMap<String, String>,
+    scope: &str,
+) -> std::collections::BTreeMap<String, String> {
+    bindings
+        .into_iter()
+        .filter_map(
+            |(chord, action_name)| match crate::input::parse_runtime_action_name(&action_name) {
+                Ok(action) if is_attach_runtime_action(&action) => {
+                    Some((chord, crate::input::action_to_name(&action).to_string()))
+                }
+                Ok(_) => None,
+                Err(error) => {
+                    eprintln!(
+                        "bmux warning: dropping invalid {scope} keybinding '{chord}' -> '{action_name}' ({error})"
+                    );
+                    None
+                }
+            },
+        )
+        .collect()
 }
 
 fn inject_attach_global_defaults(global: &mut std::collections::BTreeMap<String, String>) {
@@ -1514,41 +1537,41 @@ fn inject_attach_global_defaults(global: &mut std::collections::BTreeMap<String,
     }
 }
 
-fn is_attach_keymap_action(action: &str) -> bool {
+fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
     matches!(
-        action.trim().to_ascii_lowercase().as_str(),
-        "detach"
-            | "quit"
-            | "new_window"
-            | "new_session"
-            | "enter_window_mode"
-            | "exit_mode"
-            | "window_prev"
-            | "window_next"
-            | "window_goto_1"
-            | "window_goto_2"
-            | "window_goto_3"
-            | "window_goto_4"
-            | "window_goto_5"
-            | "window_goto_6"
-            | "window_goto_7"
-            | "window_goto_8"
-            | "window_goto_9"
-            | "window_close"
-            | "split_focused_vertical"
-            | "split_focused_horizontal"
-            | "focus_next"
-            | "focus_left"
-            | "focus_right"
-            | "focus_up"
-            | "focus_down"
-            | "increase_split"
-            | "decrease_split"
-            | "resize_left"
-            | "resize_right"
-            | "resize_up"
-            | "resize_down"
-            | "close_focused_pane"
+        action,
+        RuntimeAction::Detach
+            | RuntimeAction::Quit
+            | RuntimeAction::NewWindow
+            | RuntimeAction::NewSession
+            | RuntimeAction::EnterWindowMode
+            | RuntimeAction::ExitMode
+            | RuntimeAction::WindowPrev
+            | RuntimeAction::WindowNext
+            | RuntimeAction::WindowGoto1
+            | RuntimeAction::WindowGoto2
+            | RuntimeAction::WindowGoto3
+            | RuntimeAction::WindowGoto4
+            | RuntimeAction::WindowGoto5
+            | RuntimeAction::WindowGoto6
+            | RuntimeAction::WindowGoto7
+            | RuntimeAction::WindowGoto8
+            | RuntimeAction::WindowGoto9
+            | RuntimeAction::WindowClose
+            | RuntimeAction::SplitFocusedVertical
+            | RuntimeAction::SplitFocusedHorizontal
+            | RuntimeAction::FocusNext
+            | RuntimeAction::FocusLeft
+            | RuntimeAction::FocusRight
+            | RuntimeAction::FocusUp
+            | RuntimeAction::FocusDown
+            | RuntimeAction::IncreaseSplit
+            | RuntimeAction::DecreaseSplit
+            | RuntimeAction::ResizeLeft
+            | RuntimeAction::ResizeRight
+            | RuntimeAction::ResizeUp
+            | RuntimeAction::ResizeDown
+            | RuntimeAction::CloseFocusedPane
     )
 }
 
@@ -3615,6 +3638,12 @@ mod tests {
                 crate::input::RuntimeAction::NewSession
             ))
         ));
+    }
+
+    #[test]
+    fn attach_keybindings_keep_focus_next_pane_binding() {
+        let (runtime, _global) = super::filtered_attach_keybindings(&BmuxConfig::default());
+        assert_eq!(runtime.get("o"), Some(&"focus_next_pane".to_string()));
     }
 
     #[test]

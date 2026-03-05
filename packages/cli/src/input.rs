@@ -757,7 +757,7 @@ fn find_overlaps(bindings: &[KeyBinding], label: &str) -> Vec<String> {
     warnings
 }
 
-fn action_to_name(action: &RuntimeAction) -> &'static str {
+pub(crate) fn action_to_name(action: &RuntimeAction) -> &'static str {
     match action {
         RuntimeAction::Quit => "quit",
         RuntimeAction::Detach => "detach",
@@ -1183,6 +1183,10 @@ fn parse_action(value: &str) -> Result<RuntimeAction> {
         "window_close" => Ok(RuntimeAction::WindowClose),
         unknown => bail!("unknown keymap action '{unknown}'"),
     }
+}
+
+pub(crate) fn parse_runtime_action_name(value: &str) -> Result<RuntimeAction> {
+    parse_action(value)
 }
 
 impl KeyStroke {
