@@ -1023,22 +1023,23 @@ async fn run_session_attach_with_client(
             break;
         }
 
-        let mut frame_needs_render =
-            view_state.dirty.status_needs_redraw || view_state.dirty.layout_needs_refresh;
+        let mut frame_needs_render = view_state.dirty.status_needs_redraw;
 
-        let layout_state = match client.attach_layout(view_state.attached_id).await {
-            Ok(state) => state,
-            Err(error) if is_attach_stream_closed_error(&error) => {
-                exit_reason = AttachExitReason::StreamClosed;
-                break;
+        if view_state.dirty.layout_needs_refresh || view_state.cached_layout_state.is_none() {
+            let layout_state = match client.attach_layout(view_state.attached_id).await {
+                Ok(state) => state,
+                Err(error) if is_attach_stream_closed_error(&error) => {
+                    exit_reason = AttachExitReason::StreamClosed;
+                    break;
+                }
+                Err(error) => return Err(map_attach_client_error(error)),
+            };
+            if view_state.cached_layout_state.as_ref() != Some(&layout_state) {
+                frame_needs_render = true;
+                view_state.cached_layout_state = Some(layout_state);
             }
-            Err(error) => return Err(map_attach_client_error(error)),
-        };
-        if view_state.cached_layout_state.as_ref() != Some(&layout_state) {
-            frame_needs_render = true;
-            view_state.cached_layout_state = Some(layout_state);
+            view_state.dirty.layout_needs_refresh = false;
         }
-        view_state.dirty.layout_needs_refresh = false;
 
         let Some(layout_state) = view_state.cached_layout_state.clone() else {
             continue;
