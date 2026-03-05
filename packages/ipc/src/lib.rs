@@ -140,6 +140,20 @@ pub enum PaneFocusDirection {
     Prev,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneLayoutNode {
+    Leaf {
+        pane_id: Uuid,
+    },
+    Split {
+        direction: PaneSplitDirection,
+        ratio_percent: u8,
+        first: Box<PaneLayoutNode>,
+        second: Box<PaneLayoutNode>,
+    },
+}
+
 /// Session role used for collaborative permission controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -241,6 +255,14 @@ pub enum Request {
         session_id: Uuid,
         max_bytes: usize,
     },
+    AttachLayout {
+        session_id: Uuid,
+    },
+    AttachPaneOutputBatch {
+        session_id: Uuid,
+        pane_ids: Vec<Uuid>,
+        max_bytes: usize,
+    },
     SubscribeEvents,
     PollEvents {
         max_events: usize,
@@ -281,6 +303,12 @@ pub struct PaneSummary {
     pub index: u32,
     pub name: Option<String>,
     pub focused: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachPaneChunk {
+    pub pane_id: Uuid,
+    pub data: Vec<u8>,
 }
 
 /// Summary returned when listing connected clients.
@@ -424,6 +452,16 @@ pub enum ResponsePayload {
     },
     AttachOutput {
         data: Vec<u8>,
+    },
+    AttachLayout {
+        session_id: Uuid,
+        window_id: Uuid,
+        focused_pane_id: Uuid,
+        panes: Vec<PaneSummary>,
+        layout_root: PaneLayoutNode,
+    },
+    AttachPaneOutputBatch {
+        chunks: Vec<AttachPaneChunk>,
     },
     EventsSubscribed,
     EventBatch {

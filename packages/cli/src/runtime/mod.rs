@@ -3,23 +3,28 @@ use crate::cli::{
     TraceFamily, WindowCommand,
 };
 use crate::input::{InputProcessor, RuntimeAction};
-use crate::status::{AttachTab, build_attach_status_line, write_status_line};
+use crate::status::{AttachTab, build_attach_status_line};
 use anyhow::{Context, Result};
 use bmux_client::{BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, TerminfoAutoInstall};
 use bmux_ipc::{
-    PaneFocusDirection, PaneSplitDirection, SessionRole, SessionSelector, SessionSummary,
-    WindowSelector, transport::IpcTransportError,
+    PaneFocusDirection, PaneLayoutNode, PaneSplitDirection, SessionRole, SessionSelector,
+    SessionSummary, WindowSelector, transport::IpcTransportError,
 };
 use bmux_server::BmuxServer;
 use clap::Parser;
+use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::queue;
+use crossterm::style::Print;
 use crossterm::terminal;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
+use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 mod terminal_protocol;
@@ -28,7 +33,6 @@ use terminal_protocol::{
     protocol_profile_name, secondary_da_for_profile, supported_query_names,
 };
 
-const STATUS_REDRAW_INTERVAL: Duration = Duration::from_millis(200);
 const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_STATUS_TIMEOUT: Duration = Duration::from_millis(1000);
@@ -758,7 +762,9 @@ async fn run_session_attach_with_client(
     let mut can_write = attach_info.can_write;
     let mut ui_mode = AttachUiMode::Normal;
     let mut status_needs_redraw = true;
-    let mut last_status_redraw = Instant::now();
+    let mut quit_confirmation_pending = false;
+    let mut pane_buffers: BTreeMap<Uuid, PaneRenderBuffer> = BTreeMap::new();
+    let mut cached_status_line: Option<String> = None;
 
     if !can_write {
         println!("read-only attach: input disabled");
@@ -809,6 +815,40 @@ async fn run_session_attach_with_client(
         }
 
         if let Some(event) = poll_attach_terminal_event(ATTACH_IO_POLL_INTERVAL).await? {
+            if quit_confirmation_pending {
+                if let Event::Key(key) = &event
+                    && key.kind == KeyEventKind::Press
+                {
+                    match key.code {
+                        KeyCode::Char('y') | KeyCode::Char('Y') => {
+                            match client.kill_session(SessionSelector::ById(attached_id)).await {
+                                Ok(_) => {
+                                    break;
+                                }
+                                Err(error) => {
+                                    println!("quit failed: {}", map_attach_client_error(error));
+                                }
+                            }
+                            quit_confirmation_pending = false;
+                            status_needs_redraw = true;
+                            continue;
+                        }
+                        KeyCode::Char('n')
+                        | KeyCode::Char('N')
+                        | KeyCode::Esc
+                        | KeyCode::Enter => {
+                            quit_confirmation_pending = false;
+                            status_needs_redraw = true;
+                            continue;
+                        }
+                        _ => {
+                            continue;
+                        }
+                    }
+                }
+                continue;
+            }
+
             let mut detach_requested = false;
             for attach_action in attach_event_actions(&event, &mut attach_input_processor, ui_mode)?
             {
@@ -819,10 +859,15 @@ async fn run_session_attach_with_client(
                     }
                     AttachEventAction::Send(bytes) => {
                         if can_write {
-                            client
-                                .attach_input(attached_id, bytes)
-                                .await
-                                .map_err(map_attach_client_error)?;
+                            match client.attach_input(attached_id, bytes).await {
+                                Ok(_) => {}
+                                Err(error) if is_attach_stream_closed_error(&error) => {
+                                    println!("attach stream closed");
+                                    detach_requested = true;
+                                    break;
+                                }
+                                Err(error) => return Err(map_attach_client_error(error)),
+                            }
                         }
                     }
                     AttachEventAction::Runtime(action) => {
@@ -840,6 +885,11 @@ async fn run_session_attach_with_client(
                         }
                     }
                     AttachEventAction::Ui(action) => {
+                        if matches!(action, RuntimeAction::Quit) {
+                            quit_confirmation_pending = true;
+                            status_needs_redraw = true;
+                            continue;
+                        }
                         if let Err(error) = handle_attach_ui_action(
                             &mut client,
                             action,
@@ -865,35 +915,79 @@ async fn run_session_attach_with_client(
             }
         }
 
-        let output = client
-            .attach_output(attached_id, 64 * 1024)
+        let layout_state = match client.attach_layout(attached_id).await {
+            Ok(state) => state,
+            Err(error) if is_attach_stream_closed_error(&error) => {
+                println!("attach stream closed");
+                break;
+            }
+            Err(error) => return Err(map_attach_client_error(error)),
+        };
+
+        let mut pane_ids = Vec::new();
+        collect_pane_ids(&layout_state.layout_root, &mut pane_ids);
+        pane_buffers.retain(|pane_id, _| pane_ids.iter().any(|id| id == pane_id));
+
+        let chunks = match client
+            .attach_pane_output_batch(attached_id, pane_ids.clone(), 8 * 1024)
             .await
-            .map_err(map_attach_client_error)?;
-        if !output.is_empty() {
-            write_attach_output(output).await?;
-            status_needs_redraw = true;
+        {
+            Ok(chunks) => chunks,
+            Err(error) if is_attach_stream_closed_error(&error) => {
+                println!("attach stream closed");
+                break;
+            }
+            Err(error) => return Err(map_attach_client_error(error)),
+        };
+
+        for chunk in chunks {
+            if chunk.data.is_empty() {
+                continue;
+            }
+            let buffer = pane_buffers.entry(chunk.pane_id).or_default();
+            append_pane_output(buffer, &chunk.data);
         }
 
-        if status_needs_redraw || last_status_redraw.elapsed() >= STATUS_REDRAW_INTERVAL {
-            redraw_attach_status_line(
-                &mut client,
-                attached_id,
-                can_write,
-                ui_mode,
-                follow_target_id,
-                global,
-            )
-            .await
-            .map_err(map_attach_client_error)?;
+        if status_needs_redraw {
+            cached_status_line = Some(
+                build_attach_status_line_for_draw(
+                    &mut client,
+                    attached_id,
+                    can_write,
+                    ui_mode,
+                    follow_target_id,
+                    global,
+                    quit_confirmation_pending,
+                )
+                .await
+                .map_err(map_attach_client_error)?,
+            );
             status_needs_redraw = false;
-            last_status_redraw = Instant::now();
         }
+
+        let mut stdout = io::stdout();
+        queue!(stdout, Hide).context("failed queuing hide cursor for attach frame")?;
+        if let Some(status_line) = cached_status_line.as_deref() {
+            queue_attach_status_line(&mut stdout, status_line)?;
+        }
+        let cursor_state = render_attach_panes(
+            &mut stdout,
+            &layout_state.layout_root,
+            layout_state.focused_pane_id,
+            &mut pane_buffers,
+        )?;
+        apply_attach_cursor_state(&mut stdout, cursor_state)?;
+        stdout
+            .flush()
+            .context("failed flushing attach frame")?;
     }
 
     let _ = client.detach().await;
     if follow_target_id.is_some() {
         let _ = client.unfollow().await;
     }
+    let _ = queue!(io::stdout(), Show);
+    let _ = io::stdout().flush();
     println!("detached");
     Ok(0)
 }
@@ -1124,17 +1218,18 @@ fn parse_window_auto_index(name: &str) -> Option<u32> {
     suffix.parse::<u32>().ok()
 }
 
-async fn redraw_attach_status_line(
+async fn build_attach_status_line_for_draw(
     client: &mut BmuxClient,
     session_id: Uuid,
     can_write: bool,
     ui_mode: AttachUiMode,
     follow_target_id: Option<Uuid>,
     follow_global: bool,
-) -> std::result::Result<(), ClientError> {
+    quit_confirmation_pending: bool,
+) -> std::result::Result<String, ClientError> {
     let (cols, _) = terminal::size().unwrap_or((0, 0));
     if cols == 0 {
-        return Ok(());
+        return Ok(String::new());
     }
 
     let tabs = build_attach_tabs(client, session_id).await?;
@@ -1151,9 +1246,15 @@ async fn redraw_attach_status_line(
             format!("following {}", short_uuid(id))
         }
     });
-    let hint = match ui_mode {
-        AttachUiMode::Normal => "Ctrl-T window mode | Ctrl-A d detach",
-        AttachUiMode::Window => "h/l prev/next | 1-9 goto | n new | x close | Esc/Enter exit",
+    let hint = if quit_confirmation_pending {
+        "Quit session and all panes? [y/N]"
+    } else {
+        match ui_mode {
+            AttachUiMode::Normal => "Ctrl-T window mode | Ctrl-A d detach | Ctrl-A q quit",
+            AttachUiMode::Window => {
+                "h/l prev/next | 1-9 goto | n new | x close | Esc/Enter exit"
+            }
+        }
     };
 
     let status_line = build_attach_status_line(
@@ -1165,12 +1266,34 @@ async fn redraw_attach_status_line(
         hint,
     );
 
-    write_status_line(&status_line, cols).map_err(|error| {
-        ClientError::Transport(IpcTransportError::Io(io::Error::new(
-            error.kind(),
-            format!("failed writing attach status line: {error}"),
-        )))
-    })
+    Ok(format_status_line_for_width(&status_line, cols))
+}
+
+fn format_status_line_for_width(status_line: &str, cols: u16) -> String {
+    let width = usize::from(cols);
+    let mut rendered = status_line.to_string();
+    if rendered.len() > width {
+        rendered.truncate(width);
+    } else {
+        rendered.push_str(&" ".repeat(width - rendered.len()));
+    }
+    rendered
+}
+
+fn queue_attach_status_line(stdout: &mut io::Stdout, status_line: &str) -> Result<()> {
+    let (cols, rows) = terminal::size().unwrap_or((0, 0));
+    if cols == 0 || rows == 0 {
+        return Ok(());
+    }
+    let rendered = format_status_line_for_width(status_line, cols);
+    queue!(
+        stdout,
+        MoveTo(0, 0),
+        Print("\x1b[7m"),
+        Print(rendered),
+        Print("\x1b[0m")
+    )
+    .context("failed queuing attach status line")
 }
 
 async fn build_attach_tabs(
@@ -1294,6 +1417,7 @@ fn is_attach_keymap_action(action: &str) -> bool {
     matches!(
         action.trim().to_ascii_lowercase().as_str(),
         "detach"
+            | "quit"
             | "new_window"
             | "new_session"
             | "enter_window_mode"
@@ -1354,6 +1478,33 @@ enum AttachUiMode {
     Window,
 }
 
+#[derive(Clone, Copy)]
+struct PaneRect {
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct AttachCursorState {
+    x: u16,
+    y: u16,
+    visible: bool,
+}
+
+struct PaneRenderBuffer {
+    parser: vt100::Parser,
+}
+
+impl Default for PaneRenderBuffer {
+    fn default() -> Self {
+        Self {
+            parser: vt100::Parser::new(24, 80, 4_096),
+        }
+    }
+}
+
 struct RawModeGuard;
 
 impl RawModeGuard {
@@ -1382,16 +1533,315 @@ async fn poll_attach_terminal_event(timeout: Duration) -> Result<Option<Event>> 
     .context("failed to join terminal event task")?
 }
 
-async fn write_attach_output(output: Vec<u8>) -> Result<()> {
-    tokio::task::spawn_blocking(move || {
-        let mut stdout = io::stdout();
-        stdout
-            .write_all(&output)
-            .context("failed writing attach output")?;
-        stdout.flush().context("failed flushing attach output")
-    })
-    .await
-    .context("failed to join attach output task")?
+fn collect_pane_ids(layout: &PaneLayoutNode, out: &mut Vec<Uuid>) {
+    match layout {
+        PaneLayoutNode::Leaf { pane_id } => out.push(*pane_id),
+        PaneLayoutNode::Split { first, second, .. } => {
+            collect_pane_ids(first, out);
+            collect_pane_ids(second, out);
+        }
+    }
+}
+
+fn split_rect(rect: PaneRect, ratio_percent: u8, vertical: bool) -> (PaneRect, PaneRect) {
+    if vertical {
+        let split = ((u32::from(rect.w) * u32::from(ratio_percent)) / 100) as u16;
+        let left_w = split.max(1).min(rect.w.saturating_sub(1));
+        let right_w = rect.w.saturating_sub(left_w);
+        (
+            PaneRect {
+                x: rect.x,
+                y: rect.y,
+                w: left_w,
+                h: rect.h,
+            },
+            PaneRect {
+                x: rect.x.saturating_add(left_w),
+                y: rect.y,
+                w: right_w,
+                h: rect.h,
+            },
+        )
+    } else {
+        let split = ((u32::from(rect.h) * u32::from(ratio_percent)) / 100) as u16;
+        let top_h = split.max(1).min(rect.h.saturating_sub(1));
+        let bottom_h = rect.h.saturating_sub(top_h);
+        (
+            PaneRect {
+                x: rect.x,
+                y: rect.y,
+                w: rect.w,
+                h: top_h,
+            },
+            PaneRect {
+                x: rect.x,
+                y: rect.y.saturating_add(top_h),
+                w: rect.w,
+                h: bottom_h,
+            },
+        )
+    }
+}
+
+fn collect_layout_rects(layout: &PaneLayoutNode, rect: PaneRect, out: &mut BTreeMap<Uuid, PaneRect>) {
+    match layout {
+        PaneLayoutNode::Leaf { pane_id } => {
+            out.insert(*pane_id, rect);
+        }
+        PaneLayoutNode::Split {
+            direction,
+            ratio_percent,
+            first,
+            second,
+        } => {
+            let vertical = matches!(direction, PaneSplitDirection::Vertical);
+            let (first_rect, second_rect) = split_rect(rect, *ratio_percent, vertical);
+            collect_layout_rects(first, first_rect, out);
+            collect_layout_rects(second, second_rect, out);
+        }
+    }
+}
+
+fn append_pane_output(buffer: &mut PaneRenderBuffer, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    buffer.parser.process(bytes);
+}
+
+fn draw_box_line(width: usize, left: char, mid: char, right: char) -> String {
+    if width <= 1 {
+        return left.to_string();
+    }
+    let mut line = String::new();
+    line.push(left);
+    if width > 2 {
+        line.extend(std::iter::repeat_n(mid, width - 2));
+    }
+    line.push(right);
+    line
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+struct CellStyle {
+    fg: vt100::Color,
+    bg: vt100::Color,
+    bold: bool,
+    dim: bool,
+    italic: bool,
+    underline: bool,
+    inverse: bool,
+}
+
+fn cell_style(cell: &vt100::Cell) -> CellStyle {
+    CellStyle {
+        fg: cell.fgcolor(),
+        bg: cell.bgcolor(),
+        bold: cell.bold(),
+        dim: cell.dim(),
+        italic: cell.italic(),
+        underline: cell.underline(),
+        inverse: cell.inverse(),
+    }
+}
+
+fn color_sgr(color: vt100::Color, foreground: bool) -> String {
+    match color {
+        vt100::Color::Default => {
+            if foreground {
+                "39".to_string()
+            } else {
+                "49".to_string()
+            }
+        }
+        vt100::Color::Idx(idx) => {
+            if foreground {
+                format!("38;5;{idx}")
+            } else {
+                format!("48;5;{idx}")
+            }
+        }
+        vt100::Color::Rgb(r, g, b) => {
+            if foreground {
+                format!("38;2;{r};{g};{b}")
+            } else {
+                format!("48;2;{r};{g};{b}")
+            }
+        }
+    }
+}
+
+fn style_sgr(style: CellStyle) -> String {
+    let mut parts = vec!["0".to_string()];
+    if style.bold {
+        parts.push("1".to_string());
+    }
+    if style.dim {
+        parts.push("2".to_string());
+    }
+    if style.italic {
+        parts.push("3".to_string());
+    }
+    if style.underline {
+        parts.push("4".to_string());
+    }
+    if style.inverse {
+        parts.push("7".to_string());
+    }
+    parts.push(color_sgr(style.fg, true));
+    parts.push(color_sgr(style.bg, false));
+    format!("\x1b[{}m", parts.join(";"))
+}
+
+fn render_attach_panes(
+    stdout: &mut io::Stdout,
+    layout: &PaneLayoutNode,
+    focused_pane_id: Uuid,
+    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
+) -> Result<Option<AttachCursorState>> {
+    let (cols, rows) = terminal::size().unwrap_or((0, 0));
+    if cols == 0 || rows <= 1 {
+        return Ok(None);
+    }
+
+    let draw_rows = rows.saturating_sub(1);
+    let root = PaneRect {
+        x: 0,
+        y: 1,
+        w: cols,
+        h: draw_rows,
+    };
+
+    let mut rects = BTreeMap::new();
+    collect_layout_rects(layout, root, &mut rects);
+
+    let mut cursor_state = None;
+    for y in 1..rows {
+        queue!(stdout, MoveTo(0, y), Print(" ".repeat(usize::from(cols))))
+            .context("failed clearing attach pane row")?;
+    }
+
+    for (pane_id, rect) in rects {
+        if rect.w < 2 || rect.h < 2 {
+            continue;
+        }
+        let focus = pane_id == focused_pane_id;
+        let hch = if focus { '=' } else { '-' };
+        let top = draw_box_line(usize::from(rect.w), '+', hch, '+');
+        let bottom = draw_box_line(usize::from(rect.w), '+', hch, '+');
+        queue!(stdout, MoveTo(rect.x, rect.y), Print(top)).context("failed drawing pane top")?;
+        queue!(
+            stdout,
+            MoveTo(rect.x, rect.y.saturating_add(rect.h.saturating_sub(1))),
+            Print(bottom)
+        )
+        .context("failed drawing pane bottom")?;
+
+        for y in rect.y.saturating_add(1)..rect.y.saturating_add(rect.h.saturating_sub(1)) {
+            queue!(stdout, MoveTo(rect.x, y), Print("|"))
+                .context("failed drawing pane left border")?;
+            queue!(stdout, MoveTo(rect.x.saturating_add(rect.w.saturating_sub(1)), y), Print("|"))
+                .context("failed drawing pane right border")?;
+        }
+
+        let inner_w_u16 = rect.w.saturating_sub(2);
+        let inner_h_u16 = rect.h.saturating_sub(2);
+        let inner_w = usize::from(inner_w_u16);
+        let inner_h = usize::from(inner_h_u16);
+        if let Some(entry) = pane_buffers.get_mut(&pane_id) {
+            entry.parser.screen_mut().set_size(inner_h_u16.max(1), inner_w_u16.max(1));
+            let screen = entry.parser.screen();
+            if pane_id == focused_pane_id {
+                let (cursor_row, cursor_col) = screen.cursor_position();
+                let cursor_row = cursor_row.min(inner_h_u16.saturating_sub(1));
+                let cursor_col = cursor_col.min(inner_w_u16.saturating_sub(1));
+                cursor_state = Some(AttachCursorState {
+                    x: rect.x.saturating_add(1).saturating_add(cursor_col),
+                    y: rect.y.saturating_add(1).saturating_add(cursor_row),
+                    visible: !screen.hide_cursor(),
+                });
+            }
+            for row in 0..inner_h {
+                let y = rect.y.saturating_add(1 + row as u16);
+                let mut line = String::new();
+                let mut current = CellStyle::default();
+                let mut used_cols = 0usize;
+                let mut col = 0u16;
+                while col < inner_w_u16 {
+                    if let Some(cell) = screen.cell(row as u16, col) {
+                        let style = cell_style(cell);
+                        if style != current {
+                            line.push_str(&style_sgr(style));
+                            current = style;
+                        }
+                        if cell.is_wide_continuation() {
+                            line.push(' ');
+                            used_cols = used_cols.saturating_add(1);
+                            col = col.saturating_add(1);
+                            continue;
+                        }
+                        let text = if cell.has_contents() { cell.contents() } else { " " };
+                        line.push_str(text);
+                        let width = UnicodeWidthStr::width(text).max(1);
+                        used_cols = used_cols.saturating_add(width);
+                        if cell.is_wide() {
+                            col = col.saturating_add(2);
+                        } else {
+                            col = col.saturating_add(1);
+                        }
+                    } else {
+                        if current != CellStyle::default() {
+                            line.push_str("\x1b[0m");
+                            current = CellStyle::default();
+                        }
+                        line.push(' ');
+                        used_cols = used_cols.saturating_add(1);
+                        col = col.saturating_add(1);
+                    }
+                }
+
+                if used_cols < inner_w {
+                    if current != CellStyle::default() {
+                        line.push_str("\x1b[0m");
+                    }
+                    line.push_str(&" ".repeat(inner_w - used_cols));
+                } else if current != CellStyle::default() {
+                    line.push_str("\x1b[0m");
+                }
+
+                queue!(stdout, MoveTo(rect.x.saturating_add(1), y), Print(line))
+                    .context("failed drawing pane content")?;
+            }
+        } else {
+            for row in 0..inner_h {
+                let y = rect.y.saturating_add(1 + row as u16);
+                queue!(
+                    stdout,
+                    MoveTo(rect.x.saturating_add(1), y),
+                    Print(" ".repeat(inner_w))
+                )
+                .context("failed clearing pane content")?;
+            }
+        }
+    }
+
+    Ok(cursor_state)
+}
+
+fn apply_attach_cursor_state(
+    stdout: &mut io::Stdout,
+    cursor_state: Option<AttachCursorState>,
+) -> Result<()> {
+    match cursor_state {
+        Some(state) if state.visible => {
+            queue!(stdout, MoveTo(state.x, state.y), Show)
+                .context("failed applying visible attach cursor")?;
+        }
+        _ => {
+            queue!(stdout, Hide).context("failed applying hidden attach cursor")?;
+        }
+    }
+    Ok(())
 }
 
 fn attach_event_actions(
@@ -1429,11 +1879,8 @@ fn attach_key_event_actions(
                     AttachEventAction::Send(bytes)
                 }
             }
-            RuntimeAction::NewWindow | RuntimeAction::NewSession => {
-                AttachEventAction::Runtime(action)
-            }
+            RuntimeAction::NewWindow | RuntimeAction::NewSession => AttachEventAction::Runtime(action),
             RuntimeAction::EnterWindowMode
-            | RuntimeAction::ExitMode
             | RuntimeAction::SplitFocusedVertical
             | RuntimeAction::SplitFocusedHorizontal
             | RuntimeAction::FocusNext
@@ -1447,7 +1894,8 @@ fn attach_key_event_actions(
             | RuntimeAction::ResizeRight
             | RuntimeAction::ResizeUp
             | RuntimeAction::ResizeDown
-            | RuntimeAction::CloseFocusedPane
+            | RuntimeAction::CloseFocusedPane => AttachEventAction::Ui(action),
+            RuntimeAction::ExitMode
             | RuntimeAction::WindowPrev
             | RuntimeAction::WindowNext
             | RuntimeAction::WindowGoto1
@@ -1460,19 +1908,45 @@ fn attach_key_event_actions(
             | RuntimeAction::WindowGoto8
             | RuntimeAction::WindowGoto9
             | RuntimeAction::WindowClose => {
-                if ui_mode == AttachUiMode::Normal
-                    && !matches!(action, RuntimeAction::EnterWindowMode)
-                {
+                if ui_mode == AttachUiMode::Window {
+                    AttachEventAction::Ui(action)
+                } else {
                     attach_key_event_to_bytes(key)
                         .map(AttachEventAction::Send)
                         .unwrap_or(AttachEventAction::Ignore)
-                } else {
-                    AttachEventAction::Ui(action)
                 }
             }
-            _ => AttachEventAction::Ignore,
+            RuntimeAction::Quit
+            => AttachEventAction::Ui(action),
+            RuntimeAction::ToggleSplitDirection
+            | RuntimeAction::RestartFocusedPane
+            | RuntimeAction::ShowHelp
+            | RuntimeAction::EnterScrollMode
+            | RuntimeAction::ExitScrollMode
+            | RuntimeAction::ScrollUpLine
+            | RuntimeAction::ScrollDownLine
+            | RuntimeAction::ScrollUpPage
+            | RuntimeAction::ScrollDownPage
+            | RuntimeAction::ScrollTop
+            | RuntimeAction::ScrollBottom
+            | RuntimeAction::BeginSelection
+            | RuntimeAction::MoveCursorLeft
+            | RuntimeAction::MoveCursorRight
+            | RuntimeAction::MoveCursorUp
+            | RuntimeAction::MoveCursorDown
+            | RuntimeAction::CopyScrollback => AttachEventAction::Ignore,
         })
         .collect())
+}
+
+fn is_attach_stream_closed_error(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::NotFound,
+            ..
+        }
+    )
 }
 
 fn attach_key_event_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
@@ -2789,6 +3263,60 @@ mod tests {
             new_window.first(),
             Some(super::AttachEventAction::Runtime(
                 crate::input::RuntimeAction::NewWindow
+            ))
+        ));
+
+        let _ = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+        let split_vertical = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('%'),
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+        assert!(matches!(
+            split_vertical.first(),
+            Some(super::AttachEventAction::Ui(
+                crate::input::RuntimeAction::SplitFocusedVertical
+            ))
+        ));
+
+        let _ = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+        let quit = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('q'),
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+        assert!(matches!(
+            quit.first(),
+            Some(super::AttachEventAction::Ui(
+                crate::input::RuntimeAction::Quit
             ))
         ));
 

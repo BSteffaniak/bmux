@@ -9,9 +9,9 @@ use bmux_config::{BmuxConfig, ConfigPaths};
 pub use bmux_ipc::Event as ServerEvent;
 use bmux_ipc::transport::{IpcTransportError, LocalIpcStream};
 use bmux_ipc::{
-    AttachGrant, ClientSummary, Envelope, EnvelopeKind, ErrorCode, IpcEndpoint, PaneFocusDirection,
-    PaneSelector, PaneSplitDirection, PaneSummary, ProtocolVersion, Request, Response,
-    ResponsePayload,
+    AttachGrant, AttachPaneChunk, ClientSummary, Envelope, EnvelopeKind, ErrorCode, IpcEndpoint,
+    PaneFocusDirection, PaneLayoutNode, PaneSelector, PaneSplitDirection, PaneSummary,
+    ProtocolVersion, Request, Response, ResponsePayload,
     ServerSnapshotStatus, SessionPermissionSummary, SessionRole, SessionSelector, SessionSummary,
     WindowSelector, WindowSummary, decode, encode,
 };
@@ -28,6 +28,15 @@ pub type Result<T> = std::result::Result<T, ClientError>;
 pub struct AttachOpenInfo {
     pub session_id: Uuid,
     pub can_write: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachLayoutState {
+    pub session_id: Uuid,
+    pub window_id: Uuid,
+    pub focused_pane_id: Uuid,
+    pub panes: Vec<PaneSummary>,
+    pub layout_root: PaneLayoutNode,
 }
 
 /// Server status details returned by status RPC.
@@ -701,6 +710,46 @@ impl BmuxClient {
         }
     }
 
+    pub async fn attach_layout(&mut self, session_id: Uuid) -> Result<AttachLayoutState> {
+        match self.request(Request::AttachLayout { session_id }).await? {
+            ResponsePayload::AttachLayout {
+                session_id,
+                window_id,
+                focused_pane_id,
+                panes,
+                layout_root,
+            } => Ok(AttachLayoutState {
+                session_id,
+                window_id,
+                focused_pane_id,
+                panes,
+                layout_root,
+            }),
+            _ => Err(ClientError::UnexpectedResponse("expected attach layout response")),
+        }
+    }
+
+    pub async fn attach_pane_output_batch(
+        &mut self,
+        session_id: Uuid,
+        pane_ids: Vec<Uuid>,
+        max_bytes: usize,
+    ) -> Result<Vec<AttachPaneChunk>> {
+        match self
+            .request(Request::AttachPaneOutputBatch {
+                session_id,
+                pane_ids,
+                max_bytes,
+            })
+            .await?
+        {
+            ResponsePayload::AttachPaneOutputBatch { chunks } => Ok(chunks),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attach pane output batch response",
+            )),
+        }
+    }
+
     /// Subscribe this client to server lifecycle events.
     ///
     /// # Errors
@@ -903,6 +952,21 @@ mod tests {
             .await
             .expect("attach open should succeed");
         assert_eq!(attached_id, session_id);
+
+        let layout = client
+            .attach_layout(session_id)
+            .await
+            .expect("attach layout should succeed");
+        assert_eq!(layout.session_id, session_id);
+        assert_eq!(layout.panes.len(), 1);
+        let first_pane_id = layout.panes[0].id;
+
+        let initial_chunks = client
+            .attach_pane_output_batch(session_id, vec![first_pane_id], 1024)
+            .await
+            .expect("attach pane output batch should succeed");
+        assert_eq!(initial_chunks.len(), 1);
+        assert_eq!(initial_chunks[0].pane_id, first_pane_id);
 
         let marker = format!("bmux-marker-{}", Uuid::new_v4());
         let command = format!("printf '{marker}\\n'\\n");
