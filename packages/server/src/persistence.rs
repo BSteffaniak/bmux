@@ -10,7 +10,7 @@ use uuid::Uuid;
 const SNAPSHOT_VERSION_V1: u32 = 1;
 const SNAPSHOT_VERSION_V2: u32 = 2;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SnapshotV2 {
     pub sessions: Vec<SessionSnapshotV2>,
     pub roles: Vec<RoleAssignmentSnapshotV2>,
@@ -18,7 +18,7 @@ pub(crate) struct SnapshotV2 {
     pub selected_sessions: Vec<ClientSelectedSessionSnapshotV2>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SessionSnapshotV2 {
     pub id: Uuid,
     pub name: Option<String>,
@@ -26,12 +26,14 @@ pub(crate) struct SessionSnapshotV2 {
     pub active_window_id: Option<Uuid>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct WindowSnapshotV2 {
     pub id: Uuid,
     pub name: Option<String>,
     pub panes: Vec<PaneSnapshotV2>,
     pub focused_pane_id: Option<Uuid>,
+    #[serde(default)]
+    pub layout_root: Option<PaneLayoutNodeSnapshotV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +41,27 @@ pub(crate) struct PaneSnapshotV2 {
     pub id: Uuid,
     pub name: Option<String>,
     pub shell: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub(crate) enum PaneLayoutNodeSnapshotV2 {
+    Leaf {
+        pane_id: Uuid,
+    },
+    Split {
+        direction: PaneSplitDirectionSnapshotV2,
+        ratio: f32,
+        first: Box<PaneLayoutNodeSnapshotV2>,
+        second: Box<PaneLayoutNodeSnapshotV2>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PaneSplitDirectionSnapshotV2 {
+    Vertical,
+    Horizontal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -110,7 +133,7 @@ struct SnapshotEnvelopeV1 {
     snapshot: SnapshotV1,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct SnapshotEnvelopeV2 {
     version: u32,
     checksum: u64,
@@ -334,6 +357,17 @@ fn validate_snapshot(snapshot: &SnapshotV2) -> Result<(), SnapshotError> {
                     focused_pane_id, window.id
                 )));
             }
+
+            if let Some(layout_root) = &window.layout_root {
+                let mut layout_pane_ids = BTreeSet::new();
+                collect_layout_pane_ids(layout_root, &mut layout_pane_ids)?;
+                if layout_pane_ids != window_pane_ids {
+                    return Err(SnapshotError::Validation(format!(
+                        "layout panes do not match pane set for window {}",
+                        window.id
+                    )));
+                }
+            }
         }
 
         if let Some(active_window_id) = session.active_window_id
@@ -448,6 +482,38 @@ fn validate_snapshot_v1(snapshot: &SnapshotV1) -> Result<(), SnapshotError> {
     Ok(())
 }
 
+fn collect_layout_pane_ids(
+    node: &PaneLayoutNodeSnapshotV2,
+    out: &mut BTreeSet<Uuid>,
+) -> Result<(), SnapshotError> {
+    match node {
+        PaneLayoutNodeSnapshotV2::Leaf { pane_id } => {
+            if !out.insert(*pane_id) {
+                return Err(SnapshotError::Validation(format!(
+                    "duplicate pane id {} in layout",
+                    pane_id
+                )));
+            }
+        }
+        PaneLayoutNodeSnapshotV2::Split {
+            ratio,
+            first,
+            second,
+            ..
+        } => {
+            if !(0.1..=0.9).contains(ratio) {
+                return Err(SnapshotError::Validation(format!(
+                    "split ratio {} out of range [0.1, 0.9]",
+                    ratio
+                )));
+            }
+            collect_layout_pane_ids(first, out)?;
+            collect_layout_pane_ids(second, out)?;
+        }
+    }
+    Ok(())
+}
+
 fn upgrade_snapshot_v1(snapshot: SnapshotV1) -> SnapshotV2 {
     SnapshotV2 {
         sessions: snapshot
@@ -468,6 +534,7 @@ fn upgrade_snapshot_v1(snapshot: SnapshotV1) -> SnapshotV2 {
                             shell: default_shell_for_upgrade(),
                         }],
                         focused_pane_id: Some(window.id),
+                        layout_root: Some(PaneLayoutNodeSnapshotV2::Leaf { pane_id: window.id }),
                     })
                     .collect(),
                 active_window_id: session.active_window_id,
@@ -515,9 +582,9 @@ fn default_shell_for_upgrade() -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientSelectedSessionSnapshotV2, FollowEdgeSnapshotV2, PaneSnapshotV2,
-        RoleAssignmentSnapshotV2, SessionSnapshotV2, SnapshotError, SnapshotManager, SnapshotV2,
-        WindowSnapshotV2,
+        ClientSelectedSessionSnapshotV2, FollowEdgeSnapshotV2, PaneLayoutNodeSnapshotV2,
+        PaneSnapshotV2, RoleAssignmentSnapshotV2, SessionSnapshotV2, SnapshotError,
+        SnapshotManager, SnapshotV2, WindowSnapshotV2,
     };
     use bmux_ipc::SessionRole;
     use uuid::Uuid;
@@ -542,6 +609,7 @@ mod tests {
                         shell: "/bin/sh".to_string(),
                     }],
                     focused_pane_id: Some(window_id),
+                    layout_root: Some(PaneLayoutNodeSnapshotV2::Leaf { pane_id: window_id }),
                 }],
                 active_window_id: Some(window_id),
             }],
@@ -602,6 +670,7 @@ mod tests {
                         shell: "/bin/sh".to_string(),
                     }],
                     focused_pane_id: None,
+                    layout_root: None,
                 }],
                 active_window_id: None,
             }],

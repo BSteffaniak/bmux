@@ -20,8 +20,9 @@ use bmux_ipc::{
 use bmux_session::{ClientId, Session, SessionId, SessionManager, WindowId};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
 use persistence::{
-    ClientSelectedSessionSnapshotV2, FollowEdgeSnapshotV2, PaneSnapshotV2,
-    RoleAssignmentSnapshotV2, SessionSnapshotV2, SnapshotManager, SnapshotV2, WindowSnapshotV2,
+    ClientSelectedSessionSnapshotV2, FollowEdgeSnapshotV2, PaneLayoutNodeSnapshotV2,
+    PaneSnapshotV2, PaneSplitDirectionSnapshotV2, RoleAssignmentSnapshotV2, SessionSnapshotV2,
+    SnapshotManager, SnapshotV2, WindowSnapshotV2,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -563,7 +564,7 @@ async fn shutdown_runtime_handle(removed: RemovedRuntime) {
     }
 }
 
-async fn shutdown_window_handle(mut window: WindowRuntimeHandle) {
+async fn shutdown_window_handle(window: WindowRuntimeHandle) {
     for pane in window.panes.into_values() {
         shutdown_pane_handle(pane).await;
     }
@@ -601,6 +602,7 @@ struct WindowRuntimeHandle {
     id: bmux_session::WindowId,
     name: Option<String>,
     panes: BTreeMap<Uuid, PaneRuntimeHandle>,
+    layout_root: PaneLayoutNode,
     focused_pane_id: Uuid,
 }
 
@@ -705,7 +707,6 @@ struct RemovedWindowRuntime {
 struct WindowRuntimeSummary {
     id: bmux_session::WindowId,
     name: Option<String>,
-    pane: PaneRuntimeMeta,
     active: bool,
 }
 
@@ -714,7 +715,21 @@ struct RestoreWindowRuntimeSpec {
     id: bmux_session::WindowId,
     name: Option<String>,
     panes: Vec<PaneRuntimeMeta>,
+    layout_root: Option<PaneLayoutNode>,
     focused_pane_id: Uuid,
+}
+
+#[derive(Debug, Clone)]
+enum PaneLayoutNode {
+    Leaf {
+        pane_id: Uuid,
+    },
+    Split {
+        direction: PaneSplitDirection,
+        ratio: f32,
+        first: Box<PaneLayoutNode>,
+        second: Box<PaneLayoutNode>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -729,6 +744,147 @@ enum SessionRuntimeError {
     NotFound,
     NotAttached,
     Closed,
+}
+
+impl PaneLayoutNode {
+    fn pane_order(&self, out: &mut Vec<Uuid>) {
+        match self {
+            Self::Leaf { pane_id } => out.push(*pane_id),
+            Self::Split { first, second, .. } => {
+                first.pane_order(out);
+                second.pane_order(out);
+            }
+        }
+    }
+
+    fn replace_leaf_with_split(
+        &mut self,
+        target: Uuid,
+        direction: PaneSplitDirection,
+        ratio: f32,
+        new_pane_id: Uuid,
+    ) -> bool {
+        match self {
+            Self::Leaf { pane_id } if *pane_id == target => {
+                *self = Self::Split {
+                    direction,
+                    ratio,
+                    first: Box::new(Self::Leaf { pane_id: target }),
+                    second: Box::new(Self::Leaf {
+                        pane_id: new_pane_id,
+                    }),
+                };
+                true
+            }
+            Self::Split { first, second, .. } => {
+                first.replace_leaf_with_split(target, direction, ratio, new_pane_id)
+                    || second.replace_leaf_with_split(target, direction, ratio, new_pane_id)
+            }
+            _ => false,
+        }
+    }
+
+    fn remove_leaf(&mut self, target: Uuid) -> bool {
+        match self {
+            Self::Leaf { pane_id } => *pane_id == target,
+            Self::Split { first, second, .. } => {
+                if first.remove_leaf(target) {
+                    *self = *second.clone();
+                    true
+                } else if second.remove_leaf(target) {
+                    *self = *first.clone();
+                    true
+                } else {
+                    false
+                }
+            }
+        }
+    }
+
+    fn adjust_focused_ratio(&mut self, target: Uuid, delta: f32) -> Option<f32> {
+        match self {
+            Self::Leaf { .. } => None,
+            Self::Split {
+                ratio,
+                first,
+                second,
+                ..
+            } => {
+                if contains_pane(first, target) || contains_pane(second, target) {
+                    *ratio = (*ratio + delta).clamp(0.1, 0.9);
+                    Some(*ratio)
+                } else {
+                    first
+                        .adjust_focused_ratio(target, delta)
+                        .or_else(|| second.adjust_focused_ratio(target, delta))
+                }
+            }
+        }
+    }
+}
+
+fn contains_pane(node: &PaneLayoutNode, pane_id: Uuid) -> bool {
+    match node {
+        PaneLayoutNode::Leaf { pane_id: id } => *id == pane_id,
+        PaneLayoutNode::Split { first, second, .. } => {
+            contains_pane(first, pane_id) || contains_pane(second, pane_id)
+        }
+    }
+}
+
+fn layout_from_panes(panes: &[PaneRuntimeMeta]) -> Option<PaneLayoutNode> {
+    let mut iter = panes.iter();
+    let first = iter.next()?;
+    let mut root = PaneLayoutNode::Leaf { pane_id: first.id };
+    for pane in iter {
+        root = PaneLayoutNode::Split {
+            direction: PaneSplitDirection::Vertical,
+            ratio: 0.5,
+            first: Box::new(root),
+            second: Box::new(PaneLayoutNode::Leaf { pane_id: pane.id }),
+        };
+    }
+    Some(root)
+}
+
+fn snapshot_layout_from_runtime(node: &PaneLayoutNode) -> PaneLayoutNodeSnapshotV2 {
+    match node {
+        PaneLayoutNode::Leaf { pane_id } => PaneLayoutNodeSnapshotV2::Leaf { pane_id: *pane_id },
+        PaneLayoutNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => PaneLayoutNodeSnapshotV2::Split {
+            direction: match direction {
+                PaneSplitDirection::Vertical => PaneSplitDirectionSnapshotV2::Vertical,
+                PaneSplitDirection::Horizontal => PaneSplitDirectionSnapshotV2::Horizontal,
+            },
+            ratio: *ratio,
+            first: Box::new(snapshot_layout_from_runtime(first)),
+            second: Box::new(snapshot_layout_from_runtime(second)),
+        },
+    }
+}
+
+fn runtime_layout_from_snapshot(node: &PaneLayoutNodeSnapshotV2) -> PaneLayoutNode {
+    match node {
+        PaneLayoutNodeSnapshotV2::Leaf { pane_id } => PaneLayoutNode::Leaf { pane_id: *pane_id },
+        PaneLayoutNodeSnapshotV2::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => PaneLayoutNode::Split {
+            direction: match direction {
+                PaneSplitDirectionSnapshotV2::Vertical => PaneSplitDirection::Vertical,
+                PaneSplitDirectionSnapshotV2::Horizontal => PaneSplitDirection::Horizontal,
+            },
+            ratio: *ratio,
+            first: Box::new(runtime_layout_from_snapshot(first)),
+            second: Box::new(runtime_layout_from_snapshot(second)),
+        },
+    }
 }
 
 impl SessionRuntimeManager {
@@ -811,6 +967,14 @@ impl SessionRuntimeManager {
                 let pane = self.spawn_pane_runtime(pane_meta.clone(), window.id)?;
                 handle.panes.insert(pane_meta.id, pane);
             }
+            handle.layout_root = window.layout_root.unwrap_or_else(|| {
+                let metas = handle
+                    .panes
+                    .values()
+                    .map(|pane| pane.meta.clone())
+                    .collect::<Vec<_>>();
+                layout_from_panes(&metas).expect("restored window has panes")
+            });
             handle.focused_pane_id = window.focused_pane_id;
             runtime_windows.insert(window.id, handle);
         }
@@ -854,6 +1018,9 @@ impl SessionRuntimeManager {
             id: window_id,
             name,
             panes,
+            layout_root: PaneLayoutNode::Leaf {
+                pane_id: pane_meta.id,
+            },
             focused_pane_id: pane_meta.id,
         })
     }
@@ -913,7 +1080,10 @@ impl SessionRuntimeManager {
             let reader_output = Arc::clone(&output_buffer_for_reader);
             let writer_for_reader = Arc::clone(&writer);
             let reader_thread = std::thread::Builder::new()
-                .name(format!("bmux-server-window-{}-pane-{}", window_id.0, pane_id))
+                .name(format!(
+                    "bmux-server-window-{}-pane-{}",
+                    window_id.0, pane_id
+                ))
                 .spawn(move || {
                     let mut buffer = [0_u8; 8192];
                     let mut protocol_engine = TerminalProtocolEngine::new(protocol_profile);
@@ -1025,15 +1195,6 @@ impl SessionRuntimeManager {
             .map(|window| WindowRuntimeSummary {
                 id: window.id,
                 name: window.name.clone(),
-                pane: window
-                    .panes
-                    .get(&window.focused_pane_id)
-                    .map(|pane| pane.meta.clone())
-                    .unwrap_or(PaneRuntimeMeta {
-                        id: window.focused_pane_id,
-                        name: Some("pane".to_string()),
-                        shell: self.shell.clone(),
-                    }),
                 active: window.id == session.active_window,
             })
             .collect())
@@ -1075,7 +1236,7 @@ impl SessionRuntimeManager {
             name: next_pane_name,
             shell,
         };
-        let mut handle = self.spawn_pane_runtime(pane_meta, window_id)?;
+        let handle = self.spawn_pane_runtime(pane_meta, window_id)?;
         for client_id in client_ids {
             if let Ok(mut output) = handle.output_buffer.lock() {
                 output.register_client_at_tail(client_id);
@@ -1090,7 +1251,17 @@ impl SessionRuntimeManager {
             .windows
             .get_mut(&session.active_window)
             .ok_or_else(|| anyhow::anyhow!("active window not found"))?;
+        let focused_before_split = window.focused_pane_id;
         window.panes.insert(pane_id, handle);
+        let replaced = window.layout_root.replace_leaf_with_split(
+            focused_before_split,
+            direction,
+            0.5,
+            pane_id,
+        );
+        if !replaced {
+            anyhow::bail!("failed to apply split to layout tree")
+        }
         window.focused_pane_id = pane_id;
         Ok(pane_id)
     }
@@ -1104,8 +1275,8 @@ impl SessionRuntimeManager {
             .windows
             .get_mut(&session.active_window)
             .ok_or_else(|| anyhow::anyhow!("active window not found"))?;
-        let mut pane_ids = window.panes.keys().copied().collect::<Vec<_>>();
-        pane_ids.sort();
+        let mut pane_ids = Vec::new();
+        window.layout_root.pane_order(&mut pane_ids);
         if pane_ids.is_empty() {
             anyhow::bail!("no panes in active window")
         }
@@ -1128,7 +1299,10 @@ impl SessionRuntimeManager {
         Ok(window.focused_pane_id)
     }
 
-    fn close_focused_pane(&mut self, session_id: SessionId) -> Result<Option<RemovedWindowRuntime>> {
+    fn close_focused_pane(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<Option<RemovedWindowRuntime>> {
         let (window_id, pane_id, remove_window) = {
             let session = self
                 .runtimes
@@ -1156,11 +1330,14 @@ impl SessionRuntimeManager {
             .windows
             .get_mut(&window_id)
             .ok_or_else(|| anyhow::anyhow!("active window not found"))?;
-        let mut pane = window
+        let pane = window
             .panes
             .remove(&pane_id)
             .ok_or_else(|| anyhow::anyhow!("focused pane not found"))?;
-        if let Some(next_id) = window.panes.keys().next().copied() {
+        let _ = window.layout_root.remove_leaf(pane_id);
+        let mut remaining = Vec::new();
+        window.layout_root.pane_order(&mut remaining);
+        if let Some(next_id) = remaining.first().copied() {
             window.focused_pane_id = next_id;
         }
 
@@ -1170,22 +1347,29 @@ impl SessionRuntimeManager {
         Ok(None)
     }
 
-    fn resize_focused_pane(&mut self, session_id: SessionId, _delta: i16) -> Result<()> {
+    fn resize_focused_pane(&mut self, session_id: SessionId, delta: i16) -> Result<()> {
         let session = self
             .runtimes
-            .get(&session_id)
+            .get_mut(&session_id)
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
         let window = session
             .windows
-            .get(&session.active_window)
+            .get_mut(&session.active_window)
             .ok_or_else(|| anyhow::anyhow!("active window not found"))?;
         if !window.panes.contains_key(&window.focused_pane_id) {
             anyhow::bail!("focused pane not found")
         }
+        let step = (delta as f32) * 0.05;
+        let _ = window
+            .layout_root
+            .adjust_focused_ratio(window.focused_pane_id, step);
         Ok(())
     }
 
-    fn list_panes(&self, session_id: SessionId) -> Result<(bmux_session::WindowId, Vec<PaneSummary>)> {
+    fn list_panes(
+        &self,
+        session_id: SessionId,
+    ) -> Result<(bmux_session::WindowId, Vec<PaneSummary>)> {
         let session = self
             .runtimes
             .get(&session_id)
@@ -1194,8 +1378,8 @@ impl SessionRuntimeManager {
             .windows
             .get(&session.active_window)
             .ok_or_else(|| anyhow::anyhow!("active window not found"))?;
-        let mut pane_ids = window.panes.keys().copied().collect::<Vec<_>>();
-        pane_ids.sort();
+        let mut pane_ids = Vec::new();
+        window.layout_root.pane_order(&mut pane_ids);
         let panes = pane_ids
             .iter()
             .enumerate()
@@ -1379,8 +1563,7 @@ impl SessionRuntimeManager {
             .ok_or(SessionRuntimeError::NotFound)?;
 
         let bytes = data.len();
-        pane
-            .input_tx
+        pane.input_tx
             .send(data)
             .map_err(|_| SessionRuntimeError::Closed)?;
         Ok(bytes)
@@ -2108,6 +2291,7 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV2> {
                             name: window.name.clone(),
                             panes,
                             focused_pane_id: Some(window.focused_pane_id),
+                            layout_root: Some(snapshot_layout_from_runtime(&window.layout_root)),
                         }
                     })
                     .collect::<Vec<_>>();
@@ -2294,6 +2478,10 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV2) -> Resu
                         id: WindowId(window.id),
                         name: window.name.clone(),
                         panes,
+                        layout_root: window
+                            .layout_root
+                            .as_ref()
+                            .map(runtime_layout_from_snapshot),
                         focused_pane_id: window
                             .focused_pane_id
                             .or_else(|| window.panes.first().map(|pane| pane.id))
@@ -3029,9 +3217,9 @@ async fn handle_request(
                     .and_then(|runtime| runtime.windows.get(&active_window_id))
                     .map(|window| window.focused_pane_id)
                     .ok_or_else(|| anyhow::anyhow!("active window not found"))?;
-                let removed_window = runtime_manager.close_focused_pane(session_id).map_err(|error| {
-                    anyhow::anyhow!("failed closing pane: {error:#}")
-                })?;
+                let removed_window = runtime_manager
+                    .close_focused_pane(session_id)
+                    .map_err(|error| anyhow::anyhow!("failed closing pane: {error:#}"))?;
                 (focused_pane_id, active_window_id, removed_window)
             };
 
@@ -3049,7 +3237,8 @@ async fn handle_request(
                         .session_manager
                         .lock()
                         .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                    if let Some(session_model) = manager.get_session_mut(&removed_window_session_id) {
+                    if let Some(session_model) = manager.get_session_mut(&removed_window_session_id)
+                    {
                         session_model.remove_window(&removed_window_id);
                     }
                 }

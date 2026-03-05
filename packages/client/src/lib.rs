@@ -9,10 +9,10 @@ use bmux_config::{BmuxConfig, ConfigPaths};
 pub use bmux_ipc::Event as ServerEvent;
 use bmux_ipc::transport::{IpcTransportError, LocalIpcStream};
 use bmux_ipc::{
-    AttachGrant, ClientSummary, Envelope, EnvelopeKind, ErrorCode, IpcEndpoint,
-    PaneFocusDirection, PaneSplitDirection, PaneSummary, ProtocolVersion, Request, Response,
-    ResponsePayload, ServerSnapshotStatus, SessionPermissionSummary, SessionRole,
-    SessionSelector, SessionSummary, WindowSelector, WindowSummary, decode, encode,
+    AttachGrant, ClientSummary, Envelope, EnvelopeKind, ErrorCode, IpcEndpoint, PaneFocusDirection,
+    PaneSplitDirection, PaneSummary, ProtocolVersion, Request, Response, ResponsePayload,
+    ServerSnapshotStatus, SessionPermissionSummary, SessionRole, SessionSelector, SessionSummary,
+    WindowSelector, WindowSummary, decode, encode,
 };
 use std::time::Duration;
 use thiserror::Error;
@@ -414,7 +414,10 @@ impl BmuxClient {
         session: Option<SessionSelector>,
         direction: PaneSplitDirection,
     ) -> Result<Uuid> {
-        match self.request(Request::SplitPane { session, direction }).await? {
+        match self
+            .request(Request::SplitPane { session, direction })
+            .await?
+        {
             ResponsePayload::PaneSplit { id, .. } => Ok(id),
             _ => Err(ClientError::UnexpectedResponse("expected pane split")),
         }
@@ -425,13 +428,20 @@ impl BmuxClient {
         session: Option<SessionSelector>,
         direction: PaneFocusDirection,
     ) -> Result<Uuid> {
-        match self.request(Request::FocusPane { session, direction }).await? {
+        match self
+            .request(Request::FocusPane { session, direction })
+            .await?
+        {
             ResponsePayload::PaneFocused { id, .. } => Ok(id),
             _ => Err(ClientError::UnexpectedResponse("expected pane focused")),
         }
     }
 
-    pub async fn resize_pane(&mut self, session: Option<SessionSelector>, delta: i16) -> Result<()> {
+    pub async fn resize_pane(
+        &mut self,
+        session: Option<SessionSelector>,
+        delta: i16,
+    ) -> Result<()> {
         match self.request(Request::ResizePane { session, delta }).await? {
             ResponsePayload::PaneResized { .. } => Ok(()),
             _ => Err(ClientError::UnexpectedResponse("expected pane resized")),
@@ -445,7 +455,10 @@ impl BmuxClient {
         }
     }
 
-    pub async fn list_panes(&mut self, session: Option<SessionSelector>) -> Result<Vec<PaneSummary>> {
+    pub async fn list_panes(
+        &mut self,
+        session: Option<SessionSelector>,
+    ) -> Result<Vec<PaneSummary>> {
         match self.request(Request::ListPanes { session }).await? {
             ResponsePayload::PaneList { panes } => Ok(panes),
             _ => Err(ClientError::UnexpectedResponse("expected pane list")),
