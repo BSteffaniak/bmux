@@ -857,6 +857,49 @@ fn contains_pane(node: &PaneLayoutNode, pane_id: Uuid) -> bool {
     }
 }
 
+fn collect_runtime_layout_pane_ids(
+    node: &PaneLayoutNode,
+    out: &mut BTreeSet<Uuid>,
+) -> Result<()> {
+    match node {
+        PaneLayoutNode::Leaf { pane_id } => {
+            if !out.insert(*pane_id) {
+                anyhow::bail!("duplicate pane id {} in runtime layout", pane_id)
+            }
+        }
+        PaneLayoutNode::Split {
+            ratio,
+            first,
+            second,
+            ..
+        } => {
+            if !(0.1..=0.9).contains(ratio) {
+                anyhow::bail!("runtime split ratio {} out of range [0.1, 0.9]", ratio)
+            }
+            collect_runtime_layout_pane_ids(first, out)?;
+            collect_runtime_layout_pane_ids(second, out)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_runtime_layout_matches_panes(
+    layout_root: &PaneLayoutNode,
+    panes: &BTreeMap<Uuid, PaneRuntimeHandle>,
+) -> Result<()> {
+    let pane_ids = panes.keys().copied().collect::<BTreeSet<_>>();
+    let mut layout_ids = BTreeSet::new();
+    collect_runtime_layout_pane_ids(layout_root, &mut layout_ids)?;
+    if pane_ids != layout_ids {
+        anyhow::bail!(
+            "runtime layout panes do not match runtime pane map (layout: {}, panes: {})",
+            layout_ids.len(),
+            pane_ids.len()
+        )
+    }
+    Ok(())
+}
+
 fn layout_from_panes(panes: &[PaneRuntimeMeta]) -> Option<PaneLayoutNode> {
     let mut iter = panes.iter();
     let first = iter.next()?;
@@ -1000,6 +1043,7 @@ impl SessionRuntimeManager {
                     .collect::<Vec<_>>();
                 layout_from_panes(&metas).expect("restored window has panes")
             });
+            validate_runtime_layout_matches_panes(&handle.layout_root, &handle.panes)?;
             handle.focused_pane_id = window.focused_pane_id;
             runtime_windows.insert(window.id, handle);
         }
@@ -2341,41 +2385,59 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV2> {
                     .into_iter()
                     .flatten()
                     .map(|window| {
-                        let mut pane_ids = window.panes.keys().copied().collect::<Vec<_>>();
-                        pane_ids.sort();
+                        validate_runtime_layout_matches_panes(&window.layout_root, &window.panes)
+                            .with_context(|| {
+                                format!(
+                                    "cannot snapshot inconsistent layout for window {} in session {}",
+                                    window.id.0, session_info.id.0
+                                )
+                            })?;
+
+                        let mut pane_ids = Vec::new();
+                        window.layout_root.pane_order(&mut pane_ids);
                         let panes = pane_ids
                             .into_iter()
-                            .filter_map(|pane_id| {
-                                window.panes.get(&pane_id).map(|pane| PaneSnapshotV2 {
-                                    id: pane.meta.id,
-                                    name: pane.meta.name.clone(),
-                                    shell: pane.meta.shell.clone(),
-                                })
+                            .map(|pane_id| {
+                                window
+                                    .panes
+                                    .get(&pane_id)
+                                    .map(|pane| PaneSnapshotV2 {
+                                        id: pane.meta.id,
+                                        name: pane.meta.name.clone(),
+                                        shell: pane.meta.shell.clone(),
+                                    })
+                                    .ok_or_else(|| {
+                                        anyhow::anyhow!(
+                                            "layout references missing pane {} in window {}",
+                                            pane_id,
+                                            window.id.0
+                                        )
+                                    })
                             })
-                            .collect::<Vec<_>>();
+                            .collect::<Result<Vec<_>>>()?;
 
-                        WindowSnapshotV2 {
+                        Ok(WindowSnapshotV2 {
                             id: window.id.0,
                             name: window.name.clone(),
                             panes,
                             focused_pane_id: Some(window.focused_pane_id),
                             layout_root: Some(snapshot_layout_from_runtime(&window.layout_root)),
-                        }
+                        })
                     })
-                    .collect::<Vec<_>>();
+                    .collect::<Result<Vec<_>>>()?;
 
                 let name = manager
                     .get_session(&session_info.id)
                     .and_then(|session| session.name.clone());
 
-                SessionSnapshotV2 {
+                Ok(SessionSnapshotV2 {
                     id: session_info.id.0,
                     name,
                     windows: window_snapshots,
                     active_window_id,
-                }
+                })
             })
-            .collect::<Vec<_>>()
+            .collect::<Result<Vec<_>>>()?
     };
 
     let roles = {
