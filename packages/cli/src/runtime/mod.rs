@@ -5,7 +5,7 @@ use crate::cli::{
 use crate::input::{InputProcessor, RuntimeAction};
 use crate::status::{AttachTab, build_attach_status_line};
 use anyhow::{Context, Result};
-use bmux_client::{BmuxClient, ClientError};
+use bmux_client::{AttachLayoutState, BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, TerminfoAutoInstall};
 use bmux_ipc::{
     PaneFocusDirection, PaneLayoutNode, PaneSplitDirection, SessionRole, SessionSelector,
@@ -18,6 +18,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifier
 use crossterm::queue;
 use crossterm::style::Print;
 use crossterm::terminal;
+use crossterm::terminal::{Clear, ClearType};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::collections::BTreeMap;
 use std::io::{self, IsTerminal, Write};
@@ -821,56 +822,74 @@ async fn run_session_attach_with_client(
     let mut quit_confirmation_pending = false;
     let mut pane_buffers: BTreeMap<Uuid, PaneRenderBuffer> = BTreeMap::new();
     let mut cached_status_line: Option<String> = None;
+    let mut cached_layout_state: Option<AttachLayoutState> = None;
+    let mut layout_needs_refresh = true;
 
     if !can_write {
         println!("read-only attach: input disabled");
     }
     println!("press Ctrl-A d to detach");
+    client
+        .subscribe_events()
+        .await
+        .map_err(map_attach_client_error)?;
 
-    let _raw_mode = RawModeGuard::enable().context("failed to enable raw mode for attach")?;
+    let raw_mode_guard = RawModeGuard::enable().context("failed to enable raw mode for attach")?;
+    let mut exit_reason = AttachExitReason::Detached;
 
     loop {
-        if follow_target_id.is_some() {
-            let events = client
-                .poll_events(16)
-                .await
-                .map_err(map_attach_client_error)?;
-            for server_event in events {
-                match server_event {
-                    bmux_client::ServerEvent::FollowTargetChanged {
-                        follower_client_id,
-                        leader_client_id,
-                        session_id,
-                    } => {
-                        if Some(leader_client_id) != follow_target_id
-                            || Some(follower_client_id) != self_client_id
-                        {
-                            continue;
-                        }
-                        attach_info = open_attach_for_session(&mut client, session_id)
-                            .await
-                            .map_err(map_attach_client_error)?;
-                        attached_id = attach_info.session_id;
-                        can_write = attach_info.can_write;
-                        ui_mode = AttachUiMode::Normal;
-                        status_needs_redraw = true;
-                        println!("follow handoff -> session {attached_id}");
-                        if !can_write {
-                            println!("read-only attach: input disabled");
-                        }
-                    }
-                    bmux_client::ServerEvent::FollowTargetGone {
-                        former_leader_client_id,
-                        ..
-                    } if Some(former_leader_client_id) == follow_target_id => {
-                        println!("follow target disconnected; staying on current session");
-                    }
-                    _ => {}
+        let events = client
+            .poll_events(16)
+            .await
+            .map_err(map_attach_client_error)?;
+        for server_event in events {
+            match server_event {
+                bmux_client::ServerEvent::SessionRemoved { id } if id == attached_id => {
+                    exit_reason = AttachExitReason::StreamClosed;
+                    break;
                 }
+                bmux_client::ServerEvent::ClientDetached { id } if id == attached_id => {
+                    exit_reason = AttachExitReason::StreamClosed;
+                    break;
+                }
+                bmux_client::ServerEvent::FollowTargetChanged {
+                    follower_client_id,
+                    leader_client_id,
+                    session_id,
+                } => {
+                    if Some(leader_client_id) != follow_target_id
+                        || Some(follower_client_id) != self_client_id
+                    {
+                        continue;
+                    }
+                    attach_info = open_attach_for_session(&mut client, session_id)
+                        .await
+                        .map_err(map_attach_client_error)?;
+                    attached_id = attach_info.session_id;
+                    can_write = attach_info.can_write;
+                    ui_mode = AttachUiMode::Normal;
+                    status_needs_redraw = true;
+                    layout_needs_refresh = true;
+                    println!("follow handoff -> session {attached_id}");
+                    if !can_write {
+                        println!("read-only attach: input disabled");
+                    }
+                }
+                bmux_client::ServerEvent::FollowTargetGone {
+                    former_leader_client_id,
+                    ..
+                } if Some(former_leader_client_id) == follow_target_id => {
+                    println!("follow target disconnected; staying on current session");
+                }
+                _ => {}
             }
+        }
+        if exit_reason == AttachExitReason::StreamClosed {
+            break;
         }
 
         if let Some(event) = poll_attach_terminal_event(ATTACH_IO_POLL_INTERVAL).await? {
+            let mut skip_attach_key_actions = false;
             if quit_confirmation_pending {
                 if let Event::Key(key) = &event
                     && key.kind == KeyEventKind::Press
@@ -882,6 +901,7 @@ async fn run_session_attach_with_client(
                                 .await
                             {
                                 Ok(_) => {
+                                    exit_reason = AttachExitReason::Quit;
                                     break;
                                 }
                                 Err(error) => {
@@ -890,94 +910,114 @@ async fn run_session_attach_with_client(
                             }
                             quit_confirmation_pending = false;
                             status_needs_redraw = true;
-                            continue;
+                            skip_attach_key_actions = true;
                         }
                         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
                             quit_confirmation_pending = false;
                             status_needs_redraw = true;
-                            continue;
+                            skip_attach_key_actions = true;
                         }
                         _ => {
-                            continue;
+                            skip_attach_key_actions = true;
                         }
                     }
                 }
-                continue;
+                if skip_attach_key_actions {
+                    // Keep checking attach/session closure in this iteration.
+                }
             }
 
-            let mut detach_requested = false;
-            for attach_action in attach_event_actions(&event, &mut attach_input_processor, ui_mode)?
-            {
-                match attach_action {
-                    AttachEventAction::Detach => {
-                        detach_requested = true;
-                        break;
-                    }
-                    AttachEventAction::Send(bytes) => {
-                        if can_write {
-                            match client.attach_input(attached_id, bytes).await {
-                                Ok(_) => {}
-                                Err(error) if is_attach_stream_closed_error(&error) => {
-                                    println!("attach stream closed");
-                                    detach_requested = true;
-                                    break;
+            if !skip_attach_key_actions {
+                let mut detach_requested = false;
+                for attach_action in
+                    attach_event_actions(&event, &mut attach_input_processor, ui_mode)?
+                {
+                    match attach_action {
+                        AttachEventAction::Detach => {
+                            detach_requested = true;
+                            break;
+                        }
+                        AttachEventAction::Send(bytes) => {
+                            if can_write {
+                                match client.attach_input(attached_id, bytes).await {
+                                    Ok(_) => {}
+                                    Err(error) if is_attach_stream_closed_error(&error) => {
+                                        exit_reason = AttachExitReason::StreamClosed;
+                                        detach_requested = true;
+                                        break;
+                                    }
+                                    Err(error) => return Err(map_attach_client_error(error)),
                                 }
-                                Err(error) => return Err(map_attach_client_error(error)),
                             }
                         }
-                    }
-                    AttachEventAction::Runtime(action) => {
-                        if let Err(error) = handle_attach_runtime_action(
-                            &mut client,
-                            action,
-                            &mut attached_id,
-                            &mut can_write,
-                        )
-                        .await
-                        {
-                            println!("attach action failed: {}", map_attach_client_error(error));
-                        } else {
+                        AttachEventAction::Runtime(action) => {
+                            if let Err(error) = handle_attach_runtime_action(
+                                &mut client,
+                                action,
+                                &mut attached_id,
+                                &mut can_write,
+                            )
+                            .await
+                            {
+                                println!("attach action failed: {}", map_attach_client_error(error));
+                            } else {
+                                status_needs_redraw = true;
+                                layout_needs_refresh = true;
+                            }
+                        }
+                        AttachEventAction::Ui(action) => {
+                            if matches!(action, RuntimeAction::Quit) {
+                                quit_confirmation_pending = true;
+                                status_needs_redraw = true;
+                                continue;
+                            }
+                            if let Err(error) = handle_attach_ui_action(
+                                &mut client,
+                                action,
+                                &mut attached_id,
+                                &mut can_write,
+                                &mut ui_mode,
+                            )
+                            .await
+                            {
+                                println!("attach action failed: {}", map_attach_client_error(error));
+                            } else {
+                                layout_needs_refresh = true;
+                            }
                             status_needs_redraw = true;
                         }
-                    }
-                    AttachEventAction::Ui(action) => {
-                        if matches!(action, RuntimeAction::Quit) {
-                            quit_confirmation_pending = true;
+                        AttachEventAction::Redraw => {
                             status_needs_redraw = true;
-                            continue;
+                            layout_needs_refresh = true;
                         }
-                        if let Err(error) = handle_attach_ui_action(
-                            &mut client,
-                            action,
-                            &mut attached_id,
-                            &mut can_write,
-                            &mut ui_mode,
-                        )
-                        .await
-                        {
-                            println!("attach action failed: {}", map_attach_client_error(error));
-                        }
-                        status_needs_redraw = true;
+                        AttachEventAction::Ignore => {}
                     }
-                    AttachEventAction::Redraw => {
-                        status_needs_redraw = true;
-                    }
-                    AttachEventAction::Ignore => {}
+                }
+
+                if detach_requested {
+                    break;
                 }
             }
-
-            if detach_requested {
-                break;
-            }
         }
+
+        let mut frame_needs_render = status_needs_redraw;
 
         let layout_state = match client.attach_layout(attached_id).await {
             Ok(state) => state,
             Err(error) if is_attach_stream_closed_error(&error) => {
-                println!("attach stream closed");
+                exit_reason = AttachExitReason::StreamClosed;
                 break;
             }
             Err(error) => return Err(map_attach_client_error(error)),
+        };
+        if cached_layout_state.as_ref() != Some(&layout_state) {
+            frame_needs_render = true;
+            cached_layout_state = Some(layout_state);
+        }
+        layout_needs_refresh = false;
+
+        let Some(layout_state) = cached_layout_state.as_ref() else {
+            continue;
         };
 
         let mut pane_ids = Vec::new();
@@ -990,7 +1030,7 @@ async fn run_session_attach_with_client(
         {
             Ok(chunks) => chunks,
             Err(error) if is_attach_stream_closed_error(&error) => {
-                println!("attach stream closed");
+                exit_reason = AttachExitReason::StreamClosed;
                 break;
             }
             Err(error) => return Err(map_attach_client_error(error)),
@@ -1002,6 +1042,11 @@ async fn run_session_attach_with_client(
             }
             let buffer = pane_buffers.entry(chunk.pane_id).or_default();
             append_pane_output(buffer, &chunk.data);
+            frame_needs_render = true;
+        }
+
+        if !frame_needs_render {
+            continue;
         }
 
         if status_needs_redraw {
@@ -1036,12 +1081,16 @@ async fn run_session_attach_with_client(
         stdout.flush().context("failed flushing attach frame")?;
     }
 
+    drop(raw_mode_guard);
+    restore_terminal_after_attach_ui()?;
+
     let _ = client.detach().await;
     if follow_target_id.is_some() {
         let _ = client.unfollow().await;
     }
-    let _ = queue!(io::stdout(), Show);
-    let _ = io::stdout().flush();
+    if exit_reason == AttachExitReason::StreamClosed {
+        println!("attach stream closed");
+    }
     println!("detached");
     Ok(0)
 }
@@ -1530,6 +1579,13 @@ enum AttachUiMode {
     Window,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AttachExitReason {
+    Detached,
+    StreamClosed,
+    Quit,
+}
+
 #[derive(Clone, Copy)]
 struct PaneRect {
     x: u16,
@@ -1909,6 +1965,22 @@ fn apply_attach_cursor_state(
         }
     }
     Ok(())
+}
+
+fn restore_terminal_after_attach_ui() -> Result<()> {
+    let mut stdout = io::stdout();
+    queue!(
+        stdout,
+        Show,
+        Print("\x1b[0m"),
+        MoveTo(0, 0),
+        Clear(ClearType::All),
+        MoveTo(0, 0)
+    )
+    .context("failed restoring terminal after attach ui")?;
+    stdout
+        .flush()
+        .context("failed flushing terminal restoration")
 }
 
 fn attach_event_actions(

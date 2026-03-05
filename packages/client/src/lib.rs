@@ -877,9 +877,9 @@ fn endpoint_from_paths(paths: &ConfigPaths) -> IpcEndpoint {
 
 #[cfg(test)]
 mod tests {
-    use super::{BmuxClient, ServerEvent};
+    use super::{BmuxClient, ClientError, ServerEvent};
     use bmux_ipc::{
-        IpcEndpoint, PaneFocusDirection, PaneSelector, PaneSplitDirection, SessionRole,
+        ErrorCode, IpcEndpoint, PaneFocusDirection, PaneSelector, PaneSplitDirection, SessionRole,
         SessionSelector, WindowSelector,
     };
     use bmux_server::BmuxServer;
@@ -1059,6 +1059,84 @@ mod tests {
                 .expect("list after kill should succeed")
                 .is_empty()
         );
+
+        client.stop_server().await.expect("stop should succeed");
+        server_task
+            .await
+            .expect("server task should join")
+            .expect("server should stop cleanly");
+
+        if socket_path.exists() {
+            std::fs::remove_file(&socket_path).expect("socket cleanup should succeed");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attach_batch_output_detects_closed_active_pane_and_reaps_session() {
+        let (server_task, socket_path, endpoint) = start_server().await;
+        let mut client = BmuxClient::connect(&endpoint, Duration::from_secs(2), "attach-exit-test")
+            .await
+            .expect("client should connect");
+
+        let session_id = client
+            .new_session(Some("exit-session".to_string()))
+            .await
+            .expect("new-session should succeed");
+        let grant = client
+            .attach_grant(SessionSelector::ById(session_id))
+            .await
+            .expect("attach grant should succeed");
+        let attached_id = client
+            .open_attach_stream(&grant)
+            .await
+            .expect("attach open should succeed");
+        assert_eq!(attached_id, session_id);
+
+        let pane_id = client
+            .attach_layout(session_id)
+            .await
+            .expect("attach layout should succeed")
+            .panes
+            .first()
+            .expect("single pane should exist")
+            .id;
+
+        client
+            .close_pane(Some(SessionSelector::ById(session_id)))
+            .await
+            .expect("close active pane should succeed");
+
+        let mut closed = false;
+        for _ in 0..80 {
+            match client
+                .attach_pane_output_batch(session_id, vec![pane_id], 1024)
+                .await
+            {
+                Ok(_) => {}
+                Err(ClientError::ServerError { code, .. }) if code == ErrorCode::NotFound => {
+                    closed = true;
+                    break;
+                }
+                Err(error) => panic!("unexpected attach batch error: {error}"),
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        assert!(closed, "closed active pane should close attach stream");
+
+        let mut removed = false;
+        for _ in 0..40 {
+            let sessions = client
+                .list_sessions()
+                .await
+                .expect("list sessions should succeed");
+            if sessions.is_empty() {
+                removed = true;
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        assert!(removed, "session should be removed after last pane exits");
 
         client.stop_server().await.expect("stop should succeed");
         server_task

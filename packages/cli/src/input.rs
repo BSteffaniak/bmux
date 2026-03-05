@@ -358,10 +358,16 @@ impl InputProcessor {
     }
 
     pub(crate) fn process_terminal_event(&mut self, event: Event) -> Vec<RuntimeAction> {
+        let mut actions = Vec::new();
+        if self.pending_timed_out() {
+            self.resolve_pending(&mut actions, true);
+        }
+
         let Some(input_event) = crossterm_event_to_input_event(event) else {
-            return Vec::new();
+            return actions;
         };
-        self.process_input_events(std::iter::once(input_event))
+        actions.extend(self.process_input_events(std::iter::once(input_event)));
+        actions
     }
 
     fn process_input_events<I>(&mut self, events: I) -> Vec<RuntimeAction>
@@ -1469,6 +1475,30 @@ mod tests {
         assert!(processor.process_chunk(&[0x01, b'w']).is_empty());
         thread::sleep(Duration::from_millis(70));
         assert_eq!(processor.process_chunk(&[]), vec![RuntimeAction::ShowHelp]);
+    }
+
+    #[test]
+    fn terminal_event_timeout_falls_back_to_shorter_match() {
+        let mut runtime = BTreeMap::new();
+        runtime.insert("w".to_string(), "show_help".to_string());
+        runtime.insert("w o".to_string(), "focus_next_pane".to_string());
+        let keymap =
+            Keymap::from_parts("ctrl+a", 50, &runtime, &BTreeMap::new()).expect("valid keymap");
+        let mut processor = InputProcessor::new(keymap);
+
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Char('a'), KeyModifiers::CONTROL)),
+            Vec::<RuntimeAction>::new()
+        );
+        assert_eq!(
+            processor.process_terminal_event(key_event(KeyCode::Char('w'), KeyModifiers::NONE)),
+            Vec::<RuntimeAction>::new()
+        );
+        thread::sleep(Duration::from_millis(70));
+        assert_eq!(
+            processor.process_terminal_event(Event::FocusGained),
+            vec![RuntimeAction::ShowHelp]
+        );
     }
 
     #[test]
