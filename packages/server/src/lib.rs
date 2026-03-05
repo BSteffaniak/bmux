@@ -12,9 +12,10 @@ use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
     AttachGrant, CURRENT_PROTOCOL_VERSION, ClientSummary, Envelope, EnvelopeKind, ErrorCode,
-    ErrorResponse, Event, IpcEndpoint, ProtocolVersion, Request, Response, ResponsePayload,
-    ServerSnapshotStatus, SessionPermissionSummary, SessionRole, SessionSelector, SessionSummary,
-    WindowSelector, WindowSummary, decode, encode,
+    ErrorResponse, Event, IpcEndpoint, PaneFocusDirection, PaneSplitDirection, PaneSummary,
+    ProtocolVersion, Request, Response, ResponsePayload, ServerSnapshotStatus,
+    SessionPermissionSummary, SessionRole, SessionSelector, SessionSummary, WindowSelector,
+    WindowSummary, decode, encode,
 };
 use bmux_session::{ClientId, Session, SessionId, SessionManager, WindowId};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
@@ -563,15 +564,21 @@ async fn shutdown_runtime_handle(removed: RemovedRuntime) {
 }
 
 async fn shutdown_window_handle(mut window: WindowRuntimeHandle) {
-    if let Some(stop_tx) = window.stop_tx.take() {
+    for pane in window.panes.into_values() {
+        shutdown_pane_handle(pane).await;
+    }
+}
+
+async fn shutdown_pane_handle(mut pane: PaneRuntimeHandle) {
+    if let Some(stop_tx) = pane.stop_tx.take() {
         let _ = stop_tx.send(());
     }
 
-    match tokio::time::timeout(Duration::from_millis(250), &mut window.task).await {
+    match tokio::time::timeout(Duration::from_millis(250), &mut pane.task).await {
         Ok(_) => {}
         Err(_) => {
-            window.task.abort();
-            let _ = window.task.await;
+            pane.task.abort();
+            let _ = pane.task.await;
         }
     }
 }
@@ -593,11 +600,8 @@ struct SessionRuntimeHandle {
 struct WindowRuntimeHandle {
     id: bmux_session::WindowId,
     name: Option<String>,
-    pane: PaneRuntimeMeta,
-    stop_tx: Option<oneshot::Sender<()>>,
-    task: JoinHandle<()>,
-    input_tx: mpsc::UnboundedSender<Vec<u8>>,
-    output_buffer: Arc<std::sync::Mutex<OutputFanoutBuffer>>,
+    panes: BTreeMap<Uuid, PaneRuntimeHandle>,
+    focused_pane_id: Uuid,
 }
 
 #[derive(Debug, Clone)]
@@ -605,6 +609,14 @@ struct PaneRuntimeMeta {
     id: Uuid,
     name: Option<String>,
     shell: String,
+}
+
+struct PaneRuntimeHandle {
+    meta: PaneRuntimeMeta,
+    stop_tx: Option<oneshot::Sender<()>>,
+    task: JoinHandle<()>,
+    input_tx: mpsc::UnboundedSender<Vec<u8>>,
+    output_buffer: Arc<std::sync::Mutex<OutputFanoutBuffer>>,
 }
 
 struct OutputFanoutBuffer {
@@ -701,7 +713,7 @@ struct WindowRuntimeSummary {
 struct RestoreWindowRuntimeSpec {
     id: bmux_session::WindowId,
     name: Option<String>,
-    pane: PaneRuntimeMeta,
+    panes: Vec<PaneRuntimeMeta>,
     focused_pane_id: Uuid,
 }
 
@@ -769,16 +781,37 @@ impl SessionRuntimeManager {
 
         let mut runtime_windows = BTreeMap::new();
         for window in windows {
-            if window.focused_pane_id != window.pane.id {
+            if window.panes.is_empty() {
+                anyhow::bail!("restored runtime window must include panes");
+            }
+            if !window
+                .panes
+                .iter()
+                .any(|pane| pane.id == window.focused_pane_id)
+            {
                 anyhow::bail!("focused pane missing from restored runtime window");
             }
             let handle = self.spawn_window_runtime(
                 Some(window.id),
                 window.name,
-                Some(window.pane.id),
-                window.pane.name,
-                Some(window.pane.shell),
+                Some(window.focused_pane_id),
+                None,
+                None,
             )?;
+            let mut handle = handle;
+            let existing_focused = handle.focused_pane_id;
+            if let Some(existing) = handle.panes.remove(&existing_focused) {
+                tokio::spawn(async move {
+                    shutdown_pane_handle(existing).await;
+                });
+            }
+
+            handle.panes.clear();
+            for pane_meta in window.panes {
+                let pane = self.spawn_pane_runtime(pane_meta.clone(), window.id)?;
+                handle.panes.insert(pane_meta.id, pane);
+            }
+            handle.focused_pane_id = window.focused_pane_id;
             runtime_windows.insert(window.id, handle);
         }
 
@@ -807,21 +840,40 @@ impl SessionRuntimeManager {
         pane_name: Option<String>,
         pane_shell: Option<String>,
     ) -> Result<WindowRuntimeHandle> {
+        let window_id = id.unwrap_or_else(bmux_session::WindowId::new);
+        let pane_meta = PaneRuntimeMeta {
+            id: pane_id.unwrap_or(window_id.0),
+            name: pane_name,
+            shell: pane_shell.unwrap_or_else(|| self.shell.clone()),
+        };
+        let pane = self.spawn_pane_runtime(pane_meta.clone(), window_id)?;
+        let mut panes = BTreeMap::new();
+        panes.insert(pane_meta.id, pane);
+
+        Ok(WindowRuntimeHandle {
+            id: window_id,
+            name,
+            panes,
+            focused_pane_id: pane_meta.id,
+        })
+    }
+
+    fn spawn_pane_runtime(
+        &self,
+        pane_meta: PaneRuntimeMeta,
+        window_id: bmux_session::WindowId,
+    ) -> Result<PaneRuntimeHandle> {
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
         let output_buffer = Arc::new(std::sync::Mutex::new(OutputFanoutBuffer::new(
             MAX_WINDOW_OUTPUT_BUFFER_BYTES,
         )));
-        let shell = pane_shell.unwrap_or_else(|| self.shell.clone());
+        let shell = pane_meta.shell.clone();
         let pane_term = self.pane_term.clone();
         let protocol_profile = self.protocol_profile;
-        let window_id = id.unwrap_or_else(bmux_session::WindowId::new);
-        let pane = PaneRuntimeMeta {
-            id: pane_id.unwrap_or(window_id.0),
-            name: pane_name,
-            shell: shell.clone(),
-        };
+        let pane_id = pane_meta.id;
         let output_buffer_for_reader = Arc::clone(&output_buffer);
+
         let task = tokio::spawn(async move {
             let pty_system = native_pty_system();
             let pty_pair = match pty_system.openpty(PtySize {
@@ -861,7 +913,7 @@ impl SessionRuntimeManager {
             let reader_output = Arc::clone(&output_buffer_for_reader);
             let writer_for_reader = Arc::clone(&writer);
             let reader_thread = std::thread::Builder::new()
-                .name(format!("bmux-server-window-{}", window_id.0))
+                .name(format!("bmux-server-window-{}-pane-{}", window_id.0, pane_id))
                 .spawn(move || {
                     let mut buffer = [0_u8; 8192];
                     let mut protocol_engine = TerminalProtocolEngine::new(protocol_profile);
@@ -875,7 +927,6 @@ impl SessionRuntimeManager {
                                 } else {
                                     break;
                                 }
-
                                 let reply = protocol_engine.process_output(chunk, (0, 0));
                                 if !reply.is_empty() {
                                     if let Ok(mut writer) = writer_for_reader.lock() {
@@ -896,9 +947,7 @@ impl SessionRuntimeManager {
 
             loop {
                 tokio::select! {
-                    _ = &mut stop_rx => {
-                        break;
-                    }
+                    _ = &mut stop_rx => break,
                     input = input_rx.recv() => {
                         match input {
                             Some(bytes) => {
@@ -923,10 +972,8 @@ impl SessionRuntimeManager {
             }
         });
 
-        Ok(WindowRuntimeHandle {
-            id: window_id,
-            name,
-            pane,
+        Ok(PaneRuntimeHandle {
+            meta: pane_meta,
             stop_tx: Some(stop_tx),
             task,
             input_tx,
@@ -978,10 +1025,190 @@ impl SessionRuntimeManager {
             .map(|window| WindowRuntimeSummary {
                 id: window.id,
                 name: window.name.clone(),
-                pane: window.pane.clone(),
+                pane: window
+                    .panes
+                    .get(&window.focused_pane_id)
+                    .map(|pane| pane.meta.clone())
+                    .unwrap_or(PaneRuntimeMeta {
+                        id: window.focused_pane_id,
+                        name: Some("pane".to_string()),
+                        shell: self.shell.clone(),
+                    }),
                 active: window.id == session.active_window,
             })
             .collect())
+    }
+
+    fn split_focused_pane(
+        &mut self,
+        session_id: SessionId,
+        direction: PaneSplitDirection,
+    ) -> Result<Uuid> {
+        let (window_id, next_pane_name, shell, client_ids) = {
+            let session = self
+                .runtimes
+                .get_mut(&session_id)
+                .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+            let window = session
+                .windows
+                .get_mut(&session.active_window)
+                .ok_or_else(|| anyhow::anyhow!("active window not found"))?;
+            let focused = window
+                .panes
+                .get(&window.focused_pane_id)
+                .ok_or_else(|| anyhow::anyhow!("focused pane not found"))?;
+            let name_prefix = match direction {
+                PaneSplitDirection::Vertical => "v",
+                PaneSplitDirection::Horizontal => "h",
+            };
+            (
+                window.id,
+                Some(format!("{name_prefix}-pane-{}", window.panes.len() + 1)),
+                focused.meta.shell.clone(),
+                session.attached_clients.iter().copied().collect::<Vec<_>>(),
+            )
+        };
+
+        let pane_id = Uuid::new_v4();
+        let pane_meta = PaneRuntimeMeta {
+            id: pane_id,
+            name: next_pane_name,
+            shell,
+        };
+        let mut handle = self.spawn_pane_runtime(pane_meta, window_id)?;
+        for client_id in client_ids {
+            if let Ok(mut output) = handle.output_buffer.lock() {
+                output.register_client_at_tail(client_id);
+            }
+        }
+
+        let session = self
+            .runtimes
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        let window = session
+            .windows
+            .get_mut(&session.active_window)
+            .ok_or_else(|| anyhow::anyhow!("active window not found"))?;
+        window.panes.insert(pane_id, handle);
+        window.focused_pane_id = pane_id;
+        Ok(pane_id)
+    }
+
+    fn focus_pane(&mut self, session_id: SessionId, direction: PaneFocusDirection) -> Result<Uuid> {
+        let session = self
+            .runtimes
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        let window = session
+            .windows
+            .get_mut(&session.active_window)
+            .ok_or_else(|| anyhow::anyhow!("active window not found"))?;
+        let mut pane_ids = window.panes.keys().copied().collect::<Vec<_>>();
+        pane_ids.sort();
+        if pane_ids.is_empty() {
+            anyhow::bail!("no panes in active window")
+        }
+        let current_index = pane_ids
+            .iter()
+            .position(|id| *id == window.focused_pane_id)
+            .unwrap_or(0);
+        let len = pane_ids.len();
+        let next_index = match direction {
+            PaneFocusDirection::Next => (current_index + 1) % len,
+            PaneFocusDirection::Prev => {
+                if current_index == 0 {
+                    len - 1
+                } else {
+                    current_index - 1
+                }
+            }
+        };
+        window.focused_pane_id = pane_ids[next_index];
+        Ok(window.focused_pane_id)
+    }
+
+    fn close_focused_pane(&mut self, session_id: SessionId) -> Result<Option<RemovedWindowRuntime>> {
+        let (window_id, pane_id, remove_window) = {
+            let session = self
+                .runtimes
+                .get_mut(&session_id)
+                .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+            let window_id = session.active_window;
+            let window = session
+                .windows
+                .get_mut(&window_id)
+                .ok_or_else(|| anyhow::anyhow!("active window not found"))?;
+            let pane_id = window.focused_pane_id;
+            (window_id, pane_id, window.panes.len() == 1)
+        };
+
+        if remove_window {
+            let removed = self.kill_window(session_id, WindowSelection::Id(window_id))?;
+            return Ok(Some(removed));
+        }
+
+        let session = self
+            .runtimes
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        let window = session
+            .windows
+            .get_mut(&window_id)
+            .ok_or_else(|| anyhow::anyhow!("active window not found"))?;
+        let mut pane = window
+            .panes
+            .remove(&pane_id)
+            .ok_or_else(|| anyhow::anyhow!("focused pane not found"))?;
+        if let Some(next_id) = window.panes.keys().next().copied() {
+            window.focused_pane_id = next_id;
+        }
+
+        tokio::spawn(async move {
+            shutdown_pane_handle(pane).await;
+        });
+        Ok(None)
+    }
+
+    fn resize_focused_pane(&mut self, session_id: SessionId, _delta: i16) -> Result<()> {
+        let session = self
+            .runtimes
+            .get(&session_id)
+            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        let window = session
+            .windows
+            .get(&session.active_window)
+            .ok_or_else(|| anyhow::anyhow!("active window not found"))?;
+        if !window.panes.contains_key(&window.focused_pane_id) {
+            anyhow::bail!("focused pane not found")
+        }
+        Ok(())
+    }
+
+    fn list_panes(&self, session_id: SessionId) -> Result<(bmux_session::WindowId, Vec<PaneSummary>)> {
+        let session = self
+            .runtimes
+            .get(&session_id)
+            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        let window = session
+            .windows
+            .get(&session.active_window)
+            .ok_or_else(|| anyhow::anyhow!("active window not found"))?;
+        let mut pane_ids = window.panes.keys().copied().collect::<Vec<_>>();
+        pane_ids.sort();
+        let panes = pane_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pane_id)| {
+                window.panes.get(pane_id).map(|pane| PaneSummary {
+                    id: *pane_id,
+                    index: (index + 1) as u32,
+                    name: pane.meta.name.clone(),
+                    focused: *pane_id == window.focused_pane_id,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok((window.id, panes))
     }
 
     fn switch_window(
@@ -1101,11 +1328,13 @@ impl SessionRuntimeManager {
 
         runtime.attached_clients.insert(client_id);
         for window in runtime.windows.values_mut() {
-            let mut output = window
-                .output_buffer
-                .lock()
-                .map_err(|_| SessionRuntimeError::Closed)?;
-            output.register_client_at_tail(client_id);
+            for pane in window.panes.values_mut() {
+                let mut output = pane
+                    .output_buffer
+                    .lock()
+                    .map_err(|_| SessionRuntimeError::Closed)?;
+                output.register_client_at_tail(client_id);
+            }
         }
         Ok(())
     }
@@ -1115,8 +1344,10 @@ impl SessionRuntimeManager {
             let removed = runtime.attached_clients.remove(&client_id);
             if removed {
                 for window in runtime.windows.values_mut() {
-                    if let Ok(mut output) = window.output_buffer.lock() {
-                        output.unregister_client(client_id);
+                    for pane in window.panes.values_mut() {
+                        if let Ok(mut output) = pane.output_buffer.lock() {
+                            output.unregister_client(client_id);
+                        }
                     }
                 }
             }
@@ -1142,9 +1373,13 @@ impl SessionRuntimeManager {
             .windows
             .get_mut(&runtime.active_window)
             .ok_or(SessionRuntimeError::NotFound)?;
+        let pane = window
+            .panes
+            .get_mut(&window.focused_pane_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
 
         let bytes = data.len();
-        window
+        pane
             .input_tx
             .send(data)
             .map_err(|_| SessionRuntimeError::Closed)?;
@@ -1170,8 +1405,12 @@ impl SessionRuntimeManager {
             .windows
             .get_mut(&runtime.active_window)
             .ok_or(SessionRuntimeError::NotFound)?;
+        let pane = window
+            .panes
+            .get_mut(&window.focused_pane_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
 
-        let mut output = window
+        let mut output = pane
             .output_buffer
             .lock()
             .map_err(|_| SessionRuntimeError::Closed)?;
@@ -1840,21 +2079,36 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV2> {
         sessions
             .iter()
             .map(|session_info| {
-                let windows = runtime_manager
-                    .list_windows(session_info.id)
-                    .unwrap_or_default();
-                let active_window_id = windows.iter().find(|w| w.active).map(|w| w.id.0);
-                let window_snapshots = windows
+                let active_window_id = runtime_manager
+                    .runtimes
+                    .get(&session_info.id)
+                    .map(|runtime| runtime.active_window.0);
+                let window_snapshots = runtime_manager
+                    .runtimes
+                    .get(&session_info.id)
+                    .map(|runtime| runtime.windows.values())
                     .into_iter()
-                    .map(|window| WindowSnapshotV2 {
-                        id: window.id.0,
-                        name: window.name,
-                        panes: vec![PaneSnapshotV2 {
-                            id: window.pane.id,
-                            name: window.pane.name,
-                            shell: window.pane.shell,
-                        }],
-                        focused_pane_id: Some(window.pane.id),
+                    .flatten()
+                    .map(|window| {
+                        let mut pane_ids = window.panes.keys().copied().collect::<Vec<_>>();
+                        pane_ids.sort();
+                        let panes = pane_ids
+                            .into_iter()
+                            .filter_map(|pane_id| {
+                                window.panes.get(&pane_id).map(|pane| PaneSnapshotV2 {
+                                    id: pane.meta.id,
+                                    name: pane.meta.name.clone(),
+                                    shell: pane.meta.shell.clone(),
+                                })
+                            })
+                            .collect::<Vec<_>>();
+
+                        WindowSnapshotV2 {
+                            id: window.id.0,
+                            name: window.name.clone(),
+                            panes,
+                            focused_pane_id: Some(window.focused_pane_id),
+                        }
                     })
                     .collect::<Vec<_>>();
 
@@ -2027,20 +2281,23 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV2) -> Resu
                 .windows
                 .iter()
                 .map(|window| {
-                    let pane = window
+                    let panes = window
                         .panes
-                        .first()
-                        .cloned()
-                        .expect("snapshot validation ensures pane exists");
+                        .iter()
+                        .map(|pane| PaneRuntimeMeta {
+                            id: pane.id,
+                            name: pane.name.clone(),
+                            shell: pane.shell.clone(),
+                        })
+                        .collect::<Vec<_>>();
                     RestoreWindowRuntimeSpec {
                         id: WindowId(window.id),
                         name: window.name.clone(),
-                        pane: PaneRuntimeMeta {
-                            id: pane.id,
-                            name: pane.name,
-                            shell: pane.shell,
-                        },
-                        focused_pane_id: window.focused_pane_id.unwrap_or(pane.id),
+                        panes,
+                        focused_pane_id: window
+                            .focused_pane_id
+                            .or_else(|| window.panes.first().map(|pane| pane.id))
+                            .expect("snapshot validation ensures pane exists"),
                     }
                 })
                 .collect::<Vec<_>>();
@@ -2602,6 +2859,263 @@ async fn handle_request(
             Response::Ok(ResponsePayload::WindowSwitched {
                 id: switched_id.0,
                 session_id: session_id.0,
+            })
+        }
+        Request::ListPanes { session } => {
+            let manager = state
+                .session_manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+            let session_id =
+                match resolve_window_request_session_id(&manager, &session, selected_session) {
+                    Ok(session_id) => session_id,
+                    Err(response) => return Ok(Response::Err(response)),
+                };
+            drop(manager);
+
+            let runtime_manager = state
+                .session_runtimes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+            let (_window_id, panes) = match runtime_manager.list_panes(session_id) {
+                Ok(result) => result,
+                Err(error) => {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::NotFound,
+                        message: format!("failed listing panes: {error:#}"),
+                    }));
+                }
+            };
+            Response::Ok(ResponsePayload::PaneList { panes })
+        }
+        Request::SplitPane { session, direction } => {
+            let manager = state
+                .session_manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+            let session_id =
+                match resolve_window_request_session_id(&manager, &session, selected_session) {
+                    Ok(session_id) => session_id,
+                    Err(response) => return Ok(Response::Err(response)),
+                };
+            drop(manager);
+            if let Err(response) = ensure_writer_for_session(state, session_id, client_id) {
+                return Ok(Response::Err(response));
+            }
+            let mut runtime_manager = state
+                .session_runtimes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+            let pane_id = match runtime_manager.split_focused_pane(session_id, direction) {
+                Ok(id) => id,
+                Err(error) => {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::Internal,
+                        message: format!("failed splitting pane: {error:#}"),
+                    }));
+                }
+            };
+            let window_id = runtime_manager
+                .runtimes
+                .get(&session_id)
+                .map(|runtime| runtime.active_window)
+                .unwrap_or(WindowId(Uuid::nil()));
+            Response::Ok(ResponsePayload::PaneSplit {
+                id: pane_id,
+                session_id: session_id.0,
+                window_id: window_id.0,
+            })
+        }
+        Request::FocusPane { session, direction } => {
+            let manager = state
+                .session_manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+            let session_id =
+                match resolve_window_request_session_id(&manager, &session, selected_session) {
+                    Ok(session_id) => session_id,
+                    Err(response) => return Ok(Response::Err(response)),
+                };
+            drop(manager);
+            if let Err(response) = ensure_writer_for_session(state, session_id, client_id) {
+                return Ok(Response::Err(response));
+            }
+            let mut runtime_manager = state
+                .session_runtimes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+            let pane_id = match runtime_manager.focus_pane(session_id, direction) {
+                Ok(id) => id,
+                Err(error) => {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::NotFound,
+                        message: format!("failed focusing pane: {error:#}"),
+                    }));
+                }
+            };
+            let window_id = runtime_manager
+                .runtimes
+                .get(&session_id)
+                .map(|runtime| runtime.active_window)
+                .unwrap_or(WindowId(Uuid::nil()));
+            Response::Ok(ResponsePayload::PaneFocused {
+                id: pane_id,
+                session_id: session_id.0,
+                window_id: window_id.0,
+            })
+        }
+        Request::ResizePane { session, delta } => {
+            let manager = state
+                .session_manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+            let session_id =
+                match resolve_window_request_session_id(&manager, &session, selected_session) {
+                    Ok(session_id) => session_id,
+                    Err(response) => return Ok(Response::Err(response)),
+                };
+            drop(manager);
+            if let Err(response) = ensure_writer_for_session(state, session_id, client_id) {
+                return Ok(Response::Err(response));
+            }
+            let mut runtime_manager = state
+                .session_runtimes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+            if let Err(error) = runtime_manager.resize_focused_pane(session_id, delta) {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!("failed resizing pane: {error:#}"),
+                }));
+            }
+            let window_id = runtime_manager
+                .runtimes
+                .get(&session_id)
+                .map(|runtime| runtime.active_window)
+                .unwrap_or(WindowId(Uuid::nil()));
+            Response::Ok(ResponsePayload::PaneResized {
+                session_id: session_id.0,
+                window_id: window_id.0,
+            })
+        }
+        Request::ClosePane { session } => {
+            let session_id = {
+                let manager = state
+                    .session_manager
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                match resolve_window_request_session_id(&manager, &session, selected_session) {
+                    Ok(session_id) => session_id,
+                    Err(response) => return Ok(Response::Err(response)),
+                }
+            };
+            if let Err(response) = ensure_writer_for_session(state, session_id, client_id) {
+                return Ok(Response::Err(response));
+            }
+
+            let (focused_pane_id, active_window_id, removed_window) = {
+                let mut runtime_manager = state
+                    .session_runtimes
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+                let active_window_id = runtime_manager
+                    .runtimes
+                    .get(&session_id)
+                    .map(|runtime| runtime.active_window)
+                    .ok_or_else(|| anyhow::anyhow!("runtime not found"))?;
+                let focused_pane_id = runtime_manager
+                    .runtimes
+                    .get(&session_id)
+                    .and_then(|runtime| runtime.windows.get(&active_window_id))
+                    .map(|window| window.focused_pane_id)
+                    .ok_or_else(|| anyhow::anyhow!("active window not found"))?;
+                let removed_window = runtime_manager.close_focused_pane(session_id).map_err(|error| {
+                    anyhow::anyhow!("failed closing pane: {error:#}")
+                })?;
+                (focused_pane_id, active_window_id, removed_window)
+            };
+
+            let mut window_closed = false;
+            let mut session_closed = false;
+            if let Some(removed_window) = removed_window {
+                window_closed = true;
+                let removed_window_session_id = removed_window.session_id;
+                let removed_window_id = removed_window.window_id;
+                let removed_window_handle = removed_window.handle;
+                let session_removed = removed_window.session_removed;
+                shutdown_window_handle(removed_window_handle).await;
+                {
+                    let mut manager = state
+                        .session_manager
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                    if let Some(session_model) = manager.get_session_mut(&removed_window_session_id) {
+                        session_model.remove_window(&removed_window_id);
+                    }
+                }
+                emit_event(
+                    state,
+                    Event::WindowRemoved {
+                        id: removed_window_id.0,
+                        session_id: removed_window_session_id.0,
+                    },
+                )?;
+                if let Some(removed_session) = session_removed {
+                    session_closed = true;
+                    if removed_session.had_attached_clients {
+                        emit_event(
+                            state,
+                            Event::ClientDetached {
+                                id: removed_window_session_id.0,
+                            },
+                        )?;
+                    }
+                    shutdown_runtime_handle(removed_session).await;
+                    let mut manager = state
+                        .session_manager
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                    let _ = manager.remove_session(&removed_window_session_id);
+                    if *selected_session == Some(removed_window_session_id) {
+                        *selected_session = None;
+                        persist_selected_session(state, client_id, None)?;
+                    }
+                    if *attached_stream_session == Some(removed_window_session_id) {
+                        *attached_stream_session = None;
+                    }
+                    drop(manager);
+
+                    let mut attach_tokens = state
+                        .attach_tokens
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
+                    attach_tokens.remove_for_session(removed_window_session_id);
+                    drop(attach_tokens);
+
+                    clear_selected_session_for_all(state, removed_window_session_id)?;
+
+                    let mut permission_state = state
+                        .permission_state
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
+                    permission_state.remove_session(removed_window_session_id);
+                    drop(permission_state);
+
+                    emit_event(
+                        state,
+                        Event::SessionRemoved {
+                            id: removed_window_session_id.0,
+                        },
+                    )?;
+                }
+            }
+
+            Response::Ok(ResponsePayload::PaneClosed {
+                id: focused_pane_id,
+                session_id: session_id.0,
+                window_id: active_window_id.0,
+                window_closed,
+                session_closed,
             })
         }
         Request::ListSessions => {
@@ -3219,6 +3733,10 @@ fn request_requires_exclusive(request: &Request) -> bool {
             | Request::KillSession { .. }
             | Request::KillWindow { .. }
             | Request::SwitchWindow { .. }
+            | Request::SplitPane { .. }
+            | Request::FocusPane { .. }
+            | Request::ResizePane { .. }
+            | Request::ClosePane { .. }
             | Request::FollowClient { .. }
             | Request::Unfollow
             | Request::Attach { .. }
@@ -3236,6 +3754,10 @@ fn response_requires_snapshot(response: &Response) -> bool {
                 | ResponsePayload::WindowCreated { .. }
                 | ResponsePayload::WindowKilled { .. }
                 | ResponsePayload::WindowSwitched { .. }
+                | ResponsePayload::PaneSplit { .. }
+                | ResponsePayload::PaneFocused { .. }
+                | ResponsePayload::PaneResized { .. }
+                | ResponsePayload::PaneClosed { .. }
                 | ResponsePayload::SessionKilled { .. }
                 | ResponsePayload::RoleGranted { .. }
                 | ResponsePayload::RoleRevoked { .. }
@@ -3377,6 +3899,27 @@ fn ensure_owner_for_session(
         Err(ErrorResponse {
             code: ErrorCode::InvalidRequest,
             message: "owner role required for this operation".to_string(),
+        })
+    }
+}
+
+fn ensure_writer_for_session(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    client_id: ClientId,
+) -> std::result::Result<(), ErrorResponse> {
+    let permission_state = state.permission_state.lock().map_err(|_| ErrorResponse {
+        code: ErrorCode::Internal,
+        message: "permission state lock poisoned".to_string(),
+    })?;
+
+    let role = permission_state.role_for(session_id, client_id);
+    if role == SessionRole::Owner || role == SessionRole::Writer {
+        Ok(())
+    } else {
+        Err(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: "writer or owner role required for this operation".to_string(),
         })
     }
 }

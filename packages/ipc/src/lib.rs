@@ -118,6 +118,28 @@ pub enum WindowSelector {
     Active,
 }
 
+/// Pane selector accepted by commands and protocol requests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PaneSelector {
+    ById(Uuid),
+    ByIndex(u32),
+    Active,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneSplitDirection {
+    Vertical,
+    Horizontal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneFocusDirection {
+    Next,
+    Prev,
+}
+
 /// Session role used for collaborative permission controls.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -177,6 +199,24 @@ pub enum Request {
         session: Option<SessionSelector>,
         target: WindowSelector,
     },
+    SplitPane {
+        session: Option<SessionSelector>,
+        direction: PaneSplitDirection,
+    },
+    FocusPane {
+        session: Option<SessionSelector>,
+        direction: PaneFocusDirection,
+    },
+    ResizePane {
+        session: Option<SessionSelector>,
+        delta: i16,
+    },
+    ClosePane {
+        session: Option<SessionSelector>,
+    },
+    ListPanes {
+        session: Option<SessionSelector>,
+    },
     FollowClient {
         target_client_id: Uuid,
         global: bool,
@@ -228,6 +268,15 @@ pub struct WindowSummary {
     pub session_id: Uuid,
     pub name: Option<String>,
     pub active: bool,
+}
+
+/// Summary returned when listing panes in the active window.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PaneSummary {
+    pub id: Uuid,
+    pub index: u32,
+    pub name: Option<String>,
+    pub focused: bool,
 }
 
 /// Summary returned when listing connected clients.
@@ -316,6 +365,30 @@ pub enum ResponsePayload {
     WindowSwitched {
         id: Uuid,
         session_id: Uuid,
+    },
+    PaneSplit {
+        id: Uuid,
+        session_id: Uuid,
+        window_id: Uuid,
+    },
+    PaneFocused {
+        id: Uuid,
+        session_id: Uuid,
+        window_id: Uuid,
+    },
+    PaneResized {
+        session_id: Uuid,
+        window_id: Uuid,
+    },
+    PaneClosed {
+        id: Uuid,
+        session_id: Uuid,
+        window_id: Uuid,
+        window_closed: bool,
+        session_closed: bool,
+    },
+    PaneList {
+        panes: Vec<PaneSummary>,
     },
     FollowStarted {
         follower_client_id: Uuid,

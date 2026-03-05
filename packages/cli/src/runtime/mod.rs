@@ -8,7 +8,8 @@ use anyhow::{Context, Result};
 use bmux_client::{BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, TerminfoAutoInstall};
 use bmux_ipc::{
-    SessionRole, SessionSelector, SessionSummary, WindowSelector, transport::IpcTransportError,
+    PaneFocusDirection, PaneSplitDirection, SessionRole, SessionSelector, SessionSummary,
+    WindowSelector, transport::IpcTransportError,
 };
 use bmux_server::BmuxServer;
 use clap::Parser;
@@ -973,6 +974,61 @@ async fn handle_attach_ui_action(
                 )
                 .await?;
         }
+        RuntimeAction::SplitFocusedVertical => {
+            let _ = client
+                .split_pane(
+                    Some(SessionSelector::ById(*attached_id)),
+                    PaneSplitDirection::Vertical,
+                )
+                .await?;
+        }
+        RuntimeAction::SplitFocusedHorizontal => {
+            let _ = client
+                .split_pane(
+                    Some(SessionSelector::ById(*attached_id)),
+                    PaneSplitDirection::Horizontal,
+                )
+                .await?;
+        }
+        RuntimeAction::FocusNext
+        | RuntimeAction::FocusLeft
+        | RuntimeAction::FocusRight
+        | RuntimeAction::FocusUp
+        | RuntimeAction::FocusDown => {
+            let direction = if matches!(action, RuntimeAction::FocusLeft | RuntimeAction::FocusUp) {
+                PaneFocusDirection::Prev
+            } else {
+                PaneFocusDirection::Next
+            };
+            let _ = client
+                .focus_pane(Some(SessionSelector::ById(*attached_id)), direction)
+                .await?;
+        }
+        RuntimeAction::IncreaseSplit
+        | RuntimeAction::DecreaseSplit
+        | RuntimeAction::ResizeLeft
+        | RuntimeAction::ResizeRight
+        | RuntimeAction::ResizeUp
+        | RuntimeAction::ResizeDown => {
+            let delta = if matches!(
+                action,
+                RuntimeAction::IncreaseSplit
+                    | RuntimeAction::ResizeRight
+                    | RuntimeAction::ResizeDown
+            ) {
+                1
+            } else {
+                -1
+            };
+            client
+                .resize_pane(Some(SessionSelector::ById(*attached_id)), delta)
+                .await?;
+        }
+        RuntimeAction::CloseFocusedPane => {
+            client
+                .close_pane(Some(SessionSelector::ById(*attached_id)))
+                .await?;
+        }
         RuntimeAction::NewWindow | RuntimeAction::NewSession => {
             handle_attach_runtime_action(client, action, attached_id, can_write).await?;
         }
@@ -1254,6 +1310,20 @@ fn is_attach_keymap_action(action: &str) -> bool {
             | "window_goto_8"
             | "window_goto_9"
             | "window_close"
+            | "split_focused_vertical"
+            | "split_focused_horizontal"
+            | "focus_next"
+            | "focus_left"
+            | "focus_right"
+            | "focus_up"
+            | "focus_down"
+            | "increase_split"
+            | "decrease_split"
+            | "resize_left"
+            | "resize_right"
+            | "resize_up"
+            | "resize_down"
+            | "close_focused_pane"
     )
 }
 
@@ -1364,6 +1434,20 @@ fn attach_key_event_actions(
             }
             RuntimeAction::EnterWindowMode
             | RuntimeAction::ExitMode
+            | RuntimeAction::SplitFocusedVertical
+            | RuntimeAction::SplitFocusedHorizontal
+            | RuntimeAction::FocusNext
+            | RuntimeAction::FocusLeft
+            | RuntimeAction::FocusRight
+            | RuntimeAction::FocusUp
+            | RuntimeAction::FocusDown
+            | RuntimeAction::IncreaseSplit
+            | RuntimeAction::DecreaseSplit
+            | RuntimeAction::ResizeLeft
+            | RuntimeAction::ResizeRight
+            | RuntimeAction::ResizeUp
+            | RuntimeAction::ResizeDown
+            | RuntimeAction::CloseFocusedPane
             | RuntimeAction::WindowPrev
             | RuntimeAction::WindowNext
             | RuntimeAction::WindowGoto1
