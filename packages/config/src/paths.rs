@@ -76,6 +76,12 @@ impl ConfigPaths {
             .join("terminfo-prompt-state.json")
     }
 
+    /// Get persisted profile principal id file path.
+    #[must_use]
+    pub fn principal_id_file(&self) -> PathBuf {
+        self.data_dir.join("runtime").join("principal-id")
+    }
+
     /// Get the server socket path
     #[must_use]
     pub fn server_socket(&self) -> PathBuf {

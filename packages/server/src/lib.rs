@@ -21,9 +21,9 @@ use bmux_ipc::{
 use bmux_session::{ClientId, Session, SessionId, SessionManager, WindowId};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
 use persistence::{
-    ClientSelectedSessionSnapshotV2, FollowEdgeSnapshotV2, PaneLayoutNodeSnapshotV2,
-    PaneSnapshotV2, PaneSplitDirectionSnapshotV2, RoleAssignmentSnapshotV2, SessionSnapshotV2,
-    SnapshotManager, SnapshotV2, WindowSnapshotV2,
+    ClientSelectedSessionSnapshotV2, FollowEdgeSnapshotV2, OwnerPrincipalSnapshotV2,
+    PaneLayoutNodeSnapshotV2, PaneSnapshotV2, PaneSplitDirectionSnapshotV2,
+    RoleAssignmentSnapshotV2, SessionSnapshotV2, SnapshotManager, SnapshotV2, WindowSnapshotV2,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -58,6 +58,8 @@ struct ServerState {
     snapshot_runtime: Mutex<SnapshotRuntime>,
     operation_lock: AsyncMutex<()>,
     event_hub: Mutex<EventHub>,
+    client_principals: Mutex<BTreeMap<ClientId, Uuid>>,
+    server_owner_principal_id: Uuid,
     handshake_timeout: Duration,
     pane_exit_rx: AsyncMutex<mpsc::UnboundedReceiver<PaneExitEvent>>,
 }
@@ -284,20 +286,36 @@ struct FollowState {
 
 #[derive(Debug, Default)]
 struct PermissionState {
+    owner_principals: BTreeMap<SessionId, Uuid>,
     roles: BTreeMap<SessionId, BTreeMap<ClientId, SessionRole>>,
 }
 
 impl PermissionState {
-    fn ensure_owner(&mut self, session_id: SessionId, owner_client_id: ClientId) {
-        let session_roles = self.roles.entry(session_id).or_default();
-        session_roles.insert(owner_client_id, SessionRole::Owner);
+    fn ensure_owner(&mut self, session_id: SessionId, owner_principal_id: Uuid) {
+        self.owner_principals.insert(session_id, owner_principal_id);
     }
 
-    fn role_for(&self, session_id: SessionId, client_id: ClientId) -> SessionRole {
+    fn owner_principal_for(&self, session_id: SessionId) -> Option<Uuid> {
+        self.owner_principals.get(&session_id).copied()
+    }
+
+    fn role_for(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        principal_id: Uuid,
+    ) -> SessionRole {
+        if self.owner_principal_for(session_id) == Some(principal_id) {
+            return SessionRole::Owner;
+        }
         self.roles
             .get(&session_id)
             .and_then(|session_roles| session_roles.get(&client_id).copied())
             .unwrap_or(SessionRole::Observer)
+    }
+
+    fn set_owner_principal(&mut self, session_id: SessionId, principal_id: Uuid) {
+        self.owner_principals.insert(session_id, principal_id);
     }
 
     fn set_role(&mut self, session_id: SessionId, client_id: ClientId, role: SessionRole) {
@@ -312,15 +330,18 @@ impl PermissionState {
     }
 
     fn remove_session(&mut self, session_id: SessionId) {
+        self.owner_principals.remove(&session_id);
         self.roles.remove(&session_id);
     }
 
-    fn is_owner(&self, session_id: SessionId, client_id: ClientId) -> bool {
-        self.role_for(session_id, client_id) == SessionRole::Owner
-    }
-
-    fn list_permissions(&self, session_id: SessionId) -> Vec<SessionPermissionSummary> {
-        self.roles
+    fn list_permissions(
+        &self,
+        session_id: SessionId,
+        connected_clients: &BTreeSet<ClientId>,
+        client_principals: &BTreeMap<ClientId, Uuid>,
+    ) -> Vec<SessionPermissionSummary> {
+        let mut permissions = self
+            .roles
             .get(&session_id)
             .map(|session_roles| {
                 session_roles
@@ -331,71 +352,30 @@ impl PermissionState {
                     })
                     .collect::<Vec<_>>()
             })
-            .unwrap_or_default()
-    }
+            .unwrap_or_default();
 
-    fn rebalance_after_disconnect(
-        &mut self,
-        disconnected_client_id: ClientId,
-        connected_clients: &BTreeSet<ClientId>,
-        session_clients: &BTreeMap<SessionId, BTreeSet<ClientId>>,
-    ) -> Vec<Event> {
-        let mut events = Vec::new();
-
-        for (session_id, roles) in &mut self.roles {
-            let disconnected_role = roles.get(&disconnected_client_id).copied();
-
-            if disconnected_role == Some(SessionRole::Owner) {
-                let writer_candidate = roles
-                    .iter()
-                    .filter_map(|(client_id, role)| {
-                        (*client_id != disconnected_client_id
-                            && *role == SessionRole::Writer
-                            && connected_clients.contains(client_id))
-                        .then_some(*client_id)
-                    })
-                    .next();
-
-                let observer_candidate = roles
-                    .iter()
-                    .filter_map(|(client_id, role)| {
-                        (*client_id != disconnected_client_id
-                            && *role == SessionRole::Observer
-                            && connected_clients.contains(client_id))
-                        .then_some(*client_id)
-                    })
-                    .next();
-
-                let implicit_observer_candidate =
-                    session_clients.get(session_id).and_then(|clients| {
-                        clients
-                            .iter()
-                            .find(|client_id| {
-                                **client_id != disconnected_client_id
-                                    && connected_clients.contains(client_id)
-                            })
-                            .copied()
-                    });
-
-                if let Some(next_owner) = writer_candidate
-                    .or(observer_candidate)
-                    .or(implicit_observer_candidate)
+        if let Some(owner_principal_id) = self.owner_principal_for(session_id) {
+            for client_id in connected_clients {
+                if client_principals.get(client_id) == Some(&owner_principal_id)
+                    && !permissions
+                        .iter()
+                        .any(|entry| entry.client_id == client_id.0)
                 {
-                    roles.insert(next_owner, SessionRole::Owner);
-                    roles.remove(&disconnected_client_id);
-                    events.push(Event::RoleChanged {
-                        session_id: session_id.0,
-                        client_id: next_owner.0,
+                    permissions.push(SessionPermissionSummary {
+                        client_id: client_id.0,
                         role: SessionRole::Owner,
-                        by_client_id: disconnected_client_id.0,
                     });
                 }
-            } else {
-                roles.remove(&disconnected_client_id);
             }
         }
 
-        events
+        permissions
+    }
+
+    fn clear_client_roles(&mut self, client_id: ClientId) {
+        for roles in self.roles.values_mut() {
+            roles.remove(&client_id);
+        }
     }
 }
 
@@ -1987,7 +1967,11 @@ fn window_not_found_in_session_message(
 }
 
 impl BmuxServer {
-    fn new_with_snapshot(endpoint: IpcEndpoint, snapshot_manager: Option<SnapshotManager>) -> Self {
+    fn new_with_snapshot(
+        endpoint: IpcEndpoint,
+        snapshot_manager: Option<SnapshotManager>,
+        server_owner_principal_id: Uuid,
+    ) -> Self {
         let snapshot_runtime = match snapshot_manager {
             Some(manager) => SnapshotRuntime::with_manager(manager),
             None => SnapshotRuntime::disabled(),
@@ -2015,6 +1999,8 @@ impl BmuxServer {
                 snapshot_runtime: Mutex::new(snapshot_runtime),
                 operation_lock: AsyncMutex::new(()),
                 event_hub: Mutex::new(EventHub::new(1024)),
+                client_principals: Mutex::new(BTreeMap::new()),
+                server_owner_principal_id,
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
                 pane_exit_rx: AsyncMutex::new(pane_exit_rx),
             }),
@@ -2025,7 +2011,7 @@ impl BmuxServer {
     /// Create a server with an explicit endpoint.
     #[must_use]
     pub fn new(endpoint: IpcEndpoint) -> Self {
-        Self::new_with_snapshot(endpoint, None)
+        Self::new_with_snapshot(endpoint, None, Uuid::new_v4())
     }
 
     /// Create a server with endpoint derived from config paths.
@@ -2038,7 +2024,12 @@ impl BmuxServer {
         let endpoint = IpcEndpoint::windows_named_pipe(paths.server_named_pipe());
 
         let snapshot_manager = SnapshotManager::from_paths(paths);
-        Self::new_with_snapshot(endpoint, Some(snapshot_manager))
+        let server_owner_principal_id =
+            load_or_create_principal_id(paths).unwrap_or_else(|error| {
+                warn!("failed loading server owner principal id: {error}");
+                Uuid::new_v4()
+            });
+        Self::new_with_snapshot(endpoint, Some(snapshot_manager), server_owner_principal_id)
     }
 
     /// Create a server using default bmux config paths.
@@ -2182,6 +2173,7 @@ async fn handle_connection(
     mut stream: LocalIpcStream,
 ) -> Result<()> {
     let client_id = ClientId::new();
+    let client_principal_id: Uuid;
     let mut selected_session: Option<SessionId> = None;
     let mut attached_stream_session: Option<SessionId> = None;
 
@@ -2194,6 +2186,7 @@ async fn handle_connection(
         Request::Hello {
             protocol_version,
             client_name,
+            principal_id,
         } => {
             if protocol_version != ProtocolVersion::current() {
                 send_error(
@@ -2208,6 +2201,7 @@ async fn handle_connection(
                 .await?;
                 return Ok(());
             }
+            client_principal_id = principal_id;
             debug!("accepted client handshake: {client_name}");
             let snapshot = snapshot_status(&state)?;
             send_ok(
@@ -2216,6 +2210,8 @@ async fn handle_connection(
                 ResponsePayload::ServerStatus {
                     running: true,
                     snapshot,
+                    principal_id,
+                    server_owner_principal_id: state.server_owner_principal_id,
                 },
             )
             .await?;
@@ -2238,6 +2234,13 @@ async fn handle_connection(
             .lock()
             .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
         follow_state.connect_client(client_id);
+    }
+    {
+        let mut principals = state
+            .client_principals
+            .lock()
+            .map_err(|_| anyhow::anyhow!("client principal map lock poisoned"))?;
+        principals.insert(client_id, client_principal_id);
     }
 
     loop {
@@ -2269,6 +2272,7 @@ async fn handle_connection(
             &state,
             &shutdown_tx,
             client_id,
+            client_principal_id,
             &mut selected_session,
             &mut attached_stream_session,
             request,
@@ -2285,6 +2289,13 @@ async fn handle_connection(
     )?;
     disconnect_follow_state(&state, client_id)?;
     rebalance_owner_roles_after_disconnect(&state, client_id)?;
+    {
+        let mut principals = state
+            .client_principals
+            .lock()
+            .map_err(|_| anyhow::anyhow!("client principal map lock poisoned"))?;
+        principals.remove(&client_id);
+    }
     mark_snapshot_dirty(&state)?;
     maybe_flush_snapshot(&state, false)?;
     unsubscribe_events(&state, client_id)?;
@@ -2430,45 +2441,11 @@ fn rebalance_owner_roles_after_disconnect(
     state: &Arc<ServerState>,
     disconnected_client_id: ClientId,
 ) -> Result<()> {
-    let connected_clients = {
-        let follow_state = state
-            .follow_state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
-        follow_state.connected_clients.clone()
-    };
-
-    let session_clients = {
-        let manager = state
-            .session_manager
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-        manager
-            .list_sessions()
-            .into_iter()
-            .filter_map(|summary| {
-                manager
-                    .get_session(&summary.id)
-                    .map(|session| (summary.id, session.clients.clone()))
-            })
-            .collect::<BTreeMap<SessionId, BTreeSet<ClientId>>>()
-    };
-
-    let role_change_events = {
-        let mut permission_state = state
-            .permission_state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-        permission_state.rebalance_after_disconnect(
-            disconnected_client_id,
-            &connected_clients,
-            &session_clients,
-        )
-    };
-
-    for event in role_change_events {
-        emit_event(state, event)?;
-    }
+    let mut permission_state = state
+        .permission_state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
+    permission_state.clear_client_roles(disconnected_client_id);
 
     Ok(())
 }
@@ -2649,17 +2626,26 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV2> {
             .collect::<Result<Vec<_>>>()?
     };
 
-    let roles = {
+    let (owner_principals, roles) = {
         let permission_state = state
             .permission_state
             .lock()
             .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-        permission_state
+        let owner_principals = permission_state
+            .owner_principals
+            .iter()
+            .map(|(session_id, principal_id)| OwnerPrincipalSnapshotV2 {
+                session_id: session_id.0,
+                principal_id: *principal_id,
+            })
+            .collect::<Vec<_>>();
+        let roles = permission_state
             .roles
             .iter()
             .flat_map(|(session_id, assignments)| {
                 assignments
                     .iter()
+                    .filter(|(_, role)| **role != SessionRole::Owner)
                     .map(|(client_id, role)| RoleAssignmentSnapshotV2 {
                         session_id: session_id.0,
                         client_id: client_id.0,
@@ -2667,7 +2653,8 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV2> {
                     })
                     .collect::<Vec<_>>()
             })
-            .collect::<Vec<_>>()
+            .collect::<Vec<_>>();
+        (owner_principals, roles)
     };
 
     let (follows, selected_sessions) = {
@@ -2699,6 +2686,7 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV2> {
 
     Ok(SnapshotV2 {
         sessions: session_snapshots,
+        owner_principals,
         roles,
         follows,
         selected_sessions,
@@ -2850,15 +2838,27 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV2) -> Resu
             .permission_state
             .lock()
             .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
+        permission_state.owner_principals.clear();
         permission_state.roles.clear();
 
         let session_manager = state
             .session_manager
             .lock()
             .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+        for owner in &snapshot.owner_principals {
+            let session_id = SessionId(owner.session_id);
+            if session_manager.get_session(&session_id).is_some() {
+                permission_state.set_owner_principal(session_id, owner.principal_id);
+                summary.roles += 1;
+            }
+        }
+
         for role in &snapshot.roles {
             let session_id = SessionId(role.session_id);
             if session_manager.get_session(&session_id).is_some() {
+                if role.role == SessionRole::Owner {
+                    continue;
+                }
                 permission_state.set_role(session_id, ClientId(role.client_id), role.role);
                 summary.roles += 1;
             }
@@ -3200,6 +3200,7 @@ async fn handle_request(
     state: &Arc<ServerState>,
     shutdown_tx: &watch::Sender<bool>,
     client_id: ClientId,
+    client_principal_id: Uuid,
     selected_session: &mut Option<SessionId>,
     attached_stream_session: &mut Option<SessionId>,
     request: Request,
@@ -3226,11 +3227,18 @@ async fn handle_request(
         }),
         Request::Ping => Response::Ok(ResponsePayload::Pong),
         Request::WhoAmI => Response::Ok(ResponsePayload::ClientIdentity { id: client_id.0 }),
+        Request::WhoAmIPrincipal => Response::Ok(ResponsePayload::PrincipalIdentity {
+            principal_id: client_principal_id,
+            server_owner_principal_id: state.server_owner_principal_id,
+            force_local_authorized: client_principal_id == state.server_owner_principal_id,
+        }),
         Request::ServerStatus => {
             let snapshot = snapshot_status(state)?;
             Response::Ok(ResponsePayload::ServerStatus {
                 running: true,
                 snapshot,
+                principal_id: client_principal_id,
+                server_owner_principal_id: state.server_owner_principal_id,
             })
         }
         Request::ServerSave => {
@@ -3376,7 +3384,7 @@ async fn handle_request(
                         .permission_state
                         .lock()
                         .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-                    permission_state.ensure_owner(session_id, client_id);
+                    permission_state.ensure_owner(session_id, client_principal_id);
 
                     Response::Ok(ResponsePayload::SessionCreated {
                         id: session_id.0,
@@ -3401,7 +3409,9 @@ async fn handle_request(
                 };
             drop(manager);
 
-            if let Err(response) = ensure_owner_for_session(state, session_id, client_id) {
+            if let Err(response) =
+                ensure_owner_for_session(state, session_id, client_id, client_principal_id)
+            {
                 return Ok(Response::Err(response));
             }
 
@@ -3488,8 +3498,17 @@ async fn handle_request(
                 }
             };
 
+            if force_local && client_principal_id != state.server_owner_principal_id {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "force-local is only allowed for the server owner principal"
+                        .to_string(),
+                }));
+            }
+
             if !force_local
-                && let Err(response) = ensure_owner_for_session(state, session_id, client_id)
+                && let Err(response) =
+                    ensure_owner_for_session(state, session_id, client_id, client_principal_id)
             {
                 return Ok(Response::Err(response));
             }
@@ -3599,7 +3618,9 @@ async fn handle_request(
                     Ok(session_id) => session_id,
                     Err(response) => return Ok(Response::Err(response)),
                 };
-            if let Err(response) = ensure_owner_for_session(state, session_id, client_id) {
+            if let Err(response) =
+                ensure_owner_for_session(state, session_id, client_id, client_principal_id)
+            {
                 return Ok(Response::Err(response));
             }
             let selection = window_selection_from_selector(target);
@@ -3679,7 +3700,9 @@ async fn handle_request(
                     Err(response) => return Ok(Response::Err(response)),
                 };
             drop(manager);
-            if let Err(response) = ensure_writer_for_session(state, session_id, client_id) {
+            if let Err(response) =
+                ensure_writer_for_session(state, session_id, client_id, client_principal_id)
+            {
                 return Ok(Response::Err(response));
             }
             let mut runtime_manager = state
@@ -3721,7 +3744,9 @@ async fn handle_request(
                     Err(response) => return Ok(Response::Err(response)),
                 };
             drop(manager);
-            if let Err(response) = ensure_writer_for_session(state, session_id, client_id) {
+            if let Err(response) =
+                ensure_writer_for_session(state, session_id, client_id, client_principal_id)
+            {
                 return Ok(Response::Err(response));
             }
             let mut runtime_manager = state
@@ -3774,7 +3799,9 @@ async fn handle_request(
                     Err(response) => return Ok(Response::Err(response)),
                 };
             drop(manager);
-            if let Err(response) = ensure_writer_for_session(state, session_id, client_id) {
+            if let Err(response) =
+                ensure_writer_for_session(state, session_id, client_id, client_principal_id)
+            {
                 return Ok(Response::Err(response));
             }
             let mut runtime_manager = state
@@ -3808,7 +3835,9 @@ async fn handle_request(
                     Err(response) => return Ok(Response::Err(response)),
                 }
             };
-            if let Err(response) = ensure_writer_for_session(state, session_id, client_id) {
+            if let Err(response) =
+                ensure_writer_for_session(state, session_id, client_id, client_principal_id)
+            {
                 return Ok(Response::Err(response));
             }
 
@@ -3941,6 +3970,10 @@ async fn handle_request(
                 .follow_state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
+            let client_principals = state
+                .client_principals
+                .lock()
+                .map_err(|_| anyhow::anyhow!("client principal map lock poisoned"))?;
             let permission_state = state
                 .permission_state
                 .lock()
@@ -3950,7 +3983,15 @@ async fn handle_request(
                 .into_iter()
                 .map(|mut client| {
                     client.session_role = client.selected_session_id.map(|session_id| {
-                        permission_state.role_for(SessionId(session_id), ClientId(client.id))
+                        let principal_id = client_principals
+                            .get(&ClientId(client.id))
+                            .copied()
+                            .unwrap_or(Uuid::nil());
+                        permission_state.role_for(
+                            SessionId(session_id),
+                            ClientId(client.id),
+                            principal_id,
+                        )
                     });
                     client
                 })
@@ -3974,7 +4015,19 @@ async fn handle_request(
                 .permission_state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-            let permissions = permission_state.list_permissions(session_id);
+            let follow_state = state
+                .follow_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
+            let client_principals = state
+                .client_principals
+                .lock()
+                .map_err(|_| anyhow::anyhow!("client principal map lock poisoned"))?;
+            let permissions = permission_state.list_permissions(
+                session_id,
+                &follow_state.connected_clients,
+                &client_principals,
+            );
             Response::Ok(ResponsePayload::PermissionsList {
                 session_id: session_id.0,
                 permissions,
@@ -3997,17 +4050,38 @@ async fn handle_request(
             };
             drop(manager);
 
-            if let Err(response) = ensure_owner_for_session(state, session_id, client_id) {
+            if let Err(response) =
+                ensure_owner_for_session(state, session_id, client_id, client_principal_id)
+            {
                 return Ok(Response::Err(response));
             }
 
             let target_client_id = ClientId(target_client_id);
+            let target_principal_id = {
+                let principals = state
+                    .client_principals
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("client principal map lock poisoned"))?;
+                match principals.get(&target_client_id).copied() {
+                    Some(id) => id,
+                    None => {
+                        return Ok(Response::Err(ErrorResponse {
+                            code: ErrorCode::NotFound,
+                            message: format!("target client not connected: {}", target_client_id.0),
+                        }));
+                    }
+                }
+            };
 
             let mut permission_state = state
                 .permission_state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-            permission_state.set_role(session_id, target_client_id, role);
+            if role == SessionRole::Owner {
+                permission_state.set_owner_principal(session_id, target_principal_id);
+            } else {
+                permission_state.set_role(session_id, target_client_id, role);
+            }
             if role == SessionRole::Owner && target_client_id != client_id {
                 permission_state.clear_to_observer(session_id, client_id);
             }
@@ -4056,16 +4130,28 @@ async fn handle_request(
             };
             drop(manager);
 
-            if let Err(response) = ensure_owner_for_session(state, session_id, client_id) {
+            if let Err(response) =
+                ensure_owner_for_session(state, session_id, client_id, client_principal_id)
+            {
                 return Ok(Response::Err(response));
             }
 
             let target_client_id = ClientId(target_client_id);
+            let target_principal_id = {
+                let principals = state
+                    .client_principals
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("client principal map lock poisoned"))?;
+                principals.get(&target_client_id).copied()
+            };
             let mut permission_state = state
                 .permission_state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-            if permission_state.role_for(session_id, target_client_id) == SessionRole::Owner {
+            if target_principal_id.is_some_and(|principal_id| {
+                permission_state.role_for(session_id, target_client_id, principal_id)
+                    == SessionRole::Owner
+            }) {
                 return Ok(Response::Err(ErrorResponse {
                     code: ErrorCode::InvalidRequest,
                     message: "cannot revoke the current owner role".to_string(),
@@ -4106,8 +4192,17 @@ async fn handle_request(
                     }));
                 };
 
+                if force_local && client_principal_id != state.server_owner_principal_id {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::InvalidRequest,
+                        message: "force-local is only allowed for the server owner principal"
+                            .to_string(),
+                    }));
+                }
+
                 if !force_local
-                    && let Err(response) = ensure_owner_for_session(state, session_id, client_id)
+                    && let Err(response) =
+                        ensure_owner_for_session(state, session_id, client_id, client_principal_id)
                 {
                     return Ok(Response::Err(response));
                 }
@@ -4333,7 +4428,7 @@ async fn handle_request(
                             .lock()
                             .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
                         matches!(
-                            permission_state.role_for(session_id, client_id),
+                            permission_state.role_for(session_id, client_id, client_principal_id),
                             SessionRole::Owner | SessionRole::Writer
                         )
                     };
@@ -4384,7 +4479,7 @@ async fn handle_request(
                     .permission_state
                     .lock()
                     .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-                permission_state.role_for(session_id, client_id)
+                permission_state.role_for(session_id, client_id, client_principal_id)
             };
             if role == SessionRole::Observer {
                 return Ok(Response::Err(ErrorResponse {
@@ -4816,20 +4911,24 @@ fn resolve_window_request_session_id(
 fn ensure_owner_for_session(
     state: &Arc<ServerState>,
     session_id: SessionId,
-    client_id: ClientId,
+    _client_id: ClientId,
+    client_principal_id: Uuid,
 ) -> std::result::Result<(), ErrorResponse> {
-    let permission_state = state.permission_state.lock().map_err(|_| ErrorResponse {
+    let mut permission_state = state.permission_state.lock().map_err(|_| ErrorResponse {
         code: ErrorCode::Internal,
         message: "permission state lock poisoned".to_string(),
     })?;
 
-    if permission_state.is_owner(session_id, client_id) {
-        Ok(())
-    } else {
-        Err(ErrorResponse {
+    match permission_state.owner_principal_for(session_id) {
+        Some(owner_principal_id) if owner_principal_id == client_principal_id => Ok(()),
+        Some(_) => Err(ErrorResponse {
             code: ErrorCode::InvalidRequest,
             message: "owner role required for this operation".to_string(),
-        })
+        }),
+        None => {
+            permission_state.set_owner_principal(session_id, client_principal_id);
+            Ok(())
+        }
     }
 }
 
@@ -4837,13 +4936,14 @@ fn ensure_writer_for_session(
     state: &Arc<ServerState>,
     session_id: SessionId,
     client_id: ClientId,
+    client_principal_id: Uuid,
 ) -> std::result::Result<(), ErrorResponse> {
     let permission_state = state.permission_state.lock().map_err(|_| ErrorResponse {
         code: ErrorCode::Internal,
         message: "permission state lock poisoned".to_string(),
     })?;
 
-    let role = permission_state.role_for(session_id, client_id);
+    let role = permission_state.role_for(session_id, client_id, client_principal_id);
     if role == SessionRole::Owner || role == SessionRole::Writer {
         Ok(())
     } else {
@@ -4867,6 +4967,30 @@ fn parse_request(envelope: &Envelope) -> Result<Request> {
         anyhow::bail!("expected request envelope kind")
     }
     decode(&envelope.payload).context("failed to decode request payload")
+}
+
+fn load_or_create_principal_id(paths: &ConfigPaths) -> Result<Uuid> {
+    let path = paths.principal_id_file();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed creating principal id dir {}", parent.display()))?;
+    }
+
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let raw = content.trim();
+            Uuid::parse_str(raw)
+                .with_context(|| format!("invalid principal id in {}: {}", path.display(), raw))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let principal_id = Uuid::new_v4();
+            std::fs::write(&path, principal_id.to_string())
+                .with_context(|| format!("failed writing principal id file {}", path.display()))?;
+            Ok(principal_id)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("failed reading principal id file {}", path.display())),
+    }
 }
 
 async fn send_ok(
@@ -5029,6 +5153,7 @@ mod tests {
         let hello_payload = encode(&Request::Hello {
             protocol_version: ProtocolVersion::current(),
             client_name: "test-client".to_string(),
+            principal_id: Uuid::new_v4(),
         })
         .expect("hello should encode");
         let hello = Envelope::new(1, EnvelopeKind::Request, hello_payload);
@@ -5073,6 +5198,7 @@ mod tests {
         let hello_payload = encode(&Request::Hello {
             protocol_version: ProtocolVersion(99),
             client_name: "test-client".to_string(),
+            principal_id: Uuid::new_v4(),
         })
         .expect("hello should encode");
         let hello = Envelope::new(77, EnvelopeKind::Request, hello_payload);
@@ -5252,7 +5378,9 @@ mod tests {
     async fn non_owner_cannot_mutate_session_or_windows() {
         let (server, endpoint, socket_path, server_task) = start_server().await;
         let mut owner = connect_and_handshake(&endpoint).await;
-        let mut observer = connect_and_handshake(&endpoint).await;
+        let mut observer =
+            connect_and_handshake_with_principal(&endpoint, server.state.server_owner_principal_id)
+                .await;
 
         let session_id = match send_request(
             &mut owner,
@@ -5506,7 +5634,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn owner_disconnect_promotes_writer() {
+    async fn owner_disconnect_keeps_principal_owner_and_writer_cannot_mutate() {
         let (server, endpoint, socket_path, server_task) = start_server().await;
         let mut owner = connect_and_handshake(&endpoint).await;
         let mut writer = connect_and_handshake(&endpoint).await;
@@ -5561,7 +5689,7 @@ mod tests {
         match listed {
             Response::Ok(ResponsePayload::PermissionsList { permissions, .. }) => {
                 assert!(permissions.iter().any(|entry| {
-                    entry.client_id == writer_id && entry.role == SessionRole::Owner
+                    entry.client_id == writer_id && entry.role == SessionRole::Writer
                 }));
             }
             other => panic!("unexpected permissions list response: {other:?}"),
@@ -5573,6 +5701,50 @@ mod tests {
             Request::NewWindow {
                 session: Some(SessionSelector::ById(session_id)),
                 name: Some("post-promotion".to_string()),
+            },
+        )
+        .await;
+        assert!(matches!(
+            mutation,
+            Response::Err(ErrorResponse {
+                code: ErrorCode::InvalidRequest,
+                ..
+            })
+        ));
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn same_principal_reconnect_retains_owner_permissions() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let principal_id = Uuid::new_v4();
+
+        let mut owner_a = connect_and_handshake_with_principal(&endpoint, principal_id).await;
+        let session_id = match send_request(
+            &mut owner_a,
+            185,
+            Request::NewSession {
+                name: Some("principal-reconnect".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected create response: {other:?}"),
+        };
+
+        drop(owner_a);
+        sleep(Duration::from_millis(50)).await;
+
+        let mut owner_b = connect_and_handshake_with_principal(&endpoint, principal_id).await;
+        let mutation = send_request(
+            &mut owner_b,
+            186,
+            Request::NewWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                name: Some("still-owner".to_string()),
             },
         )
         .await;
@@ -8493,12 +8665,21 @@ mod tests {
 
     #[cfg(unix)]
     async fn connect_and_handshake(endpoint: &IpcEndpoint) -> LocalIpcStream {
+        connect_and_handshake_with_principal(endpoint, Uuid::new_v4()).await
+    }
+
+    #[cfg(unix)]
+    async fn connect_and_handshake_with_principal(
+        endpoint: &IpcEndpoint,
+        principal_id: Uuid,
+    ) -> LocalIpcStream {
         let mut client = LocalIpcStream::connect(endpoint)
             .await
             .expect("client should connect");
         let hello_payload = encode(&Request::Hello {
             protocol_version: ProtocolVersion::current(),
             client_name: "test-client".to_string(),
+            principal_id,
         })
         .expect("hello should encode");
         let hello = Envelope::new(1, EnvelopeKind::Request, hello_payload);

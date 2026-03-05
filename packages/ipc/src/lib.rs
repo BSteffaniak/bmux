@@ -52,7 +52,7 @@ impl IpcEndpoint {
 }
 
 /// Current IPC protocol version.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 1;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 2;
 
 /// Protocol version used in IPC envelopes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -170,9 +170,11 @@ pub enum Request {
     Hello {
         protocol_version: ProtocolVersion,
         client_name: String,
+        principal_id: Uuid,
     },
     Ping,
     WhoAmI,
+    WhoAmIPrincipal,
     ServerStatus,
     ServerSave,
     ServerRestoreDryRun,
@@ -349,9 +351,16 @@ pub enum ResponsePayload {
     ClientIdentity {
         id: Uuid,
     },
+    PrincipalIdentity {
+        principal_id: Uuid,
+        server_owner_principal_id: Uuid,
+        force_local_authorized: bool,
+    },
     ServerStatus {
         running: bool,
         snapshot: ServerSnapshotStatus,
+        principal_id: Uuid,
+        server_owner_principal_id: Uuid,
     },
     ServerSnapshotSaved {
         path: Option<String>,

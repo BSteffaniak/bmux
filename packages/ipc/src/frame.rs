@@ -192,10 +192,8 @@ mod tests {
         let error = decode_frame_exact(&frame).expect_err("expected version mismatch");
         assert!(matches!(
             error,
-            FrameDecodeError::UnsupportedVersion {
-                actual: 9999,
-                expected: 1
-            }
+            FrameDecodeError::UnsupportedVersion { actual: 9999, expected }
+                if expected == crate::CURRENT_PROTOCOL_VERSION
         ));
     }
 }

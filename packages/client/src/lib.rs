@@ -44,6 +44,16 @@ pub struct AttachLayoutState {
 pub struct ServerStatusInfo {
     pub running: bool,
     pub snapshot: ServerSnapshotStatus,
+    pub principal_id: Uuid,
+    pub server_owner_principal_id: Uuid,
+}
+
+/// Principal identity details returned by whoami-principal RPC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PrincipalIdentityInfo {
+    pub principal_id: Uuid,
+    pub server_owner_principal_id: Uuid,
+    pub force_local_authorized: bool,
 }
 
 /// Summary returned by apply-restore operation.
@@ -78,6 +88,18 @@ pub enum ClientError {
     UnexpectedResponse(&'static str),
     #[error("failed loading config: {0}")]
     ConfigLoad(#[from] bmux_config::ConfigError),
+    #[error("failed reading principal id file {path}: {source}")]
+    PrincipalIdRead {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("failed writing principal id file {path}: {source}")]
+    PrincipalIdWrite {
+        path: String,
+        source: std::io::Error,
+    },
+    #[error("invalid principal id in {path}: {value}")]
+    PrincipalIdParse { path: String, value: String },
 }
 
 /// Main client API for communicating with bmux server.
@@ -86,6 +108,7 @@ pub struct BmuxClient {
     stream: LocalIpcStream,
     timeout: Duration,
     next_request_id: u64,
+    principal_id: Uuid,
 }
 
 impl BmuxClient {
@@ -99,17 +122,34 @@ impl BmuxClient {
         timeout: Duration,
         client_name: impl Into<String>,
     ) -> Result<Self> {
+        Self::connect_with_principal(endpoint, timeout, client_name, Uuid::new_v4()).await
+    }
+
+    /// Connect to a server endpoint and complete protocol handshake using a caller-provided
+    /// principal identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if connection or handshake fails.
+    pub async fn connect_with_principal(
+        endpoint: &IpcEndpoint,
+        timeout: Duration,
+        client_name: impl Into<String>,
+        principal_id: Uuid,
+    ) -> Result<Self> {
         let stream = LocalIpcStream::connect(endpoint).await?;
         let mut client = Self {
             stream,
             timeout,
             next_request_id: 1,
+            principal_id,
         };
 
         let hello_response = client
             .request(Request::Hello {
                 protocol_version: ProtocolVersion::current(),
                 client_name: client_name.into(),
+                principal_id,
             })
             .await?;
 
@@ -132,7 +172,8 @@ impl BmuxClient {
     ) -> Result<Self> {
         let timeout = Duration::from_millis(BmuxConfig::load()?.general.server_timeout.max(1));
         let endpoint = endpoint_from_paths(paths);
-        Self::connect(&endpoint, timeout, client_name).await
+        let principal_id = load_or_create_principal_id(paths)?;
+        Self::connect_with_principal(&endpoint, timeout, client_name, principal_id).await
     }
 
     /// Connect using default config paths.
@@ -168,6 +209,34 @@ impl BmuxClient {
         }
     }
 
+    /// Return this connection's profile-scoped principal identity.
+    #[must_use]
+    pub const fn principal_id(&self) -> Uuid {
+        self.principal_id
+    }
+
+    /// Return principal identity information for this client and server owner.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn whoami_principal(&mut self) -> Result<PrincipalIdentityInfo> {
+        match self.request(Request::WhoAmIPrincipal).await? {
+            ResponsePayload::PrincipalIdentity {
+                principal_id,
+                server_owner_principal_id,
+                force_local_authorized,
+            } => Ok(PrincipalIdentityInfo {
+                principal_id,
+                server_owner_principal_id,
+                force_local_authorized,
+            }),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected principal identity",
+            )),
+        }
+    }
+
     /// Retrieve server status.
     ///
     /// # Errors
@@ -175,10 +244,35 @@ impl BmuxClient {
     /// Returns an error if request or response validation fails.
     pub async fn server_status(&mut self) -> Result<ServerStatusInfo> {
         match self.request(Request::ServerStatus).await? {
-            ResponsePayload::ServerStatus { running, snapshot } => {
-                Ok(ServerStatusInfo { running, snapshot })
-            }
+            ResponsePayload::ServerStatus {
+                running,
+                snapshot,
+                principal_id,
+                server_owner_principal_id,
+            } => Ok(ServerStatusInfo {
+                running,
+                snapshot,
+                principal_id,
+                server_owner_principal_id,
+            }),
             _ => Err(ClientError::UnexpectedResponse("expected server status")),
+        }
+    }
+
+    /// Return whether this principal can use force-local kill bypass.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn force_local_authorized(&mut self) -> Result<bool> {
+        match self.request(Request::WhoAmIPrincipal).await? {
+            ResponsePayload::PrincipalIdentity {
+                force_local_authorized,
+                ..
+            } => Ok(force_local_authorized),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected principal identity",
+            )),
         }
     }
 
@@ -872,6 +966,40 @@ fn endpoint_from_paths(paths: &ConfigPaths) -> IpcEndpoint {
     #[cfg(windows)]
     {
         IpcEndpoint::windows_named_pipe(paths.server_named_pipe())
+    }
+}
+
+fn load_or_create_principal_id(paths: &ConfigPaths) -> Result<Uuid> {
+    let path = paths.principal_id_file();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| ClientError::PrincipalIdWrite {
+            path: path.display().to_string(),
+            source,
+        })?;
+    }
+
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let raw = content.trim();
+            Uuid::parse_str(raw).map_err(|_| ClientError::PrincipalIdParse {
+                path: path.display().to_string(),
+                value: raw.to_string(),
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let principal_id = Uuid::new_v4();
+            std::fs::write(&path, principal_id.to_string()).map_err(|source| {
+                ClientError::PrincipalIdWrite {
+                    path: path.display().to_string(),
+                    source,
+                }
+            })?;
+            Ok(principal_id)
+        }
+        Err(source) => Err(ClientError::PrincipalIdRead {
+            path: path.display().to_string(),
+            source,
+        }),
     }
 }
 

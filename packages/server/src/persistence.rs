@@ -13,9 +13,17 @@ const SNAPSHOT_VERSION_V2: u32 = 2;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(crate) struct SnapshotV2 {
     pub sessions: Vec<SessionSnapshotV2>,
+    #[serde(default)]
+    pub owner_principals: Vec<OwnerPrincipalSnapshotV2>,
     pub roles: Vec<RoleAssignmentSnapshotV2>,
     pub follows: Vec<FollowEdgeSnapshotV2>,
     pub selected_sessions: Vec<ClientSelectedSessionSnapshotV2>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct OwnerPrincipalSnapshotV2 {
+    pub session_id: Uuid,
+    pub principal_id: Uuid,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -389,6 +397,22 @@ fn validate_snapshot(snapshot: &SnapshotV2) -> Result<(), SnapshotError> {
         }
     }
 
+    let mut owner_sessions = BTreeSet::new();
+    for owner in &snapshot.owner_principals {
+        if !session_ids.contains(&owner.session_id) {
+            return Err(SnapshotError::Validation(format!(
+                "owner principal references missing session {}",
+                owner.session_id
+            )));
+        }
+        if !owner_sessions.insert(owner.session_id) {
+            return Err(SnapshotError::Validation(format!(
+                "duplicate owner principal assignment for session {}",
+                owner.session_id
+            )));
+        }
+    }
+
     for follow in &snapshot.follows {
         if follow.follower_client_id == follow.leader_client_id {
             return Err(SnapshotError::Validation(format!(
@@ -540,6 +564,7 @@ fn upgrade_snapshot_v1(snapshot: SnapshotV1) -> SnapshotV2 {
                 active_window_id: session.active_window_id,
             })
             .collect(),
+        owner_principals: Vec::new(),
         roles: snapshot
             .roles
             .into_iter()
@@ -613,6 +638,7 @@ mod tests {
                 }],
                 active_window_id: Some(window_id),
             }],
+            owner_principals: vec![],
             roles: vec![RoleAssignmentSnapshotV2 {
                 session_id,
                 client_id,
@@ -674,6 +700,7 @@ mod tests {
                 }],
                 active_window_id: None,
             }],
+            owner_principals: vec![],
             roles: vec![],
             follows: vec![],
             selected_sessions: vec![],

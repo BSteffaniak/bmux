@@ -103,6 +103,8 @@ bmux server start --daemon
 
 # Check server status and stop gracefully
 bmux server status
+bmux server status --json
+bmux server whoami-principal
 bmux server save
 bmux server restore --dry-run
 bmux server restore --yes
@@ -155,6 +157,9 @@ bmux window kill active --session dev
 bmux window kill active --session dev --force-local
 bmux window kill-all --session dev
 bmux window kill-all --session dev --force-local
+
+# Force-local is authorized only for the server owner principal
+bmux server whoami-principal --json
 bmux session clients
 bmux session permissions --session dev
 bmux session permissions --session dev --watch

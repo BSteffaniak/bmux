@@ -274,6 +274,7 @@ async fn run_command(command: &Command) -> Result<u8> {
                 foreground_internal,
             } => run_server_start(*daemon, *foreground_internal).await,
             ServerCommand::Status { json } => run_server_status(*json).await,
+            ServerCommand::WhoamiPrincipal { json } => run_server_whoami_principal(*json).await,
             ServerCommand::Save => run_server_save().await,
             ServerCommand::Restore { dry_run, yes } => run_server_restore(*dry_run, *yes).await,
             ServerCommand::Stop => run_server_stop().await,
@@ -340,6 +341,9 @@ async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8>
 #[derive(Debug, serde::Serialize)]
 struct ServerStatusJsonPayload {
     running: bool,
+    principal_id: Option<Uuid>,
+    server_owner_principal_id: Option<Uuid>,
+    force_local_authorized: bool,
     latest_server_event: Option<String>,
     snapshot: Option<bmux_ipc::ServerSnapshotStatus>,
     server_metadata: Option<ServerRuntimeMetadata>,
@@ -374,8 +378,13 @@ async fn run_server_status(as_json: bool) -> Result<u8> {
         };
         let payload = ServerStatusJsonPayload {
             running: matches!(status, Some(ref s) if s.running),
+            principal_id: status.as_ref().map(|entry| entry.principal_id),
+            server_owner_principal_id: status.as_ref().map(|entry| entry.server_owner_principal_id),
+            force_local_authorized: status
+                .as_ref()
+                .is_some_and(|entry| entry.principal_id == entry.server_owner_principal_id),
             latest_server_event: latest_event,
-            snapshot: status.map(|entry| entry.snapshot),
+            snapshot: status.as_ref().map(|entry| entry.snapshot.clone()),
             server_metadata: metadata,
             cli_build: current_build_id,
             stale_build,
@@ -408,6 +417,19 @@ async fn run_server_status(as_json: bool) -> Result<u8> {
                     println!("warning: {warning}");
                 }
             }
+            println!("principal id: {}", status.principal_id);
+            println!(
+                "server owner principal id: {}",
+                status.server_owner_principal_id
+            );
+            println!(
+                "force-local authorized: {}",
+                if status.principal_id == status.server_owner_principal_id {
+                    "yes"
+                } else {
+                    "no"
+                }
+            );
             println!(
                 "snapshot: {}{}",
                 if status.snapshot.enabled {
@@ -448,6 +470,53 @@ async fn run_server_status(as_json: bool) -> Result<u8> {
             Ok(1)
         }
     }
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ServerWhoAmIPrincipalJsonPayload {
+    principal_id: Uuid,
+    server_owner_principal_id: Uuid,
+    force_local_authorized: bool,
+}
+
+async fn run_server_whoami_principal(as_json: bool) -> Result<u8> {
+    cleanup_stale_pid_file().await?;
+    let mut client = BmuxClient::connect_default("bmux-cli-server-whoami-principal")
+        .await
+        .map_err(map_cli_client_error)?;
+    let identity = client
+        .whoami_principal()
+        .await
+        .map_err(map_cli_client_error)?;
+
+    if as_json {
+        let payload = ServerWhoAmIPrincipalJsonPayload {
+            principal_id: identity.principal_id,
+            server_owner_principal_id: identity.server_owner_principal_id,
+            force_local_authorized: identity.force_local_authorized,
+        };
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .context("failed encoding server whoami-principal json")?
+        );
+        return Ok(0);
+    }
+
+    println!("principal id: {}", identity.principal_id);
+    println!(
+        "server owner principal id: {}",
+        identity.server_owner_principal_id
+    );
+    println!(
+        "force-local authorized: {}",
+        if identity.force_local_authorized {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    Ok(0)
 }
 
 async fn run_server_save() -> Result<u8> {

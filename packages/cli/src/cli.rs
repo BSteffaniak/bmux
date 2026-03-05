@@ -353,6 +353,12 @@ pub(crate) enum ServerCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Show caller and server owner principal identities
+    WhoamiPrincipal {
+        /// Print principal identity as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Trigger immediate server snapshot save
     Save,
     /// Validate persisted snapshot without applying restore
@@ -484,6 +490,32 @@ mod tests {
             panic!("expected server subcommand");
         };
         assert!(matches!(command, ServerCommand::Status { json: true }));
+    }
+
+    #[test]
+    fn parses_server_whoami_principal_subcommand() {
+        let cli =
+            Cli::try_parse_from(["bmux", "server", "whoami-principal"]).expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::WhoamiPrincipal { json: false }
+        ));
+    }
+
+    #[test]
+    fn parses_server_whoami_principal_json_flag() {
+        let cli = Cli::try_parse_from(["bmux", "server", "whoami-principal", "--json"])
+            .expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::WhoamiPrincipal { json: true }
+        ));
     }
 
     #[test]

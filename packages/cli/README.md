@@ -32,6 +32,8 @@ bmux server start --daemon
 
 # status and graceful shutdown
 bmux server status
+bmux server status --json
+bmux server whoami-principal
 bmux server save
 bmux server restore --dry-run
 bmux server restore --yes
@@ -43,6 +45,7 @@ Shutdown behavior:
 - `bmux server stop` tries graceful IPC shutdown first.
 - If graceful shutdown times out, CLI falls back to PID-based termination.
 - `bmux server restore --yes` replaces the current in-memory server state with the persisted snapshot.
+- `--force-local` kill bypass is allowed only when your profile principal matches the server owner principal (`bmux server whoami-principal`).
 
 ## Session Commands
 
