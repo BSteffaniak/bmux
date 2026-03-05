@@ -4314,9 +4314,9 @@ mod tests {
     use bmux_config::ConfigPaths;
     use bmux_ipc::transport::LocalIpcStream;
     use bmux_ipc::{
-        Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, ProtocolVersion,
-        Request, Response, ResponsePayload, SessionRole, SessionSelector, WindowSelector, decode,
-        encode,
+        Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, PaneSelector,
+        PaneSplitDirection, ProtocolVersion, Request, Response, ResponsePayload, SessionRole,
+        SessionSelector, WindowSelector, decode, encode,
     };
     use bmux_session::{SessionId, SessionManager};
     use std::path::Path;
@@ -7416,6 +7416,222 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn restores_multi_pane_layout_shape_across_restart() {
+        let suffix = Uuid::new_v4().to_string();
+        let root = std::path::PathBuf::from(format!("/tmp/bmxr-{}", &suffix[..8]));
+        let paths = ConfigPaths::new(root.join("config"), root.join("runtime"), root.join("data"));
+        paths.ensure_dirs().expect("paths should be created");
+
+        let endpoint = IpcEndpoint::unix_socket(paths.server_socket());
+        let (_server, server_task) = start_server_from_paths(&paths).await;
+
+        let mut client = connect_and_handshake(&endpoint).await;
+        let session_id = match send_request(
+            &mut client,
+            360,
+            Request::NewSession {
+                name: Some("layout-shape".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected session create response: {other:?}"),
+        };
+
+        let pane_2 = match send_request(
+            &mut client,
+            361,
+            Request::SplitPane {
+                session: Some(SessionSelector::ById(session_id)),
+                target: None,
+                direction: PaneSplitDirection::Vertical,
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::PaneSplit { id, .. }) => id,
+            other => panic!("unexpected first split response: {other:?}"),
+        };
+
+        let pane_3 = match send_request(
+            &mut client,
+            362,
+            Request::SplitPane {
+                session: Some(SessionSelector::ById(session_id)),
+                target: Some(PaneSelector::ByIndex(1)),
+                direction: PaneSplitDirection::Horizontal,
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::PaneSplit { id, .. }) => id,
+            other => panic!("unexpected second split response: {other:?}"),
+        };
+
+        let focused = send_request(
+            &mut client,
+            363,
+            Request::FocusPane {
+                session: Some(SessionSelector::ById(session_id)),
+                target: Some(PaneSelector::ById(pane_2)),
+                direction: None,
+            },
+        )
+        .await;
+        assert!(matches!(
+            focused,
+            Response::Ok(ResponsePayload::PaneFocused { id, .. }) if id == pane_2
+        ));
+
+        let pane_4 = match send_request(
+            &mut client,
+            364,
+            Request::SplitPane {
+                session: Some(SessionSelector::ById(session_id)),
+                target: None,
+                direction: PaneSplitDirection::Horizontal,
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::PaneSplit { id, .. }) => id,
+            other => panic!("unexpected third split response: {other:?}"),
+        };
+
+        let resized_left = send_request(
+            &mut client,
+            365,
+            Request::ResizePane {
+                session: Some(SessionSelector::ById(session_id)),
+                target: Some(PaneSelector::ByIndex(1)),
+                delta: -1,
+            },
+        )
+        .await;
+        assert!(matches!(
+            resized_left,
+            Response::Ok(ResponsePayload::PaneResized { .. })
+        ));
+
+        let resized_right = send_request(
+            &mut client,
+            366,
+            Request::ResizePane {
+                session: Some(SessionSelector::ById(session_id)),
+                target: Some(PaneSelector::ById(pane_4)),
+                delta: 1,
+            },
+        )
+        .await;
+        assert!(matches!(
+            resized_right,
+            Response::Ok(ResponsePayload::PaneResized { .. })
+        ));
+
+        let active_window_id = match send_request(
+            &mut client,
+            367,
+            Request::ListWindows {
+                session: Some(SessionSelector::ById(session_id)),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::WindowList { windows }) => windows
+                .into_iter()
+                .find(|window| window.active)
+                .map(|window| window.id)
+                .expect("active window should exist"),
+            other => panic!("unexpected list windows response: {other:?}"),
+        };
+
+        let pane_order_before_restart = match send_request(
+            &mut client,
+            368,
+            Request::ListPanes {
+                session: Some(SessionSelector::ById(session_id)),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::PaneList { panes }) => panes
+                .into_iter()
+                .map(|pane| pane.id)
+                .collect::<Vec<_>>(),
+            other => panic!("unexpected list panes response: {other:?}"),
+        };
+
+        let expected_order = vec![active_window_id, pane_3, pane_2, pane_4];
+        assert_eq!(pane_order_before_restart, expected_order);
+
+        let saved = send_request(&mut client, 369, Request::ServerSave).await;
+        let snapshot_path = match saved {
+            Response::Ok(ResponsePayload::ServerSnapshotSaved { path: Some(path) }) => path,
+            other => panic!("unexpected save response: {other:?}"),
+        };
+
+        let snapshot_before: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&snapshot_path).expect("snapshot should exist"),
+        )
+        .expect("snapshot json should decode");
+        let layout_before = extract_window_layout(&snapshot_before, session_id, active_window_id);
+
+        let stopped = send_request(&mut client, 370, Request::ServerStop).await;
+        assert_eq!(stopped, Response::Ok(ResponsePayload::ServerStopping));
+        server_task
+            .await
+            .expect("server task should join")
+            .expect("server should stop cleanly");
+
+        if Path::new(paths.server_socket().as_path()).exists() {
+            std::fs::remove_file(paths.server_socket()).expect("socket cleanup should succeed");
+        }
+
+        let (_restored_server, restored_task) = start_server_from_paths(&paths).await;
+        let mut restored_client = connect_and_handshake(&endpoint).await;
+
+        let pane_order_after_restart = match send_request(
+            &mut restored_client,
+            371,
+            Request::ListPanes {
+                session: Some(SessionSelector::ById(session_id)),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::PaneList { panes }) => panes
+                .into_iter()
+                .map(|pane| pane.id)
+                .collect::<Vec<_>>(),
+            other => panic!("unexpected restored list panes response: {other:?}"),
+        };
+        assert_eq!(pane_order_after_restart, expected_order);
+
+        let resaved = send_request(&mut restored_client, 372, Request::ServerSave).await;
+        assert!(matches!(
+            resaved,
+            Response::Ok(ResponsePayload::ServerSnapshotSaved { .. })
+        ));
+
+        let snapshot_after: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&snapshot_path).expect("resaved snapshot should exist"),
+        )
+        .expect("resaved snapshot json should decode");
+        let layout_after = extract_window_layout(&snapshot_after, session_id, active_window_id);
+
+        assert_eq!(layout_before, layout_after);
+
+        let stop_restored = send_request(&mut restored_client, 373, Request::ServerStop).await;
+        assert_eq!(stop_restored, Response::Ok(ResponsePayload::ServerStopping));
+        restored_task
+            .await
+            .expect("restored server task should join")
+            .expect("restored server should stop cleanly");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
     async fn restore_apply_replaces_current_state() {
         let suffix = Uuid::new_v4().to_string();
         let root = std::path::PathBuf::from(format!("/tmp/bmxr-{}", &suffix[..8]));
@@ -7603,6 +7819,30 @@ mod tests {
             .expect("request reply should be received");
         assert_eq!(reply.request_id, request_id);
         decode(&reply.payload).expect("response decode should succeed")
+    }
+
+    #[cfg(unix)]
+    fn extract_window_layout(
+        snapshot_envelope: &serde_json::Value,
+        session_id: Uuid,
+        window_id: Uuid,
+    ) -> serde_json::Value {
+        let sessions = snapshot_envelope["snapshot"]["sessions"]
+            .as_array()
+            .expect("snapshot sessions should be array");
+        let session = sessions
+            .iter()
+            .find(|session| session["id"] == serde_json::json!(session_id))
+            .expect("session should exist in snapshot");
+        let windows = session["windows"]
+            .as_array()
+            .expect("session windows should be array");
+        windows
+            .iter()
+            .find(|window| window["id"] == serde_json::json!(window_id))
+            .and_then(|window| window.get("layout_root"))
+            .cloned()
+            .expect("window layout_root should exist")
     }
 
     #[cfg(unix)]
