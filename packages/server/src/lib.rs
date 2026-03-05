@@ -7752,6 +7752,110 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test]
+    async fn restore_rejects_layout_root_with_missing_pane_leaf() {
+        let suffix = Uuid::new_v4().to_string();
+        let root = std::path::PathBuf::from(format!("/tmp/bmxr-{}", &suffix[..8]));
+        let paths = ConfigPaths::new(root.join("config"), root.join("runtime"), root.join("data"));
+        paths.ensure_dirs().expect("paths should be created");
+
+        let endpoint = IpcEndpoint::unix_socket(paths.server_socket());
+        let (_server, server_task) = start_server_from_paths(&paths).await;
+        let mut client = connect_and_handshake(&endpoint).await;
+
+        let session_id = match send_request(
+            &mut client,
+            354,
+            Request::NewSession {
+                name: Some("layout-invalid".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected new session response: {other:?}"),
+        };
+
+        let split = send_request(
+            &mut client,
+            355,
+            Request::SplitPane {
+                session: Some(SessionSelector::ById(session_id)),
+                target: None,
+                direction: PaneSplitDirection::Vertical,
+            },
+        )
+        .await;
+        assert!(matches!(split, Response::Ok(ResponsePayload::PaneSplit { .. })));
+
+        let saved = send_request(&mut client, 356, Request::ServerSave).await;
+        let snapshot_path = match saved {
+            Response::Ok(ResponsePayload::ServerSnapshotSaved { path: Some(path) }) => path,
+            other => panic!("unexpected save response: {other:?}"),
+        };
+
+        let mut payload: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(&snapshot_path).expect("snapshot file should exist"),
+        )
+        .expect("snapshot json should decode");
+
+        payload["snapshot"]["sessions"][0]["windows"][0]["layout_root"] = serde_json::json!({
+            "kind": "leaf",
+            "pane_id": Uuid::new_v4(),
+        });
+
+        let snapshot_model: super::SnapshotV2 =
+            serde_json::from_value(payload["snapshot"].clone()).expect("snapshot model decode");
+        let snapshot_bytes = serde_json::to_vec(&snapshot_model).expect("snapshot json should encode");
+        let checksum = {
+            let mut hash = 0xcbf29ce484222325u64;
+            for byte in snapshot_bytes {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+            hash
+        };
+        payload["checksum"] = serde_json::json!(checksum);
+
+        std::fs::write(
+            &snapshot_path,
+            serde_json::to_vec_pretty(&payload).expect("snapshot json should encode"),
+        )
+        .expect("tampered snapshot should write");
+
+        let dry_run = send_request(&mut client, 357, Request::ServerRestoreDryRun).await;
+        match dry_run {
+            Response::Ok(ResponsePayload::ServerSnapshotRestoreDryRun { ok, message }) => {
+                assert!(!ok, "dry-run should fail for malformed layout snapshot");
+                assert!(
+                    message.contains("layout") || message.contains("pane set"),
+                    "unexpected dry-run failure message: {message}"
+                );
+            }
+            other => panic!("unexpected dry-run response: {other:?}"),
+        }
+
+        let apply = send_request(&mut client, 358, Request::ServerRestoreApply).await;
+        match apply {
+            Response::Err(ErrorResponse { code, message }) => {
+                assert_eq!(code, ErrorCode::InvalidRequest);
+                assert!(
+                    message.contains("layout") || message.contains("pane set"),
+                    "unexpected restore apply message: {message}"
+                );
+            }
+            other => panic!("unexpected restore apply response: {other:?}"),
+        }
+
+        let stopped = send_request(&mut client, 359, Request::ServerStop).await;
+        assert_eq!(stopped, Response::Ok(ResponsePayload::ServerStopping));
+        server_task
+            .await
+            .expect("server task should join")
+            .expect("server should stop cleanly");
+    }
+
+    #[cfg(unix)]
     async fn start_server() -> (
         BmuxServer,
         IpcEndpoint,
