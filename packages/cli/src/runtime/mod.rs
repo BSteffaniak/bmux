@@ -972,17 +972,9 @@ async fn run_session_attach_with_client(
         println!("attached to session: {}", attach_info.session_id);
     }
 
-    let mut attached_id = attach_info.session_id;
-    let mut can_write = attach_info.can_write;
-    let mut ui_mode = AttachUiMode::Normal;
-    let mut status_needs_redraw = true;
-    let mut quit_confirmation_pending = false;
-    let mut pane_buffers: BTreeMap<Uuid, PaneRenderBuffer> = BTreeMap::new();
-    let mut cached_status_line: Option<String> = None;
-    let mut cached_layout_state: Option<AttachLayoutState> = None;
-    let mut layout_needs_refresh = true;
+    let mut view_state = AttachViewState::new(attach_info.clone());
 
-    if !can_write {
+    if !view_state.can_write {
         println!("read-only attach: input disabled");
     }
     if let Some(detach_key) = attach_keymap.primary_binding_for_action(&RuntimeAction::Detach) {
@@ -1005,11 +997,11 @@ async fn run_session_attach_with_client(
             .map_err(map_attach_client_error)?;
         for server_event in events {
             match server_event {
-                bmux_client::ServerEvent::SessionRemoved { id } if id == attached_id => {
+                bmux_client::ServerEvent::SessionRemoved { id } if id == view_state.attached_id => {
                     exit_reason = AttachExitReason::StreamClosed;
                     break;
                 }
-                bmux_client::ServerEvent::ClientDetached { id } if id == attached_id => {
+                bmux_client::ServerEvent::ClientDetached { id } if id == view_state.attached_id => {
                     exit_reason = AttachExitReason::StreamClosed;
                     break;
                 }
@@ -1026,13 +1018,13 @@ async fn run_session_attach_with_client(
                     attach_info = open_attach_for_session(&mut client, session_id)
                         .await
                         .map_err(map_attach_client_error)?;
-                    attached_id = attach_info.session_id;
-                    can_write = attach_info.can_write;
-                    ui_mode = AttachUiMode::Normal;
-                    status_needs_redraw = true;
-                    layout_needs_refresh = true;
-                    println!("follow handoff -> session {attached_id}");
-                    if !can_write {
+                    view_state.attached_id = attach_info.session_id;
+                    view_state.can_write = attach_info.can_write;
+                    view_state.ui_mode = AttachUiMode::Normal;
+                    view_state.dirty.status_needs_redraw = true;
+                    view_state.dirty.layout_needs_refresh = true;
+                    println!("follow handoff -> session {}", view_state.attached_id);
+                    if !view_state.can_write {
                         println!("read-only attach: input disabled");
                     }
                 }
@@ -1051,14 +1043,14 @@ async fn run_session_attach_with_client(
 
         if let Some(event) = poll_attach_terminal_event(ATTACH_IO_POLL_INTERVAL).await? {
             let mut skip_attach_key_actions = false;
-            if quit_confirmation_pending {
+            if view_state.quit_confirmation_pending {
                 if let Event::Key(key) = &event
                     && key.kind == KeyEventKind::Press
                 {
                     match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
                             match client
-                                .kill_session(SessionSelector::ById(attached_id))
+                                .kill_session(SessionSelector::ById(view_state.attached_id))
                                 .await
                             {
                                 Ok(_) => {
@@ -1069,13 +1061,13 @@ async fn run_session_attach_with_client(
                                     println!("quit failed: {}", map_attach_client_error(error));
                                 }
                             }
-                            quit_confirmation_pending = false;
-                            status_needs_redraw = true;
+                            view_state.quit_confirmation_pending = false;
+                            view_state.dirty.status_needs_redraw = true;
                             skip_attach_key_actions = true;
                         }
                         KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
-                            quit_confirmation_pending = false;
-                            status_needs_redraw = true;
+                            view_state.quit_confirmation_pending = false;
+                            view_state.dirty.status_needs_redraw = true;
                             skip_attach_key_actions = true;
                         }
                         _ => {
@@ -1091,7 +1083,7 @@ async fn run_session_attach_with_client(
             if !skip_attach_key_actions {
                 let mut detach_requested = false;
                 for attach_action in
-                    attach_event_actions(&event, &mut attach_input_processor, ui_mode)?
+                    attach_event_actions(&event, &mut attach_input_processor, view_state.ui_mode)?
                 {
                     match attach_action {
                         AttachEventAction::Detach => {
@@ -1099,8 +1091,8 @@ async fn run_session_attach_with_client(
                             break;
                         }
                         AttachEventAction::Send(bytes) => {
-                            if can_write {
-                                match client.attach_input(attached_id, bytes).await {
+                            if view_state.can_write {
+                                match client.attach_input(view_state.attached_id, bytes).await {
                                     Ok(_) => {}
                                     Err(error) if is_attach_stream_closed_error(&error) => {
                                         exit_reason = AttachExitReason::StreamClosed;
@@ -1115,8 +1107,8 @@ async fn run_session_attach_with_client(
                             if let Err(error) = handle_attach_runtime_action(
                                 &mut client,
                                 action,
-                                &mut attached_id,
-                                &mut can_write,
+                                &mut view_state.attached_id,
+                                &mut view_state.can_write,
                             )
                             .await
                             {
@@ -1125,22 +1117,22 @@ async fn run_session_attach_with_client(
                                     map_attach_client_error(error)
                                 );
                             } else {
-                                status_needs_redraw = true;
-                                layout_needs_refresh = true;
+                                view_state.dirty.status_needs_redraw = true;
+                                view_state.dirty.layout_needs_refresh = true;
                             }
                         }
                         AttachEventAction::Ui(action) => {
                             if matches!(action, RuntimeAction::Quit) {
-                                quit_confirmation_pending = true;
-                                status_needs_redraw = true;
+                                view_state.quit_confirmation_pending = true;
+                                view_state.dirty.status_needs_redraw = true;
                                 continue;
                             }
                             if let Err(error) = handle_attach_ui_action(
                                 &mut client,
                                 action,
-                                &mut attached_id,
-                                &mut can_write,
-                                &mut ui_mode,
+                                &mut view_state.attached_id,
+                                &mut view_state.can_write,
+                                &mut view_state.ui_mode,
                             )
                             .await
                             {
@@ -1149,13 +1141,13 @@ async fn run_session_attach_with_client(
                                     map_attach_client_error(error)
                                 );
                             } else {
-                                layout_needs_refresh = true;
+                                view_state.dirty.layout_needs_refresh = true;
                             }
-                            status_needs_redraw = true;
+                            view_state.dirty.status_needs_redraw = true;
                         }
                         AttachEventAction::Redraw => {
-                            status_needs_redraw = true;
-                            layout_needs_refresh = true;
+                            view_state.dirty.status_needs_redraw = true;
+                            view_state.dirty.layout_needs_refresh = true;
                         }
                         AttachEventAction::Ignore => {}
                     }
@@ -1167,9 +1159,9 @@ async fn run_session_attach_with_client(
             }
         }
 
-        let mut frame_needs_render = status_needs_redraw;
+        let mut frame_needs_render = view_state.dirty.status_needs_redraw;
 
-        let layout_state = match client.attach_layout(attached_id).await {
+        let layout_state = match client.attach_layout(view_state.attached_id).await {
             Ok(state) => state,
             Err(error) if is_attach_stream_closed_error(&error) => {
                 exit_reason = AttachExitReason::StreamClosed;
@@ -1177,22 +1169,24 @@ async fn run_session_attach_with_client(
             }
             Err(error) => return Err(map_attach_client_error(error)),
         };
-        if cached_layout_state.as_ref() != Some(&layout_state) {
+        if view_state.cached_layout_state.as_ref() != Some(&layout_state) {
             frame_needs_render = true;
-            cached_layout_state = Some(layout_state);
+            view_state.cached_layout_state = Some(layout_state);
         }
-        layout_needs_refresh = false;
+        view_state.dirty.layout_needs_refresh = false;
 
-        let Some(layout_state) = cached_layout_state.as_ref() else {
+        let Some(layout_state) = view_state.cached_layout_state.as_ref() else {
             continue;
         };
 
         let mut pane_ids = Vec::new();
         collect_pane_ids(&layout_state.layout_root, &mut pane_ids);
-        pane_buffers.retain(|pane_id, _| pane_ids.iter().any(|id| id == pane_id));
+        view_state
+            .pane_buffers
+            .retain(|pane_id, _| pane_ids.iter().any(|id| id == pane_id));
 
         let chunks = match client
-            .attach_pane_output_batch(attached_id, pane_ids.clone(), 8 * 1024)
+            .attach_pane_output_batch(view_state.attached_id, pane_ids.clone(), 8 * 1024)
             .await
         {
             Ok(chunks) => chunks,
@@ -1207,7 +1201,7 @@ async fn run_session_attach_with_client(
             if chunk.data.is_empty() {
                 continue;
             }
-            let buffer = pane_buffers.entry(chunk.pane_id).or_default();
+            let buffer = view_state.pane_buffers.entry(chunk.pane_id).or_default();
             append_pane_output(buffer, &chunk.data);
             frame_needs_render = true;
         }
@@ -1216,34 +1210,34 @@ async fn run_session_attach_with_client(
             continue;
         }
 
-        if status_needs_redraw {
-            cached_status_line = Some(
+        if view_state.dirty.status_needs_redraw {
+            view_state.cached_status_line = Some(
                 build_attach_status_line_for_draw(
                     &mut client,
-                    attached_id,
-                    can_write,
-                    ui_mode,
+                    view_state.attached_id,
+                    view_state.can_write,
+                    view_state.ui_mode,
                     follow_target_id,
                     global,
-                    quit_confirmation_pending,
+                    view_state.quit_confirmation_pending,
                     &attach_keymap,
                 )
                 .await
                 .map_err(map_attach_client_error)?,
             );
-            status_needs_redraw = false;
+            view_state.dirty.status_needs_redraw = false;
         }
 
         let mut stdout = io::stdout();
         queue!(stdout, Hide).context("failed queuing hide cursor for attach frame")?;
-        if let Some(status_line) = cached_status_line.as_deref() {
+        if let Some(status_line) = view_state.cached_status_line.as_deref() {
             queue_attach_status_line(&mut stdout, status_line)?;
         }
         let cursor_state = render_attach_panes(
             &mut stdout,
             &layout_state.layout_root,
             layout_state.focused_pane_id,
-            &mut pane_buffers,
+            &mut view_state.pane_buffers,
         )?;
         apply_attach_cursor_state(&mut stdout, cursor_state)?;
         stdout.flush().context("failed flushing attach frame")?;
@@ -1801,6 +1795,47 @@ enum AttachExitReason {
     Detached,
     StreamClosed,
     Quit,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AttachDirtyFlags {
+    status_needs_redraw: bool,
+    layout_needs_refresh: bool,
+}
+
+impl Default for AttachDirtyFlags {
+    fn default() -> Self {
+        Self {
+            status_needs_redraw: true,
+            layout_needs_refresh: true,
+        }
+    }
+}
+
+struct AttachViewState {
+    attached_id: Uuid,
+    can_write: bool,
+    ui_mode: AttachUiMode,
+    quit_confirmation_pending: bool,
+    pane_buffers: BTreeMap<Uuid, PaneRenderBuffer>,
+    cached_status_line: Option<String>,
+    cached_layout_state: Option<AttachLayoutState>,
+    dirty: AttachDirtyFlags,
+}
+
+impl AttachViewState {
+    fn new(attach_info: bmux_client::AttachOpenInfo) -> Self {
+        Self {
+            attached_id: attach_info.session_id,
+            can_write: attach_info.can_write,
+            ui_mode: AttachUiMode::Normal,
+            quit_confirmation_pending: false,
+            pane_buffers: BTreeMap::new(),
+            cached_status_line: None,
+            cached_layout_state: None,
+            dirty: AttachDirtyFlags::default(),
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
