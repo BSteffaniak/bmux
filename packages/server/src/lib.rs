@@ -12,8 +12,8 @@ use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
     AttachGrant, AttachPaneChunk, CURRENT_PROTOCOL_VERSION, ClientSummary, Envelope, EnvelopeKind,
-    ErrorCode, ErrorResponse, Event, IpcEndpoint, PaneFocusDirection, PaneLayoutNode as IpcPaneLayoutNode,
-    PaneSelector, PaneSplitDirection, PaneSummary,
+    ErrorCode, ErrorResponse, Event, IpcEndpoint, PaneFocusDirection,
+    PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection, PaneSummary,
     ProtocolVersion, Request, Response, ResponsePayload, ServerSnapshotStatus,
     SessionPermissionSummary, SessionRole, SessionSelector, SessionSummary, WindowSelector,
     WindowSummary, decode, encode,
@@ -885,10 +885,7 @@ fn ipc_layout_from_runtime(node: &PaneLayoutNode) -> IpcPaneLayoutNode {
     }
 }
 
-fn collect_runtime_layout_pane_ids(
-    node: &PaneLayoutNode,
-    out: &mut BTreeSet<Uuid>,
-) -> Result<()> {
+fn collect_runtime_layout_pane_ids(node: &PaneLayoutNode, out: &mut BTreeSet<Uuid>) -> Result<()> {
     match node {
         PaneLayoutNode::Leaf { pane_id } => {
             if !out.insert(*pane_id) {
@@ -1312,11 +1309,9 @@ impl SessionRuntimeManager {
                 .windows
                 .get_mut(&session.active_window)
                 .ok_or_else(|| anyhow::anyhow!("active window not found"))?;
-            let target_pane_id = resolve_pane_id_from_selector(
-                window,
-                target.unwrap_or(PaneSelector::Active),
-            )
-            .ok_or_else(|| anyhow::anyhow!("target pane not found"))?;
+            let target_pane_id =
+                resolve_pane_id_from_selector(window, target.unwrap_or(PaneSelector::Active))
+                    .ok_or_else(|| anyhow::anyhow!("target pane not found"))?;
             let focused = window
                 .panes
                 .get(&target_pane_id)
@@ -1430,11 +1425,9 @@ impl SessionRuntimeManager {
                 .windows
                 .get_mut(&window_id)
                 .ok_or_else(|| anyhow::anyhow!("active window not found"))?;
-            let pane_id = resolve_pane_id_from_selector(
-                window,
-                target.unwrap_or(PaneSelector::Active),
-            )
-            .ok_or_else(|| anyhow::anyhow!("target pane not found"))?;
+            let pane_id =
+                resolve_pane_id_from_selector(window, target.unwrap_or(PaneSelector::Active))
+                    .ok_or_else(|| anyhow::anyhow!("target pane not found"))?;
             (window_id, pane_id, window.panes.len() == 1)
         };
 
@@ -1458,7 +1451,8 @@ impl SessionRuntimeManager {
         let _ = window.layout_root.remove_leaf(pane_id);
         let mut remaining = Vec::new();
         window.layout_root.pane_order(&mut remaining);
-        if window.focused_pane_id == pane_id || !window.panes.contains_key(&window.focused_pane_id) {
+        if window.focused_pane_id == pane_id || !window.panes.contains_key(&window.focused_pane_id)
+        {
             if let Some(next_id) = remaining.first().copied() {
                 window.focused_pane_id = next_id;
             }
@@ -1470,7 +1464,12 @@ impl SessionRuntimeManager {
         Ok((pane_id, None))
     }
 
-    fn resize_pane(&mut self, session_id: SessionId, target: Option<PaneSelector>, delta: i16) -> Result<()> {
+    fn resize_pane(
+        &mut self,
+        session_id: SessionId,
+        target: Option<PaneSelector>,
+        delta: i16,
+    ) -> Result<()> {
         let session = self
             .runtimes
             .get_mut(&session_id)
@@ -1866,7 +1865,10 @@ fn resolve_window_id_from_selector(
     }
 }
 
-fn resolve_pane_id_from_selector(window: &WindowRuntimeHandle, selector: PaneSelector) -> Option<Uuid> {
+fn resolve_pane_id_from_selector(
+    window: &WindowRuntimeHandle,
+    selector: PaneSelector,
+) -> Option<Uuid> {
     match selector {
         PaneSelector::Active => window
             .panes
@@ -2502,11 +2504,11 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV2> {
                     .map(|window| {
                         validate_runtime_layout_matches_panes(&window.layout_root, &window.panes)
                             .with_context(|| {
-                                format!(
-                                    "cannot snapshot inconsistent layout for window {} in session {}",
-                                    window.id.0, session_info.id.0
-                                )
-                            })?;
+                            format!(
+                                "cannot snapshot inconsistent layout for window {} in session {}",
+                                window.id.0, session_info.id.0
+                            )
+                        })?;
 
                         let mut pane_ids = Vec::new();
                         window.layout_root.pane_order(&mut pane_ids);
@@ -3228,7 +3230,11 @@ async fn handle_request(
                     .collect(),
             })
         }
-        Request::KillWindow { session, target } => {
+        Request::KillWindow {
+            session,
+            target,
+            force_local,
+        } => {
             let session_id = {
                 let manager = state
                     .session_manager
@@ -3240,7 +3246,9 @@ async fn handle_request(
                 }
             };
 
-            if let Err(response) = ensure_owner_for_session(state, session_id, client_id) {
+            if !force_local
+                && let Err(response) = ensure_owner_for_session(state, session_id, client_id)
+            {
                 return Ok(Response::Err(response));
             }
 
@@ -3482,8 +3490,7 @@ async fn handle_request(
                 (Some(_), Some(_)) => {
                     return Ok(Response::Err(ErrorResponse {
                         code: ErrorCode::InvalidRequest,
-                        message: "focus-pane cannot use target and direction together"
-                            .to_string(),
+                        message: "focus-pane cannot use target and direction together".to_string(),
                     }));
                 }
                 (Some(target), None) => runtime_manager.focus_pane_target(session_id, target),
@@ -3841,7 +3848,10 @@ async fn handle_request(
                 role: SessionRole::Observer,
             })
         }
-        Request::KillSession { selector } => {
+        Request::KillSession {
+            selector,
+            force_local,
+        } => {
             let (session_id, removed_runtime) = {
                 let mut manager = state
                     .session_manager
@@ -3854,7 +3864,9 @@ async fn handle_request(
                     }));
                 };
 
-                if let Err(response) = ensure_owner_for_session(state, session_id, client_id) {
+                if !force_local
+                    && let Err(response) = ensure_owner_for_session(state, session_id, client_id)
+                {
                     return Ok(Response::Err(response));
                 }
 
@@ -4993,6 +5005,7 @@ mod tests {
             132,
             Request::KillSession {
                 selector: SessionSelector::ById(session_id),
+                force_local: false,
             },
         )
         .await;
@@ -5003,6 +5016,20 @@ mod tests {
                 ..
             })
         ));
+
+        let forced_kill_attempt = send_request(
+            &mut observer,
+            133,
+            Request::KillSession {
+                selector: SessionSelector::ById(session_id),
+                force_local: true,
+            },
+        )
+        .await;
+        assert_eq!(
+            forced_kill_attempt,
+            Response::Ok(ResponsePayload::SessionKilled { id: session_id })
+        );
 
         stop_server(server, server_task, &socket_path).await;
     }
@@ -5789,6 +5816,7 @@ mod tests {
             Request::KillWindow {
                 session: Some(SessionSelector::ById(session_id)),
                 target: WindowSelector::ById(logs_window_id),
+                force_local: false,
             },
         )
         .await;
@@ -6092,6 +6120,7 @@ mod tests {
             Request::KillWindow {
                 session: Some(SessionSelector::ById(session_id)),
                 target: WindowSelector::ById(window_id),
+                force_local: false,
             },
         )
         .await;
@@ -6180,6 +6209,7 @@ mod tests {
             23,
             Request::KillSession {
                 selector: SessionSelector::ById(session_id),
+                force_local: false,
             },
         )
         .await;
@@ -6853,6 +6883,7 @@ mod tests {
             85,
             Request::KillSession {
                 selector: SessionSelector::ById(session_id),
+                force_local: false,
             },
         )
         .await;
@@ -7852,10 +7883,9 @@ mod tests {
         )
         .await
         {
-            Response::Ok(ResponsePayload::PaneList { panes }) => panes
-                .into_iter()
-                .map(|pane| pane.id)
-                .collect::<Vec<_>>(),
+            Response::Ok(ResponsePayload::PaneList { panes }) => {
+                panes.into_iter().map(|pane| pane.id).collect::<Vec<_>>()
+            }
             other => panic!("unexpected list panes response: {other:?}"),
         };
 
@@ -7868,10 +7898,9 @@ mod tests {
             other => panic!("unexpected save response: {other:?}"),
         };
 
-        let snapshot_before: serde_json::Value = serde_json::from_slice(
-            &std::fs::read(&snapshot_path).expect("snapshot should exist"),
-        )
-        .expect("snapshot json should decode");
+        let snapshot_before: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&snapshot_path).expect("snapshot should exist"))
+                .expect("snapshot json should decode");
         let layout_before = extract_window_layout(&snapshot_before, session_id, active_window_id);
 
         let stopped = send_request(&mut client, 370, Request::ServerStop).await;
@@ -7897,10 +7926,9 @@ mod tests {
         )
         .await
         {
-            Response::Ok(ResponsePayload::PaneList { panes }) => panes
-                .into_iter()
-                .map(|pane| pane.id)
-                .collect::<Vec<_>>(),
+            Response::Ok(ResponsePayload::PaneList { panes }) => {
+                panes.into_iter().map(|pane| pane.id).collect::<Vec<_>>()
+            }
             other => panic!("unexpected restored list panes response: {other:?}"),
         };
         assert_eq!(pane_order_after_restart, expected_order);
@@ -8083,7 +8111,10 @@ mod tests {
             },
         )
         .await;
-        assert!(matches!(split, Response::Ok(ResponsePayload::PaneSplit { .. })));
+        assert!(matches!(
+            split,
+            Response::Ok(ResponsePayload::PaneSplit { .. })
+        ));
 
         let saved = send_request(&mut client, 356, Request::ServerSave).await;
         let snapshot_path = match saved {
@@ -8103,7 +8134,8 @@ mod tests {
 
         let snapshot_model: super::SnapshotV2 =
             serde_json::from_value(payload["snapshot"].clone()).expect("snapshot model decode");
-        let snapshot_bytes = serde_json::to_vec(&snapshot_model).expect("snapshot json should encode");
+        let snapshot_bytes =
+            serde_json::to_vec(&snapshot_model).expect("snapshot json should encode");
         let checksum = {
             let mut hash = 0xcbf29ce484222325u64;
             for byte in snapshot_bytes {

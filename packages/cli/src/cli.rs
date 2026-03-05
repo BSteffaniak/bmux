@@ -89,6 +89,15 @@ pub(crate) enum Command {
     KillSession {
         /// Session name or UUID
         target: String,
+        /// Bypass ownership checks for local kill operations
+        #[arg(long)]
+        force_local: bool,
+    },
+    /// Kill all sessions
+    KillAllSessions {
+        /// Bypass ownership checks for local kill operations
+        #[arg(long)]
+        force_local: bool,
     },
     /// Attach to a session by name or UUID
     Attach {
@@ -128,6 +137,18 @@ pub(crate) enum Command {
         /// Optional session name or UUID (uses attached session when omitted)
         #[arg(long)]
         session: Option<String>,
+        /// Bypass ownership checks for local kill operations
+        #[arg(long)]
+        force_local: bool,
+    },
+    /// Kill all windows in a session
+    KillAllWindows {
+        /// Optional session name or UUID (uses attached session when omitted)
+        #[arg(long)]
+        session: Option<String>,
+        /// Bypass ownership checks for local kill operations
+        #[arg(long)]
+        force_local: bool,
     },
     /// Switch active window by name, UUID, or `active`
     SwitchWindow {
@@ -230,6 +251,15 @@ pub(crate) enum SessionCommand {
     Kill {
         /// Session name or UUID
         target: String,
+        /// Bypass ownership checks for local kill operations
+        #[arg(long)]
+        force_local: bool,
+    },
+    /// Kill all sessions
+    KillAll {
+        /// Bypass ownership checks for local kill operations
+        #[arg(long)]
+        force_local: bool,
     },
     /// Attach to a session by name or UUID
     Attach {
@@ -283,6 +313,18 @@ pub(crate) enum WindowCommand {
         /// Optional session name or UUID (uses attached session when omitted)
         #[arg(long)]
         session: Option<String>,
+        /// Bypass ownership checks for local kill operations
+        #[arg(long)]
+        force_local: bool,
+    },
+    /// Kill all windows in a session
+    KillAll {
+        /// Optional session name or UUID (uses attached session when omitted)
+        #[arg(long)]
+        session: Option<String>,
+        /// Bypass ownership checks for local kill operations
+        #[arg(long)]
+        force_local: bool,
     },
     /// Switch active window by name, UUID, or `active`
     Switch {
@@ -510,10 +552,47 @@ mod tests {
     #[test]
     fn parses_top_level_kill_session_command() {
         let cli = Cli::try_parse_from(["bmux", "kill-session", "dev"]).expect("valid CLI args");
-        let Some(Command::KillSession { target }) = cli.command else {
+        let Some(Command::KillSession {
+            target,
+            force_local,
+        }) = cli.command
+        else {
             panic!("expected kill-session command");
         };
         assert_eq!(target, "dev");
+        assert!(!force_local);
+    }
+
+    #[test]
+    fn parses_top_level_kill_session_force_local_flag() {
+        let cli = Cli::try_parse_from(["bmux", "kill-session", "dev", "--force-local"])
+            .expect("valid CLI args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::KillSession {
+                target,
+                force_local: true
+            }) if target == "dev"
+        ));
+    }
+
+    #[test]
+    fn parses_top_level_kill_all_sessions_command() {
+        let cli = Cli::try_parse_from(["bmux", "kill-all-sessions"]).expect("valid CLI args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::KillAllSessions { force_local: false })
+        ));
+    }
+
+    #[test]
+    fn parses_top_level_kill_all_sessions_force_local_flag() {
+        let cli = Cli::try_parse_from(["bmux", "kill-all-sessions", "--force-local"])
+            .expect("valid CLI args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::KillAllSessions { force_local: true })
+        ));
     }
 
     #[test]
@@ -592,11 +671,55 @@ mod tests {
     fn parses_top_level_kill_window_command() {
         let cli = Cli::try_parse_from(["bmux", "kill-window", "active", "--session", "dev"])
             .expect("valid CLI args");
-        let Some(Command::KillWindow { target, session }) = cli.command else {
+        let Some(Command::KillWindow {
+            target,
+            session,
+            force_local,
+        }) = cli.command
+        else {
             panic!("expected kill-window command");
         };
         assert_eq!(target, "active");
         assert_eq!(session.as_deref(), Some("dev"));
+        assert!(!force_local);
+    }
+
+    #[test]
+    fn parses_top_level_kill_all_windows_command() {
+        let cli = Cli::try_parse_from(["bmux", "kill-all-windows", "--session", "dev"])
+            .expect("valid CLI args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::KillAllWindows {
+                session: Some(ref session),
+                force_local: false
+            }) if session == "dev"
+        ));
+    }
+
+    #[test]
+    fn parses_top_level_kill_all_windows_without_session_command() {
+        let cli = Cli::try_parse_from(["bmux", "kill-all-windows"]).expect("valid CLI args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::KillAllWindows {
+                session: None,
+                force_local: false
+            })
+        ));
+    }
+
+    #[test]
+    fn parses_top_level_kill_all_windows_force_local_flag() {
+        let cli = Cli::try_parse_from(["bmux", "kill-all-windows", "--force-local"])
+            .expect("valid CLI args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::KillAllWindows {
+                session: None,
+                force_local: true
+            })
+        ));
     }
 
     #[test]
@@ -844,7 +967,35 @@ mod tests {
         };
         assert!(matches!(
             command,
-            SessionCommand::Kill { target } if target == "dev"
+            SessionCommand::Kill {
+                target,
+                force_local: false
+            } if target == "dev"
+        ));
+    }
+
+    #[test]
+    fn parses_grouped_session_kill_all_command() {
+        let cli = Cli::try_parse_from(["bmux", "session", "kill-all"]).expect("valid CLI args");
+        let Some(Command::Session { command }) = cli.command else {
+            panic!("expected session command");
+        };
+        assert!(matches!(
+            command,
+            SessionCommand::KillAll { force_local: false }
+        ));
+    }
+
+    #[test]
+    fn parses_grouped_session_kill_all_force_local_flag() {
+        let cli = Cli::try_parse_from(["bmux", "session", "kill-all", "--force-local"])
+            .expect("valid CLI args");
+        let Some(Command::Session { command }) = cli.command else {
+            panic!("expected session command");
+        };
+        assert!(matches!(
+            command,
+            SessionCommand::KillAll { force_local: true }
         ));
     }
 
@@ -1003,8 +1154,65 @@ mod tests {
             command,
             WindowCommand::Kill {
                 target,
-                session: Some(ref session)
+                session: Some(ref session),
+                force_local: false
             } if target == "active" && session == "dev"
+        ));
+    }
+
+    #[test]
+    fn parses_grouped_window_kill_force_local_flag() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "window",
+            "kill",
+            "active",
+            "--session",
+            "dev",
+            "--force-local",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Window { command }) = cli.command else {
+            panic!("expected window command");
+        };
+        assert!(matches!(
+            command,
+            WindowCommand::Kill {
+                target,
+                session: Some(ref session),
+                force_local: true
+            } if target == "active" && session == "dev"
+        ));
+    }
+
+    #[test]
+    fn parses_grouped_window_kill_all_command() {
+        let cli = Cli::try_parse_from(["bmux", "window", "kill-all", "--session", "dev"])
+            .expect("valid CLI args");
+        let Some(Command::Window { command }) = cli.command else {
+            panic!("expected window command");
+        };
+        assert!(matches!(
+            command,
+            WindowCommand::KillAll {
+                session: Some(ref session),
+                force_local: false
+            } if session == "dev"
+        ));
+    }
+
+    #[test]
+    fn parses_grouped_window_kill_all_without_session_command() {
+        let cli = Cli::try_parse_from(["bmux", "window", "kill-all"]).expect("valid CLI args");
+        let Some(Command::Window { command }) = cli.command else {
+            panic!("expected window command");
+        };
+        assert!(matches!(
+            command,
+            WindowCommand::KillAll {
+                session: None,
+                force_local: false
+            }
         ));
     }
 

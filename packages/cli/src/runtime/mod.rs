@@ -162,7 +162,11 @@ async fn run_command(command: &Command) -> Result<u8> {
             role,
         } => run_grant_role(session, client, *role).await,
         Command::Revoke { session, client } => run_revoke_role(session, client).await,
-        Command::KillSession { target } => run_session_kill(target).await,
+        Command::KillSession {
+            target,
+            force_local,
+        } => run_session_kill(target, *force_local).await,
+        Command::KillAllSessions { force_local } => run_session_kill_all(*force_local).await,
         Command::Attach {
             target,
             follow,
@@ -173,7 +177,15 @@ async fn run_command(command: &Command) -> Result<u8> {
             run_window_new(session.as_ref(), name.clone()).await
         }
         Command::ListWindows { session, json } => run_window_list(session.as_ref(), *json).await,
-        Command::KillWindow { target, session } => run_window_kill(target, session.as_ref()).await,
+        Command::KillWindow {
+            target,
+            session,
+            force_local,
+        } => run_window_kill(target, session.as_ref(), *force_local).await,
+        Command::KillAllWindows {
+            session,
+            force_local,
+        } => run_window_kill_all(session.as_ref(), *force_local).await,
         Command::SwitchWindow { target, session } => {
             run_window_switch(target, session.as_ref()).await
         }
@@ -197,7 +209,11 @@ async fn run_command(command: &Command) -> Result<u8> {
                 role,
             } => run_grant_role(session, client, *role).await,
             SessionCommand::Revoke { session, client } => run_revoke_role(session, client).await,
-            SessionCommand::Kill { target } => run_session_kill(target).await,
+            SessionCommand::Kill {
+                target,
+                force_local,
+            } => run_session_kill(target, *force_local).await,
+            SessionCommand::KillAll { force_local } => run_session_kill_all(*force_local).await,
             SessionCommand::Attach {
                 target,
                 follow,
@@ -215,9 +231,15 @@ async fn run_command(command: &Command) -> Result<u8> {
                 run_window_new(session.as_ref(), name.clone()).await
             }
             WindowCommand::List { session, json } => run_window_list(session.as_ref(), *json).await,
-            WindowCommand::Kill { target, session } => {
-                run_window_kill(target, session.as_ref()).await
-            }
+            WindowCommand::Kill {
+                target,
+                session,
+                force_local,
+            } => run_window_kill(target, session.as_ref(), *force_local).await,
+            WindowCommand::KillAll {
+                session,
+                force_local,
+            } => run_window_kill_all(session.as_ref(), *force_local).await,
             WindowCommand::Switch { target, session } => {
                 run_window_switch(target, session.as_ref()).await
             }
@@ -658,17 +680,51 @@ async fn run_revoke_role(session: &str, client: &str) -> Result<u8> {
     Ok(0)
 }
 
-async fn run_session_kill(target: &str) -> Result<u8> {
+async fn run_session_kill(target: &str, force_local: bool) -> Result<u8> {
     let selector = parse_session_selector(target);
     let mut client = BmuxClient::connect_default("bmux-cli-kill-session")
         .await
         .map_err(map_cli_client_error)?;
     let killed_id = client
-        .kill_session(selector)
+        .kill_session_with_options(selector, force_local)
         .await
         .map_err(map_cli_client_error)?;
     println!("killed session: {killed_id}");
     Ok(0)
+}
+
+async fn run_session_kill_all(force_local: bool) -> Result<u8> {
+    let mut client = BmuxClient::connect_default("bmux-cli-kill-all-sessions")
+        .await
+        .map_err(map_cli_client_error)?;
+    let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
+
+    if sessions.is_empty() {
+        println!("no sessions");
+        return Ok(0);
+    }
+
+    let mut killed_count = 0usize;
+    let mut failed_count = 0usize;
+    for session in sessions {
+        match client
+            .kill_session_with_options(SessionSelector::ById(session.id), force_local)
+            .await
+        {
+            Ok(killed_id) => {
+                println!("killed session: {killed_id}");
+                killed_count = killed_count.saturating_add(1);
+            }
+            Err(error) => {
+                failed_count = failed_count.saturating_add(1);
+                let mapped_error = map_cli_client_error(error);
+                eprintln!("failed killing session {}: {mapped_error:#}", session.id);
+            }
+        }
+    }
+
+    println!("kill-all-sessions complete: killed {killed_count}, failed {failed_count}");
+    Ok(if failed_count == 0 { 0 } else { 1 })
 }
 
 async fn run_session_attach(
@@ -821,7 +877,10 @@ async fn run_session_attach_with_client(
                 {
                     match key.code {
                         KeyCode::Char('y') | KeyCode::Char('Y') => {
-                            match client.kill_session(SessionSelector::ById(attached_id)).await {
+                            match client
+                                .kill_session(SessionSelector::ById(attached_id))
+                                .await
+                            {
                                 Ok(_) => {
                                     break;
                                 }
@@ -833,10 +892,7 @@ async fn run_session_attach_with_client(
                             status_needs_redraw = true;
                             continue;
                         }
-                        KeyCode::Char('n')
-                        | KeyCode::Char('N')
-                        | KeyCode::Esc
-                        | KeyCode::Enter => {
+                        KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
                             quit_confirmation_pending = false;
                             status_needs_redraw = true;
                             continue;
@@ -977,9 +1033,7 @@ async fn run_session_attach_with_client(
             &mut pane_buffers,
         )?;
         apply_attach_cursor_state(&mut stdout, cursor_state)?;
-        stdout
-            .flush()
-            .context("failed flushing attach frame")?;
+        stdout.flush().context("failed flushing attach frame")?;
     }
 
     let _ = client.detach().await;
@@ -1251,9 +1305,7 @@ async fn build_attach_status_line_for_draw(
     } else {
         match ui_mode {
             AttachUiMode::Normal => "Ctrl-T window mode | Ctrl-A d detach | Ctrl-A q quit",
-            AttachUiMode::Window => {
-                "h/l prev/next | 1-9 goto | n new | x close | Esc/Enter exit"
-            }
+            AttachUiMode::Window => "h/l prev/next | 1-9 goto | n new | x close | Esc/Enter exit",
         }
     };
 
@@ -1583,7 +1635,11 @@ fn split_rect(rect: PaneRect, ratio_percent: u8, vertical: bool) -> (PaneRect, P
     }
 }
 
-fn collect_layout_rects(layout: &PaneLayoutNode, rect: PaneRect, out: &mut BTreeMap<Uuid, PaneRect>) {
+fn collect_layout_rects(
+    layout: &PaneLayoutNode,
+    rect: PaneRect,
+    out: &mut BTreeMap<Uuid, PaneRect>,
+) {
     match layout {
         PaneLayoutNode::Leaf { pane_id } => {
             out.insert(*pane_id, rect);
@@ -1740,8 +1796,12 @@ fn render_attach_panes(
         for y in rect.y.saturating_add(1)..rect.y.saturating_add(rect.h.saturating_sub(1)) {
             queue!(stdout, MoveTo(rect.x, y), Print("|"))
                 .context("failed drawing pane left border")?;
-            queue!(stdout, MoveTo(rect.x.saturating_add(rect.w.saturating_sub(1)), y), Print("|"))
-                .context("failed drawing pane right border")?;
+            queue!(
+                stdout,
+                MoveTo(rect.x.saturating_add(rect.w.saturating_sub(1)), y),
+                Print("|")
+            )
+            .context("failed drawing pane right border")?;
         }
 
         let inner_w_u16 = rect.w.saturating_sub(2);
@@ -1749,7 +1809,10 @@ fn render_attach_panes(
         let inner_w = usize::from(inner_w_u16);
         let inner_h = usize::from(inner_h_u16);
         if let Some(entry) = pane_buffers.get_mut(&pane_id) {
-            entry.parser.screen_mut().set_size(inner_h_u16.max(1), inner_w_u16.max(1));
+            entry
+                .parser
+                .screen_mut()
+                .set_size(inner_h_u16.max(1), inner_w_u16.max(1));
             let screen = entry.parser.screen();
             if pane_id == focused_pane_id {
                 let (cursor_row, cursor_col) = screen.cursor_position();
@@ -1780,7 +1843,11 @@ fn render_attach_panes(
                             col = col.saturating_add(1);
                             continue;
                         }
-                        let text = if cell.has_contents() { cell.contents() } else { " " };
+                        let text = if cell.has_contents() {
+                            cell.contents()
+                        } else {
+                            " "
+                        };
                         line.push_str(text);
                         let width = UnicodeWidthStr::width(text).max(1);
                         used_cols = used_cols.saturating_add(width);
@@ -1879,7 +1946,9 @@ fn attach_key_event_actions(
                     AttachEventAction::Send(bytes)
                 }
             }
-            RuntimeAction::NewWindow | RuntimeAction::NewSession => AttachEventAction::Runtime(action),
+            RuntimeAction::NewWindow | RuntimeAction::NewSession => {
+                AttachEventAction::Runtime(action)
+            }
             RuntimeAction::EnterWindowMode
             | RuntimeAction::SplitFocusedVertical
             | RuntimeAction::SplitFocusedHorizontal
@@ -1916,8 +1985,7 @@ fn attach_key_event_actions(
                         .unwrap_or(AttachEventAction::Ignore)
                 }
             }
-            RuntimeAction::Quit
-            => AttachEventAction::Ui(action),
+            RuntimeAction::Quit => AttachEventAction::Ui(action),
             RuntimeAction::ToggleSplitDirection
             | RuntimeAction::RestartFocusedPane
             | RuntimeAction::ShowHelp
@@ -2110,18 +2178,60 @@ async fn run_window_list(session: Option<&String>, as_json: bool) -> Result<u8> 
     Ok(0)
 }
 
-async fn run_window_kill(target: &str, session: Option<&String>) -> Result<u8> {
+async fn run_window_kill(target: &str, session: Option<&String>, force_local: bool) -> Result<u8> {
     let session_selector = session.map(|value| parse_session_selector(value));
     let window_selector = parse_window_selector(target);
     let mut client = BmuxClient::connect_default("bmux-cli-kill-window")
         .await
         .map_err(map_cli_client_error)?;
     let window_id = client
-        .kill_window(session_selector, window_selector)
+        .kill_window_with_options(session_selector, window_selector, force_local)
         .await
         .map_err(map_cli_client_error)?;
     println!("killed window: {window_id}");
     Ok(0)
+}
+
+async fn run_window_kill_all(session: Option<&String>, force_local: bool) -> Result<u8> {
+    let session_selector = session.map(|value| parse_session_selector(value));
+    let mut client = BmuxClient::connect_default("bmux-cli-kill-all-windows")
+        .await
+        .map_err(map_cli_client_error)?;
+    let windows = client
+        .list_windows(session_selector.clone())
+        .await
+        .map_err(map_cli_client_error)?;
+
+    if windows.is_empty() {
+        println!("no windows");
+        return Ok(0);
+    }
+
+    let mut killed_count = 0usize;
+    let mut failed_count = 0usize;
+    for window in windows {
+        match client
+            .kill_window_with_options(
+                session_selector.clone(),
+                WindowSelector::ById(window.id),
+                force_local,
+            )
+            .await
+        {
+            Ok(window_id) => {
+                println!("killed window: {window_id}");
+                killed_count = killed_count.saturating_add(1);
+            }
+            Err(error) => {
+                failed_count = failed_count.saturating_add(1);
+                let mapped_error = map_cli_client_error(error);
+                eprintln!("failed killing window {}: {mapped_error:#}", window.id);
+            }
+        }
+    }
+
+    println!("kill-all-windows complete: killed {killed_count}, failed {failed_count}");
+    Ok(if failed_count == 0 { 0 } else { 1 })
 }
 
 async fn run_window_switch(target: &str, session: Option<&String>) -> Result<u8> {

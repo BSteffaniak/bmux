@@ -204,10 +204,12 @@ pub enum Request {
     },
     KillSession {
         selector: SessionSelector,
+        force_local: bool,
     },
     KillWindow {
         session: Option<SessionSelector>,
         target: WindowSelector,
+        force_local: bool,
     },
     SwitchWindow {
         session: Option<SessionSelector>,
@@ -594,6 +596,7 @@ mod tests {
     fn serializes_request_roundtrip() {
         let request = Request::KillSession {
             selector: SessionSelector::ByName("dev-shell".to_string()),
+            force_local: false,
         };
         let bytes = encode(&request).expect("request should encode");
         let decoded: Request = decode(&bytes).expect("request should decode");

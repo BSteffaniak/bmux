@@ -64,6 +64,9 @@ bmux attach dev
 bmux attach --follow 550e8400-e29b-41d4-a716-446655440000 --global
 bmux detach
 bmux kill-session dev
+bmux kill-session dev --force-local
+bmux kill-all-sessions
+bmux kill-all-sessions --force-local
 
 # grouped aliases
 bmux session new dev
@@ -80,6 +83,9 @@ bmux session attach dev
 bmux session attach --follow 550e8400-e29b-41d4-a716-446655440000 --global
 bmux session detach
 bmux session kill dev
+bmux session kill dev --force-local
+bmux session kill-all
+bmux session kill-all --force-local
 ```
 
 Session target values for `attach`/`kill` support both:
@@ -109,6 +115,9 @@ bmux list-windows --session dev
 bmux list-windows --session dev --json
 bmux switch-window active --session dev
 bmux kill-window active --session dev
+bmux kill-window active --session dev --force-local
+bmux kill-all-windows --session dev
+bmux kill-all-windows --session dev --force-local
 
 # grouped aliases
 bmux window new --session dev --name editor
@@ -116,6 +125,9 @@ bmux window list --session dev
 bmux window list --session dev --json
 bmux window switch active --session dev
 bmux window kill active --session dev
+bmux window kill active --session dev --force-local
+bmux window kill-all --session dev
+bmux window kill-all --session dev --force-local
 ```
 
 Window target values for `switch`/`kill` support:

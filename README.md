@@ -115,12 +115,18 @@ bmux list-sessions --json
 bmux attach dev
 bmux attach --follow 550e8400-e29b-41d4-a716-446655440000 --global
 bmux kill-session dev
+bmux kill-session dev --force-local
+bmux kill-all-sessions
+bmux kill-all-sessions --force-local
 
 # Window lifecycle (top-level)
 bmux new-window --session dev --name editor
 bmux list-windows --session dev
 bmux switch-window active --session dev
 bmux kill-window active --session dev
+bmux kill-window active --session dev --force-local
+bmux kill-all-windows --session dev
+bmux kill-all-windows --session dev --force-local
 
 # Follow controls (top-level)
 bmux list-clients
@@ -138,11 +144,17 @@ bmux session list --json
 bmux session attach dev
 bmux session attach --follow 550e8400-e29b-41d4-a716-446655440000 --global
 bmux session kill dev
+bmux session kill dev --force-local
+bmux session kill-all
+bmux session kill-all --force-local
 bmux session detach
 bmux window new --session dev --name editor
 bmux window list --session dev
 bmux window switch active --session dev
 bmux window kill active --session dev
+bmux window kill active --session dev --force-local
+bmux window kill-all --session dev
+bmux window kill-all --session dev --force-local
 bmux session clients
 bmux session permissions --session dev
 bmux session permissions --session dev --watch

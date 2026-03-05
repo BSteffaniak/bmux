@@ -11,9 +11,9 @@ use bmux_ipc::transport::{IpcTransportError, LocalIpcStream};
 use bmux_ipc::{
     AttachGrant, AttachPaneChunk, ClientSummary, Envelope, EnvelopeKind, ErrorCode, IpcEndpoint,
     PaneFocusDirection, PaneLayoutNode, PaneSelector, PaneSplitDirection, PaneSummary,
-    ProtocolVersion, Request, Response, ResponsePayload,
-    ServerSnapshotStatus, SessionPermissionSummary, SessionRole, SessionSelector, SessionSummary,
-    WindowSelector, WindowSummary, decode, encode,
+    ProtocolVersion, Request, Response, ResponsePayload, ServerSnapshotStatus,
+    SessionPermissionSummary, SessionRole, SessionSelector, SessionSummary, WindowSelector,
+    WindowSummary, decode, encode,
 };
 use std::time::Duration;
 use thiserror::Error;
@@ -344,7 +344,26 @@ impl BmuxClient {
     ///
     /// Returns an error if request or response validation fails.
     pub async fn kill_session(&mut self, selector: SessionSelector) -> Result<Uuid> {
-        match self.request(Request::KillSession { selector }).await? {
+        self.kill_session_with_options(selector, false).await
+    }
+
+    /// Kill a session selected by name or UUID with explicit force-local option.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn kill_session_with_options(
+        &mut self,
+        selector: SessionSelector,
+        force_local: bool,
+    ) -> Result<Uuid> {
+        match self
+            .request(Request::KillSession {
+                selector,
+                force_local,
+            })
+            .await?
+        {
             ResponsePayload::SessionKilled { id } => Ok(id),
             _ => Err(ClientError::UnexpectedResponse("expected session killed")),
         }
@@ -391,8 +410,26 @@ impl BmuxClient {
         session: Option<SessionSelector>,
         target: WindowSelector,
     ) -> Result<Uuid> {
+        self.kill_window_with_options(session, target, false).await
+    }
+
+    /// Kill a window selected by id/name/active with explicit force-local option.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn kill_window_with_options(
+        &mut self,
+        session: Option<SessionSelector>,
+        target: WindowSelector,
+        force_local: bool,
+    ) -> Result<Uuid> {
         match self
-            .request(Request::KillWindow { session, target })
+            .request(Request::KillWindow {
+                session,
+                target,
+                force_local,
+            })
             .await?
         {
             ResponsePayload::WindowKilled { id, .. } => Ok(id),
@@ -725,7 +762,9 @@ impl BmuxClient {
                 panes,
                 layout_root,
             }),
-            _ => Err(ClientError::UnexpectedResponse("expected attach layout response")),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attach layout response",
+            )),
         }
     }
 
@@ -1249,7 +1288,11 @@ mod tests {
             .expect("list panes should succeed");
         assert_eq!(panes.len(), 3);
         assert!(panes.iter().any(|pane| pane.id == second_pane));
-        assert!(panes.iter().any(|pane| pane.id == third_pane && pane.focused));
+        assert!(
+            panes
+                .iter()
+                .any(|pane| pane.id == third_pane && pane.focused)
+        );
 
         let focused_by_id = client
             .focus_pane_target(session.clone(), PaneSelector::ById(second_pane))
