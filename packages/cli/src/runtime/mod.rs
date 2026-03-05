@@ -40,6 +40,15 @@ const SERVER_STATUS_TIMEOUT: Duration = Duration::from_millis(1000);
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_millis(5000);
 const ATTACH_IO_POLL_INTERVAL: Duration = Duration::from_millis(15);
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ServerRuntimeMetadata {
+    pid: u32,
+    version: String,
+    build_id: String,
+    executable_path: String,
+    started_at_epoch_ms: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalProfile {
     Bmux256Color,
@@ -71,6 +80,7 @@ async fn run_default_server_attach() -> Result<u8> {
 
 async fn ensure_server_running_for_default_attach() -> Result<()> {
     if server_is_running().await? {
+        maybe_warn_stale_server_build()?;
         return Ok(());
     }
 
@@ -293,6 +303,7 @@ async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8>
             .stderr(Stdio::null());
         let child = child.spawn().context("failed to spawn background server")?;
         write_server_pid_file(child.id())?;
+        write_server_runtime_metadata(child.id())?;
 
         if !wait_for_server_running(SERVER_START_TIMEOUT).await? {
             let _ = try_kill_pid(child.id());
@@ -306,6 +317,7 @@ async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8>
 
     let server = BmuxServer::from_default_paths();
     write_server_pid_file(std::process::id())?;
+    write_server_runtime_metadata(std::process::id())?;
     let run_result = server.run().await;
     let _ = remove_server_pid_file();
     run_result?;
@@ -315,11 +327,32 @@ async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8>
 async fn run_server_status() -> Result<u8> {
     cleanup_stale_pid_file().await?;
     let status = fetch_server_status().await?;
+    let metadata = read_server_runtime_metadata()?;
+    let current_build_id = current_cli_build_id().ok();
 
     match status {
         Some(status) if status.running => {
             if let Some(event_name) = latest_server_event_name().await? {
                 println!("latest server event: {event_name}");
+            }
+            if let Some(metadata) = metadata.as_ref() {
+                println!("server pid: {}", metadata.pid);
+                println!("server version: {}", metadata.version);
+                println!("server build: {}", metadata.build_id);
+                println!("server executable: {}", metadata.executable_path);
+                println!("server started_at_ms: {}", metadata.started_at_epoch_ms);
+            } else {
+                println!("server metadata: missing");
+            }
+            if let Some(build_id) = current_build_id.as_ref() {
+                println!("cli build: {build_id}");
+                if let Some(metadata) = metadata.as_ref()
+                    && metadata.build_id != *build_id
+                {
+                    println!(
+                        "warning: running server build differs from current CLI build; restart with `bmux server stop` then rerun"
+                    );
+                }
             }
             println!(
                 "snapshot: {}{}",
@@ -2461,6 +2494,91 @@ fn server_pid_file_path() -> PathBuf {
     bmux_config::ConfigPaths::default().server_pid_file()
 }
 
+fn server_runtime_metadata_file_path() -> PathBuf {
+    let paths = bmux_config::ConfigPaths::default();
+    paths.runtime_dir.join("server-meta.json")
+}
+
+fn current_cli_build_id() -> Result<String> {
+    let executable = std::env::current_exe().context("failed resolving current executable")?;
+    let metadata = std::fs::metadata(&executable)
+        .with_context(|| format!("failed reading executable metadata {}", executable.display()))?;
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0_u128, |duration| duration.as_millis());
+    Ok(format!("{}-{modified}", metadata.len()))
+}
+
+fn current_server_runtime_metadata(pid: u32) -> Result<ServerRuntimeMetadata> {
+    let executable = std::env::current_exe().context("failed resolving current executable")?;
+    Ok(ServerRuntimeMetadata {
+        pid,
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        build_id: current_cli_build_id()?,
+        executable_path: executable.display().to_string(),
+        started_at_epoch_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis() as u64),
+    })
+}
+
+fn write_server_runtime_metadata(pid: u32) -> Result<()> {
+    let path = server_runtime_metadata_file_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed creating runtime dir {}", parent.display()))?;
+    }
+    let metadata = current_server_runtime_metadata(pid)?;
+    let payload = serde_json::to_vec_pretty(&metadata).context("failed encoding server metadata")?;
+    std::fs::write(&path, payload)
+        .with_context(|| format!("failed writing server metadata file {}", path.display()))
+}
+
+fn read_server_runtime_metadata() -> Result<Option<ServerRuntimeMetadata>> {
+    let path = server_runtime_metadata_file_path();
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed reading server metadata file {}", path.display()));
+        }
+    };
+    let metadata = serde_json::from_slice::<ServerRuntimeMetadata>(&bytes).with_context(|| {
+        format!(
+            "failed parsing server metadata file {}; remove stale file and retry",
+            path.display()
+        )
+    })?;
+    Ok(Some(metadata))
+}
+
+fn remove_server_runtime_metadata_file() -> Result<()> {
+    let path = server_runtime_metadata_file_path();
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("failed removing server metadata file {}", path.display())),
+    }
+}
+
+fn maybe_warn_stale_server_build() -> Result<()> {
+    let Some(metadata) = read_server_runtime_metadata()? else {
+        return Ok(());
+    };
+    let current_build = current_cli_build_id()?;
+    if metadata.build_id != current_build {
+        eprintln!(
+            "bmux warning: running server build ({}) differs from current CLI build ({}); restart with `bmux server stop`",
+            metadata.build_id, current_build
+        );
+    }
+    Ok(())
+}
+
 fn write_server_pid_file(pid: u32) -> Result<()> {
     let path = server_pid_file_path();
     if let Some(parent) = path.parent() {
@@ -2493,13 +2611,15 @@ fn read_server_pid_file() -> Result<Option<u32>> {
 
 fn remove_server_pid_file() -> Result<()> {
     let path = server_pid_file_path();
-    match std::fs::remove_file(&path) {
+    let remove_pid_result = match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => {
             Err(error).with_context(|| format!("failed removing pid file {}", path.display()))
         }
-    }
+    };
+    let remove_metadata_result = remove_server_runtime_metadata_file();
+    remove_pid_result.and(remove_metadata_result)
 }
 
 fn try_kill_pid(pid: u32) -> Result<bool> {
