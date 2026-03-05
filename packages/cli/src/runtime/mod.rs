@@ -13,7 +13,7 @@ use bmux_ipc::{
 };
 use bmux_server::BmuxServer;
 use clap::Parser;
-use crossterm::cursor::{Hide, MoveTo, Show};
+use crossterm::cursor::{Hide, MoveTo, RestorePosition, SavePosition, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::queue;
 use crossterm::style::Print;
@@ -1476,7 +1476,7 @@ async fn render_attach_frame(
     }
 
     let mut stdout = io::stdout();
-    queue!(stdout, Hide).context("failed queuing hide cursor for attach frame")?;
+    queue!(stdout, SavePosition).context("failed queuing cursor save for attach frame")?;
     if let Some(status_line) = view_state.cached_status_line.as_deref() {
         queue_attach_status_line(&mut stdout, status_line)?;
     }
@@ -1488,7 +1488,7 @@ async fn render_attach_frame(
         &view_state.dirty.pane_dirty_ids,
         view_state.dirty.full_pane_redraw,
     )?;
-    apply_attach_cursor_state(&mut stdout, cursor_state)?;
+    apply_attach_cursor_state(&mut stdout, cursor_state, &mut view_state.last_cursor_state)?;
     stdout.flush().context("failed flushing attach frame")?;
     view_state.dirty.full_pane_redraw = false;
     view_state.dirty.pane_dirty_ids.clear();
@@ -1744,6 +1744,7 @@ struct AttachViewState {
     pane_buffers: BTreeMap<Uuid, PaneRenderBuffer>,
     cached_status_line: Option<String>,
     cached_layout_state: Option<AttachLayoutState>,
+    last_cursor_state: Option<AttachCursorState>,
     dirty: AttachDirtyFlags,
 }
 
@@ -1757,6 +1758,7 @@ impl AttachViewState {
             pane_buffers: BTreeMap::new(),
             cached_status_line: None,
             cached_layout_state: None,
+            last_cursor_state: None,
             dirty: AttachDirtyFlags::default(),
         }
     }
@@ -2342,16 +2344,41 @@ fn render_attach_panes(
 fn apply_attach_cursor_state(
     stdout: &mut io::Stdout,
     cursor_state: Option<AttachCursorState>,
+    last_cursor_state: &mut Option<AttachCursorState>,
 ) -> Result<()> {
-    match cursor_state {
-        Some(state) if state.visible => {
-            queue!(stdout, MoveTo(state.x, state.y), Show)
-                .context("failed applying visible attach cursor")?;
+    match (cursor_state, *last_cursor_state) {
+        (Some(current), Some(previous)) if current == previous => {
+            queue!(stdout, RestorePosition).context("failed restoring cursor position")?;
         }
-        _ => {
-            queue!(stdout, Hide).context("failed applying hidden attach cursor")?;
+        (Some(current), Some(previous)) => {
+            if current.visible != previous.visible {
+                if current.visible {
+                    queue!(stdout, Show).context("failed showing attach cursor")?;
+                } else {
+                    queue!(stdout, Hide).context("failed hiding attach cursor")?;
+                }
+            }
+            queue!(stdout, MoveTo(current.x, current.y))
+                .context("failed moving attach cursor")?;
         }
+        (Some(current), None) => {
+            if current.visible {
+                queue!(stdout, Show).context("failed showing attach cursor")?;
+            } else {
+                queue!(stdout, Hide).context("failed hiding attach cursor")?;
+            }
+            queue!(stdout, MoveTo(current.x, current.y))
+                .context("failed moving attach cursor")?;
+        }
+        (None, Some(previous)) => {
+            if previous.visible {
+                queue!(stdout, Hide).context("failed hiding attach cursor")?;
+            }
+        }
+        (None, None) => {}
     }
+
+    *last_cursor_state = cursor_state;
     Ok(())
 }
 
