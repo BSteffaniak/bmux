@@ -1,64 +1,7 @@
-use crate::input::{Keymap, RuntimeAction};
-use std::io::{self, Write};
-use std::path::Path;
-
 pub(crate) struct AttachTab {
     pub(crate) index: usize,
     pub(crate) title: String,
     pub(crate) active: bool,
-}
-
-pub(crate) fn build_status_line(
-    shell_name: &str,
-    cwd: &Path,
-    cols: u16,
-    rows: u16,
-    focused_pane: usize,
-    keymap: &Keymap,
-    debug_suffix: Option<&str>,
-) -> String {
-    let focused_label = if focused_pane == 0 { "left" } else { "right" };
-    let switch_hint = key_hint_or_unbound(keymap, RuntimeAction::FocusNext);
-    let scroll_hint = key_hint_or_unbound(keymap, RuntimeAction::EnterScrollMode);
-    let detach_hint = key_hint_or_unbound(keymap, RuntimeAction::Detach);
-    let quit_hint = key_hint_or_unbound(keymap, RuntimeAction::Quit);
-    let help_hint = key_hint_or_unbound(keymap, RuntimeAction::ShowHelp);
-
-    let mut status = format!(
-        " bmux | shell: {shell_name} | cwd: {} | size: {cols}x{rows} | focus: {focused_label} | {switch_hint} switch | {scroll_hint} scroll | {detach_hint} detach | {quit_hint} quit | {help_hint} help ",
-        cwd.display()
-    );
-
-    if let Some(suffix) = debug_suffix {
-        status.push_str(" | ");
-        status.push_str(suffix);
-    }
-
-    status
-}
-
-fn key_hint_or_unbound(keymap: &Keymap, action: RuntimeAction) -> String {
-    keymap
-        .primary_binding_for_action(&action)
-        .unwrap_or_else(|| "unbound".to_string())
-}
-
-pub(crate) fn write_status_line(status_line: &str, cols: u16) -> io::Result<()> {
-    if cols == 0 {
-        return Ok(());
-    }
-
-    let width = usize::from(cols);
-    let mut rendered = status_line.to_string();
-
-    if rendered.len() > width {
-        rendered.truncate(width);
-    } else {
-        rendered.push_str(&" ".repeat(width - rendered.len()));
-    }
-
-    write!(io::stdout(), "\x1b7\x1b[1;1H\x1b[7m{rendered}\x1b[0m\x1b8")?;
-    io::stdout().flush()
 }
 
 pub(crate) fn build_attach_status_line(

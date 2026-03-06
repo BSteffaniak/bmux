@@ -147,6 +147,7 @@ struct PendingChord {
 }
 
 impl Keymap {
+    #[cfg(test)]
     pub(crate) fn default_runtime() -> Self {
         let mut runtime = BTreeMap::new();
         runtime.insert("c".to_string(), "new_window".to_string());
@@ -424,23 +425,6 @@ impl InputProcessor {
         actions
     }
 
-    pub(crate) fn finish(&mut self) -> Option<RuntimeAction> {
-        self.resolve_pending(&mut Vec::new(), true);
-
-        if let Some(bytes) = self.pending.take().map(pending_bytes) {
-            if !bytes.is_empty() {
-                return Some(RuntimeAction::ForwardToPane(bytes));
-            }
-        }
-
-        let tail = self.decoder.take_pending();
-        if tail.is_empty() {
-            None
-        } else {
-            Some(RuntimeAction::ForwardToPane(tail))
-        }
-    }
-
     fn pending_timed_out(&self) -> bool {
         self.pending
             .as_ref()
@@ -712,9 +696,6 @@ impl ByteDecoder {
         events
     }
 
-    fn take_pending(&mut self) -> Vec<u8> {
-        std::mem::take(&mut self.pending)
-    }
 }
 
 fn validate_no_duplicate_chords(bindings: &[KeyBinding], scope: &str) -> Result<()> {
