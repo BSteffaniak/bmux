@@ -13,8 +13,8 @@ use anyhow::{Context, Result};
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, ResolvedTimeout, TerminfoAutoInstall};
 use bmux_ipc::{
-    PaneFocusDirection, PaneSplitDirection, SessionRole, SessionSelector, SessionSummary,
-    WindowSelector,
+    AttachViewComponent, PaneFocusDirection, PaneSplitDirection, SessionRole, SessionSelector,
+    SessionSummary, WindowSelector,
 };
 use bmux_server::BmuxServer;
 use clap::Parser;
@@ -595,6 +595,7 @@ fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
         bmux_client::ServerEvent::FollowTargetGone { .. } => "follow_target_gone",
         bmux_client::ServerEvent::FollowTargetChanged { .. } => "follow_target_changed",
         bmux_client::ServerEvent::RoleChanged { .. } => "role_changed",
+        bmux_client::ServerEvent::AttachViewChanged { .. } => "attach_view_changed",
     }
 }
 
@@ -2269,10 +2270,39 @@ async fn handle_attach_server_event(
         } if Some(former_leader_client_id) == follow_target_id => {
             println!("follow target disconnected; staying on current session");
         }
+        bmux_client::ServerEvent::AttachViewChanged {
+            session_id,
+            components,
+            ..
+        } if session_id == view_state.attached_id => {
+            apply_attach_view_change_components(&components, view_state);
+        }
         _ => {}
     }
 
     Ok(AttachLoopControl::Continue)
+}
+
+fn apply_attach_view_change_components(
+    components: &[AttachViewComponent],
+    view_state: &mut AttachViewState,
+) {
+    for component in components {
+        match component {
+            AttachViewComponent::Layout => {
+                view_state.dirty.layout_needs_refresh = true;
+                view_state.dirty.full_pane_redraw = true;
+                view_state.dirty.status_needs_redraw = true;
+            }
+            AttachViewComponent::Tabs => {
+                view_state.dirty.layout_needs_refresh = true;
+                view_state.dirty.status_needs_redraw = true;
+            }
+            AttachViewComponent::Status => {
+                view_state.dirty.status_needs_redraw = true;
+            }
+        }
+    }
 }
 
 fn is_attach_terminal_server_exit_event(
@@ -3606,15 +3636,17 @@ fn init_logging(verbose: bool) {
 mod tests {
     use super::{
         ProtocolDirection, ProtocolTraceEvent, TerminalProfile, TraceFamily,
-        attach_keymap_from_config, filter_trace_events, map_attach_client_error,
-        map_cli_client_error, merged_runtime_keybindings, parse_pid_content, profile_for_term,
-        protocol_profile_for_terminal_profile, resolve_pane_term_with_checker,
+        apply_attach_view_change_components, attach_keymap_from_config, filter_trace_events,
+        map_attach_client_error, map_cli_client_error, merged_runtime_keybindings,
+        parse_pid_content, profile_for_term, protocol_profile_for_terminal_profile,
+        resolve_pane_term_with_checker,
     };
     use crate::input::InputProcessor;
-    use bmux_client::ClientError;
+    use crate::runtime::attach::state::AttachViewState;
+    use bmux_client::{AttachOpenInfo, ClientError};
     use bmux_config::{BmuxConfig, ResolvedTimeout};
-    use bmux_ipc::ErrorCode;
     use bmux_ipc::transport::IpcTransportError;
+    use bmux_ipc::{AttachViewComponent, ErrorCode};
     use crossterm::event::{
         KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
         KeyEventKind as CrosstermKeyEventKind, KeyModifiers,
@@ -3740,6 +3772,38 @@ mod tests {
             }),
             "profile:traditional (450ms)"
         );
+    }
+
+    #[test]
+    fn attach_view_change_components_mark_expected_dirty_flags() {
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            session_id: uuid::Uuid::new_v4(),
+            can_write: true,
+        });
+        view_state.dirty.status_needs_redraw = false;
+        view_state.dirty.layout_needs_refresh = false;
+        view_state.dirty.full_pane_redraw = false;
+
+        apply_attach_view_change_components(&[AttachViewComponent::Status], &mut view_state);
+        assert!(view_state.dirty.status_needs_redraw);
+        assert!(!view_state.dirty.layout_needs_refresh);
+        assert!(!view_state.dirty.full_pane_redraw);
+
+        view_state.dirty.status_needs_redraw = false;
+        apply_attach_view_change_components(&[AttachViewComponent::Tabs], &mut view_state);
+        assert!(view_state.dirty.status_needs_redraw);
+        assert!(view_state.dirty.layout_needs_refresh);
+        assert!(!view_state.dirty.full_pane_redraw);
+
+        view_state.dirty.status_needs_redraw = false;
+        view_state.dirty.layout_needs_refresh = false;
+        apply_attach_view_change_components(
+            &[AttachViewComponent::Layout, AttachViewComponent::Tabs],
+            &mut view_state,
+        );
+        assert!(view_state.dirty.status_needs_redraw);
+        assert!(view_state.dirty.layout_needs_refresh);
+        assert!(view_state.dirty.full_pane_redraw);
     }
 
     #[test]

@@ -163,6 +163,14 @@ pub enum SessionRole {
     Observer,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachViewComponent {
+    Layout,
+    Tabs,
+    Status,
+}
+
 /// Request payload variants for client/server IPC.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -587,6 +595,11 @@ pub enum Event {
         role: SessionRole,
         by_client_id: Uuid,
     },
+    AttachViewChanged {
+        session_id: Uuid,
+        revision: u64,
+        components: Vec<AttachViewComponent>,
+    },
 }
 
 /// Serialize any protocol message using postcard.
@@ -616,9 +629,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        Envelope, EnvelopeKind, ErrorCode, Event, IpcEndpoint, ProtocolVersion, Request, Response,
-        ResponsePayload, SessionPermissionSummary, SessionRole, SessionSelector, SessionSummary,
-        decode, encode,
+        AttachViewComponent, Envelope, EnvelopeKind, ErrorCode, Event, IpcEndpoint,
+        ProtocolVersion, Request, Response, ResponsePayload, SessionPermissionSummary, SessionRole,
+        SessionSelector, SessionSummary, decode, encode,
     };
     use std::path::Path;
     use uuid::Uuid;
@@ -654,6 +667,18 @@ mod tests {
         let event = Event::SessionCreated {
             id: Uuid::new_v4(),
             name: Some("ops".to_string()),
+        };
+        let bytes = encode(&event).expect("event should encode");
+        let decoded: Event = decode(&bytes).expect("event should decode");
+        assert_eq!(decoded, event);
+    }
+
+    #[test]
+    fn serializes_attach_view_changed_roundtrip() {
+        let event = Event::AttachViewChanged {
+            session_id: Uuid::new_v4(),
+            revision: 7,
+            components: vec![AttachViewComponent::Layout, AttachViewComponent::Tabs],
         };
         let bytes = encode(&event).expect("event should encode");
         let decoded: Event = decode(&bytes).expect("event should decode");

@@ -11,8 +11,8 @@ use anyhow::{Context, Result};
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
-    AttachGrant, AttachPaneChunk, CURRENT_PROTOCOL_VERSION, ClientSummary, Envelope, EnvelopeKind,
-    ErrorCode, ErrorResponse, Event, IpcEndpoint, PaneFocusDirection,
+    AttachGrant, AttachPaneChunk, AttachViewComponent, CURRENT_PROTOCOL_VERSION, ClientSummary,
+    Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, PaneFocusDirection,
     PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection, PaneSummary,
     ProtocolVersion, Request, Response, ResponsePayload, ServerSnapshotStatus,
     SessionPermissionSummary, SessionRole, SessionSelector, SessionSummary, WindowSelector,
@@ -587,6 +587,7 @@ struct SessionRuntimeHandle {
     next_auto_window_number: u32,
     attached_clients: BTreeSet<ClientId>,
     attach_viewport: Option<AttachViewport>,
+    attach_view_revision: u64,
 }
 
 #[derive(Clone, Copy)]
@@ -653,6 +654,14 @@ impl PaneRuntimeHandle {
             .lock()
             .map(|value| *value)
             .unwrap_or((0, 0))
+    }
+}
+
+impl SessionRuntimeManager {
+    fn bump_attach_view_revision(&mut self, session_id: SessionId) -> Option<u64> {
+        let runtime = self.runtimes.get_mut(&session_id)?;
+        runtime.attach_view_revision = runtime.attach_view_revision.saturating_add(1);
+        Some(runtime.attach_view_revision)
     }
 }
 
@@ -1162,6 +1171,7 @@ impl SessionRuntimeManager {
                 next_auto_window_number: 2,
                 attached_clients: BTreeSet::new(),
                 attach_viewport: None,
+                attach_view_revision: 0,
             },
         );
         Ok(())
@@ -1235,6 +1245,7 @@ impl SessionRuntimeManager {
                 next_auto_window_number: 2,
                 attached_clients: BTreeSet::new(),
                 attach_viewport: None,
+                attach_view_revision: 0,
             },
         );
 
@@ -2583,6 +2594,51 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
     Ok(())
 }
 
+fn emit_attach_view_changed(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    components: &[AttachViewComponent],
+) -> Result<()> {
+    let components = normalize_attach_view_components(components);
+    if components.is_empty() {
+        return Ok(());
+    }
+    let revision = {
+        let mut runtime_manager = state
+            .session_runtimes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+        let Some(revision) = runtime_manager.bump_attach_view_revision(session_id) else {
+            return Ok(());
+        };
+        revision
+    };
+    emit_event(
+        state,
+        Event::AttachViewChanged {
+            session_id: session_id.0,
+            revision,
+            components,
+        },
+    )
+}
+
+fn normalize_attach_view_components(
+    components: &[AttachViewComponent],
+) -> Vec<AttachViewComponent> {
+    let mut normalized = Vec::new();
+    for component in [
+        AttachViewComponent::Layout,
+        AttachViewComponent::Tabs,
+        AttachViewComponent::Status,
+    ] {
+        if components.contains(&component) {
+            normalized.push(component);
+        }
+    }
+    normalized
+}
+
 fn unsubscribe_events(state: &Arc<ServerState>, client_id: ClientId) -> Result<()> {
     let mut hub = state
         .event_hub
@@ -3311,7 +3367,15 @@ async fn reap_closed_active_pane(
                     id: removed_window_session_id.0,
                 },
             )?;
+        } else {
+            emit_attach_view_changed(
+                state,
+                removed_window_session_id,
+                &[AttachViewComponent::Layout, AttachViewComponent::Tabs],
+            )?;
         }
+    } else {
+        emit_attach_view_changed(state, session_id, &[AttachViewComponent::Layout])?;
     }
 
     Ok(())
@@ -3825,6 +3889,13 @@ async fn handle_request(
                     session_id: removed_window_session_id.0,
                 },
             )?;
+            if session_removed.is_none() {
+                emit_attach_view_changed(
+                    state,
+                    removed_window_session_id,
+                    &[AttachViewComponent::Layout, AttachViewComponent::Tabs],
+                )?;
+            }
 
             if let Some(removed_session) = session_removed {
                 if removed_session.had_attached_clients {
@@ -3923,6 +3994,11 @@ async fn handle_request(
                     by_client_id: client_id.0,
                 },
             )?;
+            emit_attach_view_changed(
+                state,
+                session_id,
+                &[AttachViewComponent::Layout, AttachViewComponent::Tabs],
+            )?;
 
             Response::Ok(ResponsePayload::WindowSwitched {
                 id: switched_id.0,
@@ -3994,6 +4070,8 @@ async fn handle_request(
                 .get(&session_id)
                 .map(|runtime| runtime.active_window)
                 .unwrap_or(WindowId(Uuid::nil()));
+            drop(runtime_manager);
+            emit_attach_view_changed(state, session_id, &[AttachViewComponent::Layout])?;
             Response::Ok(ResponsePayload::PaneSplit {
                 id: pane_id,
                 session_id: session_id.0,
@@ -4049,6 +4127,8 @@ async fn handle_request(
                 .get(&session_id)
                 .map(|runtime| runtime.active_window)
                 .unwrap_or(WindowId(Uuid::nil()));
+            drop(runtime_manager);
+            emit_attach_view_changed(state, session_id, &[AttachViewComponent::Layout])?;
             Response::Ok(ResponsePayload::PaneFocused {
                 id: pane_id,
                 session_id: session_id.0,
@@ -4090,6 +4170,8 @@ async fn handle_request(
                 .get(&session_id)
                 .map(|runtime| runtime.active_window)
                 .unwrap_or(WindowId(Uuid::nil()));
+            drop(runtime_manager);
+            emit_attach_view_changed(state, session_id, &[AttachViewComponent::Layout])?;
             Response::Ok(ResponsePayload::PaneResized {
                 session_id: session_id.0,
                 window_id: window_id.0,
@@ -4203,6 +4285,13 @@ async fn handle_request(
                     )?;
                 }
             }
+
+            let components: &[AttachViewComponent] = if window_closed {
+                &[AttachViewComponent::Layout, AttachViewComponent::Tabs]
+            } else {
+                &[AttachViewComponent::Layout]
+            };
+            emit_attach_view_changed(state, session_id, components)?;
 
             Response::Ok(ResponsePayload::PaneClosed {
                 id: closed_pane_id,
@@ -5118,6 +5207,7 @@ async fn handle_request(
                 name: name.clone(),
             },
         )?;
+        emit_attach_view_changed(state, SessionId(*session_id), &[AttachViewComponent::Tabs])?;
     }
     if let Response::Ok(ResponsePayload::AttachReady { session_id, .. }) = &response {
         emit_event(state, Event::ClientAttached { id: *session_id })?;
@@ -5418,9 +5508,9 @@ mod tests {
     use bmux_config::ConfigPaths;
     use bmux_ipc::transport::LocalIpcStream;
     use bmux_ipc::{
-        Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, PaneSelector,
-        PaneSplitDirection, ProtocolVersion, Request, Response, ResponsePayload, SessionRole,
-        SessionSelector, WindowSelector, decode, encode,
+        AttachViewComponent, Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint,
+        PaneSelector, PaneSplitDirection, ProtocolVersion, Request, Response, ResponsePayload,
+        SessionRole, SessionSelector, WindowSelector, decode, encode,
     };
     use bmux_session::{SessionId, SessionManager};
     use std::path::Path;
@@ -8135,6 +8225,134 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, Event::FollowStopped { .. }))
         );
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attach_view_changed_events_cover_layout_tabs_and_full_scopes() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut actor = connect_and_handshake(&endpoint).await;
+        let mut observer = connect_and_handshake(&endpoint).await;
+
+        let subscribed = send_request(&mut observer, 900, Request::SubscribeEvents).await;
+        assert_eq!(subscribed, Response::Ok(ResponsePayload::EventsSubscribed));
+
+        let session_id = match send_request(
+            &mut actor,
+            901,
+            Request::NewSession {
+                name: Some("attach-view-events".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected session create response: {other:?}"),
+        };
+
+        let _ = poll_events_collect(&mut observer, 902, 10, 4).await;
+
+        let split = send_request(
+            &mut actor,
+            910,
+            Request::SplitPane {
+                session: Some(SessionSelector::ById(session_id)),
+                target: None,
+                direction: PaneSplitDirection::Vertical,
+            },
+        )
+        .await;
+        assert!(matches!(
+            split,
+            Response::Ok(ResponsePayload::PaneSplit { .. })
+        ));
+
+        let split_events = poll_events_collect(&mut observer, 911, 10, 4).await;
+        let split_revision = split_events
+            .iter()
+            .find_map(|event| match event {
+                Event::AttachViewChanged {
+                    session_id: changed_session,
+                    revision,
+                    components,
+                } if *changed_session == session_id
+                    && components == &vec![AttachViewComponent::Layout] =>
+                {
+                    Some(*revision)
+                }
+                _ => None,
+            })
+            .expect("layout attach view change should exist after split");
+
+        let created_window_id = match send_request(
+            &mut actor,
+            920,
+            Request::NewWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                name: Some("extra".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::WindowCreated { id, .. }) => id,
+            other => panic!("unexpected window create response: {other:?}"),
+        };
+
+        let window_create_events = poll_events_collect(&mut observer, 921, 10, 4).await;
+        let tabs_revision = window_create_events
+            .iter()
+            .find_map(|event| match event {
+                Event::AttachViewChanged {
+                    session_id: changed_session,
+                    revision,
+                    components,
+                } if *changed_session == session_id
+                    && components == &vec![AttachViewComponent::Tabs] =>
+                {
+                    Some(*revision)
+                }
+                _ => None,
+            })
+            .expect("tabs attach view change should exist after window create");
+        assert!(tabs_revision > split_revision);
+
+        let switched = send_request(
+            &mut actor,
+            930,
+            Request::SwitchWindow {
+                session: Some(SessionSelector::ById(session_id)),
+                target: WindowSelector::ById(created_window_id),
+            },
+        )
+        .await;
+        assert!(matches!(
+            switched,
+            Response::Ok(ResponsePayload::WindowSwitched {
+                session_id: switched_session,
+                ..
+            }) if switched_session == session_id
+        ));
+
+        let switch_events = poll_events_collect(&mut observer, 931, 10, 4).await;
+        let switched_revision = switch_events
+            .iter()
+            .find_map(|event| match event {
+                Event::AttachViewChanged {
+                    session_id: changed_session,
+                    revision,
+                    components,
+                } if *changed_session == session_id
+                    && components
+                        == &vec![AttachViewComponent::Layout, AttachViewComponent::Tabs] =>
+                {
+                    Some(*revision)
+                }
+                _ => None,
+            })
+            .expect("layout+tabs attach view change should exist after window switch");
+        assert!(switched_revision > tabs_revision);
 
         stop_server(server, server_task, &socket_path).await;
     }
