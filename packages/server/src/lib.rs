@@ -637,6 +637,10 @@ impl OutputFanoutBuffer {
         self.cursors.insert(client_id, self.end_offset());
     }
 
+    fn register_client_at_start(&mut self, client_id: ClientId) {
+        self.cursors.insert(client_id, self.start_offset);
+    }
+
     fn unregister_client(&mut self, client_id: ClientId) {
         self.cursors.remove(&client_id);
     }
@@ -1779,7 +1783,7 @@ impl SessionRuntimeManager {
                     .output_buffer
                     .lock()
                     .map_err(|_| SessionRuntimeError::Closed)?;
-                output.register_client_at_tail(client_id);
+                output.register_client_at_start(client_id);
             }
         }
         Ok(())
@@ -6894,6 +6898,27 @@ mod tests {
             })
         );
 
+        let marker = "resume-check";
+        let write_before_detach = send_request(
+            &mut client,
+            721,
+            Request::AttachInput {
+                session_id,
+                data: format!("printf '{marker}\\n'\\n").into_bytes(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            write_before_detach,
+            Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
+        ));
+
+        let output_before_detach = collect_attach_output_until(&mut client, session_id, marker, 20).await;
+        assert!(
+            output_before_detach.contains(marker),
+            "expected marker in pre-detach output, got: {output_before_detach:?}"
+        );
+
         let detached = send_request(&mut client, 73, Request::Detach).await;
         assert_eq!(detached, Response::Ok(ResponsePayload::Detached));
 
@@ -6934,6 +6959,12 @@ mod tests {
                 session_id,
                 can_write: true,
             })
+        );
+
+        let output_after_reattach = collect_attach_output_until(&mut client, session_id, marker, 10).await;
+        assert!(
+            output_after_reattach.contains(marker),
+            "expected marker to replay after reattach, got: {output_after_reattach:?}"
         );
 
         stop_server(server, server_task, &socket_path).await;
