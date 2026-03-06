@@ -1429,7 +1429,8 @@ fn attach_mode_hint(ui_mode: AttachUiMode, keymap: &Keymap) -> String {
             let window_mode = key_hint_or_unbound(keymap, RuntimeAction::EnterWindowMode);
             let detach = key_hint_or_unbound(keymap, RuntimeAction::Detach);
             let quit = key_hint_or_unbound(keymap, RuntimeAction::Quit);
-            format!("{window_mode} window mode | {detach} detach | {quit} quit")
+            let help = key_hint_or_unbound(keymap, RuntimeAction::ShowHelp);
+            format!("{window_mode} window mode | {detach} detach | {quit} quit | {help} help")
         }
         AttachUiMode::Window => {
             let prev = key_hint_or_unbound(keymap, RuntimeAction::WindowPrev);
@@ -1438,8 +1439,9 @@ fn attach_mode_hint(ui_mode: AttachUiMode, keymap: &Keymap) -> String {
             let new_window = key_hint_or_unbound(keymap, RuntimeAction::NewWindow);
             let close = key_hint_or_unbound(keymap, RuntimeAction::WindowClose);
             let exit = key_hint_or_unbound(keymap, RuntimeAction::ExitMode);
+            let help = key_hint_or_unbound(keymap, RuntimeAction::ShowHelp);
             format!(
-                "{prev}/{next} prev/next | {goto_one} goto-1 | {new_window} new | {close} close | {exit} exit"
+                "{prev}/{next} prev/next | {goto_one} goto-1 | {new_window} new | {close} close | {exit} exit | {help} help"
             )
         }
     }
@@ -1790,17 +1792,82 @@ fn effective_attach_keybindings(config: &BmuxConfig) -> Vec<AttachKeybindingEntr
 }
 
 fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
-    effective_attach_keybindings(config)
-        .into_iter()
-        .map(|entry| {
-            format!(
+    let mut groups: Vec<(&str, Vec<AttachKeybindingEntry>)> = vec![
+        ("Session", Vec::new()),
+        ("Window", Vec::new()),
+        ("Pane", Vec::new()),
+        ("Mode", Vec::new()),
+        ("Other", Vec::new()),
+    ];
+
+    for entry in effective_attach_keybindings(config) {
+        let category = match entry.action {
+            RuntimeAction::NewSession | RuntimeAction::Detach | RuntimeAction::Quit => "Session",
+            RuntimeAction::NewWindow
+            | RuntimeAction::WindowPrev
+            | RuntimeAction::WindowNext
+            | RuntimeAction::WindowGoto1
+            | RuntimeAction::WindowGoto2
+            | RuntimeAction::WindowGoto3
+            | RuntimeAction::WindowGoto4
+            | RuntimeAction::WindowGoto5
+            | RuntimeAction::WindowGoto6
+            | RuntimeAction::WindowGoto7
+            | RuntimeAction::WindowGoto8
+            | RuntimeAction::WindowGoto9
+            | RuntimeAction::WindowClose => "Window",
+            RuntimeAction::SplitFocusedVertical
+            | RuntimeAction::SplitFocusedHorizontal
+            | RuntimeAction::FocusNext
+            | RuntimeAction::FocusLeft
+            | RuntimeAction::FocusRight
+            | RuntimeAction::FocusUp
+            | RuntimeAction::FocusDown
+            | RuntimeAction::IncreaseSplit
+            | RuntimeAction::DecreaseSplit
+            | RuntimeAction::ResizeLeft
+            | RuntimeAction::ResizeRight
+            | RuntimeAction::ResizeUp
+            | RuntimeAction::ResizeDown
+            | RuntimeAction::CloseFocusedPane => "Pane",
+            RuntimeAction::EnterWindowMode | RuntimeAction::ExitMode | RuntimeAction::ShowHelp => {
+                "Mode"
+            }
+            _ => "Other",
+        };
+
+        if let Some((_, entries)) = groups.iter_mut().find(|(name, _)| *name == category) {
+            entries.push(entry);
+        }
+    }
+
+    let mut lines = Vec::new();
+    for (category, mut entries) in groups {
+        if entries.is_empty() {
+            continue;
+        }
+        entries.sort_by(|left, right| {
+            left.scope
+                .as_str()
+                .cmp(right.scope.as_str())
+                .then_with(|| left.chord.cmp(&right.chord))
+        });
+        lines.push(format!("-- {category} --"));
+        for entry in entries {
+            lines.push(format!(
                 "[{:<7}] {:<20} {}",
                 entry.scope.as_str(),
                 entry.chord,
                 entry.action_name
-            )
-        })
-        .collect()
+            ));
+        }
+        lines.push(String::new());
+    }
+
+    if lines.last().is_some_and(String::is_empty) {
+        let _ = lines.pop();
+    }
+    lines
 }
 
 fn normalize_attach_keybindings(
@@ -4148,6 +4215,15 @@ mod tests {
         assert_eq!(super::adjust_help_overlay_scroll(17, 10, 20, 5), 15);
         assert_eq!(super::adjust_help_overlay_scroll(4, -2, 20, 5), 2);
         assert_eq!(super::adjust_help_overlay_scroll(0, 4, 0, 5), 0);
+    }
+
+    #[test]
+    fn build_attach_help_lines_groups_entries_by_category() {
+        let lines = super::build_attach_help_lines(&BmuxConfig::default());
+        assert!(lines.iter().any(|line| line == "-- Session --"));
+        assert!(lines.iter().any(|line| line == "-- Window --"));
+        assert!(lines.iter().any(|line| line == "-- Pane --"));
+        assert!(lines.iter().any(|line| line == "-- Mode --"));
     }
 
     #[test]
