@@ -150,7 +150,7 @@ impl Default for BehaviorConfig {
             pane_term: "bmux-256color".to_string(),
             protocol_trace_enabled: false,
             protocol_trace_capacity: 200,
-            terminfo_auto_install: TerminfoAutoInstall::Ask,
+            terminfo_auto_install: TerminfoAutoInstall::Never,
             terminfo_prompt_cooldown_days: 7,
         }
     }

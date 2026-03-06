@@ -26,15 +26,13 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-mod terminal_protocol;
 mod attach;
+mod terminal_protocol;
 use attach::cursor::apply_attach_cursor_state;
 use attach::events::{AttachLoopControl, AttachLoopEvent, collect_attach_loop_events};
 use attach::layout::collect_pane_ids;
 use attach::render::{append_pane_output, render_attach_panes};
-use attach::state::{
-    AttachEventAction, AttachExitReason, AttachUiMode, AttachViewState,
-};
+use attach::state::{AttachEventAction, AttachExitReason, AttachUiMode, AttachViewState};
 use terminal_protocol::{
     ProtocolDirection, ProtocolProfile, ProtocolTraceEvent, primary_da_for_profile,
     protocol_profile_name, secondary_da_for_profile, supported_query_names,
@@ -1058,8 +1056,14 @@ async fn run_session_attach_with_client(
                         if previous.layout_root != layout_state.layout_root {
                             view_state.dirty.full_pane_redraw = true;
                         } else if previous.focused_pane_id != layout_state.focused_pane_id {
-                            view_state.dirty.pane_dirty_ids.insert(previous.focused_pane_id);
-                            view_state.dirty.pane_dirty_ids.insert(layout_state.focused_pane_id);
+                            view_state
+                                .dirty
+                                .pane_dirty_ids
+                                .insert(previous.focused_pane_id);
+                            view_state
+                                .dirty
+                                .pane_dirty_ids
+                                .insert(layout_state.focused_pane_id);
                         }
                     }
                 }
@@ -1495,14 +1499,25 @@ fn adjust_help_overlay_scroll(
     next.min(max_scroll)
 }
 
-fn queue_attach_help_overlay(stdout: &mut io::Stdout, lines: &[String], scroll: usize) -> Result<()> {
+fn queue_attach_help_overlay(
+    stdout: &mut io::Stdout,
+    lines: &[String],
+    scroll: usize,
+) -> Result<()> {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
     if cols < 20 || rows < 6 {
         return Ok(());
     }
 
-    let content_width = lines.iter().map(|line| line.len()).max().unwrap_or(0).min(80);
-    let width = (content_width + 4).max(36).min((cols as usize).saturating_sub(2));
+    let content_width = lines
+        .iter()
+        .map(|line| line.len())
+        .max()
+        .unwrap_or(0)
+        .min(80);
+    let width = (content_width + 4)
+        .max(36)
+        .min((cols as usize).saturating_sub(2));
     let max_content_rows = (rows as usize).saturating_sub(6);
     let content_rows = lines.len().min(max_content_rows);
     let height = (content_rows + 4).min((rows as usize).saturating_sub(2));
@@ -1552,12 +1567,7 @@ fn queue_attach_help_overlay(stdout: &mut io::Stdout, lines: &[String], scroll: 
 
     let start = scroll.min(lines.len().saturating_sub(body_rows));
     let end = (start + body_rows).min(lines.len());
-    for (idx, line) in lines
-        .iter()
-        .skip(start)
-        .take(body_rows)
-        .enumerate()
-    {
+    for (idx, line) in lines.iter().skip(start).take(body_rows).enumerate() {
         let mut rendered = line.clone();
         if rendered.len() > width.saturating_sub(4) {
             rendered.truncate(width.saturating_sub(4));
@@ -2010,15 +2020,17 @@ async fn handle_attach_loop_event(
     view_state: &mut AttachViewState,
 ) -> Result<AttachLoopControl> {
     match event {
-        AttachLoopEvent::Server(server_event) => handle_attach_server_event(
-            client,
-            server_event,
-            follow_target_id,
-            self_client_id,
-            global,
-            view_state,
-        )
-        .await,
+        AttachLoopEvent::Server(server_event) => {
+            handle_attach_server_event(
+                client,
+                server_event,
+                follow_target_id,
+                self_client_id,
+                global,
+                view_state,
+            )
+            .await
+        }
         AttachLoopEvent::Terminal(terminal_event) => {
             handle_attach_terminal_event(
                 client,
@@ -2195,13 +2207,13 @@ async fn handle_attach_terminal_event(
         }
     }
 
-    for attach_action in attach_event_actions(
-        &terminal_event,
-        attach_input_processor,
-        view_state.ui_mode,
-    )? {
+    for attach_action in
+        attach_event_actions(&terminal_event, attach_input_processor, view_state.ui_mode)?
+    {
         match attach_action {
-            AttachEventAction::Detach => return Ok(AttachLoopControl::Break(AttachExitReason::Detached)),
+            AttachEventAction::Detach => {
+                return Ok(AttachLoopControl::Break(AttachExitReason::Detached));
+            }
             AttachEventAction::Send(bytes) => {
                 if view_state.help_overlay_open {
                     continue;
@@ -4185,9 +4197,10 @@ mod tests {
         .expect("attach key action should parse");
 
         assert!(matches!(
-            help_question.first()
-                .or_else(|| help_shift_slash.first()),
-            Some(super::AttachEventAction::Ui(crate::input::RuntimeAction::ShowHelp))
+            help_question.first().or_else(|| help_shift_slash.first()),
+            Some(super::AttachEventAction::Ui(
+                crate::input::RuntimeAction::ShowHelp
+            ))
         ));
     }
 
