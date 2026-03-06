@@ -1361,6 +1361,7 @@ async fn build_attach_status_line_for_draw(
     follow_target_id: Option<Uuid>,
     follow_global: bool,
     quit_confirmation_pending: bool,
+    help_overlay_open: bool,
     keymap: &Keymap,
 ) -> std::result::Result<String, ClientError> {
     let (cols, _) = terminal::size().unwrap_or((0, 0));
@@ -1370,9 +1371,13 @@ async fn build_attach_status_line_for_draw(
 
     let tabs = build_attach_tabs(client, session_id).await?;
     let session_label = resolve_attach_session_label(client, session_id).await?;
-    let mode_label = match ui_mode {
-        AttachUiMode::Normal => "NORMAL",
-        AttachUiMode::Window => "WINDOW",
+    let mode_label = if help_overlay_open {
+        "HELP"
+    } else {
+        match ui_mode {
+            AttachUiMode::Normal => "NORMAL",
+            AttachUiMode::Window => "WINDOW",
+        }
     };
     let role_label = if can_write { "write" } else { "read-only" };
     let follow_label = follow_target_id.map(|id| {
@@ -1384,6 +1389,8 @@ async fn build_attach_status_line_for_draw(
     });
     let hint = if quit_confirmation_pending {
         "Quit session and all panes? [y/N]".to_string()
+    } else if help_overlay_open {
+        "Help overlay open | ? toggles | Esc/Enter close".to_string()
     } else {
         attach_mode_hint(ui_mode, keymap)
     };
@@ -1473,6 +1480,7 @@ async fn render_attach_frame(
                 follow_target_id,
                 follow_global,
                 view_state.quit_confirmation_pending,
+                view_state.help_overlay_open,
                 keymap,
             )
             .await
@@ -1733,6 +1741,7 @@ fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
             | RuntimeAction::ResizeUp
             | RuntimeAction::ResizeDown
             | RuntimeAction::CloseFocusedPane
+            | RuntimeAction::ShowHelp
     )
 }
 
@@ -1895,6 +1904,17 @@ async fn handle_attach_terminal_event(
         return Ok(AttachLoopControl::Continue);
     }
 
+    if view_state.help_overlay_open
+        && let Event::Key(key) = &terminal_event
+        && key.kind == KeyEventKind::Press
+        && matches!(key.code, KeyCode::Esc | KeyCode::Enter)
+    {
+        view_state.help_overlay_open = false;
+        view_state.dirty.status_needs_redraw = true;
+        view_state.dirty.full_pane_redraw = true;
+        return Ok(AttachLoopControl::Continue);
+    }
+
     for attach_action in attach_event_actions(
         &terminal_event,
         attach_input_processor,
@@ -1903,6 +1923,9 @@ async fn handle_attach_terminal_event(
         match attach_action {
             AttachEventAction::Detach => return Ok(AttachLoopControl::Break(AttachExitReason::Detached)),
             AttachEventAction::Send(bytes) => {
+                if view_state.help_overlay_open {
+                    continue;
+                }
                 if view_state.can_write {
                     match client.attach_input(view_state.attached_id, bytes).await {
                         Ok(_) => {}
@@ -1914,6 +1937,9 @@ async fn handle_attach_terminal_event(
                 }
             }
             AttachEventAction::Runtime(action) => {
+                if view_state.help_overlay_open {
+                    continue;
+                }
                 if let Err(error) = handle_attach_runtime_action(
                     client,
                     action,
@@ -1930,6 +1956,22 @@ async fn handle_attach_terminal_event(
                 }
             }
             AttachEventAction::Ui(action) => {
+                if matches!(action, RuntimeAction::ShowHelp) {
+                    view_state.help_overlay_open = !view_state.help_overlay_open;
+                    view_state.dirty.status_needs_redraw = true;
+                    view_state.dirty.full_pane_redraw = true;
+                    continue;
+                }
+                if view_state.help_overlay_open {
+                    if matches!(action, RuntimeAction::ExitMode)
+                        || matches!(action, RuntimeAction::ForwardToPane(_))
+                    {
+                        view_state.help_overlay_open = false;
+                        view_state.dirty.status_needs_redraw = true;
+                        view_state.dirty.full_pane_redraw = true;
+                    }
+                    continue;
+                }
                 if matches!(action, RuntimeAction::Quit) {
                     view_state.quit_confirmation_pending = true;
                     view_state.dirty.status_needs_redraw = true;
@@ -2054,9 +2096,9 @@ fn attach_key_event_actions(
                 }
             }
             RuntimeAction::Quit => AttachEventAction::Ui(action),
+            RuntimeAction::ShowHelp => AttachEventAction::Ui(action),
             RuntimeAction::ToggleSplitDirection
             | RuntimeAction::RestartFocusedPane
-            | RuntimeAction::ShowHelp
             | RuntimeAction::EnterScrollMode
             | RuntimeAction::ExitScrollMode
             | RuntimeAction::ScrollUpLine
@@ -3806,6 +3848,63 @@ mod tests {
     fn attach_keybindings_keep_focus_next_pane_binding() {
         let (runtime, _global) = super::filtered_attach_keybindings(&BmuxConfig::default());
         assert_eq!(runtime.get("o"), Some(&"focus_next_pane".to_string()));
+    }
+
+    #[test]
+    fn attach_key_event_action_maps_show_help_to_ui() {
+        let config = BmuxConfig::default();
+        let keymap = super::attach_keymap_from_config(&config);
+        let mut processor = InputProcessor::new(keymap);
+
+        let _ = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+
+        let help_question = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('?'),
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+
+        let _ = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+
+        let help_shift_slash = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('/'),
+                KeyModifiers::SHIFT,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+
+        assert!(matches!(
+            help_question.first()
+                .or_else(|| help_shift_slash.first()),
+            Some(super::AttachEventAction::Ui(crate::input::RuntimeAction::ShowHelp))
+        ));
     }
 
     #[test]
