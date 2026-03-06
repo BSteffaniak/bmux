@@ -649,7 +649,10 @@ impl PaneRuntimeHandle {
 
     #[cfg(test)]
     fn last_requested_pty_size(&self) -> (u16, u16) {
-        self.last_requested_size.lock().map(|value| *value).unwrap_or((0, 0))
+        self.last_requested_size
+            .lock()
+            .map(|value| *value)
+            .unwrap_or((0, 0))
     }
 }
 
@@ -1012,7 +1015,11 @@ fn split_layout_rect(rect: LayoutRect, ratio: f32, vertical: bool) -> (LayoutRec
     }
 }
 
-fn collect_layout_rects(node: &PaneLayoutNode, rect: LayoutRect, out: &mut BTreeMap<Uuid, LayoutRect>) {
+fn collect_layout_rects(
+    node: &PaneLayoutNode,
+    rect: LayoutRect,
+    out: &mut BTreeMap<Uuid, LayoutRect>,
+) {
     match node {
         PaneLayoutNode::Leaf { pane_id } => {
             out.insert(*pane_id, rect);
@@ -4688,10 +4695,9 @@ async fn handle_request(
                     };
 
                     let begin_result = {
-                        let mut runtime_manager = state
-                            .session_runtimes
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+                        let mut runtime_manager = state.session_runtimes.lock().map_err(|_| {
+                            anyhow::anyhow!("session runtime manager lock poisoned")
+                        })?;
                         if let Some(previous_stream_session) = *attached_stream_session
                             && previous_stream_session != session_id
                         {
@@ -7256,7 +7262,8 @@ mod tests {
             Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
         ));
 
-        let output_before_detach = collect_attach_output_until(&mut client, session_id, marker, 20).await;
+        let output_before_detach =
+            collect_attach_output_until(&mut client, session_id, marker, 20).await;
         assert!(
             output_before_detach.contains(marker),
             "expected marker in pre-detach output, got: {output_before_detach:?}"

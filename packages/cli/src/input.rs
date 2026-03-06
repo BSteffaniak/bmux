@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow, bail};
+use bmux_config::{MAX_TIMEOUT_MS, MIN_TIMEOUT_MS};
 use crossterm::event::{
     Event, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent, KeyEventKind, KeyModifiers,
 };
@@ -97,7 +98,7 @@ struct KeyBinding {
 
 #[derive(Debug, Clone)]
 pub(crate) struct Keymap {
-    timeout: Duration,
+    timeout: Option<Duration>,
     global_bindings: Vec<KeyBinding>,
     runtime_bindings: Vec<KeyBinding>,
 }
@@ -191,17 +192,23 @@ impl Keymap {
         runtime.insert("q".to_string(), "quit".to_string());
 
         let global = BTreeMap::new();
-        Self::from_parts("ctrl+a", 400, &runtime, &global).expect("default keymap must be valid")
+        Self::from_parts("ctrl+a", None, &runtime, &global).expect("default keymap must be valid")
     }
 
     pub(crate) fn from_parts(
         prefix: &str,
-        timeout_ms: u64,
+        timeout_ms: Option<u64>,
         runtime: &BTreeMap<String, String>,
         global: &BTreeMap<String, String>,
     ) -> Result<Self> {
-        if timeout_ms < 50 || timeout_ms > 5_000 {
-            bail!("keymap timeout_ms must be between 50 and 5000");
+        if let Some(timeout_ms) = timeout_ms
+            && !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&timeout_ms)
+        {
+            bail!(
+                "keymap timeout_ms must be between {} and {}",
+                MIN_TIMEOUT_MS,
+                MAX_TIMEOUT_MS
+            );
         }
 
         let prefix_stroke = parse_stroke(prefix)?;
@@ -228,7 +235,7 @@ impl Keymap {
         validate_no_duplicate_chords(&global_bindings, "global")?;
 
         Ok(Self {
-            timeout: Duration::from_millis(timeout_ms),
+            timeout: timeout_ms.map(Duration::from_millis),
             global_bindings,
             runtime_bindings,
         })
@@ -428,7 +435,8 @@ impl InputProcessor {
     fn pending_timed_out(&self) -> bool {
         self.pending
             .as_ref()
-            .is_some_and(|pending| pending.started_at.elapsed() >= self.keymap.timeout)
+            .zip(self.keymap.timeout)
+            .is_some_and(|(pending, timeout)| pending.started_at.elapsed() >= timeout)
     }
 
     fn resolve_pending(&mut self, actions: &mut Vec<RuntimeAction>, force_timeout: bool) {
@@ -695,7 +703,6 @@ impl ByteDecoder {
 
         events
     }
-
 }
 
 fn validate_no_duplicate_chords(bindings: &[KeyBinding], scope: &str) -> Result<()> {
@@ -1320,7 +1327,8 @@ mod tests {
         let mut global = BTreeMap::new();
         global.insert("ctrl+b w".to_string(), "show_help".to_string());
 
-        let keymap = Keymap::from_parts("ctrl+a", 400, &runtime, &global).expect("valid keymap");
+        let keymap =
+            Keymap::from_parts("ctrl+a", Some(400), &runtime, &global).expect("valid keymap");
         let binding = keymap
             .primary_binding_for_action(&RuntimeAction::ShowHelp)
             .expect("show_help should be bound");
@@ -1333,8 +1341,8 @@ mod tests {
         runtime.insert("q".to_string(), "quit".to_string());
         runtime.insert("w q".to_string(), "quit".to_string());
 
-        let keymap =
-            Keymap::from_parts("ctrl+a", 400, &runtime, &BTreeMap::new()).expect("valid keymap");
+        let keymap = Keymap::from_parts("ctrl+a", Some(400), &runtime, &BTreeMap::new())
+            .expect("valid keymap");
         let binding = keymap
             .primary_binding_for_action(&RuntimeAction::Quit)
             .expect("quit should be bound");
@@ -1523,8 +1531,8 @@ mod tests {
         let mut runtime = BTreeMap::new();
         runtime.insert("+".to_string(), "increase_split".to_string());
         runtime.insert("minus".to_string(), "decrease_split".to_string());
-        let keymap =
-            Keymap::from_parts("ctrl+a", 400, &runtime, &BTreeMap::new()).expect("valid keymap");
+        let keymap = Keymap::from_parts("ctrl+a", Some(400), &runtime, &BTreeMap::new())
+            .expect("valid keymap");
 
         let mut processor = InputProcessor::new(keymap);
         assert_eq!(
@@ -1541,8 +1549,8 @@ mod tests {
     fn supports_configurable_prefix() {
         let mut runtime = BTreeMap::new();
         runtime.insert("o".to_string(), "focus_next_pane".to_string());
-        let keymap =
-            Keymap::from_parts("ctrl+b", 400, &runtime, &BTreeMap::new()).expect("valid keymap");
+        let keymap = Keymap::from_parts("ctrl+b", Some(400), &runtime, &BTreeMap::new())
+            .expect("valid keymap");
         let mut processor = InputProcessor::new(keymap);
 
         assert_eq!(
@@ -1556,8 +1564,8 @@ mod tests {
         let mut runtime = BTreeMap::new();
         runtime.insert("w".to_string(), "show_help".to_string());
         runtime.insert("w o".to_string(), "focus_next_pane".to_string());
-        let keymap =
-            Keymap::from_parts("ctrl+a", 80, &runtime, &BTreeMap::new()).expect("valid keymap");
+        let keymap = Keymap::from_parts("ctrl+a", Some(80), &runtime, &BTreeMap::new())
+            .expect("valid keymap");
         let mut processor = InputProcessor::new(keymap);
 
         assert!(processor.process_chunk(&[0x01, b'w']).is_empty());
@@ -1572,8 +1580,8 @@ mod tests {
         let mut runtime = BTreeMap::new();
         runtime.insert("w".to_string(), "show_help".to_string());
         runtime.insert("w o".to_string(), "focus_next_pane".to_string());
-        let keymap =
-            Keymap::from_parts("ctrl+a", 50, &runtime, &BTreeMap::new()).expect("valid keymap");
+        let keymap = Keymap::from_parts("ctrl+a", Some(50), &runtime, &BTreeMap::new())
+            .expect("valid keymap");
         let mut processor = InputProcessor::new(keymap);
 
         assert!(processor.process_chunk(&[0x01, b'w']).is_empty());
@@ -1582,12 +1590,49 @@ mod tests {
     }
 
     #[test]
-    fn terminal_event_timeout_falls_back_to_shorter_match() {
+    fn indefinite_timeout_keeps_waiting_for_longer_match() {
         let mut runtime = BTreeMap::new();
         runtime.insert("w".to_string(), "show_help".to_string());
         runtime.insert("w o".to_string(), "focus_next_pane".to_string());
         let keymap =
-            Keymap::from_parts("ctrl+a", 50, &runtime, &BTreeMap::new()).expect("valid keymap");
+            Keymap::from_parts("ctrl+a", None, &runtime, &BTreeMap::new()).expect("valid keymap");
+        let mut processor = InputProcessor::new(keymap);
+
+        assert!(processor.process_chunk(&[0x01, b'w']).is_empty());
+        thread::sleep(Duration::from_millis(70));
+        assert!(processor.process_chunk(&[]).is_empty());
+        assert_eq!(
+            processor.process_chunk(&[b'o']),
+            vec![RuntimeAction::FocusNext]
+        );
+    }
+
+    #[test]
+    fn indefinite_timeout_falls_back_when_next_key_breaks_longer_match() {
+        let mut runtime = BTreeMap::new();
+        runtime.insert("w".to_string(), "show_help".to_string());
+        runtime.insert("w o".to_string(), "focus_next_pane".to_string());
+        let keymap =
+            Keymap::from_parts("ctrl+a", None, &runtime, &BTreeMap::new()).expect("valid keymap");
+        let mut processor = InputProcessor::new(keymap);
+
+        assert!(processor.process_chunk(&[0x01, b'w']).is_empty());
+        assert_eq!(
+            processor.process_chunk(&[b'x']),
+            vec![
+                RuntimeAction::ShowHelp,
+                RuntimeAction::ForwardToPane(vec![b'x'])
+            ]
+        );
+    }
+
+    #[test]
+    fn terminal_event_timeout_falls_back_to_shorter_match() {
+        let mut runtime = BTreeMap::new();
+        runtime.insert("w".to_string(), "show_help".to_string());
+        runtime.insert("w o".to_string(), "focus_next_pane".to_string());
+        let keymap = Keymap::from_parts("ctrl+a", Some(50), &runtime, &BTreeMap::new())
+            .expect("valid keymap");
         let mut processor = InputProcessor::new(keymap);
 
         assert_eq!(
@@ -1609,8 +1654,8 @@ mod tests {
     fn global_binding_works_without_prefix() {
         let mut global = BTreeMap::new();
         global.insert("ctrl+q".to_string(), "quit".to_string());
-        let keymap =
-            Keymap::from_parts("ctrl+a", 400, &BTreeMap::new(), &global).expect("valid keymap");
+        let keymap = Keymap::from_parts("ctrl+a", Some(400), &BTreeMap::new(), &global)
+            .expect("valid keymap");
         let mut processor = InputProcessor::new(keymap);
 
         assert_eq!(processor.process_chunk(&[0x11]), vec![RuntimeAction::Quit]);
@@ -1623,7 +1668,8 @@ mod tests {
         let mut runtime = BTreeMap::new();
         runtime.insert("o".to_string(), "focus_next_pane".to_string());
 
-        let keymap = Keymap::from_parts("ctrl+a", 400, &runtime, &global).expect("valid keymap");
+        let keymap =
+            Keymap::from_parts("ctrl+a", Some(400), &runtime, &global).expect("valid keymap");
         let mut processor = InputProcessor::new(keymap);
 
         assert_eq!(

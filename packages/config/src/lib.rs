@@ -17,7 +17,7 @@ pub mod keybind;
 pub mod paths;
 pub mod theme;
 
-pub use keybind::KeyBindingConfig;
+pub use keybind::{KeyBindingConfig, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS, ResolvedTimeout};
 pub use paths::ConfigPaths;
 pub use theme::ThemeConfig;
 
@@ -338,10 +338,10 @@ impl BmuxConfig {
             });
         }
 
-        if self.keybindings.timeout_ms == 0 {
+        if let Err(error) = self.keybindings.resolve_timeout() {
             return Err(ConfigError::InvalidValue {
-                field: "keybindings.timeout_ms".to_string(),
-                value: "0".to_string(),
+                field: "keybindings".to_string(),
+                value: error,
             });
         }
 
@@ -378,11 +378,12 @@ impl BmuxConfig {
             ));
         }
 
-        if self.keybindings.timeout_ms == 0 {
+        if let Err(error) = self.keybindings.resolve_timeout() {
             self.keybindings.timeout_ms = keybind_defaults.timeout_ms;
+            self.keybindings.timeout_profile = keybind_defaults.timeout_profile.clone();
+            self.keybindings.timeout_profiles = keybind_defaults.timeout_profiles.clone();
             repaired_fields.push(format!(
-                "keybindings.timeout_ms=0 -> {}",
-                keybind_defaults.timeout_ms
+                "keybindings timeout settings -> indefinite ({error})"
             ));
         }
 
@@ -407,17 +408,10 @@ impl BmuxConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::BmuxConfig;
+    use super::{BmuxConfig, ResolvedTimeout};
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn default_config_is_valid() {
-        let config = BmuxConfig::default();
-        assert!(config.validate().is_ok());
-    }
-
-    #[test]
-    fn load_missing_file_returns_defaults_without_creating_file() {
+    fn temp_config_path() -> std::path::PathBuf {
         let unique = format!(
             "bmux-config-test-{}-{}",
             std::process::id(),
@@ -428,7 +422,26 @@ mod tests {
         );
         let dir = std::env::temp_dir().join(unique);
         std::fs::create_dir_all(&dir).expect("failed to create temp test directory");
-        let path = dir.join("bmux.toml");
+        dir.join("bmux.toml")
+    }
+
+    #[test]
+    fn default_config_is_valid() {
+        let config = BmuxConfig::default();
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            config
+                .keybindings
+                .resolve_timeout()
+                .expect("default timeout"),
+            ResolvedTimeout::Indefinite
+        );
+    }
+
+    #[test]
+    fn load_missing_file_returns_defaults_without_creating_file() {
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
 
         let config = BmuxConfig::load_from_path(&path).expect("failed loading missing config");
         let defaults = BmuxConfig::default();
@@ -447,23 +460,18 @@ mod tests {
             config.keybindings.timeout_ms,
             defaults.keybindings.timeout_ms
         );
+        assert_eq!(
+            config.keybindings.timeout_profile,
+            defaults.keybindings.timeout_profile
+        );
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
     }
 
     #[test]
     fn load_repairs_zero_general_limits_without_persisting() {
-        let unique = format!(
-            "bmux-config-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time before epoch")
-                .as_nanos()
-        );
-        let dir = std::env::temp_dir().join(unique);
-        std::fs::create_dir_all(&dir).expect("failed to create temp test directory");
-        let path = dir.join("bmux.toml");
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
 
         std::fs::write(
             &path,
@@ -484,17 +492,8 @@ mod tests {
 
     #[test]
     fn load_repairs_invalid_fields_and_keeps_valid_behavior_settings_without_persisting() {
-        let unique = format!(
-            "bmux-config-test-{}-{}",
-            std::process::id(),
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("system time before epoch")
-                .as_nanos()
-        );
-        let dir = std::env::temp_dir().join(unique);
-        std::fs::create_dir_all(&dir).expect("failed to create temp test directory");
-        let path = dir.join("bmux.toml");
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
 
         std::fs::write(
             &path,
@@ -509,7 +508,10 @@ protocol_trace_capacity = 0
 
 [keybindings]
 prefix = ""
-timeout_ms = 0
+timeout_profile = "warp"
+
+[keybindings.timeout_profiles]
+fast = 10
 "#,
         )
         .expect("failed writing invalid config fixture");
@@ -518,7 +520,13 @@ timeout_ms = 0
         assert_eq!(config.general.scrollback_limit, 10_000);
         assert_eq!(config.general.server_timeout, 5_000);
         assert_eq!(config.keybindings.prefix, "ctrl+a");
-        assert_eq!(config.keybindings.timeout_ms, 400);
+        assert_eq!(
+            config
+                .keybindings
+                .resolve_timeout()
+                .expect("resolved timeout"),
+            ResolvedTimeout::Indefinite
+        );
         assert_eq!(config.behavior.pane_term, "xterm-256color");
         assert!(config.behavior.protocol_trace_enabled);
         assert_eq!(config.behavior.protocol_trace_capacity, 200);
@@ -526,9 +534,74 @@ timeout_ms = 0
         let persisted = std::fs::read_to_string(&path).expect("failed reading config file");
         assert!(persisted.contains("scrollback_limit = 0"));
         assert!(persisted.contains("prefix = \"\""));
-        assert!(persisted.contains("timeout_ms = 0"));
+        assert!(persisted.contains("timeout_profile = \"warp\""));
+        assert!(persisted.contains("fast = 10"));
         assert!(persisted.contains("protocol_trace_capacity = 0"));
         assert!(persisted.contains("pane_term = \"xterm-256color\""));
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn timeout_profile_resolves_with_override() {
+        let mut config = BmuxConfig::default();
+        config.keybindings.timeout_profile = Some("traditional".to_string());
+        config
+            .keybindings
+            .timeout_profiles
+            .insert("traditional".to_string(), 450);
+
+        assert_eq!(
+            config
+                .keybindings
+                .resolve_timeout()
+                .expect("resolved timeout"),
+            ResolvedTimeout::Profile {
+                name: "traditional".to_string(),
+                ms: 450,
+            }
+        );
+    }
+
+    #[test]
+    fn exact_timeout_takes_precedence_over_profile() {
+        let mut config = BmuxConfig::default();
+        config.keybindings.timeout_ms = Some(275);
+        config.keybindings.timeout_profile = Some("slow".to_string());
+
+        assert_eq!(
+            config
+                .keybindings
+                .resolve_timeout()
+                .expect("resolved timeout"),
+            ResolvedTimeout::Exact(275)
+        );
+    }
+
+    #[test]
+    fn invalid_profile_repairs_to_indefinite_without_persisting() {
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        std::fs::write(
+            &path,
+            r#"[keybindings]
+timeout_profile = "missing"
+"#,
+        )
+        .expect("failed writing invalid config fixture");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(
+            config
+                .keybindings
+                .resolve_timeout()
+                .expect("resolved timeout"),
+            ResolvedTimeout::Indefinite
+        );
+        assert_eq!(config.keybindings.timeout_profile, None);
+
+        let persisted = std::fs::read_to_string(&path).expect("failed reading config file");
+        assert!(persisted.contains("timeout_profile = \"missing\""));
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
     }

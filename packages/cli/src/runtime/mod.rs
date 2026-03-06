@@ -6,7 +6,7 @@ use crate::input::{InputProcessor, Keymap, RuntimeAction};
 use crate::status::{AttachTab, build_attach_status_line};
 use anyhow::{Context, Result};
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
-use bmux_config::{BmuxConfig, TerminfoAutoInstall};
+use bmux_config::{BmuxConfig, ResolvedTimeout, TerminfoAutoInstall};
 use bmux_ipc::{
     PaneFocusDirection, PaneSplitDirection, SessionRole, SessionSelector, SessionSummary,
     WindowSelector, transport::IpcTransportError,
@@ -997,7 +997,10 @@ async fn run_session_attach_with_client(
         .subscribe_events()
         .await
         .map_err(map_attach_client_error)?;
-    let _ = client.poll_events(256).await.map_err(map_attach_client_error)?;
+    let _ = client
+        .poll_events(256)
+        .await
+        .map_err(map_attach_client_error)?;
 
     let raw_mode_guard = RawModeGuard::enable().context("failed to enable raw mode for attach")?;
     let mut exit_reason = AttachExitReason::Detached;
@@ -1269,7 +1272,10 @@ async fn handle_attach_ui_action(
                 PaneFocusDirection::Next
             };
             let _ = client
-                .focus_pane(Some(SessionSelector::ById(view_state.attached_id)), direction)
+                .focus_pane(
+                    Some(SessionSelector::ById(view_state.attached_id)),
+                    direction,
+                )
                 .await?;
         }
         RuntimeAction::IncreaseSplit
@@ -1829,9 +1835,14 @@ async fn open_attach_for_session(
 
 fn attach_keymap_from_config(config: &BmuxConfig) -> crate::input::Keymap {
     let (runtime_bindings, global_bindings) = filtered_attach_keybindings(config);
+    let timeout_ms = config
+        .keybindings
+        .resolve_timeout()
+        .map(|timeout| timeout.timeout_ms())
+        .unwrap_or(None);
     match crate::input::Keymap::from_parts(
         &config.keybindings.prefix,
-        config.keybindings.timeout_ms,
+        timeout_ms,
         &runtime_bindings,
         &global_bindings,
     ) {
@@ -2085,13 +2096,26 @@ fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
 fn default_attach_keymap() -> crate::input::Keymap {
     let defaults = BmuxConfig::default();
     let (runtime_bindings, global_bindings) = filtered_attach_keybindings(&defaults);
+    let timeout_ms = defaults
+        .keybindings
+        .resolve_timeout()
+        .expect("default timeout config must be valid")
+        .timeout_ms();
     crate::input::Keymap::from_parts(
         &defaults.keybindings.prefix,
-        defaults.keybindings.timeout_ms,
+        timeout_ms,
         &runtime_bindings,
         &global_bindings,
     )
     .expect("default attach keymap must be valid")
+}
+
+fn describe_timeout(timeout: &ResolvedTimeout) -> String {
+    match timeout {
+        ResolvedTimeout::Indefinite => "indefinite".to_string(),
+        ResolvedTimeout::Exact(ms) => format!("exact ({ms}ms)"),
+        ResolvedTimeout::Profile { name, ms } => format!("profile:{name} ({ms}ms)"),
+    }
 }
 
 struct RawModeGuard;
@@ -2297,7 +2321,10 @@ async fn handle_attach_server_event(
     Ok(AttachLoopControl::Continue)
 }
 
-fn is_attach_terminal_server_exit_event(event: &bmux_client::ServerEvent, attached_id: Uuid) -> bool {
+fn is_attach_terminal_server_exit_event(
+    event: &bmux_client::ServerEvent,
+    attached_id: Uuid,
+) -> bool {
     matches!(event, bmux_client::ServerEvent::SessionRemoved { id } if *id == attached_id)
 }
 
@@ -2380,13 +2407,7 @@ async fn handle_attach_terminal_event(
                 if view_state.help_overlay_open {
                     continue;
                 }
-                if let Err(error) = handle_attach_runtime_action(
-                    client,
-                    action,
-                    view_state,
-                )
-                .await
-                {
+                if let Err(error) = handle_attach_runtime_action(client, action, view_state).await {
                     println!("attach action failed: {}", map_attach_client_error(error));
                 } else {
                     view_state.dirty.status_needs_redraw = true;
@@ -2420,13 +2441,7 @@ async fn handle_attach_terminal_event(
                     view_state.dirty.status_needs_redraw = true;
                     continue;
                 }
-                if let Err(error) = handle_attach_ui_action(
-                    client,
-                    action,
-                    view_state,
-                )
-                .await
-                {
+                if let Err(error) = handle_attach_ui_action(client, action, view_state).await {
                     println!("attach action failed: {}", map_attach_client_error(error));
                 } else {
                     view_state.dirty.layout_needs_refresh = true;
@@ -3633,9 +3648,14 @@ fn run_keymap_doctor(as_json: bool) -> Result<u8> {
         }
     };
     let (runtime_bindings, global_bindings) = merged_runtime_keybindings(&config);
+    let resolved_timeout = config
+        .keybindings
+        .resolve_timeout()
+        .map_err(anyhow::Error::msg)
+        .context("failed resolving keymap timeout")?;
     let keymap = crate::input::Keymap::from_parts(
         &config.keybindings.prefix,
-        config.keybindings.timeout_ms,
+        resolved_timeout.timeout_ms(),
         &runtime_bindings,
         &global_bindings,
     )
@@ -3648,6 +3668,22 @@ fn run_keymap_doctor(as_json: bool) -> Result<u8> {
         let payload = serde_json::json!({
             "prefix": config.keybindings.prefix,
             "timeout_ms": config.keybindings.timeout_ms,
+            "timeout_profile": config.keybindings.timeout_profile,
+            "timeout_profiles": config.keybindings.merged_timeout_profiles(),
+            "resolved_timeout": match &resolved_timeout {
+                ResolvedTimeout::Indefinite => serde_json::json!({
+                    "mode": "indefinite"
+                }),
+                ResolvedTimeout::Exact(ms) => serde_json::json!({
+                    "mode": "exact",
+                    "ms": ms,
+                }),
+                ResolvedTimeout::Profile { name, ms } => serde_json::json!({
+                    "mode": "profile",
+                    "name": name,
+                    "ms": ms,
+                }),
+            },
             "global": report
                 .global
                 .iter()
@@ -3684,7 +3720,7 @@ fn run_keymap_doctor(as_json: bool) -> Result<u8> {
 
     println!("bmux keymap doctor");
     println!("prefix: {}", config.keybindings.prefix);
-    println!("timeout_ms: {}", config.keybindings.timeout_ms);
+    println!("timeout: {}", describe_timeout(&resolved_timeout));
     for line in keymap.doctor_lines() {
         println!("{line}");
     }
@@ -3733,7 +3769,7 @@ mod tests {
     };
     use crate::input::InputProcessor;
     use bmux_client::ClientError;
-    use bmux_config::BmuxConfig;
+    use bmux_config::{BmuxConfig, ResolvedTimeout};
     use bmux_ipc::ErrorCode;
     use bmux_ipc::transport::IpcTransportError;
     use crossterm::event::{
@@ -3842,6 +3878,25 @@ mod tests {
             Some(&"split_focused_vertical".to_string())
         );
         assert_eq!(runtime.get("["), Some(&"enter_scroll_mode".to_string()));
+    }
+
+    #[test]
+    fn describe_timeout_formats_resolved_timeout_states() {
+        assert_eq!(
+            super::describe_timeout(&ResolvedTimeout::Indefinite),
+            "indefinite"
+        );
+        assert_eq!(
+            super::describe_timeout(&ResolvedTimeout::Exact(275)),
+            "exact (275ms)"
+        );
+        assert_eq!(
+            super::describe_timeout(&ResolvedTimeout::Profile {
+                name: "traditional".to_string(),
+                ms: 450,
+            }),
+            "profile:traditional (450ms)"
+        );
     }
 
     #[test]
@@ -4483,7 +4538,9 @@ mod tests {
             can_write: true,
         });
         view_state.help_overlay_open = true;
-        let lines = (0..200).map(|idx| format!("line {idx}")).collect::<Vec<_>>();
+        let lines = (0..200)
+            .map(|idx| format!("line {idx}"))
+            .collect::<Vec<_>>();
 
         let handled = super::handle_help_overlay_key_event(
             &CrosstermKeyEvent::new_with_kind(
@@ -4506,7 +4563,9 @@ mod tests {
         });
         view_state.help_overlay_open = true;
         view_state.help_overlay_scroll = 5;
-        let lines = (0..200).map(|idx| format!("line {idx}")).collect::<Vec<_>>();
+        let lines = (0..200)
+            .map(|idx| format!("line {idx}"))
+            .collect::<Vec<_>>();
 
         let handled = super::handle_help_overlay_key_event(
             &CrosstermKeyEvent::new_with_kind(

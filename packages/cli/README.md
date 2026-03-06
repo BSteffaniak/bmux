@@ -107,6 +107,22 @@ Attach UI defaults (user-overridable via keybindings):
 - `Ctrl-T`: enter window mode
 - window mode: `h/l` previous/next window (wrap), `1..9` jump to index, `n` new window, `x` close active window, `Esc`/`Enter` exit window mode
 
+Prefix timeout behavior is configurable under `[keybindings]`:
+
+- omit both `timeout_profile` and `timeout_ms` to keep prefix mode active indefinitely
+- set `timeout_profile = "fast" | "traditional" | "slow"` for named timed behavior
+- override built-in profile values with `[keybindings.timeout_profiles]`
+- set `timeout_ms` for an exact override; it takes precedence over `timeout_profile`
+
+```toml
+[keybindings]
+prefix = "ctrl+a"
+timeout_profile = "traditional"
+
+[keybindings.timeout_profiles]
+traditional = 450
+```
+
 ## Window Commands
 
 Top-level and grouped forms are exact aliases.

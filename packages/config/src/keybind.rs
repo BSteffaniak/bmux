@@ -7,14 +7,25 @@ use bmux_event::{KeyCode, KeyEvent, Mode};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+pub const MIN_TIMEOUT_MS: u64 = 50;
+pub const MAX_TIMEOUT_MS: u64 = 5_000;
+
+const PROFILE_FAST: &str = "fast";
+const PROFILE_TRADITIONAL: &str = "traditional";
+const PROFILE_SLOW: &str = "slow";
+
 /// Key binding configuration for all modes
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KeyBindingConfig {
     /// Prefix key used for runtime key chords (e.g. "ctrl+a")
     pub prefix: String,
-    /// Timeout for multi-stroke chord resolution
-    pub timeout_ms: u64,
+    /// Exact timeout override for multi-stroke chord resolution
+    pub timeout_ms: Option<u64>,
+    /// Named timeout profile for multi-stroke chord resolution
+    pub timeout_profile: Option<String>,
+    /// User overrides for built-in timeout profiles
+    pub timeout_profiles: BTreeMap<String, u64>,
     /// Runtime action bindings after prefix
     pub runtime: BTreeMap<String, String>,
     /// Global runtime action bindings (no prefix required)
@@ -33,13 +44,32 @@ impl Default for KeyBindingConfig {
     fn default() -> Self {
         Self {
             prefix: "ctrl+a".to_string(),
-            timeout_ms: 400,
+            timeout_ms: None,
+            timeout_profile: None,
+            timeout_profiles: BTreeMap::new(),
             runtime: default_runtime_bindings(),
             global: default_global_runtime_bindings(),
             normal: default_normal_bindings(),
             insert: default_insert_bindings(),
             visual: default_visual_bindings(),
             command: default_command_bindings(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedTimeout {
+    Indefinite,
+    Exact(u64),
+    Profile { name: String, ms: u64 },
+}
+
+impl ResolvedTimeout {
+    #[must_use]
+    pub const fn timeout_ms(&self) -> Option<u64> {
+        match self {
+            Self::Indefinite => None,
+            Self::Exact(ms) | Self::Profile { ms, .. } => Some(*ms),
         }
     }
 }
@@ -93,6 +123,59 @@ fn default_runtime_bindings() -> BTreeMap<String, String> {
 }
 
 impl KeyBindingConfig {
+    #[must_use]
+    pub fn built_in_timeout_profiles() -> BTreeMap<String, u64> {
+        BTreeMap::from([
+            (PROFILE_FAST.to_string(), 200),
+            (PROFILE_TRADITIONAL.to_string(), 400),
+            (PROFILE_SLOW.to_string(), 800),
+        ])
+    }
+
+    #[must_use]
+    pub fn merged_timeout_profiles(&self) -> BTreeMap<String, u64> {
+        let mut profiles = Self::built_in_timeout_profiles();
+        for (name, value) in &self.timeout_profiles {
+            profiles.insert(name.clone(), *value);
+        }
+        profiles
+    }
+
+    #[must_use]
+    pub fn resolve_timeout(&self) -> Result<ResolvedTimeout, String> {
+        if let Some(timeout_ms) = self.timeout_ms {
+            validate_timeout_value(timeout_ms, "keybindings.timeout_ms")?;
+            return Ok(ResolvedTimeout::Exact(timeout_ms));
+        }
+
+        let profiles = self.merged_timeout_profiles();
+        for (name, value) in &self.timeout_profiles {
+            validate_timeout_value(*value, &format!("keybindings.timeout_profiles.{name}"))?;
+        }
+
+        let Some(profile_name) = self.timeout_profile.as_deref() else {
+            return Ok(ResolvedTimeout::Indefinite);
+        };
+
+        if profile_name.trim().is_empty() {
+            return Err("keybindings.timeout_profile must not be empty".to_string());
+        }
+
+        let Some(timeout_ms) = profiles.get(profile_name) else {
+            return Err(format!(
+                "keybindings.timeout_profile references unknown profile '{profile_name}'"
+            ));
+        };
+        validate_timeout_value(
+            *timeout_ms,
+            &format!("keybindings.timeout_profiles.{profile_name}"),
+        )?;
+        Ok(ResolvedTimeout::Profile {
+            name: profile_name.to_string(),
+            ms: *timeout_ms,
+        })
+    }
+
     /// Get key bindings for a specific mode
     #[must_use]
     pub const fn get_bindings_for_mode(&self, mode: Mode) -> &BTreeMap<String, String> {
@@ -133,6 +216,15 @@ impl KeyBindingConfig {
         };
         bindings.remove(key)
     }
+}
+
+fn validate_timeout_value(value: u64, field: &str) -> Result<(), String> {
+    if !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&value) {
+        return Err(format!(
+            "{field} must be between {MIN_TIMEOUT_MS} and {MAX_TIMEOUT_MS}"
+        ));
+    }
+    Ok(())
 }
 
 /// Convert a key code to a string representation for binding lookup
