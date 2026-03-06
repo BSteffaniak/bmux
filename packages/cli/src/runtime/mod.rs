@@ -777,6 +777,158 @@ fn render_permissions_table(permissions: &[bmux_ipc::SessionPermissionSummary]) 
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DestructiveOpErrorKind {
+    OwnerRoleRequired,
+    ForceLocalUnauthorized,
+    NotFound,
+    Other,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct KillFailureSummary {
+    permission_denied: usize,
+    not_found: usize,
+    other: usize,
+}
+
+impl KillFailureSummary {
+    fn record(&mut self, kind: DestructiveOpErrorKind) {
+        match kind {
+            DestructiveOpErrorKind::OwnerRoleRequired
+            | DestructiveOpErrorKind::ForceLocalUnauthorized => {
+                self.permission_denied = self.permission_denied.saturating_add(1);
+            }
+            DestructiveOpErrorKind::NotFound => {
+                self.not_found = self.not_found.saturating_add(1);
+            }
+            DestructiveOpErrorKind::Other => {
+                self.other = self.other.saturating_add(1);
+            }
+        }
+    }
+}
+
+fn classify_destructive_op_error(error: &ClientError) -> DestructiveOpErrorKind {
+    match error {
+        ClientError::ServerError { code, message } => match code {
+            bmux_ipc::ErrorCode::InvalidRequest
+                if message.contains("owner role required for this operation") =>
+            {
+                DestructiveOpErrorKind::OwnerRoleRequired
+            }
+            bmux_ipc::ErrorCode::InvalidRequest
+                if message
+                    .contains("force-local is only allowed for the server owner principal") =>
+            {
+                DestructiveOpErrorKind::ForceLocalUnauthorized
+            }
+            bmux_ipc::ErrorCode::NotFound => DestructiveOpErrorKind::NotFound,
+            _ => DestructiveOpErrorKind::Other,
+        },
+        _ => DestructiveOpErrorKind::Other,
+    }
+}
+
+fn format_destructive_op_error(noun: &str, error: ClientError, force_local: bool) -> String {
+    match classify_destructive_op_error(&error) {
+        DestructiveOpErrorKind::OwnerRoleRequired => format!(
+            "{noun} kill requires the session owner role. Inspect roles with `bmux session permissions <session>`.{}",
+            if force_local {
+                " If you intended to override locally, use `--force-local` only from the server owner principal."
+            } else {
+                ""
+            }
+        ),
+        DestructiveOpErrorKind::ForceLocalUnauthorized =>
+            "`--force-local` is only available to the server owner principal. Check `bmux server whoami-principal`."
+                .to_string(),
+        DestructiveOpErrorKind::NotFound => map_cli_client_error(error).to_string(),
+        DestructiveOpErrorKind::Other => map_cli_client_error(error).to_string(),
+    }
+}
+
+async fn kill_preflight_identity(
+    client: &mut BmuxClient,
+    force_local: bool,
+) -> Result<Option<bmux_client::PrincipalIdentityInfo>> {
+    if !force_local {
+        return Ok(None);
+    }
+    let identity = client
+        .whoami_principal()
+        .await
+        .map_err(map_cli_client_error)?;
+    if !identity.force_local_authorized {
+        anyhow::bail!(
+            "`--force-local` is only available to the server owner principal.\ncurrent principal: {}\nserver owner principal: {}\nInspect with `bmux server whoami-principal`.",
+            identity.principal_id,
+            identity.server_owner_principal_id
+        );
+    }
+    Ok(Some(identity))
+}
+
+async fn print_bulk_kill_preflight(
+    client: &mut BmuxClient,
+    noun: &str,
+    force_local: bool,
+) -> Result<Option<bmux_client::PrincipalIdentityInfo>> {
+    let identity = client
+        .whoami_principal()
+        .await
+        .map_err(map_cli_client_error)?;
+    if force_local {
+        if !identity.force_local_authorized {
+            anyhow::bail!(
+                "`--force-local` is only available to the server owner principal.\ncurrent principal: {}\nserver owner principal: {}\nInspect with `bmux server whoami-principal`.",
+                identity.principal_id,
+                identity.server_owner_principal_id
+            );
+        }
+        println!(
+            "kill-all {noun}: force-local enabled for principal {}",
+            identity.principal_id
+        );
+        return Ok(Some(identity));
+    }
+
+    println!(
+        "kill-all {noun}: principal {} (server owner: {})",
+        identity.principal_id, identity.server_owner_principal_id
+    );
+    println!(
+        "note: non-owned {noun} may fail; inspect roles with `bmux session permissions <session>`"
+    );
+    Ok(Some(identity))
+}
+
+fn print_bulk_kill_failure_summary(noun: &str, summary: KillFailureSummary) {
+    if summary == KillFailureSummary::default() {
+        return;
+    }
+    println!(
+        "{noun} kill failures: permission_denied={}, not_found={}, other={}",
+        summary.permission_denied, summary.not_found, summary.other
+    );
+    if summary.permission_denied > 0 {
+        println!(
+            "hint: inspect roles with `bmux session permissions <session>` or identity with `bmux server whoami-principal`"
+        );
+    }
+}
+
+fn attach_quit_failure_status(error: &ClientError) -> &'static str {
+    match classify_destructive_op_error(error) {
+        DestructiveOpErrorKind::OwnerRoleRequired => "quit requires session owner",
+        DestructiveOpErrorKind::ForceLocalUnauthorized => {
+            "quit requires server owner for --force-local"
+        }
+        DestructiveOpErrorKind::NotFound => "quit failed: session not found",
+        DestructiveOpErrorKind::Other => "quit failed",
+    }
+}
+
 async fn run_grant_role(session: &str, client: &str, role: RoleValue) -> Result<u8> {
     let selector = parse_session_selector(session);
     let client_id = parse_uuid_value(client, "client id")?;
@@ -808,16 +960,20 @@ async fn run_revoke_role(session: &str, client: &str) -> Result<u8> {
 async fn run_session_kill(target: &str, force_local: bool) -> Result<u8> {
     let selector = parse_session_selector(target);
     let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-kill-session").await?;
+    let _ = kill_preflight_identity(&mut client, force_local).await?;
     let killed_id = client
         .kill_session_with_options(selector, force_local)
         .await
-        .map_err(map_cli_client_error)?;
+        .map_err(|error| {
+            anyhow::anyhow!(format_destructive_op_error("session", error, force_local))
+        })?;
     println!("killed session: {killed_id}");
     Ok(0)
 }
 
 async fn run_session_kill_all(force_local: bool) -> Result<u8> {
     let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-kill-all-sessions").await?;
+    let _ = print_bulk_kill_preflight(&mut client, "sessions", force_local).await?;
     let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
 
     if sessions.is_empty() {
@@ -827,6 +983,7 @@ async fn run_session_kill_all(force_local: bool) -> Result<u8> {
 
     let mut killed_count = 0usize;
     let mut failed_count = 0usize;
+    let mut failure_summary = KillFailureSummary::default();
     for session in sessions {
         match client
             .kill_session_with_options(SessionSelector::ById(session.id), force_local)
@@ -838,13 +995,16 @@ async fn run_session_kill_all(force_local: bool) -> Result<u8> {
             }
             Err(error) => {
                 failed_count = failed_count.saturating_add(1);
-                let mapped_error = map_cli_client_error(error);
-                eprintln!("failed killing session {}: {mapped_error:#}", session.id);
+                let kind = classify_destructive_op_error(&error);
+                failure_summary.record(kind);
+                let mapped_error = format_destructive_op_error("session", error, force_local);
+                eprintln!("failed killing session {}: {mapped_error}", session.id);
             }
         }
     }
 
     println!("kill-all-sessions complete: killed {killed_count}, failed {failed_count}");
+    print_bulk_kill_failure_summary("session", failure_summary);
     Ok(if failed_count == 0 { 0 } else { 1 })
 }
 
@@ -2336,7 +2496,12 @@ async fn handle_attach_terminal_event(
                     {
                         Ok(_) => return Ok(AttachLoopControl::Break(AttachExitReason::Quit)),
                         Err(error) => {
-                            println!("quit failed: {}", map_attach_client_error(error));
+                            let status = attach_quit_failure_status(&error);
+                            view_state.set_transient_status(
+                                status,
+                                Instant::now(),
+                                ATTACH_TRANSIENT_STATUS_TTL,
+                            );
                         }
                     }
                     view_state.quit_confirmation_pending = false;
@@ -2739,10 +2904,13 @@ async fn run_window_kill(target: &str, session: Option<&String>, force_local: bo
     let session_selector = session.map(|value| parse_session_selector(value));
     let window_selector = parse_window_selector(target);
     let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-kill-window").await?;
+    let _ = kill_preflight_identity(&mut client, force_local).await?;
     let window_id = client
         .kill_window_with_options(session_selector, window_selector, force_local)
         .await
-        .map_err(map_cli_client_error)?;
+        .map_err(|error| {
+            anyhow::anyhow!(format_destructive_op_error("window", error, force_local))
+        })?;
     println!("killed window: {window_id}");
     Ok(0)
 }
@@ -2750,6 +2918,7 @@ async fn run_window_kill(target: &str, session: Option<&String>, force_local: bo
 async fn run_window_kill_all(session: Option<&String>, force_local: bool) -> Result<u8> {
     let session_selector = session.map(|value| parse_session_selector(value));
     let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-kill-all-windows").await?;
+    let _ = print_bulk_kill_preflight(&mut client, "windows", force_local).await?;
     let windows = client
         .list_windows(session_selector.clone())
         .await
@@ -2762,6 +2931,7 @@ async fn run_window_kill_all(session: Option<&String>, force_local: bool) -> Res
 
     let mut killed_count = 0usize;
     let mut failed_count = 0usize;
+    let mut failure_summary = KillFailureSummary::default();
     for window in windows {
         match client
             .kill_window_with_options(
@@ -2777,13 +2947,16 @@ async fn run_window_kill_all(session: Option<&String>, force_local: bool) -> Res
             }
             Err(error) => {
                 failed_count = failed_count.saturating_add(1);
-                let mapped_error = map_cli_client_error(error);
-                eprintln!("failed killing window {}: {mapped_error:#}", window.id);
+                let kind = classify_destructive_op_error(&error);
+                failure_summary.record(kind);
+                let mapped_error = format_destructive_op_error("window", error, force_local);
+                eprintln!("failed killing window {}: {mapped_error}", window.id);
             }
         }
     }
 
     println!("kill-all-windows complete: killed {killed_count}, failed {failed_count}");
+    print_bulk_kill_failure_summary("window", failure_summary);
     Ok(if failed_count == 0 { 0 } else { 1 })
 }
 
@@ -3912,6 +4085,46 @@ mod tests {
 
         assert!(message.contains("transport error"));
         assert!(!message.contains("bmux server is not running"));
+    }
+
+    #[test]
+    fn destructive_op_error_formats_owner_role_guidance() {
+        let message = super::format_destructive_op_error(
+            "session",
+            ClientError::ServerError {
+                code: ErrorCode::InvalidRequest,
+                message: "owner role required for this operation".to_string(),
+            },
+            false,
+        );
+
+        assert!(message.contains("requires the session owner role"));
+        assert!(message.contains("bmux session permissions <session>"));
+    }
+
+    #[test]
+    fn destructive_op_error_formats_force_local_guidance() {
+        let message = super::format_destructive_op_error(
+            "window",
+            ClientError::ServerError {
+                code: ErrorCode::InvalidRequest,
+                message: "force-local is only allowed for the server owner principal".to_string(),
+            },
+            true,
+        );
+
+        assert!(message.contains("--force-local"));
+        assert!(message.contains("bmux server whoami-principal"));
+    }
+
+    #[test]
+    fn attach_quit_failure_status_is_actionable_for_owner_errors() {
+        let status = super::attach_quit_failure_status(&ClientError::ServerError {
+            code: ErrorCode::InvalidRequest,
+            message: "owner role required for this operation".to_string(),
+        });
+
+        assert_eq!(status, "quit requires session owner");
     }
 
     #[test]
