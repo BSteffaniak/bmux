@@ -1013,6 +1013,7 @@ async fn run_session_attach_with_client(
                 follow_target_id,
                 self_client_id,
                 global,
+                &attach_help_lines,
                 &mut view_state,
             )
             .await?
@@ -1103,6 +1104,7 @@ async fn run_session_attach_with_client(
             continue;
         }
 
+        let help_scroll = view_state.help_overlay_scroll;
         render_attach_frame(
             &mut client,
             &mut view_state,
@@ -1111,6 +1113,7 @@ async fn run_session_attach_with_client(
             global,
             &attach_keymap,
             &attach_help_lines,
+            help_scroll,
         )
         .await?;
     }
@@ -1464,7 +1467,33 @@ fn queue_attach_status_line(stdout: &mut io::Stdout, status_line: &str) -> Resul
     .context("failed queuing attach status line")
 }
 
-fn queue_attach_help_overlay(stdout: &mut io::Stdout, lines: &[String]) -> Result<()> {
+fn help_overlay_visible_rows(lines: &[String]) -> usize {
+    let (_cols, rows) = terminal::size().unwrap_or((0, 0));
+    let max_content_rows = (rows as usize).saturating_sub(6);
+    let content_rows = lines.len().min(max_content_rows);
+    let height = (content_rows + 4).min((rows as usize).saturating_sub(2));
+    height.saturating_sub(4).max(1)
+}
+
+fn adjust_help_overlay_scroll(
+    current: usize,
+    delta: isize,
+    total_lines: usize,
+    visible_rows: usize,
+) -> usize {
+    if total_lines == 0 {
+        return 0;
+    }
+    let max_scroll = total_lines.saturating_sub(visible_rows.max(1));
+    let next = if delta.is_negative() {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        current.saturating_add(delta as usize)
+    };
+    next.min(max_scroll)
+}
+
+fn queue_attach_help_overlay(stdout: &mut io::Stdout, lines: &[String], scroll: usize) -> Result<()> {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
     if cols < 20 || rows < 6 {
         return Ok(());
@@ -1477,6 +1506,7 @@ fn queue_attach_help_overlay(stdout: &mut io::Stdout, lines: &[String]) -> Resul
     let height = (content_rows + 4).min((rows as usize).saturating_sub(2));
     let x = ((cols as usize).saturating_sub(width)) / 2;
     let y = ((rows as usize).saturating_sub(height)) / 2;
+    let body_rows = height.saturating_sub(4).max(1);
 
     let top = format!("+{}+", "-".repeat(width.saturating_sub(2)));
     queue!(stdout, MoveTo(x as u16, y as u16), Print(&top))
@@ -1518,7 +1548,14 @@ fn queue_attach_help_overlay(stdout: &mut io::Stdout, lines: &[String]) -> Resul
     )
     .context("failed drawing help overlay header")?;
 
-    for (idx, line) in lines.iter().take(content_rows.saturating_sub(1)).enumerate() {
+    let start = scroll.min(lines.len().saturating_sub(body_rows));
+    let end = (start + body_rows).min(lines.len());
+    for (idx, line) in lines
+        .iter()
+        .skip(start)
+        .take(body_rows)
+        .enumerate()
+    {
         let mut rendered = line.clone();
         if rendered.len() > width.saturating_sub(4) {
             rendered.truncate(width.saturating_sub(4));
@@ -1531,6 +1568,23 @@ fn queue_attach_help_overlay(stdout: &mut io::Stdout, lines: &[String]) -> Resul
             .context("failed drawing help overlay entry")?;
     }
 
+    let footer = format!(
+        "j/k or ↑/↓ scroll | PgUp/PgDn | Esc close | {}-{} / {}",
+        if lines.is_empty() { 0 } else { start + 1 },
+        end,
+        lines.len()
+    );
+    let mut footer_rendered = footer;
+    if footer_rendered.len() > width.saturating_sub(4) {
+        footer_rendered.truncate(width.saturating_sub(4));
+    }
+    queue!(
+        stdout,
+        MoveTo((x + 2) as u16, (y + height - 2) as u16),
+        Print(footer_rendered)
+    )
+    .context("failed drawing help overlay footer")?;
+
     Ok(())
 }
 
@@ -1542,6 +1596,7 @@ async fn render_attach_frame(
     follow_global: bool,
     keymap: &crate::input::Keymap,
     help_lines: &[String],
+    help_scroll: usize,
 ) -> Result<()> {
     if view_state.dirty.status_needs_redraw {
         view_state.cached_status_line = Some(
@@ -1576,7 +1631,7 @@ async fn render_attach_frame(
         view_state.dirty.full_pane_redraw,
     )?;
     if view_state.help_overlay_open {
-        queue_attach_help_overlay(&mut stdout, help_lines)?;
+        queue_attach_help_overlay(&mut stdout, help_lines, help_scroll)?;
         apply_attach_cursor_state(&mut stdout, None, &mut view_state.last_cursor_state)?;
     } else {
         apply_attach_cursor_state(&mut stdout, cursor_state, &mut view_state.last_cursor_state)?;
@@ -1884,6 +1939,7 @@ async fn handle_attach_loop_event(
     follow_target_id: Option<Uuid>,
     self_client_id: Option<Uuid>,
     global: bool,
+    help_lines: &[String],
     view_state: &mut AttachViewState,
 ) -> Result<AttachLoopControl> {
     match event {
@@ -1897,8 +1953,14 @@ async fn handle_attach_loop_event(
         )
         .await,
         AttachLoopEvent::Terminal(terminal_event) => {
-            handle_attach_terminal_event(client, terminal_event, attach_input_processor, view_state)
-                .await
+            handle_attach_terminal_event(
+                client,
+                terminal_event,
+                attach_input_processor,
+                help_lines,
+                view_state,
+            )
+            .await
         }
     }
 }
@@ -1958,6 +2020,7 @@ async fn handle_attach_terminal_event(
     client: &mut BmuxClient,
     terminal_event: Event,
     attach_input_processor: &mut InputProcessor,
+    help_lines: &[String],
     view_state: &mut AttachViewState,
 ) -> Result<AttachLoopControl> {
     let mut skip_attach_key_actions = false;
@@ -1999,12 +2062,70 @@ async fn handle_attach_terminal_event(
     if view_state.help_overlay_open
         && let Event::Key(key) = &terminal_event
         && key.kind == KeyEventKind::Press
-        && matches!(key.code, KeyCode::Esc | KeyCode::Enter)
     {
-        view_state.help_overlay_open = false;
-        view_state.dirty.status_needs_redraw = true;
-        view_state.dirty.full_pane_redraw = true;
-        return Ok(AttachLoopControl::Continue);
+        match key.code {
+            KeyCode::Esc | KeyCode::Enter => {
+                view_state.help_overlay_open = false;
+                view_state.help_overlay_scroll = 0;
+                view_state.dirty.status_needs_redraw = true;
+                view_state.dirty.full_pane_redraw = true;
+                return Ok(AttachLoopControl::Continue);
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                view_state.help_overlay_scroll = adjust_help_overlay_scroll(
+                    view_state.help_overlay_scroll,
+                    -1,
+                    help_lines.len(),
+                    help_overlay_visible_rows(help_lines),
+                );
+                view_state.dirty.full_pane_redraw = true;
+                return Ok(AttachLoopControl::Continue);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                view_state.help_overlay_scroll = adjust_help_overlay_scroll(
+                    view_state.help_overlay_scroll,
+                    1,
+                    help_lines.len(),
+                    help_overlay_visible_rows(help_lines),
+                );
+                view_state.dirty.full_pane_redraw = true;
+                return Ok(AttachLoopControl::Continue);
+            }
+            KeyCode::PageUp => {
+                let page = help_overlay_visible_rows(help_lines) as isize;
+                view_state.help_overlay_scroll = adjust_help_overlay_scroll(
+                    view_state.help_overlay_scroll,
+                    -page,
+                    help_lines.len(),
+                    help_overlay_visible_rows(help_lines),
+                );
+                view_state.dirty.full_pane_redraw = true;
+                return Ok(AttachLoopControl::Continue);
+            }
+            KeyCode::PageDown => {
+                let page = help_overlay_visible_rows(help_lines) as isize;
+                view_state.help_overlay_scroll = adjust_help_overlay_scroll(
+                    view_state.help_overlay_scroll,
+                    page,
+                    help_lines.len(),
+                    help_overlay_visible_rows(help_lines),
+                );
+                view_state.dirty.full_pane_redraw = true;
+                return Ok(AttachLoopControl::Continue);
+            }
+            KeyCode::Home => {
+                view_state.help_overlay_scroll = 0;
+                view_state.dirty.full_pane_redraw = true;
+                return Ok(AttachLoopControl::Continue);
+            }
+            KeyCode::End => {
+                let visible = help_overlay_visible_rows(help_lines);
+                view_state.help_overlay_scroll = help_lines.len().saturating_sub(visible);
+                view_state.dirty.full_pane_redraw = true;
+                return Ok(AttachLoopControl::Continue);
+            }
+            _ => {}
+        }
     }
 
     for attach_action in attach_event_actions(
@@ -2050,6 +2171,9 @@ async fn handle_attach_terminal_event(
             AttachEventAction::Ui(action) => {
                 if matches!(action, RuntimeAction::ShowHelp) {
                     view_state.help_overlay_open = !view_state.help_overlay_open;
+                    if !view_state.help_overlay_open {
+                        view_state.help_overlay_scroll = 0;
+                    }
                     view_state.dirty.status_needs_redraw = true;
                     view_state.dirty.full_pane_redraw = true;
                     continue;
@@ -2059,6 +2183,7 @@ async fn handle_attach_terminal_event(
                         || matches!(action, RuntimeAction::ForwardToPane(_))
                     {
                         view_state.help_overlay_open = false;
+                        view_state.help_overlay_scroll = 0;
                         view_state.dirty.status_needs_redraw = true;
                         view_state.dirty.full_pane_redraw = true;
                     }
@@ -4014,6 +4139,15 @@ mod tests {
                 && entry.action_name == "enter_window_mode"
                 && entry.action == crate::input::RuntimeAction::EnterWindowMode
         }));
+    }
+
+    #[test]
+    fn adjust_help_overlay_scroll_clamps_to_bounds() {
+        assert_eq!(super::adjust_help_overlay_scroll(0, -10, 20, 5), 0);
+        assert_eq!(super::adjust_help_overlay_scroll(0, 3, 20, 5), 3);
+        assert_eq!(super::adjust_help_overlay_scroll(17, 10, 20, 5), 15);
+        assert_eq!(super::adjust_help_overlay_scroll(4, -2, 20, 5), 2);
+        assert_eq!(super::adjust_help_overlay_scroll(0, 4, 0, 5), 0);
     }
 
     #[test]
