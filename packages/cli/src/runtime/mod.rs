@@ -6,7 +6,7 @@ use crate::input::{InputProcessor, Keymap, RuntimeAction};
 use crate::status::{AttachTab, build_attach_status_line};
 use anyhow::{Context, Result};
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
-use bmux_config::{BmuxConfig, ResolvedTimeout, TerminfoAutoInstall};
+use bmux_config::{BmuxConfig, ResolvedTimeout, StaleBuildAction, TerminfoAutoInstall};
 use bmux_ipc::{
     PaneFocusDirection, PaneSplitDirection, SessionRole, SessionSelector, SessionSummary,
     WindowSelector, transport::IpcTransportError,
@@ -57,6 +57,12 @@ struct ServerRuntimeMetadata {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ServerConnectionPolicyScope {
+    Normal,
+    RecoveryInspection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalProfile {
     Bmux256Color,
     Screen256Color,
@@ -77,10 +83,11 @@ pub(crate) async fn run() -> Result<u8> {
 
 async fn run_default_server_attach() -> Result<u8> {
     ensure_server_running_for_default_attach().await?;
-    warn_stale_server_build_on_default_attach()?;
-    let mut client = BmuxClient::connect_default("bmux-cli-default-attach")
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut client = connect_default_client(
+        "bmux-cli-default-attach",
+        ServerConnectionPolicyScope::Normal,
+    )
+    .await?;
     let target = resolve_default_attach_target(&mut client).await?;
     let target = target.to_string();
     run_session_attach_with_client(client, Some(target.as_str()), None, false).await
@@ -98,17 +105,75 @@ async fn ensure_server_running_for_default_attach() -> Result<()> {
     Ok(())
 }
 
-fn warn_stale_server_build_on_default_attach() -> Result<()> {
-    let Some(metadata) = read_server_runtime_metadata()? else {
-        return Ok(());
-    };
-    let current_build = current_cli_build_id()?;
-    if metadata.build_id != current_build {
-        eprintln!(
-            "bmux warning: running server build differs from current CLI build; restart with `bmux server stop`"
-        );
+async fn connect_default_client(
+    client_name: &'static str,
+    scope: ServerConnectionPolicyScope,
+) -> Result<BmuxClient> {
+    apply_stale_build_policy(scope)?;
+    BmuxClient::connect_default(client_name)
+        .await
+        .map_err(map_cli_client_error)
+}
+
+fn apply_stale_build_policy(scope: ServerConnectionPolicyScope) -> Result<()> {
+    let config = BmuxConfig::load().context("failed loading bmux config")?;
+    match evaluate_stale_build_policy(
+        scope,
+        config.behavior.stale_build_action,
+        read_server_runtime_metadata().ok().flatten(),
+        current_cli_build_id().ok(),
+    )? {
+        Some(ServerBuildPolicyEffect::Warn(message)) => {
+            eprintln!("{message}");
+        }
+        None => {}
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ServerBuildPolicyEffect {
+    Warn(String),
+}
+
+fn evaluate_stale_build_policy(
+    scope: ServerConnectionPolicyScope,
+    action: StaleBuildAction,
+    metadata: Option<ServerRuntimeMetadata>,
+    current_build_id: Option<String>,
+) -> Result<Option<ServerBuildPolicyEffect>> {
+    if scope == ServerConnectionPolicyScope::RecoveryInspection {
+        return Ok(None);
+    }
+    let (Some(metadata), Some(current_build_id)) = (metadata, current_build_id) else {
+        return Ok(None);
+    };
+    if metadata.build_id == current_build_id {
+        return Ok(None);
+    }
+
+    let message = format_stale_build_message(&metadata, &current_build_id, action);
+    match action {
+        StaleBuildAction::Error => anyhow::bail!(message),
+        StaleBuildAction::Warn => Ok(Some(ServerBuildPolicyEffect::Warn(message))),
+    }
+}
+
+fn format_stale_build_message(
+    metadata: &ServerRuntimeMetadata,
+    current_build_id: &str,
+    action: StaleBuildAction,
+) -> String {
+    format!(
+        "bmux {}: running server build differs from current CLI build.\nserver build: {} ({})\ncli build: {}\nRestart with `bmux server stop` and retry.",
+        match action {
+            StaleBuildAction::Error => "error",
+            StaleBuildAction::Warn => "warning",
+        },
+        metadata.build_id,
+        metadata.executable_path,
+        current_build_id,
+    )
 }
 
 async fn resolve_default_attach_target(client: &mut BmuxClient) -> Result<Uuid> {
@@ -488,9 +553,11 @@ struct ServerWhoAmIPrincipalJsonPayload {
 
 async fn run_server_whoami_principal(as_json: bool) -> Result<u8> {
     cleanup_stale_pid_file().await?;
-    let mut client = BmuxClient::connect_default("bmux-cli-server-whoami-principal")
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut client = connect_default_client(
+        "bmux-cli-server-whoami-principal",
+        ServerConnectionPolicyScope::RecoveryInspection,
+    )
+    .await?;
     let identity = client
         .whoami_principal()
         .await
@@ -528,9 +595,11 @@ async fn run_server_whoami_principal(as_json: bool) -> Result<u8> {
 
 async fn run_server_save() -> Result<u8> {
     cleanup_stale_pid_file().await?;
-    let mut client = BmuxClient::connect_default("bmux-cli-server-save")
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut client = connect_default_client(
+        "bmux-cli-server-save",
+        ServerConnectionPolicyScope::RecoveryInspection,
+    )
+    .await?;
     let path = client.server_save().await.map_err(map_cli_client_error)?;
 
     match path {
@@ -547,9 +616,11 @@ async fn run_server_restore(dry_run: bool, yes: bool) -> Result<u8> {
     cleanup_stale_pid_file().await?;
 
     if dry_run {
-        let mut client = BmuxClient::connect_default("bmux-cli-server-restore-dry-run")
-            .await
-            .map_err(map_cli_client_error)?;
+        let mut client = connect_default_client(
+            "bmux-cli-server-restore-dry-run",
+            ServerConnectionPolicyScope::RecoveryInspection,
+        )
+        .await?;
         let (ok, message) = client
             .server_restore_dry_run()
             .await
@@ -563,9 +634,11 @@ async fn run_server_restore(dry_run: bool, yes: bool) -> Result<u8> {
         return Ok(1);
     }
 
-    let mut client = BmuxClient::connect_default("bmux-cli-server-restore-apply")
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut client = connect_default_client(
+        "bmux-cli-server-restore-apply",
+        ServerConnectionPolicyScope::RecoveryInspection,
+    )
+    .await?;
     let summary = client
         .server_restore_apply()
         .await
@@ -659,9 +732,8 @@ async fn run_server_stop() -> Result<u8> {
 }
 
 async fn run_session_new(name: Option<String>) -> Result<u8> {
-    let mut client = BmuxClient::connect_default("bmux-cli-new-session")
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut client =
+        connect_default_client("bmux-cli-new-session", ServerConnectionPolicyScope::Normal).await?;
     let session_id = client
         .new_session(name)
         .await
@@ -671,9 +743,11 @@ async fn run_session_new(name: Option<String>) -> Result<u8> {
 }
 
 async fn run_session_list(as_json: bool) -> Result<u8> {
-    let mut client = BmuxClient::connect_default("bmux-cli-list-sessions")
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut client = connect_default_client(
+        "bmux-cli-list-sessions",
+        ServerConnectionPolicyScope::Normal,
+    )
+    .await?;
     let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
 
     if as_json {
@@ -702,9 +776,9 @@ async fn run_session_list(as_json: bool) -> Result<u8> {
 }
 
 async fn run_client_list(as_json: bool) -> Result<u8> {
-    let mut client = BmuxClient::connect_default("bmux-cli-list-clients")
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut client =
+        connect_default_client("bmux-cli-list-clients", ServerConnectionPolicyScope::Normal)
+            .await?;
     let self_id = client.whoami().await.map_err(map_cli_client_error)?;
     let clients = client.list_clients().await.map_err(map_cli_client_error)?;
     let mut clients = clients;
@@ -752,9 +826,11 @@ async fn run_permissions_list(session: &str, as_json: bool, watch: bool) -> Resu
     let selector = parse_session_selector(session);
 
     if watch {
-        let mut client = BmuxClient::connect_default("bmux-cli-watch-permissions")
-            .await
-            .map_err(map_cli_client_error)?;
+        let mut client = connect_default_client(
+            "bmux-cli-watch-permissions",
+            ServerConnectionPolicyScope::Normal,
+        )
+        .await?;
 
         println!("watching permissions for session '{session}' (Ctrl-C to stop)");
         let mut last_permissions: Option<Vec<bmux_ipc::SessionPermissionSummary>> = None;
@@ -774,9 +850,11 @@ async fn run_permissions_list(session: &str, as_json: bool, watch: bool) -> Resu
         }
     }
 
-    let mut client = BmuxClient::connect_default("bmux-cli-list-permissions")
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut client = connect_default_client(
+        "bmux-cli-list-permissions",
+        ServerConnectionPolicyScope::Normal,
+    )
+    .await?;
     let permissions = client
         .list_permissions(selector)
         .await
@@ -815,9 +893,8 @@ fn render_permissions_table(permissions: &[bmux_ipc::SessionPermissionSummary]) 
 async fn run_grant_role(session: &str, client: &str, role: RoleValue) -> Result<u8> {
     let selector = parse_session_selector(session);
     let client_id = parse_uuid_value(client, "client id")?;
-    let mut api = BmuxClient::connect_default("bmux-cli-grant-role")
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut api =
+        connect_default_client("bmux-cli-grant-role", ServerConnectionPolicyScope::Normal).await?;
     api.grant_role(selector, client_id, session_role_from_value(role))
         .await
         .map_err(map_cli_client_error)?;
@@ -833,9 +910,8 @@ async fn run_grant_role(session: &str, client: &str, role: RoleValue) -> Result<
 async fn run_revoke_role(session: &str, client: &str) -> Result<u8> {
     let selector = parse_session_selector(session);
     let client_id = parse_uuid_value(client, "client id")?;
-    let mut api = BmuxClient::connect_default("bmux-cli-revoke-role")
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut api =
+        connect_default_client("bmux-cli-revoke-role", ServerConnectionPolicyScope::Normal).await?;
     api.revoke_role(selector, client_id)
         .await
         .map_err(map_cli_client_error)?;
@@ -846,9 +922,9 @@ async fn run_revoke_role(session: &str, client: &str) -> Result<u8> {
 
 async fn run_session_kill(target: &str, force_local: bool) -> Result<u8> {
     let selector = parse_session_selector(target);
-    let mut client = BmuxClient::connect_default("bmux-cli-kill-session")
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut client =
+        connect_default_client("bmux-cli-kill-session", ServerConnectionPolicyScope::Normal)
+            .await?;
     let killed_id = client
         .kill_session_with_options(selector, force_local)
         .await
@@ -858,9 +934,11 @@ async fn run_session_kill(target: &str, force_local: bool) -> Result<u8> {
 }
 
 async fn run_session_kill_all(force_local: bool) -> Result<u8> {
-    let mut client = BmuxClient::connect_default("bmux-cli-kill-all-sessions")
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut client = connect_default_client(
+        "bmux-cli-kill-all-sessions",
+        ServerConnectionPolicyScope::Normal,
+    )
+    .await?;
     let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
 
     if sessions.is_empty() {
@@ -896,9 +974,8 @@ async fn run_session_attach(
     follow: Option<&str>,
     global: bool,
 ) -> Result<u8> {
-    let client = BmuxClient::connect_default("bmux-cli-attach")
-        .await
-        .map_err(map_attach_client_error)?;
+    let client =
+        connect_default_client("bmux-cli-attach", ServerConnectionPolicyScope::Normal).await?;
     run_session_attach_with_client(client, target, follow, global).await
 }
 
@@ -2670,6 +2747,23 @@ fn map_attach_client_error(error: ClientError) -> anyhow::Error {
 }
 
 fn map_cli_client_error(error: ClientError) -> anyhow::Error {
+    if let ClientError::ServerError { code, .. } = &error
+        && *code == bmux_ipc::ErrorCode::VersionMismatch
+    {
+        return anyhow::anyhow!(
+            "bmux error: client/server protocol mismatch. Restart with `bmux server stop` and retry."
+        );
+    }
+
+    if let ClientError::Transport(IpcTransportError::FrameDecode(
+        bmux_ipc::frame::FrameDecodeError::UnsupportedVersion { .. },
+    )) = &error
+    {
+        return anyhow::anyhow!(
+            "bmux error: client/server protocol mismatch. Restart with `bmux server stop` and retry."
+        );
+    }
+
     if let ClientError::Transport(IpcTransportError::Io(io_error)) = &error
         && io_error.kind() == std::io::ErrorKind::NotFound
     {
@@ -2682,9 +2776,8 @@ fn map_cli_client_error(error: ClientError) -> anyhow::Error {
 }
 
 async fn run_session_detach() -> Result<u8> {
-    let mut client = BmuxClient::connect_default("bmux-cli-detach")
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut client =
+        connect_default_client("bmux-cli-detach", ServerConnectionPolicyScope::Normal).await?;
     client.detach().await.map_err(map_cli_client_error)?;
     println!("detached");
     Ok(0)
@@ -2692,9 +2785,8 @@ async fn run_session_detach() -> Result<u8> {
 
 async fn run_follow(target_client_id: &str, global: bool) -> Result<u8> {
     let target_client_id = parse_uuid_value(target_client_id, "target client id")?;
-    let mut client = BmuxClient::connect_default("bmux-cli-follow")
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut client =
+        connect_default_client("bmux-cli-follow", ServerConnectionPolicyScope::Normal).await?;
     client
         .follow_client(target_client_id, global)
         .await
@@ -2708,9 +2800,8 @@ async fn run_follow(target_client_id: &str, global: bool) -> Result<u8> {
 }
 
 async fn run_unfollow() -> Result<u8> {
-    let mut client = BmuxClient::connect_default("bmux-cli-unfollow")
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut client =
+        connect_default_client("bmux-cli-unfollow", ServerConnectionPolicyScope::Normal).await?;
     client.unfollow().await.map_err(map_cli_client_error)?;
     println!("follow stopped");
     Ok(0)
@@ -2718,9 +2809,8 @@ async fn run_unfollow() -> Result<u8> {
 
 async fn run_window_new(session: Option<&String>, name: Option<String>) -> Result<u8> {
     let session_selector = session.map(|target| parse_session_selector(target));
-    let mut client = BmuxClient::connect_default("bmux-cli-new-window")
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut client =
+        connect_default_client("bmux-cli-new-window", ServerConnectionPolicyScope::Normal).await?;
     let window_id = client
         .new_window(session_selector, name)
         .await
@@ -2731,9 +2821,9 @@ async fn run_window_new(session: Option<&String>, name: Option<String>) -> Resul
 
 async fn run_window_list(session: Option<&String>, as_json: bool) -> Result<u8> {
     let session_selector = session.map(|target| parse_session_selector(target));
-    let mut client = BmuxClient::connect_default("bmux-cli-list-windows")
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut client =
+        connect_default_client("bmux-cli-list-windows", ServerConnectionPolicyScope::Normal)
+            .await?;
     let windows = client
         .list_windows(session_selector)
         .await
@@ -2772,9 +2862,8 @@ async fn run_window_list(session: Option<&String>, as_json: bool) -> Result<u8> 
 async fn run_window_kill(target: &str, session: Option<&String>, force_local: bool) -> Result<u8> {
     let session_selector = session.map(|value| parse_session_selector(value));
     let window_selector = parse_window_selector(target);
-    let mut client = BmuxClient::connect_default("bmux-cli-kill-window")
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut client =
+        connect_default_client("bmux-cli-kill-window", ServerConnectionPolicyScope::Normal).await?;
     let window_id = client
         .kill_window_with_options(session_selector, window_selector, force_local)
         .await
@@ -2785,9 +2874,11 @@ async fn run_window_kill(target: &str, session: Option<&String>, force_local: bo
 
 async fn run_window_kill_all(session: Option<&String>, force_local: bool) -> Result<u8> {
     let session_selector = session.map(|value| parse_session_selector(value));
-    let mut client = BmuxClient::connect_default("bmux-cli-kill-all-windows")
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut client = connect_default_client(
+        "bmux-cli-kill-all-windows",
+        ServerConnectionPolicyScope::Normal,
+    )
+    .await?;
     let windows = client
         .list_windows(session_selector.clone())
         .await
@@ -2828,9 +2919,11 @@ async fn run_window_kill_all(session: Option<&String>, force_local: bool) -> Res
 async fn run_window_switch(target: &str, session: Option<&String>) -> Result<u8> {
     let session_selector = session.map(|value| parse_session_selector(value));
     let window_selector = parse_window_selector(target);
-    let mut client = BmuxClient::connect_default("bmux-cli-switch-window")
-        .await
-        .map_err(map_cli_client_error)?;
+    let mut client = connect_default_client(
+        "bmux-cli-switch-window",
+        ServerConnectionPolicyScope::Normal,
+    )
+    .await?;
     let window_id = client
         .switch_window(session_selector, window_selector)
         .await
@@ -3763,14 +3856,16 @@ fn init_logging(verbose: bool) {
 mod tests {
     use super::{
         ProtocolDirection, ProtocolTraceEvent, TerminalProfile, TraceFamily,
-        attach_keymap_from_config, filter_trace_events, map_attach_client_error,
-        map_cli_client_error, merged_runtime_keybindings, parse_pid_content, profile_for_term,
-        protocol_profile_for_terminal_profile, resolve_pane_term_with_checker,
+        attach_keymap_from_config, evaluate_stale_build_policy, filter_trace_events,
+        map_attach_client_error, map_cli_client_error, merged_runtime_keybindings,
+        parse_pid_content, profile_for_term, protocol_profile_for_terminal_profile,
+        resolve_pane_term_with_checker,
     };
     use crate::input::InputProcessor;
     use bmux_client::ClientError;
-    use bmux_config::{BmuxConfig, ResolvedTimeout};
+    use bmux_config::{BmuxConfig, ResolvedTimeout, StaleBuildAction};
     use bmux_ipc::ErrorCode;
+    use bmux_ipc::frame::FrameDecodeError;
     use bmux_ipc::transport::IpcTransportError;
     use crossterm::event::{
         KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
@@ -4005,6 +4100,83 @@ mod tests {
 
         assert!(message.contains("transport error"));
         assert!(!message.contains("bmux server is not running"));
+    }
+
+    #[test]
+    fn stale_build_policy_blocks_normal_commands_by_default() {
+        let error = evaluate_stale_build_policy(
+            super::ServerConnectionPolicyScope::Normal,
+            StaleBuildAction::Error,
+            Some(super::ServerRuntimeMetadata {
+                pid: 1,
+                version: "0.0.1-alpha.0".to_string(),
+                build_id: "server-build".to_string(),
+                executable_path: "/tmp/bmux-server".to_string(),
+                started_at_epoch_ms: 0,
+            }),
+            Some("cli-build".to_string()),
+        )
+        .expect_err("expected stale build policy to block");
+
+        let message = error.to_string();
+        assert!(message.contains("running server build differs from current CLI build"));
+        assert!(message.contains("bmux server stop"));
+    }
+
+    #[test]
+    fn stale_build_policy_warns_when_configured() {
+        let effect = evaluate_stale_build_policy(
+            super::ServerConnectionPolicyScope::Normal,
+            StaleBuildAction::Warn,
+            Some(super::ServerRuntimeMetadata {
+                pid: 1,
+                version: "0.0.1-alpha.0".to_string(),
+                build_id: "server-build".to_string(),
+                executable_path: "/tmp/bmux-server".to_string(),
+                started_at_epoch_ms: 0,
+            }),
+            Some("cli-build".to_string()),
+        )
+        .expect("warn mode should continue");
+
+        assert!(matches!(
+            effect,
+            Some(super::ServerBuildPolicyEffect::Warn(message))
+                if message.contains("bmux warning") && message.contains("bmux server stop")
+        ));
+    }
+
+    #[test]
+    fn stale_build_policy_skips_recovery_inspection_commands() {
+        let effect = evaluate_stale_build_policy(
+            super::ServerConnectionPolicyScope::RecoveryInspection,
+            StaleBuildAction::Error,
+            Some(super::ServerRuntimeMetadata {
+                pid: 1,
+                version: "0.0.1-alpha.0".to_string(),
+                build_id: "server-build".to_string(),
+                executable_path: "/tmp/bmux-server".to_string(),
+                started_at_epoch_ms: 0,
+            }),
+            Some("cli-build".to_string()),
+        )
+        .expect("recovery commands should bypass stale build policy");
+
+        assert!(effect.is_none());
+    }
+
+    #[test]
+    fn map_cli_client_error_rewrites_protocol_mismatch() {
+        let error = map_cli_client_error(ClientError::Transport(IpcTransportError::FrameDecode(
+            FrameDecodeError::UnsupportedVersion {
+                actual: 1,
+                expected: 3,
+            },
+        )));
+
+        let message = error.to_string();
+        assert!(message.contains("client/server protocol mismatch"));
+        assert!(message.contains("bmux server stop"));
     }
 
     #[test]

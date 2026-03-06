@@ -135,6 +135,8 @@ pub struct BehaviorConfig {
     pub terminfo_auto_install: TerminfoAutoInstall,
     /// Cooldown before prompting again after declining install
     pub terminfo_prompt_cooldown_days: u64,
+    /// Behavior when the running server build differs from the current CLI build
+    pub stale_build_action: StaleBuildAction,
 }
 
 impl Default for BehaviorConfig {
@@ -152,8 +154,17 @@ impl Default for BehaviorConfig {
             protocol_trace_capacity: 200,
             terminfo_auto_install: TerminfoAutoInstall::Never,
             terminfo_prompt_cooldown_days: 7,
+            stale_build_action: StaleBuildAction::Error,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum StaleBuildAction {
+    #[default]
+    Error,
+    Warn,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -408,7 +419,7 @@ impl BmuxConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{BmuxConfig, ResolvedTimeout};
+    use super::{BmuxConfig, ResolvedTimeout, StaleBuildAction};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_config_path() -> std::path::PathBuf {
@@ -429,6 +440,7 @@ mod tests {
     fn default_config_is_valid() {
         let config = BmuxConfig::default();
         assert!(config.validate().is_ok());
+        assert_eq!(config.behavior.stale_build_action, StaleBuildAction::Error);
         assert_eq!(
             config
                 .keybindings
@@ -602,6 +614,19 @@ timeout_profile = "missing"
 
         let persisted = std::fs::read_to_string(&path).expect("failed reading config file");
         assert!(persisted.contains("timeout_profile = \"missing\""));
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn load_parses_warn_stale_build_action() {
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        std::fs::write(&path, "[behavior]\nstale_build_action = \"warn\"\n")
+            .expect("failed writing config fixture");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(config.behavior.stale_build_action, StaleBuildAction::Warn);
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
     }
