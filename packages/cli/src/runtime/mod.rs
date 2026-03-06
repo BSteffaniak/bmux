@@ -2356,7 +2356,19 @@ fn attach_key_event_actions(
                 }
             }
             RuntimeAction::NewWindow | RuntimeAction::NewSession => {
-                AttachEventAction::Runtime(action)
+                if ui_mode == AttachUiMode::Window {
+                    AttachEventAction::Runtime(action)
+                } else if matches!(key.code, KeyCode::Char('n'))
+                    && !key.modifiers.contains(KeyModifiers::CONTROL)
+                    && !key.modifiers.contains(KeyModifiers::ALT)
+                    && !key.modifiers.contains(KeyModifiers::SUPER)
+                {
+                    attach_key_event_to_bytes(key)
+                        .map(AttachEventAction::Send)
+                        .unwrap_or(AttachEventAction::Ignore)
+                } else {
+                    AttachEventAction::Runtime(action)
+                }
             }
             RuntimeAction::EnterWindowMode
             | RuntimeAction::SplitFocusedVertical
@@ -4032,6 +4044,48 @@ mod tests {
             window_actions.first(),
             Some(super::AttachEventAction::Ui(
                 crate::input::RuntimeAction::WindowPrev
+            ))
+        ));
+    }
+
+    #[test]
+    fn attach_key_event_action_routes_n_to_pane_in_normal_mode() {
+        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
+
+        let normal_actions = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('n'),
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+        assert!(matches!(
+            normal_actions.first(),
+            Some(super::AttachEventAction::Send(bytes)) if bytes.as_slice() == b"n"
+        ));
+    }
+
+    #[test]
+    fn attach_key_event_action_routes_n_to_new_window_in_window_mode() {
+        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
+
+        let window_actions = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('n'),
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Window,
+        )
+        .expect("attach key action should parse");
+        assert!(matches!(
+            window_actions.first(),
+            Some(super::AttachEventAction::Runtime(
+                crate::input::RuntimeAction::NewWindow
             ))
         ));
     }
