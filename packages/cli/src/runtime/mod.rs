@@ -43,6 +43,8 @@ const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_STATUS_TIMEOUT: Duration = Duration::from_millis(1000);
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_millis(5000);
 const ATTACH_IO_POLL_INTERVAL: Duration = Duration::from_millis(15);
+const ATTACH_WINDOW_MODE_UNBOUND_STATUS: &str = "window mode: unbound key (Esc/Enter to exit)";
+const ATTACH_TRANSIENT_STATUS_TTL: Duration = Duration::from_millis(1800);
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ServerRuntimeMetadata {
@@ -1030,6 +1032,8 @@ async fn run_session_attach_with_client(
             break;
         }
 
+        let _ = view_state.clear_expired_transient_status(Instant::now());
+
         let mut frame_needs_render = view_state.dirty.status_needs_redraw;
 
         if view_state.dirty.layout_needs_refresh || view_state.cached_layout_state.is_none() {
@@ -1372,6 +1376,7 @@ async fn build_attach_status_line_for_draw(
     follow_global: bool,
     quit_confirmation_pending: bool,
     help_overlay_open: bool,
+    transient_status: Option<&str>,
     keymap: &Keymap,
 ) -> std::result::Result<String, ClientError> {
     let (cols, _) = terminal::size().unwrap_or((0, 0));
@@ -1401,6 +1406,8 @@ async fn build_attach_status_line_for_draw(
         "Quit session and all panes? [y/N]".to_string()
     } else if help_overlay_open {
         "Help overlay open | ? toggles | Esc/Enter close".to_string()
+    } else if let Some(status) = transient_status {
+        status.to_string()
     } else {
         attach_mode_hint(ui_mode, keymap)
     };
@@ -1612,6 +1619,7 @@ async fn render_attach_frame(
     help_scroll: usize,
 ) -> Result<()> {
     if view_state.dirty.status_needs_redraw {
+        let now = Instant::now();
         view_state.cached_status_line = Some(
             build_attach_status_line_for_draw(
                 client,
@@ -1622,6 +1630,7 @@ async fn render_attach_frame(
                 follow_global,
                 view_state.quit_confirmation_pending,
                 view_state.help_overlay_open,
+                view_state.transient_status_text(now),
                 keymap,
             )
             .await
@@ -2298,6 +2307,13 @@ async fn handle_attach_terminal_event(
                 view_state.dirty.full_pane_redraw = true;
             }
             AttachEventAction::Ignore => {}
+            AttachEventAction::WindowModeUnboundKey => {
+                view_state.set_transient_status(
+                    ATTACH_WINDOW_MODE_UNBOUND_STATUS,
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            }
         }
     }
 
@@ -2350,7 +2366,7 @@ fn attach_key_event_actions(
             RuntimeAction::Detach => AttachEventAction::Detach,
             RuntimeAction::ForwardToPane(bytes) => {
                 if ui_mode == AttachUiMode::Window {
-                    AttachEventAction::Ignore
+                    AttachEventAction::WindowModeUnboundKey
                 } else {
                     AttachEventAction::Send(bytes)
                 }
@@ -2384,7 +2400,13 @@ fn attach_key_event_actions(
             | RuntimeAction::ResizeRight
             | RuntimeAction::ResizeUp
             | RuntimeAction::ResizeDown
-            | RuntimeAction::CloseFocusedPane => AttachEventAction::Ui(action),
+            | RuntimeAction::CloseFocusedPane => {
+                if ui_mode == AttachUiMode::Window {
+                    AttachEventAction::WindowModeUnboundKey
+                } else {
+                    AttachEventAction::Ui(action)
+                }
+            }
             RuntimeAction::ExitMode
             | RuntimeAction::WindowPrev
             | RuntimeAction::WindowNext
@@ -4087,6 +4109,26 @@ mod tests {
             Some(super::AttachEventAction::Runtime(
                 crate::input::RuntimeAction::NewWindow
             ))
+        ));
+    }
+
+    #[test]
+    fn attach_key_event_action_eats_unbound_plain_key_in_window_mode() {
+        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
+
+        let window_actions = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('z'),
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Window,
+        )
+        .expect("attach key action should parse");
+        assert!(matches!(
+            window_actions.first(),
+            Some(super::AttachEventAction::WindowModeUnboundKey)
         ));
     }
 
