@@ -1591,6 +1591,63 @@ fn filtered_attach_keybindings(
     (runtime, global)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachKeybindingScope {
+    Runtime,
+    Global,
+}
+
+impl AttachKeybindingScope {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Runtime => "runtime",
+            Self::Global => "global",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AttachKeybindingEntry {
+    scope: AttachKeybindingScope,
+    chord: String,
+    action: RuntimeAction,
+    action_name: String,
+}
+
+fn effective_attach_keybindings(config: &BmuxConfig) -> Vec<AttachKeybindingEntry> {
+    let (runtime, global) = filtered_attach_keybindings(config);
+    let mut entries = Vec::new();
+
+    for (chord, action_name) in runtime {
+        if let Ok(action) = crate::input::parse_runtime_action_name(&action_name) {
+            entries.push(AttachKeybindingEntry {
+                scope: AttachKeybindingScope::Runtime,
+                chord,
+                action,
+                action_name,
+            });
+        }
+    }
+    for (chord, action_name) in global {
+        if let Ok(action) = crate::input::parse_runtime_action_name(&action_name) {
+            entries.push(AttachKeybindingEntry {
+                scope: AttachKeybindingScope::Global,
+                chord,
+                action,
+                action_name,
+            });
+        }
+    }
+
+    entries.sort_by(|left, right| {
+        left.scope
+            .as_str()
+            .cmp(right.scope.as_str())
+            .then_with(|| left.chord.cmp(&right.chord))
+    });
+    entries
+}
+
 fn normalize_attach_keybindings(
     bindings: std::collections::BTreeMap<String, String>,
     scope: &str,
@@ -3077,6 +3134,7 @@ fn run_keymap_doctor(as_json: bool) -> Result<u8> {
     .context("failed to compile keymap")?;
 
     let report = keymap.doctor_report();
+    let attach_effective = effective_attach_keybindings(&config);
 
     if as_json {
         let payload = serde_json::json!({
@@ -3099,6 +3157,14 @@ fn run_keymap_doctor(as_json: bool) -> Result<u8> {
                 }))
                 .collect::<Vec<_>>(),
             "overlaps": report.overlaps,
+            "attach_effective": attach_effective
+                .iter()
+                .map(|entry| serde_json::json!({
+                    "scope": entry.scope.as_str(),
+                    "chord": entry.chord,
+                    "action": entry.action_name,
+                }))
+                .collect::<Vec<_>>(),
         });
         println!(
             "{}",
@@ -3113,6 +3179,16 @@ fn run_keymap_doctor(as_json: bool) -> Result<u8> {
     println!("timeout_ms: {}", config.keybindings.timeout_ms);
     for line in keymap.doctor_lines() {
         println!("{line}");
+    }
+
+    println!("attach_effective:");
+    for entry in attach_effective {
+        println!(
+            "  [{}] {} -> {}",
+            entry.scope.as_str(),
+            entry.chord,
+            entry.action_name
+        );
     }
 
     Ok(0)
@@ -3730,6 +3806,23 @@ mod tests {
     fn attach_keybindings_keep_focus_next_pane_binding() {
         let (runtime, _global) = super::filtered_attach_keybindings(&BmuxConfig::default());
         assert_eq!(runtime.get("o"), Some(&"focus_next_pane".to_string()));
+    }
+
+    #[test]
+    fn effective_attach_keybindings_include_scope_and_canonical_action_names() {
+        let entries = super::effective_attach_keybindings(&BmuxConfig::default());
+        assert!(entries.iter().any(|entry| {
+            entry.scope == super::AttachKeybindingScope::Runtime
+                && entry.chord == "o"
+                && entry.action_name == "focus_next_pane"
+                && entry.action == crate::input::RuntimeAction::FocusNext
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry.scope == super::AttachKeybindingScope::Global
+                && entry.chord == "ctrl+t"
+                && entry.action_name == "enter_window_mode"
+                && entry.action == crate::input::RuntimeAction::EnterWindowMode
+        }));
     }
 
     #[test]
