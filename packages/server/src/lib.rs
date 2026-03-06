@@ -617,6 +617,7 @@ struct PaneRuntimeHandle {
     input_tx: mpsc::UnboundedSender<PaneRuntimeCommand>,
     output_buffer: Arc<std::sync::Mutex<OutputFanoutBuffer>>,
     exited: Arc<AtomicBool>,
+    last_requested_size: Arc<std::sync::Mutex<(u16, u16)>>,
 }
 
 enum PaneRuntimeCommand {
@@ -638,9 +639,17 @@ impl PaneRuntimeHandle {
     }
 
     fn resize_pty(&self, rows: u16, cols: u16) {
+        if let Ok(mut last) = self.last_requested_size.lock() {
+            *last = (rows, cols);
+        }
         let _ = self
             .input_tx
             .send(PaneRuntimeCommand::Resize { rows, cols });
+    }
+
+    #[cfg(test)]
+    fn last_requested_pty_size(&self) -> (u16, u16) {
+        self.last_requested_size.lock().map(|value| *value).unwrap_or((0, 0))
     }
 }
 
@@ -1247,6 +1256,7 @@ impl SessionRuntimeManager {
         let output_buffer = Arc::new(std::sync::Mutex::new(OutputFanoutBuffer::new(
             MAX_WINDOW_OUTPUT_BUFFER_BYTES,
         )));
+        let last_requested_size = Arc::new(std::sync::Mutex::new((24_u16, 80_u16)));
         let shell = pane_meta.shell.clone();
         let pane_term = self.pane_term.clone();
         let protocol_profile = self.protocol_profile;
@@ -1403,6 +1413,7 @@ impl SessionRuntimeManager {
             input_tx,
             output_buffer,
             exited,
+            last_requested_size,
         })
     }
 
@@ -7170,6 +7181,108 @@ mod tests {
         assert!(
             output_after_reattach.contains(marker),
             "expected marker to replay after reattach, got: {output_after_reattach:?}"
+        );
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attach_set_viewport_resizes_active_pane_pty() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut client = connect_and_handshake(&endpoint).await;
+
+        let created = send_request(
+            &mut client,
+            280,
+            Request::NewSession {
+                name: Some("viewport-size".to_string()),
+            },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected session create response: {other:?}"),
+        };
+
+        let grant = match send_request(
+            &mut client,
+            281,
+            Request::Attach {
+                selector: SessionSelector::ById(session_id),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::Attached { grant }) => grant,
+            other => panic!("unexpected attach response: {other:?}"),
+        };
+
+        let open = send_request(
+            &mut client,
+            282,
+            Request::AttachOpen {
+                session_id,
+                attach_token: grant.attach_token,
+            },
+        )
+        .await;
+        assert!(matches!(
+            open,
+            Response::Ok(ResponsePayload::AttachReady {
+                session_id: opened,
+                can_write: true,
+            }) if opened == session_id
+        ));
+
+        let viewport_cols: u16 = 120;
+        let viewport_rows: u16 = 50;
+        let viewport_set = send_request(
+            &mut client,
+            283,
+            Request::AttachSetViewport {
+                session_id,
+                cols: viewport_cols,
+                rows: viewport_rows,
+            },
+        )
+        .await;
+        assert_eq!(
+            viewport_set,
+            Response::Ok(ResponsePayload::AttachViewportSet {
+                session_id,
+                cols: viewport_cols,
+                rows: viewport_rows,
+            })
+        );
+
+        let (measured_rows, measured_cols) = {
+            let runtime_manager = server
+                .state
+                .session_runtimes
+                .lock()
+                .expect("runtime manager lock should succeed");
+            let runtime = runtime_manager
+                .runtimes
+                .get(&SessionId(session_id))
+                .expect("runtime should exist for created session");
+            let window = runtime
+                .windows
+                .get(&runtime.active_window)
+                .expect("active window should exist");
+            let pane = window
+                .panes
+                .get(&window.focused_pane_id)
+                .expect("focused pane should exist");
+            pane.last_requested_pty_size()
+        };
+
+        let expected_rows = viewport_rows.saturating_sub(3);
+        let expected_cols = viewport_cols.saturating_sub(2);
+        assert_eq!(
+            (measured_rows, measured_cols),
+            (expected_rows, expected_cols),
+            "expected requested PTY size to match pane inner size"
         );
 
         stop_server(server, server_task, &socket_path).await;
