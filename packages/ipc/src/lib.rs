@@ -52,7 +52,7 @@ impl IpcEndpoint {
 }
 
 /// Current IPC protocol version.
-pub const CURRENT_PROTOCOL_VERSION: u16 = 2;
+pub const CURRENT_PROTOCOL_VERSION: u16 = 3;
 
 /// Protocol version used in IPC envelopes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -272,6 +272,10 @@ pub enum Request {
         pane_ids: Vec<Uuid>,
         max_bytes: usize,
     },
+    AttachSnapshot {
+        session_id: Uuid,
+        max_bytes_per_pane: usize,
+    },
     SubscribeEvents,
     PollEvents {
         max_events: usize,
@@ -482,6 +486,14 @@ pub enum ResponsePayload {
         layout_root: PaneLayoutNode,
     },
     AttachPaneOutputBatch {
+        chunks: Vec<AttachPaneChunk>,
+    },
+    AttachSnapshot {
+        session_id: Uuid,
+        window_id: Uuid,
+        focused_pane_id: Uuid,
+        panes: Vec<PaneSummary>,
+        layout_root: PaneLayoutNode,
         chunks: Vec<AttachPaneChunk>,
     },
     EventsSubscribed,

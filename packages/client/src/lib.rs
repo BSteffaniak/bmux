@@ -39,6 +39,16 @@ pub struct AttachLayoutState {
     pub layout_root: PaneLayoutNode,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachSnapshotState {
+    pub session_id: Uuid,
+    pub window_id: Uuid,
+    pub focused_pane_id: Uuid,
+    pub panes: Vec<PaneSummary>,
+    pub layout_root: PaneLayoutNode,
+    pub chunks: Vec<AttachPaneChunk>,
+}
+
 /// Server status details returned by status RPC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerStatusInfo {
@@ -905,6 +915,39 @@ impl BmuxClient {
             ResponsePayload::AttachPaneOutputBatch { chunks } => Ok(chunks),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected attach pane output batch response",
+            )),
+        }
+    }
+
+    pub async fn attach_snapshot(
+        &mut self,
+        session_id: Uuid,
+        max_bytes_per_pane: usize,
+    ) -> Result<AttachSnapshotState> {
+        match self
+            .request(Request::AttachSnapshot {
+                session_id,
+                max_bytes_per_pane,
+            })
+            .await?
+        {
+            ResponsePayload::AttachSnapshot {
+                session_id,
+                window_id,
+                focused_pane_id,
+                panes,
+                layout_root,
+                chunks,
+            } => Ok(AttachSnapshotState {
+                session_id,
+                window_id,
+                focused_pane_id,
+                panes,
+                layout_root,
+                chunks,
+            }),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attach snapshot response",
             )),
         }
     }

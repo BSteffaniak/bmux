@@ -5,7 +5,7 @@ use crate::cli::{
 use crate::input::{InputProcessor, Keymap, RuntimeAction};
 use crate::status::{AttachTab, build_attach_status_line};
 use anyhow::{Context, Result};
-use bmux_client::{AttachLayoutState, BmuxClient, ClientError};
+use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, TerminfoAutoInstall};
 use bmux_ipc::{
     PaneFocusDirection, PaneSplitDirection, SessionRole, SessionSelector, SessionSummary,
@@ -30,9 +30,9 @@ mod attach;
 mod terminal_protocol;
 use attach::cursor::apply_attach_cursor_state;
 use attach::events::{AttachLoopControl, AttachLoopEvent, collect_attach_loop_events};
-use attach::layout::collect_pane_ids;
+use attach::layout::{collect_layout_rects, collect_pane_ids};
 use attach::render::{append_pane_output, render_attach_panes};
-use attach::state::{AttachEventAction, AttachExitReason, AttachUiMode, AttachViewState};
+use attach::state::{AttachEventAction, AttachExitReason, AttachUiMode, AttachViewState, PaneRect};
 use terminal_protocol::{
     ProtocolDirection, ProtocolProfile, ProtocolTraceEvent, primary_da_for_profile,
     protocol_profile_name, secondary_da_for_profile, supported_query_names,
@@ -43,6 +43,7 @@ const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_STATUS_TIMEOUT: Duration = Duration::from_millis(1000);
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_millis(5000);
 const ATTACH_IO_POLL_INTERVAL: Duration = Duration::from_millis(15);
+const ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE: usize = 1_048_576;
 const ATTACH_WINDOW_MODE_UNBOUND_STATUS: &str = "window mode: unbound key (Esc/Enter to exit)";
 const ATTACH_TRANSIENT_STATUS_TTL: Duration = Duration::from_millis(1800);
 
@@ -982,6 +983,7 @@ async fn run_session_attach_with_client(
     let mut view_state = AttachViewState::new(attach_info.clone());
 
     update_attach_viewport(&mut client, view_state.attached_id).await?;
+    hydrate_attach_state_from_snapshot(&mut client, &mut view_state).await?;
 
     if !view_state.can_write {
         println!("read-only attach: input disabled");
@@ -1083,6 +1085,8 @@ async fn run_session_attach_with_client(
             continue;
         };
 
+        resize_attach_parsers_for_layout(&mut view_state.pane_buffers, &layout_state.layout_root);
+
         let mut pane_ids = Vec::new();
         collect_pane_ids(&layout_state.layout_root, &mut pane_ids);
         view_state
@@ -1146,17 +1150,16 @@ async fn run_session_attach_with_client(
 async fn handle_attach_runtime_action(
     client: &mut BmuxClient,
     action: RuntimeAction,
-    attached_id: &mut Uuid,
-    can_write: &mut bool,
+    view_state: &mut AttachViewState,
 ) -> std::result::Result<(), ClientError> {
     match action {
         RuntimeAction::NewWindow => {
             let window_id = client
-                .new_window(Some(SessionSelector::ById(*attached_id)), None)
+                .new_window(Some(SessionSelector::ById(view_state.attached_id)), None)
                 .await?;
             let active_window_id = client
                 .switch_window(
-                    Some(SessionSelector::ById(*attached_id)),
+                    Some(SessionSelector::ById(view_state.attached_id)),
                     WindowSelector::ById(window_id),
                 )
                 .await?;
@@ -1166,14 +1169,15 @@ async fn handle_attach_runtime_action(
         RuntimeAction::NewSession => {
             let session_id = client.new_session(None).await?;
             let attach_info = open_attach_for_session(client, session_id).await?;
-            *attached_id = attach_info.session_id;
-            *can_write = attach_info.can_write;
-            update_attach_viewport(client, *attached_id).await?;
+            view_state.attached_id = attach_info.session_id;
+            view_state.can_write = attach_info.can_write;
+            update_attach_viewport(client, view_state.attached_id).await?;
+            hydrate_attach_state_from_snapshot(client, view_state).await?;
             println!(
                 "created and switched to session: {}",
                 attach_info.session_id
             );
-            if !*can_write {
+            if !view_state.can_write {
                 println!("read-only attach: input disabled");
             }
         }
@@ -1186,36 +1190,52 @@ async fn handle_attach_runtime_action(
 async fn handle_attach_ui_action(
     client: &mut BmuxClient,
     action: RuntimeAction,
-    attached_id: &mut Uuid,
-    can_write: &mut bool,
-    ui_mode: &mut AttachUiMode,
+    view_state: &mut AttachViewState,
 ) -> std::result::Result<(), ClientError> {
     match action {
         RuntimeAction::EnterWindowMode => {
-            *ui_mode = AttachUiMode::Window;
+            view_state.ui_mode = AttachUiMode::Window;
         }
         RuntimeAction::ExitMode => {
-            *ui_mode = AttachUiMode::Normal;
+            view_state.ui_mode = AttachUiMode::Normal;
         }
         RuntimeAction::WindowPrev => {
-            switch_attach_window_relative(client, *attached_id, -1).await?;
+            switch_attach_window_relative(client, view_state.attached_id, -1).await?;
         }
         RuntimeAction::WindowNext => {
-            switch_attach_window_relative(client, *attached_id, 1).await?;
+            switch_attach_window_relative(client, view_state.attached_id, 1).await?;
         }
-        RuntimeAction::WindowGoto1 => switch_attach_window_index(client, *attached_id, 0).await?,
-        RuntimeAction::WindowGoto2 => switch_attach_window_index(client, *attached_id, 1).await?,
-        RuntimeAction::WindowGoto3 => switch_attach_window_index(client, *attached_id, 2).await?,
-        RuntimeAction::WindowGoto4 => switch_attach_window_index(client, *attached_id, 3).await?,
-        RuntimeAction::WindowGoto5 => switch_attach_window_index(client, *attached_id, 4).await?,
-        RuntimeAction::WindowGoto6 => switch_attach_window_index(client, *attached_id, 5).await?,
-        RuntimeAction::WindowGoto7 => switch_attach_window_index(client, *attached_id, 6).await?,
-        RuntimeAction::WindowGoto8 => switch_attach_window_index(client, *attached_id, 7).await?,
-        RuntimeAction::WindowGoto9 => switch_attach_window_index(client, *attached_id, 8).await?,
+        RuntimeAction::WindowGoto1 => {
+            switch_attach_window_index(client, view_state.attached_id, 0).await?
+        }
+        RuntimeAction::WindowGoto2 => {
+            switch_attach_window_index(client, view_state.attached_id, 1).await?
+        }
+        RuntimeAction::WindowGoto3 => {
+            switch_attach_window_index(client, view_state.attached_id, 2).await?
+        }
+        RuntimeAction::WindowGoto4 => {
+            switch_attach_window_index(client, view_state.attached_id, 3).await?
+        }
+        RuntimeAction::WindowGoto5 => {
+            switch_attach_window_index(client, view_state.attached_id, 4).await?
+        }
+        RuntimeAction::WindowGoto6 => {
+            switch_attach_window_index(client, view_state.attached_id, 5).await?
+        }
+        RuntimeAction::WindowGoto7 => {
+            switch_attach_window_index(client, view_state.attached_id, 6).await?
+        }
+        RuntimeAction::WindowGoto8 => {
+            switch_attach_window_index(client, view_state.attached_id, 7).await?
+        }
+        RuntimeAction::WindowGoto9 => {
+            switch_attach_window_index(client, view_state.attached_id, 8).await?
+        }
         RuntimeAction::WindowClose => {
             let _ = client
                 .kill_window(
-                    Some(SessionSelector::ById(*attached_id)),
+                    Some(SessionSelector::ById(view_state.attached_id)),
                     WindowSelector::Active,
                 )
                 .await?;
@@ -1223,7 +1243,7 @@ async fn handle_attach_ui_action(
         RuntimeAction::SplitFocusedVertical => {
             let _ = client
                 .split_pane(
-                    Some(SessionSelector::ById(*attached_id)),
+                    Some(SessionSelector::ById(view_state.attached_id)),
                     PaneSplitDirection::Vertical,
                 )
                 .await?;
@@ -1231,7 +1251,7 @@ async fn handle_attach_ui_action(
         RuntimeAction::SplitFocusedHorizontal => {
             let _ = client
                 .split_pane(
-                    Some(SessionSelector::ById(*attached_id)),
+                    Some(SessionSelector::ById(view_state.attached_id)),
                     PaneSplitDirection::Horizontal,
                 )
                 .await?;
@@ -1247,7 +1267,7 @@ async fn handle_attach_ui_action(
                 PaneFocusDirection::Next
             };
             let _ = client
-                .focus_pane(Some(SessionSelector::ById(*attached_id)), direction)
+                .focus_pane(Some(SessionSelector::ById(view_state.attached_id)), direction)
                 .await?;
         }
         RuntimeAction::IncreaseSplit
@@ -1267,16 +1287,16 @@ async fn handle_attach_ui_action(
                 -1
             };
             client
-                .resize_pane(Some(SessionSelector::ById(*attached_id)), delta)
+                .resize_pane(Some(SessionSelector::ById(view_state.attached_id)), delta)
                 .await?;
         }
         RuntimeAction::CloseFocusedPane => {
             client
-                .close_pane(Some(SessionSelector::ById(*attached_id)))
+                .close_pane(Some(SessionSelector::ById(view_state.attached_id)))
                 .await?;
         }
         RuntimeAction::NewWindow | RuntimeAction::NewSession => {
-            handle_attach_runtime_action(client, action, attached_id, can_write).await?;
+            handle_attach_runtime_action(client, action, view_state).await?;
         }
         _ => {}
     }
@@ -2034,6 +2054,75 @@ async fn update_attach_viewport(
     Ok(())
 }
 
+async fn hydrate_attach_state_from_snapshot(
+    client: &mut BmuxClient,
+    view_state: &mut AttachViewState,
+) -> std::result::Result<(), ClientError> {
+    let AttachSnapshotState {
+        session_id,
+        window_id,
+        focused_pane_id,
+        panes,
+        layout_root,
+        chunks,
+    } = client
+        .attach_snapshot(view_state.attached_id, ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE)
+        .await?;
+
+    view_state.cached_layout_state = Some(AttachLayoutState {
+        session_id,
+        window_id,
+        focused_pane_id,
+        panes,
+        layout_root,
+    });
+    view_state.pane_buffers.clear();
+    if let Some(layout_state) = view_state.cached_layout_state.as_ref() {
+        resize_attach_parsers_for_layout(&mut view_state.pane_buffers, &layout_state.layout_root);
+    }
+    for chunk in chunks {
+        if chunk.data.is_empty() {
+            continue;
+        }
+        let buffer = view_state.pane_buffers.entry(chunk.pane_id).or_default();
+        append_pane_output(buffer, &chunk.data);
+        view_state.dirty.pane_dirty_ids.insert(chunk.pane_id);
+    }
+    view_state.dirty.layout_needs_refresh = false;
+    view_state.dirty.full_pane_redraw = true;
+    view_state.dirty.status_needs_redraw = true;
+    Ok(())
+}
+
+fn resize_attach_parsers_for_layout(
+    pane_buffers: &mut std::collections::BTreeMap<Uuid, attach::state::PaneRenderBuffer>,
+    layout: &bmux_ipc::PaneLayoutNode,
+) {
+    let (cols, rows) = terminal::size().unwrap_or((0, 0));
+    if cols == 0 || rows <= 1 {
+        return;
+    }
+
+    let root = PaneRect {
+        x: 0,
+        y: 1,
+        w: cols,
+        h: rows.saturating_sub(1),
+    };
+
+    let mut rects = std::collections::BTreeMap::new();
+    collect_layout_rects(layout, root, &mut rects);
+    for (pane_id, rect) in rects {
+        if rect.w < 2 || rect.h < 2 {
+            continue;
+        }
+        let inner_w = rect.w.saturating_sub(2).max(1);
+        let inner_h = rect.h.saturating_sub(2).max(1);
+        let buffer = pane_buffers.entry(pane_id).or_default();
+        buffer.parser.screen_mut().set_size(inner_h, inner_w);
+    }
+}
+
 async fn handle_attach_loop_event(
     event: AttachLoopEvent,
     client: &mut BmuxClient,
@@ -2098,10 +2187,10 @@ async fn handle_attach_server_event(
             view_state.attached_id = attach_info.session_id;
             view_state.can_write = attach_info.can_write;
             update_attach_viewport(client, view_state.attached_id).await?;
+            hydrate_attach_state_from_snapshot(client, view_state)
+                .await
+                .map_err(map_attach_client_error)?;
             view_state.ui_mode = AttachUiMode::Normal;
-            view_state.dirty.status_needs_redraw = true;
-            view_state.dirty.layout_needs_refresh = true;
-            view_state.dirty.full_pane_redraw = true;
             println!("follow handoff -> session {}", view_state.attached_id);
             if !view_state.can_write {
                 println!("read-only attach: input disabled");
@@ -2267,8 +2356,7 @@ async fn handle_attach_terminal_event(
                 if let Err(error) = handle_attach_runtime_action(
                     client,
                     action,
-                    &mut view_state.attached_id,
-                    &mut view_state.can_write,
+                    view_state,
                 )
                 .await
                 {
@@ -2308,9 +2396,7 @@ async fn handle_attach_terminal_event(
                 if let Err(error) = handle_attach_ui_action(
                     client,
                     action,
-                    &mut view_state.attached_id,
-                    &mut view_state.can_write,
-                    &mut view_state.ui_mode,
+                    view_state,
                 )
                 .await
                 {

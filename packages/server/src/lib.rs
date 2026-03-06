@@ -678,10 +678,6 @@ impl OutputFanoutBuffer {
         self.cursors.insert(client_id, self.end_offset());
     }
 
-    fn register_client_at_start(&mut self, client_id: ClientId) {
-        self.cursors.insert(client_id, self.start_offset);
-    }
-
     fn unregister_client(&mut self, client_id: ClientId) {
         self.cursors.remove(&client_id);
     }
@@ -725,6 +721,20 @@ impl OutputFanoutBuffer {
         *cursor = cursor.saturating_add(output.len() as u64);
         output
     }
+
+    fn read_recent(&self, max_bytes: usize) -> Vec<u8> {
+        if self.data.is_empty() {
+            return Vec::new();
+        }
+        let to_read = self.data.len().min(max_bytes.max(1));
+        let start_index = self.data.len().saturating_sub(to_read);
+        self.data
+            .iter()
+            .skip(start_index)
+            .take(to_read)
+            .copied()
+            .collect()
+    }
 }
 
 struct RemovedRuntime {
@@ -751,6 +761,15 @@ struct AttachLayoutState {
     focused_pane_id: Uuid,
     panes: Vec<PaneSummary>,
     layout_root: IpcPaneLayoutNode,
+}
+
+struct AttachSnapshotState {
+    session_id: SessionId,
+    window_id: bmux_session::WindowId,
+    focused_pane_id: Uuid,
+    panes: Vec<PaneSummary>,
+    layout_root: IpcPaneLayoutNode,
+    chunks: Vec<AttachPaneChunk>,
 }
 
 #[derive(Debug, Clone)]
@@ -1729,6 +1748,61 @@ impl SessionRuntimeManager {
         })
     }
 
+    fn attach_snapshot_state(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+        max_bytes_per_pane: usize,
+    ) -> Result<AttachSnapshotState, SessionRuntimeError> {
+        let session = self
+            .runtimes
+            .get(&session_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        if !session.attached_clients.contains(&client_id) {
+            return Err(SessionRuntimeError::NotAttached);
+        }
+        let window = session
+            .windows
+            .get(&session.active_window)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        let mut pane_ids = Vec::new();
+        window.layout_root.pane_order(&mut pane_ids);
+        let panes = pane_ids
+            .iter()
+            .enumerate()
+            .filter_map(|(index, pane_id)| {
+                window.panes.get(pane_id).map(|pane| PaneSummary {
+                    id: *pane_id,
+                    index: (index + 1) as u32,
+                    name: pane.meta.name.clone(),
+                    focused: *pane_id == window.focused_pane_id,
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let mut chunks = Vec::new();
+        for pane_id in pane_ids {
+            let Some(pane) = window.panes.get(&pane_id) else {
+                continue;
+            };
+            let data = pane
+                .output_buffer
+                .lock()
+                .map_err(|_| SessionRuntimeError::Closed)?
+                .read_recent(max_bytes_per_pane);
+            chunks.push(AttachPaneChunk { pane_id, data });
+        }
+
+        Ok(AttachSnapshotState {
+            session_id,
+            window_id: window.id,
+            focused_pane_id: window.focused_pane_id,
+            panes,
+            layout_root: ipc_layout_from_runtime(&window.layout_root),
+            chunks,
+        })
+    }
+
     fn read_pane_output_batch(
         &mut self,
         session_id: SessionId,
@@ -1923,7 +1997,7 @@ impl SessionRuntimeManager {
                     .output_buffer
                     .lock()
                     .map_err(|_| SessionRuntimeError::Closed)?;
-                output.register_client_at_start(client_id);
+                output.register_client_at_tail(client_id);
             }
         }
         if let Some(viewport) = runtime.attach_viewport {
@@ -4865,6 +4939,59 @@ async fn handle_request(
                 }
             }
         }
+        Request::AttachSnapshot {
+            session_id,
+            max_bytes_per_pane,
+        } => {
+            let session_id = SessionId(session_id);
+            if !ensure_attach_session_exists(state, session_id).await? {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!("session runtime not found: {}", session_id.0),
+                }));
+            }
+
+            let snapshot = {
+                let runtime_manager = state
+                    .session_runtimes
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+                runtime_manager.attach_snapshot_state(session_id, client_id, max_bytes_per_pane)
+            };
+
+            match snapshot {
+                Ok(snapshot) => Response::Ok(ResponsePayload::AttachSnapshot {
+                    session_id: snapshot.session_id.0,
+                    window_id: snapshot.window_id.0,
+                    focused_pane_id: snapshot.focused_pane_id,
+                    panes: snapshot.panes,
+                    layout_root: snapshot.layout_root,
+                    chunks: snapshot.chunks,
+                }),
+                Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!("session runtime not found: {}", session_id.0),
+                }),
+                Err(SessionRuntimeError::NotAttached) => Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "client is not attached to session runtime".to_string(),
+                }),
+                Err(SessionRuntimeError::Closed) => {
+                    let _ = reap_closed_active_pane(
+                        state,
+                        session_id,
+                        client_id,
+                        selected_session,
+                        attached_stream_session,
+                    )
+                    .await;
+                    Response::Err(ErrorResponse {
+                        code: ErrorCode::NotFound,
+                        message: "active pane is closed".to_string(),
+                    })
+                }
+            }
+        }
         Request::AttachPaneOutputBatch {
             session_id,
             pane_ids,
@@ -7177,11 +7304,29 @@ mod tests {
             })
         );
 
-        let output_after_reattach = collect_attach_output_until(&mut client, session_id, marker, 10).await;
-        assert!(
-            output_after_reattach.contains(marker),
-            "expected marker to replay after reattach, got: {output_after_reattach:?}"
-        );
+        let snapshot_after_reattach = send_request(
+            &mut client,
+            76,
+            Request::AttachSnapshot {
+                session_id,
+                max_bytes_per_pane: 1024 * 1024,
+            },
+        )
+        .await;
+        match snapshot_after_reattach {
+            Response::Ok(ResponsePayload::AttachSnapshot { chunks, .. }) => {
+                let combined = chunks
+                    .into_iter()
+                    .flat_map(|chunk| chunk.data)
+                    .collect::<Vec<_>>();
+                let text = String::from_utf8_lossy(&combined);
+                assert!(
+                    text.contains(marker),
+                    "expected marker in attach snapshot after reattach, got: {text:?}"
+                );
+            }
+            other => panic!("unexpected attach snapshot response: {other:?}"),
+        }
 
         stop_server(server, server_task, &socket_path).await;
     }
