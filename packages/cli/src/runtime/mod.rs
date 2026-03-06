@@ -8,27 +8,33 @@ use anyhow::{Context, Result};
 use bmux_client::{AttachLayoutState, BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, TerminfoAutoInstall};
 use bmux_ipc::{
-    PaneFocusDirection, PaneLayoutNode, PaneSplitDirection, SessionRole, SessionSelector,
-    SessionSummary, WindowSelector, transport::IpcTransportError,
+    PaneFocusDirection, PaneSplitDirection, SessionRole, SessionSelector, SessionSummary,
+    WindowSelector, transport::IpcTransportError,
 };
 use bmux_server::BmuxServer;
 use clap::Parser;
-use crossterm::cursor::{Hide, MoveTo, RestorePosition, SavePosition, Show};
+use crossterm::cursor::{MoveTo, SavePosition, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::queue;
 use crossterm::style::Print;
 use crossterm::terminal;
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
-use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
 mod terminal_protocol;
+mod attach;
+use attach::cursor::apply_attach_cursor_state;
+use attach::events::{AttachLoopControl, AttachLoopEvent, collect_attach_loop_events};
+use attach::layout::collect_pane_ids;
+use attach::render::{append_pane_output, render_attach_panes};
+use attach::state::{
+    AttachEventAction, AttachExitReason, AttachUiMode, AttachViewState,
+};
 use terminal_protocol::{
     ProtocolDirection, ProtocolProfile, ProtocolTraceEvent, primary_da_for_profile,
     protocol_profile_name, secondary_da_for_profile, supported_query_names,
@@ -1685,112 +1691,6 @@ fn default_attach_keymap() -> crate::input::Keymap {
     .expect("default attach keymap must be valid")
 }
 
-enum AttachEventAction {
-    Send(Vec<u8>),
-    Runtime(RuntimeAction),
-    Ui(RuntimeAction),
-    Redraw,
-    Detach,
-    Ignore,
-}
-
-enum AttachLoopEvent {
-    Server(bmux_client::ServerEvent),
-    Terminal(Event),
-}
-
-enum AttachLoopControl {
-    Continue,
-    Break(AttachExitReason),
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AttachUiMode {
-    Normal,
-    Window,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AttachExitReason {
-    Detached,
-    StreamClosed,
-    Quit,
-}
-
-#[derive(Debug, Clone)]
-struct AttachDirtyFlags {
-    status_needs_redraw: bool,
-    layout_needs_refresh: bool,
-    pane_dirty_ids: BTreeSet<Uuid>,
-    full_pane_redraw: bool,
-}
-
-impl Default for AttachDirtyFlags {
-    fn default() -> Self {
-        Self {
-            status_needs_redraw: true,
-            layout_needs_refresh: true,
-            pane_dirty_ids: BTreeSet::new(),
-            full_pane_redraw: true,
-        }
-    }
-}
-
-struct AttachViewState {
-    attached_id: Uuid,
-    can_write: bool,
-    ui_mode: AttachUiMode,
-    quit_confirmation_pending: bool,
-    pane_buffers: BTreeMap<Uuid, PaneRenderBuffer>,
-    cached_status_line: Option<String>,
-    cached_layout_state: Option<AttachLayoutState>,
-    last_cursor_state: Option<AttachCursorState>,
-    dirty: AttachDirtyFlags,
-}
-
-impl AttachViewState {
-    fn new(attach_info: bmux_client::AttachOpenInfo) -> Self {
-        Self {
-            attached_id: attach_info.session_id,
-            can_write: attach_info.can_write,
-            ui_mode: AttachUiMode::Normal,
-            quit_confirmation_pending: false,
-            pane_buffers: BTreeMap::new(),
-            cached_status_line: None,
-            cached_layout_state: None,
-            last_cursor_state: None,
-            dirty: AttachDirtyFlags::default(),
-        }
-    }
-}
-
-#[derive(Clone, Copy)]
-struct PaneRect {
-    x: u16,
-    y: u16,
-    w: u16,
-    h: u16,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct AttachCursorState {
-    x: u16,
-    y: u16,
-    visible: bool,
-}
-
-struct PaneRenderBuffer {
-    parser: vt100::Parser,
-}
-
-impl Default for PaneRenderBuffer {
-    fn default() -> Self {
-        Self {
-            parser: vt100::Parser::new(24, 80, 4_096),
-        }
-    }
-}
-
 struct RawModeGuard;
 
 impl RawModeGuard {
@@ -1817,20 +1717,6 @@ async fn poll_attach_terminal_event(timeout: Duration) -> Result<Option<Event>> 
     })
     .await
     .context("failed to join terminal event task")?
-}
-
-fn collect_attach_loop_events(
-    server_events: Vec<bmux_client::ServerEvent>,
-    terminal_event: Option<Event>,
-) -> Vec<AttachLoopEvent> {
-    let mut events = server_events
-        .into_iter()
-        .map(AttachLoopEvent::Server)
-        .collect::<Vec<_>>();
-    if let Some(event) = terminal_event {
-        events.push(AttachLoopEvent::Terminal(event));
-    }
-    events
 }
 
 async fn handle_attach_loop_event(
@@ -2018,368 +1904,6 @@ async fn handle_attach_terminal_event(
     }
 
     Ok(AttachLoopControl::Continue)
-}
-
-fn collect_pane_ids(layout: &PaneLayoutNode, out: &mut Vec<Uuid>) {
-    match layout {
-        PaneLayoutNode::Leaf { pane_id } => out.push(*pane_id),
-        PaneLayoutNode::Split { first, second, .. } => {
-            collect_pane_ids(first, out);
-            collect_pane_ids(second, out);
-        }
-    }
-}
-
-fn split_rect(rect: PaneRect, ratio_percent: u8, vertical: bool) -> (PaneRect, PaneRect) {
-    if vertical {
-        let split = ((u32::from(rect.w) * u32::from(ratio_percent)) / 100) as u16;
-        let left_w = split.max(1).min(rect.w.saturating_sub(1));
-        let right_w = rect.w.saturating_sub(left_w);
-        (
-            PaneRect {
-                x: rect.x,
-                y: rect.y,
-                w: left_w,
-                h: rect.h,
-            },
-            PaneRect {
-                x: rect.x.saturating_add(left_w),
-                y: rect.y,
-                w: right_w,
-                h: rect.h,
-            },
-        )
-    } else {
-        let split = ((u32::from(rect.h) * u32::from(ratio_percent)) / 100) as u16;
-        let top_h = split.max(1).min(rect.h.saturating_sub(1));
-        let bottom_h = rect.h.saturating_sub(top_h);
-        (
-            PaneRect {
-                x: rect.x,
-                y: rect.y,
-                w: rect.w,
-                h: top_h,
-            },
-            PaneRect {
-                x: rect.x,
-                y: rect.y.saturating_add(top_h),
-                w: rect.w,
-                h: bottom_h,
-            },
-        )
-    }
-}
-
-fn collect_layout_rects(
-    layout: &PaneLayoutNode,
-    rect: PaneRect,
-    out: &mut BTreeMap<Uuid, PaneRect>,
-) {
-    match layout {
-        PaneLayoutNode::Leaf { pane_id } => {
-            out.insert(*pane_id, rect);
-        }
-        PaneLayoutNode::Split {
-            direction,
-            ratio_percent,
-            first,
-            second,
-        } => {
-            let vertical = matches!(direction, PaneSplitDirection::Vertical);
-            let (first_rect, second_rect) = split_rect(rect, *ratio_percent, vertical);
-            collect_layout_rects(first, first_rect, out);
-            collect_layout_rects(second, second_rect, out);
-        }
-    }
-}
-
-fn append_pane_output(buffer: &mut PaneRenderBuffer, bytes: &[u8]) {
-    if bytes.is_empty() {
-        return;
-    }
-    buffer.parser.process(bytes);
-}
-
-fn draw_box_line(width: usize, left: char, mid: char, right: char) -> String {
-    if width <= 1 {
-        return left.to_string();
-    }
-    let mut line = String::new();
-    line.push(left);
-    if width > 2 {
-        line.extend(std::iter::repeat_n(mid, width - 2));
-    }
-    line.push(right);
-    line
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Default)]
-struct CellStyle {
-    fg: vt100::Color,
-    bg: vt100::Color,
-    bold: bool,
-    dim: bool,
-    italic: bool,
-    underline: bool,
-    inverse: bool,
-}
-
-fn cell_style(cell: &vt100::Cell) -> CellStyle {
-    CellStyle {
-        fg: cell.fgcolor(),
-        bg: cell.bgcolor(),
-        bold: cell.bold(),
-        dim: cell.dim(),
-        italic: cell.italic(),
-        underline: cell.underline(),
-        inverse: cell.inverse(),
-    }
-}
-
-fn color_sgr(color: vt100::Color, foreground: bool) -> String {
-    match color {
-        vt100::Color::Default => {
-            if foreground {
-                "39".to_string()
-            } else {
-                "49".to_string()
-            }
-        }
-        vt100::Color::Idx(idx) => {
-            if foreground {
-                format!("38;5;{idx}")
-            } else {
-                format!("48;5;{idx}")
-            }
-        }
-        vt100::Color::Rgb(r, g, b) => {
-            if foreground {
-                format!("38;2;{r};{g};{b}")
-            } else {
-                format!("48;2;{r};{g};{b}")
-            }
-        }
-    }
-}
-
-fn style_sgr(style: CellStyle) -> String {
-    let mut parts = vec!["0".to_string()];
-    if style.bold {
-        parts.push("1".to_string());
-    }
-    if style.dim {
-        parts.push("2".to_string());
-    }
-    if style.italic {
-        parts.push("3".to_string());
-    }
-    if style.underline {
-        parts.push("4".to_string());
-    }
-    if style.inverse {
-        parts.push("7".to_string());
-    }
-    parts.push(color_sgr(style.fg, true));
-    parts.push(color_sgr(style.bg, false));
-    format!("\x1b[{}m", parts.join(";"))
-}
-
-fn render_attach_panes(
-    stdout: &mut io::Stdout,
-    layout: &PaneLayoutNode,
-    focused_pane_id: Uuid,
-    pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
-    dirty_pane_ids: &BTreeSet<Uuid>,
-    full_pane_redraw: bool,
-) -> Result<Option<AttachCursorState>> {
-    let (cols, rows) = terminal::size().unwrap_or((0, 0));
-    if cols == 0 || rows <= 1 {
-        return Ok(None);
-    }
-
-    let draw_rows = rows.saturating_sub(1);
-    let root = PaneRect {
-        x: 0,
-        y: 1,
-        w: cols,
-        h: draw_rows,
-    };
-
-    let mut rects = BTreeMap::new();
-    collect_layout_rects(layout, root, &mut rects);
-
-    let mut cursor_state = None;
-    if full_pane_redraw {
-        for y in 1..rows {
-            queue!(stdout, MoveTo(0, y), Print(" ".repeat(usize::from(cols))))
-                .context("failed clearing attach pane row")?;
-        }
-    }
-
-    for (pane_id, rect) in rects {
-        if rect.w < 2 || rect.h < 2 {
-            continue;
-        }
-        let should_draw = full_pane_redraw || dirty_pane_ids.contains(&pane_id);
-        let focus = pane_id == focused_pane_id;
-        if should_draw {
-            let hch = if focus { '=' } else { '-' };
-            let top = draw_box_line(usize::from(rect.w), '+', hch, '+');
-            let bottom = draw_box_line(usize::from(rect.w), '+', hch, '+');
-            queue!(stdout, MoveTo(rect.x, rect.y), Print(top))
-                .context("failed drawing pane top")?;
-            queue!(
-                stdout,
-                MoveTo(rect.x, rect.y.saturating_add(rect.h.saturating_sub(1))),
-                Print(bottom)
-            )
-            .context("failed drawing pane bottom")?;
-
-            for y in rect.y.saturating_add(1)..rect.y.saturating_add(rect.h.saturating_sub(1)) {
-                queue!(stdout, MoveTo(rect.x, y), Print("|"))
-                    .context("failed drawing pane left border")?;
-                queue!(
-                    stdout,
-                    MoveTo(rect.x.saturating_add(rect.w.saturating_sub(1)), y),
-                    Print("|")
-                )
-                .context("failed drawing pane right border")?;
-            }
-        }
-
-        let inner_w_u16 = rect.w.saturating_sub(2);
-        let inner_h_u16 = rect.h.saturating_sub(2);
-        let inner_w = usize::from(inner_w_u16);
-        let inner_h = usize::from(inner_h_u16);
-        if let Some(entry) = pane_buffers.get_mut(&pane_id) {
-            entry
-                .parser
-                .screen_mut()
-                .set_size(inner_h_u16.max(1), inner_w_u16.max(1));
-            let screen = entry.parser.screen();
-            if pane_id == focused_pane_id {
-                let (cursor_row, cursor_col) = screen.cursor_position();
-                let cursor_row = cursor_row.min(inner_h_u16.saturating_sub(1));
-                let cursor_col = cursor_col.min(inner_w_u16.saturating_sub(1));
-                cursor_state = Some(AttachCursorState {
-                    x: rect.x.saturating_add(1).saturating_add(cursor_col),
-                    y: rect.y.saturating_add(1).saturating_add(cursor_row),
-                    visible: !screen.hide_cursor(),
-                });
-            }
-            if !should_draw {
-                continue;
-            }
-            for row in 0..inner_h {
-                let y = rect.y.saturating_add(1 + row as u16);
-                let mut line = String::new();
-                let mut current = CellStyle::default();
-                let mut used_cols = 0usize;
-                let mut col = 0u16;
-                while col < inner_w_u16 {
-                    if let Some(cell) = screen.cell(row as u16, col) {
-                        let style = cell_style(cell);
-                        if style != current {
-                            line.push_str(&style_sgr(style));
-                            current = style;
-                        }
-                        if cell.is_wide_continuation() {
-                            line.push(' ');
-                            used_cols = used_cols.saturating_add(1);
-                            col = col.saturating_add(1);
-                            continue;
-                        }
-                        let text = if cell.has_contents() {
-                            cell.contents()
-                        } else {
-                            " "
-                        };
-                        line.push_str(text);
-                        let width = UnicodeWidthStr::width(text).max(1);
-                        used_cols = used_cols.saturating_add(width);
-                        if cell.is_wide() {
-                            col = col.saturating_add(2);
-                        } else {
-                            col = col.saturating_add(1);
-                        }
-                    } else {
-                        if current != CellStyle::default() {
-                            line.push_str("\x1b[0m");
-                            current = CellStyle::default();
-                        }
-                        line.push(' ');
-                        used_cols = used_cols.saturating_add(1);
-                        col = col.saturating_add(1);
-                    }
-                }
-
-                if used_cols < inner_w {
-                    if current != CellStyle::default() {
-                        line.push_str("\x1b[0m");
-                    }
-                    line.push_str(&" ".repeat(inner_w - used_cols));
-                } else if current != CellStyle::default() {
-                    line.push_str("\x1b[0m");
-                }
-
-                queue!(stdout, MoveTo(rect.x.saturating_add(1), y), Print(line))
-                    .context("failed drawing pane content")?;
-            }
-        } else if should_draw {
-            for row in 0..inner_h {
-                let y = rect.y.saturating_add(1 + row as u16);
-                queue!(
-                    stdout,
-                    MoveTo(rect.x.saturating_add(1), y),
-                    Print(" ".repeat(inner_w))
-                )
-                .context("failed clearing pane content")?;
-            }
-        }
-    }
-
-    Ok(cursor_state)
-}
-
-fn apply_attach_cursor_state(
-    stdout: &mut io::Stdout,
-    cursor_state: Option<AttachCursorState>,
-    last_cursor_state: &mut Option<AttachCursorState>,
-) -> Result<()> {
-    match (cursor_state, *last_cursor_state) {
-        (Some(current), Some(previous)) if current == previous => {
-            queue!(stdout, RestorePosition).context("failed restoring cursor position")?;
-        }
-        (Some(current), Some(previous)) => {
-            if current.visible != previous.visible {
-                if current.visible {
-                    queue!(stdout, Show).context("failed showing attach cursor")?;
-                } else {
-                    queue!(stdout, Hide).context("failed hiding attach cursor")?;
-                }
-            }
-            queue!(stdout, MoveTo(current.x, current.y))
-                .context("failed moving attach cursor")?;
-        }
-        (Some(current), None) => {
-            if current.visible {
-                queue!(stdout, Show).context("failed showing attach cursor")?;
-            } else {
-                queue!(stdout, Hide).context("failed hiding attach cursor")?;
-            }
-            queue!(stdout, MoveTo(current.x, current.y))
-                .context("failed moving attach cursor")?;
-        }
-        (None, Some(previous)) => {
-            if previous.visible {
-                queue!(stdout, Hide).context("failed hiding attach cursor")?;
-            }
-        }
-        (None, None) => {}
-    }
-
-    *last_cursor_state = cursor_state;
-    Ok(())
 }
 
 fn restore_terminal_after_attach_ui() -> Result<()> {
