@@ -123,6 +123,34 @@ timeout_profile = "traditional"
 traditional = 450
 ```
 
+Sample timeout sections:
+
+```toml
+# Default modal-style prefix: stays active until the next key
+[keybindings]
+prefix = "ctrl+a"
+```
+
+```toml
+# Named timed behavior with user-overridden built-in profile values
+[keybindings]
+prefix = "ctrl+a"
+timeout_profile = "traditional"
+
+[keybindings.timeout_profiles]
+fast = 180
+traditional = 450
+slow = 900
+```
+
+```toml
+# Exact millisecond override wins over timeout_profile
+[keybindings]
+prefix = "ctrl+a"
+timeout_profile = "traditional"
+timeout_ms = 275
+```
+
 ## Window Commands
 
 Top-level and grouped forms are exact aliases.
