@@ -821,6 +821,32 @@ impl BmuxClient {
         }
     }
 
+    /// Update attached viewport dimensions for pane PTY sizing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn attach_set_viewport(
+        &mut self,
+        session_id: Uuid,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(u16, u16)> {
+        match self
+            .request(Request::AttachSetViewport {
+                session_id,
+                cols,
+                rows,
+            })
+            .await?
+        {
+            ResponsePayload::AttachViewportSet { cols, rows, .. } => Ok((cols, rows)),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attach viewport set response",
+            )),
+        }
+    }
+
     /// Read bytes from an attached session runtime.
     ///
     /// # Errors

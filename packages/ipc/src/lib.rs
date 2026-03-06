@@ -255,6 +255,11 @@ pub enum Request {
         session_id: Uuid,
         data: Vec<u8>,
     },
+    AttachSetViewport {
+        session_id: Uuid,
+        cols: u16,
+        rows: u16,
+    },
     AttachOutput {
         session_id: Uuid,
         max_bytes: usize,
@@ -460,6 +465,11 @@ pub enum ResponsePayload {
     },
     AttachInputAccepted {
         bytes: usize,
+    },
+    AttachViewportSet {
+        session_id: Uuid,
+        cols: u16,
+        rows: u16,
     },
     AttachOutput {
         data: Vec<u8>,

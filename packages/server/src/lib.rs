@@ -586,6 +586,13 @@ struct SessionRuntimeHandle {
     active_window: bmux_session::WindowId,
     next_auto_window_number: u32,
     attached_clients: BTreeSet<ClientId>,
+    attach_viewport: Option<AttachViewport>,
+}
+
+#[derive(Clone, Copy)]
+struct AttachViewport {
+    cols: u16,
+    rows: u16,
 }
 
 struct WindowRuntimeHandle {
@@ -607,9 +614,34 @@ struct PaneRuntimeHandle {
     meta: PaneRuntimeMeta,
     stop_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
-    input_tx: mpsc::UnboundedSender<Vec<u8>>,
+    input_tx: mpsc::UnboundedSender<PaneRuntimeCommand>,
     output_buffer: Arc<std::sync::Mutex<OutputFanoutBuffer>>,
     exited: Arc<AtomicBool>,
+}
+
+enum PaneRuntimeCommand {
+    Input(Vec<u8>),
+    Resize { rows: u16, cols: u16 },
+}
+
+#[derive(Clone, Copy)]
+struct LayoutRect {
+    w: u16,
+    h: u16,
+}
+
+impl PaneRuntimeHandle {
+    fn send_input(&self, data: Vec<u8>) -> std::result::Result<(), SessionRuntimeError> {
+        self.input_tx
+            .send(PaneRuntimeCommand::Input(data))
+            .map_err(|_| SessionRuntimeError::Closed)
+    }
+
+    fn resize_pty(&self, rows: u16, cols: u16) {
+        let _ = self
+            .input_tx
+            .send(PaneRuntimeCommand::Resize { rows, cols });
+    }
 }
 
 struct OutputFanoutBuffer {
@@ -919,6 +951,86 @@ fn validate_runtime_layout_matches_panes(
     Ok(())
 }
 
+fn split_layout_rect(rect: LayoutRect, ratio: f32, vertical: bool) -> (LayoutRect, LayoutRect) {
+    let ratio = ratio.clamp(0.1, 0.9);
+    if vertical {
+        let split = ((f32::from(rect.w) * ratio).round()) as u16;
+        let first_w = split.max(1).min(rect.w.saturating_sub(1).max(1));
+        let second_w = rect.w.saturating_sub(first_w).max(1);
+        (
+            LayoutRect {
+                w: first_w,
+                h: rect.h,
+            },
+            LayoutRect {
+                w: second_w,
+                h: rect.h,
+            },
+        )
+    } else {
+        let split = ((f32::from(rect.h) * ratio).round()) as u16;
+        let first_h = split.max(1).min(rect.h.saturating_sub(1).max(1));
+        let second_h = rect.h.saturating_sub(first_h).max(1);
+        (
+            LayoutRect {
+                w: rect.w,
+                h: first_h,
+            },
+            LayoutRect {
+                w: rect.w,
+                h: second_h,
+            },
+        )
+    }
+}
+
+fn collect_layout_rects(node: &PaneLayoutNode, rect: LayoutRect, out: &mut BTreeMap<Uuid, LayoutRect>) {
+    match node {
+        PaneLayoutNode::Leaf { pane_id } => {
+            out.insert(*pane_id, rect);
+        }
+        PaneLayoutNode::Split {
+            direction,
+            ratio,
+            first,
+            second,
+        } => {
+            let vertical = matches!(direction, PaneSplitDirection::Vertical);
+            let (first_rect, second_rect) = split_layout_rect(rect, *ratio, vertical);
+            collect_layout_rects(first, first_rect, out);
+            collect_layout_rects(second, second_rect, out);
+        }
+    }
+}
+
+fn pane_pty_size(layout_rect: LayoutRect) -> (u16, u16) {
+    let cols = layout_rect.w.saturating_sub(2).max(1);
+    let rows = layout_rect.h.saturating_sub(2).max(1);
+    (rows, cols)
+}
+
+fn resize_active_window_ptys(runtime: &mut SessionRuntimeHandle, cols: u16, rows: u16) {
+    let root = LayoutRect {
+        w: cols.max(1),
+        h: rows.saturating_sub(1).max(1),
+    };
+    let Some(window) = runtime.windows.get_mut(&runtime.active_window) else {
+        return;
+    };
+
+    let mut rects = BTreeMap::new();
+    collect_layout_rects(&window.layout_root, root, &mut rects);
+    for (pane_id, pane) in &window.panes {
+        if pane.exited.load(Ordering::SeqCst) {
+            continue;
+        }
+        if let Some(rect) = rects.get(pane_id).copied() {
+            let (rows, cols) = pane_pty_size(rect);
+            pane.resize_pty(rows, cols);
+        }
+    }
+}
+
 fn layout_from_panes(panes: &[PaneRuntimeMeta]) -> Option<PaneLayoutNode> {
     let mut iter = panes.iter();
     let first = iter.next()?;
@@ -1014,6 +1126,7 @@ impl SessionRuntimeManager {
                 active_window: first_window_id,
                 next_auto_window_number: 2,
                 attached_clients: BTreeSet::new(),
+                attach_viewport: None,
             },
         );
         Ok(())
@@ -1086,6 +1199,7 @@ impl SessionRuntimeManager {
                 active_window,
                 next_auto_window_number: 2,
                 attached_clients: BTreeSet::new(),
+                attach_viewport: None,
             },
         );
 
@@ -1129,7 +1243,7 @@ impl SessionRuntimeManager {
         window_id: bmux_session::WindowId,
     ) -> Result<PaneRuntimeHandle> {
         let (stop_tx, mut stop_rx) = oneshot::channel();
-        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        let (input_tx, mut input_rx) = mpsc::unbounded_channel::<PaneRuntimeCommand>();
         let output_buffer = Arc::new(std::sync::Mutex::new(OutputFanoutBuffer::new(
             MAX_WINDOW_OUTPUT_BUFFER_BYTES,
         )));
@@ -1163,14 +1277,16 @@ impl SessionRuntimeManager {
             let mut child_killer = child.clone_killer();
             drop(pty_pair.slave);
 
-            let mut reader = match pty_pair.master.try_clone_reader() {
+            let master = pty_pair.master;
+
+            let mut reader = match master.try_clone_reader() {
                 Ok(reader) => reader,
                 Err(_) => {
                     let _ = child.kill();
                     return;
                 }
             };
-            let writer = match pty_pair.master.take_writer() {
+            let writer = match master.take_writer() {
                 Ok(writer) => writer,
                 Err(_) => {
                     let _ = child.kill();
@@ -1248,7 +1364,7 @@ impl SessionRuntimeManager {
                     }
                     input = input_rx.recv() => {
                         match input {
-                            Some(bytes) => {
+                            Some(PaneRuntimeCommand::Input(bytes)) => {
                                 if let Ok(mut writer) = writer.lock()
                                     && writer.write_all(&bytes).is_ok()
                                 {
@@ -1256,6 +1372,14 @@ impl SessionRuntimeManager {
                                 } else {
                                     break;
                                 }
+                            }
+                            Some(PaneRuntimeCommand::Resize { rows, cols }) => {
+                                let _ = master.resize(PtySize {
+                                    rows,
+                                    cols,
+                                    pixel_width: 0,
+                                    pixel_height: 0,
+                                });
                             }
                             None => break,
                         }
@@ -1312,6 +1436,7 @@ impl SessionRuntimeManager {
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
         session.windows.insert(window_id, window);
         session.next_auto_window_number = session.next_auto_window_number.saturating_add(1);
+        self.apply_stored_attach_viewport(session_id);
         Ok((window_id, resolved_name))
     }
 
@@ -1397,6 +1522,7 @@ impl SessionRuntimeManager {
             anyhow::bail!("failed to apply split to layout tree")
         }
         window.focused_pane_id = pane_id;
+        self.apply_stored_attach_viewport(session_id);
         Ok(pane_id)
     }
 
@@ -1499,6 +1625,7 @@ impl SessionRuntimeManager {
         tokio::spawn(async move {
             shutdown_pane_handle(pane).await;
         });
+        self.apply_stored_attach_viewport(session_id);
         Ok((pane_id, None))
     }
 
@@ -1520,6 +1647,7 @@ impl SessionRuntimeManager {
             .ok_or_else(|| anyhow::anyhow!("target pane not found"))?;
         let step = (delta as f32) * 0.05;
         let _ = window.layout_root.adjust_focused_ratio(pane_id, step);
+        self.apply_stored_attach_viewport(session_id);
         Ok(())
     }
 
@@ -1666,6 +1794,7 @@ impl SessionRuntimeManager {
             ))
         })?;
         session.active_window = window_id;
+        self.apply_stored_attach_viewport(session_id);
         Ok(window_id)
     }
 
@@ -1786,6 +1915,9 @@ impl SessionRuntimeManager {
                 output.register_client_at_start(client_id);
             }
         }
+        if let Some(viewport) = runtime.attach_viewport {
+            resize_active_window_ptys(runtime, viewport.cols, viewport.rows);
+        }
         Ok(())
     }
 
@@ -1802,6 +1934,39 @@ impl SessionRuntimeManager {
                 }
             }
         }
+    }
+
+    fn set_attach_viewport(
+        &mut self,
+        session_id: SessionId,
+        client_id: ClientId,
+        cols: u16,
+        rows: u16,
+    ) -> Result<(u16, u16), SessionRuntimeError> {
+        let runtime = self
+            .runtimes
+            .get_mut(&session_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+
+        if !runtime.attached_clients.contains(&client_id) {
+            return Err(SessionRuntimeError::NotAttached);
+        }
+
+        let cols = cols.max(1);
+        let rows = rows.max(2);
+        runtime.attach_viewport = Some(AttachViewport { cols, rows });
+        resize_active_window_ptys(runtime, cols, rows);
+        Ok((cols, rows))
+    }
+
+    fn apply_stored_attach_viewport(&mut self, session_id: SessionId) {
+        let Some(runtime) = self.runtimes.get_mut(&session_id) else {
+            return;
+        };
+        let Some(viewport) = runtime.attach_viewport else {
+            return;
+        };
+        resize_active_window_ptys(runtime, viewport.cols, viewport.rows);
     }
 
     fn write_input(
@@ -1833,9 +1998,7 @@ impl SessionRuntimeManager {
         }
 
         let bytes = data.len();
-        pane.input_tx
-            .send(data)
-            .map_err(|_| SessionRuntimeError::Closed)?;
+        pane.send_input(data)?;
         Ok(bytes)
     }
 
@@ -4559,6 +4722,47 @@ async fn handle_request(
                 }
             }
         }
+        Request::AttachSetViewport {
+            session_id,
+            cols,
+            rows,
+        } => {
+            let session_id = SessionId(session_id);
+            if !ensure_attach_session_exists(state, session_id).await? {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!("session runtime not found: {}", session_id.0),
+                }));
+            }
+
+            let update_result = {
+                let mut runtime_manager = state
+                    .session_runtimes
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+                runtime_manager.set_attach_viewport(session_id, client_id, cols, rows)
+            };
+
+            match update_result {
+                Ok((cols, rows)) => Response::Ok(ResponsePayload::AttachViewportSet {
+                    session_id: session_id.0,
+                    cols,
+                    rows,
+                }),
+                Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!("session runtime not found: {}", session_id.0),
+                }),
+                Err(SessionRuntimeError::NotAttached) => Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "client is not attached to session runtime".to_string(),
+                }),
+                Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: "active pane is closed".to_string(),
+                }),
+            }
+        }
         Request::AttachOutput {
             session_id,
             max_bytes,
@@ -4805,6 +5009,7 @@ fn request_requires_exclusive(request: &Request) -> bool {
             | Request::Attach { .. }
             | Request::AttachOpen { .. }
             | Request::AttachInput { .. }
+            | Request::AttachSetViewport { .. }
             | Request::Detach
     )
 }

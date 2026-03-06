@@ -981,6 +981,8 @@ async fn run_session_attach_with_client(
 
     let mut view_state = AttachViewState::new(attach_info.clone());
 
+    update_attach_viewport(&mut client, view_state.attached_id).await?;
+
     if !view_state.can_write {
         println!("read-only attach: input disabled");
     }
@@ -1166,6 +1168,7 @@ async fn handle_attach_runtime_action(
             let attach_info = open_attach_for_session(client, session_id).await?;
             *attached_id = attach_info.session_id;
             *can_write = attach_info.can_write;
+            update_attach_viewport(client, *attached_id).await?;
             println!(
                 "created and switched to session: {}",
                 attach_info.session_id
@@ -2019,6 +2022,18 @@ async fn poll_attach_terminal_event(timeout: Duration) -> Result<Option<Event>> 
     .context("failed to join terminal event task")?
 }
 
+async fn update_attach_viewport(
+    client: &mut BmuxClient,
+    session_id: Uuid,
+) -> std::result::Result<(), ClientError> {
+    let (cols, rows) = terminal::size().unwrap_or((0, 0));
+    if cols == 0 || rows == 0 {
+        return Ok(());
+    }
+    client.attach_set_viewport(session_id, cols, rows).await?;
+    Ok(())
+}
+
 async fn handle_attach_loop_event(
     event: AttachLoopEvent,
     client: &mut BmuxClient,
@@ -2082,6 +2097,7 @@ async fn handle_attach_server_event(
                 .map_err(map_attach_client_error)?;
             view_state.attached_id = attach_info.session_id;
             view_state.can_write = attach_info.can_write;
+            update_attach_viewport(client, view_state.attached_id).await?;
             view_state.ui_mode = AttachUiMode::Normal;
             view_state.dirty.status_needs_redraw = true;
             view_state.dirty.layout_needs_refresh = true;
@@ -2114,6 +2130,10 @@ async fn handle_attach_terminal_event(
     help_lines: &[String],
     view_state: &mut AttachViewState,
 ) -> Result<AttachLoopControl> {
+    if matches!(terminal_event, Event::Resize(_, _)) {
+        update_attach_viewport(client, view_state.attached_id).await?;
+    }
+
     let mut skip_attach_key_actions = false;
     if view_state.quit_confirmation_pending {
         if let Event::Key(key) = &terminal_event
