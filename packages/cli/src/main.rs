@@ -4,6 +4,7 @@
 #![allow(clippy::cargo_common_metadata)]
 
 mod cli;
+mod connection;
 mod input;
 mod runtime;
 mod status;
