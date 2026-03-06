@@ -991,6 +991,7 @@ async fn run_session_attach_with_client(
         .subscribe_events()
         .await
         .map_err(map_attach_client_error)?;
+    let _ = client.poll_events(256).await.map_err(map_attach_client_error)?;
 
     let raw_mode_guard = RawModeGuard::enable().context("failed to enable raw mode for attach")?;
     let mut exit_reason = AttachExitReason::Detached;
@@ -2052,13 +2053,11 @@ async fn handle_attach_server_event(
     _global: bool,
     view_state: &mut AttachViewState,
 ) -> Result<AttachLoopControl> {
+    if is_attach_terminal_server_exit_event(&server_event, view_state.attached_id) {
+        return Ok(AttachLoopControl::Break(AttachExitReason::StreamClosed));
+    }
+
     match server_event {
-        bmux_client::ServerEvent::SessionRemoved { id } if id == view_state.attached_id => {
-            return Ok(AttachLoopControl::Break(AttachExitReason::StreamClosed));
-        }
-        bmux_client::ServerEvent::ClientDetached { id } if id == view_state.attached_id => {
-            return Ok(AttachLoopControl::Break(AttachExitReason::StreamClosed));
-        }
         bmux_client::ServerEvent::FollowTargetChanged {
             follower_client_id,
             leader_client_id,
@@ -2093,6 +2092,10 @@ async fn handle_attach_server_event(
     }
 
     Ok(AttachLoopControl::Continue)
+}
+
+fn is_attach_terminal_server_exit_event(event: &bmux_client::ServerEvent, attached_id: Uuid) -> bool {
+    matches!(event, bmux_client::ServerEvent::SessionRemoved { id } if *id == attached_id)
 }
 
 async fn handle_attach_terminal_event(
@@ -3729,6 +3732,19 @@ mod tests {
         assert_eq!(parse_pid_content(""), None);
         assert_eq!(parse_pid_content("0"), None);
         assert_eq!(parse_pid_content("abc"), None);
+    }
+
+    #[test]
+    fn attach_exit_events_ignore_session_scoped_client_detach() {
+        let session_id = uuid::Uuid::new_v4();
+        assert!(super::is_attach_terminal_server_exit_event(
+            &bmux_client::ServerEvent::SessionRemoved { id: session_id },
+            session_id,
+        ));
+        assert!(!super::is_attach_terminal_server_exit_event(
+            &bmux_client::ServerEvent::ClientDetached { id: session_id },
+            session_id,
+        ));
     }
 
     #[test]

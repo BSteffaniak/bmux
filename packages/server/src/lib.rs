@@ -1760,6 +1760,18 @@ impl SessionRuntimeManager {
             .get_mut(&session_id)
             .ok_or(SessionRuntimeError::NotFound)?;
 
+        let window = runtime
+            .windows
+            .get(&runtime.active_window)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        let pane = window
+            .panes
+            .get(&window.focused_pane_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        if pane.exited.load(Ordering::SeqCst) {
+            return Err(SessionRuntimeError::Closed);
+        }
+
         runtime.attached_clients.insert(client_id);
         for window in runtime.windows.values_mut() {
             for pane in window.panes.values_mut() {
@@ -4388,40 +4400,30 @@ async fn handle_request(
         } => {
             let session_id = SessionId(session_id);
 
-            let manager = state
-                .session_manager
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            if manager.get_session(&session_id).is_none() {
+            let session_exists = {
+                let manager = state
+                    .session_manager
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                manager.get_session(&session_id).is_some()
+            };
+            if !session_exists {
                 return Ok(Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
                     message: format!("session not found: {}", session_id.0),
                 }));
             }
-            drop(manager);
 
-            let mut attach_tokens = state
-                .attach_tokens
-                .lock()
-                .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
-            match attach_tokens.consume(session_id, attach_token) {
+            let consumed = {
+                let mut attach_tokens = state
+                    .attach_tokens
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
+                attach_tokens.consume(session_id, attach_token)
+            };
+
+            match consumed {
                 Ok(()) => {
-                    drop(attach_tokens);
-                    let mut runtime_manager = state
-                        .session_runtimes
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                    if let Some(previous_stream_session) = *attached_stream_session
-                        && previous_stream_session != session_id
-                    {
-                        runtime_manager.end_attach(previous_stream_session, client_id);
-                        emit_event(
-                            state,
-                            Event::ClientDetached {
-                                id: previous_stream_session.0,
-                            },
-                        )?;
-                    }
                     let can_write = {
                         let permission_state = state
                             .permission_state
@@ -4432,7 +4434,27 @@ async fn handle_request(
                             SessionRole::Owner | SessionRole::Writer
                         )
                     };
-                    match runtime_manager.begin_attach(session_id, client_id) {
+
+                    let begin_result = {
+                        let mut runtime_manager = state
+                            .session_runtimes
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+                        if let Some(previous_stream_session) = *attached_stream_session
+                            && previous_stream_session != session_id
+                        {
+                            runtime_manager.end_attach(previous_stream_session, client_id);
+                            emit_event(
+                                state,
+                                Event::ClientDetached {
+                                    id: previous_stream_session.0,
+                                },
+                            )?;
+                        }
+                        runtime_manager.begin_attach(session_id, client_id)
+                    };
+
+                    match begin_result {
                         Ok(()) => {
                             *attached_stream_session = Some(session_id);
                             Response::Ok(ResponsePayload::AttachReady {
@@ -4444,10 +4466,22 @@ async fn handle_request(
                             code: ErrorCode::NotFound,
                             message: format!("session runtime not found: {}", session_id.0),
                         }),
-                        Err(SessionRuntimeError::NotAttached | SessionRuntimeError::Closed) => {
+                        Err(SessionRuntimeError::NotAttached) => Response::Err(ErrorResponse {
+                            code: ErrorCode::Internal,
+                            message: "failed opening attach stream".to_string(),
+                        }),
+                        Err(SessionRuntimeError::Closed) => {
+                            let _ = reap_closed_active_pane(
+                                state,
+                                session_id,
+                                client_id,
+                                selected_session,
+                                attached_stream_session,
+                            )
+                            .await;
                             Response::Err(ErrorResponse {
-                                code: ErrorCode::Internal,
-                                message: "failed opening attach stream".to_string(),
+                                code: ErrorCode::NotFound,
+                                message: format!("session runtime not found: {}", session_id.0),
                             })
                         }
                     }
