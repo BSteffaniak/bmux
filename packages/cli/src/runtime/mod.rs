@@ -929,6 +929,7 @@ async fn run_session_attach_with_client(
         }
     };
     let attach_keymap = attach_keymap_from_config(&attach_config);
+    let attach_help_lines = build_attach_help_lines(&attach_config);
     let mut attach_input_processor = InputProcessor::new(attach_keymap.clone());
 
     if let Some(leader_client_id) = follow_target_id {
@@ -1109,6 +1110,7 @@ async fn run_session_attach_with_client(
             follow_target_id,
             global,
             &attach_keymap,
+            &attach_help_lines,
         )
         .await?;
     }
@@ -1462,6 +1464,76 @@ fn queue_attach_status_line(stdout: &mut io::Stdout, status_line: &str) -> Resul
     .context("failed queuing attach status line")
 }
 
+fn queue_attach_help_overlay(stdout: &mut io::Stdout, lines: &[String]) -> Result<()> {
+    let (cols, rows) = terminal::size().unwrap_or((0, 0));
+    if cols < 20 || rows < 6 {
+        return Ok(());
+    }
+
+    let content_width = lines.iter().map(|line| line.len()).max().unwrap_or(0).min(80);
+    let width = (content_width + 4).max(36).min((cols as usize).saturating_sub(2));
+    let max_content_rows = (rows as usize).saturating_sub(6);
+    let content_rows = lines.len().min(max_content_rows);
+    let height = (content_rows + 4).min((rows as usize).saturating_sub(2));
+    let x = ((cols as usize).saturating_sub(width)) / 2;
+    let y = ((rows as usize).saturating_sub(height)) / 2;
+
+    let top = format!("+{}+", "-".repeat(width.saturating_sub(2)));
+    queue!(stdout, MoveTo(x as u16, y as u16), Print(&top))
+        .context("failed drawing help overlay top")?;
+
+    let title = " bmux help ";
+    let title_x = x + ((width.saturating_sub(title.len())) / 2);
+    queue!(stdout, MoveTo(title_x as u16, y as u16), Print(title))
+        .context("failed drawing help overlay title")?;
+
+    for row in 1..height.saturating_sub(1) {
+        let y_row = (y + row) as u16;
+        queue!(
+            stdout,
+            MoveTo(x as u16, y_row),
+            Print("|"),
+            MoveTo((x + width - 1) as u16, y_row),
+            Print("|")
+        )
+        .context("failed drawing help overlay border")?;
+    }
+
+    queue!(
+        stdout,
+        MoveTo(x as u16, (y + height - 1) as u16),
+        Print(&top)
+    )
+    .context("failed drawing help overlay bottom")?;
+
+    let header = "scope    chord                action";
+    let mut header_rendered = header.to_string();
+    if header_rendered.len() > width.saturating_sub(4) {
+        header_rendered.truncate(width.saturating_sub(4));
+    }
+    queue!(
+        stdout,
+        MoveTo((x + 2) as u16, (y + 1) as u16),
+        Print(header_rendered)
+    )
+    .context("failed drawing help overlay header")?;
+
+    for (idx, line) in lines.iter().take(content_rows.saturating_sub(1)).enumerate() {
+        let mut rendered = line.clone();
+        if rendered.len() > width.saturating_sub(4) {
+            rendered.truncate(width.saturating_sub(4));
+        }
+        let row = y + 2 + idx;
+        if row >= y + height - 1 {
+            break;
+        }
+        queue!(stdout, MoveTo((x + 2) as u16, row as u16), Print(rendered))
+            .context("failed drawing help overlay entry")?;
+    }
+
+    Ok(())
+}
+
 async fn render_attach_frame(
     client: &mut BmuxClient,
     view_state: &mut AttachViewState,
@@ -1469,6 +1541,7 @@ async fn render_attach_frame(
     follow_target_id: Option<Uuid>,
     follow_global: bool,
     keymap: &crate::input::Keymap,
+    help_lines: &[String],
 ) -> Result<()> {
     if view_state.dirty.status_needs_redraw {
         view_state.cached_status_line = Some(
@@ -1502,7 +1575,12 @@ async fn render_attach_frame(
         &view_state.dirty.pane_dirty_ids,
         view_state.dirty.full_pane_redraw,
     )?;
-    apply_attach_cursor_state(&mut stdout, cursor_state, &mut view_state.last_cursor_state)?;
+    if view_state.help_overlay_open {
+        queue_attach_help_overlay(&mut stdout, help_lines)?;
+        apply_attach_cursor_state(&mut stdout, None, &mut view_state.last_cursor_state)?;
+    } else {
+        apply_attach_cursor_state(&mut stdout, cursor_state, &mut view_state.last_cursor_state)?;
+    }
     stdout.flush().context("failed flushing attach frame")?;
     view_state.dirty.full_pane_redraw = false;
     view_state.dirty.pane_dirty_ids.clear();
@@ -1654,6 +1732,20 @@ fn effective_attach_keybindings(config: &BmuxConfig) -> Vec<AttachKeybindingEntr
             .then_with(|| left.chord.cmp(&right.chord))
     });
     entries
+}
+
+fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
+    effective_attach_keybindings(config)
+        .into_iter()
+        .map(|entry| {
+            format!(
+                "[{:<7}] {:<20} {}",
+                entry.scope.as_str(),
+                entry.chord,
+                entry.action_name
+            )
+        })
+        .collect()
 }
 
 fn normalize_attach_keybindings(
