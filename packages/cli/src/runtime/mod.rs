@@ -1038,7 +1038,9 @@ async fn run_session_attach_with_client(
 
         let _ = view_state.clear_expired_transient_status(Instant::now());
 
-        let mut frame_needs_render = view_state.dirty.status_needs_redraw;
+        let mut frame_needs_render = view_state.dirty.status_needs_redraw
+            || view_state.dirty.full_pane_redraw
+            || !view_state.dirty.pane_dirty_ids.is_empty();
 
         if view_state.dirty.layout_needs_refresh || view_state.cached_layout_state.is_none() {
             let previous_layout = view_state.cached_layout_state.clone();
@@ -1528,6 +1530,84 @@ fn adjust_help_overlay_scroll(
         current.saturating_add(delta as usize)
     };
     next.min(max_scroll)
+}
+
+fn help_overlay_accepts_key_kind(kind: KeyEventKind) -> bool {
+    matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat)
+}
+
+fn handle_help_overlay_key_event(
+    key: &KeyEvent,
+    help_lines: &[String],
+    view_state: &mut AttachViewState,
+) -> bool {
+    if !help_overlay_accepts_key_kind(key.kind) {
+        return false;
+    }
+
+    match key.code {
+        KeyCode::Esc | KeyCode::Enter => {
+            view_state.help_overlay_open = false;
+            view_state.help_overlay_scroll = 0;
+            view_state.dirty.status_needs_redraw = true;
+            view_state.dirty.full_pane_redraw = true;
+            true
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            view_state.help_overlay_scroll = adjust_help_overlay_scroll(
+                view_state.help_overlay_scroll,
+                -1,
+                help_lines.len(),
+                help_overlay_visible_rows(help_lines),
+            );
+            view_state.dirty.full_pane_redraw = true;
+            true
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            view_state.help_overlay_scroll = adjust_help_overlay_scroll(
+                view_state.help_overlay_scroll,
+                1,
+                help_lines.len(),
+                help_overlay_visible_rows(help_lines),
+            );
+            view_state.dirty.full_pane_redraw = true;
+            true
+        }
+        KeyCode::PageUp => {
+            let page = help_overlay_visible_rows(help_lines) as isize;
+            view_state.help_overlay_scroll = adjust_help_overlay_scroll(
+                view_state.help_overlay_scroll,
+                -page,
+                help_lines.len(),
+                help_overlay_visible_rows(help_lines),
+            );
+            view_state.dirty.full_pane_redraw = true;
+            true
+        }
+        KeyCode::PageDown => {
+            let page = help_overlay_visible_rows(help_lines) as isize;
+            view_state.help_overlay_scroll = adjust_help_overlay_scroll(
+                view_state.help_overlay_scroll,
+                page,
+                help_lines.len(),
+                help_overlay_visible_rows(help_lines),
+            );
+            view_state.dirty.full_pane_redraw = true;
+            true
+        }
+        KeyCode::Home => {
+            view_state.help_overlay_scroll = 0;
+            view_state.dirty.full_pane_redraw = true;
+            true
+        }
+        KeyCode::End => {
+            let visible = help_overlay_visible_rows(help_lines);
+            view_state.help_overlay_scroll = help_lines.len().saturating_sub(visible);
+            view_state.dirty.full_pane_redraw = true;
+            true
+        }
+        _ => false,
+    }
 }
 
 fn queue_attach_help_overlay(
@@ -2270,71 +2350,9 @@ async fn handle_attach_terminal_event(
 
     if view_state.help_overlay_open
         && let Event::Key(key) = &terminal_event
-        && key.kind == KeyEventKind::Press
+        && handle_help_overlay_key_event(key, help_lines, view_state)
     {
-        match key.code {
-            KeyCode::Esc | KeyCode::Enter => {
-                view_state.help_overlay_open = false;
-                view_state.help_overlay_scroll = 0;
-                view_state.dirty.status_needs_redraw = true;
-                view_state.dirty.full_pane_redraw = true;
-                return Ok(AttachLoopControl::Continue);
-            }
-            KeyCode::Up | KeyCode::Char('k') => {
-                view_state.help_overlay_scroll = adjust_help_overlay_scroll(
-                    view_state.help_overlay_scroll,
-                    -1,
-                    help_lines.len(),
-                    help_overlay_visible_rows(help_lines),
-                );
-                view_state.dirty.full_pane_redraw = true;
-                return Ok(AttachLoopControl::Continue);
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                view_state.help_overlay_scroll = adjust_help_overlay_scroll(
-                    view_state.help_overlay_scroll,
-                    1,
-                    help_lines.len(),
-                    help_overlay_visible_rows(help_lines),
-                );
-                view_state.dirty.full_pane_redraw = true;
-                return Ok(AttachLoopControl::Continue);
-            }
-            KeyCode::PageUp => {
-                let page = help_overlay_visible_rows(help_lines) as isize;
-                view_state.help_overlay_scroll = adjust_help_overlay_scroll(
-                    view_state.help_overlay_scroll,
-                    -page,
-                    help_lines.len(),
-                    help_overlay_visible_rows(help_lines),
-                );
-                view_state.dirty.full_pane_redraw = true;
-                return Ok(AttachLoopControl::Continue);
-            }
-            KeyCode::PageDown => {
-                let page = help_overlay_visible_rows(help_lines) as isize;
-                view_state.help_overlay_scroll = adjust_help_overlay_scroll(
-                    view_state.help_overlay_scroll,
-                    page,
-                    help_lines.len(),
-                    help_overlay_visible_rows(help_lines),
-                );
-                view_state.dirty.full_pane_redraw = true;
-                return Ok(AttachLoopControl::Continue);
-            }
-            KeyCode::Home => {
-                view_state.help_overlay_scroll = 0;
-                view_state.dirty.full_pane_redraw = true;
-                return Ok(AttachLoopControl::Continue);
-            }
-            KeyCode::End => {
-                let visible = help_overlay_visible_rows(help_lines);
-                view_state.help_overlay_scroll = help_lines.len().saturating_sub(visible);
-                view_state.dirty.full_pane_redraw = true;
-                return Ok(AttachLoopControl::Continue);
-            }
-            _ => {}
-        }
+        return Ok(AttachLoopControl::Continue);
     }
 
     for attach_action in
@@ -4456,6 +4474,51 @@ mod tests {
         assert_eq!(super::adjust_help_overlay_scroll(17, 10, 20, 5), 15);
         assert_eq!(super::adjust_help_overlay_scroll(4, -2, 20, 5), 2);
         assert_eq!(super::adjust_help_overlay_scroll(0, 4, 0, 5), 0);
+    }
+
+    #[test]
+    fn help_overlay_repeat_navigation_is_handled() {
+        let mut view_state = super::AttachViewState::new(bmux_client::AttachOpenInfo {
+            session_id: uuid::Uuid::new_v4(),
+            can_write: true,
+        });
+        view_state.help_overlay_open = true;
+        let lines = (0..200).map(|idx| format!("line {idx}")).collect::<Vec<_>>();
+
+        let handled = super::handle_help_overlay_key_event(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Down,
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Repeat,
+            ),
+            &lines,
+            &mut view_state,
+        );
+        assert!(handled);
+        assert!(view_state.help_overlay_scroll > 0);
+    }
+
+    #[test]
+    fn help_overlay_release_is_ignored() {
+        let mut view_state = super::AttachViewState::new(bmux_client::AttachOpenInfo {
+            session_id: uuid::Uuid::new_v4(),
+            can_write: true,
+        });
+        view_state.help_overlay_open = true;
+        view_state.help_overlay_scroll = 5;
+        let lines = (0..200).map(|idx| format!("line {idx}")).collect::<Vec<_>>();
+
+        let handled = super::handle_help_overlay_key_event(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Down,
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Release,
+            ),
+            &lines,
+            &mut view_state,
+        );
+        assert!(!handled);
+        assert_eq!(view_state.help_overlay_scroll, 5);
     }
 
     #[test]
