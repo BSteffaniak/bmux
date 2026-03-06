@@ -43,7 +43,7 @@ impl IpcEndpoint {
 
     /// Return the Windows named pipe when this endpoint uses named pipes.
     #[must_use]
-    pub fn as_windows_named_pipe(&self) -> Option<&str> {
+    pub const fn as_windows_named_pipe(&self) -> Option<&str> {
         match self {
             Self::UnixSocket(_) => None,
             Self::WindowsNamedPipe(name) => Some(name.as_str()),
@@ -93,7 +93,7 @@ pub struct Envelope {
 impl Envelope {
     /// Build a new envelope.
     #[must_use]
-    pub fn new(request_id: u64, kind: EnvelopeKind, payload: Vec<u8>) -> Self {
+    pub const fn new(request_id: u64, kind: EnvelopeKind, payload: Vec<u8>) -> Self {
         Self {
             version: ProtocolVersion::current(),
             request_id,
@@ -149,8 +149,8 @@ pub enum PaneLayoutNode {
     Split {
         direction: PaneSplitDirection,
         ratio_percent: u8,
-        first: Box<PaneLayoutNode>,
-        second: Box<PaneLayoutNode>,
+        first: Box<Self>,
+        second: Box<Self>,
     },
 }
 

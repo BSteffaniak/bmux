@@ -11,7 +11,7 @@ use std::io;
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
-pub(crate) fn append_pane_output(buffer: &mut PaneRenderBuffer, bytes: &[u8]) {
+pub fn append_pane_output(buffer: &mut PaneRenderBuffer, bytes: &[u8]) {
     if bytes.is_empty() {
         return;
     }
@@ -102,7 +102,7 @@ fn style_sgr(style: CellStyle) -> String {
     format!("\x1b[{}m", parts.join(";"))
 }
 
-pub(crate) fn render_attach_panes(
+pub fn render_attach_panes(
     stdout: &mut io::Stdout,
     layout: &PaneLayoutNode,
     focused_pane_id: Uuid,

@@ -3,7 +3,7 @@ use bmux_ipc::{PaneLayoutNode, PaneSplitDirection};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
-pub(crate) fn collect_pane_ids(layout: &PaneLayoutNode, out: &mut Vec<Uuid>) {
+pub fn collect_pane_ids(layout: &PaneLayoutNode, out: &mut Vec<Uuid>) {
     match layout {
         PaneLayoutNode::Leaf { pane_id } => out.push(*pane_id),
         PaneLayoutNode::Split { first, second, .. } => {
@@ -53,7 +53,7 @@ fn split_rect(rect: PaneRect, ratio_percent: u8, vertical: bool) -> (PaneRect, P
     }
 }
 
-pub(crate) fn collect_layout_rects(
+pub fn collect_layout_rects(
     layout: &PaneLayoutNode,
     rect: PaneRect,
     out: &mut BTreeMap<Uuid, PaneRect>,

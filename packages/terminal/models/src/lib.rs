@@ -59,13 +59,13 @@ pub enum SplitDirection {
 pub enum PaneLayout {
     Single(PaneId),
     HSplit {
-        top: Box<PaneLayout>,
-        bottom: Box<PaneLayout>,
+        top: Box<Self>,
+        bottom: Box<Self>,
         ratio: f32, // 0.0 to 1.0, percentage for top pane
     },
     VSplit {
-        left: Box<PaneLayout>,
-        right: Box<PaneLayout>,
+        left: Box<Self>,
+        right: Box<Self>,
         ratio: f32, // 0.0 to 1.0, percentage for left pane
     },
 }
@@ -285,10 +285,10 @@ impl Window {
     ) -> Result<(), bmux_session_models::PaneError> {
         if self.panes.contains_key(&pane_id) {
             // Deactivate old pane
-            if let Some(old_pane_id) = self.active_pane {
-                if let Some(old_pane) = self.panes.get_mut(&old_pane_id) {
-                    old_pane.set_active(false);
-                }
+            if let Some(old_pane_id) = self.active_pane
+                && let Some(old_pane) = self.panes.get_mut(&old_pane_id)
+            {
+                old_pane.set_active(false);
             }
 
             // Activate new pane

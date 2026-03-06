@@ -1,10 +1,10 @@
-pub(crate) struct AttachTab {
+pub struct AttachTab {
     pub(crate) index: usize,
     pub(crate) title: String,
     pub(crate) active: bool,
 }
 
-pub(crate) fn build_attach_status_line(
+pub fn build_attach_status_line(
     session_label: &str,
     tabs: &[AttachTab],
     mode_label: &str,

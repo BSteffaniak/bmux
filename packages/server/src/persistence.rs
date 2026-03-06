@@ -11,7 +11,7 @@ const SNAPSHOT_VERSION_V1: u32 = 1;
 const SNAPSHOT_VERSION_V2: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct SnapshotV2 {
+pub struct SnapshotV2 {
     pub sessions: Vec<SessionSnapshotV2>,
     #[serde(default)]
     pub owner_principals: Vec<OwnerPrincipalSnapshotV2>,
@@ -21,13 +21,13 @@ pub(crate) struct SnapshotV2 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct OwnerPrincipalSnapshotV2 {
+pub struct OwnerPrincipalSnapshotV2 {
     pub session_id: Uuid,
     pub principal_id: Uuid,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct SessionSnapshotV2 {
+pub struct SessionSnapshotV2 {
     pub id: Uuid,
     pub name: Option<String>,
     pub windows: Vec<WindowSnapshotV2>,
@@ -35,7 +35,7 @@ pub(crate) struct SessionSnapshotV2 {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub(crate) struct WindowSnapshotV2 {
+pub struct WindowSnapshotV2 {
     pub id: Uuid,
     pub name: Option<String>,
     pub panes: Vec<PaneSnapshotV2>,
@@ -45,7 +45,7 @@ pub(crate) struct WindowSnapshotV2 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct PaneSnapshotV2 {
+pub struct PaneSnapshotV2 {
     pub id: Uuid,
     pub name: Option<String>,
     pub shell: String,
@@ -53,41 +53,41 @@ pub(crate) struct PaneSnapshotV2 {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
-pub(crate) enum PaneLayoutNodeSnapshotV2 {
+pub enum PaneLayoutNodeSnapshotV2 {
     Leaf {
         pane_id: Uuid,
     },
     Split {
         direction: PaneSplitDirectionSnapshotV2,
         ratio: f32,
-        first: Box<PaneLayoutNodeSnapshotV2>,
-        second: Box<PaneLayoutNodeSnapshotV2>,
+        first: Box<Self>,
+        second: Box<Self>,
     },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum PaneSplitDirectionSnapshotV2 {
+pub enum PaneSplitDirectionSnapshotV2 {
     Vertical,
     Horizontal,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct RoleAssignmentSnapshotV2 {
+pub struct RoleAssignmentSnapshotV2 {
     pub session_id: Uuid,
     pub client_id: Uuid,
     pub role: SessionRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct FollowEdgeSnapshotV2 {
+pub struct FollowEdgeSnapshotV2 {
     pub follower_client_id: Uuid,
     pub leader_client_id: Uuid,
     pub global: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub(crate) struct ClientSelectedSessionSnapshotV2 {
+pub struct ClientSelectedSessionSnapshotV2 {
     pub client_id: Uuid,
     pub session_id: Option<Uuid>,
 }
@@ -149,7 +149,7 @@ struct SnapshotEnvelopeV2 {
 }
 
 #[derive(Debug, Error)]
-pub(crate) enum SnapshotError {
+pub enum SnapshotError {
     #[error("snapshot io error: {0}")]
     Io(#[from] std::io::Error),
     #[error("snapshot encode error: {0}")]
@@ -161,7 +161,7 @@ pub(crate) enum SnapshotError {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct SnapshotManager {
+pub struct SnapshotManager {
     path: PathBuf,
 }
 
@@ -177,7 +177,7 @@ impl SnapshotManager {
 
     #[must_use]
     #[allow(dead_code)]
-    pub(crate) fn from_path(path: PathBuf) -> Self {
+    pub(crate) const fn from_path(path: PathBuf) -> Self {
         Self { path }
     }
 
@@ -514,8 +514,7 @@ fn collect_layout_pane_ids(
         PaneLayoutNodeSnapshotV2::Leaf { pane_id } => {
             if !out.insert(*pane_id) {
                 return Err(SnapshotError::Validation(format!(
-                    "duplicate pane id {} in layout",
-                    pane_id
+                    "duplicate pane id {pane_id} in layout"
                 )));
             }
         }
@@ -527,8 +526,7 @@ fn collect_layout_pane_ids(
         } => {
             if !(0.1..=0.9).contains(ratio) {
                 return Err(SnapshotError::Validation(format!(
-                    "split ratio {} out of range [0.1, 0.9]",
-                    ratio
+                    "split ratio {ratio} out of range [0.1, 0.9]"
                 )));
             }
             collect_layout_pane_ids(first, out)?;

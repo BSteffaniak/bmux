@@ -74,7 +74,7 @@ impl ResolvedTimeout {
     }
 }
 
-fn default_global_runtime_bindings() -> BTreeMap<String, String> {
+const fn default_global_runtime_bindings() -> BTreeMap<String, String> {
     BTreeMap::new()
 }
 

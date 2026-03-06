@@ -1,17 +1,17 @@
 use super::state::AttachExitReason;
 use crossterm::event::Event;
 
-pub(crate) enum AttachLoopEvent {
+pub enum AttachLoopEvent {
     Server(bmux_client::ServerEvent),
     Terminal(Event),
 }
 
-pub(crate) enum AttachLoopControl {
+pub enum AttachLoopControl {
     Continue,
     Break(AttachExitReason),
 }
 
-pub(crate) fn collect_attach_loop_events(
+pub fn collect_attach_loop_events(
     server_events: Vec<bmux_client::ServerEvent>,
     terminal_event: Option<Event>,
 ) -> Vec<AttachLoopEvent> {

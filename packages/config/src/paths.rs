@@ -152,6 +152,40 @@ fn stable_fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
+impl Default for ConfigPaths {
+    fn default() -> Self {
+        let config_dir = dirs::config_dir().map_or_else(
+            || {
+                dirs::home_dir().map_or_else(
+                    || PathBuf::from(".bmux"),
+                    |d| d.join(".config").join("bmux"),
+                )
+            },
+            |d| d.join("bmux"),
+        );
+
+        let data_dir = dirs::data_dir().map_or_else(
+            || {
+                dirs::home_dir().map_or_else(
+                    || PathBuf::from(".bmux"),
+                    |d| d.join(".local").join("share").join("bmux"),
+                )
+            },
+            |d| d.join("bmux"),
+        );
+
+        let runtime_dir = if cfg!(unix) {
+            std::env::var("XDG_RUNTIME_DIR")
+                .map(PathBuf::from)
+                .map_or_else(|_| std::env::temp_dir().join("bmux"), |d| d.join("bmux"))
+        } else {
+            std::env::temp_dir().join("bmux")
+        };
+
+        Self::new(config_dir, runtime_dir, data_dir)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{ConfigPaths, stable_fnv1a64};
@@ -230,39 +264,5 @@ mod tests {
     #[test]
     fn hash_fnv1a_known_vector() {
         assert_eq!(stable_fnv1a64(b"bmux"), 0xbb09969bbc2c17fd);
-    }
-}
-
-impl Default for ConfigPaths {
-    fn default() -> Self {
-        let config_dir = dirs::config_dir().map_or_else(
-            || {
-                dirs::home_dir().map_or_else(
-                    || PathBuf::from(".bmux"),
-                    |d| d.join(".config").join("bmux"),
-                )
-            },
-            |d| d.join("bmux"),
-        );
-
-        let data_dir = dirs::data_dir().map_or_else(
-            || {
-                dirs::home_dir().map_or_else(
-                    || PathBuf::from(".bmux"),
-                    |d| d.join(".local").join("share").join("bmux"),
-                )
-            },
-            |d| d.join("bmux"),
-        );
-
-        let runtime_dir = if cfg!(unix) {
-            std::env::var("XDG_RUNTIME_DIR")
-                .map(PathBuf::from)
-                .map_or_else(|_| std::env::temp_dir().join("bmux"), |d| d.join("bmux"))
-        } else {
-            std::env::temp_dir().join("bmux")
-        };
-
-        Self::new(config_dir, runtime_dir, data_dir)
     }
 }

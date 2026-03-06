@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum RuntimeAction {
+pub enum RuntimeAction {
     Quit,
     Detach,
     NewWindow,
@@ -97,20 +97,20 @@ struct KeyBinding {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct Keymap {
+pub struct Keymap {
     timeout: Option<Duration>,
     global_bindings: Vec<KeyBinding>,
     runtime_bindings: Vec<KeyBinding>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct DoctorBinding {
+pub struct DoctorBinding {
     pub(crate) chord: String,
     pub(crate) action: String,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct KeymapDoctorReport {
+pub struct KeymapDoctorReport {
     pub(crate) global: Vec<DoctorBinding>,
     pub(crate) runtime: Vec<DoctorBinding>,
     pub(crate) overlaps: Vec<String>,
@@ -134,7 +134,7 @@ struct ByteDecoder {
     pending: Vec<u8>,
 }
 
-pub(crate) struct InputProcessor {
+pub struct InputProcessor {
     keymap: Keymap,
     decoder: ByteDecoder,
     pending: Option<PendingChord>,
@@ -553,7 +553,7 @@ fn key_event_to_input_event(key: &CrosstermKeyEvent) -> Option<InputEvent> {
     Some(InputEvent::Key(DecodedStroke { stroke, raw }))
 }
 
-fn key_event_to_stroke(key: &CrosstermKeyEvent) -> Option<KeyStroke> {
+const fn key_event_to_stroke(key: &CrosstermKeyEvent) -> Option<KeyStroke> {
     let modifiers = key.modifiers;
     let ctrl = modifiers.contains(KeyModifiers::CONTROL);
     let alt = modifiers.contains(KeyModifiers::ALT);
@@ -768,7 +768,7 @@ fn find_overlaps(bindings: &[KeyBinding], label: &str) -> Vec<String> {
     warnings
 }
 
-pub(crate) fn action_to_name(action: &RuntimeAction) -> &'static str {
+pub const fn action_to_name(action: &RuntimeAction) -> &'static str {
     match action {
         RuntimeAction::Quit => "quit",
         RuntimeAction::Detach => "detach",
@@ -823,7 +823,7 @@ pub(crate) fn action_to_name(action: &RuntimeAction) -> &'static str {
     }
 }
 
-fn scroll_mode_action(stroke: KeyStroke) -> Option<RuntimeAction> {
+const fn scroll_mode_action(stroke: KeyStroke) -> Option<RuntimeAction> {
     if stroke.alt || stroke.super_key {
         return None;
     }
@@ -1255,7 +1255,7 @@ fn parse_action(value: &str) -> Result<RuntimeAction> {
     }
 }
 
-pub(crate) fn parse_runtime_action_name(value: &str) -> Result<RuntimeAction> {
+pub fn parse_runtime_action_name(value: &str) -> Result<RuntimeAction> {
     parse_action(value)
 }
 
@@ -1419,35 +1419,35 @@ mod tests {
             vec![RuntimeAction::MoveCursorRight]
         );
         assert_eq!(
-            processor.process_chunk(&[b'g']),
+            processor.process_chunk(b"g"),
             vec![RuntimeAction::ScrollTop]
         );
         assert_eq!(
-            processor.process_chunk(&[b'G']),
+            processor.process_chunk(b"G"),
             vec![RuntimeAction::ScrollBottom]
         );
         assert_eq!(
-            processor.process_chunk(&[b'v']),
+            processor.process_chunk(b"v"),
             vec![RuntimeAction::BeginSelection]
         );
         assert_eq!(
-            processor.process_chunk(&[b'h']),
+            processor.process_chunk(b"h"),
             vec![RuntimeAction::MoveCursorLeft]
         );
         assert_eq!(
-            processor.process_chunk(&[b'j']),
+            processor.process_chunk(b"j"),
             vec![RuntimeAction::MoveCursorDown]
         );
         assert_eq!(
-            processor.process_chunk(&[b'k']),
+            processor.process_chunk(b"k"),
             vec![RuntimeAction::MoveCursorUp]
         );
         assert_eq!(
-            processor.process_chunk(&[b'l']),
+            processor.process_chunk(b"l"),
             vec![RuntimeAction::MoveCursorRight]
         );
         assert_eq!(
-            processor.process_chunk(&[b'y']),
+            processor.process_chunk(b"y"),
             vec![RuntimeAction::CopyScrollback]
         );
         assert_eq!(
@@ -1570,7 +1570,7 @@ mod tests {
 
         assert!(processor.process_chunk(&[0x01, b'w']).is_empty());
         assert_eq!(
-            processor.process_chunk(&[b'o']),
+            processor.process_chunk(b"o"),
             vec![RuntimeAction::FocusNext]
         );
     }
@@ -1602,7 +1602,7 @@ mod tests {
         thread::sleep(Duration::from_millis(70));
         assert!(processor.process_chunk(&[]).is_empty());
         assert_eq!(
-            processor.process_chunk(&[b'o']),
+            processor.process_chunk(b"o"),
             vec![RuntimeAction::FocusNext]
         );
     }
@@ -1618,7 +1618,7 @@ mod tests {
 
         assert!(processor.process_chunk(&[0x01, b'w']).is_empty());
         assert_eq!(
-            processor.process_chunk(&[b'x']),
+            processor.process_chunk(b"x"),
             vec![
                 RuntimeAction::ShowHelp,
                 RuntimeAction::ForwardToPane(vec![b'x'])
@@ -1682,7 +1682,7 @@ mod tests {
     fn forwards_unmatched_bytes() {
         let mut processor = InputProcessor::new(Keymap::default_runtime());
         assert_eq!(
-            processor.process_chunk(&[b'h', b'i']),
+            processor.process_chunk(b"hi"),
             vec![
                 RuntimeAction::ForwardToPane(vec![b'h']),
                 RuntimeAction::ForwardToPane(vec![b'i'])

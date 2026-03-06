@@ -1,20 +1,20 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum DebugRenderLogFormat {
+pub enum DebugRenderLogFormat {
     Text,
     Csv,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum TraceFamily {
+pub enum TraceFamily {
     Csi,
     Osc,
     Dcs,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub(crate) enum RoleValue {
+pub enum RoleValue {
     Owner,
     Writer,
     Observer,
@@ -24,7 +24,7 @@ pub(crate) enum RoleValue {
 #[command(author, version, about, long_about = None)]
 #[command(name = "bmux")]
 #[command(about = "Server-backed terminal multiplexer CLI")]
-pub(crate) struct Cli {
+pub struct Cli {
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
 
@@ -34,7 +34,7 @@ pub(crate) struct Cli {
 }
 
 #[derive(Debug, Subcommand)]
-pub(crate) enum Command {
+pub enum Command {
     /// Create a new session
     NewSession {
         /// Optional session name
@@ -196,7 +196,7 @@ pub(crate) enum Command {
 }
 
 #[derive(Debug, Subcommand)]
-pub(crate) enum SessionCommand {
+pub enum SessionCommand {
     /// Create a new session
     New {
         /// Optional session name
@@ -287,7 +287,7 @@ pub(crate) enum SessionCommand {
 }
 
 #[derive(Debug, Subcommand)]
-pub(crate) enum WindowCommand {
+pub enum WindowCommand {
     /// Create a new window in a session
     New {
         /// Optional session name or UUID (uses attached session when omitted)
@@ -337,7 +337,7 @@ pub(crate) enum WindowCommand {
 }
 
 #[derive(Debug, Subcommand)]
-pub(crate) enum ServerCommand {
+pub enum ServerCommand {
     /// Start local bmux server
     Start {
         /// Run server in background daemon mode
@@ -375,7 +375,7 @@ pub(crate) enum ServerCommand {
 }
 
 #[derive(Debug, Subcommand)]
-pub(crate) enum KeymapCommand {
+pub enum KeymapCommand {
     /// Print compiled keymap and overlap diagnostics
     Doctor {
         /// Print diagnostics as JSON
@@ -385,7 +385,7 @@ pub(crate) enum KeymapCommand {
 }
 
 #[derive(Debug, Subcommand)]
-pub(crate) enum TerminalCommand {
+pub enum TerminalCommand {
     /// Show terminal capability profile used for panes
     Doctor {
         /// Print diagnostics as JSON

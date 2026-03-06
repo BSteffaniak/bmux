@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-pub(crate) enum AttachEventAction {
+pub enum AttachEventAction {
     Send(Vec<u8>),
     Runtime(RuntimeAction),
     Ui(RuntimeAction),
@@ -15,20 +15,20 @@ pub(crate) enum AttachEventAction {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AttachUiMode {
+pub enum AttachUiMode {
     Normal,
     Window,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AttachExitReason {
+pub enum AttachExitReason {
     Detached,
     StreamClosed,
     Quit,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct AttachDirtyFlags {
+pub struct AttachDirtyFlags {
     pub(crate) status_needs_redraw: bool,
     pub(crate) layout_needs_refresh: bool,
     pub(crate) pane_dirty_ids: BTreeSet<Uuid>,
@@ -47,7 +47,7 @@ impl Default for AttachDirtyFlags {
 }
 
 #[derive(Clone, Copy)]
-pub(crate) struct PaneRect {
+pub struct PaneRect {
     pub(crate) x: u16,
     pub(crate) y: u16,
     pub(crate) w: u16,
@@ -55,13 +55,13 @@ pub(crate) struct PaneRect {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AttachCursorState {
+pub struct AttachCursorState {
     pub(crate) x: u16,
     pub(crate) y: u16,
     pub(crate) visible: bool,
 }
 
-pub(crate) struct PaneRenderBuffer {
+pub struct PaneRenderBuffer {
     pub(crate) parser: vt100::Parser,
 }
 
@@ -73,7 +73,7 @@ impl Default for PaneRenderBuffer {
     }
 }
 
-pub(crate) struct AttachViewState {
+pub struct AttachViewState {
     pub(crate) attached_id: Uuid,
     pub(crate) can_write: bool,
     pub(crate) ui_mode: AttachUiMode,

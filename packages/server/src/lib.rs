@@ -91,7 +91,7 @@ struct RestoreSummary {
 }
 
 impl SnapshotRuntime {
-    fn disabled() -> Self {
+    const fn disabled() -> Self {
         Self {
             manager: None,
             dirty: false,
@@ -103,7 +103,7 @@ impl SnapshotRuntime {
         }
     }
 
-    fn with_manager(manager: SnapshotManager) -> Self {
+    const fn with_manager(manager: SnapshotManager) -> Self {
         Self {
             manager: Some(manager),
             dirty: false,
@@ -129,7 +129,7 @@ struct EventRecord {
 }
 
 impl EventHub {
-    fn new(max_events: usize) -> Self {
+    const fn new(max_events: usize) -> Self {
         Self {
             events: Vec::new(),
             subscribers: BTreeMap::new(),
@@ -193,7 +193,7 @@ enum AttachTokenValidationError {
 }
 
 impl AttachTokenManager {
-    fn new(ttl: Duration) -> Self {
+    const fn new(ttl: Duration) -> Self {
         Self {
             ttl,
             tokens: BTreeMap::new(),
@@ -564,12 +564,10 @@ async fn shutdown_pane_handle(mut pane: PaneRuntimeHandle) {
         let _ = stop_tx.send(());
     }
 
-    match tokio::time::timeout(Duration::from_millis(250), &mut pane.task).await {
-        Ok(_) => {}
-        Err(_) => {
-            pane.task.abort();
-            let _ = pane.task.await;
-        }
+    if let Ok(_) = tokio::time::timeout(Duration::from_millis(250), &mut pane.task).await {
+    } else {
+        pane.task.abort();
+        let _ = pane.task.await;
     }
 }
 
@@ -801,8 +799,8 @@ enum PaneLayoutNode {
     Split {
         direction: PaneSplitDirection,
         ratio: f32,
-        first: Box<PaneLayoutNode>,
-        second: Box<PaneLayoutNode>,
+        first: Box<Self>,
+        second: Box<Self>,
     },
 }
 
@@ -1131,7 +1129,7 @@ fn runtime_layout_from_snapshot(node: &PaneLayoutNodeSnapshotV2) -> PaneLayoutNo
 }
 
 impl SessionRuntimeManager {
-    fn new(
+    const fn new(
         shell: String,
         pane_term: String,
         protocol_profile: ProtocolProfile,
@@ -1261,7 +1259,7 @@ impl SessionRuntimeManager {
         pane_name: Option<String>,
         pane_shell: Option<String>,
     ) -> Result<WindowRuntimeHandle> {
-        let window_id = id.unwrap_or_else(bmux_session::WindowId::new);
+        let window_id = id.unwrap_or_default();
         let pane_meta = PaneRuntimeMeta {
             id: pane_id.unwrap_or(window_id.0),
             name: pane_name,
@@ -1326,19 +1324,17 @@ impl SessionRuntimeManager {
 
             let master = pty_pair.master;
 
-            let mut reader = match master.try_clone_reader() {
-                Ok(reader) => reader,
-                Err(_) => {
-                    let _ = child.kill();
-                    return;
-                }
+            let mut reader = if let Ok(reader) = master.try_clone_reader() {
+                reader
+            } else {
+                let _ = child.kill();
+                return;
             };
-            let writer = match master.take_writer() {
-                Ok(writer) => writer,
-                Err(_) => {
-                    let _ = child.kill();
-                    return;
-                }
+            let writer = if let Ok(writer) = master.take_writer() {
+                writer
+            } else {
+                let _ = child.kill();
+                return;
             };
             let writer = Arc::new(std::sync::Mutex::new(writer));
 
@@ -1663,11 +1659,11 @@ impl SessionRuntimeManager {
         let _ = window.layout_root.remove_leaf(pane_id);
         let mut remaining = Vec::new();
         window.layout_root.pane_order(&mut remaining);
-        if window.focused_pane_id == pane_id || !window.panes.contains_key(&window.focused_pane_id)
+        if (window.focused_pane_id == pane_id
+            || !window.panes.contains_key(&window.focused_pane_id))
+            && let Some(next_id) = remaining.first().copied()
         {
-            if let Some(next_id) = remaining.first().copied() {
-                window.focused_pane_id = next_id;
-            }
+            window.focused_pane_id = next_id;
         }
 
         tokio::spawn(async move {
@@ -1693,7 +1689,7 @@ impl SessionRuntimeManager {
             .ok_or_else(|| anyhow::anyhow!("active window not found"))?;
         let pane_id = resolve_pane_id_from_selector(window, target.unwrap_or(PaneSelector::Active))
             .ok_or_else(|| anyhow::anyhow!("target pane not found"))?;
-        let step = (delta as f32) * 0.05;
+        let step = f32::from(delta) * 0.05;
         let _ = window.layout_root.adjust_focused_ratio(pane_id, step);
         self.apply_stored_attach_viewport(session_id);
         Ok(())
@@ -2164,8 +2160,7 @@ impl SessionRuntimeManager {
     fn window_count(&self, session_id: SessionId) -> usize {
         self.runtimes
             .get(&session_id)
-            .map(|runtime| runtime.windows.len())
-            .unwrap_or(0)
+            .map_or(0, |runtime| runtime.windows.len())
     }
 }
 
@@ -2464,50 +2459,48 @@ async fn handle_connection(
         .context("handshake timed out")??;
 
     let handshake = parse_request(&first_envelope)?;
-    match handshake {
-        Request::Hello {
-            protocol_version,
-            client_name,
-            principal_id,
-        } => {
-            if protocol_version != ProtocolVersion::current() {
-                send_error(
-                    &mut stream,
-                    first_envelope.request_id,
-                    ErrorCode::VersionMismatch,
-                    format!(
-                        "unsupported protocol version {}; expected {}",
-                        protocol_version.0, CURRENT_PROTOCOL_VERSION
-                    ),
-                )
-                .await?;
-                return Ok(());
-            }
-            client_principal_id = principal_id;
-            debug!("accepted client handshake: {client_name}");
-            let snapshot = snapshot_status(&state)?;
-            send_ok(
-                &mut stream,
-                first_envelope.request_id,
-                ResponsePayload::ServerStatus {
-                    running: true,
-                    snapshot,
-                    principal_id,
-                    server_owner_principal_id: state.server_owner_principal_id,
-                },
-            )
-            .await?;
-        }
-        _ => {
+    if let Request::Hello {
+        protocol_version,
+        client_name,
+        principal_id,
+    } = handshake
+    {
+        if protocol_version != ProtocolVersion::current() {
             send_error(
                 &mut stream,
                 first_envelope.request_id,
-                ErrorCode::InvalidRequest,
-                "first request must be hello".to_string(),
+                ErrorCode::VersionMismatch,
+                format!(
+                    "unsupported protocol version {}; expected {}",
+                    protocol_version.0, CURRENT_PROTOCOL_VERSION
+                ),
             )
             .await?;
             return Ok(());
         }
+        client_principal_id = principal_id;
+        debug!("accepted client handshake: {client_name}");
+        let snapshot = snapshot_status(&state)?;
+        send_ok(
+            &mut stream,
+            first_envelope.request_id,
+            ResponsePayload::ServerStatus {
+                running: true,
+                snapshot,
+                principal_id,
+                server_owner_principal_id: state.server_owner_principal_id,
+            },
+        )
+        .await?;
+    } else {
+        send_error(
+            &mut stream,
+            first_envelope.request_id,
+            ErrorCode::InvalidRequest,
+            "first request must be hello".to_string(),
+        )
+        .await?;
+        return Ok(());
     }
 
     {
@@ -4068,8 +4061,7 @@ async fn handle_request(
             let window_id = runtime_manager
                 .runtimes
                 .get(&session_id)
-                .map(|runtime| runtime.active_window)
-                .unwrap_or(WindowId(Uuid::nil()));
+                .map_or(WindowId(Uuid::nil()), |runtime| runtime.active_window);
             drop(runtime_manager);
             emit_attach_view_changed(state, session_id, &[AttachViewComponent::Layout])?;
             Response::Ok(ResponsePayload::PaneSplit {
@@ -4125,8 +4117,7 @@ async fn handle_request(
             let window_id = runtime_manager
                 .runtimes
                 .get(&session_id)
-                .map(|runtime| runtime.active_window)
-                .unwrap_or(WindowId(Uuid::nil()));
+                .map_or(WindowId(Uuid::nil()), |runtime| runtime.active_window);
             drop(runtime_manager);
             emit_attach_view_changed(state, session_id, &[AttachViewComponent::Layout])?;
             Response::Ok(ResponsePayload::PaneFocused {
@@ -4168,8 +4159,7 @@ async fn handle_request(
             let window_id = runtime_manager
                 .runtimes
                 .get(&session_id)
-                .map(|runtime| runtime.active_window)
-                .unwrap_or(WindowId(Uuid::nil()));
+                .map_or(WindowId(Uuid::nil()), |runtime| runtime.active_window);
             drop(runtime_manager);
             emit_attach_view_changed(state, session_id, &[AttachViewComponent::Layout])?;
             Response::Ok(ResponsePayload::PaneResized {
@@ -5221,7 +5211,7 @@ async fn handle_request(
     Ok(response)
 }
 
-fn request_requires_exclusive(request: &Request) -> bool {
+const fn request_requires_exclusive(request: &Request) -> bool {
     matches!(
         request,
         Request::ServerSave
@@ -5248,7 +5238,7 @@ fn request_requires_exclusive(request: &Request) -> bool {
     )
 }
 
-fn response_requires_snapshot(response: &Response) -> bool {
+const fn response_requires_snapshot(response: &Response) -> bool {
     matches!(
         response,
         Response::Ok(
@@ -9625,7 +9615,9 @@ mod tests {
 
     fn force_expire_attach_token(token_manager: &mut super::AttachTokenManager, token: Uuid) {
         if let Some(entry) = token_manager.tokens.get_mut(&token) {
-            entry.expires_at = std::time::Instant::now() - Duration::from_millis(1);
+            entry.expires_at = std::time::Instant::now()
+                .checked_sub(Duration::from_millis(1))
+                .unwrap();
         }
     }
 }

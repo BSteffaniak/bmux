@@ -60,7 +60,7 @@ enum TerminalProfile {
     Conservative,
 }
 
-pub(crate) async fn run() -> Result<u8> {
+pub async fn run() -> Result<u8> {
     let cli = Cli::parse();
     init_logging(cli.verbose);
 
@@ -113,8 +113,7 @@ async fn resolve_default_attach_target(client: &mut BmuxClient) -> Result<Uuid> 
         let role = permissions
             .iter()
             .find(|permission| permission.client_id == client_id)
-            .map(|permission| permission.role)
-            .unwrap_or(SessionRole::Observer);
+            .map_or(SessionRole::Observer, |permission| permission.role);
         if role == SessionRole::Owner || role == SessionRole::Writer {
             writable_sessions.push(session.clone());
         }
@@ -381,7 +380,7 @@ async fn run_server_status(as_json: bool) -> Result<u8> {
             "{}",
             serde_json::to_string_pretty(&payload).context("failed encoding server status json")?
         );
-        return Ok(if payload.running { 0 } else { 1 });
+        return Ok(u8::from(!payload.running));
     }
 
     match status {
@@ -579,7 +578,7 @@ async fn latest_server_event_name() -> Result<Option<&'static str>> {
     Ok(events.last().map(server_event_name))
 }
 
-fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
+const fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
     match event {
         bmux_client::ServerEvent::ServerStarted => "server_started",
         bmux_client::ServerEvent::ServerStopping => "server_stopping",
@@ -793,7 +792,7 @@ struct KillFailureSummary {
 }
 
 impl KillFailureSummary {
-    fn record(&mut self, kind: DestructiveOpErrorKind) {
+    const fn record(&mut self, kind: DestructiveOpErrorKind) {
         match kind {
             DestructiveOpErrorKind::OwnerRoleRequired
             | DestructiveOpErrorKind::ForceLocalUnauthorized => {
@@ -1005,7 +1004,7 @@ async fn run_session_kill_all(force_local: bool) -> Result<u8> {
 
     println!("kill-all-sessions complete: killed {killed_count}, failed {failed_count}");
     print_bulk_kill_failure_summary("session", failure_summary);
-    Ok(if failed_count == 0 { 0 } else { 1 })
+    Ok(u8::from(failed_count != 0))
 }
 
 async fn run_session_attach(
@@ -1095,7 +1094,7 @@ async fn run_session_attach_with_client(
         println!("attached to session: {}", attach_info.session_id);
     }
 
-    let mut view_state = AttachViewState::new(attach_info.clone());
+    let mut view_state = AttachViewState::new(attach_info);
 
     update_attach_viewport(&mut client, view_state.attached_id).await?;
     hydrate_attach_state_from_snapshot(&mut client, &mut view_state).await?;
@@ -1326,31 +1325,31 @@ async fn handle_attach_ui_action(
             switch_attach_window_relative(client, view_state.attached_id, 1).await?;
         }
         RuntimeAction::WindowGoto1 => {
-            switch_attach_window_index(client, view_state.attached_id, 0).await?
+            switch_attach_window_index(client, view_state.attached_id, 0).await?;
         }
         RuntimeAction::WindowGoto2 => {
-            switch_attach_window_index(client, view_state.attached_id, 1).await?
+            switch_attach_window_index(client, view_state.attached_id, 1).await?;
         }
         RuntimeAction::WindowGoto3 => {
-            switch_attach_window_index(client, view_state.attached_id, 2).await?
+            switch_attach_window_index(client, view_state.attached_id, 2).await?;
         }
         RuntimeAction::WindowGoto4 => {
-            switch_attach_window_index(client, view_state.attached_id, 3).await?
+            switch_attach_window_index(client, view_state.attached_id, 3).await?;
         }
         RuntimeAction::WindowGoto5 => {
-            switch_attach_window_index(client, view_state.attached_id, 4).await?
+            switch_attach_window_index(client, view_state.attached_id, 4).await?;
         }
         RuntimeAction::WindowGoto6 => {
-            switch_attach_window_index(client, view_state.attached_id, 5).await?
+            switch_attach_window_index(client, view_state.attached_id, 5).await?;
         }
         RuntimeAction::WindowGoto7 => {
-            switch_attach_window_index(client, view_state.attached_id, 6).await?
+            switch_attach_window_index(client, view_state.attached_id, 6).await?;
         }
         RuntimeAction::WindowGoto8 => {
-            switch_attach_window_index(client, view_state.attached_id, 7).await?
+            switch_attach_window_index(client, view_state.attached_id, 7).await?;
         }
         RuntimeAction::WindowGoto9 => {
-            switch_attach_window_index(client, view_state.attached_id, 8).await?
+            switch_attach_window_index(client, view_state.attached_id, 8).await?;
         }
         RuntimeAction::WindowClose => {
             let _ = client
@@ -1653,7 +1652,7 @@ fn adjust_help_overlay_scroll(
     next.min(max_scroll)
 }
 
-fn help_overlay_accepts_key_kind(kind: KeyEventKind) -> bool {
+const fn help_overlay_accepts_key_kind(kind: KeyEventKind) -> bool {
     matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
@@ -1743,7 +1742,7 @@ fn queue_attach_help_overlay(
 
     let content_width = lines
         .iter()
-        .map(|line| line.len())
+        .map(std::string::String::len)
         .max()
         .unwrap_or(0)
         .min(80);
@@ -1935,7 +1934,9 @@ async fn resolve_follow_target_session(
         .into_iter()
         .find(|entry| entry.id == leader_client_id)
         .and_then(|entry| entry.selected_session_id)
-        .ok_or_else(|| ClientError::UnexpectedResponse("follow target has no selected session"))
+        .ok_or(ClientError::UnexpectedResponse(
+            "follow target has no selected session",
+        ))
 }
 
 async fn open_attach_for_session(
@@ -1990,7 +1991,7 @@ enum AttachKeybindingScope {
 }
 
 impl AttachKeybindingScope {
-    fn as_str(self) -> &'static str {
+    const fn as_str(self) -> &'static str {
         match self {
             Self::Runtime => "runtime",
             Self::Global => "global",
@@ -2169,7 +2170,7 @@ fn inject_attach_global_defaults(global: &mut std::collections::BTreeMap<String,
     }
 }
 
-fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
+const fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
     matches!(
         action,
         RuntimeAction::Detach
@@ -2484,38 +2485,37 @@ async fn handle_attach_terminal_event(
     }
 
     let mut skip_attach_key_actions = false;
-    if view_state.quit_confirmation_pending {
-        if let Event::Key(key) = &terminal_event
-            && key.kind == KeyEventKind::Press
-        {
-            match key.code {
-                KeyCode::Char('y') | KeyCode::Char('Y') => {
-                    match client
-                        .kill_session(SessionSelector::ById(view_state.attached_id))
-                        .await
-                    {
-                        Ok(_) => return Ok(AttachLoopControl::Break(AttachExitReason::Quit)),
-                        Err(error) => {
-                            let status = attach_quit_failure_status(&error);
-                            view_state.set_transient_status(
-                                status,
-                                Instant::now(),
-                                ATTACH_TRANSIENT_STATUS_TTL,
-                            );
-                        }
+    if view_state.quit_confirmation_pending
+        && let Event::Key(key) = &terminal_event
+        && key.kind == KeyEventKind::Press
+    {
+        match key.code {
+            KeyCode::Char('y' | 'Y') => {
+                match client
+                    .kill_session(SessionSelector::ById(view_state.attached_id))
+                    .await
+                {
+                    Ok(_) => return Ok(AttachLoopControl::Break(AttachExitReason::Quit)),
+                    Err(error) => {
+                        let status = attach_quit_failure_status(&error);
+                        view_state.set_transient_status(
+                            status,
+                            Instant::now(),
+                            ATTACH_TRANSIENT_STATUS_TTL,
+                        );
                     }
-                    view_state.quit_confirmation_pending = false;
-                    view_state.dirty.status_needs_redraw = true;
-                    skip_attach_key_actions = true;
                 }
-                KeyCode::Char('n') | KeyCode::Char('N') | KeyCode::Esc | KeyCode::Enter => {
-                    view_state.quit_confirmation_pending = false;
-                    view_state.dirty.status_needs_redraw = true;
-                    skip_attach_key_actions = true;
-                }
-                _ => {
-                    skip_attach_key_actions = true;
-                }
+                view_state.quit_confirmation_pending = false;
+                view_state.dirty.status_needs_redraw = true;
+                skip_attach_key_actions = true;
+            }
+            KeyCode::Char('n' | 'N') | KeyCode::Esc | KeyCode::Enter => {
+                view_state.quit_confirmation_pending = false;
+                view_state.dirty.status_needs_redraw = true;
+                skip_attach_key_actions = true;
+            }
+            _ => {
+                skip_attach_key_actions = true;
             }
         }
     }
@@ -2656,7 +2656,7 @@ fn attach_key_event_actions(
         return Ok(vec![AttachEventAction::Ignore]);
     }
 
-    let actions = attach_input_processor.process_terminal_event(Event::Key(key.clone()));
+    let actions = attach_input_processor.process_terminal_event(Event::Key(*key));
     Ok(actions
         .into_iter()
         .map(|action| match action {
@@ -2677,8 +2677,7 @@ fn attach_key_event_actions(
                     && !key.modifiers.contains(KeyModifiers::SUPER)
                 {
                     attach_key_event_to_bytes(key)
-                        .map(AttachEventAction::Send)
-                        .unwrap_or(AttachEventAction::Ignore)
+                        .map_or(AttachEventAction::Ignore, AttachEventAction::Send)
                 } else {
                     AttachEventAction::Runtime(action)
                 }
@@ -2721,8 +2720,7 @@ fn attach_key_event_actions(
                     AttachEventAction::Ui(action)
                 } else {
                     attach_key_event_to_bytes(key)
-                        .map(AttachEventAction::Send)
-                        .unwrap_or(AttachEventAction::Ignore)
+                        .map_or(AttachEventAction::Ignore, AttachEventAction::Send)
                 }
             }
             RuntimeAction::Quit => AttachEventAction::Ui(action),
@@ -2747,7 +2745,7 @@ fn attach_key_event_actions(
         .collect())
 }
 
-fn is_attach_stream_closed_error(error: &ClientError) -> bool {
+const fn is_attach_stream_closed_error(error: &ClientError) -> bool {
     matches!(
         error,
         ClientError::ServerError {
@@ -2957,7 +2955,7 @@ async fn run_window_kill_all(session: Option<&String>, force_local: bool) -> Res
 
     println!("kill-all-windows complete: killed {killed_count}, failed {failed_count}");
     print_bulk_kill_failure_summary("window", failure_summary);
-    Ok(if failed_count == 0 { 0 } else { 1 })
+    Ok(u8::from(failed_count != 0))
 }
 
 async fn run_window_switch(target: &str, session: Option<&String>) -> Result<u8> {
@@ -2994,7 +2992,7 @@ fn parse_uuid_value(value: &str, label: &str) -> Result<Uuid> {
     Uuid::parse_str(value).with_context(|| format!("{label} must be a UUID, got '{value}'"))
 }
 
-fn session_role_from_value(role: RoleValue) -> SessionRole {
+const fn session_role_from_value(role: RoleValue) -> SessionRole {
     match role {
         RoleValue::Owner => SessionRole::Owner,
         RoleValue::Writer => SessionRole::Writer,
@@ -3002,7 +3000,7 @@ fn session_role_from_value(role: RoleValue) -> SessionRole {
     }
 }
 
-fn session_role_label(role: SessionRole) -> &'static str {
+const fn session_role_label(role: SessionRole) -> &'static str {
     match role {
         SessionRole::Owner => "owner",
         SessionRole::Writer => "writer",
@@ -3101,12 +3099,11 @@ fn read_server_pid_file() -> Result<Option<u32>> {
         }
     };
 
-    match parse_pid_content(&content) {
-        Some(pid) => Ok(Some(pid)),
-        None => {
-            let _ = remove_server_pid_file();
-            Ok(None)
-        }
+    if let Some(pid) = parse_pid_content(&content) {
+        Ok(Some(pid))
+    } else {
+        let _ = remove_server_pid_file();
+        Ok(None)
     }
 }
 
@@ -3135,7 +3132,7 @@ fn try_kill_pid(pid: u32) -> Result<bool> {
             .arg(pid.to_string())
             .status()
             .context("failed to execute kill command")?;
-        return Ok(status.success());
+        Ok(status.success())
     }
 
     #[cfg(windows)]
@@ -3163,7 +3160,7 @@ fn is_pid_running(pid: u32) -> Result<bool> {
             .arg(pid.to_string())
             .status()
             .context("failed to execute kill -0 command")?;
-        return Ok(status.success());
+        Ok(status.success())
     }
 
     #[cfg(windows)]
@@ -3203,9 +3200,10 @@ fn parse_pid_content(content: &str) -> Option<u32> {
 }
 
 fn run_terminal_install_terminfo(yes: bool, check_only: bool) -> Result<u8> {
-    let configured = BmuxConfig::load()
-        .map(|cfg| cfg.behavior.pane_term)
-        .unwrap_or_else(|_| "bmux-256color".to_string());
+    let configured = BmuxConfig::load().map_or_else(
+        |_| "bmux-256color".to_string(),
+        |cfg| cfg.behavior.pane_term,
+    );
     let is_installed = check_terminfo_available("bmux-256color") == Some(true);
 
     if check_only {
@@ -3381,15 +3379,13 @@ fn run_terminal_doctor(
     }
 
     if include_trace {
-        println!("trace events (latest {}):", trace_limit);
+        println!("trace events (latest {trace_limit}):");
         println!("trace dropped events: {}", trace_data.dropped);
         if trace_family.is_some() || trace_pane.is_some() {
             println!(
                 "trace filters: family={} pane={}",
-                trace_family.map(trace_family_name).unwrap_or("any"),
-                trace_pane
-                    .map(|pane| pane.to_string())
-                    .unwrap_or_else(|| "any".to_string())
+                trace_family.map_or("any", trace_family_name),
+                trace_pane.map_or_else(|| "any".to_string(), |pane| pane.to_string())
             );
         }
         if trace_events.is_empty() {
@@ -3481,12 +3477,9 @@ fn filter_trace_events(
     let mut filtered: Vec<ProtocolTraceEvent> = events
         .iter()
         .filter(|event| {
-            let family_matches = family
-                .map(|value| event.family == trace_family_name(value))
-                .unwrap_or(true);
-            let pane_matches = pane
-                .map(|value| event.pane_id == Some(value))
-                .unwrap_or(true);
+            let family_matches =
+                family.is_none_or(|value| event.family == trace_family_name(value));
+            let pane_matches = pane.is_none_or(|value| event.pane_id == Some(value));
             family_matches && pane_matches
         })
         .cloned()
@@ -3498,7 +3491,7 @@ fn filter_trace_events(
     filtered
 }
 
-fn trace_family_name(family: TraceFamily) -> &'static str {
+const fn trace_family_name(family: TraceFamily) -> &'static str {
     match family {
         TraceFamily::Csi => "csi",
         TraceFamily::Osc => "osc",
@@ -3532,7 +3525,7 @@ fn install_bmux_terminfo() -> Result<()> {
     Ok(())
 }
 
-fn terminfo_auto_install_name(policy: TerminfoAutoInstall) -> &'static str {
+const fn terminfo_auto_install_name(policy: TerminfoAutoInstall) -> &'static str {
     match policy {
         TerminfoAutoInstall::Ask => "ask",
         TerminfoAutoInstall::Always => "always",
@@ -3579,7 +3572,7 @@ where
 
     let fallback_chain = vec!["xterm-256color".to_string(), "screen-256color".to_string()];
     let mut terminfo_checks = Vec::new();
-    let mut pane_term = configured_normalized.clone();
+    let mut pane_term = configured_normalized;
 
     let configured_check = checker(&pane_term);
     terminfo_checks.push((pane_term.clone(), configured_check));
@@ -3621,8 +3614,7 @@ where
         }
     } else if configured_check.is_none() {
         warnings.push(format!(
-            "could not verify terminfo for pane TERM '{}'; continuing without fallback checks",
-            pane_term
+            "could not verify terminfo for pane TERM '{pane_term}'; continuing without fallback checks"
         ));
     }
 
@@ -3635,8 +3627,7 @@ where
 
     if profile == TerminalProfile::Conservative {
         warnings.push(format!(
-            "pane TERM '{}' uses conservative capability profile; compatibility depends on host terminfo",
-            pane_term
+            "pane TERM '{pane_term}' uses conservative capability profile; compatibility depends on host terminfo"
         ));
     }
 
@@ -3662,7 +3653,7 @@ fn profile_for_term(term: &str) -> TerminalProfile {
     }
 }
 
-fn terminal_profile_name(profile: TerminalProfile) -> &'static str {
+const fn terminal_profile_name(profile: TerminalProfile) -> &'static str {
     match profile {
         TerminalProfile::Bmux256Color => "bmux-256color",
         TerminalProfile::Screen256Color => "screen-256color-compatible",
@@ -3671,7 +3662,7 @@ fn terminal_profile_name(profile: TerminalProfile) -> &'static str {
     }
 }
 
-fn protocol_profile_for_terminal_profile(profile: TerminalProfile) -> ProtocolProfile {
+const fn protocol_profile_for_terminal_profile(profile: TerminalProfile) -> ProtocolProfile {
     match profile {
         TerminalProfile::Bmux256Color => ProtocolProfile::Bmux,
         TerminalProfile::Screen256Color => ProtocolProfile::Screen,

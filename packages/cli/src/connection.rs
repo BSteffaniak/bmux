@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use bmux_client::{BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, StaleBuildAction};
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
-pub(crate) struct ServerRuntimeMetadata {
+pub struct ServerRuntimeMetadata {
     pub(crate) pid: u32,
     pub(crate) version: String,
     pub(crate) build_id: String,
@@ -11,17 +11,17 @@ pub(crate) struct ServerRuntimeMetadata {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ConnectionPolicyScope {
+pub enum ConnectionPolicyScope {
     Normal,
     RecoveryInspection,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ServerBuildPolicyEffect {
+pub enum ServerBuildPolicyEffect {
     Warn(String),
 }
 
-pub(crate) async fn connect(
+pub async fn connect(
     scope: ConnectionPolicyScope,
     client_name: &'static str,
 ) -> Result<BmuxClient> {
@@ -31,13 +31,13 @@ pub(crate) async fn connect(
         .map_err(map_client_connect_error)
 }
 
-pub(crate) async fn connect_raw(client_name: &'static str) -> Result<BmuxClient> {
+pub async fn connect_raw(client_name: &'static str) -> Result<BmuxClient> {
     BmuxClient::connect_default(client_name)
         .await
         .map_err(map_client_connect_error)
 }
 
-pub(crate) fn map_client_connect_error(error: ClientError) -> anyhow::Error {
+pub fn map_client_connect_error(error: ClientError) -> anyhow::Error {
     if let ClientError::ServerError { code, .. } = &error
         && *code == bmux_ipc::ErrorCode::VersionMismatch
     {
@@ -66,7 +66,7 @@ pub(crate) fn map_client_connect_error(error: ClientError) -> anyhow::Error {
     anyhow::Error::from(error)
 }
 
-pub(crate) fn apply_stale_build_policy(scope: ConnectionPolicyScope) -> Result<()> {
+pub fn apply_stale_build_policy(scope: ConnectionPolicyScope) -> Result<()> {
     let config = BmuxConfig::load().context("failed loading bmux config")?;
     match evaluate_stale_build_policy(
         scope,
@@ -80,7 +80,7 @@ pub(crate) fn apply_stale_build_policy(scope: ConnectionPolicyScope) -> Result<(
     Ok(())
 }
 
-pub(crate) fn evaluate_stale_build_policy(
+pub fn evaluate_stale_build_policy(
     scope: ConnectionPolicyScope,
     action: StaleBuildAction,
     metadata: Option<ServerRuntimeMetadata>,
@@ -125,7 +125,7 @@ fn server_runtime_metadata_file_path() -> std::path::PathBuf {
     paths.runtime_dir.join("server-meta.json")
 }
 
-pub(crate) fn current_cli_build_id() -> Result<String> {
+pub fn current_cli_build_id() -> Result<String> {
     let executable = std::env::current_exe().context("failed resolving current executable")?;
     let metadata = std::fs::metadata(&executable).with_context(|| {
         format!(
@@ -154,7 +154,7 @@ fn current_server_runtime_metadata(pid: u32) -> Result<ServerRuntimeMetadata> {
     })
 }
 
-pub(crate) fn write_server_runtime_metadata(pid: u32) -> Result<()> {
+pub fn write_server_runtime_metadata(pid: u32) -> Result<()> {
     let path = server_runtime_metadata_file_path();
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
@@ -167,7 +167,7 @@ pub(crate) fn write_server_runtime_metadata(pid: u32) -> Result<()> {
         .with_context(|| format!("failed writing server metadata file {}", path.display()))
 }
 
-pub(crate) fn read_server_runtime_metadata() -> Result<Option<ServerRuntimeMetadata>> {
+pub fn read_server_runtime_metadata() -> Result<Option<ServerRuntimeMetadata>> {
     let path = server_runtime_metadata_file_path();
     let bytes = match std::fs::read(&path) {
         Ok(bytes) => bytes,
@@ -187,7 +187,7 @@ pub(crate) fn read_server_runtime_metadata() -> Result<Option<ServerRuntimeMetad
     Ok(Some(metadata))
 }
 
-pub(crate) fn remove_server_runtime_metadata_file() -> Result<()> {
+pub fn remove_server_runtime_metadata_file() -> Result<()> {
     let path = server_runtime_metadata_file_path();
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),

@@ -392,7 +392,7 @@ impl BmuxConfig {
         if let Err(error) = self.keybindings.resolve_timeout() {
             self.keybindings.timeout_ms = keybind_defaults.timeout_ms;
             self.keybindings.timeout_profile = keybind_defaults.timeout_profile.clone();
-            self.keybindings.timeout_profiles = keybind_defaults.timeout_profiles.clone();
+            self.keybindings.timeout_profiles = keybind_defaults.timeout_profiles;
             repaired_fields.push(format!(
                 "keybindings timeout settings -> indefinite ({error})"
             ));

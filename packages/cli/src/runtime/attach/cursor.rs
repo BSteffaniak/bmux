@@ -4,7 +4,7 @@ use crossterm::cursor::{Hide, MoveTo, RestorePosition, Show};
 use crossterm::queue;
 use std::io;
 
-pub(crate) fn apply_attach_cursor_state(
+pub fn apply_attach_cursor_state(
     stdout: &mut io::Stdout,
     cursor_state: Option<AttachCursorState>,
     last_cursor_state: &mut Option<AttachCursorState>,
