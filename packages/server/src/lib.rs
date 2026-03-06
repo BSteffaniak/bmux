@@ -7304,6 +7304,20 @@ mod tests {
             })
         );
 
+        let stream_after_reattach = send_request(
+            &mut client,
+            751,
+            Request::AttachOutput {
+                session_id,
+                max_bytes: 8192,
+            },
+        )
+        .await;
+        assert!(matches!(
+            stream_after_reattach,
+            Response::Ok(ResponsePayload::AttachOutput { data }) if data.is_empty()
+        ));
+
         let snapshot_after_reattach = send_request(
             &mut client,
             76,

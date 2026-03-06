@@ -2099,6 +2099,15 @@ fn resize_attach_parsers_for_layout(
     layout: &bmux_ipc::PaneLayoutNode,
 ) {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
+    resize_attach_parsers_for_layout_with_size(pane_buffers, layout, cols, rows);
+}
+
+fn resize_attach_parsers_for_layout_with_size(
+    pane_buffers: &mut std::collections::BTreeMap<Uuid, attach::state::PaneRenderBuffer>,
+    layout: &bmux_ipc::PaneLayoutNode,
+    cols: u16,
+    rows: u16,
+) {
     if cols == 0 || rows <= 1 {
         return;
     }
@@ -3713,6 +3722,7 @@ mod tests {
         KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
         KeyEventKind as CrosstermKeyEventKind, KeyModifiers,
     };
+    use std::collections::BTreeMap;
 
     #[test]
     fn pane_term_profile_mapping_is_stable() {
@@ -4500,5 +4510,24 @@ mod tests {
             ordered_names,
             vec!["window-2", "window-10", "editor", "zeta"]
         );
+    }
+
+    #[test]
+    fn resize_attach_parsers_applies_layout_size_before_snapshot_bytes() {
+        let pane_id = uuid::Uuid::new_v4();
+        let layout = bmux_ipc::PaneLayoutNode::Leaf { pane_id };
+        let mut pane_buffers = BTreeMap::new();
+        pane_buffers.insert(pane_id, super::attach::state::PaneRenderBuffer::default());
+
+        super::resize_attach_parsers_for_layout_with_size(&mut pane_buffers, &layout, 120, 50);
+
+        let buffer = pane_buffers
+            .get_mut(&pane_id)
+            .expect("pane buffer should exist");
+        super::append_pane_output(&mut *buffer, b"\x1b[999;999H");
+        let (row, col) = buffer.parser.screen().cursor_position();
+
+        assert_eq!(row, 46, "cursor row should clamp to pane inner height");
+        assert_eq!(col, 117, "cursor col should clamp to pane inner width");
     }
 }
