@@ -46,7 +46,7 @@ impl Default for AttachDirtyFlags {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaneRect {
     pub(crate) x: u16,
     pub(crate) y: u16,

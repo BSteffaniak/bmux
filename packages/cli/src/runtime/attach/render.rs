@@ -11,6 +11,30 @@ use std::io;
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum AttachLayer {
+    Pane = 0,
+    Overlay = 100,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AttachLayerSurface {
+    pub(crate) rect: PaneRect,
+    pub(crate) layer: AttachLayer,
+    pub(crate) opaque: bool,
+}
+
+impl AttachLayerSurface {
+    pub(crate) const fn new(rect: PaneRect, layer: AttachLayer, opaque: bool) -> Self {
+        Self {
+            rect,
+            layer,
+            opaque,
+        }
+    }
+}
+
 pub fn append_pane_output(buffer: &mut PaneRenderBuffer, bytes: &[u8]) {
     if bytes.is_empty() {
         return;
@@ -29,6 +53,42 @@ fn draw_box_line(width: usize, left: char, mid: char, right: char) -> String {
     }
     line.push(right);
     line
+}
+
+pub(crate) fn opaque_row_text(content: &str, width: usize) -> String {
+    let mut rendered = content.to_string();
+    if rendered.len() > width {
+        rendered.truncate(width);
+    }
+    if rendered.len() < width {
+        rendered.push_str(&" ".repeat(width - rendered.len()));
+    }
+    rendered
+}
+
+pub(crate) fn queue_layer_fill<W: io::Write>(
+    stdout: &mut W,
+    surface: AttachLayerSurface,
+) -> Result<()> {
+    if !surface.opaque || surface.rect.w <= 2 || surface.rect.h <= 2 {
+        return Ok(());
+    }
+
+    let fill = " ".repeat(usize::from(surface.rect.w.saturating_sub(2)));
+    for y in surface.rect.y.saturating_add(1)
+        ..surface
+            .rect
+            .y
+            .saturating_add(surface.rect.h.saturating_sub(1))
+    {
+        queue!(
+            stdout,
+            MoveTo(surface.rect.x.saturating_add(1), y),
+            Print(&fill)
+        )
+        .with_context(|| format!("failed filling {:?} layer row", surface.layer))?;
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
@@ -257,4 +317,65 @@ pub fn render_attach_panes(
     }
 
     Ok(cursor_state)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AttachLayer, AttachLayerSurface, opaque_row_text, queue_layer_fill};
+    use crate::runtime::attach::state::PaneRect;
+    use crossterm::cursor::MoveTo;
+    use crossterm::queue;
+    use crossterm::style::Print;
+
+    fn screen_row(screen: &vt100::Screen, row: u16, width: u16) -> String {
+        let mut line = String::new();
+        for col in 0..width {
+            let cell = screen.cell(row, col).expect("screen cell should exist");
+            line.push_str(if cell.has_contents() {
+                cell.contents()
+            } else {
+                " "
+            });
+        }
+        line
+    }
+
+    #[test]
+    fn opaque_row_text_truncates_and_pads() {
+        assert_eq!(opaque_row_text("help", 8), "help    ");
+        assert_eq!(opaque_row_text("123456789", 5), "12345");
+    }
+
+    #[test]
+    fn queue_layer_fill_and_text_overwrite_existing_content() {
+        let mut parser = vt100::Parser::new(6, 20, 128);
+        parser.process(b"\x1b[2;1H0123456789abcdefghij");
+
+        let surface = AttachLayerSurface::new(
+            PaneRect {
+                x: 0,
+                y: 0,
+                w: 12,
+                h: 4,
+            },
+            AttachLayer::Overlay,
+            true,
+        );
+
+        let mut bytes = Vec::new();
+        queue_layer_fill(&mut bytes, surface).expect("overlay fill should succeed");
+        queue!(
+            bytes,
+            MoveTo(1, 1),
+            Print(opaque_row_text(
+                "help",
+                usize::from(surface.rect.w.saturating_sub(2))
+            ))
+        )
+        .expect("overlay text should queue");
+
+        parser.process(&bytes);
+
+        assert_eq!(screen_row(parser.screen(), 1, 12), "0help      b");
+    }
 }

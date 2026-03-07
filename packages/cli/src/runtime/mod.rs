@@ -36,7 +36,10 @@ mod terminal_protocol;
 use attach::cursor::apply_attach_cursor_state;
 use attach::events::{AttachLoopControl, AttachLoopEvent, collect_attach_loop_events};
 use attach::layout::{collect_layout_rects, collect_pane_ids};
-use attach::render::{append_pane_output, render_attach_panes};
+use attach::render::{
+    AttachLayer, AttachLayerSurface, append_pane_output, opaque_row_text, queue_layer_fill,
+    render_attach_panes,
+};
 use attach::state::{AttachEventAction, AttachExitReason, AttachUiMode, AttachViewState, PaneRect};
 use terminal_protocol::{
     ProtocolDirection, ProtocolProfile, ProtocolTraceEvent, primary_da_for_profile,
@@ -1751,6 +1754,17 @@ fn queue_attach_help_overlay(
     let x = ((cols as usize).saturating_sub(width)) / 2;
     let y = ((rows as usize).saturating_sub(height)) / 2;
     let body_rows = height.saturating_sub(4).max(1);
+    let surface = AttachLayerSurface::new(
+        PaneRect {
+            x: x as u16,
+            y: y as u16,
+            w: width as u16,
+            h: height as u16,
+        },
+        AttachLayer::Overlay,
+        true,
+    );
+    let text_width = width.saturating_sub(4);
 
     let top = format!("+{}+", "-".repeat(width.saturating_sub(2)));
     queue!(stdout, MoveTo(x as u16, y as u16), Print(&top))
@@ -1773,6 +1787,8 @@ fn queue_attach_help_overlay(
         .context("failed drawing help overlay border")?;
     }
 
+    queue_layer_fill(stdout, surface).context("failed filling help overlay body")?;
+
     queue!(
         stdout,
         MoveTo(x as u16, (y + height - 1) as u16),
@@ -1781,10 +1797,7 @@ fn queue_attach_help_overlay(
     .context("failed drawing help overlay bottom")?;
 
     let header = "scope    chord                action";
-    let mut header_rendered = header.to_string();
-    if header_rendered.len() > width.saturating_sub(4) {
-        header_rendered.truncate(width.saturating_sub(4));
-    }
+    let header_rendered = opaque_row_text(header, text_width);
     queue!(
         stdout,
         MoveTo((x + 2) as u16, (y + 1) as u16),
@@ -1795,10 +1808,7 @@ fn queue_attach_help_overlay(
     let start = scroll.min(lines.len().saturating_sub(body_rows));
     let end = (start + body_rows).min(lines.len());
     for (idx, line) in lines.iter().skip(start).take(body_rows).enumerate() {
-        let mut rendered = line.clone();
-        if rendered.len() > width.saturating_sub(4) {
-            rendered.truncate(width.saturating_sub(4));
-        }
+        let rendered = opaque_row_text(line, text_width);
         let row = y + 2 + idx;
         if row >= y + height - 1 {
             break;
@@ -1813,10 +1823,7 @@ fn queue_attach_help_overlay(
         end,
         lines.len()
     );
-    let mut footer_rendered = footer;
-    if footer_rendered.len() > width.saturating_sub(4) {
-        footer_rendered.truncate(width.saturating_sub(4));
-    }
+    let footer_rendered = opaque_row_text(&footer, text_width);
     queue!(
         stdout,
         MoveTo((x + 2) as u16, (y + height - 2) as u16),
