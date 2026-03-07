@@ -105,7 +105,7 @@ Attach UI defaults (user-overridable via keybindings):
 
 - `Ctrl-A d`: detach
 - `Ctrl-A [`: enter scrollback mode for the focused pane
-- scrollback mode: `PageUp/PageDown` page, `Ctrl-Y/Ctrl-E` line, `g/G` top/bottom, `Ctrl-A ]` or `Esc` exit
+- scrollback mode: arrows or `h/j/k/l` move the cursor, `PageUp/PageDown` page, `Ctrl-Y/Ctrl-E` line-scroll the viewport, `g/G` top/bottom, `Ctrl-A ]` or `Esc` exit
 - `Ctrl-T`: enter window mode
 - window mode: `H/L` previous/next session (wrap), `h/l` previous/next window (wrap), `1..9` jump to index, `n` new window, `x` close active window, `Esc`/`Enter` exit window mode
 

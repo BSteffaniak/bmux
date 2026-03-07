@@ -73,12 +73,19 @@ impl Default for PaneRenderBuffer {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AttachScrollbackCursor {
+    pub(crate) row: usize,
+    pub(crate) col: usize,
+}
+
 pub struct AttachViewState {
     pub(crate) attached_id: Uuid,
     pub(crate) can_write: bool,
     pub(crate) ui_mode: AttachUiMode,
     pub(crate) scrollback_active: bool,
     pub(crate) scrollback_offset: usize,
+    pub(crate) scrollback_cursor: Option<AttachScrollbackCursor>,
     pub(crate) quit_confirmation_pending: bool,
     pub(crate) help_overlay_open: bool,
     pub(crate) help_overlay_scroll: usize,
@@ -99,6 +106,7 @@ impl AttachViewState {
             ui_mode: AttachUiMode::Normal,
             scrollback_active: false,
             scrollback_offset: 0,
+            scrollback_cursor: None,
             quit_confirmation_pending: false,
             help_overlay_open: false,
             help_overlay_scroll: 0,
@@ -149,5 +157,6 @@ impl AttachViewState {
     pub(crate) fn exit_scrollback(&mut self) {
         self.scrollback_active = false;
         self.scrollback_offset = 0;
+        self.scrollback_cursor = None;
     }
 }

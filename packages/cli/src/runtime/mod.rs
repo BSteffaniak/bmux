@@ -1350,12 +1350,26 @@ async fn handle_attach_ui_action(
         RuntimeAction::ScrollTop => {
             if view_state.scrollback_active {
                 view_state.scrollback_offset = max_attach_scrollback(view_state);
+                clamp_attach_scrollback_cursor(view_state);
             }
         }
         RuntimeAction::ScrollBottom => {
             if view_state.scrollback_active {
                 view_state.scrollback_offset = 0;
+                clamp_attach_scrollback_cursor(view_state);
             }
+        }
+        RuntimeAction::MoveCursorLeft => {
+            move_attach_scrollback_cursor_horizontal(view_state, -1);
+        }
+        RuntimeAction::MoveCursorRight => {
+            move_attach_scrollback_cursor_horizontal(view_state, 1);
+        }
+        RuntimeAction::MoveCursorUp => {
+            move_attach_scrollback_cursor_vertical(view_state, -1);
+        }
+        RuntimeAction::MoveCursorDown => {
+            move_attach_scrollback_cursor_vertical(view_state, 1);
         }
         RuntimeAction::BeginSelection | RuntimeAction::CopyScrollback => {
             view_state.set_transient_status(
@@ -1493,11 +1507,19 @@ async fn handle_attach_ui_action(
 }
 
 fn enter_attach_scrollback(view_state: &mut AttachViewState) -> bool {
-    if focused_attach_pane_buffer(view_state).is_none() {
+    let Some((inner_w, inner_h)) = focused_attach_pane_inner_size(view_state) else {
         return false;
-    }
+    };
+    let Some(buffer) = focused_attach_pane_buffer(view_state) else {
+        return false;
+    };
+    let (row, col) = buffer.parser.screen().cursor_position();
     view_state.scrollback_active = true;
     view_state.scrollback_offset = 0;
+    view_state.scrollback_cursor = Some(attach::state::AttachScrollbackCursor {
+        row: usize::from(row).min(inner_h.saturating_sub(1)),
+        col: usize::from(col).min(inner_w.saturating_sub(1)),
+    });
     true
 }
 
@@ -1508,6 +1530,61 @@ fn step_attach_scrollback(view_state: &mut AttachViewState, delta: isize) {
     let max_offset = max_attach_scrollback(view_state);
     view_state.scrollback_offset =
         adjust_attach_scrollback_offset(view_state.scrollback_offset, delta, max_offset);
+    clamp_attach_scrollback_cursor(view_state);
+}
+
+fn move_attach_scrollback_cursor_horizontal(view_state: &mut AttachViewState, delta: isize) {
+    if !view_state.scrollback_active {
+        return;
+    }
+    let Some((inner_w, _)) = focused_attach_pane_inner_size(view_state) else {
+        return;
+    };
+    let Some(cursor) = view_state.scrollback_cursor.as_mut() else {
+        return;
+    };
+    cursor.col = adjust_scrollback_cursor_component(cursor.col, delta, inner_w.saturating_sub(1));
+}
+
+fn move_attach_scrollback_cursor_vertical(view_state: &mut AttachViewState, delta: isize) {
+    if !view_state.scrollback_active || delta == 0 {
+        return;
+    }
+    let Some((_, inner_h)) = focused_attach_pane_inner_size(view_state) else {
+        return;
+    };
+    let max_offset = max_attach_scrollback(view_state);
+    let Some(cursor) = view_state.scrollback_cursor.as_mut() else {
+        return;
+    };
+
+    if delta < 0 {
+        for _ in 0..delta.unsigned_abs() {
+            if cursor.row > 0 {
+                cursor.row -= 1;
+            } else if view_state.scrollback_offset < max_offset {
+                view_state.scrollback_offset += 1;
+            }
+        }
+    } else {
+        for _ in 0..(delta as usize) {
+            if cursor.row + 1 < inner_h {
+                cursor.row += 1;
+            } else if view_state.scrollback_offset > 0 {
+                view_state.scrollback_offset -= 1;
+            }
+        }
+    }
+
+    clamp_attach_scrollback_cursor(view_state);
+}
+
+fn adjust_scrollback_cursor_component(current: usize, delta: isize, max_value: usize) -> usize {
+    if delta < 0 {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        current.saturating_add(delta as usize).min(max_value)
+    }
 }
 
 fn adjust_attach_scrollback_offset(current: usize, delta: isize, max_offset: usize) -> usize {
@@ -1529,8 +1606,22 @@ fn max_attach_scrollback(view_state: &mut AttachViewState) -> usize {
     max_offset
 }
 
+fn clamp_attach_scrollback_cursor(view_state: &mut AttachViewState) {
+    let Some((inner_w, inner_h)) = focused_attach_pane_inner_size(view_state) else {
+        view_state.scrollback_cursor = None;
+        return;
+    };
+    let Some(cursor) = view_state.scrollback_cursor.as_mut() else {
+        return;
+    };
+    cursor.row = cursor.row.min(inner_h.saturating_sub(1));
+    cursor.col = cursor.col.min(inner_w.saturating_sub(1));
+}
+
 fn attach_scrollback_page_size(view_state: &AttachViewState) -> usize {
-    focused_attach_pane_inner_height(view_state).unwrap_or(10)
+    focused_attach_pane_inner_size(view_state)
+        .map(|(_, inner_h)| inner_h)
+        .unwrap_or(10)
 }
 
 fn focused_attach_pane_buffer(
@@ -1540,14 +1631,19 @@ fn focused_attach_pane_buffer(
     view_state.pane_buffers.get_mut(&focused_pane_id)
 }
 
-fn focused_attach_pane_inner_height(view_state: &AttachViewState) -> Option<usize> {
+fn focused_attach_pane_inner_size(view_state: &AttachViewState) -> Option<(usize, usize)> {
     let layout_state = view_state.cached_layout_state.as_ref()?;
     layout_state
         .scene
         .surfaces
         .iter()
         .find(|surface| surface.visible && surface.pane_id == Some(layout_state.focused_pane_id))
-        .map(|surface| usize::from(surface.rect.h.saturating_sub(2).max(1)))
+        .map(|surface| {
+            (
+                usize::from(surface.rect.w.saturating_sub(2).max(1)),
+                usize::from(surface.rect.h.saturating_sub(2).max(1)),
+            )
+        })
 }
 
 async fn switch_attach_window_relative(
@@ -1780,11 +1876,17 @@ fn attach_mode_hint(ui_mode: AttachUiMode, keymap: &Keymap) -> String {
 
 fn attach_scrollback_hint(keymap: &Keymap) -> String {
     let exit = key_hint_or_unbound(keymap, RuntimeAction::ExitScrollMode);
+    let up = key_hint_or_unbound(keymap, RuntimeAction::MoveCursorUp);
+    let down = key_hint_or_unbound(keymap, RuntimeAction::MoveCursorDown);
+    let left = key_hint_or_unbound(keymap, RuntimeAction::MoveCursorLeft);
+    let right = key_hint_or_unbound(keymap, RuntimeAction::MoveCursorRight);
     let page_up = key_hint_or_unbound(keymap, RuntimeAction::ScrollUpPage);
     let page_down = key_hint_or_unbound(keymap, RuntimeAction::ScrollDownPage);
     let top = key_hint_or_unbound(keymap, RuntimeAction::ScrollTop);
     let bottom = key_hint_or_unbound(keymap, RuntimeAction::ScrollBottom);
-    format!("{page_up}/{page_down} page | {top}/{bottom} top/bottom | {exit} exit scroll")
+    format!(
+        "{up}/{down} line | {left}/{right} col | {page_up}/{page_down} page | {top}/{bottom} top/bottom | {exit} exit scroll"
+    )
 }
 
 fn key_hint_or_unbound(keymap: &Keymap, action: RuntimeAction) -> String {
@@ -2089,6 +2191,7 @@ async fn render_attach_frame(
         view_state.dirty.full_pane_redraw,
         view_state.scrollback_active,
         view_state.scrollback_offset,
+        view_state.scrollback_cursor,
     )?;
     if view_state.help_overlay_open {
         if let Some(help_surface) = help_overlay_surface(help_lines) {
@@ -4102,16 +4205,66 @@ mod tests {
     };
     use crate::input::InputProcessor;
     use crate::runtime::attach::state::AttachViewState;
-    use bmux_client::{AttachOpenInfo, ClientError};
+    use bmux_client::{AttachLayoutState, AttachOpenInfo, ClientError};
     use bmux_config::{BmuxConfig, ResolvedTimeout};
     use bmux_ipc::transport::IpcTransportError;
-    use bmux_ipc::{AttachViewComponent, ErrorCode, SessionRole, SessionSummary};
+    use bmux_ipc::{
+        AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
+        AttachViewComponent, ErrorCode, PaneLayoutNode, PaneSummary, SessionRole, SessionSummary,
+    };
     use crossterm::event::{
         KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
         KeyEventKind as CrosstermKeyEventKind, KeyModifiers,
     };
     use std::collections::BTreeMap;
     use uuid::Uuid;
+
+    fn attach_view_state_with_scrollback_fixture() -> AttachViewState {
+        let pane_id = Uuid::from_u128(11);
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            session_id: Uuid::from_u128(12),
+            can_write: true,
+        });
+        view_state.cached_layout_state = Some(AttachLayoutState {
+            session_id: Uuid::from_u128(12),
+            window_id: Uuid::from_u128(13),
+            focused_pane_id: pane_id,
+            panes: vec![PaneSummary {
+                id: pane_id,
+                index: 0,
+                name: None,
+                focused: true,
+            }],
+            layout_root: PaneLayoutNode::Leaf { pane_id },
+            scene: AttachScene {
+                session_id: Uuid::from_u128(12),
+                window_id: Uuid::from_u128(13),
+                focus: AttachFocusTarget::Pane { pane_id },
+                surfaces: vec![AttachSurface {
+                    id: pane_id,
+                    kind: AttachSurfaceKind::Pane,
+                    layer: AttachLayer::Pane,
+                    z: 0,
+                    rect: AttachRect {
+                        x: 0,
+                        y: 1,
+                        w: 12,
+                        h: 6,
+                    },
+                    opaque: true,
+                    visible: true,
+                    accepts_input: true,
+                    cursor_owner: true,
+                    pane_id: Some(pane_id),
+                }],
+            },
+        });
+        let mut buffer = super::attach::state::PaneRenderBuffer::default();
+        buffer.parser.screen_mut().set_size(4, 10);
+        buffer.parser.process(b"one\ntwo\nthree\nfour\nfive\nsix\n");
+        view_state.pane_buffers.insert(pane_id, buffer);
+        view_state
+    }
 
     #[test]
     fn pane_term_profile_mapping_is_stable() {
@@ -4988,6 +5141,71 @@ mod tests {
         assert_eq!(super::adjust_attach_scrollback_offset(3, -10, 4), 4);
         assert_eq!(super::adjust_attach_scrollback_offset(4, 1, 4), 3);
         assert_eq!(super::adjust_attach_scrollback_offset(1, 50, 4), 0);
+    }
+
+    #[test]
+    fn adjust_scrollback_cursor_component_clamps_within_bounds() {
+        assert_eq!(super::adjust_scrollback_cursor_component(0, -1, 5), 0);
+        assert_eq!(super::adjust_scrollback_cursor_component(2, -1, 5), 1);
+        assert_eq!(super::adjust_scrollback_cursor_component(2, 10, 5), 5);
+    }
+
+    #[test]
+    fn enter_attach_scrollback_initializes_cursor_from_live_position() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+
+        assert!(super::enter_attach_scrollback(&mut view_state));
+        assert!(view_state.scrollback_active);
+        assert_eq!(view_state.scrollback_offset, 0);
+        assert_eq!(
+            view_state.scrollback_cursor,
+            Some(super::attach::state::AttachScrollbackCursor { row: 3, col: 2 })
+        );
+    }
+
+    #[test]
+    fn move_attach_scrollback_cursor_vertical_scrolls_at_viewport_edges() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        assert!(super::enter_attach_scrollback(&mut view_state));
+
+        super::move_attach_scrollback_cursor_vertical(&mut view_state, -1);
+        assert_eq!(
+            view_state.scrollback_cursor,
+            Some(super::attach::state::AttachScrollbackCursor { row: 2, col: 2 })
+        );
+        assert_eq!(view_state.scrollback_offset, 0);
+
+        super::move_attach_scrollback_cursor_vertical(&mut view_state, -3);
+        assert_eq!(
+            view_state.scrollback_cursor,
+            Some(super::attach::state::AttachScrollbackCursor { row: 0, col: 2 })
+        );
+        assert_eq!(view_state.scrollback_offset, 1);
+
+        super::move_attach_scrollback_cursor_vertical(&mut view_state, 1);
+        assert_eq!(
+            view_state.scrollback_cursor,
+            Some(super::attach::state::AttachScrollbackCursor { row: 1, col: 2 })
+        );
+        assert_eq!(view_state.scrollback_offset, 1);
+    }
+
+    #[test]
+    fn move_attach_scrollback_cursor_horizontal_updates_column() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        assert!(super::enter_attach_scrollback(&mut view_state));
+
+        super::move_attach_scrollback_cursor_horizontal(&mut view_state, 3);
+        assert_eq!(
+            view_state.scrollback_cursor,
+            Some(super::attach::state::AttachScrollbackCursor { row: 3, col: 5 })
+        );
+
+        super::move_attach_scrollback_cursor_horizontal(&mut view_state, -10);
+        assert_eq!(
+            view_state.scrollback_cursor,
+            Some(super::attach::state::AttachScrollbackCursor { row: 3, col: 0 })
+        );
     }
 
     #[test]

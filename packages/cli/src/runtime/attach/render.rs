@@ -1,4 +1,4 @@
-use super::state::{AttachCursorState, PaneRect, PaneRenderBuffer};
+use super::state::{AttachCursorState, AttachScrollbackCursor, PaneRect, PaneRenderBuffer};
 use anyhow::{Context, Result};
 use bmux_ipc::{AttachFocusTarget, AttachScene, AttachSurfaceKind};
 use crossterm::cursor::MoveTo;
@@ -173,14 +173,15 @@ pub fn visible_scene_pane_ids(scene: &AttachScene) -> Vec<Uuid> {
     pane_ids.into_iter().collect()
 }
 
-pub fn render_attach_scene(
-    stdout: &mut io::Stdout,
+pub fn render_attach_scene<W: io::Write>(
+    stdout: &mut W,
     scene: &AttachScene,
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     dirty_pane_ids: &BTreeSet<Uuid>,
     full_pane_redraw: bool,
     scrollback_active: bool,
     scrollback_offset: usize,
+    scrollback_cursor: Option<AttachScrollbackCursor>,
 ) -> Result<Option<AttachCursorState>> {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
     if cols == 0 || rows <= 1 {
@@ -273,14 +274,25 @@ pub fn render_attach_scene(
                 entry.parser.screen_mut().set_scrollback(scrollback_offset);
             }
             let screen = entry.parser.screen();
-            if focus && !use_scrollback {
-                let (cursor_row, cursor_col) = screen.cursor_position();
-                let cursor_row = cursor_row.min(inner_h_u16.saturating_sub(1));
-                let cursor_col = cursor_col.min(inner_w_u16.saturating_sub(1));
+            if focus {
+                let (cursor_row, cursor_col) = if use_scrollback {
+                    let cursor =
+                        scrollback_cursor.unwrap_or(AttachScrollbackCursor { row: 0, col: 0 });
+                    (
+                        cursor.row.min(inner_h.saturating_sub(1)) as u16,
+                        cursor.col.min(inner_w.saturating_sub(1)) as u16,
+                    )
+                } else {
+                    let (cursor_row, cursor_col) = screen.cursor_position();
+                    (
+                        cursor_row.min(inner_h_u16.saturating_sub(1)),
+                        cursor_col.min(inner_w_u16.saturating_sub(1)),
+                    )
+                };
                 cursor_state = Some(AttachCursorState {
                     x: rect.x.saturating_add(1).saturating_add(cursor_col),
                     y: rect.y.saturating_add(1).saturating_add(cursor_row),
-                    visible: !screen.hide_cursor(),
+                    visible: use_scrollback || !screen.hide_cursor(),
                 });
             }
             if !should_draw {
@@ -365,11 +377,19 @@ pub fn render_attach_scene(
 
 #[cfg(test)]
 mod tests {
-    use super::{AttachLayer, AttachLayerSurface, opaque_row_text, queue_layer_fill};
-    use crate::runtime::attach::state::PaneRect;
+    use super::{
+        AttachLayer, AttachLayerSurface, opaque_row_text, queue_layer_fill, render_attach_scene,
+    };
+    use crate::runtime::attach::state::{AttachScrollbackCursor, PaneRect, PaneRenderBuffer};
+    use bmux_ipc::{
+        AttachFocusTarget, AttachLayer as SurfaceLayer, AttachRect, AttachScene, AttachSurface,
+        AttachSurfaceKind,
+    };
     use crossterm::cursor::MoveTo;
     use crossterm::queue;
     use crossterm::style::Print;
+    use std::collections::{BTreeMap, BTreeSet};
+    use uuid::Uuid;
 
     fn screen_row(screen: &vt100::Screen, row: u16, width: u16) -> String {
         let mut line = String::new();
@@ -421,5 +441,55 @@ mod tests {
         parser.process(&bytes);
 
         assert_eq!(screen_row(parser.screen(), 1, 12), "0help      b");
+    }
+
+    #[test]
+    fn render_attach_scene_keeps_cursor_visible_in_scrollback() {
+        let pane_id = Uuid::from_u128(1);
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(2),
+            window_id: Uuid::from_u128(3),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![AttachSurface {
+                id: pane_id,
+                kind: AttachSurfaceKind::Pane,
+                layer: SurfaceLayer::Pane,
+                z: 0,
+                rect: AttachRect {
+                    x: 0,
+                    y: 1,
+                    w: 20,
+                    h: 6,
+                },
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+                pane_id: Some(pane_id),
+            }],
+        };
+        let mut pane_buffers = BTreeMap::new();
+        let mut buffer = PaneRenderBuffer::default();
+        buffer.parser.screen_mut().set_size(4, 18);
+        buffer.parser.process(b"hello\nworld\n");
+        buffer.parser.process(b"\x1b[?25l");
+        buffer.parser.screen_mut().set_scrollback(1);
+        pane_buffers.insert(pane_id, buffer);
+
+        let mut output = Vec::new();
+        let cursor_state = render_attach_scene(
+            &mut output,
+            &scene,
+            &mut pane_buffers,
+            &BTreeSet::from([pane_id]),
+            true,
+            true,
+            1,
+            Some(AttachScrollbackCursor { row: 0, col: 0 }),
+        )
+        .expect("render should succeed");
+
+        assert!(cursor_state.is_some());
+        assert!(cursor_state.expect("cursor state").visible);
     }
 }
