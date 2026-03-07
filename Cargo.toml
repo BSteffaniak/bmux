@@ -3,6 +3,7 @@ members = [
     "packages/bmux",
     "packages/cli",
     "packages/client",
+    "packages/clipboard",
     "packages/config",
     "packages/event",
     "packages/event/models",
@@ -63,6 +64,7 @@ version    = "0.0.1-alpha.0"
 bmux                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/bmux" }
 bmux_cli               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli" }
 bmux_client            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/client" }
+bmux_clipboard         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/clipboard" }
 bmux_config            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }
 bmux_event             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event" }
 bmux_event_models      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event/models" }

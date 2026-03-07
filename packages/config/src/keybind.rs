@@ -30,6 +30,8 @@ pub struct KeyBindingConfig {
     pub runtime: BTreeMap<String, String>,
     /// Global runtime action bindings (no prefix required)
     pub global: BTreeMap<String, String>,
+    /// Scrollback mode bindings (no prefix required unless chord includes it)
+    pub scroll: BTreeMap<String, String>,
     /// Normal mode key bindings
     pub normal: BTreeMap<String, String>,
     /// Insert mode key bindings (usually just Escape)
@@ -49,6 +51,7 @@ impl Default for KeyBindingConfig {
             timeout_profiles: BTreeMap::new(),
             runtime: default_runtime_bindings(),
             global: default_global_runtime_bindings(),
+            scroll: default_scroll_bindings(),
             normal: default_normal_bindings(),
             insert: default_insert_bindings(),
             visual: default_visual_bindings(),
@@ -119,6 +122,30 @@ fn default_runtime_bindings() -> BTreeMap<String, String> {
     bindings.insert("y".to_string(), "copy_scrollback".to_string());
     bindings.insert("d".to_string(), "detach".to_string());
     bindings.insert("q".to_string(), "quit".to_string());
+    bindings
+}
+
+fn default_scroll_bindings() -> BTreeMap<String, String> {
+    let mut bindings = BTreeMap::new();
+    bindings.insert("escape".to_string(), "exit_scroll_mode".to_string());
+    bindings.insert("ctrl+a ]".to_string(), "exit_scroll_mode".to_string());
+    bindings.insert("enter".to_string(), "confirm_scrollback".to_string());
+    bindings.insert("arrow_left".to_string(), "move_cursor_left".to_string());
+    bindings.insert("arrow_right".to_string(), "move_cursor_right".to_string());
+    bindings.insert("arrow_up".to_string(), "move_cursor_up".to_string());
+    bindings.insert("arrow_down".to_string(), "move_cursor_down".to_string());
+    bindings.insert("h".to_string(), "move_cursor_left".to_string());
+    bindings.insert("l".to_string(), "move_cursor_right".to_string());
+    bindings.insert("k".to_string(), "move_cursor_up".to_string());
+    bindings.insert("j".to_string(), "move_cursor_down".to_string());
+    bindings.insert("ctrl+y".to_string(), "scroll_up_line".to_string());
+    bindings.insert("ctrl+e".to_string(), "scroll_down_line".to_string());
+    bindings.insert("page_up".to_string(), "scroll_up_page".to_string());
+    bindings.insert("page_down".to_string(), "scroll_down_page".to_string());
+    bindings.insert("g".to_string(), "scroll_top".to_string());
+    bindings.insert("shift+g".to_string(), "scroll_bottom".to_string());
+    bindings.insert("v".to_string(), "begin_selection".to_string());
+    bindings.insert("y".to_string(), "copy_scrollback".to_string());
     bindings
 }
 

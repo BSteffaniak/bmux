@@ -79,6 +79,12 @@ pub struct AttachScrollbackCursor {
     pub(crate) col: usize,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AttachScrollbackPosition {
+    pub(crate) row: usize,
+    pub(crate) col: usize,
+}
+
 pub struct AttachViewState {
     pub(crate) attached_id: Uuid,
     pub(crate) can_write: bool,
@@ -86,6 +92,7 @@ pub struct AttachViewState {
     pub(crate) scrollback_active: bool,
     pub(crate) scrollback_offset: usize,
     pub(crate) scrollback_cursor: Option<AttachScrollbackCursor>,
+    pub(crate) selection_anchor: Option<AttachScrollbackPosition>,
     pub(crate) quit_confirmation_pending: bool,
     pub(crate) help_overlay_open: bool,
     pub(crate) help_overlay_scroll: usize,
@@ -107,6 +114,7 @@ impl AttachViewState {
             scrollback_active: false,
             scrollback_offset: 0,
             scrollback_cursor: None,
+            selection_anchor: None,
             quit_confirmation_pending: false,
             help_overlay_open: false,
             help_overlay_scroll: 0,
@@ -158,5 +166,10 @@ impl AttachViewState {
         self.scrollback_active = false;
         self.scrollback_offset = 0;
         self.scrollback_cursor = None;
+        self.selection_anchor = None;
+    }
+
+    pub(crate) const fn selection_active(&self) -> bool {
+        self.selection_anchor.is_some()
     }
 }

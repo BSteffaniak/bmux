@@ -45,6 +45,7 @@ pub enum RuntimeAction {
     MoveCursorUp,
     MoveCursorDown,
     CopyScrollback,
+    ConfirmScrollback,
     EnterWindowMode,
     ExitMode,
     WindowPrev,
@@ -103,6 +104,7 @@ pub struct Keymap {
     timeout: Option<Duration>,
     global_bindings: Vec<KeyBinding>,
     runtime_bindings: Vec<KeyBinding>,
+    scroll_bindings: Vec<KeyBinding>,
 }
 
 #[derive(Debug, Clone)]
@@ -115,6 +117,7 @@ pub struct DoctorBinding {
 pub struct KeymapDoctorReport {
     pub(crate) global: Vec<DoctorBinding>,
     pub(crate) runtime: Vec<DoctorBinding>,
+    pub(crate) scroll: Vec<DoctorBinding>,
     pub(crate) overlaps: Vec<String>,
 }
 
@@ -194,7 +197,29 @@ impl Keymap {
         runtime.insert("q".to_string(), "quit".to_string());
 
         let global = BTreeMap::new();
-        Self::from_parts("ctrl+a", None, &runtime, &global).expect("default keymap must be valid")
+        let scroll = BTreeMap::from([
+            ("escape".to_string(), "exit_scroll_mode".to_string()),
+            ("ctrl+a ]".to_string(), "exit_scroll_mode".to_string()),
+            ("enter".to_string(), "confirm_scrollback".to_string()),
+            ("arrow_left".to_string(), "move_cursor_left".to_string()),
+            ("arrow_right".to_string(), "move_cursor_right".to_string()),
+            ("arrow_up".to_string(), "move_cursor_up".to_string()),
+            ("arrow_down".to_string(), "move_cursor_down".to_string()),
+            ("h".to_string(), "move_cursor_left".to_string()),
+            ("l".to_string(), "move_cursor_right".to_string()),
+            ("k".to_string(), "move_cursor_up".to_string()),
+            ("j".to_string(), "move_cursor_down".to_string()),
+            ("ctrl+y".to_string(), "scroll_up_line".to_string()),
+            ("ctrl+e".to_string(), "scroll_down_line".to_string()),
+            ("page_up".to_string(), "scroll_up_page".to_string()),
+            ("page_down".to_string(), "scroll_down_page".to_string()),
+            ("g".to_string(), "scroll_top".to_string()),
+            ("shift+g".to_string(), "scroll_bottom".to_string()),
+            ("v".to_string(), "begin_selection".to_string()),
+            ("y".to_string(), "copy_scrollback".to_string()),
+        ]);
+        Self::from_parts_with_scroll("ctrl+a", None, &runtime, &global, &scroll)
+            .expect("default keymap must be valid")
     }
 
     pub(crate) fn from_parts(
@@ -202,6 +227,22 @@ impl Keymap {
         timeout_ms: Option<u64>,
         runtime: &BTreeMap<String, String>,
         global: &BTreeMap<String, String>,
+    ) -> Result<Self> {
+        Self::from_parts_with_scroll(
+            prefix,
+            timeout_ms,
+            runtime,
+            global,
+            &default_scroll_bindings(),
+        )
+    }
+
+    pub(crate) fn from_parts_with_scroll(
+        prefix: &str,
+        timeout_ms: Option<u64>,
+        runtime: &BTreeMap<String, String>,
+        global: &BTreeMap<String, String>,
+        scroll: &BTreeMap<String, String>,
     ) -> Result<Self> {
         if let Some(timeout_ms) = timeout_ms
             && !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&timeout_ms)
@@ -216,6 +257,7 @@ impl Keymap {
         let prefix_stroke = parse_stroke(prefix)?;
         let mut runtime_bindings = Vec::new();
         let mut global_bindings = Vec::new();
+        let mut scroll_bindings = Vec::new();
 
         for (binding, action_name) in runtime {
             let mut chord = vec![prefix_stroke];
@@ -233,13 +275,22 @@ impl Keymap {
             });
         }
 
+        for (binding, action_name) in scroll {
+            scroll_bindings.push(KeyBinding {
+                chord: parse_chord(binding)?,
+                action: parse_action(action_name)?,
+            });
+        }
+
         validate_no_duplicate_chords(&runtime_bindings, "runtime")?;
         validate_no_duplicate_chords(&global_bindings, "global")?;
+        validate_no_duplicate_chords(&scroll_bindings, "scroll")?;
 
         Ok(Self {
             timeout: timeout_ms.map(Duration::from_millis),
             global_bindings,
             runtime_bindings,
+            scroll_bindings,
         })
     }
 
@@ -256,6 +307,18 @@ impl Keymap {
     fn has_any_prefix(&self, strokes: &[KeyStroke]) -> bool {
         has_any_prefix(&self.global_bindings, strokes)
             || has_any_prefix(&self.runtime_bindings, strokes)
+    }
+
+    fn exact_scroll_action(&self, strokes: &[KeyStroke]) -> Option<RuntimeAction> {
+        find_exact(&self.scroll_bindings, strokes)
+    }
+
+    fn has_longer_scroll_match(&self, strokes: &[KeyStroke]) -> bool {
+        has_longer_prefix(&self.scroll_bindings, strokes)
+    }
+
+    fn has_any_scroll_prefix(&self, strokes: &[KeyStroke]) -> bool {
+        has_any_prefix(&self.scroll_bindings, strokes)
     }
 
     pub(crate) fn doctor_lines(&self) -> Vec<String> {
@@ -276,6 +339,15 @@ impl Keymap {
             lines.push("  (none)".to_string());
         } else {
             for binding in &report.runtime {
+                lines.push(format!("  {} -> {}", binding.chord, binding.action));
+            }
+        }
+
+        lines.push("Scroll bindings:".to_string());
+        if report.scroll.is_empty() {
+            lines.push("  (none)".to_string());
+        } else {
+            for binding in &report.scroll {
                 lines.push(format!("  {} -> {}", binding.chord, binding.action));
             }
         }
@@ -311,34 +383,38 @@ impl Keymap {
             })
             .collect();
 
+        let scroll = self
+            .scroll_bindings
+            .iter()
+            .map(|binding| DoctorBinding {
+                chord: chord_to_string(&binding.chord),
+                action: action_to_name(&binding.action).to_string(),
+            })
+            .collect();
+
         KeymapDoctorReport {
             global,
             runtime,
+            scroll,
             overlaps: self.overlap_warnings(),
         }
     }
 
     pub(crate) fn primary_binding_for_action(&self, action: &RuntimeAction) -> Option<String> {
-        let mut best: Option<(usize, u8, String)> = None;
+        primary_binding_for_sets(
+            action,
+            [
+                (0_u8, &self.global_bindings),
+                (1_u8, &self.runtime_bindings),
+            ],
+        )
+    }
 
-        for (scope_rank, bindings) in [
-            (0_u8, &self.global_bindings),
-            (1_u8, &self.runtime_bindings),
-        ] {
-            for binding in bindings {
-                if &binding.action != action {
-                    continue;
-                }
-
-                let display = display_chord(&binding.chord);
-                let candidate = (binding.chord.len(), scope_rank, display.clone());
-                if best.as_ref().is_none_or(|current| candidate < *current) {
-                    best = Some(candidate);
-                }
-            }
-        }
-
-        best.map(|(_, _, display)| display)
+    pub(crate) fn primary_scroll_binding_for_action(
+        &self,
+        action: &RuntimeAction,
+    ) -> Option<String> {
+        primary_binding_for_sets(action, [(0_u8, &self.scroll_bindings)])
     }
 
     fn overlap_warnings(&self) -> Vec<String> {
@@ -346,6 +422,7 @@ impl Keymap {
 
         warnings.extend(find_overlaps(&self.runtime_bindings, "runtime"));
         warnings.extend(find_overlaps(&self.global_bindings, "global"));
+        warnings.extend(find_overlaps(&self.scroll_bindings, "scroll"));
 
         for global in &self.global_bindings {
             for runtime in &self.runtime_bindings {
@@ -361,6 +438,30 @@ impl Keymap {
 
         warnings
     }
+}
+
+fn default_scroll_bindings() -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("escape".to_string(), "exit_scroll_mode".to_string()),
+        ("ctrl+a ]".to_string(), "exit_scroll_mode".to_string()),
+        ("enter".to_string(), "confirm_scrollback".to_string()),
+        ("arrow_left".to_string(), "move_cursor_left".to_string()),
+        ("arrow_right".to_string(), "move_cursor_right".to_string()),
+        ("arrow_up".to_string(), "move_cursor_up".to_string()),
+        ("arrow_down".to_string(), "move_cursor_down".to_string()),
+        ("h".to_string(), "move_cursor_left".to_string()),
+        ("l".to_string(), "move_cursor_right".to_string()),
+        ("k".to_string(), "move_cursor_up".to_string()),
+        ("j".to_string(), "move_cursor_down".to_string()),
+        ("ctrl+y".to_string(), "scroll_up_line".to_string()),
+        ("ctrl+e".to_string(), "scroll_down_line".to_string()),
+        ("page_up".to_string(), "scroll_up_page".to_string()),
+        ("page_down".to_string(), "scroll_down_page".to_string()),
+        ("g".to_string(), "scroll_top".to_string()),
+        ("shift+g".to_string(), "scroll_bottom".to_string()),
+        ("v".to_string(), "begin_selection".to_string()),
+        ("y".to_string(), "copy_scrollback".to_string()),
+    ])
 }
 
 impl InputProcessor {
@@ -449,13 +550,22 @@ impl InputProcessor {
 
             let strokes: Vec<KeyStroke> = pending.decoded.iter().map(|item| item.stroke).collect();
 
-            if self.scroll_mode
-                && strokes.len() == 1
-                && let Some(action) = scroll_mode_action(strokes[0])
-            {
-                actions.push(action);
-                self.pending = None;
-                continue;
+            if self.scroll_mode {
+                let exact_scroll = self.keymap.exact_scroll_action(&strokes);
+                let longer_scroll = self.keymap.has_longer_scroll_match(&strokes);
+                let any_scroll_prefix = self.keymap.has_any_scroll_prefix(&strokes);
+                if let Some(action) = exact_scroll {
+                    if longer_scroll && !force_timeout {
+                        break;
+                    }
+                    actions.push(action);
+                    self.pending = None;
+                    continue;
+                }
+
+                if any_scroll_prefix {
+                    break;
+                }
             }
 
             let exact = self.keymap.exact_action(&strokes);
@@ -737,6 +847,29 @@ fn find_exact(bindings: &[KeyBinding], strokes: &[KeyStroke]) -> Option<RuntimeA
         .map(|binding| binding.action.clone())
 }
 
+fn primary_binding_for_sets<const N: usize>(
+    action: &RuntimeAction,
+    binding_sets: [(u8, &Vec<KeyBinding>); N],
+) -> Option<String> {
+    let mut best: Option<(usize, u8, String)> = None;
+
+    for (scope_rank, bindings) in binding_sets {
+        for binding in bindings {
+            if &binding.action != action {
+                continue;
+            }
+
+            let display = display_chord(&binding.chord);
+            let candidate = (binding.chord.len(), scope_rank, display.clone());
+            if best.as_ref().is_none_or(|current| candidate < *current) {
+                best = Some(candidate);
+            }
+        }
+    }
+
+    best.map(|(_, _, display)| display)
+}
+
 fn has_any_prefix(bindings: &[KeyBinding], strokes: &[KeyStroke]) -> bool {
     bindings
         .iter()
@@ -813,6 +946,7 @@ pub const fn action_to_name(action: &RuntimeAction) -> &'static str {
         RuntimeAction::MoveCursorUp => "move_cursor_up",
         RuntimeAction::MoveCursorDown => "move_cursor_down",
         RuntimeAction::CopyScrollback => "copy_scrollback",
+        RuntimeAction::ConfirmScrollback => "confirm_scrollback",
         RuntimeAction::EnterWindowMode => "enter_window_mode",
         RuntimeAction::ExitMode => "exit_mode",
         RuntimeAction::WindowPrev => "window_prev",
@@ -828,33 +962,6 @@ pub const fn action_to_name(action: &RuntimeAction) -> &'static str {
         RuntimeAction::WindowGoto9 => "window_goto_9",
         RuntimeAction::WindowClose => "window_close",
         RuntimeAction::ForwardToPane(_) => "forward_to_pane",
-    }
-}
-
-const fn scroll_mode_action(stroke: KeyStroke) -> Option<RuntimeAction> {
-    if stroke.alt || stroke.super_key {
-        return None;
-    }
-
-    match (stroke.ctrl, stroke.shift, stroke.key) {
-        (false, false, KeyCode::Escape) => Some(RuntimeAction::ExitScrollMode),
-        (false, false, KeyCode::ArrowUp) => Some(RuntimeAction::MoveCursorUp),
-        (false, false, KeyCode::ArrowDown) => Some(RuntimeAction::MoveCursorDown),
-        (false, false, KeyCode::PageUp) => Some(RuntimeAction::ScrollUpPage),
-        (false, false, KeyCode::PageDown) => Some(RuntimeAction::ScrollDownPage),
-        (false, false, KeyCode::ArrowLeft) => Some(RuntimeAction::MoveCursorLeft),
-        (false, false, KeyCode::ArrowRight) => Some(RuntimeAction::MoveCursorRight),
-        (false, false, KeyCode::Char('g')) => Some(RuntimeAction::ScrollTop),
-        (false, true, KeyCode::Char('g')) => Some(RuntimeAction::ScrollBottom),
-        (false, false, KeyCode::Char('v')) => Some(RuntimeAction::BeginSelection),
-        (false, false, KeyCode::Char('h')) => Some(RuntimeAction::MoveCursorLeft),
-        (false, false, KeyCode::Char('l')) => Some(RuntimeAction::MoveCursorRight),
-        (false, false, KeyCode::Char('k')) => Some(RuntimeAction::MoveCursorUp),
-        (false, false, KeyCode::Char('j')) => Some(RuntimeAction::MoveCursorDown),
-        (true, false, KeyCode::Char('y')) => Some(RuntimeAction::ScrollUpLine),
-        (true, false, KeyCode::Char('e')) => Some(RuntimeAction::ScrollDownLine),
-        (false, false, KeyCode::Char('y')) => Some(RuntimeAction::CopyScrollback),
-        _ => None,
     }
 }
 
@@ -1247,6 +1354,7 @@ fn parse_action(value: &str) -> Result<RuntimeAction> {
         "move_cursor_up" => Ok(RuntimeAction::MoveCursorUp),
         "move_cursor_down" => Ok(RuntimeAction::MoveCursorDown),
         "copy_scrollback" => Ok(RuntimeAction::CopyScrollback),
+        "confirm_scrollback" => Ok(RuntimeAction::ConfirmScrollback),
         "enter_window_mode" => Ok(RuntimeAction::EnterWindowMode),
         "exit_mode" => Ok(RuntimeAction::ExitMode),
         "window_prev" => Ok(RuntimeAction::WindowPrev),

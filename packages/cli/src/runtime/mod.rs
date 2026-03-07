@@ -11,6 +11,7 @@ use crate::input::{InputProcessor, Keymap, RuntimeAction};
 use crate::status::{AttachTab, build_attach_status_line};
 use anyhow::{Context, Result};
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
+use bmux_clipboard::ClipboardError;
 use bmux_config::{BmuxConfig, ResolvedTimeout, TerminfoAutoInstall};
 use bmux_ipc::{
     AttachViewComponent, PaneFocusDirection, PaneSplitDirection, SessionRole, SessionSelector,
@@ -39,7 +40,10 @@ use attach::render::{
     AttachLayer, AttachLayerSurface, append_pane_output, opaque_row_text, queue_layer_fill,
     render_attach_scene, visible_scene_pane_ids,
 };
-use attach::state::{AttachEventAction, AttachExitReason, AttachUiMode, AttachViewState, PaneRect};
+use attach::state::{
+    AttachEventAction, AttachExitReason, AttachScrollbackCursor, AttachScrollbackPosition,
+    AttachUiMode, AttachViewState, PaneRect,
+};
 use terminal_protocol::{
     ProtocolDirection, ProtocolProfile, ProtocolTraceEvent, primary_da_for_profile,
     protocol_profile_name, secondary_da_for_profile, supported_query_names,
@@ -53,7 +57,10 @@ const ATTACH_IO_POLL_INTERVAL: Duration = Duration::from_millis(15);
 const ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE: usize = 1_048_576;
 const ATTACH_WINDOW_MODE_UNBOUND_STATUS: &str = "window mode: unbound key (Esc/Enter to exit)";
 const ATTACH_SCROLLBACK_UNAVAILABLE_STATUS: &str = "scrollback unavailable for focused pane";
-const ATTACH_SELECTION_UNAVAILABLE_STATUS: &str = "attach selection/copy not implemented yet";
+const ATTACH_SELECTION_STARTED_STATUS: &str = "selection started";
+const ATTACH_SELECTION_CLEARED_STATUS: &str = "selection cleared";
+const ATTACH_SELECTION_COPIED_STATUS: &str = "selection copied";
+const ATTACH_SELECTION_EMPTY_STATUS: &str = "no selection";
 const ATTACH_TRANSIENT_STATUS_TTL: Duration = Duration::from_millis(1800);
 const HELP_OVERLAY_SURFACE_ID: Uuid = Uuid::from_u128(1);
 
@@ -1330,7 +1337,11 @@ async fn handle_attach_ui_action(
             }
         }
         RuntimeAction::ExitScrollMode => {
-            view_state.exit_scrollback();
+            if view_state.selection_active() {
+                clear_attach_selection(view_state, true);
+            } else {
+                view_state.exit_scrollback();
+            }
         }
         RuntimeAction::ScrollUpLine => {
             step_attach_scrollback(view_state, -1);
@@ -1371,12 +1382,20 @@ async fn handle_attach_ui_action(
         RuntimeAction::MoveCursorDown => {
             move_attach_scrollback_cursor_vertical(view_state, 1);
         }
-        RuntimeAction::BeginSelection | RuntimeAction::CopyScrollback => {
-            view_state.set_transient_status(
-                ATTACH_SELECTION_UNAVAILABLE_STATUS,
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
+        RuntimeAction::BeginSelection => {
+            if begin_attach_selection(view_state) {
+                view_state.set_transient_status(
+                    ATTACH_SELECTION_STARTED_STATUS,
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            }
+        }
+        RuntimeAction::CopyScrollback => {
+            copy_attach_selection(view_state, false);
+        }
+        RuntimeAction::ConfirmScrollback => {
+            confirm_attach_scrollback(view_state);
         }
         RuntimeAction::SessionPrev => {
             view_state.exit_scrollback();
@@ -1516,11 +1535,53 @@ fn enter_attach_scrollback(view_state: &mut AttachViewState) -> bool {
     let (row, col) = buffer.parser.screen().cursor_position();
     view_state.scrollback_active = true;
     view_state.scrollback_offset = 0;
-    view_state.scrollback_cursor = Some(attach::state::AttachScrollbackCursor {
+    view_state.scrollback_cursor = Some(AttachScrollbackCursor {
         row: usize::from(row).min(inner_h.saturating_sub(1)),
         col: usize::from(col).min(inner_w.saturating_sub(1)),
     });
+    view_state.selection_anchor = None;
     true
+}
+
+fn begin_attach_selection(view_state: &mut AttachViewState) -> bool {
+    if !view_state.scrollback_active {
+        return false;
+    }
+    view_state.selection_anchor = attach_scrollback_cursor_absolute_position(view_state);
+    view_state.selection_anchor.is_some()
+}
+
+fn clear_attach_selection(view_state: &mut AttachViewState, show_status: bool) {
+    view_state.selection_anchor = None;
+    if show_status {
+        view_state.set_transient_status(
+            ATTACH_SELECTION_CLEARED_STATUS,
+            Instant::now(),
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
+    }
+}
+
+fn attach_scrollback_cursor_absolute_position(
+    view_state: &AttachViewState,
+) -> Option<AttachScrollbackPosition> {
+    let cursor = view_state.scrollback_cursor?;
+    Some(AttachScrollbackPosition {
+        row: view_state.scrollback_offset.saturating_add(cursor.row),
+        col: cursor.col,
+    })
+}
+
+fn attach_selection_bounds(
+    view_state: &AttachViewState,
+) -> Option<(AttachScrollbackPosition, AttachScrollbackPosition)> {
+    let anchor = view_state.selection_anchor?;
+    let head = attach_scrollback_cursor_absolute_position(view_state)?;
+    Some(if anchor <= head {
+        (anchor, head)
+    } else {
+        (head, anchor)
+    })
 }
 
 fn step_attach_scrollback(view_state: &mut AttachViewState, delta: isize) {
@@ -1585,6 +1646,80 @@ fn adjust_scrollback_cursor_component(current: usize, delta: isize, max_value: u
     } else {
         current.saturating_add(delta as usize).min(max_value)
     }
+}
+
+fn copy_attach_selection(view_state: &mut AttachViewState, exit_after_copy: bool) {
+    let Some(text) = selected_attach_text(view_state) else {
+        if exit_after_copy {
+            view_state.exit_scrollback();
+        } else {
+            view_state.set_transient_status(
+                ATTACH_SELECTION_EMPTY_STATUS,
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+        }
+        return;
+    };
+
+    match bmux_clipboard::copy_text(&text) {
+        Ok(()) => {
+            view_state.set_transient_status(
+                ATTACH_SELECTION_COPIED_STATUS,
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+            if exit_after_copy {
+                view_state.exit_scrollback();
+            }
+        }
+        Err(error) => {
+            view_state.set_transient_status(
+                format_clipboard_error(&error),
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+        }
+    }
+}
+
+fn confirm_attach_scrollback(view_state: &mut AttachViewState) {
+    copy_attach_selection(view_state, true);
+}
+
+fn format_clipboard_error(error: &ClipboardError) -> String {
+    match error {
+        ClipboardError::BackendUnavailable { .. } => "clipboard backend unavailable".to_string(),
+        ClipboardError::BackendFailed { message, .. } => {
+            format!("clipboard copy failed: {message}")
+        }
+    }
+}
+
+fn selected_attach_text(view_state: &mut AttachViewState) -> Option<String> {
+    let (start, end) = attach_selection_bounds(view_state)?;
+    extract_attach_text(view_state, start, end)
+}
+
+fn extract_attach_text(
+    view_state: &mut AttachViewState,
+    start: AttachScrollbackPosition,
+    end: AttachScrollbackPosition,
+) -> Option<String> {
+    let buffer = focused_attach_pane_buffer(view_state)?;
+    let original_scrollback = buffer.parser.screen().scrollback();
+    buffer.parser.screen_mut().set_scrollback(start.row);
+    let text = buffer.parser.screen().contents_between(
+        0,
+        start.col as u16,
+        end.row.saturating_sub(start.row) as u16,
+        end.col.saturating_add(1) as u16,
+    );
+    buffer
+        .parser
+        .screen_mut()
+        .set_scrollback(original_scrollback);
+    Some(text)
 }
 
 fn adjust_attach_scrollback_offset(current: usize, delta: isize, max_offset: usize) -> usize {
@@ -1875,18 +2010,27 @@ fn attach_mode_hint(ui_mode: AttachUiMode, keymap: &Keymap) -> String {
 }
 
 fn attach_scrollback_hint(keymap: &Keymap) -> String {
-    let exit = key_hint_or_unbound(keymap, RuntimeAction::ExitScrollMode);
-    let up = key_hint_or_unbound(keymap, RuntimeAction::MoveCursorUp);
-    let down = key_hint_or_unbound(keymap, RuntimeAction::MoveCursorDown);
-    let left = key_hint_or_unbound(keymap, RuntimeAction::MoveCursorLeft);
-    let right = key_hint_or_unbound(keymap, RuntimeAction::MoveCursorRight);
-    let page_up = key_hint_or_unbound(keymap, RuntimeAction::ScrollUpPage);
-    let page_down = key_hint_or_unbound(keymap, RuntimeAction::ScrollDownPage);
-    let top = key_hint_or_unbound(keymap, RuntimeAction::ScrollTop);
-    let bottom = key_hint_or_unbound(keymap, RuntimeAction::ScrollBottom);
+    let exit = scroll_key_hint_or_unbound(keymap, RuntimeAction::ExitScrollMode);
+    let confirm = scroll_key_hint_or_unbound(keymap, RuntimeAction::ConfirmScrollback);
+    let left = scroll_key_hint_or_unbound(keymap, RuntimeAction::MoveCursorLeft);
+    let right = scroll_key_hint_or_unbound(keymap, RuntimeAction::MoveCursorRight);
+    let up = scroll_key_hint_or_unbound(keymap, RuntimeAction::MoveCursorUp);
+    let down = scroll_key_hint_or_unbound(keymap, RuntimeAction::MoveCursorDown);
+    let page_up = scroll_key_hint_or_unbound(keymap, RuntimeAction::ScrollUpPage);
+    let page_down = scroll_key_hint_or_unbound(keymap, RuntimeAction::ScrollDownPage);
+    let top = scroll_key_hint_or_unbound(keymap, RuntimeAction::ScrollTop);
+    let bottom = scroll_key_hint_or_unbound(keymap, RuntimeAction::ScrollBottom);
+    let select = scroll_key_hint_or_unbound(keymap, RuntimeAction::BeginSelection);
+    let copy = scroll_key_hint_or_unbound(keymap, RuntimeAction::CopyScrollback);
     format!(
-        "{up}/{down} line | {left}/{right} col | {page_up}/{page_down} page | {top}/{bottom} top/bottom | {exit} exit scroll"
+        "{up}/{down} line | {left}/{right} col | {page_up}/{page_down} page | {top}/{bottom} top/bottom | {select} select | {copy} copy | {confirm} copy+exit | {exit} cancel/exit scroll"
     )
+}
+
+fn scroll_key_hint_or_unbound(keymap: &Keymap, action: RuntimeAction) -> String {
+    keymap
+        .primary_scroll_binding_for_action(&action)
+        .unwrap_or_else(|| "unbound".to_string())
 }
 
 fn key_hint_or_unbound(keymap: &Keymap, action: RuntimeAction) -> String {
@@ -2192,6 +2336,7 @@ async fn render_attach_frame(
         view_state.scrollback_active,
         view_state.scrollback_offset,
         view_state.scrollback_cursor,
+        view_state.selection_anchor,
     )?;
     if view_state.help_overlay_open {
         if let Some(help_surface) = help_overlay_surface(help_lines) {
@@ -2276,11 +2421,12 @@ fn attach_keymap_from_config(config: &BmuxConfig) -> crate::input::Keymap {
         .resolve_timeout()
         .map(|timeout| timeout.timeout_ms())
         .unwrap_or(None);
-    match crate::input::Keymap::from_parts(
+    match crate::input::Keymap::from_parts_with_scroll(
         &config.keybindings.prefix,
         timeout_ms,
         &runtime_bindings,
         &global_bindings,
+        &config.keybindings.scroll,
     ) {
         Ok(keymap) => keymap,
         Err(error) => {
@@ -2416,6 +2562,7 @@ fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
             | RuntimeAction::ScrollBottom
             | RuntimeAction::BeginSelection
             | RuntimeAction::CopyScrollback
+            | RuntimeAction::ConfirmScrollback
             | RuntimeAction::ShowHelp => "Mode",
             _ => "Other",
         };
@@ -2527,6 +2674,7 @@ const fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
             | RuntimeAction::ScrollBottom
             | RuntimeAction::BeginSelection
             | RuntimeAction::CopyScrollback
+            | RuntimeAction::ConfirmScrollback
             | RuntimeAction::WindowPrev
             | RuntimeAction::WindowNext
             | RuntimeAction::WindowGoto1
@@ -2565,11 +2713,12 @@ fn default_attach_keymap() -> crate::input::Keymap {
         .resolve_timeout()
         .expect("default timeout config must be valid")
         .timeout_ms();
-    crate::input::Keymap::from_parts(
+    crate::input::Keymap::from_parts_with_scroll(
         &defaults.keybindings.prefix,
         timeout_ms,
         &runtime_bindings,
         &global_bindings,
+        &defaults.keybindings.scroll,
     )
     .expect("default attach keymap must be valid")
 }
@@ -3138,7 +3287,8 @@ fn attach_key_event_actions(
             | RuntimeAction::MoveCursorRight
             | RuntimeAction::MoveCursorUp
             | RuntimeAction::MoveCursorDown
-            | RuntimeAction::CopyScrollback => AttachEventAction::Ui(action),
+            | RuntimeAction::CopyScrollback
+            | RuntimeAction::ConfirmScrollback => AttachEventAction::Ui(action),
         })
         .collect())
 }
@@ -5209,10 +5359,60 @@ mod tests {
     }
 
     #[test]
+    fn begin_attach_selection_uses_absolute_cursor_position() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        assert!(super::enter_attach_scrollback(&mut view_state));
+        view_state.scrollback_offset = 2;
+
+        assert!(super::begin_attach_selection(&mut view_state));
+        assert_eq!(
+            view_state.selection_anchor,
+            Some(super::attach::state::AttachScrollbackPosition { row: 5, col: 2 })
+        );
+    }
+
+    #[test]
+    fn clear_attach_selection_removes_anchor() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        assert!(super::enter_attach_scrollback(&mut view_state));
+        assert!(super::begin_attach_selection(&mut view_state));
+
+        super::clear_attach_selection(&mut view_state, false);
+        assert_eq!(view_state.selection_anchor, None);
+    }
+
+    #[test]
+    fn selected_attach_text_extracts_multiline_range() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        assert!(super::enter_attach_scrollback(&mut view_state));
+        view_state.selection_anchor =
+            Some(super::attach::state::AttachScrollbackPosition { row: 1, col: 1 });
+        view_state.scrollback_cursor =
+            Some(super::attach::state::AttachScrollbackCursor { row: 3, col: 2 });
+        view_state.scrollback_offset = 0;
+
+        assert_eq!(
+            super::selected_attach_text(&mut view_state),
+            Some("four\n     five\n".to_string())
+        );
+    }
+
+    #[test]
+    fn confirm_attach_scrollback_exits_when_no_selection() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        assert!(super::enter_attach_scrollback(&mut view_state));
+
+        super::confirm_attach_scrollback(&mut view_state);
+        assert!(!view_state.scrollback_active);
+    }
+
+    #[test]
     fn attach_scrollback_hint_uses_default_bindings() {
         let keymap = attach_keymap_from_config(&BmuxConfig::default());
         let hint = super::attach_scrollback_hint(&keymap);
 
+        assert!(hint.contains("select"));
+        assert!(hint.contains("copy"));
         assert!(hint.contains("page"));
         assert!(hint.contains("top/bottom"));
         assert!(hint.contains("exit scroll"));

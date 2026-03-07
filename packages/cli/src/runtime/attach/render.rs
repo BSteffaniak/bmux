@@ -1,4 +1,6 @@
-use super::state::{AttachCursorState, AttachScrollbackCursor, PaneRect, PaneRenderBuffer};
+use super::state::{
+    AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
+};
 use anyhow::{Context, Result};
 use bmux_ipc::{AttachFocusTarget, AttachScene, AttachSurfaceKind};
 use crossterm::cursor::MoveTo;
@@ -161,6 +163,52 @@ fn style_sgr(style: CellStyle) -> String {
     format!("\x1b[{}m", parts.join(";"))
 }
 
+fn selected_style(mut style: CellStyle) -> CellStyle {
+    style.inverse = !style.inverse;
+    style
+}
+
+fn selection_bounds(
+    anchor: Option<AttachScrollbackPosition>,
+    cursor: Option<AttachScrollbackCursor>,
+    scrollback_offset: usize,
+) -> Option<(AttachScrollbackPosition, AttachScrollbackPosition)> {
+    let anchor = anchor?;
+    let cursor = cursor?;
+    let head = AttachScrollbackPosition {
+        row: scrollback_offset.saturating_add(cursor.row),
+        col: cursor.col,
+    };
+    Some(if anchor <= head {
+        (anchor, head)
+    } else {
+        (head, anchor)
+    })
+}
+
+fn cell_selected(
+    selection: Option<(AttachScrollbackPosition, AttachScrollbackPosition)>,
+    row: usize,
+    col: usize,
+) -> bool {
+    let Some((start, end)) = selection else {
+        return false;
+    };
+    if row < start.row || row > end.row {
+        return false;
+    }
+    if start.row == end.row {
+        return row == start.row && col >= start.col && col <= end.col;
+    }
+    if row == start.row {
+        return col >= start.col;
+    }
+    if row == end.row {
+        return col <= end.col;
+    }
+    true
+}
+
 pub fn visible_scene_pane_ids(scene: &AttachScene) -> Vec<Uuid> {
     let mut pane_ids = BTreeSet::new();
     for surface in &scene.surfaces {
@@ -182,6 +230,7 @@ pub fn render_attach_scene<W: io::Write>(
     scrollback_active: bool,
     scrollback_offset: usize,
     scrollback_cursor: Option<AttachScrollbackCursor>,
+    selection_anchor: Option<AttachScrollbackPosition>,
 ) -> Result<Option<AttachCursorState>> {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
     if cols == 0 || rows <= 1 {
@@ -274,6 +323,11 @@ pub fn render_attach_scene<W: io::Write>(
                 entry.parser.screen_mut().set_scrollback(scrollback_offset);
             }
             let screen = entry.parser.screen();
+            let selection = if use_scrollback {
+                selection_bounds(selection_anchor, scrollback_cursor, scrollback_offset)
+            } else {
+                None
+            };
             if focus {
                 let (cursor_row, cursor_col) = if use_scrollback {
                     let cursor =
@@ -306,7 +360,12 @@ pub fn render_attach_scene<W: io::Write>(
                 let mut col = 0u16;
                 while col < inner_w_u16 {
                     if let Some(cell) = screen.cell(row as u16, col) {
-                        let style = cell_style(cell);
+                        let absolute_row = scrollback_offset.saturating_add(row);
+                        let style = if cell_selected(selection, absolute_row, usize::from(col)) {
+                            selected_style(cell_style(cell))
+                        } else {
+                            cell_style(cell)
+                        };
                         if style != current {
                             line.push_str(&style_sgr(style));
                             current = style;
@@ -380,7 +439,9 @@ mod tests {
     use super::{
         AttachLayer, AttachLayerSurface, opaque_row_text, queue_layer_fill, render_attach_scene,
     };
-    use crate::runtime::attach::state::{AttachScrollbackCursor, PaneRect, PaneRenderBuffer};
+    use crate::runtime::attach::state::{
+        AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
+    };
     use bmux_ipc::{
         AttachFocusTarget, AttachLayer as SurfaceLayer, AttachRect, AttachScene, AttachSurface,
         AttachSurfaceKind,
@@ -486,10 +547,60 @@ mod tests {
             true,
             1,
             Some(AttachScrollbackCursor { row: 0, col: 0 }),
+            None,
         )
         .expect("render should succeed");
 
         assert!(cursor_state.is_some());
         assert!(cursor_state.expect("cursor state").visible);
+    }
+
+    #[test]
+    fn render_attach_scene_highlights_selected_cells() {
+        let pane_id = Uuid::from_u128(21);
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(22),
+            window_id: Uuid::from_u128(23),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![AttachSurface {
+                id: pane_id,
+                kind: AttachSurfaceKind::Pane,
+                layer: SurfaceLayer::Pane,
+                z: 0,
+                rect: AttachRect {
+                    x: 0,
+                    y: 1,
+                    w: 12,
+                    h: 4,
+                },
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+                pane_id: Some(pane_id),
+            }],
+        };
+        let mut pane_buffers = BTreeMap::new();
+        let mut buffer = PaneRenderBuffer::default();
+        buffer.parser.screen_mut().set_size(2, 10);
+        buffer.parser.process(b"abcdef\n");
+        pane_buffers.insert(pane_id, buffer);
+
+        let mut output = Vec::new();
+        let _ = render_attach_scene(
+            &mut output,
+            &scene,
+            &mut pane_buffers,
+            &BTreeSet::from([pane_id]),
+            true,
+            true,
+            0,
+            Some(AttachScrollbackCursor { row: 0, col: 4 }),
+            Some(AttachScrollbackPosition { row: 0, col: 1 }),
+        )
+        .expect("render should succeed");
+
+        let rendered = String::from_utf8(output).expect("render output should be utf8");
+        assert!(rendered.contains("\x1b[0;7;39;49m"));
     }
 }

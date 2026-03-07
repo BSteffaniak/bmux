@@ -91,6 +91,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "anyhow",
  "bmux_client",
+ "bmux_clipboard",
  "bmux_config",
  "bmux_event",
  "bmux_ipc",
@@ -129,6 +130,14 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "bmux_clipboard"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "anyhow",
+ "thiserror 2.0.12",
 ]
 
 [[package]]
