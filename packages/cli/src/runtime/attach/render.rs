@@ -179,6 +179,8 @@ pub fn render_attach_scene(
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     dirty_pane_ids: &BTreeSet<Uuid>,
     full_pane_redraw: bool,
+    scrollback_active: bool,
+    scrollback_offset: usize,
 ) -> Result<Option<AttachCursorState>> {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
     if cols == 0 || rows <= 1 {
@@ -265,8 +267,13 @@ pub fn render_attach_scene(
                 .parser
                 .screen_mut()
                 .set_size(inner_h_u16.max(1), inner_w_u16.max(1));
+            let use_scrollback = scrollback_active && focus;
+            let previous_scrollback = entry.parser.screen().scrollback();
+            if use_scrollback {
+                entry.parser.screen_mut().set_scrollback(scrollback_offset);
+            }
             let screen = entry.parser.screen();
-            if focus {
+            if focus && !use_scrollback {
                 let (cursor_row, cursor_col) = screen.cursor_position();
                 let cursor_row = cursor_row.min(inner_h_u16.saturating_sub(1));
                 let cursor_col = cursor_col.min(inner_w_u16.saturating_sub(1));
@@ -333,6 +340,12 @@ pub fn render_attach_scene(
 
                 queue!(stdout, MoveTo(rect.x.saturating_add(1), y), Print(line))
                     .context("failed drawing pane content")?;
+            }
+            if use_scrollback {
+                entry
+                    .parser
+                    .screen_mut()
+                    .set_scrollback(previous_scrollback);
             }
         } else if should_draw {
             for row in 0..inner_h {

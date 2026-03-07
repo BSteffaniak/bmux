@@ -52,6 +52,8 @@ const SERVER_STOP_TIMEOUT: Duration = Duration::from_millis(5000);
 const ATTACH_IO_POLL_INTERVAL: Duration = Duration::from_millis(15);
 const ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE: usize = 1_048_576;
 const ATTACH_WINDOW_MODE_UNBOUND_STATUS: &str = "window mode: unbound key (Esc/Enter to exit)";
+const ATTACH_SCROLLBACK_UNAVAILABLE_STATUS: &str = "scrollback unavailable for focused pane";
+const ATTACH_SELECTION_UNAVAILABLE_STATUS: &str = "attach selection/copy not implemented yet";
 const ATTACH_TRANSIENT_STATUS_TTL: Duration = Duration::from_millis(1800);
 const HELP_OVERLAY_SURFACE_ID: Uuid = Uuid::from_u128(1);
 
@@ -1310,51 +1312,112 @@ async fn handle_attach_ui_action(
 ) -> std::result::Result<(), ClientError> {
     match action {
         RuntimeAction::EnterWindowMode => {
+            view_state.exit_scrollback();
             view_state.ui_mode = AttachUiMode::Window;
         }
         RuntimeAction::ExitMode => {
             view_state.ui_mode = AttachUiMode::Normal;
         }
+        RuntimeAction::EnterScrollMode => {
+            if enter_attach_scrollback(view_state) {
+                view_state.ui_mode = AttachUiMode::Normal;
+            } else {
+                view_state.set_transient_status(
+                    ATTACH_SCROLLBACK_UNAVAILABLE_STATUS,
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            }
+        }
+        RuntimeAction::ExitScrollMode => {
+            view_state.exit_scrollback();
+        }
+        RuntimeAction::ScrollUpLine => {
+            step_attach_scrollback(view_state, -1);
+        }
+        RuntimeAction::ScrollDownLine => {
+            step_attach_scrollback(view_state, 1);
+        }
+        RuntimeAction::ScrollUpPage => {
+            step_attach_scrollback(
+                view_state,
+                -(attach_scrollback_page_size(view_state) as isize),
+            );
+        }
+        RuntimeAction::ScrollDownPage => {
+            step_attach_scrollback(view_state, attach_scrollback_page_size(view_state) as isize);
+        }
+        RuntimeAction::ScrollTop => {
+            if view_state.scrollback_active {
+                view_state.scrollback_offset = max_attach_scrollback(view_state);
+            }
+        }
+        RuntimeAction::ScrollBottom => {
+            if view_state.scrollback_active {
+                view_state.scrollback_offset = 0;
+            }
+        }
+        RuntimeAction::BeginSelection | RuntimeAction::CopyScrollback => {
+            view_state.set_transient_status(
+                ATTACH_SELECTION_UNAVAILABLE_STATUS,
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+        }
         RuntimeAction::SessionPrev => {
+            view_state.exit_scrollback();
             switch_attach_session_relative(client, view_state, -1).await?;
         }
         RuntimeAction::SessionNext => {
+            view_state.exit_scrollback();
             switch_attach_session_relative(client, view_state, 1).await?;
         }
         RuntimeAction::WindowPrev => {
+            view_state.exit_scrollback();
             switch_attach_window_relative(client, view_state.attached_id, -1).await?;
         }
         RuntimeAction::WindowNext => {
+            view_state.exit_scrollback();
             switch_attach_window_relative(client, view_state.attached_id, 1).await?;
         }
         RuntimeAction::WindowGoto1 => {
+            view_state.exit_scrollback();
             switch_attach_window_index(client, view_state.attached_id, 0).await?;
         }
         RuntimeAction::WindowGoto2 => {
+            view_state.exit_scrollback();
             switch_attach_window_index(client, view_state.attached_id, 1).await?;
         }
         RuntimeAction::WindowGoto3 => {
+            view_state.exit_scrollback();
             switch_attach_window_index(client, view_state.attached_id, 2).await?;
         }
         RuntimeAction::WindowGoto4 => {
+            view_state.exit_scrollback();
             switch_attach_window_index(client, view_state.attached_id, 3).await?;
         }
         RuntimeAction::WindowGoto5 => {
+            view_state.exit_scrollback();
             switch_attach_window_index(client, view_state.attached_id, 4).await?;
         }
         RuntimeAction::WindowGoto6 => {
+            view_state.exit_scrollback();
             switch_attach_window_index(client, view_state.attached_id, 5).await?;
         }
         RuntimeAction::WindowGoto7 => {
+            view_state.exit_scrollback();
             switch_attach_window_index(client, view_state.attached_id, 6).await?;
         }
         RuntimeAction::WindowGoto8 => {
+            view_state.exit_scrollback();
             switch_attach_window_index(client, view_state.attached_id, 7).await?;
         }
         RuntimeAction::WindowGoto9 => {
+            view_state.exit_scrollback();
             switch_attach_window_index(client, view_state.attached_id, 8).await?;
         }
         RuntimeAction::WindowClose => {
+            view_state.exit_scrollback();
             let _ = client
                 .kill_window(
                     Some(SessionSelector::ById(view_state.attached_id)),
@@ -1427,6 +1490,64 @@ async fn handle_attach_ui_action(
     }
 
     Ok(())
+}
+
+fn enter_attach_scrollback(view_state: &mut AttachViewState) -> bool {
+    if focused_attach_pane_buffer(view_state).is_none() {
+        return false;
+    }
+    view_state.scrollback_active = true;
+    view_state.scrollback_offset = 0;
+    true
+}
+
+fn step_attach_scrollback(view_state: &mut AttachViewState, delta: isize) {
+    if !view_state.scrollback_active {
+        return;
+    }
+    let max_offset = max_attach_scrollback(view_state);
+    view_state.scrollback_offset =
+        adjust_attach_scrollback_offset(view_state.scrollback_offset, delta, max_offset);
+}
+
+fn adjust_attach_scrollback_offset(current: usize, delta: isize, max_offset: usize) -> usize {
+    if delta < 0 {
+        current.saturating_add(delta.unsigned_abs()).min(max_offset)
+    } else {
+        current.saturating_sub(delta as usize)
+    }
+}
+
+fn max_attach_scrollback(view_state: &mut AttachViewState) -> usize {
+    let Some(buffer) = focused_attach_pane_buffer(view_state) else {
+        return 0;
+    };
+    let previous = buffer.parser.screen().scrollback();
+    buffer.parser.screen_mut().set_scrollback(usize::MAX);
+    let max_offset = buffer.parser.screen().scrollback();
+    buffer.parser.screen_mut().set_scrollback(previous);
+    max_offset
+}
+
+fn attach_scrollback_page_size(view_state: &AttachViewState) -> usize {
+    focused_attach_pane_inner_height(view_state).unwrap_or(10)
+}
+
+fn focused_attach_pane_buffer(
+    view_state: &mut AttachViewState,
+) -> Option<&mut attach::state::PaneRenderBuffer> {
+    let focused_pane_id = view_state.cached_layout_state.as_ref()?.focused_pane_id;
+    view_state.pane_buffers.get_mut(&focused_pane_id)
+}
+
+fn focused_attach_pane_inner_height(view_state: &AttachViewState) -> Option<usize> {
+    let layout_state = view_state.cached_layout_state.as_ref()?;
+    layout_state
+        .scene
+        .surfaces
+        .iter()
+        .find(|surface| surface.visible && surface.pane_id == Some(layout_state.focused_pane_id))
+        .map(|surface| usize::from(surface.rect.h.saturating_sub(2).max(1)))
 }
 
 async fn switch_attach_window_relative(
@@ -1563,6 +1684,7 @@ async fn build_attach_status_line_for_draw(
     session_id: Uuid,
     can_write: bool,
     ui_mode: AttachUiMode,
+    scrollback_active: bool,
     follow_target_id: Option<Uuid>,
     follow_global: bool,
     quit_confirmation_pending: bool,
@@ -1579,6 +1701,8 @@ async fn build_attach_status_line_for_draw(
     let session_label = resolve_attach_session_label(client, session_id).await?;
     let mode_label = if help_overlay_open {
         "HELP"
+    } else if scrollback_active {
+        "SCROLL"
     } else {
         match ui_mode {
             AttachUiMode::Normal => "NORMAL",
@@ -1599,6 +1723,8 @@ async fn build_attach_status_line_for_draw(
         "Help overlay open | ? toggles | Esc/Enter close".to_string()
     } else if let Some(status) = transient_status {
         status.to_string()
+    } else if scrollback_active {
+        attach_scrollback_hint(keymap)
     } else {
         attach_mode_hint(ui_mode, keymap)
     };
@@ -1650,6 +1776,15 @@ fn attach_mode_hint(ui_mode: AttachUiMode, keymap: &Keymap) -> String {
             )
         }
     }
+}
+
+fn attach_scrollback_hint(keymap: &Keymap) -> String {
+    let exit = key_hint_or_unbound(keymap, RuntimeAction::ExitScrollMode);
+    let page_up = key_hint_or_unbound(keymap, RuntimeAction::ScrollUpPage);
+    let page_down = key_hint_or_unbound(keymap, RuntimeAction::ScrollDownPage);
+    let top = key_hint_or_unbound(keymap, RuntimeAction::ScrollTop);
+    let bottom = key_hint_or_unbound(keymap, RuntimeAction::ScrollBottom);
+    format!("{page_up}/{page_down} page | {top}/{bottom} top/bottom | {exit} exit scroll")
 }
 
 fn key_hint_or_unbound(keymap: &Keymap, action: RuntimeAction) -> String {
@@ -1927,6 +2062,7 @@ async fn render_attach_frame(
                 view_state.attached_id,
                 view_state.can_write,
                 view_state.ui_mode,
+                view_state.scrollback_active,
                 follow_target_id,
                 follow_global,
                 view_state.quit_confirmation_pending,
@@ -1951,6 +2087,8 @@ async fn render_attach_frame(
         &mut view_state.pane_buffers,
         &view_state.dirty.pane_dirty_ids,
         view_state.dirty.full_pane_redraw,
+        view_state.scrollback_active,
+        view_state.scrollback_offset,
     )?;
     if view_state.help_overlay_open {
         if let Some(help_surface) = help_overlay_surface(help_lines) {
@@ -2163,9 +2301,19 @@ fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
             | RuntimeAction::ResizeUp
             | RuntimeAction::ResizeDown
             | RuntimeAction::CloseFocusedPane => "Pane",
-            RuntimeAction::EnterWindowMode | RuntimeAction::ExitMode | RuntimeAction::ShowHelp => {
-                "Mode"
-            }
+            RuntimeAction::EnterWindowMode
+            | RuntimeAction::ExitMode
+            | RuntimeAction::EnterScrollMode
+            | RuntimeAction::ExitScrollMode
+            | RuntimeAction::ScrollUpLine
+            | RuntimeAction::ScrollDownLine
+            | RuntimeAction::ScrollUpPage
+            | RuntimeAction::ScrollDownPage
+            | RuntimeAction::ScrollTop
+            | RuntimeAction::ScrollBottom
+            | RuntimeAction::BeginSelection
+            | RuntimeAction::CopyScrollback
+            | RuntimeAction::ShowHelp => "Mode",
             _ => "Other",
         };
 
@@ -2266,6 +2414,16 @@ const fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
             | RuntimeAction::SessionNext
             | RuntimeAction::EnterWindowMode
             | RuntimeAction::ExitMode
+            | RuntimeAction::EnterScrollMode
+            | RuntimeAction::ExitScrollMode
+            | RuntimeAction::ScrollUpLine
+            | RuntimeAction::ScrollDownLine
+            | RuntimeAction::ScrollUpPage
+            | RuntimeAction::ScrollDownPage
+            | RuntimeAction::ScrollTop
+            | RuntimeAction::ScrollBottom
+            | RuntimeAction::BeginSelection
+            | RuntimeAction::CopyScrollback
             | RuntimeAction::WindowPrev
             | RuntimeAction::WindowNext
             | RuntimeAction::WindowGoto1
@@ -2690,6 +2848,7 @@ async fn handle_attach_terminal_event(
                     view_state.dirty.layout_needs_refresh = true;
                     view_state.dirty.full_pane_redraw = true;
                 }
+                attach_input_processor.set_scroll_mode(view_state.scrollback_active);
             }
             AttachEventAction::Ui(action) => {
                 if matches!(action, RuntimeAction::ShowHelp) {
@@ -2723,6 +2882,7 @@ async fn handle_attach_terminal_event(
                     view_state.dirty.layout_needs_refresh = true;
                     view_state.dirty.full_pane_redraw = true;
                 }
+                attach_input_processor.set_scroll_mode(view_state.scrollback_active);
                 view_state.dirty.status_needs_redraw = true;
             }
             AttachEventAction::Redraw => {
@@ -2875,7 +3035,7 @@ fn attach_key_event_actions(
             | RuntimeAction::MoveCursorRight
             | RuntimeAction::MoveCursorUp
             | RuntimeAction::MoveCursorDown
-            | RuntimeAction::CopyScrollback => AttachEventAction::Ignore,
+            | RuntimeAction::CopyScrollback => AttachEventAction::Ui(action),
         })
         .collect())
 }
@@ -4529,6 +4689,39 @@ mod tests {
     }
 
     #[test]
+    fn attach_key_event_action_routes_enter_scroll_mode_to_ui() {
+        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
+
+        let _ = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+        let actions = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('['),
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+
+        assert!(matches!(
+            actions.first(),
+            Some(super::AttachEventAction::Ui(
+                crate::input::RuntimeAction::EnterScrollMode
+            ))
+        ));
+    }
+
+    #[test]
     fn attach_key_event_action_routes_shift_h_as_session_ui_only_in_window_mode() {
         let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
 
@@ -4787,6 +4980,24 @@ mod tests {
             super::relative_session_id(&sessions, session_b, 1),
             Some(session_a)
         );
+    }
+
+    #[test]
+    fn adjust_attach_scrollback_offset_clamps_within_bounds() {
+        assert_eq!(super::adjust_attach_scrollback_offset(0, -1, 4), 1);
+        assert_eq!(super::adjust_attach_scrollback_offset(3, -10, 4), 4);
+        assert_eq!(super::adjust_attach_scrollback_offset(4, 1, 4), 3);
+        assert_eq!(super::adjust_attach_scrollback_offset(1, 50, 4), 0);
+    }
+
+    #[test]
+    fn attach_scrollback_hint_uses_default_bindings() {
+        let keymap = attach_keymap_from_config(&BmuxConfig::default());
+        let hint = super::attach_scrollback_hint(&keymap);
+
+        assert!(hint.contains("page"));
+        assert!(hint.contains("top/bottom"));
+        assert!(hint.contains("exit scroll"));
     }
 
     #[test]

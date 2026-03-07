@@ -77,6 +77,8 @@ pub struct AttachViewState {
     pub(crate) attached_id: Uuid,
     pub(crate) can_write: bool,
     pub(crate) ui_mode: AttachUiMode,
+    pub(crate) scrollback_active: bool,
+    pub(crate) scrollback_offset: usize,
     pub(crate) quit_confirmation_pending: bool,
     pub(crate) help_overlay_open: bool,
     pub(crate) help_overlay_scroll: usize,
@@ -95,6 +97,8 @@ impl AttachViewState {
             attached_id: attach_info.session_id,
             can_write: attach_info.can_write,
             ui_mode: AttachUiMode::Normal,
+            scrollback_active: false,
+            scrollback_offset: 0,
             quit_confirmation_pending: false,
             help_overlay_open: false,
             help_overlay_scroll: 0,
@@ -140,5 +144,10 @@ impl AttachViewState {
             return None;
         }
         self.transient_status.as_deref()
+    }
+
+    pub(crate) fn exit_scrollback(&mut self) {
+        self.scrollback_active = false;
+        self.scrollback_offset = 0;
     }
 }

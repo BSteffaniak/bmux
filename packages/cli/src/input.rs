@@ -536,6 +536,10 @@ impl InputProcessor {
             }
         }
     }
+
+    pub(crate) fn set_scroll_mode(&mut self, enabled: bool) {
+        self.scroll_mode = enabled;
+    }
 }
 
 fn crossterm_event_to_input_event(event: Event) -> Option<InputEvent> {
