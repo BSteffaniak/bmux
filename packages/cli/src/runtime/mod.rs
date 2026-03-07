@@ -2448,6 +2448,9 @@ fn apply_attach_view_change_components(
     components: &[AttachViewComponent],
     view_state: &mut AttachViewState,
 ) {
+    // Components are applied sequentially in server-provided order so future
+    // fine-grained refresh behavior can build on earlier invalidation steps
+    // without re-sorting or undoing prior effects.
     for component in components {
         match component {
             AttachViewComponent::Layout => {

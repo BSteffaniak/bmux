@@ -2592,6 +2592,9 @@ fn emit_attach_view_changed(
     session_id: SessionId,
     components: &[AttachViewComponent],
 ) -> Result<()> {
+    // Attach view change components are server-normalized before emission so every
+    // subscriber receives the same deduplicated canonical ordering. Clients apply
+    // components in the received order.
     let components = normalize_attach_view_components(components);
     if components.is_empty() {
         return Ok(());
@@ -2619,6 +2622,8 @@ fn emit_attach_view_changed(
 fn normalize_attach_view_components(
     components: &[AttachViewComponent],
 ) -> Vec<AttachViewComponent> {
+    // The server owns the canonical attach update ordering. Add new components
+    // deliberately here so clients can trust and preserve the emitted sequence.
     let mut normalized = Vec::new();
     for component in [
         AttachViewComponent::Layout,
