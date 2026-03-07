@@ -2661,6 +2661,38 @@ fn emit_attach_view_changed_for_pane_close(
     )
 }
 
+fn emit_attach_view_changed_for_layout(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+) -> Result<()> {
+    emit_attach_view_changed(state, session_id, &[AttachViewComponent::Layout])
+}
+
+fn emit_attach_view_changed_for_window_tabs(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+) -> Result<()> {
+    emit_attach_view_changed(state, session_id, &[AttachViewComponent::Tabs])
+}
+
+fn emit_attach_view_changed_for_window_switch(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+) -> Result<()> {
+    emit_attach_view_changed(
+        state,
+        session_id,
+        &[AttachViewComponent::Layout, AttachViewComponent::Tabs],
+    )
+}
+
+fn emit_attach_view_changed_for_status(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+) -> Result<()> {
+    emit_attach_view_changed(state, session_id, &[AttachViewComponent::Status])
+}
+
 fn unsubscribe_events(state: &Arc<ServerState>, client_id: ClientId) -> Result<()> {
     let mut hub = state
         .event_hub
@@ -3912,11 +3944,7 @@ async fn handle_request(
                 },
             )?;
             if session_removed.is_none() {
-                emit_attach_view_changed(
-                    state,
-                    removed_window_session_id,
-                    &[AttachViewComponent::Layout, AttachViewComponent::Tabs],
-                )?;
+                emit_attach_view_changed_for_window_switch(state, removed_window_session_id)?;
             }
 
             if let Some(removed_session) = session_removed {
@@ -4016,11 +4044,7 @@ async fn handle_request(
                     by_client_id: client_id.0,
                 },
             )?;
-            emit_attach_view_changed(
-                state,
-                session_id,
-                &[AttachViewComponent::Layout, AttachViewComponent::Tabs],
-            )?;
+            emit_attach_view_changed_for_window_switch(state, session_id)?;
 
             Response::Ok(ResponsePayload::WindowSwitched {
                 id: switched_id.0,
@@ -4092,7 +4116,7 @@ async fn handle_request(
                 .get(&session_id)
                 .map_or(WindowId(Uuid::nil()), |runtime| runtime.active_window);
             drop(runtime_manager);
-            emit_attach_view_changed(state, session_id, &[AttachViewComponent::Layout])?;
+            emit_attach_view_changed_for_layout(state, session_id)?;
             Response::Ok(ResponsePayload::PaneSplit {
                 id: pane_id,
                 session_id: session_id.0,
@@ -4148,7 +4172,7 @@ async fn handle_request(
                 .get(&session_id)
                 .map_or(WindowId(Uuid::nil()), |runtime| runtime.active_window);
             drop(runtime_manager);
-            emit_attach_view_changed(state, session_id, &[AttachViewComponent::Layout])?;
+            emit_attach_view_changed_for_layout(state, session_id)?;
             Response::Ok(ResponsePayload::PaneFocused {
                 id: pane_id,
                 session_id: session_id.0,
@@ -4190,7 +4214,7 @@ async fn handle_request(
                 .get(&session_id)
                 .map_or(WindowId(Uuid::nil()), |runtime| runtime.active_window);
             drop(runtime_manager);
-            emit_attach_view_changed(state, session_id, &[AttachViewComponent::Layout])?;
+            emit_attach_view_changed_for_layout(state, session_id)?;
             Response::Ok(ResponsePayload::PaneResized {
                 session_id: session_id.0,
                 window_id: window_id.0,
@@ -4475,6 +4499,7 @@ async fn handle_request(
                     by_client_id: client_id.0,
                 },
             )?;
+            emit_attach_view_changed_for_status(state, session_id)?;
             if role == SessionRole::Owner && target_client_id != client_id {
                 emit_event(
                     state,
@@ -4485,6 +4510,7 @@ async fn handle_request(
                         by_client_id: client_id.0,
                     },
                 )?;
+                emit_attach_view_changed_for_status(state, session_id)?;
             }
 
             Response::Ok(ResponsePayload::RoleGranted {
@@ -4548,6 +4574,7 @@ async fn handle_request(
                     by_client_id: client_id.0,
                 },
             )?;
+            emit_attach_view_changed_for_status(state, session_id)?;
 
             Response::Ok(ResponsePayload::RoleRevoked {
                 session_id: session_id.0,
@@ -5226,7 +5253,7 @@ async fn handle_request(
                 name: name.clone(),
             },
         )?;
-        emit_attach_view_changed(state, SessionId(*session_id), &[AttachViewComponent::Tabs])?;
+        emit_attach_view_changed_for_window_tabs(state, SessionId(*session_id))?;
     }
     if let Response::Ok(ResponsePayload::AttachReady { session_id, .. }) = &response {
         emit_event(state, Event::ClientAttached { id: *session_id })?;
@@ -8505,6 +8532,70 @@ mod tests {
             final_layout.expect("attach layout should collapse to one pane after exit");
         assert_ne!(focused_pane_id, split_pane_id);
         assert_eq!(panes[0].id, focused_pane_id);
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn role_change_emits_status_attach_view_change() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut owner = connect_and_handshake(&endpoint).await;
+        let mut target = connect_and_handshake(&endpoint).await;
+        let mut observer = connect_and_handshake(&endpoint).await;
+
+        let subscribed = send_request(&mut observer, 970, Request::SubscribeEvents).await;
+        assert_eq!(subscribed, Response::Ok(ResponsePayload::EventsSubscribed));
+
+        let session_id = match send_request(
+            &mut owner,
+            971,
+            Request::NewSession {
+                name: Some("role-status-refresh".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected session create response: {other:?}"),
+        };
+        let _ = poll_events_collect(&mut observer, 972, 16, 4).await;
+
+        let target_client_id = match send_request(&mut target, 973, Request::WhoAmI).await {
+            Response::Ok(ResponsePayload::ClientIdentity { id }) => id,
+            other => panic!("unexpected whoami response: {other:?}"),
+        };
+
+        let granted = send_request(
+            &mut owner,
+            974,
+            Request::GrantRole {
+                session: SessionSelector::ById(session_id),
+                client_id: target_client_id,
+                role: SessionRole::Writer,
+            },
+        )
+        .await;
+        assert!(matches!(
+            granted,
+            Response::Ok(ResponsePayload::RoleGranted {
+                role: SessionRole::Writer,
+                ..
+            })
+        ));
+
+        let role_events = poll_events_collect(&mut observer, 975, 16, 8).await;
+        assert!(role_events.iter().any(|event| {
+            matches!(
+                event,
+                Event::AttachViewChanged {
+                    session_id: changed_session,
+                    components,
+                    ..
+                } if *changed_session == session_id
+                    && components == &vec![AttachViewComponent::Status]
+            )
+        }));
 
         stop_server(server, server_task, &socket_path).await;
     }

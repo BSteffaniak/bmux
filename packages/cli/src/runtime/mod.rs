@@ -1058,11 +1058,7 @@ async fn run_session_attach_with_client(
             .map_err(map_attach_client_error)?;
     }
 
-    let self_client_id = if follow_target_id.is_some() {
-        Some(client.whoami().await.map_err(map_attach_client_error)?)
-    } else {
-        None
-    };
+    let self_client_id = client.whoami().await.map_err(map_attach_client_error)?;
 
     let attach_info = if let Some(leader_client_id) = follow_target_id {
         let target_session = resolve_follow_target_session(&mut client, leader_client_id)
@@ -1133,7 +1129,7 @@ async fn run_session_attach_with_client(
                 &mut client,
                 &mut attach_input_processor,
                 follow_target_id,
-                self_client_id,
+                Some(self_client_id),
                 global,
                 &attach_help_lines,
                 &mut view_state,
@@ -2438,10 +2434,30 @@ async fn handle_attach_server_event(
         } if session_id == view_state.attached_id => {
             apply_attach_view_change_components(&components, view_state);
         }
+        bmux_client::ServerEvent::RoleChanged {
+            session_id,
+            client_id,
+            role,
+            ..
+        } if session_id == view_state.attached_id && Some(client_id) == self_client_id => {
+            apply_attach_role_change(role, view_state);
+        }
         _ => {}
     }
 
     Ok(AttachLoopControl::Continue)
+}
+
+fn role_allows_attach_input(role: SessionRole) -> bool {
+    matches!(role, SessionRole::Owner | SessionRole::Writer)
+}
+
+fn apply_attach_role_change(role: SessionRole, view_state: &mut AttachViewState) {
+    let can_write = role_allows_attach_input(role);
+    if view_state.can_write != can_write {
+        view_state.can_write = can_write;
+        view_state.dirty.status_needs_redraw = true;
+    }
 }
 
 fn apply_attach_view_change_components(
@@ -3803,17 +3819,17 @@ fn init_logging(verbose: bool) {
 mod tests {
     use super::{
         ProtocolDirection, ProtocolTraceEvent, TerminalProfile, TraceFamily,
-        apply_attach_view_change_components, attach_keymap_from_config, filter_trace_events,
-        map_attach_client_error, map_cli_client_error, merged_runtime_keybindings,
-        parse_pid_content, profile_for_term, protocol_profile_for_terminal_profile,
-        resolve_pane_term_with_checker,
+        apply_attach_role_change, apply_attach_view_change_components, attach_keymap_from_config,
+        filter_trace_events, map_attach_client_error, map_cli_client_error,
+        merged_runtime_keybindings, parse_pid_content, profile_for_term,
+        protocol_profile_for_terminal_profile, resolve_pane_term_with_checker,
     };
     use crate::input::InputProcessor;
     use crate::runtime::attach::state::AttachViewState;
     use bmux_client::{AttachOpenInfo, ClientError};
     use bmux_config::{BmuxConfig, ResolvedTimeout};
     use bmux_ipc::transport::IpcTransportError;
-    use bmux_ipc::{AttachViewComponent, ErrorCode};
+    use bmux_ipc::{AttachViewComponent, ErrorCode, SessionRole};
     use crossterm::event::{
         KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
         KeyEventKind as CrosstermKeyEventKind, KeyModifiers,
@@ -3971,6 +3987,28 @@ mod tests {
         assert!(view_state.dirty.status_needs_redraw);
         assert!(view_state.dirty.layout_needs_refresh);
         assert!(view_state.dirty.full_pane_redraw);
+    }
+
+    #[test]
+    fn attach_role_change_updates_write_status_only_when_needed() {
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            session_id: uuid::Uuid::new_v4(),
+            can_write: true,
+        });
+        view_state.dirty.status_needs_redraw = false;
+
+        apply_attach_role_change(SessionRole::Writer, &mut view_state);
+        assert!(view_state.can_write);
+        assert!(!view_state.dirty.status_needs_redraw);
+
+        apply_attach_role_change(SessionRole::Observer, &mut view_state);
+        assert!(!view_state.can_write);
+        assert!(view_state.dirty.status_needs_redraw);
+
+        view_state.dirty.status_needs_redraw = false;
+        apply_attach_role_change(SessionRole::Observer, &mut view_state);
+        assert!(!view_state.can_write);
+        assert!(!view_state.dirty.status_needs_redraw);
     }
 
     #[test]
