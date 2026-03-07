@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 use super::state::PaneRect;
 use bmux_ipc::{PaneLayoutNode, PaneSplitDirection};
 use std::collections::BTreeMap;

@@ -35,10 +35,9 @@ mod attach;
 mod terminal_protocol;
 use attach::cursor::apply_attach_cursor_state;
 use attach::events::{AttachLoopControl, AttachLoopEvent, collect_attach_loop_events};
-use attach::layout::{collect_layout_rects, collect_pane_ids};
 use attach::render::{
     AttachLayer, AttachLayerSurface, append_pane_output, opaque_row_text, queue_layer_fill,
-    render_attach_panes,
+    render_attach_scene, visible_scene_pane_ids,
 };
 use attach::state::{AttachEventAction, AttachExitReason, AttachUiMode, AttachViewState, PaneRect};
 use terminal_protocol::{
@@ -54,6 +53,7 @@ const ATTACH_IO_POLL_INTERVAL: Duration = Duration::from_millis(15);
 const ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE: usize = 1_048_576;
 const ATTACH_WINDOW_MODE_UNBOUND_STATUS: &str = "window mode: unbound key (Esc/Enter to exit)";
 const ATTACH_TRANSIENT_STATUS_TTL: Duration = Duration::from_millis(1800);
+const HELP_OVERLAY_SURFACE_ID: Uuid = Uuid::from_u128(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalProfile {
@@ -1170,8 +1170,7 @@ async fn run_session_attach_with_client(
             };
             if view_state.cached_layout_state.as_ref() != Some(&layout_state) {
                 frame_needs_render = true;
-                let mut pane_ids = Vec::new();
-                collect_pane_ids(&layout_state.layout_root, &mut pane_ids);
+                let pane_ids = visible_scene_pane_ids(&layout_state.scene);
                 for pane_id in pane_ids {
                     view_state.dirty.pane_dirty_ids.insert(pane_id);
                 }
@@ -1180,7 +1179,7 @@ async fn run_session_attach_with_client(
                         view_state.dirty.full_pane_redraw = true;
                     }
                     Some(previous) => {
-                        if previous.layout_root != layout_state.layout_root {
+                        if previous.scene != layout_state.scene {
                             view_state.dirty.full_pane_redraw = true;
                         } else if previous.focused_pane_id != layout_state.focused_pane_id {
                             view_state
@@ -1203,10 +1202,9 @@ async fn run_session_attach_with_client(
             continue;
         };
 
-        resize_attach_parsers_for_layout(&mut view_state.pane_buffers, &layout_state.layout_root);
+        resize_attach_parsers_for_scene(&mut view_state.pane_buffers, &layout_state.scene);
 
-        let mut pane_ids = Vec::new();
-        collect_pane_ids(&layout_state.layout_root, &mut pane_ids);
+        let pane_ids = visible_scene_pane_ids(&layout_state.scene);
         view_state
             .pane_buffers
             .retain(|pane_id, _| pane_ids.iter().any(|id| id == pane_id));
@@ -1729,14 +1727,10 @@ fn handle_help_overlay_key_event(
     }
 }
 
-fn queue_attach_help_overlay(
-    stdout: &mut io::Stdout,
-    lines: &[String],
-    scroll: usize,
-) -> Result<()> {
+fn help_overlay_surface(lines: &[String]) -> Option<bmux_ipc::AttachSurface> {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
     if cols < 20 || rows < 6 {
-        return Ok(());
+        return None;
     }
 
     let content_width = lines
@@ -1753,13 +1747,43 @@ fn queue_attach_help_overlay(
     let height = (content_rows + 4).min((rows as usize).saturating_sub(2));
     let x = ((cols as usize).saturating_sub(width)) / 2;
     let y = ((rows as usize).saturating_sub(height)) / 2;
-    let body_rows = height.saturating_sub(4).max(1);
-    let surface = AttachLayerSurface::new(
-        PaneRect {
+
+    Some(bmux_ipc::AttachSurface {
+        id: HELP_OVERLAY_SURFACE_ID,
+        kind: bmux_ipc::AttachSurfaceKind::Overlay,
+        layer: bmux_ipc::AttachLayer::Overlay,
+        z: i32::MAX,
+        rect: bmux_ipc::AttachRect {
             x: x as u16,
             y: y as u16,
             w: width as u16,
             h: height as u16,
+        },
+        opaque: true,
+        visible: true,
+        accepts_input: true,
+        cursor_owner: false,
+        pane_id: None,
+    })
+}
+
+fn queue_attach_help_overlay(
+    stdout: &mut io::Stdout,
+    surface_meta: &bmux_ipc::AttachSurface,
+    lines: &[String],
+    scroll: usize,
+) -> Result<()> {
+    let width = usize::from(surface_meta.rect.w);
+    let height = usize::from(surface_meta.rect.h);
+    let x = usize::from(surface_meta.rect.x);
+    let y = usize::from(surface_meta.rect.y);
+    let body_rows = height.saturating_sub(4).max(1);
+    let surface = AttachLayerSurface::new(
+        PaneRect {
+            x: surface_meta.rect.x,
+            y: surface_meta.rect.y,
+            w: surface_meta.rect.w,
+            h: surface_meta.rect.h,
         },
         AttachLayer::Overlay,
         true,
@@ -1870,16 +1894,17 @@ async fn render_attach_frame(
     if let Some(status_line) = view_state.cached_status_line.as_deref() {
         queue_attach_status_line(&mut stdout, status_line)?;
     }
-    let cursor_state = render_attach_panes(
+    let cursor_state = render_attach_scene(
         &mut stdout,
-        &layout_state.layout_root,
-        layout_state.focused_pane_id,
+        &layout_state.scene,
         &mut view_state.pane_buffers,
         &view_state.dirty.pane_dirty_ids,
         view_state.dirty.full_pane_redraw,
     )?;
     if view_state.help_overlay_open {
-        queue_attach_help_overlay(&mut stdout, help_lines, help_scroll)?;
+        if let Some(help_surface) = help_overlay_surface(help_lines) {
+            queue_attach_help_overlay(&mut stdout, &help_surface, help_lines, help_scroll)?;
+        }
         apply_attach_cursor_state(&mut stdout, None, &mut view_state.last_cursor_state)?;
     } else {
         apply_attach_cursor_state(&mut stdout, cursor_state, &mut view_state.last_cursor_state)?;
@@ -2287,6 +2312,7 @@ async fn hydrate_attach_state_from_snapshot(
         focused_pane_id,
         panes,
         layout_root,
+        scene,
         chunks,
     } = client
         .attach_snapshot(view_state.attached_id, ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE)
@@ -2298,10 +2324,11 @@ async fn hydrate_attach_state_from_snapshot(
         focused_pane_id,
         panes,
         layout_root,
+        scene,
     });
     view_state.pane_buffers.clear();
     if let Some(layout_state) = view_state.cached_layout_state.as_ref() {
-        resize_attach_parsers_for_layout(&mut view_state.pane_buffers, &layout_state.layout_root);
+        resize_attach_parsers_for_scene(&mut view_state.pane_buffers, &layout_state.scene);
     }
     for chunk in chunks {
         if chunk.data.is_empty() {
@@ -2317,17 +2344,17 @@ async fn hydrate_attach_state_from_snapshot(
     Ok(())
 }
 
-fn resize_attach_parsers_for_layout(
+fn resize_attach_parsers_for_scene(
     pane_buffers: &mut std::collections::BTreeMap<Uuid, attach::state::PaneRenderBuffer>,
-    layout: &bmux_ipc::PaneLayoutNode,
+    scene: &bmux_ipc::AttachScene,
 ) {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
-    resize_attach_parsers_for_layout_with_size(pane_buffers, layout, cols, rows);
+    resize_attach_parsers_for_scene_with_size(pane_buffers, scene, cols, rows);
 }
 
-fn resize_attach_parsers_for_layout_with_size(
+fn resize_attach_parsers_for_scene_with_size(
     pane_buffers: &mut std::collections::BTreeMap<Uuid, attach::state::PaneRenderBuffer>,
-    layout: &bmux_ipc::PaneLayoutNode,
+    scene: &bmux_ipc::AttachScene,
     cols: u16,
     rows: u16,
 ) {
@@ -2335,16 +2362,22 @@ fn resize_attach_parsers_for_layout_with_size(
         return;
     }
 
-    let root = PaneRect {
-        x: 0,
-        y: 1,
-        w: cols,
-        h: rows.saturating_sub(1),
-    };
-
-    let mut rects = std::collections::BTreeMap::new();
-    collect_layout_rects(layout, root, &mut rects);
-    for (pane_id, rect) in rects {
+    for surface in &scene.surfaces {
+        let Some(pane_id) = surface.pane_id else {
+            continue;
+        };
+        if !surface.visible {
+            continue;
+        }
+        let rect = PaneRect {
+            x: surface.rect.x.min(cols.saturating_sub(1)),
+            y: surface.rect.y.min(rows.saturating_sub(1)),
+            w: surface.rect.w.min(cols),
+            h: surface
+                .rect
+                .h
+                .min(rows.saturating_sub(surface.rect.y.min(rows.saturating_sub(1)))),
+        };
         if rect.w < 2 || rect.h < 2 {
             continue;
         }
@@ -2476,6 +2509,15 @@ fn apply_attach_view_change_components(
     // without re-sorting or undoing prior effects.
     for component in components {
         match component {
+            AttachViewComponent::Scene => {
+                view_state.dirty.layout_needs_refresh = true;
+                view_state.dirty.full_pane_redraw = true;
+                view_state.dirty.status_needs_redraw = true;
+            }
+            AttachViewComponent::SurfaceContent => {
+                view_state.dirty.layout_needs_refresh = true;
+                view_state.dirty.full_pane_redraw = true;
+            }
             AttachViewComponent::Layout => {
                 view_state.dirty.layout_needs_refresh = true;
                 view_state.dirty.full_pane_redraw = true;
@@ -3988,7 +4030,7 @@ mod tests {
         view_state.dirty.status_needs_redraw = false;
         view_state.dirty.layout_needs_refresh = false;
         apply_attach_view_change_components(
-            &[AttachViewComponent::Layout, AttachViewComponent::Tabs],
+            &[AttachViewComponent::Scene, AttachViewComponent::Tabs],
             &mut view_state,
         );
         assert!(view_state.dirty.status_needs_redraw);
@@ -4796,11 +4838,32 @@ mod tests {
     #[test]
     fn resize_attach_parsers_applies_layout_size_before_snapshot_bytes() {
         let pane_id = uuid::Uuid::new_v4();
-        let layout = bmux_ipc::PaneLayoutNode::Leaf { pane_id };
+        let scene = bmux_ipc::AttachScene {
+            session_id: uuid::Uuid::new_v4(),
+            window_id: uuid::Uuid::new_v4(),
+            focus: bmux_ipc::AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![bmux_ipc::AttachSurface {
+                id: pane_id,
+                kind: bmux_ipc::AttachSurfaceKind::Pane,
+                layer: bmux_ipc::AttachLayer::Pane,
+                z: 0,
+                rect: bmux_ipc::AttachRect {
+                    x: 0,
+                    y: 1,
+                    w: 120,
+                    h: 49,
+                },
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+                pane_id: Some(pane_id),
+            }],
+        };
         let mut pane_buffers = BTreeMap::new();
         pane_buffers.insert(pane_id, super::attach::state::PaneRenderBuffer::default());
 
-        super::resize_attach_parsers_for_layout_with_size(&mut pane_buffers, &layout, 120, 50);
+        super::resize_attach_parsers_for_scene_with_size(&mut pane_buffers, &scene, 120, 50);
 
         let buffer = pane_buffers
             .get_mut(&pane_id)

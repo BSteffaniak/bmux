@@ -9,10 +9,21 @@ use uuid::Uuid;
 
 const SNAPSHOT_VERSION_V1: u32 = 1;
 const SNAPSHOT_VERSION_V2: u32 = 2;
+const SNAPSHOT_VERSION_V3: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotV2 {
     pub sessions: Vec<SessionSnapshotV2>,
+    #[serde(default)]
+    pub owner_principals: Vec<OwnerPrincipalSnapshotV2>,
+    pub roles: Vec<RoleAssignmentSnapshotV2>,
+    pub follows: Vec<FollowEdgeSnapshotV2>,
+    pub selected_sessions: Vec<ClientSelectedSessionSnapshotV2>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SnapshotV3 {
+    pub sessions: Vec<SessionSnapshotV3>,
     #[serde(default)]
     pub owner_principals: Vec<OwnerPrincipalSnapshotV2>,
     pub roles: Vec<RoleAssignmentSnapshotV2>,
@@ -42,6 +53,41 @@ pub struct WindowSnapshotV2 {
     pub focused_pane_id: Option<Uuid>,
     #[serde(default)]
     pub layout_root: Option<PaneLayoutNodeSnapshotV2>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionSnapshotV3 {
+    pub id: Uuid,
+    pub name: Option<String>,
+    pub windows: Vec<WindowSnapshotV3>,
+    pub active_window_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WindowSnapshotV3 {
+    pub id: Uuid,
+    pub name: Option<String>,
+    pub panes: Vec<PaneSnapshotV2>,
+    pub focused_pane_id: Option<Uuid>,
+    #[serde(default)]
+    pub layout_root: Option<PaneLayoutNodeSnapshotV2>,
+    #[serde(default)]
+    pub floating_surfaces: Vec<FloatingSurfaceSnapshotV3>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FloatingSurfaceSnapshotV3 {
+    pub id: Uuid,
+    pub pane_id: Uuid,
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+    pub z: i32,
+    pub visible: bool,
+    pub opaque: bool,
+    pub accepts_input: bool,
+    pub cursor_owner: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +194,13 @@ struct SnapshotEnvelopeV2 {
     snapshot: SnapshotV2,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct SnapshotEnvelopeV3 {
+    version: u32,
+    checksum: u64,
+    snapshot: SnapshotV3,
+}
+
 #[derive(Debug, Error)]
 pub enum SnapshotError {
     #[error("snapshot io error: {0}")]
@@ -186,18 +239,18 @@ impl SnapshotManager {
         &self.path
     }
 
-    pub(crate) fn encode_snapshot(snapshot: &SnapshotV2) -> Result<Vec<u8>, SnapshotError> {
-        validate_snapshot(snapshot)?;
-        let checksum = snapshot_checksum(snapshot).map_err(SnapshotError::Encode)?;
-        let envelope = SnapshotEnvelopeV2 {
-            version: SNAPSHOT_VERSION_V2,
+    pub(crate) fn encode_snapshot(snapshot: &SnapshotV3) -> Result<Vec<u8>, SnapshotError> {
+        validate_snapshot_v3(snapshot)?;
+        let checksum = snapshot_checksum_v3(snapshot).map_err(SnapshotError::Encode)?;
+        let envelope = SnapshotEnvelopeV3 {
+            version: SNAPSHOT_VERSION_V3,
             checksum,
             snapshot: snapshot.clone(),
         };
         serde_json::to_vec_pretty(&envelope).map_err(SnapshotError::Encode)
     }
 
-    pub(crate) fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotV2, SnapshotError> {
+    pub(crate) fn decode_snapshot(bytes: &[u8]) -> Result<SnapshotV3, SnapshotError> {
         let value: serde_json::Value = serde_json::from_slice(bytes)?;
         let version = value
             .get("version")
@@ -215,7 +268,7 @@ impl SnapshotManager {
                     ));
                 }
                 validate_snapshot_v1(&envelope.snapshot)?;
-                Ok(upgrade_snapshot_v1(envelope.snapshot))
+                Ok(upgrade_snapshot_v2(upgrade_snapshot_v1(envelope.snapshot)))
             }
             SNAPSHOT_VERSION_V2 => {
                 let envelope: SnapshotEnvelopeV2 = serde_json::from_value(value)?;
@@ -227,13 +280,25 @@ impl SnapshotManager {
                     ));
                 }
                 validate_snapshot(&envelope.snapshot)?;
+                Ok(upgrade_snapshot_v2(envelope.snapshot))
+            }
+            SNAPSHOT_VERSION_V3 => {
+                let envelope: SnapshotEnvelopeV3 = serde_json::from_value(value)?;
+                let expected_checksum =
+                    snapshot_checksum_v3(&envelope.snapshot).map_err(SnapshotError::Encode)?;
+                if expected_checksum != envelope.checksum {
+                    return Err(SnapshotError::Validation(
+                        "snapshot checksum mismatch".to_string(),
+                    ));
+                }
+                validate_snapshot_v3(&envelope.snapshot)?;
                 Ok(envelope.snapshot)
             }
             other => Err(SnapshotError::UnsupportedVersion(other)),
         }
     }
 
-    pub(crate) fn write_snapshot(&self, snapshot: &SnapshotV2) -> Result<(), SnapshotError> {
+    pub(crate) fn write_snapshot(&self, snapshot: &SnapshotV3) -> Result<(), SnapshotError> {
         let encoded = Self::encode_snapshot(snapshot)?;
         if let Some(parent) = self.path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -262,7 +327,7 @@ impl SnapshotManager {
         Ok(())
     }
 
-    pub(crate) fn read_snapshot(&self) -> Result<SnapshotV2, SnapshotError> {
+    pub(crate) fn read_snapshot(&self) -> Result<SnapshotV3, SnapshotError> {
         let bytes = std::fs::read(&self.path)?;
         Self::decode_snapshot(&bytes)
     }
@@ -282,6 +347,11 @@ impl SnapshotManager {
 }
 
 fn snapshot_checksum(snapshot: &SnapshotV2) -> Result<u64, serde_json::Error> {
+    let bytes = serde_json::to_vec(snapshot)?;
+    Ok(fnv1a64(&bytes))
+}
+
+fn snapshot_checksum_v3(snapshot: &SnapshotV3) -> Result<u64, serde_json::Error> {
     let bytes = serde_json::to_vec(snapshot)?;
     Ok(fnv1a64(&bytes))
 }
@@ -433,6 +503,68 @@ fn validate_snapshot(snapshot: &SnapshotV2) -> Result<(), SnapshotError> {
         }
     }
 
+    Ok(())
+}
+
+fn validate_snapshot_v3(snapshot: &SnapshotV3) -> Result<(), SnapshotError> {
+    let legacy_equivalent = SnapshotV2 {
+        sessions: snapshot
+            .sessions
+            .iter()
+            .map(|session| SessionSnapshotV2 {
+                id: session.id,
+                name: session.name.clone(),
+                windows: session
+                    .windows
+                    .iter()
+                    .map(|window| WindowSnapshotV2 {
+                        id: window.id,
+                        name: window.name.clone(),
+                        panes: window.panes.clone(),
+                        focused_pane_id: window.focused_pane_id,
+                        layout_root: window.layout_root.clone(),
+                    })
+                    .collect(),
+                active_window_id: session.active_window_id,
+            })
+            .collect(),
+        owner_principals: snapshot.owner_principals.clone(),
+        roles: snapshot.roles.clone(),
+        follows: snapshot.follows.clone(),
+        selected_sessions: snapshot.selected_sessions.clone(),
+    };
+    validate_snapshot(&legacy_equivalent)?;
+
+    let mut surface_ids = BTreeSet::new();
+    for session in &snapshot.sessions {
+        for window in &session.windows {
+            let window_pane_ids = window
+                .panes
+                .iter()
+                .map(|pane| pane.id)
+                .collect::<BTreeSet<_>>();
+            for surface in &window.floating_surfaces {
+                if !surface_ids.insert(surface.id) {
+                    return Err(SnapshotError::Validation(format!(
+                        "duplicate floating surface id {}",
+                        surface.id
+                    )));
+                }
+                if !window_pane_ids.contains(&surface.pane_id) {
+                    return Err(SnapshotError::Validation(format!(
+                        "floating surface {} references missing pane {} in window {}",
+                        surface.id, surface.pane_id, window.id
+                    )));
+                }
+                if surface.w == 0 || surface.h == 0 {
+                    return Err(SnapshotError::Validation(format!(
+                        "floating surface {} in window {} has zero-sized rect",
+                        surface.id, window.id
+                    )));
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -592,6 +724,36 @@ fn upgrade_snapshot_v1(snapshot: SnapshotV1) -> SnapshotV2 {
     }
 }
 
+fn upgrade_snapshot_v2(snapshot: SnapshotV2) -> SnapshotV3 {
+    SnapshotV3 {
+        sessions: snapshot
+            .sessions
+            .into_iter()
+            .map(|session| SessionSnapshotV3 {
+                id: session.id,
+                name: session.name,
+                windows: session
+                    .windows
+                    .into_iter()
+                    .map(|window| WindowSnapshotV3 {
+                        id: window.id,
+                        name: window.name,
+                        panes: window.panes,
+                        focused_pane_id: window.focused_pane_id,
+                        layout_root: window.layout_root,
+                        floating_surfaces: Vec::new(),
+                    })
+                    .collect(),
+                active_window_id: session.active_window_id,
+            })
+            .collect(),
+        owner_principals: snapshot.owner_principals,
+        roles: snapshot.roles,
+        follows: snapshot.follows,
+        selected_sessions: snapshot.selected_sessions,
+    }
+}
+
 fn default_shell_for_upgrade() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| {
         if cfg!(windows) {
@@ -606,8 +768,8 @@ fn default_shell_for_upgrade() -> String {
 mod tests {
     use super::{
         ClientSelectedSessionSnapshotV2, FollowEdgeSnapshotV2, PaneLayoutNodeSnapshotV2,
-        PaneSnapshotV2, RoleAssignmentSnapshotV2, SessionSnapshotV2, SnapshotError,
-        SnapshotManager, SnapshotV2, WindowSnapshotV2,
+        PaneSnapshotV2, RoleAssignmentSnapshotV2, SessionSnapshotV3, SnapshotError,
+        SnapshotManager, SnapshotV3, WindowSnapshotV3,
     };
     use bmux_ipc::SessionRole;
     use uuid::Uuid;
@@ -619,11 +781,11 @@ mod tests {
         let client_id = Uuid::new_v4();
         let leader_id = Uuid::new_v4();
 
-        let snapshot = SnapshotV2 {
-            sessions: vec![SessionSnapshotV2 {
+        let snapshot = SnapshotV3 {
+            sessions: vec![SessionSnapshotV3 {
                 id: session_id,
                 name: Some("dev".to_string()),
-                windows: vec![WindowSnapshotV2 {
+                windows: vec![WindowSnapshotV3 {
                     id: window_id,
                     name: Some("main".to_string()),
                     panes: vec![PaneSnapshotV2 {
@@ -633,6 +795,7 @@ mod tests {
                     }],
                     focused_pane_id: Some(window_id),
                     layout_root: Some(PaneLayoutNodeSnapshotV2::Leaf { pane_id: window_id }),
+                    floating_surfaces: vec![],
                 }],
                 active_window_id: Some(window_id),
             }],
@@ -681,11 +844,11 @@ mod tests {
 
     #[test]
     fn decode_rejects_invalid_references() {
-        let snapshot = SnapshotV2 {
-            sessions: vec![SessionSnapshotV2 {
+        let snapshot = SnapshotV3 {
+            sessions: vec![SessionSnapshotV3 {
                 id: Uuid::new_v4(),
                 name: Some("valid".to_string()),
-                windows: vec![WindowSnapshotV2 {
+                windows: vec![WindowSnapshotV3 {
                     id: Uuid::new_v4(),
                     name: Some("w1".to_string()),
                     panes: vec![PaneSnapshotV2 {
@@ -695,6 +858,7 @@ mod tests {
                     }],
                     focused_pane_id: None,
                     layout_root: None,
+                    floating_surfaces: vec![],
                 }],
                 active_window_id: None,
             }],

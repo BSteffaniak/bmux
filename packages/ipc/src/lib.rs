@@ -166,9 +166,70 @@ pub enum SessionRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachViewComponent {
+    Scene,
+    SurfaceContent,
     Layout,
     Tabs,
     Status,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachRect {
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachLayer {
+    Status,
+    Pane,
+    Overlay,
+    FloatingPane,
+    Tooltip,
+    Cursor,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachFocusTarget {
+    None,
+    Pane { pane_id: Uuid },
+    Surface { surface_id: Uuid },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachSurfaceKind {
+    Pane,
+    FloatingPane,
+    Modal,
+    Overlay,
+    Tooltip,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachSurface {
+    pub id: Uuid,
+    pub kind: AttachSurfaceKind,
+    pub layer: AttachLayer,
+    pub z: i32,
+    pub rect: AttachRect,
+    pub opaque: bool,
+    pub visible: bool,
+    pub accepts_input: bool,
+    pub cursor_owner: bool,
+    pub pane_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachScene {
+    pub session_id: Uuid,
+    pub window_id: Uuid,
+    pub focus: AttachFocusTarget,
+    pub surfaces: Vec<AttachSurface>,
 }
 
 /// Request payload variants for client/server IPC.
@@ -492,6 +553,7 @@ pub enum ResponsePayload {
         focused_pane_id: Uuid,
         panes: Vec<PaneSummary>,
         layout_root: PaneLayoutNode,
+        scene: AttachScene,
     },
     AttachPaneOutputBatch {
         chunks: Vec<AttachPaneChunk>,
@@ -502,6 +564,7 @@ pub enum ResponsePayload {
         focused_pane_id: Uuid,
         panes: Vec<PaneSummary>,
         layout_root: PaneLayoutNode,
+        scene: AttachScene,
         chunks: Vec<AttachPaneChunk>,
     },
     EventsSubscribed,
@@ -629,6 +692,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
+        AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
         AttachViewComponent, Envelope, EnvelopeKind, ErrorCode, Event, IpcEndpoint,
         ProtocolVersion, Request, Response, ResponsePayload, SessionPermissionSummary, SessionRole,
         SessionSelector, SessionSummary, decode, encode,
@@ -656,6 +720,45 @@ mod tests {
                 window_count: 2,
                 client_count: 1,
             }],
+        });
+        let bytes = encode(&response).expect("response should encode");
+        let decoded: Response = decode(&bytes).expect("response should decode");
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn serializes_attach_scene_response_roundtrip() {
+        let pane_id = Uuid::new_v4();
+        let session_id = Uuid::new_v4();
+        let window_id = Uuid::new_v4();
+        let response = Response::Ok(ResponsePayload::AttachLayout {
+            session_id,
+            window_id,
+            focused_pane_id: pane_id,
+            panes: vec![],
+            layout_root: super::PaneLayoutNode::Leaf { pane_id },
+            scene: AttachScene {
+                session_id,
+                window_id,
+                focus: AttachFocusTarget::Pane { pane_id },
+                surfaces: vec![AttachSurface {
+                    id: pane_id,
+                    kind: AttachSurfaceKind::Pane,
+                    layer: AttachLayer::Pane,
+                    z: 0,
+                    rect: AttachRect {
+                        x: 0,
+                        y: 1,
+                        w: 80,
+                        h: 24,
+                    },
+                    opaque: true,
+                    visible: true,
+                    accepts_input: true,
+                    cursor_owner: true,
+                    pane_id: Some(pane_id),
+                }],
+            },
         });
         let bytes = encode(&response).expect("response should encode");
         let decoded: Response = decode(&bytes).expect("response should decode");

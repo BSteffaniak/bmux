@@ -11,7 +11,8 @@ use anyhow::{Context, Result};
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
-    AttachGrant, AttachPaneChunk, AttachViewComponent, CURRENT_PROTOCOL_VERSION, ClientSummary,
+    AttachFocusTarget, AttachGrant, AttachLayer, AttachPaneChunk, AttachRect, AttachScene,
+    AttachSurface, AttachSurfaceKind, AttachViewComponent, CURRENT_PROTOCOL_VERSION, ClientSummary,
     Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, PaneFocusDirection,
     PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection, PaneSummary,
     ProtocolVersion, Request, Response, ResponsePayload, ServerSnapshotStatus,
@@ -21,9 +22,10 @@ use bmux_ipc::{
 use bmux_session::{ClientId, Session, SessionId, SessionManager, WindowId};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
 use persistence::{
-    ClientSelectedSessionSnapshotV2, FollowEdgeSnapshotV2, OwnerPrincipalSnapshotV2,
-    PaneLayoutNodeSnapshotV2, PaneSnapshotV2, PaneSplitDirectionSnapshotV2,
-    RoleAssignmentSnapshotV2, SessionSnapshotV2, SnapshotManager, SnapshotV2, WindowSnapshotV2,
+    ClientSelectedSessionSnapshotV2, FloatingSurfaceSnapshotV3, FollowEdgeSnapshotV2,
+    OwnerPrincipalSnapshotV2, PaneLayoutNodeSnapshotV2, PaneSnapshotV2,
+    PaneSplitDirectionSnapshotV2, RoleAssignmentSnapshotV2, SessionSnapshotV3, SnapshotManager,
+    SnapshotV3, WindowSnapshotV3,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -600,6 +602,19 @@ struct WindowRuntimeHandle {
     panes: BTreeMap<Uuid, PaneRuntimeHandle>,
     layout_root: PaneLayoutNode,
     focused_pane_id: Uuid,
+    floating_surfaces: Vec<FloatingSurfaceRuntime>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FloatingSurfaceRuntime {
+    id: Uuid,
+    pane_id: Uuid,
+    rect: LayoutRect,
+    z: i32,
+    visible: bool,
+    opaque: bool,
+    accepts_input: bool,
+    cursor_owner: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -624,8 +639,10 @@ enum PaneRuntimeCommand {
     Resize { rows: u16, cols: u16 },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LayoutRect {
+    x: u16,
+    y: u16,
     w: u16,
     h: u16,
 }
@@ -771,6 +788,7 @@ struct AttachLayoutState {
     focused_pane_id: Uuid,
     panes: Vec<PaneSummary>,
     layout_root: IpcPaneLayoutNode,
+    scene: AttachScene,
 }
 
 struct AttachSnapshotState {
@@ -779,6 +797,7 @@ struct AttachSnapshotState {
     focused_pane_id: Uuid,
     panes: Vec<PaneSummary>,
     layout_root: IpcPaneLayoutNode,
+    scene: AttachScene,
     chunks: Vec<AttachPaneChunk>,
 }
 
@@ -789,6 +808,7 @@ struct RestoreWindowRuntimeSpec {
     panes: Vec<PaneRuntimeMeta>,
     layout_root: Option<PaneLayoutNode>,
     focused_pane_id: Uuid,
+    floating_surfaces: Vec<FloatingSurfaceRuntime>,
 }
 
 #[derive(Debug, Clone)]
@@ -997,10 +1017,14 @@ fn split_layout_rect(rect: LayoutRect, ratio: f32, vertical: bool) -> (LayoutRec
         let second_w = rect.w.saturating_sub(first_w).max(1);
         (
             LayoutRect {
+                x: rect.x,
+                y: rect.y,
                 w: first_w,
                 h: rect.h,
             },
             LayoutRect {
+                x: rect.x.saturating_add(first_w),
+                y: rect.y,
                 w: second_w,
                 h: rect.h,
             },
@@ -1011,10 +1035,14 @@ fn split_layout_rect(rect: LayoutRect, ratio: f32, vertical: bool) -> (LayoutRec
         let second_h = rect.h.saturating_sub(first_h).max(1);
         (
             LayoutRect {
+                x: rect.x,
+                y: rect.y,
                 w: rect.w,
                 h: first_h,
             },
             LayoutRect {
+                x: rect.x,
+                y: rect.y.saturating_add(first_h),
                 w: rect.w,
                 h: second_h,
             },
@@ -1045,6 +1073,88 @@ fn collect_layout_rects(
     }
 }
 
+fn attach_rect_from_layout_rect(rect: LayoutRect) -> AttachRect {
+    AttachRect {
+        x: rect.x,
+        y: rect.y,
+        w: rect.w,
+        h: rect.h,
+    }
+}
+
+fn scene_root_from_viewport(viewport: Option<AttachViewport>) -> LayoutRect {
+    let (cols, rows) = viewport.map_or((0, 0), |viewport| (viewport.cols, viewport.rows));
+    LayoutRect {
+        x: 0,
+        y: 1,
+        w: cols.max(1),
+        h: rows.saturating_sub(1).max(1),
+    }
+}
+
+fn build_attach_scene(
+    session_id: SessionId,
+    window: &WindowRuntimeHandle,
+    viewport: Option<AttachViewport>,
+) -> AttachScene {
+    let mut rects = BTreeMap::new();
+    collect_layout_rects(
+        &window.layout_root,
+        scene_root_from_viewport(viewport),
+        &mut rects,
+    );
+
+    let mut pane_ids = Vec::new();
+    window.layout_root.pane_order(&mut pane_ids);
+
+    let mut surfaces = pane_ids
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, pane_id)| {
+            rects.get(&pane_id).copied().map(|rect| AttachSurface {
+                id: pane_id,
+                kind: AttachSurfaceKind::Pane,
+                layer: AttachLayer::Pane,
+                z: index as i32,
+                rect: attach_rect_from_layout_rect(rect),
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: pane_id == window.focused_pane_id,
+                pane_id: Some(pane_id),
+            })
+        })
+        .collect::<Vec<_>>();
+
+    surfaces.extend(
+        window
+            .floating_surfaces
+            .iter()
+            .filter(|surface| window.panes.contains_key(&surface.pane_id))
+            .map(|surface| AttachSurface {
+                id: surface.id,
+                kind: AttachSurfaceKind::FloatingPane,
+                layer: AttachLayer::FloatingPane,
+                z: surface.z,
+                rect: attach_rect_from_layout_rect(surface.rect),
+                opaque: surface.opaque,
+                visible: surface.visible,
+                accepts_input: surface.accepts_input,
+                cursor_owner: surface.cursor_owner,
+                pane_id: Some(surface.pane_id),
+            }),
+    );
+
+    AttachScene {
+        session_id: session_id.0,
+        window_id: window.id.0,
+        focus: AttachFocusTarget::Pane {
+            pane_id: window.focused_pane_id,
+        },
+        surfaces,
+    }
+}
+
 fn pane_pty_size(layout_rect: LayoutRect) -> (u16, u16) {
     let cols = layout_rect.w.saturating_sub(2).max(1);
     let rows = layout_rect.h.saturating_sub(2).max(1);
@@ -1053,6 +1163,8 @@ fn pane_pty_size(layout_rect: LayoutRect) -> (u16, u16) {
 
 fn resize_active_window_ptys(runtime: &mut SessionRuntimeHandle, cols: u16, rows: u16) {
     let root = LayoutRect {
+        x: 0,
+        y: 1,
         w: cols.max(1),
         h: rows.saturating_sub(1).max(1),
     };
@@ -1228,6 +1340,7 @@ impl SessionRuntimeManager {
             });
             validate_runtime_layout_matches_panes(&handle.layout_root, &handle.panes)?;
             handle.focused_pane_id = window.focused_pane_id;
+            handle.floating_surfaces = window.floating_surfaces;
             runtime_windows.insert(window.id, handle);
         }
 
@@ -1277,6 +1390,7 @@ impl SessionRuntimeManager {
                 pane_id: pane_meta.id,
             },
             focused_pane_id: pane_meta.id,
+            floating_surfaces: Vec::new(),
         })
     }
 
@@ -1740,6 +1854,7 @@ impl SessionRuntimeManager {
             .windows
             .get(&session.active_window)
             .ok_or(SessionRuntimeError::NotFound)?;
+        let scene = build_attach_scene(session_id, window, session.attach_viewport);
         let mut pane_ids = Vec::new();
         window.layout_root.pane_order(&mut pane_ids);
         let panes = pane_ids
@@ -1759,6 +1874,7 @@ impl SessionRuntimeManager {
             focused_pane_id: window.focused_pane_id,
             panes,
             layout_root: ipc_layout_from_runtime(&window.layout_root),
+            scene,
         })
     }
 
@@ -1779,6 +1895,7 @@ impl SessionRuntimeManager {
             .windows
             .get(&session.active_window)
             .ok_or(SessionRuntimeError::NotFound)?;
+        let scene = build_attach_scene(session_id, window, session.attach_viewport);
         let mut pane_ids = Vec::new();
         window.layout_root.pane_order(&mut pane_ids);
         let panes = pane_ids
@@ -1813,6 +1930,7 @@ impl SessionRuntimeManager {
             focused_pane_id: window.focused_pane_id,
             panes,
             layout_root: ipc_layout_from_runtime(&window.layout_root),
+            scene,
             chunks,
         })
     }
@@ -2626,6 +2744,8 @@ fn normalize_attach_view_components(
     // deliberately here so clients can trust and preserve the emitted sequence.
     let mut normalized = Vec::new();
     for component in [
+        AttachViewComponent::Scene,
+        AttachViewComponent::SurfaceContent,
         AttachViewComponent::Layout,
         AttachViewComponent::Tabs,
         AttachViewComponent::Status,
@@ -2639,9 +2759,9 @@ fn normalize_attach_view_components(
 
 fn attach_view_components_for_pane_close(window_closed: bool) -> &'static [AttachViewComponent] {
     if window_closed {
-        &[AttachViewComponent::Layout, AttachViewComponent::Tabs]
+        &[AttachViewComponent::Scene, AttachViewComponent::Tabs]
     } else {
-        &[AttachViewComponent::Layout]
+        &[AttachViewComponent::Scene]
     }
 }
 
@@ -2665,7 +2785,7 @@ fn emit_attach_view_changed_for_layout(
     state: &Arc<ServerState>,
     session_id: SessionId,
 ) -> Result<()> {
-    emit_attach_view_changed(state, session_id, &[AttachViewComponent::Layout])
+    emit_attach_view_changed(state, session_id, &[AttachViewComponent::Scene])
 }
 
 fn emit_attach_view_changed_for_window_tabs(
@@ -2682,7 +2802,7 @@ fn emit_attach_view_changed_for_window_switch(
     emit_attach_view_changed(
         state,
         session_id,
-        &[AttachViewComponent::Layout, AttachViewComponent::Tabs],
+        &[AttachViewComponent::Scene, AttachViewComponent::Tabs],
     )
 }
 
@@ -2919,7 +3039,7 @@ fn snapshot_status(state: &Arc<ServerState>) -> Result<ServerSnapshotStatus> {
     })
 }
 
-fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV2> {
+fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV3> {
     let sessions = {
         let manager = state
             .session_manager
@@ -2983,12 +3103,29 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV2> {
                             })
                             .collect::<Result<Vec<_>>>()?;
 
-                        Ok(WindowSnapshotV2 {
+                        Ok(WindowSnapshotV3 {
                             id: window.id.0,
                             name: window.name.clone(),
                             panes,
                             focused_pane_id: Some(window.focused_pane_id),
                             layout_root: Some(snapshot_layout_from_runtime(&window.layout_root)),
+                            floating_surfaces: window
+                                .floating_surfaces
+                                .iter()
+                                .map(|surface| FloatingSurfaceSnapshotV3 {
+                                    id: surface.id,
+                                    pane_id: surface.pane_id,
+                                    x: surface.rect.x,
+                                    y: surface.rect.y,
+                                    w: surface.rect.w,
+                                    h: surface.rect.h,
+                                    z: surface.z,
+                                    visible: surface.visible,
+                                    opaque: surface.opaque,
+                                    accepts_input: surface.accepts_input,
+                                    cursor_owner: surface.cursor_owner,
+                                })
+                                .collect(),
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -2997,7 +3134,7 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV2> {
                     .get_session(&session_info.id)
                     .and_then(|session| session.name.clone());
 
-                Ok(SessionSnapshotV2 {
+                Ok(SessionSnapshotV3 {
                     id: session_info.id.0,
                     name,
                     windows: window_snapshots,
@@ -3065,7 +3202,7 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV2> {
         (follows, selected_sessions)
     };
 
-    Ok(SnapshotV2 {
+    Ok(SnapshotV3 {
         sessions: session_snapshots,
         owner_principals,
         roles,
@@ -3123,7 +3260,7 @@ fn restore_snapshot_if_present(state: &Arc<ServerState>) -> Result<()> {
     Ok(())
 }
 
-fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV2) -> Result<RestoreSummary> {
+fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV3) -> Result<RestoreSummary> {
     let mut summary = RestoreSummary::default();
 
     {
@@ -3194,6 +3331,25 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV2) -> Resu
                             .focused_pane_id
                             .or_else(|| window.panes.first().map(|pane| pane.id))
                             .expect("snapshot validation ensures pane exists"),
+                        floating_surfaces: window
+                            .floating_surfaces
+                            .iter()
+                            .map(|surface| FloatingSurfaceRuntime {
+                                id: surface.id,
+                                pane_id: surface.pane_id,
+                                rect: LayoutRect {
+                                    x: surface.x,
+                                    y: surface.y,
+                                    w: surface.w,
+                                    h: surface.h,
+                                },
+                                z: surface.z,
+                                visible: surface.visible,
+                                opaque: surface.opaque,
+                                accepts_input: surface.accepts_input,
+                                cursor_owner: surface.cursor_owner,
+                            })
+                            .collect(),
                     }
                 })
                 .collect::<Vec<_>>();
@@ -3288,7 +3444,7 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV2) -> Resu
 
 async fn restore_snapshot_replace(
     state: &Arc<ServerState>,
-    snapshot: SnapshotV2,
+    snapshot: SnapshotV3,
 ) -> Result<RestoreSummary> {
     let removed_runtimes = {
         let mut runtime_manager = state
@@ -5055,6 +5211,7 @@ async fn handle_request(
                     focused_pane_id: snapshot.focused_pane_id,
                     panes: snapshot.panes,
                     layout_root: snapshot.layout_root,
+                    scene: snapshot.scene,
                 }),
                 Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
@@ -5107,6 +5264,7 @@ async fn handle_request(
                     focused_pane_id: snapshot.focused_pane_id,
                     panes: snapshot.panes,
                     layout_root: snapshot.layout_root,
+                    scene: snapshot.scene,
                     chunks: snapshot.chunks,
                 }),
                 Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
@@ -8324,7 +8482,7 @@ mod tests {
                     revision,
                     components,
                 } if *changed_session == session_id
-                    && components == &vec![AttachViewComponent::Layout] =>
+                    && components == &vec![AttachViewComponent::Scene] =>
                 {
                     Some(*revision)
                 }
@@ -8391,7 +8549,7 @@ mod tests {
                     components,
                 } if *changed_session == session_id
                     && components
-                        == &vec![AttachViewComponent::Layout, AttachViewComponent::Tabs] =>
+                        == &vec![AttachViewComponent::Scene, AttachViewComponent::Tabs] =>
                 {
                     Some(*revision)
                 }
@@ -8481,7 +8639,7 @@ mod tests {
                     components,
                     ..
                 } if *changed_session == session_id
-                    && components == &vec![AttachViewComponent::Layout]
+                    && components == &vec![AttachViewComponent::Scene]
             )
         }));
 
@@ -8508,7 +8666,7 @@ mod tests {
                     components,
                     ..
                 } if *changed_session == session_id
-                    && components == &vec![AttachViewComponent::Layout]
+                    && components == &vec![AttachViewComponent::Scene]
             )
         }));
 
@@ -9598,7 +9756,7 @@ mod tests {
             "pane_id": Uuid::new_v4(),
         });
 
-        let snapshot_model: super::SnapshotV2 =
+        let snapshot_model: super::SnapshotV3 =
             serde_json::from_value(payload["snapshot"].clone()).expect("snapshot model decode");
         let snapshot_bytes =
             serde_json::to_vec(&snapshot_model).expect("snapshot json should encode");

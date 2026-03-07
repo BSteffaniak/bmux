@@ -1,7 +1,6 @@
-use super::layout::collect_layout_rects;
 use super::state::{AttachCursorState, PaneRect, PaneRenderBuffer};
 use anyhow::{Context, Result};
-use bmux_ipc::PaneLayoutNode;
+use bmux_ipc::{AttachFocusTarget, AttachScene, AttachSurfaceKind};
 use crossterm::cursor::MoveTo;
 use crossterm::queue;
 use crossterm::style::Print;
@@ -162,10 +161,21 @@ fn style_sgr(style: CellStyle) -> String {
     format!("\x1b[{}m", parts.join(";"))
 }
 
-pub fn render_attach_panes(
+pub fn visible_scene_pane_ids(scene: &AttachScene) -> Vec<Uuid> {
+    let mut pane_ids = BTreeSet::new();
+    for surface in &scene.surfaces {
+        if surface.visible
+            && let Some(pane_id) = surface.pane_id
+        {
+            pane_ids.insert(pane_id);
+        }
+    }
+    pane_ids.into_iter().collect()
+}
+
+pub fn render_attach_scene(
     stdout: &mut io::Stdout,
-    layout: &PaneLayoutNode,
-    focused_pane_id: Uuid,
+    scene: &AttachScene,
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     dirty_pane_ids: &BTreeSet<Uuid>,
     full_pane_redraw: bool,
@@ -175,17 +185,6 @@ pub fn render_attach_panes(
         return Ok(None);
     }
 
-    let draw_rows = rows.saturating_sub(1);
-    let root = PaneRect {
-        x: 0,
-        y: 1,
-        w: cols,
-        h: draw_rows,
-    };
-
-    let mut rects = BTreeMap::new();
-    collect_layout_rects(layout, root, &mut rects);
-
     let mut cursor_state = None;
     if full_pane_redraw {
         for y in 1..rows {
@@ -194,12 +193,44 @@ pub fn render_attach_panes(
         }
     }
 
-    for (pane_id, rect) in rects {
+    let focused_surface_id = match scene.focus {
+        AttachFocusTarget::Surface { surface_id } => Some(surface_id),
+        _ => None,
+    };
+    let focused_pane_id = match scene.focus {
+        AttachFocusTarget::Pane { pane_id } => Some(pane_id),
+        _ => None,
+    };
+
+    let mut ordered_surfaces = scene.surfaces.iter().enumerate().collect::<Vec<_>>();
+    ordered_surfaces.sort_by_key(|(index, surface)| (surface.layer, surface.z, *index));
+
+    for (_index, surface) in ordered_surfaces {
+        if !surface.visible {
+            continue;
+        }
+        let Some(pane_id) = surface.pane_id else {
+            continue;
+        };
+        if !matches!(
+            surface.kind,
+            AttachSurfaceKind::Pane | AttachSurfaceKind::FloatingPane
+        ) {
+            continue;
+        }
+        let rect = PaneRect {
+            x: surface.rect.x,
+            y: surface.rect.y,
+            w: surface.rect.w,
+            h: surface.rect.h,
+        };
         if rect.w < 2 || rect.h < 2 {
             continue;
         }
         let should_draw = full_pane_redraw || dirty_pane_ids.contains(&pane_id);
-        let focus = pane_id == focused_pane_id;
+        let focus = surface.cursor_owner
+            || focused_surface_id == Some(surface.id)
+            || focused_pane_id == Some(pane_id);
         if should_draw {
             let hch = if focus { '=' } else { '-' };
             let top = draw_box_line(usize::from(rect.w), '+', hch, '+');
@@ -235,7 +266,7 @@ pub fn render_attach_panes(
                 .screen_mut()
                 .set_size(inner_h_u16.max(1), inner_w_u16.max(1));
             let screen = entry.parser.screen();
-            if pane_id == focused_pane_id {
+            if focus {
                 let (cursor_row, cursor_col) = screen.cursor_position();
                 let cursor_row = cursor_row.min(inner_h_u16.saturating_sub(1));
                 let cursor_col = cursor_col.min(inner_w_u16.saturating_sub(1));

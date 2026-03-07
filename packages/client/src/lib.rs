@@ -9,8 +9,8 @@ use bmux_config::{BmuxConfig, ConfigPaths};
 pub use bmux_ipc::Event as ServerEvent;
 use bmux_ipc::transport::{IpcTransportError, LocalIpcStream};
 use bmux_ipc::{
-    AttachGrant, AttachPaneChunk, ClientSummary, Envelope, EnvelopeKind, ErrorCode, IpcEndpoint,
-    PaneFocusDirection, PaneLayoutNode, PaneSelector, PaneSplitDirection, PaneSummary,
+    AttachGrant, AttachPaneChunk, AttachScene, ClientSummary, Envelope, EnvelopeKind, ErrorCode,
+    IpcEndpoint, PaneFocusDirection, PaneLayoutNode, PaneSelector, PaneSplitDirection, PaneSummary,
     ProtocolVersion, Request, Response, ResponsePayload, ServerSnapshotStatus,
     SessionPermissionSummary, SessionRole, SessionSelector, SessionSummary, WindowSelector,
     WindowSummary, decode, encode,
@@ -37,6 +37,7 @@ pub struct AttachLayoutState {
     pub focused_pane_id: Uuid,
     pub panes: Vec<PaneSummary>,
     pub layout_root: PaneLayoutNode,
+    pub scene: AttachScene,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,6 +47,7 @@ pub struct AttachSnapshotState {
     pub focused_pane_id: Uuid,
     pub panes: Vec<PaneSummary>,
     pub layout_root: PaneLayoutNode,
+    pub scene: AttachScene,
     pub chunks: Vec<AttachPaneChunk>,
 }
 
@@ -885,12 +887,14 @@ impl BmuxClient {
                 focused_pane_id,
                 panes,
                 layout_root,
+                scene,
             } => Ok(AttachLayoutState {
                 session_id,
                 window_id,
                 focused_pane_id,
                 panes,
                 layout_root,
+                scene,
             }),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected attach layout response",
@@ -937,6 +941,7 @@ impl BmuxClient {
                 focused_pane_id,
                 panes,
                 layout_root,
+                scene,
                 chunks,
             } => Ok(AttachSnapshotState {
                 session_id,
@@ -944,6 +949,7 @@ impl BmuxClient {
                 focused_pane_id,
                 panes,
                 layout_root,
+                scene,
                 chunks,
             }),
             _ => Err(ClientError::UnexpectedResponse(
