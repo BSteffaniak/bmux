@@ -2637,6 +2637,30 @@ fn normalize_attach_view_components(
     normalized
 }
 
+fn attach_view_components_for_pane_close(window_closed: bool) -> &'static [AttachViewComponent] {
+    if window_closed {
+        &[AttachViewComponent::Layout, AttachViewComponent::Tabs]
+    } else {
+        &[AttachViewComponent::Layout]
+    }
+}
+
+fn emit_attach_view_changed_for_pane_close(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+    window_closed: bool,
+    session_closed: bool,
+) -> Result<()> {
+    if session_closed {
+        return Ok(());
+    }
+    emit_attach_view_changed(
+        state,
+        session_id,
+        attach_view_components_for_pane_close(window_closed),
+    )
+}
+
 fn unsubscribe_events(state: &Arc<ServerState>, client_id: ClientId) -> Result<()> {
     let mut hub = state
         .event_hub
@@ -3366,14 +3390,10 @@ async fn reap_closed_active_pane(
                 },
             )?;
         } else {
-            emit_attach_view_changed(
-                state,
-                removed_window_session_id,
-                &[AttachViewComponent::Layout, AttachViewComponent::Tabs],
-            )?;
+            emit_attach_view_changed_for_pane_close(state, removed_window_session_id, true, false)?;
         }
     } else {
-        emit_attach_view_changed(state, session_id, &[AttachViewComponent::Layout])?;
+        emit_attach_view_changed_for_pane_close(state, session_id, false, false)?;
     }
 
     Ok(())
@@ -3465,7 +3485,11 @@ async fn reap_exited_pane(
                     id: removed_window_session_id.0,
                 },
             )?;
+        } else {
+            emit_attach_view_changed_for_pane_close(state, removed_window_session_id, true, false)?;
         }
+    } else {
+        emit_attach_view_changed_for_pane_close(state, session_id, false, false)?;
     }
 
     Ok(())
@@ -4281,12 +4305,12 @@ async fn handle_request(
                 }
             }
 
-            let components: &[AttachViewComponent] = if window_closed {
-                &[AttachViewComponent::Layout, AttachViewComponent::Tabs]
-            } else {
-                &[AttachViewComponent::Layout]
-            };
-            emit_attach_view_changed(state, session_id, components)?;
+            emit_attach_view_changed_for_pane_close(
+                state,
+                session_id,
+                window_closed,
+                session_closed,
+            )?;
 
             Response::Ok(ResponsePayload::PaneClosed {
                 id: closed_pane_id,
@@ -8348,6 +8372,139 @@ mod tests {
             })
             .expect("layout+tabs attach view change should exist after window switch");
         assert!(switched_revision > tabs_revision);
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exiting_attached_split_pane_emits_layout_change_and_updates_attach_layout() {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut actor = connect_and_handshake(&endpoint).await;
+        let mut observer = connect_and_handshake(&endpoint).await;
+
+        let subscribed = send_request(&mut observer, 940, Request::SubscribeEvents).await;
+        assert_eq!(subscribed, Response::Ok(ResponsePayload::EventsSubscribed));
+
+        let session_id = match send_request(
+            &mut actor,
+            941,
+            Request::NewSession {
+                name: Some("pane-exit-attach-refresh".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected session create response: {other:?}"),
+        };
+
+        let grant = match send_request(
+            &mut actor,
+            942,
+            Request::Attach {
+                selector: SessionSelector::ById(session_id),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::Attached { grant }) => grant,
+            other => panic!("unexpected attach grant response: {other:?}"),
+        };
+        let opened = send_request(
+            &mut actor,
+            943,
+            Request::AttachOpen {
+                session_id,
+                attach_token: grant.attach_token,
+            },
+        )
+        .await;
+        assert!(matches!(
+            opened,
+            Response::Ok(ResponsePayload::AttachReady {
+                session_id: attached_session,
+                ..
+            }) if attached_session == session_id
+        ));
+
+        let _ = poll_events_collect(&mut observer, 944, 16, 4).await;
+
+        let split = send_request(
+            &mut actor,
+            945,
+            Request::SplitPane {
+                session: Some(SessionSelector::ById(session_id)),
+                target: None,
+                direction: PaneSplitDirection::Horizontal,
+            },
+        )
+        .await;
+        let split_pane_id = match split {
+            Response::Ok(ResponsePayload::PaneSplit { id, .. }) => id,
+            other => panic!("unexpected split response: {other:?}"),
+        };
+
+        let split_events = poll_events_collect(&mut observer, 946, 16, 4).await;
+        assert!(split_events.iter().any(|event| {
+            matches!(
+                event,
+                Event::AttachViewChanged {
+                    session_id: changed_session,
+                    components,
+                    ..
+                } if *changed_session == session_id
+                    && components == &vec![AttachViewComponent::Layout]
+            )
+        }));
+
+        let accepted = send_request(
+            &mut actor,
+            947,
+            Request::AttachInput {
+                session_id,
+                data: b"exit\n".to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            accepted,
+            Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
+        ));
+
+        let exit_events = poll_events_collect(&mut observer, 948, 16, 40).await;
+        assert!(exit_events.iter().any(|event| {
+            matches!(
+                event,
+                Event::AttachViewChanged {
+                    session_id: changed_session,
+                    components,
+                    ..
+                } if *changed_session == session_id
+                    && components == &vec![AttachViewComponent::Layout]
+            )
+        }));
+
+        let mut final_layout = None;
+        for request_id in 949..=960 {
+            let layout =
+                send_request(&mut actor, request_id, Request::AttachLayout { session_id }).await;
+            if let Response::Ok(ResponsePayload::AttachLayout {
+                focused_pane_id,
+                panes,
+                ..
+            }) = layout
+                && panes.len() == 1
+            {
+                final_layout = Some((focused_pane_id, panes));
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+        let (focused_pane_id, panes) =
+            final_layout.expect("attach layout should collapse to one pane after exit");
+        assert_ne!(focused_pane_id, split_pane_id);
+        assert_eq!(panes[0].id, focused_pane_id);
 
         stop_server(server, server_task, &socket_path).await;
     }
