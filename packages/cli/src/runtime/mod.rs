@@ -1315,6 +1315,12 @@ async fn handle_attach_ui_action(
         RuntimeAction::ExitMode => {
             view_state.ui_mode = AttachUiMode::Normal;
         }
+        RuntimeAction::SessionPrev => {
+            switch_attach_session_relative(client, view_state, -1).await?;
+        }
+        RuntimeAction::SessionNext => {
+            switch_attach_session_relative(client, view_state, 1).await?;
+        }
         RuntimeAction::WindowPrev => {
             switch_attach_window_relative(client, view_state.attached_id, -1).await?;
         }
@@ -1449,6 +1455,49 @@ async fn switch_attach_window_relative(
         )
         .await?;
     Ok(())
+}
+
+async fn switch_attach_session_relative(
+    client: &mut BmuxClient,
+    view_state: &mut AttachViewState,
+    step: isize,
+) -> std::result::Result<(), ClientError> {
+    let sessions = client.list_sessions().await?;
+    let Some(target_session_id) = relative_session_id(&sessions, view_state.attached_id, step)
+    else {
+        return Ok(());
+    };
+
+    let attach_info = open_attach_for_session(client, target_session_id).await?;
+    view_state.attached_id = attach_info.session_id;
+    view_state.can_write = attach_info.can_write;
+    update_attach_viewport(client, view_state.attached_id).await?;
+    hydrate_attach_state_from_snapshot(client, view_state).await?;
+    Ok(())
+}
+
+fn relative_session_id(
+    sessions: &[SessionSummary],
+    current_session_id: Uuid,
+    step: isize,
+) -> Option<Uuid> {
+    if sessions.is_empty() {
+        return None;
+    }
+
+    let current_index = sessions
+        .iter()
+        .position(|session| session.id == current_session_id)
+        .unwrap_or(0);
+    let len = sessions.len() as isize;
+    let mut target_index = current_index as isize + step;
+    while target_index < 0 {
+        target_index += len;
+    }
+    target_index %= len;
+    sessions
+        .get(target_index as usize)
+        .map(|session| session.id)
 }
 
 async fn switch_attach_window_index(
@@ -1587,6 +1636,8 @@ fn attach_mode_hint(ui_mode: AttachUiMode, keymap: &Keymap) -> String {
             format!("{window_mode} window mode | {detach} detach | {quit} quit | {help} help")
         }
         AttachUiMode::Window => {
+            let session_prev = key_hint_or_unbound(keymap, RuntimeAction::SessionPrev);
+            let session_next = key_hint_or_unbound(keymap, RuntimeAction::SessionNext);
             let prev = key_hint_or_unbound(keymap, RuntimeAction::WindowPrev);
             let next = key_hint_or_unbound(keymap, RuntimeAction::WindowNext);
             let goto_one = key_hint_or_unbound(keymap, RuntimeAction::WindowGoto1);
@@ -1595,7 +1646,7 @@ fn attach_mode_hint(ui_mode: AttachUiMode, keymap: &Keymap) -> String {
             let exit = key_hint_or_unbound(keymap, RuntimeAction::ExitMode);
             let help = key_hint_or_unbound(keymap, RuntimeAction::ShowHelp);
             format!(
-                "{prev}/{next} prev/next | {goto_one} goto-1 | {new_window} new | {close} close | {exit} exit | {help} help"
+                "{session_prev}/{session_next} prev/next session | {prev}/{next} prev/next window | {goto_one} goto-1 | {new_window} new | {close} close | {exit} exit | {help} help"
             )
         }
     }
@@ -2080,7 +2131,11 @@ fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
 
     for entry in effective_attach_keybindings(config) {
         let category = match entry.action {
-            RuntimeAction::NewSession | RuntimeAction::Detach | RuntimeAction::Quit => "Session",
+            RuntimeAction::NewSession
+            | RuntimeAction::SessionPrev
+            | RuntimeAction::SessionNext
+            | RuntimeAction::Detach
+            | RuntimeAction::Quit => "Session",
             RuntimeAction::NewWindow
             | RuntimeAction::WindowPrev
             | RuntimeAction::WindowNext
@@ -2176,6 +2231,8 @@ fn inject_attach_global_defaults(global: &mut std::collections::BTreeMap<String,
         ("ctrl+t", "enter_window_mode"),
         ("escape", "exit_mode"),
         ("enter", "exit_mode"),
+        ("shift+h", "session_prev"),
+        ("shift+l", "session_next"),
         ("h", "window_prev"),
         ("l", "window_next"),
         ("1", "window_goto_1"),
@@ -2205,6 +2262,8 @@ const fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
             | RuntimeAction::Quit
             | RuntimeAction::NewWindow
             | RuntimeAction::NewSession
+            | RuntimeAction::SessionPrev
+            | RuntimeAction::SessionNext
             | RuntimeAction::EnterWindowMode
             | RuntimeAction::ExitMode
             | RuntimeAction::WindowPrev
@@ -2748,6 +2807,14 @@ fn attach_key_event_actions(
                         .map_or(AttachEventAction::Ignore, AttachEventAction::Send)
                 } else {
                     AttachEventAction::Runtime(action)
+                }
+            }
+            RuntimeAction::SessionPrev | RuntimeAction::SessionNext => {
+                if ui_mode == AttachUiMode::Window {
+                    AttachEventAction::Ui(action)
+                } else {
+                    attach_key_event_to_bytes(key)
+                        .map_or(AttachEventAction::Ignore, AttachEventAction::Send)
                 }
             }
             RuntimeAction::EnterWindowMode
@@ -3878,12 +3945,13 @@ mod tests {
     use bmux_client::{AttachOpenInfo, ClientError};
     use bmux_config::{BmuxConfig, ResolvedTimeout};
     use bmux_ipc::transport::IpcTransportError;
-    use bmux_ipc::{AttachViewComponent, ErrorCode, SessionRole};
+    use bmux_ipc::{AttachViewComponent, ErrorCode, SessionRole, SessionSummary};
     use crossterm::event::{
         KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
         KeyEventKind as CrosstermKeyEventKind, KeyModifiers,
     };
     use std::collections::BTreeMap;
+    use uuid::Uuid;
 
     #[test]
     fn pane_term_profile_mapping_is_stable() {
@@ -4461,6 +4529,43 @@ mod tests {
     }
 
     #[test]
+    fn attach_key_event_action_routes_shift_h_as_session_ui_only_in_window_mode() {
+        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
+
+        let normal_actions = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('H'),
+                KeyModifiers::SHIFT,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+        assert!(matches!(
+            normal_actions.first(),
+            Some(super::AttachEventAction::Send(bytes)) if bytes.as_slice() == b"H"
+        ));
+
+        let window_actions = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('H'),
+                KeyModifiers::SHIFT,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Window,
+        )
+        .expect("attach key action should parse");
+        assert!(matches!(
+            window_actions.first(),
+            Some(super::AttachEventAction::Ui(
+                crate::input::RuntimeAction::SessionPrev
+            ))
+        ));
+    }
+
+    #[test]
     fn attach_key_event_action_routes_n_to_pane_in_normal_mode() {
         let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
 
@@ -4583,11 +4688,19 @@ mod tests {
         config
             .keybindings
             .global
+            .insert("shift+h".to_string(), "new_session".to_string());
+        config
+            .keybindings
+            .global
+            .insert("shift+l".to_string(), "detach".to_string());
+        config
+            .keybindings
+            .global
             .insert("h".to_string(), "new_session".to_string());
         config
             .keybindings
             .global
-            .insert("l".to_string(), "new_session".to_string());
+            .insert("l".to_string(), "detach".to_string());
         config
             .keybindings
             .global
@@ -4635,11 +4748,45 @@ mod tests {
 
         let keymap = attach_keymap_from_config(&config);
         let hint = super::attach_mode_hint(super::AttachUiMode::Window, &keymap);
-        assert!(hint.contains("u/i prev/next"));
+        assert!(hint.contains("unbound/unbound prev/next session"));
+        assert!(hint.contains("u/i prev/next window"));
         assert!(hint.contains("0 goto-1"));
         assert!(hint.contains("m new"));
         assert!(hint.contains("k close"));
         assert!(hint.contains("Ctrl-G exit"));
+    }
+
+    #[test]
+    fn relative_session_id_wraps_between_sessions() {
+        let session_a = Uuid::from_u128(1);
+        let session_b = Uuid::from_u128(2);
+        let sessions = vec![
+            SessionSummary {
+                id: session_a,
+                name: Some("a".to_string()),
+                window_count: 1,
+                client_count: 1,
+            },
+            SessionSummary {
+                id: session_b,
+                name: Some("b".to_string()),
+                window_count: 1,
+                client_count: 1,
+            },
+        ];
+
+        assert_eq!(
+            super::relative_session_id(&sessions, session_a, -1),
+            Some(session_b)
+        );
+        assert_eq!(
+            super::relative_session_id(&sessions, session_a, 1),
+            Some(session_b)
+        );
+        assert_eq!(
+            super::relative_session_id(&sessions, session_b, 1),
+            Some(session_a)
+        );
     }
 
     #[test]

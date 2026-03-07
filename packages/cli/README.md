@@ -105,7 +105,7 @@ Attach UI defaults (user-overridable via keybindings):
 
 - `Ctrl-A d`: detach
 - `Ctrl-T`: enter window mode
-- window mode: `h/l` previous/next window (wrap), `1..9` jump to index, `n` new window, `x` close active window, `Esc`/`Enter` exit window mode
+- window mode: `H/L` previous/next session (wrap), `h/l` previous/next window (wrap), `1..9` jump to index, `n` new window, `x` close active window, `Esc`/`Enter` exit window mode
 
 Prefix timeout behavior is configurable under `[keybindings]`:
 
