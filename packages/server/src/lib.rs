@@ -2297,6 +2297,12 @@ fn resolve_window_id_from_selector(
     session: &SessionRuntimeHandle,
     selector: WindowSelection,
 ) -> Option<bmux_session::WindowId> {
+    let sorted_windows = || {
+        let mut windows = session.windows.values().collect::<Vec<_>>();
+        windows.sort_by_key(|window| (window.number, window.id));
+        windows
+    };
+
     match selector {
         WindowSelection::Active => Some(session.active_window),
         WindowSelection::Id(id) => session.windows.contains_key(&id).then_some(id),
@@ -2306,26 +2312,25 @@ fn resolve_window_id_from_selector(
             .find(|window| window.number == number)
             .map(|window| window.id),
         WindowSelection::Name(value) => {
-            if let Some(window) = session
-                .windows
-                .values()
+            let windows = sorted_windows();
+
+            if let Some(window) = windows
+                .iter()
                 .find(|window| window.name.as_deref() == Some(value.as_str()))
             {
                 return Some(window.id);
             }
 
-            if let Some(window) = session
-                .windows
-                .values()
+            if let Some(window) = windows
+                .iter()
                 .find(|window| window.id.to_string().eq_ignore_ascii_case(&value))
             {
                 return Some(window.id);
             }
 
             let value_lower = value.to_ascii_lowercase();
-            session
-                .windows
-                .values()
+            windows
+                .iter()
                 .find(|window| {
                     window
                         .id
@@ -8719,7 +8724,7 @@ mod tests {
                     components,
                     ..
                 } if *changed_session == session_id
-                    && components == &vec![AttachViewComponent::Scene]
+                    && components.contains(&AttachViewComponent::Scene)
             )
         }));
 

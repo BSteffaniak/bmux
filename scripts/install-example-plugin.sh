@@ -89,9 +89,9 @@ LIB_PATH="${TARGET_DIR}/$(library_filename)"
 cd "$ROOT_DIR"
 
 if [[ "$BUILD_PROFILE" == "release" ]]; then
-  cargo build --release -p bmux_example_native_plugin
+  cargo build --locked --release -p bmux_example_native_plugin
 else
-  cargo build -p bmux_example_native_plugin
+  cargo build --locked -p bmux_example_native_plugin
 fi
 
 mkdir -p "$PLUGIN_ROOT"
