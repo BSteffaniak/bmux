@@ -121,6 +121,9 @@ pub enum PluginError {
     #[error("plugin '{plugin_id}' event payload contains interior NUL")]
     InvalidNativeEventInput { plugin_id: String },
 
+    #[error("unsupported host operation: {operation}")]
+    UnsupportedHostOperation { operation: &'static str },
+
     #[error("failed to parse plugin manifest: {0}")]
     ManifestParse(#[from] toml::de::Error),
 

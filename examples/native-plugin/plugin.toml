@@ -10,6 +10,11 @@ execution = "host_callback"
 name      = "hello"
 summary   = "Print a hello message"
 
+[[commands]]
+execution = "host_callback"
+name      = "permissions-list"
+summary   = "List session permissions through bmux host IPC"
+
 [[event_subscriptions]]
 kinds = ["system", "window"]
 names = ["server_started", "window_created"]

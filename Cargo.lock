@@ -69,6 +69,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "toml",
  "tracing",
  "tracing-subscriber",
  "unicode-width",
@@ -144,8 +145,13 @@ dependencies = [
 name = "bmux_example_native_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_client",
+ "bmux_config",
+ "bmux_ipc",
  "bmux_plugin",
  "serde_json",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]

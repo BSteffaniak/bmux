@@ -2,7 +2,13 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use bmux_plugin::{DEFAULT_NATIVE_COMMAND_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL};
+use bmux_client::BmuxClient;
+use bmux_config::ConfigPaths;
+use bmux_ipc::SessionSelector;
+use bmux_plugin::{
+    DEFAULT_NATIVE_COMMAND_SYMBOL, DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL,
+    DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
+};
 use bmux_plugin::{DEFAULT_NATIVE_ENTRY_SYMBOL, DEFAULT_NATIVE_EVENT_SYMBOL};
 use std::ffi::{CStr, c_char};
 
@@ -15,6 +21,10 @@ const DESCRIPTOR: &str = concat!(
     "[[commands]]\n",
     "name = \"hello\"\n",
     "summary = \"Print a hello message\"\n",
+    "execution = \"host_callback\"\n\n",
+    "[[commands]]\n",
+    "name = \"permissions-list\"\n",
+    "summary = \"List session permissions through bmux host IPC\"\n",
     "execution = \"host_callback\"\n\n",
     "[[event_subscriptions]]\n",
     "kinds = [\"system\", \"window\"]\n",
@@ -30,6 +40,33 @@ const DESCRIPTOR: &str = concat!(
 pub extern "C" fn bmux_plugin_entry_v1() -> *const c_char {
     debug_assert_eq!(DEFAULT_NATIVE_ENTRY_SYMBOL, "bmux_plugin_entry_v1");
     DESCRIPTOR.as_ptr().cast()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn bmux_plugin_run_command_with_context_v1(context: *const c_char) -> i32 {
+    debug_assert_eq!(
+        DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL,
+        "bmux_plugin_run_command_with_context_v1"
+    );
+    let Ok(payload) = c_str_to_string(context) else {
+        return 2;
+    };
+    let Ok(context) = serde_json::from_str::<bmux_plugin::NativeCommandContext>(&payload) else {
+        return 3;
+    };
+
+    match context.command.as_str() {
+        "permissions-list" => run_permissions_list(&context),
+        "hello" => {
+            if context.arguments.is_empty() {
+                println!("example.native: hello from bmux plugin");
+            } else {
+                println!("example.native: hello {}", context.arguments.join(" "));
+            }
+            0
+        }
+        _ => 64,
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -129,6 +166,78 @@ fn c_str_to_string(ptr: *const c_char) -> Result<String, ()> {
         .map_err(|_| ())
 }
 
+fn run_permissions_list(context: &bmux_plugin::NativeCommandContext) -> i32 {
+    let Some(session) = context.arguments.first() else {
+        eprintln!("example.native permissions-list requires a session name or UUID");
+        return 64;
+    };
+
+    let paths = ConfigPaths::new(
+        context.connection.config_dir.clone().into(),
+        context.connection.runtime_dir.clone().into(),
+        context.connection.data_dir.clone().into(),
+    );
+
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            tokio::task::block_in_place(|| handle.block_on(async_permissions_list(&paths, session)))
+        }
+        Err(_) => match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(async_permissions_list(&paths, session)),
+            Err(_) => 70,
+        },
+    }
+}
+
+async fn async_permissions_list(paths: &ConfigPaths, session: &str) -> i32 {
+    let selector = parse_session_selector(session);
+    match BmuxClient::connect_with_paths(paths, "example-native-plugin").await {
+        Ok(mut client) => match client.list_permissions(selector).await {
+            Ok(permissions) => {
+                if permissions.is_empty() {
+                    println!("example.native: no explicit role assignments");
+                } else {
+                    println!("example.native permissions:");
+                    for permission in permissions {
+                        println!(
+                            "{} {}",
+                            permission.client_id,
+                            session_role_name(permission.role)
+                        );
+                    }
+                }
+                0
+            }
+            Err(error) => {
+                eprintln!("example.native: failed listing permissions: {error}");
+                1
+            }
+        },
+        Err(error) => {
+            eprintln!("example.native: failed connecting to bmux host: {error}");
+            1
+        }
+    }
+}
+
+fn parse_session_selector(value: &str) -> SessionSelector {
+    match uuid::Uuid::parse_str(value) {
+        Ok(id) => SessionSelector::ById(id),
+        Err(_) => SessionSelector::ByName(value.to_string()),
+    }
+}
+
+fn session_role_name(role: bmux_ipc::SessionRole) -> &'static str {
+    match role {
+        bmux_ipc::SessionRole::Owner => "owner",
+        bmux_ipc::SessionRole::Writer => "writer",
+        bmux_ipc::SessionRole::Observer => "observer",
+    }
+}
+
 fn c_array_to_vec(argc: usize, argv: *const *const c_char) -> Result<Vec<String>, ()> {
     if argc == 0 {
         return Ok(Vec::new());
@@ -151,7 +260,7 @@ mod tests {
         let parsed = bmux_plugin::NativeDescriptor::from_toml_str(descriptor)
             .expect("example descriptor should parse");
         assert_eq!(parsed.id, "example.native");
-        assert_eq!(parsed.commands.len(), 1);
+        assert_eq!(parsed.commands.len(), 2);
         assert_eq!(parsed.event_subscriptions.len(), 1);
     }
 

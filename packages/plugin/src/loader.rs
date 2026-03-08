@@ -1,6 +1,7 @@
 use crate::{
     DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_COMMAND_SYMBOL,
-    DEFAULT_NATIVE_DEACTIVATE_SYMBOL, DEFAULT_NATIVE_EVENT_SYMBOL, HostMetadata, PluginCapability,
+    DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
+    DEFAULT_NATIVE_EVENT_SYMBOL, HostConnectionInfo, HostMetadata, PluginCapability,
     PluginDeclaration, PluginEntrypoint, PluginError, PluginEvent, PluginLifecycle,
     PluginManifestCompatibility, PluginRegistry, RegisteredPlugin, Result,
 };
@@ -12,6 +13,7 @@ use std::path::Path;
 
 type NativeDescriptorFn = unsafe extern "C" fn() -> *const c_char;
 type NativeRunCommandFn = unsafe extern "C" fn(*const c_char, usize, *const *const c_char) -> i32;
+type NativeRunCommandWithContextFn = unsafe extern "C" fn(*const c_char) -> i32;
 type NativeLifecycleFn = unsafe extern "C" fn(*const c_char) -> i32;
 type NativeEventFn = unsafe extern "C" fn(*const c_char) -> i32;
 
@@ -19,6 +21,18 @@ type NativeEventFn = unsafe extern "C" fn(*const c_char) -> i32;
 pub struct NativeLifecycleContext {
     pub plugin_id: String,
     pub host: HostMetadata,
+    pub connection: HostConnectionInfo,
+    #[serde(default)]
+    pub settings: Option<toml::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NativeCommandContext {
+    pub plugin_id: String,
+    pub command: String,
+    pub arguments: Vec<String>,
+    pub host: HostMetadata,
+    pub connection: HostConnectionInfo,
     #[serde(default)]
     pub settings: Option<toml::Value>,
 }
@@ -115,11 +129,43 @@ impl LoadedPlugin {
     /// command symbol cannot be loaded, or any command input contains an
     /// interior NUL byte.
     pub fn run_command(&self, command_name: &str, arguments: &[String]) -> Result<i32> {
+        self.run_command_with_context(command_name, arguments, None)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the plugin does not declare the command, the
+    /// command symbol cannot be loaded, or any command input contains an
+    /// interior NUL byte.
+    pub fn run_command_with_context(
+        &self,
+        command_name: &str,
+        arguments: &[String],
+        context: Option<&NativeCommandContext>,
+    ) -> Result<i32> {
         if !self.supports_command(command_name) {
             return Err(PluginError::UnknownPluginCommand {
                 plugin_id: self.declaration.id.as_str().to_string(),
                 command: command_name.to_string(),
             });
+        }
+
+        if let Some(context) = context {
+            let payload = CString::new(
+                serde_json::to_string(context).expect("native command context should serialize"),
+            )
+            .map_err(|_| PluginError::InvalidNativeCommandInput {
+                plugin_id: self.declaration.id.as_str().to_string(),
+                field: "context",
+            })?;
+
+            if let Ok(command_symbol) = unsafe {
+                self._library.get::<NativeRunCommandWithContextFn>(
+                    DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL.as_bytes(),
+                )
+            } {
+                return Ok(unsafe { command_symbol(payload.as_ptr()) });
+            }
         }
 
         let command_name =
@@ -581,6 +627,11 @@ minimum = "1.0"
                 product_version: "0.1.0".to_string(),
                 plugin_api_version: ApiVersion::new(1, 0),
                 plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: crate::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
             },
             settings: Some(toml::Value::String("enabled".to_string())),
         };

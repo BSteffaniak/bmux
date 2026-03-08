@@ -34,13 +34,15 @@ pub use discovery::{
 pub use error::{PluginError, Result};
 pub use event::{PluginEvent, PluginEventKind, PluginEventPayload, PluginEventSubscription};
 pub use host::{
-    ClipboardService, CommandService, ConfigService, EventService, HostMetadata, PaneHandle,
-    PaneService, PluginContext, PluginHost, PluginStorage, RenderService, SessionHandle,
-    SessionService, WindowHandle, WindowService,
+    ClientInfo, ClientService, ClipboardService, CommandService, ConfigService, EventService,
+    HostConnectionInfo, HostMetadata, PaneHandle, PaneInfo, PaneService, PermissionEntry,
+    PermissionService, PluginContext, PluginHost, PluginStorage, RenderService, ServerService,
+    ServerStatusInfo, SessionHandle, SessionInfo, SessionService, WindowHandle, WindowInfo,
+    WindowService,
 };
 pub use loader::{
-    LoadedPlugin, NativeDescriptor, NativeLifecycleContext, NativePluginLoader,
-    load_registered_plugin,
+    LoadedPlugin, NativeCommandContext, NativeDescriptor, NativeLifecycleContext,
+    NativePluginLoader, load_registered_plugin,
 };
 pub use manifest::{PluginManifest, PluginManifestCompatibility, PluginRuntime};
 pub use registry::{PluginCompatibilityReport, PluginRegistry, RegisteredPlugin};
@@ -57,6 +59,10 @@ pub const DEFAULT_NATIVE_ENTRY_SYMBOL: &str = "bmux_plugin_entry_v1";
 
 /// Default exported symbol used to invoke a plugin command.
 pub const DEFAULT_NATIVE_COMMAND_SYMBOL: &str = "bmux_plugin_run_command_v1";
+
+/// Default exported symbol used to invoke a plugin command with host context.
+pub const DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL: &str =
+    "bmux_plugin_run_command_with_context_v1";
 
 /// Default exported symbol used to activate a plugin lifecycle hook.
 pub const DEFAULT_NATIVE_ACTIVATE_SYMBOL: &str = "bmux_plugin_activate_v1";

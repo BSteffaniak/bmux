@@ -19,9 +19,10 @@ use bmux_ipc::{
 };
 use bmux_keybind::action_to_name;
 use bmux_plugin::{
-    CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostMetadata, NativeLifecycleContext,
-    PluginCapability, PluginEvent, PluginEventKind, PluginManifest, PluginRegistry,
-    discover_plugin_manifests, load_registered_plugin as load_native_registered_plugin,
+    CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
+    NativeCommandContext, NativeLifecycleContext, PluginCapability, PluginEvent, PluginEventKind,
+    PluginManifest, PluginRegistry, discover_plugin_manifests,
+    load_registered_plugin as load_native_registered_plugin,
 };
 use bmux_server::BmuxServer;
 use clap::Parser;
@@ -40,6 +41,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 mod attach;
+mod plugin_host;
 mod terminal_protocol;
 use attach::cursor::apply_attach_cursor_state;
 use attach::events::{AttachLoopControl, AttachLoopEvent, collect_attach_loop_events};
@@ -368,7 +370,7 @@ async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8>
     }
 
     let loaded_plugins = load_enabled_plugins(&config, &registry)?;
-    activate_loaded_plugins(&loaded_plugins, &config)?;
+    activate_loaded_plugins(&loaded_plugins, &config, &paths)?;
     dispatch_loaded_plugin_event(&loaded_plugins, plugin_system_event("server_starting"))?;
     let server = BmuxServer::from_default_paths();
     write_server_pid_file(std::process::id())?;
@@ -398,7 +400,7 @@ async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8>
     {
         warn!("failed delivering server_stopping plugin event: {error}");
     }
-    if let Err(error) = deactivate_loaded_plugins(&loaded_plugins, &config) {
+    if let Err(error) = deactivate_loaded_plugins(&loaded_plugins, &config, &paths) {
         warn!("failed deactivating plugins during server shutdown: {error}");
     }
     let _ = remove_server_pid_file();
@@ -413,6 +415,12 @@ fn plugin_host_metadata() -> HostMetadata {
         plugin_api_version: CURRENT_PLUGIN_API_VERSION,
         plugin_abi_version: CURRENT_PLUGIN_ABI_VERSION,
     }
+}
+
+fn plugin_host_connection(paths: &ConfigPaths) -> HostConnectionInfo {
+    let host =
+        plugin_host::CliPluginHost::new(plugin_host_metadata(), paths, BmuxConfig::default());
+    bmux_plugin::PluginHost::connection(&host).clone()
 }
 
 #[cfg(test)]
@@ -499,10 +507,32 @@ fn load_enabled_plugins(
     Ok(loaded_plugins)
 }
 
-fn plugin_lifecycle_context(config: &BmuxConfig, plugin_id: &str) -> NativeLifecycleContext {
+fn plugin_lifecycle_context(
+    config: &BmuxConfig,
+    paths: &ConfigPaths,
+    plugin_id: &str,
+) -> NativeLifecycleContext {
     NativeLifecycleContext {
         plugin_id: plugin_id.to_string(),
         host: plugin_host_metadata(),
+        connection: plugin_host_connection(paths),
+        settings: config.plugins.settings.get(plugin_id).cloned(),
+    }
+}
+
+fn plugin_command_context(
+    config: &BmuxConfig,
+    paths: &ConfigPaths,
+    plugin_id: &str,
+    command: &str,
+    arguments: &[String],
+) -> NativeCommandContext {
+    NativeCommandContext {
+        plugin_id: plugin_id.to_string(),
+        command: command.to_string(),
+        arguments: arguments.to_vec(),
+        host: plugin_host_metadata(),
+        connection: plugin_host_connection(paths),
         settings: config.plugins.settings.get(plugin_id).cloned(),
     }
 }
@@ -521,6 +551,7 @@ fn plugin_system_event(name: &str) -> PluginEvent {
 fn activate_loaded_plugins(
     loaded_plugins: &[bmux_plugin::LoadedPlugin],
     config: &BmuxConfig,
+    paths: &ConfigPaths,
 ) -> Result<()> {
     let mut activated: Vec<&bmux_plugin::LoadedPlugin> = Vec::new();
     for plugin in loaded_plugins {
@@ -528,11 +559,14 @@ fn activate_loaded_plugins(
             continue;
         }
 
-        let context = plugin_lifecycle_context(config, plugin.declaration.id.as_str());
+        let context = plugin_lifecycle_context(config, paths, plugin.declaration.id.as_str());
         if let Err(error) = plugin.activate(&context) {
             for activated_plugin in activated.into_iter().rev() {
-                let context =
-                    plugin_lifecycle_context(config, activated_plugin.declaration.id.as_str());
+                let context = plugin_lifecycle_context(
+                    config,
+                    paths,
+                    activated_plugin.declaration.id.as_str(),
+                );
                 if let Err(deactivate_error) = activated_plugin.deactivate(&context) {
                     warn!(
                         "failed rolling back plugin activation for {}: {deactivate_error}",
@@ -557,13 +591,14 @@ fn activate_loaded_plugins(
 fn deactivate_loaded_plugins(
     loaded_plugins: &[bmux_plugin::LoadedPlugin],
     config: &BmuxConfig,
+    paths: &ConfigPaths,
 ) -> Result<()> {
     for plugin in loaded_plugins.iter().rev() {
         if !plugin.declaration.lifecycle.activate_on_startup {
             continue;
         }
 
-        let context = plugin_lifecycle_context(config, plugin.declaration.id.as_str());
+        let context = plugin_lifecycle_context(config, paths, plugin.declaration.id.as_str());
         let _ = plugin.deactivate(&context).with_context(|| {
             format!(
                 "failed deactivating plugin '{}'",
@@ -773,8 +808,9 @@ async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]
         SUPPORTED_PLUGIN_CAPABILITIES,
     )
     .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"))?;
+    let context = plugin_command_context(&config, &paths, plugin_id, command_name, args);
     let status = loaded
-        .run_command(command_name, args)
+        .run_command_with_context(command_name, args, Some(&context))
         .with_context(|| format!("failed running plugin command '{plugin_id}:{command_name}'"))?;
     Ok(status.clamp(0, i32::from(u8::MAX)) as u8)
 }
@@ -5208,8 +5244,14 @@ mod tests {
             .settings
             .insert("example.plugin".to_string(), "configured".into());
 
-        let context = super::plugin_lifecycle_context(&config, "example.plugin");
+        let paths = ConfigPaths::new(
+            std::path::PathBuf::from("/config"),
+            std::path::PathBuf::from("/runtime"),
+            std::path::PathBuf::from("/data"),
+        );
+        let context = super::plugin_lifecycle_context(&config, &paths, "example.plugin");
         assert_eq!(context.plugin_id, "example.plugin");
+        assert_eq!(context.connection.data_dir, "/data");
         assert_eq!(
             context.settings.as_ref().and_then(|value| value.as_str()),
             Some("configured")

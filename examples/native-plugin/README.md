@@ -8,6 +8,7 @@ It demonstrates all currently supported native plugin surfaces:
 - activation and deactivation hooks
 - plugin commands
 - event subscriptions
+- host-aware command execution through bmux IPC
 
 ## Build
 
@@ -47,6 +48,7 @@ enabled = ["example.native"]
 ```bash
 bmux plugin list
 bmux plugin run example.native hello world
+bmux plugin run example.native permissions-list my-session
 ```
 
 Start the server and the plugin will also log activation plus matching events such as `server_started` and `window_created`.
