@@ -1,6 +1,6 @@
 use crate::{
-    ApiVersion, PluginCapability, PluginDeclaration, PluginEntrypoint, PluginError, PluginId,
-    Result, VersionRange,
+    ApiVersion, PluginCapability, PluginCommand, PluginDeclaration, PluginEntrypoint, PluginError,
+    PluginId, Result, VersionRange,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -59,6 +59,8 @@ pub struct PluginManifest {
     pub native_abi: PluginManifestCompatibility,
     #[serde(default)]
     pub capabilities: BTreeSet<PluginCapability>,
+    #[serde(default)]
+    pub commands: Vec<PluginCommand>,
 }
 
 impl PluginManifest {
@@ -106,7 +108,7 @@ impl PluginManifest {
             description: self.description.clone(),
             homepage: self.homepage.clone(),
             capabilities: self.capabilities.clone(),
-            commands: Vec::new(),
+            commands: self.commands.clone(),
             lifecycle: crate::PluginLifecycle::default(),
         };
         declaration.validate()?;
@@ -143,6 +145,11 @@ runtime = "native"
 entry = "libgit_status.dylib"
 capabilities = ["commands", "event_subscription"]
 
+[[commands]]
+name = "hello"
+summary = "hello"
+execution = "host_callback"
+
 [plugin_api]
 minimum = "1.0"
 
@@ -154,5 +161,6 @@ minimum = "1.0"
 
         assert_eq!(manifest.id, "git.status");
         assert!(manifest.capabilities.contains(&PluginCapability::Commands));
+        assert_eq!(manifest.commands.len(), 1);
     }
 }

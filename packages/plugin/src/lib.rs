@@ -51,3 +51,6 @@ pub const CURRENT_PLUGIN_ABI_VERSION: ApiVersion = ApiVersion::new(1, 0);
 
 /// Default exported symbol that a native plugin should expose.
 pub const DEFAULT_NATIVE_ENTRY_SYMBOL: &str = "bmux_plugin_entry_v1";
+
+/// Default exported symbol used to invoke a plugin command.
+pub const DEFAULT_NATIVE_COMMAND_SYMBOL: &str = "bmux_plugin_run_command_v1";

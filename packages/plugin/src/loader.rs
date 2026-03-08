@@ -1,14 +1,16 @@
 use crate::{
-    HostMetadata, PluginCapability, PluginDeclaration, PluginEntrypoint, PluginError,
-    PluginLifecycle, PluginManifestCompatibility, PluginRegistry, RegisteredPlugin, Result,
+    DEFAULT_NATIVE_COMMAND_SYMBOL, HostMetadata, PluginCapability, PluginDeclaration,
+    PluginEntrypoint, PluginError, PluginLifecycle, PluginManifestCompatibility, PluginRegistry,
+    RegisteredPlugin, Result,
 };
 use libloading::{Library, Symbol};
 use serde::Deserialize;
 use std::collections::BTreeSet;
-use std::ffi::{CStr, c_char};
+use std::ffi::{CStr, CString, c_char};
 use std::path::Path;
 
 type NativeDescriptorFn = unsafe extern "C" fn() -> *const c_char;
+type NativeRunCommandFn = unsafe extern "C" fn(*const c_char, usize, *const *const c_char) -> i32;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct NativeDescriptor {
@@ -77,6 +79,73 @@ pub struct LoadedPlugin {
     pub registered: RegisteredPlugin,
     pub declaration: PluginDeclaration,
     _library: Library,
+}
+
+impl LoadedPlugin {
+    #[must_use]
+    pub fn commands(&self) -> &[crate::PluginCommand] {
+        &self.declaration.commands
+    }
+
+    #[must_use]
+    pub fn supports_command(&self, command_name: &str) -> bool {
+        self.declaration
+            .commands
+            .iter()
+            .any(|command| command.name == command_name)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the plugin does not declare the command, the
+    /// command symbol cannot be loaded, or any command input contains an
+    /// interior NUL byte.
+    pub fn run_command(&self, command_name: &str, arguments: &[String]) -> Result<i32> {
+        if !self.supports_command(command_name) {
+            return Err(PluginError::UnknownPluginCommand {
+                plugin_id: self.declaration.id.as_str().to_string(),
+                command: command_name.to_string(),
+            });
+        }
+
+        let command_name =
+            CString::new(command_name).map_err(|_| PluginError::InvalidNativeCommandInput {
+                plugin_id: self.declaration.id.as_str().to_string(),
+                field: "command_name",
+            })?;
+        let argument_values = arguments
+            .iter()
+            .map(|argument| {
+                CString::new(argument.as_str()).map_err(|_| {
+                    PluginError::InvalidNativeCommandInput {
+                        plugin_id: self.declaration.id.as_str().to_string(),
+                        field: "arguments",
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let argument_ptrs = argument_values
+            .iter()
+            .map(|value| value.as_ptr())
+            .collect::<Vec<_>>();
+
+        let command_symbol: Symbol<'_, NativeRunCommandFn> =
+            unsafe { self._library.get(DEFAULT_NATIVE_COMMAND_SYMBOL.as_bytes()) }.map_err(
+                |error| PluginError::NativeCommandSymbol {
+                    plugin_id: self.declaration.id.as_str().to_string(),
+                    symbol: DEFAULT_NATIVE_COMMAND_SYMBOL.to_string(),
+                    details: error.to_string(),
+                },
+            )?;
+
+        Ok(unsafe {
+            command_symbol(
+                command_name.as_ptr(),
+                argument_ptrs.len(),
+                argument_ptrs.as_ptr(),
+            )
+        })
+    }
 }
 
 #[derive(Debug, Default)]
@@ -238,6 +307,13 @@ fn compare_manifest_and_descriptor(
         &format!("{:?}", registered_plugin.declaration.capabilities),
         &format!("{:?}", declaration.capabilities),
     )?;
+    ensure_match(
+        registered_plugin.declaration.id.as_str(),
+        "commands",
+        &serde_json::to_string(&registered_plugin.declaration.commands)
+            .expect("plugin commands should serialize"),
+        &serde_json::to_string(&declaration.commands).expect("plugin commands should serialize"),
+    )?;
 
     Ok(())
 }
@@ -262,8 +338,31 @@ fn ensure_match(
 
 #[cfg(test)]
 mod tests {
-    use super::NativeDescriptor;
-    use crate::{DEFAULT_NATIVE_ENTRY_SYMBOL, PluginEntrypoint};
+    use super::{LoadedPlugin, NativeDescriptor};
+    use crate::{DEFAULT_NATIVE_ENTRY_SYMBOL, PluginEntrypoint, PluginManifest, PluginRegistry};
+    use libloading::Library;
+    use std::ffi::c_char;
+
+    const TEST_DESCRIPTOR_TEXT: &str = concat!(
+        "id = \"test.plugin\"\n",
+        "display_name = \"Test Plugin\"\n",
+        "plugin_version = \"0.1.0\"\n",
+        "capabilities = [\"commands\"]\n\n",
+        "[[commands]]\n",
+        "name = \"hello\"\n",
+        "summary = \"hello\"\n",
+        "execution = \"host_callback\"\n\n",
+        "[plugin_api]\n",
+        "minimum = \"1.0\"\n\n",
+        "[native_abi]\n",
+        "minimum = \"1.0\"\n",
+        "\0"
+    );
+
+    #[unsafe(no_mangle)]
+    extern "C" fn bmux_plugin_entry_v1() -> *const c_char {
+        TEST_DESCRIPTOR_TEXT.as_ptr().cast()
+    }
 
     #[test]
     fn parses_native_descriptor_document() {
@@ -315,5 +414,61 @@ minimum = "1.0"
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    fn loaded_plugin_reports_declared_commands() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "test.plugin"
+name = "Test Plugin"
+version = "0.1.0"
+entry = "unused.dylib"
+capabilities = ["commands"]
+
+[[commands]]
+name = "hello"
+summary = "hello"
+execution = "host_callback"
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+        )
+        .expect("manifest should parse");
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(std::path::Path::new("plugin.toml"), manifest)
+            .expect("manifest should register");
+
+        #[cfg(unix)]
+        let library = Library::from(libloading::os::unix::Library::this());
+        #[cfg(windows)]
+        let library = Library::from(
+            libloading::os::windows::Library::this().expect("current library should load"),
+        );
+
+        let loaded = LoadedPlugin {
+            registered: registry
+                .get("test.plugin")
+                .expect("plugin should exist")
+                .clone(),
+            declaration: NativeDescriptor::from_toml_str(
+                TEST_DESCRIPTOR_TEXT.trim_end_matches('\0'),
+            )
+            .expect("descriptor should parse")
+            .into_declaration(PluginEntrypoint::Native {
+                symbol: DEFAULT_NATIVE_ENTRY_SYMBOL.to_string(),
+            })
+            .expect("declaration should build"),
+            _library: library,
+        };
+
+        assert_eq!(loaded.commands().len(), 1);
+        assert!(loaded.supports_command("hello"));
+        assert!(loaded.run_command("missing", &[]).is_err());
     }
 }

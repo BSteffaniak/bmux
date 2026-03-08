@@ -85,6 +85,22 @@ pub enum PluginError {
         descriptor_value: String,
     },
 
+    #[error("plugin '{plugin_id}' does not declare command '{command}'")]
+    UnknownPluginCommand { plugin_id: String, command: String },
+
+    #[error("failed to resolve command symbol '{symbol}' for plugin '{plugin_id}': {details}")]
+    NativeCommandSymbol {
+        plugin_id: String,
+        symbol: String,
+        details: String,
+    },
+
+    #[error("plugin '{plugin_id}' command input contains interior NUL in {field}")]
+    InvalidNativeCommandInput {
+        plugin_id: String,
+        field: &'static str,
+    },
+
     #[error("failed to parse plugin manifest: {0}")]
     ManifestParse(#[from] toml::de::Error),
 

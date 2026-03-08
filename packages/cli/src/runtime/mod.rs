@@ -1,6 +1,6 @@
 use crate::cli::{
-    Cli, Command, KeymapCommand, RoleValue, ServerCommand, SessionCommand, TerminalCommand,
-    TraceFamily, WindowCommand,
+    Cli, Command, KeymapCommand, PluginCommand, RoleValue, ServerCommand, SessionCommand,
+    TerminalCommand, TraceFamily, WindowCommand,
 };
 use crate::connection::{
     ConnectionPolicyScope, ServerRuntimeMetadata, connect, connect_raw, current_cli_build_id,
@@ -318,6 +318,14 @@ async fn run_command(command: &Command) -> Result<u8> {
                 run_terminal_install_terminfo(*yes, *check)
             }
         },
+        Command::Plugin { command } => match command {
+            PluginCommand::List { json } => run_plugin_list(*json).await,
+            PluginCommand::Run {
+                plugin,
+                command,
+                args,
+            } => run_plugin_command(plugin, command, args).await,
+        },
     }
 }
 
@@ -460,6 +468,115 @@ fn load_enabled_plugins(
     }
 
     Ok(loaded_plugins)
+}
+
+#[derive(Debug, serde::Serialize)]
+struct PluginListJsonEntry {
+    id: String,
+    display_name: String,
+    version: String,
+    enabled: bool,
+    capabilities: Vec<String>,
+    commands: Vec<String>,
+}
+
+async fn run_plugin_list(as_json: bool) -> Result<u8> {
+    let config = BmuxConfig::load()?;
+    let paths = ConfigPaths::default();
+    let registry = scan_available_plugins(&paths)?;
+    let enabled = config
+        .plugins
+        .enabled
+        .iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut entries = registry
+        .iter()
+        .map(|plugin| PluginListJsonEntry {
+            id: plugin.declaration.id.as_str().to_string(),
+            display_name: plugin.declaration.display_name.clone(),
+            version: plugin.declaration.plugin_version.clone(),
+            enabled: enabled.contains(&plugin.declaration.id.as_str().to_string()),
+            capabilities: plugin
+                .declaration
+                .capabilities
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            commands: plugin
+                .declaration
+                .commands
+                .iter()
+                .map(|command| command.name.clone())
+                .collect(),
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.id.cmp(&right.id));
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&entries).context("failed encoding plugin list json")?
+        );
+    } else if entries.is_empty() {
+        println!("no plugins discovered");
+    } else {
+        for entry in entries {
+            println!(
+                "{}{} - {} ({})",
+                entry.id,
+                if entry.enabled { " [enabled]" } else { "" },
+                entry.display_name,
+                entry.version
+            );
+            if !entry.commands.is_empty() {
+                println!("  commands: {}", entry.commands.join(", "));
+            }
+            if !entry.capabilities.is_empty() {
+                println!("  capabilities: {}", entry.capabilities.join(", "));
+            }
+        }
+    }
+
+    Ok(0)
+}
+
+async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]) -> Result<u8> {
+    let config = BmuxConfig::load()?;
+    let paths = ConfigPaths::default();
+    let registry = scan_available_plugins(&paths)?;
+    let plugin = registry.get(plugin_id).with_context(|| {
+        let available = registry.plugin_ids();
+        if available.is_empty() {
+            format!("plugin '{plugin_id}' was not found")
+        } else {
+            format!(
+                "plugin '{plugin_id}' was not found (available: {})",
+                available.join(", ")
+            )
+        }
+    })?;
+
+    if !config
+        .plugins
+        .enabled
+        .iter()
+        .any(|enabled| enabled == plugin_id)
+    {
+        anyhow::bail!(
+            "plugin '{plugin_id}' is not enabled in config; add it under plugins.enabled to run commands"
+        );
+    }
+
+    let loaded = load_native_registered_plugin(
+        plugin,
+        &plugin_host_metadata(),
+        SUPPORTED_PLUGIN_CAPABILITIES,
+    )
+    .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"))?;
+    let status = loaded
+        .run_command(command_name, args)
+        .with_context(|| format!("failed running plugin command '{plugin_id}:{command_name}'"))?;
+    Ok(status.clamp(0, i32::from(u8::MAX)) as u8)
 }
 
 #[derive(Debug, serde::Serialize)]
