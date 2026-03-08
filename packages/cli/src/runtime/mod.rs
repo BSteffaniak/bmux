@@ -2627,30 +2627,30 @@ fn normalize_attach_keybindings(
 
 fn inject_attach_global_defaults(global: &mut std::collections::BTreeMap<String, String>) {
     let defaults = [
-        ("ctrl+t", "enter_window_mode"),
-        ("escape", "exit_mode"),
-        ("enter", "exit_mode"),
-        ("shift+h", "session_prev"),
-        ("shift+l", "session_next"),
-        ("h", "window_prev"),
-        ("l", "window_next"),
-        ("1", "window_goto_1"),
-        ("2", "window_goto_2"),
-        ("3", "window_goto_3"),
-        ("4", "window_goto_4"),
-        ("5", "window_goto_5"),
-        ("6", "window_goto_6"),
-        ("7", "window_goto_7"),
-        ("8", "window_goto_8"),
-        ("9", "window_goto_9"),
-        ("x", "window_close"),
-        ("n", "new_window"),
+        ("ctrl+t", RuntimeAction::EnterWindowMode),
+        ("escape", RuntimeAction::ExitMode),
+        ("enter", RuntimeAction::ExitMode),
+        ("shift+h", RuntimeAction::SessionPrev),
+        ("shift+l", RuntimeAction::SessionNext),
+        ("h", RuntimeAction::WindowPrev),
+        ("l", RuntimeAction::WindowNext),
+        ("1", RuntimeAction::WindowGoto1),
+        ("2", RuntimeAction::WindowGoto2),
+        ("3", RuntimeAction::WindowGoto3),
+        ("4", RuntimeAction::WindowGoto4),
+        ("5", RuntimeAction::WindowGoto5),
+        ("6", RuntimeAction::WindowGoto6),
+        ("7", RuntimeAction::WindowGoto7),
+        ("8", RuntimeAction::WindowGoto8),
+        ("9", RuntimeAction::WindowGoto9),
+        ("x", RuntimeAction::WindowClose),
+        ("n", RuntimeAction::NewWindow),
     ];
 
     for (key, action) in defaults {
         global
             .entry(key.to_string())
-            .or_insert_with(|| action.to_string());
+            .or_insert_with(|| action_to_name(&action).to_string());
     }
 }
 

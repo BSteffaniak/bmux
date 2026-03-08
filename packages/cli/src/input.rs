@@ -146,27 +146,7 @@ impl Keymap {
         .collect();
 
         let global = BTreeMap::new();
-        let scroll = BTreeMap::from([
-            ("escape".to_string(), "exit_scroll_mode".to_string()),
-            ("ctrl+a ]".to_string(), "exit_scroll_mode".to_string()),
-            ("enter".to_string(), "confirm_scrollback".to_string()),
-            ("arrow_left".to_string(), "move_cursor_left".to_string()),
-            ("arrow_right".to_string(), "move_cursor_right".to_string()),
-            ("arrow_up".to_string(), "move_cursor_up".to_string()),
-            ("arrow_down".to_string(), "move_cursor_down".to_string()),
-            ("h".to_string(), "move_cursor_left".to_string()),
-            ("l".to_string(), "move_cursor_right".to_string()),
-            ("k".to_string(), "move_cursor_up".to_string()),
-            ("j".to_string(), "move_cursor_down".to_string()),
-            ("ctrl+y".to_string(), "scroll_up_line".to_string()),
-            ("ctrl+e".to_string(), "scroll_down_line".to_string()),
-            ("page_up".to_string(), "scroll_up_page".to_string()),
-            ("page_down".to_string(), "scroll_down_page".to_string()),
-            ("g".to_string(), "scroll_top".to_string()),
-            ("shift+g".to_string(), "scroll_bottom".to_string()),
-            ("v".to_string(), "begin_selection".to_string()),
-            ("y".to_string(), "copy_scrollback".to_string()),
-        ]);
+        let scroll = default_scroll_bindings();
         Self::from_parts_with_scroll("ctrl+a", None, &runtime, &global, &scroll)
             .expect("default keymap must be valid")
     }
