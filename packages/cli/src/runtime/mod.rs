@@ -17,6 +17,7 @@ use bmux_ipc::{
     AttachViewComponent, PaneFocusDirection, PaneSplitDirection, SessionRole, SessionSelector,
     SessionSummary, WindowSelector,
 };
+use bmux_keybind::action_to_name;
 use bmux_server::BmuxServer;
 use clap::Parser;
 use crossterm::cursor::{MoveTo, SavePosition, Show};
@@ -2610,7 +2611,7 @@ fn normalize_attach_keybindings(
         .filter_map(
             |(chord, action_name)| match crate::input::parse_runtime_action_name(&action_name) {
                 Ok(action) if is_attach_runtime_action(&action) => {
-                    Some((chord, crate::input::action_to_name(&action).to_string()))
+                    Some((chord, action_to_name(&action).to_string()))
                 }
                 Ok(_) => None,
                 Err(error) => {

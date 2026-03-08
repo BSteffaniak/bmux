@@ -4,6 +4,7 @@
 //! for modal keybindings (Normal, Insert, Visual, Command modes).
 
 use bmux_event::{KeyCode, KeyEvent, Mode};
+use bmux_keybind::{RuntimeAction, action_to_name};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -82,71 +83,78 @@ const fn default_global_runtime_bindings() -> BTreeMap<String, String> {
 }
 
 fn default_runtime_bindings() -> BTreeMap<String, String> {
-    let mut bindings = BTreeMap::new();
-    bindings.insert("c".to_string(), "new_window".to_string());
-    bindings.insert("shift+c".to_string(), "new_session".to_string());
-    bindings.insert("o".to_string(), "focus_next_pane".to_string());
-    bindings.insert("h".to_string(), "focus_left_pane".to_string());
-    bindings.insert("l".to_string(), "focus_right_pane".to_string());
-    bindings.insert("k".to_string(), "focus_up_pane".to_string());
-    bindings.insert("j".to_string(), "focus_down_pane".to_string());
-    bindings.insert("arrow_left".to_string(), "focus_left_pane".to_string());
-    bindings.insert("arrow_right".to_string(), "focus_right_pane".to_string());
-    bindings.insert("arrow_up".to_string(), "focus_up_pane".to_string());
-    bindings.insert("arrow_down".to_string(), "focus_down_pane".to_string());
-    bindings.insert("t".to_string(), "toggle_split_direction".to_string());
-    bindings.insert("%".to_string(), "split_focused_vertical".to_string());
-    bindings.insert("\"".to_string(), "split_focused_horizontal".to_string());
-    bindings.insert("plus".to_string(), "increase_split".to_string());
-    bindings.insert("minus".to_string(), "decrease_split".to_string());
-    bindings.insert("shift+h".to_string(), "resize_left".to_string());
-    bindings.insert("shift+l".to_string(), "resize_right".to_string());
-    bindings.insert("shift+k".to_string(), "resize_up".to_string());
-    bindings.insert("shift+j".to_string(), "resize_down".to_string());
-    bindings.insert("shift+arrow_left".to_string(), "resize_left".to_string());
-    bindings.insert("shift+arrow_right".to_string(), "resize_right".to_string());
-    bindings.insert("shift+arrow_up".to_string(), "resize_up".to_string());
-    bindings.insert("shift+arrow_down".to_string(), "resize_down".to_string());
-    bindings.insert("r".to_string(), "restart_focused_pane".to_string());
-    bindings.insert("x".to_string(), "close_focused_pane".to_string());
-    bindings.insert("?".to_string(), "show_help".to_string());
-    bindings.insert("[".to_string(), "enter_scroll_mode".to_string());
-    bindings.insert("]".to_string(), "exit_scroll_mode".to_string());
-    bindings.insert("ctrl+y".to_string(), "scroll_up_line".to_string());
-    bindings.insert("ctrl+e".to_string(), "scroll_down_line".to_string());
-    bindings.insert("page_up".to_string(), "scroll_up_page".to_string());
-    bindings.insert("page_down".to_string(), "scroll_down_page".to_string());
-    bindings.insert("g".to_string(), "scroll_top".to_string());
-    bindings.insert("shift+g".to_string(), "scroll_bottom".to_string());
-    bindings.insert("v".to_string(), "begin_selection".to_string());
-    bindings.insert("y".to_string(), "copy_scrollback".to_string());
-    bindings.insert("d".to_string(), "detach".to_string());
-    bindings.insert("q".to_string(), "quit".to_string());
-    bindings
+    action_bindings(&[
+        ("c", RuntimeAction::NewWindow),
+        ("shift+c", RuntimeAction::NewSession),
+        ("o", RuntimeAction::FocusNext),
+        ("h", RuntimeAction::FocusLeft),
+        ("l", RuntimeAction::FocusRight),
+        ("k", RuntimeAction::FocusUp),
+        ("j", RuntimeAction::FocusDown),
+        ("arrow_left", RuntimeAction::FocusLeft),
+        ("arrow_right", RuntimeAction::FocusRight),
+        ("arrow_up", RuntimeAction::FocusUp),
+        ("arrow_down", RuntimeAction::FocusDown),
+        ("t", RuntimeAction::ToggleSplitDirection),
+        ("%", RuntimeAction::SplitFocusedVertical),
+        ("\"", RuntimeAction::SplitFocusedHorizontal),
+        ("plus", RuntimeAction::IncreaseSplit),
+        ("minus", RuntimeAction::DecreaseSplit),
+        ("shift+h", RuntimeAction::ResizeLeft),
+        ("shift+l", RuntimeAction::ResizeRight),
+        ("shift+k", RuntimeAction::ResizeUp),
+        ("shift+j", RuntimeAction::ResizeDown),
+        ("shift+arrow_left", RuntimeAction::ResizeLeft),
+        ("shift+arrow_right", RuntimeAction::ResizeRight),
+        ("shift+arrow_up", RuntimeAction::ResizeUp),
+        ("shift+arrow_down", RuntimeAction::ResizeDown),
+        ("r", RuntimeAction::RestartFocusedPane),
+        ("x", RuntimeAction::CloseFocusedPane),
+        ("?", RuntimeAction::ShowHelp),
+        ("[", RuntimeAction::EnterScrollMode),
+        ("]", RuntimeAction::ExitScrollMode),
+        ("ctrl+y", RuntimeAction::ScrollUpLine),
+        ("ctrl+e", RuntimeAction::ScrollDownLine),
+        ("page_up", RuntimeAction::ScrollUpPage),
+        ("page_down", RuntimeAction::ScrollDownPage),
+        ("g", RuntimeAction::ScrollTop),
+        ("shift+g", RuntimeAction::ScrollBottom),
+        ("v", RuntimeAction::BeginSelection),
+        ("y", RuntimeAction::CopyScrollback),
+        ("d", RuntimeAction::Detach),
+        ("q", RuntimeAction::Quit),
+    ])
 }
 
 fn default_scroll_bindings() -> BTreeMap<String, String> {
-    let mut bindings = BTreeMap::new();
-    bindings.insert("escape".to_string(), "exit_scroll_mode".to_string());
-    bindings.insert("ctrl+a ]".to_string(), "exit_scroll_mode".to_string());
-    bindings.insert("enter".to_string(), "confirm_scrollback".to_string());
-    bindings.insert("arrow_left".to_string(), "move_cursor_left".to_string());
-    bindings.insert("arrow_right".to_string(), "move_cursor_right".to_string());
-    bindings.insert("arrow_up".to_string(), "move_cursor_up".to_string());
-    bindings.insert("arrow_down".to_string(), "move_cursor_down".to_string());
-    bindings.insert("h".to_string(), "move_cursor_left".to_string());
-    bindings.insert("l".to_string(), "move_cursor_right".to_string());
-    bindings.insert("k".to_string(), "move_cursor_up".to_string());
-    bindings.insert("j".to_string(), "move_cursor_down".to_string());
-    bindings.insert("ctrl+y".to_string(), "scroll_up_line".to_string());
-    bindings.insert("ctrl+e".to_string(), "scroll_down_line".to_string());
-    bindings.insert("page_up".to_string(), "scroll_up_page".to_string());
-    bindings.insert("page_down".to_string(), "scroll_down_page".to_string());
-    bindings.insert("g".to_string(), "scroll_top".to_string());
-    bindings.insert("shift+g".to_string(), "scroll_bottom".to_string());
-    bindings.insert("v".to_string(), "begin_selection".to_string());
-    bindings.insert("y".to_string(), "copy_scrollback".to_string());
-    bindings
+    action_bindings(&[
+        ("escape", RuntimeAction::ExitScrollMode),
+        ("ctrl+a ]", RuntimeAction::ExitScrollMode),
+        ("enter", RuntimeAction::ConfirmScrollback),
+        ("arrow_left", RuntimeAction::MoveCursorLeft),
+        ("arrow_right", RuntimeAction::MoveCursorRight),
+        ("arrow_up", RuntimeAction::MoveCursorUp),
+        ("arrow_down", RuntimeAction::MoveCursorDown),
+        ("h", RuntimeAction::MoveCursorLeft),
+        ("l", RuntimeAction::MoveCursorRight),
+        ("k", RuntimeAction::MoveCursorUp),
+        ("j", RuntimeAction::MoveCursorDown),
+        ("ctrl+y", RuntimeAction::ScrollUpLine),
+        ("ctrl+e", RuntimeAction::ScrollDownLine),
+        ("page_up", RuntimeAction::ScrollUpPage),
+        ("page_down", RuntimeAction::ScrollDownPage),
+        ("g", RuntimeAction::ScrollTop),
+        ("shift+g", RuntimeAction::ScrollBottom),
+        ("v", RuntimeAction::BeginSelection),
+        ("y", RuntimeAction::CopyScrollback),
+    ])
+}
+
+fn action_bindings(pairs: &[(&str, RuntimeAction)]) -> BTreeMap<String, String> {
+    pairs
+        .iter()
+        .map(|(key, action)| ((*key).to_string(), action_to_name(action).to_string()))
+        .collect()
 }
 
 impl KeyBindingConfig {

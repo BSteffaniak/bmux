@@ -11,7 +11,8 @@ version     = { workspace = true }
 
 [dependencies]
 # Internal bmux packages
-bmux_event = { workspace = true, features = ["serde"] }
+bmux_event   = { workspace = true, features = ["serde"] }
+bmux_keybind = { workspace = true }
 
 # External dependencies
 anyhow    = { workspace = true, features = ["std"] }

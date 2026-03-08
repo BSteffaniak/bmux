@@ -95,6 +95,7 @@ dependencies = [
  "bmux_config",
  "bmux_event",
  "bmux_ipc",
+ "bmux_keybind",
  "bmux_server",
  "bmux_session",
  "bmux_terminal",
@@ -146,6 +147,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "anyhow",
  "bmux_event",
+ "bmux_keybind",
  "dirs",
  "serde",
  "thiserror 2.0.12",
@@ -203,12 +205,6 @@ name = "bmux_keybind"
 version = "0.0.1-alpha.0"
 dependencies = [
  "anyhow",
- "bmux_config",
- "bmux_event",
- "crossterm",
- "serde",
- "thiserror 2.0.12",
- "tracing",
 ]
 
 [[package]]

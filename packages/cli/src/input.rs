@@ -1,67 +1,12 @@
 use anyhow::{Result, anyhow, bail};
 use bmux_config::{MAX_TIMEOUT_MS, MIN_TIMEOUT_MS};
+pub use bmux_keybind::RuntimeAction;
+use bmux_keybind::{action_to_name, parse_action};
 use crossterm::event::{
     Event, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent, KeyEventKind, KeyModifiers,
 };
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RuntimeAction {
-    Quit,
-    Detach,
-    NewWindow,
-    NewSession,
-    SessionPrev,
-    SessionNext,
-    FocusNext,
-    FocusLeft,
-    FocusRight,
-    FocusUp,
-    FocusDown,
-    ToggleSplitDirection,
-    SplitFocusedVertical,
-    SplitFocusedHorizontal,
-    IncreaseSplit,
-    DecreaseSplit,
-    ResizeLeft,
-    ResizeRight,
-    ResizeUp,
-    ResizeDown,
-    RestartFocusedPane,
-    CloseFocusedPane,
-    ShowHelp,
-    EnterScrollMode,
-    ExitScrollMode,
-    ScrollUpLine,
-    ScrollDownLine,
-    ScrollUpPage,
-    ScrollDownPage,
-    ScrollTop,
-    ScrollBottom,
-    BeginSelection,
-    MoveCursorLeft,
-    MoveCursorRight,
-    MoveCursorUp,
-    MoveCursorDown,
-    CopyScrollback,
-    ConfirmScrollback,
-    EnterWindowMode,
-    ExitMode,
-    WindowPrev,
-    WindowNext,
-    WindowGoto1,
-    WindowGoto2,
-    WindowGoto3,
-    WindowGoto4,
-    WindowGoto5,
-    WindowGoto6,
-    WindowGoto7,
-    WindowGoto8,
-    WindowGoto9,
-    WindowClose,
-    ForwardToPane(Vec<u8>),
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum KeyCode {
@@ -155,46 +100,50 @@ struct PendingChord {
 impl Keymap {
     #[cfg(test)]
     pub(crate) fn default_runtime() -> Self {
-        let mut runtime = BTreeMap::new();
-        runtime.insert("c".to_string(), "new_window".to_string());
-        runtime.insert("shift+c".to_string(), "new_session".to_string());
-        runtime.insert("o".to_string(), "focus_next_pane".to_string());
-        runtime.insert("h".to_string(), "focus_left_pane".to_string());
-        runtime.insert("l".to_string(), "focus_right_pane".to_string());
-        runtime.insert("k".to_string(), "focus_up_pane".to_string());
-        runtime.insert("j".to_string(), "focus_down_pane".to_string());
-        runtime.insert("arrow_left".to_string(), "focus_left_pane".to_string());
-        runtime.insert("arrow_right".to_string(), "focus_right_pane".to_string());
-        runtime.insert("arrow_up".to_string(), "focus_up_pane".to_string());
-        runtime.insert("arrow_down".to_string(), "focus_down_pane".to_string());
-        runtime.insert("t".to_string(), "toggle_split_direction".to_string());
-        runtime.insert("%".to_string(), "split_focused_vertical".to_string());
-        runtime.insert("\"".to_string(), "split_focused_horizontal".to_string());
-        runtime.insert("plus".to_string(), "increase_split".to_string());
-        runtime.insert("minus".to_string(), "decrease_split".to_string());
-        runtime.insert("shift+h".to_string(), "resize_left".to_string());
-        runtime.insert("shift+l".to_string(), "resize_right".to_string());
-        runtime.insert("shift+k".to_string(), "resize_up".to_string());
-        runtime.insert("shift+j".to_string(), "resize_down".to_string());
-        runtime.insert("shift+arrow_left".to_string(), "resize_left".to_string());
-        runtime.insert("shift+arrow_right".to_string(), "resize_right".to_string());
-        runtime.insert("shift+arrow_up".to_string(), "resize_up".to_string());
-        runtime.insert("shift+arrow_down".to_string(), "resize_down".to_string());
-        runtime.insert("r".to_string(), "restart_focused_pane".to_string());
-        runtime.insert("x".to_string(), "close_focused_pane".to_string());
-        runtime.insert("?".to_string(), "show_help".to_string());
-        runtime.insert("[".to_string(), "enter_scroll_mode".to_string());
-        runtime.insert("]".to_string(), "exit_scroll_mode".to_string());
-        runtime.insert("ctrl+y".to_string(), "scroll_up_line".to_string());
-        runtime.insert("ctrl+e".to_string(), "scroll_down_line".to_string());
-        runtime.insert("page_up".to_string(), "scroll_up_page".to_string());
-        runtime.insert("page_down".to_string(), "scroll_down_page".to_string());
-        runtime.insert("g".to_string(), "scroll_top".to_string());
-        runtime.insert("shift+g".to_string(), "scroll_bottom".to_string());
-        runtime.insert("v".to_string(), "begin_selection".to_string());
-        runtime.insert("y".to_string(), "copy_scrollback".to_string());
-        runtime.insert("d".to_string(), "detach".to_string());
-        runtime.insert("q".to_string(), "quit".to_string());
+        let runtime = [
+            ("c", RuntimeAction::NewWindow),
+            ("shift+c", RuntimeAction::NewSession),
+            ("o", RuntimeAction::FocusNext),
+            ("h", RuntimeAction::FocusLeft),
+            ("l", RuntimeAction::FocusRight),
+            ("k", RuntimeAction::FocusUp),
+            ("j", RuntimeAction::FocusDown),
+            ("arrow_left", RuntimeAction::FocusLeft),
+            ("arrow_right", RuntimeAction::FocusRight),
+            ("arrow_up", RuntimeAction::FocusUp),
+            ("arrow_down", RuntimeAction::FocusDown),
+            ("t", RuntimeAction::ToggleSplitDirection),
+            ("%", RuntimeAction::SplitFocusedVertical),
+            ("\"", RuntimeAction::SplitFocusedHorizontal),
+            ("plus", RuntimeAction::IncreaseSplit),
+            ("minus", RuntimeAction::DecreaseSplit),
+            ("shift+h", RuntimeAction::ResizeLeft),
+            ("shift+l", RuntimeAction::ResizeRight),
+            ("shift+k", RuntimeAction::ResizeUp),
+            ("shift+j", RuntimeAction::ResizeDown),
+            ("shift+arrow_left", RuntimeAction::ResizeLeft),
+            ("shift+arrow_right", RuntimeAction::ResizeRight),
+            ("shift+arrow_up", RuntimeAction::ResizeUp),
+            ("shift+arrow_down", RuntimeAction::ResizeDown),
+            ("r", RuntimeAction::RestartFocusedPane),
+            ("x", RuntimeAction::CloseFocusedPane),
+            ("?", RuntimeAction::ShowHelp),
+            ("[", RuntimeAction::EnterScrollMode),
+            ("]", RuntimeAction::ExitScrollMode),
+            ("ctrl+y", RuntimeAction::ScrollUpLine),
+            ("ctrl+e", RuntimeAction::ScrollDownLine),
+            ("page_up", RuntimeAction::ScrollUpPage),
+            ("page_down", RuntimeAction::ScrollDownPage),
+            ("g", RuntimeAction::ScrollTop),
+            ("shift+g", RuntimeAction::ScrollBottom),
+            ("v", RuntimeAction::BeginSelection),
+            ("y", RuntimeAction::CopyScrollback),
+            ("d", RuntimeAction::Detach),
+            ("q", RuntimeAction::Quit),
+        ]
+        .into_iter()
+        .map(|(key, action)| (key.to_string(), action_to_name(&action).to_string()))
+        .collect();
 
         let global = BTreeMap::new();
         let scroll = BTreeMap::from([
@@ -441,27 +390,30 @@ impl Keymap {
 }
 
 fn default_scroll_bindings() -> BTreeMap<String, String> {
-    BTreeMap::from([
-        ("escape".to_string(), "exit_scroll_mode".to_string()),
-        ("ctrl+a ]".to_string(), "exit_scroll_mode".to_string()),
-        ("enter".to_string(), "confirm_scrollback".to_string()),
-        ("arrow_left".to_string(), "move_cursor_left".to_string()),
-        ("arrow_right".to_string(), "move_cursor_right".to_string()),
-        ("arrow_up".to_string(), "move_cursor_up".to_string()),
-        ("arrow_down".to_string(), "move_cursor_down".to_string()),
-        ("h".to_string(), "move_cursor_left".to_string()),
-        ("l".to_string(), "move_cursor_right".to_string()),
-        ("k".to_string(), "move_cursor_up".to_string()),
-        ("j".to_string(), "move_cursor_down".to_string()),
-        ("ctrl+y".to_string(), "scroll_up_line".to_string()),
-        ("ctrl+e".to_string(), "scroll_down_line".to_string()),
-        ("page_up".to_string(), "scroll_up_page".to_string()),
-        ("page_down".to_string(), "scroll_down_page".to_string()),
-        ("g".to_string(), "scroll_top".to_string()),
-        ("shift+g".to_string(), "scroll_bottom".to_string()),
-        ("v".to_string(), "begin_selection".to_string()),
-        ("y".to_string(), "copy_scrollback".to_string()),
-    ])
+    [
+        ("escape", RuntimeAction::ExitScrollMode),
+        ("ctrl+a ]", RuntimeAction::ExitScrollMode),
+        ("enter", RuntimeAction::ConfirmScrollback),
+        ("arrow_left", RuntimeAction::MoveCursorLeft),
+        ("arrow_right", RuntimeAction::MoveCursorRight),
+        ("arrow_up", RuntimeAction::MoveCursorUp),
+        ("arrow_down", RuntimeAction::MoveCursorDown),
+        ("h", RuntimeAction::MoveCursorLeft),
+        ("l", RuntimeAction::MoveCursorRight),
+        ("k", RuntimeAction::MoveCursorUp),
+        ("j", RuntimeAction::MoveCursorDown),
+        ("ctrl+y", RuntimeAction::ScrollUpLine),
+        ("ctrl+e", RuntimeAction::ScrollDownLine),
+        ("page_up", RuntimeAction::ScrollUpPage),
+        ("page_down", RuntimeAction::ScrollDownPage),
+        ("g", RuntimeAction::ScrollTop),
+        ("shift+g", RuntimeAction::ScrollBottom),
+        ("v", RuntimeAction::BeginSelection),
+        ("y", RuntimeAction::CopyScrollback),
+    ]
+    .into_iter()
+    .map(|(key, action)| (key.to_string(), action_to_name(&action).to_string()))
+    .collect()
 }
 
 impl InputProcessor {
@@ -907,64 +859,6 @@ fn find_overlaps(bindings: &[KeyBinding], label: &str) -> Vec<String> {
     warnings
 }
 
-pub const fn action_to_name(action: &RuntimeAction) -> &'static str {
-    match action {
-        RuntimeAction::Quit => "quit",
-        RuntimeAction::Detach => "detach",
-        RuntimeAction::NewWindow => "new_window",
-        RuntimeAction::NewSession => "new_session",
-        RuntimeAction::SessionPrev => "session_prev",
-        RuntimeAction::SessionNext => "session_next",
-        RuntimeAction::FocusNext => "focus_next_pane",
-        RuntimeAction::FocusLeft => "focus_left_pane",
-        RuntimeAction::FocusRight => "focus_right_pane",
-        RuntimeAction::FocusUp => "focus_up_pane",
-        RuntimeAction::FocusDown => "focus_down_pane",
-        RuntimeAction::ToggleSplitDirection => "toggle_split_direction",
-        RuntimeAction::SplitFocusedVertical => "split_focused_vertical",
-        RuntimeAction::SplitFocusedHorizontal => "split_focused_horizontal",
-        RuntimeAction::IncreaseSplit => "increase_split",
-        RuntimeAction::DecreaseSplit => "decrease_split",
-        RuntimeAction::ResizeLeft => "resize_left",
-        RuntimeAction::ResizeRight => "resize_right",
-        RuntimeAction::ResizeUp => "resize_up",
-        RuntimeAction::ResizeDown => "resize_down",
-        RuntimeAction::RestartFocusedPane => "restart_focused_pane",
-        RuntimeAction::CloseFocusedPane => "close_focused_pane",
-        RuntimeAction::ShowHelp => "show_help",
-        RuntimeAction::EnterScrollMode => "enter_scroll_mode",
-        RuntimeAction::ExitScrollMode => "exit_scroll_mode",
-        RuntimeAction::ScrollUpLine => "scroll_up_line",
-        RuntimeAction::ScrollDownLine => "scroll_down_line",
-        RuntimeAction::ScrollUpPage => "scroll_up_page",
-        RuntimeAction::ScrollDownPage => "scroll_down_page",
-        RuntimeAction::ScrollTop => "scroll_top",
-        RuntimeAction::ScrollBottom => "scroll_bottom",
-        RuntimeAction::BeginSelection => "begin_selection",
-        RuntimeAction::MoveCursorLeft => "move_cursor_left",
-        RuntimeAction::MoveCursorRight => "move_cursor_right",
-        RuntimeAction::MoveCursorUp => "move_cursor_up",
-        RuntimeAction::MoveCursorDown => "move_cursor_down",
-        RuntimeAction::CopyScrollback => "copy_scrollback",
-        RuntimeAction::ConfirmScrollback => "confirm_scrollback",
-        RuntimeAction::EnterWindowMode => "enter_window_mode",
-        RuntimeAction::ExitMode => "exit_mode",
-        RuntimeAction::WindowPrev => "window_prev",
-        RuntimeAction::WindowNext => "window_next",
-        RuntimeAction::WindowGoto1 => "window_goto_1",
-        RuntimeAction::WindowGoto2 => "window_goto_2",
-        RuntimeAction::WindowGoto3 => "window_goto_3",
-        RuntimeAction::WindowGoto4 => "window_goto_4",
-        RuntimeAction::WindowGoto5 => "window_goto_5",
-        RuntimeAction::WindowGoto6 => "window_goto_6",
-        RuntimeAction::WindowGoto7 => "window_goto_7",
-        RuntimeAction::WindowGoto8 => "window_goto_8",
-        RuntimeAction::WindowGoto9 => "window_goto_9",
-        RuntimeAction::WindowClose => "window_close",
-        RuntimeAction::ForwardToPane(_) => "forward_to_pane",
-    }
-}
-
 fn chord_to_string(chord: &[KeyStroke]) -> String {
     chord
         .iter()
@@ -1315,66 +1209,11 @@ fn parse_key_token(value: &str) -> Result<KeyCode> {
     }
 }
 
-fn parse_action(value: &str) -> Result<RuntimeAction> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "quit" | "quit_destroy" => Ok(RuntimeAction::Quit),
-        "detach" => Ok(RuntimeAction::Detach),
-        "new_window" => Ok(RuntimeAction::NewWindow),
-        "new_session" => Ok(RuntimeAction::NewSession),
-        "session_prev" => Ok(RuntimeAction::SessionPrev),
-        "session_next" => Ok(RuntimeAction::SessionNext),
-        "focus_next_pane" => Ok(RuntimeAction::FocusNext),
-        "focus_left_pane" => Ok(RuntimeAction::FocusLeft),
-        "focus_right_pane" => Ok(RuntimeAction::FocusRight),
-        "focus_up_pane" => Ok(RuntimeAction::FocusUp),
-        "focus_down_pane" => Ok(RuntimeAction::FocusDown),
-        "toggle_split_direction" => Ok(RuntimeAction::ToggleSplitDirection),
-        "split_focused_vertical" => Ok(RuntimeAction::SplitFocusedVertical),
-        "split_focused_horizontal" => Ok(RuntimeAction::SplitFocusedHorizontal),
-        "increase_split" => Ok(RuntimeAction::IncreaseSplit),
-        "decrease_split" => Ok(RuntimeAction::DecreaseSplit),
-        "resize_left" => Ok(RuntimeAction::ResizeLeft),
-        "resize_right" => Ok(RuntimeAction::ResizeRight),
-        "resize_up" => Ok(RuntimeAction::ResizeUp),
-        "resize_down" => Ok(RuntimeAction::ResizeDown),
-        "restart_focused_pane" => Ok(RuntimeAction::RestartFocusedPane),
-        "close_focused_pane" => Ok(RuntimeAction::CloseFocusedPane),
-        "show_help" => Ok(RuntimeAction::ShowHelp),
-        "enter_scroll_mode" => Ok(RuntimeAction::EnterScrollMode),
-        "exit_scroll_mode" => Ok(RuntimeAction::ExitScrollMode),
-        "scroll_up_line" => Ok(RuntimeAction::ScrollUpLine),
-        "scroll_down_line" => Ok(RuntimeAction::ScrollDownLine),
-        "scroll_up_page" => Ok(RuntimeAction::ScrollUpPage),
-        "scroll_down_page" => Ok(RuntimeAction::ScrollDownPage),
-        "scroll_top" => Ok(RuntimeAction::ScrollTop),
-        "scroll_bottom" => Ok(RuntimeAction::ScrollBottom),
-        "begin_selection" => Ok(RuntimeAction::BeginSelection),
-        "move_cursor_left" => Ok(RuntimeAction::MoveCursorLeft),
-        "move_cursor_right" => Ok(RuntimeAction::MoveCursorRight),
-        "move_cursor_up" => Ok(RuntimeAction::MoveCursorUp),
-        "move_cursor_down" => Ok(RuntimeAction::MoveCursorDown),
-        "copy_scrollback" => Ok(RuntimeAction::CopyScrollback),
-        "confirm_scrollback" => Ok(RuntimeAction::ConfirmScrollback),
-        "enter_window_mode" => Ok(RuntimeAction::EnterWindowMode),
-        "exit_mode" => Ok(RuntimeAction::ExitMode),
-        "window_prev" => Ok(RuntimeAction::WindowPrev),
-        "window_next" => Ok(RuntimeAction::WindowNext),
-        "window_goto_1" => Ok(RuntimeAction::WindowGoto1),
-        "window_goto_2" => Ok(RuntimeAction::WindowGoto2),
-        "window_goto_3" => Ok(RuntimeAction::WindowGoto3),
-        "window_goto_4" => Ok(RuntimeAction::WindowGoto4),
-        "window_goto_5" => Ok(RuntimeAction::WindowGoto5),
-        "window_goto_6" => Ok(RuntimeAction::WindowGoto6),
-        "window_goto_7" => Ok(RuntimeAction::WindowGoto7),
-        "window_goto_8" => Ok(RuntimeAction::WindowGoto8),
-        "window_goto_9" => Ok(RuntimeAction::WindowGoto9),
-        "window_close" => Ok(RuntimeAction::WindowClose),
-        unknown => bail!("unknown keymap action '{unknown}'"),
-    }
-}
-
 pub fn parse_runtime_action_name(value: &str) -> Result<RuntimeAction> {
-    parse_action(value)
+    match value.trim().to_ascii_lowercase().as_str() {
+        "quit_destroy" => Ok(RuntimeAction::Quit),
+        _ => parse_action(value),
+    }
 }
 
 impl KeyStroke {
