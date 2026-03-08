@@ -7,11 +7,9 @@ members = [
     "packages/config",
     "packages/event",
     "packages/event/models",
-    "packages/history",
     "packages/ipc",
     "packages/keybind",
     "packages/plugin",
-    "packages/search",
     "packages/server",
     "packages/session",
     "packages/session/models",
@@ -68,11 +66,9 @@ bmux_clipboard         = { version = "0.0.1-alpha.0", default-features = false, 
 bmux_config            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }
 bmux_event             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event" }
 bmux_event_models      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event/models" }
-bmux_history           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/history" }
 bmux_ipc               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ipc" }
 bmux_keybind           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/keybind" }
 bmux_plugin            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
-bmux_search            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/search" }
 bmux_server            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
 bmux_session           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }
 bmux_session_models    = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session/models" }

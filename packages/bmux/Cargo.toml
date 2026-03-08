@@ -19,10 +19,8 @@ bmux_terminal = { workspace = true, optional = true }
 # Feature-gated packages
 bmux_cli     = { workspace = true, optional = true }
 bmux_client  = { workspace = true, optional = true }
-bmux_history = { workspace = true, optional = true }
 bmux_keybind = { workspace = true, optional = true }
 bmux_plugin  = { workspace = true, optional = true }
-bmux_search  = { workspace = true, optional = true }
 bmux_server  = { workspace = true, optional = true }
 
 [features]
@@ -33,16 +31,7 @@ default = ["all"]
 fail-on-warnings = []
 
 # Feature groups
-all = [
-    "cli",
-    "client",
-    "core",
-    "history",
-    "keybind",
-    "plugin",
-    "search",
-    "server",
-]
+all  = ["cli", "client", "core", "keybind", "plugin", "server"]
 core = ["config", "event", "session", "terminal"]
 
 # Individual package features
@@ -50,10 +39,8 @@ cli      = ["dep:bmux_cli"]
 client   = ["dep:bmux_client"]
 config   = ["dep:bmux_config"]
 event    = ["dep:bmux_event"]
-history  = ["dep:bmux_history"]
 keybind  = ["dep:bmux_keybind"]
 plugin   = ["dep:bmux_plugin"]
-search   = ["dep:bmux_search"]
 server   = ["dep:bmux_server"]
 session  = ["dep:bmux_session"]
 terminal = ["dep:bmux_terminal"]

@@ -6,7 +6,7 @@
 //!
 //! bmux is a high-performance terminal multiplexer that introduces innovative
 //! features like multi-client session sharing with independent views, vim-inspired
-//! modal interactions, and extensible plugin architecture.
+//! modal interactions, and a planned plugin architecture.
 //!
 //! This crate serves as an umbrella package that optionally re-exports all bmux
 //! functionality based on enabled features.
@@ -26,9 +26,7 @@
 //!
 //! ## Extension Features
 //! - `keybind` - Key binding system
-//! - `history` - Scrollback history management
-//! - `search` - Fuzzy search functionality
-//! - `plugin` - Plugin system for extensibility
+//! - `plugin` - Planned plugin system for extensibility
 //!
 //! ## Feature Groups
 //! - `core` - Enables all core features
@@ -71,12 +69,6 @@ pub use bmux_client as client;
 // Extension re-exports
 #[cfg(feature = "keybind")]
 pub use bmux_keybind as keybind;
-
-#[cfg(feature = "history")]
-pub use bmux_history as history;
-
-#[cfg(feature = "search")]
-pub use bmux_search as search;
 
 #[cfg(feature = "plugin")]
 pub use bmux_plugin as plugin;

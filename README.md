@@ -40,13 +40,11 @@
 ### User Experience
 
 - **Modal Interactions**: Vim-inspired interface with Normal mode as default (unlike tmux's prefix-key approach)
-- **Fuzzy Search**: Built-in fuzzy finder for sessions, windows, and commands
-- **Scrollback History**: Persistent scrollback with search capabilities
 - **Customizable**: Extensive configuration options and theming support
 
 ### Extensibility
 
-- **Plugin System**: Powerful plugin architecture for extending functionality
+- **Plugin System**: Planned plugin architecture for future extensibility
 - **Scriptable**: Automation support through built-in scripting capabilities
 - **Event System**: Hook into session events for custom workflows
 - **API Integration**: RESTful API for external tool integration
