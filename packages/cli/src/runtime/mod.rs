@@ -63,6 +63,7 @@ const ATTACH_SELECTION_CLEARED_STATUS: &str = "selection cleared";
 const ATTACH_SELECTION_COPIED_STATUS: &str = "selection copied";
 const ATTACH_SELECTION_EMPTY_STATUS: &str = "no selection";
 const ATTACH_TRANSIENT_STATUS_TTL: Duration = Duration::from_millis(1800);
+const ATTACH_WELCOME_STATUS_TTL: Duration = Duration::from_millis(2600);
 const HELP_OVERLAY_SURFACE_ID: Uuid = Uuid::from_u128(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1107,6 +1108,11 @@ async fn run_session_attach_with_client(
 
     update_attach_viewport(&mut client, view_state.attached_id).await?;
     hydrate_attach_state_from_snapshot(&mut client, &mut view_state).await?;
+    view_state.set_transient_status(
+        initial_attach_status(&attach_keymap, view_state.can_write),
+        Instant::now(),
+        ATTACH_WELCOME_STATUS_TTL,
+    );
 
     if !view_state.can_write {
         println!("read-only attach: input disabled");
@@ -1266,10 +1272,9 @@ async fn run_session_attach_with_client(
     if follow_target_id.is_some() {
         let _ = client.unfollow().await;
     }
-    if exit_reason == AttachExitReason::StreamClosed {
-        println!("attach stream closed");
+    if let Some(message) = attach_exit_message(exit_reason) {
+        println!("{message}");
     }
-    println!("detached");
     Ok(0)
 }
 
@@ -1322,6 +1327,11 @@ async fn handle_attach_ui_action(
         RuntimeAction::EnterWindowMode => {
             view_state.exit_scrollback();
             view_state.ui_mode = AttachUiMode::Window;
+            view_state.set_transient_status(
+                window_mode_enter_status(),
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
         }
         RuntimeAction::ExitMode => {
             view_state.ui_mode = AttachUiMode::Normal;
@@ -2010,6 +2020,27 @@ fn attach_mode_hint(ui_mode: AttachUiMode, keymap: &Keymap) -> String {
     }
 }
 
+fn initial_attach_status(keymap: &Keymap, can_write: bool) -> String {
+    let help = key_hint_or_unbound(keymap, RuntimeAction::ShowHelp);
+    let window_mode = key_hint_or_unbound(keymap, RuntimeAction::EnterWindowMode);
+    if can_write {
+        format!("{help} help | {window_mode} window mode | typing goes to pane")
+    } else {
+        format!("read-only attach | {help} help | {window_mode} window mode")
+    }
+}
+
+fn window_mode_enter_status() -> String {
+    "window mode: use window bindings, Esc/Enter exits".to_string()
+}
+
+fn attach_exit_message(reason: AttachExitReason) -> Option<&'static str> {
+    match reason {
+        AttachExitReason::Detached | AttachExitReason::Quit => None,
+        AttachExitReason::StreamClosed => Some("attach ended unexpectedly: server stream closed"),
+    }
+}
+
 fn attach_scrollback_hint(keymap: &Keymap) -> String {
     let exit = scroll_key_hint_or_unbound(keymap, RuntimeAction::ExitScrollMode);
     let confirm = scroll_key_hint_or_unbound(keymap, RuntimeAction::ConfirmScrollback);
@@ -2509,6 +2540,11 @@ fn effective_attach_keybindings(config: &BmuxConfig) -> Vec<AttachKeybindingEntr
 }
 
 fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
+    let keymap = attach_keymap_from_config(config);
+    let help = key_hint_or_unbound(&keymap, RuntimeAction::ShowHelp);
+    let window_mode = key_hint_or_unbound(&keymap, RuntimeAction::EnterWindowMode);
+    let detach = key_hint_or_unbound(&keymap, RuntimeAction::Detach);
+    let scroll = key_hint_or_unbound(&keymap, RuntimeAction::EnterScrollMode);
     let mut groups: Vec<(&str, Vec<AttachKeybindingEntry>)> = vec![
         ("Session", Vec::new()),
         ("Window", Vec::new()),
@@ -2574,6 +2610,12 @@ fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
     }
 
     let mut lines = Vec::new();
+    lines.push("Attach Help".to_string());
+    lines.push(format!(
+        "Normal mode sends typing to the pane. Use {window_mode} for window mode, {scroll} for scrollback, {detach} to detach, and {help} to toggle help."
+    ));
+    lines.push("Window mode captures window/session keys until Esc or Enter exits it.".to_string());
+    lines.push(String::new());
     for (category, mut entries) in groups {
         if entries.is_empty() {
             continue;
@@ -5561,10 +5603,37 @@ mod tests {
     #[test]
     fn build_attach_help_lines_groups_entries_by_category() {
         let lines = super::build_attach_help_lines(&BmuxConfig::default());
+        assert_eq!(lines.first().map(String::as_str), Some("Attach Help"));
+        assert!(lines[1].contains("Normal mode sends typing to the pane"));
         assert!(lines.iter().any(|line| line == "-- Session --"));
         assert!(lines.iter().any(|line| line == "-- Window --"));
         assert!(lines.iter().any(|line| line == "-- Pane --"));
         assert!(lines.iter().any(|line| line == "-- Mode --"));
+    }
+
+    #[test]
+    fn attach_exit_message_suppresses_normal_detach_and_formats_stream_close() {
+        assert_eq!(
+            super::attach_exit_message(super::AttachExitReason::Detached),
+            None
+        );
+        assert_eq!(
+            super::attach_exit_message(super::AttachExitReason::Quit),
+            None
+        );
+        assert_eq!(
+            super::attach_exit_message(super::AttachExitReason::StreamClosed),
+            Some("attach ended unexpectedly: server stream closed")
+        );
+    }
+
+    #[test]
+    fn initial_attach_status_mentions_help_and_window_mode() {
+        let keymap = attach_keymap_from_config(&BmuxConfig::default());
+        let status = super::initial_attach_status(&keymap, true);
+        assert!(status.contains("help"));
+        assert!(status.contains("window mode"));
+        assert!(status.contains("typing goes to pane"));
     }
 
     #[test]
