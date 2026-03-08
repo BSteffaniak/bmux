@@ -121,8 +121,8 @@ pub const fn action_to_name(action: &RuntimeAction) -> &'static str {
 }
 
 pub fn parse_action(value: &str) -> Result<RuntimeAction> {
-    match value {
-        "quit" => Ok(RuntimeAction::Quit),
+    match value.trim().to_ascii_lowercase().as_str() {
+        "quit" | "quit_destroy" => Ok(RuntimeAction::Quit),
         "detach" => Ok(RuntimeAction::Detach),
         "new_window" => Ok(RuntimeAction::NewWindow),
         "new_session" => Ok(RuntimeAction::NewSession),
@@ -175,5 +175,18 @@ pub fn parse_action(value: &str) -> Result<RuntimeAction> {
         "window_goto_9" => Ok(RuntimeAction::WindowGoto9),
         "window_close" => Ok(RuntimeAction::WindowClose),
         unknown => bail!("unknown keymap action '{unknown}'"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{RuntimeAction, parse_action};
+
+    #[test]
+    fn parse_action_accepts_quit_destroy_alias() {
+        assert_eq!(
+            parse_action("quit_destroy").expect("alias should parse"),
+            RuntimeAction::Quit
+        );
     }
 }

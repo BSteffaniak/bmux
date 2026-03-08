@@ -1190,10 +1190,7 @@ fn parse_key_token(value: &str) -> Result<KeyCode> {
 }
 
 pub fn parse_runtime_action_name(value: &str) -> Result<RuntimeAction> {
-    match value.trim().to_ascii_lowercase().as_str() {
-        "quit_destroy" => Ok(RuntimeAction::Quit),
-        _ => parse_action(value),
-    }
+    parse_action(value)
 }
 
 impl KeyStroke {
