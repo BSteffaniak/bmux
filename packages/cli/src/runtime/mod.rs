@@ -374,7 +374,25 @@ async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8>
     write_server_pid_file(std::process::id())?;
     write_server_runtime_metadata(std::process::id())?;
     dispatch_loaded_plugin_event(&loaded_plugins, plugin_system_event("server_started"))?;
-    let run_result = server.run().await;
+    let run_result = if loaded_plugins.is_empty() {
+        server.run().await
+    } else {
+        let (plugin_bridge_shutdown_tx, plugin_bridge_shutdown_rx) =
+            tokio::sync::watch::channel(false);
+        let plugin_bridge = plugin_event_bridge_loop(&loaded_plugins, plugin_bridge_shutdown_rx);
+        tokio::pin!(plugin_bridge);
+        tokio::select! {
+            result = server.run() => {
+                let _ = plugin_bridge_shutdown_tx.send(true);
+                result
+            }
+            result = &mut plugin_bridge => {
+                let _ = plugin_bridge_shutdown_tx.send(true);
+                result?;
+                Ok(())
+            }
+        }
+    };
     if let Err(error) =
         dispatch_loaded_plugin_event(&loaded_plugins, plugin_system_event("server_stopping"))
     {
@@ -572,6 +590,84 @@ fn dispatch_loaded_plugin_event(
     }
 
     Ok(())
+}
+
+async fn plugin_event_bridge_loop(
+    loaded_plugins: &[bmux_plugin::LoadedPlugin],
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> Result<()> {
+    if loaded_plugins.is_empty() {
+        return Ok(());
+    }
+
+    let mut client = loop {
+        if *shutdown_rx.borrow() {
+            return Ok(());
+        }
+
+        match connect_raw("bmux-plugin-event-bridge").await {
+            Ok(client) => break client,
+            Err(_) => {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => {
+                        if *shutdown_rx.borrow() {
+                            return Ok(());
+                        }
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            }
+        }
+    };
+
+    client
+        .subscribe_events()
+        .await
+        .map_err(map_cli_client_error)?;
+    loop {
+        tokio::select! {
+            _ = shutdown_rx.changed() => {
+                if *shutdown_rx.borrow() {
+                    return Ok(());
+                }
+            }
+            result = client.poll_events(32) => {
+                let events = result.map_err(map_cli_client_error)?;
+                for event in events {
+                    dispatch_loaded_plugin_event(loaded_plugins, plugin_event_from_server_event(&event)?)?;
+                }
+            }
+        }
+    }
+}
+
+fn plugin_event_from_server_event(event: &bmux_client::ServerEvent) -> Result<PluginEvent> {
+    Ok(PluginEvent {
+        kind: plugin_event_kind_from_server_event(event),
+        name: server_event_name(event).to_string(),
+        payload: serde_json::to_value(event).context("failed encoding server event payload")?,
+    })
+}
+
+const fn plugin_event_kind_from_server_event(event: &bmux_client::ServerEvent) -> PluginEventKind {
+    match event {
+        bmux_client::ServerEvent::ServerStarted | bmux_client::ServerEvent::ServerStopping => {
+            PluginEventKind::System
+        }
+        bmux_client::ServerEvent::SessionCreated { .. }
+        | bmux_client::ServerEvent::SessionRemoved { .. }
+        | bmux_client::ServerEvent::FollowStarted { .. }
+        | bmux_client::ServerEvent::FollowStopped { .. }
+        | bmux_client::ServerEvent::FollowTargetGone { .. }
+        | bmux_client::ServerEvent::FollowTargetChanged { .. }
+        | bmux_client::ServerEvent::RoleChanged { .. } => PluginEventKind::Session,
+        bmux_client::ServerEvent::WindowCreated { .. }
+        | bmux_client::ServerEvent::WindowRemoved { .. }
+        | bmux_client::ServerEvent::WindowSwitched { .. } => PluginEventKind::Window,
+        bmux_client::ServerEvent::ClientAttached { .. }
+        | bmux_client::ServerEvent::ClientDetached { .. } => PluginEventKind::Client,
+        bmux_client::ServerEvent::AttachViewChanged { .. } => PluginEventKind::Pane,
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -5132,6 +5228,22 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("bmux")
         );
+    }
+
+    #[test]
+    fn plugin_event_from_server_event_maps_kind_and_payload() {
+        let session_id = Uuid::from_u128(2);
+        let event =
+            super::plugin_event_from_server_event(&bmux_client::ServerEvent::WindowCreated {
+                id: Uuid::from_u128(1),
+                session_id,
+                name: Some("editor".to_string()),
+            })
+            .expect("plugin event should build");
+        let session_id_text = session_id.to_string();
+        assert_eq!(event.kind, bmux_plugin::PluginEventKind::Window);
+        assert_eq!(event.name, "window_created");
+        assert!(event.payload.to_string().contains(&session_id_text));
     }
 
     #[test]
