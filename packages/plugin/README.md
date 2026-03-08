@@ -20,7 +20,7 @@ Native-first plugin SDK for bmux.
 
 ## Current Scope
 
-This crate currently establishes the contract for plugins and hosts. It does not yet load dynamic libraries or wire plugins into the live bmux runtime.
+This crate now supports native plugin discovery, validation, loading, lifecycle hooks, command execution, and event delivery. Host services are still intentionally narrow and deeper runtime hooks are still being built out.
 
 ## Manifest Example
 
@@ -87,3 +87,4 @@ registry.validate_against_host(&host, &[PluginCapability::Commands])?;
 
 - `docs/plugin-architecture.md`
 - `docs/plugin-versioning.md`
+- `examples/native-plugin/README.md`

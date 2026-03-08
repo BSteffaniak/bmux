@@ -1,0 +1,21 @@
+capabilities = ["commands", "event_subscription"]
+entry        = "../../../target/debug/libbmux_example_native_plugin.dylib"
+id           = "example.native"
+name         = "Example Native Plugin"
+runtime      = "native"
+version      = "0.0.1-alpha.0"
+
+[[commands]]
+execution = "host_callback"
+name      = "hello"
+summary   = "Print a hello message"
+
+[[event_subscriptions]]
+kinds = ["system", "window"]
+names = ["server_started", "window_created"]
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
