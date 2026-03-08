@@ -61,11 +61,15 @@ pub struct SessionSnapshotV3 {
     pub name: Option<String>,
     pub windows: Vec<WindowSnapshotV3>,
     pub active_window_id: Option<Uuid>,
+    #[serde(default)]
+    pub next_window_number: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WindowSnapshotV3 {
     pub id: Uuid,
+    #[serde(default)]
+    pub number: u32,
     pub name: Option<String>,
     pub panes: Vec<PaneSnapshotV2>,
     pub focused_pane_id: Option<Uuid>,
@@ -291,8 +295,9 @@ impl SnapshotManager {
                         "snapshot checksum mismatch".to_string(),
                     ));
                 }
-                validate_snapshot_v3(&envelope.snapshot)?;
-                Ok(envelope.snapshot)
+                let snapshot = normalize_snapshot_v3_numbering(envelope.snapshot);
+                validate_snapshot_v3(&snapshot)?;
+                Ok(snapshot)
             }
             other => Err(SnapshotError::UnsupportedVersion(other)),
         }
@@ -537,7 +542,22 @@ fn validate_snapshot_v3(snapshot: &SnapshotV3) -> Result<(), SnapshotError> {
 
     let mut surface_ids = BTreeSet::new();
     for session in &snapshot.sessions {
+        let mut session_window_numbers = BTreeSet::new();
+        let mut max_window_number = 0u32;
         for window in &session.windows {
+            if window.number == 0 {
+                return Err(SnapshotError::Validation(format!(
+                    "window {} in session {} has invalid number 0",
+                    window.id, session.id
+                )));
+            }
+            if !session_window_numbers.insert(window.number) {
+                return Err(SnapshotError::Validation(format!(
+                    "duplicate window number {} in session {}",
+                    window.number, session.id
+                )));
+            }
+            max_window_number = max_window_number.max(window.number);
             let window_pane_ids = window
                 .panes
                 .iter()
@@ -563,6 +583,13 @@ fn validate_snapshot_v3(snapshot: &SnapshotV3) -> Result<(), SnapshotError> {
                     )));
                 }
             }
+        }
+        let min_next_window_number = max_window_number.saturating_add(1);
+        if session.next_window_number < min_next_window_number {
+            return Err(SnapshotError::Validation(format!(
+                "session {} next_window_number {} must be at least {}",
+                session.id, session.next_window_number, min_next_window_number
+            )));
         }
     }
     Ok(())
@@ -729,22 +756,28 @@ fn upgrade_snapshot_v2(snapshot: SnapshotV2) -> SnapshotV3 {
         sessions: snapshot
             .sessions
             .into_iter()
-            .map(|session| SessionSnapshotV3 {
-                id: session.id,
-                name: session.name,
-                windows: session
-                    .windows
-                    .into_iter()
-                    .map(|window| WindowSnapshotV3 {
-                        id: window.id,
-                        name: window.name,
-                        panes: window.panes,
-                        focused_pane_id: window.focused_pane_id,
-                        layout_root: window.layout_root,
-                        floating_surfaces: Vec::new(),
-                    })
-                    .collect(),
-                active_window_id: session.active_window_id,
+            .map(|session| {
+                let window_count = session.windows.len() as u32;
+                SessionSnapshotV3 {
+                    id: session.id,
+                    name: session.name,
+                    windows: session
+                        .windows
+                        .into_iter()
+                        .enumerate()
+                        .map(|(index, window)| WindowSnapshotV3 {
+                            id: window.id,
+                            number: index as u32 + 1,
+                            name: window.name,
+                            panes: window.panes,
+                            focused_pane_id: window.focused_pane_id,
+                            layout_root: window.layout_root,
+                            floating_surfaces: Vec::new(),
+                        })
+                        .collect(),
+                    active_window_id: session.active_window_id,
+                    next_window_number: window_count.saturating_add(1),
+                }
             })
             .collect(),
         owner_principals: snapshot.owner_principals,
@@ -752,6 +785,23 @@ fn upgrade_snapshot_v2(snapshot: SnapshotV2) -> SnapshotV3 {
         follows: snapshot.follows,
         selected_sessions: snapshot.selected_sessions,
     }
+}
+
+fn normalize_snapshot_v3_numbering(mut snapshot: SnapshotV3) -> SnapshotV3 {
+    for session in &mut snapshot.sessions {
+        let mut max_number = 0u32;
+        for (index, window) in session.windows.iter_mut().enumerate() {
+            if window.number == 0 {
+                window.number = index as u32 + 1;
+            }
+            max_number = max_number.max(window.number);
+        }
+        let min_next_window_number = max_number.saturating_add(1);
+        if session.next_window_number < min_next_window_number {
+            session.next_window_number = min_next_window_number.max(1);
+        }
+    }
+    snapshot
 }
 
 fn default_shell_for_upgrade() -> String {
@@ -787,6 +837,7 @@ mod tests {
                 name: Some("dev".to_string()),
                 windows: vec![WindowSnapshotV3 {
                     id: window_id,
+                    number: 1,
                     name: Some("main".to_string()),
                     panes: vec![PaneSnapshotV2 {
                         id: window_id,
@@ -798,6 +849,7 @@ mod tests {
                     floating_surfaces: vec![],
                 }],
                 active_window_id: Some(window_id),
+                next_window_number: 2,
             }],
             owner_principals: vec![],
             roles: vec![RoleAssignmentSnapshotV2 {
@@ -850,6 +902,7 @@ mod tests {
                 name: Some("valid".to_string()),
                 windows: vec![WindowSnapshotV3 {
                     id: Uuid::new_v4(),
+                    number: 1,
                     name: Some("w1".to_string()),
                     panes: vec![PaneSnapshotV2 {
                         id: Uuid::new_v4(),
@@ -861,6 +914,7 @@ mod tests {
                     floating_surfaces: vec![],
                 }],
                 active_window_id: None,
+                next_window_number: 2,
             }],
             owner_principals: vec![],
             roles: vec![],

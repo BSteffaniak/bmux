@@ -584,7 +584,7 @@ struct SessionRuntimeManager {
 struct SessionRuntimeHandle {
     windows: BTreeMap<bmux_session::WindowId, WindowRuntimeHandle>,
     active_window: bmux_session::WindowId,
-    next_auto_window_number: u32,
+    next_window_number: u32,
     attached_clients: BTreeSet<ClientId>,
     attach_viewport: Option<AttachViewport>,
     attach_view_revision: u64,
@@ -598,6 +598,7 @@ struct AttachViewport {
 
 struct WindowRuntimeHandle {
     id: bmux_session::WindowId,
+    number: u32,
     name: Option<String>,
     panes: BTreeMap<Uuid, PaneRuntimeHandle>,
     layout_root: PaneLayoutNode,
@@ -779,6 +780,7 @@ struct RemovedWindowRuntime {
 
 struct WindowRuntimeSummary {
     id: bmux_session::WindowId,
+    number: u32,
     name: Option<String>,
     active: bool,
 }
@@ -804,6 +806,7 @@ struct AttachSnapshotState {
 #[derive(Debug, Clone)]
 struct RestoreWindowRuntimeSpec {
     id: bmux_session::WindowId,
+    number: u32,
     name: Option<String>,
     panes: Vec<PaneRuntimeMeta>,
     layout_root: Option<PaneLayoutNode>,
@@ -828,6 +831,7 @@ enum PaneLayoutNode {
 enum WindowSelection {
     Active,
     Id(bmux_session::WindowId),
+    Number(u32),
     Name(String),
 }
 
@@ -1264,6 +1268,7 @@ impl SessionRuntimeManager {
         let first_window = self.spawn_window_runtime(
             session_id,
             None,
+            1,
             Some("window-1".to_string()),
             None,
             Some("pane-1".to_string()),
@@ -1278,7 +1283,7 @@ impl SessionRuntimeManager {
             SessionRuntimeHandle {
                 windows,
                 active_window: first_window_id,
-                next_auto_window_number: 2,
+                next_window_number: 2,
                 attached_clients: BTreeSet::new(),
                 attach_viewport: None,
                 attach_view_revision: 0,
@@ -1292,6 +1297,7 @@ impl SessionRuntimeManager {
         session_id: SessionId,
         windows: Vec<RestoreWindowRuntimeSpec>,
         active_window: bmux_session::WindowId,
+        next_window_number: u32,
     ) -> Result<()> {
         if self.runtimes.contains_key(&session_id) {
             anyhow::bail!("runtime already exists for session {}", session_id.0);
@@ -1312,6 +1318,7 @@ impl SessionRuntimeManager {
             let handle = self.spawn_window_runtime(
                 session_id,
                 Some(window.id),
+                window.number,
                 window.name,
                 Some(window.focused_pane_id),
                 None,
@@ -1353,7 +1360,7 @@ impl SessionRuntimeManager {
             SessionRuntimeHandle {
                 windows: runtime_windows,
                 active_window,
-                next_auto_window_number: 2,
+                next_window_number,
                 attached_clients: BTreeSet::new(),
                 attach_viewport: None,
                 attach_view_revision: 0,
@@ -1367,6 +1374,7 @@ impl SessionRuntimeManager {
         &self,
         session_id: SessionId,
         id: Option<bmux_session::WindowId>,
+        number: u32,
         name: Option<String>,
         pane_id: Option<Uuid>,
         pane_name: Option<String>,
@@ -1384,6 +1392,7 @@ impl SessionRuntimeManager {
 
         Ok(WindowRuntimeHandle {
             id: window_id,
+            number,
             name,
             panes,
             layout_root: PaneLayoutNode::Leaf {
@@ -1568,19 +1577,17 @@ impl SessionRuntimeManager {
         &mut self,
         session_id: SessionId,
         name: Option<String>,
-    ) -> Result<(bmux_session::WindowId, Option<String>)> {
-        let resolved_name = if let Some(name) = name {
-            Some(name)
-        } else {
-            let session = self
-                .runtimes
-                .get(&session_id)
-                .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
-            Some(format!("window-{}", session.next_auto_window_number))
-        };
+    ) -> Result<(bmux_session::WindowId, u32, Option<String>)> {
+        let number = self
+            .runtimes
+            .get(&session_id)
+            .map(|session| session.next_window_number)
+            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        let resolved_name = name.or_else(|| Some(format!("window-{number}")));
         let window = self.spawn_window_runtime(
             session_id,
             None,
+            number,
             resolved_name.clone(),
             None,
             Some("pane-1".to_string()),
@@ -1593,9 +1600,9 @@ impl SessionRuntimeManager {
             .get_mut(&session_id)
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
         session.windows.insert(window_id, window);
-        session.next_auto_window_number = session.next_auto_window_number.saturating_add(1);
+        session.next_window_number = session.next_window_number.saturating_add(1);
         self.apply_stored_attach_viewport(session_id);
-        Ok((window_id, resolved_name))
+        Ok((window_id, number, resolved_name))
     }
 
     fn list_windows(&self, session_id: SessionId) -> Result<Vec<WindowRuntimeSummary>> {
@@ -1604,15 +1611,18 @@ impl SessionRuntimeManager {
             .get(&session_id)
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
 
-        Ok(session
+        let mut windows = session
             .windows
             .values()
             .map(|window| WindowRuntimeSummary {
                 id: window.id,
+                number: window.number,
                 name: window.name.clone(),
                 active: window.id == session.active_window,
             })
-            .collect())
+            .collect::<Vec<_>>();
+        windows.sort_by_key(|window| (window.number, window.id));
+        Ok(windows)
     }
 
     fn split_pane(
@@ -2036,9 +2046,10 @@ impl SessionRuntimeManager {
             if !is_last_window && session.active_window == window_id {
                 let next_active = session
                     .windows
-                    .keys()
-                    .copied()
-                    .find(|id| *id != window_id)
+                    .values()
+                    .filter(|window| window.id != window_id)
+                    .min_by_key(|window| window.number)
+                    .map(|window| window.id)
                     .ok_or_else(|| anyhow::anyhow!("failed selecting next active window"))?;
                 session.active_window = next_active;
             }
@@ -2289,6 +2300,11 @@ fn resolve_window_id_from_selector(
     match selector {
         WindowSelection::Active => Some(session.active_window),
         WindowSelection::Id(id) => session.windows.contains_key(&id).then_some(id),
+        WindowSelection::Number(number) => session
+            .windows
+            .values()
+            .find(|window| window.number == number)
+            .map(|window| window.id),
         WindowSelection::Name(value) => {
             if let Some(window) = session
                 .windows
@@ -3105,6 +3121,7 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV3> {
 
                         Ok(WindowSnapshotV3 {
                             id: window.id.0,
+                            number: window.number,
                             name: window.name.clone(),
                             panes,
                             focused_pane_id: Some(window.focused_pane_id),
@@ -3133,12 +3150,17 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV3> {
                 let name = manager
                     .get_session(&session_info.id)
                     .and_then(|session| session.name.clone());
+                let next_window_number = runtime_manager
+                    .runtimes
+                    .get(&session_info.id)
+                    .map_or(1, |runtime| runtime.next_window_number);
 
                 Ok(SessionSnapshotV3 {
                     id: session_info.id.0,
                     name,
                     windows: window_snapshots,
                     active_window_id,
+                    next_window_number,
                 })
             })
             .collect::<Result<Vec<_>>>()?
@@ -3285,8 +3307,9 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV3) -> Resu
             let session_id = SessionId(session_snapshot.id);
             let mut session = Session::new(session_snapshot.name.clone());
             session.id = session_id;
+            session.next_window_number = session_snapshot.next_window_number;
             for window_snapshot in &session_snapshot.windows {
-                session.add_window(WindowId(window_snapshot.id));
+                session.add_window(WindowId(window_snapshot.id), window_snapshot.number);
             }
 
             if let Some(active_window_id) = session_snapshot.active_window_id {
@@ -3321,6 +3344,7 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV3) -> Resu
                         .collect::<Vec<_>>();
                     RestoreWindowRuntimeSpec {
                         id: WindowId(window.id),
+                        number: window.number,
                         name: window.name.clone(),
                         panes,
                         layout_root: window
@@ -3354,9 +3378,12 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV3) -> Resu
                 })
                 .collect::<Vec<_>>();
 
-            if let Err(error) =
-                runtime_manager.restore_runtime(session_id, runtime_windows, active_window)
-            {
+            if let Err(error) = runtime_manager.restore_runtime(
+                session_id,
+                runtime_windows,
+                active_window,
+                session_snapshot.next_window_number,
+            ) {
                 warn!(
                     "failed restoring runtime for session {}: {error}",
                     session_snapshot.id
@@ -3908,9 +3935,14 @@ async fn handle_request(
                             message: format!("failed creating session runtime: {error:#}"),
                         }));
                     }
-                    let initial_window_ids = runtime_manager
+                    let initial_windows = runtime_manager
                         .list_windows(session_id)
-                        .map(|windows| windows.into_iter().map(|w| w.id).collect::<Vec<_>>())
+                        .map(|windows| {
+                            windows
+                                .into_iter()
+                                .map(|window| (window.id, window.number))
+                                .collect::<Vec<_>>()
+                        })
                         .unwrap_or_default();
                     drop(runtime_manager);
 
@@ -3919,8 +3951,8 @@ async fn handle_request(
                         .lock()
                         .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
                     if let Some(session_model) = manager.get_session_mut(&session_id) {
-                        for window_id in initial_window_ids {
-                            session_model.add_window(window_id);
+                        for (window_id, window_number) in initial_windows {
+                            session_model.add_window(window_id, window_number);
                         }
                     }
                     drop(manager);
@@ -3964,15 +3996,16 @@ async fn handle_request(
                 .session_runtimes
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-            let (window_id, resolved_name) = match runtime_manager.new_window(session_id, name) {
-                Ok(created) => created,
-                Err(error) => {
-                    return Ok(Response::Err(ErrorResponse {
-                        code: ErrorCode::Internal,
-                        message: format!("failed creating window runtime: {error:#}"),
-                    }));
-                }
-            };
+            let (window_id, window_number, resolved_name) =
+                match runtime_manager.new_window(session_id, name) {
+                    Ok(created) => created,
+                    Err(error) => {
+                        return Ok(Response::Err(ErrorResponse {
+                            code: ErrorCode::Internal,
+                            message: format!("failed creating window runtime: {error:#}"),
+                        }));
+                    }
+                };
             drop(runtime_manager);
 
             let mut manager = state
@@ -3980,12 +4013,13 @@ async fn handle_request(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
             if let Some(session_model) = manager.get_session_mut(&session_id) {
-                session_model.add_window(window_id);
+                session_model.add_window(window_id, window_number);
             }
 
             Response::Ok(ResponsePayload::WindowCreated {
                 id: window_id.0,
                 session_id: session_id.0,
+                number: window_number,
                 name: resolved_name,
             })
         }
@@ -4021,6 +4055,7 @@ async fn handle_request(
                     .map(|window| WindowSummary {
                         id: window.id.0,
                         session_id: session_id.0,
+                        number: window.number,
                         name: window.name,
                         active: window.active,
                     })
@@ -4186,6 +4221,12 @@ async fn handle_request(
                     }));
                 }
             };
+            let switched_number = runtime_manager
+                .runtimes
+                .get(&session_id)
+                .and_then(|runtime| runtime.windows.get(&switched_id))
+                .map(|window| window.number)
+                .ok_or_else(|| anyhow::anyhow!("switched window missing from runtime"))?;
             drop(runtime_manager);
 
             if let Some(session_model) = manager.get_session_mut(&session_id) {
@@ -4205,6 +4246,7 @@ async fn handle_request(
             Response::Ok(ResponsePayload::WindowSwitched {
                 id: switched_id.0,
                 session_id: session_id.0,
+                number: switched_number,
             })
         }
         Request::ListPanes { session } => {
@@ -5401,6 +5443,7 @@ async fn handle_request(
         id,
         session_id,
         name,
+        ..
     }) = &response
     {
         emit_event(
@@ -5638,6 +5681,7 @@ fn ensure_writer_for_session(
 fn window_selection_from_selector(selector: WindowSelector) -> WindowSelection {
     match selector {
         WindowSelector::ById(id) => WindowSelection::Id(WindowId(id)),
+        WindowSelector::ByNumber(number) => WindowSelection::Number(number),
         WindowSelector::ByName(name) => WindowSelection::Name(name),
         WindowSelector::Active => WindowSelection::Active,
     }
@@ -6939,13 +6983,14 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(
+        assert!(matches!(
             switched,
             Response::Ok(ResponsePayload::WindowSwitched {
-                id: logs_window_id,
-                session_id,
-            })
-        );
+                id,
+                session_id: switched_session,
+                number: 2,
+            }) if id == logs_window_id && switched_session == session_id
+        ));
 
         let killed = send_request(
             &mut client,
@@ -7020,13 +7065,14 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(
+        assert!(matches!(
             switched,
             Response::Ok(ResponsePayload::WindowSwitched {
-                id: logs_window_id,
-                session_id,
-            })
-        );
+                id,
+                session_id: switched_session,
+                number: 2,
+            }) if id == logs_window_id && switched_session == session_id
+        ));
 
         stop_server(server, server_task, &socket_path).await;
     }
@@ -7088,13 +7134,14 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(
+        assert!(matches!(
             switched,
             Response::Ok(ResponsePayload::WindowSwitched {
-                id: named_window_id,
-                session_id,
-            })
-        );
+                id,
+                session_id: switched_session,
+                number: 3,
+            }) if id == named_window_id && switched_session == session_id
+        ));
 
         stop_server(server, server_task, &socket_path).await;
     }
@@ -7162,13 +7209,14 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(
+        assert!(matches!(
             switched,
             Response::Ok(ResponsePayload::WindowSwitched {
-                id: expected_first,
-                session_id,
-            })
-        );
+                id,
+                session_id: switched_session,
+                number: 1,
+            }) if id == expected_first && switched_session == session_id
+        ));
 
         stop_server(server, server_task, &socket_path).await;
     }
@@ -7836,13 +7884,14 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(
+        assert!(matches!(
             switched_primary,
             Response::Ok(ResponsePayload::WindowSwitched {
-                id: primary_window,
-                session_id,
-            })
-        );
+                id,
+                session_id: switched_session,
+                number: 1,
+            }) if id == primary_window && switched_session == session_id
+        ));
 
         let export_primary = send_request(
             &mut client,
@@ -7868,13 +7917,14 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(
+        assert!(matches!(
             switched_secondary,
             Response::Ok(ResponsePayload::WindowSwitched {
-                id: secondary_window,
-                session_id,
-            })
-        );
+                id,
+                session_id: switched_session,
+                number: 2,
+            }) if id == secondary_window && switched_session == session_id
+        ));
 
         let print_secondary = send_request(
             &mut client,
@@ -7901,13 +7951,14 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(
+        assert!(matches!(
             switched_back,
             Response::Ok(ResponsePayload::WindowSwitched {
-                id: primary_window,
-                session_id,
-            })
-        );
+                id,
+                session_id: switched_session,
+                number: 1,
+            }) if id == primary_window && switched_session == session_id
+        ));
 
         let print_primary = send_request(
             &mut client,
@@ -8017,13 +8068,14 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(
+        assert!(matches!(
             switched_primary,
             Response::Ok(ResponsePayload::WindowSwitched {
-                id: primary_window,
-                session_id,
-            })
-        );
+                id,
+                session_id: switched_session,
+                number: 1,
+            }) if id == primary_window && switched_session == session_id
+        ));
 
         let export_primary = send_request(
             &mut client,
@@ -8049,13 +8101,14 @@ mod tests {
             },
         )
         .await;
-        assert_eq!(
+        assert!(matches!(
             switched_secondary,
             Response::Ok(ResponsePayload::WindowSwitched {
-                id: secondary_window,
-                session_id,
-            })
-        );
+                id,
+                session_id: switched_session,
+                number: 2,
+            }) if id == secondary_window && switched_session == session_id
+        ));
 
         let export_secondary = send_request(
             &mut client,

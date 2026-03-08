@@ -114,6 +114,7 @@ pub enum SessionSelector {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WindowSelector {
     ById(Uuid),
+    ByNumber(u32),
     ByName(String),
     Active,
 }
@@ -374,6 +375,7 @@ pub struct SessionSummary {
 pub struct WindowSummary {
     pub id: Uuid,
     pub session_id: Uuid,
+    pub number: u32,
     pub name: Option<String>,
     pub active: bool,
 }
@@ -461,6 +463,7 @@ pub enum ResponsePayload {
     WindowCreated {
         id: Uuid,
         session_id: Uuid,
+        number: u32,
         name: Option<String>,
     },
     SessionList {
@@ -486,6 +489,7 @@ pub enum ResponsePayload {
     WindowSwitched {
         id: Uuid,
         session_id: Uuid,
+        number: u32,
     },
     PaneSplit {
         id: Uuid,

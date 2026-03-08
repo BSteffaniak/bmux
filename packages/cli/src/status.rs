@@ -1,18 +1,20 @@
 pub struct AttachTab {
-    pub(crate) index: usize,
-    pub(crate) title: String,
+    pub(crate) label: String,
     pub(crate) active: bool,
 }
 
 pub fn build_attach_status_line(
     session_label: &str,
+    current_window_label: &str,
     tabs: &[AttachTab],
     mode_label: &str,
     role_label: &str,
     follow_label: Option<&str>,
     hint: &str,
 ) -> String {
-    let mut status = format!(" bmux [{mode_label}] [{role_label}] | session: {session_label} | ");
+    let mut status = format!(
+        " bmux [{mode_label}] [{role_label}] | session: {session_label} | window: {current_window_label} | "
+    );
 
     if tabs.is_empty() {
         status.push_str("tabs: (none)");
@@ -20,9 +22,9 @@ pub fn build_attach_status_line(
         status.push_str("tabs: ");
         for tab in tabs {
             if tab.active {
-                status.push_str(&format!("[{}:{}] ", tab.index, tab.title));
+                status.push_str(&format!("[{}] ", tab.label));
             } else {
-                status.push_str(&format!(" {}:{} ", tab.index, tab.title));
+                status.push_str(&format!(" {} ", tab.label));
             }
         }
     }

@@ -177,8 +177,9 @@ pub enum ClientError {
 pub struct Session {
     pub id: SessionId,
     pub name: Option<String>,
-    pub windows: BTreeMap<WindowId, WindowId>, // window_id -> window_id (for lookup)
+    pub windows: BTreeMap<WindowId, u32>,
     pub active_window: Option<WindowId>,
+    pub next_window_number: u32,
     pub clients: BTreeSet<ClientId>,
     pub created_at: std::time::SystemTime,
     pub last_activity: std::time::SystemTime,
@@ -193,6 +194,7 @@ impl Session {
             name,
             windows: BTreeMap::new(),
             active_window: None,
+            next_window_number: 1,
             clients: BTreeSet::new(),
             created_at: now,
             last_activity: now,
@@ -222,11 +224,12 @@ impl Session {
         self.clients.is_empty()
     }
 
-    pub fn add_window(&mut self, window_id: WindowId) {
-        self.windows.insert(window_id, window_id);
+    pub fn add_window(&mut self, window_id: WindowId, number: u32) {
+        self.windows.insert(window_id, number);
         if self.active_window.is_none() {
             self.active_window = Some(window_id);
         }
+        self.next_window_number = self.next_window_number.max(number.saturating_add(1));
         self.update_activity();
     }
 
@@ -234,7 +237,11 @@ impl Session {
         let removed = self.windows.remove(window_id).is_some();
         if removed {
             if self.active_window == Some(*window_id) {
-                self.active_window = self.windows.keys().next().copied();
+                self.active_window = self
+                    .windows
+                    .iter()
+                    .min_by_key(|(_id, number)| *number)
+                    .map(|(id, _number)| *id);
             }
             self.update_activity();
         }
@@ -258,6 +265,11 @@ impl Session {
 
     fn update_activity(&mut self) {
         self.last_activity = std::time::SystemTime::now();
+    }
+
+    #[must_use]
+    pub fn window_number(&self, window_id: WindowId) -> Option<u32> {
+        self.windows.get(&window_id).copied()
     }
 }
 
