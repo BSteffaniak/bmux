@@ -20,8 +20,8 @@ use bmux_ipc::{
 use bmux_keybind::action_to_name;
 use bmux_plugin::{
     CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostMetadata, NativeLifecycleContext,
-    PluginCapability, PluginManifest, PluginRegistry, discover_plugin_manifests,
-    load_registered_plugin as load_native_registered_plugin,
+    PluginCapability, PluginEvent, PluginEventKind, PluginManifest, PluginRegistry,
+    discover_plugin_manifests, load_registered_plugin as load_native_registered_plugin,
 };
 use bmux_server::BmuxServer;
 use clap::Parser;
@@ -369,10 +369,17 @@ async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8>
 
     let loaded_plugins = load_enabled_plugins(&config, &registry)?;
     activate_loaded_plugins(&loaded_plugins, &config)?;
+    dispatch_loaded_plugin_event(&loaded_plugins, plugin_system_event("server_starting"))?;
     let server = BmuxServer::from_default_paths();
     write_server_pid_file(std::process::id())?;
     write_server_runtime_metadata(std::process::id())?;
+    dispatch_loaded_plugin_event(&loaded_plugins, plugin_system_event("server_started"))?;
     let run_result = server.run().await;
+    if let Err(error) =
+        dispatch_loaded_plugin_event(&loaded_plugins, plugin_system_event("server_stopping"))
+    {
+        warn!("failed delivering server_stopping plugin event: {error}");
+    }
     if let Err(error) = deactivate_loaded_plugins(&loaded_plugins, &config) {
         warn!("failed deactivating plugins during server shutdown: {error}");
     }
@@ -482,6 +489,17 @@ fn plugin_lifecycle_context(config: &BmuxConfig, plugin_id: &str) -> NativeLifec
     }
 }
 
+fn plugin_system_event(name: &str) -> PluginEvent {
+    PluginEvent {
+        kind: PluginEventKind::System,
+        name: name.to_string(),
+        payload: serde_json::json!({
+            "product": "bmux",
+            "version": env!("CARGO_PKG_VERSION"),
+        }),
+    }
+}
+
 fn activate_loaded_plugins(
     loaded_plugins: &[bmux_plugin::LoadedPlugin],
     config: &BmuxConfig,
@@ -531,6 +549,23 @@ fn deactivate_loaded_plugins(
         let _ = plugin.deactivate(&context).with_context(|| {
             format!(
                 "failed deactivating plugin '{}'",
+                plugin.declaration.id.as_str()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn dispatch_loaded_plugin_event(
+    loaded_plugins: &[bmux_plugin::LoadedPlugin],
+    event: PluginEvent,
+) -> Result<()> {
+    for plugin in loaded_plugins {
+        let _ = plugin.dispatch_event(&event).with_context(|| {
+            format!(
+                "failed dispatching plugin event '{}' to '{}'",
+                event.name,
                 plugin.declaration.id.as_str()
             )
         })?;
@@ -5082,6 +5117,20 @@ mod tests {
         assert_eq!(
             context.settings.as_ref().and_then(|value| value.as_str()),
             Some("configured")
+        );
+    }
+
+    #[test]
+    fn plugin_system_event_uses_system_kind_and_name() {
+        let event = super::plugin_system_event("server_started");
+        assert_eq!(event.kind, bmux_plugin::PluginEventKind::System);
+        assert_eq!(event.name, "server_started");
+        assert_eq!(
+            event
+                .payload
+                .get("product")
+                .and_then(serde_json::Value::as_str),
+            Some("bmux")
         );
     }
 

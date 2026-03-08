@@ -1,8 +1,8 @@
 use crate::{
     DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_COMMAND_SYMBOL,
-    DEFAULT_NATIVE_DEACTIVATE_SYMBOL, HostMetadata, PluginCapability, PluginDeclaration,
-    PluginEntrypoint, PluginError, PluginLifecycle, PluginManifestCompatibility, PluginRegistry,
-    RegisteredPlugin, Result,
+    DEFAULT_NATIVE_DEACTIVATE_SYMBOL, DEFAULT_NATIVE_EVENT_SYMBOL, HostMetadata, PluginCapability,
+    PluginDeclaration, PluginEntrypoint, PluginError, PluginEvent, PluginLifecycle,
+    PluginManifestCompatibility, PluginRegistry, RegisteredPlugin, Result,
 };
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize};
@@ -13,6 +13,7 @@ use std::path::Path;
 type NativeDescriptorFn = unsafe extern "C" fn() -> *const c_char;
 type NativeRunCommandFn = unsafe extern "C" fn(*const c_char, usize, *const *const c_char) -> i32;
 type NativeLifecycleFn = unsafe extern "C" fn(*const c_char) -> i32;
+type NativeEventFn = unsafe extern "C" fn(*const c_char) -> i32;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeLifecycleContext {
@@ -37,6 +38,8 @@ pub struct NativeDescriptor {
     pub capabilities: BTreeSet<PluginCapability>,
     #[serde(default)]
     pub commands: Vec<crate::PluginCommand>,
+    #[serde(default)]
+    pub event_subscriptions: Vec<crate::PluginEventSubscription>,
     #[serde(default)]
     pub lifecycle: PluginLifecycle,
 }
@@ -71,6 +74,7 @@ impl NativeDescriptor {
             homepage: self.homepage,
             capabilities: self.capabilities,
             commands: self.commands,
+            event_subscriptions: self.event_subscriptions,
             lifecycle: self.lifecycle,
         };
         declaration.validate()?;
@@ -171,6 +175,44 @@ impl LoadedPlugin {
     /// lifecycle payload cannot be encoded.
     pub fn deactivate(&self, context: &NativeLifecycleContext) -> Result<i32> {
         self.run_lifecycle_symbol(DEFAULT_NATIVE_DEACTIVATE_SYMBOL, context)
+    }
+
+    #[must_use]
+    pub fn receives_event(&self, event: &PluginEvent) -> bool {
+        self.declaration.event_subscriptions.is_empty()
+            || self
+                .declaration
+                .event_subscriptions
+                .iter()
+                .any(|subscription| subscription.matches(event))
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the event symbol cannot be loaded or the event
+    /// payload cannot be encoded.
+    pub fn dispatch_event(&self, event: &PluginEvent) -> Result<Option<i32>> {
+        if !self.receives_event(event) {
+            return Ok(None);
+        }
+
+        let payload = CString::new(
+            serde_json::to_string(event).expect("plugin event payload should serialize"),
+        )
+        .map_err(|_| PluginError::InvalidNativeEventInput {
+            plugin_id: self.declaration.id.as_str().to_string(),
+        })?;
+
+        let event_symbol: Symbol<'_, NativeEventFn> =
+            unsafe { self._library.get(DEFAULT_NATIVE_EVENT_SYMBOL.as_bytes()) }.map_err(
+                |error| PluginError::NativeEventSymbol {
+                    plugin_id: self.declaration.id.as_str().to_string(),
+                    symbol: DEFAULT_NATIVE_EVENT_SYMBOL.to_string(),
+                    details: error.to_string(),
+                },
+            )?;
+
+        Ok(Some(unsafe { event_symbol(payload.as_ptr()) }))
     }
 
     fn run_lifecycle_symbol(&self, symbol: &str, context: &NativeLifecycleContext) -> Result<i32> {
@@ -360,6 +402,14 @@ fn compare_manifest_and_descriptor(
             .expect("plugin commands should serialize"),
         &serde_json::to_string(&declaration.commands).expect("plugin commands should serialize"),
     )?;
+    ensure_match(
+        registered_plugin.declaration.id.as_str(),
+        "event_subscriptions",
+        &serde_json::to_string(&registered_plugin.declaration.event_subscriptions)
+            .expect("plugin event subscriptions should serialize"),
+        &serde_json::to_string(&declaration.event_subscriptions)
+            .expect("plugin event subscriptions should serialize"),
+    )?;
 
     Ok(())
 }
@@ -386,10 +436,11 @@ fn ensure_match(
 mod tests {
     use super::{LoadedPlugin, NativeDescriptor, NativeLifecycleContext};
     use crate::{
-        ApiVersion, DEFAULT_NATIVE_ENTRY_SYMBOL, HostMetadata, PluginEntrypoint, PluginManifest,
-        PluginRegistry,
+        ApiVersion, DEFAULT_NATIVE_ENTRY_SYMBOL, HostMetadata, PluginEntrypoint, PluginEvent,
+        PluginEventKind, PluginEventSubscription, PluginManifest, PluginRegistry,
     };
     use libloading::Library;
+    use std::collections::BTreeSet;
     use std::ffi::c_char;
 
     const TEST_DESCRIPTOR_TEXT: &str = concat!(
@@ -538,5 +589,77 @@ minimum = "1.0"
         assert!(json.contains("test.plugin"));
         assert!(json.contains("bmux"));
         assert!(json.contains("enabled"));
+    }
+
+    #[test]
+    fn loaded_plugin_filters_events_by_subscription() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "test.plugin"
+name = "Test Plugin"
+version = "0.1.0"
+entry = "unused.dylib"
+
+[[event_subscriptions]]
+kinds = ["system"]
+names = ["server_started"]
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+        )
+        .expect("manifest should parse");
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(std::path::Path::new("plugin.toml"), manifest)
+            .expect("manifest should register");
+
+        #[cfg(unix)]
+        let library = Library::from(libloading::os::unix::Library::this());
+        #[cfg(windows)]
+        let library = Library::from(
+            libloading::os::windows::Library::this().expect("current library should load"),
+        );
+
+        let loaded = LoadedPlugin {
+            registered: registry
+                .get("test.plugin")
+                .expect("plugin should exist")
+                .clone(),
+            declaration: crate::PluginDeclaration {
+                id: crate::PluginId::new("test.plugin").expect("plugin id should parse"),
+                display_name: "Test Plugin".to_string(),
+                plugin_version: "0.1.0".to_string(),
+                plugin_api: crate::VersionRange::at_least(ApiVersion::new(1, 0)),
+                native_abi: crate::VersionRange::at_least(ApiVersion::new(1, 0)),
+                entrypoint: PluginEntrypoint::Native {
+                    symbol: DEFAULT_NATIVE_ENTRY_SYMBOL.to_string(),
+                },
+                description: None,
+                homepage: None,
+                capabilities: BTreeSet::new(),
+                commands: Vec::new(),
+                event_subscriptions: vec![PluginEventSubscription {
+                    kinds: BTreeSet::from([PluginEventKind::System]),
+                    names: BTreeSet::from(["server_started".to_string()]),
+                }],
+                lifecycle: crate::PluginLifecycle::default(),
+            },
+            _library: library,
+        };
+
+        assert!(loaded.receives_event(&PluginEvent {
+            kind: PluginEventKind::System,
+            name: "server_started".to_string(),
+            payload: serde_json::Value::Null,
+        }));
+        assert!(!loaded.receives_event(&PluginEvent {
+            kind: PluginEventKind::System,
+            name: "server_stopping".to_string(),
+            payload: serde_json::Value::Null,
+        }));
     }
 }

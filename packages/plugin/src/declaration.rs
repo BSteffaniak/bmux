@@ -1,6 +1,6 @@
 use crate::{
-    CommandExecutionKind, PluginCapability, PluginCommand, PluginContext, PluginError, Result,
-    VersionRange,
+    CommandExecutionKind, PluginCapability, PluginCommand, PluginContext, PluginError,
+    PluginEventSubscription, Result, VersionRange,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -56,6 +56,8 @@ pub struct PluginDeclaration {
     pub capabilities: BTreeSet<PluginCapability>,
     #[serde(default)]
     pub commands: Vec<PluginCommand>,
+    #[serde(default)]
+    pub event_subscriptions: Vec<PluginEventSubscription>,
     #[serde(default)]
     pub lifecycle: PluginLifecycle,
 }
@@ -173,6 +175,7 @@ mod tests {
                     execution: CommandExecutionKind::HostCallback,
                 },
             ],
+            event_subscriptions: Vec::new(),
             lifecycle: super::PluginLifecycle::default(),
         };
 
@@ -203,6 +206,7 @@ mod tests {
                 arguments: Vec::new(),
                 execution: CommandExecutionKind::RuntimeHook,
             }],
+            event_subscriptions: Vec::new(),
             lifecycle: super::PluginLifecycle::default(),
         };
 

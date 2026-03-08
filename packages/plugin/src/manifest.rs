@@ -1,6 +1,6 @@
 use crate::{
     ApiVersion, PluginCapability, PluginCommand, PluginDeclaration, PluginEntrypoint, PluginError,
-    PluginId, Result, VersionRange,
+    PluginEventSubscription, PluginId, Result, VersionRange,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -61,6 +61,8 @@ pub struct PluginManifest {
     pub capabilities: BTreeSet<PluginCapability>,
     #[serde(default)]
     pub commands: Vec<PluginCommand>,
+    #[serde(default)]
+    pub event_subscriptions: Vec<PluginEventSubscription>,
 }
 
 impl PluginManifest {
@@ -109,6 +111,7 @@ impl PluginManifest {
             homepage: self.homepage.clone(),
             capabilities: self.capabilities.clone(),
             commands: self.commands.clone(),
+            event_subscriptions: self.event_subscriptions.clone(),
             lifecycle: crate::PluginLifecycle::default(),
         };
         declaration.validate()?;
@@ -150,6 +153,10 @@ name = "hello"
 summary = "hello"
 execution = "host_callback"
 
+[[event_subscriptions]]
+kinds = ["system"]
+names = ["server_started"]
+
 [plugin_api]
 minimum = "1.0"
 
@@ -162,5 +169,6 @@ minimum = "1.0"
         assert_eq!(manifest.id, "git.status");
         assert!(manifest.capabilities.contains(&PluginCapability::Commands));
         assert_eq!(manifest.commands.len(), 1);
+        assert_eq!(manifest.event_subscriptions.len(), 1);
     }
 }

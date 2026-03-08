@@ -63,3 +63,6 @@ pub const DEFAULT_NATIVE_ACTIVATE_SYMBOL: &str = "bmux_plugin_activate_v1";
 
 /// Default exported symbol used to deactivate a plugin lifecycle hook.
 pub const DEFAULT_NATIVE_DEACTIVATE_SYMBOL: &str = "bmux_plugin_deactivate_v1";
+
+/// Default exported symbol used to deliver plugin events.
+pub const DEFAULT_NATIVE_EVENT_SYMBOL: &str = "bmux_plugin_handle_event_v1";
