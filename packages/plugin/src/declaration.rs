@@ -1,0 +1,211 @@
+use crate::{
+    CommandExecutionKind, PluginCapability, PluginCommand, PluginContext, PluginError, Result,
+    VersionRange,
+};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct PluginId(String);
+
+impl PluginId {
+    pub fn new(value: impl Into<String>) -> Result<Self> {
+        let value = value.into();
+        if is_valid_plugin_id(&value) {
+            Ok(Self(value))
+        } else {
+            Err(PluginError::InvalidPluginId { id: value })
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        self.0.as_str()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginEntrypoint {
+    Native { symbol: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginLifecycle {
+    #[serde(default = "default_true")]
+    pub activate_on_startup: bool,
+    #[serde(default)]
+    pub receive_events: bool,
+    #[serde(default = "default_true")]
+    pub allow_hot_reload: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginDeclaration {
+    pub id: PluginId,
+    pub display_name: String,
+    pub plugin_version: String,
+    pub plugin_api: VersionRange,
+    pub native_abi: VersionRange,
+    pub entrypoint: PluginEntrypoint,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub homepage: Option<String>,
+    #[serde(default)]
+    pub capabilities: BTreeSet<PluginCapability>,
+    #[serde(default)]
+    pub commands: Vec<PluginCommand>,
+    #[serde(default)]
+    pub lifecycle: PluginLifecycle,
+}
+
+impl PluginDeclaration {
+    /// # Errors
+    ///
+    /// Returns an error when the declaration contains duplicate command names or
+    /// runtime hook commands without a hot-path capability.
+    pub fn validate(&self) -> Result<()> {
+        let mut command_names = BTreeSet::new();
+        for command in &self.commands {
+            if !command_names.insert(command.name.clone()) {
+                return Err(PluginError::DuplicateCommand {
+                    plugin_id: self.id.as_str().to_string(),
+                    command: command.name.clone(),
+                });
+            }
+
+            if matches!(command.execution, CommandExecutionKind::RuntimeHook)
+                && !self
+                    .capabilities
+                    .iter()
+                    .any(|capability| capability.is_hot_path())
+            {
+                return Err(PluginError::UnsupportedCapability {
+                    plugin_id: self.id.as_str().to_string(),
+                    capability: PluginCapability::TerminalInputIntercept,
+                });
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for PluginLifecycle {
+    fn default() -> Self {
+        Self {
+            activate_on_startup: true,
+            receive_events: false,
+            allow_hot_reload: true,
+        }
+    }
+}
+
+pub trait NativePlugin: Send + Sync {
+    fn declaration(&self) -> &PluginDeclaration;
+
+    fn activate(&mut self, _context: &mut PluginContext<'_>) -> Result<()> {
+        Ok(())
+    }
+
+    fn deactivate(&mut self, _context: &mut PluginContext<'_>) -> Result<()> {
+        Ok(())
+    }
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+fn is_valid_plugin_id(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+
+    if !first.is_ascii_lowercase() {
+        return false;
+    }
+
+    chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_' | '.'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{PluginDeclaration, PluginEntrypoint, PluginId};
+    use crate::{ApiVersion, CommandExecutionKind, PluginCapability, PluginCommand, VersionRange};
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn plugin_id_requires_stable_ascii_format() {
+        assert!(PluginId::new("git.status").is_ok());
+        assert!(PluginId::new("GitStatus").is_err());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_commands() {
+        let declaration = PluginDeclaration {
+            id: PluginId::new("example.plugin").expect("id should parse"),
+            display_name: "Example".to_string(),
+            plugin_version: "0.1.0".to_string(),
+            plugin_api: VersionRange::at_least(ApiVersion::new(1, 0)),
+            native_abi: VersionRange::at_least(ApiVersion::new(1, 0)),
+            entrypoint: PluginEntrypoint::Native {
+                symbol: "bmux_plugin_entry_v1".to_string(),
+            },
+            description: None,
+            homepage: None,
+            capabilities: BTreeSet::new(),
+            commands: vec![
+                PluginCommand {
+                    name: "run".to_string(),
+                    summary: "run".to_string(),
+                    description: None,
+                    arguments: Vec::new(),
+                    execution: CommandExecutionKind::HostCallback,
+                },
+                PluginCommand {
+                    name: "run".to_string(),
+                    summary: "again".to_string(),
+                    description: None,
+                    arguments: Vec::new(),
+                    execution: CommandExecutionKind::HostCallback,
+                },
+            ],
+            lifecycle: super::PluginLifecycle::default(),
+        };
+
+        assert!(declaration.validate().is_err());
+    }
+
+    #[test]
+    fn validate_allows_runtime_hook_when_hot_path_capability_exists() {
+        let mut capabilities = BTreeSet::new();
+        capabilities.insert(PluginCapability::TerminalInputIntercept);
+
+        let declaration = PluginDeclaration {
+            id: PluginId::new("example.runtime").expect("id should parse"),
+            display_name: "Runtime".to_string(),
+            plugin_version: "0.1.0".to_string(),
+            plugin_api: VersionRange::at_least(ApiVersion::new(1, 0)),
+            native_abi: VersionRange::at_least(ApiVersion::new(1, 0)),
+            entrypoint: PluginEntrypoint::Native {
+                symbol: "bmux_plugin_entry_v1".to_string(),
+            },
+            description: None,
+            homepage: None,
+            capabilities,
+            commands: vec![PluginCommand {
+                name: "runtime".to_string(),
+                summary: "runtime".to_string(),
+                description: None,
+                arguments: Vec::new(),
+                execution: CommandExecutionKind::RuntimeHook,
+            }],
+            lifecycle: super::PluginLifecycle::default(),
+        };
+
+        assert!(declaration.validate().is_ok());
+    }
+}
