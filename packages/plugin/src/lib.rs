@@ -11,6 +11,7 @@
 mod capability;
 mod command;
 mod declaration;
+mod discovery;
 mod error;
 mod event;
 mod host;
@@ -24,6 +25,10 @@ pub use command::{
 };
 pub use declaration::{
     NativePlugin, PluginDeclaration, PluginEntrypoint, PluginId, PluginLifecycle,
+};
+pub use discovery::{
+    DEFAULT_PLUGIN_MANIFEST_FILE, PluginDiscoveryReport, discover_plugin_manifests,
+    discover_registered_plugins,
 };
 pub use error::{PluginError, Result};
 pub use event::{PluginEvent, PluginEventKind, PluginEventPayload, PluginEventSubscription};

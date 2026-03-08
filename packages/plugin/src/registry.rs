@@ -74,6 +74,16 @@ impl PluginRegistry {
     }
 
     #[must_use]
+    pub fn get(&self, plugin_id: &str) -> Option<&RegisteredPlugin> {
+        self.plugins.get(plugin_id)
+    }
+
+    #[must_use]
+    pub fn plugin_ids(&self) -> Vec<&str> {
+        self.plugins.keys().map(String::as_str).collect()
+    }
+
+    #[must_use]
     pub fn compatibility_report(
         registered_plugin: &RegisteredPlugin,
         host: &HostMetadata,
@@ -92,6 +102,56 @@ impl PluginRegistry {
 
     /// # Errors
     ///
+    /// Returns an error when the plugin is incompatible with the host or when
+    /// its native entry file is missing.
+    pub fn validate_registered_plugin(
+        registered_plugin: &RegisteredPlugin,
+        host: &HostMetadata,
+        supported_capabilities: &[PluginCapability],
+    ) -> Result<()> {
+        let report = Self::compatibility_report(registered_plugin, host);
+        if !report.api_compatible {
+            return Err(PluginError::IncompatibleApiVersion {
+                plugin_id: registered_plugin.declaration.id.as_str().to_string(),
+                required: registered_plugin.declaration.plugin_api.to_string(),
+                host: host.plugin_api_version,
+            });
+        }
+        if !report.abi_compatible {
+            return Err(PluginError::IncompatibleAbiVersion {
+                plugin_id: registered_plugin.declaration.id.as_str().to_string(),
+                required: registered_plugin.declaration.native_abi.to_string(),
+                host: host.plugin_abi_version,
+            });
+        }
+
+        for capability in &registered_plugin.declaration.capabilities {
+            if !supported_capabilities.contains(capability) {
+                return Err(PluginError::UnsupportedCapability {
+                    plugin_id: registered_plugin.declaration.id.as_str().to_string(),
+                    capability: *capability,
+                });
+            }
+        }
+
+        let entry_path = registered_plugin.manifest.resolve_entry_path(
+            registered_plugin
+                .manifest_path
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+        );
+        if !entry_path.exists() {
+            return Err(PluginError::MissingEntryFile {
+                plugin_id: registered_plugin.declaration.id.as_str().to_string(),
+                path: entry_path,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// # Errors
+    ///
     /// Returns an error when any plugin is incompatible with the host or when a
     /// native entry file is missing.
     pub fn validate_against_host(
@@ -100,44 +160,7 @@ impl PluginRegistry {
         supported_capabilities: &[PluginCapability],
     ) -> Result<()> {
         for plugin in self.plugins.values() {
-            let report = Self::compatibility_report(plugin, host);
-            if !report.api_compatible {
-                return Err(PluginError::IncompatibleApiVersion {
-                    plugin_id: plugin.declaration.id.as_str().to_string(),
-                    required: plugin.declaration.plugin_api.to_string(),
-                    host: host.plugin_api_version,
-                });
-            }
-            if !report.abi_compatible {
-                return Err(PluginError::IncompatibleAbiVersion {
-                    plugin_id: plugin.declaration.id.as_str().to_string(),
-                    required: plugin.declaration.native_abi.to_string(),
-                    host: host.plugin_abi_version,
-                });
-            }
-
-            let supported = supported_capabilities.iter().copied().collect::<Vec<_>>();
-            for capability in &plugin.declaration.capabilities {
-                if !supported.contains(capability) {
-                    return Err(PluginError::UnsupportedCapability {
-                        plugin_id: plugin.declaration.id.as_str().to_string(),
-                        capability: *capability,
-                    });
-                }
-            }
-
-            let entry_path = plugin.manifest.resolve_entry_path(
-                plugin
-                    .manifest_path
-                    .parent()
-                    .unwrap_or_else(|| Path::new(".")),
-            );
-            if !entry_path.exists() {
-                return Err(PluginError::MissingEntryFile {
-                    plugin_id: plugin.declaration.id.as_str().to_string(),
-                    path: entry_path,
-                });
-            }
+            Self::validate_registered_plugin(plugin, host, supported_capabilities)?;
         }
 
         Ok(())

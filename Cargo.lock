@@ -58,6 +58,7 @@ dependencies = [
  "bmux_event",
  "bmux_ipc",
  "bmux_keybind",
+ "bmux_plugin",
  "bmux_server",
  "bmux_session",
  "bmux_terminal",

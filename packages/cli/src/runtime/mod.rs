@@ -12,12 +12,16 @@ use crate::status::{AttachTab, build_attach_status_line};
 use anyhow::{Context, Result};
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
 use bmux_clipboard::ClipboardError;
-use bmux_config::{BmuxConfig, ResolvedTimeout, TerminfoAutoInstall};
+use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout, TerminfoAutoInstall};
 use bmux_ipc::{
     AttachViewComponent, PaneFocusDirection, PaneSplitDirection, SessionRole, SessionSelector,
     SessionSummary, WindowSelector,
 };
 use bmux_keybind::action_to_name;
+use bmux_plugin::{
+    CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostMetadata, PluginCapability,
+    PluginManifest, PluginRegistry, discover_plugin_manifests,
+};
 use bmux_server::BmuxServer;
 use clap::Parser;
 use crossterm::cursor::{MoveTo, SavePosition, Show};
@@ -31,6 +35,7 @@ use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
+use tracing::warn;
 use uuid::Uuid;
 
 mod attach;
@@ -65,6 +70,24 @@ const ATTACH_SELECTION_EMPTY_STATUS: &str = "no selection";
 const ATTACH_TRANSIENT_STATUS_TTL: Duration = Duration::from_millis(1800);
 const ATTACH_WELCOME_STATUS_TTL: Duration = Duration::from_millis(2600);
 const HELP_OVERLAY_SURFACE_ID: Uuid = Uuid::from_u128(1);
+const SUPPORTED_PLUGIN_CAPABILITIES: &[PluginCapability] = &[
+    PluginCapability::Commands,
+    PluginCapability::EventSubscription,
+    PluginCapability::KeyActions,
+    PluginCapability::StatusBarItems,
+    PluginCapability::PersistentStorage,
+    PluginCapability::Clipboard,
+    PluginCapability::SessionRead,
+    PluginCapability::SessionWrite,
+    PluginCapability::WindowRead,
+    PluginCapability::WindowWrite,
+    PluginCapability::PaneRead,
+    PluginCapability::PaneWrite,
+    PluginCapability::AttachOverlay,
+    PluginCapability::TerminalProtocolObserve,
+    PluginCapability::TerminalInputIntercept,
+    PluginCapability::TerminalOutputIntercept,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalProfile {
@@ -304,6 +327,8 @@ async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8>
         return Ok(1);
     }
 
+    validate_configured_plugins(&BmuxConfig::load()?, &ConfigPaths::default())?;
+
     if daemon && !foreground_internal {
         let executable =
             std::env::current_exe().context("failed to resolve bmux executable path")?;
@@ -336,6 +361,76 @@ async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8>
     let _ = remove_server_pid_file();
     run_result?;
     Ok(0)
+}
+
+fn plugin_host_metadata() -> HostMetadata {
+    HostMetadata {
+        product_name: "bmux".to_string(),
+        product_version: env!("CARGO_PKG_VERSION").to_string(),
+        plugin_api_version: CURRENT_PLUGIN_API_VERSION,
+        plugin_abi_version: CURRENT_PLUGIN_ABI_VERSION,
+    }
+}
+
+fn validate_configured_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Result<()> {
+    if config.plugins.enabled.is_empty() {
+        return Ok(());
+    }
+
+    let report = discover_plugin_manifests(&paths.plugins_dir())?;
+    let mut registry = PluginRegistry::new();
+    for manifest_path in report.manifest_paths {
+        match PluginManifest::from_path(&manifest_path) {
+            Ok(manifest) => {
+                if let Err(error) = registry.register_manifest(&manifest_path, manifest) {
+                    warn!(
+                        "skipping plugin manifest {} during enabled-plugin scan: {error}",
+                        manifest_path.display()
+                    );
+                }
+            }
+            Err(error) => {
+                warn!(
+                    "skipping unreadable plugin manifest {} during enabled-plugin scan: {error}",
+                    manifest_path.display()
+                );
+            }
+        }
+    }
+
+    validate_enabled_plugins(config, &registry)
+}
+
+fn validate_enabled_plugins(config: &BmuxConfig, registry: &PluginRegistry) -> Result<()> {
+    if config.plugins.enabled.is_empty() {
+        return Ok(());
+    }
+
+    let host = plugin_host_metadata();
+    for plugin_id in &config.plugins.enabled {
+        let plugin = registry.get(plugin_id).with_context(|| {
+            let available = registry.plugin_ids();
+            if available.is_empty() {
+                format!(
+                    "enabled plugin '{plugin_id}' was not found in the configured plugins directory"
+                )
+            } else {
+                format!(
+                    "enabled plugin '{plugin_id}' was not found in the configured plugins directory (available: {})",
+                    available.join(", ")
+                )
+            }
+        })?;
+
+        bmux_plugin::PluginRegistry::validate_registered_plugin(
+            plugin,
+            &host,
+            SUPPORTED_PLUGIN_CAPABILITIES,
+        )
+        .with_context(|| format!("failed validating enabled plugin '{plugin_id}'"))?;
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -4628,18 +4723,39 @@ mod tests {
     use crate::input::InputProcessor;
     use crate::runtime::attach::state::AttachViewState;
     use bmux_client::{AttachLayoutState, AttachOpenInfo, ClientError};
-    use bmux_config::{BmuxConfig, ResolvedTimeout};
+    use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout};
     use bmux_ipc::transport::IpcTransportError;
     use bmux_ipc::{
         AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
         AttachViewComponent, ErrorCode, PaneLayoutNode, PaneSummary, SessionRole, SessionSummary,
     };
+    use bmux_plugin::{PluginManifest, PluginRegistry};
     use crossterm::event::{
         KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
         KeyEventKind as CrosstermKeyEventKind, KeyModifiers,
     };
     use std::collections::BTreeMap;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
     use uuid::Uuid;
+
+    fn temp_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be monotonic for test")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("bmux-cli-plugin-test-{nanos}"));
+        fs::create_dir_all(&dir).expect("temp dir should be created");
+        dir
+    }
+
+    fn plugin_manifest(id: &str, entry: &str) -> PluginManifest {
+        PluginManifest::from_toml_str(&format!(
+            "id = '{id}'\nname = 'Example'\nversion='0.1.0'\nentry='{entry}'\ncapabilities=['commands']\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n"
+        ))
+        .expect("manifest should parse")
+    }
 
     fn attach_view_state_with_scrollback_fixture() -> AttachViewState {
         let pane_id = Uuid::from_u128(11);
@@ -4686,6 +4802,56 @@ mod tests {
         buffer.parser.process(b"one\ntwo\nthree\nfour\nfive\nsix\n");
         view_state.pane_buffers.insert(pane_id, buffer);
         view_state
+    }
+
+    #[test]
+    fn validate_enabled_plugins_accepts_registered_plugin() {
+        let dir = temp_dir();
+        let plugin_dir = dir.join("example");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir should exist");
+        fs::write(plugin_dir.join("example.dylib"), []).expect("entry should be written");
+
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(
+                &plugin_dir.join("plugin.toml"),
+                plugin_manifest("example.plugin", "example.dylib"),
+            )
+            .expect("plugin should register");
+
+        let mut config = BmuxConfig::default();
+        config.plugins.enabled.push("example.plugin".to_string());
+
+        assert!(super::validate_enabled_plugins(&config, &registry).is_ok());
+    }
+
+    #[test]
+    fn validate_enabled_plugins_rejects_missing_plugin() {
+        let mut config = BmuxConfig::default();
+        config.plugins.enabled.push("missing.plugin".to_string());
+
+        let error = super::validate_enabled_plugins(&config, &PluginRegistry::new())
+            .expect_err("validation should fail");
+        assert!(error.to_string().contains("missing.plugin"));
+    }
+
+    #[test]
+    fn validate_configured_plugins_discovers_plugins_from_default_layout() {
+        let dir = temp_dir();
+        let plugin_dir = dir.join("data").join("plugins").join("example");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir should exist");
+        fs::write(plugin_dir.join("example.dylib"), []).expect("entry should be written");
+        fs::write(
+            plugin_dir.join("plugin.toml"),
+            "id = 'example.plugin'\nname = 'Example'\nversion='0.1.0'\nentry='example.dylib'\ncapabilities=['commands']\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n",
+        )
+        .expect("manifest should be written");
+
+        let mut config = BmuxConfig::default();
+        config.plugins.enabled.push("example.plugin".to_string());
+        let paths = ConfigPaths::new(dir.join("config"), dir.join("runtime"), dir.join("data"));
+
+        assert!(super::validate_configured_plugins(&config, &paths).is_ok());
     }
 
     #[test]
