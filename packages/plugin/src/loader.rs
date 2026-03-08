@@ -1,16 +1,26 @@
 use crate::{
-    DEFAULT_NATIVE_COMMAND_SYMBOL, HostMetadata, PluginCapability, PluginDeclaration,
+    DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_COMMAND_SYMBOL,
+    DEFAULT_NATIVE_DEACTIVATE_SYMBOL, HostMetadata, PluginCapability, PluginDeclaration,
     PluginEntrypoint, PluginError, PluginLifecycle, PluginManifestCompatibility, PluginRegistry,
     RegisteredPlugin, Result,
 };
 use libloading::{Library, Symbol};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::ffi::{CStr, CString, c_char};
 use std::path::Path;
 
 type NativeDescriptorFn = unsafe extern "C" fn() -> *const c_char;
 type NativeRunCommandFn = unsafe extern "C" fn(*const c_char, usize, *const *const c_char) -> i32;
+type NativeLifecycleFn = unsafe extern "C" fn(*const c_char) -> i32;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NativeLifecycleContext {
+    pub plugin_id: String,
+    pub host: HostMetadata,
+    #[serde(default)]
+    pub settings: Option<toml::Value>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct NativeDescriptor {
@@ -145,6 +155,42 @@ impl LoadedPlugin {
                 argument_ptrs.as_ptr(),
             )
         })
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the lifecycle symbol cannot be loaded or the
+    /// lifecycle payload cannot be encoded.
+    pub fn activate(&self, context: &NativeLifecycleContext) -> Result<i32> {
+        self.run_lifecycle_symbol(DEFAULT_NATIVE_ACTIVATE_SYMBOL, context)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the lifecycle symbol cannot be loaded or the
+    /// lifecycle payload cannot be encoded.
+    pub fn deactivate(&self, context: &NativeLifecycleContext) -> Result<i32> {
+        self.run_lifecycle_symbol(DEFAULT_NATIVE_DEACTIVATE_SYMBOL, context)
+    }
+
+    fn run_lifecycle_symbol(&self, symbol: &str, context: &NativeLifecycleContext) -> Result<i32> {
+        let payload = CString::new(
+            serde_json::to_string(context).expect("native lifecycle context should serialize"),
+        )
+        .map_err(|_| PluginError::InvalidNativeLifecycleInput {
+            plugin_id: self.declaration.id.as_str().to_string(),
+        })?;
+
+        let lifecycle_symbol: Symbol<'_, NativeLifecycleFn> = unsafe {
+            self._library.get(symbol.as_bytes())
+        }
+        .map_err(|error| PluginError::NativeLifecycleSymbol {
+            plugin_id: self.declaration.id.as_str().to_string(),
+            symbol: symbol.to_string(),
+            details: error.to_string(),
+        })?;
+
+        Ok(unsafe { lifecycle_symbol(payload.as_ptr()) })
     }
 }
 
@@ -338,8 +384,11 @@ fn ensure_match(
 
 #[cfg(test)]
 mod tests {
-    use super::{LoadedPlugin, NativeDescriptor};
-    use crate::{DEFAULT_NATIVE_ENTRY_SYMBOL, PluginEntrypoint, PluginManifest, PluginRegistry};
+    use super::{LoadedPlugin, NativeDescriptor, NativeLifecycleContext};
+    use crate::{
+        ApiVersion, DEFAULT_NATIVE_ENTRY_SYMBOL, HostMetadata, PluginEntrypoint, PluginManifest,
+        PluginRegistry,
+    };
     use libloading::Library;
     use std::ffi::c_char;
 
@@ -470,5 +519,24 @@ minimum = "1.0"
         assert_eq!(loaded.commands().len(), 1);
         assert!(loaded.supports_command("hello"));
         assert!(loaded.run_command("missing", &[]).is_err());
+    }
+
+    #[test]
+    fn lifecycle_context_serializes_settings_and_host() {
+        let context = NativeLifecycleContext {
+            plugin_id: "test.plugin".to_string(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            settings: Some(toml::Value::String("enabled".to_string())),
+        };
+
+        let json = serde_json::to_string(&context).expect("context should serialize");
+        assert!(json.contains("test.plugin"));
+        assert!(json.contains("bmux"));
+        assert!(json.contains("enabled"));
     }
 }

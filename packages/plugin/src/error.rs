@@ -101,6 +101,16 @@ pub enum PluginError {
         field: &'static str,
     },
 
+    #[error("failed to resolve lifecycle symbol '{symbol}' for plugin '{plugin_id}': {details}")]
+    NativeLifecycleSymbol {
+        plugin_id: String,
+        symbol: String,
+        details: String,
+    },
+
+    #[error("plugin '{plugin_id}' lifecycle payload contains interior NUL")]
+    InvalidNativeLifecycleInput { plugin_id: String },
+
     #[error("failed to parse plugin manifest: {0}")]
     ManifestParse(#[from] toml::de::Error),
 

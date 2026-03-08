@@ -19,8 +19,8 @@ use bmux_ipc::{
 };
 use bmux_keybind::action_to_name;
 use bmux_plugin::{
-    CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostMetadata, PluginCapability,
-    PluginManifest, PluginRegistry, discover_plugin_manifests,
+    CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostMetadata, NativeLifecycleContext,
+    PluginCapability, PluginManifest, PluginRegistry, discover_plugin_manifests,
     load_registered_plugin as load_native_registered_plugin,
 };
 use bmux_server::BmuxServer;
@@ -367,11 +367,15 @@ async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8>
         return Ok(0);
     }
 
-    let _loaded_plugins = load_enabled_plugins(&config, &registry)?;
+    let loaded_plugins = load_enabled_plugins(&config, &registry)?;
+    activate_loaded_plugins(&loaded_plugins, &config)?;
     let server = BmuxServer::from_default_paths();
     write_server_pid_file(std::process::id())?;
     write_server_runtime_metadata(std::process::id())?;
     let run_result = server.run().await;
+    if let Err(error) = deactivate_loaded_plugins(&loaded_plugins, &config) {
+        warn!("failed deactivating plugins during server shutdown: {error}");
+    }
     let _ = remove_server_pid_file();
     run_result?;
     Ok(0)
@@ -468,6 +472,71 @@ fn load_enabled_plugins(
     }
 
     Ok(loaded_plugins)
+}
+
+fn plugin_lifecycle_context(config: &BmuxConfig, plugin_id: &str) -> NativeLifecycleContext {
+    NativeLifecycleContext {
+        plugin_id: plugin_id.to_string(),
+        host: plugin_host_metadata(),
+        settings: config.plugins.settings.get(plugin_id).cloned(),
+    }
+}
+
+fn activate_loaded_plugins(
+    loaded_plugins: &[bmux_plugin::LoadedPlugin],
+    config: &BmuxConfig,
+) -> Result<()> {
+    let mut activated: Vec<&bmux_plugin::LoadedPlugin> = Vec::new();
+    for plugin in loaded_plugins {
+        if !plugin.declaration.lifecycle.activate_on_startup {
+            continue;
+        }
+
+        let context = plugin_lifecycle_context(config, plugin.declaration.id.as_str());
+        if let Err(error) = plugin.activate(&context) {
+            for activated_plugin in activated.into_iter().rev() {
+                let context =
+                    plugin_lifecycle_context(config, activated_plugin.declaration.id.as_str());
+                if let Err(deactivate_error) = activated_plugin.deactivate(&context) {
+                    warn!(
+                        "failed rolling back plugin activation for {}: {deactivate_error}",
+                        activated_plugin.declaration.id.as_str()
+                    );
+                }
+            }
+            return Err(error).with_context(|| {
+                format!(
+                    "failed activating plugin '{}'",
+                    plugin.declaration.id.as_str()
+                )
+            });
+        }
+
+        activated.push(plugin);
+    }
+
+    Ok(())
+}
+
+fn deactivate_loaded_plugins(
+    loaded_plugins: &[bmux_plugin::LoadedPlugin],
+    config: &BmuxConfig,
+) -> Result<()> {
+    for plugin in loaded_plugins.iter().rev() {
+        if !plugin.declaration.lifecycle.activate_on_startup {
+            continue;
+        }
+
+        let context = plugin_lifecycle_context(config, plugin.declaration.id.as_str());
+        let _ = plugin.deactivate(&context).with_context(|| {
+            format!(
+                "failed deactivating plugin '{}'",
+                plugin.declaration.id.as_str()
+            )
+        })?;
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -4998,6 +5067,22 @@ mod tests {
         let paths = ConfigPaths::new(dir.join("config"), dir.join("runtime"), dir.join("data"));
 
         assert!(super::validate_configured_plugins(&config, &paths).is_ok());
+    }
+
+    #[test]
+    fn plugin_lifecycle_context_uses_plugin_specific_settings() {
+        let mut config = BmuxConfig::default();
+        config
+            .plugins
+            .settings
+            .insert("example.plugin".to_string(), "configured".into());
+
+        let context = super::plugin_lifecycle_context(&config, "example.plugin");
+        assert_eq!(context.plugin_id, "example.plugin");
+        assert_eq!(
+            context.settings.as_ref().and_then(|value| value.as_str()),
+            Some("configured")
+        );
     }
 
     #[test]

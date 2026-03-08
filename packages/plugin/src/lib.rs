@@ -38,7 +38,10 @@ pub use host::{
     PaneService, PluginContext, PluginHost, PluginStorage, RenderService, SessionHandle,
     SessionService, WindowHandle, WindowService,
 };
-pub use loader::{LoadedPlugin, NativeDescriptor, NativePluginLoader, load_registered_plugin};
+pub use loader::{
+    LoadedPlugin, NativeDescriptor, NativeLifecycleContext, NativePluginLoader,
+    load_registered_plugin,
+};
 pub use manifest::{PluginManifest, PluginManifestCompatibility, PluginRuntime};
 pub use registry::{PluginCompatibilityReport, PluginRegistry, RegisteredPlugin};
 pub use version::{ApiVersion, VersionRange};
@@ -54,3 +57,9 @@ pub const DEFAULT_NATIVE_ENTRY_SYMBOL: &str = "bmux_plugin_entry_v1";
 
 /// Default exported symbol used to invoke a plugin command.
 pub const DEFAULT_NATIVE_COMMAND_SYMBOL: &str = "bmux_plugin_run_command_v1";
+
+/// Default exported symbol used to activate a plugin lifecycle hook.
+pub const DEFAULT_NATIVE_ACTIVATE_SYMBOL: &str = "bmux_plugin_activate_v1";
+
+/// Default exported symbol used to deactivate a plugin lifecycle hook.
+pub const DEFAULT_NATIVE_DEACTIVATE_SYMBOL: &str = "bmux_plugin_deactivate_v1";
