@@ -17,14 +17,23 @@ cargo build -p bmux_example_native_plugin
 
 ## Install For Local Testing
 
-Create a plugin directory under your bmux data directory and copy the manifest:
+Use the helper script:
 
 ```bash
-mkdir -p "$XDG_DATA_HOME/bmux/plugins/example-native"
-cp examples/native-plugin/plugin.toml "$XDG_DATA_HOME/bmux/plugins/example-native/plugin.toml"
+./scripts/install-example-plugin.sh
 ```
 
-The checked-in manifest points at the debug dylib in `target/debug/`, so building the crate is enough for local development.
+This builds the example plugin and writes a generated manifest into your local bmux plugins directory with the correct absolute dylib path for your machine.
+
+Useful variants:
+
+```bash
+./scripts/install-example-plugin.sh --release
+./scripts/install-example-plugin.sh --print-path
+./scripts/install-example-plugin.sh --force
+```
+
+The checked-in `examples/native-plugin/plugin.toml` remains as a reference manifest for the example source tree.
 
 ## Enable In Config
 
