@@ -18,7 +18,7 @@ pub enum PluginError {
     #[error("plugin '{plugin_id}' is missing native entry path")]
     MissingEntryPath { plugin_id: String },
 
-    #[error("plugin '{plugin_id}' entry file does not exist: {}", path.display())]
+    #[error("plugin '{plugin_id}' entry file does not exist: {path:?}")]
     MissingEntryFile { plugin_id: String, path: PathBuf },
 
     #[error("plugin '{plugin_id}' has invalid version range for {field}: {details}")]
@@ -46,6 +46,43 @@ pub enum PluginError {
     UnsupportedCapability {
         plugin_id: String,
         capability: PluginCapability,
+    },
+
+    #[error("failed to load native plugin '{plugin_id}' from {path:?}: {details}")]
+    NativeLibraryLoad {
+        plugin_id: String,
+        path: PathBuf,
+        details: String,
+    },
+
+    #[error("failed to resolve entry symbol '{symbol}' for plugin '{plugin_id}': {details}")]
+    NativeEntrySymbol {
+        plugin_id: String,
+        symbol: String,
+        details: String,
+    },
+
+    #[error("plugin '{plugin_id}' returned a null native descriptor from symbol '{symbol}'")]
+    NullNativeDescriptor { plugin_id: String, symbol: String },
+
+    #[error("plugin '{plugin_id}' returned invalid UTF-8 descriptor text from '{symbol}'")]
+    InvalidNativeDescriptorUtf8 { plugin_id: String, symbol: String },
+
+    #[error("plugin '{plugin_id}' returned invalid native descriptor from '{symbol}': {details}")]
+    InvalidNativeDescriptor {
+        plugin_id: String,
+        symbol: String,
+        details: String,
+    },
+
+    #[error(
+        "plugin '{plugin_id}' descriptor field '{field}' does not match manifest (manifest: {manifest_value}, descriptor: {descriptor_value})"
+    )]
+    NativeDescriptorMismatch {
+        plugin_id: String,
+        field: &'static str,
+        manifest_value: String,
+        descriptor_value: String,
     },
 
     #[error("failed to parse plugin manifest: {0}")]

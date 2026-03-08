@@ -21,6 +21,7 @@ use bmux_keybind::action_to_name;
 use bmux_plugin::{
     CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostMetadata, PluginCapability,
     PluginManifest, PluginRegistry, discover_plugin_manifests,
+    load_registered_plugin as load_native_registered_plugin,
 };
 use bmux_server::BmuxServer;
 use clap::Parser;
@@ -327,7 +328,11 @@ async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8>
         return Ok(1);
     }
 
-    validate_configured_plugins(&BmuxConfig::load()?, &ConfigPaths::default())?;
+    let config = BmuxConfig::load()?;
+    let paths = ConfigPaths::default();
+    let registry = scan_available_plugins(&paths)?;
+    validate_enabled_plugins(&config, &registry)?;
+    let _preloaded_plugins = load_enabled_plugins(&config, &registry)?;
 
     if daemon && !foreground_internal {
         let executable =
@@ -354,6 +359,7 @@ async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8>
         return Ok(0);
     }
 
+    let _loaded_plugins = load_enabled_plugins(&config, &registry)?;
     let server = BmuxServer::from_default_paths();
     write_server_pid_file(std::process::id())?;
     write_server_runtime_metadata(std::process::id())?;
@@ -372,11 +378,13 @@ fn plugin_host_metadata() -> HostMetadata {
     }
 }
 
+#[cfg(test)]
 fn validate_configured_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Result<()> {
-    if config.plugins.enabled.is_empty() {
-        return Ok(());
-    }
+    let registry = scan_available_plugins(paths)?;
+    validate_enabled_plugins(config, &registry)
+}
 
+fn scan_available_plugins(paths: &ConfigPaths) -> Result<PluginRegistry> {
     let report = discover_plugin_manifests(&paths.plugins_dir())?;
     let mut registry = PluginRegistry::new();
     for manifest_path in report.manifest_paths {
@@ -397,8 +405,7 @@ fn validate_configured_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Resu
             }
         }
     }
-
-    validate_enabled_plugins(config, &registry)
+    Ok(registry)
 }
 
 fn validate_enabled_plugins(config: &BmuxConfig, registry: &PluginRegistry) -> Result<()> {
@@ -431,6 +438,28 @@ fn validate_enabled_plugins(config: &BmuxConfig, registry: &PluginRegistry) -> R
     }
 
     Ok(())
+}
+
+fn load_enabled_plugins(
+    config: &BmuxConfig,
+    registry: &PluginRegistry,
+) -> Result<Vec<bmux_plugin::LoadedPlugin>> {
+    if config.plugins.enabled.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let host = plugin_host_metadata();
+    let mut loaded_plugins = Vec::with_capacity(config.plugins.enabled.len());
+    for plugin_id in &config.plugins.enabled {
+        let plugin = registry.get(plugin_id).with_context(|| {
+            format!("enabled plugin '{plugin_id}' disappeared during native load")
+        })?;
+        let loaded = load_native_registered_plugin(plugin, &host, SUPPORTED_PLUGIN_CAPABILITIES)
+            .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"))?;
+        loaded_plugins.push(loaded);
+    }
+
+    Ok(loaded_plugins)
 }
 
 #[derive(Debug, serde::Serialize)]

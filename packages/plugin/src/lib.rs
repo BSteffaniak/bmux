@@ -15,6 +15,7 @@ mod discovery;
 mod error;
 mod event;
 mod host;
+mod loader;
 mod manifest;
 mod registry;
 mod version;
@@ -37,6 +38,7 @@ pub use host::{
     PaneService, PluginContext, PluginHost, PluginStorage, RenderService, SessionHandle,
     SessionService, WindowHandle, WindowService,
 };
+pub use loader::{LoadedPlugin, NativeDescriptor, NativePluginLoader, load_registered_plugin};
 pub use manifest::{PluginManifest, PluginManifestCompatibility, PluginRuntime};
 pub use registry::{PluginCompatibilityReport, PluginRegistry, RegisteredPlugin};
 pub use version::{ApiVersion, VersionRange};
