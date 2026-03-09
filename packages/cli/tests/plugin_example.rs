@@ -386,7 +386,7 @@ fn shipped_permissions_plugin_handles_permissions_command() {
         &data_home,
         &runtime_dir,
         &tmp_dir,
-        &["permissions", "--session", "demo"],
+        &["session", "permissions", "--session", "demo"],
     );
     assert!(
         permissions_output.status.success(),
@@ -438,6 +438,7 @@ fn shipped_permissions_plugin_handles_permissions_command() {
         &runtime_dir,
         &tmp_dir,
         &[
+            "session",
             "grant",
             "--session",
             "demo",
@@ -475,6 +476,28 @@ fn shipped_permissions_plugin_handles_permissions_command() {
         "granted writer role should be visible in permission list"
     );
 
+    let grouped_permissions_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &["permissions", "--session", "demo", "--json"],
+    );
+    assert!(
+        grouped_permissions_output.status.success(),
+        "top-level permissions command should succeed after grant: stdout={} stderr={}",
+        String::from_utf8_lossy(&grouped_permissions_output.stdout),
+        String::from_utf8_lossy(&grouped_permissions_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&grouped_permissions_output.stdout)
+            .contains(&target_client_id.to_string()),
+        "top-level permissions json should include granted client: {}",
+        String::from_utf8_lossy(&grouped_permissions_output.stdout)
+    );
+
     let revoke_output = run_bmux(
         &root,
         &home_dir,
@@ -483,6 +506,7 @@ fn shipped_permissions_plugin_handles_permissions_command() {
         &runtime_dir,
         &tmp_dir,
         &[
+            "session",
             "revoke",
             "--session",
             "demo",

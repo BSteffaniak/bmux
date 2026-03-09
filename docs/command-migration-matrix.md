@@ -49,6 +49,11 @@ These are the first shipped-plugin targets.
 - `session grant`
 - `session revoke`
 
+Current implementation status:
+
+- all 6 command paths now route through the shipped `bmux.permissions` plugin first
+- CLI preserves native command UX and currently falls back to native implementations when the shipped plugin artifact is unavailable
+
 Required host APIs:
 
 - session read
@@ -102,12 +107,11 @@ Likely additional host APIs needed:
 
 ## Migration Order
 
-1. `permissions`
-2. `grant` / `revoke`
-3. session/window/client list helpers
-4. doctor-style diagnostics
-5. window/session lifecycle convenience commands
-6. follow/unfollow and more advanced workflows
+1. `permissions`, `grant`, and `revoke` via `bmux.permissions`
+2. session/window/client list helpers
+3. doctor-style diagnostics
+4. window/session lifecycle convenience commands
+5. follow/unfollow and more advanced workflows
 
 ## Notes
 

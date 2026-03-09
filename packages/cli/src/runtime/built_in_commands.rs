@@ -420,8 +420,8 @@ pub fn built_in_command_by_handler(handler: BuiltInHandlerId) -> BuiltInCliComma
 #[cfg(test)]
 mod tests {
     use super::{
-        BuiltInHandlerId, CoreCommandClass, built_in_cli_commands, built_in_command_by_handler,
-        reserved_built_in_paths,
+        built_in_cli_commands, built_in_command_by_handler, reserved_built_in_paths,
+        BuiltInHandlerId, CoreCommandClass,
     };
 
     #[test]
@@ -452,6 +452,20 @@ mod tests {
     fn permissions_is_marked_plugin_backed_shipped() {
         let command = built_in_command_by_handler(BuiltInHandlerId::Permissions);
         assert_eq!(command.class, CoreCommandClass::PluginBackedShipped);
+    }
+
+    #[test]
+    fn grant_and_revoke_variants_are_marked_plugin_backed_shipped() {
+        for handler in [
+            BuiltInHandlerId::Grant,
+            BuiltInHandlerId::Revoke,
+            BuiltInHandlerId::SessionPermissions,
+            BuiltInHandlerId::SessionGrant,
+            BuiltInHandlerId::SessionRevoke,
+        ] {
+            let command = built_in_command_by_handler(handler);
+            assert_eq!(command.class, CoreCommandClass::PluginBackedShipped);
+        }
     }
 
     #[test]
