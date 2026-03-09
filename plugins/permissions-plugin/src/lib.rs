@@ -6,9 +6,10 @@ use bmux_client::BmuxClient;
 use bmux_config::ConfigPaths;
 use bmux_ipc::{SessionPermissionSummary, SessionRole, SessionSelector};
 use bmux_plugin::{
-    CommandExecutionKind, NativeCommandContext, NativeDescriptor, PluginCapability, PluginCommand,
-    RustPlugin,
+    CommandExecutionKind, HostScope, NativeCommandContext, NativeDescriptor, PluginCommand,
+    PluginFeature, RustPlugin,
 };
+use std::collections::BTreeSet;
 
 #[derive(Default)]
 struct PermissionsPlugin;
@@ -29,7 +30,14 @@ impl RustPlugin for PermissionsPlugin {
             },
             description: Some("Shipped bmux permissions command plugin".to_string()),
             homepage: None,
-            capabilities: [PluginCapability::Commands].into_iter().collect(),
+            required_host_scopes: BTreeSet::from([
+                HostScope::new("bmux.commands").expect("host scope should parse"),
+                HostScope::new("bmux.permissions.read").expect("host scope should parse"),
+                HostScope::new("bmux.permissions.write").expect("host scope should parse"),
+            ]),
+            provided_features: BTreeSet::from([
+                PluginFeature::new("bmux.permissions").expect("plugin feature should parse")
+            ]),
             commands: vec![
                 PluginCommand {
                     name: "permissions".to_string(),

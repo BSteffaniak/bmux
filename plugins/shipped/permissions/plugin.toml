@@ -1,9 +1,14 @@
-capabilities = ["commands"]
-entry        = "libbmux_permissions_plugin.dylib"
-id           = "bmux.permissions"
-name         = "bmux Permissions"
-runtime      = "native"
-version      = "0.0.1-alpha.0"
+entry = "libbmux_permissions_plugin.dylib"
+id = "bmux.permissions"
+name = "bmux Permissions"
+provided_features = ["bmux.permissions"]
+required_host_scopes = [
+    "bmux.commands",
+    "bmux.permissions.read",
+    "bmux.permissions.write",
+]
+runtime = "native"
+version = "0.0.1-alpha.0"
 
 [[commands]]
 execution     = "host_callback"

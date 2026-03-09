@@ -13,7 +13,7 @@ Native-first plugin SDK for bmux.
 
 - Plugin manifest parsing
 - Stable plugin declaration types
-- Capability tiers and risk classification
+- Host scope and plugin feature declaration types
 - Host service traits for plugin-facing integrations
 - Plugin registry and host compatibility validation
 - Native plugin entrypoint metadata constants
@@ -30,7 +30,8 @@ name = "Git Status"
 version = "0.1.0"
 runtime = "native"
 entry = "libgit_status.dylib"
-capabilities = ["commands", "event_subscription"]
+required_host_scopes = ["bmux.commands", "bmux.events.subscribe"]
+provided_features = ["git.status"]
 
 [plugin_api]
 minimum = "1.0"
@@ -45,8 +46,8 @@ The manifest `entry` should point at the installed plugin bundle artifact, typic
 
 ```rust
 use bmux_plugin::{
-    CommandExecutionKind, NativeCommandContext, NativeDescriptor, PluginCapability,
-    PluginCommand, PluginManifestCompatibility, RustPlugin,
+    CommandExecutionKind, HostScope, NativeCommandContext, NativeDescriptor, PluginCommand,
+    PluginFeature, PluginManifestCompatibility, RustPlugin,
 };
 
 #[derive(Default)]
@@ -68,7 +69,12 @@ impl RustPlugin for HelloPlugin {
             },
             description: Some("Small example plugin".to_string()),
             homepage: None,
-            capabilities: [PluginCapability::Commands].into_iter().collect(),
+            required_host_scopes: [HostScope::new("bmux.commands").unwrap()]
+                .into_iter()
+                .collect(),
+            provided_features: [PluginFeature::new("hello.example").unwrap()]
+                .into_iter()
+                .collect(),
             commands: vec![PluginCommand {
                 name: "hello".to_string(),
                 path: Vec::new(),
@@ -80,6 +86,7 @@ impl RustPlugin for HelloPlugin {
                 expose_in_cli: true,
             }],
             event_subscriptions: Vec::new(),
+            dependencies: Vec::new(),
             lifecycle: Default::default(),
         }
     }
@@ -101,7 +108,7 @@ bmux_plugin::export_plugin!(HelloPlugin);
 ## Design Notes
 
 - Prefer plugin-facing DTOs, handles, and service traits over direct access to server internals
-- Treat hot-path runtime hooks as explicit high-risk capabilities
+- Treat hot-path runtime hooks as explicit high-risk host scopes
 - Keep ordinary plugins compatible across bmux releases by stabilizing `bmux_plugin` first
-- Leave room for future non-Rust runtimes by defining manifests and capabilities as host concepts
+- Leave room for future non-Rust runtimes by defining manifests, host scopes, and plugin features as host concepts
 - Keep plugin domain ownership, capability policy, and migration intent in code and tests rather than external markdown planning docs

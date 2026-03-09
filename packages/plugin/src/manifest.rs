@@ -1,6 +1,6 @@
 use crate::{
-    ApiVersion, PluginCapability, PluginCommand, PluginDeclaration, PluginDependency,
-    PluginEntrypoint, PluginError, PluginEventSubscription, PluginId, Result, VersionRange,
+    ApiVersion, HostScope, PluginCommand, PluginDeclaration, PluginDependency, PluginEntrypoint,
+    PluginError, PluginEventSubscription, PluginFeature, PluginId, Result, VersionRange,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -67,7 +67,9 @@ pub struct PluginManifest {
     pub plugin_api: PluginManifestCompatibility,
     pub native_abi: PluginManifestCompatibility,
     #[serde(default)]
-    pub capabilities: BTreeSet<PluginCapability>,
+    pub required_host_scopes: BTreeSet<HostScope>,
+    #[serde(default)]
+    pub provided_features: BTreeSet<PluginFeature>,
     #[serde(default)]
     pub commands: Vec<PluginCommand>,
     #[serde(default)]
@@ -120,7 +122,8 @@ impl PluginManifest {
             },
             description: self.description.clone(),
             homepage: self.homepage.clone(),
-            capabilities: self.capabilities.clone(),
+            required_host_scopes: self.required_host_scopes.clone(),
+            provided_features: self.provided_features.clone(),
             commands: self.commands.clone(),
             event_subscriptions: self.event_subscriptions.clone(),
             dependencies: self
@@ -165,7 +168,7 @@ fn default_dependency_version_req() -> String {
 #[cfg(test)]
 mod tests {
     use super::PluginManifest;
-    use crate::PluginCapability;
+    use crate::HostScope;
 
     #[test]
     fn parses_native_plugin_manifest() {
@@ -176,7 +179,7 @@ name = "Git Status"
 version = "0.1.0"
 runtime = "native"
 entry = "libgit_status.dylib"
-capabilities = ["commands", "event_subscription"]
+required_host_scopes = ["bmux.commands", "bmux.events.subscribe"]
 
 [[commands]]
 name = "hello"
@@ -197,7 +200,11 @@ minimum = "1.0"
         .expect("manifest should parse");
 
         assert_eq!(manifest.id, "git.status");
-        assert!(manifest.capabilities.contains(&PluginCapability::Commands));
+        assert!(
+            manifest
+                .required_host_scopes
+                .contains(&HostScope::new("bmux.commands").expect("scope should parse"))
+        );
         assert_eq!(manifest.commands.len(), 1);
         assert_eq!(manifest.event_subscriptions.len(), 1);
     }

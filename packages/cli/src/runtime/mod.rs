@@ -20,7 +20,7 @@ use bmux_ipc::{
 use bmux_keybind::action_to_name;
 use bmux_plugin::{
     CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
-    NativeCommandContext, NativeLifecycleContext, PluginCapability, PluginEvent, PluginEventKind,
+    HostScope, NativeCommandContext, NativeLifecycleContext, PluginEvent, PluginEventKind,
     PluginManifest, PluginRegistry, load_registered_plugin as load_native_registered_plugin,
 };
 use bmux_server::BmuxServer;
@@ -76,30 +76,35 @@ const ATTACH_SELECTION_EMPTY_STATUS: &str = "no selection";
 const ATTACH_TRANSIENT_STATUS_TTL: Duration = Duration::from_millis(1800);
 const ATTACH_WELCOME_STATUS_TTL: Duration = Duration::from_millis(2600);
 const HELP_OVERLAY_SURFACE_ID: Uuid = Uuid::from_u128(1);
-const SUPPORTED_PLUGIN_CAPABILITIES: &[PluginCapability] = &[
-    PluginCapability::Commands,
-    PluginCapability::EventSubscription,
-    PluginCapability::KeyActions,
-    PluginCapability::StatusBarItems,
-    PluginCapability::PersistentStorage,
-    PluginCapability::Clipboard,
-    PluginCapability::PermissionRead,
-    PluginCapability::PermissionWrite,
-    PluginCapability::SessionRead,
-    PluginCapability::SessionWrite,
-    PluginCapability::WindowRead,
-    PluginCapability::WindowWrite,
-    PluginCapability::PaneRead,
-    PluginCapability::PaneWrite,
-    PluginCapability::FollowRead,
-    PluginCapability::FollowWrite,
-    PluginCapability::PersistenceRead,
-    PluginCapability::PersistenceWrite,
-    PluginCapability::AttachOverlay,
-    PluginCapability::TerminalProtocolObserve,
-    PluginCapability::TerminalInputIntercept,
-    PluginCapability::TerminalOutputIntercept,
-];
+fn supported_plugin_host_scopes() -> Vec<HostScope> {
+    [
+        "bmux.commands",
+        "bmux.events.subscribe",
+        "bmux.key_actions",
+        "bmux.status_bar_items",
+        "bmux.storage",
+        "bmux.clipboard",
+        "bmux.permissions.read",
+        "bmux.permissions.write",
+        "bmux.sessions.read",
+        "bmux.sessions.write",
+        "bmux.windows.read",
+        "bmux.windows.write",
+        "bmux.panes.read",
+        "bmux.panes.write",
+        "bmux.follow.read",
+        "bmux.follow.write",
+        "bmux.persistence.read",
+        "bmux.persistence.write",
+        "bmux.attach.overlay",
+        "bmux.terminal.observe",
+        "bmux.terminal.input_intercept",
+        "bmux.terminal.output_intercept",
+    ]
+    .into_iter()
+    .map(|scope| HostScope::new(scope).expect("supported plugin host scope should parse"))
+    .collect()
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalProfile {
@@ -761,6 +766,7 @@ fn validate_enabled_plugins(config: &BmuxConfig, registry: &PluginRegistry) -> R
     }
 
     let host = plugin_host_metadata();
+    let supported_host_scopes = supported_plugin_host_scopes();
     let ordered_plugins = registry
         .activation_order_for(&config.plugins.enabled)
         .context("enabled plugin dependency graph is invalid")?;
@@ -769,7 +775,7 @@ fn validate_enabled_plugins(config: &BmuxConfig, registry: &PluginRegistry) -> R
         bmux_plugin::PluginRegistry::validate_registered_plugin(
             plugin,
             &host,
-            SUPPORTED_PLUGIN_CAPABILITIES,
+            &supported_host_scopes,
         )
         .with_context(|| format!("failed validating enabled plugin '{plugin_id}'"))?;
     }
@@ -795,13 +801,14 @@ fn load_enabled_plugins(
     }
 
     let host = plugin_host_metadata();
+    let supported_host_scopes = supported_plugin_host_scopes();
     let ordered_plugins = registry
         .activation_order_for(&config.plugins.enabled)
         .context("enabled plugin dependency graph is invalid")?;
     let mut loaded_plugins = Vec::with_capacity(ordered_plugins.len());
     for plugin in ordered_plugins {
         let plugin_id = plugin.declaration.id.as_str();
-        let loaded = load_native_registered_plugin(plugin, &host, SUPPORTED_PLUGIN_CAPABILITIES)
+        let loaded = load_native_registered_plugin(plugin, &host, &supported_host_scopes)
             .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"))?;
         loaded_plugins.push(loaded);
     }
@@ -1013,7 +1020,8 @@ struct PluginListJsonEntry {
     display_name: String,
     version: String,
     enabled: bool,
-    capabilities: Vec<String>,
+    required_host_scopes: Vec<String>,
+    provided_features: Vec<String>,
     commands: Vec<String>,
 }
 
@@ -1033,9 +1041,15 @@ async fn run_plugin_list(as_json: bool) -> Result<u8> {
             display_name: plugin.declaration.display_name.clone(),
             version: plugin.declaration.plugin_version.clone(),
             enabled: enabled.contains(&plugin.declaration.id.as_str().to_string()),
-            capabilities: plugin
+            required_host_scopes: plugin
                 .declaration
-                .capabilities
+                .required_host_scopes
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            provided_features: plugin
+                .declaration
+                .provided_features
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
@@ -1068,8 +1082,11 @@ async fn run_plugin_list(as_json: bool) -> Result<u8> {
             if !entry.commands.is_empty() {
                 println!("  commands: {}", entry.commands.join(", "));
             }
-            if !entry.capabilities.is_empty() {
-                println!("  capabilities: {}", entry.capabilities.join(", "));
+            if !entry.required_host_scopes.is_empty() {
+                println!("  host scopes: {}", entry.required_host_scopes.join(", "));
+            }
+            if !entry.provided_features.is_empty() {
+                println!("  features: {}", entry.provided_features.join(", "));
             }
         }
     }
@@ -1107,7 +1124,7 @@ async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]
     let loaded = load_native_registered_plugin(
         plugin,
         &plugin_host_metadata(),
-        SUPPORTED_PLUGIN_CAPABILITIES,
+        &supported_plugin_host_scopes(),
     )
     .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"))?;
     let context = plugin_command_context(&config, &paths, plugin_id, command_name, args);
@@ -1140,7 +1157,7 @@ async fn try_run_shipped_plugin_command(
     let loaded = load_native_registered_plugin(
         plugin,
         &plugin_host_metadata(),
-        SUPPORTED_PLUGIN_CAPABILITIES,
+        &supported_plugin_host_scopes(),
     )
     .with_context(|| format!("failed loading shipped plugin '{plugin_id}'"))?;
     let context = plugin_command_context(&config, &paths, plugin_id, command_name, args);
@@ -5462,7 +5479,7 @@ mod tests {
 
     fn plugin_manifest(id: &str, entry: &str) -> PluginManifest {
         PluginManifest::from_toml_str(&format!(
-            "id = '{id}'\nname = 'Example'\nversion='0.1.0'\nentry='{entry}'\ncapabilities=['commands']\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n"
+            "id = '{id}'\nname = 'Example'\nversion='0.1.0'\nentry='{entry}'\nrequired_host_scopes=['bmux.commands']\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n"
         ))
         .expect("manifest should parse")
     }
@@ -5553,7 +5570,7 @@ mod tests {
         fs::write(plugin_dir.join("example.dylib"), []).expect("entry should be written");
         fs::write(
             plugin_dir.join("plugin.toml"),
-            "id = 'example.plugin'\nname = 'Example'\nversion='0.1.0'\nentry='example.dylib'\ncapabilities=['commands']\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n",
+            "id = 'example.plugin'\nname = 'Example'\nversion='0.1.0'\nentry='example.dylib'\nrequired_host_scopes=['bmux.commands']\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n",
         )
         .expect("manifest should be written");
 

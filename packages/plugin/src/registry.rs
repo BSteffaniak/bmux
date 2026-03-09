@@ -1,6 +1,4 @@
-use crate::{
-    HostMetadata, PluginCapability, PluginDeclaration, PluginError, PluginManifest, Result,
-};
+use crate::{HostMetadata, HostScope, PluginDeclaration, PluginError, PluginManifest, Result};
 use semver::Version;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -247,7 +245,7 @@ impl PluginRegistry {
     pub fn validate_registered_plugin(
         registered_plugin: &RegisteredPlugin,
         host: &HostMetadata,
-        supported_capabilities: &[PluginCapability],
+        supported_host_scopes: &[HostScope],
     ) -> Result<()> {
         let report = Self::compatibility_report(registered_plugin, host);
         if !report.api_compatible {
@@ -265,11 +263,11 @@ impl PluginRegistry {
             });
         }
 
-        for capability in &registered_plugin.declaration.capabilities {
-            if !supported_capabilities.contains(capability) {
-                return Err(PluginError::UnsupportedCapability {
+        for scope in &registered_plugin.declaration.required_host_scopes {
+            if !supported_host_scopes.contains(scope) {
+                return Err(PluginError::UnsupportedHostScope {
                     plugin_id: registered_plugin.declaration.id.as_str().to_string(),
-                    capability: *capability,
+                    scope: scope.as_str().to_string(),
                 });
             }
         }
@@ -297,11 +295,11 @@ impl PluginRegistry {
     pub fn validate_against_host(
         &self,
         host: &HostMetadata,
-        supported_capabilities: &[PluginCapability],
+        supported_host_scopes: &[HostScope],
     ) -> Result<()> {
         let plugin_ids = self.plugins.keys().cloned().collect::<Vec<_>>();
         for plugin in self.activation_order_for(&plugin_ids)? {
-            Self::validate_registered_plugin(plugin, host, supported_capabilities)?;
+            Self::validate_registered_plugin(plugin, host, supported_host_scopes)?;
         }
 
         Ok(())
@@ -311,7 +309,7 @@ impl PluginRegistry {
 #[cfg(test)]
 mod tests {
     use super::PluginRegistry;
-    use crate::{ApiVersion, HostMetadata, PluginCapability, PluginManifest};
+    use crate::{ApiVersion, HostMetadata, HostScope, PluginManifest};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -364,7 +362,7 @@ id = "git.status"
 name = "Git Status"
 version = "0.1.0"
 entry = "libgit_status.dylib"
-capabilities = ["commands"]
+required_host_scopes = ["bmux.commands"]
 
 [plugin_api]
 minimum = "1.0"
@@ -389,7 +387,10 @@ minimum = "1.0"
         };
 
         registry
-            .validate_against_host(&host, &[PluginCapability::Commands])
+            .validate_against_host(
+                &host,
+                &[HostScope::new("bmux.commands").expect("scope should parse")],
+            )
             .expect("plugin should validate");
     }
 

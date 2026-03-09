@@ -1,4 +1,4 @@
-use crate::{ApiVersion, PluginCapability};
+use crate::ApiVersion;
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -20,6 +20,12 @@ pub enum PluginError {
 
     #[error("plugin '{plugin_id}' has duplicate CLI alias entries for command '{command}'")]
     DuplicatePluginCommandAlias { plugin_id: String, command: String },
+
+    #[error("invalid host scope '{scope}'")]
+    InvalidHostScope { scope: String },
+
+    #[error("invalid plugin feature '{feature}'")]
+    InvalidPluginFeature { feature: String },
 
     #[error("plugin '{plugin_id}' declares duplicate dependency '{dependency_id}'")]
     DuplicatePluginDependency {
@@ -86,11 +92,8 @@ pub enum PluginError {
         host: ApiVersion,
     },
 
-    #[error("plugin '{plugin_id}' requested unsupported capability '{capability}'")]
-    UnsupportedCapability {
-        plugin_id: String,
-        capability: PluginCapability,
-    },
+    #[error("plugin '{plugin_id}' requested unsupported host scope '{scope}'")]
+    UnsupportedHostScope { plugin_id: String, scope: String },
 
     #[error("failed to load native plugin '{plugin_id}' from {path:?}: {details}")]
     NativeLibraryLoad {

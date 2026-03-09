@@ -1,9 +1,14 @@
-capabilities = ["commands", "event_subscription"]
-entry        = "libbmux_example_native_plugin.dylib"
-id           = "example.native"
-name         = "Example Native Plugin"
-runtime      = "native"
-version      = "0.0.1-alpha.0"
+entry = "libbmux_example_native_plugin.dylib"
+id = "example.native"
+name = "Example Native Plugin"
+provided_features = ["example.native"]
+required_host_scopes = [
+    "bmux.commands",
+    "bmux.events.subscribe",
+    "bmux.permissions.read",
+]
+runtime = "native"
+version = "0.0.1-alpha.0"
 
 [[commands]]
 execution = "host_callback"

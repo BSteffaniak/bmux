@@ -6,8 +6,8 @@ use bmux_client::BmuxClient;
 use bmux_config::ConfigPaths;
 use bmux_ipc::SessionSelector;
 use bmux_plugin::{
-    CommandExecutionKind, NativeCommandContext, NativeDescriptor, PluginCapability, PluginCommand,
-    PluginEvent, PluginEventKind, PluginEventSubscription, RustPlugin,
+    CommandExecutionKind, HostScope, NativeCommandContext, NativeDescriptor, PluginCommand,
+    PluginEvent, PluginEventKind, PluginEventSubscription, PluginFeature, RustPlugin,
 };
 use std::collections::BTreeSet;
 
@@ -30,12 +30,14 @@ impl RustPlugin for ExamplePlugin {
             },
             description: Some("Example in-repo native plugin for bmux".to_string()),
             homepage: None,
-            capabilities: [
-                PluginCapability::Commands,
-                PluginCapability::EventSubscription,
-            ]
-            .into_iter()
-            .collect(),
+            required_host_scopes: BTreeSet::from([
+                HostScope::new("bmux.commands").expect("host scope should parse"),
+                HostScope::new("bmux.events.subscribe").expect("host scope should parse"),
+                HostScope::new("bmux.permissions.read").expect("host scope should parse"),
+            ]),
+            provided_features: BTreeSet::from([
+                PluginFeature::new("example.native").expect("plugin feature should parse")
+            ]),
             commands: vec![
                 PluginCommand {
                     name: "hello".to_string(),

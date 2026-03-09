@@ -21,7 +21,7 @@ mod native_exports;
 mod registry;
 mod version;
 
-pub use capability::{PluginCapability, PluginCapabilityTier, PluginRisk};
+pub use capability::{HostScope, PluginFeature};
 pub use command::{
     CommandExecutionKind, PluginCommand, PluginCommandArgument, PluginCommandArgumentKind,
 };

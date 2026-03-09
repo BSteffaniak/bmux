@@ -107,7 +107,8 @@ name = "Example Native Plugin"
 version = "0.0.1-alpha.0"
 runtime = "native"
 entry = "${LIB_PATH}"
-capabilities = ["commands", "event_subscription"]
+required_host_scopes = ["bmux.commands", "bmux.events.subscribe", "bmux.permissions.read"]
+provided_features = ["example.native"]
 
 [[commands]]
 name = "hello"

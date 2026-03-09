@@ -10146,15 +10146,20 @@ mod tests {
         request_id: u64,
         request: Request,
     ) -> Response {
+        let request_debug = format!("{request:?}");
         let payload = encode(&request).expect("request should encode");
         let envelope = Envelope::new(request_id, EnvelopeKind::Request, payload);
-        client
-            .send_envelope(&envelope)
+        tokio::time::timeout(Duration::from_secs(5), client.send_envelope(&envelope))
             .await
+            .unwrap_or_else(|_| {
+                panic!("timed out sending request {request_id} ({request_debug}) to test server")
+            })
             .expect("request send should succeed");
-        let reply = client
-            .recv_envelope()
+        let reply = tokio::time::timeout(Duration::from_secs(5), client.recv_envelope())
             .await
+            .unwrap_or_else(|_| {
+                panic!("timed out waiting for reply to request {request_id} ({request_debug})")
+            })
             .expect("request reply should be received");
         assert_eq!(reply.request_id, request_id);
         decode(&reply.payload).expect("response decode should succeed")
