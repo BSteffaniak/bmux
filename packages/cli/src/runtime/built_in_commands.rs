@@ -5,39 +5,22 @@ pub enum BuiltInHandlerId {
     NewSession,
     ListSessions,
     ListClients,
-    Permissions,
-    Grant,
-    Revoke,
     KillSession,
     KillAllSessions,
     Attach,
     Detach,
-    NewWindow,
-    ListWindows,
-    KillWindow,
-    KillAllWindows,
-    SwitchWindow,
     Follow,
     Unfollow,
     Session,
     SessionNew,
     SessionList,
     SessionClients,
-    SessionPermissions,
-    SessionGrant,
-    SessionRevoke,
     SessionKill,
     SessionKillAll,
     SessionAttach,
     SessionDetach,
     SessionFollow,
     SessionUnfollow,
-    Window,
-    WindowNew,
-    WindowList,
-    WindowKill,
-    WindowKillAll,
-    WindowSwitch,
     Server,
     ServerStart,
     ServerStatus,
@@ -58,7 +41,6 @@ pub enum BuiltInHandlerId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CoreCommandClass {
     CoreNative,
-    PluginBackedShipped,
     PluginBackedLater,
 }
 
@@ -148,27 +130,6 @@ pub fn built_in_cli_commands() -> Vec<BuiltInCliCommand> {
         )
         .with_domain(PluginDomain::Follow),
         BuiltInCliCommand::new(
-            BuiltInHandlerId::Permissions,
-            &["permissions"],
-            "List explicit role assignments for a session",
-            CoreCommandClass::PluginBackedShipped,
-        )
-        .with_domain(PluginDomain::Permissions),
-        BuiltInCliCommand::new(
-            BuiltInHandlerId::Grant,
-            &["grant"],
-            "Grant a role to a client in a session",
-            CoreCommandClass::PluginBackedShipped,
-        )
-        .with_domain(PluginDomain::Permissions),
-        BuiltInCliCommand::new(
-            BuiltInHandlerId::Revoke,
-            &["revoke"],
-            "Revoke explicit role from a client in a session",
-            CoreCommandClass::PluginBackedShipped,
-        )
-        .with_domain(PluginDomain::Permissions),
-        BuiltInCliCommand::new(
             BuiltInHandlerId::KillSession,
             &["kill-session"],
             "Kill a session by name or UUID",
@@ -194,41 +155,6 @@ pub fn built_in_cli_commands() -> Vec<BuiltInCliCommand> {
             "Detach from the current session",
             CoreCommandClass::CoreNative,
         ),
-        BuiltInCliCommand::new(
-            BuiltInHandlerId::NewWindow,
-            &["new-window"],
-            "Create a new window in a session",
-            CoreCommandClass::PluginBackedShipped,
-        )
-        .with_domain(PluginDomain::Windows),
-        BuiltInCliCommand::new(
-            BuiltInHandlerId::ListWindows,
-            &["list-windows"],
-            "List windows for a session",
-            CoreCommandClass::PluginBackedShipped,
-        )
-        .with_domain(PluginDomain::Windows),
-        BuiltInCliCommand::new(
-            BuiltInHandlerId::KillWindow,
-            &["kill-window"],
-            "Kill a window by name, UUID, or active",
-            CoreCommandClass::PluginBackedShipped,
-        )
-        .with_domain(PluginDomain::Windows),
-        BuiltInCliCommand::new(
-            BuiltInHandlerId::KillAllWindows,
-            &["kill-all-windows"],
-            "Kill all windows in a session",
-            CoreCommandClass::PluginBackedShipped,
-        )
-        .with_domain(PluginDomain::Windows),
-        BuiltInCliCommand::new(
-            BuiltInHandlerId::SwitchWindow,
-            &["switch-window"],
-            "Switch active window by name, UUID, or active",
-            CoreCommandClass::PluginBackedShipped,
-        )
-        .with_domain(PluginDomain::Windows),
         BuiltInCliCommand::new(
             BuiltInHandlerId::Follow,
             &["follow"],
@@ -271,27 +197,6 @@ pub fn built_in_cli_commands() -> Vec<BuiltInCliCommand> {
         )
         .with_domain(PluginDomain::Follow),
         BuiltInCliCommand::new(
-            BuiltInHandlerId::SessionPermissions,
-            &["session", "permissions"],
-            "List explicit role assignments for a session",
-            CoreCommandClass::PluginBackedShipped,
-        )
-        .with_domain(PluginDomain::Permissions),
-        BuiltInCliCommand::new(
-            BuiltInHandlerId::SessionGrant,
-            &["session", "grant"],
-            "Grant a role to a client in a session",
-            CoreCommandClass::PluginBackedShipped,
-        )
-        .with_domain(PluginDomain::Permissions),
-        BuiltInCliCommand::new(
-            BuiltInHandlerId::SessionRevoke,
-            &["session", "revoke"],
-            "Revoke explicit role from a client in a session",
-            CoreCommandClass::PluginBackedShipped,
-        )
-        .with_domain(PluginDomain::Permissions),
-        BuiltInCliCommand::new(
             BuiltInHandlerId::SessionKill,
             &["session", "kill"],
             "Kill a session by name or UUID",
@@ -331,47 +236,6 @@ pub fn built_in_cli_commands() -> Vec<BuiltInCliCommand> {
             CoreCommandClass::PluginBackedLater,
         )
         .with_domain(PluginDomain::Follow),
-        BuiltInCliCommand::new(
-            BuiltInHandlerId::Window,
-            &["window"],
-            "Window management commands",
-            CoreCommandClass::CoreNative,
-        ),
-        BuiltInCliCommand::new(
-            BuiltInHandlerId::WindowNew,
-            &["window", "new"],
-            "Create a new window in a session",
-            CoreCommandClass::PluginBackedShipped,
-        )
-        .with_domain(PluginDomain::Windows),
-        BuiltInCliCommand::new(
-            BuiltInHandlerId::WindowList,
-            &["window", "list"],
-            "List windows for a session",
-            CoreCommandClass::PluginBackedShipped,
-        )
-        .with_domain(PluginDomain::Windows),
-        BuiltInCliCommand::new(
-            BuiltInHandlerId::WindowKill,
-            &["window", "kill"],
-            "Kill a window by name, UUID, or active",
-            CoreCommandClass::PluginBackedShipped,
-        )
-        .with_domain(PluginDomain::Windows),
-        BuiltInCliCommand::new(
-            BuiltInHandlerId::WindowKillAll,
-            &["window", "kill-all"],
-            "Kill all windows in a session",
-            CoreCommandClass::PluginBackedShipped,
-        )
-        .with_domain(PluginDomain::Windows),
-        BuiltInCliCommand::new(
-            BuiltInHandlerId::WindowSwitch,
-            &["window", "switch"],
-            "Switch active window by name, UUID, or active",
-            CoreCommandClass::PluginBackedShipped,
-        )
-        .with_domain(PluginDomain::Windows),
         BuiltInCliCommand::new(
             BuiltInHandlerId::Server,
             &["server"],
@@ -471,12 +335,7 @@ pub fn reserved_built_in_paths() -> BTreeSet<Vec<String>> {
     built_in_cli_commands()
         .into_iter()
         .filter(|command| command.class == CoreCommandClass::CoreNative)
-        .filter(|command| {
-            !matches!(
-                command.handler,
-                BuiltInHandlerId::Session | BuiltInHandlerId::Window
-            )
-        })
+        .filter(|command| !matches!(command.handler, BuiltInHandlerId::Session))
         .flat_map(|command| command.all_paths().cloned().collect::<Vec<_>>())
         .collect()
 }
@@ -505,8 +364,8 @@ mod tests {
     fn built_in_table_contains_expected_handler() {
         let commands = built_in_cli_commands();
         assert!(commands.iter().any(|command| {
-            command.handler == BuiltInHandlerId::Permissions
-                && command.canonical_path == vec!["permissions".to_string()]
+            command.handler == BuiltInHandlerId::PluginRun
+                && command.canonical_path == vec!["plugin".to_string(), "run".to_string()]
         }));
     }
 
@@ -520,35 +379,9 @@ mod tests {
     }
 
     #[test]
-    fn permissions_is_marked_plugin_backed_shipped() {
-        let command = built_in_command_by_handler(BuiltInHandlerId::Permissions);
-        assert_eq!(command.class, CoreCommandClass::PluginBackedShipped);
-        assert_eq!(command.domain, Some(PluginDomain::Permissions));
-    }
-
-    #[test]
-    fn grant_and_revoke_variants_are_marked_plugin_backed_shipped() {
-        for handler in [
-            BuiltInHandlerId::Grant,
-            BuiltInHandlerId::Revoke,
-            BuiltInHandlerId::SessionPermissions,
-            BuiltInHandlerId::SessionGrant,
-            BuiltInHandlerId::SessionRevoke,
-        ] {
-            let command = built_in_command_by_handler(handler);
-            assert_eq!(command.class, CoreCommandClass::PluginBackedShipped);
-            assert_eq!(command.domain, Some(PluginDomain::Permissions));
-        }
-    }
-
-    #[test]
     fn future_plugin_domains_are_classified_in_code() {
         assert!(all_plugin_domains().contains(&PluginDomain::Panes));
         assert!(all_plugin_domains().contains(&PluginDomain::Persistence));
-        assert_eq!(
-            built_in_command_by_handler(BuiltInHandlerId::WindowList).domain,
-            Some(PluginDomain::Windows)
-        );
         assert_eq!(
             built_in_command_by_handler(BuiltInHandlerId::SessionList).domain,
             Some(PluginDomain::Sessions)
@@ -560,22 +393,35 @@ mod tests {
     }
 
     #[test]
-    fn windows_variants_are_marked_plugin_backed_shipped() {
-        for handler in [
-            BuiltInHandlerId::NewWindow,
-            BuiltInHandlerId::ListWindows,
-            BuiltInHandlerId::KillWindow,
-            BuiltInHandlerId::KillAllWindows,
-            BuiltInHandlerId::SwitchWindow,
-            BuiltInHandlerId::WindowNew,
-            BuiltInHandlerId::WindowList,
-            BuiltInHandlerId::WindowKill,
-            BuiltInHandlerId::WindowKillAll,
-            BuiltInHandlerId::WindowSwitch,
+    fn migrated_plugin_owned_commands_are_not_in_core_execution_table() {
+        let paths = built_in_cli_commands()
+            .into_iter()
+            .map(|command| command.canonical_path)
+            .collect::<Vec<_>>();
+        for removed in [
+            vec!["permissions".to_string()],
+            vec!["grant".to_string()],
+            vec!["revoke".to_string()],
+            vec!["session".to_string(), "permissions".to_string()],
+            vec!["session".to_string(), "grant".to_string()],
+            vec!["session".to_string(), "revoke".to_string()],
+            vec!["new-window".to_string()],
+            vec!["list-windows".to_string()],
+            vec!["kill-window".to_string()],
+            vec!["kill-all-windows".to_string()],
+            vec!["switch-window".to_string()],
+            vec!["window".to_string()],
+            vec!["window".to_string(), "new".to_string()],
+            vec!["window".to_string(), "list".to_string()],
+            vec!["window".to_string(), "kill".to_string()],
+            vec!["window".to_string(), "kill-all".to_string()],
+            vec!["window".to_string(), "switch".to_string()],
         ] {
-            let command = built_in_command_by_handler(handler);
-            assert_eq!(command.class, CoreCommandClass::PluginBackedShipped);
-            assert_eq!(command.domain, Some(PluginDomain::Windows));
+            assert!(
+                !paths.contains(&removed),
+                "migrated plugin-owned command path {:?} should not remain in core command table",
+                removed
+            );
         }
     }
 
