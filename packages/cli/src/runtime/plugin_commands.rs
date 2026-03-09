@@ -1,3 +1,4 @@
+use super::built_in_commands::reserved_built_in_paths;
 use anyhow::{Result, bail};
 use bmux_config::BmuxConfig;
 use bmux_plugin::PluginRegistry;
@@ -169,65 +170,6 @@ fn validate_prefix_collision(
 
 fn is_prefix_collision(left: &[String], right: &[String]) -> bool {
     left != right && (left.starts_with(right) || right.starts_with(left))
-}
-
-fn reserved_built_in_paths() -> BTreeSet<Vec<String>> {
-    [
-        vec!["new-session"],
-        vec!["list-sessions"],
-        vec!["list-clients"],
-        vec!["permissions"],
-        vec!["grant"],
-        vec!["revoke"],
-        vec!["kill-session"],
-        vec!["kill-all-sessions"],
-        vec!["attach"],
-        vec!["detach"],
-        vec!["new-window"],
-        vec!["list-windows"],
-        vec!["kill-window"],
-        vec!["kill-all-windows"],
-        vec!["switch-window"],
-        vec!["follow"],
-        vec!["unfollow"],
-        vec!["session"],
-        vec!["session", "new"],
-        vec!["session", "list"],
-        vec!["session", "clients"],
-        vec!["session", "permissions"],
-        vec!["session", "grant"],
-        vec!["session", "revoke"],
-        vec!["session", "kill"],
-        vec!["session", "kill-all"],
-        vec!["session", "attach"],
-        vec!["session", "detach"],
-        vec!["session", "follow"],
-        vec!["session", "unfollow"],
-        vec!["window"],
-        vec!["window", "new"],
-        vec!["window", "list"],
-        vec!["window", "kill"],
-        vec!["window", "kill-all"],
-        vec!["window", "switch"],
-        vec!["server"],
-        vec!["server", "start"],
-        vec!["server", "status"],
-        vec!["server", "whoami-principal"],
-        vec!["server", "save"],
-        vec!["server", "restore"],
-        vec!["server", "stop"],
-        vec!["keymap"],
-        vec!["keymap", "doctor"],
-        vec!["terminal"],
-        vec!["terminal", "doctor"],
-        vec!["terminal", "install-terminfo"],
-        vec!["plugin"],
-        vec!["plugin", "list"],
-        vec!["plugin", "run"],
-    ]
-    .into_iter()
-    .map(|path| path.into_iter().map(str::to_string).collect())
-    .collect()
 }
 
 #[cfg(test)]

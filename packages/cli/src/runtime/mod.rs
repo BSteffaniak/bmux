@@ -40,6 +40,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 mod attach;
+mod built_in_commands;
 mod plugin_commands;
 mod plugin_host;
 mod terminal_protocol;
