@@ -3,57 +3,31 @@
 [![Rust](https://github.com/BSteffaniak/bmux/workflows/Rust/badge.svg)](https://github.com/BSteffaniak/bmux/actions)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](https://opensource.org/licenses/MPL-2.0)
 
-> **⚠️ Work in Progress**: bmux is currently in early development. The core architecture has been established, but most user-facing features are planned but not yet implemented.
+> **Work in Progress**: bmux is in active development. The architecture is moving quickly, and the current CLI surface is already usable while the broader experience continues to take shape.
 
-**bmux** is a modern, high-performance terminal multiplexer written in Rust. Designed as a powerful alternative to tmux, bmux introduces innovative features like multi-client session sharing with independent views, advanced modal interactions, and extensible plugin architecture.
+**bmux** is a modern terminal multiplexer written in Rust, built for flexible multi-client workflows, modal interaction, and deep customization. bmux is plugin-driven by design, making extensibility a first-class part of the product rather than an afterthought.
 
-## ✅ Current Status
+## Why bmux
 
-- **Development Infrastructure**: Modular architecture with strict code quality standards
-- **Local IPC Foundation**: Versioned client/server protocol with cross-platform endpoint abstraction
-- **CLI Server Management**: Foreground/daemon server lifecycle commands with graceful stop + fallback
-- **Session Command Surface**: Top-level and grouped session commands are available
+- Multi-client sessions with independent views
+- Modal, keyboard-driven interaction
+- Plugin-driven extensibility and customization
+- A modern Rust implementation focused on performance and reliability
+- A server-backed CLI built for reusable session workflows
 
-## 🚀 Key (planned) Features
+## Extensibility
 
-### Multi-Client Architecture
+Extensibility in bmux is built in, not bolted on.
 
-- **Simultaneous Multi-Client Access**: Multiple clients can connect to the same session simultaneously
-- **Independent Views**: Each client can view different panes/windows within the same session (unlike tmux)
-- **Client Following**: Optional client synchronization where one client can follow another's view
-- **Session Isolation**: Robust session management with proper client isolation
+Plugins are not an afterthought in bmux - they are part of the architecture and part of how bmux works. That makes bmux flexible to adapt, easier to customize, and better suited for workflows that do not fit a one-size-fits-all terminal multiplexer.
 
-### Advanced Terminal Management
+## Current Status
 
-- **Split Panes**: Flexible horizontal and vertical pane splitting with intuitive resizing
-- **Multiple Windows**: Organize work across multiple virtual windows within sessions
-- **Session Management**: Create, switch, and manage multiple named sessions
-- **Cross-Platform**: Native support for Linux, macOS, and Windows
+Today, bmux includes a working server-backed CLI, session and window management workflows, multi-client foundations, diagnostics, and plugin-driven extensibility. It is still early, but it is no longer just a skeleton or roadmap.
 
-### Performance & Reliability
+## Installation
 
-- **Rust-Powered**: Built with Rust for maximum performance and memory safety
-- **Zero-Copy Operations**: Optimized data handling for minimal latency
-- **Efficient Rendering**: Smart terminal rendering with minimal screen updates
-- **Low Resource Usage**: Designed for efficiency even with many concurrent sessions
-
-### User Experience
-
-- **Modal Interactions**: Vim-inspired interface with Normal mode as default (unlike tmux's prefix-key approach)
-- **Customizable**: Extensive configuration options and theming support
-
-### Extensibility
-
-- **Plugin System**: Planned plugin architecture for future extensibility
-- **Scriptable**: Automation support through built-in scripting capabilities
-- **Event System**: Hook into session events for custom workflows
-- **API Integration**: RESTful API for external tool integration
-
-## 📦 Installation
-
-### Development Build
-
-Since bmux is in early development, installation is currently only available by building from source:
+bmux is currently installed by building from source:
 
 ```bash
 git clone https://github.com/BSteffaniak/bmux.git
@@ -62,149 +36,56 @@ cargo build --all-targets
 cargo test --all-targets
 ```
 
-### Development Tools
+## Current CLI Workflow
 
-For active development, install additional tools:
-
-```bash
-# Install development dependencies
-cargo install cargo-watch
-
-# Continuous checking during development
-cargo watch -x check
-
-# Run clippy for code quality
-cargo clippy --all-targets --all-features
-
-# Format code consistently
-cargo fmt
-```
-
-## 🛠️ Development
-
-## 🧭 Current CLI Workflow
-
-The current CLI supports both top-level and grouped session commands with identical behavior.
-
-Running `bmux` with no subcommand is server-backed by default:
-
-- starts the server automatically (daemon mode) if needed
-- reuses an existing session when available
-- creates `session-1` (or next `session-N`) when no sessions exist, then attaches
+The current CLI is server-backed by default. Running `bmux` with no subcommand starts or reuses a server, creates a session when needed, and attaches.
 
 ```bash
-# Start server in foreground (default)
+# Start or inspect the server
 bmux server start
-
-# Start server in background daemon mode
-bmux server start --daemon
-
-# Check server status and stop gracefully
 bmux server status
-bmux server status --json
-bmux server whoami-principal
-bmux server save
-bmux server restore --dry-run
-bmux server restore --yes
 bmux server stop
 
-# Create/list/attach/kill sessions (top-level)
+# Create and attach sessions
 bmux new-session dev
 bmux list-sessions
-bmux list-sessions --json
 bmux attach dev
-bmux attach --follow 550e8400-e29b-41d4-a716-446655440000 --global
-bmux kill-session dev
-bmux kill-session dev --force-local
-bmux kill-all-sessions
-bmux kill-all-sessions --force-local
 
-# Window lifecycle (top-level)
-bmux new-window --session dev --name editor
-bmux list-windows --session dev
-bmux switch-window active --session dev
-bmux kill-window active --session dev
-bmux kill-window active --session dev --force-local
-bmux kill-all-windows --session dev
-bmux kill-all-windows --session dev --force-local
-
-# Follow controls (top-level)
-bmux list-clients
-bmux permissions --session dev
-bmux permissions --session dev --watch
-bmux grant --session dev --client 550e8400-e29b-41d4-a716-446655440000 --role writer
-bmux revoke --session dev --client 550e8400-e29b-41d4-a716-446655440000
-bmux follow 550e8400-e29b-41d4-a716-446655440000 --global
-bmux unfollow
-
-# Same operations via grouped aliases
-bmux session new dev
-bmux session list
-bmux session list --json
-bmux session attach dev
-bmux session attach --follow 550e8400-e29b-41d4-a716-446655440000 --global
-bmux session kill dev
-bmux session kill dev --force-local
-bmux session kill-all
-bmux session kill-all --force-local
-bmux session detach
+# Work with windows
 bmux window new --session dev --name editor
 bmux window list --session dev
-bmux window switch active --session dev
-bmux window kill active --session dev
-bmux window kill active --session dev --force-local
-bmux window kill-all --session dev
-bmux window kill-all --session dev --force-local
 
-# Force-local is authorized only for the server owner principal
-bmux server whoami-principal --json
-bmux session clients
-bmux session permissions --session dev
-bmux session permissions --session dev --watch
-bmux session grant --session dev --client 550e8400-e29b-41d4-a716-446655440000 --role writer
-bmux session revoke --session dev --client 550e8400-e29b-41d4-a716-446655440000
-bmux session follow 550e8400-e29b-41d4-a716-446655440000 --global
-bmux session unfollow
+# Multi-client collaboration
+bmux list-clients
+bmux follow <client-uuid>
+bmux unfollow
 ```
+
+Top-level and grouped command forms are supported in many areas of the CLI.
 
 All list commands with `--json` output a bare JSON array.
 
-Role policy: `owner` controls session/window mutations and role changes, `writer` can send attach input, and `observer` is read-only.
+Role policy: `owner` controls session and window mutations plus role changes, `writer` can send attach input, and `observer` is read-only.
 
-### Server stop behavior
+## Development
 
-`bmux server stop` uses graceful IPC shutdown first. If that times out, it falls back to PID-based termination.
-`bmux server restore --yes` applies replace semantics: current in-memory server state is cleared and replaced from snapshot.
-
-### Troubleshooting stale PID state
-
-If daemon startup/stop was interrupted, stale PID state can remain under the runtime directory (`$XDG_RUNTIME_DIR/bmux/server.pid` on most Linux setups, or temp-dir based equivalents). The CLI auto-cleans stale PID files when it can prove the process is gone, but you can remove the file manually if needed.
-
-### Building from Source
+Useful commands:
 
 ```bash
-git clone https://github.com/BSteffaniak/bmux.git
-cd bmux
-cargo build --release
-```
-
-### Running Tests
-
-```bash
+cargo check
 cargo test --all
+cargo clippy --all-targets --all-features
+cargo fmt
 ```
 
-### Development Setup
+For active development:
 
 ```bash
-# Install development dependencies
-cargo install cargo-watch cargo-audit
-
-# Run in development mode with auto-reload
-cargo watch -x 'run --bin bmux'
+cargo install cargo-watch
+cargo watch -x check
 ```
 
-### Nix + direnv Setup
+### Nix + direnv
 
 If you use Nix, bmux provides a flake-based development shell:
 
@@ -218,6 +99,6 @@ To automatically load the shell when entering the repository:
 direnv allow
 ```
 
-## 📄 License
+## License
 
 bmux is licensed under the [Mozilla Public License 2.0](LICENSE).
