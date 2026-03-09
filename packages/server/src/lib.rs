@@ -1888,6 +1888,29 @@ impl SessionRuntimeManager {
         })
     }
 
+    fn active_pane_exited(
+        &self,
+        session_id: SessionId,
+        client_id: ClientId,
+    ) -> Result<bool, SessionRuntimeError> {
+        let session = self
+            .runtimes
+            .get(&session_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        if !session.attached_clients.contains(&client_id) {
+            return Err(SessionRuntimeError::NotAttached);
+        }
+        let window = session
+            .windows
+            .get(&session.active_window)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        let pane = window
+            .panes
+            .get(&window.focused_pane_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        Ok(pane.exited.load(Ordering::SeqCst))
+    }
+
     fn attach_snapshot_state(
         &self,
         session_id: SessionId,
@@ -1952,7 +1975,7 @@ impl SessionRuntimeManager {
         pane_ids: &[Uuid],
         max_bytes: usize,
     ) -> Result<Vec<AttachPaneChunk>, SessionRuntimeError> {
-        let (chunks, closed_active, closed_non_active) = {
+        let (chunks, closed_active) = {
             let session = self
                 .runtimes
                 .get_mut(&session_id)
@@ -1967,7 +1990,6 @@ impl SessionRuntimeManager {
 
             let mut chunks = Vec::new();
             let mut closed_active = false;
-            let mut closed_non_active = Vec::new();
             for pane_id in pane_ids {
                 let Some(pane) = window.panes.get_mut(pane_id) else {
                     continue;
@@ -1981,8 +2003,6 @@ impl SessionRuntimeManager {
                 if pane.exited.load(Ordering::SeqCst) {
                     if *pane_id == window.focused_pane_id {
                         closed_active = true;
-                    } else {
-                        closed_non_active.push(*pane_id);
                     }
                 }
                 chunks.push(AttachPaneChunk {
@@ -1990,12 +2010,8 @@ impl SessionRuntimeManager {
                     data,
                 });
             }
-            (chunks, closed_active, closed_non_active)
+            (chunks, closed_active)
         };
-
-        for pane_id in closed_non_active {
-            let _ = self.close_pane(session_id, Some(PaneSelector::ById(pane_id)));
-        }
 
         if closed_active {
             return Err(SessionRuntimeError::Closed);
@@ -5244,6 +5260,44 @@ async fn handle_request(
                     message: format!("session runtime not found: {}", session_id.0),
                 }));
             }
+            let active_pane_exited = {
+                let runtime_manager = state
+                    .session_runtimes
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+                runtime_manager.active_pane_exited(session_id, client_id)
+            };
+            match active_pane_exited {
+                Ok(true) => {
+                    let _ = reap_closed_active_pane(
+                        state,
+                        session_id,
+                        client_id,
+                        selected_session,
+                        attached_stream_session,
+                    )
+                    .await;
+                }
+                Ok(false) => {}
+                Err(SessionRuntimeError::NotFound) => {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::NotFound,
+                        message: format!("session runtime not found: {}", session_id.0),
+                    }));
+                }
+                Err(SessionRuntimeError::NotAttached) => {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::InvalidRequest,
+                        message: "client is not attached to session runtime".to_string(),
+                    }));
+                }
+                Err(SessionRuntimeError::Closed) => {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::NotFound,
+                        message: "active pane is closed".to_string(),
+                    }));
+                }
+            }
             let state_snapshot = {
                 let runtime_manager = state
                     .session_runtimes
@@ -5757,7 +5811,7 @@ async fn send_response(
 
 #[cfg(test)]
 mod tests {
-    use super::{BmuxServer, resolve_session_id};
+    use super::{BmuxServer, reap_exited_pane, resolve_session_id};
     use bmux_config::ConfigPaths;
     use bmux_ipc::transport::LocalIpcStream;
     use bmux_ipc::{
@@ -8701,22 +8755,16 @@ mod tests {
             )
         }));
 
-        let accepted = send_request(
-            &mut actor,
-            947,
-            Request::AttachInput {
-                session_id,
-                data: b"exit\n".to_vec(),
-            },
-        )
-        .await;
+        let accepted = send_request(&mut actor, 947, Request::AttachLayout { session_id }).await;
         assert!(matches!(
             accepted,
-            Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
+            Response::Ok(ResponsePayload::AttachLayout { .. })
         ));
 
-        let exit_events = poll_events_collect(&mut observer, 948, 16, 40).await;
-        assert!(exit_events.iter().any(|event| {
+        let exited_pane_id = reap_focused_attached_pane(&server, session_id).await;
+
+        let exit_events = poll_events_collect(&mut observer, 948, 16, 1).await;
+        let saw_scene_refresh = exit_events.iter().any(|event| {
             matches!(
                 event,
                 Event::AttachViewChanged {
@@ -8726,10 +8774,140 @@ mod tests {
                 } if *changed_session == session_id
                     && components.contains(&AttachViewComponent::Scene)
             )
-        }));
+        });
+
+        assert!(
+            saw_scene_refresh,
+            "expected attach scene refresh after exiting split pane"
+        );
+        let layout = send_request(&mut actor, 949, Request::AttachLayout { session_id }).await;
+        let (focused_pane_id, panes) = match layout {
+            Response::Ok(ResponsePayload::AttachLayout {
+                focused_pane_id,
+                panes,
+                ..
+            }) => (focused_pane_id, panes),
+            other => panic!("unexpected attach layout response: {other:?}"),
+        };
+        assert_eq!(exited_pane_id, split_pane_id);
+        assert_eq!(panes[0].id, focused_pane_id);
+        assert_eq!(panes.len(), 1);
+
+        stop_server(server, server_task, &socket_path).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn attached_split_pane_exit_via_pty_eventually_updates_attach_layout() {
+        let shell_path = write_test_shell_script(
+            "pty-exit-smoke",
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  if [ \"$line\" = \"__bmux_ready__\" ]; then\n    printf '__bmux_ready__\\n'\n  elif [ \"$line\" = \"__bmux_exit__\" ]; then\n    printf '__bmux_exit__\\n'\n    exit 0\n  fi\ndone\n",
+        );
+        let (server, endpoint, socket_path, server_task) =
+            start_server_with_shell(&shell_path).await;
+        let mut actor = connect_and_handshake(&endpoint).await;
+
+        let session_id = match send_request(
+            &mut actor,
+            980,
+            Request::NewSession {
+                name: Some("pane-exit-pty-smoke".to_string()),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            other => panic!("unexpected session create response: {other:?}"),
+        };
+
+        let grant = match send_request(
+            &mut actor,
+            981,
+            Request::Attach {
+                selector: SessionSelector::ById(session_id),
+            },
+        )
+        .await
+        {
+            Response::Ok(ResponsePayload::Attached { grant }) => grant,
+            other => panic!("unexpected attach grant response: {other:?}"),
+        };
+        let opened = send_request(
+            &mut actor,
+            982,
+            Request::AttachOpen {
+                session_id,
+                attach_token: grant.attach_token,
+            },
+        )
+        .await;
+        assert!(matches!(
+            opened,
+            Response::Ok(ResponsePayload::AttachReady {
+                session_id: attached_session,
+                ..
+            }) if attached_session == session_id
+        ));
+
+        let split = send_request(
+            &mut actor,
+            983,
+            Request::SplitPane {
+                session: Some(SessionSelector::ById(session_id)),
+                target: None,
+                direction: PaneSplitDirection::Horizontal,
+            },
+        )
+        .await;
+        let split_pane_id = match split {
+            Response::Ok(ResponsePayload::PaneSplit { id, .. }) => id,
+            other => panic!("unexpected split response: {other:?}"),
+        };
+
+        let ready_input = send_request(
+            &mut actor,
+            984,
+            Request::AttachInput {
+                session_id,
+                data: b"__bmux_ready__\n".to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            ready_input,
+            Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
+        ));
+
+        let ready_output =
+            collect_attach_output_until(&mut actor, session_id, "__bmux_ready__", 20).await;
+        assert!(
+            ready_output.contains("__bmux_ready__"),
+            "split pane should echo readiness sentinel before exit: {ready_output}"
+        );
+
+        let exit_input = send_request(
+            &mut actor,
+            985,
+            Request::AttachInput {
+                session_id,
+                data: b"__bmux_exit__\n".to_vec(),
+            },
+        )
+        .await;
+        assert!(matches!(
+            exit_input,
+            Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
+        ));
+
+        let exit_output =
+            collect_attach_output_until(&mut actor, session_id, "__bmux_exit__", 20).await;
+        assert!(
+            exit_output.contains("__bmux_exit__"),
+            "split pane should echo exit sentinel before layout collapse: {exit_output}"
+        );
 
         let mut final_layout = None;
-        for request_id in 949..=960 {
+        for request_id in 986..=1066 {
             let layout =
                 send_request(&mut actor, request_id, Request::AttachLayout { session_id }).await;
             if let Response::Ok(ResponsePayload::AttachLayout {
@@ -8744,12 +8922,14 @@ mod tests {
             }
             sleep(Duration::from_millis(25)).await;
         }
+
         let (focused_pane_id, panes) =
-            final_layout.expect("attach layout should collapse to one pane after exit");
+            final_layout.expect("attach layout should collapse to one pane after pty exit");
         assert_ne!(focused_pane_id, split_pane_id);
         assert_eq!(panes[0].id, focused_pane_id);
 
         stop_server(server, server_task, &socket_path).await;
+        let _ = std::fs::remove_file(shell_path);
     }
 
     #[cfg(unix)]
@@ -9881,6 +10061,26 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn start_server_with_shell(
+        shell: &std::path::Path,
+    ) -> (
+        BmuxServer,
+        IpcEndpoint,
+        std::path::PathBuf,
+        tokio::task::JoinHandle<anyhow::Result<()>>,
+    ) {
+        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let mut runtime_manager = server
+            .state
+            .session_runtimes
+            .lock()
+            .expect("session runtime manager lock should not be poisoned");
+        runtime_manager.shell = shell.display().to_string();
+        drop(runtime_manager);
+        (server, endpoint, socket_path, server_task)
+    }
+
+    #[cfg(unix)]
     async fn start_server_from_paths(
         paths: &ConfigPaths,
     ) -> (BmuxServer, tokio::task::JoinHandle<anyhow::Result<()>>) {
@@ -9892,6 +10092,21 @@ mod tests {
     #[cfg(unix)]
     async fn connect_and_handshake(endpoint: &IpcEndpoint) -> LocalIpcStream {
         connect_and_handshake_with_principal(endpoint, Uuid::new_v4()).await
+    }
+
+    #[cfg(unix)]
+    fn write_test_shell_script(name: &str, contents: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = std::env::temp_dir().join(format!("bmux-server-{name}-{}.sh", Uuid::new_v4()));
+        std::fs::write(&path, contents).expect("test shell script should be written");
+        let mut permissions = std::fs::metadata(&path)
+            .expect("test shell script metadata should exist")
+            .permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&path, permissions)
+            .expect("test shell script should be executable");
+        path
     }
 
     #[cfg(unix)]
@@ -10064,6 +10279,35 @@ mod tests {
             sleep(Duration::from_millis(25)).await;
         }
         collected
+    }
+
+    #[cfg(unix)]
+    async fn reap_focused_attached_pane(server: &BmuxServer, session_id: Uuid) -> Uuid {
+        let pane_id = {
+            let runtime_manager = server
+                .state
+                .session_runtimes
+                .lock()
+                .expect("session runtime manager lock should not be poisoned");
+            let runtime = runtime_manager
+                .runtimes
+                .get(&SessionId(session_id))
+                .expect("session runtime should exist");
+            let window = runtime
+                .windows
+                .get(&runtime.active_window)
+                .expect("active window should exist");
+            assert!(
+                !runtime.attached_clients.is_empty(),
+                "session should have attached clients before deterministic pane reap"
+            );
+            window.focused_pane_id
+        };
+
+        reap_exited_pane(&server.state, SessionId(session_id), pane_id)
+            .await
+            .expect("focused attached pane reap should succeed");
+        pane_id
     }
 
     #[cfg(unix)]
