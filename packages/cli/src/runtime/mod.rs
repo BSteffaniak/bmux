@@ -1133,6 +1133,19 @@ async fn try_run_shipped_plugin_command(
     Ok(Some(status.clamp(0, i32::from(u8::MAX)) as u8))
 }
 
+async fn require_shipped_plugin_command(
+    plugin_id: &str,
+    command_name: &str,
+    args: &[String],
+) -> Result<u8> {
+    match try_run_shipped_plugin_command(plugin_id, command_name, args).await? {
+        Some(code) => Ok(code),
+        None => anyhow::bail!(
+            "required shipped plugin command '{plugin_id}:{command_name}' is unavailable; ensure the shipped plugin bundle is installed"
+        ),
+    }
+}
+
 async fn run_external_plugin_command(args: &[String]) -> Result<u8> {
     let config = BmuxConfig::load()?;
     let paths = ConfigPaths::default();
@@ -1577,10 +1590,7 @@ async fn run_client_list(as_json: bool) -> Result<u8> {
 
 async fn run_permissions_list(session: &str, as_json: bool, watch: bool) -> Result<u8> {
     let args = permissions_plugin_args(session, as_json, watch);
-    match try_run_shipped_plugin_command("bmux.permissions", "permissions", &args).await? {
-        Some(code) => Ok(code),
-        None => run_permissions_list_native(session, as_json, watch).await,
-    }
+    require_shipped_plugin_command("bmux.permissions", "permissions", &args).await
 }
 
 fn permissions_plugin_args(session: &str, as_json: bool, watch: bool) -> Vec<String> {
@@ -1592,67 +1602,6 @@ fn permissions_plugin_args(session: &str, as_json: bool, watch: bool) -> Vec<Str
         args.push("--watch".to_string());
     }
     args
-}
-
-async fn run_permissions_list_native(session: &str, as_json: bool, watch: bool) -> Result<u8> {
-    let selector = parse_session_selector(session);
-
-    if watch {
-        let mut client =
-            connect(ConnectionPolicyScope::Normal, "bmux-cli-watch-permissions").await?;
-
-        println!("watching permissions for session '{session}' (Ctrl-C to stop)");
-        let mut last_permissions: Option<Vec<bmux_ipc::SessionPermissionSummary>> = None;
-
-        loop {
-            let permissions = client
-                .list_permissions(selector.clone())
-                .await
-                .map_err(map_cli_client_error)?;
-
-            if last_permissions.as_ref() != Some(&permissions) {
-                render_permissions_table(&permissions);
-                last_permissions = Some(permissions);
-            }
-
-            tokio::time::sleep(Duration::from_millis(500)).await;
-        }
-    }
-
-    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-list-permissions").await?;
-    let permissions = client
-        .list_permissions(selector)
-        .await
-        .map_err(map_cli_client_error)?;
-
-    if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&permissions)
-                .context("failed to encode permissions json")?
-        );
-        return Ok(0);
-    }
-
-    render_permissions_table(&permissions);
-
-    Ok(0)
-}
-
-fn render_permissions_table(permissions: &[bmux_ipc::SessionPermissionSummary]) {
-    if permissions.is_empty() {
-        println!("no explicit role assignments");
-        return;
-    }
-
-    println!("CLIENT_ID                            ROLE");
-    for permission in permissions {
-        println!(
-            "{:<36} {}",
-            permission.client_id,
-            session_role_label(permission.role)
-        );
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1809,11 +1758,7 @@ fn attach_quit_failure_status(error: &ClientError) -> &'static str {
 
 async fn run_grant_role(session: &str, client: &str, role: RoleValue) -> Result<u8> {
     let args = grant_plugin_args(session, client, role);
-    if let Some(code) = try_run_shipped_plugin_command("bmux.permissions", "grant", &args).await? {
-        return Ok(code);
-    }
-
-    run_grant_role_native(session, client, role).await
+    require_shipped_plugin_command("bmux.permissions", "grant", &args).await
 }
 
 fn grant_plugin_args(session: &str, client: &str, role: RoleValue) -> Vec<String> {
@@ -1827,29 +1772,9 @@ fn grant_plugin_args(session: &str, client: &str, role: RoleValue) -> Vec<String
     ]
 }
 
-async fn run_grant_role_native(session: &str, client: &str, role: RoleValue) -> Result<u8> {
-    let selector = parse_session_selector(session);
-    let client_id = parse_uuid_value(client, "client id")?;
-    let mut api = connect(ConnectionPolicyScope::Normal, "bmux-cli-grant-role").await?;
-    api.grant_role(selector, client_id, session_role_from_value(role))
-        .await
-        .map_err(map_cli_client_error)?;
-
-    println!(
-        "granted role {} to client {}",
-        session_role_label(session_role_from_value(role)),
-        client_id
-    );
-    Ok(0)
-}
-
 async fn run_revoke_role(session: &str, client: &str) -> Result<u8> {
     let args = revoke_plugin_args(session, client);
-    if let Some(code) = try_run_shipped_plugin_command("bmux.permissions", "revoke", &args).await? {
-        return Ok(code);
-    }
-
-    run_revoke_role_native(session, client).await
+    require_shipped_plugin_command("bmux.permissions", "revoke", &args).await
 }
 
 fn revoke_plugin_args(session: &str, client: &str) -> Vec<String> {
@@ -1859,18 +1784,6 @@ fn revoke_plugin_args(session: &str, client: &str) -> Vec<String> {
         "--client".to_string(),
         client.to_string(),
     ]
-}
-
-async fn run_revoke_role_native(session: &str, client: &str) -> Result<u8> {
-    let selector = parse_session_selector(session);
-    let client_id = parse_uuid_value(client, "client id")?;
-    let mut api = connect(ConnectionPolicyScope::Normal, "bmux-cli-revoke-role").await?;
-    api.revoke_role(selector, client_id)
-        .await
-        .map_err(map_cli_client_error)?;
-
-    println!("revoked explicit role for client {client_id}");
-    Ok(0)
 }
 
 const fn role_value_label(role: RoleValue) -> &'static str {
@@ -4690,14 +4603,6 @@ fn parse_window_selector(target: &str) -> WindowSelector {
 
 fn parse_uuid_value(value: &str, label: &str) -> Result<Uuid> {
     Uuid::parse_str(value).with_context(|| format!("{label} must be a UUID, got '{value}'"))
-}
-
-const fn session_role_from_value(role: RoleValue) -> SessionRole {
-    match role {
-        RoleValue::Owner => SessionRole::Owner,
-        RoleValue::Writer => SessionRole::Writer,
-        RoleValue::Observer => SessionRole::Observer,
-    }
 }
 
 const fn session_role_label(role: SessionRole) -> &'static str {

@@ -52,7 +52,7 @@ These are the first shipped-plugin targets.
 Current implementation status:
 
 - all 6 command paths now route through the shipped `bmux.permissions` plugin first
-- CLI preserves native command UX and currently falls back to native implementations when the shipped plugin artifact is unavailable
+- CLI preserves native command UX and now requires the shipped plugin bundle for these commands
 
 Required host APIs:
 
