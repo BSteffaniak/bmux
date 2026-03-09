@@ -1,9 +1,13 @@
+use bmux_client::BmuxClient;
+use bmux_config::ConfigPaths;
+use bmux_ipc::{IpcEndpoint, SessionRole, SessionSelector};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
+use uuid::Uuid;
 
 fn workspace_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -104,6 +108,38 @@ fn stage_shipped_permissions_bundle(root: &Path, sandbox: &Path) -> PathBuf {
     .expect("permissions plugin manifest should be staged");
 
     shipped_root
+}
+
+fn config_paths_for_test(config_dir: &Path, runtime_dir: &Path, data_home: &Path) -> ConfigPaths {
+    let data_dir = if cfg!(target_os = "macos") {
+        config_dir.to_path_buf()
+    } else {
+        data_home.join("bmux")
+    };
+    ConfigPaths::new(config_dir.to_path_buf(), runtime_dir.join("bmux"), data_dir)
+}
+
+fn test_endpoint(paths: &ConfigPaths) -> IpcEndpoint {
+    #[cfg(unix)]
+    {
+        IpcEndpoint::unix_socket(paths.server_socket())
+    }
+
+    #[cfg(windows)]
+    {
+        IpcEndpoint::windows_named_pipe(paths.server_named_pipe())
+    }
+}
+
+fn with_runtime<F, T>(future: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("test runtime should build")
+        .block_on(future)
 }
 
 fn sandbox_setup() -> (
@@ -364,6 +400,130 @@ fn shipped_permissions_plugin_handles_permissions_command() {
         "permissions output should include owner role table: {}",
         String::from_utf8_lossy(&permissions_output.stdout)
     );
+
+    let paths = config_paths_for_test(&config_dir, &runtime_dir, &data_home);
+    let endpoint = test_endpoint(&paths);
+    let (target_tx, target_rx) = std::sync::mpsc::channel();
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+    let target_thread = {
+        let endpoint = endpoint.clone();
+        std::thread::spawn(move || {
+            with_runtime(async move {
+                let mut target = BmuxClient::connect_with_principal(
+                    &endpoint,
+                    Duration::from_secs(2),
+                    "plugin-e2e-target",
+                    Uuid::new_v4(),
+                )
+                .await
+                .expect("target client should connect");
+                let target_id = target.whoami().await.expect("target whoami should succeed");
+                target_tx.send(target_id).expect("target id should send");
+                shutdown_rx
+                    .recv()
+                    .expect("target shutdown signal should arrive");
+                drop(target);
+            });
+        })
+    };
+    let target_client_id = target_rx
+        .recv()
+        .expect("target client id should be received");
+
+    let grant_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &[
+            "grant",
+            "--session",
+            "demo",
+            "--client",
+            &target_client_id.to_string(),
+            "--role",
+            "writer",
+        ],
+    );
+    assert!(
+        grant_output.status.success(),
+        "grant command should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&grant_output.stdout),
+        String::from_utf8_lossy(&grant_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&grant_output.stdout).contains("granted role writer"),
+        "grant output should confirm writer role: {}",
+        String::from_utf8_lossy(&grant_output.stdout)
+    );
+
+    let permissions_after_grant = with_runtime(async {
+        let mut owner = BmuxClient::connect_with_paths(&paths, "plugin-e2e-owner-list")
+            .await
+            .expect("owner list client should connect");
+        owner
+            .list_permissions(SessionSelector::ByName("demo".to_string()))
+            .await
+            .expect("permissions should list after grant")
+    });
+    assert!(
+        permissions_after_grant.iter().any(|entry| {
+            entry.client_id == target_client_id && entry.role == SessionRole::Writer
+        }),
+        "granted writer role should be visible in permission list"
+    );
+
+    let revoke_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &[
+            "revoke",
+            "--session",
+            "demo",
+            "--client",
+            &target_client_id.to_string(),
+        ],
+    );
+    assert!(
+        revoke_output.status.success(),
+        "revoke command should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&revoke_output.stdout),
+        String::from_utf8_lossy(&revoke_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&revoke_output.stdout).contains("revoked explicit role"),
+        "revoke output should confirm role removal: {}",
+        String::from_utf8_lossy(&revoke_output.stdout)
+    );
+
+    let permissions_after_revoke = with_runtime(async {
+        let mut owner = BmuxClient::connect_with_paths(&paths, "plugin-e2e-owner-list-after")
+            .await
+            .expect("owner list client should reconnect");
+        owner
+            .list_permissions(SessionSelector::ByName("demo".to_string()))
+            .await
+            .expect("permissions should list after revoke")
+    });
+    assert!(
+        !permissions_after_revoke
+            .iter()
+            .any(|entry| entry.client_id == target_client_id),
+        "revoked role should disappear from explicit permission list"
+    );
+
+    shutdown_tx
+        .send(())
+        .expect("target client shutdown signal should send");
+    target_thread
+        .join()
+        .expect("target client thread should join cleanly");
 
     let stop_output = run_bmux(
         &root,

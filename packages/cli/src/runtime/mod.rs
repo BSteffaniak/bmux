@@ -1808,6 +1808,26 @@ fn attach_quit_failure_status(error: &ClientError) -> &'static str {
 }
 
 async fn run_grant_role(session: &str, client: &str, role: RoleValue) -> Result<u8> {
+    let args = grant_plugin_args(session, client, role);
+    if let Some(code) = try_run_shipped_plugin_command("bmux.permissions", "grant", &args).await? {
+        return Ok(code);
+    }
+
+    run_grant_role_native(session, client, role).await
+}
+
+fn grant_plugin_args(session: &str, client: &str, role: RoleValue) -> Vec<String> {
+    vec![
+        "--session".to_string(),
+        session.to_string(),
+        "--client".to_string(),
+        client.to_string(),
+        "--role".to_string(),
+        role_value_label(role).to_string(),
+    ]
+}
+
+async fn run_grant_role_native(session: &str, client: &str, role: RoleValue) -> Result<u8> {
     let selector = parse_session_selector(session);
     let client_id = parse_uuid_value(client, "client id")?;
     let mut api = connect(ConnectionPolicyScope::Normal, "bmux-cli-grant-role").await?;
@@ -1824,6 +1844,24 @@ async fn run_grant_role(session: &str, client: &str, role: RoleValue) -> Result<
 }
 
 async fn run_revoke_role(session: &str, client: &str) -> Result<u8> {
+    let args = revoke_plugin_args(session, client);
+    if let Some(code) = try_run_shipped_plugin_command("bmux.permissions", "revoke", &args).await? {
+        return Ok(code);
+    }
+
+    run_revoke_role_native(session, client).await
+}
+
+fn revoke_plugin_args(session: &str, client: &str) -> Vec<String> {
+    vec![
+        "--session".to_string(),
+        session.to_string(),
+        "--client".to_string(),
+        client.to_string(),
+    ]
+}
+
+async fn run_revoke_role_native(session: &str, client: &str) -> Result<u8> {
     let selector = parse_session_selector(session);
     let client_id = parse_uuid_value(client, "client id")?;
     let mut api = connect(ConnectionPolicyScope::Normal, "bmux-cli-revoke-role").await?;
@@ -1833,6 +1871,14 @@ async fn run_revoke_role(session: &str, client: &str) -> Result<u8> {
 
     println!("revoked explicit role for client {client_id}");
     Ok(0)
+}
+
+const fn role_value_label(role: RoleValue) -> &'static str {
+    match role {
+        RoleValue::Owner => "owner",
+        RoleValue::Writer => "writer",
+        RoleValue::Observer => "observer",
+    }
 }
 
 async fn run_session_kill(target: &str, force_local: bool) -> Result<u8> {

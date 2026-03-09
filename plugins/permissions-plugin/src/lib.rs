@@ -30,16 +30,38 @@ impl RustPlugin for PermissionsPlugin {
             description: Some("Shipped bmux permissions command plugin".to_string()),
             homepage: None,
             capabilities: [PluginCapability::Commands].into_iter().collect(),
-            commands: vec![PluginCommand {
-                name: "permissions".to_string(),
-                path: vec!["permissions".to_string()],
-                aliases: Vec::new(),
-                summary: "List explicit role assignments for a session".to_string(),
-                description: None,
-                arguments: Vec::new(),
-                execution: CommandExecutionKind::HostCallback,
-                expose_in_cli: false,
-            }],
+            commands: vec![
+                PluginCommand {
+                    name: "permissions".to_string(),
+                    path: vec!["permissions".to_string()],
+                    aliases: Vec::new(),
+                    summary: "List explicit role assignments for a session".to_string(),
+                    description: None,
+                    arguments: Vec::new(),
+                    execution: CommandExecutionKind::HostCallback,
+                    expose_in_cli: false,
+                },
+                PluginCommand {
+                    name: "grant".to_string(),
+                    path: vec!["grant".to_string()],
+                    aliases: Vec::new(),
+                    summary: "Grant a role to a client in a session".to_string(),
+                    description: None,
+                    arguments: Vec::new(),
+                    execution: CommandExecutionKind::HostCallback,
+                    expose_in_cli: false,
+                },
+                PluginCommand {
+                    name: "revoke".to_string(),
+                    path: vec!["revoke".to_string()],
+                    aliases: Vec::new(),
+                    summary: "Revoke an explicit role from a client in a session".to_string(),
+                    description: None,
+                    arguments: Vec::new(),
+                    execution: CommandExecutionKind::HostCallback,
+                    expose_in_cli: false,
+                },
+            ],
             event_subscriptions: Vec::new(),
             lifecycle: bmux_plugin::PluginLifecycle {
                 activate_on_startup: false,
@@ -52,6 +74,8 @@ impl RustPlugin for PermissionsPlugin {
     fn run_command(&mut self, context: NativeCommandContext) -> i32 {
         match context.command.as_str() {
             "permissions" => run_permissions_command(&context),
+            "grant" => run_grant_command(&context),
+            "revoke" => run_revoke_command(&context),
             _ => 64,
         }
     }
@@ -146,6 +170,166 @@ async fn async_permissions_command(
     }
 }
 
+fn run_grant_command(context: &NativeCommandContext) -> i32 {
+    let mut session = None;
+    let mut client = None;
+    let mut role = None;
+    let mut iter = context.arguments.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--session" => session = iter.next().cloned(),
+            "--client" => client = iter.next().cloned(),
+            "--role" => role = iter.next().cloned(),
+            _ => return 64,
+        }
+    }
+
+    let (Some(session), Some(client), Some(role)) = (session, client, role) else {
+        eprintln!("grant requires --session <name-or-uuid> --client <uuid> --role <role>");
+        return 64;
+    };
+    let client_id = match uuid::Uuid::parse_str(&client) {
+        Ok(client_id) => client_id,
+        Err(_) => {
+            eprintln!("invalid client id: {client}");
+            return 64;
+        }
+    };
+    let role = match parse_role(&role) {
+        Some(role) => role,
+        None => {
+            eprintln!("invalid role: {role}");
+            return 64;
+        }
+    };
+
+    let paths = command_paths(context);
+    match block_on_plugin_future(async move {
+        async_grant_command(&paths, &session, client_id, role).await
+    }) {
+        Ok(code) => code,
+        Err(_) => 70,
+    }
+}
+
+async fn async_grant_command(
+    paths: &ConfigPaths,
+    session: &str,
+    client_id: uuid::Uuid,
+    role: SessionRole,
+) -> i32 {
+    let selector = parse_session_selector(session);
+    let mut client = match connect_client(paths).await {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+
+    match client.grant_role(selector, client_id, role).await {
+        Ok(()) => {
+            println!("granted role {} to client {}", role_label(role), client_id);
+            0
+        }
+        Err(error) => {
+            eprintln!("failed granting role: {error}");
+            1
+        }
+    }
+}
+
+fn run_revoke_command(context: &NativeCommandContext) -> i32 {
+    let mut session = None;
+    let mut client = None;
+    let mut iter = context.arguments.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--session" => session = iter.next().cloned(),
+            "--client" => client = iter.next().cloned(),
+            _ => return 64,
+        }
+    }
+
+    let (Some(session), Some(client)) = (session, client) else {
+        eprintln!("revoke requires --session <name-or-uuid> --client <uuid>");
+        return 64;
+    };
+    let client_id = match uuid::Uuid::parse_str(&client) {
+        Ok(client_id) => client_id,
+        Err(_) => {
+            eprintln!("invalid client id: {client}");
+            return 64;
+        }
+    };
+
+    let paths = command_paths(context);
+    match block_on_plugin_future(
+        async move { async_revoke_command(&paths, &session, client_id).await },
+    ) {
+        Ok(code) => code,
+        Err(_) => 70,
+    }
+}
+
+async fn async_revoke_command(paths: &ConfigPaths, session: &str, client_id: uuid::Uuid) -> i32 {
+    let selector = parse_session_selector(session);
+    let mut client = match connect_client(paths).await {
+        Ok(client) => client,
+        Err(code) => return code,
+    };
+
+    match client.revoke_role(selector, client_id).await {
+        Ok(()) => {
+            println!("revoked explicit role for client {client_id}");
+            0
+        }
+        Err(error) => {
+            eprintln!("failed revoking role: {error}");
+            1
+        }
+    }
+}
+
+fn command_paths(context: &NativeCommandContext) -> ConfigPaths {
+    ConfigPaths::new(
+        context.connection.config_dir.clone().into(),
+        context.connection.runtime_dir.clone().into(),
+        context.connection.data_dir.clone().into(),
+    )
+}
+
+async fn connect_client(paths: &ConfigPaths) -> Result<BmuxClient, i32> {
+    BmuxClient::connect_with_paths(paths, "bmux-permissions-plugin")
+        .await
+        .map_err(|error| {
+            eprintln!("failed connecting to bmux host: {error}");
+            1
+        })
+}
+
+fn block_on_plugin_future<F>(future: F) -> Result<i32, ()>
+where
+    F: std::future::Future<Output = i32>,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => Ok(tokio::task::block_in_place(|| handle.block_on(future))),
+        Err(_) => match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => Ok(runtime.block_on(future)),
+            Err(_) => Err(()),
+        },
+    }
+}
+
+fn parse_role(value: &str) -> Option<SessionRole> {
+    match value {
+        "owner" => Some(SessionRole::Owner),
+        "writer" => Some(SessionRole::Writer),
+        "observer" => Some(SessionRole::Observer),
+        _ => None,
+    }
+}
+
 fn render_permissions(permissions: &[SessionPermissionSummary], as_json: bool) {
     if as_json {
         println!(
@@ -199,8 +383,13 @@ mod tests {
         let reparsed = bmux_plugin::NativeDescriptor::from_toml_str(&serialized)
             .expect("descriptor should parse");
         assert_eq!(reparsed.id, "bmux.permissions");
-        assert_eq!(reparsed.commands.len(), 1);
-        assert!(!reparsed.commands[0].expose_in_cli);
+        assert_eq!(reparsed.commands.len(), 3);
+        assert!(
+            reparsed
+                .commands
+                .iter()
+                .all(|command| !command.expose_in_cli)
+        );
     }
 
     #[test]

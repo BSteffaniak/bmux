@@ -12,6 +12,20 @@ name          = "permissions"
 path          = ["permissions"]
 summary       = "List explicit role assignments for a session"
 
+[[commands]]
+execution     = "host_callback"
+expose_in_cli = false
+name          = "grant"
+path          = ["grant"]
+summary       = "Grant a role to a client in a session"
+
+[[commands]]
+execution     = "host_callback"
+expose_in_cli = false
+name          = "revoke"
+path          = ["revoke"]
+summary       = "Revoke an explicit role from a client in a session"
+
 [plugin_api]
 minimum = "1.0"
 
