@@ -11,22 +11,25 @@ runtime = "native"
 version = "0.0.1-alpha.0"
 
 [[commands]]
+aliases       = [["session", "permissions"]]
 execution     = "host_callback"
-expose_in_cli = false
+expose_in_cli = true
 name          = "permissions"
 path          = ["permissions"]
 summary       = "List explicit role assignments for a session"
 
 [[commands]]
+aliases       = [["session", "grant"]]
 execution     = "host_callback"
-expose_in_cli = false
+expose_in_cli = true
 name          = "grant"
 path          = ["grant"]
 summary       = "Grant a role to a client in a session"
 
 [[commands]]
+aliases       = [["session", "revoke"]]
 execution     = "host_callback"
-expose_in_cli = false
+expose_in_cli = true
 name          = "revoke"
 path          = ["revoke"]
 summary       = "Revoke an explicit role from a client in a session"

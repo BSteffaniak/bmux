@@ -470,6 +470,13 @@ pub fn built_in_cli_commands() -> Vec<BuiltInCliCommand> {
 pub fn reserved_built_in_paths() -> BTreeSet<Vec<String>> {
     built_in_cli_commands()
         .into_iter()
+        .filter(|command| command.class == CoreCommandClass::CoreNative)
+        .filter(|command| {
+            !matches!(
+                command.handler,
+                BuiltInHandlerId::Session | BuiltInHandlerId::Window
+            )
+        })
         .flat_map(|command| command.all_paths().cloned().collect::<Vec<_>>())
         .collect()
 }

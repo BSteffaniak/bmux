@@ -16,7 +16,7 @@ async fn main() -> ExitCode {
     match runtime::run().await {
         Ok(code) => ExitCode::from(code),
         Err(error) => {
-            eprintln!("bmux error: {error}");
+            eprintln!("bmux error: {error:#}");
             ExitCode::from(1)
         }
     }

@@ -12,36 +12,41 @@ runtime = "native"
 version = "0.0.1-alpha.0"
 
 [[commands]]
+aliases       = [["window", "new"]]
 execution     = "host_callback"
-expose_in_cli = false
+expose_in_cli = true
 name          = "new-window"
 path          = ["new-window"]
 summary       = "Create a new window in a session"
 
 [[commands]]
+aliases       = [["window", "list"]]
 execution     = "host_callback"
-expose_in_cli = false
+expose_in_cli = true
 name          = "list-windows"
 path          = ["list-windows"]
 summary       = "List windows for a session"
 
 [[commands]]
+aliases       = [["window", "kill"]]
 execution     = "host_callback"
-expose_in_cli = false
+expose_in_cli = true
 name          = "kill-window"
 path          = ["kill-window"]
 summary       = "Kill a window by name, UUID, or active"
 
 [[commands]]
+aliases       = [["window", "kill-all"]]
 execution     = "host_callback"
-expose_in_cli = false
+expose_in_cli = true
 name          = "kill-all-windows"
 path          = ["kill-all-windows"]
 summary       = "Kill all windows in a session"
 
 [[commands]]
+aliases       = [["window", "switch"]]
 execution     = "host_callback"
-expose_in_cli = false
+expose_in_cli = true
 name          = "switch-window"
 path          = ["switch-window"]
 summary       = "Switch active window by name, UUID, or active"

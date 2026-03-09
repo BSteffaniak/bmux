@@ -40,13 +40,30 @@ impl RustPlugin for WindowsPlugin {
                 PluginFeature::new("bmux.windows").expect("plugin feature should parse")
             ]),
             commands: vec![
-                plugin_command("new-window", "Create a new window in a session"),
-                plugin_command("list-windows", "List windows for a session"),
-                plugin_command("kill-window", "Kill a window by name, UUID, or active"),
-                plugin_command("kill-all-windows", "Kill all windows in a session"),
+                plugin_command(
+                    "new-window",
+                    "Create a new window in a session",
+                    vec![vec!["window".to_string(), "new".to_string()]],
+                ),
+                plugin_command(
+                    "list-windows",
+                    "List windows for a session",
+                    vec![vec!["window".to_string(), "list".to_string()]],
+                ),
+                plugin_command(
+                    "kill-window",
+                    "Kill a window by name, UUID, or active",
+                    vec![vec!["window".to_string(), "kill".to_string()]],
+                ),
+                plugin_command(
+                    "kill-all-windows",
+                    "Kill all windows in a session",
+                    vec![vec!["window".to_string(), "kill-all".to_string()]],
+                ),
                 plugin_command(
                     "switch-window",
                     "Switch active window by name, UUID, or active",
+                    vec![vec!["window".to_string(), "switch".to_string()]],
                 ),
             ],
             event_subscriptions: Vec::new(),
@@ -73,16 +90,16 @@ impl RustPlugin for WindowsPlugin {
 
 bmux_plugin::export_plugin!(WindowsPlugin);
 
-fn plugin_command(name: &str, summary: &str) -> PluginCommand {
+fn plugin_command(name: &str, summary: &str, aliases: Vec<Vec<String>>) -> PluginCommand {
     PluginCommand {
         name: name.to_string(),
         path: vec![name.to_string()],
-        aliases: Vec::new(),
+        aliases,
         summary: summary.to_string(),
         description: None,
         arguments: Vec::new(),
         execution: CommandExecutionKind::HostCallback,
-        expose_in_cli: false,
+        expose_in_cli: true,
     }
 }
 
@@ -342,7 +359,7 @@ async fn async_kill_all_windows(
         }
     }
     println!("kill-all-windows complete: killed {killed_count}, failed {failed_count}");
-    i32::from(failed_count != 0)
+    if failed_count == 0 { 0 } else { 1 }
 }
 
 fn run_switch_window(context: &NativeCommandContext) -> i32 {

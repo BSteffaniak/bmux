@@ -42,32 +42,32 @@ impl RustPlugin for PermissionsPlugin {
                 PluginCommand {
                     name: "permissions".to_string(),
                     path: vec!["permissions".to_string()],
-                    aliases: Vec::new(),
+                    aliases: vec![vec!["session".to_string(), "permissions".to_string()]],
                     summary: "List explicit role assignments for a session".to_string(),
                     description: None,
                     arguments: Vec::new(),
                     execution: CommandExecutionKind::HostCallback,
-                    expose_in_cli: false,
+                    expose_in_cli: true,
                 },
                 PluginCommand {
                     name: "grant".to_string(),
                     path: vec!["grant".to_string()],
-                    aliases: Vec::new(),
+                    aliases: vec![vec!["session".to_string(), "grant".to_string()]],
                     summary: "Grant a role to a client in a session".to_string(),
                     description: None,
                     arguments: Vec::new(),
                     execution: CommandExecutionKind::HostCallback,
-                    expose_in_cli: false,
+                    expose_in_cli: true,
                 },
                 PluginCommand {
                     name: "revoke".to_string(),
                     path: vec!["revoke".to_string()],
-                    aliases: Vec::new(),
+                    aliases: vec![vec!["session".to_string(), "revoke".to_string()]],
                     summary: "Revoke an explicit role from a client in a session".to_string(),
                     description: None,
                     arguments: Vec::new(),
                     execution: CommandExecutionKind::HostCallback,
-                    expose_in_cli: false,
+                    expose_in_cli: true,
                 },
             ],
             event_subscriptions: Vec::new(),
@@ -397,8 +397,20 @@ mod tests {
             reparsed
                 .commands
                 .iter()
-                .all(|command| !command.expose_in_cli)
+                .all(|command| command.expose_in_cli)
         );
+        assert!(reparsed.commands.iter().any(|command| {
+            command.name == "permissions"
+                && command.aliases == vec![vec!["session".to_string(), "permissions".to_string()]]
+        }));
+        assert!(reparsed.commands.iter().any(|command| {
+            command.name == "grant"
+                && command.aliases == vec![vec!["session".to_string(), "grant".to_string()]]
+        }));
+        assert!(reparsed.commands.iter().any(|command| {
+            command.name == "revoke"
+                && command.aliases == vec![vec!["session".to_string(), "revoke".to_string()]]
+        }));
     }
 
     #[test]

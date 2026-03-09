@@ -226,4 +226,96 @@ minimum = "1.0"
         assert_eq!(resolved.command_name, "permissions");
         assert_eq!(resolved.arguments, vec!["dev"]);
     }
+
+    #[test]
+    fn shipped_permissions_aliases_build_without_collision() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "bmux.permissions"
+name = "Permissions"
+version = "0.1.0"
+entry = "plugin.dylib"
+required_host_scopes = ["bmux.commands"]
+
+[[commands]]
+name = "permissions"
+path = ["permissions"]
+aliases = [["session", "permissions"]]
+summary = "list"
+execution = "host_callback"
+expose_in_cli = true
+
+[[commands]]
+name = "grant"
+path = ["grant"]
+aliases = [["session", "grant"]]
+summary = "grant"
+execution = "host_callback"
+expose_in_cli = true
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+        )
+        .expect("manifest should parse");
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest_from_root(
+                Path::new("/plugins"),
+                Path::new("/plugins/plugin.toml"),
+                manifest,
+            )
+            .expect("manifest should register");
+        PluginCommandRegistry::build(&config_with_enabled("bmux.permissions"), &registry)
+            .expect("permissions command registry should build");
+    }
+
+    #[test]
+    fn shipped_windows_aliases_build_without_collision() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "bmux.windows"
+name = "Windows"
+version = "0.1.0"
+entry = "plugin.dylib"
+required_host_scopes = ["bmux.commands"]
+
+[[commands]]
+name = "new-window"
+path = ["new-window"]
+aliases = [["window", "new"]]
+summary = "new"
+execution = "host_callback"
+expose_in_cli = true
+
+[[commands]]
+name = "switch-window"
+path = ["switch-window"]
+aliases = [["window", "switch"]]
+summary = "switch"
+execution = "host_callback"
+expose_in_cli = true
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+        )
+        .expect("manifest should parse");
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest_from_root(
+                Path::new("/plugins"),
+                Path::new("/plugins/plugin.toml"),
+                manifest,
+            )
+            .expect("manifest should register");
+        PluginCommandRegistry::build(&config_with_enabled("bmux.windows"), &registry)
+            .expect("windows command registry should build");
+    }
 }

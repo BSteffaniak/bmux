@@ -52,39 +52,6 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// List explicit role assignments for a session
-    Permissions {
-        /// Session name or UUID
-        #[arg(long)]
-        session: String,
-        /// Print permissions as JSON
-        #[arg(long)]
-        json: bool,
-        /// Keep watching permission changes until interrupted
-        #[arg(long, conflicts_with = "json")]
-        watch: bool,
-    },
-    /// Grant a role to a client in a session
-    Grant {
-        /// Session name or UUID
-        #[arg(long)]
-        session: String,
-        /// Target client UUID
-        #[arg(long)]
-        client: String,
-        /// Role to grant
-        #[arg(long, value_enum)]
-        role: RoleValue,
-    },
-    /// Revoke explicit role from a client in a session
-    Revoke {
-        /// Session name or UUID
-        #[arg(long)]
-        session: String,
-        /// Target client UUID
-        #[arg(long)]
-        client: String,
-    },
     /// Kill a session by name or UUID
     KillSession {
         /// Session name or UUID
@@ -112,52 +79,6 @@ pub enum Command {
     },
     /// Detach from the current session
     Detach,
-    /// Create a new window in a session
-    NewWindow {
-        /// Optional session name or UUID (uses attached session when omitted)
-        #[arg(long)]
-        session: Option<String>,
-        /// Optional window name
-        #[arg(long)]
-        name: Option<String>,
-    },
-    /// List windows for a session
-    ListWindows {
-        /// Optional session name or UUID (uses attached session when omitted)
-        #[arg(long)]
-        session: Option<String>,
-        /// Print windows as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Kill a window by name, UUID, or `active`
-    KillWindow {
-        /// Window name, UUID, or `active`
-        target: String,
-        /// Optional session name or UUID (uses attached session when omitted)
-        #[arg(long)]
-        session: Option<String>,
-        /// Bypass ownership checks for local kill operations
-        #[arg(long)]
-        force_local: bool,
-    },
-    /// Kill all windows in a session
-    KillAllWindows {
-        /// Optional session name or UUID (uses attached session when omitted)
-        #[arg(long)]
-        session: Option<String>,
-        /// Bypass ownership checks for local kill operations
-        #[arg(long)]
-        force_local: bool,
-    },
-    /// Switch active window by name, UUID, or `active`
-    SwitchWindow {
-        /// Window name, UUID, or `active`
-        target: String,
-        /// Optional session name or UUID (uses attached session when omitted)
-        #[arg(long)]
-        session: Option<String>,
-    },
     /// Follow another client's active target
     Follow {
         /// Target client UUID to follow
@@ -221,39 +142,6 @@ pub enum SessionCommand {
         #[arg(long)]
         json: bool,
     },
-    /// List explicit role assignments for a session
-    Permissions {
-        /// Session name or UUID
-        #[arg(long)]
-        session: String,
-        /// Print permissions as JSON
-        #[arg(long)]
-        json: bool,
-        /// Keep watching permission changes until interrupted
-        #[arg(long, conflicts_with = "json")]
-        watch: bool,
-    },
-    /// Grant a role to a client in a session
-    Grant {
-        /// Session name or UUID
-        #[arg(long)]
-        session: String,
-        /// Target client UUID
-        #[arg(long)]
-        client: String,
-        /// Role to grant
-        #[arg(long, value_enum)]
-        role: RoleValue,
-    },
-    /// Revoke explicit role from a client in a session
-    Revoke {
-        /// Session name or UUID
-        #[arg(long)]
-        session: String,
-        /// Target client UUID
-        #[arg(long)]
-        client: String,
-    },
     /// Kill a session by name or UUID
     Kill {
         /// Session name or UUID
@@ -291,56 +179,14 @@ pub enum SessionCommand {
     },
     /// Stop following a client
     Unfollow,
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
 #[derive(Debug, Subcommand)]
 pub enum WindowCommand {
-    /// Create a new window in a session
-    New {
-        /// Optional session name or UUID (uses attached session when omitted)
-        #[arg(long)]
-        session: Option<String>,
-        /// Optional window name
-        #[arg(long)]
-        name: Option<String>,
-    },
-    /// List windows for a session
-    List {
-        /// Optional session name or UUID (uses attached session when omitted)
-        #[arg(long)]
-        session: Option<String>,
-        /// Print windows as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Kill a window by name, UUID, or `active`
-    Kill {
-        /// Window name, UUID, or `active`
-        target: String,
-        /// Optional session name or UUID (uses attached session when omitted)
-        #[arg(long)]
-        session: Option<String>,
-        /// Bypass ownership checks for local kill operations
-        #[arg(long)]
-        force_local: bool,
-    },
-    /// Kill all windows in a session
-    KillAll {
-        /// Optional session name or UUID (uses attached session when omitted)
-        #[arg(long)]
-        session: Option<String>,
-        /// Bypass ownership checks for local kill operations
-        #[arg(long)]
-        force_local: bool,
-    },
-    /// Switch active window by name, UUID, or `active`
-    Switch {
-        /// Window name, UUID, or `active`
-        target: String,
-        /// Optional session name or UUID (uses attached session when omitted)
-        #[arg(long)]
-        session: Option<String>,
-    },
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
 #[derive(Debug, Subcommand)]
@@ -445,8 +291,8 @@ pub enum PluginCommand {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, KeymapCommand, PluginCommand, RoleValue, ServerCommand, SessionCommand,
-        TerminalCommand, TraceFamily, WindowCommand,
+        Cli, Command, KeymapCommand, PluginCommand, ServerCommand, SessionCommand, TerminalCommand,
+        TraceFamily, WindowCommand,
     };
     use clap::Parser;
 
@@ -721,11 +567,11 @@ mod tests {
         let cli =
             Cli::try_parse_from(["bmux", "new-window", "--name", "editor", "--session", "dev"])
                 .expect("valid CLI args");
-        let Some(Command::NewWindow { session, name }) = cli.command else {
-            panic!("expected new-window command");
-        };
-        assert_eq!(session.as_deref(), Some("dev"));
-        assert_eq!(name.as_deref(), Some("editor"));
+        assert!(matches!(
+            cli.command,
+            Some(Command::External(args))
+                if args == vec!["new-window", "--name", "editor", "--session", "dev"]
+        ));
     }
 
     #[test]
@@ -733,10 +579,7 @@ mod tests {
         let cli = Cli::try_parse_from(["bmux", "list-windows", "--json"]).expect("valid CLI args");
         assert!(matches!(
             cli.command,
-            Some(Command::ListWindows {
-                session: None,
-                json: true
-            })
+            Some(Command::External(args)) if args == vec!["list-windows", "--json"]
         ));
     }
 
@@ -744,17 +587,11 @@ mod tests {
     fn parses_top_level_kill_window_command() {
         let cli = Cli::try_parse_from(["bmux", "kill-window", "active", "--session", "dev"])
             .expect("valid CLI args");
-        let Some(Command::KillWindow {
-            target,
-            session,
-            force_local,
-        }) = cli.command
-        else {
-            panic!("expected kill-window command");
-        };
-        assert_eq!(target, "active");
-        assert_eq!(session.as_deref(), Some("dev"));
-        assert!(!force_local);
+        assert!(matches!(
+            cli.command,
+            Some(Command::External(args))
+                if args == vec!["kill-window", "active", "--session", "dev"]
+        ));
     }
 
     #[test]
@@ -763,10 +600,7 @@ mod tests {
             .expect("valid CLI args");
         assert!(matches!(
             cli.command,
-            Some(Command::KillAllWindows {
-                session: Some(ref session),
-                force_local: false
-            }) if session == "dev"
+            Some(Command::External(args)) if args == vec!["kill-all-windows", "--session", "dev"]
         ));
     }
 
@@ -775,10 +609,7 @@ mod tests {
         let cli = Cli::try_parse_from(["bmux", "kill-all-windows"]).expect("valid CLI args");
         assert!(matches!(
             cli.command,
-            Some(Command::KillAllWindows {
-                session: None,
-                force_local: false
-            })
+            Some(Command::External(args)) if args == vec!["kill-all-windows"]
         ));
     }
 
@@ -788,21 +619,17 @@ mod tests {
             .expect("valid CLI args");
         assert!(matches!(
             cli.command,
-            Some(Command::KillAllWindows {
-                session: None,
-                force_local: true
-            })
+            Some(Command::External(args)) if args == vec!["kill-all-windows", "--force-local"]
         ));
     }
 
     #[test]
     fn parses_top_level_switch_window_command() {
         let cli = Cli::try_parse_from(["bmux", "switch-window", "editor"]).expect("valid CLI args");
-        let Some(Command::SwitchWindow { target, session }) = cli.command else {
-            panic!("expected switch-window command");
-        };
-        assert_eq!(target, "editor");
-        assert_eq!(session, None);
+        assert!(matches!(
+            cli.command,
+            Some(Command::External(args)) if args == vec!["switch-window", "editor"]
+        ));
     }
 
     #[test]
@@ -860,11 +687,7 @@ mod tests {
             .expect("valid CLI args");
         assert!(matches!(
             cli.command,
-            Some(Command::Permissions {
-                session,
-                json: false,
-                watch: false
-            }) if session == "dev"
+            Some(Command::External(args)) if args == vec!["permissions", "--session", "dev"]
         ));
     }
 
@@ -874,11 +697,8 @@ mod tests {
             .expect("valid CLI args");
         assert!(matches!(
             cli.command,
-            Some(Command::Permissions {
-                session,
-                json: false,
-                watch: true
-            }) if session == "dev"
+            Some(Command::External(args))
+                if args == vec!["permissions", "--session", "dev", "--watch"]
         ));
     }
 
@@ -897,11 +717,16 @@ mod tests {
         .expect("valid CLI args");
         assert!(matches!(
             cli.command,
-            Some(Command::Grant {
-                session,
-                client,
-                role: RoleValue::Writer
-            }) if session == "dev" && client == "550e8400-e29b-41d4-a716-446655440000"
+            Some(Command::External(args))
+                if args == vec![
+                    "grant",
+                    "--session",
+                    "dev",
+                    "--client",
+                    "550e8400-e29b-41d4-a716-446655440000",
+                    "--role",
+                    "writer",
+                ]
         ));
     }
 
@@ -918,8 +743,14 @@ mod tests {
         .expect("valid CLI args");
         assert!(matches!(
             cli.command,
-            Some(Command::Revoke { session, client })
-                if session == "dev" && client == "550e8400-e29b-41d4-a716-446655440000"
+            Some(Command::External(args))
+                if args == vec![
+                    "revoke",
+                    "--session",
+                    "dev",
+                    "--client",
+                    "550e8400-e29b-41d4-a716-446655440000",
+                ]
         ));
     }
 
@@ -949,14 +780,9 @@ mod tests {
         let Some(Command::Session { command }) = cli.command else {
             panic!("expected session command");
         };
-        assert!(matches!(
-            command,
-            SessionCommand::Permissions {
-                session,
-                json: false,
-                watch: false
-            } if session == "dev"
-        ));
+        assert!(
+            matches!(command, SessionCommand::External(args) if args == vec!["permissions", "--session", "dev"])
+        );
     }
 
     #[test]
@@ -973,14 +799,9 @@ mod tests {
         let Some(Command::Session { command }) = cli.command else {
             panic!("expected session command");
         };
-        assert!(matches!(
-            command,
-            SessionCommand::Permissions {
-                session,
-                json: false,
-                watch: true
-            } if session == "dev"
-        ));
+        assert!(
+            matches!(command, SessionCommand::External(args) if args == vec!["permissions", "--session", "dev", "--watch"])
+        );
     }
 
     #[test]
@@ -1000,14 +821,17 @@ mod tests {
         let Some(Command::Session { command }) = cli.command else {
             panic!("expected session command");
         };
-        assert!(matches!(
-            command,
-            SessionCommand::Grant {
-                session,
-                client,
-                role: RoleValue::Observer
-            } if session == "dev" && client == "550e8400-e29b-41d4-a716-446655440000"
-        ));
+        assert!(
+            matches!(command, SessionCommand::External(args) if args == vec![
+                "grant",
+                "--session",
+                "dev",
+                "--client",
+                "550e8400-e29b-41d4-a716-446655440000",
+                "--role",
+                "observer",
+            ])
+        );
     }
 
     #[test]
@@ -1025,11 +849,15 @@ mod tests {
         let Some(Command::Session { command }) = cli.command else {
             panic!("expected session command");
         };
-        assert!(matches!(
-            command,
-            SessionCommand::Revoke { session, client }
-                if session == "dev" && client == "550e8400-e29b-41d4-a716-446655440000"
-        ));
+        assert!(
+            matches!(command, SessionCommand::External(args) if args == vec![
+                "revoke",
+                "--session",
+                "dev",
+                "--client",
+                "550e8400-e29b-41d4-a716-446655440000",
+            ])
+        );
     }
 
     #[test]
@@ -1192,13 +1020,9 @@ mod tests {
         let Some(Command::Window { command }) = cli.command else {
             panic!("expected window command");
         };
-        assert!(matches!(
-            command,
-            WindowCommand::New {
-                session: Some(ref session),
-                name: Some(ref name)
-            } if session == "dev" && name == "editor"
-        ));
+        assert!(
+            matches!(command, WindowCommand::External(args) if args == vec!["new", "--session", "dev", "--name", "editor"])
+        );
     }
 
     #[test]
@@ -1207,13 +1031,7 @@ mod tests {
         let Some(Command::Window { command }) = cli.command else {
             panic!("expected window command");
         };
-        assert!(matches!(
-            command,
-            WindowCommand::List {
-                session: None,
-                json: false
-            }
-        ));
+        assert!(matches!(command, WindowCommand::External(args) if args == vec!["list"]));
     }
 
     #[test]
@@ -1223,14 +1041,9 @@ mod tests {
         let Some(Command::Window { command }) = cli.command else {
             panic!("expected window command");
         };
-        assert!(matches!(
-            command,
-            WindowCommand::Kill {
-                target,
-                session: Some(ref session),
-                force_local: false
-            } if target == "active" && session == "dev"
-        ));
+        assert!(
+            matches!(command, WindowCommand::External(args) if args == vec!["kill", "active", "--session", "dev"])
+        );
     }
 
     #[test]
@@ -1248,14 +1061,9 @@ mod tests {
         let Some(Command::Window { command }) = cli.command else {
             panic!("expected window command");
         };
-        assert!(matches!(
-            command,
-            WindowCommand::Kill {
-                target,
-                session: Some(ref session),
-                force_local: true
-            } if target == "active" && session == "dev"
-        ));
+        assert!(
+            matches!(command, WindowCommand::External(args) if args == vec!["kill", "active", "--session", "dev", "--force-local"])
+        );
     }
 
     #[test]
@@ -1265,13 +1073,9 @@ mod tests {
         let Some(Command::Window { command }) = cli.command else {
             panic!("expected window command");
         };
-        assert!(matches!(
-            command,
-            WindowCommand::KillAll {
-                session: Some(ref session),
-                force_local: false
-            } if session == "dev"
-        ));
+        assert!(
+            matches!(command, WindowCommand::External(args) if args == vec!["kill-all", "--session", "dev"])
+        );
     }
 
     #[test]
@@ -1280,13 +1084,7 @@ mod tests {
         let Some(Command::Window { command }) = cli.command else {
             panic!("expected window command");
         };
-        assert!(matches!(
-            command,
-            WindowCommand::KillAll {
-                session: None,
-                force_local: false
-            }
-        ));
+        assert!(matches!(command, WindowCommand::External(args) if args == vec!["kill-all"]));
     }
 
     #[test]
@@ -1296,10 +1094,7 @@ mod tests {
         let Some(Command::Window { command }) = cli.command else {
             panic!("expected window command");
         };
-        assert!(matches!(
-            command,
-            WindowCommand::Switch { target, session: None } if target == "main"
-        ));
+        assert!(matches!(command, WindowCommand::External(args) if args == vec!["switch", "main"]));
     }
 
     #[test]

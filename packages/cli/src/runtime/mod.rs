@@ -1,6 +1,6 @@
 use crate::cli::{
-    Cli, Command, KeymapCommand, PluginCommand, RoleValue, ServerCommand, SessionCommand,
-    TerminalCommand, TraceFamily, WindowCommand,
+    Cli, Command, KeymapCommand, PluginCommand, ServerCommand, SessionCommand, TerminalCommand,
+    TraceFamily, WindowCommand,
 };
 use crate::connection::{
     ConnectionPolicyScope, ServerRuntimeMetadata, connect, connect_raw, current_cli_build_id,
@@ -213,6 +213,20 @@ fn next_default_session_name(sessions: &[SessionSummary]) -> String {
 async fn run_command(command: &Command) -> Result<u8> {
     match command {
         Command::External(args) => run_external_plugin_command(args).await,
+        Command::Session {
+            command: SessionCommand::External(args),
+        } => {
+            let mut full_args = vec!["session".to_string()];
+            full_args.extend(args.clone());
+            run_external_plugin_command(&full_args).await
+        }
+        Command::Window {
+            command: WindowCommand::External(args),
+        } => {
+            let mut full_args = vec!["window".to_string()];
+            full_args.extend(args.clone());
+            run_external_plugin_command(&full_args).await
+        }
         _ => dispatch_built_in_command(command).await,
     }
 }
@@ -222,40 +236,30 @@ fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
         Command::NewSession { .. } => BuiltInHandlerId::NewSession,
         Command::ListSessions { .. } => BuiltInHandlerId::ListSessions,
         Command::ListClients { .. } => BuiltInHandlerId::ListClients,
-        Command::Permissions { .. } => BuiltInHandlerId::Permissions,
-        Command::Grant { .. } => BuiltInHandlerId::Grant,
-        Command::Revoke { .. } => BuiltInHandlerId::Revoke,
         Command::KillSession { .. } => BuiltInHandlerId::KillSession,
         Command::KillAllSessions { .. } => BuiltInHandlerId::KillAllSessions,
         Command::Attach { .. } => BuiltInHandlerId::Attach,
         Command::Detach => BuiltInHandlerId::Detach,
-        Command::NewWindow { .. } => BuiltInHandlerId::NewWindow,
-        Command::ListWindows { .. } => BuiltInHandlerId::ListWindows,
-        Command::KillWindow { .. } => BuiltInHandlerId::KillWindow,
-        Command::KillAllWindows { .. } => BuiltInHandlerId::KillAllWindows,
-        Command::SwitchWindow { .. } => BuiltInHandlerId::SwitchWindow,
         Command::Follow { .. } => BuiltInHandlerId::Follow,
         Command::Unfollow => BuiltInHandlerId::Unfollow,
         Command::Session { command } => match command {
             SessionCommand::New { .. } => BuiltInHandlerId::SessionNew,
             SessionCommand::List { .. } => BuiltInHandlerId::SessionList,
             SessionCommand::Clients { .. } => BuiltInHandlerId::SessionClients,
-            SessionCommand::Permissions { .. } => BuiltInHandlerId::SessionPermissions,
-            SessionCommand::Grant { .. } => BuiltInHandlerId::SessionGrant,
-            SessionCommand::Revoke { .. } => BuiltInHandlerId::SessionRevoke,
             SessionCommand::Kill { .. } => BuiltInHandlerId::SessionKill,
             SessionCommand::KillAll { .. } => BuiltInHandlerId::SessionKillAll,
             SessionCommand::Attach { .. } => BuiltInHandlerId::SessionAttach,
             SessionCommand::Detach => BuiltInHandlerId::SessionDetach,
             SessionCommand::Follow { .. } => BuiltInHandlerId::SessionFollow,
             SessionCommand::Unfollow => BuiltInHandlerId::SessionUnfollow,
+            SessionCommand::External(_) => {
+                unreachable!("session external commands are dispatched separately")
+            }
         },
         Command::Window { command } => match command {
-            WindowCommand::New { .. } => BuiltInHandlerId::WindowNew,
-            WindowCommand::List { .. } => BuiltInHandlerId::WindowList,
-            WindowCommand::Kill { .. } => BuiltInHandlerId::WindowKill,
-            WindowCommand::KillAll { .. } => BuiltInHandlerId::WindowKillAll,
-            WindowCommand::Switch { .. } => BuiltInHandlerId::WindowSwitch,
+            WindowCommand::External(_) => {
+                unreachable!("window external commands are dispatched separately")
+            }
         },
         Command::Server { command } => match command {
             ServerCommand::Start { .. } => BuiltInHandlerId::ServerStart,
@@ -292,25 +296,6 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
             run_client_list(*json).await
         }
         (
-            BuiltInHandlerId::Permissions,
-            Command::Permissions {
-                session,
-                json,
-                watch,
-            },
-        ) => run_permissions_list(session, *json, *watch).await,
-        (
-            BuiltInHandlerId::Grant,
-            Command::Grant {
-                session,
-                client,
-                role,
-            },
-        ) => run_grant_role(session, client, *role).await,
-        (BuiltInHandlerId::Revoke, Command::Revoke { session, client }) => {
-            run_revoke_role(session, client).await
-        }
-        (
             BuiltInHandlerId::KillSession,
             Command::KillSession {
                 target,
@@ -329,30 +314,6 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
             },
         ) => run_session_attach(target.as_deref(), follow.as_deref(), *global).await,
         (BuiltInHandlerId::Detach, Command::Detach) => run_session_detach().await,
-        (BuiltInHandlerId::NewWindow, Command::NewWindow { session, name }) => {
-            run_window_new(session.as_ref(), name.clone()).await
-        }
-        (BuiltInHandlerId::ListWindows, Command::ListWindows { session, json }) => {
-            run_window_list(session.as_ref(), *json).await
-        }
-        (
-            BuiltInHandlerId::KillWindow,
-            Command::KillWindow {
-                target,
-                session,
-                force_local,
-            },
-        ) => run_window_kill(target, session.as_ref(), *force_local).await,
-        (
-            BuiltInHandlerId::KillAllWindows,
-            Command::KillAllWindows {
-                session,
-                force_local,
-            },
-        ) => run_window_kill_all(session.as_ref(), *force_local).await,
-        (BuiltInHandlerId::SwitchWindow, Command::SwitchWindow { target, session }) => {
-            run_window_switch(target, session.as_ref()).await
-        }
         (
             BuiltInHandlerId::Follow,
             Command::Follow {
@@ -379,34 +340,6 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 command: SessionCommand::Clients { json },
             },
         ) => run_client_list(*json).await,
-        (
-            BuiltInHandlerId::SessionPermissions,
-            Command::Session {
-                command:
-                    SessionCommand::Permissions {
-                        session,
-                        json,
-                        watch,
-                    },
-            },
-        ) => run_permissions_list(session, *json, *watch).await,
-        (
-            BuiltInHandlerId::SessionGrant,
-            Command::Session {
-                command:
-                    SessionCommand::Grant {
-                        session,
-                        client,
-                        role,
-                    },
-            },
-        ) => run_grant_role(session, client, *role).await,
-        (
-            BuiltInHandlerId::SessionRevoke,
-            Command::Session {
-                command: SessionCommand::Revoke { session, client },
-            },
-        ) => run_revoke_role(session, client).await,
         (
             BuiltInHandlerId::SessionKill,
             Command::Session {
@@ -456,45 +389,6 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 command: SessionCommand::Unfollow,
             },
         ) => run_unfollow().await,
-        (
-            BuiltInHandlerId::WindowNew,
-            Command::Window {
-                command: WindowCommand::New { session, name },
-            },
-        ) => run_window_new(session.as_ref(), name.clone()).await,
-        (
-            BuiltInHandlerId::WindowList,
-            Command::Window {
-                command: WindowCommand::List { session, json },
-            },
-        ) => run_window_list(session.as_ref(), *json).await,
-        (
-            BuiltInHandlerId::WindowKill,
-            Command::Window {
-                command:
-                    WindowCommand::Kill {
-                        target,
-                        session,
-                        force_local,
-                    },
-            },
-        ) => run_window_kill(target, session.as_ref(), *force_local).await,
-        (
-            BuiltInHandlerId::WindowKillAll,
-            Command::Window {
-                command:
-                    WindowCommand::KillAll {
-                        session,
-                        force_local,
-                    },
-            },
-        ) => run_window_kill_all(session.as_ref(), *force_local).await,
-        (
-            BuiltInHandlerId::WindowSwitch,
-            Command::Window {
-                command: WindowCommand::Switch { target, session },
-            },
-        ) => run_window_switch(target, session.as_ref()).await,
         (
             BuiltInHandlerId::ServerStart,
             Command::Server {
@@ -1134,54 +1028,6 @@ async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]
     Ok(status.clamp(0, i32::from(u8::MAX)) as u8)
 }
 
-async fn try_run_shipped_plugin_command(
-    plugin_id: &str,
-    command_name: &str,
-    args: &[String],
-) -> Result<Option<u8>> {
-    let config = BmuxConfig::load()?;
-    let paths = ConfigPaths::default();
-    let registry = scan_available_plugins(&config, &paths)?;
-    let Some(plugin) = registry.get(plugin_id) else {
-        return Ok(None);
-    };
-    let entry_path = plugin.manifest.resolve_entry_path(
-        plugin
-            .manifest_path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new(".")),
-    );
-    if !entry_path.exists() {
-        return Ok(None);
-    }
-    let loaded = load_native_registered_plugin(
-        plugin,
-        &plugin_host_metadata(),
-        &supported_plugin_host_scopes(),
-    )
-    .with_context(|| format!("failed loading shipped plugin '{plugin_id}'"))?;
-    let context = plugin_command_context(&config, &paths, plugin_id, command_name, args);
-    let status = loaded
-        .run_command_with_context(command_name, args, Some(&context))
-        .with_context(|| {
-            format!("failed running shipped plugin command '{plugin_id}:{command_name}'")
-        })?;
-    Ok(Some(status.clamp(0, i32::from(u8::MAX)) as u8))
-}
-
-async fn require_shipped_plugin_command(
-    plugin_id: &str,
-    command_name: &str,
-    args: &[String],
-) -> Result<u8> {
-    match try_run_shipped_plugin_command(plugin_id, command_name, args).await? {
-        Some(code) => Ok(code),
-        None => anyhow::bail!(
-            "required shipped plugin command '{plugin_id}:{command_name}' is unavailable; ensure the shipped plugin bundle is installed"
-        ),
-    }
-}
-
 async fn run_external_plugin_command(args: &[String]) -> Result<u8> {
     let config = BmuxConfig::load()?;
     let paths = ConfigPaths::default();
@@ -1624,22 +1470,6 @@ async fn run_client_list(as_json: bool) -> Result<u8> {
     Ok(0)
 }
 
-async fn run_permissions_list(session: &str, as_json: bool, watch: bool) -> Result<u8> {
-    let args = permissions_plugin_args(session, as_json, watch);
-    require_shipped_plugin_command("bmux.permissions", "permissions", &args).await
-}
-
-fn permissions_plugin_args(session: &str, as_json: bool, watch: bool) -> Vec<String> {
-    let mut args = vec!["--session".to_string(), session.to_string()];
-    if as_json {
-        args.push("--json".to_string());
-    }
-    if watch {
-        args.push("--watch".to_string());
-    }
-    args
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DestructiveOpErrorKind {
     OwnerRoleRequired,
@@ -1789,44 +1619,6 @@ fn attach_quit_failure_status(error: &ClientError) -> &'static str {
         }
         DestructiveOpErrorKind::NotFound => "quit failed: session not found",
         DestructiveOpErrorKind::Other => "quit failed",
-    }
-}
-
-async fn run_grant_role(session: &str, client: &str, role: RoleValue) -> Result<u8> {
-    let args = grant_plugin_args(session, client, role);
-    require_shipped_plugin_command("bmux.permissions", "grant", &args).await
-}
-
-fn grant_plugin_args(session: &str, client: &str, role: RoleValue) -> Vec<String> {
-    vec![
-        "--session".to_string(),
-        session.to_string(),
-        "--client".to_string(),
-        client.to_string(),
-        "--role".to_string(),
-        role_value_label(role).to_string(),
-    ]
-}
-
-async fn run_revoke_role(session: &str, client: &str) -> Result<u8> {
-    let args = revoke_plugin_args(session, client);
-    require_shipped_plugin_command("bmux.permissions", "revoke", &args).await
-}
-
-fn revoke_plugin_args(session: &str, client: &str) -> Vec<String> {
-    vec![
-        "--session".to_string(),
-        session.to_string(),
-        "--client".to_string(),
-        client.to_string(),
-    ]
-}
-
-const fn role_value_label(role: RoleValue) -> &'static str {
-    match role {
-        RoleValue::Owner => "owner",
-        RoleValue::Writer => "writer",
-        RoleValue::Observer => "observer",
     }
 }
 
@@ -4441,95 +4233,6 @@ async fn run_unfollow() -> Result<u8> {
     Ok(0)
 }
 
-async fn run_window_new(session: Option<&String>, name: Option<String>) -> Result<u8> {
-    let args = new_window_plugin_args(session, name.as_ref());
-    require_shipped_plugin_command("bmux.windows", "new-window", &args).await
-}
-
-async fn run_window_list(session: Option<&String>, as_json: bool) -> Result<u8> {
-    let args = list_windows_plugin_args(session, as_json);
-    require_shipped_plugin_command("bmux.windows", "list-windows", &args).await
-}
-
-async fn run_window_kill(target: &str, session: Option<&String>, force_local: bool) -> Result<u8> {
-    let args = kill_window_plugin_args(target, session, force_local);
-    require_shipped_plugin_command("bmux.windows", "kill-window", &args).await
-}
-
-async fn run_window_kill_all(session: Option<&String>, force_local: bool) -> Result<u8> {
-    let args = kill_all_windows_plugin_args(session, force_local);
-    require_shipped_plugin_command("bmux.windows", "kill-all-windows", &args).await
-}
-
-async fn run_window_switch(target: &str, session: Option<&String>) -> Result<u8> {
-    let args = switch_window_plugin_args(target, session);
-    require_shipped_plugin_command("bmux.windows", "switch-window", &args).await
-}
-
-fn new_window_plugin_args(session: Option<&String>, name: Option<&String>) -> Vec<String> {
-    let mut args = Vec::new();
-    if let Some(session) = session {
-        args.push("--session".to_string());
-        args.push(session.clone());
-    }
-    if let Some(name) = name {
-        args.push("--name".to_string());
-        args.push(name.clone());
-    }
-    args
-}
-
-fn list_windows_plugin_args(session: Option<&String>, as_json: bool) -> Vec<String> {
-    let mut args = Vec::new();
-    if let Some(session) = session {
-        args.push("--session".to_string());
-        args.push(session.clone());
-    }
-    if as_json {
-        args.push("--json".to_string());
-    }
-    args
-}
-
-fn kill_window_plugin_args(
-    target: &str,
-    session: Option<&String>,
-    force_local: bool,
-) -> Vec<String> {
-    let mut args = Vec::new();
-    args.push(target.to_string());
-    if let Some(session) = session {
-        args.push("--session".to_string());
-        args.push(session.clone());
-    }
-    if force_local {
-        args.push("--force-local".to_string());
-    }
-    args
-}
-
-fn kill_all_windows_plugin_args(session: Option<&String>, force_local: bool) -> Vec<String> {
-    let mut args = Vec::new();
-    if let Some(session) = session {
-        args.push("--session".to_string());
-        args.push(session.clone());
-    }
-    if force_local {
-        args.push("--force-local".to_string());
-    }
-    args
-}
-
-fn switch_window_plugin_args(target: &str, session: Option<&String>) -> Vec<String> {
-    let mut args = Vec::new();
-    args.push(target.to_string());
-    if let Some(session) = session {
-        args.push("--session".to_string());
-        args.push(session.clone());
-    }
-    args
-}
-
 fn parse_session_selector(target: &str) -> SessionSelector {
     match Uuid::parse_str(target) {
         Ok(id) => SessionSelector::ById(id),
@@ -5534,15 +5237,14 @@ mod tests {
     }
 
     #[test]
-    fn built_in_handler_mapping_stays_in_sync_for_top_level_permissions() {
-        let command = Command::Permissions {
-            session: "dev".to_string(),
-            json: false,
-            watch: false,
+    fn built_in_handler_mapping_stays_in_sync_for_core_native_commands() {
+        let command = Command::KillSession {
+            target: "dev".to_string(),
+            force_local: false,
         };
         assert_eq!(
             super::built_in_handler_for_command(&command),
-            super::BuiltInHandlerId::Permissions
+            super::BuiltInHandlerId::KillSession
         );
     }
 
