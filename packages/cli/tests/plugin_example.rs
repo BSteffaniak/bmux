@@ -302,7 +302,7 @@ fn installs_example_plugin_and_runs_command() {
         &data_home,
         &runtime_dir,
         &tmp_dir,
-        &["plugin", "run", "example.native", "hello", "world"],
+        &["hello", "world"],
     );
 
     assert!(

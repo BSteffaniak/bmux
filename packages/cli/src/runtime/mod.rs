@@ -24,7 +24,7 @@ use bmux_plugin::{
     PluginManifest, PluginRegistry, load_registered_plugin as load_native_registered_plugin,
 };
 use bmux_server::BmuxServer;
-use clap::Parser;
+use clap::{CommandFactory, FromArgMatches};
 use crossterm::cursor::{MoveTo, SavePosition, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::queue;
@@ -115,14 +115,67 @@ enum TerminalProfile {
 }
 
 pub async fn run() -> Result<u8> {
-    let cli = Cli::parse();
-    init_logging(cli.verbose);
+    match parse_runtime_cli()? {
+        ParsedRuntimeCli::BuiltIn(cli) => {
+            init_logging(cli.verbose);
 
-    if let Some(command) = &cli.command {
-        return run_command(command).await;
+            if let Some(command) = &cli.command {
+                return run_command(command).await;
+            }
+
+            run_default_server_attach().await
+        }
+        ParsedRuntimeCli::Plugin {
+            verbose,
+            plugin_id,
+            command_name,
+            arguments,
+        } => {
+            init_logging(verbose);
+            run_plugin_command(&plugin_id, &command_name, &arguments).await
+        }
+    }
+}
+
+enum ParsedRuntimeCli {
+    BuiltIn(Cli),
+    Plugin {
+        verbose: bool,
+        plugin_id: String,
+        command_name: String,
+        arguments: Vec<String>,
+    },
+}
+
+fn parse_runtime_cli() -> Result<ParsedRuntimeCli> {
+    let argv = std::env::args_os().collect::<Vec<_>>();
+    let config = BmuxConfig::load()?;
+    let paths = ConfigPaths::default();
+    let registry = scan_available_plugins(&config, &paths)?;
+    let command_registry = PluginCommandRegistry::build(&config, &registry)
+        .context("failed building plugin CLI command registry")?;
+    let clap_command = command_registry
+        .augment_clap_command(Cli::command())
+        .context("failed augmenting CLI with plugin commands")?;
+    let matches = clap_command
+        .try_get_matches_from(&argv)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let verbose = matches.get_flag("verbose");
+    let (path, leaf_matches) = plugin_commands::selected_subcommand_path(&matches);
+    if let Some(resolved) = command_registry.resolve_exact_path(&path) {
+        let arguments =
+            PluginCommandRegistry::normalize_arguments_from_matches(&resolved.schema, leaf_matches);
+        return Ok(ParsedRuntimeCli::Plugin {
+            verbose,
+            plugin_id: resolved.plugin_id,
+            command_name: resolved.command_name,
+            arguments,
+        });
     }
 
-    run_default_server_attach().await
+    let cli =
+        Cli::from_arg_matches(&matches).map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    Ok(ParsedRuntimeCli::BuiltIn(cli))
 }
 
 async fn run_default_server_attach() -> Result<u8> {

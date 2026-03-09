@@ -15,10 +15,28 @@ execution = "host_callback"
 name      = "hello"
 summary   = "Print a hello message"
 
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "message"
+position            = 0
+summary             = "Optional greeting target"
+trailing_var_arg    = true
+value_name          = "MESSAGE"
+
 [[commands]]
 execution = "host_callback"
 name      = "permissions-list"
 summary   = "List session permissions through bmux host IPC"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "session"
+position   = 0
+required   = true
+summary    = "Session name or UUID"
+value_name = "SESSION"
 
 [[event_subscriptions]]
 kinds = ["system", "window"]

@@ -7,7 +7,8 @@ use bmux_config::ConfigPaths;
 use bmux_ipc::SessionSelector;
 use bmux_plugin::{
     CommandExecutionKind, HostScope, NativeCommandContext, NativeDescriptor, PluginCommand,
-    PluginEvent, PluginEventKind, PluginEventSubscription, PluginFeature, RustPlugin,
+    PluginCommandArgument, PluginCommandArgumentKind, PluginEvent, PluginEventKind,
+    PluginEventSubscription, PluginFeature, RustPlugin,
 };
 use std::collections::BTreeSet;
 
@@ -45,7 +46,20 @@ impl RustPlugin for ExamplePlugin {
                     aliases: Vec::new(),
                     summary: "Print a hello message".to_string(),
                     description: None,
-                    arguments: Vec::new(),
+                    arguments: vec![PluginCommandArgument {
+                        name: "message".to_string(),
+                        kind: PluginCommandArgumentKind::String,
+                        choice_values: Vec::new(),
+                        position: Some(0),
+                        long: None,
+                        short: None,
+                        required: false,
+                        multiple: true,
+                        trailing_var_arg: true,
+                        allow_hyphen_values: true,
+                        summary: Some("Optional greeting target".to_string()),
+                        value_name: Some("MESSAGE".to_string()),
+                    }],
                     execution: CommandExecutionKind::HostCallback,
                     expose_in_cli: true,
                 },
@@ -55,7 +69,20 @@ impl RustPlugin for ExamplePlugin {
                     aliases: Vec::new(),
                     summary: "List session permissions through bmux host IPC".to_string(),
                     description: None,
-                    arguments: Vec::new(),
+                    arguments: vec![PluginCommandArgument {
+                        name: "session".to_string(),
+                        kind: PluginCommandArgumentKind::String,
+                        choice_values: Vec::new(),
+                        position: Some(0),
+                        long: None,
+                        short: None,
+                        required: true,
+                        multiple: false,
+                        trailing_var_arg: false,
+                        allow_hyphen_values: false,
+                        summary: Some("Session name or UUID".to_string()),
+                        value_name: Some("SESSION".to_string()),
+                    }],
                     execution: CommandExecutionKind::HostCallback,
                     expose_in_cli: true,
                 },

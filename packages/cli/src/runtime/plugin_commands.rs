@@ -4,7 +4,7 @@ use bmux_config::BmuxConfig;
 use bmux_plugin::{
     PluginCommand, PluginCommandArgument, PluginCommandArgumentKind, PluginRegistry,
 };
-use clap::{Arg, ArgAction, Command};
+use clap::{Arg, ArgAction, ArgMatches, Command};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]
@@ -126,6 +126,23 @@ impl PluginCommandRegistry {
             })
     }
 
+    pub fn resolve_exact_path(&self, path: &[String]) -> Option<ResolvedPluginCommand> {
+        self.commands.iter().find_map(|command| {
+            let matches_path =
+                command.canonical_path == path || command.aliases.iter().any(|alias| alias == path);
+            if matches_path {
+                Some(ResolvedPluginCommand {
+                    plugin_id: command.plugin_id.clone(),
+                    command_name: command.command_name.clone(),
+                    arguments: Vec::new(),
+                    schema: command.schema.clone(),
+                })
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn validate_arguments(
         command: &PluginCommand,
         arguments: &[String],
@@ -183,6 +200,112 @@ impl PluginCommandRegistry {
 
         Ok(normalized)
     }
+
+    pub fn normalize_arguments_from_matches(
+        command: &PluginCommand,
+        matches: &ArgMatches,
+    ) -> Vec<String> {
+        let mut normalized = Vec::new();
+        for argument in &command.arguments {
+            if let Some(long) = &argument.long {
+                if matches.value_source(&argument.name).is_none() {
+                    continue;
+                }
+                if matches!(argument.kind, PluginCommandArgumentKind::Boolean) {
+                    if matches.get_flag(&argument.name) {
+                        normalized.push(format!("--{long}"));
+                    }
+                    continue;
+                }
+                if argument.multiple {
+                    if let Some(values) = matches.get_many::<String>(&argument.name) {
+                        for value in values {
+                            normalized.push(format!("--{long}"));
+                            normalized.push(value.to_string());
+                        }
+                    }
+                } else if let Some(value) = matches.get_one::<String>(&argument.name) {
+                    normalized.push(format!("--{long}"));
+                    normalized.push(value.to_string());
+                }
+                continue;
+            }
+
+            if argument.multiple {
+                if let Some(values) = matches.get_many::<String>(&argument.name) {
+                    normalized.extend(values.cloned());
+                }
+            } else if let Some(value) = matches.get_one::<String>(&argument.name) {
+                normalized.push(value.to_string());
+            }
+        }
+        normalized
+    }
+
+    pub fn augment_clap_command(&self, root: Command) -> Result<Command> {
+        let mut root = root;
+        for command in &self.commands {
+            for path in std::iter::once(&command.canonical_path).chain(command.aliases.iter()) {
+                insert_plugin_path(&mut root, path, &command.schema)?;
+            }
+        }
+        Ok(root)
+    }
+}
+
+pub fn selected_subcommand_path<'a>(matches: &'a ArgMatches) -> (Vec<String>, &'a ArgMatches) {
+    let mut path = Vec::new();
+    let mut current = matches;
+    while let Some((name, next)) = current.subcommand() {
+        path.push(name.to_string());
+        current = next;
+    }
+    (path, current)
+}
+
+fn insert_plugin_path(root: &mut Command, path: &[String], schema: &PluginCommand) -> Result<()> {
+    if path.is_empty() {
+        bail!("plugin command path cannot be empty");
+    }
+
+    if path.len() == 1 {
+        let updated = std::mem::replace(root, Command::new("bmux-temp-root")).subcommand(
+            build_plugin_leaf_command(path.last().expect("leaf exists"), schema)?,
+        );
+        *root = updated;
+        return Ok(());
+    }
+
+    let head = &path[0];
+    let tail = &path[1..];
+    let child = root.find_subcommand_mut(head).with_context(|| {
+        format!(
+            "missing clap namespace for plugin path '{}'",
+            path.join(" ")
+        )
+    })?;
+    if tail.len() == 1 {
+        let updated = std::mem::replace(child, Command::new("bmux-temp-child")).subcommand(
+            build_plugin_leaf_command(tail.last().expect("leaf exists"), schema)?,
+        );
+        *child = updated;
+        return Ok(());
+    }
+
+    insert_plugin_path(child, tail, schema)
+}
+
+fn build_plugin_leaf_command(name: &str, schema: &PluginCommand) -> Result<Command> {
+    let mut command = Command::new(leak_string(name))
+        .about(leak_string(&schema.summary))
+        .disable_help_subcommand(true);
+    if let Some(description) = &schema.description {
+        command = command.long_about(leak_string(description));
+    }
+    for argument in &schema.arguments {
+        command = command.arg(build_clap_arg(argument)?);
+    }
+    Ok(command)
 }
 
 fn build_clap_arg(argument: &PluginCommandArgument) -> Result<Arg> {
