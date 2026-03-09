@@ -120,3 +120,12 @@ Raw internal types would make plugins brittle and would tightly couple every plu
 - runtime key actions should support plugin-defined actions rather than only built-in enums
 - server request handling should be decomposed into smaller units with clear extension seams
 - plugin-facing event flow should converge on a single event model
+
+## Command Boundary
+
+bmux classifies commands using a simple rule:
+
+- core-native: bmux must retain the functionality for bootstrap, recovery, administration, or native simplicity
+- plugin-backed: bmux can still exist without the feature, so it is a candidate for shipped or installed plugins
+
+The current migration matrix lives in `docs/command-migration-matrix.md`.
