@@ -1,6 +1,6 @@
 use crate::cli::{
     Cli, Command, KeymapCommand, PluginCommand, ServerCommand, SessionCommand, TerminalCommand,
-    TraceFamily, WindowCommand,
+    TraceFamily,
 };
 use crate::connection::{
     ConnectionPolicyScope, ServerRuntimeMetadata, connect, connect_raw, current_cli_build_id,
@@ -306,13 +306,6 @@ async fn run_command(command: &Command) -> Result<u8> {
             full_args.extend(args.clone());
             run_external_plugin_command(&full_args).await
         }
-        Command::Window {
-            command: WindowCommand::External(args),
-        } => {
-            let mut full_args = vec!["window".to_string()];
-            full_args.extend(args.clone());
-            run_external_plugin_command(&full_args).await
-        }
         _ => dispatch_built_in_command(command).await,
     }
 }
@@ -340,11 +333,6 @@ fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
             SessionCommand::Unfollow => BuiltInHandlerId::SessionUnfollow,
             SessionCommand::External(_) => {
                 unreachable!("session external commands are dispatched separately")
-            }
-        },
-        Command::Window { command } => match command {
-            WindowCommand::External(_) => {
-                unreachable!("window external commands are dispatched separately")
             }
         },
         Command::Server { command } => match command {

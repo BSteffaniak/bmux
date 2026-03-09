@@ -278,9 +278,14 @@ fn insert_plugin_path(root: &mut Command, path: &[String], schema: &PluginComman
 
     let head = &path[0];
     let tail = &path[1..];
+    if root.find_subcommand(head).is_none() {
+        let updated = std::mem::replace(root, Command::new("bmux-temp-root"))
+            .subcommand(build_plugin_namespace_command(head));
+        *root = updated;
+    }
     let child = root.find_subcommand_mut(head).with_context(|| {
         format!(
-            "missing clap namespace for plugin path '{}'",
+            "missing clap namespace for plugin path '{}' after namespace creation",
             path.join(" ")
         )
     })?;
@@ -293,6 +298,12 @@ fn insert_plugin_path(root: &mut Command, path: &[String], schema: &PluginComman
     }
 
     insert_plugin_path(child, tail, schema)
+}
+
+fn build_plugin_namespace_command(name: &str) -> Command {
+    Command::new(leak_string(name))
+        .disable_help_subcommand(true)
+        .arg_required_else_help(true)
 }
 
 fn build_plugin_leaf_command(name: &str, schema: &PluginCommand) -> Result<Command> {
@@ -418,6 +429,7 @@ mod tests {
     use super::PluginCommandRegistry;
     use bmux_config::BmuxConfig;
     use bmux_plugin::{PluginManifest, PluginRegistry};
+    use clap::Command;
     use std::path::Path;
 
     fn config_with_enabled(plugin_id: &str) -> BmuxConfig {
@@ -558,5 +570,53 @@ minimum = "1.0"
             .expect("manifest should register");
         PluginCommandRegistry::build(&config_with_enabled("bmux.windows"), &registry)
             .expect("windows command registry should build");
+    }
+
+    #[test]
+    fn augment_clap_command_creates_missing_namespace_roots() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "bmux.windows"
+name = "Windows"
+version = "0.1.0"
+entry = "plugin.dylib"
+required_host_scopes = ["bmux.commands"]
+
+[[commands]]
+name = "new-window"
+path = ["new-window"]
+aliases = [["window", "new"]]
+summary = "new"
+execution = "host_callback"
+expose_in_cli = true
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+        )
+        .expect("manifest should parse");
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest_from_root(
+                Path::new("/plugins"),
+                Path::new("/plugins/plugin.toml"),
+                manifest,
+            )
+            .expect("manifest should register");
+        let commands =
+            PluginCommandRegistry::build(&config_with_enabled("bmux.windows"), &registry)
+                .expect("windows command registry should build");
+
+        let clap = commands
+            .augment_clap_command(Command::new("bmux"))
+            .expect("dynamic namespace should be created");
+        let matches = clap
+            .try_get_matches_from(["bmux", "window", "new"])
+            .expect("window namespace path should parse");
+        let (path, _) = super::selected_subcommand_path(&matches);
+        assert_eq!(path, vec!["window".to_string(), "new".to_string()]);
     }
 }

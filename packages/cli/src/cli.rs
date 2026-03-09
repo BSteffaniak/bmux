@@ -94,11 +94,6 @@ pub enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
-    /// Window management commands
-    Window {
-        #[command(subcommand)]
-        command: WindowCommand,
-    },
     /// Server lifecycle and status tools
     Server {
         #[command(subcommand)]
@@ -179,12 +174,6 @@ pub enum SessionCommand {
     },
     /// Stop following a client
     Unfollow,
-    #[command(external_subcommand)]
-    External(Vec<String>),
-}
-
-#[derive(Debug, Subcommand)]
-pub enum WindowCommand {
     #[command(external_subcommand)]
     External(Vec<String>),
 }
@@ -292,7 +281,7 @@ pub enum PluginCommand {
 mod tests {
     use super::{
         Cli, Command, KeymapCommand, PluginCommand, ServerCommand, SessionCommand, TerminalCommand,
-        TraceFamily, WindowCommand,
+        TraceFamily,
     };
     use clap::Parser;
 
@@ -1003,98 +992,6 @@ mod tests {
             panic!("expected session command");
         };
         assert!(matches!(command, SessionCommand::Unfollow));
-    }
-
-    #[test]
-    fn parses_grouped_window_new_command() {
-        let cli = Cli::try_parse_from([
-            "bmux",
-            "window",
-            "new",
-            "--session",
-            "dev",
-            "--name",
-            "editor",
-        ])
-        .expect("valid CLI args");
-        let Some(Command::Window { command }) = cli.command else {
-            panic!("expected window command");
-        };
-        assert!(
-            matches!(command, WindowCommand::External(args) if args == vec!["new", "--session", "dev", "--name", "editor"])
-        );
-    }
-
-    #[test]
-    fn parses_grouped_window_list_command() {
-        let cli = Cli::try_parse_from(["bmux", "window", "list"]).expect("valid CLI args");
-        let Some(Command::Window { command }) = cli.command else {
-            panic!("expected window command");
-        };
-        assert!(matches!(command, WindowCommand::External(args) if args == vec!["list"]));
-    }
-
-    #[test]
-    fn parses_grouped_window_kill_command() {
-        let cli = Cli::try_parse_from(["bmux", "window", "kill", "active", "--session", "dev"])
-            .expect("valid CLI args");
-        let Some(Command::Window { command }) = cli.command else {
-            panic!("expected window command");
-        };
-        assert!(
-            matches!(command, WindowCommand::External(args) if args == vec!["kill", "active", "--session", "dev"])
-        );
-    }
-
-    #[test]
-    fn parses_grouped_window_kill_force_local_flag() {
-        let cli = Cli::try_parse_from([
-            "bmux",
-            "window",
-            "kill",
-            "active",
-            "--session",
-            "dev",
-            "--force-local",
-        ])
-        .expect("valid CLI args");
-        let Some(Command::Window { command }) = cli.command else {
-            panic!("expected window command");
-        };
-        assert!(
-            matches!(command, WindowCommand::External(args) if args == vec!["kill", "active", "--session", "dev", "--force-local"])
-        );
-    }
-
-    #[test]
-    fn parses_grouped_window_kill_all_command() {
-        let cli = Cli::try_parse_from(["bmux", "window", "kill-all", "--session", "dev"])
-            .expect("valid CLI args");
-        let Some(Command::Window { command }) = cli.command else {
-            panic!("expected window command");
-        };
-        assert!(
-            matches!(command, WindowCommand::External(args) if args == vec!["kill-all", "--session", "dev"])
-        );
-    }
-
-    #[test]
-    fn parses_grouped_window_kill_all_without_session_command() {
-        let cli = Cli::try_parse_from(["bmux", "window", "kill-all"]).expect("valid CLI args");
-        let Some(Command::Window { command }) = cli.command else {
-            panic!("expected window command");
-        };
-        assert!(matches!(command, WindowCommand::External(args) if args == vec!["kill-all"]));
-    }
-
-    #[test]
-    fn parses_grouped_window_switch_command() {
-        let cli =
-            Cli::try_parse_from(["bmux", "window", "switch", "main"]).expect("valid CLI args");
-        let Some(Command::Window { command }) = cli.command else {
-            panic!("expected window command");
-        };
-        assert!(matches!(command, WindowCommand::External(args) if args == vec!["switch", "main"]));
     }
 
     #[test]
