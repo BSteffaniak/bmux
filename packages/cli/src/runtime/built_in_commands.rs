@@ -345,9 +345,19 @@ pub fn reserved_built_in_paths() -> BTreeSet<Vec<String>> {
         .collect()
 }
 
+pub fn built_in_command_by_handler(handler: BuiltInHandlerId) -> BuiltInCliCommand {
+    built_in_cli_commands()
+        .into_iter()
+        .find(|command| command.handler == handler)
+        .expect("built-in command handler should be registered")
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{BuiltInHandlerId, built_in_cli_commands, reserved_built_in_paths};
+    use super::{
+        BuiltInHandlerId, built_in_cli_commands, built_in_command_by_handler,
+        reserved_built_in_paths,
+    };
 
     #[test]
     fn reserved_paths_include_nested_plugin_run_path() {
@@ -362,5 +372,14 @@ mod tests {
             command.handler == BuiltInHandlerId::Permissions
                 && command.canonical_path == vec!["permissions".to_string()]
         }));
+    }
+
+    #[test]
+    fn command_lookup_by_handler_returns_descriptor() {
+        let command = built_in_command_by_handler(BuiltInHandlerId::PluginRun);
+        assert_eq!(
+            command.canonical_path,
+            vec!["plugin".to_string(), "run".to_string()]
+        );
     }
 }

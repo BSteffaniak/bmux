@@ -54,6 +54,7 @@ use attach::state::{
     AttachEventAction, AttachExitReason, AttachScrollbackCursor, AttachScrollbackPosition,
     AttachUiMode, AttachViewState, PaneRect,
 };
+use built_in_commands::{BuiltInHandlerId, built_in_command_by_handler};
 use plugin_commands::PluginCommandRegistry;
 use terminal_protocol::{
     ProtocolDirection, ProtocolProfile, ProtocolTraceEvent, primary_da_for_profile,
@@ -200,137 +201,372 @@ fn next_default_session_name(sessions: &[SessionSummary]) -> String {
 
 async fn run_command(command: &Command) -> Result<u8> {
     match command {
-        Command::NewSession { name } => run_session_new(name.clone()).await,
-        Command::ListSessions { json } => run_session_list(*json).await,
-        Command::ListClients { json } => run_client_list(*json).await,
-        Command::Permissions {
-            session,
-            json,
-            watch,
-        } => run_permissions_list(session, *json, *watch).await,
-        Command::Grant {
-            session,
-            client,
-            role,
-        } => run_grant_role(session, client, *role).await,
-        Command::Revoke { session, client } => run_revoke_role(session, client).await,
-        Command::KillSession {
-            target,
-            force_local,
-        } => run_session_kill(target, *force_local).await,
-        Command::KillAllSessions { force_local } => run_session_kill_all(*force_local).await,
-        Command::Attach {
-            target,
-            follow,
-            global,
-        } => run_session_attach(target.as_deref(), follow.as_deref(), *global).await,
-        Command::Detach => run_session_detach().await,
-        Command::NewWindow { session, name } => {
-            run_window_new(session.as_ref(), name.clone()).await
-        }
-        Command::ListWindows { session, json } => run_window_list(session.as_ref(), *json).await,
-        Command::KillWindow {
-            target,
-            session,
-            force_local,
-        } => run_window_kill(target, session.as_ref(), *force_local).await,
-        Command::KillAllWindows {
-            session,
-            force_local,
-        } => run_window_kill_all(session.as_ref(), *force_local).await,
-        Command::SwitchWindow { target, session } => {
-            run_window_switch(target, session.as_ref()).await
-        }
-        Command::Follow {
-            target_client_id,
-            global,
-        } => run_follow(target_client_id, *global).await,
-        Command::Unfollow => run_unfollow().await,
+        Command::External(args) => run_external_plugin_command(args).await,
+        _ => dispatch_built_in_command(command).await,
+    }
+}
+
+fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
+    match command {
+        Command::NewSession { .. } => BuiltInHandlerId::NewSession,
+        Command::ListSessions { .. } => BuiltInHandlerId::ListSessions,
+        Command::ListClients { .. } => BuiltInHandlerId::ListClients,
+        Command::Permissions { .. } => BuiltInHandlerId::Permissions,
+        Command::Grant { .. } => BuiltInHandlerId::Grant,
+        Command::Revoke { .. } => BuiltInHandlerId::Revoke,
+        Command::KillSession { .. } => BuiltInHandlerId::KillSession,
+        Command::KillAllSessions { .. } => BuiltInHandlerId::KillAllSessions,
+        Command::Attach { .. } => BuiltInHandlerId::Attach,
+        Command::Detach => BuiltInHandlerId::Detach,
+        Command::NewWindow { .. } => BuiltInHandlerId::NewWindow,
+        Command::ListWindows { .. } => BuiltInHandlerId::ListWindows,
+        Command::KillWindow { .. } => BuiltInHandlerId::KillWindow,
+        Command::KillAllWindows { .. } => BuiltInHandlerId::KillAllWindows,
+        Command::SwitchWindow { .. } => BuiltInHandlerId::SwitchWindow,
+        Command::Follow { .. } => BuiltInHandlerId::Follow,
+        Command::Unfollow => BuiltInHandlerId::Unfollow,
         Command::Session { command } => match command {
-            SessionCommand::New { name } => run_session_new(name.clone()).await,
-            SessionCommand::List { json } => run_session_list(*json).await,
-            SessionCommand::Clients { json } => run_client_list(*json).await,
-            SessionCommand::Permissions {
+            SessionCommand::New { .. } => BuiltInHandlerId::SessionNew,
+            SessionCommand::List { .. } => BuiltInHandlerId::SessionList,
+            SessionCommand::Clients { .. } => BuiltInHandlerId::SessionClients,
+            SessionCommand::Permissions { .. } => BuiltInHandlerId::SessionPermissions,
+            SessionCommand::Grant { .. } => BuiltInHandlerId::SessionGrant,
+            SessionCommand::Revoke { .. } => BuiltInHandlerId::SessionRevoke,
+            SessionCommand::Kill { .. } => BuiltInHandlerId::SessionKill,
+            SessionCommand::KillAll { .. } => BuiltInHandlerId::SessionKillAll,
+            SessionCommand::Attach { .. } => BuiltInHandlerId::SessionAttach,
+            SessionCommand::Detach => BuiltInHandlerId::SessionDetach,
+            SessionCommand::Follow { .. } => BuiltInHandlerId::SessionFollow,
+            SessionCommand::Unfollow => BuiltInHandlerId::SessionUnfollow,
+        },
+        Command::Window { command } => match command {
+            WindowCommand::New { .. } => BuiltInHandlerId::WindowNew,
+            WindowCommand::List { .. } => BuiltInHandlerId::WindowList,
+            WindowCommand::Kill { .. } => BuiltInHandlerId::WindowKill,
+            WindowCommand::KillAll { .. } => BuiltInHandlerId::WindowKillAll,
+            WindowCommand::Switch { .. } => BuiltInHandlerId::WindowSwitch,
+        },
+        Command::Server { command } => match command {
+            ServerCommand::Start { .. } => BuiltInHandlerId::ServerStart,
+            ServerCommand::Status { .. } => BuiltInHandlerId::ServerStatus,
+            ServerCommand::WhoamiPrincipal { .. } => BuiltInHandlerId::ServerWhoamiPrincipal,
+            ServerCommand::Save => BuiltInHandlerId::ServerSave,
+            ServerCommand::Restore { .. } => BuiltInHandlerId::ServerRestore,
+            ServerCommand::Stop => BuiltInHandlerId::ServerStop,
+        },
+        Command::Keymap { .. } => BuiltInHandlerId::KeymapDoctor,
+        Command::Terminal { command } => match command {
+            TerminalCommand::Doctor { .. } => BuiltInHandlerId::TerminalDoctor,
+            TerminalCommand::InstallTerminfo { .. } => BuiltInHandlerId::TerminalInstallTerminfo,
+        },
+        Command::Plugin { command } => match command {
+            PluginCommand::List { .. } => BuiltInHandlerId::PluginList,
+            PluginCommand::Run { .. } => BuiltInHandlerId::PluginRun,
+        },
+        Command::External(_) => unreachable!("external commands are dispatched separately"),
+    }
+}
+
+async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
+    let handler = built_in_handler_for_command(command);
+    let _descriptor = built_in_command_by_handler(handler);
+    match (handler, command) {
+        (BuiltInHandlerId::NewSession, Command::NewSession { name }) => {
+            run_session_new(name.clone()).await
+        }
+        (BuiltInHandlerId::ListSessions, Command::ListSessions { json }) => {
+            run_session_list(*json).await
+        }
+        (BuiltInHandlerId::ListClients, Command::ListClients { json }) => {
+            run_client_list(*json).await
+        }
+        (
+            BuiltInHandlerId::Permissions,
+            Command::Permissions {
                 session,
                 json,
                 watch,
-            } => run_permissions_list(session, *json, *watch).await,
-            SessionCommand::Grant {
+            },
+        ) => run_permissions_list(session, *json, *watch).await,
+        (
+            BuiltInHandlerId::Grant,
+            Command::Grant {
                 session,
                 client,
                 role,
-            } => run_grant_role(session, client, *role).await,
-            SessionCommand::Revoke { session, client } => run_revoke_role(session, client).await,
-            SessionCommand::Kill {
+            },
+        ) => run_grant_role(session, client, *role).await,
+        (BuiltInHandlerId::Revoke, Command::Revoke { session, client }) => {
+            run_revoke_role(session, client).await
+        }
+        (
+            BuiltInHandlerId::KillSession,
+            Command::KillSession {
                 target,
                 force_local,
-            } => run_session_kill(target, *force_local).await,
-            SessionCommand::KillAll { force_local } => run_session_kill_all(*force_local).await,
-            SessionCommand::Attach {
+            },
+        ) => run_session_kill(target, *force_local).await,
+        (BuiltInHandlerId::KillAllSessions, Command::KillAllSessions { force_local }) => {
+            run_session_kill_all(*force_local).await
+        }
+        (
+            BuiltInHandlerId::Attach,
+            Command::Attach {
                 target,
                 follow,
                 global,
-            } => run_session_attach(target.as_deref(), follow.as_deref(), *global).await,
-            SessionCommand::Detach => run_session_detach().await,
-            SessionCommand::Follow {
-                target_client_id,
-                global,
-            } => run_follow(target_client_id, *global).await,
-            SessionCommand::Unfollow => run_unfollow().await,
-        },
-        Command::Window { command } => match command {
-            WindowCommand::New { session, name } => {
-                run_window_new(session.as_ref(), name.clone()).await
-            }
-            WindowCommand::List { session, json } => run_window_list(session.as_ref(), *json).await,
-            WindowCommand::Kill {
+            },
+        ) => run_session_attach(target.as_deref(), follow.as_deref(), *global).await,
+        (BuiltInHandlerId::Detach, Command::Detach) => run_session_detach().await,
+        (BuiltInHandlerId::NewWindow, Command::NewWindow { session, name }) => {
+            run_window_new(session.as_ref(), name.clone()).await
+        }
+        (BuiltInHandlerId::ListWindows, Command::ListWindows { session, json }) => {
+            run_window_list(session.as_ref(), *json).await
+        }
+        (
+            BuiltInHandlerId::KillWindow,
+            Command::KillWindow {
                 target,
                 session,
                 force_local,
-            } => run_window_kill(target, session.as_ref(), *force_local).await,
-            WindowCommand::KillAll {
+            },
+        ) => run_window_kill(target, session.as_ref(), *force_local).await,
+        (
+            BuiltInHandlerId::KillAllWindows,
+            Command::KillAllWindows {
                 session,
                 force_local,
-            } => run_window_kill_all(session.as_ref(), *force_local).await,
-            WindowCommand::Switch { target, session } => {
-                run_window_switch(target, session.as_ref()).await
-            }
-        },
-        Command::Server { command } => match command {
-            ServerCommand::Start {
-                daemon,
-                foreground_internal,
-            } => run_server_start(*daemon, *foreground_internal).await,
-            ServerCommand::Status { json } => run_server_status(*json).await,
-            ServerCommand::WhoamiPrincipal { json } => run_server_whoami_principal(*json).await,
-            ServerCommand::Save => run_server_save().await,
-            ServerCommand::Restore { dry_run, yes } => run_server_restore(*dry_run, *yes).await,
-            ServerCommand::Stop => run_server_stop().await,
-        },
-        Command::Keymap { command } => match command {
-            KeymapCommand::Doctor { json } => run_keymap_doctor(*json),
-        },
-        Command::Terminal { command } => match command {
-            TerminalCommand::Doctor {
-                json,
-                trace,
-                trace_limit,
-                trace_family,
-                trace_pane,
-            } => run_terminal_doctor(*json, *trace, *trace_limit, *trace_family, *trace_pane),
-            TerminalCommand::InstallTerminfo { yes, check } => {
-                run_terminal_install_terminfo(*yes, *check)
-            }
-        },
-        Command::Plugin { command } => match command {
-            PluginCommand::List { json } => run_plugin_list(*json).await,
-            PluginCommand::Run {
-                plugin,
-                command,
-                args,
-            } => run_plugin_command(plugin, command, args).await,
-        },
-        Command::External(args) => run_external_plugin_command(args).await,
+            },
+        ) => run_window_kill_all(session.as_ref(), *force_local).await,
+        (BuiltInHandlerId::SwitchWindow, Command::SwitchWindow { target, session }) => {
+            run_window_switch(target, session.as_ref()).await
+        }
+        (
+            BuiltInHandlerId::Follow,
+            Command::Follow {
+                target_client_id,
+                global,
+            },
+        ) => run_follow(target_client_id, *global).await,
+        (BuiltInHandlerId::Unfollow, Command::Unfollow) => run_unfollow().await,
+        (
+            BuiltInHandlerId::SessionNew,
+            Command::Session {
+                command: SessionCommand::New { name },
+            },
+        ) => run_session_new(name.clone()).await,
+        (
+            BuiltInHandlerId::SessionList,
+            Command::Session {
+                command: SessionCommand::List { json },
+            },
+        ) => run_session_list(*json).await,
+        (
+            BuiltInHandlerId::SessionClients,
+            Command::Session {
+                command: SessionCommand::Clients { json },
+            },
+        ) => run_client_list(*json).await,
+        (
+            BuiltInHandlerId::SessionPermissions,
+            Command::Session {
+                command:
+                    SessionCommand::Permissions {
+                        session,
+                        json,
+                        watch,
+                    },
+            },
+        ) => run_permissions_list(session, *json, *watch).await,
+        (
+            BuiltInHandlerId::SessionGrant,
+            Command::Session {
+                command:
+                    SessionCommand::Grant {
+                        session,
+                        client,
+                        role,
+                    },
+            },
+        ) => run_grant_role(session, client, *role).await,
+        (
+            BuiltInHandlerId::SessionRevoke,
+            Command::Session {
+                command: SessionCommand::Revoke { session, client },
+            },
+        ) => run_revoke_role(session, client).await,
+        (
+            BuiltInHandlerId::SessionKill,
+            Command::Session {
+                command:
+                    SessionCommand::Kill {
+                        target,
+                        force_local,
+                    },
+            },
+        ) => run_session_kill(target, *force_local).await,
+        (
+            BuiltInHandlerId::SessionKillAll,
+            Command::Session {
+                command: SessionCommand::KillAll { force_local },
+            },
+        ) => run_session_kill_all(*force_local).await,
+        (
+            BuiltInHandlerId::SessionAttach,
+            Command::Session {
+                command:
+                    SessionCommand::Attach {
+                        target,
+                        follow,
+                        global,
+                    },
+            },
+        ) => run_session_attach(target.as_deref(), follow.as_deref(), *global).await,
+        (
+            BuiltInHandlerId::SessionDetach,
+            Command::Session {
+                command: SessionCommand::Detach,
+            },
+        ) => run_session_detach().await,
+        (
+            BuiltInHandlerId::SessionFollow,
+            Command::Session {
+                command:
+                    SessionCommand::Follow {
+                        target_client_id,
+                        global,
+                    },
+            },
+        ) => run_follow(target_client_id, *global).await,
+        (
+            BuiltInHandlerId::SessionUnfollow,
+            Command::Session {
+                command: SessionCommand::Unfollow,
+            },
+        ) => run_unfollow().await,
+        (
+            BuiltInHandlerId::WindowNew,
+            Command::Window {
+                command: WindowCommand::New { session, name },
+            },
+        ) => run_window_new(session.as_ref(), name.clone()).await,
+        (
+            BuiltInHandlerId::WindowList,
+            Command::Window {
+                command: WindowCommand::List { session, json },
+            },
+        ) => run_window_list(session.as_ref(), *json).await,
+        (
+            BuiltInHandlerId::WindowKill,
+            Command::Window {
+                command:
+                    WindowCommand::Kill {
+                        target,
+                        session,
+                        force_local,
+                    },
+            },
+        ) => run_window_kill(target, session.as_ref(), *force_local).await,
+        (
+            BuiltInHandlerId::WindowKillAll,
+            Command::Window {
+                command:
+                    WindowCommand::KillAll {
+                        session,
+                        force_local,
+                    },
+            },
+        ) => run_window_kill_all(session.as_ref(), *force_local).await,
+        (
+            BuiltInHandlerId::WindowSwitch,
+            Command::Window {
+                command: WindowCommand::Switch { target, session },
+            },
+        ) => run_window_switch(target, session.as_ref()).await,
+        (
+            BuiltInHandlerId::ServerStart,
+            Command::Server {
+                command:
+                    ServerCommand::Start {
+                        daemon,
+                        foreground_internal,
+                    },
+            },
+        ) => run_server_start(*daemon, *foreground_internal).await,
+        (
+            BuiltInHandlerId::ServerStatus,
+            Command::Server {
+                command: ServerCommand::Status { json },
+            },
+        ) => run_server_status(*json).await,
+        (
+            BuiltInHandlerId::ServerWhoamiPrincipal,
+            Command::Server {
+                command: ServerCommand::WhoamiPrincipal { json },
+            },
+        ) => run_server_whoami_principal(*json).await,
+        (
+            BuiltInHandlerId::ServerSave,
+            Command::Server {
+                command: ServerCommand::Save,
+            },
+        ) => run_server_save().await,
+        (
+            BuiltInHandlerId::ServerRestore,
+            Command::Server {
+                command: ServerCommand::Restore { dry_run, yes },
+            },
+        ) => run_server_restore(*dry_run, *yes).await,
+        (
+            BuiltInHandlerId::ServerStop,
+            Command::Server {
+                command: ServerCommand::Stop,
+            },
+        ) => run_server_stop().await,
+        (
+            BuiltInHandlerId::KeymapDoctor,
+            Command::Keymap {
+                command: KeymapCommand::Doctor { json },
+            },
+        ) => run_keymap_doctor(*json),
+        (
+            BuiltInHandlerId::TerminalDoctor,
+            Command::Terminal {
+                command:
+                    TerminalCommand::Doctor {
+                        json,
+                        trace,
+                        trace_limit,
+                        trace_family,
+                        trace_pane,
+                    },
+            },
+        ) => run_terminal_doctor(*json, *trace, *trace_limit, *trace_family, *trace_pane),
+        (
+            BuiltInHandlerId::TerminalInstallTerminfo,
+            Command::Terminal {
+                command: TerminalCommand::InstallTerminfo { yes, check },
+            },
+        ) => run_terminal_install_terminfo(*yes, *check),
+        (
+            BuiltInHandlerId::PluginList,
+            Command::Plugin {
+                command: PluginCommand::List { json },
+            },
+        ) => run_plugin_list(*json).await,
+        (
+            BuiltInHandlerId::PluginRun,
+            Command::Plugin {
+                command:
+                    PluginCommand::Run {
+                        plugin,
+                        command,
+                        args,
+                    },
+            },
+        ) => run_plugin_command(plugin, command, args).await,
+        _ => unreachable!("built-in command handler and command variant should stay in sync"),
     }
 }
 
@@ -5169,6 +5405,7 @@ mod tests {
         merged_runtime_keybindings, parse_pid_content, profile_for_term,
         protocol_profile_for_terminal_profile, resolve_pane_term_with_checker,
     };
+    use crate::cli::Command;
     use crate::input::InputProcessor;
     use crate::runtime::attach::state::AttachViewState;
     use bmux_client::{AttachLayoutState, AttachOpenInfo, ClientError};
@@ -5353,6 +5590,19 @@ mod tests {
         assert_eq!(event.kind, bmux_plugin::PluginEventKind::Window);
         assert_eq!(event.name, "window_created");
         assert!(event.payload.to_string().contains(&session_id_text));
+    }
+
+    #[test]
+    fn built_in_handler_mapping_stays_in_sync_for_top_level_permissions() {
+        let command = Command::Permissions {
+            session: "dev".to_string(),
+            json: false,
+            watch: false,
+        };
+        assert_eq!(
+            super::built_in_handler_for_command(&command),
+            super::BuiltInHandlerId::Permissions
+        );
     }
 
     #[test]
