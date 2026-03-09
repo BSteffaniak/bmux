@@ -40,52 +40,30 @@ impl RustPlugin for ExamplePlugin {
                 PluginFeature::new("example.native").expect("plugin feature should parse")
             ]),
             commands: vec![
-                PluginCommand {
-                    name: "hello".to_string(),
-                    path: Vec::new(),
-                    aliases: Vec::new(),
-                    summary: "Print a hello message".to_string(),
-                    description: None,
-                    arguments: vec![PluginCommandArgument {
-                        name: "message".to_string(),
-                        kind: PluginCommandArgumentKind::String,
-                        choice_values: Vec::new(),
-                        position: Some(0),
-                        long: None,
-                        short: None,
-                        required: false,
-                        multiple: true,
-                        trailing_var_arg: true,
-                        allow_hyphen_values: true,
-                        summary: Some("Optional greeting target".to_string()),
-                        value_name: Some("MESSAGE".to_string()),
-                    }],
-                    execution: CommandExecutionKind::HostCallback,
-                    expose_in_cli: true,
-                },
-                PluginCommand {
-                    name: "permissions-list".to_string(),
-                    path: Vec::new(),
-                    aliases: Vec::new(),
-                    summary: "List session permissions through bmux host IPC".to_string(),
-                    description: None,
-                    arguments: vec![PluginCommandArgument {
-                        name: "session".to_string(),
-                        kind: PluginCommandArgumentKind::String,
-                        choice_values: Vec::new(),
-                        position: Some(0),
-                        long: None,
-                        short: None,
-                        required: true,
-                        multiple: false,
-                        trailing_var_arg: false,
-                        allow_hyphen_values: false,
-                        summary: Some("Session name or UUID".to_string()),
-                        value_name: Some("SESSION".to_string()),
-                    }],
-                    execution: CommandExecutionKind::HostCallback,
-                    expose_in_cli: true,
-                },
+                PluginCommand::new("hello", "Print a hello message")
+                    .argument(
+                        PluginCommandArgument::positional(
+                            "message",
+                            PluginCommandArgumentKind::String,
+                        )
+                        .multiple(true)
+                        .trailing_var_arg(true)
+                        .allow_hyphen_values(true)
+                        .summary("Optional greeting target"),
+                    )
+                    .execution(CommandExecutionKind::HostCallback)
+                    .expose_in_cli(true),
+                PluginCommand::new(
+                    "permissions-list",
+                    "List session permissions through bmux host IPC",
+                )
+                .argument(
+                    PluginCommandArgument::positional("session", PluginCommandArgumentKind::String)
+                        .required(true)
+                        .summary("Session name or UUID"),
+                )
+                .execution(CommandExecutionKind::HostCallback)
+                .expose_in_cli(true),
             ],
             event_subscriptions: vec![PluginEventSubscription {
                 kinds: BTreeSet::from([PluginEventKind::System, PluginEventKind::Window]),

@@ -134,11 +134,28 @@ pub async fn run() -> Result<u8> {
             init_logging(verbose);
             run_plugin_command(&plugin_id, &command_name, &arguments).await
         }
+        ParsedRuntimeCli::ImmediateExit {
+            code,
+            output,
+            stderr,
+        } => {
+            if stderr {
+                eprint!("{output}");
+            } else {
+                print!("{output}");
+            }
+            Ok(code)
+        }
     }
 }
 
 enum ParsedRuntimeCli {
     BuiltIn(Cli),
+    ImmediateExit {
+        code: u8,
+        output: String,
+        stderr: bool,
+    },
     Plugin {
         verbose: bool,
         plugin_id: String,
@@ -157,9 +174,25 @@ fn parse_runtime_cli() -> Result<ParsedRuntimeCli> {
     let clap_command = command_registry
         .augment_clap_command(Cli::command())
         .context("failed augmenting CLI with plugin commands")?;
-    let matches = clap_command
-        .try_get_matches_from(&argv)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let matches = match clap_command.try_get_matches_from(&argv) {
+        Ok(matches) => matches,
+        Err(error) => {
+            return Ok(match error.kind() {
+                clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
+                    ParsedRuntimeCli::ImmediateExit {
+                        code: 0,
+                        output: error.to_string(),
+                        stderr: false,
+                    }
+                }
+                _ => ParsedRuntimeCli::ImmediateExit {
+                    code: 2,
+                    output: error.to_string(),
+                    stderr: true,
+                },
+            });
+        }
+    };
     let verbose = matches.get_flag("verbose");
     let (path, leaf_matches) = plugin_commands::selected_subcommand_path(&matches);
     if let Some(resolved) = command_registry.resolve_exact_path(&path) {

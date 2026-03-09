@@ -73,6 +73,57 @@ const fn default_expose_in_cli() -> bool {
 
 impl PluginCommand {
     #[must_use]
+    pub fn new(name: impl Into<String>, summary: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            path: Vec::new(),
+            aliases: Vec::new(),
+            summary: summary.into(),
+            description: None,
+            arguments: Vec::new(),
+            execution: default_execution_kind(),
+            expose_in_cli: default_expose_in_cli(),
+        }
+    }
+
+    #[must_use]
+    pub fn path(mut self, path: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.path = path.into_iter().map(Into::into).collect();
+        self
+    }
+
+    #[must_use]
+    pub fn alias(mut self, path: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.aliases
+            .push(path.into_iter().map(Into::into).collect());
+        self
+    }
+
+    #[must_use]
+    pub fn description(mut self, description: impl Into<String>) -> Self {
+        self.description = Some(description.into());
+        self
+    }
+
+    #[must_use]
+    pub fn argument(mut self, argument: PluginCommandArgument) -> Self {
+        self.arguments.push(argument);
+        self
+    }
+
+    #[must_use]
+    pub fn execution(mut self, execution: CommandExecutionKind) -> Self {
+        self.execution = execution;
+        self
+    }
+
+    #[must_use]
+    pub fn expose_in_cli(mut self, expose_in_cli: bool) -> Self {
+        self.expose_in_cli = expose_in_cli;
+        self
+    }
+
+    #[must_use]
     pub fn canonical_path(&self) -> Vec<String> {
         if self.path.is_empty() {
             vec![self.name.clone()]
@@ -98,5 +149,118 @@ impl PluginCommand {
         }
 
         paths
+    }
+}
+
+impl PluginCommandArgument {
+    #[must_use]
+    pub fn option(name: impl Into<String>, kind: PluginCommandArgumentKind) -> Self {
+        let name = name.into();
+        Self {
+            value_name: Some(name.replace('-', "_").to_uppercase()),
+            long: Some(name.clone()),
+            name,
+            kind,
+            choice_values: Vec::new(),
+            position: None,
+            short: None,
+            required: false,
+            multiple: false,
+            trailing_var_arg: false,
+            allow_hyphen_values: false,
+            summary: None,
+        }
+    }
+
+    #[must_use]
+    pub fn flag(name: impl Into<String>) -> Self {
+        let name = name.into();
+        Self {
+            name: name.clone(),
+            kind: PluginCommandArgumentKind::Boolean,
+            choice_values: Vec::new(),
+            position: None,
+            long: Some(name),
+            short: None,
+            required: false,
+            multiple: false,
+            trailing_var_arg: false,
+            allow_hyphen_values: false,
+            summary: None,
+            value_name: None,
+        }
+    }
+
+    #[must_use]
+    pub fn positional(name: impl Into<String>, kind: PluginCommandArgumentKind) -> Self {
+        let name = name.into();
+        Self {
+            value_name: Some(name.to_uppercase()),
+            name,
+            kind,
+            choice_values: Vec::new(),
+            position: Some(0),
+            long: None,
+            short: None,
+            required: false,
+            multiple: false,
+            trailing_var_arg: false,
+            allow_hyphen_values: false,
+            summary: None,
+        }
+    }
+
+    #[must_use]
+    pub fn short(mut self, short: char) -> Self {
+        self.short = Some(short);
+        self
+    }
+
+    #[must_use]
+    pub fn required(mut self, required: bool) -> Self {
+        self.required = required;
+        self
+    }
+
+    #[must_use]
+    pub fn multiple(mut self, multiple: bool) -> Self {
+        self.multiple = multiple;
+        self
+    }
+
+    #[must_use]
+    pub fn trailing_var_arg(mut self, trailing_var_arg: bool) -> Self {
+        self.trailing_var_arg = trailing_var_arg;
+        self
+    }
+
+    #[must_use]
+    pub fn allow_hyphen_values(mut self, allow_hyphen_values: bool) -> Self {
+        self.allow_hyphen_values = allow_hyphen_values;
+        self
+    }
+
+    #[must_use]
+    pub fn summary(mut self, summary: impl Into<String>) -> Self {
+        self.summary = Some(summary.into());
+        self
+    }
+
+    #[must_use]
+    pub fn value_name(mut self, value_name: impl Into<String>) -> Self {
+        self.value_name = Some(value_name.into());
+        self
+    }
+
+    #[must_use]
+    pub fn choice_values(mut self, values: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        self.choice_values = values.into_iter().map(Into::into).collect();
+        self
+    }
+
+    #[must_use]
+    pub fn position(mut self, position: usize) -> Self {
+        self.position = Some(position);
+        self
     }
 }

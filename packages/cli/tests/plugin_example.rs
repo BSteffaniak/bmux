@@ -350,6 +350,25 @@ fn shipped_permissions_plugin_handles_permissions_command() {
     )
     .expect("config should be written");
 
+    let help_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &["permissions", "--help"],
+    );
+    assert!(
+        help_output.status.success(),
+        "permissions help should succeed"
+    );
+    let permissions_help = String::from_utf8_lossy(&help_output.stdout);
+    assert!(
+        permissions_help.contains("--session") && permissions_help.contains("--watch"),
+        "permissions help should include plugin-defined flags: {permissions_help}"
+    );
+
     let (mut server, server_stdout, server_stderr) = spawn_bmux(
         &root,
         &home_dir,
@@ -602,6 +621,25 @@ fn shipped_windows_plugin_handles_window_commands() {
         ),
     )
     .expect("config should be written");
+
+    let help_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &["window", "new", "--help"],
+    );
+    assert!(
+        help_output.status.success(),
+        "window new help should succeed"
+    );
+    let window_help = String::from_utf8_lossy(&help_output.stdout);
+    assert!(
+        window_help.contains("--session") && window_help.contains("--name"),
+        "window new help should include plugin-defined flags: {window_help}"
+    );
 
     let (mut server, server_stdout, server_stderr) = spawn_bmux(
         &root,

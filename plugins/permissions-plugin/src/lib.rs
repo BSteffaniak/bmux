@@ -39,87 +39,60 @@ impl RustPlugin for PermissionsPlugin {
                 PluginFeature::new("bmux.permissions").expect("plugin feature should parse")
             ]),
             commands: vec![
-                PluginCommand {
-                    name: "permissions".to_string(),
-                    path: vec!["permissions".to_string()],
-                    aliases: vec![vec!["session".to_string(), "permissions".to_string()]],
-                    summary: "List explicit role assignments for a session".to_string(),
-                    description: None,
-                    arguments: vec![
-                        option_arg(
-                            "session",
-                            PluginCommandArgumentKind::String,
-                            true,
-                            Some('s'),
-                            Vec::new(),
-                        ),
-                        flag_arg("json", Some('j')),
-                        flag_arg("watch", Some('w')),
-                    ],
-                    execution: CommandExecutionKind::HostCallback,
-                    expose_in_cli: true,
-                },
-                PluginCommand {
-                    name: "grant".to_string(),
-                    path: vec!["grant".to_string()],
-                    aliases: vec![vec!["session".to_string(), "grant".to_string()]],
-                    summary: "Grant a role to a client in a session".to_string(),
-                    description: None,
-                    arguments: vec![
-                        option_arg(
-                            "session",
-                            PluginCommandArgumentKind::String,
-                            true,
-                            Some('s'),
-                            Vec::new(),
-                        ),
-                        option_arg(
-                            "client",
-                            PluginCommandArgumentKind::String,
-                            true,
-                            Some('c'),
-                            Vec::new(),
-                        ),
-                        option_arg(
-                            "role",
-                            PluginCommandArgumentKind::Choice,
-                            true,
-                            Some('r'),
-                            vec![
-                                "owner".to_string(),
-                                "writer".to_string(),
-                                "observer".to_string(),
-                            ],
-                        ),
-                    ],
-                    execution: CommandExecutionKind::HostCallback,
-                    expose_in_cli: true,
-                },
-                PluginCommand {
-                    name: "revoke".to_string(),
-                    path: vec!["revoke".to_string()],
-                    aliases: vec![vec!["session".to_string(), "revoke".to_string()]],
-                    summary: "Revoke an explicit role from a client in a session".to_string(),
-                    description: None,
-                    arguments: vec![
-                        option_arg(
-                            "session",
-                            PluginCommandArgumentKind::String,
-                            true,
-                            Some('s'),
-                            Vec::new(),
-                        ),
-                        option_arg(
-                            "client",
-                            PluginCommandArgumentKind::String,
-                            true,
-                            Some('c'),
-                            Vec::new(),
-                        ),
-                    ],
-                    execution: CommandExecutionKind::HostCallback,
-                    expose_in_cli: true,
-                },
+                PluginCommand::new(
+                    "permissions",
+                    "List explicit role assignments for a session",
+                )
+                .path(["permissions"])
+                .alias(["session", "permissions"])
+                .argument(
+                    PluginCommandArgument::option("session", PluginCommandArgumentKind::String)
+                        .required(true)
+                        .short('s'),
+                )
+                .argument(PluginCommandArgument::flag("json").short('j'))
+                .argument(PluginCommandArgument::flag("watch").short('w'))
+                .execution(CommandExecutionKind::HostCallback)
+                .expose_in_cli(true),
+                PluginCommand::new("grant", "Grant a role to a client in a session")
+                    .path(["grant"])
+                    .alias(["session", "grant"])
+                    .argument(
+                        PluginCommandArgument::option("session", PluginCommandArgumentKind::String)
+                            .required(true)
+                            .short('s'),
+                    )
+                    .argument(
+                        PluginCommandArgument::option("client", PluginCommandArgumentKind::String)
+                            .required(true)
+                            .short('c'),
+                    )
+                    .argument(
+                        PluginCommandArgument::option("role", PluginCommandArgumentKind::Choice)
+                            .required(true)
+                            .short('r')
+                            .choice_values(["owner", "writer", "observer"]),
+                    )
+                    .execution(CommandExecutionKind::HostCallback)
+                    .expose_in_cli(true),
+                PluginCommand::new(
+                    "revoke",
+                    "Revoke an explicit role from a client in a session",
+                )
+                .path(["revoke"])
+                .alias(["session", "revoke"])
+                .argument(
+                    PluginCommandArgument::option("session", PluginCommandArgumentKind::String)
+                        .required(true)
+                        .short('s'),
+                )
+                .argument(
+                    PluginCommandArgument::option("client", PluginCommandArgumentKind::String)
+                        .required(true)
+                        .short('c'),
+                )
+                .execution(CommandExecutionKind::HostCallback)
+                .expose_in_cli(true),
             ],
             event_subscriptions: Vec::new(),
             dependencies: Vec::new(),
@@ -142,46 +115,6 @@ impl RustPlugin for PermissionsPlugin {
 }
 
 bmux_plugin::export_plugin!(PermissionsPlugin);
-
-fn option_arg(
-    name: &str,
-    kind: PluginCommandArgumentKind,
-    required: bool,
-    short: Option<char>,
-    choice_values: Vec<String>,
-) -> PluginCommandArgument {
-    PluginCommandArgument {
-        name: name.to_string(),
-        kind,
-        choice_values,
-        position: None,
-        long: Some(name.to_string()),
-        short,
-        required,
-        multiple: false,
-        trailing_var_arg: false,
-        allow_hyphen_values: false,
-        summary: None,
-        value_name: Some(name.to_uppercase()),
-    }
-}
-
-fn flag_arg(name: &str, short: Option<char>) -> PluginCommandArgument {
-    PluginCommandArgument {
-        name: name.to_string(),
-        kind: PluginCommandArgumentKind::Boolean,
-        choice_values: Vec::new(),
-        position: None,
-        long: Some(name.to_string()),
-        short,
-        required: false,
-        multiple: false,
-        trailing_var_arg: false,
-        allow_hyphen_values: false,
-        summary: None,
-        value_name: None,
-    }
-}
 
 fn run_permissions_command(context: &NativeCommandContext) -> i32 {
     let mut session = None;
