@@ -1,5 +1,5 @@
 capabilities = ["commands", "event_subscription"]
-entry        = "../../../target/debug/libbmux_example_native_plugin.dylib"
+entry        = "libbmux_example_native_plugin.dylib"
 id           = "example.native"
 name         = "Example Native Plugin"
 runtime      = "native"

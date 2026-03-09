@@ -37,7 +37,7 @@ pub struct NativeCommandContext {
     pub settings: Option<toml::Value>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeDescriptor {
     pub id: String,
     pub display_name: String,
@@ -100,6 +100,13 @@ impl NativeDescriptor {
     /// Returns an error when the descriptor text cannot be parsed.
     pub fn from_toml_str(value: &str) -> std::result::Result<Self, toml::de::Error> {
         toml::from_str(value)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the descriptor cannot be encoded as TOML.
+    pub fn to_toml_string(&self) -> std::result::Result<String, toml::ser::Error> {
+        toml::to_string(self)
     }
 }
 

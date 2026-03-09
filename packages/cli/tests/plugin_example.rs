@@ -72,6 +72,40 @@ fn preserve_toolchain_env(command: &mut Command) {
     command.env("CARGO_TARGET_DIR", workspace_root().join("target"));
 }
 
+fn dynamic_library_file(stem: &str) -> String {
+    if cfg!(target_os = "macos") {
+        format!("lib{stem}.dylib")
+    } else if cfg!(target_os = "windows") {
+        format!("{stem}.dll")
+    } else {
+        format!("lib{stem}.so")
+    }
+}
+
+fn stage_shipped_permissions_bundle(root: &Path, sandbox: &Path) -> PathBuf {
+    let shipped_root = sandbox.join("shipped-plugins");
+    let plugin_dir = shipped_root.join("permissions");
+    fs::create_dir_all(&plugin_dir).expect("staged shipped plugin dir should be created");
+
+    let library_name = dynamic_library_file("bmux_permissions_plugin");
+    fs::copy(
+        root.join("target").join("debug").join(&library_name),
+        plugin_dir.join(&library_name),
+    )
+    .expect("permissions plugin library should be staged");
+
+    fs::copy(
+        root.join("plugins")
+            .join("shipped")
+            .join("permissions")
+            .join("plugin.toml"),
+        plugin_dir.join("plugin.toml"),
+    )
+    .expect("permissions plugin manifest should be staged");
+
+    shipped_root
+}
+
 fn sandbox_setup() -> (
     PathBuf,
     PathBuf,
@@ -246,14 +280,8 @@ fn installs_example_plugin_and_runs_command() {
 #[test]
 fn shipped_permissions_plugin_handles_permissions_command() {
     let root = workspace_root();
-    let (_sandbox, home_dir, config_home, data_home, runtime_dir, tmp_dir, config_dir) =
+    let (sandbox, home_dir, config_home, data_home, runtime_dir, tmp_dir, config_dir) =
         sandbox_setup();
-
-    fs::write(
-        config_dir.join("bmux.toml"),
-        "[plugins]\nenabled = [\"bmux.permissions\"]\n",
-    )
-    .expect("config should be written");
 
     let mut build_command = Command::new("cargo");
     build_command
@@ -269,6 +297,16 @@ fn shipped_permissions_plugin_handles_permissions_command() {
         build_status.success(),
         "permissions plugin build should succeed"
     );
+
+    let shipped_root = stage_shipped_permissions_bundle(&root, &sandbox);
+    fs::write(
+        config_dir.join("bmux.toml"),
+        format!(
+            "[plugins]\nenabled = [\"bmux.permissions\"]\nsearch_paths = [\"{}\"]\n",
+            shipped_root.display()
+        ),
+    )
+    .expect("config should be written");
 
     let (mut server, server_stdout, server_stderr) = spawn_bmux(
         &root,

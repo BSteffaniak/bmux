@@ -75,6 +75,8 @@ The native-first model assumes plugins declare:
 - requested capabilities
 - an exported entry symbol
 
+For Rust plugins, `bmux_plugin` should provide the default authoring path so plugin authors implement ordinary Rust traits and let the crate generate the native export glue.
+
 The host should load a plugin only after validating compatibility and capability support.
 
 ## Why This Is Not Raw Internal Rust API

@@ -703,15 +703,6 @@ fn resolve_plugin_search_paths(config: &BmuxConfig, paths: &ConfigPaths) -> Resu
     let mut resolved = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
 
-    let repo_shipped = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("plugins")
-        .join("shipped");
-    if repo_shipped.exists() && seen.insert(repo_shipped.clone()) {
-        resolved.push(repo_shipped);
-    }
-
     if let Ok(executable) = std::env::current_exe() {
         if let Some(parent) = executable.parent() {
             let shipped = parent.join("plugins");

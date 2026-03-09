@@ -39,41 +39,63 @@ minimum = "1.0"
 minimum = "1.0"
 ```
 
+The manifest `entry` should point at the installed plugin bundle artifact, typically a library placed next to the manifest, rather than a hardcoded Cargo `target/` path.
+
 ## Rust Example
 
 ```rust
 use bmux_plugin::{
-    ApiVersion, HostMetadata, PluginCapability, PluginManifest, PluginRegistry,
+    CommandExecutionKind, NativeCommandContext, NativeDescriptor, PluginCapability,
+    PluginCommand, PluginManifestCompatibility, RustPlugin,
 };
 
-let manifest = PluginManifest::from_toml_str(
-    r#"
-id = "git.status"
-name = "Git Status"
-version = "0.1.0"
-entry = "libgit_status.dylib"
-capabilities = ["commands"]
+#[derive(Default)]
+struct HelloPlugin;
 
-[plugin_api]
-minimum = "1.0"
+impl RustPlugin for HelloPlugin {
+    fn descriptor(&self) -> NativeDescriptor {
+        NativeDescriptor {
+            id: "hello.example".to_string(),
+            display_name: "Hello Example".to_string(),
+            plugin_version: "0.1.0".to_string(),
+            plugin_api: PluginManifestCompatibility {
+                minimum: "1.0".to_string(),
+                maximum: None,
+            },
+            native_abi: PluginManifestCompatibility {
+                minimum: "1.0".to_string(),
+                maximum: None,
+            },
+            description: Some("Small example plugin".to_string()),
+            homepage: None,
+            capabilities: [PluginCapability::Commands].into_iter().collect(),
+            commands: vec![PluginCommand {
+                name: "hello".to_string(),
+                path: Vec::new(),
+                aliases: Vec::new(),
+                summary: "Print a greeting".to_string(),
+                description: None,
+                arguments: Vec::new(),
+                execution: CommandExecutionKind::HostCallback,
+                expose_in_cli: true,
+            }],
+            event_subscriptions: Vec::new(),
+            lifecycle: Default::default(),
+        }
+    }
 
-[native_abi]
-minimum = "1.0"
-"#,
-)?;
+    fn run_command(&mut self, context: NativeCommandContext) -> i32 {
+        match context.command.as_str() {
+            "hello" => {
+                println!("hello from bmux");
+                0
+            }
+            _ => 64,
+        }
+    }
+}
 
-let mut registry = PluginRegistry::new();
-registry.register_manifest(std::path::Path::new("plugins/git/plugin.toml"), manifest)?;
-
-let host = HostMetadata {
-    product_name: "bmux".to_string(),
-    product_version: "0.1.0".to_string(),
-    plugin_api_version: ApiVersion::new(1, 0),
-    plugin_abi_version: ApiVersion::new(1, 0),
-};
-
-registry.validate_against_host(&host, &[PluginCapability::Commands])?;
-# Ok::<(), bmux_plugin::PluginError>(())
+bmux_plugin::export_plugin!(HelloPlugin);
 ```
 
 ## Design Notes

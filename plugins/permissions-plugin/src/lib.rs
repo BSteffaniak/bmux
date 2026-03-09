@@ -6,86 +6,60 @@ use bmux_client::BmuxClient;
 use bmux_config::ConfigPaths;
 use bmux_ipc::{SessionPermissionSummary, SessionRole, SessionSelector};
 use bmux_plugin::{
-    DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL,
-    DEFAULT_NATIVE_DEACTIVATE_SYMBOL, DEFAULT_NATIVE_ENTRY_SYMBOL, DEFAULT_NATIVE_EVENT_SYMBOL,
+    CommandExecutionKind, NativeCommandContext, NativeDescriptor, PluginCapability, PluginCommand,
+    RustPlugin,
 };
-use std::ffi::{CStr, c_char};
 
-const DESCRIPTOR: &str = concat!(
-    "id = \"bmux.permissions\"\n",
-    "display_name = \"bmux Permissions\"\n",
-    "plugin_version = \"0.0.1-alpha.0\"\n",
-    "description = \"Shipped bmux permissions command plugin\"\n",
-    "capabilities = [\"commands\"]\n\n",
-    "[[commands]]\n",
-    "name = \"permissions\"\n",
-    "path = [\"permissions\"]\n",
-    "summary = \"List explicit role assignments for a session\"\n",
-    "execution = \"host_callback\"\n",
-    "expose_in_cli = false\n\n",
-    "[plugin_api]\n",
-    "minimum = \"1.0\"\n\n",
-    "[native_abi]\n",
-    "minimum = \"1.0\"\n",
-    "\0"
-);
+#[derive(Default)]
+struct PermissionsPlugin;
 
-#[unsafe(no_mangle)]
-pub extern "C" fn bmux_plugin_entry_v1() -> *const c_char {
-    debug_assert_eq!(DEFAULT_NATIVE_ENTRY_SYMBOL, "bmux_plugin_entry_v1");
-    DESCRIPTOR.as_ptr().cast()
-}
+impl RustPlugin for PermissionsPlugin {
+    fn descriptor(&self) -> NativeDescriptor {
+        NativeDescriptor {
+            id: "bmux.permissions".to_string(),
+            display_name: "bmux Permissions".to_string(),
+            plugin_version: env!("CARGO_PKG_VERSION").to_string(),
+            plugin_api: bmux_plugin::PluginManifestCompatibility {
+                minimum: "1.0".to_string(),
+                maximum: None,
+            },
+            native_abi: bmux_plugin::PluginManifestCompatibility {
+                minimum: "1.0".to_string(),
+                maximum: None,
+            },
+            description: Some("Shipped bmux permissions command plugin".to_string()),
+            homepage: None,
+            capabilities: [PluginCapability::Commands].into_iter().collect(),
+            commands: vec![PluginCommand {
+                name: "permissions".to_string(),
+                path: vec!["permissions".to_string()],
+                aliases: Vec::new(),
+                summary: "List explicit role assignments for a session".to_string(),
+                description: None,
+                arguments: Vec::new(),
+                execution: CommandExecutionKind::HostCallback,
+                expose_in_cli: false,
+            }],
+            event_subscriptions: Vec::new(),
+            lifecycle: bmux_plugin::PluginLifecycle {
+                activate_on_startup: false,
+                receive_events: false,
+                allow_hot_reload: true,
+            },
+        }
+    }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn bmux_plugin_run_command_with_context_v1(context: *const c_char) -> i32 {
-    debug_assert_eq!(
-        DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL,
-        "bmux_plugin_run_command_with_context_v1"
-    );
-    let Ok(payload) = c_str_to_string(context) else {
-        return 2;
-    };
-    let Ok(context) = serde_json::from_str::<bmux_plugin::NativeCommandContext>(&payload) else {
-        return 3;
-    };
-
-    match context.command.as_str() {
-        "permissions" => run_permissions_command(&context),
-        _ => 64,
+    fn run_command(&mut self, context: NativeCommandContext) -> i32 {
+        match context.command.as_str() {
+            "permissions" => run_permissions_command(&context),
+            _ => 64,
+        }
     }
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn bmux_plugin_activate_v1(context: *const c_char) -> i32 {
-    debug_assert_eq!(DEFAULT_NATIVE_ACTIVATE_SYMBOL, "bmux_plugin_activate_v1");
-    match c_str_to_string(context) {
-        Ok(_) => 0,
-        Err(_) => 2,
-    }
-}
+bmux_plugin::export_plugin!(PermissionsPlugin);
 
-#[unsafe(no_mangle)]
-pub extern "C" fn bmux_plugin_deactivate_v1(context: *const c_char) -> i32 {
-    debug_assert_eq!(
-        DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
-        "bmux_plugin_deactivate_v1"
-    );
-    match c_str_to_string(context) {
-        Ok(_) => 0,
-        Err(_) => 2,
-    }
-}
-
-#[unsafe(no_mangle)]
-pub extern "C" fn bmux_plugin_handle_event_v1(event: *const c_char) -> i32 {
-    debug_assert_eq!(DEFAULT_NATIVE_EVENT_SYMBOL, "bmux_plugin_handle_event_v1");
-    match c_str_to_string(event) {
-        Ok(_) => 0,
-        Err(_) => 2,
-    }
-}
-
-fn run_permissions_command(context: &bmux_plugin::NativeCommandContext) -> i32 {
+fn run_permissions_command(context: &NativeCommandContext) -> i32 {
     let mut session = None;
     let mut as_json = false;
     let mut watch = false;
@@ -211,33 +185,26 @@ fn parse_session_selector(value: &str) -> SessionSelector {
     }
 }
 
-fn c_str_to_string(ptr: *const c_char) -> Result<String, ()> {
-    if ptr.is_null() {
-        return Err(());
-    }
-
-    unsafe { CStr::from_ptr(ptr) }
-        .to_str()
-        .map(str::to_owned)
-        .map_err(|_| ())
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{DESCRIPTOR, bmux_plugin_entry_v1};
+    use super::PermissionsPlugin;
+    use bmux_plugin::RustPlugin;
 
     #[test]
     fn descriptor_parses() {
-        let descriptor =
-            bmux_plugin::NativeDescriptor::from_toml_str(DESCRIPTOR.trim_end_matches('\0'))
-                .expect("descriptor should parse");
-        assert_eq!(descriptor.id, "bmux.permissions");
-        assert_eq!(descriptor.commands.len(), 1);
-        assert!(!descriptor.commands[0].expose_in_cli);
+        let descriptor = PermissionsPlugin.descriptor();
+        let serialized = descriptor
+            .to_toml_string()
+            .expect("descriptor should serialize");
+        let reparsed = bmux_plugin::NativeDescriptor::from_toml_str(&serialized)
+            .expect("descriptor should parse");
+        assert_eq!(reparsed.id, "bmux.permissions");
+        assert_eq!(reparsed.commands.len(), 1);
+        assert!(!reparsed.commands[0].expose_in_cli);
     }
 
     #[test]
-    fn entrypoint_returns_pointer() {
-        assert!(!bmux_plugin_entry_v1().is_null());
+    fn exported_entrypoint_returns_pointer() {
+        assert!(!crate::bmux_plugin_entry_v1().is_null());
     }
 }

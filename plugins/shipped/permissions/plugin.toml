@@ -1,5 +1,5 @@
 capabilities = ["commands"]
-entry        = "../../../target/debug/libbmux_permissions_plugin.dylib"
+entry        = "libbmux_permissions_plugin.dylib"
 id           = "bmux.permissions"
 name         = "bmux Permissions"
 runtime      = "native"
