@@ -1,15 +1,24 @@
 use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, ConfigPaths};
-use bmux_ipc::{SessionRole, SessionSelector};
+use bmux_ipc::{
+    PaneFocusDirection as IpcPaneFocusDirection, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector,
+    PaneSplitDirection as IpcPaneSplitDirection, SessionRole, SessionSelector, WindowSelector,
+};
 use bmux_plugin::{
-    ClientInfo, ClientService, ClipboardService, CommandService, ConfigService, EventService,
-    HostConnectionInfo, HostMetadata, PaneHandle, PaneInfo, PaneService, PermissionEntry,
-    PermissionService, PluginError, PluginEvent, PluginHost, PluginStorage, RenderService,
-    ServerService, ServerStatusInfo, SessionHandle, SessionInfo, SessionService, WindowHandle,
-    WindowInfo, WindowService,
+    ClientQueryService, ClientSummary, ClipboardService, ConfigService, EventService,
+    FollowCommandService, FollowQueryService, FollowState, HostConnectionInfo, HostMetadata,
+    PaneCommandService, PaneFocusDirection, PaneHandle, PaneLayoutNode, PaneQueryService, PaneRef,
+    PaneSnapshot, PaneSplitDirection, PaneSummary, PermissionCommandService, PermissionEntry,
+    PermissionQueryService, PersistenceCommandService, PersistenceQueryService,
+    PersistenceRestorePreview, PersistenceRestoreResult, PersistenceStatus, PluginError,
+    PluginEvent, PluginHost, PluginStorage, PrincipalIdentityInfo, RenderService, ServerStatusInfo,
+    SessionCommandService, SessionHandle, SessionQueryService, SessionRef, SessionRoleValue,
+    SessionSnapshot, SessionSummary, WindowCommandService, WindowHandle, WindowQueryService,
+    WindowRef, WindowSnapshot, WindowSummary,
 };
 use std::collections::BTreeMap;
 use toml::Value;
+use uuid::Uuid;
 
 pub struct CliPluginHost {
     metadata: HostMetadata,
@@ -62,13 +71,128 @@ fn unsupported_operation(operation: &str) -> PluginError {
     }
 }
 
-fn session_role_name(role: SessionRole) -> String {
+fn map_role(role: SessionRole) -> SessionRoleValue {
     match role {
-        SessionRole::Owner => "owner",
-        SessionRole::Writer => "writer",
-        SessionRole::Observer => "observer",
+        SessionRole::Owner => SessionRoleValue::Owner,
+        SessionRole::Writer => SessionRoleValue::Writer,
+        SessionRole::Observer => SessionRoleValue::Observer,
     }
-    .to_string()
+}
+
+fn map_role_to_ipc(role: SessionRoleValue) -> SessionRole {
+    match role {
+        SessionRoleValue::Owner => SessionRole::Owner,
+        SessionRoleValue::Writer => SessionRole::Writer,
+        SessionRoleValue::Observer => SessionRole::Observer,
+    }
+}
+
+fn map_session_ref(session: SessionRef) -> SessionSelector {
+    match session {
+        SessionRef::Handle(handle) => SessionSelector::ById(handle.0),
+        SessionRef::Name(name) => SessionSelector::ByName(name),
+    }
+}
+
+fn map_optional_session(session: Option<SessionHandle>) -> Option<SessionSelector> {
+    session.map(|handle| SessionSelector::ById(handle.0))
+}
+
+fn map_window_ref(window: WindowRef) -> WindowSelector {
+    match window {
+        WindowRef::Handle(handle) => WindowSelector::ById(handle.0),
+        WindowRef::Number(number) => WindowSelector::ByNumber(number),
+        WindowRef::Name(name) => WindowSelector::ByName(name),
+        WindowRef::Active => WindowSelector::Active,
+    }
+}
+
+fn map_pane_ref(pane: PaneRef) -> PaneSelector {
+    match pane {
+        PaneRef::Handle(handle) => PaneSelector::ById(handle.0),
+        PaneRef::Index(index) => PaneSelector::ByIndex(index),
+        PaneRef::Active => PaneSelector::Active,
+    }
+}
+
+fn map_split_direction(direction: PaneSplitDirection) -> IpcPaneSplitDirection {
+    match direction {
+        PaneSplitDirection::Vertical => IpcPaneSplitDirection::Vertical,
+        PaneSplitDirection::Horizontal => IpcPaneSplitDirection::Horizontal,
+    }
+}
+
+fn map_focus_direction(direction: PaneFocusDirection) -> IpcPaneFocusDirection {
+    match direction {
+        PaneFocusDirection::Next => IpcPaneFocusDirection::Next,
+        PaneFocusDirection::Prev => IpcPaneFocusDirection::Prev,
+    }
+}
+
+fn map_layout_node(node: IpcPaneLayoutNode) -> PaneLayoutNode {
+    match node {
+        IpcPaneLayoutNode::Leaf { pane_id } => PaneLayoutNode::Leaf {
+            pane: PaneHandle(pane_id),
+        },
+        IpcPaneLayoutNode::Split {
+            direction,
+            ratio_percent,
+            first,
+            second,
+        } => PaneLayoutNode::Split {
+            direction: match direction {
+                IpcPaneSplitDirection::Vertical => PaneSplitDirection::Vertical,
+                IpcPaneSplitDirection::Horizontal => PaneSplitDirection::Horizontal,
+            },
+            ratio_percent,
+            first: Box::new(map_layout_node(*first)),
+            second: Box::new(map_layout_node(*second)),
+        },
+    }
+}
+
+fn map_session_summary(entry: bmux_ipc::SessionSummary) -> SessionSummary {
+    SessionSummary {
+        handle: SessionHandle(entry.id),
+        name: entry.name,
+        window_count: entry.window_count,
+        client_count: entry.client_count,
+    }
+}
+
+fn map_window_summary(entry: bmux_ipc::WindowSummary) -> WindowSummary {
+    WindowSummary {
+        handle: WindowHandle(entry.id),
+        session: SessionHandle(entry.session_id),
+        number: entry.number,
+        name: entry.name,
+        active: entry.active,
+    }
+}
+
+fn map_pane_summary(
+    entry: bmux_ipc::PaneSummary,
+    session: SessionHandle,
+    window: WindowHandle,
+) -> PaneSummary {
+    PaneSummary {
+        handle: PaneHandle(entry.id),
+        session,
+        window,
+        index: entry.index,
+        name: entry.name,
+        focused: entry.focused,
+    }
+}
+
+fn map_client_summary(entry: bmux_ipc::ClientSummary) -> ClientSummary {
+    ClientSummary {
+        id: entry.id,
+        selected_session: entry.selected_session_id.map(SessionHandle),
+        following_client_id: entry.following_client_id,
+        following_global: entry.following_global,
+        role: entry.session_role.map(map_role),
+    }
 }
 
 impl PluginHost for CliPluginHost {
@@ -84,31 +208,55 @@ impl PluginHost for CliPluginHost {
         self
     }
 
-    fn commands(&self) -> &dyn CommandService {
+    fn session_queries(&self) -> &dyn SessionQueryService {
         self
     }
 
-    fn sessions(&self) -> &dyn SessionService {
+    fn session_commands(&self) -> &dyn SessionCommandService {
         self
     }
 
-    fn windows(&self) -> &dyn WindowService {
+    fn window_queries(&self) -> &dyn WindowQueryService {
         self
     }
 
-    fn panes(&self) -> &dyn PaneService {
+    fn window_commands(&self) -> &dyn WindowCommandService {
         self
     }
 
-    fn permissions(&self) -> &dyn PermissionService {
+    fn pane_queries(&self) -> &dyn PaneQueryService {
         self
     }
 
-    fn clients(&self) -> &dyn ClientService {
+    fn pane_commands(&self) -> &dyn PaneCommandService {
         self
     }
 
-    fn server(&self) -> &dyn ServerService {
+    fn permission_queries(&self) -> &dyn PermissionQueryService {
+        self
+    }
+
+    fn permission_commands(&self) -> &dyn PermissionCommandService {
+        self
+    }
+
+    fn client_queries(&self) -> &dyn ClientQueryService {
+        self
+    }
+
+    fn follow_queries(&self) -> &dyn FollowQueryService {
+        self
+    }
+
+    fn follow_commands(&self) -> &dyn FollowCommandService {
+        self
+    }
+
+    fn persistence_queries(&self) -> &dyn PersistenceQueryService {
+        self
+    }
+
+    fn persistence_commands(&self) -> &dyn PersistenceCommandService {
         self
     }
 
@@ -135,13 +283,7 @@ impl EventService for CliPluginHost {
     }
 }
 
-impl CommandService for CliPluginHost {
-    fn invoke(&self, _command_name: &str, _arguments: &[String]) -> bmux_plugin::Result<()> {
-        Err(unsupported_operation("invoke_command"))
-    }
-}
-
-impl SessionService for CliPluginHost {
+impl SessionQueryService for CliPluginHost {
     fn active_session(&self) -> bmux_plugin::Result<Option<SessionHandle>> {
         with_client(&self.connection, |client| {
             tokio::runtime::Handle::current().block_on(async {
@@ -153,59 +295,128 @@ impl SessionService for CliPluginHost {
         })
     }
 
-    fn list_sessions(&self) -> bmux_plugin::Result<Vec<SessionHandle>> {
+    fn list_sessions(&self) -> bmux_plugin::Result<Vec<SessionSummary>> {
         with_client(&self.connection, |client| {
             tokio::runtime::Handle::current().block_on(async {
                 let sessions = client.list_sessions().await.map_err(|error| {
                     unsupported_operation(&format!("list_sessions failed: {error}"))
                 })?;
-                Ok(sessions
-                    .into_iter()
-                    .map(|session| SessionHandle(session.id))
-                    .collect())
+                Ok(sessions.into_iter().map(map_session_summary).collect())
             })
         })
     }
 
-    fn get_session(&self, session: SessionHandle) -> bmux_plugin::Result<Option<SessionInfo>> {
+    fn get_session(&self, session: SessionHandle) -> bmux_plugin::Result<Option<SessionSummary>> {
+        self.list_sessions()
+            .map(|sessions| sessions.into_iter().find(|entry| entry.handle == session))
+    }
+
+    fn snapshot_session(
+        &self,
+        session: SessionHandle,
+    ) -> bmux_plugin::Result<Option<SessionSnapshot>> {
         with_client(&self.connection, |client| {
             tokio::runtime::Handle::current().block_on(async {
                 let sessions = client.list_sessions().await.map_err(|error| {
                     unsupported_operation(&format!("list_sessions failed: {error}"))
                 })?;
-                Ok(sessions
-                    .into_iter()
-                    .find(|entry| entry.id == session.0)
-                    .map(|entry| SessionInfo {
-                        handle: SessionHandle(entry.id),
-                        name: entry.name,
-                        window_count: entry.window_count,
-                        client_count: entry.client_count,
-                    }))
-            })
-        })
-    }
-}
+                let Some(session_entry) = sessions.into_iter().find(|entry| entry.id == session.0)
+                else {
+                    return Ok(None);
+                };
 
-impl WindowService for CliPluginHost {
-    fn list_windows(&self, session: SessionHandle) -> bmux_plugin::Result<Vec<WindowHandle>> {
-        with_client(&self.connection, |client| {
-            tokio::runtime::Handle::current().block_on(async {
                 let windows = client
                     .list_windows(Some(SessionSelector::ById(session.0)))
                     .await
                     .map_err(|error| {
                         unsupported_operation(&format!("list_windows failed: {error}"))
                     })?;
-                Ok(windows
-                    .into_iter()
-                    .map(|window| WindowHandle(window.id))
-                    .collect())
+                let clients = client.list_clients().await.map_err(|error| {
+                    unsupported_operation(&format!("list_clients failed: {error}"))
+                })?;
+                let permissions = client
+                    .list_permissions(SessionSelector::ById(session.0))
+                    .await
+                    .map_err(|error| {
+                        unsupported_operation(&format!("list_permissions failed: {error}"))
+                    })?;
+
+                Ok(Some(SessionSnapshot {
+                    session: map_session_summary(session_entry),
+                    active_window: windows
+                        .iter()
+                        .find(|entry| entry.active)
+                        .map(|entry| WindowHandle(entry.id)),
+                    windows: windows.into_iter().map(map_window_summary).collect(),
+                    clients: clients
+                        .into_iter()
+                        .filter(|entry| entry.selected_session_id == Some(session.0))
+                        .map(map_client_summary)
+                        .collect(),
+                    permissions: permissions
+                        .into_iter()
+                        .map(|entry| PermissionEntry {
+                            client_id: entry.client_id,
+                            role: map_role(entry.role),
+                        })
+                        .collect(),
+                }))
+            })
+        })
+    }
+}
+
+impl SessionCommandService for CliPluginHost {
+    fn create_session(&self, name: Option<String>) -> bmux_plugin::Result<SessionHandle> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                client
+                    .new_session(name)
+                    .await
+                    .map(SessionHandle)
+                    .map_err(|error| unsupported_operation(&format!("new_session failed: {error}")))
             })
         })
     }
 
-    fn get_window(&self, window: WindowHandle) -> bmux_plugin::Result<Option<WindowInfo>> {
+    fn kill_session(
+        &self,
+        session: SessionRef,
+        force_local: bool,
+    ) -> bmux_plugin::Result<SessionHandle> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                client
+                    .kill_session_with_options(map_session_ref(session), force_local)
+                    .await
+                    .map(SessionHandle)
+                    .map_err(|error| {
+                        unsupported_operation(&format!("kill_session failed: {error}"))
+                    })
+            })
+        })
+    }
+}
+
+impl WindowQueryService for CliPluginHost {
+    fn list_windows(
+        &self,
+        session: Option<SessionHandle>,
+    ) -> bmux_plugin::Result<Vec<WindowSummary>> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                client
+                    .list_windows(map_optional_session(session))
+                    .await
+                    .map(|windows| windows.into_iter().map(map_window_summary).collect())
+                    .map_err(|error| {
+                        unsupported_operation(&format!("list_windows failed: {error}"))
+                    })
+            })
+        })
+    }
+
+    fn get_window(&self, window: WindowHandle) -> bmux_plugin::Result<Option<WindowSummary>> {
         with_client(&self.connection, |client| {
             tokio::runtime::Handle::current().block_on(async {
                 let sessions = client.list_sessions().await.map_err(|error| {
@@ -219,12 +430,48 @@ impl WindowService for CliPluginHost {
                             unsupported_operation(&format!("list_windows failed: {error}"))
                         })?;
                     if let Some(entry) = windows.into_iter().find(|entry| entry.id == window.0) {
-                        return Ok(Some(WindowInfo {
-                            handle: WindowHandle(entry.id),
-                            session: SessionHandle(entry.session_id),
-                            number: entry.number,
-                            name: entry.name,
-                            active: entry.active,
+                        return Ok(Some(map_window_summary(entry)));
+                    }
+                }
+                Ok(None)
+            })
+        })
+    }
+
+    fn snapshot_window(&self, window: WindowHandle) -> bmux_plugin::Result<Option<WindowSnapshot>> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                let sessions = client.list_sessions().await.map_err(|error| {
+                    unsupported_operation(&format!("list_sessions failed: {error}"))
+                })?;
+                for session in sessions {
+                    let windows = client
+                        .list_windows(Some(SessionSelector::ById(session.id)))
+                        .await
+                        .map_err(|error| {
+                            unsupported_operation(&format!("list_windows failed: {error}"))
+                        })?;
+                    if let Some(entry) = windows.into_iter().find(|entry| entry.id == window.0) {
+                        if !entry.active {
+                            return Err(unsupported_operation(
+                                "snapshot_window for inactive window",
+                            ));
+                        }
+                        let layout = client.attach_layout(session.id).await.map_err(|error| {
+                            unsupported_operation(&format!("attach_layout failed: {error}"))
+                        })?;
+                        let session_handle = SessionHandle(session.id);
+                        let window_handle = WindowHandle(entry.id);
+                        let panes = layout
+                            .panes
+                            .into_iter()
+                            .map(|pane| map_pane_summary(pane, session_handle, window_handle))
+                            .collect();
+                        return Ok(Some(WindowSnapshot {
+                            window: map_window_summary(entry),
+                            focused_pane: Some(PaneHandle(layout.focused_pane_id)),
+                            panes,
+                            layout_root: Some(map_layout_node(layout.layout_root)),
                         }));
                     }
                 }
@@ -234,81 +481,514 @@ impl WindowService for CliPluginHost {
     }
 }
 
-impl PaneService for CliPluginHost {
-    fn focused_pane(&self) -> bmux_plugin::Result<Option<PaneHandle>> {
-        Err(unsupported_operation("focused_pane"))
+impl WindowCommandService for CliPluginHost {
+    fn create_window(
+        &self,
+        session: Option<SessionHandle>,
+        name: Option<String>,
+    ) -> bmux_plugin::Result<WindowHandle> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                client
+                    .new_window(map_optional_session(session), name)
+                    .await
+                    .map(WindowHandle)
+                    .map_err(|error| unsupported_operation(&format!("new_window failed: {error}")))
+            })
+        })
     }
 
-    fn list_panes(&self, _window: WindowHandle) -> bmux_plugin::Result<Vec<PaneHandle>> {
-        Err(unsupported_operation("list_panes"))
+    fn kill_window(
+        &self,
+        session: Option<SessionHandle>,
+        target: WindowRef,
+        force_local: bool,
+    ) -> bmux_plugin::Result<WindowHandle> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                client
+                    .kill_window_with_options(
+                        map_optional_session(session),
+                        map_window_ref(target),
+                        force_local,
+                    )
+                    .await
+                    .map(WindowHandle)
+                    .map_err(|error| unsupported_operation(&format!("kill_window failed: {error}")))
+            })
+        })
     }
 
-    fn get_pane(&self, _pane: PaneHandle) -> bmux_plugin::Result<Option<PaneInfo>> {
-        Err(unsupported_operation("get_pane"))
+    fn switch_window(
+        &self,
+        session: Option<SessionHandle>,
+        target: WindowRef,
+    ) -> bmux_plugin::Result<WindowHandle> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                client
+                    .switch_window(map_optional_session(session), map_window_ref(target))
+                    .await
+                    .map(WindowHandle)
+                    .map_err(|error| {
+                        unsupported_operation(&format!("switch_window failed: {error}"))
+                    })
+            })
+        })
     }
 }
 
-impl PermissionService for CliPluginHost {
+impl PaneQueryService for CliPluginHost {
+    fn focused_pane(
+        &self,
+        session: Option<SessionHandle>,
+    ) -> bmux_plugin::Result<Option<PaneHandle>> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                let session_selector = map_optional_session(session);
+                let windows = client
+                    .list_windows(session_selector.clone())
+                    .await
+                    .map_err(|error| {
+                        unsupported_operation(&format!("list_windows failed: {error}"))
+                    })?;
+                let Some(active_window) = windows.into_iter().find(|entry| entry.active) else {
+                    return Ok(None);
+                };
+                let panes = client.list_panes(session_selector).await.map_err(|error| {
+                    unsupported_operation(&format!("list_panes failed: {error}"))
+                })?;
+                Ok(panes.into_iter().find(|entry| entry.focused).map(|entry| {
+                    let _ = active_window;
+                    PaneHandle(entry.id)
+                }))
+            })
+        })
+    }
+
+    fn list_panes(&self, session: Option<SessionHandle>) -> bmux_plugin::Result<Vec<PaneSummary>> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                let session_selector = map_optional_session(session);
+                let windows = client
+                    .list_windows(session_selector.clone())
+                    .await
+                    .map_err(|error| {
+                        unsupported_operation(&format!("list_windows failed: {error}"))
+                    })?;
+                let Some(active_window) = windows.into_iter().find(|entry| entry.active) else {
+                    return Ok(Vec::new());
+                };
+                let session_handle = SessionHandle(active_window.session_id);
+                let window_handle = WindowHandle(active_window.id);
+                client
+                    .list_panes(session_selector)
+                    .await
+                    .map(|panes| {
+                        panes
+                            .into_iter()
+                            .map(|entry| map_pane_summary(entry, session_handle, window_handle))
+                            .collect()
+                    })
+                    .map_err(|error| unsupported_operation(&format!("list_panes failed: {error}")))
+            })
+        })
+    }
+
+    fn get_pane(&self, pane: PaneHandle) -> bmux_plugin::Result<Option<PaneSummary>> {
+        self.list_sessions_and_active_panes()
+            .map(|panes| panes.into_iter().find(|entry| entry.handle == pane))
+    }
+
+    fn snapshot_pane(&self, pane: PaneHandle) -> bmux_plugin::Result<Option<PaneSnapshot>> {
+        self.get_pane(pane)
+            .map(|pane| pane.map(|pane| PaneSnapshot { pane }))
+    }
+}
+
+impl CliPluginHost {
+    fn list_sessions_and_active_panes(&self) -> bmux_plugin::Result<Vec<PaneSummary>> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                let sessions = client.list_sessions().await.map_err(|error| {
+                    unsupported_operation(&format!("list_sessions failed: {error}"))
+                })?;
+                let mut panes = Vec::new();
+                for session in sessions {
+                    let windows = client
+                        .list_windows(Some(SessionSelector::ById(session.id)))
+                        .await
+                        .map_err(|error| {
+                            unsupported_operation(&format!("list_windows failed: {error}"))
+                        })?;
+                    let Some(active_window) = windows.into_iter().find(|entry| entry.active) else {
+                        continue;
+                    };
+                    let session_handle = SessionHandle(session.id);
+                    let window_handle = WindowHandle(active_window.id);
+                    let active_panes = client
+                        .list_panes(Some(SessionSelector::ById(session.id)))
+                        .await
+                        .map_err(|error| {
+                            unsupported_operation(&format!("list_panes failed: {error}"))
+                        })?;
+                    panes.extend(
+                        active_panes
+                            .into_iter()
+                            .map(|pane| map_pane_summary(pane, session_handle, window_handle)),
+                    );
+                }
+                Ok(panes)
+            })
+        })
+    }
+}
+
+impl PaneCommandService for CliPluginHost {
+    fn split_pane(
+        &self,
+        session: Option<SessionHandle>,
+        target: Option<PaneRef>,
+        direction: PaneSplitDirection,
+    ) -> bmux_plugin::Result<PaneHandle> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                let pane_id = match target {
+                    Some(target) => {
+                        client
+                            .split_pane_target(
+                                map_optional_session(session),
+                                map_pane_ref(target),
+                                map_split_direction(direction),
+                            )
+                            .await
+                    }
+                    None => {
+                        client
+                            .split_pane(
+                                map_optional_session(session),
+                                map_split_direction(direction),
+                            )
+                            .await
+                    }
+                }
+                .map_err(|error| unsupported_operation(&format!("split_pane failed: {error}")))?;
+                Ok(PaneHandle(pane_id))
+            })
+        })
+    }
+
+    fn focus_pane(
+        &self,
+        session: Option<SessionHandle>,
+        target: Option<PaneRef>,
+        direction: Option<PaneFocusDirection>,
+    ) -> bmux_plugin::Result<PaneHandle> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                let pane_id = match (target, direction) {
+                    (Some(_), Some(_)) => {
+                        return Err(unsupported_operation(
+                            "focus_pane with both target and direction",
+                        ));
+                    }
+                    (Some(target), None) => {
+                        client
+                            .focus_pane_target(map_optional_session(session), map_pane_ref(target))
+                            .await
+                    }
+                    (None, Some(direction)) => {
+                        client
+                            .focus_pane(
+                                map_optional_session(session),
+                                map_focus_direction(direction),
+                            )
+                            .await
+                    }
+                    (None, None) => {
+                        return Err(unsupported_operation(
+                            "focus_pane requires either a target or direction",
+                        ));
+                    }
+                }
+                .map_err(|error| unsupported_operation(&format!("focus_pane failed: {error}")))?;
+                Ok(PaneHandle(pane_id))
+            })
+        })
+    }
+
+    fn resize_pane(
+        &self,
+        session: Option<SessionHandle>,
+        target: Option<PaneRef>,
+        delta: i16,
+    ) -> bmux_plugin::Result<()> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                match target {
+                    Some(target) => {
+                        client
+                            .resize_pane_target(
+                                map_optional_session(session),
+                                map_pane_ref(target),
+                                delta,
+                            )
+                            .await
+                    }
+                    None => {
+                        client
+                            .resize_pane(map_optional_session(session), delta)
+                            .await
+                    }
+                }
+                .map_err(|error| unsupported_operation(&format!("resize_pane failed: {error}")))
+            })
+        })
+    }
+
+    fn close_pane(
+        &self,
+        session: Option<SessionHandle>,
+        target: Option<PaneRef>,
+    ) -> bmux_plugin::Result<()> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                match target {
+                    Some(target) => {
+                        client
+                            .close_pane_target(map_optional_session(session), map_pane_ref(target))
+                            .await
+                    }
+                    None => client.close_pane(map_optional_session(session)).await,
+                }
+                .map_err(|error| unsupported_operation(&format!("close_pane failed: {error}")))
+            })
+        })
+    }
+}
+
+impl PermissionQueryService for CliPluginHost {
     fn list_permissions(
         &self,
         session: SessionHandle,
     ) -> bmux_plugin::Result<Vec<PermissionEntry>> {
         with_client(&self.connection, |client| {
             tokio::runtime::Handle::current().block_on(async {
-                let permissions = client
+                client
                     .list_permissions(SessionSelector::ById(session.0))
                     .await
+                    .map(|entries| {
+                        entries
+                            .into_iter()
+                            .map(|entry| PermissionEntry {
+                                client_id: entry.client_id,
+                                role: map_role(entry.role),
+                            })
+                            .collect()
+                    })
                     .map_err(|error| {
                         unsupported_operation(&format!("list_permissions failed: {error}"))
-                    })?;
-                Ok(permissions
-                    .into_iter()
-                    .map(|entry| PermissionEntry {
-                        client_id: entry.client_id,
-                        role: session_role_name(entry.role),
                     })
-                    .collect())
             })
         })
     }
 }
 
-impl ClientService for CliPluginHost {
-    fn list_clients(&self) -> bmux_plugin::Result<Vec<ClientInfo>> {
+impl PermissionCommandService for CliPluginHost {
+    fn grant_role(
+        &self,
+        session: SessionHandle,
+        client_id: Uuid,
+        role: SessionRoleValue,
+    ) -> bmux_plugin::Result<()> {
         with_client(&self.connection, |client| {
             tokio::runtime::Handle::current().block_on(async {
-                let clients = client.list_clients().await.map_err(|error| {
-                    unsupported_operation(&format!("list_clients failed: {error}"))
-                })?;
-                Ok(clients
-                    .into_iter()
-                    .map(|entry| ClientInfo {
-                        id: entry.id,
-                        selected_session: entry.selected_session_id.map(SessionHandle),
-                        following_client_id: entry.following_client_id,
-                        following_global: entry.following_global,
-                        role: entry.session_role.map(session_role_name),
-                    })
-                    .collect())
+                client
+                    .grant_role(
+                        SessionSelector::ById(session.0),
+                        client_id,
+                        map_role_to_ipc(role),
+                    )
+                    .await
+                    .map_err(|error| unsupported_operation(&format!("grant_role failed: {error}")))
+            })
+        })
+    }
+
+    fn revoke_role(&self, session: SessionHandle, client_id: Uuid) -> bmux_plugin::Result<()> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                client
+                    .revoke_role(SessionSelector::ById(session.0), client_id)
+                    .await
+                    .map_err(|error| unsupported_operation(&format!("revoke_role failed: {error}")))
             })
         })
     }
 }
 
-impl ServerService for CliPluginHost {
-    fn status(&self) -> bmux_plugin::Result<ServerStatusInfo> {
+impl ClientQueryService for CliPluginHost {
+    fn current_client_id(&self) -> bmux_plugin::Result<Uuid> {
         with_client(&self.connection, |client| {
             tokio::runtime::Handle::current().block_on(async {
-                let status = client.server_status().await.map_err(|error| {
-                    unsupported_operation(&format!("server_status failed: {error}"))
-                })?;
-                Ok(ServerStatusInfo {
-                    running: status.running,
-                    principal_id: status.principal_id,
-                    server_owner_principal_id: status.server_owner_principal_id,
-                    snapshot_enabled: status.snapshot.enabled,
-                    snapshot_exists: status.snapshot.snapshot_exists,
-                })
+                client
+                    .whoami()
+                    .await
+                    .map_err(|error| unsupported_operation(&format!("whoami failed: {error}")))
+            })
+        })
+    }
+
+    fn principal_identity(&self) -> bmux_plugin::Result<PrincipalIdentityInfo> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                client
+                    .whoami_principal()
+                    .await
+                    .map(|identity| PrincipalIdentityInfo {
+                        principal_id: identity.principal_id,
+                        server_owner_principal_id: identity.server_owner_principal_id,
+                        force_local_authorized: identity.force_local_authorized,
+                    })
+                    .map_err(|error| {
+                        unsupported_operation(&format!("whoami_principal failed: {error}"))
+                    })
+            })
+        })
+    }
+
+    fn list_clients(&self) -> bmux_plugin::Result<Vec<ClientSummary>> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                client
+                    .list_clients()
+                    .await
+                    .map(|clients| clients.into_iter().map(map_client_summary).collect())
+                    .map_err(|error| {
+                        unsupported_operation(&format!("list_clients failed: {error}"))
+                    })
+            })
+        })
+    }
+}
+
+impl FollowQueryService for CliPluginHost {
+    fn current_follow_state(&self) -> bmux_plugin::Result<FollowState> {
+        let current_client_id = self.current_client_id()?;
+        let clients = self.list_clients()?;
+        let current = clients
+            .into_iter()
+            .find(|client| client.id == current_client_id)
+            .ok_or_else(|| unsupported_operation("current client missing from client list"))?;
+        Ok(FollowState {
+            follower_client_id: current.id,
+            leader_client_id: current.following_client_id,
+            global: current.following_global,
+            selected_session: current.selected_session,
+        })
+    }
+}
+
+impl FollowCommandService for CliPluginHost {
+    fn follow_client(&self, target_client_id: Uuid, global: bool) -> bmux_plugin::Result<()> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                client
+                    .follow_client(target_client_id, global)
+                    .await
+                    .map_err(|error| {
+                        unsupported_operation(&format!("follow_client failed: {error}"))
+                    })
+            })
+        })
+    }
+
+    fn unfollow(&self) -> bmux_plugin::Result<()> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                client
+                    .unfollow()
+                    .await
+                    .map_err(|error| unsupported_operation(&format!("unfollow failed: {error}")))
+            })
+        })
+    }
+}
+
+impl PersistenceQueryService for CliPluginHost {
+    fn status(&self) -> bmux_plugin::Result<PersistenceStatus> {
+        self.server_status().map(|status| status.snapshot)
+    }
+
+    fn server_status(&self) -> bmux_plugin::Result<ServerStatusInfo> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                client
+                    .server_status()
+                    .await
+                    .map(|status| ServerStatusInfo {
+                        running: status.running,
+                        principal_id: status.principal_id,
+                        server_owner_principal_id: status.server_owner_principal_id,
+                        snapshot: PersistenceStatus {
+                            enabled: status.snapshot.enabled,
+                            path: status.snapshot.path,
+                            snapshot_exists: status.snapshot.snapshot_exists,
+                            last_write_epoch_ms: status.snapshot.last_write_epoch_ms,
+                            last_restore_epoch_ms: status.snapshot.last_restore_epoch_ms,
+                            last_restore_error: status.snapshot.last_restore_error,
+                        },
+                    })
+                    .map_err(|error| {
+                        unsupported_operation(&format!("server_status failed: {error}"))
+                    })
+            })
+        })
+    }
+}
+
+impl PersistenceCommandService for CliPluginHost {
+    fn save(&self) -> bmux_plugin::Result<Option<String>> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                client
+                    .server_save()
+                    .await
+                    .map_err(|error| unsupported_operation(&format!("server_save failed: {error}")))
+            })
+        })
+    }
+
+    fn restore_dry_run(&self) -> bmux_plugin::Result<PersistenceRestorePreview> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                client
+                    .server_restore_dry_run()
+                    .await
+                    .map(|(ok, message)| PersistenceRestorePreview { ok, message })
+                    .map_err(|error| {
+                        unsupported_operation(&format!("server_restore_dry_run failed: {error}"))
+                    })
+            })
+        })
+    }
+
+    fn restore_apply(&self) -> bmux_plugin::Result<PersistenceRestoreResult> {
+        with_client(&self.connection, |client| {
+            tokio::runtime::Handle::current().block_on(async {
+                client
+                    .server_restore_apply()
+                    .await
+                    .map(|summary| PersistenceRestoreResult {
+                        sessions: summary.sessions,
+                        windows: summary.windows,
+                        roles: summary.roles,
+                        follows: summary.follows,
+                        selected_sessions: summary.selected_sessions,
+                    })
+                    .map_err(|error| {
+                        unsupported_operation(&format!("server_restore_apply failed: {error}"))
+                    })
             })
         })
     }

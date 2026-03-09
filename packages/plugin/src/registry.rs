@@ -1,6 +1,7 @@
 use crate::{
     HostMetadata, PluginCapability, PluginDeclaration, PluginError, PluginManifest, Result,
 };
+use semver::Version;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
@@ -100,6 +101,123 @@ impl PluginRegistry {
         self.plugins.get(plugin_id)
     }
 
+    /// # Errors
+    ///
+    /// Returns an error when the requested plugins or any required dependency is
+    /// missing, incompatible, or introduces a dependency cycle.
+    pub fn activation_order_for<'a>(
+        &'a self,
+        plugin_ids: &[String],
+    ) -> Result<Vec<&'a RegisteredPlugin>> {
+        #[derive(Clone, Copy, PartialEq, Eq)]
+        enum VisitState {
+            Visiting,
+            Visited,
+        }
+
+        fn visit<'a>(
+            registry: &'a PluginRegistry,
+            requested: &[String],
+            plugin_id: &str,
+            states: &mut BTreeMap<String, VisitState>,
+            stack: &mut Vec<String>,
+            ordered: &mut Vec<&'a RegisteredPlugin>,
+        ) -> Result<()> {
+            match states.get(plugin_id) {
+                Some(VisitState::Visited) => return Ok(()),
+                Some(VisitState::Visiting) => {
+                    let start = stack
+                        .iter()
+                        .position(|entry| entry == plugin_id)
+                        .unwrap_or_default();
+                    let mut cycle = stack[start..].to_vec();
+                    cycle.push(plugin_id.to_string());
+                    return Err(PluginError::PluginDependencyCycle { cycle });
+                }
+                None => {}
+            }
+
+            let plugin =
+                registry
+                    .get(plugin_id)
+                    .ok_or_else(|| PluginError::MissingRequiredDependency {
+                        plugin_id: plugin_id.to_string(),
+                        dependency_id: plugin_id.to_string(),
+                    })?;
+            states.insert(plugin_id.to_string(), VisitState::Visiting);
+            stack.push(plugin_id.to_string());
+
+            for dependency in &plugin.declaration.dependencies {
+                let dependency_id = dependency.plugin_id.as_str();
+                let Some(registered_dependency) = registry.get(dependency_id) else {
+                    if dependency.required {
+                        return Err(PluginError::MissingRequiredDependency {
+                            plugin_id: plugin_id.to_string(),
+                            dependency_id: dependency_id.to_string(),
+                        });
+                    }
+                    continue;
+                };
+
+                let dependency_version = Version::parse(
+                    &registered_dependency.declaration.plugin_version,
+                )
+                .map_err(|error| PluginError::InvalidDependencyVersion {
+                    plugin_id: plugin_id.to_string(),
+                    dependency_id: dependency_id.to_string(),
+                    version_req: dependency.version_req.clone(),
+                    details: error.to_string(),
+                })?;
+                let version_req =
+                    semver::VersionReq::parse(&dependency.version_req).map_err(|error| {
+                        PluginError::InvalidDependencyVersion {
+                            plugin_id: plugin_id.to_string(),
+                            dependency_id: dependency_id.to_string(),
+                            version_req: dependency.version_req.clone(),
+                            details: error.to_string(),
+                        }
+                    })?;
+                if !version_req.matches(&dependency_version) {
+                    return Err(PluginError::IncompatibleDependencyVersion {
+                        plugin_id: plugin_id.to_string(),
+                        dependency_id: dependency_id.to_string(),
+                        version_req: dependency.version_req.clone(),
+                        found_version: registered_dependency.declaration.plugin_version.clone(),
+                    });
+                }
+
+                if requested.iter().any(|entry| entry == dependency_id) {
+                    visit(registry, requested, dependency_id, states, stack, ordered)?;
+                } else if dependency.required {
+                    return Err(PluginError::MissingRequiredDependency {
+                        plugin_id: plugin_id.to_string(),
+                        dependency_id: dependency_id.to_string(),
+                    });
+                }
+            }
+
+            stack.pop();
+            states.insert(plugin_id.to_string(), VisitState::Visited);
+            ordered.push(plugin);
+            Ok(())
+        }
+
+        let mut ordered = Vec::new();
+        let mut states = BTreeMap::new();
+        let mut stack = Vec::new();
+        for plugin_id in plugin_ids {
+            visit(
+                self,
+                plugin_ids,
+                plugin_id,
+                &mut states,
+                &mut stack,
+                &mut ordered,
+            )?;
+        }
+        Ok(ordered)
+    }
+
     #[must_use]
     pub fn plugin_ids(&self) -> Vec<&str> {
         self.plugins.keys().map(String::as_str).collect()
@@ -181,7 +299,8 @@ impl PluginRegistry {
         host: &HostMetadata,
         supported_capabilities: &[PluginCapability],
     ) -> Result<()> {
-        for plugin in self.plugins.values() {
+        let plugin_ids = self.plugins.keys().cloned().collect::<Vec<_>>();
+        for plugin in self.activation_order_for(&plugin_ids)? {
             Self::validate_registered_plugin(plugin, host, supported_capabilities)?;
         }
 
@@ -272,5 +391,61 @@ minimum = "1.0"
         registry
             .validate_against_host(&host, &[PluginCapability::Commands])
             .expect("plugin should validate");
+    }
+
+    #[test]
+    fn activation_order_sorts_required_dependencies_first() {
+        let dir = temp_dir();
+        fs::write(dir.join("libsessions.dylib"), []).expect("sessions entry should be written");
+        fs::write(dir.join("libfollow.dylib"), []).expect("follow entry should be written");
+
+        let sessions = PluginManifest::from_toml_str(
+            r#"
+id = "bmux.sessions"
+name = "Sessions"
+version = "0.1.0"
+entry = "libsessions.dylib"
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+        )
+        .expect("sessions manifest should parse");
+        let follow = PluginManifest::from_toml_str(
+            r#"
+id = "bmux.follow"
+name = "Follow"
+version = "0.1.0"
+entry = "libfollow.dylib"
+
+[[dependencies]]
+plugin_id = "bmux.sessions"
+version_req = "^0.1"
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+        )
+        .expect("follow manifest should parse");
+
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(&dir.join("sessions.toml"), sessions)
+            .expect("sessions registration should succeed");
+        registry
+            .register_manifest(&dir.join("follow.toml"), follow)
+            .expect("follow registration should succeed");
+
+        let order = registry
+            .activation_order_for(&["bmux.follow".to_string(), "bmux.sessions".to_string()])
+            .expect("dependency activation order should succeed");
+        assert_eq!(order[0].declaration.id.as_str(), "bmux.sessions");
+        assert_eq!(order[1].declaration.id.as_str(), "bmux.follow");
     }
 }

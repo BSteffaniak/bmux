@@ -1,6 +1,6 @@
 use crate::{
-    ApiVersion, PluginCapability, PluginCommand, PluginDeclaration, PluginEntrypoint, PluginError,
-    PluginEventSubscription, PluginId, Result, VersionRange,
+    ApiVersion, PluginCapability, PluginCommand, PluginDeclaration, PluginDependency,
+    PluginEntrypoint, PluginError, PluginEventSubscription, PluginId, Result, VersionRange,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -24,6 +24,15 @@ pub struct PluginManifestCompatibility {
     pub minimum: String,
     #[serde(default)]
     pub maximum: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginManifestDependency {
+    pub plugin_id: String,
+    #[serde(default = "default_dependency_version_req")]
+    pub version_req: String,
+    #[serde(default = "default_true")]
+    pub required: bool,
 }
 
 impl PluginManifestCompatibility {
@@ -63,6 +72,8 @@ pub struct PluginManifest {
     pub commands: Vec<PluginCommand>,
     #[serde(default)]
     pub event_subscriptions: Vec<PluginEventSubscription>,
+    #[serde(default)]
+    pub dependencies: Vec<PluginManifestDependency>,
 }
 
 impl PluginManifest {
@@ -112,6 +123,17 @@ impl PluginManifest {
             capabilities: self.capabilities.clone(),
             commands: self.commands.clone(),
             event_subscriptions: self.event_subscriptions.clone(),
+            dependencies: self
+                .dependencies
+                .iter()
+                .map(|dependency| {
+                    Ok(PluginDependency {
+                        plugin_id: PluginId::new(dependency.plugin_id.clone())?,
+                        version_req: dependency.version_req.clone(),
+                        required: dependency.required,
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
             lifecycle: crate::PluginLifecycle::default(),
         };
         declaration.validate()?;
@@ -130,6 +152,14 @@ impl PluginManifest {
 
 fn default_entry_symbol() -> String {
     crate::DEFAULT_NATIVE_ENTRY_SYMBOL.to_string()
+}
+
+const fn default_true() -> bool {
+    true
+}
+
+fn default_dependency_version_req() -> String {
+    "*".to_string()
 }
 
 #[cfg(test)]

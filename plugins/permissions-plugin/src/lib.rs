@@ -63,6 +63,7 @@ impl RustPlugin for PermissionsPlugin {
                 },
             ],
             event_subscriptions: Vec::new(),
+            dependencies: Vec::new(),
             lifecycle: bmux_plugin::PluginLifecycle {
                 activate_on_startup: false,
                 receive_events: false,

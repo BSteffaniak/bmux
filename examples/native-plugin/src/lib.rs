@@ -62,6 +62,7 @@ impl RustPlugin for ExamplePlugin {
                 kinds: BTreeSet::from([PluginEventKind::System, PluginEventKind::Window]),
                 names: BTreeSet::from(["server_started".to_string(), "window_created".to_string()]),
             }],
+            dependencies: Vec::new(),
             lifecycle: bmux_plugin::PluginLifecycle {
                 activate_on_startup: true,
                 receive_events: true,

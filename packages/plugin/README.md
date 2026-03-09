@@ -104,9 +104,4 @@ bmux_plugin::export_plugin!(HelloPlugin);
 - Treat hot-path runtime hooks as explicit high-risk capabilities
 - Keep ordinary plugins compatible across bmux releases by stabilizing `bmux_plugin` first
 - Leave room for future non-Rust runtimes by defining manifests and capabilities as host concepts
-
-## Related Docs
-
-- `docs/plugin-architecture.md`
-- `docs/plugin-versioning.md`
-- `examples/native-plugin/README.md`
+- Keep plugin domain ownership, capability policy, and migration intent in code and tests rather than external markdown planning docs

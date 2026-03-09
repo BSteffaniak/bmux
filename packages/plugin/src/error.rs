@@ -21,6 +21,44 @@ pub enum PluginError {
     #[error("plugin '{plugin_id}' has duplicate CLI alias entries for command '{command}'")]
     DuplicatePluginCommandAlias { plugin_id: String, command: String },
 
+    #[error("plugin '{plugin_id}' declares duplicate dependency '{dependency_id}'")]
+    DuplicatePluginDependency {
+        plugin_id: String,
+        dependency_id: String,
+    },
+
+    #[error("plugin '{plugin_id}' cannot depend on itself")]
+    PluginDependencyOnSelf { plugin_id: String },
+
+    #[error(
+        "plugin '{plugin_id}' declares invalid dependency version requirement for '{dependency_id}': '{version_req}' ({details})"
+    )]
+    InvalidDependencyVersion {
+        plugin_id: String,
+        dependency_id: String,
+        version_req: String,
+        details: String,
+    },
+
+    #[error("plugin '{plugin_id}' requires missing dependency '{dependency_id}'")]
+    MissingRequiredDependency {
+        plugin_id: String,
+        dependency_id: String,
+    },
+
+    #[error(
+        "plugin '{plugin_id}' requires dependency '{dependency_id}' matching '{version_req}', but found version '{found_version}'"
+    )]
+    IncompatibleDependencyVersion {
+        plugin_id: String,
+        dependency_id: String,
+        version_req: String,
+        found_version: String,
+    },
+
+    #[error("plugin dependency cycle detected: {cycle:?}")]
+    PluginDependencyCycle { cycle: Vec<String> },
+
     #[error("plugin '{plugin_id}' is missing native entry path")]
     MissingEntryPath { plugin_id: String },
 

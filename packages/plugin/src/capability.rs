@@ -10,12 +10,18 @@ pub enum PluginCapability {
     StatusBarItems,
     PersistentStorage,
     Clipboard,
+    PermissionRead,
+    PermissionWrite,
     SessionRead,
     SessionWrite,
     WindowRead,
     WindowWrite,
     PaneRead,
     PaneWrite,
+    FollowRead,
+    FollowWrite,
+    PersistenceRead,
+    PersistenceWrite,
     AttachOverlay,
     TerminalProtocolObserve,
     TerminalInputIntercept,
@@ -46,7 +52,13 @@ impl PluginCapability {
             | Self::StatusBarItems
             | Self::PersistentStorage
             | Self::Clipboard => PluginCapabilityTier::Automation,
-            Self::SessionRead
+            Self::PermissionRead
+            | Self::PermissionWrite
+            | Self::FollowRead
+            | Self::FollowWrite
+            | Self::PersistenceRead
+            | Self::PersistenceWrite
+            | Self::SessionRead
             | Self::SessionWrite
             | Self::WindowRead
             | Self::WindowWrite
@@ -68,12 +80,18 @@ impl PluginCapability {
             | Self::StatusBarItems
             | Self::PersistentStorage
             | Self::Clipboard
+            | Self::PermissionRead
             | Self::SessionRead
             | Self::WindowRead
-            | Self::PaneRead => PluginRisk::Safe,
-            Self::SessionWrite
+            | Self::PaneRead
+            | Self::FollowRead
+            | Self::PersistenceRead => PluginRisk::Safe,
+            Self::PermissionWrite
+            | Self::SessionWrite
             | Self::WindowWrite
             | Self::PaneWrite
+            | Self::FollowWrite
+            | Self::PersistenceWrite
             | Self::AttachOverlay
             | Self::TerminalProtocolObserve => PluginRisk::Elevated,
             Self::TerminalInputIntercept | Self::TerminalOutputIntercept => PluginRisk::HotPath,
@@ -95,12 +113,18 @@ impl fmt::Display for PluginCapability {
             Self::StatusBarItems => "status_bar_items",
             Self::PersistentStorage => "persistent_storage",
             Self::Clipboard => "clipboard",
+            Self::PermissionRead => "permission_read",
+            Self::PermissionWrite => "permission_write",
             Self::SessionRead => "session_read",
             Self::SessionWrite => "session_write",
             Self::WindowRead => "window_read",
             Self::WindowWrite => "window_write",
             Self::PaneRead => "pane_read",
             Self::PaneWrite => "pane_write",
+            Self::FollowRead => "follow_read",
+            Self::FollowWrite => "follow_write",
+            Self::PersistenceRead => "persistence_read",
+            Self::PersistenceWrite => "persistence_write",
             Self::AttachOverlay => "attach_overlay",
             Self::TerminalProtocolObserve => "terminal_protocol_observe",
             Self::TerminalInputIntercept => "terminal_input_intercept",

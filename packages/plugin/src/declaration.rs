@@ -2,6 +2,7 @@ use crate::{
     CommandExecutionKind, PluginCapability, PluginCommand, PluginContext, PluginError,
     PluginEventSubscription, Result, VersionRange,
 };
+use semver::VersionReq;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
@@ -41,6 +42,31 @@ pub struct PluginLifecycle {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginDependency {
+    pub plugin_id: PluginId,
+    #[serde(default = "default_dependency_version_req")]
+    pub version_req: String,
+    #[serde(default = "default_true")]
+    pub required: bool,
+}
+
+impl PluginDependency {
+    /// # Errors
+    ///
+    /// Returns an error when the version requirement cannot be parsed.
+    pub fn parsed_version_req(&self) -> Result<VersionReq> {
+        VersionReq::parse(&self.version_req).map_err(|error| {
+            PluginError::InvalidDependencyVersion {
+                plugin_id: self.plugin_id.as_str().to_string(),
+                dependency_id: self.plugin_id.as_str().to_string(),
+                version_req: self.version_req.clone(),
+                details: error.to_string(),
+            }
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginDeclaration {
     pub id: PluginId,
     pub display_name: String,
@@ -59,6 +85,8 @@ pub struct PluginDeclaration {
     #[serde(default)]
     pub event_subscriptions: Vec<PluginEventSubscription>,
     #[serde(default)]
+    pub dependencies: Vec<PluginDependency>,
+    #[serde(default)]
     pub lifecycle: PluginLifecycle,
 }
 
@@ -69,6 +97,7 @@ impl PluginDeclaration {
     /// runtime hook commands without a hot-path capability.
     pub fn validate(&self) -> Result<()> {
         let mut command_names = BTreeSet::new();
+        let mut dependency_ids = BTreeSet::new();
         for command in &self.commands {
             if !command_names.insert(command.name.clone()) {
                 return Err(PluginError::DuplicateCommand {
@@ -115,6 +144,28 @@ impl PluginDeclaration {
             }
         }
 
+        for dependency in &self.dependencies {
+            if dependency.plugin_id == self.id {
+                return Err(PluginError::PluginDependencyOnSelf {
+                    plugin_id: self.id.as_str().to_string(),
+                });
+            }
+            if !dependency_ids.insert(dependency.plugin_id.as_str().to_string()) {
+                return Err(PluginError::DuplicatePluginDependency {
+                    plugin_id: self.id.as_str().to_string(),
+                    dependency_id: dependency.plugin_id.as_str().to_string(),
+                });
+            }
+            VersionReq::parse(&dependency.version_req).map_err(|error| {
+                PluginError::InvalidDependencyVersion {
+                    plugin_id: self.id.as_str().to_string(),
+                    dependency_id: dependency.plugin_id.as_str().to_string(),
+                    version_req: dependency.version_req.clone(),
+                    details: error.to_string(),
+                }
+            })?;
+        }
+
         Ok(())
     }
 }
@@ -158,9 +209,13 @@ fn is_valid_plugin_id(value: &str) -> bool {
     chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '-' | '_' | '.'))
 }
 
+fn default_dependency_version_req() -> String {
+    "*".to_string()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{PluginDeclaration, PluginEntrypoint, PluginId};
+    use super::{PluginDeclaration, PluginDependency, PluginEntrypoint, PluginId};
     use crate::{ApiVersion, CommandExecutionKind, PluginCapability, PluginCommand, VersionRange};
     use std::collections::BTreeSet;
 
@@ -207,6 +262,7 @@ mod tests {
                 },
             ],
             event_subscriptions: Vec::new(),
+            dependencies: Vec::new(),
             lifecycle: super::PluginLifecycle::default(),
         };
 
@@ -241,9 +297,44 @@ mod tests {
                 expose_in_cli: true,
             }],
             event_subscriptions: Vec::new(),
+            dependencies: Vec::new(),
             lifecycle: super::PluginLifecycle::default(),
         };
 
         assert!(declaration.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_rejects_duplicate_dependencies() {
+        let declaration = PluginDeclaration {
+            id: PluginId::new("example.plugin").expect("id should parse"),
+            display_name: "Example".to_string(),
+            plugin_version: "0.1.0".to_string(),
+            plugin_api: VersionRange::at_least(ApiVersion::new(1, 0)),
+            native_abi: VersionRange::at_least(ApiVersion::new(1, 0)),
+            entrypoint: PluginEntrypoint::Native {
+                symbol: "bmux_plugin_entry_v1".to_string(),
+            },
+            description: None,
+            homepage: None,
+            capabilities: BTreeSet::new(),
+            commands: Vec::new(),
+            event_subscriptions: Vec::new(),
+            dependencies: vec![
+                PluginDependency {
+                    plugin_id: PluginId::new("bmux.sessions").expect("dep id should parse"),
+                    version_req: "^0.1".to_string(),
+                    required: true,
+                },
+                PluginDependency {
+                    plugin_id: PluginId::new("bmux.sessions").expect("dep id should parse"),
+                    version_req: "^0.1".to_string(),
+                    required: true,
+                },
+            ],
+            lifecycle: super::PluginLifecycle::default(),
+        };
+
+        assert!(declaration.validate().is_err());
     }
 }

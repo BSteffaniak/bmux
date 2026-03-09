@@ -55,6 +55,8 @@ pub struct NativeDescriptor {
     #[serde(default)]
     pub event_subscriptions: Vec<crate::PluginEventSubscription>,
     #[serde(default)]
+    pub dependencies: Vec<crate::PluginDependency>,
+    #[serde(default)]
     pub lifecycle: PluginLifecycle,
 }
 
@@ -89,6 +91,7 @@ impl NativeDescriptor {
             capabilities: self.capabilities,
             commands: self.commands,
             event_subscriptions: self.event_subscriptions,
+            dependencies: self.dependencies,
             lifecycle: self.lifecycle,
         };
         declaration.validate()?;
@@ -463,6 +466,14 @@ fn compare_manifest_and_descriptor(
         &serde_json::to_string(&declaration.event_subscriptions)
             .expect("plugin event subscriptions should serialize"),
     )?;
+    ensure_match(
+        registered_plugin.declaration.id.as_str(),
+        "dependencies",
+        &serde_json::to_string(&registered_plugin.declaration.dependencies)
+            .expect("plugin dependencies should serialize"),
+        &serde_json::to_string(&declaration.dependencies)
+            .expect("plugin dependencies should serialize"),
+    )?;
 
     Ok(())
 }
@@ -704,6 +715,7 @@ minimum = "1.0"
                     kinds: BTreeSet::from([PluginEventKind::System]),
                     names: BTreeSet::from(["server_started".to_string()]),
                 }],
+                dependencies: Vec::new(),
                 lifecycle: crate::PluginLifecycle::default(),
             },
             _library: library,

@@ -83,12 +83,18 @@ const SUPPORTED_PLUGIN_CAPABILITIES: &[PluginCapability] = &[
     PluginCapability::StatusBarItems,
     PluginCapability::PersistentStorage,
     PluginCapability::Clipboard,
+    PluginCapability::PermissionRead,
+    PluginCapability::PermissionWrite,
     PluginCapability::SessionRead,
     PluginCapability::SessionWrite,
     PluginCapability::WindowRead,
     PluginCapability::WindowWrite,
     PluginCapability::PaneRead,
     PluginCapability::PaneWrite,
+    PluginCapability::FollowRead,
+    PluginCapability::FollowWrite,
+    PluginCapability::PersistenceRead,
+    PluginCapability::PersistenceWrite,
     PluginCapability::AttachOverlay,
     PluginCapability::TerminalProtocolObserve,
     PluginCapability::TerminalInputIntercept,
@@ -738,9 +744,8 @@ fn validate_enabled_plugins(config: &BmuxConfig, registry: &PluginRegistry) -> R
         return Ok(());
     }
 
-    let host = plugin_host_metadata();
     for plugin_id in &config.plugins.enabled {
-        let plugin = registry.get(plugin_id).with_context(|| {
+        let _ = registry.get(plugin_id).with_context(|| {
             let available = registry.plugin_ids();
             if available.is_empty() {
                 format!(
@@ -753,7 +758,14 @@ fn validate_enabled_plugins(config: &BmuxConfig, registry: &PluginRegistry) -> R
                 )
             }
         })?;
+    }
 
+    let host = plugin_host_metadata();
+    let ordered_plugins = registry
+        .activation_order_for(&config.plugins.enabled)
+        .context("enabled plugin dependency graph is invalid")?;
+    for plugin in ordered_plugins {
+        let plugin_id = plugin.declaration.id.as_str();
         bmux_plugin::PluginRegistry::validate_registered_plugin(
             plugin,
             &host,
@@ -776,12 +788,19 @@ fn load_enabled_plugins(
         return Ok(Vec::new());
     }
 
-    let host = plugin_host_metadata();
-    let mut loaded_plugins = Vec::with_capacity(config.plugins.enabled.len());
     for plugin_id in &config.plugins.enabled {
-        let plugin = registry.get(plugin_id).with_context(|| {
+        let _ = registry.get(plugin_id).with_context(|| {
             format!("enabled plugin '{plugin_id}' disappeared during native load")
         })?;
+    }
+
+    let host = plugin_host_metadata();
+    let ordered_plugins = registry
+        .activation_order_for(&config.plugins.enabled)
+        .context("enabled plugin dependency graph is invalid")?;
+    let mut loaded_plugins = Vec::with_capacity(ordered_plugins.len());
+    for plugin in ordered_plugins {
+        let plugin_id = plugin.declaration.id.as_str();
         let loaded = load_native_registered_plugin(plugin, &host, SUPPORTED_PLUGIN_CAPABILITIES)
             .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"))?;
         loaded_plugins.push(loaded);

@@ -26,7 +26,7 @@ pub use command::{
     CommandExecutionKind, PluginCommand, PluginCommandArgument, PluginCommandArgumentKind,
 };
 pub use declaration::{
-    NativePlugin, PluginDeclaration, PluginEntrypoint, PluginId, PluginLifecycle,
+    NativePlugin, PluginDeclaration, PluginDependency, PluginEntrypoint, PluginId, PluginLifecycle,
 };
 pub use discovery::{
     DEFAULT_PLUGIN_MANIFEST_FILE, PluginDiscoveryReport, discover_plugin_manifests,
@@ -36,11 +36,16 @@ pub use discovery::{
 pub use error::{PluginError, Result};
 pub use event::{PluginEvent, PluginEventKind, PluginEventPayload, PluginEventSubscription};
 pub use host::{
-    ClientInfo, ClientService, ClipboardService, CommandService, ConfigService, EventService,
-    HostConnectionInfo, HostMetadata, PaneHandle, PaneInfo, PaneService, PermissionEntry,
-    PermissionService, PluginContext, PluginHost, PluginStorage, RenderService, ServerService,
-    ServerStatusInfo, SessionHandle, SessionInfo, SessionService, WindowHandle, WindowInfo,
-    WindowService,
+    ClientQueryService, ClientSummary, ClipboardService, ConfigService, EventService,
+    FollowCommandService, FollowQueryService, FollowState, HostConnectionInfo, HostMetadata,
+    PaneCommandService, PaneFocusDirection, PaneHandle, PaneLayoutNode, PaneQueryService, PaneRef,
+    PaneSnapshot, PaneSplitDirection, PaneSummary, PermissionCommandService, PermissionEntry,
+    PermissionQueryService, PersistenceCommandService, PersistenceQueryService,
+    PersistenceRestorePreview, PersistenceRestoreResult, PersistenceStatus, PluginContext,
+    PluginHost, PluginStorage, PrincipalIdentityInfo, RenderService, ServerStatusInfo,
+    SessionCommandService, SessionHandle, SessionQueryService, SessionRef, SessionRoleValue,
+    SessionSnapshot, SessionSummary, WindowCommandService, WindowHandle, WindowQueryService,
+    WindowRef, WindowSnapshot, WindowSummary,
 };
 pub use loader::{
     LoadedPlugin, NativeCommandContext, NativeDescriptor, NativeLifecycleContext,
