@@ -198,6 +198,8 @@ pub enum Command {
         #[command(subcommand)]
         command: PluginCommand,
     },
+    #[command(external_subcommand)]
+    External(Vec<String>),
 }
 
 #[derive(Debug, Subcommand)]
@@ -1440,5 +1442,15 @@ mod tests {
                 args,
             } if plugin == "git.status" && command == "hello" && args == vec!["--flag", "value"]
         ));
+    }
+
+    #[test]
+    fn parses_external_plugin_command_path() {
+        let cli =
+            Cli::try_parse_from(["bmux", "acl", "permissions", "dev"]).expect("valid CLI args");
+        let Some(Command::External(args)) = cli.command else {
+            panic!("expected external plugin command path");
+        };
+        assert_eq!(args, vec!["acl", "permissions", "dev"]);
     }
 }

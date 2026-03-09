@@ -88,6 +88,31 @@ impl PluginDeclaration {
                     capability: PluginCapability::TerminalInputIntercept,
                 });
             }
+
+            let canonical_path = command.canonical_path();
+            if canonical_path.is_empty() || canonical_path.iter().any(|segment| segment.is_empty())
+            {
+                return Err(PluginError::InvalidPluginCommandPath {
+                    plugin_id: self.id.as_str().to_string(),
+                    command: command.name.clone(),
+                });
+            }
+
+            let mut seen_paths = BTreeSet::from([canonical_path.clone()]);
+            for alias in &command.aliases {
+                if alias.is_empty() || alias.iter().any(|segment| segment.is_empty()) {
+                    return Err(PluginError::InvalidPluginCommandPath {
+                        plugin_id: self.id.as_str().to_string(),
+                        command: command.name.clone(),
+                    });
+                }
+                if !seen_paths.insert(alias.clone()) {
+                    return Err(PluginError::DuplicatePluginCommandAlias {
+                        plugin_id: self.id.as_str().to_string(),
+                        command: command.name.clone(),
+                    });
+                }
+            }
         }
 
         Ok(())
@@ -162,17 +187,23 @@ mod tests {
             commands: vec![
                 PluginCommand {
                     name: "run".to_string(),
+                    path: Vec::new(),
+                    aliases: Vec::new(),
                     summary: "run".to_string(),
                     description: None,
                     arguments: Vec::new(),
                     execution: CommandExecutionKind::HostCallback,
+                    expose_in_cli: true,
                 },
                 PluginCommand {
                     name: "run".to_string(),
+                    path: Vec::new(),
+                    aliases: Vec::new(),
                     summary: "again".to_string(),
                     description: None,
                     arguments: Vec::new(),
                     execution: CommandExecutionKind::HostCallback,
+                    expose_in_cli: true,
                 },
             ],
             event_subscriptions: Vec::new(),
@@ -201,10 +232,13 @@ mod tests {
             capabilities,
             commands: vec![PluginCommand {
                 name: "runtime".to_string(),
+                path: Vec::new(),
+                aliases: Vec::new(),
                 summary: "runtime".to_string(),
                 description: None,
                 arguments: Vec::new(),
                 execution: CommandExecutionKind::RuntimeHook,
+                expose_in_cli: true,
             }],
             event_subscriptions: Vec::new(),
             lifecycle: super::PluginLifecycle::default(),

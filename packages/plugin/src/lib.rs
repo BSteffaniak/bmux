@@ -29,7 +29,8 @@ pub use declaration::{
 };
 pub use discovery::{
     DEFAULT_PLUGIN_MANIFEST_FILE, PluginDiscoveryReport, discover_plugin_manifests,
-    discover_registered_plugins,
+    discover_plugin_manifests_in_roots, discover_registered_plugins,
+    discover_registered_plugins_in_roots,
 };
 pub use error::{PluginError, Result};
 pub use event::{PluginEvent, PluginEventKind, PluginEventPayload, PluginEventSubscription};

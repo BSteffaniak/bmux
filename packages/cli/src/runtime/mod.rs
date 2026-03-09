@@ -21,8 +21,7 @@ use bmux_keybind::action_to_name;
 use bmux_plugin::{
     CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
     NativeCommandContext, NativeLifecycleContext, PluginCapability, PluginEvent, PluginEventKind,
-    PluginManifest, PluginRegistry, discover_plugin_manifests,
-    load_registered_plugin as load_native_registered_plugin,
+    PluginManifest, PluginRegistry, load_registered_plugin as load_native_registered_plugin,
 };
 use bmux_server::BmuxServer;
 use clap::Parser;
@@ -41,6 +40,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 mod attach;
+mod plugin_commands;
 mod plugin_host;
 mod terminal_protocol;
 use attach::cursor::apply_attach_cursor_state;
@@ -53,6 +53,7 @@ use attach::state::{
     AttachEventAction, AttachExitReason, AttachScrollbackCursor, AttachScrollbackPosition,
     AttachUiMode, AttachViewState, PaneRect,
 };
+use plugin_commands::PluginCommandRegistry;
 use terminal_protocol::{
     ProtocolDirection, ProtocolProfile, ProtocolTraceEvent, primary_da_for_profile,
     protocol_profile_name, secondary_da_for_profile, supported_query_names,
@@ -328,6 +329,7 @@ async fn run_command(command: &Command) -> Result<u8> {
                 args,
             } => run_plugin_command(plugin, command, args).await,
         },
+        Command::External(args) => run_external_plugin_command(args).await,
     }
 }
 
@@ -340,7 +342,7 @@ async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8>
 
     let config = BmuxConfig::load()?;
     let paths = ConfigPaths::default();
-    let registry = scan_available_plugins(&paths)?;
+    let registry = scan_available_plugins(&config, &paths)?;
     validate_enabled_plugins(&config, &registry)?;
     let _preloaded_plugins = load_enabled_plugins(&config, &registry)?;
 
@@ -425,32 +427,73 @@ fn plugin_host_connection(paths: &ConfigPaths) -> HostConnectionInfo {
 
 #[cfg(test)]
 fn validate_configured_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Result<()> {
-    let registry = scan_available_plugins(paths)?;
+    let registry = scan_available_plugins(config, paths)?;
     validate_enabled_plugins(config, &registry)
 }
 
-fn scan_available_plugins(paths: &ConfigPaths) -> Result<PluginRegistry> {
-    let report = discover_plugin_manifests(&paths.plugins_dir())?;
+fn scan_available_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Result<PluginRegistry> {
+    let search_paths = resolve_plugin_search_paths(config, paths)?;
+    let reports = bmux_plugin::discover_plugin_manifests_in_roots(&search_paths)?;
     let mut registry = PluginRegistry::new();
-    for manifest_path in report.manifest_paths {
-        match PluginManifest::from_path(&manifest_path) {
-            Ok(manifest) => {
-                if let Err(error) = registry.register_manifest(&manifest_path, manifest) {
+    for report in reports {
+        for manifest_path in report.manifest_paths {
+            match PluginManifest::from_path(&manifest_path) {
+                Ok(manifest) => {
+                    if let Err(error) = registry.register_manifest_from_root(
+                        &report.search_root,
+                        &manifest_path,
+                        manifest,
+                    ) {
+                        warn!(
+                            "skipping plugin manifest {} during enabled-plugin scan: {error}",
+                            manifest_path.display()
+                        );
+                    }
+                }
+                Err(error) => {
                     warn!(
-                        "skipping plugin manifest {} during enabled-plugin scan: {error}",
+                        "skipping unreadable plugin manifest {} during enabled-plugin scan: {error}",
                         manifest_path.display()
                     );
                 }
             }
-            Err(error) => {
-                warn!(
-                    "skipping unreadable plugin manifest {} during enabled-plugin scan: {error}",
-                    manifest_path.display()
-                );
-            }
         }
     }
     Ok(registry)
+}
+
+fn resolve_plugin_search_paths(config: &BmuxConfig, paths: &ConfigPaths) -> Result<Vec<PathBuf>> {
+    let mut resolved = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+
+    if let Ok(executable) = std::env::current_exe() {
+        if let Some(parent) = executable.parent() {
+            let shipped = parent.join("plugins");
+            if seen.insert(shipped.clone()) {
+                resolved.push(shipped);
+            }
+        }
+    }
+
+    let user_plugins = paths.plugins_dir();
+    if seen.insert(user_plugins.clone()) {
+        resolved.push(user_plugins);
+    }
+
+    for search_path in &config.plugins.search_paths {
+        let absolute = if search_path.is_absolute() {
+            search_path.clone()
+        } else {
+            std::env::current_dir()
+                .context("failed resolving current directory for plugin search path")?
+                .join(search_path)
+        };
+        if seen.insert(absolute.clone()) {
+            resolved.push(absolute);
+        }
+    }
+
+    Ok(resolved)
 }
 
 fn validate_enabled_plugins(config: &BmuxConfig, registry: &PluginRegistry) -> Result<()> {
@@ -481,6 +524,9 @@ fn validate_enabled_plugins(config: &BmuxConfig, registry: &PluginRegistry) -> R
         )
         .with_context(|| format!("failed validating enabled plugin '{plugin_id}'"))?;
     }
+
+    PluginCommandRegistry::build(config, registry)
+        .context("failed building plugin CLI command registry")?;
 
     Ok(())
 }
@@ -718,7 +764,7 @@ struct PluginListJsonEntry {
 async fn run_plugin_list(as_json: bool) -> Result<u8> {
     let config = BmuxConfig::load()?;
     let paths = ConfigPaths::default();
-    let registry = scan_available_plugins(&paths)?;
+    let registry = scan_available_plugins(&config, &paths)?;
     let enabled = config
         .plugins
         .enabled
@@ -778,7 +824,7 @@ async fn run_plugin_list(as_json: bool) -> Result<u8> {
 async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]) -> Result<u8> {
     let config = BmuxConfig::load()?;
     let paths = ConfigPaths::default();
-    let registry = scan_available_plugins(&paths)?;
+    let registry = scan_available_plugins(&config, &paths)?;
     let plugin = registry.get(plugin_id).with_context(|| {
         let available = registry.plugin_ids();
         if available.is_empty() {
@@ -813,6 +859,26 @@ async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]
         .run_command_with_context(command_name, args, Some(&context))
         .with_context(|| format!("failed running plugin command '{plugin_id}:{command_name}'"))?;
     Ok(status.clamp(0, i32::from(u8::MAX)) as u8)
+}
+
+async fn run_external_plugin_command(args: &[String]) -> Result<u8> {
+    let config = BmuxConfig::load()?;
+    let paths = ConfigPaths::default();
+    let registry = scan_available_plugins(&config, &paths)?;
+    let command_registry = PluginCommandRegistry::build(&config, &registry)
+        .context("failed building plugin CLI command registry")?;
+    let resolved = command_registry.resolve(args).with_context(|| {
+        format!(
+            "unknown command '{}'; run 'bmux plugin list' to inspect available plugins",
+            args.join(" ")
+        )
+    })?;
+    run_plugin_command(
+        &resolved.plugin_id,
+        &resolved.command_name,
+        &resolved.arguments,
+    )
+    .await
 }
 
 #[derive(Debug, serde::Serialize)]

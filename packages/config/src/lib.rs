@@ -196,6 +196,8 @@ pub struct MultiClientConfig {
 pub struct PluginConfig {
     /// Enabled plugins
     pub enabled: Vec<String>,
+    /// Additional plugin search roots
+    pub search_paths: Vec<PathBuf>,
     /// Plugin-specific settings
     pub settings: BTreeMap<String, toml::Value>,
 }

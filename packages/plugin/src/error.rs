@@ -15,6 +15,12 @@ pub enum PluginError {
     #[error("plugin '{plugin_id}' requests duplicate command '{command}'")]
     DuplicateCommand { plugin_id: String, command: String },
 
+    #[error("plugin '{plugin_id}' has invalid CLI path for command '{command}'")]
+    InvalidPluginCommandPath { plugin_id: String, command: String },
+
+    #[error("plugin '{plugin_id}' has duplicate CLI alias entries for command '{command}'")]
+    DuplicatePluginCommandAlias { plugin_id: String, command: String },
+
     #[error("plugin '{plugin_id}' is missing native entry path")]
     MissingEntryPath { plugin_id: String },
 

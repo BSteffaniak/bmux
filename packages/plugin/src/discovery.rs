@@ -7,7 +7,7 @@ pub const DEFAULT_PLUGIN_MANIFEST_FILE: &str = "plugin.toml";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PluginDiscoveryReport {
-    pub searched_dir: PathBuf,
+    pub search_root: PathBuf,
     pub manifest_paths: Vec<PathBuf>,
 }
 
@@ -17,7 +17,7 @@ pub struct PluginDiscoveryReport {
 pub fn discover_plugin_manifests(plugins_dir: &Path) -> Result<PluginDiscoveryReport> {
     if !plugins_dir.exists() {
         return Ok(PluginDiscoveryReport {
-            searched_dir: plugins_dir.to_path_buf(),
+            search_root: plugins_dir.to_path_buf(),
             manifest_paths: Vec::new(),
         });
     }
@@ -45,9 +45,21 @@ pub fn discover_plugin_manifests(plugins_dir: &Path) -> Result<PluginDiscoveryRe
     }
 
     Ok(PluginDiscoveryReport {
-        searched_dir: plugins_dir.to_path_buf(),
+        search_root: plugins_dir.to_path_buf(),
         manifest_paths: manifests.into_iter().collect(),
     })
+}
+
+/// # Errors
+///
+/// Returns an error when any plugin search root cannot be read.
+pub fn discover_plugin_manifests_in_roots(
+    plugin_roots: &[PathBuf],
+) -> Result<Vec<PluginDiscoveryReport>> {
+    plugin_roots
+        .iter()
+        .map(|root| discover_plugin_manifests(root))
+        .collect()
 }
 
 /// # Errors
@@ -58,7 +70,22 @@ pub fn discover_registered_plugins(plugins_dir: &Path) -> Result<PluginRegistry>
     let mut registry = PluginRegistry::new();
     for manifest_path in report.manifest_paths {
         let manifest = PluginManifest::from_path(&manifest_path)?;
-        registry.register_manifest(&manifest_path, manifest)?;
+        registry.register_manifest_from_root(&report.search_root, &manifest_path, manifest)?;
+    }
+    Ok(registry)
+}
+
+/// # Errors
+///
+/// Returns an error when manifest discovery, parsing, or registration fails.
+pub fn discover_registered_plugins_in_roots(plugin_roots: &[PathBuf]) -> Result<PluginRegistry> {
+    let reports = discover_plugin_manifests_in_roots(plugin_roots)?;
+    let mut registry = PluginRegistry::new();
+    for report in reports {
+        for manifest_path in report.manifest_paths {
+            let manifest = PluginManifest::from_path(&manifest_path)?;
+            registry.register_manifest_from_root(&report.search_root, &manifest_path, manifest)?;
+        }
     }
     Ok(registry)
 }

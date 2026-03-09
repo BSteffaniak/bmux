@@ -19,6 +19,7 @@ impl PluginCompatibilityReport {
 
 #[derive(Debug, Clone)]
 pub struct RegisteredPlugin {
+    pub search_root: PathBuf,
     pub manifest_path: PathBuf,
     pub manifest: PluginManifest,
     pub declaration: PluginDeclaration,
@@ -42,13 +43,33 @@ impl PluginRegistry {
     /// Returns an error when the manifest cannot be registered.
     pub fn register_manifest_path(&mut self, path: &Path) -> Result<()> {
         let manifest = PluginManifest::from_path(path)?;
-        self.register_manifest(path, manifest)
+        self.register_manifest_from_root(
+            path.parent().unwrap_or_else(|| Path::new(".")),
+            path,
+            manifest,
+        )
     }
 
     /// # Errors
     ///
     /// Returns an error when the manifest is invalid or uses a duplicate id.
     pub fn register_manifest(&mut self, path: &Path, manifest: PluginManifest) -> Result<()> {
+        self.register_manifest_from_root(
+            path.parent().unwrap_or_else(|| Path::new(".")),
+            path,
+            manifest,
+        )
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the manifest is invalid or uses a duplicate id.
+    pub fn register_manifest_from_root(
+        &mut self,
+        search_root: &Path,
+        path: &Path,
+        manifest: PluginManifest,
+    ) -> Result<()> {
         let declaration = manifest.to_declaration()?;
         let plugin_id = declaration.id.as_str().to_string();
 
@@ -59,6 +80,7 @@ impl PluginRegistry {
         self.plugins.insert(
             plugin_id,
             RegisteredPlugin {
+                search_root: search_root.to_path_buf(),
                 manifest_path: path.to_path_buf(),
                 manifest,
                 declaration,
