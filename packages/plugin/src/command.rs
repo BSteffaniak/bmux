@@ -31,20 +31,36 @@ pub struct PluginCommand {
 pub struct PluginCommandArgument {
     pub name: String,
     pub kind: PluginCommandArgumentKind,
+    #[serde(default, alias = "values")]
+    pub choice_values: Vec<String>,
+    #[serde(default)]
+    pub position: Option<usize>,
+    #[serde(default)]
+    pub long: Option<String>,
+    #[serde(default)]
+    pub short: Option<char>,
     #[serde(default)]
     pub required: bool,
     #[serde(default)]
+    pub multiple: bool,
+    #[serde(default)]
+    pub trailing_var_arg: bool,
+    #[serde(default)]
+    pub allow_hyphen_values: bool,
+    #[serde(default)]
     pub summary: Option<String>,
+    #[serde(default)]
+    pub value_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum PluginCommandArgumentKind {
     String,
     Integer,
     Boolean,
     Path,
-    Choice { values: Vec<String> },
+    Choice,
 }
 
 const fn default_execution_kind() -> CommandExecutionKind {

@@ -7,7 +7,7 @@ use bmux_config::ConfigPaths;
 use bmux_ipc::{SessionSelector, WindowSelector, WindowSummary};
 use bmux_plugin::{
     CommandExecutionKind, HostScope, NativeCommandContext, NativeDescriptor, PluginCommand,
-    PluginFeature, RustPlugin,
+    PluginCommandArgument, PluginCommandArgumentKind, PluginFeature, RustPlugin,
 };
 use std::collections::BTreeSet;
 
@@ -97,9 +97,121 @@ fn plugin_command(name: &str, summary: &str, aliases: Vec<Vec<String>>) -> Plugi
         aliases,
         summary: summary.to_string(),
         description: None,
-        arguments: Vec::new(),
+        arguments: command_arguments(name),
         execution: CommandExecutionKind::HostCallback,
         expose_in_cli: true,
+    }
+}
+
+fn command_arguments(name: &str) -> Vec<PluginCommandArgument> {
+    match name {
+        "new-window" => vec![
+            option_arg(
+                "session",
+                PluginCommandArgumentKind::String,
+                false,
+                Some('s'),
+            ),
+            option_arg("name", PluginCommandArgumentKind::String, false, Some('n')),
+        ],
+        "list-windows" => vec![
+            option_arg(
+                "session",
+                PluginCommandArgumentKind::String,
+                false,
+                Some('s'),
+            ),
+            flag_arg("json", Some('j')),
+        ],
+        "kill-window" => vec![
+            positional_arg("target", PluginCommandArgumentKind::String, true),
+            option_arg(
+                "session",
+                PluginCommandArgumentKind::String,
+                false,
+                Some('s'),
+            ),
+            flag_arg("force-local", None),
+        ],
+        "kill-all-windows" => vec![
+            option_arg(
+                "session",
+                PluginCommandArgumentKind::String,
+                false,
+                Some('s'),
+            ),
+            flag_arg("force-local", None),
+        ],
+        "switch-window" => vec![
+            positional_arg("target", PluginCommandArgumentKind::String, true),
+            option_arg(
+                "session",
+                PluginCommandArgumentKind::String,
+                false,
+                Some('s'),
+            ),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+fn option_arg(
+    name: &str,
+    kind: PluginCommandArgumentKind,
+    required: bool,
+    short: Option<char>,
+) -> PluginCommandArgument {
+    PluginCommandArgument {
+        name: name.to_string(),
+        kind,
+        choice_values: Vec::new(),
+        position: None,
+        long: Some(name.to_string()),
+        short,
+        required,
+        multiple: false,
+        trailing_var_arg: false,
+        allow_hyphen_values: false,
+        summary: None,
+        value_name: Some(name.replace('-', "_").to_uppercase()),
+    }
+}
+
+fn positional_arg(
+    name: &str,
+    kind: PluginCommandArgumentKind,
+    required: bool,
+) -> PluginCommandArgument {
+    PluginCommandArgument {
+        name: name.to_string(),
+        kind,
+        choice_values: Vec::new(),
+        position: Some(0),
+        long: None,
+        short: None,
+        required,
+        multiple: false,
+        trailing_var_arg: false,
+        allow_hyphen_values: false,
+        summary: None,
+        value_name: Some(name.to_uppercase()),
+    }
+}
+
+fn flag_arg(name: &str, short: Option<char>) -> PluginCommandArgument {
+    PluginCommandArgument {
+        name: name.to_string(),
+        kind: PluginCommandArgumentKind::Boolean,
+        choice_values: Vec::new(),
+        position: None,
+        long: Some(name.to_string()),
+        short,
+        required: false,
+        multiple: false,
+        trailing_var_arg: false,
+        allow_hyphen_values: false,
+        summary: None,
+        value_name: None,
     }
 }
 

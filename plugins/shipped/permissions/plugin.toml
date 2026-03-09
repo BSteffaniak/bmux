@@ -18,6 +18,26 @@ name          = "permissions"
 path          = ["permissions"]
 summary       = "List explicit role assignments for a session"
 
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+required   = true
+short      = "s"
+value_name = "SESSION"
+
+[[commands.arguments]]
+kind  = "boolean"
+long  = "json"
+name  = "json"
+short = "j"
+
+[[commands.arguments]]
+kind  = "boolean"
+long  = "watch"
+name  = "watch"
+short = "w"
+
 [[commands]]
 aliases       = [["session", "grant"]]
 execution     = "host_callback"
@@ -26,6 +46,31 @@ name          = "grant"
 path          = ["grant"]
 summary       = "Grant a role to a client in a session"
 
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+required   = true
+short      = "s"
+value_name = "SESSION"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "client"
+name       = "client"
+required   = true
+short      = "c"
+value_name = "CLIENT"
+
+[[commands.arguments]]
+kind       = "choice"
+long       = "role"
+name       = "role"
+required   = true
+short      = "r"
+value_name = "ROLE"
+values     = ["owner", "writer", "observer"]
+
 [[commands]]
 aliases       = [["session", "revoke"]]
 execution     = "host_callback"
@@ -33,6 +78,22 @@ expose_in_cli = true
 name          = "revoke"
 path          = ["revoke"]
 summary       = "Revoke an explicit role from a client in a session"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+required   = true
+short      = "s"
+value_name = "SESSION"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "client"
+name       = "client"
+required   = true
+short      = "c"
+value_name = "CLIENT"
 
 [plugin_api]
 minimum = "1.0"

@@ -1040,10 +1040,13 @@ async fn run_external_plugin_command(args: &[String]) -> Result<u8> {
             args.join(" ")
         )
     })?;
+    let validated_arguments =
+        PluginCommandRegistry::validate_arguments(&resolved.schema, &resolved.arguments)
+            .context("failed validating plugin command arguments")?;
     run_plugin_command(
         &resolved.plugin_id,
         &resolved.command_name,
-        &resolved.arguments,
+        &validated_arguments,
     )
     .await
 }

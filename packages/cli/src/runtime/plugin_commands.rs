@@ -1,7 +1,10 @@
 use super::built_in_commands::reserved_built_in_paths;
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use bmux_config::BmuxConfig;
-use bmux_plugin::PluginRegistry;
+use bmux_plugin::{
+    PluginCommand, PluginCommandArgument, PluginCommandArgumentKind, PluginRegistry,
+};
+use clap::{Arg, ArgAction, Command};
 use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Debug, Clone)]
@@ -9,6 +12,7 @@ pub struct ResolvedPluginCommand {
     pub plugin_id: String,
     pub command_name: String,
     pub arguments: Vec<String>,
+    pub schema: PluginCommand,
 }
 
 #[derive(Debug, Clone)]
@@ -17,6 +21,7 @@ pub struct RegisteredPluginCommand {
     pub command_name: String,
     pub canonical_path: Vec<String>,
     pub aliases: Vec<Vec<String>>,
+    pub schema: PluginCommand,
 }
 
 #[derive(Debug, Default, Clone)]
@@ -96,6 +101,7 @@ impl PluginCommandRegistry {
                     command_name: command.name.clone(),
                     canonical_path: canonical,
                     aliases,
+                    schema: command.clone(),
                 });
             }
         }
@@ -116,8 +122,120 @@ impl PluginCommandRegistry {
                 plugin_id: command.plugin_id.clone(),
                 command_name: command.command_name.clone(),
                 arguments: raw[path.len()..].to_vec(),
+                schema: command.schema.clone(),
             })
     }
+
+    pub fn validate_arguments(
+        command: &PluginCommand,
+        arguments: &[String],
+    ) -> Result<Vec<String>> {
+        let mut clap_command =
+            Command::new(leak_string(&command.name)).disable_help_subcommand(true);
+        for argument in &command.arguments {
+            clap_command = clap_command.arg(build_clap_arg(argument)?);
+        }
+        let mut argv = Vec::with_capacity(arguments.len() + 1);
+        argv.push(command.name.clone());
+        argv.extend(arguments.iter().cloned());
+        let matches = clap_command.try_get_matches_from(argv).with_context(|| {
+            format!(
+                "invalid arguments for plugin command '{}': {}",
+                command.name,
+                arguments.join(" ")
+            )
+        })?;
+
+        let mut normalized = Vec::new();
+        for argument in &command.arguments {
+            if let Some(long) = &argument.long {
+                if matches.value_source(&argument.name).is_none() {
+                    continue;
+                }
+                if matches!(argument.kind, PluginCommandArgumentKind::Boolean) {
+                    if matches.get_flag(&argument.name) {
+                        normalized.push(format!("--{long}"));
+                    }
+                    continue;
+                }
+                if argument.multiple {
+                    if let Some(values) = matches.get_many::<String>(&argument.name) {
+                        for value in values {
+                            normalized.push(format!("--{long}"));
+                            normalized.push(value.to_string());
+                        }
+                    }
+                } else if let Some(value) = matches.get_one::<String>(&argument.name) {
+                    normalized.push(format!("--{long}"));
+                    normalized.push(value.to_string());
+                }
+                continue;
+            }
+
+            if argument.multiple {
+                if let Some(values) = matches.get_many::<String>(&argument.name) {
+                    normalized.extend(values.cloned());
+                }
+            } else if let Some(value) = matches.get_one::<String>(&argument.name) {
+                normalized.push(value.to_string());
+            }
+        }
+
+        Ok(normalized)
+    }
+}
+
+fn build_clap_arg(argument: &PluginCommandArgument) -> Result<Arg> {
+    let mut arg = Arg::new(leak_string(&argument.name)).required(argument.required);
+    if let Some(position) = argument.position {
+        arg = arg.index(position + 1);
+    }
+    if let Some(long) = &argument.long {
+        arg = arg.long(leak_string(long));
+    }
+    if let Some(short) = argument.short {
+        arg = arg.short(short);
+    }
+    if let Some(summary) = &argument.summary {
+        arg = arg.help(summary);
+    }
+    if let Some(value_name) = &argument.value_name {
+        arg = arg.value_name(leak_string(value_name));
+    }
+    if argument.multiple {
+        arg = arg.action(ArgAction::Append);
+    } else if matches!(argument.kind, PluginCommandArgumentKind::Boolean) {
+        arg = arg.action(ArgAction::SetTrue);
+    } else {
+        arg = arg.action(ArgAction::Set);
+    }
+    if argument.trailing_var_arg {
+        arg = arg.trailing_var_arg(true);
+    }
+    if argument.allow_hyphen_values {
+        arg = arg.allow_hyphen_values(true);
+    }
+    match &argument.kind {
+        PluginCommandArgumentKind::Integer => {
+            arg = arg.value_parser(clap::value_parser!(i64));
+        }
+        PluginCommandArgumentKind::Choice => {
+            let leaked = argument
+                .choice_values
+                .iter()
+                .map(|value| Box::leak(value.clone().into_boxed_str()) as &'static str)
+                .collect::<Vec<_>>();
+            arg = arg.value_parser(leaked);
+        }
+        PluginCommandArgumentKind::String
+        | PluginCommandArgumentKind::Boolean
+        | PluginCommandArgumentKind::Path => {}
+    }
+    Ok(arg)
+}
+
+fn leak_string(value: &str) -> &'static str {
+    Box::leak(value.to_string().into_boxed_str())
 }
 
 fn validate_path_collision(
