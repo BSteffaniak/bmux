@@ -174,8 +174,6 @@ pub enum SessionCommand {
     },
     /// Stop following a client
     Unfollow,
-    #[command(external_subcommand)]
-    External(Vec<String>),
 }
 
 #[derive(Debug, Subcommand)]
@@ -763,90 +761,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_grouped_session_permissions_command() {
-        let cli = Cli::try_parse_from(["bmux", "session", "permissions", "--session", "dev"])
-            .expect("valid CLI args");
-        let Some(Command::Session { command }) = cli.command else {
-            panic!("expected session command");
-        };
-        assert!(
-            matches!(command, SessionCommand::External(args) if args == vec!["permissions", "--session", "dev"])
-        );
-    }
-
-    #[test]
-    fn parses_grouped_session_permissions_watch_command() {
-        let cli = Cli::try_parse_from([
-            "bmux",
-            "session",
-            "permissions",
-            "--session",
-            "dev",
-            "--watch",
-        ])
-        .expect("valid CLI args");
-        let Some(Command::Session { command }) = cli.command else {
-            panic!("expected session command");
-        };
-        assert!(
-            matches!(command, SessionCommand::External(args) if args == vec!["permissions", "--session", "dev", "--watch"])
-        );
-    }
-
-    #[test]
-    fn parses_grouped_session_grant_command() {
-        let cli = Cli::try_parse_from([
-            "bmux",
-            "session",
-            "grant",
-            "--session",
-            "dev",
-            "--client",
-            "550e8400-e29b-41d4-a716-446655440000",
-            "--role",
-            "observer",
-        ])
-        .expect("valid CLI args");
-        let Some(Command::Session { command }) = cli.command else {
-            panic!("expected session command");
-        };
-        assert!(
-            matches!(command, SessionCommand::External(args) if args == vec![
-                "grant",
-                "--session",
-                "dev",
-                "--client",
-                "550e8400-e29b-41d4-a716-446655440000",
-                "--role",
-                "observer",
-            ])
-        );
-    }
-
-    #[test]
-    fn parses_grouped_session_revoke_command() {
-        let cli = Cli::try_parse_from([
-            "bmux",
-            "session",
-            "revoke",
-            "--session",
-            "dev",
-            "--client",
-            "550e8400-e29b-41d4-a716-446655440000",
-        ])
-        .expect("valid CLI args");
-        let Some(Command::Session { command }) = cli.command else {
-            panic!("expected session command");
-        };
-        assert!(
-            matches!(command, SessionCommand::External(args) if args == vec![
-                "revoke",
-                "--session",
-                "dev",
-                "--client",
-                "550e8400-e29b-41d4-a716-446655440000",
-            ])
-        );
+    fn static_session_namespace_rejects_plugin_owned_subcommands() {
+        let error = Cli::try_parse_from(["bmux", "session", "permissions", "--session", "dev"])
+            .expect_err("static CLI should reject plugin-owned session descendant");
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
 
     #[test]

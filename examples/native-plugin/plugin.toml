@@ -11,9 +11,10 @@ runtime = "native"
 version = "0.0.1-alpha.0"
 
 [[commands]]
-execution = "host_callback"
-name      = "hello"
-summary   = "Print a hello message"
+execution     = "host_callback"
+expose_in_cli = true
+name          = "hello"
+summary       = "Print a hello message"
 
 [[commands.arguments]]
 allow_hyphen_values = true
@@ -26,9 +27,10 @@ trailing_var_arg    = true
 value_name          = "MESSAGE"
 
 [[commands]]
-execution = "host_callback"
-name      = "permissions-list"
-summary   = "List session permissions through bmux host IPC"
+execution     = "host_callback"
+expose_in_cli = true
+name          = "permissions-list"
+summary       = "List session permissions through bmux host IPC"
 
 [[commands.arguments]]
 kind       = "string"

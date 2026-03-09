@@ -427,9 +427,10 @@ fn is_prefix_collision(left: &[String], right: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::PluginCommandRegistry;
+    use crate::cli::Cli;
     use bmux_config::BmuxConfig;
     use bmux_plugin::{PluginManifest, PluginRegistry};
-    use clap::Command;
+    use clap::{Command, CommandFactory};
     use std::path::Path;
 
     fn config_with_enabled(plugin_id: &str) -> BmuxConfig {
@@ -618,5 +619,53 @@ minimum = "1.0"
             .expect("window namespace path should parse");
         let (path, _) = super::selected_subcommand_path(&matches);
         assert_eq!(path, vec!["window".to_string(), "new".to_string()]);
+    }
+
+    #[test]
+    fn augment_clap_command_extends_existing_session_namespace() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "bmux.permissions"
+name = "Permissions"
+version = "0.1.0"
+entry = "plugin.dylib"
+required_host_scopes = ["bmux.commands"]
+
+[[commands]]
+name = "permissions"
+path = ["permissions"]
+aliases = [["session", "permissions"]]
+summary = "list"
+execution = "host_callback"
+expose_in_cli = true
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+        )
+        .expect("manifest should parse");
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest_from_root(
+                Path::new("/plugins"),
+                Path::new("/plugins/plugin.toml"),
+                manifest,
+            )
+            .expect("manifest should register");
+        let commands =
+            PluginCommandRegistry::build(&config_with_enabled("bmux.permissions"), &registry)
+                .expect("permissions command registry should build");
+
+        let clap = commands
+            .augment_clap_command(Cli::command())
+            .expect("existing session namespace should be extended");
+        let matches = clap
+            .try_get_matches_from(["bmux", "session", "permissions"])
+            .expect("plugin session alias should parse under mixed namespace");
+        let (path, _) = super::selected_subcommand_path(&matches);
+        assert_eq!(path, vec!["session".to_string(), "permissions".to_string()]);
     }
 }

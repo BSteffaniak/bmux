@@ -149,6 +149,7 @@ pub async fn run() -> Result<u8> {
     }
 }
 
+#[derive(Debug)]
 enum ParsedRuntimeCli {
     BuiltIn(Cli),
     ImmediateExit {
@@ -169,12 +170,20 @@ fn parse_runtime_cli() -> Result<ParsedRuntimeCli> {
     let config = BmuxConfig::load()?;
     let paths = ConfigPaths::default();
     let registry = scan_available_plugins(&config, &paths)?;
+    parse_runtime_cli_with_registry(&argv, &config, &registry)
+}
+
+fn parse_runtime_cli_with_registry(
+    argv: &[std::ffi::OsString],
+    config: &BmuxConfig,
+    registry: &PluginRegistry,
+) -> Result<ParsedRuntimeCli> {
     let command_registry = PluginCommandRegistry::build(&config, &registry)
         .context("failed building plugin CLI command registry")?;
     let clap_command = command_registry
         .augment_clap_command(Cli::command())
         .context("failed augmenting CLI with plugin commands")?;
-    let matches = match clap_command.try_get_matches_from(&argv) {
+    let matches = match clap_command.try_get_matches_from(argv.iter().cloned()) {
         Ok(matches) => matches,
         Err(error) => {
             return Ok(match error.kind() {
@@ -299,13 +308,6 @@ fn next_default_session_name(sessions: &[SessionSummary]) -> String {
 async fn run_command(command: &Command) -> Result<u8> {
     match command {
         Command::External(args) => run_external_plugin_command(args).await,
-        Command::Session {
-            command: SessionCommand::External(args),
-        } => {
-            let mut full_args = vec!["session".to_string()];
-            full_args.extend(args.clone());
-            run_external_plugin_command(&full_args).await
-        }
         _ => dispatch_built_in_command(command).await,
     }
 }
@@ -331,9 +333,6 @@ fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
             SessionCommand::Detach => BuiltInHandlerId::SessionDetach,
             SessionCommand::Follow { .. } => BuiltInHandlerId::SessionFollow,
             SessionCommand::Unfollow => BuiltInHandlerId::SessionUnfollow,
-            SessionCommand::External(_) => {
-                unreachable!("session external commands are dispatched separately")
-            }
         },
         Command::Server { command } => match command {
             ServerCommand::Start { .. } => BuiltInHandlerId::ServerStart,
@@ -5142,6 +5141,7 @@ mod tests {
         KeyEventKind as CrosstermKeyEventKind, KeyModifiers,
     };
     use std::collections::BTreeMap;
+    use std::ffi::OsString;
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -5160,6 +5160,13 @@ mod tests {
     fn plugin_manifest(id: &str, entry: &str) -> PluginManifest {
         PluginManifest::from_toml_str(&format!(
             "id = '{id}'\nname = 'Example'\nversion='0.1.0'\nentry='{entry}'\nrequired_host_scopes=['bmux.commands']\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n"
+        ))
+        .expect("manifest should parse")
+    }
+
+    fn plugin_manifest_with_commands(id: &str, entry: &str, commands: &str) -> PluginManifest {
+        PluginManifest::from_toml_str(&format!(
+            "id = '{id}'\nname = 'Example'\nversion='0.1.0'\nentry='{entry}'\nrequired_host_scopes=['bmux.commands']\n{commands}\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n"
         ))
         .expect("manifest should parse")
     }
@@ -5259,6 +5266,52 @@ mod tests {
         let paths = ConfigPaths::new(dir.join("config"), dir.join("runtime"), dir.join("data"));
 
         assert!(super::validate_configured_plugins(&config, &paths).is_ok());
+    }
+
+    #[test]
+    fn runtime_cli_prefers_dynamic_session_plugin_aliases_over_static_cli_rejection() {
+        let dir = temp_dir();
+        let plugin_dir = dir.join("permissions");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir should exist");
+        fs::write(plugin_dir.join("permissions.dylib"), []).expect("entry should be written");
+
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(
+                &plugin_dir.join("plugin.toml"),
+                plugin_manifest_with_commands(
+                    "bmux.permissions",
+                    "permissions.dylib",
+                    "[[commands]]\nname='permissions'\npath=['permissions']\naliases=[[\"session\",\"permissions\"]]\nsummary='list'\nexecution='host_callback'\nexpose_in_cli=true\n[[commands.arguments]]\nname='session'\nkind='string'\nlong='session'\nrequired=true\n",
+                ),
+            )
+            .expect("plugin should register");
+
+        let mut config = BmuxConfig::default();
+        config.plugins.enabled.push("bmux.permissions".to_string());
+        let argv = vec![
+            OsString::from("bmux"),
+            OsString::from("session"),
+            OsString::from("permissions"),
+            OsString::from("--session"),
+            OsString::from("dev"),
+        ];
+
+        let parsed = super::parse_runtime_cli_with_registry(&argv, &config, &registry)
+            .expect("runtime CLI should parse plugin alias under session namespace");
+        match parsed {
+            super::ParsedRuntimeCli::Plugin {
+                plugin_id,
+                command_name,
+                arguments,
+                ..
+            } => {
+                assert_eq!(plugin_id, "bmux.permissions");
+                assert_eq!(command_name, "permissions");
+                assert_eq!(arguments, vec!["--session".to_string(), "dev".to_string()]);
+            }
+            other => panic!("expected plugin runtime parse, got {other:?}"),
+        }
     }
 
     #[test]
