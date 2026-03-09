@@ -86,26 +86,31 @@ fn dynamic_library_file(stem: &str) -> String {
     }
 }
 
-fn stage_shipped_permissions_bundle(root: &Path, sandbox: &Path) -> PathBuf {
+fn stage_shipped_bundle(
+    root: &Path,
+    sandbox: &Path,
+    plugin_dir_name: &str,
+    library_stem: &str,
+) -> PathBuf {
     let shipped_root = sandbox.join("shipped-plugins");
-    let plugin_dir = shipped_root.join("permissions");
+    let plugin_dir = shipped_root.join(plugin_dir_name);
     fs::create_dir_all(&plugin_dir).expect("staged shipped plugin dir should be created");
 
-    let library_name = dynamic_library_file("bmux_permissions_plugin");
+    let library_name = dynamic_library_file(library_stem);
     fs::copy(
         root.join("target").join("debug").join(&library_name),
         plugin_dir.join(&library_name),
     )
-    .expect("permissions plugin library should be staged");
+    .expect("shipped plugin library should be staged");
 
     fs::copy(
         root.join("plugins")
             .join("shipped")
-            .join("permissions")
+            .join(plugin_dir_name)
             .join("plugin.toml"),
         plugin_dir.join("plugin.toml"),
     )
-    .expect("permissions plugin manifest should be staged");
+    .expect("shipped plugin manifest should be staged");
 
     shipped_root
 }
@@ -334,7 +339,8 @@ fn shipped_permissions_plugin_handles_permissions_command() {
         "permissions plugin build should succeed"
     );
 
-    let shipped_root = stage_shipped_permissions_bundle(&root, &sandbox);
+    let shipped_root =
+        stage_shipped_bundle(&root, &sandbox, "permissions", "bmux_permissions_plugin");
     fs::write(
         config_dir.join("bmux.toml"),
         format!(
@@ -548,6 +554,210 @@ fn shipped_permissions_plugin_handles_permissions_command() {
     target_thread
         .join()
         .expect("target client thread should join cleanly");
+
+    let stop_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &["server", "stop"],
+    );
+    assert!(stop_output.status.success(), "server stop should succeed");
+    let server_status = server.wait().expect("server process should exit");
+    assert!(
+        server_status.success(),
+        "server process should exit cleanly"
+    );
+}
+
+#[test]
+fn shipped_windows_plugin_handles_window_commands() {
+    let root = workspace_root();
+    let (sandbox, home_dir, config_home, data_home, runtime_dir, tmp_dir, config_dir) =
+        sandbox_setup();
+
+    let mut build_command = Command::new("cargo");
+    build_command
+        .current_dir(&root)
+        .arg("build")
+        .arg("-p")
+        .arg("bmux_windows_plugin")
+        .env("TMPDIR", &tmp_dir);
+    configure_bmux_env(&mut build_command, &home_dir, &config_home, &data_home);
+    preserve_toolchain_env(&mut build_command);
+    let build_status = build_command.status().expect("plugin build should run");
+    assert!(
+        build_status.success(),
+        "windows plugin build should succeed"
+    );
+
+    let shipped_root = stage_shipped_bundle(&root, &sandbox, "windows", "bmux_windows_plugin");
+    fs::write(
+        config_dir.join("bmux.toml"),
+        format!(
+            "[plugins]\nenabled = [\"bmux.windows\"]\nsearch_paths = [\"{}\"]\n",
+            shipped_root.display()
+        ),
+    )
+    .expect("config should be written");
+
+    let (mut server, server_stdout, server_stderr) = spawn_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &["server", "start", "--foreground-internal"],
+    );
+    wait_for_server_ready(
+        &mut server,
+        &server_stdout,
+        &server_stderr,
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+    );
+
+    let session_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &["new-session", "demo"],
+    );
+    assert!(
+        session_output.status.success(),
+        "new-session should succeed"
+    );
+
+    let new_window_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &["window", "new", "--session", "demo", "--name", "notes"],
+    );
+    assert!(
+        new_window_output.status.success(),
+        "window new should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&new_window_output.stdout),
+        String::from_utf8_lossy(&new_window_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&new_window_output.stdout).contains("notes"),
+        "window new output should mention notes window: {}",
+        String::from_utf8_lossy(&new_window_output.stdout)
+    );
+
+    let list_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &["list-windows", "--session", "demo", "--json"],
+    );
+    assert!(
+        list_output.status.success(),
+        "list-windows should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&list_output.stdout),
+        String::from_utf8_lossy(&list_output.stderr)
+    );
+    let list_json = String::from_utf8_lossy(&list_output.stdout);
+    assert!(
+        list_json.contains("notes") && list_json.contains("\"active\": true"),
+        "list-windows json should include active notes window: {list_json}"
+    );
+
+    let paths = config_paths_for_test(&config_dir, &runtime_dir, &data_home);
+    let windows_after_create = with_runtime(async {
+        let mut client = BmuxClient::connect_with_paths(&paths, "windows-plugin-e2e-list")
+            .await
+            .expect("client should connect");
+        client
+            .list_windows(Some(SessionSelector::ByName("demo".to_string())))
+            .await
+            .expect("window list should succeed")
+    });
+    let notes_window = windows_after_create
+        .iter()
+        .find(|window| window.name.as_deref() == Some("notes"))
+        .expect("notes window should exist");
+
+    let switch_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &[
+            "window",
+            "switch",
+            &notes_window.id.to_string(),
+            "--session",
+            "demo",
+        ],
+    );
+    assert!(
+        switch_output.status.success(),
+        "window switch should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&switch_output.stdout),
+        String::from_utf8_lossy(&switch_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&switch_output.stdout).contains("notes"),
+        "window switch output should mention notes window: {}",
+        String::from_utf8_lossy(&switch_output.stdout)
+    );
+
+    let kill_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &[
+            "kill-window",
+            &notes_window.id.to_string(),
+            "--session",
+            "demo",
+        ],
+    );
+    assert!(
+        kill_output.status.success(),
+        "kill-window should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&kill_output.stdout),
+        String::from_utf8_lossy(&kill_output.stderr)
+    );
+
+    let windows_after_kill = with_runtime(async {
+        let mut client = BmuxClient::connect_with_paths(&paths, "windows-plugin-e2e-list-after")
+            .await
+            .expect("client should reconnect");
+        client
+            .list_windows(Some(SessionSelector::ByName("demo".to_string())))
+            .await
+            .expect("window list after kill should succeed")
+    });
+    assert!(
+        !windows_after_kill
+            .iter()
+            .any(|window| window.id == notes_window.id),
+        "notes window should be removed after kill"
+    );
 
     let stop_output = run_bmux(
         &root,

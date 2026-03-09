@@ -271,6 +271,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_windows_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_client",
+ "bmux_config",
+ "bmux_ipc",
+ "bmux_plugin",
+ "serde_json",
+ "tokio",
+ "uuid",
+]
+
+[[package]]
 name = "bumpalo"
 version = "3.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

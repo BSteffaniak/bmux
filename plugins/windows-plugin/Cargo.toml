@@ -1,0 +1,24 @@
+[package]
+authors     = { workspace = true }
+description = "Shipped windows plugin for bmux"
+edition     = { workspace = true }
+license     = { workspace = true }
+name        = "bmux_windows_plugin"
+publish     = false
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bmux_client = { workspace = true }
+bmux_config = { workspace = true }
+bmux_ipc    = { workspace = true }
+bmux_plugin = { workspace = true }
+serde_json  = { workspace = true }
+tokio       = { workspace = true, features = ["rt-multi-thread"] }
+uuid        = { workspace = true, features = ["std"] }
+
+[features]
+fail-on-warnings = []

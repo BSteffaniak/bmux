@@ -1,0 +1,53 @@
+entry = "libbmux_windows_plugin.dylib"
+id = "bmux.windows"
+name = "bmux Windows"
+provided_features = ["bmux.windows"]
+required_host_scopes = [
+    "bmux.commands",
+    "bmux.sessions.read",
+    "bmux.windows.read",
+    "bmux.windows.write",
+]
+runtime = "native"
+version = "0.0.1-alpha.0"
+
+[[commands]]
+execution     = "host_callback"
+expose_in_cli = false
+name          = "new-window"
+path          = ["new-window"]
+summary       = "Create a new window in a session"
+
+[[commands]]
+execution     = "host_callback"
+expose_in_cli = false
+name          = "list-windows"
+path          = ["list-windows"]
+summary       = "List windows for a session"
+
+[[commands]]
+execution     = "host_callback"
+expose_in_cli = false
+name          = "kill-window"
+path          = ["kill-window"]
+summary       = "Kill a window by name, UUID, or active"
+
+[[commands]]
+execution     = "host_callback"
+expose_in_cli = false
+name          = "kill-all-windows"
+path          = ["kill-all-windows"]
+summary       = "Kill all windows in a session"
+
+[[commands]]
+execution     = "host_callback"
+expose_in_cli = false
+name          = "switch-window"
+path          = ["switch-window"]
+summary       = "Switch active window by name, UUID, or active"
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"

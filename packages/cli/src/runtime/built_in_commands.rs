@@ -198,35 +198,35 @@ pub fn built_in_cli_commands() -> Vec<BuiltInCliCommand> {
             BuiltInHandlerId::NewWindow,
             &["new-window"],
             "Create a new window in a session",
-            CoreCommandClass::PluginBackedLater,
+            CoreCommandClass::PluginBackedShipped,
         )
         .with_domain(PluginDomain::Windows),
         BuiltInCliCommand::new(
             BuiltInHandlerId::ListWindows,
             &["list-windows"],
             "List windows for a session",
-            CoreCommandClass::PluginBackedLater,
+            CoreCommandClass::PluginBackedShipped,
         )
         .with_domain(PluginDomain::Windows),
         BuiltInCliCommand::new(
             BuiltInHandlerId::KillWindow,
             &["kill-window"],
             "Kill a window by name, UUID, or active",
-            CoreCommandClass::PluginBackedLater,
+            CoreCommandClass::PluginBackedShipped,
         )
         .with_domain(PluginDomain::Windows),
         BuiltInCliCommand::new(
             BuiltInHandlerId::KillAllWindows,
             &["kill-all-windows"],
             "Kill all windows in a session",
-            CoreCommandClass::PluginBackedLater,
+            CoreCommandClass::PluginBackedShipped,
         )
         .with_domain(PluginDomain::Windows),
         BuiltInCliCommand::new(
             BuiltInHandlerId::SwitchWindow,
             &["switch-window"],
             "Switch active window by name, UUID, or active",
-            CoreCommandClass::PluginBackedLater,
+            CoreCommandClass::PluginBackedShipped,
         )
         .with_domain(PluginDomain::Windows),
         BuiltInCliCommand::new(
@@ -341,35 +341,35 @@ pub fn built_in_cli_commands() -> Vec<BuiltInCliCommand> {
             BuiltInHandlerId::WindowNew,
             &["window", "new"],
             "Create a new window in a session",
-            CoreCommandClass::PluginBackedLater,
+            CoreCommandClass::PluginBackedShipped,
         )
         .with_domain(PluginDomain::Windows),
         BuiltInCliCommand::new(
             BuiltInHandlerId::WindowList,
             &["window", "list"],
             "List windows for a session",
-            CoreCommandClass::PluginBackedLater,
+            CoreCommandClass::PluginBackedShipped,
         )
         .with_domain(PluginDomain::Windows),
         BuiltInCliCommand::new(
             BuiltInHandlerId::WindowKill,
             &["window", "kill"],
             "Kill a window by name, UUID, or active",
-            CoreCommandClass::PluginBackedLater,
+            CoreCommandClass::PluginBackedShipped,
         )
         .with_domain(PluginDomain::Windows),
         BuiltInCliCommand::new(
             BuiltInHandlerId::WindowKillAll,
             &["window", "kill-all"],
             "Kill all windows in a session",
-            CoreCommandClass::PluginBackedLater,
+            CoreCommandClass::PluginBackedShipped,
         )
         .with_domain(PluginDomain::Windows),
         BuiltInCliCommand::new(
             BuiltInHandlerId::WindowSwitch,
             &["window", "switch"],
             "Switch active window by name, UUID, or active",
-            CoreCommandClass::PluginBackedLater,
+            CoreCommandClass::PluginBackedShipped,
         )
         .with_domain(PluginDomain::Windows),
         BuiltInCliCommand::new(
@@ -550,6 +550,26 @@ mod tests {
             built_in_command_by_handler(BuiltInHandlerId::Follow).domain,
             Some(PluginDomain::Follow)
         );
+    }
+
+    #[test]
+    fn windows_variants_are_marked_plugin_backed_shipped() {
+        for handler in [
+            BuiltInHandlerId::NewWindow,
+            BuiltInHandlerId::ListWindows,
+            BuiltInHandlerId::KillWindow,
+            BuiltInHandlerId::KillAllWindows,
+            BuiltInHandlerId::SwitchWindow,
+            BuiltInHandlerId::WindowNew,
+            BuiltInHandlerId::WindowList,
+            BuiltInHandlerId::WindowKill,
+            BuiltInHandlerId::WindowKillAll,
+            BuiltInHandlerId::WindowSwitch,
+        ] {
+            let command = built_in_command_by_handler(handler);
+            assert_eq!(command.class, CoreCommandClass::PluginBackedShipped);
+            assert_eq!(command.domain, Some(PluginDomain::Windows));
+        }
     }
 
     #[test]

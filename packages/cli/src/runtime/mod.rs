@@ -3411,26 +3411,6 @@ fn set_attach_context_status(
     view_state.set_transient_status(status, now, ttl);
 }
 
-async fn resolve_window_summary_by_id(
-    client: &mut BmuxClient,
-    session_selector: Option<SessionSelector>,
-    window_id: Uuid,
-) -> std::result::Result<Option<bmux_ipc::WindowSummary>, ClientError> {
-    let windows = client.list_windows(session_selector).await?;
-    Ok(windows.into_iter().find(|window| window.id == window_id))
-}
-
-async fn cli_window_context_label(
-    client: &mut BmuxClient,
-    window: &bmux_ipc::WindowSummary,
-) -> std::result::Result<String, ClientError> {
-    let session_label = resolve_attach_session_label(client, window.session_id).await?;
-    Ok(format!(
-        "session: {session_label} | window: {}",
-        window_summary_label(window)
-    ))
-}
-
 fn short_uuid(id: Uuid) -> String {
     id.to_string().chars().take(8).collect()
 }
@@ -4462,178 +4442,98 @@ async fn run_unfollow() -> Result<u8> {
 }
 
 async fn run_window_new(session: Option<&String>, name: Option<String>) -> Result<u8> {
-    let session_selector = session.map(|target| parse_session_selector(target));
-    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-new-window").await?;
-    let window_id = client
-        .new_window(session_selector.clone(), name)
-        .await
-        .map_err(map_cli_client_error)?;
-    let window = resolve_window_summary_by_id(&mut client, session_selector, window_id)
-        .await
-        .map_err(map_cli_client_error)?
-        .ok_or_else(|| anyhow::anyhow!("created window missing from list response"))?;
-    println!(
-        "created window: {}",
-        cli_window_context_label(&mut client, &window)
-            .await
-            .map_err(map_cli_client_error)?
-    );
-    Ok(0)
+    let args = new_window_plugin_args(session, name.as_ref());
+    require_shipped_plugin_command("bmux.windows", "new-window", &args).await
 }
 
 async fn run_window_list(session: Option<&String>, as_json: bool) -> Result<u8> {
-    let session_selector = session.map(|target| parse_session_selector(target));
-    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-list-windows").await?;
-    let windows = client
-        .list_windows(session_selector)
-        .await
-        .map_err(map_cli_client_error)?;
-
-    if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&windows).context("failed to encode windows json")?
-        );
-        return Ok(0);
-    }
-
-    if windows.is_empty() {
-        println!("no windows");
-        return Ok(0);
-    }
-
-    let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
-    let mut windows = windows;
-    sort_attach_windows(&mut windows);
-    if session.is_none() {
-        let session_label = sessions
-            .iter()
-            .find(|entry| entry.id == windows[0].session_id)
-            .map(session_summary_label)
-            .unwrap_or_else(|| format!("session-{}", short_uuid(windows[0].session_id)));
-        println!("session context: {session_label}");
-    }
-    println!("ID                                   SESSION          WINDOW ACTIVE");
-    for window in windows {
-        let session_label = sessions
-            .iter()
-            .find(|session| session.id == window.session_id)
-            .map(session_summary_label)
-            .unwrap_or_else(|| format!("session-{}", short_uuid(window.session_id)));
-        println!(
-            "{:<36} {:<16} {:<12} {}",
-            window.id,
-            session_label,
-            window_summary_label(&window),
-            if window.active { "yes" } else { "no" }
-        );
-    }
-
-    Ok(0)
+    let args = list_windows_plugin_args(session, as_json);
+    require_shipped_plugin_command("bmux.windows", "list-windows", &args).await
 }
 
 async fn run_window_kill(target: &str, session: Option<&String>, force_local: bool) -> Result<u8> {
-    let session_selector = session.map(|value| parse_session_selector(value));
-    let window_selector = parse_window_selector(target);
-    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-kill-window").await?;
-    let _ = kill_preflight_identity(&mut client, force_local).await?;
-    let window_id = client
-        .kill_window_with_options(session_selector, window_selector, force_local)
-        .await
-        .map_err(|error| {
-            anyhow::anyhow!(format_destructive_op_error("window", error, force_local))
-        })?;
-    println!("killed window: {window_id}");
-    Ok(0)
+    let args = kill_window_plugin_args(target, session, force_local);
+    require_shipped_plugin_command("bmux.windows", "kill-window", &args).await
 }
 
 async fn run_window_kill_all(session: Option<&String>, force_local: bool) -> Result<u8> {
-    let session_selector = session.map(|value| parse_session_selector(value));
-    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-kill-all-windows").await?;
-    let _ = print_bulk_kill_preflight(&mut client, "windows", force_local).await?;
-    let windows = client
-        .list_windows(session_selector.clone())
-        .await
-        .map_err(map_cli_client_error)?;
-
-    if windows.is_empty() {
-        println!("no windows");
-        return Ok(0);
-    }
-
-    let mut killed_count = 0usize;
-    let mut failed_count = 0usize;
-    let mut failure_summary = KillFailureSummary::default();
-    for window in windows {
-        match client
-            .kill_window_with_options(
-                session_selector.clone(),
-                WindowSelector::ById(window.id),
-                force_local,
-            )
-            .await
-        {
-            Ok(window_id) => {
-                println!("killed window: {window_id}");
-                killed_count = killed_count.saturating_add(1);
-            }
-            Err(error) => {
-                failed_count = failed_count.saturating_add(1);
-                let kind = classify_destructive_op_error(&error);
-                failure_summary.record(kind);
-                let mapped_error = format_destructive_op_error("window", error, force_local);
-                eprintln!("failed killing window {}: {mapped_error}", window.id);
-            }
-        }
-    }
-
-    println!("kill-all-windows complete: killed {killed_count}, failed {failed_count}");
-    print_bulk_kill_failure_summary("window", failure_summary);
-    Ok(u8::from(failed_count != 0))
+    let args = kill_all_windows_plugin_args(session, force_local);
+    require_shipped_plugin_command("bmux.windows", "kill-all-windows", &args).await
 }
 
 async fn run_window_switch(target: &str, session: Option<&String>) -> Result<u8> {
-    let session_selector = session.map(|value| parse_session_selector(value));
-    let window_selector = parse_window_selector(target);
-    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-switch-window").await?;
-    let window_id = client
-        .switch_window(session_selector.clone(), window_selector)
-        .await
-        .map_err(map_cli_client_error)?;
-    let window = resolve_window_summary_by_id(&mut client, session_selector, window_id)
-        .await
-        .map_err(map_cli_client_error)?
-        .ok_or_else(|| anyhow::anyhow!("active window missing from list response"))?;
-    println!(
-        "active window: {}",
-        cli_window_context_label(&mut client, &window)
-            .await
-            .map_err(map_cli_client_error)?
-    );
-    Ok(0)
+    let args = switch_window_plugin_args(target, session);
+    require_shipped_plugin_command("bmux.windows", "switch-window", &args).await
+}
+
+fn new_window_plugin_args(session: Option<&String>, name: Option<&String>) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(session) = session {
+        args.push("--session".to_string());
+        args.push(session.clone());
+    }
+    if let Some(name) = name {
+        args.push("--name".to_string());
+        args.push(name.clone());
+    }
+    args
+}
+
+fn list_windows_plugin_args(session: Option<&String>, as_json: bool) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(session) = session {
+        args.push("--session".to_string());
+        args.push(session.clone());
+    }
+    if as_json {
+        args.push("--json".to_string());
+    }
+    args
+}
+
+fn kill_window_plugin_args(
+    target: &str,
+    session: Option<&String>,
+    force_local: bool,
+) -> Vec<String> {
+    let mut args = Vec::new();
+    args.push(target.to_string());
+    if let Some(session) = session {
+        args.push("--session".to_string());
+        args.push(session.clone());
+    }
+    if force_local {
+        args.push("--force-local".to_string());
+    }
+    args
+}
+
+fn kill_all_windows_plugin_args(session: Option<&String>, force_local: bool) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(session) = session {
+        args.push("--session".to_string());
+        args.push(session.clone());
+    }
+    if force_local {
+        args.push("--force-local".to_string());
+    }
+    args
+}
+
+fn switch_window_plugin_args(target: &str, session: Option<&String>) -> Vec<String> {
+    let mut args = Vec::new();
+    args.push(target.to_string());
+    if let Some(session) = session {
+        args.push("--session".to_string());
+        args.push(session.clone());
+    }
+    args
 }
 
 fn parse_session_selector(target: &str) -> SessionSelector {
     match Uuid::parse_str(target) {
         Ok(id) => SessionSelector::ById(id),
         Err(_) => SessionSelector::ByName(target.to_string()),
-    }
-}
-
-fn parse_window_selector(target: &str) -> WindowSelector {
-    if target.eq_ignore_ascii_case("active") {
-        return WindowSelector::Active;
-    }
-
-    if let Ok(number) = target.parse::<u32>()
-        && number > 0
-    {
-        return WindowSelector::ByNumber(number);
-    }
-
-    match Uuid::parse_str(target) {
-        Ok(id) => WindowSelector::ById(id),
-        Err(_) => WindowSelector::ByName(target.to_string()),
     }
 }
 
