@@ -17,6 +17,7 @@ members = [
     "packages/terminal",
     "packages/terminal/models",
     "packages/terminal_protocol",
+    "plugins/permissions-plugin",
 ]
 
 resolver = "2"

@@ -1,0 +1,19 @@
+capabilities = ["commands"]
+entry        = "../../../target/debug/libbmux_permissions_plugin.dylib"
+id           = "bmux.permissions"
+name         = "bmux Permissions"
+runtime      = "native"
+version      = "0.0.1-alpha.0"
+
+[[commands]]
+execution     = "host_callback"
+expose_in_cli = false
+name          = "permissions"
+path          = ["permissions"]
+summary       = "List explicit role assignments for a session"
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"

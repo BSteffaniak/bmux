@@ -703,6 +703,15 @@ fn resolve_plugin_search_paths(config: &BmuxConfig, paths: &ConfigPaths) -> Resu
     let mut resolved = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
 
+    let repo_shipped = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("plugins")
+        .join("shipped");
+    if repo_shipped.exists() && seen.insert(repo_shipped.clone()) {
+        resolved.push(repo_shipped);
+    }
+
     if let Ok(executable) = std::env::current_exe() {
         if let Some(parent) = executable.parent() {
             let shipped = parent.join("plugins");
@@ -1096,6 +1105,41 @@ async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]
         .run_command_with_context(command_name, args, Some(&context))
         .with_context(|| format!("failed running plugin command '{plugin_id}:{command_name}'"))?;
     Ok(status.clamp(0, i32::from(u8::MAX)) as u8)
+}
+
+async fn try_run_shipped_plugin_command(
+    plugin_id: &str,
+    command_name: &str,
+    args: &[String],
+) -> Result<Option<u8>> {
+    let config = BmuxConfig::load()?;
+    let paths = ConfigPaths::default();
+    let registry = scan_available_plugins(&config, &paths)?;
+    let Some(plugin) = registry.get(plugin_id) else {
+        return Ok(None);
+    };
+    let entry_path = plugin.manifest.resolve_entry_path(
+        plugin
+            .manifest_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new(".")),
+    );
+    if !entry_path.exists() {
+        return Ok(None);
+    }
+    let loaded = load_native_registered_plugin(
+        plugin,
+        &plugin_host_metadata(),
+        SUPPORTED_PLUGIN_CAPABILITIES,
+    )
+    .with_context(|| format!("failed loading shipped plugin '{plugin_id}'"))?;
+    let context = plugin_command_context(&config, &paths, plugin_id, command_name, args);
+    let status = loaded
+        .run_command_with_context(command_name, args, Some(&context))
+        .with_context(|| {
+            format!("failed running shipped plugin command '{plugin_id}:{command_name}'")
+        })?;
+    Ok(Some(status.clamp(0, i32::from(u8::MAX)) as u8))
 }
 
 async fn run_external_plugin_command(args: &[String]) -> Result<u8> {
@@ -1541,6 +1585,25 @@ async fn run_client_list(as_json: bool) -> Result<u8> {
 }
 
 async fn run_permissions_list(session: &str, as_json: bool, watch: bool) -> Result<u8> {
+    let args = permissions_plugin_args(session, as_json, watch);
+    match try_run_shipped_plugin_command("bmux.permissions", "permissions", &args).await? {
+        Some(code) => Ok(code),
+        None => run_permissions_list_native(session, as_json, watch).await,
+    }
+}
+
+fn permissions_plugin_args(session: &str, as_json: bool, watch: bool) -> Vec<String> {
+    let mut args = vec!["--session".to_string(), session.to_string()];
+    if as_json {
+        args.push("--json".to_string());
+    }
+    if watch {
+        args.push("--watch".to_string());
+    }
+    args
+}
+
+async fn run_permissions_list_native(session: &str, as_json: bool, watch: bool) -> Result<u8> {
     let selector = parse_session_selector(session);
 
     if watch {
