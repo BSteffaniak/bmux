@@ -6,10 +6,11 @@ use bmux_client::BmuxClient;
 use bmux_config::ConfigPaths;
 use bmux_ipc::{SessionSelector, WindowSelector, WindowSummary};
 use bmux_plugin::{
-    CommandExecutionKind, HostScope, NativeCommandContext, NativeDescriptor, PluginCommand,
-    PluginCommandArgument, PluginCommandArgumentKind, PluginFeature, PluginService, RustPlugin,
-    ServiceKind,
+    CommandExecutionKind, HostScope, NativeCommandContext, NativeDescriptor, NativeServiceContext,
+    PluginCommand, PluginCommandArgument, PluginCommandArgumentKind, PluginFeature, PluginService,
+    RustPlugin, ServiceKind, ServiceResponse, decode_service_message, encode_service_message,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 #[derive(Default)]
@@ -103,9 +104,81 @@ impl RustPlugin for WindowsPlugin {
             _ => 64,
         }
     }
+
+    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        match (
+            context.request.service.interface_id.as_str(),
+            context.request.operation.as_str(),
+        ) {
+            ("window-query/v1", "list") => run_window_query_service(&context),
+            _ => ServiceResponse::error(
+                "unsupported_service_operation",
+                format!(
+                    "unsupported windows service invocation '{}:{}'",
+                    context.request.service.interface_id, context.request.operation,
+                ),
+            ),
+        }
+    }
 }
 
 bmux_plugin::export_plugin!(WindowsPlugin);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ListWindowsRequest {
+    session: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ListWindowsResponse {
+    windows: Vec<WindowSummary>,
+}
+
+fn run_window_query_service(context: &NativeServiceContext) -> ServiceResponse {
+    let request = match decode_service_message::<ListWindowsRequest>(&context.request.payload) {
+        Ok(request) => request,
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+    };
+
+    let paths = ConfigPaths::new(
+        context.connection.config_dir.clone().into(),
+        context.connection.runtime_dir.clone().into(),
+        context.connection.data_dir.clone().into(),
+    );
+
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(async_list_windows_service(&paths, request))
+        }),
+        Err(_) => match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(async_list_windows_service(&paths, request)),
+            Err(error) => ServiceResponse::error("runtime_error", error.to_string()),
+        },
+    }
+}
+
+async fn async_list_windows_service(
+    paths: &ConfigPaths,
+    request: ListWindowsRequest,
+) -> ServiceResponse {
+    let selector = request.session.as_deref().map(parse_session_selector);
+    let mut client = match connect_client(paths).await {
+        Ok(client) => client,
+        Err(code) => {
+            return ServiceResponse::error("connect_failed", format!("client error code {code}"));
+        }
+    };
+    match client.list_windows(selector).await {
+        Ok(windows) => match encode_service_message(&ListWindowsResponse { windows }) {
+            Ok(payload) => ServiceResponse::ok(payload),
+            Err(error) => ServiceResponse::error("encode_error", error.to_string()),
+        },
+        Err(error) => ServiceResponse::error("list_failed", error.to_string()),
+    }
+}
 
 fn plugin_command(name: &str, summary: &str, aliases: Vec<Vec<String>>) -> PluginCommand {
     let mut command = PluginCommand::new(name, summary)

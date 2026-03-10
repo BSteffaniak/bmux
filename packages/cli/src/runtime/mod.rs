@@ -21,7 +21,8 @@ use bmux_keybind::action_to_name;
 use bmux_plugin::{
     CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostMetadata, HostScope,
     NativeCommandContext, NativeLifecycleContext, PluginEvent, PluginEventKind, PluginManifest,
-    PluginRegistry, RegisteredService, load_registered_plugin as load_native_registered_plugin,
+    PluginRegistry, RegisteredService, ServiceKind,
+    load_registered_plugin as load_native_registered_plugin,
 };
 use bmux_server::BmuxServer;
 use clap::{CommandFactory, FromArgMatches};
@@ -79,6 +80,7 @@ const HELP_OVERLAY_SURFACE_ID: Uuid = Uuid::from_u128(1);
 fn core_provided_capabilities() -> Vec<HostScope> {
     [
         "bmux.commands",
+        "bmux.config.read",
         "bmux.events.subscribe",
         "bmux.key_actions",
         "bmux.status_bar_items",
@@ -102,6 +104,15 @@ fn core_provided_capabilities() -> Vec<HostScope> {
     .collect()
 }
 
+fn core_service_descriptors() -> Vec<RegisteredService> {
+    vec![RegisteredService {
+        capability: HostScope::new("bmux.config.read").expect("capability should parse"),
+        kind: ServiceKind::Query,
+        interface_id: "config-query/v1".to_string(),
+        provider_plugin_id: "core".to_string(),
+    }]
+}
+
 fn available_capability_providers(
     config: &BmuxConfig,
     registry: &PluginRegistry,
@@ -115,31 +126,33 @@ fn available_service_descriptors(
     config: &BmuxConfig,
     registry: &PluginRegistry,
 ) -> Result<Vec<RegisteredService>> {
-    Ok(registry
-        .service_providers_for(&config.plugins.enabled)
-        .context("failed resolving service providers")?
-        .into_values()
-        .map(|provider| provider.service)
-        .collect())
+    let mut services = core_service_descriptors();
+    services.extend(
+        registry
+            .service_providers_for(&config.plugins.enabled)
+            .context("failed resolving service providers")?
+            .into_values()
+            .map(|provider| provider.service),
+    );
+    Ok(services)
 }
 
 fn service_descriptors_from_declarations<'a>(
     declarations: impl IntoIterator<Item = &'a bmux_plugin::PluginDeclaration>,
 ) -> Vec<RegisteredService> {
-    declarations
-        .into_iter()
-        .flat_map(|declaration| {
-            declaration
-                .services
-                .iter()
-                .map(move |service| RegisteredService {
-                    capability: service.capability.clone(),
-                    kind: service.kind,
-                    interface_id: service.interface_id.clone(),
-                    provider_plugin_id: declaration.id.as_str().to_string(),
-                })
-        })
-        .collect()
+    let mut services = core_service_descriptors();
+    services.extend(declarations.into_iter().flat_map(|declaration| {
+        declaration
+            .services
+            .iter()
+            .map(move |service| RegisteredService {
+                capability: service.capability.clone(),
+                kind: service.kind,
+                interface_id: service.interface_id.clone(),
+                provider_plugin_id: declaration.id.as_str().to_string(),
+            })
+    }));
+    services
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -5588,8 +5601,19 @@ mod tests {
             context.provided_capabilities,
             vec!["bmux.windows.write".to_string()]
         );
-        assert_eq!(context.services.len(), 1);
-        assert_eq!(context.services[0].interface_id, "window-command/v1");
+        assert_eq!(context.services.len(), 2);
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "config-query/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "window-command/v1")
+        );
         assert_eq!(
             context.settings.as_ref().and_then(|value| value.as_str()),
             Some("configured")
@@ -5677,7 +5701,13 @@ mod tests {
                 "bmux.windows.write".to_string()
             ]
         );
-        assert_eq!(context.services.len(), 2);
+        assert_eq!(context.services.len(), 3);
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "config-query/v1")
+        );
     }
 
     #[test]

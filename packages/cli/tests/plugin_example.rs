@@ -335,15 +335,17 @@ fn installs_example_plugin_and_runs_command() {
         sandbox_setup();
     let paths = config_paths_for_test(&config_dir, &runtime_dir, &data_home);
 
-    let mut build_permissions_command = Command::new("cargo");
-    build_permissions_command
+    let mut build_shipped_plugins_command = Command::new("cargo");
+    build_shipped_plugins_command
         .current_dir(&root)
         .arg("build")
         .arg("-p")
         .arg("bmux_permissions_plugin")
+        .arg("-p")
+        .arg("bmux_windows_plugin")
         .env("TMPDIR", &tmp_dir);
     configure_bmux_env(
-        &mut build_permissions_command,
+        &mut build_shipped_plugins_command,
         &home_dir,
         &config_home,
         &data_home,
@@ -351,19 +353,20 @@ fn installs_example_plugin_and_runs_command() {
         &paths.runtime_dir,
         &paths.data_dir,
     );
-    preserve_toolchain_env(&mut build_permissions_command);
-    let build_permissions_status = build_permissions_command
+    preserve_toolchain_env(&mut build_shipped_plugins_command);
+    let build_permissions_status = build_shipped_plugins_command
         .status()
-        .expect("permissions plugin should build");
+        .expect("shipped plugins should build");
     assert!(build_permissions_status.success());
 
     let shipped_root =
         stage_shipped_bundle(&root, &sandbox, "permissions", "bmux_permissions_plugin");
+    let _ = stage_shipped_bundle(&root, &sandbox, "windows", "bmux_windows_plugin");
 
     fs::write(
         config_dir.join("bmux.toml"),
         format!(
-            "[plugins]\nenabled = [\"bmux.permissions\", \"example.native\"]\nsearch_paths = [\"{}\"]\n",
+            "[plugins]\nenabled = [\"bmux.permissions\", \"bmux.windows\", \"example.native\"]\nsearch_paths = [\"{}\"]\n\n[plugins.settings.\"example.native\"]\ngreeting = \"hello\"\nmode = \"service\"\n",
             shipped_root.display()
         ),
     )
@@ -481,6 +484,49 @@ fn installs_example_plugin_and_runs_command() {
         String::from_utf8_lossy(&permissions_output.stdout).contains("owner"),
         "service-backed example output should include owner role: {}",
         String::from_utf8_lossy(&permissions_output.stdout)
+    );
+
+    let windows_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &["windows-list", "demo"],
+    );
+    assert!(
+        windows_output.status.success(),
+        "service-backed windows command should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&windows_output.stdout),
+        String::from_utf8_lossy(&windows_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&windows_output.stdout).contains("example.native windows:"),
+        "service-backed windows output should be present: {}",
+        String::from_utf8_lossy(&windows_output.stdout)
+    );
+
+    let settings_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &["settings-show"],
+    );
+    assert!(
+        settings_output.status.success(),
+        "config service command should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&settings_output.stdout),
+        String::from_utf8_lossy(&settings_output.stderr)
+    );
+    let settings_stdout = String::from_utf8_lossy(&settings_output.stdout);
+    assert!(
+        settings_stdout.contains("greeting = \"hello\"")
+            && settings_stdout.contains("mode = \"service\""),
+        "config service output should include configured values: {settings_stdout}"
     );
 
     let _ = server.kill();

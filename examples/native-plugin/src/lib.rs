@@ -32,7 +32,9 @@ impl RustPlugin for ExamplePlugin {
             required_capabilities: BTreeSet::from([
                 HostScope::new("bmux.commands").expect("host scope should parse"),
                 HostScope::new("bmux.events.subscribe").expect("host scope should parse"),
+                HostScope::new("bmux.config.read").expect("host scope should parse"),
                 HostScope::new("bmux.permissions.read").expect("host scope should parse"),
+                HostScope::new("bmux.windows.read").expect("host scope should parse"),
             ]),
             provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::from([
@@ -64,17 +66,42 @@ impl RustPlugin for ExamplePlugin {
                 )
                 .execution(CommandExecutionKind::ProviderExec)
                 .expose_in_cli(true),
+                PluginCommand::new(
+                    "windows-list",
+                    "List session windows through bmux provider service",
+                )
+                .argument(
+                    PluginCommandArgument::positional("session", PluginCommandArgumentKind::String)
+                        .required(true)
+                        .summary("Session name or UUID"),
+                )
+                .execution(CommandExecutionKind::ProviderExec)
+                .expose_in_cli(true),
+                PluginCommand::new(
+                    "settings-show",
+                    "Show plugin settings through bmux config service",
+                )
+                .execution(CommandExecutionKind::ProviderExec)
+                .expose_in_cli(true),
             ],
             event_subscriptions: vec![PluginEventSubscription {
                 kinds: BTreeSet::from([PluginEventKind::System, PluginEventKind::Window]),
                 names: BTreeSet::from(["server_started".to_string(), "window_created".to_string()]),
             }],
-            dependencies: vec![bmux_plugin::PluginDependency {
-                plugin_id: bmux_plugin::PluginId::new("bmux.permissions")
-                    .expect("plugin id should parse"),
-                version_req: format!("={}", env!("CARGO_PKG_VERSION")),
-                required: true,
-            }],
+            dependencies: vec![
+                bmux_plugin::PluginDependency {
+                    plugin_id: bmux_plugin::PluginId::new("bmux.permissions")
+                        .expect("plugin id should parse"),
+                    version_req: format!("={}", env!("CARGO_PKG_VERSION")),
+                    required: true,
+                },
+                bmux_plugin::PluginDependency {
+                    plugin_id: bmux_plugin::PluginId::new("bmux.windows")
+                        .expect("plugin id should parse"),
+                    version_req: format!("={}", env!("CARGO_PKG_VERSION")),
+                    required: true,
+                },
+            ],
             lifecycle: bmux_plugin::PluginLifecycle {
                 activate_on_startup: true,
                 receive_events: true,
@@ -86,6 +113,8 @@ impl RustPlugin for ExamplePlugin {
     fn run_command(&mut self, context: NativeCommandContext) -> i32 {
         match context.command.as_str() {
             "permissions-list" => run_permissions_list(&context),
+            "windows-list" => run_windows_list(&context),
+            "settings-show" => run_settings_show(&context),
             "hello" => {
                 if context.arguments.is_empty() {
                     println!("example.native: hello from bmux plugin");
@@ -154,6 +183,74 @@ fn run_permissions_list(context: &NativeCommandContext) -> i32 {
     0
 }
 
+fn run_windows_list(context: &NativeCommandContext) -> i32 {
+    let Some(session) = context.arguments.first() else {
+        eprintln!("example.native windows-list requires a session name or UUID");
+        return 64;
+    };
+
+    let response = match context.call_service::<ListWindowsRequest, ListWindowsResponse>(
+        "bmux.windows.read",
+        ServiceKind::Query,
+        "window-query/v1",
+        "list",
+        &ListWindowsRequest {
+            session: Some(session.to_string()),
+        },
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("example.native: failed listing windows through service: {error}");
+            return 1;
+        }
+    };
+
+    if response.windows.is_empty() {
+        println!("example.native: no windows");
+    } else {
+        println!("example.native windows:");
+        for window in response.windows {
+            println!(
+                "{} {}{}",
+                window.id,
+                window.name.unwrap_or_else(|| format!("#{}", window.number)),
+                if window.active { " [active]" } else { "" }
+            );
+        }
+    }
+
+    0
+}
+
+fn run_settings_show(context: &NativeCommandContext) -> i32 {
+    let response = match context.call_service::<PluginSettingsRequest, PluginSettingsResponse>(
+        "bmux.config.read",
+        ServiceKind::Query,
+        "config-query/v1",
+        "plugin_settings",
+        &PluginSettingsRequest {
+            plugin_id: context.plugin_id.clone(),
+        },
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("example.native: failed reading settings through service: {error}");
+            return 1;
+        }
+    };
+
+    if response.settings.is_empty() {
+        println!("example.native: no configured settings");
+        return 0;
+    }
+
+    println!("example.native settings:");
+    for (key, value) in response.settings {
+        println!("{key} = {value}");
+    }
+    0
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ListPermissionsRequest {
     session: String,
@@ -162,6 +259,26 @@ struct ListPermissionsRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ListPermissionsResponse {
     permissions: Vec<bmux_ipc::SessionPermissionSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ListWindowsRequest {
+    session: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ListWindowsResponse {
+    windows: Vec<bmux_ipc::WindowSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PluginSettingsRequest {
+    plugin_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PluginSettingsResponse {
+    settings: std::collections::BTreeMap<String, String>,
 }
 
 fn session_role_name(role: bmux_ipc::SessionRole) -> &'static str {
@@ -186,6 +303,6 @@ mod tests {
         let reparsed = bmux_plugin::NativeDescriptor::from_toml_str(&serialized)
             .expect("descriptor should parse");
         assert_eq!(reparsed.id, "example.native");
-        assert_eq!(reparsed.commands.len(), 2);
+        assert_eq!(reparsed.commands.len(), 4);
     }
 }

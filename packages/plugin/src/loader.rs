@@ -25,6 +25,16 @@ type NativeInvokeServiceFn =
 const NATIVE_SERVICE_STATUS_OK: i32 = 0;
 const NATIVE_SERVICE_STATUS_BUFFER_TOO_SMALL: i32 = 4;
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CorePluginSettingsRequest {
+    plugin_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct CorePluginSettingsResponse {
+    settings: BTreeMap<String, String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeLifecycleContext {
     pub plugin_id: String,
@@ -92,9 +102,9 @@ pub struct NativeServiceContext {
     pub host: HostMetadata,
     pub connection: HostConnectionInfo,
     #[serde(default)]
-    pub settings: Option<toml::Value>,
+    pub settings: BTreeMap<String, String>,
     #[serde(default)]
-    pub plugin_settings_map: BTreeMap<String, toml::Value>,
+    pub plugin_settings_map: BTreeMap<String, BTreeMap<String, String>>,
 }
 
 impl NativeCommandContext {
@@ -181,6 +191,7 @@ impl NativeServiceContext {
         operation: &str,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
+        let plugin_settings_map = deserialize_plugin_settings_map(&self.plugin_settings_map)?;
         call_service_raw(
             &self.plugin_id,
             &self.required_capabilities,
@@ -191,7 +202,7 @@ impl NativeServiceContext {
             &self.plugin_search_roots,
             &self.host,
             &self.connection,
-            &self.plugin_settings_map,
+            &plugin_settings_map,
             capability,
             kind,
             interface_id,
@@ -243,6 +254,10 @@ fn call_service_raw(
         .ok_or_else(|| PluginError::UnsupportedHostOperation {
             operation: "call_service",
         })?;
+
+    if service.provider_plugin_id == "core" {
+        return handle_core_service_call(service, operation, payload, plugin_settings_map);
+    }
 
     let search_roots = plugin_search_roots
         .iter()
@@ -296,10 +311,10 @@ fn call_service_raw(
         plugin_search_roots: plugin_search_roots.to_vec(),
         host: host.clone(),
         connection: connection.clone(),
-        settings: plugin_settings_map
-            .get(registered.declaration.id.as_str())
-            .cloned(),
-        plugin_settings_map: plugin_settings_map.clone(),
+        settings: serialize_plugin_settings(
+            plugin_settings_map.get(registered.declaration.id.as_str()),
+        ),
+        plugin_settings_map: serialize_plugin_settings_map(plugin_settings_map),
     })?;
 
     if let Some(error) = response.error {
@@ -314,6 +329,68 @@ fn call_service_raw(
     }
 
     Ok(response.payload)
+}
+
+fn serialize_plugin_settings(value: Option<&toml::Value>) -> BTreeMap<String, String> {
+    value
+        .and_then(toml::Value::as_table)
+        .map(|table| {
+            table
+                .iter()
+                .map(|(key, value)| (key.clone(), value.to_string()))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default()
+}
+
+fn serialize_plugin_settings_map(
+    plugin_settings_map: &BTreeMap<String, toml::Value>,
+) -> BTreeMap<String, BTreeMap<String, String>> {
+    plugin_settings_map
+        .iter()
+        .map(|(plugin_id, value)| (plugin_id.clone(), serialize_plugin_settings(Some(value))))
+        .collect()
+}
+
+fn deserialize_plugin_settings_map(
+    plugin_settings_map: &BTreeMap<String, BTreeMap<String, String>>,
+) -> Result<BTreeMap<String, toml::Value>> {
+    plugin_settings_map
+        .iter()
+        .map(|(plugin_id, settings)| {
+            let table = settings
+                .iter()
+                .map(|(key, value)| {
+                    toml::from_str::<toml::Value>(value)
+                        .map(|parsed| (key.clone(), parsed))
+                        .map_err(|error| PluginError::ServiceProtocol {
+                            details: format!(
+                                "failed parsing serialized setting '{key}' for plugin '{plugin_id}': {error}",
+                            ),
+                        })
+                })
+                .collect::<Result<toml::map::Map<_, _>>>()?;
+            Ok((plugin_id.clone(), toml::Value::Table(table)))
+        })
+        .collect()
+}
+
+fn handle_core_service_call(
+    service: RegisteredService,
+    operation: &str,
+    payload: Vec<u8>,
+    plugin_settings_map: &BTreeMap<String, toml::Value>,
+) -> Result<Vec<u8>> {
+    match (service.interface_id.as_str(), operation) {
+        ("config-query/v1", "plugin_settings") => {
+            let request: CorePluginSettingsRequest = decode_service_message(&payload)?;
+            let settings = serialize_plugin_settings(plugin_settings_map.get(&request.plugin_id));
+            encode_service_message(&CorePluginSettingsResponse { settings })
+        }
+        _ => Err(PluginError::UnsupportedHostOperation {
+            operation: "call_service",
+        }),
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -872,7 +949,8 @@ mod tests {
     use crate::{
         ApiVersion, DEFAULT_NATIVE_ENTRY_SYMBOL, HostMetadata, PluginEntrypoint, PluginEvent,
         PluginEventKind, PluginEventSubscription, PluginManifest, PluginRegistry,
-        ServiceEnvelopeKind, ServiceResponse, decode_service_envelope, encode_service_envelope,
+        ServiceEnvelopeKind, ServiceResponse, decode_service_envelope, decode_service_message,
+        encode_service_envelope, encode_service_message,
     };
     use libloading::Library;
     use std::collections::{BTreeMap, BTreeSet};
@@ -1148,6 +1226,67 @@ minimum = "1.0"
             )
             .expect_err("missing service registration should fail");
         assert!(error.to_string().contains("call_service"));
+    }
+
+    #[test]
+    fn command_context_calls_core_config_service() {
+        let mut plugin_settings_map = BTreeMap::new();
+        plugin_settings_map.insert(
+            "caller.plugin".to_string(),
+            toml::Value::Table(toml::map::Map::from_iter([(
+                "greeting".to_string(),
+                toml::Value::String("hello".to_string()),
+            )])),
+        );
+        let context = super::NativeCommandContext {
+            plugin_id: "caller.plugin".to_string(),
+            command: "hello".to_string(),
+            arguments: Vec::new(),
+            required_capabilities: vec!["bmux.config.read".to_string()],
+            provided_capabilities: Vec::new(),
+            services: vec![crate::RegisteredService {
+                capability: crate::HostScope::new("bmux.config.read")
+                    .expect("capability should parse"),
+                kind: crate::ServiceKind::Query,
+                interface_id: "config-query/v1".to_string(),
+                provider_plugin_id: "core".to_string(),
+            }],
+            available_capabilities: vec!["bmux.config.read".to_string()],
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: crate::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+            },
+            settings: None,
+            plugin_settings_map,
+        };
+
+        let response = context
+            .call_service_raw(
+                "bmux.config.read",
+                crate::ServiceKind::Query,
+                "config-query/v1",
+                "plugin_settings",
+                encode_service_message(&super::CorePluginSettingsRequest {
+                    plugin_id: "caller.plugin".to_string(),
+                })
+                .expect("request should encode"),
+            )
+            .expect("core config service should succeed");
+        let response: super::CorePluginSettingsResponse =
+            decode_service_message(&response).expect("response should decode");
+        assert_eq!(
+            response.settings.get("greeting"),
+            Some(&"\"hello\"".to_string())
+        );
     }
 
     #[test]

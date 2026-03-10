@@ -4,8 +4,10 @@ name = "Example Native Plugin"
 provided_features = ["example.native"]
 required_capabilities = [
     "bmux.commands",
+    "bmux.config.read",
     "bmux.events.subscribe",
     "bmux.permissions.read",
+    "bmux.windows.read",
 ]
 runtime = "native"
 version = "0.0.1-alpha.0"
@@ -30,7 +32,7 @@ value_name          = "MESSAGE"
 execution     = "provider_exec"
 expose_in_cli = true
 name          = "permissions-list"
-summary       = "List session permissions through bmux host IPC"
+summary       = "List session permissions through bmux provider service"
 
 [[commands.arguments]]
 kind       = "string"
@@ -40,12 +42,36 @@ required   = true
 summary    = "Session name or UUID"
 value_name = "SESSION"
 
+[[commands]]
+execution     = "provider_exec"
+expose_in_cli = true
+name          = "windows-list"
+summary       = "List session windows through bmux provider service"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "session"
+position   = 0
+required   = true
+summary    = "Session name or UUID"
+value_name = "SESSION"
+
+[[commands]]
+execution     = "provider_exec"
+expose_in_cli = true
+name          = "settings-show"
+summary       = "Show plugin settings through bmux config service"
+
 [[event_subscriptions]]
 kinds = ["system", "window"]
 names = ["server_started", "window_created"]
 
 [[dependencies]]
 plugin_id   = "bmux.permissions"
+version_req = "=0.0.1-alpha.0"
+
+[[dependencies]]
+plugin_id   = "bmux.windows"
 version_req = "=0.0.1-alpha.0"
 
 [plugin_api]
