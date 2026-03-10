@@ -12,6 +12,7 @@ use bmux_plugin::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use uuid::Uuid;
 
 #[derive(Default)]
 struct PermissionsPlugin;
@@ -137,6 +138,8 @@ impl RustPlugin for PermissionsPlugin {
             context.request.operation.as_str(),
         ) {
             ("permission-query/v1", "list") => run_permission_query_service(&context),
+            ("permission-command/v1", "grant") => run_permission_command_service(&context),
+            ("permission-command/v1", "revoke") => run_permission_command_service(&context),
             _ => ServiceResponse::error(
                 "unsupported_service_operation",
                 format!(
@@ -158,6 +161,30 @@ struct ListPermissionsRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ListPermissionsResponse {
     permissions: Vec<SessionPermissionSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GrantPermissionRequest {
+    session: String,
+    client_id: Uuid,
+    role: SessionRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GrantPermissionResponse {
+    client_id: Uuid,
+    role: SessionRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RevokePermissionRequest {
+    session: String,
+    client_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RevokePermissionResponse {
+    client_id: Uuid,
 }
 
 fn run_permission_query_service(context: &NativeServiceContext) -> ServiceResponse {
@@ -203,6 +230,102 @@ async fn async_list_permissions_service(paths: &ConfigPaths, session: &str) -> S
             Err(error) => ServiceResponse::error("list_failed", error.to_string()),
         },
         Err(error) => ServiceResponse::error("connect_failed", error.to_string()),
+    }
+}
+
+fn run_permission_command_service(context: &NativeServiceContext) -> ServiceResponse {
+    let paths = ConfigPaths::new(
+        context.connection.config_dir.clone().into(),
+        context.connection.runtime_dir.clone().into(),
+        context.connection.data_dir.clone().into(),
+    );
+
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(async_permission_command_service(
+                &paths,
+                context.request.operation.as_str(),
+                &context.request.payload,
+            ))
+        }),
+        Err(_) => match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(async_permission_command_service(
+                &paths,
+                context.request.operation.as_str(),
+                &context.request.payload,
+            )),
+            Err(error) => ServiceResponse::error("runtime_error", error.to_string()),
+        },
+    }
+}
+
+async fn async_permission_command_service(
+    paths: &ConfigPaths,
+    operation: &str,
+    payload: &[u8],
+) -> ServiceResponse {
+    match operation {
+        "grant" => {
+            let request = match decode_service_message::<GrantPermissionRequest>(payload) {
+                Ok(request) => request,
+                Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+            };
+            let selector = parse_session_selector(&request.session);
+            let mut client = match connect_client(paths).await {
+                Ok(client) => client,
+                Err(code) => {
+                    return ServiceResponse::error(
+                        "connect_failed",
+                        format!("client error code {code}"),
+                    );
+                }
+            };
+            match client
+                .grant_role(selector, request.client_id, request.role)
+                .await
+            {
+                Ok(()) => match encode_service_message(&GrantPermissionResponse {
+                    client_id: request.client_id,
+                    role: request.role,
+                }) {
+                    Ok(payload) => ServiceResponse::ok(payload),
+                    Err(error) => ServiceResponse::error("encode_error", error.to_string()),
+                },
+                Err(error) => ServiceResponse::error("grant_failed", error.to_string()),
+            }
+        }
+        "revoke" => {
+            let request = match decode_service_message::<RevokePermissionRequest>(payload) {
+                Ok(request) => request,
+                Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+            };
+            let selector = parse_session_selector(&request.session);
+            let mut client = match connect_client(paths).await {
+                Ok(client) => client,
+                Err(code) => {
+                    return ServiceResponse::error(
+                        "connect_failed",
+                        format!("client error code {code}"),
+                    );
+                }
+            };
+            match client.revoke_role(selector, request.client_id).await {
+                Ok(()) => match encode_service_message(&RevokePermissionResponse {
+                    client_id: request.client_id,
+                }) {
+                    Ok(payload) => ServiceResponse::ok(payload),
+                    Err(error) => ServiceResponse::error("encode_error", error.to_string()),
+                },
+                Err(error) => ServiceResponse::error("revoke_failed", error.to_string()),
+            }
+        }
+        _ => ServiceResponse::error(
+            "unsupported_service_operation",
+            format!("unsupported permissions command operation '{operation}'"),
+        ),
     }
 }
 

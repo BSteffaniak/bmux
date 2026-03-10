@@ -487,6 +487,120 @@ fn installs_example_plugin_and_runs_command() {
         String::from_utf8_lossy(&permissions_output.stdout)
     );
 
+    let endpoint = test_endpoint(&paths);
+    let (target_tx, target_rx) = std::sync::mpsc::channel();
+    let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
+    let target_thread = {
+        let endpoint = endpoint.clone();
+        std::thread::spawn(move || {
+            with_runtime(async move {
+                let mut target = BmuxClient::connect_with_principal(
+                    &endpoint,
+                    Duration::from_secs(2),
+                    "example-plugin-target",
+                    Uuid::new_v4(),
+                )
+                .await
+                .expect("target client should connect");
+                let target_id = target.whoami().await.expect("target whoami should succeed");
+                target_tx.send(target_id).expect("target id should send");
+                shutdown_rx
+                    .recv()
+                    .expect("target shutdown signal should arrive");
+                drop(target);
+            });
+        })
+    };
+    let target_client_id = target_rx
+        .recv()
+        .expect("target client id should be received");
+
+    let grant_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &[
+            "permissions-grant",
+            "demo",
+            "--client",
+            &target_client_id.to_string(),
+            "--role",
+            "writer",
+        ],
+    );
+    assert!(
+        grant_output.status.success(),
+        "service-backed permissions grant should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&grant_output.stdout),
+        String::from_utf8_lossy(&grant_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&grant_output.stdout).contains("granted role writer"),
+        "service-backed grant output should confirm role: {}",
+        String::from_utf8_lossy(&grant_output.stdout)
+    );
+
+    let permissions_after_grant = with_runtime(async {
+        let mut owner = BmuxClient::connect_with_paths(&paths, "example-plugin-owner-list")
+            .await
+            .expect("owner list client should connect");
+        owner
+            .list_permissions(SessionSelector::ByName("demo".to_string()))
+            .await
+            .expect("permissions should list after grant")
+    });
+    assert!(
+        permissions_after_grant.iter().any(|entry| {
+            entry.client_id == target_client_id && entry.role == SessionRole::Writer
+        }),
+        "granted writer role should be visible in permission list"
+    );
+
+    let revoke_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &[
+            "permissions-revoke",
+            "demo",
+            "--client",
+            &target_client_id.to_string(),
+        ],
+    );
+    assert!(
+        revoke_output.status.success(),
+        "service-backed permissions revoke should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&revoke_output.stdout),
+        String::from_utf8_lossy(&revoke_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&revoke_output.stdout).contains("revoked explicit role"),
+        "service-backed revoke output should confirm role removal: {}",
+        String::from_utf8_lossy(&revoke_output.stdout)
+    );
+
+    let permissions_after_revoke = with_runtime(async {
+        let mut owner = BmuxClient::connect_with_paths(&paths, "example-plugin-owner-list-after")
+            .await
+            .expect("owner list client should reconnect");
+        owner
+            .list_permissions(SessionSelector::ByName("demo".to_string()))
+            .await
+            .expect("permissions should list after revoke")
+    });
+    assert!(
+        !permissions_after_revoke
+            .iter()
+            .any(|entry| entry.client_id == target_client_id),
+        "revoked role should disappear from explicit permission list"
+    );
+
     let create_window_output = run_bmux(
         &root,
         &home_dir,
@@ -551,6 +665,13 @@ fn installs_example_plugin_and_runs_command() {
             && settings_stdout.contains("mode = \"service\""),
         "config service output should include configured values: {settings_stdout}"
     );
+
+    shutdown_tx
+        .send(())
+        .expect("target client shutdown signal should send");
+    target_thread
+        .join()
+        .expect("target client thread should join cleanly");
 
     let _ = server.kill();
     let _ = server.wait();

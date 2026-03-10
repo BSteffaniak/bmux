@@ -34,6 +34,7 @@ impl RustPlugin for ExamplePlugin {
                 HostScope::new("bmux.events.subscribe").expect("host scope should parse"),
                 HostScope::new("bmux.config.read").expect("host scope should parse"),
                 HostScope::new("bmux.permissions.read").expect("host scope should parse"),
+                HostScope::new("bmux.permissions.write").expect("host scope should parse"),
                 HostScope::new("bmux.windows.read").expect("host scope should parse"),
                 HostScope::new("bmux.windows.write").expect("host scope should parse"),
             ]),
@@ -64,6 +65,47 @@ impl RustPlugin for ExamplePlugin {
                     PluginCommandArgument::positional("session", PluginCommandArgumentKind::String)
                         .required(true)
                         .summary("Session name or UUID"),
+                )
+                .execution(CommandExecutionKind::ProviderExec)
+                .expose_in_cli(true),
+                PluginCommand::new(
+                    "permissions-grant",
+                    "Grant a role through bmux provider service",
+                )
+                .argument(
+                    PluginCommandArgument::positional("session", PluginCommandArgumentKind::String)
+                        .required(true)
+                        .summary("Session name or UUID"),
+                )
+                .argument(
+                    PluginCommandArgument::option("client", PluginCommandArgumentKind::String)
+                        .required(true)
+                        .short('c')
+                        .summary("Client UUID"),
+                )
+                .argument(
+                    PluginCommandArgument::option("role", PluginCommandArgumentKind::Choice)
+                        .required(true)
+                        .short('r')
+                        .choice_values(["owner", "writer", "observer"])
+                        .summary("Role to grant"),
+                )
+                .execution(CommandExecutionKind::ProviderExec)
+                .expose_in_cli(true),
+                PluginCommand::new(
+                    "permissions-revoke",
+                    "Revoke a role through bmux provider service",
+                )
+                .argument(
+                    PluginCommandArgument::positional("session", PluginCommandArgumentKind::String)
+                        .required(true)
+                        .summary("Session name or UUID"),
+                )
+                .argument(
+                    PluginCommandArgument::option("client", PluginCommandArgumentKind::String)
+                        .required(true)
+                        .short('c')
+                        .summary("Client UUID"),
                 )
                 .execution(CommandExecutionKind::ProviderExec)
                 .expose_in_cli(true),
@@ -130,6 +172,8 @@ impl RustPlugin for ExamplePlugin {
     fn run_command(&mut self, context: NativeCommandContext) -> i32 {
         match context.command.as_str() {
             "permissions-list" => run_permissions_list(&context),
+            "permissions-grant" => run_permissions_grant(&context),
+            "permissions-revoke" => run_permissions_revoke(&context),
             "windows-list" => run_windows_list(&context),
             "windows-new" => run_windows_new(&context),
             "settings-show" => run_settings_show(&context),
@@ -198,6 +242,123 @@ fn run_permissions_list(context: &NativeCommandContext) -> i32 {
         }
     }
 
+    0
+}
+
+fn run_permissions_grant(context: &NativeCommandContext) -> i32 {
+    let Some(session) = context.arguments.first() else {
+        eprintln!("example.native permissions-grant requires a session name or UUID");
+        return 64;
+    };
+
+    let mut client_id = None;
+    let mut role = None;
+    let mut args = context.arguments.iter().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--client" | "-c" => client_id = args.next().cloned(),
+            "--role" | "-r" => role = args.next().cloned(),
+            other => {
+                eprintln!("example.native permissions-grant does not accept argument '{other}'");
+                return 64;
+            }
+        }
+    }
+
+    let Some(client_id) = client_id else {
+        eprintln!("example.native permissions-grant requires --client <uuid>");
+        return 64;
+    };
+    let client_id = match uuid::Uuid::parse_str(&client_id) {
+        Ok(value) => value,
+        Err(_) => {
+            eprintln!("example.native permissions-grant received invalid client id");
+            return 64;
+        }
+    };
+    let Some(role) = role else {
+        eprintln!("example.native permissions-grant requires --role <role>");
+        return 64;
+    };
+    let Some(role) = parse_role(&role) else {
+        eprintln!("example.native permissions-grant received invalid role '{role}'");
+        return 64;
+    };
+
+    let response = match context.call_service::<GrantPermissionRequest, GrantPermissionResponse>(
+        "bmux.permissions.write",
+        ServiceKind::Command,
+        "permission-command/v1",
+        "grant",
+        &GrantPermissionRequest {
+            session: session.to_string(),
+            client_id,
+            role,
+        },
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("example.native: failed granting role through service: {error}");
+            return 1;
+        }
+    };
+
+    println!(
+        "granted role {} to client {}",
+        session_role_name(response.role),
+        response.client_id
+    );
+    0
+}
+
+fn run_permissions_revoke(context: &NativeCommandContext) -> i32 {
+    let Some(session) = context.arguments.first() else {
+        eprintln!("example.native permissions-revoke requires a session name or UUID");
+        return 64;
+    };
+
+    let mut client_id = None;
+    let mut args = context.arguments.iter().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--client" | "-c" => client_id = args.next().cloned(),
+            other => {
+                eprintln!("example.native permissions-revoke does not accept argument '{other}'");
+                return 64;
+            }
+        }
+    }
+
+    let Some(client_id) = client_id else {
+        eprintln!("example.native permissions-revoke requires --client <uuid>");
+        return 64;
+    };
+    let client_id = match uuid::Uuid::parse_str(&client_id) {
+        Ok(value) => value,
+        Err(_) => {
+            eprintln!("example.native permissions-revoke received invalid client id");
+            return 64;
+        }
+    };
+
+    let response = match context.call_service::<RevokePermissionRequest, RevokePermissionResponse>(
+        "bmux.permissions.write",
+        ServiceKind::Command,
+        "permission-command/v1",
+        "revoke",
+        &RevokePermissionRequest {
+            session: session.to_string(),
+            client_id,
+        },
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("example.native: failed revoking role through service: {error}");
+            return 1;
+        }
+    };
+
+    println!("revoked explicit role for client {}", response.client_id);
     0
 }
 
@@ -325,6 +486,30 @@ struct ListPermissionsResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GrantPermissionRequest {
+    session: String,
+    client_id: uuid::Uuid,
+    role: bmux_ipc::SessionRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GrantPermissionResponse {
+    client_id: uuid::Uuid,
+    role: bmux_ipc::SessionRole,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RevokePermissionRequest {
+    session: String,
+    client_id: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RevokePermissionResponse {
+    client_id: uuid::Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ListWindowsRequest {
     session: Option<String>,
 }
@@ -363,6 +548,15 @@ fn session_role_name(role: bmux_ipc::SessionRole) -> &'static str {
     }
 }
 
+fn parse_role(value: &str) -> Option<bmux_ipc::SessionRole> {
+    match value {
+        "owner" => Some(bmux_ipc::SessionRole::Owner),
+        "writer" => Some(bmux_ipc::SessionRole::Writer),
+        "observer" => Some(bmux_ipc::SessionRole::Observer),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ExamplePlugin;
@@ -377,6 +571,6 @@ mod tests {
         let reparsed = bmux_plugin::NativeDescriptor::from_toml_str(&serialized)
             .expect("descriptor should parse");
         assert_eq!(reparsed.id, "example.native");
-        assert_eq!(reparsed.commands.len(), 5);
+        assert_eq!(reparsed.commands.len(), 7);
     }
 }

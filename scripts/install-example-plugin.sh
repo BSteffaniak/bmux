@@ -112,7 +112,7 @@ name = "Example Native Plugin"
 version = "0.0.1-alpha.0"
 runtime = "native"
 entry = "${LIB_PATH}"
-required_capabilities = ["bmux.commands", "bmux.config.read", "bmux.events.subscribe", "bmux.permissions.read", "bmux.windows.read", "bmux.windows.write"]
+required_capabilities = ["bmux.commands", "bmux.config.read", "bmux.events.subscribe", "bmux.permissions.read", "bmux.permissions.write", "bmux.windows.read", "bmux.windows.write"]
 provided_features = ["example.native"]
 
 [[dependencies]]
@@ -152,6 +152,62 @@ position = 0
 required = true
 summary = "Session name or UUID"
 value_name = "SESSION"
+
+[[commands]]
+name = "permissions-grant"
+summary = "Grant a role through bmux provider service"
+execution = "provider_exec"
+expose_in_cli = true
+
+[[commands.arguments]]
+name = "session"
+kind = "string"
+position = 0
+required = true
+summary = "Session name or UUID"
+value_name = "SESSION"
+
+[[commands.arguments]]
+name = "client"
+kind = "string"
+long = "client"
+short = "c"
+required = true
+summary = "Client UUID"
+value_name = "CLIENT"
+
+[[commands.arguments]]
+name = "role"
+kind = "choice"
+long = "role"
+short = "r"
+required = true
+summary = "Role to grant"
+value_name = "ROLE"
+values = ["owner", "writer", "observer"]
+
+[[commands]]
+name = "permissions-revoke"
+summary = "Revoke a role through bmux provider service"
+execution = "provider_exec"
+expose_in_cli = true
+
+[[commands.arguments]]
+name = "session"
+kind = "string"
+position = 0
+required = true
+summary = "Session name or UUID"
+value_name = "SESSION"
+
+[[commands.arguments]]
+name = "client"
+kind = "string"
+long = "client"
+short = "c"
+required = true
+summary = "Client UUID"
+value_name = "CLIENT"
 
 [[commands]]
 name = "windows-list"

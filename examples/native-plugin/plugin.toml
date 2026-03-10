@@ -7,6 +7,7 @@ required_capabilities = [
     "bmux.config.read",
     "bmux.events.subscribe",
     "bmux.permissions.read",
+    "bmux.permissions.write",
     "bmux.windows.read",
     "bmux.windows.write",
 ]
@@ -42,6 +43,62 @@ position   = 0
 required   = true
 summary    = "Session name or UUID"
 value_name = "SESSION"
+
+[[commands]]
+execution     = "provider_exec"
+expose_in_cli = true
+name          = "permissions-grant"
+summary       = "Grant a role through bmux provider service"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "session"
+position   = 0
+required   = true
+summary    = "Session name or UUID"
+value_name = "SESSION"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "client"
+name       = "client"
+required   = true
+short      = "c"
+summary    = "Client UUID"
+value_name = "CLIENT"
+
+[[commands.arguments]]
+kind       = "choice"
+long       = "role"
+name       = "role"
+required   = true
+short      = "r"
+summary    = "Role to grant"
+value_name = "ROLE"
+values     = ["owner", "writer", "observer"]
+
+[[commands]]
+execution     = "provider_exec"
+expose_in_cli = true
+name          = "permissions-revoke"
+summary       = "Revoke a role through bmux provider service"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "session"
+position   = 0
+required   = true
+summary    = "Session name or UUID"
+value_name = "SESSION"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "client"
+name       = "client"
+required   = true
+short      = "c"
+summary    = "Client UUID"
+value_name = "CLIENT"
 
 [[commands]]
 execution     = "provider_exec"
