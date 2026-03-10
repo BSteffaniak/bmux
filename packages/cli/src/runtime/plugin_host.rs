@@ -72,6 +72,22 @@ impl CliPluginHost {
             })
         }
     }
+
+    fn assert_registered_service(
+        &self,
+        capability: &str,
+        kind: bmux_plugin::ServiceKind,
+        interface_id: &str,
+        operation: &'static str,
+    ) -> bmux_plugin::Result<()> {
+        let capability = HostScope::new(capability).expect("capability id should parse");
+        self.resolve_service(&capability, kind, interface_id)
+            .map(|_| ())
+            .map_err(|error| match error {
+                PluginError::CapabilityAccessDenied { .. } => error,
+                _ => PluginError::UnsupportedHostOperation { operation },
+            })
+    }
 }
 
 fn paths_from_connection(connection: &HostConnectionInfo) -> ConfigPaths {
@@ -258,55 +274,7 @@ impl PluginHost for CliPluginHost {
         self
     }
 
-    fn session_queries(&self) -> &dyn SessionQueryService {
-        self
-    }
-
-    fn session_commands(&self) -> &dyn SessionCommandService {
-        self
-    }
-
-    fn window_queries(&self) -> &dyn WindowQueryService {
-        self
-    }
-
-    fn window_commands(&self) -> &dyn WindowCommandService {
-        self
-    }
-
-    fn pane_queries(&self) -> &dyn PaneQueryService {
-        self
-    }
-
-    fn pane_commands(&self) -> &dyn PaneCommandService {
-        self
-    }
-
-    fn permission_queries(&self) -> &dyn PermissionQueryService {
-        self
-    }
-
-    fn permission_commands(&self) -> &dyn PermissionCommandService {
-        self
-    }
-
     fn client_queries(&self) -> &dyn ClientQueryService {
-        self
-    }
-
-    fn follow_queries(&self) -> &dyn FollowQueryService {
-        self
-    }
-
-    fn follow_commands(&self) -> &dyn FollowCommandService {
-        self
-    }
-
-    fn persistence_queries(&self) -> &dyn PersistenceQueryService {
-        self
-    }
-
-    fn persistence_commands(&self) -> &dyn PersistenceCommandService {
         self
     }
 
@@ -459,7 +427,12 @@ impl WindowQueryService for CliPluginHost {
         &self,
         session: Option<SessionHandle>,
     ) -> bmux_plugin::Result<Vec<WindowSummary>> {
-        self.assert_capability("bmux.windows.read", "window.list")?;
+        self.assert_registered_service(
+            "bmux.windows.read",
+            bmux_plugin::ServiceKind::Query,
+            "window-query/v1",
+            "window.list",
+        )?;
         with_client(&self.connection, |client| {
             tokio::runtime::Handle::current().block_on(async {
                 client
@@ -474,7 +447,12 @@ impl WindowQueryService for CliPluginHost {
     }
 
     fn get_window(&self, window: WindowHandle) -> bmux_plugin::Result<Option<WindowSummary>> {
-        self.assert_capability("bmux.windows.read", "window.get")?;
+        self.assert_registered_service(
+            "bmux.windows.read",
+            bmux_plugin::ServiceKind::Query,
+            "window-query/v1",
+            "window.get",
+        )?;
         with_client(&self.connection, |client| {
             tokio::runtime::Handle::current().block_on(async {
                 let sessions = client.list_sessions().await.map_err(|error| {
@@ -497,7 +475,12 @@ impl WindowQueryService for CliPluginHost {
     }
 
     fn snapshot_window(&self, window: WindowHandle) -> bmux_plugin::Result<Option<WindowSnapshot>> {
-        self.assert_capability("bmux.windows.read", "window.snapshot")?;
+        self.assert_registered_service(
+            "bmux.windows.read",
+            bmux_plugin::ServiceKind::Query,
+            "window-query/v1",
+            "window.snapshot",
+        )?;
         with_client(&self.connection, |client| {
             tokio::runtime::Handle::current().block_on(async {
                 let sessions = client.list_sessions().await.map_err(|error| {
@@ -546,7 +529,12 @@ impl WindowCommandService for CliPluginHost {
         session: Option<SessionHandle>,
         name: Option<String>,
     ) -> bmux_plugin::Result<WindowHandle> {
-        self.assert_capability("bmux.windows.write", "window.create")?;
+        self.assert_registered_service(
+            "bmux.windows.write",
+            bmux_plugin::ServiceKind::Command,
+            "window-command/v1",
+            "window.create",
+        )?;
         with_client(&self.connection, |client| {
             tokio::runtime::Handle::current().block_on(async {
                 client
@@ -564,7 +552,12 @@ impl WindowCommandService for CliPluginHost {
         target: WindowRef,
         force_local: bool,
     ) -> bmux_plugin::Result<WindowHandle> {
-        self.assert_capability("bmux.windows.write", "window.kill")?;
+        self.assert_registered_service(
+            "bmux.windows.write",
+            bmux_plugin::ServiceKind::Command,
+            "window-command/v1",
+            "window.kill",
+        )?;
         with_client(&self.connection, |client| {
             tokio::runtime::Handle::current().block_on(async {
                 client
@@ -585,7 +578,12 @@ impl WindowCommandService for CliPluginHost {
         session: Option<SessionHandle>,
         target: WindowRef,
     ) -> bmux_plugin::Result<WindowHandle> {
-        self.assert_capability("bmux.windows.write", "window.switch")?;
+        self.assert_registered_service(
+            "bmux.windows.write",
+            bmux_plugin::ServiceKind::Command,
+            "window-command/v1",
+            "window.switch",
+        )?;
         with_client(&self.connection, |client| {
             tokio::runtime::Handle::current().block_on(async {
                 client
@@ -842,7 +840,12 @@ impl PermissionQueryService for CliPluginHost {
         &self,
         session: SessionHandle,
     ) -> bmux_plugin::Result<Vec<PermissionEntry>> {
-        self.assert_capability("bmux.permissions.read", "permission.list")?;
+        self.assert_registered_service(
+            "bmux.permissions.read",
+            bmux_plugin::ServiceKind::Query,
+            "permission-query/v1",
+            "permission.list",
+        )?;
         with_client(&self.connection, |client| {
             tokio::runtime::Handle::current().block_on(async {
                 client
@@ -872,7 +875,12 @@ impl PermissionCommandService for CliPluginHost {
         client_id: Uuid,
         role: SessionRoleValue,
     ) -> bmux_plugin::Result<()> {
-        self.assert_capability("bmux.permissions.write", "permission.grant")?;
+        self.assert_registered_service(
+            "bmux.permissions.write",
+            bmux_plugin::ServiceKind::Command,
+            "permission-command/v1",
+            "permission.grant",
+        )?;
         with_client(&self.connection, |client| {
             tokio::runtime::Handle::current().block_on(async {
                 client
@@ -888,7 +896,12 @@ impl PermissionCommandService for CliPluginHost {
     }
 
     fn revoke_role(&self, session: SessionHandle, client_id: Uuid) -> bmux_plugin::Result<()> {
-        self.assert_capability("bmux.permissions.write", "permission.revoke")?;
+        self.assert_registered_service(
+            "bmux.permissions.write",
+            bmux_plugin::ServiceKind::Command,
+            "permission-command/v1",
+            "permission.revoke",
+        )?;
         with_client(&self.connection, |client| {
             tokio::runtime::Handle::current().block_on(async {
                 client
@@ -1125,13 +1138,26 @@ mod tests {
     use bmux_config::{BmuxConfig, ConfigPaths};
     use bmux_plugin::{
         CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, ClipboardService, HostMetadata,
-        HostScope, PersistenceQueryService, PluginHost, PluginStorage, SessionQueryService,
-        WindowCommandService,
+        HostScope, PersistenceQueryService, PluginHost, PluginStorage, RegisteredService,
+        ServiceKind, SessionQueryService, WindowCommandService,
     };
     use std::collections::BTreeSet;
     use std::path::PathBuf;
 
-    fn host(required: &[&str], provided: &[&str]) -> CliPluginHost {
+    fn service(capability: &str, kind: ServiceKind, interface_id: &str) -> RegisteredService {
+        RegisteredService {
+            capability: HostScope::new(capability).expect("capability should parse"),
+            kind,
+            interface_id: interface_id.to_string(),
+            provider_plugin_id: "provider.plugin".to_string(),
+        }
+    }
+
+    fn host(
+        required: &[&str],
+        provided: &[&str],
+        services: Vec<RegisteredService>,
+    ) -> CliPluginHost {
         CliPluginHost::for_plugin(
             "example.plugin",
             HostMetadata {
@@ -1154,13 +1180,13 @@ mod tests {
                 .iter()
                 .map(|value| HostScope::new(*value).expect("capability should parse"))
                 .collect::<BTreeSet<_>>(),
-            Vec::new(),
+            services,
         )
     }
 
     #[test]
     fn reports_required_and_provided_capabilities() {
-        let host = host(&["bmux.sessions.read"], &["bmux.windows.write"]);
+        let host = host(&["bmux.sessions.read"], &["bmux.windows.write"], Vec::new());
         assert_eq!(PluginHost::plugin_id(&host), "example.plugin");
         assert!(PluginHost::has_capability(
             &host,
@@ -1174,7 +1200,7 @@ mod tests {
 
     #[test]
     fn session_queries_require_sessions_read_capability() {
-        let host = host(&[], &[]);
+        let host = host(&[], &[], Vec::new());
         let error = SessionQueryService::list_sessions(&host)
             .expect_err("missing capability should be rejected");
         assert!(error.to_string().contains("bmux.sessions.read"));
@@ -1182,7 +1208,15 @@ mod tests {
 
     #[test]
     fn provider_owned_capability_counts_for_access_checks() {
-        let host = host(&[], &["bmux.windows.write"]);
+        let host = host(
+            &[],
+            &["bmux.windows.write"],
+            vec![service(
+                "bmux.windows.write",
+                ServiceKind::Command,
+                "window-command/v1",
+            )],
+        );
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
             .build()
@@ -1194,8 +1228,21 @@ mod tests {
     }
 
     #[test]
+    fn window_commands_require_registered_service_descriptor() {
+        let host = host(&[], &["bmux.windows.write"], Vec::new());
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("runtime should build");
+        let error = runtime
+            .block_on(async { WindowCommandService::create_window(&host, None, None) })
+            .expect_err("missing service descriptor should fail");
+        assert!(error.to_string().contains("window.create"));
+    }
+
+    #[test]
     fn storage_and_clipboard_checks_happen_before_unsupported_operation() {
-        let host = host(&[], &[]);
+        let host = host(&[], &[], Vec::new());
         let storage_error = PluginStorage::get(&host, "example.plugin", "key")
             .expect_err("storage should require capability");
         assert!(storage_error.to_string().contains("bmux.storage"));
@@ -1207,7 +1254,7 @@ mod tests {
 
     #[test]
     fn persistence_queries_require_capability() {
-        let host = host(&[], &[]);
+        let host = host(&[], &[], Vec::new());
         let error = PersistenceQueryService::status(&host)
             .expect_err("persistence status should require capability");
         assert!(error.to_string().contains("bmux.persistence.read"));

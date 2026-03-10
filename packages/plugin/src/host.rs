@@ -235,19 +235,7 @@ pub trait PluginHost: Send + Sync {
             })
     }
     fn events(&self) -> &dyn EventService;
-    fn session_queries(&self) -> &dyn SessionQueryService;
-    fn session_commands(&self) -> &dyn SessionCommandService;
-    fn window_queries(&self) -> &dyn WindowQueryService;
-    fn window_commands(&self) -> &dyn WindowCommandService;
-    fn pane_queries(&self) -> &dyn PaneQueryService;
-    fn pane_commands(&self) -> &dyn PaneCommandService;
-    fn permission_queries(&self) -> &dyn PermissionQueryService;
-    fn permission_commands(&self) -> &dyn PermissionCommandService;
     fn client_queries(&self) -> &dyn ClientQueryService;
-    fn follow_queries(&self) -> &dyn FollowQueryService;
-    fn follow_commands(&self) -> &dyn FollowCommandService;
-    fn persistence_queries(&self) -> &dyn PersistenceQueryService;
-    fn persistence_commands(&self) -> &dyn PersistenceCommandService;
     fn render(&self) -> &dyn RenderService;
     fn config(&self) -> &dyn ConfigService;
     fn storage(&self) -> &dyn PluginStorage;
@@ -390,143 +378,11 @@ pub trait ClipboardService: Send + Sync {
 mod tests {
     use super::*;
 
-    struct MockWindowService;
-    struct MockPermissionService;
     struct MockNoop;
 
     impl EventService for MockNoop {
         fn emit(&self, _event: PluginEvent) -> Result<()> {
             Ok(())
-        }
-    }
-
-    impl SessionQueryService for MockNoop {
-        fn active_session(&self) -> Result<Option<SessionHandle>> {
-            Ok(None)
-        }
-        fn list_sessions(&self) -> Result<Vec<SessionSummary>> {
-            Ok(Vec::new())
-        }
-        fn get_session(&self, _session: SessionHandle) -> Result<Option<SessionSummary>> {
-            Ok(None)
-        }
-        fn snapshot_session(&self, _session: SessionHandle) -> Result<Option<SessionSnapshot>> {
-            Ok(None)
-        }
-    }
-
-    impl SessionCommandService for MockNoop {
-        fn create_session(&self, _name: Option<String>) -> Result<SessionHandle> {
-            unreachable!()
-        }
-        fn kill_session(&self, _session: SessionRef, _force_local: bool) -> Result<SessionHandle> {
-            unreachable!()
-        }
-    }
-
-    impl WindowQueryService for MockWindowService {
-        fn list_windows(&self, _session: Option<SessionHandle>) -> Result<Vec<WindowSummary>> {
-            Ok(Vec::new())
-        }
-        fn get_window(&self, _window: WindowHandle) -> Result<Option<WindowSummary>> {
-            Ok(None)
-        }
-        fn snapshot_window(&self, _window: WindowHandle) -> Result<Option<WindowSnapshot>> {
-            Ok(None)
-        }
-    }
-
-    impl WindowCommandService for MockWindowService {
-        fn create_window(
-            &self,
-            _session: Option<SessionHandle>,
-            _name: Option<String>,
-        ) -> Result<WindowHandle> {
-            unreachable!()
-        }
-        fn kill_window(
-            &self,
-            _session: Option<SessionHandle>,
-            _target: WindowRef,
-            _force_local: bool,
-        ) -> Result<WindowHandle> {
-            unreachable!()
-        }
-        fn switch_window(
-            &self,
-            _session: Option<SessionHandle>,
-            _target: WindowRef,
-        ) -> Result<WindowHandle> {
-            unreachable!()
-        }
-    }
-
-    impl PaneQueryService for MockNoop {
-        fn focused_pane(&self, _session: Option<SessionHandle>) -> Result<Option<PaneHandle>> {
-            Ok(None)
-        }
-        fn list_panes(&self, _session: Option<SessionHandle>) -> Result<Vec<PaneSummary>> {
-            Ok(Vec::new())
-        }
-        fn get_pane(&self, _pane: PaneHandle) -> Result<Option<PaneSummary>> {
-            Ok(None)
-        }
-        fn snapshot_pane(&self, _pane: PaneHandle) -> Result<Option<PaneSnapshot>> {
-            Ok(None)
-        }
-    }
-
-    impl PaneCommandService for MockNoop {
-        fn split_pane(
-            &self,
-            _session: Option<SessionHandle>,
-            _target: Option<PaneRef>,
-            _direction: PaneSplitDirection,
-        ) -> Result<PaneHandle> {
-            unreachable!()
-        }
-        fn focus_pane(
-            &self,
-            _session: Option<SessionHandle>,
-            _target: Option<PaneRef>,
-            _direction: Option<PaneFocusDirection>,
-        ) -> Result<PaneHandle> {
-            unreachable!()
-        }
-        fn resize_pane(
-            &self,
-            _session: Option<SessionHandle>,
-            _target: Option<PaneRef>,
-            _delta: i16,
-        ) -> Result<()> {
-            unreachable!()
-        }
-        fn close_pane(
-            &self,
-            _session: Option<SessionHandle>,
-            _target: Option<PaneRef>,
-        ) -> Result<()> {
-            unreachable!()
-        }
-    }
-
-    impl PermissionQueryService for MockPermissionService {
-        fn list_permissions(&self, _session: SessionHandle) -> Result<Vec<PermissionEntry>> {
-            Ok(Vec::new())
-        }
-    }
-
-    impl PermissionCommandService for MockPermissionService {
-        fn grant_role(
-            &self,
-            _session: SessionHandle,
-            _client_id: Uuid,
-            _role: SessionRoleValue,
-        ) -> Result<()> {
-            unreachable!()
-        }
-        fn revoke_role(&self, _session: SessionHandle, _client_id: Uuid) -> Result<()> {
-            unreachable!()
         }
     }
 
@@ -539,42 +395,6 @@ mod tests {
         }
         fn list_clients(&self) -> Result<Vec<ClientSummary>> {
             Ok(Vec::new())
-        }
-    }
-
-    impl FollowQueryService for MockNoop {
-        fn current_follow_state(&self) -> Result<FollowState> {
-            unreachable!()
-        }
-    }
-
-    impl FollowCommandService for MockNoop {
-        fn follow_client(&self, _target_client_id: Uuid, _global: bool) -> Result<()> {
-            unreachable!()
-        }
-        fn unfollow(&self) -> Result<()> {
-            unreachable!()
-        }
-    }
-
-    impl PersistenceQueryService for MockNoop {
-        fn status(&self) -> Result<PersistenceStatus> {
-            unreachable!()
-        }
-        fn server_status(&self) -> Result<ServerStatusInfo> {
-            unreachable!()
-        }
-    }
-
-    impl PersistenceCommandService for MockNoop {
-        fn save(&self) -> Result<Option<String>> {
-            unreachable!()
-        }
-        fn restore_dry_run(&self) -> Result<PersistenceRestorePreview> {
-            unreachable!()
-        }
-        fn restore_apply(&self) -> Result<PersistenceRestoreResult> {
-            unreachable!()
         }
     }
 
@@ -610,8 +430,6 @@ mod tests {
         provided: BTreeSet<HostScope>,
         services: Vec<RegisteredService>,
         noop: MockNoop,
-        windows: MockWindowService,
-        permissions: MockPermissionService,
         metadata: HostMetadata,
         connection: HostConnectionInfo,
     }
@@ -629,8 +447,6 @@ mod tests {
                     .collect(),
                 services,
                 noop: MockNoop,
-                windows: MockWindowService,
-                permissions: MockPermissionService,
                 metadata: HostMetadata {
                     product_name: "bmux".to_string(),
                     product_version: "0.1.0".to_string(),
@@ -668,43 +484,7 @@ mod tests {
         fn events(&self) -> &dyn EventService {
             &self.noop
         }
-        fn session_queries(&self) -> &dyn SessionQueryService {
-            &self.noop
-        }
-        fn session_commands(&self) -> &dyn SessionCommandService {
-            &self.noop
-        }
-        fn window_queries(&self) -> &dyn WindowQueryService {
-            &self.windows
-        }
-        fn window_commands(&self) -> &dyn WindowCommandService {
-            &self.windows
-        }
-        fn pane_queries(&self) -> &dyn PaneQueryService {
-            &self.noop
-        }
-        fn pane_commands(&self) -> &dyn PaneCommandService {
-            &self.noop
-        }
-        fn permission_queries(&self) -> &dyn PermissionQueryService {
-            &self.permissions
-        }
-        fn permission_commands(&self) -> &dyn PermissionCommandService {
-            &self.permissions
-        }
         fn client_queries(&self) -> &dyn ClientQueryService {
-            &self.noop
-        }
-        fn follow_queries(&self) -> &dyn FollowQueryService {
-            &self.noop
-        }
-        fn follow_commands(&self) -> &dyn FollowCommandService {
-            &self.noop
-        }
-        fn persistence_queries(&self) -> &dyn PersistenceQueryService {
-            &self.noop
-        }
-        fn persistence_commands(&self) -> &dyn PersistenceCommandService {
             &self.noop
         }
         fn render(&self) -> &dyn RenderService {

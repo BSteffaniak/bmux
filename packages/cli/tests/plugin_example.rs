@@ -1,10 +1,10 @@
 use bmux_client::BmuxClient;
 use bmux_config::ConfigPaths;
 use bmux_ipc::{IpcEndpoint, SessionRole, SessionSelector};
+use serial_test::serial;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -28,9 +28,10 @@ fn temp_dir() -> PathBuf {
     dir
 }
 
-fn plugin_test_lock() -> &'static Mutex<()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+fn bmux_bin_path() -> PathBuf {
+    std::env::var_os("CARGO_BIN_EXE_bmux")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_bmux")))
 }
 
 fn sandbox_paths(root: &Path) -> (PathBuf, PathBuf) {
@@ -220,7 +221,7 @@ fn run_bmux(
     args: &[&str],
 ) -> std::process::Output {
     let paths = config_paths_from_sandbox_env(home_dir, config_home, data_home, runtime_dir);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_bmux"));
+    let mut command = Command::new(bmux_bin_path());
     command
         .current_dir(root)
         .env("XDG_RUNTIME_DIR", runtime_dir)
@@ -252,7 +253,7 @@ fn spawn_bmux(
     let stderr_path = tmp_dir.join(format!("bmux-stderr-{}.log", args.join("-")));
     let stdout = fs::File::create(&stdout_path).expect("stdout log should be created");
     let stderr = fs::File::create(&stderr_path).expect("stderr log should be created");
-    let mut command = Command::new(env!("CARGO_BIN_EXE_bmux"));
+    let mut command = Command::new(bmux_bin_path());
     command
         .current_dir(root)
         .env("XDG_RUNTIME_DIR", runtime_dir)
@@ -324,10 +325,8 @@ fn wait_for_server_ready(
 }
 
 #[test]
+#[serial]
 fn installs_example_plugin_and_runs_command() {
-    let _guard = plugin_test_lock()
-        .lock()
-        .expect("plugin test lock poisoned");
     let root = workspace_root();
     let (_sandbox, home_dir, config_home, data_home, runtime_dir, tmp_dir, config_dir) =
         sandbox_setup();
@@ -399,10 +398,8 @@ fn installs_example_plugin_and_runs_command() {
 }
 
 #[test]
+#[serial]
 fn shipped_permissions_plugin_handles_permissions_command() {
-    let _guard = plugin_test_lock()
-        .lock()
-        .expect("plugin test lock poisoned");
     let root = workspace_root();
     let (sandbox, home_dir, config_home, data_home, runtime_dir, tmp_dir, config_dir) =
         sandbox_setup();
@@ -683,10 +680,8 @@ fn shipped_permissions_plugin_handles_permissions_command() {
 }
 
 #[test]
+#[serial]
 fn shipped_windows_plugin_handles_window_commands() {
-    let _guard = plugin_test_lock()
-        .lock()
-        .expect("plugin test lock poisoned");
     let root = workspace_root();
     let (sandbox, home_dir, config_home, data_home, runtime_dir, tmp_dir, config_dir) =
         sandbox_setup();

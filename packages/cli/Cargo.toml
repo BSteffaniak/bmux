@@ -54,3 +54,6 @@ logging = ["dep:tracing-subscriber"]
 
 # Serialization features
 serde = ["bmux_event/serde", "bmux_session/serde", "bmux_terminal/serde"]
+
+[dev-dependencies]
+serial_test = { workspace = true }

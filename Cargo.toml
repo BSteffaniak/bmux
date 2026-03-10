@@ -93,6 +93,7 @@ serde = { version = "1.0.219", default-features = false, features = ["std"] }
 serde_json = { version = "1.0.143", default-features = false, features = [
     "std",
 ] }
+serial_test = { version = "3.4.0", default-features = false }
 thiserror = { version = "2.0.12", default-features = false }
 tokio = { version = "1.45.1", default-features = false }
 toml = { version = "0.8.23", default-features = false, features = ["display"] }
