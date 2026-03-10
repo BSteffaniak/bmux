@@ -37,15 +37,13 @@ pub use discovery::{
 pub use error::{PluginError, Result};
 pub use event::{PluginEvent, PluginEventKind, PluginEventPayload, PluginEventSubscription};
 pub use host::{
-    ClientQueryService, ClientSummary, ClipboardService, ConfigService, EventService,
-    FollowCommandService, FollowQueryService, FollowState, HostConnectionInfo, HostMetadata,
-    PaneCommandService, PaneFocusDirection, PaneHandle, PaneLayoutNode, PaneQueryService, PaneRef,
-    PaneSnapshot, PaneSplitDirection, PaneSummary, PermissionEntry, PersistenceCommandService,
-    PersistenceQueryService, PersistenceRestorePreview, PersistenceRestoreResult,
-    PersistenceStatus, PluginContext, PluginHost, PluginStorage, PrincipalIdentityInfo,
-    RenderService, ServerStatusInfo, SessionCommandService, SessionHandle, SessionQueryService,
-    SessionRef, SessionRoleValue, SessionSnapshot, SessionSummary, WindowHandle, WindowRef,
-    WindowSnapshot, WindowSummary,
+    ClientQueryService, ClientSummary, ClipboardService, ConfigService, EventService, FollowState,
+    HostConnectionInfo, HostMetadata, PaneFocusDirection, PaneHandle, PaneLayoutNode, PaneRef,
+    PaneSnapshot, PaneSplitDirection, PaneSummary, PermissionEntry, PersistenceRestorePreview,
+    PersistenceRestoreResult, PersistenceStatus, PluginContext, PluginHost, PluginStorage,
+    PrincipalIdentityInfo, RenderService, ServerStatusInfo, SessionHandle, SessionRef,
+    SessionRoleValue, SessionSnapshot, SessionSummary, WindowHandle, WindowRef, WindowSnapshot,
+    WindowSummary,
 };
 pub use loader::{
     LoadedPlugin, NativeCommandContext, NativeDescriptor, NativeLifecycleContext,

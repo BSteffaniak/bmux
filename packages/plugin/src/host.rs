@@ -251,71 +251,10 @@ pub trait EventService: Send + Sync {
     fn emit(&self, event: PluginEvent) -> Result<()>;
 }
 
-pub trait SessionQueryService: Send + Sync {
-    fn active_session(&self) -> Result<Option<SessionHandle>>;
-    fn list_sessions(&self) -> Result<Vec<SessionSummary>>;
-    fn get_session(&self, session: SessionHandle) -> Result<Option<SessionSummary>>;
-    fn snapshot_session(&self, session: SessionHandle) -> Result<Option<SessionSnapshot>>;
-}
-
-pub trait SessionCommandService: Send + Sync {
-    fn create_session(&self, name: Option<String>) -> Result<SessionHandle>;
-    fn kill_session(&self, session: SessionRef, force_local: bool) -> Result<SessionHandle>;
-}
-
-pub trait PaneQueryService: Send + Sync {
-    fn focused_pane(&self, session: Option<SessionHandle>) -> Result<Option<PaneHandle>>;
-    fn list_panes(&self, session: Option<SessionHandle>) -> Result<Vec<PaneSummary>>;
-    fn get_pane(&self, pane: PaneHandle) -> Result<Option<PaneSummary>>;
-    fn snapshot_pane(&self, pane: PaneHandle) -> Result<Option<PaneSnapshot>>;
-}
-
-pub trait PaneCommandService: Send + Sync {
-    fn split_pane(
-        &self,
-        session: Option<SessionHandle>,
-        target: Option<PaneRef>,
-        direction: PaneSplitDirection,
-    ) -> Result<PaneHandle>;
-    fn focus_pane(
-        &self,
-        session: Option<SessionHandle>,
-        target: Option<PaneRef>,
-        direction: Option<PaneFocusDirection>,
-    ) -> Result<PaneHandle>;
-    fn resize_pane(
-        &self,
-        session: Option<SessionHandle>,
-        target: Option<PaneRef>,
-        delta: i16,
-    ) -> Result<()>;
-    fn close_pane(&self, session: Option<SessionHandle>, target: Option<PaneRef>) -> Result<()>;
-}
-
 pub trait ClientQueryService: Send + Sync {
     fn current_client_id(&self) -> Result<Uuid>;
     fn principal_identity(&self) -> Result<PrincipalIdentityInfo>;
     fn list_clients(&self) -> Result<Vec<ClientSummary>>;
-}
-
-pub trait FollowQueryService: Send + Sync {
-    fn current_follow_state(&self) -> Result<FollowState>;
-}
-
-pub trait FollowCommandService: Send + Sync {
-    fn follow_client(&self, target_client_id: Uuid, global: bool) -> Result<()>;
-    fn unfollow(&self) -> Result<()>;
-}
-
-pub trait PersistenceQueryService: Send + Sync {
-    fn status(&self) -> Result<PersistenceStatus>;
-    fn server_status(&self) -> Result<ServerStatusInfo>;
-}
-
-pub trait PersistenceCommandService: Send + Sync {
-    fn save(&self) -> Result<Option<String>>;
-    fn restore_dry_run(&self) -> Result<PersistenceRestorePreview>;
-    fn restore_apply(&self) -> Result<PersistenceRestoreResult>;
 }
 
 pub trait RenderService: Send + Sync {
