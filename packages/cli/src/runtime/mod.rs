@@ -19,9 +19,9 @@ use bmux_ipc::{
 };
 use bmux_keybind::action_to_name;
 use bmux_plugin::{
-    CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
-    HostScope, NativeCommandContext, NativeLifecycleContext, PluginEvent, PluginEventKind,
-    PluginManifest, PluginRegistry, load_registered_plugin as load_native_registered_plugin,
+    CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostMetadata, HostScope,
+    NativeCommandContext, NativeLifecycleContext, PluginEvent, PluginEventKind, PluginManifest,
+    PluginRegistry, load_registered_plugin as load_native_registered_plugin,
 };
 use bmux_server::BmuxServer;
 use clap::{CommandFactory, FromArgMatches};
@@ -639,10 +639,19 @@ fn plugin_host_metadata() -> HostMetadata {
     }
 }
 
-fn plugin_host_connection(paths: &ConfigPaths) -> HostConnectionInfo {
-    let host =
-        plugin_host::CliPluginHost::new(plugin_host_metadata(), paths, BmuxConfig::default());
-    bmux_plugin::PluginHost::connection(&host).clone()
+fn plugin_host_for_declaration(
+    declaration: &bmux_plugin::PluginDeclaration,
+    paths: &ConfigPaths,
+    config: &BmuxConfig,
+) -> plugin_host::CliPluginHost {
+    plugin_host::CliPluginHost::for_plugin(
+        declaration.id.as_str(),
+        plugin_host_metadata(),
+        paths,
+        config.clone(),
+        declaration.required_capabilities.clone(),
+        declaration.provided_capabilities.clone(),
+    )
 }
 
 #[cfg(test)]
@@ -791,30 +800,60 @@ fn load_enabled_plugins(
 fn plugin_lifecycle_context(
     config: &BmuxConfig,
     paths: &ConfigPaths,
-    plugin_id: &str,
+    declaration: &bmux_plugin::PluginDeclaration,
 ) -> NativeLifecycleContext {
+    let host = plugin_host_for_declaration(declaration, paths, config);
     NativeLifecycleContext {
-        plugin_id: plugin_id.to_string(),
+        plugin_id: declaration.id.as_str().to_string(),
+        required_capabilities: declaration
+            .required_capabilities
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        provided_capabilities: declaration
+            .provided_capabilities
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         host: plugin_host_metadata(),
-        connection: plugin_host_connection(paths),
-        settings: config.plugins.settings.get(plugin_id).cloned(),
+        connection: bmux_plugin::PluginHost::connection(&host).clone(),
+        settings: config
+            .plugins
+            .settings
+            .get(declaration.id.as_str())
+            .cloned(),
     }
 }
 
 fn plugin_command_context(
     config: &BmuxConfig,
     paths: &ConfigPaths,
-    plugin_id: &str,
+    declaration: &bmux_plugin::PluginDeclaration,
     command: &str,
     arguments: &[String],
 ) -> NativeCommandContext {
+    let host = plugin_host_for_declaration(declaration, paths, config);
     NativeCommandContext {
-        plugin_id: plugin_id.to_string(),
+        plugin_id: declaration.id.as_str().to_string(),
         command: command.to_string(),
         arguments: arguments.to_vec(),
+        required_capabilities: declaration
+            .required_capabilities
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        provided_capabilities: declaration
+            .provided_capabilities
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
         host: plugin_host_metadata(),
-        connection: plugin_host_connection(paths),
-        settings: config.plugins.settings.get(plugin_id).cloned(),
+        connection: bmux_plugin::PluginHost::connection(&host).clone(),
+        settings: config
+            .plugins
+            .settings
+            .get(declaration.id.as_str())
+            .cloned(),
     }
 }
 
@@ -840,14 +879,11 @@ fn activate_loaded_plugins(
             continue;
         }
 
-        let context = plugin_lifecycle_context(config, paths, plugin.declaration.id.as_str());
+        let context = plugin_lifecycle_context(config, paths, &plugin.declaration);
         if let Err(error) = plugin.activate(&context) {
             for activated_plugin in activated.into_iter().rev() {
-                let context = plugin_lifecycle_context(
-                    config,
-                    paths,
-                    activated_plugin.declaration.id.as_str(),
-                );
+                let context =
+                    plugin_lifecycle_context(config, paths, &activated_plugin.declaration);
                 if let Err(deactivate_error) = activated_plugin.deactivate(&context) {
                     warn!(
                         "failed rolling back plugin activation for {}: {deactivate_error}",
@@ -879,7 +915,7 @@ fn deactivate_loaded_plugins(
             continue;
         }
 
-        let context = plugin_lifecycle_context(config, paths, plugin.declaration.id.as_str());
+        let context = plugin_lifecycle_context(config, paths, &plugin.declaration);
         let _ = plugin.deactivate(&context).with_context(|| {
             format!(
                 "failed deactivating plugin '{}'",
@@ -1105,7 +1141,7 @@ async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]
         &available_capability_providers(&config, &registry)?,
     )
     .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"))?;
-    let context = plugin_command_context(&config, &paths, plugin_id, command_name, args);
+    let context = plugin_command_context(&config, &paths, &plugin.declaration, command_name, args);
     let status = loaded
         .run_command_with_context(command_name, args, Some(&context))
         .with_context(|| format!("failed running plugin command '{plugin_id}:{command_name}'"))?;
@@ -5375,12 +5411,105 @@ mod tests {
             std::path::PathBuf::from("/runtime"),
             std::path::PathBuf::from("/data"),
         );
-        let context = super::plugin_lifecycle_context(&config, &paths, "example.plugin");
+        let declaration = bmux_plugin::PluginDeclaration {
+            id: bmux_plugin::PluginId::new("example.plugin").expect("id should parse"),
+            display_name: "Example".to_string(),
+            plugin_version: "0.1.0".to_string(),
+            plugin_api: bmux_plugin::VersionRange::at_least(bmux_plugin::ApiVersion::new(1, 0)),
+            native_abi: bmux_plugin::VersionRange::at_least(bmux_plugin::ApiVersion::new(1, 0)),
+            entrypoint: bmux_plugin::PluginEntrypoint::Native {
+                symbol: bmux_plugin::DEFAULT_NATIVE_ENTRY_SYMBOL.to_string(),
+            },
+            description: None,
+            homepage: None,
+            required_capabilities: std::collections::BTreeSet::from([bmux_plugin::HostScope::new(
+                "bmux.commands",
+            )
+            .expect("capability should parse")]),
+            provided_capabilities: std::collections::BTreeSet::from([bmux_plugin::HostScope::new(
+                "bmux.windows.write",
+            )
+            .expect("capability should parse")]),
+            provided_features: std::collections::BTreeSet::new(),
+            commands: Vec::new(),
+            event_subscriptions: Vec::new(),
+            dependencies: Vec::new(),
+            lifecycle: bmux_plugin::PluginLifecycle::default(),
+        };
+        let context = super::plugin_lifecycle_context(&config, &paths, &declaration);
         assert_eq!(context.plugin_id, "example.plugin");
         assert_eq!(context.connection.data_dir, "/data");
         assert_eq!(
+            context.required_capabilities,
+            vec!["bmux.commands".to_string()]
+        );
+        assert_eq!(
+            context.provided_capabilities,
+            vec!["bmux.windows.write".to_string()]
+        );
+        assert_eq!(
             context.settings.as_ref().and_then(|value| value.as_str()),
             Some("configured")
+        );
+    }
+
+    #[test]
+    fn plugin_command_context_includes_capability_sets() {
+        let config = BmuxConfig::default();
+        let paths = ConfigPaths::new(
+            std::path::PathBuf::from("/config"),
+            std::path::PathBuf::from("/runtime"),
+            std::path::PathBuf::from("/data"),
+        );
+        let declaration = bmux_plugin::PluginDeclaration {
+            id: bmux_plugin::PluginId::new("bmux.windows").expect("id should parse"),
+            display_name: "Windows".to_string(),
+            plugin_version: "0.1.0".to_string(),
+            plugin_api: bmux_plugin::VersionRange::at_least(bmux_plugin::ApiVersion::new(1, 0)),
+            native_abi: bmux_plugin::VersionRange::at_least(bmux_plugin::ApiVersion::new(1, 0)),
+            entrypoint: bmux_plugin::PluginEntrypoint::Native {
+                symbol: bmux_plugin::DEFAULT_NATIVE_ENTRY_SYMBOL.to_string(),
+            },
+            description: None,
+            homepage: None,
+            required_capabilities: std::collections::BTreeSet::from([
+                bmux_plugin::HostScope::new("bmux.commands").expect("capability should parse"),
+                bmux_plugin::HostScope::new("bmux.sessions.read").expect("capability should parse"),
+            ]),
+            provided_capabilities: std::collections::BTreeSet::from([
+                bmux_plugin::HostScope::new("bmux.windows.read").expect("capability should parse"),
+                bmux_plugin::HostScope::new("bmux.windows.write").expect("capability should parse"),
+            ]),
+            provided_features: std::collections::BTreeSet::new(),
+            commands: Vec::new(),
+            event_subscriptions: Vec::new(),
+            dependencies: Vec::new(),
+            lifecycle: bmux_plugin::PluginLifecycle::default(),
+        };
+
+        let context = super::plugin_command_context(
+            &config,
+            &paths,
+            &declaration,
+            "new-window",
+            &["--name".to_string(), "editor".to_string()],
+        );
+
+        assert_eq!(context.plugin_id, "bmux.windows");
+        assert_eq!(context.command, "new-window");
+        assert_eq!(
+            context.required_capabilities,
+            vec![
+                "bmux.commands".to_string(),
+                "bmux.sessions.read".to_string()
+            ]
+        );
+        assert_eq!(
+            context.provided_capabilities,
+            vec![
+                "bmux.windows.read".to_string(),
+                "bmux.windows.write".to_string()
+            ]
         );
     }
 

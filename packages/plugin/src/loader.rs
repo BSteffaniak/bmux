@@ -20,6 +20,10 @@ type NativeEventFn = unsafe extern "C" fn(*const c_char) -> i32;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeLifecycleContext {
     pub plugin_id: String,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+    #[serde(default)]
+    pub provided_capabilities: Vec<String>,
     pub host: HostMetadata,
     pub connection: HostConnectionInfo,
     #[serde(default)]
@@ -31,6 +35,10 @@ pub struct NativeCommandContext {
     pub plugin_id: String,
     pub command: String,
     pub arguments: Vec<String>,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+    #[serde(default)]
+    pub provided_capabilities: Vec<String>,
     pub host: HostMetadata,
     pub connection: HostConnectionInfo,
     #[serde(default)]
@@ -659,6 +667,8 @@ minimum = "1.0"
     fn lifecycle_context_serializes_settings_and_host() {
         let context = NativeLifecycleContext {
             plugin_id: "test.plugin".to_string(),
+            required_capabilities: Vec::new(),
+            provided_capabilities: Vec::new(),
             host: HostMetadata {
                 product_name: "bmux".to_string(),
                 product_version: "0.1.0".to_string(),

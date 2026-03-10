@@ -30,17 +30,6 @@ pub struct CliPluginHost {
 }
 
 impl CliPluginHost {
-    pub fn new(metadata: HostMetadata, paths: &ConfigPaths, config: BmuxConfig) -> Self {
-        Self::for_plugin(
-            "core",
-            metadata,
-            paths,
-            config,
-            BTreeSet::new(),
-            BTreeSet::new(),
-        )
-    }
-
     pub fn for_plugin(
         plugin_id: impl Into<String>,
         metadata: HostMetadata,
