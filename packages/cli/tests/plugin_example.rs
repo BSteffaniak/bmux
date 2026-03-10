@@ -53,8 +53,14 @@ fn configure_bmux_env(
     home_dir: &Path,
     config_home: &Path,
     data_home: &Path,
+    config_dir: &Path,
+    runtime_dir: &Path,
+    data_dir: &Path,
 ) {
     command.env("HOME", home_dir);
+    command.env("BMUX_CONFIG_DIR", config_dir);
+    command.env("BMUX_RUNTIME_DIR", runtime_dir);
+    command.env("BMUX_DATA_DIR", data_dir);
     if !cfg!(target_os = "macos") {
         command.env("XDG_CONFIG_HOME", config_home);
         command.env("XDG_DATA_HOME", data_home);
@@ -130,6 +136,23 @@ fn config_paths_for_test(config_dir: &Path, runtime_dir: &Path, data_home: &Path
     ConfigPaths::new(config_dir.to_path_buf(), runtime_dir.join("bmux"), data_dir)
 }
 
+fn config_paths_from_sandbox_env(
+    home_dir: &Path,
+    config_home: &Path,
+    data_home: &Path,
+    runtime_dir: &Path,
+) -> ConfigPaths {
+    let config_dir = if cfg!(target_os = "macos") {
+        home_dir
+            .join("Library")
+            .join("Application Support")
+            .join("bmux")
+    } else {
+        config_home.join("bmux")
+    };
+    config_paths_for_test(&config_dir, runtime_dir, data_home)
+}
+
 fn test_endpoint(paths: &ConfigPaths) -> IpcEndpoint {
     #[cfg(unix)]
     {
@@ -196,13 +219,22 @@ fn run_bmux(
     tmp_dir: &Path,
     args: &[&str],
 ) -> std::process::Output {
+    let paths = config_paths_from_sandbox_env(home_dir, config_home, data_home, runtime_dir);
     let mut command = Command::new(env!("CARGO_BIN_EXE_bmux"));
     command
         .current_dir(root)
         .env("XDG_RUNTIME_DIR", runtime_dir)
         .env("TMPDIR", tmp_dir)
         .args(args);
-    configure_bmux_env(&mut command, home_dir, config_home, data_home);
+    configure_bmux_env(
+        &mut command,
+        home_dir,
+        config_home,
+        data_home,
+        &paths.config_dir,
+        &paths.runtime_dir,
+        &paths.data_dir,
+    );
     command.output().expect("bmux command should run")
 }
 
@@ -215,6 +247,7 @@ fn spawn_bmux(
     tmp_dir: &Path,
     args: &[&str],
 ) -> (Child, PathBuf, PathBuf) {
+    let paths = config_paths_from_sandbox_env(home_dir, config_home, data_home, runtime_dir);
     let stdout_path = tmp_dir.join(format!("bmux-stdout-{}.log", args.join("-")));
     let stderr_path = tmp_dir.join(format!("bmux-stderr-{}.log", args.join("-")));
     let stdout = fs::File::create(&stdout_path).expect("stdout log should be created");
@@ -228,7 +261,15 @@ fn spawn_bmux(
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
         .args(args);
-    configure_bmux_env(&mut command, home_dir, config_home, data_home);
+    configure_bmux_env(
+        &mut command,
+        home_dir,
+        config_home,
+        data_home,
+        &paths.config_dir,
+        &paths.runtime_dir,
+        &paths.data_dir,
+    );
     (
         command.spawn().expect("bmux command should spawn"),
         stdout_path,
@@ -290,6 +331,7 @@ fn installs_example_plugin_and_runs_command() {
     let root = workspace_root();
     let (_sandbox, home_dir, config_home, data_home, runtime_dir, tmp_dir, config_dir) =
         sandbox_setup();
+    let paths = config_paths_for_test(&config_dir, &runtime_dir, &data_home);
 
     fs::write(
         config_dir.join("bmux.toml"),
@@ -299,10 +341,39 @@ fn installs_example_plugin_and_runs_command() {
 
     let mut install_command = Command::new(root.join("scripts/install-example-plugin.sh"));
     install_command.current_dir(&root).env("TMPDIR", &tmp_dir);
-    configure_bmux_env(&mut install_command, &home_dir, &config_home, &data_home);
+    configure_bmux_env(
+        &mut install_command,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &paths.config_dir,
+        &paths.runtime_dir,
+        &paths.data_dir,
+    );
     preserve_toolchain_env(&mut install_command);
     let install_status = install_command.status().expect("installer should run");
     assert!(install_status.success(), "installer should succeed");
+
+    let plugin_list_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &["plugin", "list", "--json"],
+    );
+    assert!(
+        plugin_list_output.status.success(),
+        "plugin list should succeed after install: stdout={} stderr={}",
+        String::from_utf8_lossy(&plugin_list_output.stdout),
+        String::from_utf8_lossy(&plugin_list_output.stderr)
+    );
+    let plugin_list = String::from_utf8_lossy(&plugin_list_output.stdout);
+    assert!(
+        plugin_list.contains("example.native") && plugin_list.contains("hello"),
+        "plugin list should include installed command metadata: {plugin_list}"
+    );
 
     let output = run_bmux(
         &root,
@@ -335,6 +406,7 @@ fn shipped_permissions_plugin_handles_permissions_command() {
     let root = workspace_root();
     let (sandbox, home_dir, config_home, data_home, runtime_dir, tmp_dir, config_dir) =
         sandbox_setup();
+    let paths = config_paths_for_test(&config_dir, &runtime_dir, &data_home);
 
     let mut build_command = Command::new("cargo");
     build_command
@@ -343,7 +415,15 @@ fn shipped_permissions_plugin_handles_permissions_command() {
         .arg("-p")
         .arg("bmux_permissions_plugin")
         .env("TMPDIR", &tmp_dir);
-    configure_bmux_env(&mut build_command, &home_dir, &config_home, &data_home);
+    configure_bmux_env(
+        &mut build_command,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &paths.config_dir,
+        &paths.runtime_dir,
+        &paths.data_dir,
+    );
     preserve_toolchain_env(&mut build_command);
     let build_status = build_command.status().expect("plugin build should run");
     assert!(
@@ -438,7 +518,6 @@ fn shipped_permissions_plugin_handles_permissions_command() {
         String::from_utf8_lossy(&permissions_output.stdout)
     );
 
-    let paths = config_paths_for_test(&config_dir, &runtime_dir, &data_home);
     let endpoint = test_endpoint(&paths);
     let (target_tx, target_rx) = std::sync::mpsc::channel();
     let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
@@ -611,6 +690,7 @@ fn shipped_windows_plugin_handles_window_commands() {
     let root = workspace_root();
     let (sandbox, home_dir, config_home, data_home, runtime_dir, tmp_dir, config_dir) =
         sandbox_setup();
+    let paths = config_paths_for_test(&config_dir, &runtime_dir, &data_home);
 
     let mut build_command = Command::new("cargo");
     build_command
@@ -619,7 +699,15 @@ fn shipped_windows_plugin_handles_window_commands() {
         .arg("-p")
         .arg("bmux_windows_plugin")
         .env("TMPDIR", &tmp_dir);
-    configure_bmux_env(&mut build_command, &home_dir, &config_home, &data_home);
+    configure_bmux_env(
+        &mut build_command,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &paths.config_dir,
+        &paths.runtime_dir,
+        &paths.data_dir,
+    );
     preserve_toolchain_env(&mut build_command);
     let build_status = build_command.status().expect("plugin build should run");
     assert!(

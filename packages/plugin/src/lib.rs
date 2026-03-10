@@ -40,12 +40,12 @@ pub use host::{
     FollowCommandService, FollowQueryService, FollowState, HostConnectionInfo, HostMetadata,
     PaneCommandService, PaneFocusDirection, PaneHandle, PaneLayoutNode, PaneQueryService, PaneRef,
     PaneSnapshot, PaneSplitDirection, PaneSummary, PermissionCommandService, PermissionEntry,
-    PermissionQueryService, PersistenceCommandService, PersistenceQueryService,
+    PermissionQueryService, PermissionsAccess, PersistenceCommandService, PersistenceQueryService,
     PersistenceRestorePreview, PersistenceRestoreResult, PersistenceStatus, PluginContext,
     PluginHost, PluginStorage, PrincipalIdentityInfo, RenderService, ServerStatusInfo,
     SessionCommandService, SessionHandle, SessionQueryService, SessionRef, SessionRoleValue,
     SessionSnapshot, SessionSummary, WindowCommandService, WindowHandle, WindowQueryService,
-    WindowRef, WindowSnapshot, WindowSummary,
+    WindowRef, WindowSnapshot, WindowSummary, WindowsAccess,
 };
 pub use loader::{
     LoadedPlugin, NativeCommandContext, NativeDescriptor, NativeLifecycleContext,

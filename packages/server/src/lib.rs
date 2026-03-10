@@ -7891,7 +7891,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn attach_io_routes_through_active_window() {
-        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let shell_path = write_test_shell_script(
+            "attach-window-routing",
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  eval \"$line\"\ndone\n",
+        );
+        let (server, endpoint, socket_path, server_task) =
+            start_server_with_shell(&shell_path).await;
         let mut client = connect_and_handshake(&endpoint).await;
 
         let created = send_request(
@@ -7990,7 +7995,7 @@ mod tests {
             306,
             Request::AttachInput {
                 session_id,
-                data: b"export BMUX_WINDOW_ROUTE=one\n".to_vec(),
+                data: b"export BMUX_WINDOW_ROUTE=one; printf '__bmux_route_one__\\n'\n".to_vec(),
             },
         )
         .await;
@@ -7998,7 +8003,8 @@ mod tests {
             export_primary,
             Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
         ));
-        let _ = collect_attach_output_until(&mut client, session_id, "one", 5).await;
+        let _ =
+            collect_attach_output_until(&mut client, session_id, "__bmux_route_one__", 20).await;
 
         let switched_secondary = send_request(
             &mut client,
@@ -8500,7 +8506,7 @@ mod tests {
             508,
             Request::AttachInput {
                 session_id: alpha_session,
-                data: b"export BMUX_FOLLOW_STREAM=ok\n".to_vec(),
+                data: b"export BMUX_FOLLOW_STREAM=ok; printf '__bmux_follow_ready__\\n'\n".to_vec(),
             },
         )
         .await;
@@ -8508,6 +8514,9 @@ mod tests {
             set_marker,
             Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
         ));
+        let _ =
+            collect_attach_output_until(&mut follower, alpha_session, "__bmux_follow_ready__", 20)
+                .await;
 
         let leader_attached_beta = send_request(
             &mut leader,
@@ -10384,8 +10393,9 @@ mod tests {
         socket_path: &std::path::Path,
     ) {
         server.request_shutdown();
-        server_task
+        tokio::time::timeout(Duration::from_secs(5), server_task)
             .await
+            .unwrap_or_else(|_| panic!("timed out waiting for server task shutdown"))
             .expect("server task should join")
             .expect("server should shut down cleanly");
         if socket_path.exists() {

@@ -22,7 +22,12 @@ Options:
 EOF
 }
 
-data_home() {
+data_root() {
+  if [[ -n "${BMUX_DATA_DIR:-}" ]]; then
+    printf '%s\n' "$BMUX_DATA_DIR"
+    return
+  fi
+
   if [[ -n "${XDG_DATA_HOME:-}" ]]; then
     printf '%s\n' "$XDG_DATA_HOME"
     return
@@ -81,7 +86,7 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-PLUGIN_ROOT="$(data_home)/bmux/plugins/${PLUGIN_DIR_NAME}"
+PLUGIN_ROOT="$(data_root)/plugins/${PLUGIN_DIR_NAME}"
 MANIFEST_PATH="${PLUGIN_ROOT}/plugin.toml"
 TARGET_DIR="${ROOT_DIR}/target/${BUILD_PROFILE}"
 LIB_PATH="${TARGET_DIR}/$(library_filename)"

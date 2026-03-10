@@ -154,27 +154,39 @@ fn stable_fnv1a64(bytes: &[u8]) -> u64 {
 
 impl Default for ConfigPaths {
     fn default() -> Self {
-        let config_dir = dirs::config_dir().map_or_else(
+        let config_dir = std::env::var_os("BMUX_CONFIG_DIR").map_or_else(
             || {
-                dirs::home_dir().map_or_else(
-                    || PathBuf::from(".bmux"),
-                    |d| d.join(".config").join("bmux"),
+                dirs::config_dir().map_or_else(
+                    || {
+                        dirs::home_dir().map_or_else(
+                            || PathBuf::from(".bmux"),
+                            |d| d.join(".config").join("bmux"),
+                        )
+                    },
+                    |d| d.join("bmux"),
                 )
             },
-            |d| d.join("bmux"),
+            PathBuf::from,
         );
 
-        let data_dir = dirs::data_dir().map_or_else(
+        let data_dir = std::env::var_os("BMUX_DATA_DIR").map_or_else(
             || {
-                dirs::home_dir().map_or_else(
-                    || PathBuf::from(".bmux"),
-                    |d| d.join(".local").join("share").join("bmux"),
+                dirs::data_dir().map_or_else(
+                    || {
+                        dirs::home_dir().map_or_else(
+                            || PathBuf::from(".bmux"),
+                            |d| d.join(".local").join("share").join("bmux"),
+                        )
+                    },
+                    |d| d.join("bmux"),
                 )
             },
-            |d| d.join("bmux"),
+            PathBuf::from,
         );
 
-        let runtime_dir = if cfg!(unix) {
+        let runtime_dir = if let Some(path) = std::env::var_os("BMUX_RUNTIME_DIR") {
+            PathBuf::from(path)
+        } else if cfg!(unix) {
             std::env::var("XDG_RUNTIME_DIR")
                 .map(PathBuf::from)
                 .map_or_else(|_| std::env::temp_dir().join("bmux"), |d| d.join("bmux"))
