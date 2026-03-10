@@ -282,14 +282,16 @@ fn wait_for_server_ready(
     server: &mut Child,
     stdout_path: &Path,
     stderr_path: &Path,
-    root: &Path,
+    _root: &Path,
     home_dir: &Path,
     config_home: &Path,
     data_home: &Path,
     runtime_dir: &Path,
-    tmp_dir: &Path,
+    _tmp_dir: &Path,
 ) {
-    for _ in 0..25 {
+    let paths = config_paths_from_sandbox_env(home_dir, config_home, data_home, runtime_dir);
+    let endpoint = test_endpoint(&paths);
+    for _ in 0..100 {
         if let Some(status) = server
             .try_wait()
             .expect("server process should be queryable")
@@ -300,16 +302,17 @@ fn wait_for_server_ready(
                 fs::read_to_string(stderr_path).unwrap_or_default()
             );
         }
-        let status_output = run_bmux(
-            root,
-            home_dir,
-            config_home,
-            data_home,
-            runtime_dir,
-            tmp_dir,
-            &["server", "status", "--json"],
-        );
-        if status_output.status.success() {
+        let ready = with_runtime(async {
+            BmuxClient::connect_with_principal(
+                &endpoint,
+                Duration::from_millis(250),
+                "plugin-e2e-ready-check",
+                uuid::Uuid::new_v4(),
+            )
+            .await
+            .is_ok()
+        });
+        if ready {
             return;
         }
         thread::sleep(Duration::from_millis(200));

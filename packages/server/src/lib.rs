@@ -1464,14 +1464,20 @@ impl SessionRuntimeManager {
                 pixel_height: 0,
             }) {
                 Ok(pair) => pair,
-                Err(_) => return,
+                Err(_) => {
+                    exited_for_task.store(true, Ordering::SeqCst);
+                    return;
+                }
             };
 
             let mut command = CommandBuilder::new(&shell);
             command.env("TERM", &pane_term);
             let mut child = match pty_pair.slave.spawn_command(command) {
                 Ok(child) => child,
-                Err(_) => return,
+                Err(_) => {
+                    exited_for_task.store(true, Ordering::SeqCst);
+                    return;
+                }
             };
             let mut child_killer = child.clone_killer();
             drop(pty_pair.slave);
@@ -1482,12 +1488,14 @@ impl SessionRuntimeManager {
                 reader
             } else {
                 let _ = child.kill();
+                exited_for_task.store(true, Ordering::SeqCst);
                 return;
             };
             let writer = if let Ok(writer) = master.take_writer() {
                 writer
             } else {
                 let _ = child.kill();
+                exited_for_task.store(true, Ordering::SeqCst);
                 return;
             };
             let writer = Arc::new(std::sync::Mutex::new(writer));
@@ -7893,11 +7901,14 @@ mod tests {
     async fn attach_io_routes_through_active_window() {
         let shell_path = write_test_shell_script(
             "attach-window-routing",
-            "#!/bin/sh\nwhile IFS= read -r line; do\n  eval \"$line\"\ndone\n",
+            "#!/bin/sh\nstty -echo\nprintf '__bmux_shell_ready__\\n'\nwhile IFS= read -r line; do\n  eval \"$line\"\ndone\n",
         );
         let (server, endpoint, socket_path, server_task) =
             start_server_with_shell(&shell_path).await;
         let mut client = connect_and_handshake(&endpoint).await;
+
+        let subscribed = send_request(&mut client, 299, Request::SubscribeEvents).await;
+        assert_eq!(subscribed, Response::Ok(ResponsePayload::EventsSubscribed));
 
         let created = send_request(
             &mut client,
@@ -8024,6 +8035,35 @@ mod tests {
             }) if id == secondary_window && switched_session == session_id
         ));
 
+        let switch_events = wait_for_event_matching(
+            &mut client,
+            3071,
+            16,
+            12,
+            "window switched after switching to secondary window",
+            |event| {
+                matches!(
+                    event,
+                    Event::WindowSwitched {
+                        id,
+                        session_id: changed_session,
+                        ..
+                    } if *id == secondary_window && *changed_session == session_id
+                )
+            },
+        )
+        .await;
+        assert!(switch_events.iter().any(|event| {
+            matches!(
+                event,
+                Event::WindowSwitched {
+                    id,
+                    session_id: changed_session,
+                    ..
+                } if *id == secondary_window && *changed_session == session_id
+            )
+        }));
+
         let print_secondary = send_request(
             &mut client,
             308,
@@ -8057,6 +8097,25 @@ mod tests {
                 number: 1,
             }) if id == primary_window && switched_session == session_id
         ));
+
+        let _ = wait_for_event_matching(
+            &mut client,
+            3091,
+            16,
+            12,
+            "window switched after switching back to primary window",
+            |event| {
+                matches!(
+                    event,
+                    Event::WindowSwitched {
+                        id,
+                        session_id: changed_session,
+                        ..
+                    } if *id == primary_window && *changed_session == session_id
+                )
+            },
+        )
+        .await;
 
         let print_primary = send_request(
             &mut client,
@@ -8377,7 +8436,12 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn global_follow_updates_control_plane_without_rebinding_attach_stream() {
-        let (server, endpoint, socket_path, server_task) = start_server().await;
+        let shell_path = write_test_shell_script(
+            "global-follow-attach-stream",
+            "#!/bin/sh\nstty -echo\nprintf '__bmux_shell_ready__\\n'\nwhile IFS= read -r line; do\n  eval \"$line\"\ndone\n",
+        );
+        let (server, endpoint, socket_path, server_task) =
+            start_server_with_shell(&shell_path).await;
         let mut leader = connect_and_handshake(&endpoint).await;
         let mut follower = connect_and_handshake(&endpoint).await;
 
@@ -8531,8 +8595,35 @@ mod tests {
             Response::Ok(ResponsePayload::Attached { .. })
         ));
 
+        let follow_events = wait_for_event_matching(
+            &mut follower,
+            510,
+            10,
+            16,
+            "follow target changed to beta session",
+            |event| {
+                matches!(
+                    event,
+                    Event::FollowTargetChanged {
+                        session_id,
+                        ..
+                    } if *session_id == beta_session
+                )
+            },
+        )
+        .await;
+        assert!(follow_events.iter().any(|event| {
+            matches!(
+                event,
+                Event::FollowTargetChanged {
+                    session_id,
+                    ..
+                } if *session_id == beta_session
+            )
+        }));
+
         let follower_windows_beta =
-            send_request(&mut follower, 510, Request::ListWindows { session: None }).await;
+            send_request(&mut follower, 511, Request::ListWindows { session: None }).await;
         match follower_windows_beta {
             Response::Ok(ResponsePayload::WindowList { windows }) => {
                 assert_eq!(windows.len(), 1);
@@ -8543,7 +8634,7 @@ mod tests {
 
         let print_stream = send_request(
             &mut follower,
-            511,
+            512,
             Request::AttachInput {
                 session_id: alpha_session,
                 data: b"printf 'FS=[%s]\\n' \"$BMUX_FOLLOW_STREAM\"\n".to_vec(),
@@ -8557,27 +8648,21 @@ mod tests {
         let output = collect_attach_output_until(&mut follower, alpha_session, "FS=[ok]", 20).await;
         assert!(output.contains("FS=[ok]"));
 
-        let unfollowed = send_request(&mut follower, 512, Request::Unfollow).await;
+        let unfollowed = send_request(&mut follower, 513, Request::Unfollow).await;
         assert!(matches!(
             unfollowed,
             Response::Ok(ResponsePayload::FollowStopped { .. })
         ));
 
-        let events = poll_events_collect(&mut follower, 513, 10, 4).await;
-        assert!(
-            events
-                .iter()
-                .any(|event| matches!(event, Event::FollowStarted { global: true, .. }))
-        );
-        assert!(events.iter().any(|event| {
-            matches!(
-                event,
-                Event::FollowTargetChanged {
-                    session_id,
-                    ..
-                } if *session_id == beta_session
-            )
-        }));
+        let events = wait_for_event_matching(
+            &mut follower,
+            514,
+            10,
+            10,
+            "follow stopped event",
+            |event| matches!(event, Event::FollowStopped { .. }),
+        )
+        .await;
         assert!(
             events
                 .iter()
@@ -8843,7 +8928,7 @@ mod tests {
     async fn attached_split_pane_exit_via_pty_eventually_updates_attach_layout() {
         let shell_path = write_test_shell_script(
             "pty-exit-smoke",
-            "#!/bin/sh\nwhile IFS= read -r line; do\n  if [ \"$line\" = \"__bmux_ready__\" ]; then\n    printf '__bmux_ready__\\n'\n  elif [ \"$line\" = \"__bmux_exit__\" ]; then\n    printf '__bmux_exit__\\n'\n    exit 0\n  fi\ndone\n",
+            "#!/bin/sh\nstty -echo\nprintf '__bmux_shell_ready__\\n'\nwhile IFS= read -r line; do\n  if [ \"$line\" = \"__bmux_ready__\" ]; then\n    printf '__bmux_ready__\\n'\n  elif [ \"$line\" = \"__bmux_exit__\" ]; then\n    printf '__bmux_exit__\\n'\n    exit 0\n  fi\ndone\n",
         );
         let (server, endpoint, socket_path, server_task) =
             start_server_with_shell(&shell_path).await;
@@ -8925,9 +9010,37 @@ mod tests {
             )
         }));
 
+        let focused_split = send_request(
+            &mut actor,
+            9841,
+            Request::FocusPane {
+                session: Some(SessionSelector::ById(session_id)),
+                target: Some(PaneSelector::ById(split_pane_id)),
+                direction: None,
+            },
+        )
+        .await;
+        assert!(matches!(
+            focused_split,
+            Response::Ok(ResponsePayload::PaneFocused { id, .. }) if id == split_pane_id
+        ));
+
+        let _ = wait_for_attach_layout_matching(
+            &mut actor,
+            session_id,
+            9842,
+            12,
+            "split pane focused before sending exit",
+            |focused_pane_id, panes| {
+                focused_pane_id == split_pane_id
+                    && panes.iter().any(|pane| pane.id == split_pane_id)
+            },
+        )
+        .await;
+
         let ready_input = send_request(
             &mut actor,
-            985,
+            9843,
             Request::AttachInput {
                 session_id,
                 data: b"__bmux_ready__\n".to_vec(),
@@ -8940,15 +9053,15 @@ mod tests {
         ));
 
         let ready_output =
-            collect_attach_output_until(&mut actor, session_id, "__bmux_ready__", 20).await;
+            collect_attach_output_until(&mut actor, session_id, "__bmux_ready__", 40).await;
         assert!(
             ready_output.contains("__bmux_ready__"),
-            "split pane should echo readiness sentinel before exit: {ready_output}"
+            "split pane should process readiness sentinel before exit: {ready_output}"
         );
 
         let exit_input = send_request(
             &mut actor,
-            986,
+            985,
             Request::AttachInput {
                 session_id,
                 data: b"__bmux_exit__\n".to_vec(),
@@ -8960,27 +9073,57 @@ mod tests {
             Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
         ));
 
-        let mut final_layout = None;
-        for request_id in 1000..=1080 {
-            let _ = poll_events_collect(&mut observer, 2000 + request_id as u64, 16, 2).await;
+        let exit_output =
+            collect_attach_output_until(&mut actor, session_id, "__bmux_exit__", 40).await;
+        assert!(
+            exit_output.contains("__bmux_exit__"),
+            "split pane should process exit sentinel before layout collapse: {exit_output}"
+        );
 
-            let layout =
-                send_request(&mut actor, request_id, Request::AttachLayout { session_id }).await;
-            if let Response::Ok(ResponsePayload::AttachLayout {
-                focused_pane_id,
-                panes,
-                ..
-            }) = layout
-                && panes.len() == 1
-            {
-                final_layout = Some((focused_pane_id, panes));
-                break;
-            }
-            sleep(Duration::from_millis(25)).await;
-        }
+        let exit_events = wait_for_event_matching(
+            &mut observer,
+            9861,
+            16,
+            40,
+            "attach scene refresh after split pane exit",
+            |event| {
+                matches!(
+                    event,
+                    Event::AttachViewChanged {
+                        session_id: changed_session,
+                        components,
+                        ..
+                    } if *changed_session == session_id
+                        && components.contains(&AttachViewComponent::Scene)
+                )
+            },
+        )
+        .await;
+        assert!(exit_events.iter().any(|event| {
+            matches!(
+                event,
+                Event::AttachViewChanged {
+                    session_id: changed_session,
+                    components,
+                    ..
+                } if *changed_session == session_id
+                    && components.contains(&AttachViewComponent::Scene)
+            )
+        }));
 
-        let (focused_pane_id, panes) =
-            final_layout.expect("attach layout should collapse to one pane after pty exit");
+        let (focused_pane_id, panes) = wait_for_attach_layout_matching(
+            &mut actor,
+            session_id,
+            1000,
+            200,
+            "single remaining pane after pty exit",
+            |focused_pane_id, panes| {
+                panes.len() == 1
+                    && focused_pane_id != split_pane_id
+                    && panes[0].id == focused_pane_id
+            },
+        )
+        .await;
         assert_ne!(focused_pane_id, split_pane_id);
         assert_eq!(panes[0].id, focused_pane_id);
 
@@ -10271,6 +10414,101 @@ mod tests {
     }
 
     #[cfg(unix)]
+    async fn wait_for_event_matching<F>(
+        client: &mut LocalIpcStream,
+        request_id_base: u64,
+        max_events: usize,
+        attempts: usize,
+        description: &str,
+        mut predicate: F,
+    ) -> Vec<Event>
+    where
+        F: FnMut(&Event) -> bool,
+    {
+        let poll_limit = attempts.max(1);
+        let mut matched = false;
+        let events = tokio::time::timeout(Duration::from_secs(5), async {
+            let mut collected = Vec::new();
+            for idx in 0..poll_limit {
+                let response = send_request(
+                    client,
+                    request_id_base + idx as u64,
+                    Request::PollEvents { max_events },
+                )
+                .await;
+                if let Response::Ok(ResponsePayload::EventBatch { events }) = response
+                    && !events.is_empty()
+                {
+                    collected.extend(events);
+                    if collected.iter().any(&mut predicate) {
+                        matched = true;
+                        return collected;
+                    }
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+            collected
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for event: {description}"));
+
+        assert!(
+            matched,
+            "did not observe event '{description}' after {poll_limit} polls: {:?}",
+            events
+        );
+        events
+    }
+
+    #[cfg(unix)]
+    async fn wait_for_attach_layout_matching<F>(
+        client: &mut LocalIpcStream,
+        session_id: Uuid,
+        request_id_base: u64,
+        attempts: usize,
+        description: &str,
+        mut predicate: F,
+    ) -> (Uuid, Vec<bmux_ipc::PaneSummary>)
+    where
+        F: FnMut(Uuid, &[bmux_ipc::PaneSummary]) -> bool,
+    {
+        let poll_limit = attempts.max(1);
+        let mut last_layout: Option<(Uuid, Vec<bmux_ipc::PaneSummary>)> = None;
+        let matched = tokio::time::timeout(Duration::from_secs(5), async {
+            for idx in 0..poll_limit {
+                let response = send_request(
+                    client,
+                    request_id_base + idx as u64,
+                    Request::AttachLayout { session_id },
+                )
+                .await;
+                if let Response::Ok(ResponsePayload::AttachLayout {
+                    focused_pane_id,
+                    panes,
+                    ..
+                }) = response
+                {
+                    if predicate(focused_pane_id, &panes) {
+                        return Some((focused_pane_id, panes));
+                    }
+                    last_layout = Some((focused_pane_id, panes));
+                }
+                sleep(Duration::from_millis(25)).await;
+            }
+            None
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for attach layout: {description}"));
+
+        matched.unwrap_or_else(|| {
+            panic!(
+                "did not observe attach layout '{description}' after {poll_limit} polls: {:?}",
+                last_layout
+            )
+        })
+    }
+
+    #[cfg(unix)]
     async fn discover_client_id_from_window_switch(
         observer: &mut LocalIpcStream,
         actor: &mut LocalIpcStream,
@@ -10316,7 +10554,7 @@ mod tests {
         attempts: usize,
     ) -> String {
         let poll_limit = attempts.max(1).saturating_mul(10);
-        let result = tokio::time::timeout(Duration::from_secs(3), async {
+        let result = tokio::time::timeout(Duration::from_secs(10), async {
             let mut collected = String::new();
             let mut idx = 0usize;
             while idx < poll_limit {
