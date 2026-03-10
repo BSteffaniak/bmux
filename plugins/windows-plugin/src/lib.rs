@@ -12,6 +12,7 @@ use bmux_plugin::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use uuid::Uuid;
 
 #[derive(Default)]
 struct WindowsPlugin;
@@ -111,6 +112,10 @@ impl RustPlugin for WindowsPlugin {
             context.request.operation.as_str(),
         ) {
             ("window-query/v1", "list") => run_window_query_service(&context),
+            ("window-command/v1", "new") => run_window_command_service(&context),
+            ("window-command/v1", "switch") => run_window_command_service(&context),
+            ("window-command/v1", "kill") => run_window_command_service(&context),
+            ("window-command/v1", "kill_all") => run_window_command_service(&context),
             _ => ServiceResponse::error(
                 "unsupported_service_operation",
                 format!(
@@ -132,6 +137,52 @@ struct ListWindowsRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ListWindowsResponse {
     windows: Vec<WindowSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NewWindowRequest {
+    session: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NewWindowResponse {
+    window: WindowSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SwitchWindowRequest {
+    session: Option<String>,
+    target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SwitchWindowResponse {
+    window: WindowSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct KillWindowRequest {
+    session: Option<String>,
+    target: String,
+    force_local: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct KillWindowResponse {
+    window_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct KillAllWindowsRequest {
+    session: Option<String>,
+    force_local: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct KillAllWindowsResponse {
+    killed_count: usize,
+    failed_count: usize,
 }
 
 fn run_window_query_service(context: &NativeServiceContext) -> ServiceResponse {
@@ -177,6 +228,189 @@ async fn async_list_windows_service(
             Err(error) => ServiceResponse::error("encode_error", error.to_string()),
         },
         Err(error) => ServiceResponse::error("list_failed", error.to_string()),
+    }
+}
+
+fn run_window_command_service(context: &NativeServiceContext) -> ServiceResponse {
+    let paths = ConfigPaths::new(
+        context.connection.config_dir.clone().into(),
+        context.connection.runtime_dir.clone().into(),
+        context.connection.data_dir.clone().into(),
+    );
+
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(async_window_command_service(
+                &paths,
+                context.request.operation.as_str(),
+                &context.request.payload,
+            ))
+        }),
+        Err(_) => match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(async_window_command_service(
+                &paths,
+                context.request.operation.as_str(),
+                &context.request.payload,
+            )),
+            Err(error) => ServiceResponse::error("runtime_error", error.to_string()),
+        },
+    }
+}
+
+async fn async_window_command_service(
+    paths: &ConfigPaths,
+    operation: &str,
+    payload: &[u8],
+) -> ServiceResponse {
+    match operation {
+        "new" => {
+            let request = match decode_service_message::<NewWindowRequest>(payload) {
+                Ok(request) => request,
+                Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+            };
+            let selector = request.session.as_deref().map(parse_session_selector);
+            let mut client = match connect_client(paths).await {
+                Ok(client) => client,
+                Err(code) => {
+                    return ServiceResponse::error(
+                        "connect_failed",
+                        format!("client error code {code}"),
+                    );
+                }
+            };
+            let window_id = match client.new_window(selector.clone(), request.name).await {
+                Ok(window_id) => window_id,
+                Err(error) => return ServiceResponse::error("new_failed", error.to_string()),
+            };
+            match resolve_window_summary_by_id(&mut client, selector, window_id).await {
+                Ok(Some(window)) => match encode_service_message(&NewWindowResponse { window }) {
+                    Ok(payload) => ServiceResponse::ok(payload),
+                    Err(error) => ServiceResponse::error("encode_error", error.to_string()),
+                },
+                Ok(None) => ServiceResponse::error(
+                    "window_missing",
+                    "created window missing from list response",
+                ),
+                Err(error) => ServiceResponse::error("resolve_failed", error.to_string()),
+            }
+        }
+        "switch" => {
+            let request = match decode_service_message::<SwitchWindowRequest>(payload) {
+                Ok(request) => request,
+                Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+            };
+            let selector = request.session.as_deref().map(parse_session_selector);
+            let mut client = match connect_client(paths).await {
+                Ok(client) => client,
+                Err(code) => {
+                    return ServiceResponse::error(
+                        "connect_failed",
+                        format!("client error code {code}"),
+                    );
+                }
+            };
+            let window_id = match client
+                .switch_window(selector.clone(), parse_window_selector(&request.target))
+                .await
+            {
+                Ok(window_id) => window_id,
+                Err(error) => return ServiceResponse::error("switch_failed", error.to_string()),
+            };
+            match resolve_window_summary_by_id(&mut client, selector, window_id).await {
+                Ok(Some(window)) => {
+                    match encode_service_message(&SwitchWindowResponse { window }) {
+                        Ok(payload) => ServiceResponse::ok(payload),
+                        Err(error) => ServiceResponse::error("encode_error", error.to_string()),
+                    }
+                }
+                Ok(None) => ServiceResponse::error(
+                    "window_missing",
+                    "active window missing from list response",
+                ),
+                Err(error) => ServiceResponse::error("resolve_failed", error.to_string()),
+            }
+        }
+        "kill" => {
+            let request = match decode_service_message::<KillWindowRequest>(payload) {
+                Ok(request) => request,
+                Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+            };
+            let selector = request.session.as_deref().map(parse_session_selector);
+            let mut client = match connect_client(paths).await {
+                Ok(client) => client,
+                Err(code) => {
+                    return ServiceResponse::error(
+                        "connect_failed",
+                        format!("client error code {code}"),
+                    );
+                }
+            };
+            match client
+                .kill_window_with_options(
+                    selector,
+                    parse_window_selector(&request.target),
+                    request.force_local,
+                )
+                .await
+            {
+                Ok(window_id) => match encode_service_message(&KillWindowResponse { window_id }) {
+                    Ok(payload) => ServiceResponse::ok(payload),
+                    Err(error) => ServiceResponse::error("encode_error", error.to_string()),
+                },
+                Err(error) => ServiceResponse::error("kill_failed", error.to_string()),
+            }
+        }
+        "kill_all" => {
+            let request = match decode_service_message::<KillAllWindowsRequest>(payload) {
+                Ok(request) => request,
+                Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
+            };
+            let selector = request.session.as_deref().map(parse_session_selector);
+            let mut client = match connect_client(paths).await {
+                Ok(client) => client,
+                Err(code) => {
+                    return ServiceResponse::error(
+                        "connect_failed",
+                        format!("client error code {code}"),
+                    );
+                }
+            };
+            let windows = match client.list_windows(selector.clone()).await {
+                Ok(windows) => windows,
+                Err(error) => {
+                    return ServiceResponse::error("list_failed", error.to_string());
+                }
+            };
+            let mut killed_count = 0usize;
+            let mut failed_count = 0usize;
+            for window in windows {
+                match client
+                    .kill_window_with_options(
+                        selector.clone(),
+                        WindowSelector::ById(window.id),
+                        request.force_local,
+                    )
+                    .await
+                {
+                    Ok(_) => killed_count = killed_count.saturating_add(1),
+                    Err(_) => failed_count = failed_count.saturating_add(1),
+                }
+            }
+            match encode_service_message(&KillAllWindowsResponse {
+                killed_count,
+                failed_count,
+            }) {
+                Ok(payload) => ServiceResponse::ok(payload),
+                Err(error) => ServiceResponse::error("encode_error", error.to_string()),
+            }
+        }
+        _ => ServiceResponse::error(
+            "unsupported_service_operation",
+            format!("unsupported windows command operation '{operation}'"),
+        ),
     }
 }
 

@@ -35,6 +35,7 @@ impl RustPlugin for ExamplePlugin {
                 HostScope::new("bmux.config.read").expect("host scope should parse"),
                 HostScope::new("bmux.permissions.read").expect("host scope should parse"),
                 HostScope::new("bmux.windows.read").expect("host scope should parse"),
+                HostScope::new("bmux.windows.write").expect("host scope should parse"),
             ]),
             provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::from([
@@ -78,6 +79,22 @@ impl RustPlugin for ExamplePlugin {
                 .execution(CommandExecutionKind::ProviderExec)
                 .expose_in_cli(true),
                 PluginCommand::new(
+                    "windows-new",
+                    "Create a session window through bmux provider service",
+                )
+                .argument(
+                    PluginCommandArgument::positional("session", PluginCommandArgumentKind::String)
+                        .required(true)
+                        .summary("Session name or UUID"),
+                )
+                .argument(
+                    PluginCommandArgument::option("name", PluginCommandArgumentKind::String)
+                        .short('n')
+                        .summary("Optional window name"),
+                )
+                .execution(CommandExecutionKind::ProviderExec)
+                .expose_in_cli(true),
+                PluginCommand::new(
                     "settings-show",
                     "Show plugin settings through bmux config service",
                 )
@@ -114,6 +131,7 @@ impl RustPlugin for ExamplePlugin {
         match context.command.as_str() {
             "permissions-list" => run_permissions_list(&context),
             "windows-list" => run_windows_list(&context),
+            "windows-new" => run_windows_new(&context),
             "settings-show" => run_settings_show(&context),
             "hello" => {
                 if context.arguments.is_empty() {
@@ -222,6 +240,51 @@ fn run_windows_list(context: &NativeCommandContext) -> i32 {
     0
 }
 
+fn run_windows_new(context: &NativeCommandContext) -> i32 {
+    let mut args = context.arguments.iter();
+    let Some(session) = args.next() else {
+        eprintln!("example.native windows-new requires a session name or UUID");
+        return 64;
+    };
+    let mut name = None;
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--name" | "-n" => name = args.next().cloned(),
+            other => {
+                eprintln!("example.native windows-new does not accept argument '{other}'");
+                return 64;
+            }
+        }
+    }
+
+    let response = match context.call_service::<NewWindowRequest, NewWindowResponse>(
+        "bmux.windows.write",
+        ServiceKind::Command,
+        "window-command/v1",
+        "new",
+        &NewWindowRequest {
+            session: Some(session.to_string()),
+            name,
+        },
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("example.native: failed creating window through service: {error}");
+            return 1;
+        }
+    };
+
+    println!(
+        "created window: {} {}",
+        response.window.id,
+        response
+            .window
+            .name
+            .unwrap_or_else(|| format!("#{}", response.window.number))
+    );
+    0
+}
+
 fn run_settings_show(context: &NativeCommandContext) -> i32 {
     let response = match context.call_service::<PluginSettingsRequest, PluginSettingsResponse>(
         "bmux.config.read",
@@ -272,6 +335,17 @@ struct ListWindowsResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NewWindowRequest {
+    session: Option<String>,
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct NewWindowResponse {
+    window: bmux_ipc::WindowSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PluginSettingsRequest {
     plugin_id: String,
 }
@@ -303,6 +377,6 @@ mod tests {
         let reparsed = bmux_plugin::NativeDescriptor::from_toml_str(&serialized)
             .expect("descriptor should parse");
         assert_eq!(reparsed.id, "example.native");
-        assert_eq!(reparsed.commands.len(), 4);
+        assert_eq!(reparsed.commands.len(), 5);
     }
 }

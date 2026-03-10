@@ -8,6 +8,7 @@ required_capabilities = [
     "bmux.events.subscribe",
     "bmux.permissions.read",
     "bmux.windows.read",
+    "bmux.windows.write",
 ]
 runtime = "native"
 version = "0.0.1-alpha.0"
@@ -55,6 +56,28 @@ position   = 0
 required   = true
 summary    = "Session name or UUID"
 value_name = "SESSION"
+
+[[commands]]
+execution     = "provider_exec"
+expose_in_cli = true
+name          = "windows-new"
+summary       = "Create a session window through bmux provider service"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "session"
+position   = 0
+required   = true
+summary    = "Session name or UUID"
+value_name = "SESSION"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "name"
+name       = "name"
+short      = "n"
+summary    = "Optional window name"
+value_name = "NAME"
 
 [[commands]]
 execution     = "provider_exec"

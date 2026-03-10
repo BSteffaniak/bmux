@@ -487,6 +487,27 @@ fn installs_example_plugin_and_runs_command() {
         String::from_utf8_lossy(&permissions_output.stdout)
     );
 
+    let create_window_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &["windows-new", "demo", "--name", "editor"],
+    );
+    assert!(
+        create_window_output.status.success(),
+        "service-backed window create should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&create_window_output.stdout),
+        String::from_utf8_lossy(&create_window_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&create_window_output.stdout).contains("created window:"),
+        "service-backed create output should be present: {}",
+        String::from_utf8_lossy(&create_window_output.stdout)
+    );
+
     let windows_output = run_bmux(
         &root,
         &home_dir,
@@ -503,7 +524,8 @@ fn installs_example_plugin_and_runs_command() {
         String::from_utf8_lossy(&windows_output.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&windows_output.stdout).contains("example.native windows:"),
+        String::from_utf8_lossy(&windows_output.stdout).contains("example.native windows:")
+            && String::from_utf8_lossy(&windows_output.stdout).contains("editor"),
         "service-backed windows output should be present: {}",
         String::from_utf8_lossy(&windows_output.stdout)
     );

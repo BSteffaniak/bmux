@@ -112,7 +112,7 @@ name = "Example Native Plugin"
 version = "0.0.1-alpha.0"
 runtime = "native"
 entry = "${LIB_PATH}"
-required_capabilities = ["bmux.commands", "bmux.config.read", "bmux.events.subscribe", "bmux.permissions.read", "bmux.windows.read"]
+required_capabilities = ["bmux.commands", "bmux.config.read", "bmux.events.subscribe", "bmux.permissions.read", "bmux.windows.read", "bmux.windows.write"]
 provided_features = ["example.native"]
 
 [[dependencies]]
@@ -166,6 +166,28 @@ position = 0
 required = true
 summary = "Session name or UUID"
 value_name = "SESSION"
+
+[[commands]]
+name = "windows-new"
+summary = "Create a session window through bmux provider service"
+execution = "provider_exec"
+expose_in_cli = true
+
+[[commands.arguments]]
+name = "session"
+kind = "string"
+position = 0
+required = true
+summary = "Session name or UUID"
+value_name = "SESSION"
+
+[[commands.arguments]]
+name = "name"
+kind = "string"
+long = "name"
+short = "n"
+summary = "Optional window name"
+value_name = "NAME"
 
 [[commands]]
 name = "settings-show"
