@@ -5430,7 +5430,7 @@ mod tests {
                 plugin_manifest_with_commands(
                     "bmux.permissions",
                     "permissions.dylib",
-                    "[[commands]]\nname='permissions'\npath=['permissions']\naliases=[[\"session\",\"permissions\"]]\nsummary='list'\nexecution='host_callback'\nexpose_in_cli=true\n[[commands.arguments]]\nname='session'\nkind='string'\nlong='session'\nrequired=true\n",
+                    "[[commands]]\nname='permissions'\npath=['permissions']\naliases=[[\"session\",\"permissions\"]]\nsummary='list'\nexecution='provider_exec'\nexpose_in_cli=true\n[[commands.arguments]]\nname='session'\nkind='string'\nlong='session'\nrequired=true\n",
                 ),
             )
             .expect("plugin should register");

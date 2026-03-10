@@ -19,7 +19,7 @@ kind         = "command"
 
 [[commands]]
 aliases       = [["session", "permissions"]]
-execution     = "host_callback"
+execution     = "provider_exec"
 expose_in_cli = true
 name          = "permissions"
 path          = ["permissions"]
@@ -47,7 +47,7 @@ short = "w"
 
 [[commands]]
 aliases       = [["session", "grant"]]
-execution     = "host_callback"
+execution     = "provider_exec"
 expose_in_cli = true
 name          = "grant"
 path          = ["grant"]
@@ -80,7 +80,7 @@ values     = ["owner", "writer", "observer"]
 
 [[commands]]
 aliases       = [["session", "revoke"]]
-execution     = "host_callback"
+execution     = "provider_exec"
 expose_in_cli = true
 name          = "revoke"
 path          = ["revoke"]

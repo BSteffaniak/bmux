@@ -277,7 +277,7 @@ mod tests {
                     summary: "run".to_string(),
                     description: None,
                     arguments: Vec::new(),
-                    execution: CommandExecutionKind::HostCallback,
+                    execution: CommandExecutionKind::ProviderExec,
                     expose_in_cli: true,
                 },
                 PluginCommand {
@@ -287,7 +287,7 @@ mod tests {
                     summary: "again".to_string(),
                     description: None,
                     arguments: Vec::new(),
-                    execution: CommandExecutionKind::HostCallback,
+                    execution: CommandExecutionKind::ProviderExec,
                     expose_in_cli: true,
                 },
             ],

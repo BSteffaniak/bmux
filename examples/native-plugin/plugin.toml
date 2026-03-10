@@ -7,7 +7,7 @@ runtime               = "native"
 version               = "0.0.1-alpha.0"
 
 [[commands]]
-execution     = "host_callback"
+execution     = "provider_exec"
 expose_in_cli = true
 name          = "hello"
 summary       = "Print a hello message"
@@ -23,7 +23,7 @@ trailing_var_arg    = true
 value_name          = "MESSAGE"
 
 [[commands]]
-execution     = "host_callback"
+execution     = "provider_exec"
 expose_in_cli = true
 name          = "permissions-list"
 summary       = "List session permissions through bmux host IPC"

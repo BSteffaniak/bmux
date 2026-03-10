@@ -453,7 +453,7 @@ name = "permissions"
 path = ["acl", "list"]
 aliases = [["acl", "permissions"]]
 summary = "list"
-execution = "host_callback"
+execution = "provider_exec"
 
 [plugin_api]
 minimum = "1.0"
@@ -496,7 +496,7 @@ name = "permissions"
 path = ["permissions"]
 aliases = [["session", "permissions"]]
 summary = "list"
-execution = "host_callback"
+execution = "provider_exec"
 expose_in_cli = true
 
 [[commands]]
@@ -504,7 +504,7 @@ name = "grant"
 path = ["grant"]
 aliases = [["session", "grant"]]
 summary = "grant"
-execution = "host_callback"
+execution = "provider_exec"
 expose_in_cli = true
 
 [plugin_api]
@@ -542,7 +542,7 @@ name = "new-window"
 path = ["new-window"]
 aliases = [["window", "new"]]
 summary = "new"
-execution = "host_callback"
+execution = "provider_exec"
 expose_in_cli = true
 
 [[commands]]
@@ -550,7 +550,7 @@ name = "switch-window"
 path = ["switch-window"]
 aliases = [["window", "switch"]]
 summary = "switch"
-execution = "host_callback"
+execution = "provider_exec"
 expose_in_cli = true
 
 [plugin_api]
@@ -587,7 +587,7 @@ required_capabilities = ["bmux.commands"]
 name = "new-session"
 path = ["new-session"]
 summary = "new"
-execution = "host_callback"
+execution = "provider_exec"
 expose_in_cli = true
 
 [plugin_api]
@@ -627,7 +627,7 @@ name = "new-window"
 path = ["new-window"]
 aliases = [["window", "new"]]
 summary = "new"
-execution = "host_callback"
+execution = "provider_exec"
 expose_in_cli = true
 
 [plugin_api]
@@ -675,7 +675,7 @@ name = "permissions"
 path = ["permissions"]
 aliases = [["session", "permissions"]]
 summary = "list"
-execution = "host_callback"
+execution = "provider_exec"
 expose_in_cli = true
 
 [plugin_api]

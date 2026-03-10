@@ -69,7 +69,7 @@ impl RustPlugin for PermissionsPlugin {
                 )
                 .argument(PluginCommandArgument::flag("json").short('j'))
                 .argument(PluginCommandArgument::flag("watch").short('w'))
-                .execution(CommandExecutionKind::HostCallback)
+                .execution(CommandExecutionKind::ProviderExec)
                 .expose_in_cli(true),
                 PluginCommand::new("grant", "Grant a role to a client in a session")
                     .path(["grant"])
@@ -90,7 +90,7 @@ impl RustPlugin for PermissionsPlugin {
                             .short('r')
                             .choice_values(["owner", "writer", "observer"]),
                     )
-                    .execution(CommandExecutionKind::HostCallback)
+                    .execution(CommandExecutionKind::ProviderExec)
                     .expose_in_cli(true),
                 PluginCommand::new(
                     "revoke",
@@ -108,7 +108,7 @@ impl RustPlugin for PermissionsPlugin {
                         .required(true)
                         .short('c'),
                 )
-                .execution(CommandExecutionKind::HostCallback)
+                .execution(CommandExecutionKind::ProviderExec)
                 .expose_in_cli(true),
             ],
             event_subscriptions: Vec::new(),

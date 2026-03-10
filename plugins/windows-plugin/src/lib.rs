@@ -110,7 +110,7 @@ bmux_plugin::export_plugin!(WindowsPlugin);
 fn plugin_command(name: &str, summary: &str, aliases: Vec<Vec<String>>) -> PluginCommand {
     let mut command = PluginCommand::new(name, summary)
         .path([name])
-        .execution(CommandExecutionKind::HostCallback)
+        .execution(CommandExecutionKind::ProviderExec)
         .expose_in_cli(true);
     for alias in aliases {
         command = command.alias(alias);

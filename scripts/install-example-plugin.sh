@@ -118,7 +118,7 @@ provided_features = ["example.native"]
 [[commands]]
 name = "hello"
 summary = "Print a hello message"
-execution = "host_callback"
+execution = "provider_exec"
 expose_in_cli = true
 
 [[commands.arguments]]
@@ -134,7 +134,7 @@ value_name = "MESSAGE"
 [[commands]]
 name = "permissions-list"
 summary = "List session permissions through bmux host IPC"
-execution = "host_callback"
+execution = "provider_exec"
 expose_in_cli = true
 
 [[commands.arguments]]

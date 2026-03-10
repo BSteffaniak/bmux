@@ -52,7 +52,7 @@ impl RustPlugin for ExamplePlugin {
                         .allow_hyphen_values(true)
                         .summary("Optional greeting target"),
                     )
-                    .execution(CommandExecutionKind::HostCallback)
+                    .execution(CommandExecutionKind::ProviderExec)
                     .expose_in_cli(true),
                 PluginCommand::new(
                     "permissions-list",
@@ -63,7 +63,7 @@ impl RustPlugin for ExamplePlugin {
                         .required(true)
                         .summary("Session name or UUID"),
                 )
-                .execution(CommandExecutionKind::HostCallback)
+                .execution(CommandExecutionKind::ProviderExec)
                 .expose_in_cli(true),
             ],
             event_subscriptions: vec![PluginEventSubscription {

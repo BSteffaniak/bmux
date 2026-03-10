@@ -556,7 +556,7 @@ mod tests {
         "[[commands]]\n",
         "name = \"hello\"\n",
         "summary = \"hello\"\n",
-        "execution = \"host_callback\"\n\n",
+        "execution = \"provider_exec\"\n\n",
         "[plugin_api]\n",
         "minimum = \"1.0\"\n\n",
         "[native_abi]\n",
@@ -634,7 +634,7 @@ required_capabilities = ["bmux.commands"]
 [[commands]]
 name = "hello"
 summary = "hello"
-execution = "host_callback"
+execution = "provider_exec"
 
 [plugin_api]
 minimum = "1.0"

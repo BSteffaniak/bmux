@@ -19,7 +19,7 @@ kind         = "command"
 
 [[commands]]
 aliases       = [["window", "new"]]
-execution     = "host_callback"
+execution     = "provider_exec"
 expose_in_cli = true
 name          = "new-window"
 path          = ["new-window"]
@@ -41,7 +41,7 @@ value_name = "NAME"
 
 [[commands]]
 aliases       = [["window", "list"]]
-execution     = "host_callback"
+execution     = "provider_exec"
 expose_in_cli = true
 name          = "list-windows"
 path          = ["list-windows"]
@@ -62,7 +62,7 @@ short = "j"
 
 [[commands]]
 aliases       = [["window", "kill"]]
-execution     = "host_callback"
+execution     = "provider_exec"
 expose_in_cli = true
 name          = "kill-window"
 path          = ["kill-window"]
@@ -89,7 +89,7 @@ name = "force-local"
 
 [[commands]]
 aliases       = [["window", "kill-all"]]
-execution     = "host_callback"
+execution     = "provider_exec"
 expose_in_cli = true
 name          = "kill-all-windows"
 path          = ["kill-all-windows"]
@@ -109,7 +109,7 @@ name = "force-local"
 
 [[commands]]
 aliases       = [["window", "switch"]]
-execution     = "host_callback"
+execution     = "provider_exec"
 expose_in_cli = true
 name          = "switch-window"
 path          = ["switch-window"]

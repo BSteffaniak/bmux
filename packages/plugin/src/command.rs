@@ -4,7 +4,7 @@ use std::collections::BTreeSet;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CommandExecutionKind {
-    HostCallback,
+    ProviderExec,
     BackgroundTask,
     RuntimeHook,
 }
@@ -64,7 +64,7 @@ pub enum PluginCommandArgumentKind {
 }
 
 const fn default_execution_kind() -> CommandExecutionKind {
-    CommandExecutionKind::HostCallback
+    CommandExecutionKind::ProviderExec
 }
 
 const fn default_expose_in_cli() -> bool {

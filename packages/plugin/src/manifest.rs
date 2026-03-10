@@ -192,7 +192,7 @@ required_capabilities = ["bmux.commands", "bmux.events.subscribe"]
 [[commands]]
 name = "hello"
 summary = "hello"
-execution = "host_callback"
+execution = "provider_exec"
 
 [[event_subscriptions]]
 kinds = ["system"]
