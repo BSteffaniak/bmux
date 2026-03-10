@@ -255,7 +255,7 @@ fn call_service_raw(
             operation: "call_service",
         })?;
 
-    if service.provider_plugin_id == "core" {
+    if matches!(service.provider, crate::ServiceProviderId::Host) {
         return handle_core_service_call(service, operation, payload, plugin_settings_map);
     }
 
@@ -264,13 +264,18 @@ fn call_service_raw(
         .map(PathBuf::from)
         .collect::<Vec<_>>();
     let registry = discover_registered_plugins_in_roots(&search_roots)?;
-    let registered = registry.get(&service.provider_plugin_id).ok_or_else(|| {
-        PluginError::MissingServiceProvider {
-            provider_plugin_id: service.provider_plugin_id.clone(),
-            capability: service.capability.as_str().to_string(),
-            interface_id: service.interface_id.clone(),
-        }
-    })?;
+    let provider_plugin_id = match &service.provider {
+        crate::ServiceProviderId::Plugin(plugin_id) => plugin_id.clone(),
+        crate::ServiceProviderId::Host => unreachable!("host services should be handled earlier"),
+    };
+    let registered =
+        registry
+            .get(&provider_plugin_id)
+            .ok_or_else(|| PluginError::MissingServiceProvider {
+                provider_plugin_id: provider_plugin_id.clone(),
+                capability: service.capability.as_str().to_string(),
+                interface_id: service.interface_id.clone(),
+            })?;
 
     let available_capability_map = available_capabilities
         .iter()
@@ -319,7 +324,7 @@ fn call_service_raw(
 
     if let Some(error) = response.error {
         return Err(PluginError::ServiceInvocationFailed {
-            provider_plugin_id: service.provider_plugin_id,
+            provider_plugin_id: service.provider.to_string(),
             capability: service.capability.as_str().to_string(),
             interface_id: service.interface_id,
             operation: operation.to_string(),
@@ -1157,7 +1162,7 @@ minimum = "1.0"
                     .expect("capability should parse"),
                 kind: crate::ServiceKind::Query,
                 interface_id: "permission-query/v1".to_string(),
-                provider_plugin_id: "bmux.permissions".to_string(),
+                provider: crate::ServiceProviderId::Plugin("bmux.permissions".to_string()),
             }],
             available_capabilities: vec!["bmux.permissions.read".to_string()],
             enabled_plugins: vec!["bmux.permissions".to_string()],
@@ -1249,7 +1254,7 @@ minimum = "1.0"
                     .expect("capability should parse"),
                 kind: crate::ServiceKind::Query,
                 interface_id: "config-query/v1".to_string(),
-                provider_plugin_id: "core".to_string(),
+                provider: crate::ServiceProviderId::Host,
             }],
             available_capabilities: vec!["bmux.config.read".to_string()],
             enabled_plugins: Vec::new(),
@@ -1287,6 +1292,55 @@ minimum = "1.0"
             response.settings.get("greeting"),
             Some(&"\"hello\"".to_string())
         );
+    }
+
+    #[test]
+    fn native_service_context_roundtrips_through_service_envelope() {
+        let context = NativeServiceContext {
+            plugin_id: "bmux.permissions".to_string(),
+            request: crate::ServiceRequest {
+                caller_plugin_id: "example.native".to_string(),
+                service: crate::RegisteredService {
+                    capability: crate::HostScope::new("bmux.permissions.read")
+                        .expect("capability should parse"),
+                    kind: crate::ServiceKind::Query,
+                    interface_id: "permission-query/v1".to_string(),
+                    provider: crate::ServiceProviderId::Plugin("bmux.permissions".to_string()),
+                },
+                operation: "list".to_string(),
+                payload: vec![1, 2, 3],
+            },
+            required_capabilities: vec!["bmux.permissions.read".to_string()],
+            provided_capabilities: vec!["bmux.permissions.read".to_string()],
+            services: Vec::new(),
+            available_capabilities: vec!["bmux.permissions.read".to_string()],
+            enabled_plugins: vec!["bmux.permissions".to_string()],
+            plugin_search_roots: vec!["/plugins".to_string()],
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: crate::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+            },
+            settings: BTreeMap::from([("mode".to_string(), "\"service\"".to_string())]),
+            plugin_settings_map: BTreeMap::from([(
+                "example.native".to_string(),
+                BTreeMap::from([("mode".to_string(), "\"service\"".to_string())]),
+            )]),
+        };
+
+        let bytes = encode_service_envelope(7, ServiceEnvelopeKind::Request, &context)
+            .expect("context should encode");
+        let (request_id, decoded): (u64, NativeServiceContext) =
+            decode_service_envelope(&bytes, ServiceEnvelopeKind::Request)
+                .expect("context should decode");
+        assert_eq!(request_id, 7);
+        assert_eq!(decoded, context);
     }
 
     #[test]

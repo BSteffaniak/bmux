@@ -352,15 +352,17 @@ impl PluginRegistry {
                     capability: service.capability.clone(),
                     kind: service.kind,
                     interface_id: service.interface_id.clone(),
-                    provider_plugin_id: plugin.declaration.id.as_str().to_string(),
+                    provider: crate::ServiceProviderId::Plugin(
+                        plugin.declaration.id.as_str().to_string(),
+                    ),
                 };
                 if let Some(existing) = providers.get(&registered.key()) {
                     return Err(PluginError::DuplicateServiceProvider {
                         capability: registered.capability.as_str().to_string(),
                         kind: registered.kind,
                         interface_id: registered.interface_id.clone(),
-                        first_provider: existing.service.provider_plugin_id.clone(),
-                        second_provider: registered.provider_plugin_id.clone(),
+                        first_provider: existing.service.provider.to_string(),
+                        second_provider: registered.provider.to_string(),
                     });
                 }
                 providers.insert(

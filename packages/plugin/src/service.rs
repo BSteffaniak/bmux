@@ -1,5 +1,6 @@
 use crate::{HostScope, PluginError, Result};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::fmt;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -30,11 +31,33 @@ impl PluginService {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ServiceProviderId {
+    Plugin(String),
+    Host,
+}
+
+impl ServiceProviderId {
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        match self {
+            Self::Plugin(plugin_id) => plugin_id.as_str(),
+            Self::Host => "host",
+        }
+    }
+}
+
+impl fmt::Display for ServiceProviderId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.display_name())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RegisteredService {
     pub capability: HostScope,
     pub kind: ServiceKind,
     pub interface_id: String,
-    pub provider_plugin_id: String,
+    pub provider: ServiceProviderId,
 }
 
 impl RegisteredService {
@@ -202,8 +225,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        RegisteredService, ServiceEnvelopeKind, ServiceKind, ServiceRequest, ServiceResponse,
-        decode_service_envelope, decode_service_message, encode_service_envelope,
+        RegisteredService, ServiceEnvelopeKind, ServiceKind, ServiceProviderId, ServiceRequest,
+        ServiceResponse, decode_service_envelope, decode_service_message, encode_service_envelope,
         encode_service_message,
     };
     use crate::HostScope;
@@ -226,7 +249,7 @@ mod tests {
                     .expect("capability should parse"),
                 kind: ServiceKind::Query,
                 interface_id: "permission-query/v1".to_string(),
-                provider_plugin_id: "bmux.permissions".to_string(),
+                provider: ServiceProviderId::Plugin("bmux.permissions".to_string()),
             },
             operation: "list".to_string(),
             payload: vec![4, 5, 6],
