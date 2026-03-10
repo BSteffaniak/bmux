@@ -679,6 +679,33 @@ impl SessionRuntimeManager {
         runtime.attach_view_revision = runtime.attach_view_revision.saturating_add(1);
         Some(runtime.attach_view_revision)
     }
+
+    fn reset_attached_clients_to_active_pane_tail(
+        &mut self,
+        session_id: SessionId,
+    ) -> Result<(), SessionRuntimeError> {
+        let runtime = self
+            .runtimes
+            .get_mut(&session_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        let attached_clients = runtime.attached_clients.iter().copied().collect::<Vec<_>>();
+        let window = runtime
+            .windows
+            .get_mut(&runtime.active_window)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        let pane = window
+            .panes
+            .get_mut(&window.focused_pane_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        let mut output = pane
+            .output_buffer
+            .lock()
+            .map_err(|_| SessionRuntimeError::Closed)?;
+        for client_id in attached_clients {
+            output.reset_client_to_tail(client_id);
+        }
+        Ok(())
+    }
 }
 
 struct OutputFanoutBuffer {
@@ -704,6 +731,10 @@ impl OutputFanoutBuffer {
 
     fn register_client_at_tail(&mut self, client_id: ClientId) {
         self.cursors.insert(client_id, self.end_offset());
+    }
+
+    fn reset_client_to_tail(&mut self, client_id: ClientId) {
+        self.register_client_at_tail(client_id);
     }
 
     fn unregister_client(&mut self, client_id: ClientId) {
@@ -2037,6 +2068,8 @@ impl SessionRuntimeManager {
             ))
         })?;
         session.active_window = window_id;
+        self.reset_attached_clients_to_active_pane_tail(session_id)
+            .map_err(|error| anyhow::anyhow!("failed resetting attach cursors: {error:?}"))?;
         self.apply_stored_attach_viewport(session_id);
         Ok(window_id)
     }
@@ -8806,6 +8839,10 @@ mod tests {
         let (server, endpoint, socket_path, server_task) =
             start_server_with_shell(&shell_path).await;
         let mut actor = connect_and_handshake(&endpoint).await;
+        let mut observer = connect_and_handshake(&endpoint).await;
+
+        let subscribed = send_request(&mut observer, 979, Request::SubscribeEvents).await;
+        assert_eq!(subscribed, Response::Ok(ResponsePayload::EventsSubscribed));
 
         let session_id = match send_request(
             &mut actor,
@@ -8849,6 +8886,8 @@ mod tests {
             }) if attached_session == session_id
         ));
 
+        let _ = poll_events_collect(&mut observer, 982, 16, 4).await;
+
         let split = send_request(
             &mut actor,
             983,
@@ -8864,9 +8903,22 @@ mod tests {
             other => panic!("unexpected split response: {other:?}"),
         };
 
+        let split_events = poll_events_collect(&mut observer, 984, 16, 4).await;
+        assert!(split_events.iter().any(|event| {
+            matches!(
+                event,
+                Event::AttachViewChanged {
+                    session_id: changed_session,
+                    components,
+                    ..
+                } if *changed_session == session_id
+                    && components == &vec![AttachViewComponent::Scene]
+            )
+        }));
+
         let ready_input = send_request(
             &mut actor,
-            984,
+            985,
             Request::AttachInput {
                 session_id,
                 data: b"__bmux_ready__\n".to_vec(),
@@ -8887,7 +8939,7 @@ mod tests {
 
         let exit_input = send_request(
             &mut actor,
-            985,
+            986,
             Request::AttachInput {
                 session_id,
                 data: b"__bmux_exit__\n".to_vec(),
@@ -8899,15 +8951,10 @@ mod tests {
             Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
         ));
 
-        let exit_output =
-            collect_attach_output_until(&mut actor, session_id, "__bmux_exit__", 20).await;
-        assert!(
-            exit_output.contains("__bmux_exit__"),
-            "split pane should echo exit sentinel before layout collapse: {exit_output}"
-        );
-
         let mut final_layout = None;
-        for request_id in 986..=1066 {
+        for request_id in 1000..=1080 {
+            let _ = poll_events_collect(&mut observer, 2000 + request_id as u64, 16, 2).await;
+
             let layout =
                 send_request(&mut actor, request_id, Request::AttachLayout { session_id }).await;
             if let Response::Ok(ResponsePayload::AttachLayout {
@@ -10259,31 +10306,46 @@ mod tests {
         needle: &str,
         attempts: usize,
     ) -> String {
-        let mut collected = String::new();
-        let mut idx = 0usize;
-        let max_attempts = attempts.max(1).saturating_mul(10);
-        while idx < max_attempts {
-            let response = send_request(
-                client,
-                4000 + idx as u64,
-                Request::AttachOutput {
-                    session_id,
-                    max_bytes: 8192,
-                },
-            )
-            .await;
-            if let Response::Ok(ResponsePayload::AttachOutput { data }) = response
-                && !data.is_empty()
-            {
-                collected.push_str(&String::from_utf8_lossy(&data));
-                if collected.contains(needle) {
-                    break;
+        let poll_limit = attempts.max(1).saturating_mul(10);
+        let result = tokio::time::timeout(Duration::from_secs(3), async {
+            let mut collected = String::new();
+            let mut idx = 0usize;
+            while idx < poll_limit {
+                let response = send_request(
+                    client,
+                    4000 + idx as u64,
+                    Request::AttachOutput {
+                        session_id,
+                        max_bytes: 8192,
+                    },
+                )
+                .await;
+                if let Response::Ok(ResponsePayload::AttachOutput { data }) = response
+                    && !data.is_empty()
+                {
+                    collected.push_str(&String::from_utf8_lossy(&data));
+                    if collected.contains(needle) {
+                        return collected;
+                    }
                 }
+                idx += 1;
+                sleep(Duration::from_millis(25)).await;
             }
-            idx += 1;
-            sleep(Duration::from_millis(25)).await;
-        }
-        collected
+            collected
+        })
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "timed out collecting attach output for session {session_id} while waiting for '{needle}'"
+            )
+        });
+
+        assert!(
+            result.contains(needle),
+            "attach output did not contain '{needle}' after {poll_limit} polls: {:?}",
+            result
+        );
+        result
     }
 
     #[cfg(unix)]

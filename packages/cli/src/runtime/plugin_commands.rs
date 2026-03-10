@@ -574,6 +574,45 @@ minimum = "1.0"
     }
 
     #[test]
+    fn plugin_cannot_claim_current_static_core_command_path() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "example.plugin"
+name = "Example"
+version = "0.1.0"
+entry = "plugin.dylib"
+required_host_scopes = ["bmux.commands"]
+
+[[commands]]
+name = "new-session"
+path = ["new-session"]
+summary = "new"
+execution = "host_callback"
+expose_in_cli = true
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+        )
+        .expect("manifest should parse");
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest_from_root(
+                Path::new("/plugins"),
+                Path::new("/plugins/plugin.toml"),
+                manifest,
+            )
+            .expect("manifest should register");
+
+        let error = PluginCommandRegistry::build(&config_with_enabled("example.plugin"), &registry)
+            .expect_err("plugin should not shadow active static core command path");
+        assert!(error.to_string().contains("new-session"));
+    }
+
+    #[test]
     fn augment_clap_command_creates_missing_namespace_roots() {
         let manifest = PluginManifest::from_toml_str(
             r#"
