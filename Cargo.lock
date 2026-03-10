@@ -150,6 +150,7 @@ dependencies = [
  "bmux_config",
  "bmux_ipc",
  "bmux_plugin",
+ "serde",
  "serde_json",
  "tokio",
  "uuid",
@@ -181,6 +182,7 @@ dependencies = [
  "bmux_config",
  "bmux_ipc",
  "bmux_plugin",
+ "serde",
  "serde_json",
  "tokio",
  "uuid",
@@ -191,6 +193,7 @@ name = "bmux_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "libloading",
+ "postcard",
  "semver",
  "serde",
  "serde_json",

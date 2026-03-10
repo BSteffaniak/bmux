@@ -1,21 +1,29 @@
 use crate::{
-    DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_COMMAND_SYMBOL,
+    CapabilityProvider, DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_COMMAND_SYMBOL,
     DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
-    DEFAULT_NATIVE_EVENT_SYMBOL, HostConnectionInfo, HostMetadata, HostScope, PluginDeclaration,
-    PluginEntrypoint, PluginError, PluginEvent, PluginFeature, PluginLifecycle,
-    PluginManifestCompatibility, PluginRegistry, PluginService, RegisteredPlugin, Result,
+    DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL, HostConnectionInfo, HostMetadata,
+    HostScope, PluginDeclaration, PluginEntrypoint, PluginError, PluginEvent, PluginFeature,
+    PluginLifecycle, PluginManifestCompatibility, PluginRegistry, PluginService, RegisteredPlugin,
+    RegisteredService, Result, ServiceEnvelopeKind, ServiceKind, ServiceRequest, ServiceResponse,
+    decode_service_envelope, decode_service_message, discover_registered_plugins_in_roots,
+    encode_service_envelope, encode_service_message,
 };
 use libloading::{Library, Symbol};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, c_char};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 type NativeDescriptorFn = unsafe extern "C" fn() -> *const c_char;
 type NativeRunCommandFn = unsafe extern "C" fn(*const c_char, usize, *const *const c_char) -> i32;
 type NativeRunCommandWithContextFn = unsafe extern "C" fn(*const c_char) -> i32;
 type NativeLifecycleFn = unsafe extern "C" fn(*const c_char) -> i32;
 type NativeEventFn = unsafe extern "C" fn(*const c_char) -> i32;
+type NativeInvokeServiceFn =
+    unsafe extern "C" fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32;
+
+const NATIVE_SERVICE_STATUS_OK: i32 = 0;
+const NATIVE_SERVICE_STATUS_BUFFER_TOO_SMALL: i32 = 4;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeLifecycleContext {
@@ -26,10 +34,18 @@ pub struct NativeLifecycleContext {
     pub provided_capabilities: Vec<String>,
     #[serde(default)]
     pub services: Vec<crate::RegisteredService>,
+    #[serde(default)]
+    pub available_capabilities: Vec<String>,
+    #[serde(default)]
+    pub enabled_plugins: Vec<String>,
+    #[serde(default)]
+    pub plugin_search_roots: Vec<String>,
     pub host: HostMetadata,
     pub connection: HostConnectionInfo,
     #[serde(default)]
     pub settings: Option<toml::Value>,
+    #[serde(default)]
+    pub plugin_settings_map: BTreeMap<String, toml::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -43,10 +59,261 @@ pub struct NativeCommandContext {
     pub provided_capabilities: Vec<String>,
     #[serde(default)]
     pub services: Vec<crate::RegisteredService>,
+    #[serde(default)]
+    pub available_capabilities: Vec<String>,
+    #[serde(default)]
+    pub enabled_plugins: Vec<String>,
+    #[serde(default)]
+    pub plugin_search_roots: Vec<String>,
     pub host: HostMetadata,
     pub connection: HostConnectionInfo,
     #[serde(default)]
     pub settings: Option<toml::Value>,
+    #[serde(default)]
+    pub plugin_settings_map: BTreeMap<String, toml::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct NativeServiceContext {
+    pub plugin_id: String,
+    pub request: ServiceRequest,
+    #[serde(default)]
+    pub required_capabilities: Vec<String>,
+    #[serde(default)]
+    pub provided_capabilities: Vec<String>,
+    #[serde(default)]
+    pub services: Vec<RegisteredService>,
+    #[serde(default)]
+    pub available_capabilities: Vec<String>,
+    #[serde(default)]
+    pub enabled_plugins: Vec<String>,
+    #[serde(default)]
+    pub plugin_search_roots: Vec<String>,
+    pub host: HostMetadata,
+    pub connection: HostConnectionInfo,
+    #[serde(default)]
+    pub settings: Option<toml::Value>,
+    #[serde(default)]
+    pub plugin_settings_map: BTreeMap<String, toml::Value>,
+}
+
+impl NativeCommandContext {
+    pub fn call_service_raw(
+        &self,
+        capability: &str,
+        kind: ServiceKind,
+        interface_id: &str,
+        operation: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        call_service_raw(
+            &self.plugin_id,
+            &self.required_capabilities,
+            &self.provided_capabilities,
+            &self.services,
+            &self.available_capabilities,
+            &self.enabled_plugins,
+            &self.plugin_search_roots,
+            &self.host,
+            &self.connection,
+            &self.plugin_settings_map,
+            capability,
+            kind,
+            interface_id,
+            operation,
+            payload,
+        )
+    }
+
+    pub fn call_service<Request, Response>(
+        &self,
+        capability: &str,
+        kind: ServiceKind,
+        interface_id: &str,
+        operation: &str,
+        request: &Request,
+    ) -> Result<Response>
+    where
+        Request: Serialize,
+        Response: DeserializeOwned,
+    {
+        let payload = encode_service_message(request)?;
+        let response = self.call_service_raw(capability, kind, interface_id, operation, payload)?;
+        decode_service_message(&response)
+    }
+}
+
+impl NativeLifecycleContext {
+    pub fn call_service_raw(
+        &self,
+        capability: &str,
+        kind: ServiceKind,
+        interface_id: &str,
+        operation: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        call_service_raw(
+            &self.plugin_id,
+            &self.required_capabilities,
+            &self.provided_capabilities,
+            &self.services,
+            &self.available_capabilities,
+            &self.enabled_plugins,
+            &self.plugin_search_roots,
+            &self.host,
+            &self.connection,
+            &self.plugin_settings_map,
+            capability,
+            kind,
+            interface_id,
+            operation,
+            payload,
+        )
+    }
+}
+
+impl NativeServiceContext {
+    pub fn call_service_raw(
+        &self,
+        capability: &str,
+        kind: ServiceKind,
+        interface_id: &str,
+        operation: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        call_service_raw(
+            &self.plugin_id,
+            &self.required_capabilities,
+            &self.provided_capabilities,
+            &self.services,
+            &self.available_capabilities,
+            &self.enabled_plugins,
+            &self.plugin_search_roots,
+            &self.host,
+            &self.connection,
+            &self.plugin_settings_map,
+            capability,
+            kind,
+            interface_id,
+            operation,
+            payload,
+        )
+    }
+}
+
+fn call_service_raw(
+    caller_plugin_id: &str,
+    required_capabilities: &[String],
+    provided_capabilities: &[String],
+    services: &[RegisteredService],
+    available_capabilities: &[String],
+    enabled_plugins: &[String],
+    plugin_search_roots: &[String],
+    host: &HostMetadata,
+    connection: &HostConnectionInfo,
+    plugin_settings_map: &BTreeMap<String, toml::Value>,
+    capability: &str,
+    kind: ServiceKind,
+    interface_id: &str,
+    operation: &str,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>> {
+    let capability = HostScope::new(capability)?;
+    let allowed = required_capabilities
+        .iter()
+        .chain(provided_capabilities.iter())
+        .filter_map(|value| HostScope::new(value).ok())
+        .any(|entry| entry == capability);
+    if !allowed {
+        return Err(PluginError::CapabilityAccessDenied {
+            plugin_id: caller_plugin_id.to_string(),
+            capability: capability.as_str().to_string(),
+            operation: "call_service",
+        });
+    }
+
+    let service = services
+        .iter()
+        .find(|service| {
+            service.capability == capability
+                && service.kind == kind
+                && service.interface_id == interface_id
+        })
+        .cloned()
+        .ok_or_else(|| PluginError::UnsupportedHostOperation {
+            operation: "call_service",
+        })?;
+
+    let search_roots = plugin_search_roots
+        .iter()
+        .map(PathBuf::from)
+        .collect::<Vec<_>>();
+    let registry = discover_registered_plugins_in_roots(&search_roots)?;
+    let registered = registry.get(&service.provider_plugin_id).ok_or_else(|| {
+        PluginError::MissingServiceProvider {
+            provider_plugin_id: service.provider_plugin_id.clone(),
+            capability: service.capability.as_str().to_string(),
+            interface_id: service.interface_id.clone(),
+        }
+    })?;
+
+    let available_capability_map = available_capabilities
+        .iter()
+        .filter_map(|value| HostScope::new(value).ok())
+        .map(|capability| {
+            let provider = CapabilityProvider {
+                capability: capability.clone(),
+                provider_plugin_id: "available".to_string(),
+            };
+            (capability, provider)
+        })
+        .collect::<BTreeMap<_, _>>();
+
+    let loaded = load_registered_plugin(registered, host, &available_capability_map)?;
+    let response = loaded.invoke_service(&NativeServiceContext {
+        plugin_id: registered.declaration.id.as_str().to_string(),
+        request: ServiceRequest {
+            caller_plugin_id: caller_plugin_id.to_string(),
+            service: service.clone(),
+            operation: operation.to_string(),
+            payload,
+        },
+        required_capabilities: registered
+            .declaration
+            .required_capabilities
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        provided_capabilities: registered
+            .declaration
+            .provided_capabilities
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        services: services.to_vec(),
+        available_capabilities: available_capabilities.to_vec(),
+        enabled_plugins: enabled_plugins.to_vec(),
+        plugin_search_roots: plugin_search_roots.to_vec(),
+        host: host.clone(),
+        connection: connection.clone(),
+        settings: plugin_settings_map
+            .get(registered.declaration.id.as_str())
+            .cloned(),
+        plugin_settings_map: plugin_settings_map.clone(),
+    })?;
+
+    if let Some(error) = response.error {
+        return Err(PluginError::ServiceInvocationFailed {
+            provider_plugin_id: service.provider_plugin_id,
+            capability: service.capability.as_str().to_string(),
+            interface_id: service.interface_id,
+            operation: operation.to_string(),
+            code: error.code,
+            message: error.message,
+        });
+    }
+
+    Ok(response.payload)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,6 +558,68 @@ impl LoadedPlugin {
             )?;
 
         Ok(Some(unsafe { event_symbol(payload.as_ptr()) }))
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the service symbol cannot be loaded, the service
+    /// payload cannot be encoded, or the plugin returns invalid transport data.
+    pub fn invoke_service(&self, context: &NativeServiceContext) -> Result<ServiceResponse> {
+        let payload = encode_service_envelope(0, ServiceEnvelopeKind::Request, context)?;
+        let service_symbol: Symbol<'_, NativeInvokeServiceFn> =
+            unsafe { self._library.get(DEFAULT_NATIVE_SERVICE_SYMBOL.as_bytes()) }.map_err(
+                |error| PluginError::NativeServiceSymbol {
+                    plugin_id: self.declaration.id.as_str().to_string(),
+                    symbol: DEFAULT_NATIVE_SERVICE_SYMBOL.to_string(),
+                    details: error.to_string(),
+                },
+            )?;
+
+        let mut output = vec![0_u8; 4096];
+        let mut output_len = 0_usize;
+        let mut status = unsafe {
+            service_symbol(
+                payload.as_ptr(),
+                payload.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &mut output_len,
+            )
+        };
+        if status == NATIVE_SERVICE_STATUS_BUFFER_TOO_SMALL {
+            output.resize(output_len.max(output.len() * 2), 0);
+            status = unsafe {
+                service_symbol(
+                    payload.as_ptr(),
+                    payload.len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                    &mut output_len,
+                )
+            };
+        }
+
+        if status != NATIVE_SERVICE_STATUS_OK {
+            return Err(PluginError::NativeServiceInvocation {
+                plugin_id: self.declaration.id.as_str().to_string(),
+                status,
+            });
+        }
+
+        if output_len > output.len() {
+            return Err(PluginError::InvalidNativeServiceOutput {
+                plugin_id: self.declaration.id.as_str().to_string(),
+                details: format!(
+                    "service returned {output_len} bytes into {} byte buffer",
+                    output.len(),
+                ),
+            });
+        }
+        output.truncate(output_len);
+
+        let (_, response) =
+            decode_service_envelope::<ServiceResponse>(&output, ServiceEnvelopeKind::Response)?;
+        Ok(response)
     }
 
     fn run_lifecycle_symbol(&self, symbol: &str, context: &NativeLifecycleContext) -> Result<i32> {
@@ -539,14 +868,16 @@ fn ensure_match(
 
 #[cfg(test)]
 mod tests {
-    use super::{LoadedPlugin, NativeDescriptor, NativeLifecycleContext};
+    use super::{LoadedPlugin, NativeDescriptor, NativeLifecycleContext, NativeServiceContext};
     use crate::{
         ApiVersion, DEFAULT_NATIVE_ENTRY_SYMBOL, HostMetadata, PluginEntrypoint, PluginEvent,
         PluginEventKind, PluginEventSubscription, PluginManifest, PluginRegistry,
+        ServiceEnvelopeKind, ServiceResponse, decode_service_envelope, encode_service_envelope,
     };
     use libloading::Library;
-    use std::collections::BTreeSet;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::c_char;
+    use std::ptr;
 
     const TEST_DESCRIPTOR_TEXT: &str = concat!(
         "id = \"test.plugin\"\n",
@@ -567,6 +898,33 @@ mod tests {
     #[unsafe(no_mangle)]
     extern "C" fn bmux_plugin_entry_v1() -> *const c_char {
         TEST_DESCRIPTOR_TEXT.as_ptr().cast()
+    }
+
+    #[unsafe(no_mangle)]
+    extern "C" fn bmux_plugin_invoke_service_v1(
+        input_ptr: *const u8,
+        input_len: usize,
+        output_ptr: *mut u8,
+        output_capacity: usize,
+        output_len: *mut usize,
+    ) -> i32 {
+        let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+        let (request_id, context) =
+            decode_service_envelope::<NativeServiceContext>(input, ServiceEnvelopeKind::Request)
+                .expect("service request should decode");
+        let response = ServiceResponse::ok(context.request.payload);
+        let encoded = encode_service_envelope(request_id, ServiceEnvelopeKind::Response, &response)
+            .expect("service response should encode");
+        unsafe {
+            *output_len = encoded.len();
+        }
+        if output_ptr.is_null() || encoded.len() > output_capacity {
+            return 4;
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+        }
+        0
     }
 
     #[test]
@@ -684,6 +1042,9 @@ minimum = "1.0"
             required_capabilities: Vec::new(),
             provided_capabilities: Vec::new(),
             services: Vec::new(),
+            available_capabilities: Vec::new(),
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
             host: HostMetadata {
                 product_name: "bmux".to_string(),
                 product_version: "0.1.0".to_string(),
@@ -696,12 +1057,97 @@ minimum = "1.0"
                 data_dir: "/data".to_string(),
             },
             settings: Some(toml::Value::String("enabled".to_string())),
+            plugin_settings_map: BTreeMap::new(),
         };
 
         let json = serde_json::to_string(&context).expect("context should serialize");
         assert!(json.contains("test.plugin"));
         assert!(json.contains("bmux"));
         assert!(json.contains("enabled"));
+    }
+
+    #[test]
+    fn command_context_call_service_rejects_missing_capability() {
+        let context = super::NativeCommandContext {
+            plugin_id: "caller.plugin".to_string(),
+            command: "hello".to_string(),
+            arguments: Vec::new(),
+            required_capabilities: Vec::new(),
+            provided_capabilities: Vec::new(),
+            services: vec![crate::RegisteredService {
+                capability: crate::HostScope::new("bmux.permissions.read")
+                    .expect("capability should parse"),
+                kind: crate::ServiceKind::Query,
+                interface_id: "permission-query/v1".to_string(),
+                provider_plugin_id: "bmux.permissions".to_string(),
+            }],
+            available_capabilities: vec!["bmux.permissions.read".to_string()],
+            enabled_plugins: vec!["bmux.permissions".to_string()],
+            plugin_search_roots: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: crate::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+        };
+
+        let error = context
+            .call_service_raw(
+                "bmux.permissions.read",
+                crate::ServiceKind::Query,
+                "permission-query/v1",
+                "list",
+                Vec::new(),
+            )
+            .expect_err("missing capability should fail");
+        assert!(error.to_string().contains("bmux.permissions.read"));
+    }
+
+    #[test]
+    fn command_context_call_service_rejects_missing_registration() {
+        let context = super::NativeCommandContext {
+            plugin_id: "caller.plugin".to_string(),
+            command: "hello".to_string(),
+            arguments: Vec::new(),
+            required_capabilities: vec!["bmux.permissions.read".to_string()],
+            provided_capabilities: Vec::new(),
+            services: Vec::new(),
+            available_capabilities: vec!["bmux.permissions.read".to_string()],
+            enabled_plugins: vec!["bmux.permissions".to_string()],
+            plugin_search_roots: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: crate::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+        };
+
+        let error = context
+            .call_service_raw(
+                "bmux.permissions.read",
+                crate::ServiceKind::Query,
+                "permission-query/v1",
+                "list",
+                Vec::new(),
+            )
+            .expect_err("missing service registration should fail");
+        assert!(error.to_string().contains("call_service"));
     }
 
     #[test]

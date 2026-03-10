@@ -1,6 +1,18 @@
-use crate::{NativeCommandContext, NativeDescriptor, NativeLifecycleContext, PluginEvent};
+use crate::{
+    NativeCommandContext, NativeDescriptor, NativeLifecycleContext, NativeServiceContext,
+    PluginEvent, ServiceEnvelopeKind, ServiceResponse, decode_service_envelope,
+    encode_service_envelope,
+};
 use std::ffi::{CStr, CString, c_char};
+use std::ptr;
 use std::sync::{Mutex, OnceLock};
+
+const SERVICE_STATUS_OK: i32 = 0;
+const SERVICE_STATUS_INVALID_ARGUMENT: i32 = 2;
+const SERVICE_STATUS_DECODE_FAILED: i32 = 3;
+const SERVICE_STATUS_BUFFER_TOO_SMALL: i32 = 4;
+const SERVICE_STATUS_ENCODE_FAILED: i32 = 5;
+const SERVICE_STATUS_PLUGIN_UNAVAILABLE: i32 = 70;
 
 pub trait RustPlugin: Default + Send + 'static {
     fn descriptor(&self) -> NativeDescriptor;
@@ -19,6 +31,16 @@ pub trait RustPlugin: Default + Send + 'static {
 
     fn handle_event(&mut self, _event: PluginEvent) -> i32 {
         0
+    }
+
+    fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
+        ServiceResponse::error(
+            "unsupported_service",
+            format!(
+                "plugin '{}' does not implement service '{}:{}'",
+                context.plugin_id, context.request.service.interface_id, context.request.operation,
+            ),
+        )
     }
 }
 
@@ -97,6 +119,54 @@ pub fn handle_event_export<P: RustPlugin>(
                 .map_or(70, |mut plugin| plugin.handle_event(payload))
         },
     )
+}
+
+#[doc(hidden)]
+pub fn invoke_service_export<P: RustPlugin>(
+    instance: &'static Mutex<P>,
+    input_ptr: *const u8,
+    input_len: usize,
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32 {
+    if input_ptr.is_null() || output_len.is_null() {
+        return SERVICE_STATUS_INVALID_ARGUMENT;
+    }
+
+    let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+    let (request_id, context) = match decode_service_envelope::<NativeServiceContext>(
+        input,
+        ServiceEnvelopeKind::Request,
+    ) {
+        Ok(value) => value,
+        Err(_) => return SERVICE_STATUS_DECODE_FAILED,
+    };
+
+    let response = match instance.lock() {
+        Ok(mut plugin) => plugin.invoke_service(context),
+        Err(_) => return SERVICE_STATUS_PLUGIN_UNAVAILABLE,
+    };
+
+    let encoded =
+        match encode_service_envelope(request_id, ServiceEnvelopeKind::Response, &response) {
+            Ok(value) => value,
+            Err(_) => return SERVICE_STATUS_ENCODE_FAILED,
+        };
+
+    unsafe {
+        *output_len = encoded.len();
+    }
+
+    if output_ptr.is_null() || encoded.len() > output_capacity {
+        return SERVICE_STATUS_BUFFER_TOO_SMALL;
+    }
+
+    unsafe {
+        ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+    }
+
+    SERVICE_STATUS_OK
 }
 
 fn parse_json_input<T>(ptr: *const c_char, null_code: i32, parse_code: i32) -> Result<T, i32>

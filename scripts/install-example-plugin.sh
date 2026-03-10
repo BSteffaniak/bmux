@@ -112,8 +112,12 @@ name = "Example Native Plugin"
 version = "0.0.1-alpha.0"
 runtime = "native"
 entry = "${LIB_PATH}"
-required_capabilities = ["bmux.commands", "bmux.events.subscribe"]
+required_capabilities = ["bmux.commands", "bmux.events.subscribe", "bmux.permissions.read"]
 provided_features = ["example.native"]
+
+[[dependencies]]
+plugin_id = "bmux.permissions"
+version_req = "=0.0.1-alpha.0"
 
 [[commands]]
 name = "hello"
@@ -133,7 +137,7 @@ value_name = "MESSAGE"
 
 [[commands]]
 name = "permissions-list"
-summary = "List session permissions through bmux host IPC"
+summary = "List session permissions through bmux provider service"
 execution = "provider_exec"
 expose_in_cli = true
 

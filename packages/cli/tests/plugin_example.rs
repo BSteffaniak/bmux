@@ -331,13 +331,41 @@ fn wait_for_server_ready(
 #[serial]
 fn installs_example_plugin_and_runs_command() {
     let root = workspace_root();
-    let (_sandbox, home_dir, config_home, data_home, runtime_dir, tmp_dir, config_dir) =
+    let (sandbox, home_dir, config_home, data_home, runtime_dir, tmp_dir, config_dir) =
         sandbox_setup();
     let paths = config_paths_for_test(&config_dir, &runtime_dir, &data_home);
 
+    let mut build_permissions_command = Command::new("cargo");
+    build_permissions_command
+        .current_dir(&root)
+        .arg("build")
+        .arg("-p")
+        .arg("bmux_permissions_plugin")
+        .env("TMPDIR", &tmp_dir);
+    configure_bmux_env(
+        &mut build_permissions_command,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &paths.config_dir,
+        &paths.runtime_dir,
+        &paths.data_dir,
+    );
+    preserve_toolchain_env(&mut build_permissions_command);
+    let build_permissions_status = build_permissions_command
+        .status()
+        .expect("permissions plugin should build");
+    assert!(build_permissions_status.success());
+
+    let shipped_root =
+        stage_shipped_bundle(&root, &sandbox, "permissions", "bmux_permissions_plugin");
+
     fs::write(
         config_dir.join("bmux.toml"),
-        "[plugins]\nenabled = [\"example.native\"]\n",
+        format!(
+            "[plugins]\nenabled = [\"bmux.permissions\", \"example.native\"]\nsearch_paths = [\"{}\"]\n",
+            shipped_root.display()
+        ),
     )
     .expect("config should be written");
 
@@ -398,6 +426,65 @@ fn installs_example_plugin_and_runs_command() {
         "stdout should contain example plugin output: {}",
         String::from_utf8_lossy(&output.stdout)
     );
+
+    let (mut server, server_stdout, server_stderr) = spawn_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &["server", "start", "--foreground-internal"],
+    );
+    wait_for_server_ready(
+        &mut server,
+        &server_stdout,
+        &server_stderr,
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+    );
+
+    let session_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &["new-session", "demo"],
+    );
+    assert!(
+        session_output.status.success(),
+        "new-session should succeed before service-backed command"
+    );
+
+    let permissions_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &["permissions-list", "demo"],
+    );
+    assert!(
+        permissions_output.status.success(),
+        "service-backed example command should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&permissions_output.stdout),
+        String::from_utf8_lossy(&permissions_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&permissions_output.stdout).contains("owner"),
+        "service-backed example output should include owner role: {}",
+        String::from_utf8_lossy(&permissions_output.stdout)
+    );
+
+    let _ = server.kill();
+    let _ = server.wait();
 }
 
 #[test]

@@ -2,14 +2,12 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use bmux_client::BmuxClient;
-use bmux_config::ConfigPaths;
-use bmux_ipc::SessionSelector;
 use bmux_plugin::{
     CommandExecutionKind, HostScope, NativeCommandContext, NativeDescriptor, PluginCommand,
     PluginCommandArgument, PluginCommandArgumentKind, PluginEvent, PluginEventKind,
-    PluginEventSubscription, PluginFeature, RustPlugin,
+    PluginEventSubscription, PluginFeature, RustPlugin, ServiceKind,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 #[derive(Default)]
@@ -34,6 +32,7 @@ impl RustPlugin for ExamplePlugin {
             required_capabilities: BTreeSet::from([
                 HostScope::new("bmux.commands").expect("host scope should parse"),
                 HostScope::new("bmux.events.subscribe").expect("host scope should parse"),
+                HostScope::new("bmux.permissions.read").expect("host scope should parse"),
             ]),
             provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::from([
@@ -56,7 +55,7 @@ impl RustPlugin for ExamplePlugin {
                     .expose_in_cli(true),
                 PluginCommand::new(
                     "permissions-list",
-                    "List session permissions through bmux host IPC",
+                    "List session permissions through bmux provider service",
                 )
                 .argument(
                     PluginCommandArgument::positional("session", PluginCommandArgumentKind::String)
@@ -70,7 +69,12 @@ impl RustPlugin for ExamplePlugin {
                 kinds: BTreeSet::from([PluginEventKind::System, PluginEventKind::Window]),
                 names: BTreeSet::from(["server_started".to_string(), "window_created".to_string()]),
             }],
-            dependencies: Vec::new(),
+            dependencies: vec![bmux_plugin::PluginDependency {
+                plugin_id: bmux_plugin::PluginId::new("bmux.permissions")
+                    .expect("plugin id should parse"),
+                version_req: format!("={}", env!("CARGO_PKG_VERSION")),
+                required: true,
+            }],
             lifecycle: bmux_plugin::PluginLifecycle {
                 activate_on_startup: true,
                 receive_events: true,
@@ -118,62 +122,46 @@ fn run_permissions_list(context: &NativeCommandContext) -> i32 {
         return 64;
     };
 
-    let paths = ConfigPaths::new(
-        context.connection.config_dir.clone().into(),
-        context.connection.runtime_dir.clone().into(),
-        context.connection.data_dir.clone().into(),
-    );
-
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => {
-            tokio::task::block_in_place(|| handle.block_on(async_permissions_list(&paths, session)))
-        }
-        Err(_) => match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime.block_on(async_permissions_list(&paths, session)),
-            Err(_) => 70,
+    let response = match context.call_service::<ListPermissionsRequest, ListPermissionsResponse>(
+        "bmux.permissions.read",
+        ServiceKind::Query,
+        "permission-query/v1",
+        "list",
+        &ListPermissionsRequest {
+            session: session.to_string(),
         },
-    }
-}
-
-async fn async_permissions_list(paths: &ConfigPaths, session: &str) -> i32 {
-    let selector = parse_session_selector(session);
-    match BmuxClient::connect_with_paths(paths, "example-native-plugin").await {
-        Ok(mut client) => match client.list_permissions(selector).await {
-            Ok(permissions) => {
-                if permissions.is_empty() {
-                    println!("example.native: no explicit role assignments");
-                } else {
-                    println!("example.native permissions:");
-                    for permission in permissions {
-                        println!(
-                            "{} {}",
-                            permission.client_id,
-                            session_role_name(permission.role)
-                        );
-                    }
-                }
-                0
-            }
-            Err(error) => {
-                eprintln!("example.native: failed listing permissions: {error}");
-                1
-            }
-        },
+    ) {
+        Ok(response) => response,
         Err(error) => {
-            eprintln!("example.native: failed connecting to bmux host: {error}");
-            1
+            eprintln!("example.native: failed listing permissions through service: {error}");
+            return 1;
+        }
+    };
+
+    if response.permissions.is_empty() {
+        println!("example.native: no explicit role assignments");
+    } else {
+        println!("example.native permissions:");
+        for permission in response.permissions {
+            println!(
+                "{} {}",
+                permission.client_id,
+                session_role_name(permission.role)
+            );
         }
     }
+
+    0
 }
 
-fn parse_session_selector(value: &str) -> SessionSelector {
-    match uuid::Uuid::parse_str(value) {
-        Ok(id) => SessionSelector::ById(id),
-        Err(_) => SessionSelector::ByName(value.to_string()),
-    }
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ListPermissionsRequest {
+    session: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ListPermissionsResponse {
+    permissions: Vec<bmux_ipc::SessionPermissionSummary>,
 }
 
 fn session_role_name(role: bmux_ipc::SessionRole) -> &'static str {

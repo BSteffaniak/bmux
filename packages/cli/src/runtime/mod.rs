@@ -835,6 +835,9 @@ fn plugin_lifecycle_context(
     paths: &ConfigPaths,
     declaration: &bmux_plugin::PluginDeclaration,
     available_services: Vec<RegisteredService>,
+    available_capabilities: Vec<String>,
+    enabled_plugins: Vec<String>,
+    plugin_search_roots: Vec<String>,
 ) -> NativeLifecycleContext {
     let host = plugin_host_for_declaration(declaration, paths, config, available_services.clone());
     NativeLifecycleContext {
@@ -850,6 +853,9 @@ fn plugin_lifecycle_context(
             .map(ToString::to_string)
             .collect(),
         services: available_services,
+        available_capabilities,
+        enabled_plugins,
+        plugin_search_roots,
         host: plugin_host_metadata(),
         connection: bmux_plugin::PluginHost::connection(&host).clone(),
         settings: config
@@ -857,6 +863,7 @@ fn plugin_lifecycle_context(
             .settings
             .get(declaration.id.as_str())
             .cloned(),
+        plugin_settings_map: config.plugins.settings.clone(),
     }
 }
 
@@ -867,6 +874,9 @@ fn plugin_command_context(
     command: &str,
     arguments: &[String],
     available_services: Vec<RegisteredService>,
+    available_capabilities: Vec<String>,
+    enabled_plugins: Vec<String>,
+    plugin_search_roots: Vec<String>,
 ) -> NativeCommandContext {
     let host = plugin_host_for_declaration(declaration, paths, config, available_services.clone());
     NativeCommandContext {
@@ -884,6 +894,9 @@ fn plugin_command_context(
             .map(ToString::to_string)
             .collect(),
         services: available_services,
+        available_capabilities,
+        enabled_plugins,
+        plugin_search_roots,
         host: plugin_host_metadata(),
         connection: bmux_plugin::PluginHost::connection(&host).clone(),
         settings: config
@@ -891,6 +904,7 @@ fn plugin_command_context(
             .settings
             .get(declaration.id.as_str())
             .cloned(),
+        plugin_settings_map: config.plugins.settings.clone(),
     }
 }
 
@@ -911,6 +925,19 @@ fn activate_loaded_plugins(
     paths: &ConfigPaths,
 ) -> Result<()> {
     let mut activated: Vec<&bmux_plugin::LoadedPlugin> = Vec::new();
+    let plugin_search_roots = resolve_plugin_search_paths(config, paths)?
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let available_capabilities = core_provided_capabilities()
+        .into_iter()
+        .chain(
+            loaded_plugins
+                .iter()
+                .flat_map(|plugin| plugin.declaration.provided_capabilities.iter().cloned()),
+        )
+        .map(|capability| capability.to_string())
+        .collect::<Vec<_>>();
     let available_services = service_descriptors_from_declarations(
         loaded_plugins.iter().map(|plugin| &plugin.declaration),
     );
@@ -924,6 +951,9 @@ fn activate_loaded_plugins(
             paths,
             &plugin.declaration,
             available_services.clone(),
+            available_capabilities.clone(),
+            config.plugins.enabled.clone(),
+            plugin_search_roots.clone(),
         );
         if let Err(error) = plugin.activate(&context) {
             for activated_plugin in activated.into_iter().rev() {
@@ -932,6 +962,9 @@ fn activate_loaded_plugins(
                     paths,
                     &activated_plugin.declaration,
                     available_services.clone(),
+                    available_capabilities.clone(),
+                    config.plugins.enabled.clone(),
+                    plugin_search_roots.clone(),
                 );
                 if let Err(deactivate_error) = activated_plugin.deactivate(&context) {
                     warn!(
@@ -959,6 +992,19 @@ fn deactivate_loaded_plugins(
     config: &BmuxConfig,
     paths: &ConfigPaths,
 ) -> Result<()> {
+    let plugin_search_roots = resolve_plugin_search_paths(config, paths)?
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let available_capabilities = core_provided_capabilities()
+        .into_iter()
+        .chain(
+            loaded_plugins
+                .iter()
+                .flat_map(|plugin| plugin.declaration.provided_capabilities.iter().cloned()),
+        )
+        .map(|capability| capability.to_string())
+        .collect::<Vec<_>>();
     let available_services = service_descriptors_from_declarations(
         loaded_plugins.iter().map(|plugin| &plugin.declaration),
     );
@@ -972,6 +1018,9 @@ fn deactivate_loaded_plugins(
             paths,
             &plugin.declaration,
             available_services.clone(),
+            available_capabilities.clone(),
+            config.plugins.enabled.clone(),
+            plugin_search_roots.clone(),
         );
         let _ = plugin.deactivate(&context).with_context(|| {
             format!(
@@ -1198,6 +1247,14 @@ async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]
         &available_capability_providers(&config, &registry)?,
     )
     .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"))?;
+    let plugin_search_roots = resolve_plugin_search_paths(&config, &paths)?
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let available_capabilities = available_capability_providers(&config, &registry)?
+        .into_keys()
+        .map(|capability| capability.to_string())
+        .collect::<Vec<_>>();
     let context = plugin_command_context(
         &config,
         &paths,
@@ -1205,6 +1262,9 @@ async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]
         command_name,
         args,
         available_service_descriptors(&config, &registry)?,
+        available_capabilities,
+        config.plugins.enabled.clone(),
+        plugin_search_roots,
     );
     let status = loaded
         .run_command_with_context(command_name, args, Some(&context))
@@ -5511,6 +5571,12 @@ mod tests {
             &paths,
             &declaration,
             super::service_descriptors_from_declarations([&declaration]),
+            vec![
+                "bmux.commands".to_string(),
+                "bmux.windows.write".to_string(),
+            ],
+            vec!["example.plugin".to_string()],
+            vec!["/plugins".to_string()],
         );
         assert_eq!(context.plugin_id, "example.plugin");
         assert_eq!(context.connection.data_dir, "/data");
@@ -5585,6 +5651,14 @@ mod tests {
             "new-window",
             &["--name".to_string(), "editor".to_string()],
             super::service_descriptors_from_declarations([&declaration]),
+            vec![
+                "bmux.commands".to_string(),
+                "bmux.sessions.read".to_string(),
+                "bmux.windows.read".to_string(),
+                "bmux.windows.write".to_string(),
+            ],
+            vec!["bmux.windows".to_string()],
+            vec!["/plugins".to_string()],
         );
 
         assert_eq!(context.plugin_id, "bmux.windows");

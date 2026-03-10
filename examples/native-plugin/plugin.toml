@@ -1,10 +1,14 @@
-entry                 = "libbmux_example_native_plugin.dylib"
-id                    = "example.native"
-name                  = "Example Native Plugin"
-provided_features     = ["example.native"]
-required_capabilities = ["bmux.commands", "bmux.events.subscribe"]
-runtime               = "native"
-version               = "0.0.1-alpha.0"
+entry = "libbmux_example_native_plugin.dylib"
+id = "example.native"
+name = "Example Native Plugin"
+provided_features = ["example.native"]
+required_capabilities = [
+    "bmux.commands",
+    "bmux.events.subscribe",
+    "bmux.permissions.read",
+]
+runtime = "native"
+version = "0.0.1-alpha.0"
 
 [[commands]]
 execution     = "provider_exec"
@@ -39,6 +43,10 @@ value_name = "SESSION"
 [[event_subscriptions]]
 kinds = ["system", "window"]
 names = ["server_started", "window_created"]
+
+[[dependencies]]
+plugin_id   = "bmux.permissions"
+version_req = "=0.0.1-alpha.0"
 
 [plugin_api]
 minimum = "1.0"

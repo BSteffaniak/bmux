@@ -47,7 +47,7 @@ pub use host::{
 };
 pub use loader::{
     LoadedPlugin, NativeCommandContext, NativeDescriptor, NativeLifecycleContext,
-    NativePluginLoader, load_registered_plugin,
+    NativePluginLoader, NativeServiceContext, load_registered_plugin,
 };
 pub use manifest::{PluginManifest, PluginManifestCompatibility, PluginRuntime};
 pub use native_exports::RustPlugin;
@@ -55,7 +55,12 @@ pub use registry::{
     CapabilityProvider, PluginCompatibilityReport, PluginRegistry, RegisteredPlugin,
     ServiceProvider,
 };
-pub use service::{PluginService, RegisteredService, ServiceKind};
+pub use service::{
+    CURRENT_SERVICE_PROTOCOL_VERSION, PluginService, RegisteredService, ServiceEnvelope,
+    ServiceEnvelopeKind, ServiceError, ServiceKind, ServiceProtocolVersion, ServiceRequest,
+    ServiceResponse, decode_service_envelope, decode_service_message, encode_service_envelope,
+    encode_service_message,
+};
 pub use version::{ApiVersion, VersionRange};
 
 /// Stable bmux plugin API version exposed by this crate.
@@ -83,11 +88,14 @@ pub const DEFAULT_NATIVE_DEACTIVATE_SYMBOL: &str = "bmux_plugin_deactivate_v1";
 /// Default exported symbol used to deliver plugin events.
 pub const DEFAULT_NATIVE_EVENT_SYMBOL: &str = "bmux_plugin_handle_event_v1";
 
+/// Default exported symbol used to invoke a plugin-provided service.
+pub const DEFAULT_NATIVE_SERVICE_SYMBOL: &str = "bmux_plugin_invoke_service_v1";
+
 #[doc(hidden)]
 pub mod __private {
     pub use crate::native_exports::{
-        activate_export, deactivate_export, descriptor_ptr, handle_event_export, plugin_instance,
-        run_command_export,
+        activate_export, deactivate_export, descriptor_ptr, handle_event_export,
+        invoke_service_export, plugin_instance, run_command_export,
     };
 }
 
@@ -127,6 +135,24 @@ macro_rules! export_plugin {
         #[unsafe(no_mangle)]
         pub extern "C" fn bmux_plugin_handle_event_v1(event: *const ::std::ffi::c_char) -> i32 {
             $crate::__private::handle_event_export(__bmux_plugin_instance(), event)
+        }
+
+        #[unsafe(no_mangle)]
+        pub extern "C" fn bmux_plugin_invoke_service_v1(
+            input_ptr: *const u8,
+            input_len: usize,
+            output_ptr: *mut u8,
+            output_capacity: usize,
+            output_len: *mut usize,
+        ) -> i32 {
+            $crate::__private::invoke_service_export(
+                __bmux_plugin_instance(),
+                input_ptr,
+                input_len,
+                output_ptr,
+                output_capacity,
+                output_len,
+            )
         }
     };
 }

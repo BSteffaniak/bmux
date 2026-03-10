@@ -221,6 +221,43 @@ pub enum PluginError {
     #[error("plugin '{plugin_id}' event payload contains interior NUL")]
     InvalidNativeEventInput { plugin_id: String },
 
+    #[error("failed to resolve service symbol '{symbol}' for plugin '{plugin_id}': {details}")]
+    NativeServiceSymbol {
+        plugin_id: String,
+        symbol: String,
+        details: String,
+    },
+
+    #[error("plugin '{plugin_id}' service invocation failed with status {status}")]
+    NativeServiceInvocation { plugin_id: String, status: i32 },
+
+    #[error("plugin '{plugin_id}' returned invalid service output: {details}")]
+    InvalidNativeServiceOutput { plugin_id: String, details: String },
+
+    #[error("service protocol error: {details}")]
+    ServiceProtocol { details: String },
+
+    #[error(
+        "service provider '{provider_plugin_id}' for capability '{capability}' and interface '{interface_id}' is not available"
+    )]
+    MissingServiceProvider {
+        provider_plugin_id: String,
+        capability: String,
+        interface_id: String,
+    },
+
+    #[error(
+        "service call '{operation}' to '{provider_plugin_id}' failed for capability '{capability}' and interface '{interface_id}': [{code}] {message}"
+    )]
+    ServiceInvocationFailed {
+        provider_plugin_id: String,
+        capability: String,
+        interface_id: String,
+        operation: String,
+        code: String,
+        message: String,
+    },
+
     #[error("unsupported host operation: {operation}")]
     UnsupportedHostOperation { operation: &'static str },
 
