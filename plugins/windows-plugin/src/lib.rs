@@ -7,7 +7,8 @@ use bmux_config::ConfigPaths;
 use bmux_ipc::{SessionSelector, WindowSelector, WindowSummary};
 use bmux_plugin::{
     CommandExecutionKind, HostScope, NativeCommandContext, NativeDescriptor, PluginCommand,
-    PluginCommandArgument, PluginCommandArgumentKind, PluginFeature, RustPlugin,
+    PluginCommandArgument, PluginCommandArgumentKind, PluginFeature, PluginService, RustPlugin,
+    ServiceKind,
 };
 use std::collections::BTreeSet;
 
@@ -41,6 +42,20 @@ impl RustPlugin for WindowsPlugin {
             provided_features: BTreeSet::from([
                 PluginFeature::new("bmux.windows").expect("plugin feature should parse")
             ]),
+            services: vec![
+                PluginService {
+                    capability: HostScope::new("bmux.windows.read")
+                        .expect("host scope should parse"),
+                    kind: ServiceKind::Query,
+                    interface_id: "window-query/v1".to_string(),
+                },
+                PluginService {
+                    capability: HostScope::new("bmux.windows.write")
+                        .expect("host scope should parse"),
+                    kind: ServiceKind::Command,
+                    interface_id: "window-command/v1".to_string(),
+                },
+            ],
             commands: vec![
                 plugin_command(
                     "new-window",

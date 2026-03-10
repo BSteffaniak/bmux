@@ -12,9 +12,10 @@ use bmux_plugin::{
     PermissionCommandService, PermissionEntry, PermissionQueryService, PersistenceCommandService,
     PersistenceQueryService, PersistenceRestorePreview, PersistenceRestoreResult,
     PersistenceStatus, PluginError, PluginEvent, PluginHost, PluginStorage, PrincipalIdentityInfo,
-    RenderService, ServerStatusInfo, SessionCommandService, SessionHandle, SessionQueryService,
-    SessionRef, SessionRoleValue, SessionSnapshot, SessionSummary, WindowCommandService,
-    WindowHandle, WindowQueryService, WindowRef, WindowSnapshot, WindowSummary,
+    RegisteredService, RenderService, ServerStatusInfo, SessionCommandService, SessionHandle,
+    SessionQueryService, SessionRef, SessionRoleValue, SessionSnapshot, SessionSummary,
+    WindowCommandService, WindowHandle, WindowQueryService, WindowRef, WindowSnapshot,
+    WindowSummary,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use toml::Value;
@@ -27,6 +28,7 @@ pub struct CliPluginHost {
     config: BmuxConfig,
     required_capabilities: BTreeSet<HostScope>,
     provided_capabilities: BTreeSet<HostScope>,
+    available_services: Vec<RegisteredService>,
 }
 
 impl CliPluginHost {
@@ -37,6 +39,7 @@ impl CliPluginHost {
         config: BmuxConfig,
         required_capabilities: BTreeSet<HostScope>,
         provided_capabilities: BTreeSet<HostScope>,
+        available_services: Vec<RegisteredService>,
     ) -> Self {
         Self {
             plugin_id: plugin_id.into(),
@@ -49,6 +52,7 @@ impl CliPluginHost {
             config,
             required_capabilities,
             provided_capabilities,
+            available_services,
         }
     }
 
@@ -244,6 +248,10 @@ impl PluginHost for CliPluginHost {
 
     fn provided_capabilities(&self) -> &BTreeSet<HostScope> {
         &self.provided_capabilities
+    }
+
+    fn available_services(&self) -> &[RegisteredService] {
+        &self.available_services
     }
 
     fn events(&self) -> &dyn EventService {
@@ -1146,6 +1154,7 @@ mod tests {
                 .iter()
                 .map(|value| HostScope::new(*value).expect("capability should parse"))
                 .collect::<BTreeSet<_>>(),
+            Vec::new(),
         )
     }
 

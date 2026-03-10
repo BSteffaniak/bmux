@@ -19,6 +19,7 @@ mod loader;
 mod manifest;
 mod native_exports;
 mod registry;
+mod service;
 mod version;
 
 pub use capability::{HostScope, PluginFeature};
@@ -40,12 +41,12 @@ pub use host::{
     FollowCommandService, FollowQueryService, FollowState, HostConnectionInfo, HostMetadata,
     PaneCommandService, PaneFocusDirection, PaneHandle, PaneLayoutNode, PaneQueryService, PaneRef,
     PaneSnapshot, PaneSplitDirection, PaneSummary, PermissionCommandService, PermissionEntry,
-    PermissionQueryService, PermissionsAccess, PersistenceCommandService, PersistenceQueryService,
+    PermissionQueryService, PersistenceCommandService, PersistenceQueryService,
     PersistenceRestorePreview, PersistenceRestoreResult, PersistenceStatus, PluginContext,
     PluginHost, PluginStorage, PrincipalIdentityInfo, RenderService, ServerStatusInfo,
     SessionCommandService, SessionHandle, SessionQueryService, SessionRef, SessionRoleValue,
     SessionSnapshot, SessionSummary, WindowCommandService, WindowHandle, WindowQueryService,
-    WindowRef, WindowSnapshot, WindowSummary, WindowsAccess,
+    WindowRef, WindowSnapshot, WindowSummary,
 };
 pub use loader::{
     LoadedPlugin, NativeCommandContext, NativeDescriptor, NativeLifecycleContext,
@@ -55,7 +56,9 @@ pub use manifest::{PluginManifest, PluginManifestCompatibility, PluginRuntime};
 pub use native_exports::RustPlugin;
 pub use registry::{
     CapabilityProvider, PluginCompatibilityReport, PluginRegistry, RegisteredPlugin,
+    ServiceProvider,
 };
+pub use service::{PluginService, RegisteredService, ServiceKind};
 pub use version::{ApiVersion, VersionRange};
 
 /// Stable bmux plugin API version exposed by this crate.

@@ -1,4 +1,7 @@
-use crate::{HostMetadata, HostScope, PluginDeclaration, PluginError, PluginManifest, Result};
+use crate::{
+    HostMetadata, HostScope, PluginDeclaration, PluginError, PluginManifest, RegisteredService,
+    Result,
+};
 use semver::Version;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -33,6 +36,11 @@ pub struct PluginRegistry {
 pub struct CapabilityProvider {
     pub capability: HostScope,
     pub provider_plugin_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServiceProvider {
+    pub service: RegisteredService,
 }
 
 impl PluginRegistry {
@@ -332,6 +340,40 @@ impl PluginRegistry {
         Ok(())
     }
 
+    pub fn service_providers_for(
+        &self,
+        plugin_ids: &[String],
+    ) -> Result<BTreeMap<(HostScope, crate::ServiceKind, String), ServiceProvider>> {
+        let mut providers: BTreeMap<(HostScope, crate::ServiceKind, String), ServiceProvider> =
+            BTreeMap::new();
+        for plugin in self.activation_order_for(plugin_ids)? {
+            for service in &plugin.declaration.services {
+                let registered = RegisteredService {
+                    capability: service.capability.clone(),
+                    kind: service.kind,
+                    interface_id: service.interface_id.clone(),
+                    provider_plugin_id: plugin.declaration.id.as_str().to_string(),
+                };
+                if let Some(existing) = providers.get(&registered.key()) {
+                    return Err(PluginError::DuplicateServiceProvider {
+                        capability: registered.capability.as_str().to_string(),
+                        kind: registered.kind,
+                        interface_id: registered.interface_id.clone(),
+                        first_provider: existing.service.provider_plugin_id.clone(),
+                        second_provider: registered.provider_plugin_id.clone(),
+                    });
+                }
+                providers.insert(
+                    registered.key(),
+                    ServiceProvider {
+                        service: registered,
+                    },
+                );
+            }
+        }
+        Ok(providers)
+    }
+
     /// # Errors
     ///
     /// Returns an error when any plugin is incompatible with the host or when a
@@ -548,5 +590,69 @@ minimum = "1.0"
             .capability_providers_for(&["one.plugin".to_string(), "two.plugin".to_string()], &[])
             .expect_err("duplicate providers should fail");
         assert!(error.to_string().contains("bmux.windows.read"));
+    }
+
+    #[test]
+    fn service_providers_detect_duplicate_service_registration() {
+        let dir = temp_dir();
+        fs::write(dir.join("one.dylib"), []).expect("one entry should be written");
+        fs::write(dir.join("two.dylib"), []).expect("two entry should be written");
+
+        let one = PluginManifest::from_toml_str(
+            r#"
+id = "one.plugin"
+name = "One"
+version = "0.1.0"
+entry = "one.dylib"
+provided_capabilities = ["bmux.windows.read"]
+
+[[services]]
+capability = "bmux.windows.read"
+kind = "query"
+interface_id = "window-query/v1"
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+        )
+        .expect("first manifest should parse");
+
+        let two = PluginManifest::from_toml_str(
+            r#"
+id = "two.plugin"
+name = "Two"
+version = "0.1.0"
+entry = "two.dylib"
+provided_capabilities = ["bmux.windows.read"]
+
+[[services]]
+capability = "bmux.windows.read"
+kind = "query"
+interface_id = "window-query/v1"
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+        )
+        .expect("second manifest should parse");
+
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(&dir.join("one.toml"), one)
+            .expect("first registration should succeed");
+        registry
+            .register_manifest(&dir.join("two.toml"), two)
+            .expect("second registration should succeed");
+
+        let error = registry
+            .service_providers_for(&["one.plugin".to_string(), "two.plugin".to_string()])
+            .expect_err("duplicate service providers should fail");
+        assert!(error.to_string().contains("window-query/v1"));
     }
 }

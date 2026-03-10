@@ -3,7 +3,7 @@ use crate::{
     DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
     DEFAULT_NATIVE_EVENT_SYMBOL, HostConnectionInfo, HostMetadata, HostScope, PluginDeclaration,
     PluginEntrypoint, PluginError, PluginEvent, PluginFeature, PluginLifecycle,
-    PluginManifestCompatibility, PluginRegistry, RegisteredPlugin, Result,
+    PluginManifestCompatibility, PluginRegistry, PluginService, RegisteredPlugin, Result,
 };
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize};
@@ -24,6 +24,8 @@ pub struct NativeLifecycleContext {
     pub required_capabilities: Vec<String>,
     #[serde(default)]
     pub provided_capabilities: Vec<String>,
+    #[serde(default)]
+    pub services: Vec<crate::RegisteredService>,
     pub host: HostMetadata,
     pub connection: HostConnectionInfo,
     #[serde(default)]
@@ -39,6 +41,8 @@ pub struct NativeCommandContext {
     pub required_capabilities: Vec<String>,
     #[serde(default)]
     pub provided_capabilities: Vec<String>,
+    #[serde(default)]
+    pub services: Vec<crate::RegisteredService>,
     pub host: HostMetadata,
     pub connection: HostConnectionInfo,
     #[serde(default)]
@@ -63,6 +67,8 @@ pub struct NativeDescriptor {
     pub provided_capabilities: BTreeSet<HostScope>,
     #[serde(default)]
     pub provided_features: BTreeSet<PluginFeature>,
+    #[serde(default)]
+    pub services: Vec<PluginService>,
     #[serde(default)]
     pub commands: Vec<crate::PluginCommand>,
     #[serde(default)]
@@ -104,6 +110,7 @@ impl NativeDescriptor {
             required_capabilities: self.required_capabilities,
             provided_capabilities: self.provided_capabilities,
             provided_features: self.provided_features,
+            services: self.services,
             commands: self.commands,
             event_subscriptions: self.event_subscriptions,
             dependencies: self.dependencies,
@@ -480,6 +487,13 @@ fn compare_manifest_and_descriptor(
     )?;
     ensure_match(
         registered_plugin.declaration.id.as_str(),
+        "services",
+        &serde_json::to_string(&registered_plugin.declaration.services)
+            .expect("plugin services should serialize"),
+        &serde_json::to_string(&declaration.services).expect("plugin services should serialize"),
+    )?;
+    ensure_match(
+        registered_plugin.declaration.id.as_str(),
         "commands",
         &serde_json::to_string(&registered_plugin.declaration.commands)
             .expect("plugin commands should serialize"),
@@ -669,6 +683,7 @@ minimum = "1.0"
             plugin_id: "test.plugin".to_string(),
             required_capabilities: Vec::new(),
             provided_capabilities: Vec::new(),
+            services: Vec::new(),
             host: HostMetadata {
                 product_name: "bmux".to_string(),
                 product_version: "0.1.0".to_string(),
@@ -741,6 +756,7 @@ minimum = "1.0"
                 required_capabilities: BTreeSet::new(),
                 provided_capabilities: BTreeSet::new(),
                 provided_features: BTreeSet::new(),
+                services: Vec::new(),
                 commands: Vec::new(),
                 event_subscriptions: vec![PluginEventSubscription {
                     kinds: BTreeSet::from([PluginEventKind::System]),

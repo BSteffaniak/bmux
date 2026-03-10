@@ -7,6 +7,16 @@ required_capabilities = ["bmux.commands"]
 runtime               = "native"
 version               = "0.0.1-alpha.0"
 
+[[services]]
+capability   = "bmux.permissions.read"
+interface_id = "permission-query/v1"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.permissions.write"
+interface_id = "permission-command/v1"
+kind         = "command"
+
 [[commands]]
 aliases       = [["session", "permissions"]]
 execution     = "host_callback"

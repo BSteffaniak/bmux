@@ -7,6 +7,16 @@ required_capabilities = ["bmux.commands", "bmux.sessions.read"]
 runtime               = "native"
 version               = "0.0.1-alpha.0"
 
+[[services]]
+capability   = "bmux.windows.read"
+interface_id = "window-query/v1"
+kind         = "query"
+
+[[services]]
+capability   = "bmux.windows.write"
+interface_id = "window-command/v1"
+kind         = "command"
+
 [[commands]]
 aliases       = [["window", "new"]]
 execution     = "host_callback"

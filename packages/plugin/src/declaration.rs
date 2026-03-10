@@ -1,6 +1,6 @@
 use crate::{
     CommandExecutionKind, HostScope, PluginCommand, PluginContext, PluginError,
-    PluginEventSubscription, PluginFeature, Result, VersionRange,
+    PluginEventSubscription, PluginFeature, PluginService, Result, VersionRange,
 };
 use semver::VersionReq;
 use serde::{Deserialize, Serialize};
@@ -86,6 +86,8 @@ pub struct PluginDeclaration {
     #[serde(default)]
     pub provided_features: BTreeSet<PluginFeature>,
     #[serde(default)]
+    pub services: Vec<PluginService>,
+    #[serde(default)]
     pub commands: Vec<PluginCommand>,
     #[serde(default)]
     pub event_subscriptions: Vec<PluginEventSubscription>,
@@ -154,6 +156,17 @@ impl PluginDeclaration {
                 return Err(PluginError::CapabilitySelfRequirement {
                     plugin_id: self.id.as_str().to_string(),
                     capability: capability.as_str().to_string(),
+                });
+            }
+        }
+
+        for service in &self.services {
+            service.validate(self.id.as_str())?;
+            if !self.provided_capabilities.contains(&service.capability) {
+                return Err(PluginError::UnownedServiceCapability {
+                    plugin_id: self.id.as_str().to_string(),
+                    capability: service.capability.as_str().to_string(),
+                    interface_id: service.interface_id.clone(),
                 });
             }
         }
@@ -255,6 +268,7 @@ mod tests {
             required_capabilities: BTreeSet::new(),
             provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::new(),
+            services: Vec::new(),
             commands: vec![
                 PluginCommand {
                     name: "run".to_string(),
@@ -305,6 +319,7 @@ mod tests {
             required_capabilities,
             provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::new(),
+            services: Vec::new(),
             commands: vec![PluginCommand {
                 name: "runtime".to_string(),
                 path: Vec::new(),
@@ -339,6 +354,7 @@ mod tests {
             required_capabilities: BTreeSet::new(),
             provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::new(),
+            services: Vec::new(),
             commands: Vec::new(),
             event_subscriptions: Vec::new(),
             dependencies: vec![

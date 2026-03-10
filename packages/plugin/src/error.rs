@@ -1,4 +1,4 @@
-use crate::ApiVersion;
+use crate::{ApiVersion, ServiceKind};
 use std::path::PathBuf;
 use thiserror::Error;
 
@@ -37,6 +37,24 @@ pub enum PluginError {
     CapabilitySelfRequirement {
         plugin_id: String,
         capability: String,
+    },
+
+    #[error(
+        "plugin '{plugin_id}' registered invalid service interface for capability '{capability}' ({kind:?})"
+    )]
+    InvalidServiceInterfaceId {
+        plugin_id: String,
+        capability: String,
+        kind: ServiceKind,
+    },
+
+    #[error(
+        "plugin '{plugin_id}' registered service '{interface_id}' for unowned capability '{capability}'"
+    )]
+    UnownedServiceCapability {
+        plugin_id: String,
+        capability: String,
+        interface_id: String,
     },
 
     #[error("plugin '{plugin_id}' declares duplicate dependency '{dependency_id}'")]
@@ -115,6 +133,17 @@ pub enum PluginError {
     )]
     DuplicateCapabilityProvider {
         capability: String,
+        first_provider: String,
+        second_provider: String,
+    },
+
+    #[error(
+        "service '{interface_id}' for capability '{capability}' and kind '{kind:?}' has multiple providers: '{first_provider}' and '{second_provider}'"
+    )]
+    DuplicateServiceProvider {
+        capability: String,
+        kind: ServiceKind,
+        interface_id: String,
         first_provider: String,
         second_provider: String,
     },

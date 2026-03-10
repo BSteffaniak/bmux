@@ -1,4 +1,4 @@
-use crate::{HostScope, PluginError, PluginEvent, Result};
+use crate::{HostScope, PluginError, PluginEvent, RegisteredService, Result, ServiceKind};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use toml::Value;
@@ -208,6 +208,32 @@ pub trait PluginHost: Send + Sync {
         self.required_capabilities().contains(capability)
             || self.provided_capabilities().contains(capability)
     }
+    fn available_services(&self) -> &[RegisteredService];
+    fn resolve_service(
+        &self,
+        capability: &HostScope,
+        kind: ServiceKind,
+        interface_id: &str,
+    ) -> Result<&RegisteredService> {
+        if !self.has_capability(capability) {
+            return Err(PluginError::CapabilityAccessDenied {
+                plugin_id: self.plugin_id().to_string(),
+                capability: capability.as_str().to_string(),
+                operation: "resolve_service",
+            });
+        }
+
+        self.available_services()
+            .iter()
+            .find(|service| {
+                &service.capability == capability
+                    && service.kind == kind
+                    && service.interface_id == interface_id
+            })
+            .ok_or_else(|| PluginError::UnsupportedHostOperation {
+                operation: "resolve_service",
+            })
+    }
     fn events(&self) -> &dyn EventService;
     fn session_queries(&self) -> &dyn SessionQueryService;
     fn session_commands(&self) -> &dyn SessionCommandService;
@@ -231,79 +257,6 @@ pub trait PluginHost: Send + Sync {
 pub struct PluginContext<'a> {
     pub host: &'a dyn PluginHost,
     pub settings: &'a BTreeMap<String, Value>,
-}
-
-pub struct WindowsAccess<'a> {
-    queries: &'a dyn WindowQueryService,
-    commands: &'a dyn WindowCommandService,
-}
-
-impl<'a> WindowsAccess<'a> {
-    #[must_use]
-    pub fn queries(&self) -> &'a dyn WindowQueryService {
-        self.queries
-    }
-
-    #[must_use]
-    pub fn commands(&self) -> &'a dyn WindowCommandService {
-        self.commands
-    }
-}
-
-pub struct PermissionsAccess<'a> {
-    queries: &'a dyn PermissionQueryService,
-    commands: &'a dyn PermissionCommandService,
-}
-
-impl<'a> PermissionsAccess<'a> {
-    #[must_use]
-    pub fn queries(&self) -> &'a dyn PermissionQueryService {
-        self.queries
-    }
-
-    #[must_use]
-    pub fn commands(&self) -> &'a dyn PermissionCommandService {
-        self.commands
-    }
-}
-
-impl<'a> PluginContext<'a> {
-    fn require_any_capability(&self, capabilities: &[&str], operation: &'static str) -> Result<()> {
-        if capabilities.iter().any(|capability| {
-            self.host
-                .has_capability(&HostScope::new(*capability).expect("capability should parse"))
-        }) {
-            Ok(())
-        } else {
-            Err(PluginError::CapabilityAccessDenied {
-                plugin_id: self.host.plugin_id().to_string(),
-                capability: capabilities.join(" or "),
-                operation,
-            })
-        }
-    }
-
-    pub fn windows(&self) -> Result<WindowsAccess<'_>> {
-        self.require_any_capability(
-            &["bmux.windows.read", "bmux.windows.write"],
-            "plugin_context.windows",
-        )?;
-        Ok(WindowsAccess {
-            queries: self.host.window_queries(),
-            commands: self.host.window_commands(),
-        })
-    }
-
-    pub fn permissions(&self) -> Result<PermissionsAccess<'_>> {
-        self.require_any_capability(
-            &["bmux.permissions.read", "bmux.permissions.write"],
-            "plugin_context.permissions",
-        )?;
-        Ok(PermissionsAccess {
-            queries: self.host.permission_queries(),
-            commands: self.host.permission_commands(),
-        })
-    }
 }
 
 pub trait EventService: Send + Sync {
@@ -655,6 +608,7 @@ mod tests {
     struct MockHost {
         required: BTreeSet<HostScope>,
         provided: BTreeSet<HostScope>,
+        services: Vec<RegisteredService>,
         noop: MockNoop,
         windows: MockWindowService,
         permissions: MockPermissionService,
@@ -663,7 +617,7 @@ mod tests {
     }
 
     impl MockHost {
-        fn new(required: &[&str], provided: &[&str]) -> Self {
+        fn new(required: &[&str], provided: &[&str], services: Vec<RegisteredService>) -> Self {
             Self {
                 required: required
                     .iter()
@@ -673,6 +627,7 @@ mod tests {
                     .iter()
                     .map(|v| HostScope::new(*v).expect("capability should parse"))
                     .collect(),
+                services,
                 noop: MockNoop,
                 windows: MockWindowService,
                 permissions: MockPermissionService,
@@ -706,6 +661,9 @@ mod tests {
         }
         fn provided_capabilities(&self) -> &BTreeSet<HostScope> {
             &self.provided
+        }
+        fn available_services(&self) -> &[RegisteredService] {
+            &self.services
         }
         fn events(&self) -> &dyn EventService {
             &self.noop
@@ -764,50 +722,78 @@ mod tests {
     }
 
     #[test]
-    fn windows_access_allows_required_capability() {
-        let host = MockHost::new(&["bmux.windows.read"], &[]);
-        let settings = BTreeMap::new();
-        let context = PluginContext {
-            host: &host,
-            settings: &settings,
-        };
-        let access = context.windows().expect("windows access should succeed");
-        assert_eq!(
-            access
-                .queries()
-                .list_windows(None)
-                .expect("list should work"),
-            Vec::new()
+    fn resolve_service_allows_required_capability() {
+        let capability = HostScope::new("bmux.windows.read").expect("capability should parse");
+        let host = MockHost::new(
+            &["bmux.windows.read"],
+            &[],
+            vec![RegisteredService {
+                capability: capability.clone(),
+                kind: ServiceKind::Query,
+                interface_id: "window-query/v1".to_string(),
+                provider_plugin_id: "bmux.windows".to_string(),
+            }],
         );
+        let service =
+            PluginHost::resolve_service(&host, &capability, ServiceKind::Query, "window-query/v1")
+                .expect("service should resolve");
+        assert_eq!(service.provider_plugin_id, "bmux.windows");
     }
 
     #[test]
-    fn windows_access_allows_provider_capability() {
-        let host = MockHost::new(&[], &["bmux.windows.write"]);
-        let settings = BTreeMap::new();
-        let context = PluginContext {
-            host: &host,
-            settings: &settings,
-        };
-        assert!(context.windows().is_ok());
-    }
-
-    #[test]
-    fn permissions_access_rejects_missing_capabilities() {
-        let host = MockHost::new(&[], &[]);
-        let settings = BTreeMap::new();
-        let context = PluginContext {
-            host: &host,
-            settings: &settings,
-        };
-        let error = match context.permissions() {
-            Err(error) => error,
-            Ok(_) => panic!("permissions access should fail"),
-        };
+    fn resolve_service_allows_provider_capability() {
+        let capability = HostScope::new("bmux.windows.write").expect("capability should parse");
+        let host = MockHost::new(
+            &[],
+            &["bmux.windows.write"],
+            vec![RegisteredService {
+                capability: capability.clone(),
+                kind: ServiceKind::Command,
+                interface_id: "window-command/v1".to_string(),
+                provider_plugin_id: "bmux.windows".to_string(),
+            }],
+        );
         assert!(
-            error
-                .to_string()
-                .contains("bmux.permissions.read or bmux.permissions.write")
+            PluginHost::resolve_service(
+                &host,
+                &capability,
+                ServiceKind::Command,
+                "window-command/v1",
+            )
+            .is_ok()
         );
+    }
+
+    #[test]
+    fn resolve_service_rejects_missing_capability() {
+        let capability = HostScope::new("bmux.permissions.read").expect("capability should parse");
+        let host = MockHost::new(
+            &[],
+            &[],
+            vec![RegisteredService {
+                capability: capability.clone(),
+                kind: ServiceKind::Query,
+                interface_id: "permission-query/v1".to_string(),
+                provider_plugin_id: "bmux.permissions".to_string(),
+            }],
+        );
+        let error = PluginHost::resolve_service(
+            &host,
+            &capability,
+            ServiceKind::Query,
+            "permission-query/v1",
+        )
+        .expect_err("missing capability should fail");
+        assert!(error.to_string().contains("bmux.permissions.read"));
+    }
+
+    #[test]
+    fn resolve_service_rejects_missing_registration() {
+        let capability = HostScope::new("bmux.windows.read").expect("capability should parse");
+        let host = MockHost::new(&["bmux.windows.read"], &[], Vec::new());
+        let error =
+            PluginHost::resolve_service(&host, &capability, ServiceKind::Query, "window-query/v1")
+                .expect_err("missing service registration should fail");
+        assert!(error.to_string().contains("resolve_service"));
     }
 }

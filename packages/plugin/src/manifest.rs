@@ -1,6 +1,7 @@
 use crate::{
     ApiVersion, HostScope, PluginCommand, PluginDeclaration, PluginDependency, PluginEntrypoint,
-    PluginError, PluginEventSubscription, PluginFeature, PluginId, Result, VersionRange,
+    PluginError, PluginEventSubscription, PluginFeature, PluginId, PluginService, Result,
+    VersionRange,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
@@ -74,6 +75,8 @@ pub struct PluginManifest {
     #[serde(default)]
     pub provided_features: BTreeSet<PluginFeature>,
     #[serde(default)]
+    pub services: Vec<PluginService>,
+    #[serde(default)]
     pub commands: Vec<PluginCommand>,
     #[serde(default)]
     pub event_subscriptions: Vec<PluginEventSubscription>,
@@ -128,6 +131,7 @@ impl PluginManifest {
             required_capabilities: self.required_capabilities.clone(),
             provided_capabilities: self.provided_capabilities.clone(),
             provided_features: self.provided_features.clone(),
+            services: self.services.clone(),
             commands: self.commands.clone(),
             event_subscriptions: self.event_subscriptions.clone(),
             dependencies: self

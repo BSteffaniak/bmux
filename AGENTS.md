@@ -6,19 +6,26 @@ This file defines REQUIRED validation steps for coding agents working in this re
 
 If you change code, run the relevant tests before finishing and report exactly what you ran and whether it passed.
 
+In addition, for any code change anywhere in the repo, run:
+
+- `cargo nextest run --no-fail-fast`
+
+This is required. Treat failures as blocking, and do not finish with known flaky/failing tests.
+
 ## Minimum Required Commands (CLI/runtime work)
 
 For changes in `packages/cli/**` (runtime, input, pane/layout, protocol, terminal handling), run:
 
-1. `cargo test -p bmux_cli`
-2. `cargo check -p bmux_cli`
-3. `./scripts/smoke-pty-runtime.sh`
+1. `cargo nextest run --no-fail-fast`
+2. `cargo test -p bmux_cli`
+3. `cargo check -p bmux_cli`
+4. `./scripts/smoke-pty-runtime.sh`
 
 ## Compatibility-Related Changes (REQUIRED extra check)
 
 If the change touches terminal protocol behavior, TERM/profile logic, or query/reply handling, also run:
 
-4. `./scripts/compat-matrix.sh`
+5. `./scripts/compat-matrix.sh`
 
 This includes edits under:
 
@@ -30,13 +37,13 @@ This includes edits under:
 ## Change-to-Tests Mapping
 
 - Protocol/query/reply/TERM/profile changes
-  - Run all 4 commands above.
+  - Run all 5 commands above.
 - Input/keymap/runtime command handling changes
-  - Run 1-3.
+  - Run 1-4.
 - Layout/pane lifecycle/compositor changes
-  - Run 1-3.
+  - Run 1-4.
 - Config-only changes
-  - Run at least 1-2; include 3 if behavior affects runtime startup.
+  - Run at least 1-3; include 4 if behavior affects runtime startup.
 - Docs-only changes
   - No mandatory runtime commands.
 
@@ -46,6 +53,7 @@ Agents should report test execution in final response using this format:
 
 - `cargo test -p bmux_cli` - PASS/FAIL
 - `cargo check -p bmux_cli` - PASS/FAIL
+- `cargo nextest run --no-fail-fast` - PASS/FAIL
 - `./scripts/smoke-pty-runtime.sh` - PASS/FAIL
 - `./scripts/compat-matrix.sh` - PASS/FAIL (if required)
 

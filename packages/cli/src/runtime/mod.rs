@@ -21,7 +21,7 @@ use bmux_keybind::action_to_name;
 use bmux_plugin::{
     CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostMetadata, HostScope,
     NativeCommandContext, NativeLifecycleContext, PluginEvent, PluginEventKind, PluginManifest,
-    PluginRegistry, load_registered_plugin as load_native_registered_plugin,
+    PluginRegistry, RegisteredService, load_registered_plugin as load_native_registered_plugin,
 };
 use bmux_server::BmuxServer;
 use clap::{CommandFactory, FromArgMatches};
@@ -109,6 +109,37 @@ fn available_capability_providers(
     registry
         .capability_providers_for(&config.plugins.enabled, &core_provided_capabilities())
         .context("failed resolving capability providers")
+}
+
+fn available_service_descriptors(
+    config: &BmuxConfig,
+    registry: &PluginRegistry,
+) -> Result<Vec<RegisteredService>> {
+    Ok(registry
+        .service_providers_for(&config.plugins.enabled)
+        .context("failed resolving service providers")?
+        .into_values()
+        .map(|provider| provider.service)
+        .collect())
+}
+
+fn service_descriptors_from_declarations<'a>(
+    declarations: impl IntoIterator<Item = &'a bmux_plugin::PluginDeclaration>,
+) -> Vec<RegisteredService> {
+    declarations
+        .into_iter()
+        .flat_map(|declaration| {
+            declaration
+                .services
+                .iter()
+                .map(move |service| RegisteredService {
+                    capability: service.capability.clone(),
+                    kind: service.kind,
+                    interface_id: service.interface_id.clone(),
+                    provider_plugin_id: declaration.id.as_str().to_string(),
+                })
+        })
+        .collect()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -643,6 +674,7 @@ fn plugin_host_for_declaration(
     declaration: &bmux_plugin::PluginDeclaration,
     paths: &ConfigPaths,
     config: &BmuxConfig,
+    available_services: Vec<RegisteredService>,
 ) -> plugin_host::CliPluginHost {
     plugin_host::CliPluginHost::for_plugin(
         declaration.id.as_str(),
@@ -651,6 +683,7 @@ fn plugin_host_for_declaration(
         config.clone(),
         declaration.required_capabilities.clone(),
         declaration.provided_capabilities.clone(),
+        available_services,
     )
 }
 
@@ -801,8 +834,9 @@ fn plugin_lifecycle_context(
     config: &BmuxConfig,
     paths: &ConfigPaths,
     declaration: &bmux_plugin::PluginDeclaration,
+    available_services: Vec<RegisteredService>,
 ) -> NativeLifecycleContext {
-    let host = plugin_host_for_declaration(declaration, paths, config);
+    let host = plugin_host_for_declaration(declaration, paths, config, available_services.clone());
     NativeLifecycleContext {
         plugin_id: declaration.id.as_str().to_string(),
         required_capabilities: declaration
@@ -815,6 +849,7 @@ fn plugin_lifecycle_context(
             .iter()
             .map(ToString::to_string)
             .collect(),
+        services: available_services,
         host: plugin_host_metadata(),
         connection: bmux_plugin::PluginHost::connection(&host).clone(),
         settings: config
@@ -831,8 +866,9 @@ fn plugin_command_context(
     declaration: &bmux_plugin::PluginDeclaration,
     command: &str,
     arguments: &[String],
+    available_services: Vec<RegisteredService>,
 ) -> NativeCommandContext {
-    let host = plugin_host_for_declaration(declaration, paths, config);
+    let host = plugin_host_for_declaration(declaration, paths, config, available_services.clone());
     NativeCommandContext {
         plugin_id: declaration.id.as_str().to_string(),
         command: command.to_string(),
@@ -847,6 +883,7 @@ fn plugin_command_context(
             .iter()
             .map(ToString::to_string)
             .collect(),
+        services: available_services,
         host: plugin_host_metadata(),
         connection: bmux_plugin::PluginHost::connection(&host).clone(),
         settings: config
@@ -874,16 +911,28 @@ fn activate_loaded_plugins(
     paths: &ConfigPaths,
 ) -> Result<()> {
     let mut activated: Vec<&bmux_plugin::LoadedPlugin> = Vec::new();
+    let available_services = service_descriptors_from_declarations(
+        loaded_plugins.iter().map(|plugin| &plugin.declaration),
+    );
     for plugin in loaded_plugins {
         if !plugin.declaration.lifecycle.activate_on_startup {
             continue;
         }
 
-        let context = plugin_lifecycle_context(config, paths, &plugin.declaration);
+        let context = plugin_lifecycle_context(
+            config,
+            paths,
+            &plugin.declaration,
+            available_services.clone(),
+        );
         if let Err(error) = plugin.activate(&context) {
             for activated_plugin in activated.into_iter().rev() {
-                let context =
-                    plugin_lifecycle_context(config, paths, &activated_plugin.declaration);
+                let context = plugin_lifecycle_context(
+                    config,
+                    paths,
+                    &activated_plugin.declaration,
+                    available_services.clone(),
+                );
                 if let Err(deactivate_error) = activated_plugin.deactivate(&context) {
                     warn!(
                         "failed rolling back plugin activation for {}: {deactivate_error}",
@@ -910,12 +959,20 @@ fn deactivate_loaded_plugins(
     config: &BmuxConfig,
     paths: &ConfigPaths,
 ) -> Result<()> {
+    let available_services = service_descriptors_from_declarations(
+        loaded_plugins.iter().map(|plugin| &plugin.declaration),
+    );
     for plugin in loaded_plugins.iter().rev() {
         if !plugin.declaration.lifecycle.activate_on_startup {
             continue;
         }
 
-        let context = plugin_lifecycle_context(config, paths, &plugin.declaration);
+        let context = plugin_lifecycle_context(
+            config,
+            paths,
+            &plugin.declaration,
+            available_services.clone(),
+        );
         let _ = plugin.deactivate(&context).with_context(|| {
             format!(
                 "failed deactivating plugin '{}'",
@@ -1141,7 +1198,14 @@ async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]
         &available_capability_providers(&config, &registry)?,
     )
     .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"))?;
-    let context = plugin_command_context(&config, &paths, &plugin.declaration, command_name, args);
+    let context = plugin_command_context(
+        &config,
+        &paths,
+        &plugin.declaration,
+        command_name,
+        args,
+        available_service_descriptors(&config, &registry)?,
+    );
     let status = loaded
         .run_command_with_context(command_name, args, Some(&context))
         .with_context(|| format!("failed running plugin command '{plugin_id}:{command_name}'"))?;
@@ -5431,12 +5495,23 @@ mod tests {
             )
             .expect("capability should parse")]),
             provided_features: std::collections::BTreeSet::new(),
+            services: vec![bmux_plugin::PluginService {
+                capability: bmux_plugin::HostScope::new("bmux.windows.write")
+                    .expect("capability should parse"),
+                kind: bmux_plugin::ServiceKind::Command,
+                interface_id: "window-command/v1".to_string(),
+            }],
             commands: Vec::new(),
             event_subscriptions: Vec::new(),
             dependencies: Vec::new(),
             lifecycle: bmux_plugin::PluginLifecycle::default(),
         };
-        let context = super::plugin_lifecycle_context(&config, &paths, &declaration);
+        let context = super::plugin_lifecycle_context(
+            &config,
+            &paths,
+            &declaration,
+            super::service_descriptors_from_declarations([&declaration]),
+        );
         assert_eq!(context.plugin_id, "example.plugin");
         assert_eq!(context.connection.data_dir, "/data");
         assert_eq!(
@@ -5447,6 +5522,8 @@ mod tests {
             context.provided_capabilities,
             vec!["bmux.windows.write".to_string()]
         );
+        assert_eq!(context.services.len(), 1);
+        assert_eq!(context.services[0].interface_id, "window-command/v1");
         assert_eq!(
             context.settings.as_ref().and_then(|value| value.as_str()),
             Some("configured")
@@ -5481,6 +5558,20 @@ mod tests {
                 bmux_plugin::HostScope::new("bmux.windows.write").expect("capability should parse"),
             ]),
             provided_features: std::collections::BTreeSet::new(),
+            services: vec![
+                bmux_plugin::PluginService {
+                    capability: bmux_plugin::HostScope::new("bmux.windows.read")
+                        .expect("capability should parse"),
+                    kind: bmux_plugin::ServiceKind::Query,
+                    interface_id: "window-query/v1".to_string(),
+                },
+                bmux_plugin::PluginService {
+                    capability: bmux_plugin::HostScope::new("bmux.windows.write")
+                        .expect("capability should parse"),
+                    kind: bmux_plugin::ServiceKind::Command,
+                    interface_id: "window-command/v1".to_string(),
+                },
+            ],
             commands: Vec::new(),
             event_subscriptions: Vec::new(),
             dependencies: Vec::new(),
@@ -5493,6 +5584,7 @@ mod tests {
             &declaration,
             "new-window",
             &["--name".to_string(), "editor".to_string()],
+            super::service_descriptors_from_declarations([&declaration]),
         );
 
         assert_eq!(context.plugin_id, "bmux.windows");
@@ -5511,6 +5603,7 @@ mod tests {
                 "bmux.windows.write".to_string()
             ]
         );
+        assert_eq!(context.services.len(), 2);
     }
 
     #[test]

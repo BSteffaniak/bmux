@@ -39,6 +39,7 @@ impl RustPlugin for ExamplePlugin {
             provided_features: BTreeSet::from([
                 PluginFeature::new("example.native").expect("plugin feature should parse")
             ]),
+            services: Vec::new(),
             commands: vec![
                 PluginCommand::new("hello", "Print a hello message")
                     .argument(
