@@ -274,7 +274,7 @@ mod tests {
             capability: HostScope::new(capability).expect("capability should parse"),
             kind,
             interface_id: interface_id.to_string(),
-            provider: bmux_plugin::ServiceProviderId::Plugin("provider.plugin".to_string()),
+            provider: bmux_plugin::ProviderId::Plugin("provider.plugin".to_string()),
         }
     }
 

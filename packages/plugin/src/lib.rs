@@ -56,8 +56,8 @@ pub use registry::{
     ServiceProvider,
 };
 pub use service::{
-    CURRENT_SERVICE_PROTOCOL_VERSION, PluginService, RegisteredService, ServiceEnvelope,
-    ServiceEnvelopeKind, ServiceError, ServiceKind, ServiceProtocolVersion, ServiceProviderId,
+    CURRENT_SERVICE_PROTOCOL_VERSION, PluginService, ProviderId, RegisteredService,
+    ServiceEnvelope, ServiceEnvelopeKind, ServiceError, ServiceKind, ServiceProtocolVersion,
     ServiceRequest, ServiceResponse, decode_service_envelope, decode_service_message,
     encode_service_envelope, encode_service_message,
 };

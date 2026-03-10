@@ -255,7 +255,7 @@ fn call_service_raw(
             operation: "call_service",
         })?;
 
-    if matches!(service.provider, crate::ServiceProviderId::Host) {
+    if matches!(service.provider, crate::ProviderId::Host) {
         return handle_core_service_call(service, operation, payload, plugin_settings_map);
     }
 
@@ -265,8 +265,8 @@ fn call_service_raw(
         .collect::<Vec<_>>();
     let registry = discover_registered_plugins_in_roots(&search_roots)?;
     let provider_plugin_id = match &service.provider {
-        crate::ServiceProviderId::Plugin(plugin_id) => plugin_id.clone(),
-        crate::ServiceProviderId::Host => unreachable!("host services should be handled earlier"),
+        crate::ProviderId::Plugin(plugin_id) => plugin_id.clone(),
+        crate::ProviderId::Host => unreachable!("host services should be handled earlier"),
     };
     let registered =
         registry
@@ -283,7 +283,7 @@ fn call_service_raw(
         .map(|capability| {
             let provider = CapabilityProvider {
                 capability: capability.clone(),
-                provider_plugin_id: "available".to_string(),
+                provider: crate::ProviderId::Host,
             };
             (capability, provider)
         })
@@ -1162,7 +1162,7 @@ minimum = "1.0"
                     .expect("capability should parse"),
                 kind: crate::ServiceKind::Query,
                 interface_id: "permission-query/v1".to_string(),
-                provider: crate::ServiceProviderId::Plugin("bmux.permissions".to_string()),
+                provider: crate::ProviderId::Plugin("bmux.permissions".to_string()),
             }],
             available_capabilities: vec!["bmux.permissions.read".to_string()],
             enabled_plugins: vec!["bmux.permissions".to_string()],
@@ -1254,7 +1254,7 @@ minimum = "1.0"
                     .expect("capability should parse"),
                 kind: crate::ServiceKind::Query,
                 interface_id: "config-query/v1".to_string(),
-                provider: crate::ServiceProviderId::Host,
+                provider: crate::ProviderId::Host,
             }],
             available_capabilities: vec!["bmux.config.read".to_string()],
             enabled_plugins: Vec::new(),
@@ -1305,7 +1305,7 @@ minimum = "1.0"
                         .expect("capability should parse"),
                     kind: crate::ServiceKind::Query,
                     interface_id: "permission-query/v1".to_string(),
-                    provider: crate::ServiceProviderId::Plugin("bmux.permissions".to_string()),
+                    provider: crate::ProviderId::Plugin("bmux.permissions".to_string()),
                 },
                 operation: "list".to_string(),
                 payload: vec![1, 2, 3],

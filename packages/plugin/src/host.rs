@@ -411,7 +411,7 @@ mod tests {
                 capability: capability.clone(),
                 kind: ServiceKind::Query,
                 interface_id: "window-query/v1".to_string(),
-                provider: crate::ServiceProviderId::Plugin("bmux.windows".to_string()),
+                provider: crate::ProviderId::Plugin("bmux.windows".to_string()),
             }],
         );
         let service =
@@ -430,7 +430,7 @@ mod tests {
                 capability: capability.clone(),
                 kind: ServiceKind::Command,
                 interface_id: "window-command/v1".to_string(),
-                provider: crate::ServiceProviderId::Plugin("bmux.windows".to_string()),
+                provider: crate::ProviderId::Plugin("bmux.windows".to_string()),
             }],
         );
         assert!(
@@ -454,7 +454,7 @@ mod tests {
                 capability: capability.clone(),
                 kind: ServiceKind::Query,
                 interface_id: "permission-query/v1".to_string(),
-                provider: crate::ServiceProviderId::Plugin("bmux.permissions".to_string()),
+                provider: crate::ProviderId::Plugin("bmux.permissions".to_string()),
             }],
         );
         let error = PluginHost::resolve_service(

@@ -31,12 +31,12 @@ impl PluginService {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ServiceProviderId {
+pub enum ProviderId {
     Plugin(String),
     Host,
 }
 
-impl ServiceProviderId {
+impl ProviderId {
     #[must_use]
     pub fn display_name(&self) -> &str {
         match self {
@@ -46,7 +46,7 @@ impl ServiceProviderId {
     }
 }
 
-impl fmt::Display for ServiceProviderId {
+impl fmt::Display for ProviderId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.display_name())
     }
@@ -57,7 +57,7 @@ pub struct RegisteredService {
     pub capability: HostScope,
     pub kind: ServiceKind,
     pub interface_id: String,
-    pub provider: ServiceProviderId,
+    pub provider: ProviderId,
 }
 
 impl RegisteredService {
@@ -225,7 +225,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        RegisteredService, ServiceEnvelopeKind, ServiceKind, ServiceProviderId, ServiceRequest,
+        ProviderId, RegisteredService, ServiceEnvelopeKind, ServiceKind, ServiceRequest,
         ServiceResponse, decode_service_envelope, decode_service_message, encode_service_envelope,
         encode_service_message,
     };
@@ -249,7 +249,7 @@ mod tests {
                     .expect("capability should parse"),
                 kind: ServiceKind::Query,
                 interface_id: "permission-query/v1".to_string(),
-                provider: ServiceProviderId::Plugin("bmux.permissions".to_string()),
+                provider: ProviderId::Plugin("bmux.permissions".to_string()),
             },
             operation: "list".to_string(),
             payload: vec![4, 5, 6],

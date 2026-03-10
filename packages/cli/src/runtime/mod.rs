@@ -109,7 +109,7 @@ fn core_service_descriptors() -> Vec<RegisteredService> {
         capability: HostScope::new("bmux.config.read").expect("capability should parse"),
         kind: ServiceKind::Query,
         interface_id: "config-query/v1".to_string(),
-        provider: bmux_plugin::ServiceProviderId::Host,
+        provider: bmux_plugin::ProviderId::Host,
     }]
 }
 
@@ -149,9 +149,7 @@ fn service_descriptors_from_declarations<'a>(
                 capability: service.capability.clone(),
                 kind: service.kind,
                 interface_id: service.interface_id.clone(),
-                provider: bmux_plugin::ServiceProviderId::Plugin(
-                    declaration.id.as_str().to_string(),
-                ),
+                provider: bmux_plugin::ProviderId::Plugin(declaration.id.as_str().to_string()),
             })
     }));
     services

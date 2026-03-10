@@ -35,7 +35,7 @@ pub struct PluginRegistry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityProvider {
     pub capability: HostScope,
-    pub provider_plugin_id: String,
+    pub provider: crate::ProviderId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -267,7 +267,7 @@ impl PluginRegistry {
                 capability.clone(),
                 CapabilityProvider {
                     capability: capability.clone(),
-                    provider_plugin_id: "core".to_string(),
+                    provider: crate::ProviderId::Host,
                 },
             );
         }
@@ -277,7 +277,7 @@ impl PluginRegistry {
                 if let Some(existing) = providers.get(capability) {
                     return Err(PluginError::DuplicateCapabilityProvider {
                         capability: capability.as_str().to_string(),
-                        first_provider: existing.provider_plugin_id.clone(),
+                        first_provider: existing.provider.to_string(),
                         second_provider: plugin.declaration.id.as_str().to_string(),
                     });
                 }
@@ -285,7 +285,9 @@ impl PluginRegistry {
                     capability.clone(),
                     CapabilityProvider {
                         capability: capability.clone(),
-                        provider_plugin_id: plugin.declaration.id.as_str().to_string(),
+                        provider: crate::ProviderId::Plugin(
+                            plugin.declaration.id.as_str().to_string(),
+                        ),
                     },
                 );
             }
@@ -352,9 +354,7 @@ impl PluginRegistry {
                     capability: service.capability.clone(),
                     kind: service.kind,
                     interface_id: service.interface_id.clone(),
-                    provider: crate::ServiceProviderId::Plugin(
-                        plugin.declaration.id.as_str().to_string(),
-                    ),
+                    provider: crate::ProviderId::Plugin(plugin.declaration.id.as_str().to_string()),
                 };
                 if let Some(existing) = providers.get(&registered.key()) {
                     return Err(PluginError::DuplicateServiceProvider {
