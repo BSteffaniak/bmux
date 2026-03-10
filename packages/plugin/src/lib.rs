@@ -53,7 +53,9 @@ pub use loader::{
 };
 pub use manifest::{PluginManifest, PluginManifestCompatibility, PluginRuntime};
 pub use native_exports::RustPlugin;
-pub use registry::{PluginCompatibilityReport, PluginRegistry, RegisteredPlugin};
+pub use registry::{
+    CapabilityProvider, PluginCompatibilityReport, PluginRegistry, RegisteredPlugin,
+};
 pub use version::{ApiVersion, VersionRange};
 
 /// Stable bmux plugin API version exposed by this crate.

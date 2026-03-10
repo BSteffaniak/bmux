@@ -7,7 +7,7 @@ use crate::{
 };
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, c_char};
 use std::path::Path;
 
@@ -49,7 +49,10 @@ pub struct NativeDescriptor {
     #[serde(default)]
     pub homepage: Option<String>,
     #[serde(default)]
-    pub required_host_scopes: BTreeSet<HostScope>,
+    #[serde(alias = "required_host_scopes")]
+    pub required_capabilities: BTreeSet<HostScope>,
+    #[serde(default)]
+    pub provided_capabilities: BTreeSet<HostScope>,
     #[serde(default)]
     pub provided_features: BTreeSet<PluginFeature>,
     #[serde(default)]
@@ -90,7 +93,8 @@ impl NativeDescriptor {
             entrypoint,
             description: self.description,
             homepage: self.homepage,
-            required_host_scopes: self.required_host_scopes,
+            required_capabilities: self.required_capabilities,
+            provided_capabilities: self.provided_capabilities,
             provided_features: self.provided_features,
             commands: self.commands,
             event_subscriptions: self.event_subscriptions,
@@ -312,9 +316,13 @@ impl NativePluginLoader {
         &self,
         registered_plugin: &RegisteredPlugin,
         host: &HostMetadata,
-        supported_host_scopes: &[HostScope],
+        available_capabilities: &BTreeMap<HostScope, crate::CapabilityProvider>,
     ) -> Result<LoadedPlugin> {
-        PluginRegistry::validate_registered_plugin(registered_plugin, host, supported_host_scopes)?;
+        PluginRegistry::validate_registered_plugin(
+            registered_plugin,
+            host,
+            available_capabilities,
+        )?;
 
         let entry_path = registered_plugin.manifest.resolve_entry_path(
             registered_plugin
@@ -337,7 +345,7 @@ impl NativePluginLoader {
                 ..registered_plugin.clone()
             },
             host,
-            supported_host_scopes,
+            available_capabilities,
         )?;
         compare_manifest_and_descriptor(registered_plugin, &declaration)?;
 
@@ -355,9 +363,13 @@ impl NativePluginLoader {
 pub fn load_registered_plugin(
     registered_plugin: &RegisteredPlugin,
     host: &HostMetadata,
-    supported_host_scopes: &[HostScope],
+    available_capabilities: &BTreeMap<HostScope, crate::CapabilityProvider>,
 ) -> Result<LoadedPlugin> {
-    NativePluginLoader::new().load_registered_plugin(registered_plugin, host, supported_host_scopes)
+    NativePluginLoader::new().load_registered_plugin(
+        registered_plugin,
+        host,
+        available_capabilities,
+    )
 }
 
 fn load_native_declaration(
@@ -442,9 +454,15 @@ fn compare_manifest_and_descriptor(
     )?;
     ensure_match(
         registered_plugin.declaration.id.as_str(),
-        "required_host_scopes",
-        &format!("{:?}", registered_plugin.declaration.required_host_scopes),
-        &format!("{:?}", declaration.required_host_scopes),
+        "required_capabilities",
+        &format!("{:?}", registered_plugin.declaration.required_capabilities),
+        &format!("{:?}", declaration.required_capabilities),
+    )?;
+    ensure_match(
+        registered_plugin.declaration.id.as_str(),
+        "provided_capabilities",
+        &format!("{:?}", registered_plugin.declaration.provided_capabilities),
+        &format!("{:?}", declaration.provided_capabilities),
     )?;
     ensure_match(
         registered_plugin.declaration.id.as_str(),
@@ -512,7 +530,7 @@ mod tests {
         "id = \"test.plugin\"\n",
         "display_name = \"Test Plugin\"\n",
         "plugin_version = \"0.1.0\"\n",
-        "required_host_scopes = [\"bmux.commands\"]\n\n",
+        "required_capabilities = [\"bmux.commands\"]\n\n",
         "[[commands]]\n",
         "name = \"hello\"\n",
         "summary = \"hello\"\n",
@@ -536,7 +554,7 @@ mod tests {
 id = "git.status"
 display_name = "Git Status"
 plugin_version = "0.1.0"
-required_host_scopes = ["bmux.commands"]
+required_capabilities = ["bmux.commands"]
 
 [plugin_api]
 minimum = "1.0"
@@ -589,7 +607,7 @@ id = "test.plugin"
 name = "Test Plugin"
 version = "0.1.0"
 entry = "unused.dylib"
-required_host_scopes = ["bmux.commands"]
+required_capabilities = ["bmux.commands"]
 
 [[commands]]
 name = "hello"
@@ -710,7 +728,8 @@ minimum = "1.0"
                 },
                 description: None,
                 homepage: None,
-                required_host_scopes: BTreeSet::new(),
+                required_capabilities: BTreeSet::new(),
+                provided_capabilities: BTreeSet::new(),
                 provided_features: BTreeSet::new(),
                 commands: Vec::new(),
                 event_subscriptions: vec![PluginEventSubscription {

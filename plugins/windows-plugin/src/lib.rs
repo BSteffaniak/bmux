@@ -30,11 +30,13 @@ impl RustPlugin for WindowsPlugin {
             },
             description: Some("Shipped bmux windows command plugin".to_string()),
             homepage: None,
-            required_host_scopes: BTreeSet::from([
+            required_capabilities: BTreeSet::from([
                 HostScope::new("bmux.commands").expect("host scope should parse"),
+                HostScope::new("bmux.sessions.read").expect("host scope should parse"),
+            ]),
+            provided_capabilities: BTreeSet::from([
                 HostScope::new("bmux.windows.read").expect("host scope should parse"),
                 HostScope::new("bmux.windows.write").expect("host scope should parse"),
-                HostScope::new("bmux.sessions.read").expect("host scope should parse"),
             ]),
             provided_features: BTreeSet::from([
                 PluginFeature::new("bmux.windows").expect("plugin feature should parse")
@@ -577,9 +579,9 @@ mod tests {
         assert_eq!(reparsed.commands.len(), 5);
         assert!(
             reparsed
-                .provided_features
+                .provided_capabilities
                 .iter()
-                .any(|feature| feature.as_str() == "bmux.windows")
+                .any(|capability| capability.as_str() == "bmux.windows.read")
         );
     }
 }

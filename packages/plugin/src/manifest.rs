@@ -67,7 +67,10 @@ pub struct PluginManifest {
     pub plugin_api: PluginManifestCompatibility,
     pub native_abi: PluginManifestCompatibility,
     #[serde(default)]
-    pub required_host_scopes: BTreeSet<HostScope>,
+    #[serde(alias = "required_host_scopes")]
+    pub required_capabilities: BTreeSet<HostScope>,
+    #[serde(default)]
+    pub provided_capabilities: BTreeSet<HostScope>,
     #[serde(default)]
     pub provided_features: BTreeSet<PluginFeature>,
     #[serde(default)]
@@ -122,7 +125,8 @@ impl PluginManifest {
             },
             description: self.description.clone(),
             homepage: self.homepage.clone(),
-            required_host_scopes: self.required_host_scopes.clone(),
+            required_capabilities: self.required_capabilities.clone(),
+            provided_capabilities: self.provided_capabilities.clone(),
             provided_features: self.provided_features.clone(),
             commands: self.commands.clone(),
             event_subscriptions: self.event_subscriptions.clone(),
@@ -179,7 +183,7 @@ name = "Git Status"
 version = "0.1.0"
 runtime = "native"
 entry = "libgit_status.dylib"
-required_host_scopes = ["bmux.commands", "bmux.events.subscribe"]
+required_capabilities = ["bmux.commands", "bmux.events.subscribe"]
 
 [[commands]]
 name = "hello"
@@ -202,7 +206,7 @@ minimum = "1.0"
         assert_eq!(manifest.id, "git.status");
         assert!(
             manifest
-                .required_host_scopes
+                .required_capabilities
                 .contains(&HostScope::new("bmux.commands").expect("scope should parse"))
         );
         assert_eq!(manifest.commands.len(), 1);

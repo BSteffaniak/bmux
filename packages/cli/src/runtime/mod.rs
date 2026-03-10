@@ -76,7 +76,7 @@ const ATTACH_SELECTION_EMPTY_STATUS: &str = "no selection";
 const ATTACH_TRANSIENT_STATUS_TTL: Duration = Duration::from_millis(1800);
 const ATTACH_WELCOME_STATUS_TTL: Duration = Duration::from_millis(2600);
 const HELP_OVERLAY_SURFACE_ID: Uuid = Uuid::from_u128(1);
-fn supported_plugin_host_scopes() -> Vec<HostScope> {
+fn core_provided_capabilities() -> Vec<HostScope> {
     [
         "bmux.commands",
         "bmux.events.subscribe",
@@ -84,12 +84,8 @@ fn supported_plugin_host_scopes() -> Vec<HostScope> {
         "bmux.status_bar_items",
         "bmux.storage",
         "bmux.clipboard",
-        "bmux.permissions.read",
-        "bmux.permissions.write",
         "bmux.sessions.read",
         "bmux.sessions.write",
-        "bmux.windows.read",
-        "bmux.windows.write",
         "bmux.panes.read",
         "bmux.panes.write",
         "bmux.follow.read",
@@ -104,6 +100,15 @@ fn supported_plugin_host_scopes() -> Vec<HostScope> {
     .into_iter()
     .map(|scope| HostScope::new(scope).expect("supported plugin host scope should parse"))
     .collect()
+}
+
+fn available_capability_providers(
+    config: &BmuxConfig,
+    registry: &PluginRegistry,
+) -> Result<std::collections::BTreeMap<HostScope, bmux_plugin::CapabilityProvider>> {
+    registry
+        .capability_providers_for(&config.plugins.enabled, &core_provided_capabilities())
+        .context("failed resolving capability providers")
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -733,7 +738,7 @@ fn validate_enabled_plugins(config: &BmuxConfig, registry: &PluginRegistry) -> R
     }
 
     let host = plugin_host_metadata();
-    let supported_host_scopes = supported_plugin_host_scopes();
+    let available_capabilities = available_capability_providers(config, registry)?;
     let ordered_plugins = registry
         .activation_order_for(&config.plugins.enabled)
         .context("enabled plugin dependency graph is invalid")?;
@@ -742,7 +747,7 @@ fn validate_enabled_plugins(config: &BmuxConfig, registry: &PluginRegistry) -> R
         bmux_plugin::PluginRegistry::validate_registered_plugin(
             plugin,
             &host,
-            &supported_host_scopes,
+            &available_capabilities,
         )
         .with_context(|| format!("failed validating enabled plugin '{plugin_id}'"))?;
     }
@@ -768,14 +773,14 @@ fn load_enabled_plugins(
     }
 
     let host = plugin_host_metadata();
-    let supported_host_scopes = supported_plugin_host_scopes();
+    let available_capabilities = available_capability_providers(config, registry)?;
     let ordered_plugins = registry
         .activation_order_for(&config.plugins.enabled)
         .context("enabled plugin dependency graph is invalid")?;
     let mut loaded_plugins = Vec::with_capacity(ordered_plugins.len());
     for plugin in ordered_plugins {
         let plugin_id = plugin.declaration.id.as_str();
-        let loaded = load_native_registered_plugin(plugin, &host, &supported_host_scopes)
+        let loaded = load_native_registered_plugin(plugin, &host, &available_capabilities)
             .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"))?;
         loaded_plugins.push(loaded);
     }
@@ -987,8 +992,8 @@ struct PluginListJsonEntry {
     display_name: String,
     version: String,
     enabled: bool,
-    required_host_scopes: Vec<String>,
-    provided_features: Vec<String>,
+    required_capabilities: Vec<String>,
+    provided_capabilities: Vec<String>,
     commands: Vec<String>,
 }
 
@@ -1008,15 +1013,15 @@ async fn run_plugin_list(as_json: bool) -> Result<u8> {
             display_name: plugin.declaration.display_name.clone(),
             version: plugin.declaration.plugin_version.clone(),
             enabled: enabled.contains(&plugin.declaration.id.as_str().to_string()),
-            required_host_scopes: plugin
+            required_capabilities: plugin
                 .declaration
-                .required_host_scopes
+                .required_capabilities
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
-            provided_features: plugin
+            provided_capabilities: plugin
                 .declaration
-                .provided_features
+                .provided_capabilities
                 .iter()
                 .map(ToString::to_string)
                 .collect(),
@@ -1049,11 +1054,17 @@ async fn run_plugin_list(as_json: bool) -> Result<u8> {
             if !entry.commands.is_empty() {
                 println!("  commands: {}", entry.commands.join(", "));
             }
-            if !entry.required_host_scopes.is_empty() {
-                println!("  host scopes: {}", entry.required_host_scopes.join(", "));
+            if !entry.required_capabilities.is_empty() {
+                println!(
+                    "  required capabilities: {}",
+                    entry.required_capabilities.join(", ")
+                );
             }
-            if !entry.provided_features.is_empty() {
-                println!("  features: {}", entry.provided_features.join(", "));
+            if !entry.provided_capabilities.is_empty() {
+                println!(
+                    "  provided capabilities: {}",
+                    entry.provided_capabilities.join(", ")
+                );
             }
         }
     }
@@ -1091,7 +1102,7 @@ async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]
     let loaded = load_native_registered_plugin(
         plugin,
         &plugin_host_metadata(),
-        &supported_plugin_host_scopes(),
+        &available_capability_providers(&config, &registry)?,
     )
     .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"))?;
     let context = plugin_command_context(&config, &paths, plugin_id, command_name, args);
@@ -5159,14 +5170,14 @@ mod tests {
 
     fn plugin_manifest(id: &str, entry: &str) -> PluginManifest {
         PluginManifest::from_toml_str(&format!(
-            "id = '{id}'\nname = 'Example'\nversion='0.1.0'\nentry='{entry}'\nrequired_host_scopes=['bmux.commands']\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n"
+            "id = '{id}'\nname = 'Example'\nversion='0.1.0'\nentry='{entry}'\nrequired_capabilities=['bmux.commands']\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n"
         ))
         .expect("manifest should parse")
     }
 
     fn plugin_manifest_with_commands(id: &str, entry: &str, commands: &str) -> PluginManifest {
         PluginManifest::from_toml_str(&format!(
-            "id = '{id}'\nname = 'Example'\nversion='0.1.0'\nentry='{entry}'\nrequired_host_scopes=['bmux.commands']\n{commands}\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n"
+            "id = '{id}'\nname = 'Example'\nversion='0.1.0'\nentry='{entry}'\nrequired_capabilities=['bmux.commands']\n{commands}\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n"
         ))
         .expect("manifest should parse")
     }
@@ -5240,6 +5251,43 @@ mod tests {
     }
 
     #[test]
+    fn validate_enabled_plugins_accepts_plugin_provided_capabilities() {
+        let dir = temp_dir();
+        let provider_dir = dir.join("windows");
+        let dependent_dir = dir.join("consumer");
+        fs::create_dir_all(&provider_dir).expect("provider dir should exist");
+        fs::create_dir_all(&dependent_dir).expect("dependent dir should exist");
+        fs::write(provider_dir.join("windows.dylib"), []).expect("provider entry should exist");
+        fs::write(dependent_dir.join("consumer.dylib"), []).expect("dependent entry should exist");
+
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(
+                &provider_dir.join("plugin.toml"),
+                PluginManifest::from_toml_str(
+                    "id='bmux.windows'\nname='Windows'\nversion='0.1.0'\nentry='windows.dylib'\nrequired_capabilities=['bmux.commands']\nprovided_capabilities=['bmux.windows.read','bmux.windows.write']\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n",
+                )
+                .expect("provider manifest should parse"),
+            )
+            .expect("provider should register");
+        registry
+            .register_manifest(
+                &dependent_dir.join("plugin.toml"),
+                PluginManifest::from_toml_str(
+                    "id='consumer.plugin'\nname='Consumer'\nversion='0.1.0'\nentry='consumer.dylib'\nrequired_capabilities=['bmux.windows.read']\n[[dependencies]]\nplugin_id='bmux.windows'\nversion_req='^0.1'\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n",
+                )
+                .expect("dependent manifest should parse"),
+            )
+            .expect("dependent should register");
+
+        let mut config = BmuxConfig::default();
+        config.plugins.enabled.push("bmux.windows".to_string());
+        config.plugins.enabled.push("consumer.plugin".to_string());
+
+        assert!(super::validate_enabled_plugins(&config, &registry).is_ok());
+    }
+
+    #[test]
     fn validate_enabled_plugins_rejects_missing_plugin() {
         let mut config = BmuxConfig::default();
         config.plugins.enabled.push("missing.plugin".to_string());
@@ -5257,7 +5305,7 @@ mod tests {
         fs::write(plugin_dir.join("example.dylib"), []).expect("entry should be written");
         fs::write(
             plugin_dir.join("plugin.toml"),
-            "id = 'example.plugin'\nname = 'Example'\nversion='0.1.0'\nentry='example.dylib'\nrequired_host_scopes=['bmux.commands']\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n",
+            "id = 'example.plugin'\nname = 'Example'\nversion='0.1.0'\nentry='example.dylib'\nrequired_capabilities=['bmux.commands']\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n",
         )
         .expect("manifest should be written");
 

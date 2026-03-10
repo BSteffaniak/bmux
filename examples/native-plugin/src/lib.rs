@@ -31,11 +31,11 @@ impl RustPlugin for ExamplePlugin {
             },
             description: Some("Example in-repo native plugin for bmux".to_string()),
             homepage: None,
-            required_host_scopes: BTreeSet::from([
+            required_capabilities: BTreeSet::from([
                 HostScope::new("bmux.commands").expect("host scope should parse"),
                 HostScope::new("bmux.events.subscribe").expect("host scope should parse"),
-                HostScope::new("bmux.permissions.read").expect("host scope should parse"),
             ]),
+            provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::from([
                 PluginFeature::new("example.native").expect("plugin feature should parse")
             ]),

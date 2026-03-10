@@ -79,7 +79,10 @@ pub struct PluginDeclaration {
     #[serde(default)]
     pub homepage: Option<String>,
     #[serde(default)]
-    pub required_host_scopes: BTreeSet<HostScope>,
+    #[serde(alias = "required_host_scopes")]
+    pub required_capabilities: BTreeSet<HostScope>,
+    #[serde(default)]
+    pub provided_capabilities: BTreeSet<HostScope>,
     #[serde(default)]
     pub provided_features: BTreeSet<PluginFeature>,
     #[serde(default)]
@@ -109,11 +112,14 @@ impl PluginDeclaration {
             }
 
             if matches!(command.execution, CommandExecutionKind::RuntimeHook)
-                && !self.required_host_scopes.iter().any(HostScope::is_hot_path)
+                && !self
+                    .required_capabilities
+                    .iter()
+                    .any(HostScope::is_hot_path)
             {
-                return Err(PluginError::UnsupportedHostScope {
+                return Err(PluginError::MissingRequiredCapability {
                     plugin_id: self.id.as_str().to_string(),
-                    scope: "bmux.terminal.input_intercept".to_string(),
+                    capability: "bmux.terminal.input_intercept".to_string(),
                 });
             }
 
@@ -140,6 +146,15 @@ impl PluginDeclaration {
                         command: command.name.clone(),
                     });
                 }
+            }
+        }
+
+        for capability in &self.provided_capabilities {
+            if self.required_capabilities.contains(capability) {
+                return Err(PluginError::CapabilitySelfRequirement {
+                    plugin_id: self.id.as_str().to_string(),
+                    capability: capability.as_str().to_string(),
+                });
             }
         }
 
@@ -237,7 +252,8 @@ mod tests {
             },
             description: None,
             homepage: None,
-            required_host_scopes: BTreeSet::new(),
+            required_capabilities: BTreeSet::new(),
+            provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::new(),
             commands: vec![
                 PluginCommand {
@@ -271,8 +287,8 @@ mod tests {
 
     #[test]
     fn validate_allows_runtime_hook_when_hot_path_scope_exists() {
-        let mut required_host_scopes = BTreeSet::new();
-        required_host_scopes
+        let mut required_capabilities = BTreeSet::new();
+        required_capabilities
             .insert(HostScope::new("bmux.terminal.input_intercept").expect("scope should parse"));
 
         let declaration = PluginDeclaration {
@@ -286,7 +302,8 @@ mod tests {
             },
             description: None,
             homepage: None,
-            required_host_scopes,
+            required_capabilities,
+            provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::new(),
             commands: vec![PluginCommand {
                 name: "runtime".to_string(),
@@ -319,7 +336,8 @@ mod tests {
             },
             description: None,
             homepage: None,
-            required_host_scopes: BTreeSet::new(),
+            required_capabilities: BTreeSet::new(),
+            provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::new(),
             commands: Vec::new(),
             event_subscriptions: Vec::new(),

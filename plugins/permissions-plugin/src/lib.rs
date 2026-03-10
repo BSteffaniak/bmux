@@ -30,8 +30,10 @@ impl RustPlugin for PermissionsPlugin {
             },
             description: Some("Shipped bmux permissions command plugin".to_string()),
             homepage: None,
-            required_host_scopes: BTreeSet::from([
-                HostScope::new("bmux.commands").expect("host scope should parse"),
+            required_capabilities: BTreeSet::from([
+                HostScope::new("bmux.commands").expect("host scope should parse")
+            ]),
+            provided_capabilities: BTreeSet::from([
                 HostScope::new("bmux.permissions.read").expect("host scope should parse"),
                 HostScope::new("bmux.permissions.write").expect("host scope should parse"),
             ]),

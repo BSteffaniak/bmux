@@ -4,6 +4,7 @@ use bmux_ipc::{IpcEndpoint, SessionRole, SessionSelector};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -25,6 +26,11 @@ fn temp_dir() -> PathBuf {
     let dir = std::env::temp_dir().join(format!("bp-{nanos:x}"));
     fs::create_dir_all(&dir).expect("temp dir should be created");
     dir
+}
+
+fn plugin_test_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn sandbox_paths(root: &Path) -> (PathBuf, PathBuf) {
@@ -278,6 +284,9 @@ fn wait_for_server_ready(
 
 #[test]
 fn installs_example_plugin_and_runs_command() {
+    let _guard = plugin_test_lock()
+        .lock()
+        .expect("plugin test lock poisoned");
     let root = workspace_root();
     let (_sandbox, home_dir, config_home, data_home, runtime_dir, tmp_dir, config_dir) =
         sandbox_setup();
@@ -320,6 +329,9 @@ fn installs_example_plugin_and_runs_command() {
 
 #[test]
 fn shipped_permissions_plugin_handles_permissions_command() {
+    let _guard = plugin_test_lock()
+        .lock()
+        .expect("plugin test lock poisoned");
     let root = workspace_root();
     let (sandbox, home_dir, config_home, data_home, runtime_dir, tmp_dir, config_dir) =
         sandbox_setup();
@@ -593,6 +605,9 @@ fn shipped_permissions_plugin_handles_permissions_command() {
 
 #[test]
 fn shipped_windows_plugin_handles_window_commands() {
+    let _guard = plugin_test_lock()
+        .lock()
+        .expect("plugin test lock poisoned");
     let root = workspace_root();
     let (sandbox, home_dir, config_home, data_home, runtime_dir, tmp_dir, config_dir) =
         sandbox_setup();

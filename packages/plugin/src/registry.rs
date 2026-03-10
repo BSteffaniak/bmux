@@ -29,6 +29,12 @@ pub struct PluginRegistry {
     plugins: BTreeMap<String, RegisteredPlugin>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CapabilityProvider {
+    pub capability: HostScope,
+    pub provider_plugin_id: String,
+}
+
 impl PluginRegistry {
     #[must_use]
     pub const fn new() -> Self {
@@ -242,10 +248,48 @@ impl PluginRegistry {
     ///
     /// Returns an error when the plugin is incompatible with the host or when
     /// its native entry file is missing.
+    pub fn capability_providers_for(
+        &self,
+        plugin_ids: &[String],
+        core_capabilities: &[HostScope],
+    ) -> Result<BTreeMap<HostScope, CapabilityProvider>> {
+        let mut providers = BTreeMap::new();
+        for capability in core_capabilities {
+            providers.insert(
+                capability.clone(),
+                CapabilityProvider {
+                    capability: capability.clone(),
+                    provider_plugin_id: "core".to_string(),
+                },
+            );
+        }
+
+        for plugin in self.activation_order_for(plugin_ids)? {
+            for capability in &plugin.declaration.provided_capabilities {
+                if let Some(existing) = providers.get(capability) {
+                    return Err(PluginError::DuplicateCapabilityProvider {
+                        capability: capability.as_str().to_string(),
+                        first_provider: existing.provider_plugin_id.clone(),
+                        second_provider: plugin.declaration.id.as_str().to_string(),
+                    });
+                }
+                providers.insert(
+                    capability.clone(),
+                    CapabilityProvider {
+                        capability: capability.clone(),
+                        provider_plugin_id: plugin.declaration.id.as_str().to_string(),
+                    },
+                );
+            }
+        }
+
+        Ok(providers)
+    }
+
     pub fn validate_registered_plugin(
         registered_plugin: &RegisteredPlugin,
         host: &HostMetadata,
-        supported_host_scopes: &[HostScope],
+        available_capabilities: &BTreeMap<HostScope, CapabilityProvider>,
     ) -> Result<()> {
         let report = Self::compatibility_report(registered_plugin, host);
         if !report.api_compatible {
@@ -263,11 +307,11 @@ impl PluginRegistry {
             });
         }
 
-        for scope in &registered_plugin.declaration.required_host_scopes {
-            if !supported_host_scopes.contains(scope) {
-                return Err(PluginError::UnsupportedHostScope {
+        for capability in &registered_plugin.declaration.required_capabilities {
+            if !available_capabilities.contains_key(capability) {
+                return Err(PluginError::MissingRequiredCapability {
                     plugin_id: registered_plugin.declaration.id.as_str().to_string(),
-                    scope: scope.as_str().to_string(),
+                    capability: capability.as_str().to_string(),
                 });
             }
         }
@@ -295,11 +339,13 @@ impl PluginRegistry {
     pub fn validate_against_host(
         &self,
         host: &HostMetadata,
-        supported_host_scopes: &[HostScope],
+        plugin_ids: &[String],
+        core_capabilities: &[HostScope],
     ) -> Result<()> {
-        let plugin_ids = self.plugins.keys().cloned().collect::<Vec<_>>();
-        for plugin in self.activation_order_for(&plugin_ids)? {
-            Self::validate_registered_plugin(plugin, host, supported_host_scopes)?;
+        let available_capabilities =
+            self.capability_providers_for(plugin_ids, core_capabilities)?;
+        for plugin in self.activation_order_for(plugin_ids)? {
+            Self::validate_registered_plugin(plugin, host, &available_capabilities)?;
         }
 
         Ok(())
@@ -362,7 +408,7 @@ id = "git.status"
 name = "Git Status"
 version = "0.1.0"
 entry = "libgit_status.dylib"
-required_host_scopes = ["bmux.commands"]
+required_capabilities = ["bmux.commands"]
 
 [plugin_api]
 minimum = "1.0"
@@ -389,6 +435,7 @@ minimum = "1.0"
         registry
             .validate_against_host(
                 &host,
+                &["git.status".to_string()],
                 &[HostScope::new("bmux.commands").expect("scope should parse")],
             )
             .expect("plugin should validate");
@@ -448,5 +495,58 @@ minimum = "1.0"
             .expect("dependency activation order should succeed");
         assert_eq!(order[0].declaration.id.as_str(), "bmux.sessions");
         assert_eq!(order[1].declaration.id.as_str(), "bmux.follow");
+    }
+
+    #[test]
+    fn capability_providers_detect_duplicate_plugin_ownership() {
+        let dir = temp_dir();
+        fs::write(dir.join("one.dylib"), []).expect("one entry should be written");
+        fs::write(dir.join("two.dylib"), []).expect("two entry should be written");
+
+        let one = PluginManifest::from_toml_str(
+            r#"
+id = "one.plugin"
+name = "One"
+version = "0.1.0"
+entry = "one.dylib"
+provided_capabilities = ["bmux.windows.read"]
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+        )
+        .expect("first manifest should parse");
+        let two = PluginManifest::from_toml_str(
+            r#"
+id = "two.plugin"
+name = "Two"
+version = "0.1.0"
+entry = "two.dylib"
+provided_capabilities = ["bmux.windows.read"]
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+"#,
+        )
+        .expect("second manifest should parse");
+
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(&dir.join("one.toml"), one)
+            .expect("first registration should succeed");
+        registry
+            .register_manifest(&dir.join("two.toml"), two)
+            .expect("second registration should succeed");
+
+        let error = registry
+            .capability_providers_for(&["one.plugin".to_string(), "two.plugin".to_string()], &[])
+            .expect_err("duplicate providers should fail");
+        assert!(error.to_string().contains("bmux.windows.read"));
     }
 }

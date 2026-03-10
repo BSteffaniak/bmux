@@ -21,11 +21,23 @@ pub enum PluginError {
     #[error("plugin '{plugin_id}' has duplicate CLI alias entries for command '{command}'")]
     DuplicatePluginCommandAlias { plugin_id: String, command: String },
 
-    #[error("invalid host scope '{scope}'")]
-    InvalidHostScope { scope: String },
+    #[error("invalid capability id '{capability}'")]
+    InvalidCapabilityId { capability: String },
 
     #[error("invalid plugin feature '{feature}'")]
     InvalidPluginFeature { feature: String },
+
+    #[error("plugin '{plugin_id}' provides duplicate capability '{capability}'")]
+    DuplicateProvidedCapability {
+        plugin_id: String,
+        capability: String,
+    },
+
+    #[error("plugin '{plugin_id}' both requires and provides capability '{capability}'")]
+    CapabilitySelfRequirement {
+        plugin_id: String,
+        capability: String,
+    },
 
     #[error("plugin '{plugin_id}' declares duplicate dependency '{dependency_id}'")]
     DuplicatePluginDependency {
@@ -92,8 +104,20 @@ pub enum PluginError {
         host: ApiVersion,
     },
 
-    #[error("plugin '{plugin_id}' requested unsupported host scope '{scope}'")]
-    UnsupportedHostScope { plugin_id: String, scope: String },
+    #[error("plugin '{plugin_id}' requires missing capability '{capability}'")]
+    MissingRequiredCapability {
+        plugin_id: String,
+        capability: String,
+    },
+
+    #[error(
+        "capability '{capability}' has multiple providers: '{first_provider}' and '{second_provider}'"
+    )]
+    DuplicateCapabilityProvider {
+        capability: String,
+        first_provider: String,
+        second_provider: String,
+    },
 
     #[error("failed to load native plugin '{plugin_id}' from {path:?}: {details}")]
     NativeLibraryLoad {

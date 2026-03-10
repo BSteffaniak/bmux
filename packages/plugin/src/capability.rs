@@ -11,7 +11,7 @@ impl HostScope {
         if is_valid_capability_id(&value) {
             Ok(Self(value))
         } else {
-            Err(PluginError::InvalidHostScope { scope: value })
+            Err(PluginError::InvalidCapabilityId { capability: value })
         }
     }
 

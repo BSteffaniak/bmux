@@ -489,7 +489,7 @@ id = "bmux.permissions"
 name = "Permissions"
 version = "0.1.0"
 entry = "plugin.dylib"
-required_host_scopes = ["bmux.commands"]
+required_capabilities = ["bmux.commands"]
 
 [[commands]]
 name = "permissions"
@@ -535,7 +535,7 @@ id = "bmux.windows"
 name = "Windows"
 version = "0.1.0"
 entry = "plugin.dylib"
-required_host_scopes = ["bmux.commands"]
+required_capabilities = ["bmux.commands"]
 
 [[commands]]
 name = "new-window"
@@ -581,7 +581,7 @@ id = "example.plugin"
 name = "Example"
 version = "0.1.0"
 entry = "plugin.dylib"
-required_host_scopes = ["bmux.commands"]
+required_capabilities = ["bmux.commands"]
 
 [[commands]]
 name = "new-session"
@@ -620,7 +620,7 @@ id = "bmux.windows"
 name = "Windows"
 version = "0.1.0"
 entry = "plugin.dylib"
-required_host_scopes = ["bmux.commands"]
+required_capabilities = ["bmux.commands"]
 
 [[commands]]
 name = "new-window"
@@ -668,7 +668,7 @@ id = "bmux.permissions"
 name = "Permissions"
 version = "0.1.0"
 entry = "plugin.dylib"
-required_host_scopes = ["bmux.commands"]
+required_capabilities = ["bmux.commands"]
 
 [[commands]]
 name = "permissions"
