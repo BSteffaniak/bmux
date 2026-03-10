@@ -23,7 +23,8 @@ fn temp_dir() -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("time should be monotonic for test")
         .as_nanos();
-    let dir = std::env::temp_dir().join(format!("bp-{nanos:x}"));
+    let pid = std::process::id();
+    let dir = std::env::temp_dir().join(format!("bp-{pid:x}-{nanos:x}"));
     fs::create_dir_all(&dir).expect("temp dir should be created");
     dir
 }
