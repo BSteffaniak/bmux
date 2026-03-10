@@ -263,31 +263,6 @@ pub trait SessionCommandService: Send + Sync {
     fn kill_session(&self, session: SessionRef, force_local: bool) -> Result<SessionHandle>;
 }
 
-pub trait WindowQueryService: Send + Sync {
-    fn list_windows(&self, session: Option<SessionHandle>) -> Result<Vec<WindowSummary>>;
-    fn get_window(&self, window: WindowHandle) -> Result<Option<WindowSummary>>;
-    fn snapshot_window(&self, window: WindowHandle) -> Result<Option<WindowSnapshot>>;
-}
-
-pub trait WindowCommandService: Send + Sync {
-    fn create_window(
-        &self,
-        session: Option<SessionHandle>,
-        name: Option<String>,
-    ) -> Result<WindowHandle>;
-    fn kill_window(
-        &self,
-        session: Option<SessionHandle>,
-        target: WindowRef,
-        force_local: bool,
-    ) -> Result<WindowHandle>;
-    fn switch_window(
-        &self,
-        session: Option<SessionHandle>,
-        target: WindowRef,
-    ) -> Result<WindowHandle>;
-}
-
 pub trait PaneQueryService: Send + Sync {
     fn focused_pane(&self, session: Option<SessionHandle>) -> Result<Option<PaneHandle>>;
     fn list_panes(&self, session: Option<SessionHandle>) -> Result<Vec<PaneSummary>>;
@@ -315,20 +290,6 @@ pub trait PaneCommandService: Send + Sync {
         delta: i16,
     ) -> Result<()>;
     fn close_pane(&self, session: Option<SessionHandle>, target: Option<PaneRef>) -> Result<()>;
-}
-
-pub trait PermissionQueryService: Send + Sync {
-    fn list_permissions(&self, session: SessionHandle) -> Result<Vec<PermissionEntry>>;
-}
-
-pub trait PermissionCommandService: Send + Sync {
-    fn grant_role(
-        &self,
-        session: SessionHandle,
-        client_id: Uuid,
-        role: SessionRoleValue,
-    ) -> Result<()>;
-    fn revoke_role(&self, session: SessionHandle, client_id: Uuid) -> Result<()>;
 }
 
 pub trait ClientQueryService: Send + Sync {

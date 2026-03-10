@@ -1,21 +1,19 @@
 use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::{
-    PaneFocusDirection as IpcPaneFocusDirection, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector,
-    PaneSplitDirection as IpcPaneSplitDirection, SessionRole, SessionSelector, WindowSelector,
+    PaneFocusDirection as IpcPaneFocusDirection, PaneSelector,
+    PaneSplitDirection as IpcPaneSplitDirection, SessionRole, SessionSelector,
 };
 use bmux_plugin::{
     ClientQueryService, ClientSummary, ClipboardService, ConfigService, EventService,
     FollowCommandService, FollowQueryService, FollowState, HostConnectionInfo, HostMetadata,
-    HostScope, PaneCommandService, PaneFocusDirection, PaneHandle, PaneLayoutNode,
-    PaneQueryService, PaneRef, PaneSnapshot, PaneSplitDirection, PaneSummary,
-    PermissionCommandService, PermissionEntry, PermissionQueryService, PersistenceCommandService,
+    HostScope, PaneCommandService, PaneFocusDirection, PaneHandle, PaneQueryService, PaneRef,
+    PaneSnapshot, PaneSplitDirection, PaneSummary, PermissionEntry, PersistenceCommandService,
     PersistenceQueryService, PersistenceRestorePreview, PersistenceRestoreResult,
     PersistenceStatus, PluginError, PluginEvent, PluginHost, PluginStorage, PrincipalIdentityInfo,
     RegisteredService, RenderService, ServerStatusInfo, SessionCommandService, SessionHandle,
     SessionQueryService, SessionRef, SessionRoleValue, SessionSnapshot, SessionSummary,
-    WindowCommandService, WindowHandle, WindowQueryService, WindowRef, WindowSnapshot,
-    WindowSummary,
+    WindowHandle, WindowSummary,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use toml::Value;
@@ -72,22 +70,6 @@ impl CliPluginHost {
             })
         }
     }
-
-    fn assert_registered_service(
-        &self,
-        capability: &str,
-        kind: bmux_plugin::ServiceKind,
-        interface_id: &str,
-        operation: &'static str,
-    ) -> bmux_plugin::Result<()> {
-        let capability = HostScope::new(capability).expect("capability id should parse");
-        self.resolve_service(&capability, kind, interface_id)
-            .map(|_| ())
-            .map_err(|error| match error {
-                PluginError::CapabilityAccessDenied { .. } => error,
-                _ => PluginError::UnsupportedHostOperation { operation },
-            })
-    }
 }
 
 fn paths_from_connection(connection: &HostConnectionInfo) -> ConfigPaths {
@@ -129,11 +111,13 @@ fn map_role(role: SessionRole) -> SessionRoleValue {
     }
 }
 
-fn map_role_to_ipc(role: SessionRoleValue) -> SessionRole {
-    match role {
-        SessionRoleValue::Owner => SessionRole::Owner,
-        SessionRoleValue::Writer => SessionRole::Writer,
-        SessionRoleValue::Observer => SessionRole::Observer,
+fn map_window_summary(entry: bmux_ipc::WindowSummary) -> WindowSummary {
+    WindowSummary {
+        handle: WindowHandle(entry.id),
+        session: SessionHandle(entry.session_id),
+        number: entry.number,
+        name: entry.name,
+        active: entry.active,
     }
 }
 
@@ -146,15 +130,6 @@ fn map_session_ref(session: SessionRef) -> SessionSelector {
 
 fn map_optional_session(session: Option<SessionHandle>) -> Option<SessionSelector> {
     session.map(|handle| SessionSelector::ById(handle.0))
-}
-
-fn map_window_ref(window: WindowRef) -> WindowSelector {
-    match window {
-        WindowRef::Handle(handle) => WindowSelector::ById(handle.0),
-        WindowRef::Number(number) => WindowSelector::ByNumber(number),
-        WindowRef::Name(name) => WindowSelector::ByName(name),
-        WindowRef::Active => WindowSelector::Active,
-    }
 }
 
 fn map_pane_ref(pane: PaneRef) -> PaneSelector {
@@ -179,44 +154,12 @@ fn map_focus_direction(direction: PaneFocusDirection) -> IpcPaneFocusDirection {
     }
 }
 
-fn map_layout_node(node: IpcPaneLayoutNode) -> PaneLayoutNode {
-    match node {
-        IpcPaneLayoutNode::Leaf { pane_id } => PaneLayoutNode::Leaf {
-            pane: PaneHandle(pane_id),
-        },
-        IpcPaneLayoutNode::Split {
-            direction,
-            ratio_percent,
-            first,
-            second,
-        } => PaneLayoutNode::Split {
-            direction: match direction {
-                IpcPaneSplitDirection::Vertical => PaneSplitDirection::Vertical,
-                IpcPaneSplitDirection::Horizontal => PaneSplitDirection::Horizontal,
-            },
-            ratio_percent,
-            first: Box::new(map_layout_node(*first)),
-            second: Box::new(map_layout_node(*second)),
-        },
-    }
-}
-
 fn map_session_summary(entry: bmux_ipc::SessionSummary) -> SessionSummary {
     SessionSummary {
         handle: SessionHandle(entry.id),
         name: entry.name,
         window_count: entry.window_count,
         client_count: entry.client_count,
-    }
-}
-
-fn map_window_summary(entry: bmux_ipc::WindowSummary) -> WindowSummary {
-    WindowSummary {
-        handle: WindowHandle(entry.id),
-        session: SessionHandle(entry.session_id),
-        number: entry.number,
-        name: entry.name,
-        active: entry.active,
     }
 }
 
@@ -416,182 +359,6 @@ impl SessionCommandService for CliPluginHost {
                     .map(SessionHandle)
                     .map_err(|error| {
                         unsupported_operation(&format!("kill_session failed: {error}"))
-                    })
-            })
-        })
-    }
-}
-
-impl WindowQueryService for CliPluginHost {
-    fn list_windows(
-        &self,
-        session: Option<SessionHandle>,
-    ) -> bmux_plugin::Result<Vec<WindowSummary>> {
-        self.assert_registered_service(
-            "bmux.windows.read",
-            bmux_plugin::ServiceKind::Query,
-            "window-query/v1",
-            "window.list",
-        )?;
-        with_client(&self.connection, |client| {
-            tokio::runtime::Handle::current().block_on(async {
-                client
-                    .list_windows(map_optional_session(session))
-                    .await
-                    .map(|windows| windows.into_iter().map(map_window_summary).collect())
-                    .map_err(|error| {
-                        unsupported_operation(&format!("list_windows failed: {error}"))
-                    })
-            })
-        })
-    }
-
-    fn get_window(&self, window: WindowHandle) -> bmux_plugin::Result<Option<WindowSummary>> {
-        self.assert_registered_service(
-            "bmux.windows.read",
-            bmux_plugin::ServiceKind::Query,
-            "window-query/v1",
-            "window.get",
-        )?;
-        with_client(&self.connection, |client| {
-            tokio::runtime::Handle::current().block_on(async {
-                let sessions = client.list_sessions().await.map_err(|error| {
-                    unsupported_operation(&format!("list_sessions failed: {error}"))
-                })?;
-                for session in sessions {
-                    let windows = client
-                        .list_windows(Some(SessionSelector::ById(session.id)))
-                        .await
-                        .map_err(|error| {
-                            unsupported_operation(&format!("list_windows failed: {error}"))
-                        })?;
-                    if let Some(entry) = windows.into_iter().find(|entry| entry.id == window.0) {
-                        return Ok(Some(map_window_summary(entry)));
-                    }
-                }
-                Ok(None)
-            })
-        })
-    }
-
-    fn snapshot_window(&self, window: WindowHandle) -> bmux_plugin::Result<Option<WindowSnapshot>> {
-        self.assert_registered_service(
-            "bmux.windows.read",
-            bmux_plugin::ServiceKind::Query,
-            "window-query/v1",
-            "window.snapshot",
-        )?;
-        with_client(&self.connection, |client| {
-            tokio::runtime::Handle::current().block_on(async {
-                let sessions = client.list_sessions().await.map_err(|error| {
-                    unsupported_operation(&format!("list_sessions failed: {error}"))
-                })?;
-                for session in sessions {
-                    let windows = client
-                        .list_windows(Some(SessionSelector::ById(session.id)))
-                        .await
-                        .map_err(|error| {
-                            unsupported_operation(&format!("list_windows failed: {error}"))
-                        })?;
-                    if let Some(entry) = windows.into_iter().find(|entry| entry.id == window.0) {
-                        if !entry.active {
-                            return Err(unsupported_operation(
-                                "snapshot_window for inactive window",
-                            ));
-                        }
-                        let layout = client.attach_layout(session.id).await.map_err(|error| {
-                            unsupported_operation(&format!("attach_layout failed: {error}"))
-                        })?;
-                        let session_handle = SessionHandle(session.id);
-                        let window_handle = WindowHandle(entry.id);
-                        let panes = layout
-                            .panes
-                            .into_iter()
-                            .map(|pane| map_pane_summary(pane, session_handle, window_handle))
-                            .collect();
-                        return Ok(Some(WindowSnapshot {
-                            window: map_window_summary(entry),
-                            focused_pane: Some(PaneHandle(layout.focused_pane_id)),
-                            panes,
-                            layout_root: Some(map_layout_node(layout.layout_root)),
-                        }));
-                    }
-                }
-                Ok(None)
-            })
-        })
-    }
-}
-
-impl WindowCommandService for CliPluginHost {
-    fn create_window(
-        &self,
-        session: Option<SessionHandle>,
-        name: Option<String>,
-    ) -> bmux_plugin::Result<WindowHandle> {
-        self.assert_registered_service(
-            "bmux.windows.write",
-            bmux_plugin::ServiceKind::Command,
-            "window-command/v1",
-            "window.create",
-        )?;
-        with_client(&self.connection, |client| {
-            tokio::runtime::Handle::current().block_on(async {
-                client
-                    .new_window(map_optional_session(session), name)
-                    .await
-                    .map(WindowHandle)
-                    .map_err(|error| unsupported_operation(&format!("new_window failed: {error}")))
-            })
-        })
-    }
-
-    fn kill_window(
-        &self,
-        session: Option<SessionHandle>,
-        target: WindowRef,
-        force_local: bool,
-    ) -> bmux_plugin::Result<WindowHandle> {
-        self.assert_registered_service(
-            "bmux.windows.write",
-            bmux_plugin::ServiceKind::Command,
-            "window-command/v1",
-            "window.kill",
-        )?;
-        with_client(&self.connection, |client| {
-            tokio::runtime::Handle::current().block_on(async {
-                client
-                    .kill_window_with_options(
-                        map_optional_session(session),
-                        map_window_ref(target),
-                        force_local,
-                    )
-                    .await
-                    .map(WindowHandle)
-                    .map_err(|error| unsupported_operation(&format!("kill_window failed: {error}")))
-            })
-        })
-    }
-
-    fn switch_window(
-        &self,
-        session: Option<SessionHandle>,
-        target: WindowRef,
-    ) -> bmux_plugin::Result<WindowHandle> {
-        self.assert_registered_service(
-            "bmux.windows.write",
-            bmux_plugin::ServiceKind::Command,
-            "window-command/v1",
-            "window.switch",
-        )?;
-        with_client(&self.connection, |client| {
-            tokio::runtime::Handle::current().block_on(async {
-                client
-                    .switch_window(map_optional_session(session), map_window_ref(target))
-                    .await
-                    .map(WindowHandle)
-                    .map_err(|error| {
-                        unsupported_operation(&format!("switch_window failed: {error}"))
                     })
             })
         })
@@ -835,84 +602,6 @@ impl PaneCommandService for CliPluginHost {
     }
 }
 
-impl PermissionQueryService for CliPluginHost {
-    fn list_permissions(
-        &self,
-        session: SessionHandle,
-    ) -> bmux_plugin::Result<Vec<PermissionEntry>> {
-        self.assert_registered_service(
-            "bmux.permissions.read",
-            bmux_plugin::ServiceKind::Query,
-            "permission-query/v1",
-            "permission.list",
-        )?;
-        with_client(&self.connection, |client| {
-            tokio::runtime::Handle::current().block_on(async {
-                client
-                    .list_permissions(SessionSelector::ById(session.0))
-                    .await
-                    .map(|entries| {
-                        entries
-                            .into_iter()
-                            .map(|entry| PermissionEntry {
-                                client_id: entry.client_id,
-                                role: map_role(entry.role),
-                            })
-                            .collect()
-                    })
-                    .map_err(|error| {
-                        unsupported_operation(&format!("list_permissions failed: {error}"))
-                    })
-            })
-        })
-    }
-}
-
-impl PermissionCommandService for CliPluginHost {
-    fn grant_role(
-        &self,
-        session: SessionHandle,
-        client_id: Uuid,
-        role: SessionRoleValue,
-    ) -> bmux_plugin::Result<()> {
-        self.assert_registered_service(
-            "bmux.permissions.write",
-            bmux_plugin::ServiceKind::Command,
-            "permission-command/v1",
-            "permission.grant",
-        )?;
-        with_client(&self.connection, |client| {
-            tokio::runtime::Handle::current().block_on(async {
-                client
-                    .grant_role(
-                        SessionSelector::ById(session.0),
-                        client_id,
-                        map_role_to_ipc(role),
-                    )
-                    .await
-                    .map_err(|error| unsupported_operation(&format!("grant_role failed: {error}")))
-            })
-        })
-    }
-
-    fn revoke_role(&self, session: SessionHandle, client_id: Uuid) -> bmux_plugin::Result<()> {
-        self.assert_registered_service(
-            "bmux.permissions.write",
-            bmux_plugin::ServiceKind::Command,
-            "permission-command/v1",
-            "permission.revoke",
-        )?;
-        with_client(&self.connection, |client| {
-            tokio::runtime::Handle::current().block_on(async {
-                client
-                    .revoke_role(SessionSelector::ById(session.0), client_id)
-                    .await
-                    .map_err(|error| unsupported_operation(&format!("revoke_role failed: {error}")))
-            })
-        })
-    }
-}
-
 impl ClientQueryService for CliPluginHost {
     fn current_client_id(&self) -> bmux_plugin::Result<Uuid> {
         with_client(&self.connection, |client| {
@@ -1139,7 +828,7 @@ mod tests {
     use bmux_plugin::{
         CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, ClipboardService, HostMetadata,
         HostScope, PersistenceQueryService, PluginHost, PluginStorage, RegisteredService,
-        ServiceKind, SessionQueryService, WindowCommandService,
+        ServiceKind, SessionQueryService,
     };
     use std::collections::BTreeSet;
     use std::path::PathBuf;
@@ -1207,7 +896,7 @@ mod tests {
     }
 
     #[test]
-    fn provider_owned_capability_counts_for_access_checks() {
+    fn provider_owned_service_registration_is_resolvable() {
         let host = host(
             &[],
             &["bmux.windows.write"],
@@ -1217,27 +906,29 @@ mod tests {
                 "window-command/v1",
             )],
         );
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("runtime should build");
-        let error = runtime
-            .block_on(async { WindowCommandService::create_window(&host, None, None) })
-            .expect_err("provider capability should pass authorization first");
-        assert!(!error.to_string().contains("bmux.windows.write"));
+        let capability = HostScope::new("bmux.windows.write").expect("capability should parse");
+        let service = PluginHost::resolve_service(
+            &host,
+            &capability,
+            ServiceKind::Command,
+            "window-command/v1",
+        )
+        .expect("provider-owned service should resolve");
+        assert_eq!(service.interface_id, "window-command/v1");
     }
 
     #[test]
-    fn window_commands_require_registered_service_descriptor() {
+    fn missing_registered_service_is_rejected() {
         let host = host(&[], &["bmux.windows.write"], Vec::new());
-        let runtime = tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("runtime should build");
-        let error = runtime
-            .block_on(async { WindowCommandService::create_window(&host, None, None) })
-            .expect_err("missing service descriptor should fail");
-        assert!(error.to_string().contains("window.create"));
+        let capability = HostScope::new("bmux.windows.write").expect("capability should parse");
+        let error = PluginHost::resolve_service(
+            &host,
+            &capability,
+            ServiceKind::Command,
+            "window-command/v1",
+        )
+        .expect_err("missing service registration should fail");
+        assert!(error.to_string().contains("resolve_service"));
     }
 
     #[test]
