@@ -1,6 +1,6 @@
-use crate::{PluginEvent, Result};
+use crate::{HostScope, PluginEvent, Result};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use toml::Value;
 use uuid::Uuid;
 
@@ -199,8 +199,15 @@ pub enum PaneRef {
 }
 
 pub trait PluginHost: Send + Sync {
+    fn plugin_id(&self) -> &str;
     fn metadata(&self) -> &HostMetadata;
     fn connection(&self) -> &HostConnectionInfo;
+    fn required_capabilities(&self) -> &BTreeSet<HostScope>;
+    fn provided_capabilities(&self) -> &BTreeSet<HostScope>;
+    fn has_capability(&self, capability: &HostScope) -> bool {
+        self.required_capabilities().contains(capability)
+            || self.provided_capabilities().contains(capability)
+    }
     fn events(&self) -> &dyn EventService;
     fn session_queries(&self) -> &dyn SessionQueryService;
     fn session_commands(&self) -> &dyn SessionCommandService;

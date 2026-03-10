@@ -195,6 +195,15 @@ pub enum PluginError {
     #[error("unsupported host operation: {operation}")]
     UnsupportedHostOperation { operation: &'static str },
 
+    #[error(
+        "plugin '{plugin_id}' is not authorized for capability '{capability}' while performing '{operation}'"
+    )]
+    CapabilityAccessDenied {
+        plugin_id: String,
+        capability: String,
+        operation: &'static str,
+    },
+
     #[error("failed to parse plugin manifest: {0}")]
     ManifestParse(#[from] toml::de::Error),
 
