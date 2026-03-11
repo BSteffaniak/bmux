@@ -127,6 +127,14 @@ pub enum PaneSelector {
     Active,
 }
 
+/// Generic service invocation kind for plugin-dispatched RPC calls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InvokeServiceKind {
+    Query,
+    Command,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PaneSplitDirection {
@@ -250,6 +258,13 @@ pub enum Request {
     ServerRestoreDryRun,
     ServerRestoreApply,
     ServerStop,
+    InvokeService {
+        capability: String,
+        kind: InvokeServiceKind,
+        interface_id: String,
+        operation: String,
+        payload: Vec<u8>,
+    },
     NewSession {
         name: Option<String>,
     },
@@ -577,6 +592,9 @@ pub enum ResponsePayload {
     },
     Detached,
     ServerStopping,
+    ServiceInvoked {
+        payload: Vec<u8>,
+    },
 }
 
 /// Canonical error codes returned over IPC.

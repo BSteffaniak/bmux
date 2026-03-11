@@ -10,10 +10,10 @@ pub use bmux_ipc::Event as ServerEvent;
 use bmux_ipc::transport::{IpcTransportError, LocalIpcStream};
 use bmux_ipc::{
     AttachGrant, AttachPaneChunk, AttachScene, ClientSummary, Envelope, EnvelopeKind, ErrorCode,
-    IpcEndpoint, PaneFocusDirection, PaneLayoutNode, PaneSelector, PaneSplitDirection, PaneSummary,
-    ProtocolVersion, Request, Response, ResponsePayload, ServerSnapshotStatus,
-    SessionPermissionSummary, SessionRole, SessionSelector, SessionSummary, WindowSelector,
-    WindowSummary, decode, encode,
+    InvokeServiceKind, IpcEndpoint, PaneFocusDirection, PaneLayoutNode, PaneSelector,
+    PaneSplitDirection, PaneSummary, ProtocolVersion, Request, Response, ResponsePayload,
+    ServerSnapshotStatus, SessionPermissionSummary, SessionRole, SessionSelector, SessionSummary,
+    WindowSelector, WindowSummary, decode, encode,
 };
 use std::time::Duration;
 use thiserror::Error;
@@ -268,6 +268,34 @@ impl BmuxClient {
                 server_owner_principal_id,
             }),
             _ => Err(ClientError::UnexpectedResponse("expected server status")),
+        }
+    }
+
+    /// Invoke a generic service request over IPC.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails transport/protocol validation.
+    pub async fn invoke_service_raw(
+        &mut self,
+        capability: impl Into<String>,
+        kind: InvokeServiceKind,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        match self
+            .request(Request::InvokeService {
+                capability: capability.into(),
+                kind,
+                interface_id: interface_id.into(),
+                operation: operation.into(),
+                payload,
+            })
+            .await?
+        {
+            ResponsePayload::ServiceInvoked { payload } => Ok(payload),
+            _ => Err(ClientError::UnexpectedResponse("expected service invoked")),
         }
     }
 

@@ -3960,6 +3960,18 @@ async fn handle_request(
             let _ = shutdown_tx.send(true);
             Response::Ok(ResponsePayload::ServerStopping)
         }
+        Request::InvokeService {
+            capability,
+            kind,
+            interface_id,
+            operation,
+            ..
+        } => Response::Err(ErrorResponse {
+            code: ErrorCode::NotFound,
+            message: format!(
+                "no provider for service capability='{capability}' kind='{kind:?}' interface='{interface_id}' operation='{operation}'"
+            ),
+        }),
         Request::NewSession { name } => {
             let mut manager = state
                 .session_manager
