@@ -1,20 +1,11 @@
-use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, ConfigPaths};
-use bmux_ipc::SessionRole;
-use bmux_plugin::{
-    ClientQueryService, ClientSummary, ConfigService, EventService, HostConnectionInfo,
-    HostMetadata, HostScope, PluginError, PluginEvent, PluginHost, PrincipalIdentityInfo,
-    RegisteredService, RenderService, SessionHandle, SessionRoleValue,
-};
-use std::collections::{BTreeMap, BTreeSet};
-use toml::Value;
-use uuid::Uuid;
+use bmux_plugin::{HostConnectionInfo, HostMetadata, HostScope, PluginHost, RegisteredService};
+use std::collections::BTreeSet;
 
 pub struct CliPluginHost {
     plugin_id: String,
     metadata: HostMetadata,
     connection: HostConnectionInfo,
-    config: BmuxConfig,
     required_capabilities: BTreeSet<HostScope>,
     provided_capabilities: BTreeSet<HostScope>,
     available_services: Vec<RegisteredService>,
@@ -25,7 +16,7 @@ impl CliPluginHost {
         plugin_id: impl Into<String>,
         metadata: HostMetadata,
         paths: &ConfigPaths,
-        config: BmuxConfig,
+        _config: BmuxConfig,
         required_capabilities: BTreeSet<HostScope>,
         provided_capabilities: BTreeSet<HostScope>,
         available_services: Vec<RegisteredService>,
@@ -38,77 +29,10 @@ impl CliPluginHost {
                 runtime_dir: paths.runtime_dir.to_string_lossy().into_owned(),
                 data_dir: paths.data_dir.to_string_lossy().into_owned(),
             },
-            config,
             required_capabilities,
             provided_capabilities,
             available_services,
         }
-    }
-
-    fn assert_capability(
-        &self,
-        capability: &str,
-        operation: &'static str,
-    ) -> bmux_plugin::Result<()> {
-        let capability = HostScope::new(capability).expect("capability id should parse");
-        if self.has_capability(&capability) {
-            Ok(())
-        } else {
-            Err(PluginError::CapabilityAccessDenied {
-                plugin_id: self.plugin_id.clone(),
-                capability: capability.as_str().to_string(),
-                operation,
-            })
-        }
-    }
-}
-
-fn paths_from_connection(connection: &HostConnectionInfo) -> ConfigPaths {
-    ConfigPaths::new(
-        connection.config_dir.clone().into(),
-        connection.runtime_dir.clone().into(),
-        connection.data_dir.clone().into(),
-    )
-}
-
-fn with_client<T>(
-    connection: &HostConnectionInfo,
-    operation: impl FnOnce(&mut BmuxClient) -> bmux_plugin::Result<T>,
-) -> bmux_plugin::Result<T> {
-    tokio::task::block_in_place(|| {
-        tokio::runtime::Handle::current().block_on(async {
-            let mut client = BmuxClient::connect_with_paths(
-                &paths_from_connection(connection),
-                "bmux-plugin-host",
-            )
-            .await
-            .map_err(|error| unsupported_operation(&format!("client connect failed: {error}")))?;
-            operation(&mut client)
-        })
-    })
-}
-
-fn unsupported_operation(operation: &str) -> PluginError {
-    PluginError::UnsupportedHostOperation {
-        operation: Box::leak(operation.to_string().into_boxed_str()),
-    }
-}
-
-fn map_role(role: SessionRole) -> SessionRoleValue {
-    match role {
-        SessionRole::Owner => SessionRoleValue::Owner,
-        SessionRole::Writer => SessionRoleValue::Writer,
-        SessionRole::Observer => SessionRoleValue::Observer,
-    }
-}
-
-fn map_client_summary(entry: bmux_ipc::ClientSummary) -> ClientSummary {
-    ClientSummary {
-        id: entry.id,
-        selected_session: entry.selected_session_id.map(SessionHandle),
-        following_client_id: entry.following_client_id,
-        following_global: entry.following_global,
-        role: entry.session_role.map(map_role),
     }
 }
 
@@ -135,98 +59,6 @@ impl PluginHost for CliPluginHost {
 
     fn available_services(&self) -> &[RegisteredService] {
         &self.available_services
-    }
-
-    fn events(&self) -> &dyn EventService {
-        self
-    }
-
-    fn client_queries(&self) -> &dyn ClientQueryService {
-        self
-    }
-
-    fn render(&self) -> &dyn RenderService {
-        self
-    }
-
-    fn config(&self) -> &dyn ConfigService {
-        self
-    }
-}
-
-impl EventService for CliPluginHost {
-    fn emit(&self, _event: PluginEvent) -> bmux_plugin::Result<()> {
-        Err(unsupported_operation("emit_event"))
-    }
-}
-
-impl ClientQueryService for CliPluginHost {
-    fn current_client_id(&self) -> bmux_plugin::Result<Uuid> {
-        with_client(&self.connection, |client| {
-            tokio::runtime::Handle::current().block_on(async {
-                client
-                    .whoami()
-                    .await
-                    .map_err(|error| unsupported_operation(&format!("whoami failed: {error}")))
-            })
-        })
-    }
-
-    fn principal_identity(&self) -> bmux_plugin::Result<PrincipalIdentityInfo> {
-        with_client(&self.connection, |client| {
-            tokio::runtime::Handle::current().block_on(async {
-                client
-                    .whoami_principal()
-                    .await
-                    .map(|identity| PrincipalIdentityInfo {
-                        principal_id: identity.principal_id,
-                        server_owner_principal_id: identity.server_owner_principal_id,
-                        force_local_authorized: identity.force_local_authorized,
-                    })
-                    .map_err(|error| {
-                        unsupported_operation(&format!("whoami_principal failed: {error}"))
-                    })
-            })
-        })
-    }
-
-    fn list_clients(&self) -> bmux_plugin::Result<Vec<ClientSummary>> {
-        with_client(&self.connection, |client| {
-            tokio::runtime::Handle::current().block_on(async {
-                client
-                    .list_clients()
-                    .await
-                    .map(|clients| clients.into_iter().map(map_client_summary).collect())
-                    .map_err(|error| {
-                        unsupported_operation(&format!("list_clients failed: {error}"))
-                    })
-            })
-        })
-    }
-}
-
-impl RenderService for CliPluginHost {
-    fn invalidate(&self) -> bmux_plugin::Result<()> {
-        self.assert_capability("bmux.attach.overlay", "render.invalidate")?;
-        Err(unsupported_operation("render_invalidate"))
-    }
-}
-
-impl ConfigService for CliPluginHost {
-    fn plugin_settings(&self, plugin_id: &str) -> bmux_plugin::Result<BTreeMap<String, Value>> {
-        Ok(self
-            .config
-            .plugins
-            .settings
-            .get(plugin_id)
-            .and_then(|value| value.as_table())
-            .map(|table| {
-                table
-                    .iter()
-                    .map(|(key, value)| (key.clone(), value.clone()))
-                    .collect()
-            })
-            .unwrap_or_default())
     }
 }
 
@@ -282,56 +114,29 @@ mod tests {
     }
 
     #[test]
-    fn reports_required_and_provided_capabilities() {
+    fn has_required_and_provided_capabilities() {
         let host = host(
-            &["example.base.read"],
-            &["example.provider.write"],
-            Vec::new(),
+            &["example.read"],
+            &["example.write"],
+            vec![service(
+                "example.read",
+                ServiceKind::Query,
+                "example-query/v1",
+            )],
         );
+
         assert_eq!(PluginHost::plugin_id(&host), "example.plugin");
         assert!(PluginHost::has_capability(
             &host,
-            &HostScope::new("example.base.read").expect("capability should parse")
+            &HostScope::new("example.read").expect("capability should parse")
         ));
         assert!(PluginHost::has_capability(
             &host,
-            &HostScope::new("example.provider.write").expect("capability should parse")
+            &HostScope::new("example.write").expect("capability should parse")
         ));
-    }
-
-    #[test]
-    fn provider_owned_service_registration_is_resolvable() {
-        let host = host(
-            &[],
-            &["example.provider.write"],
-            vec![service(
-                "example.provider.write",
-                ServiceKind::Command,
-                "provider-command/v1",
-            )],
-        );
-        let capability = HostScope::new("example.provider.write").expect("capability should parse");
-        let service = PluginHost::resolve_service(
+        assert!(!PluginHost::has_capability(
             &host,
-            &capability,
-            ServiceKind::Command,
-            "provider-command/v1",
-        )
-        .expect("provider-owned service should resolve");
-        assert_eq!(service.interface_id, "provider-command/v1");
-    }
-
-    #[test]
-    fn missing_registered_service_is_rejected() {
-        let host = host(&[], &["example.provider.write"], Vec::new());
-        let capability = HostScope::new("example.provider.write").expect("capability should parse");
-        let error = PluginHost::resolve_service(
-            &host,
-            &capability,
-            ServiceKind::Command,
-            "provider-command/v1",
-        )
-        .expect_err("missing service registration should fail");
-        assert!(error.to_string().contains("resolve_service"));
+            &HostScope::new("example.admin").expect("capability should parse")
+        ));
     }
 }

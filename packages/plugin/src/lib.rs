@@ -38,14 +38,7 @@ pub use discovery::{
 };
 pub use error::{PluginError, Result};
 pub use event::{PluginEvent, PluginEventKind, PluginEventPayload, PluginEventSubscription};
-pub use host::{
-    ClientQueryService, ClientSummary, ConfigService, EventService, FollowState,
-    HostConnectionInfo, HostMetadata, PaneFocusDirection, PaneHandle, PaneLayoutNode, PaneRef,
-    PaneSnapshot, PaneSplitDirection, PaneSummary, PermissionEntry, PersistenceRestorePreview,
-    PersistenceRestoreResult, PersistenceStatus, PluginContext, PluginHost, PrincipalIdentityInfo,
-    RenderService, ServerStatusInfo, SessionHandle, SessionRef, SessionRoleValue, SessionSnapshot,
-    SessionSummary, WindowHandle, WindowRef, WindowSnapshot, WindowSummary,
-};
+pub use host::{HostConnectionInfo, HostMetadata, PluginContext, PluginHost};
 pub use loader::{
     LoadedPlugin, NativeCommandContext, NativeDescriptor, NativeLifecycleContext,
     NativePluginLoader, NativeServiceContext, ServiceCaller, load_registered_plugin,
