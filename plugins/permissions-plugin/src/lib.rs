@@ -347,34 +347,34 @@ fn run_permissions_command(context: &NativeCommandContext) -> i32 {
         return 64;
     };
 
-    let paths = ConfigPaths::new(
-        context.connection.config_dir.clone().into(),
-        context.connection.runtime_dir.clone().into(),
-        context.connection.data_dir.clone().into(),
-    );
-
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| {
-            handle.block_on(async_permissions_command(&paths, &session, as_json, watch))
-        }),
-        Err(_) => match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => {
-                runtime.block_on(async_permissions_command(&paths, &session, as_json, watch))
-            }
+    if watch {
+        let paths = command_paths(context);
+        return match block_on_plugin_future(async move {
+            async_watch_permissions_command(&paths, &session).await
+        }) {
+            Ok(code) => code,
             Err(_) => 70,
-        },
+        };
     }
+
+    let paths = command_paths(context);
+    let response = match block_on_permission_query(
+        &paths,
+        &ListPermissionsRequest {
+            session: session.clone(),
+        },
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("failed listing permissions: {error}");
+            return 1;
+        }
+    };
+    render_permissions(&response.permissions, as_json);
+    0
 }
 
-async fn async_permissions_command(
-    paths: &ConfigPaths,
-    session: &str,
-    as_json: bool,
-    watch: bool,
-) -> i32 {
+async fn async_watch_permissions_command(paths: &ConfigPaths, session: &str) -> i32 {
     let selector = parse_session_selector(session);
     let mut client = match BmuxClient::connect_with_paths(paths, "bmux-permissions-plugin").await {
         Ok(client) => client,
@@ -384,35 +384,22 @@ async fn async_permissions_command(
         }
     };
 
-    if watch {
-        println!("watching permissions for session '{session}' (Ctrl-C to stop)");
-        let mut last_permissions: Option<Vec<SessionPermissionSummary>> = None;
-        loop {
-            match client.list_permissions(selector.clone()).await {
-                Ok(permissions) => {
-                    if last_permissions.as_ref() != Some(&permissions) {
-                        render_permissions(&permissions, false);
-                        last_permissions = Some(permissions);
-                    }
-                }
-                Err(error) => {
-                    eprintln!("failed listing permissions: {error}");
-                    return 1;
+    println!("watching permissions for session '{session}' (Ctrl-C to stop)");
+    let mut last_permissions: Option<Vec<SessionPermissionSummary>> = None;
+    loop {
+        match client.list_permissions(selector.clone()).await {
+            Ok(permissions) => {
+                if last_permissions.as_ref() != Some(&permissions) {
+                    render_permissions(&permissions, false);
+                    last_permissions = Some(permissions);
                 }
             }
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+            Err(error) => {
+                eprintln!("failed listing permissions: {error}");
+                return 1;
+            }
         }
-    }
-
-    match client.list_permissions(selector).await {
-        Ok(permissions) => {
-            render_permissions(&permissions, as_json);
-            0
-        }
-        Err(error) => {
-            eprintln!("failed listing permissions: {error}");
-            1
-        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
     }
 }
 
@@ -450,29 +437,21 @@ fn run_grant_command(context: &NativeCommandContext) -> i32 {
     };
 
     let paths = command_paths(context);
-    match block_on_plugin_future(async move {
-        async_grant_command(&paths, &session, client_id, role).await
-    }) {
-        Ok(code) => code,
-        Err(_) => 70,
-    }
-}
-
-async fn async_grant_command(
-    paths: &ConfigPaths,
-    session: &str,
-    client_id: uuid::Uuid,
-    role: SessionRole,
-) -> i32 {
-    let selector = parse_session_selector(session);
-    let mut client = match connect_client(paths).await {
-        Ok(client) => client,
-        Err(code) => return code,
-    };
-
-    match client.grant_role(selector, client_id, role).await {
-        Ok(()) => {
-            println!("granted role {} to client {}", role_label(role), client_id);
+    match block_on_permission_command::<GrantPermissionRequest, GrantPermissionResponse>(
+        &paths,
+        "grant",
+        &GrantPermissionRequest {
+            session,
+            client_id,
+            role,
+        },
+    ) {
+        Ok(response) => {
+            println!(
+                "granted role {} to client {}",
+                role_label(response.role),
+                response.client_id
+            );
             0
         }
         Err(error) => {
@@ -507,30 +486,101 @@ fn run_revoke_command(context: &NativeCommandContext) -> i32 {
     };
 
     let paths = command_paths(context);
-    match block_on_plugin_future(
-        async move { async_revoke_command(&paths, &session, client_id).await },
+    match block_on_permission_command::<RevokePermissionRequest, RevokePermissionResponse>(
+        &paths,
+        "revoke",
+        &RevokePermissionRequest { session, client_id },
     ) {
-        Ok(code) => code,
-        Err(_) => 70,
-    }
-}
-
-async fn async_revoke_command(paths: &ConfigPaths, session: &str, client_id: uuid::Uuid) -> i32 {
-    let selector = parse_session_selector(session);
-    let mut client = match connect_client(paths).await {
-        Ok(client) => client,
-        Err(code) => return code,
-    };
-
-    match client.revoke_role(selector, client_id).await {
-        Ok(()) => {
-            println!("revoked explicit role for client {client_id}");
+        Ok(response) => {
+            println!("revoked explicit role for client {}", response.client_id);
             0
         }
         Err(error) => {
             eprintln!("failed revoking role: {error}");
             1
         }
+    }
+}
+
+fn block_on_permission_query(
+    paths: &ConfigPaths,
+    request: &ListPermissionsRequest,
+) -> Result<ListPermissionsResponse, String> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                match async_list_permissions_service(paths, &request.session).await {
+                    ServiceResponse {
+                        payload,
+                        error: None,
+                    } => decode_service_message(&payload).map_err(|error| error.to_string()),
+                    ServiceResponse {
+                        error: Some(error), ..
+                    } => Err(format!("[{}] {}", error.code, error.message)),
+                }
+            })
+        }),
+        Err(_) => match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(async {
+                match async_list_permissions_service(paths, &request.session).await {
+                    ServiceResponse {
+                        payload,
+                        error: None,
+                    } => decode_service_message(&payload).map_err(|error| error.to_string()),
+                    ServiceResponse {
+                        error: Some(error), ..
+                    } => Err(format!("[{}] {}", error.code, error.message)),
+                }
+            }),
+            Err(error) => Err(error.to_string()),
+        },
+    }
+}
+
+fn block_on_permission_command<Request, Response>(
+    paths: &ConfigPaths,
+    operation: &str,
+    request: &Request,
+) -> Result<Response, String>
+where
+    Request: Serialize,
+    Response: for<'de> Deserialize<'de>,
+{
+    let payload = encode_service_message(request).map_err(|error| error.to_string())?;
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                match async_permission_command_service(paths, operation, &payload).await {
+                    ServiceResponse {
+                        payload,
+                        error: None,
+                    } => decode_service_message(&payload).map_err(|error| error.to_string()),
+                    ServiceResponse {
+                        error: Some(error), ..
+                    } => Err(format!("[{}] {}", error.code, error.message)),
+                }
+            })
+        }),
+        Err(_) => match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(async {
+                match async_permission_command_service(paths, operation, &payload).await {
+                    ServiceResponse {
+                        payload,
+                        error: None,
+                    } => decode_service_message(&payload).map_err(|error| error.to_string()),
+                    ServiceResponse {
+                        error: Some(error), ..
+                    } => Err(format!("[{}] {}", error.code, error.message)),
+                }
+            }),
+            Err(error) => Err(error.to_string()),
+        },
     }
 }
 

@@ -495,42 +495,20 @@ fn run_new_window(context: &NativeCommandContext) -> i32 {
         Err(code) => return code,
     };
     let paths = command_paths(context);
-    match block_on_plugin_future(async move { async_new_window(&paths, args).await }) {
-        Ok(code) => code,
-        Err(_) => 70,
-    }
-}
-
-async fn async_new_window(paths: &ConfigPaths, args: WindowArgs) -> i32 {
-    let selector = args.session.as_deref().map(parse_session_selector);
-    let mut client = match connect_client(paths).await {
-        Ok(client) => client,
-        Err(code) => return code,
-    };
-    let window_id = match client.new_window(selector.clone(), args.name).await {
-        Ok(window_id) => window_id,
-        Err(error) => {
-            eprintln!("failed creating window: {error}");
-            return 1;
-        }
-    };
-    match resolve_window_summary_by_id(&mut client, selector, window_id).await {
-        Ok(Some(window)) => {
-            match cli_window_context_label(&mut client, &window).await {
-                Ok(label) => println!("created window: {label}"),
-                Err(error) => {
-                    eprintln!("failed resolving created window label: {error}");
-                    return 1;
-                }
-            }
+    match block_on_window_command::<NewWindowRequest, NewWindowResponse>(
+        &paths,
+        "new",
+        &NewWindowRequest {
+            session: args.session,
+            name: args.name,
+        },
+    ) {
+        Ok(response) => {
+            println!("created window: {}", window_summary_label(&response.window));
             0
         }
-        Ok(None) => {
-            eprintln!("created window missing from list response");
-            1
-        }
         Err(error) => {
-            eprintln!("failed resolving created window: {error}");
+            eprintln!("failed creating window: {error}");
             1
         }
     }
@@ -542,20 +520,13 @@ fn run_list_windows(context: &NativeCommandContext) -> i32 {
         Err(code) => return code,
     };
     let paths = command_paths(context);
-    match block_on_plugin_future(async move { async_list_windows(&paths, args).await }) {
-        Ok(code) => code,
-        Err(_) => 70,
-    }
-}
-
-async fn async_list_windows(paths: &ConfigPaths, args: WindowArgs) -> i32 {
-    let selector = args.session.as_deref().map(parse_session_selector);
-    let mut client = match connect_client(paths).await {
-        Ok(client) => client,
-        Err(code) => return code,
-    };
-    let windows = match client.list_windows(selector).await {
-        Ok(windows) => windows,
+    let windows = match block_on_window_query(
+        &paths,
+        &ListWindowsRequest {
+            session: args.session.clone(),
+        },
+    ) {
+        Ok(response) => response.windows,
         Err(error) => {
             eprintln!("failed listing windows: {error}");
             return 1;
@@ -575,12 +546,9 @@ async fn async_list_windows(paths: &ConfigPaths, args: WindowArgs) -> i32 {
         return 0;
     }
 
-    let sessions = match client.list_sessions().await {
+    let sessions = match block_on_window_sessions(paths) {
         Ok(sessions) => sessions,
-        Err(error) => {
-            eprintln!("failed resolving session labels: {error}");
-            return 1;
-        }
+        Err(code) => return code,
     };
 
     let mut windows = windows;
@@ -621,32 +589,17 @@ fn run_kill_window(context: &NativeCommandContext) -> i32 {
         return 64;
     };
     let paths = command_paths(context);
-    match block_on_plugin_future(async move {
-        async_kill_window(&paths, args.session, &target, args.force_local).await
-    }) {
-        Ok(code) => code,
-        Err(_) => 70,
-    }
-}
-
-async fn async_kill_window(
-    paths: &ConfigPaths,
-    session: Option<String>,
-    target: &str,
-    force_local: bool,
-) -> i32 {
-    let selector = session.as_deref().map(parse_session_selector);
-    let window_selector = parse_window_selector(target);
-    let mut client = match connect_client(paths).await {
-        Ok(client) => client,
-        Err(code) => return code,
-    };
-    match client
-        .kill_window_with_options(selector, window_selector, force_local)
-        .await
-    {
-        Ok(window_id) => {
-            println!("killed window: {window_id}");
+    match block_on_window_command::<KillWindowRequest, KillWindowResponse>(
+        &paths,
+        "kill",
+        &KillWindowRequest {
+            session: args.session,
+            target,
+            force_local: args.force_local,
+        },
+    ) {
+        Ok(response) => {
+            println!("killed window: {}", response.window_id);
             0
         }
         Err(error) => {
@@ -662,58 +615,26 @@ fn run_kill_all_windows(context: &NativeCommandContext) -> i32 {
         Err(code) => return code,
     };
     let paths = command_paths(context);
-    match block_on_plugin_future(async move {
-        async_kill_all_windows(&paths, args.session, args.force_local).await
-    }) {
-        Ok(code) => code,
-        Err(_) => 70,
-    }
-}
-
-async fn async_kill_all_windows(
-    paths: &ConfigPaths,
-    session: Option<String>,
-    force_local: bool,
-) -> i32 {
-    let selector = session.as_deref().map(parse_session_selector);
-    let mut client = match connect_client(paths).await {
-        Ok(client) => client,
-        Err(code) => return code,
-    };
-    let windows = match client.list_windows(selector.clone()).await {
-        Ok(windows) => windows,
+    match block_on_window_command::<KillAllWindowsRequest, KillAllWindowsResponse>(
+        &paths,
+        "kill_all",
+        &KillAllWindowsRequest {
+            session: args.session,
+            force_local: args.force_local,
+        },
+    ) {
+        Ok(response) => {
+            println!(
+                "kill-all-windows complete: killed {}, failed {}",
+                response.killed_count, response.failed_count
+            );
+            if response.failed_count == 0 { 0 } else { 1 }
+        }
         Err(error) => {
-            eprintln!("failed listing windows: {error}");
-            return 1;
-        }
-    };
-    if windows.is_empty() {
-        println!("no windows");
-        return 0;
-    }
-    let mut killed_count = 0usize;
-    let mut failed_count = 0usize;
-    for window in windows {
-        match client
-            .kill_window_with_options(
-                selector.clone(),
-                WindowSelector::ById(window.id),
-                force_local,
-            )
-            .await
-        {
-            Ok(window_id) => {
-                println!("killed window: {window_id}");
-                killed_count = killed_count.saturating_add(1);
-            }
-            Err(error) => {
-                failed_count = failed_count.saturating_add(1);
-                eprintln!("failed killing window {}: {error}", window.id);
-            }
+            eprintln!("failed killing windows: {error}");
+            1
         }
     }
-    println!("kill-all-windows complete: killed {killed_count}, failed {failed_count}");
-    if failed_count == 0 { 0 } else { 1 }
 }
 
 fn run_switch_window(context: &NativeCommandContext) -> i32 {
@@ -726,50 +647,131 @@ fn run_switch_window(context: &NativeCommandContext) -> i32 {
         return 64;
     };
     let paths = command_paths(context);
-    match block_on_plugin_future(
-        async move { async_switch_window(&paths, args.session, &target).await },
+    match block_on_window_command::<SwitchWindowRequest, SwitchWindowResponse>(
+        &paths,
+        "switch",
+        &SwitchWindowRequest {
+            session: args.session,
+            target,
+        },
     ) {
-        Ok(code) => code,
-        Err(_) => 70,
+        Ok(response) => {
+            println!("active window: {}", window_summary_label(&response.window));
+            0
+        }
+        Err(error) => {
+            eprintln!("failed switching window: {error}");
+            1
+        }
     }
 }
 
-async fn async_switch_window(paths: &ConfigPaths, session: Option<String>, target: &str) -> i32 {
-    let selector = session.as_deref().map(parse_session_selector);
-    let window_selector = parse_window_selector(target);
-    let mut client = match connect_client(paths).await {
-        Ok(client) => client,
-        Err(code) => return code,
-    };
-    let window_id = match client
-        .switch_window(selector.clone(), window_selector)
-        .await
-    {
-        Ok(window_id) => window_id,
-        Err(error) => {
-            eprintln!("failed switching window: {error}");
-            return 1;
-        }
-    };
-    match resolve_window_summary_by_id(&mut client, selector, window_id).await {
-        Ok(Some(window)) => match cli_window_context_label(&mut client, &window).await {
-            Ok(label) => {
-                println!("active window: {label}");
-                0
-            }
-            Err(error) => {
-                eprintln!("failed resolving switched window label: {error}");
-                1
-            }
+fn block_on_window_query(
+    paths: &ConfigPaths,
+    request: &ListWindowsRequest,
+) -> Result<ListWindowsResponse, String> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                match async_list_windows_service(paths, request.clone()).await {
+                    ServiceResponse {
+                        payload,
+                        error: None,
+                    } => decode_service_message(&payload).map_err(|error| error.to_string()),
+                    ServiceResponse {
+                        error: Some(error), ..
+                    } => Err(format!("[{}] {}", error.code, error.message)),
+                }
+            })
+        }),
+        Err(_) => match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(async {
+                match async_list_windows_service(paths, request.clone()).await {
+                    ServiceResponse {
+                        payload,
+                        error: None,
+                    } => decode_service_message(&payload).map_err(|error| error.to_string()),
+                    ServiceResponse {
+                        error: Some(error), ..
+                    } => Err(format!("[{}] {}", error.code, error.message)),
+                }
+            }),
+            Err(error) => Err(error.to_string()),
         },
-        Ok(None) => {
-            eprintln!("active window missing from list response");
-            1
-        }
-        Err(error) => {
-            eprintln!("failed resolving switched window: {error}");
-            1
-        }
+    }
+}
+
+fn block_on_window_command<Request, Response>(
+    paths: &ConfigPaths,
+    operation: &str,
+    request: &Request,
+) -> Result<Response, String>
+where
+    Request: Serialize,
+    Response: for<'de> Deserialize<'de>,
+{
+    let payload = encode_service_message(request).map_err(|error| error.to_string())?;
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                match async_window_command_service(paths, operation, &payload).await {
+                    ServiceResponse {
+                        payload,
+                        error: None,
+                    } => decode_service_message(&payload).map_err(|error| error.to_string()),
+                    ServiceResponse {
+                        error: Some(error), ..
+                    } => Err(format!("[{}] {}", error.code, error.message)),
+                }
+            })
+        }),
+        Err(_) => match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(async {
+                match async_window_command_service(paths, operation, &payload).await {
+                    ServiceResponse {
+                        payload,
+                        error: None,
+                    } => decode_service_message(&payload).map_err(|error| error.to_string()),
+                    ServiceResponse {
+                        error: Some(error), ..
+                    } => Err(format!("[{}] {}", error.code, error.message)),
+                }
+            }),
+            Err(error) => Err(error.to_string()),
+        },
+    }
+}
+
+fn block_on_window_sessions(paths: ConfigPaths) -> Result<Vec<bmux_ipc::SessionSummary>, i32> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => Ok(tokio::task::block_in_place(|| {
+            handle.block_on(async move {
+                let mut client = connect_client(&paths).await?;
+                client.list_sessions().await.map_err(|error| {
+                    eprintln!("failed resolving session labels: {error}");
+                    1
+                })
+            })
+        })?),
+        Err(_) => match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime.block_on(async move {
+                let mut client = connect_client(&paths).await?;
+                client.list_sessions().await.map_err(|error| {
+                    eprintln!("failed resolving session labels: {error}");
+                    1
+                })
+            }),
+            Err(_) => Err(70),
+        },
     }
 }
 
@@ -788,22 +790,6 @@ async fn connect_client(paths: &ConfigPaths) -> Result<BmuxClient, i32> {
             eprintln!("failed connecting to bmux host: {error}");
             1
         })
-}
-
-fn block_on_plugin_future<F>(future: F) -> Result<i32, ()>
-where
-    F: std::future::Future<Output = i32>,
-{
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => Ok(tokio::task::block_in_place(|| handle.block_on(future))),
-        Err(_) => match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => Ok(runtime.block_on(future)),
-            Err(_) => Err(()),
-        },
-    }
 }
 
 fn parse_session_selector(target: &str) -> SessionSelector {
@@ -838,23 +824,6 @@ async fn resolve_window_summary_by_id(
         .await?
         .into_iter()
         .find(|window| window.id == window_id))
-}
-
-async fn cli_window_context_label(
-    client: &mut BmuxClient,
-    window: &WindowSummary,
-) -> bmux_client::Result<String> {
-    let session_label = client
-        .list_sessions()
-        .await?
-        .into_iter()
-        .find(|entry| entry.id == window.session_id)
-        .map(|entry| session_summary_label(&entry))
-        .unwrap_or_else(|| format!("session-{}", short_uuid(window.session_id)));
-    Ok(format!(
-        "{} in {session_label}",
-        window_summary_label(window)
-    ))
 }
 
 fn short_uuid(id: uuid::Uuid) -> String {
