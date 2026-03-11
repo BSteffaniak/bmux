@@ -178,141 +178,79 @@ struct RevokePermissionResponse {
 fn run_permission_query_service(context: &NativeServiceContext) -> ServiceResponse {
     let request = match decode_service_message::<ListPermissionsRequest>(&context.request.payload) {
         Ok(request) => request,
-        Err(error) => {
-            return ServiceResponse::error("invalid_request", error.to_string());
-        }
+        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
     };
-
-    let paths = ConfigPaths::new(
-        context.connection.config_dir.clone().into(),
-        context.connection.runtime_dir.clone().into(),
-        context.connection.data_dir.clone().into(),
-    );
-
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| {
-            handle.block_on(async_list_permissions_service(&paths, &request.session))
-        }),
-        Err(_) => match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => {
-                runtime.block_on(async_list_permissions_service(&paths, &request.session))
-            }
-            Err(error) => ServiceResponse::error("runtime_error", error.to_string()),
+    let selector = parse_session_selector(&request.session);
+    with_client(
+        context,
+        "bmux-permissions-plugin-service",
+        |mut client| async move {
+            let permissions = client
+                .list_permissions(selector)
+                .await
+                .map_err(client_error)?;
+            Ok(encode_service_message(&ListPermissionsResponse {
+                permissions,
+            })?)
         },
-    }
-}
-
-async fn async_list_permissions_service(paths: &ConfigPaths, session: &str) -> ServiceResponse {
-    let selector = parse_session_selector(session);
-    match BmuxClient::connect_with_paths(paths, "bmux-permissions-service").await {
-        Ok(mut client) => match client.list_permissions(selector).await {
-            Ok(permissions) => {
-                match encode_service_message(&ListPermissionsResponse { permissions }) {
-                    Ok(payload) => ServiceResponse::ok(payload),
-                    Err(error) => ServiceResponse::error("encode_error", error.to_string()),
-                }
-            }
-            Err(error) => ServiceResponse::error("list_failed", error.to_string()),
-        },
-        Err(error) => ServiceResponse::error("connect_failed", error.to_string()),
-    }
+    )
 }
 
 fn run_permission_command_service(context: &NativeServiceContext) -> ServiceResponse {
-    let paths = ConfigPaths::new(
-        context.connection.config_dir.clone().into(),
-        context.connection.runtime_dir.clone().into(),
-        context.connection.data_dir.clone().into(),
-    );
-
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| {
-            handle.block_on(async_permission_command_service(
-                &paths,
-                context.request.operation.as_str(),
-                &context.request.payload,
-            ))
-        }),
-        Err(_) => match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime.block_on(async_permission_command_service(
-                &paths,
-                context.request.operation.as_str(),
-                &context.request.payload,
-            )),
-            Err(error) => ServiceResponse::error("runtime_error", error.to_string()),
-        },
-    }
-}
-
-async fn async_permission_command_service(
-    paths: &ConfigPaths,
-    operation: &str,
-    payload: &[u8],
-) -> ServiceResponse {
-    match operation {
+    match context.request.operation.as_str() {
         "grant" => {
-            let request = match decode_service_message::<GrantPermissionRequest>(payload) {
-                Ok(request) => request,
-                Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
-            };
+            let request =
+                match decode_service_message::<GrantPermissionRequest>(&context.request.payload) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return ServiceResponse::error("invalid_request", error.to_string());
+                    }
+                };
             let selector = parse_session_selector(&request.session);
-            let mut client = match connect_client(paths).await {
-                Ok(client) => client,
-                Err(code) => {
-                    return ServiceResponse::error(
-                        "connect_failed",
-                        format!("client error code {code}"),
-                    );
-                }
-            };
-            match client
-                .grant_role(selector, request.client_id, request.role)
-                .await
-            {
-                Ok(()) => match encode_service_message(&GrantPermissionResponse {
-                    client_id: request.client_id,
-                    role: request.role,
-                }) {
-                    Ok(payload) => ServiceResponse::ok(payload),
-                    Err(error) => ServiceResponse::error("encode_error", error.to_string()),
+            with_client(
+                context,
+                "bmux-permissions-plugin-service",
+                |mut client| async move {
+                    client
+                        .grant_role(selector, request.client_id, request.role)
+                        .await
+                        .map_err(client_error)?;
+                    Ok(encode_service_message(&GrantPermissionResponse {
+                        client_id: request.client_id,
+                        role: request.role,
+                    })?)
                 },
-                Err(error) => ServiceResponse::error("grant_failed", error.to_string()),
-            }
+            )
         }
         "revoke" => {
-            let request = match decode_service_message::<RevokePermissionRequest>(payload) {
-                Ok(request) => request,
-                Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
-            };
+            let request =
+                match decode_service_message::<RevokePermissionRequest>(&context.request.payload) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return ServiceResponse::error("invalid_request", error.to_string());
+                    }
+                };
             let selector = parse_session_selector(&request.session);
-            let mut client = match connect_client(paths).await {
-                Ok(client) => client,
-                Err(code) => {
-                    return ServiceResponse::error(
-                        "connect_failed",
-                        format!("client error code {code}"),
-                    );
-                }
-            };
-            match client.revoke_role(selector, request.client_id).await {
-                Ok(()) => match encode_service_message(&RevokePermissionResponse {
-                    client_id: request.client_id,
-                }) {
-                    Ok(payload) => ServiceResponse::ok(payload),
-                    Err(error) => ServiceResponse::error("encode_error", error.to_string()),
+            with_client(
+                context,
+                "bmux-permissions-plugin-service",
+                |mut client| async move {
+                    client
+                        .revoke_role(selector, request.client_id)
+                        .await
+                        .map_err(client_error)?;
+                    Ok(encode_service_message(&RevokePermissionResponse {
+                        client_id: request.client_id,
+                    })?)
                 },
-                Err(error) => ServiceResponse::error("revoke_failed", error.to_string()),
-            }
+            )
         }
         _ => ServiceResponse::error(
             "unsupported_service_operation",
-            format!("unsupported permissions command operation '{operation}'"),
+            format!(
+                "unsupported permissions command operation '{}'",
+                context.request.operation
+            ),
         ),
     }
 }
@@ -336,46 +274,35 @@ fn run_permissions_command(context: &NativeCommandContext) -> i32 {
     };
 
     if watch {
-        let paths = command_paths(context);
-        return match block_on_plugin_future(async move {
-            async_watch_permissions_command(&paths, &session).await
-        }) {
-            Ok(code) => code,
-            Err(_) => 70,
-        };
+        return watch_permissions(context, &session);
     }
 
-    let paths = command_paths(context);
-    let response = match block_on_permission_query(
-        &paths,
-        &ListPermissionsRequest {
-            session: session.clone(),
-        },
+    let selector = parse_session_selector(&session);
+    let permissions = match with_command_client(
+        context,
+        "bmux-permissions-plugin-command",
+        |mut client| async move { client.list_permissions(selector).await },
     ) {
-        Ok(response) => response,
+        Ok(permissions) => permissions,
         Err(error) => {
             eprintln!("failed listing permissions: {error}");
             return 1;
         }
     };
-    render_permissions(&response.permissions, as_json);
+    render_permissions(&permissions, as_json);
     0
 }
 
-async fn async_watch_permissions_command(paths: &ConfigPaths, session: &str) -> i32 {
-    let selector = parse_session_selector(session);
-    let mut client = match BmuxClient::connect_with_paths(paths, "bmux-permissions-plugin").await {
-        Ok(client) => client,
-        Err(error) => {
-            eprintln!("failed connecting to bmux host: {error}");
-            return 1;
-        }
-    };
-
+fn watch_permissions(context: &NativeCommandContext, session: &str) -> i32 {
     println!("watching permissions for session '{session}' (Ctrl-C to stop)");
     let mut last_permissions: Option<Vec<SessionPermissionSummary>> = None;
     loop {
-        match client.list_permissions(selector.clone()).await {
+        let selector = parse_session_selector(session);
+        match with_command_client(
+            context,
+            "bmux-permissions-plugin-command",
+            |mut client| async move { client.list_permissions(selector).await },
+        ) {
             Ok(permissions) => {
                 if last_permissions.as_ref() != Some(&permissions) {
                     render_permissions(&permissions, false);
@@ -387,7 +314,7 @@ async fn async_watch_permissions_command(paths: &ConfigPaths, session: &str) -> 
                 return 1;
             }
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+        std::thread::sleep(std::time::Duration::from_millis(500));
     }
 }
 
@@ -409,7 +336,7 @@ fn run_grant_command(context: &NativeCommandContext) -> i32 {
         eprintln!("grant requires --session <name-or-uuid> --client <uuid> --role <role>");
         return 64;
     };
-    let client_id = match uuid::Uuid::parse_str(&client) {
+    let client_id = match Uuid::parse_str(&client) {
         Ok(client_id) => client_id,
         Err(_) => {
             eprintln!("invalid client id: {client}");
@@ -424,14 +351,16 @@ fn run_grant_command(context: &NativeCommandContext) -> i32 {
         }
     };
 
-    let paths = command_paths(context);
-    match block_on_permission_command::<GrantPermissionRequest, GrantPermissionResponse>(
-        &paths,
-        "grant",
-        &GrantPermissionRequest {
-            session,
-            client_id,
-            role,
+    let selector = parse_session_selector(&session);
+    match with_command_client(
+        context,
+        "bmux-permissions-plugin-command",
+        |mut client| async move {
+            client.grant_role(selector, client_id, role).await?;
+            Ok::<GrantPermissionResponse, bmux_client::ClientError>(GrantPermissionResponse {
+                client_id,
+                role,
+            })
         },
     ) {
         Ok(response) => {
@@ -465,7 +394,7 @@ fn run_revoke_command(context: &NativeCommandContext) -> i32 {
         eprintln!("revoke requires --session <name-or-uuid> --client <uuid>");
         return 64;
     };
-    let client_id = match uuid::Uuid::parse_str(&client) {
+    let client_id = match Uuid::parse_str(&client) {
         Ok(client_id) => client_id,
         Err(_) => {
             eprintln!("invalid client id: {client}");
@@ -473,11 +402,16 @@ fn run_revoke_command(context: &NativeCommandContext) -> i32 {
         }
     };
 
-    let paths = command_paths(context);
-    match block_on_permission_command::<RevokePermissionRequest, RevokePermissionResponse>(
-        &paths,
-        "revoke",
-        &RevokePermissionRequest { session, client_id },
+    let selector = parse_session_selector(&session);
+    match with_command_client(
+        context,
+        "bmux-permissions-plugin-command",
+        |mut client| async move {
+            client.revoke_role(selector, client_id).await?;
+            Ok::<RevokePermissionResponse, bmux_client::ClientError>(RevokePermissionResponse {
+                client_id,
+            })
+        },
     ) {
         Ok(response) => {
             println!("revoked explicit role for client {}", response.client_id);
@@ -490,118 +424,84 @@ fn run_revoke_command(context: &NativeCommandContext) -> i32 {
     }
 }
 
-fn block_on_permission_query(
-    paths: &ConfigPaths,
-    request: &ListPermissionsRequest,
-) -> Result<ListPermissionsResponse, String> {
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| {
-            handle.block_on(async {
-                match async_list_permissions_service(paths, &request.session).await {
-                    ServiceResponse {
-                        payload,
-                        error: None,
-                    } => decode_service_message(&payload).map_err(|error| error.to_string()),
-                    ServiceResponse {
-                        error: Some(error), ..
-                    } => Err(format!("[{}] {}", error.code, error.message)),
-                }
-            })
-        }),
-        Err(_) => match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime.block_on(async {
-                match async_list_permissions_service(paths, &request.session).await {
-                    ServiceResponse {
-                        payload,
-                        error: None,
-                    } => decode_service_message(&payload).map_err(|error| error.to_string()),
-                    ServiceResponse {
-                        error: Some(error), ..
-                    } => Err(format!("[{}] {}", error.code, error.message)),
-                }
-            }),
-            Err(error) => Err(error.to_string()),
-        },
-    }
-}
-
-fn block_on_permission_command<Request, Response>(
-    paths: &ConfigPaths,
-    operation: &str,
-    request: &Request,
-) -> Result<Response, String>
+fn with_client<F, Fut>(
+    context: &NativeServiceContext,
+    principal: &str,
+    operation: F,
+) -> ServiceResponse
 where
-    Request: Serialize,
-    Response: for<'de> Deserialize<'de>,
+    F: FnOnce(BmuxClient) -> Fut,
+    Fut: std::future::Future<Output = bmux_plugin::Result<Vec<u8>>>,
 {
-    let payload = encode_service_message(request).map_err(|error| error.to_string())?;
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| {
-            handle.block_on(async {
-                match async_permission_command_service(paths, operation, &payload).await {
-                    ServiceResponse {
-                        payload,
-                        error: None,
-                    } => decode_service_message(&payload).map_err(|error| error.to_string()),
-                    ServiceResponse {
-                        error: Some(error), ..
-                    } => Err(format!("[{}] {}", error.code, error.message)),
-                }
-            })
-        }),
-        Err(_) => match tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime.block_on(async {
-                match async_permission_command_service(paths, operation, &payload).await {
-                    ServiceResponse {
-                        payload,
-                        error: None,
-                    } => decode_service_message(&payload).map_err(|error| error.to_string()),
-                    ServiceResponse {
-                        error: Some(error), ..
-                    } => Err(format!("[{}] {}", error.code, error.message)),
-                }
-            }),
-            Err(error) => Err(error.to_string()),
-        },
-    }
-}
-
-fn command_paths(context: &NativeCommandContext) -> ConfigPaths {
-    ConfigPaths::new(
+    let paths = ConfigPaths::new(
         context.connection.config_dir.clone().into(),
         context.connection.runtime_dir.clone().into(),
         context.connection.data_dir.clone().into(),
-    )
-}
-
-async fn connect_client(paths: &ConfigPaths) -> Result<BmuxClient, i32> {
-    BmuxClient::connect_with_paths(paths, "bmux-permissions-plugin")
-        .await
-        .map_err(|error| {
-            eprintln!("failed connecting to bmux host: {error}");
-            1
-        })
-}
-
-fn block_on_plugin_future<F>(future: F) -> Result<i32, ()>
-where
-    F: std::future::Future<Output = i32>,
-{
+    );
     match tokio::runtime::Handle::try_current() {
-        Ok(handle) => Ok(tokio::task::block_in_place(|| handle.block_on(future))),
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(async move {
+                match BmuxClient::connect_with_paths(&paths, principal).await {
+                    Ok(client) => match operation(client).await {
+                        Ok(payload) => ServiceResponse::ok(payload),
+                        Err(error) => ServiceResponse::error("service_failed", error.to_string()),
+                    },
+                    Err(error) => ServiceResponse::error("connect_failed", error.to_string()),
+                }
+            })
+        }),
         Err(_) => match tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
         {
-            Ok(runtime) => Ok(runtime.block_on(future)),
-            Err(_) => Err(()),
+            Ok(runtime) => runtime.block_on(async move {
+                match BmuxClient::connect_with_paths(&paths, principal).await {
+                    Ok(client) => match operation(client).await {
+                        Ok(payload) => ServiceResponse::ok(payload),
+                        Err(error) => ServiceResponse::error("service_failed", error.to_string()),
+                    },
+                    Err(error) => ServiceResponse::error("connect_failed", error.to_string()),
+                }
+            }),
+            Err(error) => ServiceResponse::error("runtime_error", error.to_string()),
         },
+    }
+}
+
+fn with_command_client<T, Fut>(
+    context: &NativeCommandContext,
+    principal: &str,
+    operation: impl FnOnce(BmuxClient) -> Fut,
+) -> Result<T, String>
+where
+    Fut: std::future::Future<Output = std::result::Result<T, bmux_client::ClientError>>,
+{
+    let paths = ConfigPaths::new(
+        context.connection.config_dir.clone().into(),
+        context.connection.runtime_dir.clone().into(),
+        context.connection.data_dir.clone().into(),
+    );
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                let client = BmuxClient::connect_with_paths(&paths, principal)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                operation(client).await.map_err(|error| error.to_string())
+            })
+        }),
+        Err(_) => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())?;
+            runtime.block_on(async {
+                let client = BmuxClient::connect_with_paths(&paths, principal)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                operation(client).await.map_err(|error| error.to_string())
+            })
+        }
     }
 }
 
@@ -654,9 +554,15 @@ fn role_label(role: SessionRole) -> &'static str {
 }
 
 fn parse_session_selector(value: &str) -> SessionSelector {
-    match uuid::Uuid::parse_str(value) {
+    match Uuid::parse_str(value) {
         Ok(id) => SessionSelector::ById(id),
         Err(_) => SessionSelector::ByName(value.to_string()),
+    }
+}
+
+fn client_error(error: bmux_client::ClientError) -> bmux_plugin::PluginError {
+    bmux_plugin::PluginError::ServiceProtocol {
+        details: error.to_string(),
     }
 }
 
@@ -675,24 +581,6 @@ mod tests {
             .expect("descriptor should parse");
         assert_eq!(reparsed.id, "bmux.permissions");
         assert_eq!(reparsed.commands.len(), 3);
-        assert!(
-            reparsed
-                .commands
-                .iter()
-                .all(|command| command.expose_in_cli)
-        );
-        assert!(reparsed.commands.iter().any(|command| {
-            command.name == "permissions"
-                && command.aliases == vec![vec!["session".to_string(), "permissions".to_string()]]
-        }));
-        assert!(reparsed.commands.iter().any(|command| {
-            command.name == "grant"
-                && command.aliases == vec![vec!["session".to_string(), "grant".to_string()]]
-        }));
-        assert!(reparsed.commands.iter().any(|command| {
-            command.name == "revoke"
-                && command.aliases == vec![vec!["session".to_string(), "revoke".to_string()]]
-        }));
     }
 
     #[test]

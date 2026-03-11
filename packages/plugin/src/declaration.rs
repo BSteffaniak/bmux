@@ -79,6 +79,8 @@ pub struct PluginDeclaration {
     #[serde(default)]
     pub homepage: Option<String>,
     #[serde(default)]
+    pub provider_priority: i32,
+    #[serde(default)]
     #[serde(alias = "required_host_scopes")]
     pub required_capabilities: BTreeSet<HostScope>,
     #[serde(default)]
@@ -265,6 +267,7 @@ mod tests {
             },
             description: None,
             homepage: None,
+            provider_priority: 0,
             required_capabilities: BTreeSet::new(),
             provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::new(),
@@ -316,6 +319,7 @@ mod tests {
             },
             description: None,
             homepage: None,
+            provider_priority: 0,
             required_capabilities,
             provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::new(),
@@ -351,6 +355,7 @@ mod tests {
             },
             description: None,
             homepage: None,
+            provider_priority: 0,
             required_capabilities: BTreeSet::new(),
             provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::new(),

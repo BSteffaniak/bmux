@@ -44,6 +44,19 @@ pub struct ServiceProvider {
 }
 
 impl PluginRegistry {
+    fn plugin_preferred_over(&self, candidate_id: &str, current_id: &str) -> bool {
+        let Some(candidate) = self.get(candidate_id) else {
+            return false;
+        };
+        let Some(current) = self.get(current_id) else {
+            return true;
+        };
+
+        candidate.declaration.provider_priority > current.declaration.provider_priority
+            || (candidate.declaration.provider_priority == current.declaration.provider_priority
+                && candidate_id < current_id)
+    }
+
     #[must_use]
     pub const fn new() -> Self {
         Self {
@@ -273,21 +286,23 @@ impl PluginRegistry {
         }
 
         for plugin in self.activation_order_for(plugin_ids)? {
+            let plugin_id = plugin.declaration.id.as_str().to_string();
             for capability in &plugin.declaration.provided_capabilities {
-                if let Some(existing) = providers.get(capability) {
-                    return Err(PluginError::DuplicateCapabilityProvider {
-                        capability: capability.as_str().to_string(),
-                        first_provider: existing.provider.to_string(),
-                        second_provider: plugin.declaration.id.as_str().to_string(),
-                    });
+                if let Some(existing) = providers.get(capability)
+                    && match &existing.provider {
+                        crate::ProviderId::Host => true,
+                        crate::ProviderId::Plugin(existing_id) => {
+                            !self.plugin_preferred_over(&plugin_id, existing_id)
+                        }
+                    }
+                {
+                    continue;
                 }
                 providers.insert(
                     capability.clone(),
                     CapabilityProvider {
                         capability: capability.clone(),
-                        provider: crate::ProviderId::Plugin(
-                            plugin.declaration.id.as_str().to_string(),
-                        ),
+                        provider: crate::ProviderId::Plugin(plugin_id.clone()),
                     },
                 );
             }
@@ -349,21 +364,23 @@ impl PluginRegistry {
         let mut providers: BTreeMap<(HostScope, crate::ServiceKind, String), ServiceProvider> =
             BTreeMap::new();
         for plugin in self.activation_order_for(plugin_ids)? {
+            let plugin_id = plugin.declaration.id.as_str().to_string();
             for service in &plugin.declaration.services {
                 let registered = RegisteredService {
                     capability: service.capability.clone(),
                     kind: service.kind,
                     interface_id: service.interface_id.clone(),
-                    provider: crate::ProviderId::Plugin(plugin.declaration.id.as_str().to_string()),
+                    provider: crate::ProviderId::Plugin(plugin_id.clone()),
                 };
-                if let Some(existing) = providers.get(&registered.key()) {
-                    return Err(PluginError::DuplicateServiceProvider {
-                        capability: registered.capability.as_str().to_string(),
-                        kind: registered.kind,
-                        interface_id: registered.interface_id.clone(),
-                        first_provider: existing.service.provider.to_string(),
-                        second_provider: registered.provider.to_string(),
-                    });
+                if let Some(existing) = providers.get(&registered.key())
+                    && match &existing.service.provider {
+                        crate::ProviderId::Host => true,
+                        crate::ProviderId::Plugin(existing_id) => {
+                            !self.plugin_preferred_over(&plugin_id, existing_id)
+                        }
+                    }
+                {
+                    continue;
                 }
                 providers.insert(
                     registered.key(),
@@ -542,7 +559,7 @@ minimum = "1.0"
     }
 
     #[test]
-    fn capability_providers_detect_duplicate_plugin_ownership() {
+    fn capability_providers_choose_deterministic_plugin_provider() {
         let dir = temp_dir();
         fs::write(dir.join("one.dylib"), []).expect("one entry should be written");
         fs::write(dir.join("two.dylib"), []).expect("two entry should be written");
@@ -588,14 +605,17 @@ minimum = "1.0"
             .register_manifest(&dir.join("two.toml"), two)
             .expect("second registration should succeed");
 
-        let error = registry
+        let providers = registry
             .capability_providers_for(&["one.plugin".to_string(), "two.plugin".to_string()], &[])
-            .expect_err("duplicate providers should fail");
-        assert!(error.to_string().contains("bmux.windows.read"));
+            .expect("provider selection should succeed");
+        let selected = providers
+            .get(&HostScope::new("bmux.windows.read").expect("scope should parse"))
+            .expect("capability should be present");
+        assert_eq!(selected.provider.to_string(), "one.plugin");
     }
 
     #[test]
-    fn service_providers_detect_duplicate_service_registration() {
+    fn service_providers_choose_highest_priority_then_plugin_id() {
         let dir = temp_dir();
         fs::write(dir.join("one.dylib"), []).expect("one entry should be written");
         fs::write(dir.join("two.dylib"), []).expect("two entry should be written");
@@ -606,6 +626,7 @@ id = "one.plugin"
 name = "One"
 version = "0.1.0"
 entry = "one.dylib"
+provider_priority = 10
 provided_capabilities = ["bmux.windows.read"]
 
 [[services]]
@@ -652,9 +673,17 @@ minimum = "1.0"
             .register_manifest(&dir.join("two.toml"), two)
             .expect("second registration should succeed");
 
-        let error = registry
+        let providers = registry
             .service_providers_for(&["one.plugin".to_string(), "two.plugin".to_string()])
-            .expect_err("duplicate service providers should fail");
-        assert!(error.to_string().contains("window-query/v1"));
+            .expect("service provider selection should succeed");
+        let key = (
+            HostScope::new("bmux.windows.read").expect("scope should parse"),
+            crate::ServiceKind::Query,
+            "window-query/v1".to_string(),
+        );
+        let selected = providers
+            .get(&key)
+            .expect("service provider should be present");
+        assert_eq!(selected.service.provider.to_string(), "one.plugin");
     }
 }

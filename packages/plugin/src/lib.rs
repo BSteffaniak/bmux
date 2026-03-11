@@ -8,7 +8,6 @@
 //! the bmux host and plugins without exposing the internal server, CLI, or
 //! terminal runtime implementation details directly.
 
-mod api;
 mod builder;
 mod capability;
 mod command;
@@ -24,11 +23,6 @@ mod registry;
 mod service;
 mod version;
 
-pub use api::{
-    ConfigClient, NewWindowResponse, PermissionGrantResponse, PermissionRecord,
-    PermissionRevokeResponse, PermissionsClient, PluginSettingsResponse, ServiceCallerExt,
-    StorageClient, StorageGetResponse, WindowRecord, WindowsClient,
-};
 pub use builder::PluginBuilder;
 pub use capability::{HostScope, PluginFeature};
 pub use command::{

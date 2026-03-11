@@ -607,6 +607,8 @@ pub struct NativeDescriptor {
     #[serde(default)]
     pub homepage: Option<String>,
     #[serde(default)]
+    pub provider_priority: i32,
+    #[serde(default)]
     #[serde(alias = "required_host_scopes")]
     pub required_capabilities: BTreeSet<HostScope>,
     #[serde(default)]
@@ -658,6 +660,7 @@ impl NativeDescriptor {
             entrypoint,
             description: self.description,
             homepage: self.homepage,
+            provider_priority: self.provider_priority,
             required_capabilities: self.required_capabilities,
             provided_capabilities: self.provided_capabilities,
             provided_features: self.provided_features,
@@ -1079,6 +1082,12 @@ fn compare_manifest_and_descriptor(
         "native_abi",
         &registered_plugin.declaration.native_abi.to_string(),
         &declaration.native_abi.to_string(),
+    )?;
+    ensure_match(
+        registered_plugin.declaration.id.as_str(),
+        "provider_priority",
+        &registered_plugin.declaration.provider_priority.to_string(),
+        &declaration.provider_priority.to_string(),
     )?;
     ensure_match(
         registered_plugin.declaration.id.as_str(),
@@ -1671,6 +1680,7 @@ minimum = "1.0"
                 },
                 description: None,
                 homepage: None,
+                provider_priority: 0,
                 required_capabilities: BTreeSet::new(),
                 provided_capabilities: BTreeSet::new(),
                 provided_features: BTreeSet::new(),
@@ -1696,5 +1706,17 @@ minimum = "1.0"
             name: "server_stopping".to_string(),
             payload: serde_json::Value::Null,
         }));
+    }
+
+    #[test]
+    fn production_loader_code_does_not_hardcode_domain_service_interfaces() {
+        let source = include_str!("loader.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or_default();
+        assert!(!source.contains("permission-query/v1"));
+        assert!(!source.contains("permission-command/v1"));
+        assert!(!source.contains("window-query/v1"));
+        assert!(!source.contains("window-command/v1"));
     }
 }

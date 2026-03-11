@@ -61,6 +61,8 @@ pub struct PluginManifest {
     #[serde(default)]
     pub homepage: Option<String>,
     #[serde(default)]
+    pub provider_priority: i32,
+    #[serde(default)]
     pub runtime: PluginRuntime,
     pub entry: PathBuf,
     #[serde(default = "default_entry_symbol")]
@@ -128,6 +130,7 @@ impl PluginManifest {
             },
             description: self.description.clone(),
             homepage: self.homepage.clone(),
+            provider_priority: self.provider_priority,
             required_capabilities: self.required_capabilities.clone(),
             provided_capabilities: self.provided_capabilities.clone(),
             provided_features: self.provided_features.clone(),

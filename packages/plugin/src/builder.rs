@@ -27,6 +27,7 @@ impl PluginBuilder {
                 },
                 description: None,
                 homepage: None,
+                provider_priority: 0,
                 required_capabilities: BTreeSet::new(),
                 provided_capabilities: BTreeSet::new(),
                 provided_features: BTreeSet::new(),
@@ -54,6 +55,12 @@ impl PluginBuilder {
     #[must_use]
     pub fn homepage(mut self, homepage: impl Into<String>) -> Self {
         self.descriptor.homepage = Some(homepage.into());
+        self
+    }
+
+    #[must_use]
+    pub const fn provider_priority(mut self, priority: i32) -> Self {
+        self.descriptor.provider_priority = priority;
         self
     }
 

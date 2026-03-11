@@ -5671,6 +5671,7 @@ mod tests {
             },
             description: None,
             homepage: None,
+            provider_priority: 0,
             required_capabilities: std::collections::BTreeSet::from([bmux_plugin::HostScope::new(
                 "bmux.commands",
             )
@@ -5763,6 +5764,7 @@ mod tests {
             },
             description: None,
             homepage: None,
+            provider_priority: 0,
             required_capabilities: std::collections::BTreeSet::from([
                 bmux_plugin::HostScope::new("bmux.commands").expect("capability should parse"),
                 bmux_plugin::HostScope::new("example.base.read").expect("capability should parse"),
