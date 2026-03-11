@@ -1110,14 +1110,59 @@ fn load_or_create_principal_id(paths: &ConfigPaths) -> Result<Uuid> {
 mod tests {
     use super::{BmuxClient, ClientError, ServerEvent};
     use bmux_ipc::{
-        ErrorCode, IpcEndpoint, PaneFocusDirection, PaneSelector, PaneSplitDirection, SessionRole,
-        SessionSelector, WindowSelector,
+        ErrorCode, InvokeServiceKind, IpcEndpoint, PaneFocusDirection, PaneSelector,
+        PaneSplitDirection, SessionRole, SessionSelector, WindowSelector,
     };
     use bmux_server::BmuxServer;
     use std::path::PathBuf;
     use std::time::Duration;
     use tokio::time::sleep;
     use uuid::Uuid;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn client_invoke_service_raw_uses_generic_service_dispatch() {
+        let socket_path = std::env::temp_dir().join(format!("bmux-client-{}.sock", Uuid::new_v4()));
+        let endpoint = IpcEndpoint::unix_socket(&socket_path);
+        let server = BmuxServer::new(endpoint.clone());
+        server
+            .register_service_handler(
+                "example.echo",
+                InvokeServiceKind::Query,
+                "echo-query/v1",
+                "ping",
+                |payload| async move { Ok(payload) },
+            )
+            .expect("service registration should succeed");
+        let server_task = tokio::spawn(async move { server.run().await });
+        wait_for_server(&endpoint).await;
+
+        let mut client = BmuxClient::connect(&endpoint, Duration::from_secs(2), "invoke-test")
+            .await
+            .expect("client should connect");
+        let payload = b"hello-service".to_vec();
+        let response = client
+            .invoke_service_raw(
+                "example.echo",
+                InvokeServiceKind::Query,
+                "echo-query/v1",
+                "ping",
+                payload.clone(),
+            )
+            .await
+            .expect("invoke-service should succeed");
+        assert_eq!(response, payload);
+
+        client.stop_server().await.expect("stop should succeed");
+        server_task
+            .await
+            .expect("server task should join")
+            .expect("server should stop cleanly");
+
+        if socket_path.exists() {
+            std::fs::remove_file(&socket_path).expect("socket cleanup should succeed");
+        }
+    }
 
     #[cfg(unix)]
     #[tokio::test]

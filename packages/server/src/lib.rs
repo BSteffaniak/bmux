@@ -2553,6 +2553,39 @@ impl BmuxServer {
         Self::from_config_paths(&ConfigPaths::default())
     }
 
+    /// Register a generic service invocation handler.
+    ///
+    /// Handlers are matched by exact `(capability, kind, interface_id, operation)`.
+    pub fn register_service_handler<F, Fut>(
+        &self,
+        capability: impl Into<String>,
+        kind: bmux_ipc::InvokeServiceKind,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        handler: F,
+    ) -> Result<()>
+    where
+        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
+    {
+        let route = ServiceRoute {
+            capability: capability.into(),
+            kind,
+            interface_id: interface_id.into(),
+            operation: operation.into(),
+        };
+        let wrapped: Arc<ServiceInvokeHandler> =
+            Arc::new(move |payload| Box::pin(handler(payload)));
+
+        let mut registry = self
+            .state
+            .service_registry
+            .lock()
+            .map_err(|_| anyhow::anyhow!("service registry lock poisoned"))?;
+        registry.handlers.insert(route, wrapped);
+        Ok(())
+    }
+
     /// Return the configured endpoint.
     #[must_use]
     pub const fn endpoint(&self) -> &IpcEndpoint {
