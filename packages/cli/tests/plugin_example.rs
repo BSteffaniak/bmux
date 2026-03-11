@@ -100,33 +100,33 @@ fn dynamic_library_file(stem: &str) -> String {
     }
 }
 
-fn stage_shipped_bundle(
+fn stage_bundled_bundle(
     root: &Path,
     sandbox: &Path,
     plugin_dir_name: &str,
     library_stem: &str,
 ) -> PathBuf {
-    let shipped_root = sandbox.join("shipped-plugins");
-    let plugin_dir = shipped_root.join(plugin_dir_name);
-    fs::create_dir_all(&plugin_dir).expect("staged shipped plugin dir should be created");
+    let bundled_root = sandbox.join("bundled-plugins");
+    let plugin_dir = bundled_root.join(plugin_dir_name);
+    fs::create_dir_all(&plugin_dir).expect("staged bundled plugin dir should be created");
 
     let library_name = dynamic_library_file(library_stem);
     fs::copy(
         root.join("target").join("debug").join(&library_name),
         plugin_dir.join(&library_name),
     )
-    .expect("shipped plugin library should be staged");
+    .expect("bundled plugin library should be staged");
 
     fs::copy(
         root.join("plugins")
-            .join("shipped")
+            .join("bundled")
             .join(plugin_dir_name)
             .join("plugin.toml"),
         plugin_dir.join("plugin.toml"),
     )
-    .expect("shipped plugin manifest should be staged");
+    .expect("bundled plugin manifest should be staged");
 
-    shipped_root
+    bundled_root
 }
 
 fn config_paths_for_test(config_dir: &Path, runtime_dir: &Path, data_home: &Path) -> ConfigPaths {
@@ -336,8 +336,8 @@ fn installs_example_plugin_and_runs_command() {
         sandbox_setup();
     let paths = config_paths_for_test(&config_dir, &runtime_dir, &data_home);
 
-    let mut build_shipped_plugins_command = Command::new("cargo");
-    build_shipped_plugins_command
+    let mut build_bundled_plugins_command = Command::new("cargo");
+    build_bundled_plugins_command
         .current_dir(&root)
         .arg("build")
         .arg("-p")
@@ -346,7 +346,7 @@ fn installs_example_plugin_and_runs_command() {
         .arg("bmux_windows_plugin")
         .env("TMPDIR", &tmp_dir);
     configure_bmux_env(
-        &mut build_shipped_plugins_command,
+        &mut build_bundled_plugins_command,
         &home_dir,
         &config_home,
         &data_home,
@@ -354,21 +354,21 @@ fn installs_example_plugin_and_runs_command() {
         &paths.runtime_dir,
         &paths.data_dir,
     );
-    preserve_toolchain_env(&mut build_shipped_plugins_command);
-    let build_permissions_status = build_shipped_plugins_command
+    preserve_toolchain_env(&mut build_bundled_plugins_command);
+    let build_permissions_status = build_bundled_plugins_command
         .status()
-        .expect("shipped plugins should build");
+        .expect("bundled plugins should build");
     assert!(build_permissions_status.success());
 
-    let shipped_root =
-        stage_shipped_bundle(&root, &sandbox, "permissions", "bmux_permissions_plugin");
-    let _ = stage_shipped_bundle(&root, &sandbox, "windows", "bmux_windows_plugin");
+    let bundled_root =
+        stage_bundled_bundle(&root, &sandbox, "permissions", "bmux_permissions_plugin");
+    let _ = stage_bundled_bundle(&root, &sandbox, "windows", "bmux_windows_plugin");
 
     fs::write(
         config_dir.join("bmux.toml"),
         format!(
             "[plugins]\nenabled = [\"bmux.permissions\", \"bmux.windows\", \"example.native\"]\nsearch_paths = [\"{}\"]\n\n[plugins.settings.\"example.native\"]\ngreeting = \"hello\"\nmode = \"service\"\n",
-            shipped_root.display()
+            bundled_root.display()
         ),
     )
     .expect("config should be written");
@@ -721,7 +721,7 @@ fn installs_example_plugin_and_runs_command() {
 
 #[test]
 #[serial]
-fn shipped_permissions_plugin_handles_permissions_command() {
+fn bundled_permissions_plugin_handles_permissions_command() {
     let root = workspace_root();
     let (sandbox, home_dir, config_home, data_home, runtime_dir, tmp_dir, config_dir) =
         sandbox_setup();
@@ -750,13 +750,13 @@ fn shipped_permissions_plugin_handles_permissions_command() {
         "permissions plugin build should succeed"
     );
 
-    let shipped_root =
-        stage_shipped_bundle(&root, &sandbox, "permissions", "bmux_permissions_plugin");
+    let bundled_root =
+        stage_bundled_bundle(&root, &sandbox, "permissions", "bmux_permissions_plugin");
     fs::write(
         config_dir.join("bmux.toml"),
         format!(
             "[plugins]\nenabled = [\"bmux.permissions\"]\nsearch_paths = [\"{}\"]\n",
-            shipped_root.display()
+            bundled_root.display()
         ),
     )
     .expect("config should be written");
@@ -1003,7 +1003,7 @@ fn shipped_permissions_plugin_handles_permissions_command() {
 
 #[test]
 #[serial]
-fn shipped_windows_plugin_handles_window_commands() {
+fn bundled_windows_plugin_handles_window_commands() {
     let root = workspace_root();
     let (sandbox, home_dir, config_home, data_home, runtime_dir, tmp_dir, config_dir) =
         sandbox_setup();
@@ -1032,12 +1032,12 @@ fn shipped_windows_plugin_handles_window_commands() {
         "windows plugin build should succeed"
     );
 
-    let shipped_root = stage_shipped_bundle(&root, &sandbox, "windows", "bmux_windows_plugin");
+    let bundled_root = stage_bundled_bundle(&root, &sandbox, "windows", "bmux_windows_plugin");
     fs::write(
         config_dir.join("bmux.toml"),
         format!(
             "[plugins]\nenabled = [\"bmux.windows\"]\nsearch_paths = [\"{}\"]\n",
-            shipped_root.display()
+            bundled_root.display()
         ),
     )
     .expect("config should be written");

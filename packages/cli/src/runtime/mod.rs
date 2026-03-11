@@ -763,9 +763,9 @@ fn resolve_plugin_search_paths(config: &BmuxConfig, paths: &ConfigPaths) -> Resu
 
     if let Ok(executable) = std::env::current_exe() {
         if let Some(parent) = executable.parent() {
-            let shipped = parent.join("plugins");
-            if seen.insert(shipped.clone()) {
-                resolved.push(shipped);
+            let bundled = parent.join("plugins");
+            if seen.insert(bundled.clone()) {
+                resolved.push(bundled);
             }
         }
     }
