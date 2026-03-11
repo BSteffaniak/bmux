@@ -67,18 +67,20 @@ struct ServerState {
     handshake_timeout: Duration,
     pane_exit_rx: AsyncMutex<mpsc::UnboundedReceiver<PaneExitEvent>>,
     service_registry: Mutex<ServiceRegistry>,
+    service_resolver: Mutex<Option<Arc<ServiceResolverHandler>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct ServiceRoute {
-    capability: String,
-    kind: bmux_ipc::InvokeServiceKind,
-    interface_id: String,
-    operation: String,
+pub struct ServiceRoute {
+    pub capability: String,
+    pub kind: bmux_ipc::InvokeServiceKind,
+    pub interface_id: String,
+    pub operation: String,
 }
 
 type ServiceInvokeFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send>>;
 type ServiceInvokeHandler = dyn Fn(Vec<u8>) -> ServiceInvokeFuture + Send + Sync;
+type ServiceResolverHandler = dyn Fn(ServiceRoute, Vec<u8>) -> ServiceInvokeFuture + Send + Sync;
 
 #[derive(Default)]
 struct ServiceRegistry {
@@ -86,22 +88,9 @@ struct ServiceRegistry {
 }
 
 impl ServiceRegistry {
-    fn dispatch(
-        &self,
-        capability: String,
-        kind: bmux_ipc::InvokeServiceKind,
-        interface_id: String,
-        operation: String,
-        payload: Vec<u8>,
-    ) -> Option<ServiceInvokeFuture> {
-        let route = ServiceRoute {
-            capability,
-            kind,
-            interface_id,
-            operation,
-        };
+    fn dispatch(&self, route: &ServiceRoute, payload: Vec<u8>) -> Option<ServiceInvokeFuture> {
         self.handlers
-            .get(&route)
+            .get(route)
             .cloned()
             .map(|handler| handler(payload))
     }
@@ -2518,6 +2507,7 @@ impl BmuxServer {
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
                 pane_exit_rx: AsyncMutex::new(pane_exit_rx),
                 service_registry: Mutex::new(ServiceRegistry::default()),
+                service_resolver: Mutex::new(None),
             }),
             shutdown_tx,
         }
@@ -2583,6 +2573,24 @@ impl BmuxServer {
             .lock()
             .map_err(|_| anyhow::anyhow!("service registry lock poisoned"))?;
         registry.handlers.insert(route, wrapped);
+        Ok(())
+    }
+
+    /// Register a generic fallback resolver for service routes that are not
+    /// explicitly present in the service registry.
+    pub fn set_service_resolver<F, Fut>(&self, resolver: F) -> Result<()>
+    where
+        F: Fn(ServiceRoute, Vec<u8>) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
+    {
+        let wrapped: Arc<ServiceResolverHandler> =
+            Arc::new(move |route, payload| Box::pin(resolver(route, payload)));
+        let mut slot = self
+            .state
+            .service_resolver
+            .lock()
+            .map_err(|_| anyhow::anyhow!("service resolver lock poisoned"))?;
+        *slot = Some(wrapped);
         Ok(())
     }
 
@@ -4042,20 +4050,31 @@ async fn handle_request(
             operation,
             payload,
         } => {
+            let route = ServiceRoute {
+                capability: capability.clone(),
+                kind,
+                interface_id: interface_id.clone(),
+                operation: operation.clone(),
+            };
             let dispatch = {
                 let registry = state
                     .service_registry
                     .lock()
                     .map_err(|_| anyhow::anyhow!("service registry lock poisoned"))?;
-                registry.dispatch(
-                    capability.clone(),
-                    kind,
-                    interface_id.clone(),
-                    operation.clone(),
-                    payload,
-                )
+                registry.dispatch(&route, payload.clone())
             };
-            if let Some(invocation) = dispatch {
+            let invocation = if let Some(invocation) = dispatch {
+                Some(invocation)
+            } else {
+                let resolver = state
+                    .service_resolver
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("service resolver lock poisoned"))?
+                    .clone();
+                resolver.map(|resolver| resolver(route.clone(), payload))
+            };
+
+            if let Some(invocation) = invocation {
                 match invocation.await {
                     Ok(payload) => Response::Ok(ResponsePayload::ServiceInvoked { payload }),
                     Err(error) => Response::Err(ErrorResponse {
@@ -5968,9 +5987,9 @@ mod tests {
     use bmux_config::ConfigPaths;
     use bmux_ipc::transport::LocalIpcStream;
     use bmux_ipc::{
-        AttachViewComponent, Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint,
-        PaneSelector, PaneSplitDirection, ProtocolVersion, Request, Response, ResponsePayload,
-        SessionRole, SessionSelector, WindowSelector, decode, encode,
+        AttachViewComponent, Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event,
+        InvokeServiceKind, IpcEndpoint, PaneSelector, PaneSplitDirection, ProtocolVersion, Request,
+        Response, ResponsePayload, SessionRole, SessionSelector, WindowSelector, decode, encode,
     };
     use bmux_session::{SessionId, SessionManager};
     use std::path::Path;
@@ -6087,6 +6106,64 @@ mod tests {
 
         let resolved = resolve_session_id(&manager, &SessionSelector::ByName(selector));
         assert_eq!(resolved, Some(expected_first));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn invoke_service_uses_registered_fallback_resolver() {
+        let socket_path = std::env::temp_dir().join(format!("bmux-server-{}.sock", Uuid::new_v4()));
+        let endpoint = IpcEndpoint::unix_socket(&socket_path);
+        let server = BmuxServer::new(endpoint.clone());
+        server
+            .set_service_resolver(|route, payload| async move {
+                if route.capability == "example.echo"
+                    && route.interface_id == "echo-query/v1"
+                    && route.operation == "ping"
+                {
+                    Ok(payload)
+                } else {
+                    anyhow::bail!("unexpected route: {route:?}")
+                }
+            })
+            .expect("resolver registration should succeed");
+        let server_task = spawn_server_with_ready(server).await;
+
+        let principal = Uuid::new_v4();
+        let mut client = connect_and_handshake_with_principal(&endpoint, principal).await;
+        let payload = b"hello-resolver".to_vec();
+        let response = send_request(
+            &mut client,
+            42,
+            Request::InvokeService {
+                capability: "example.echo".to_string(),
+                kind: InvokeServiceKind::Query,
+                interface_id: "echo-query/v1".to_string(),
+                operation: "ping".to_string(),
+                payload: payload.clone(),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            response,
+            Response::Ok(ResponsePayload::ServiceInvoked { payload })
+        );
+
+        let stop = send_request(&mut client, 43, Request::ServerStop).await;
+        assert!(matches!(
+            stop,
+            Response::Ok(ResponsePayload::ServerStopping)
+        ));
+        drop(client);
+
+        server_task
+            .await
+            .expect("server task should join")
+            .expect("server should stop cleanly");
+
+        if socket_path.exists() {
+            std::fs::remove_file(&socket_path).expect("socket cleanup should succeed");
+        }
     }
 
     #[cfg(unix)]
