@@ -2,6 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+use bmux_cli_output::{Table, TableColumn, write_table};
 use bmux_plugin::{
     CommandExecutionKind, HostScope, NativeCommandContext, NativeDescriptor, PluginCommand,
     PluginCommandArgument, PluginCommandArgumentKind, PluginEvent, PluginEventKind,
@@ -233,12 +234,19 @@ fn run_permissions_list(context: &NativeCommandContext) -> i32 {
         println!("example.native: no explicit role assignments");
     } else {
         println!("example.native permissions:");
+        let mut table = Table::new(vec![
+            TableColumn::new("CLIENT_ID").min_width(36),
+            TableColumn::new("ROLE"),
+        ]);
         for permission in response.permissions {
-            println!(
-                "{} {}",
-                permission.client_id,
-                session_role_name(permission.role)
-            );
+            table.push_row(vec![
+                permission.client_id.to_string(),
+                session_role_name(permission.role).to_string(),
+            ]);
+        }
+        if let Err(error) = write_stdout_table(&table) {
+            eprintln!("example.native: failed rendering permissions table: {error}");
+            return 1;
         }
     }
 
@@ -388,13 +396,25 @@ fn run_windows_list(context: &NativeCommandContext) -> i32 {
         println!("example.native: no windows");
     } else {
         println!("example.native windows:");
+        let mut table = Table::new(vec![
+            TableColumn::new("ID").min_width(36),
+            TableColumn::new("WINDOW"),
+            TableColumn::new("ACTIVE"),
+        ]);
         for window in response.windows {
-            println!(
-                "{} {}{}",
-                window.id,
+            table.push_row(vec![
+                window.id.to_string(),
                 window.name.unwrap_or_else(|| format!("#{}", window.number)),
-                if window.active { " [active]" } else { "" }
-            );
+                if window.active {
+                    "yes".to_string()
+                } else {
+                    "no".to_string()
+                },
+            ]);
+        }
+        if let Err(error) = write_stdout_table(&table) {
+            eprintln!("example.native: failed rendering windows table: {error}");
+            return 1;
         }
     }
 
@@ -469,10 +489,20 @@ fn run_settings_show(context: &NativeCommandContext) -> i32 {
     }
 
     println!("example.native settings:");
+    let mut table = Table::new(vec![TableColumn::new("SETTING")]);
     for (key, value) in response.settings {
-        println!("{key} = {value}");
+        table.push_row(vec![format!("{key} = {value}")]);
+    }
+    if let Err(error) = write_stdout_table(&table) {
+        eprintln!("example.native: failed rendering settings table: {error}");
+        return 1;
     }
     0
+}
+
+fn write_stdout_table(table: &Table) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    write_table(&mut stdout, table)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
