@@ -38,32 +38,6 @@ pub enum BuiltInHandlerId {
     PluginRun,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub enum PluginDomain {
-    Permissions,
-    Sessions,
-    Windows,
-    Panes,
-    Follow,
-    Persistence,
-    Diagnostics,
-}
-
-#[must_use]
-#[allow(dead_code)]
-pub fn all_plugin_domains() -> &'static [PluginDomain] {
-    &[
-        PluginDomain::Permissions,
-        PluginDomain::Sessions,
-        PluginDomain::Windows,
-        PluginDomain::Panes,
-        PluginDomain::Follow,
-        PluginDomain::Persistence,
-        PluginDomain::Diagnostics,
-    ]
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuiltInExecutionCommand {
     pub handler: BuiltInHandlerId,
@@ -85,13 +59,6 @@ impl BuiltInExecutionCommand {
     pub fn all_paths(&self) -> impl Iterator<Item = &Vec<String>> {
         std::iter::once(&self.canonical_path).chain(self.aliases.iter())
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[allow(dead_code)]
-pub struct PlannedPluginCommand {
-    pub handler: BuiltInHandlerId,
-    pub domain: PluginDomain,
 }
 
 pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
@@ -269,84 +236,6 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
     ]
 }
 
-#[allow(dead_code)]
-pub fn planned_plugin_commands() -> &'static [PlannedPluginCommand] {
-    &[
-        PlannedPluginCommand {
-            handler: BuiltInHandlerId::NewSession,
-            domain: PluginDomain::Sessions,
-        },
-        PlannedPluginCommand {
-            handler: BuiltInHandlerId::ListSessions,
-            domain: PluginDomain::Sessions,
-        },
-        PlannedPluginCommand {
-            handler: BuiltInHandlerId::ListClients,
-            domain: PluginDomain::Follow,
-        },
-        PlannedPluginCommand {
-            handler: BuiltInHandlerId::KillSession,
-            domain: PluginDomain::Sessions,
-        },
-        PlannedPluginCommand {
-            handler: BuiltInHandlerId::KillAllSessions,
-            domain: PluginDomain::Sessions,
-        },
-        PlannedPluginCommand {
-            handler: BuiltInHandlerId::Follow,
-            domain: PluginDomain::Follow,
-        },
-        PlannedPluginCommand {
-            handler: BuiltInHandlerId::Unfollow,
-            domain: PluginDomain::Follow,
-        },
-        PlannedPluginCommand {
-            handler: BuiltInHandlerId::SessionNew,
-            domain: PluginDomain::Sessions,
-        },
-        PlannedPluginCommand {
-            handler: BuiltInHandlerId::SessionList,
-            domain: PluginDomain::Sessions,
-        },
-        PlannedPluginCommand {
-            handler: BuiltInHandlerId::SessionClients,
-            domain: PluginDomain::Follow,
-        },
-        PlannedPluginCommand {
-            handler: BuiltInHandlerId::SessionKill,
-            domain: PluginDomain::Sessions,
-        },
-        PlannedPluginCommand {
-            handler: BuiltInHandlerId::SessionKillAll,
-            domain: PluginDomain::Sessions,
-        },
-        PlannedPluginCommand {
-            handler: BuiltInHandlerId::SessionFollow,
-            domain: PluginDomain::Follow,
-        },
-        PlannedPluginCommand {
-            handler: BuiltInHandlerId::SessionUnfollow,
-            domain: PluginDomain::Follow,
-        },
-        PlannedPluginCommand {
-            handler: BuiltInHandlerId::KeymapDoctor,
-            domain: PluginDomain::Diagnostics,
-        },
-        PlannedPluginCommand {
-            handler: BuiltInHandlerId::TerminalDoctor,
-            domain: PluginDomain::Diagnostics,
-        },
-    ]
-}
-
-#[allow(dead_code)]
-pub fn planned_plugin_domain(handler: BuiltInHandlerId) -> Option<PluginDomain> {
-    planned_plugin_commands()
-        .iter()
-        .find(|command| command.handler == handler)
-        .map(|command| command.domain)
-}
-
 pub fn reserved_built_in_paths() -> BTreeSet<Vec<String>> {
     built_in_execution_commands()
         .into_iter()
@@ -365,8 +254,8 @@ pub fn built_in_command_by_handler(handler: BuiltInHandlerId) -> BuiltInExecutio
 #[cfg(test)]
 mod tests {
     use super::{
-        BuiltInHandlerId, PluginDomain, all_plugin_domains, built_in_command_by_handler,
-        built_in_execution_commands, planned_plugin_domain, reserved_built_in_paths,
+        BuiltInHandlerId, built_in_command_by_handler, built_in_execution_commands,
+        reserved_built_in_paths,
     };
 
     #[test]
@@ -398,20 +287,6 @@ mod tests {
         assert_eq!(
             command.canonical_path,
             vec!["plugin".to_string(), "run".to_string()]
-        );
-    }
-
-    #[test]
-    fn future_plugin_domains_are_classified_in_code() {
-        assert!(all_plugin_domains().contains(&PluginDomain::Panes));
-        assert!(all_plugin_domains().contains(&PluginDomain::Persistence));
-        assert_eq!(
-            planned_plugin_domain(BuiltInHandlerId::SessionList),
-            Some(PluginDomain::Sessions)
-        );
-        assert_eq!(
-            planned_plugin_domain(BuiltInHandlerId::Follow),
-            Some(PluginDomain::Follow)
         );
     }
 
@@ -455,6 +330,5 @@ mod tests {
             command.canonical_path,
             vec!["server".to_string(), "status".to_string()]
         );
-        assert_eq!(planned_plugin_domain(BuiltInHandlerId::ServerStatus), None);
     }
 }
