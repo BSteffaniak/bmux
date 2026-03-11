@@ -2,6 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+use bmux_cli_output::{Table, TableColumn, write_table};
 use bmux_client::BmuxClient;
 use bmux_config::ConfigPaths;
 use bmux_ipc::{SessionSelector, WindowSelector, WindowSummary};
@@ -561,20 +562,35 @@ fn run_list_windows(context: &NativeCommandContext) -> i32 {
             .unwrap_or_else(|| format!("session-{}", short_uuid(windows[0].session_id)));
         println!("session context: {session_label}");
     }
-    println!("ID                                   SESSION          WINDOW ACTIVE");
+
+    let mut table = Table::new(vec![
+        TableColumn::new("ID").min_width(36),
+        TableColumn::new("SESSION").min_width(16),
+        TableColumn::new("WINDOW").min_width(12),
+        TableColumn::new("ACTIVE"),
+    ]);
     for window in windows {
         let session_label = sessions
             .iter()
             .find(|session| session.id == window.session_id)
             .map(session_summary_label)
             .unwrap_or_else(|| format!("session-{}", short_uuid(window.session_id)));
-        println!(
-            "{:<36} {:<16} {:<12} {}",
-            window.id,
+        table.push_row(vec![
+            window.id.to_string(),
             session_label,
             window_summary_label(&window),
-            if window.active { "yes" } else { "no" }
-        );
+            if window.active {
+                "yes".to_string()
+            } else {
+                "no".to_string()
+            },
+        ]);
+    }
+
+    let mut stdout = std::io::stdout().lock();
+    if let Err(error) = write_table(&mut stdout, &table) {
+        eprintln!("failed rendering windows table: {error}");
+        return 1;
     }
     0
 }

@@ -79,6 +79,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_cli_output"
+version = "0.0.1-alpha.0"
+
+[[package]]
 name = "bmux_client"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -179,6 +183,7 @@ dependencies = [
 name = "bmux_permissions_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_cli_output",
  "bmux_client",
  "bmux_config",
  "bmux_ipc",
@@ -279,6 +284,7 @@ dependencies = [
 name = "bmux_windows_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_cli_output",
  "bmux_client",
  "bmux_config",
  "bmux_ipc",

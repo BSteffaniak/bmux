@@ -2,6 +2,7 @@
 members = [
     "examples/native-plugin",
     "packages/bmux",
+    "packages/cli_output",
     "packages/cli",
     "packages/client",
     "packages/clipboard",
@@ -64,6 +65,7 @@ version    = "0.0.1-alpha.0"
 # Internal bmux packages
 bmux                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/bmux" }
 bmux_cli               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli" }
+bmux_cli_output        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli_output" }
 bmux_client            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/client" }
 bmux_clipboard         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/clipboard" }
 bmux_config            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }

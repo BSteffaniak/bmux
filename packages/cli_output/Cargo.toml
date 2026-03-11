@@ -1,0 +1,16 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Shared CLI output helpers for bmux"
+edition     = { workspace = true }
+keywords    = ["bmux", "cli", "output", "table"]
+license     = { workspace = true }
+name        = "bmux_cli_output"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+
+[features]
+default          = []
+fail-on-warnings = []

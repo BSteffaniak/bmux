@@ -2,6 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
+use bmux_cli_output::{Table, TableColumn, write_table};
 use bmux_client::BmuxClient;
 use bmux_config::ConfigPaths;
 use bmux_ipc::{SessionPermissionSummary, SessionRole, SessionSelector};
@@ -640,13 +641,20 @@ fn render_permissions(permissions: &[SessionPermissionSummary], as_json: bool) {
         return;
     }
 
-    println!("CLIENT_ID                            ROLE");
+    let mut table = Table::new(vec![
+        TableColumn::new("CLIENT_ID").min_width(36),
+        TableColumn::new("ROLE"),
+    ]);
     for permission in permissions {
-        println!(
-            "{:<36} {}",
-            permission.client_id,
-            role_label(permission.role)
-        );
+        table.push_row(vec![
+            permission.client_id.to_string(),
+            role_label(permission.role).to_string(),
+        ]);
+    }
+
+    let mut stdout = std::io::stdout().lock();
+    if let Err(error) = write_table(&mut stdout, &table) {
+        eprintln!("failed rendering permissions table: {error}");
     }
 }
 
