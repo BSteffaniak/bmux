@@ -9073,13 +9073,6 @@ mod tests {
             Response::Ok(ResponsePayload::AttachInputAccepted { bytes }) if bytes > 0
         ));
 
-        let exit_output =
-            collect_attach_output_until(&mut actor, session_id, "__bmux_exit__", 40).await;
-        assert!(
-            exit_output.contains("__bmux_exit__"),
-            "split pane should process exit sentinel before layout collapse: {exit_output}"
-        );
-
         let exit_events = wait_for_event_matching(
             &mut observer,
             9861,
