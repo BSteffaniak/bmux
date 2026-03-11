@@ -671,11 +671,6 @@ fn call_kernel_request(
         Ok(response_bytes) => {
             bmux_ipc::decode(&response_bytes).map_err(|error| error.to_string())?
         }
-        Err(bmux_plugin::PluginError::UnsupportedHostOperation { operation })
-            if operation == "call_host_kernel" =>
-        {
-            call_kernel_request_via_client(context, request)?
-        }
         Err(error) => return Err(error.to_string()),
     };
     match response {
@@ -692,80 +687,6 @@ fn call_kernel_request(
             Err(format!("{code}: {}", error.message))
         }
     }
-}
-
-fn call_kernel_request_via_client(
-    context: &NativeServiceContext,
-    request: KernelRequest,
-) -> Result<KernelResponse, String> {
-    let paths = ConfigPaths::new(
-        context.connection.config_dir.clone().into(),
-        context.connection.runtime_dir.clone().into(),
-        context.connection.data_dir.clone().into(),
-    );
-    let request_name = "bmux-windows-plugin-service-fallback".to_string();
-    std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| error.to_string())?;
-        runtime.block_on(async move {
-            let mut client = BmuxClient::connect_with_paths(&paths, &request_name)
-                .await
-                .map_err(|error| error.to_string())?;
-            match request {
-                KernelRequest::ListWindows { session } => {
-                    let windows = client
-                        .list_windows(session)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    Ok(KernelResponse::Ok(KernelResponsePayload::WindowList {
-                        windows,
-                    }))
-                }
-                KernelRequest::NewWindow { session, name } => {
-                    let id = client
-                        .new_window(session.clone(), name.clone())
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    Ok(KernelResponse::Ok(KernelResponsePayload::WindowCreated {
-                        id,
-                        session_id: Uuid::nil(),
-                        number: 0,
-                        name,
-                    }))
-                }
-                KernelRequest::SwitchWindow { session, target } => {
-                    let id = client
-                        .switch_window(session.clone(), target)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    Ok(KernelResponse::Ok(KernelResponsePayload::WindowSwitched {
-                        id,
-                        session_id: Uuid::nil(),
-                        number: 0,
-                    }))
-                }
-                KernelRequest::KillWindow {
-                    session,
-                    target,
-                    force_local,
-                } => {
-                    let id = client
-                        .kill_window_with_options(session, target, force_local)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    Ok(KernelResponse::Ok(KernelResponsePayload::WindowKilled {
-                        id,
-                        session_id: Uuid::nil(),
-                    }))
-                }
-                _ => Err("unsupported kernel fallback request".to_string()),
-            }
-        })
-    })
-    .join()
-    .map_err(|_| "kernel fallback worker panicked".to_string())?
 }
 
 fn with_command_client<T, Fut>(

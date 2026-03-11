@@ -207,12 +207,16 @@ dependencies = [
 name = "bmux_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_client",
+ "bmux_config",
+ "bmux_ipc",
  "libloading",
  "postcard",
  "semver",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
  "toml",
  "uuid",
 ]

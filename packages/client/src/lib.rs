@@ -299,6 +299,40 @@ impl BmuxClient {
         }
     }
 
+    /// Execute a raw kernel request and return the full response envelope payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if transport/protocol validation fails.
+    pub async fn request_raw(&mut self, request: Request) -> Result<Response> {
+        let request_id = self.take_request_id();
+        let payload = encode(&request)?;
+        let envelope = Envelope::new(request_id, EnvelopeKind::Request, payload);
+
+        tokio::time::timeout(self.timeout, self.stream.send_envelope(&envelope))
+            .await
+            .map_err(|_| ClientError::Timeout(self.timeout))??;
+
+        let response_envelope = tokio::time::timeout(self.timeout, self.stream.recv_envelope())
+            .await
+            .map_err(|_| ClientError::Timeout(self.timeout))??;
+
+        if response_envelope.request_id != request_id {
+            return Err(ClientError::RequestIdMismatch {
+                expected: request_id,
+                actual: response_envelope.request_id,
+            });
+        }
+        if response_envelope.kind != EnvelopeKind::Response {
+            return Err(ClientError::UnexpectedEnvelopeKind {
+                expected: EnvelopeKind::Response,
+                actual: response_envelope.kind,
+            });
+        }
+
+        decode(&response_envelope.payload).map_err(ClientError::from)
+    }
+
     /// Return whether this principal can use force-local kill bypass.
     ///
     /// # Errors
@@ -1015,32 +1049,7 @@ impl BmuxClient {
     }
 
     async fn request(&mut self, request: Request) -> Result<ResponsePayload> {
-        let request_id = self.take_request_id();
-        let payload = encode(&request)?;
-        let envelope = Envelope::new(request_id, EnvelopeKind::Request, payload);
-
-        tokio::time::timeout(self.timeout, self.stream.send_envelope(&envelope))
-            .await
-            .map_err(|_| ClientError::Timeout(self.timeout))??;
-
-        let response_envelope = tokio::time::timeout(self.timeout, self.stream.recv_envelope())
-            .await
-            .map_err(|_| ClientError::Timeout(self.timeout))??;
-
-        if response_envelope.request_id != request_id {
-            return Err(ClientError::RequestIdMismatch {
-                expected: request_id,
-                actual: response_envelope.request_id,
-            });
-        }
-        if response_envelope.kind != EnvelopeKind::Response {
-            return Err(ClientError::UnexpectedEnvelopeKind {
-                expected: EnvelopeKind::Response,
-                actual: response_envelope.kind,
-            });
-        }
-
-        let response: Response = decode(&response_envelope.payload)?;
+        let response = self.request_raw(request).await?;
         match response {
             Response::Ok(payload) => Ok(payload),
             Response::Err(error) => {

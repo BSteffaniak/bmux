@@ -464,11 +464,6 @@ fn call_kernel_request(
         Ok(response_bytes) => {
             bmux_ipc::decode(&response_bytes).map_err(|error| error.to_string())?
         }
-        Err(bmux_plugin::PluginError::UnsupportedHostOperation { operation })
-            if operation == "call_host_kernel" =>
-        {
-            call_kernel_request_via_client(context, request)?
-        }
         Err(error) => return Err(error.to_string()),
     };
     match response {
@@ -485,71 +480,6 @@ fn call_kernel_request(
             Err(format!("{code}: {}", error.message))
         }
     }
-}
-
-fn call_kernel_request_via_client(
-    context: &NativeServiceContext,
-    request: KernelRequest,
-) -> Result<KernelResponse, String> {
-    let paths = ConfigPaths::new(
-        context.connection.config_dir.clone().into(),
-        context.connection.runtime_dir.clone().into(),
-        context.connection.data_dir.clone().into(),
-    );
-    let request_name = "bmux-permissions-plugin-service-fallback".to_string();
-    let worker = std::thread::spawn(move || {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| error.to_string())?;
-        runtime.block_on(async move {
-            let mut client = BmuxClient::connect_with_paths(&paths, &request_name)
-                .await
-                .map_err(|error| error.to_string())?;
-            match request {
-                KernelRequest::ListPermissions { session } => {
-                    let permissions = client
-                        .list_permissions(session)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    Ok(KernelResponse::Ok(KernelResponsePayload::PermissionsList {
-                        session_id: Uuid::nil(),
-                        permissions,
-                    }))
-                }
-                KernelRequest::GrantRole {
-                    session,
-                    client_id,
-                    role,
-                } => {
-                    client
-                        .grant_role(session, client_id, role)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    Ok(KernelResponse::Ok(KernelResponsePayload::RoleGranted {
-                        session_id: Uuid::nil(),
-                        client_id,
-                        role,
-                    }))
-                }
-                KernelRequest::RevokeRole { session, client_id } => {
-                    client
-                        .revoke_role(session, client_id)
-                        .await
-                        .map_err(|error| error.to_string())?;
-                    Ok(KernelResponse::Ok(KernelResponsePayload::RoleRevoked {
-                        session_id: Uuid::nil(),
-                        client_id,
-                        role: SessionRole::Observer,
-                    }))
-                }
-                _ => Err("unsupported kernel fallback request".to_string()),
-            }
-        })
-    });
-    worker
-        .join()
-        .map_err(|_| "kernel fallback worker panicked".to_string())?
 }
 
 fn with_command_client<T, Fut>(
