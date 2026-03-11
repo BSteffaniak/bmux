@@ -4,53 +4,36 @@
 
 use bmux_clipboard::ClipboardError;
 use bmux_plugin::{
-    HostScope, NativeDescriptor, NativeServiceContext, PluginFeature, PluginService, RustPlugin,
-    ServiceKind, ServiceResponse, decode_service_message, encode_service_message,
+    HostScope, NativeDescriptor, NativeServiceContext, PluginService, RustPlugin, ServiceKind,
+    ServiceResponse, decode_service_message, encode_service_message,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 
 #[derive(Default)]
 struct ClipboardPlugin;
 
 impl RustPlugin for ClipboardPlugin {
     fn descriptor(&self) -> NativeDescriptor {
-        NativeDescriptor {
-            id: "bmux.clipboard".to_string(),
-            display_name: "bmux Clipboard".to_string(),
-            plugin_version: env!("CARGO_PKG_VERSION").to_string(),
-            plugin_api: bmux_plugin::PluginManifestCompatibility {
-                minimum: "1.0".to_string(),
-                maximum: None,
-            },
-            native_abi: bmux_plugin::PluginManifestCompatibility {
-                minimum: "1.0".to_string(),
-                maximum: None,
-            },
-            description: Some("Shipped bmux clipboard plugin".to_string()),
-            homepage: None,
-            required_capabilities: BTreeSet::new(),
-            provided_capabilities: BTreeSet::from([
-                HostScope::new("bmux.clipboard.write").expect("host scope should parse")
-            ]),
-            provided_features: BTreeSet::from([
-                PluginFeature::new("bmux.clipboard").expect("plugin feature should parse")
-            ]),
-            services: vec![PluginService {
+        NativeDescriptor::builder("bmux.clipboard", "bmux Clipboard")
+            .plugin_version(env!("CARGO_PKG_VERSION"))
+            .description("Shipped bmux clipboard plugin")
+            .provide_capability("bmux.clipboard.write")
+            .expect("capability should parse")
+            .provide_feature("bmux.clipboard")
+            .expect("feature should parse")
+            .service(PluginService {
                 capability: HostScope::new("bmux.clipboard.write")
                     .expect("host scope should parse"),
                 kind: ServiceKind::Command,
                 interface_id: "clipboard-write/v1".to_string(),
-            }],
-            commands: Vec::new(),
-            event_subscriptions: Vec::new(),
-            dependencies: Vec::new(),
-            lifecycle: bmux_plugin::PluginLifecycle {
+            })
+            .lifecycle(bmux_plugin::PluginLifecycle {
                 activate_on_startup: false,
                 receive_events: false,
                 allow_hot_reload: true,
-            },
-        }
+            })
+            .build()
+            .expect("descriptor should validate")
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {

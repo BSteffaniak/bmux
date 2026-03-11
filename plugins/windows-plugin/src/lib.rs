@@ -8,11 +8,10 @@ use bmux_config::ConfigPaths;
 use bmux_ipc::{SessionSelector, WindowSelector, WindowSummary};
 use bmux_plugin::{
     CommandExecutionKind, HostScope, NativeCommandContext, NativeDescriptor, NativeServiceContext,
-    PluginCommand, PluginCommandArgument, PluginCommandArgumentKind, PluginFeature, PluginService,
-    RustPlugin, ServiceKind, ServiceResponse, decode_service_message, encode_service_message,
+    PluginCommand, PluginCommandArgument, PluginCommandArgumentKind, PluginService, RustPlugin,
+    ServiceKind, ServiceResponse, decode_service_message, encode_service_message,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -20,80 +19,61 @@ struct WindowsPlugin;
 
 impl RustPlugin for WindowsPlugin {
     fn descriptor(&self) -> NativeDescriptor {
-        NativeDescriptor {
-            id: "bmux.windows".to_string(),
-            display_name: "bmux Windows".to_string(),
-            plugin_version: env!("CARGO_PKG_VERSION").to_string(),
-            plugin_api: bmux_plugin::PluginManifestCompatibility {
-                minimum: "1.0".to_string(),
-                maximum: None,
-            },
-            native_abi: bmux_plugin::PluginManifestCompatibility {
-                minimum: "1.0".to_string(),
-                maximum: None,
-            },
-            description: Some("Shipped bmux windows command plugin".to_string()),
-            homepage: None,
-            required_capabilities: BTreeSet::from([
-                HostScope::new("bmux.commands").expect("host scope should parse"),
-                HostScope::new("bmux.sessions.read").expect("host scope should parse"),
-            ]),
-            provided_capabilities: BTreeSet::from([
-                HostScope::new("bmux.windows.read").expect("host scope should parse"),
-                HostScope::new("bmux.windows.write").expect("host scope should parse"),
-            ]),
-            provided_features: BTreeSet::from([
-                PluginFeature::new("bmux.windows").expect("plugin feature should parse")
-            ]),
-            services: vec![
-                PluginService {
-                    capability: HostScope::new("bmux.windows.read")
-                        .expect("host scope should parse"),
-                    kind: ServiceKind::Query,
-                    interface_id: "window-query/v1".to_string(),
-                },
-                PluginService {
-                    capability: HostScope::new("bmux.windows.write")
-                        .expect("host scope should parse"),
-                    kind: ServiceKind::Command,
-                    interface_id: "window-command/v1".to_string(),
-                },
-            ],
-            commands: vec![
-                plugin_command(
-                    "new-window",
-                    "Create a new window in a session",
-                    vec![vec!["window".to_string(), "new".to_string()]],
-                ),
-                plugin_command(
-                    "list-windows",
-                    "List windows for a session",
-                    vec![vec!["window".to_string(), "list".to_string()]],
-                ),
-                plugin_command(
-                    "kill-window",
-                    "Kill a window by name, UUID, or active",
-                    vec![vec!["window".to_string(), "kill".to_string()]],
-                ),
-                plugin_command(
-                    "kill-all-windows",
-                    "Kill all windows in a session",
-                    vec![vec!["window".to_string(), "kill-all".to_string()]],
-                ),
-                plugin_command(
-                    "switch-window",
-                    "Switch active window by name, UUID, or active",
-                    vec![vec!["window".to_string(), "switch".to_string()]],
-                ),
-            ],
-            event_subscriptions: Vec::new(),
-            dependencies: Vec::new(),
-            lifecycle: bmux_plugin::PluginLifecycle {
+        NativeDescriptor::builder("bmux.windows", "bmux Windows")
+            .plugin_version(env!("CARGO_PKG_VERSION"))
+            .description("Shipped bmux windows command plugin")
+            .require_capability("bmux.commands")
+            .expect("capability should parse")
+            .require_capability("bmux.sessions.read")
+            .expect("capability should parse")
+            .provide_capability("bmux.windows.read")
+            .expect("capability should parse")
+            .provide_capability("bmux.windows.write")
+            .expect("capability should parse")
+            .provide_feature("bmux.windows")
+            .expect("feature should parse")
+            .service(PluginService {
+                capability: HostScope::new("bmux.windows.read").expect("host scope should parse"),
+                kind: ServiceKind::Query,
+                interface_id: "window-query/v1".to_string(),
+            })
+            .service(PluginService {
+                capability: HostScope::new("bmux.windows.write").expect("host scope should parse"),
+                kind: ServiceKind::Command,
+                interface_id: "window-command/v1".to_string(),
+            })
+            .command(plugin_command(
+                "new-window",
+                "Create a new window in a session",
+                vec![vec!["window".to_string(), "new".to_string()]],
+            ))
+            .command(plugin_command(
+                "list-windows",
+                "List windows for a session",
+                vec![vec!["window".to_string(), "list".to_string()]],
+            ))
+            .command(plugin_command(
+                "kill-window",
+                "Kill a window by name, UUID, or active",
+                vec![vec!["window".to_string(), "kill".to_string()]],
+            ))
+            .command(plugin_command(
+                "kill-all-windows",
+                "Kill all windows in a session",
+                vec![vec!["window".to_string(), "kill-all".to_string()]],
+            ))
+            .command(plugin_command(
+                "switch-window",
+                "Switch active window by name, UUID, or active",
+                vec![vec!["window".to_string(), "switch".to_string()]],
+            ))
+            .lifecycle(bmux_plugin::PluginLifecycle {
                 activate_on_startup: false,
                 receive_events: false,
                 allow_hot_reload: true,
-            },
-        }
+            })
+            .build()
+            .expect("descriptor should validate")
     }
 
     fn run_command(&mut self, context: NativeCommandContext) -> i32 {

@@ -8,6 +8,8 @@
 //! the bmux host and plugins without exposing the internal server, CLI, or
 //! terminal runtime implementation details directly.
 
+mod api;
+mod builder;
 mod capability;
 mod command;
 mod declaration;
@@ -22,6 +24,12 @@ mod registry;
 mod service;
 mod version;
 
+pub use api::{
+    ConfigClient, NewWindowResponse, PermissionGrantResponse, PermissionRecord,
+    PermissionRevokeResponse, PermissionsClient, PluginSettingsResponse, ServiceCallerExt,
+    StorageClient, StorageGetResponse, WindowRecord, WindowsClient,
+};
+pub use builder::PluginBuilder;
 pub use capability::{HostScope, PluginFeature};
 pub use command::{
     CommandExecutionKind, PluginCommand, PluginCommandArgument, PluginCommandArgumentKind,
@@ -46,7 +54,7 @@ pub use host::{
 };
 pub use loader::{
     LoadedPlugin, NativeCommandContext, NativeDescriptor, NativeLifecycleContext,
-    NativePluginLoader, NativeServiceContext, load_registered_plugin,
+    NativePluginLoader, NativeServiceContext, ServiceCaller, load_registered_plugin,
 };
 pub use manifest::{PluginManifest, PluginManifestCompatibility, PluginRuntime};
 pub use native_exports::RustPlugin;
@@ -89,6 +97,11 @@ pub const DEFAULT_NATIVE_EVENT_SYMBOL: &str = "bmux_plugin_handle_event_v1";
 
 /// Default exported symbol used to invoke a plugin-provided service.
 pub const DEFAULT_NATIVE_SERVICE_SYMBOL: &str = "bmux_plugin_invoke_service_v1";
+
+#[must_use]
+pub fn plugin(id: impl Into<String>, display_name: impl Into<String>) -> PluginBuilder {
+    PluginBuilder::new(id, display_name)
+}
 
 #[doc(hidden)]
 pub mod __private {

@@ -42,12 +42,12 @@ minimum = "1.0"
 
 The manifest `entry` should point at the installed plugin bundle artifact, typically a library placed next to the manifest, rather than a hardcoded Cargo `target/` path.
 
-## Rust Example
+## Rust Example (Builder-First)
 
 ```rust
 use bmux_plugin::{
     CommandExecutionKind, HostScope, NativeCommandContext, NativeDescriptor, PluginCommand,
-    PluginFeature, PluginManifestCompatibility, RustPlugin,
+    RustPlugin,
 };
 
 #[derive(Default)]
@@ -55,40 +55,19 @@ struct HelloPlugin;
 
 impl RustPlugin for HelloPlugin {
     fn descriptor(&self) -> NativeDescriptor {
-        NativeDescriptor {
-            id: "hello.example".to_string(),
-            display_name: "Hello Example".to_string(),
-            plugin_version: "0.1.0".to_string(),
-            plugin_api: PluginManifestCompatibility {
-                minimum: "1.0".to_string(),
-                maximum: None,
-            },
-            native_abi: PluginManifestCompatibility {
-                minimum: "1.0".to_string(),
-                maximum: None,
-            },
-            description: Some("Small example plugin".to_string()),
-            homepage: None,
-            required_host_scopes: [HostScope::new("bmux.commands").unwrap()]
-                .into_iter()
-                .collect(),
-            provided_features: [PluginFeature::new("hello.example").unwrap()]
-                .into_iter()
-                .collect(),
-            commands: vec![PluginCommand {
-                name: "hello".to_string(),
-                path: Vec::new(),
-                aliases: Vec::new(),
-                summary: "Print a greeting".to_string(),
-                description: None,
-                arguments: Vec::new(),
-                execution: CommandExecutionKind::HostCallback,
-                expose_in_cli: true,
-            }],
-            event_subscriptions: Vec::new(),
-            dependencies: Vec::new(),
-            lifecycle: Default::default(),
-        }
+        NativeDescriptor::builder("hello.example", "Hello Example")
+            .plugin_version("0.1.0")
+            .description("Small example plugin")
+            .require_capability("bmux.commands")
+            .unwrap()
+            .provide_feature("hello.example")
+            .unwrap()
+            .command(
+                PluginCommand::new("hello", "Print a greeting")
+                    .execution(CommandExecutionKind::ProviderExec),
+            )
+            .build()
+            .unwrap()
     }
 
     fn run_command(&mut self, context: NativeCommandContext) -> i32 {
@@ -112,3 +91,16 @@ bmux_plugin::export_plugin!(HelloPlugin);
 - Keep ordinary plugins compatible across bmux releases by stabilizing `bmux_plugin` first
 - Leave room for future non-Rust runtimes by defining manifests, host scopes, and plugin features as host concepts
 - Keep plugin domain ownership, capability policy, and migration intent in code and tests rather than external markdown planning docs
+
+## Typed Service Clients
+
+`NativeCommandContext`, `NativeLifecycleContext`, and `NativeServiceContext` now implement `ServiceCaller`, so plugins can use concise typed helpers:
+
+```rust
+use bmux_plugin::ServiceCallerExt;
+
+let permissions = context.permissions().list("my-session")?;
+let windows = context.windows().list(Some("my-session"))?;
+let settings = context.config_client().plugin_settings("example.native")?;
+context.storage().set("theme", b"sunset".to_vec())?;
+```

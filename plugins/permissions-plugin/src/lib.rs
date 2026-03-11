@@ -8,11 +8,10 @@ use bmux_config::ConfigPaths;
 use bmux_ipc::{SessionPermissionSummary, SessionRole, SessionSelector};
 use bmux_plugin::{
     CommandExecutionKind, HostScope, NativeCommandContext, NativeDescriptor, NativeServiceContext,
-    PluginCommand, PluginCommandArgument, PluginCommandArgumentKind, PluginFeature, PluginService,
-    RustPlugin, ServiceKind, ServiceResponse, decode_service_message, encode_service_message,
+    PluginCommand, PluginCommandArgument, PluginCommandArgumentKind, PluginService, RustPlugin,
+    ServiceKind, ServiceResponse, decode_service_message, encode_service_message,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 use uuid::Uuid;
 
 #[derive(Default)]
@@ -20,45 +19,30 @@ struct PermissionsPlugin;
 
 impl RustPlugin for PermissionsPlugin {
     fn descriptor(&self) -> NativeDescriptor {
-        NativeDescriptor {
-            id: "bmux.permissions".to_string(),
-            display_name: "bmux Permissions".to_string(),
-            plugin_version: env!("CARGO_PKG_VERSION").to_string(),
-            plugin_api: bmux_plugin::PluginManifestCompatibility {
-                minimum: "1.0".to_string(),
-                maximum: None,
-            },
-            native_abi: bmux_plugin::PluginManifestCompatibility {
-                minimum: "1.0".to_string(),
-                maximum: None,
-            },
-            description: Some("Shipped bmux permissions command plugin".to_string()),
-            homepage: None,
-            required_capabilities: BTreeSet::from([
-                HostScope::new("bmux.commands").expect("host scope should parse")
-            ]),
-            provided_capabilities: BTreeSet::from([
-                HostScope::new("bmux.permissions.read").expect("host scope should parse"),
-                HostScope::new("bmux.permissions.write").expect("host scope should parse"),
-            ]),
-            provided_features: BTreeSet::from([
-                PluginFeature::new("bmux.permissions").expect("plugin feature should parse")
-            ]),
-            services: vec![
-                PluginService {
-                    capability: HostScope::new("bmux.permissions.read")
-                        .expect("host scope should parse"),
-                    kind: ServiceKind::Query,
-                    interface_id: "permission-query/v1".to_string(),
-                },
-                PluginService {
-                    capability: HostScope::new("bmux.permissions.write")
-                        .expect("host scope should parse"),
-                    kind: ServiceKind::Command,
-                    interface_id: "permission-command/v1".to_string(),
-                },
-            ],
-            commands: vec![
+        NativeDescriptor::builder("bmux.permissions", "bmux Permissions")
+            .plugin_version(env!("CARGO_PKG_VERSION"))
+            .description("Shipped bmux permissions command plugin")
+            .require_capability("bmux.commands")
+            .expect("capability should parse")
+            .provide_capability("bmux.permissions.read")
+            .expect("capability should parse")
+            .provide_capability("bmux.permissions.write")
+            .expect("capability should parse")
+            .provide_feature("bmux.permissions")
+            .expect("feature should parse")
+            .service(PluginService {
+                capability: HostScope::new("bmux.permissions.read")
+                    .expect("host scope should parse"),
+                kind: ServiceKind::Query,
+                interface_id: "permission-query/v1".to_string(),
+            })
+            .service(PluginService {
+                capability: HostScope::new("bmux.permissions.write")
+                    .expect("host scope should parse"),
+                kind: ServiceKind::Command,
+                interface_id: "permission-command/v1".to_string(),
+            })
+            .command(
                 PluginCommand::new(
                     "permissions",
                     "List explicit role assignments for a session",
@@ -74,6 +58,8 @@ impl RustPlugin for PermissionsPlugin {
                 .argument(PluginCommandArgument::flag("watch").short('w'))
                 .execution(CommandExecutionKind::ProviderExec)
                 .expose_in_cli(true),
+            )
+            .command(
                 PluginCommand::new("grant", "Grant a role to a client in a session")
                     .path(["grant"])
                     .alias(["session", "grant"])
@@ -95,6 +81,8 @@ impl RustPlugin for PermissionsPlugin {
                     )
                     .execution(CommandExecutionKind::ProviderExec)
                     .expose_in_cli(true),
+            )
+            .command(
                 PluginCommand::new(
                     "revoke",
                     "Revoke an explicit role from a client in a session",
@@ -113,15 +101,14 @@ impl RustPlugin for PermissionsPlugin {
                 )
                 .execution(CommandExecutionKind::ProviderExec)
                 .expose_in_cli(true),
-            ],
-            event_subscriptions: Vec::new(),
-            dependencies: Vec::new(),
-            lifecycle: bmux_plugin::PluginLifecycle {
+            )
+            .lifecycle(bmux_plugin::PluginLifecycle {
                 activate_on_startup: false,
                 receive_events: false,
                 allow_hot_reload: true,
-            },
-        }
+            })
+            .build()
+            .expect("descriptor should validate")
     }
 
     fn run_command(&mut self, context: NativeCommandContext) -> i32 {

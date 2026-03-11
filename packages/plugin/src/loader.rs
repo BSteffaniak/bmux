@@ -197,6 +197,23 @@ impl NativeLifecycleContext {
             payload,
         )
     }
+
+    pub fn call_service<Request, Response>(
+        &self,
+        capability: &str,
+        kind: ServiceKind,
+        interface_id: &str,
+        operation: &str,
+        request: &Request,
+    ) -> Result<Response>
+    where
+        Request: Serialize,
+        Response: DeserializeOwned,
+    {
+        let payload = encode_service_message(request)?;
+        let response = self.call_service_raw(capability, kind, interface_id, operation, payload)?;
+        decode_service_message(&response)
+    }
 }
 
 impl NativeServiceContext {
@@ -220,6 +237,111 @@ impl NativeServiceContext {
             &self.host,
             &self.connection,
             &plugin_settings_map,
+            capability,
+            kind,
+            interface_id,
+            operation,
+            payload,
+        )
+    }
+
+    pub fn call_service<Request, Response>(
+        &self,
+        capability: &str,
+        kind: ServiceKind,
+        interface_id: &str,
+        operation: &str,
+        request: &Request,
+    ) -> Result<Response>
+    where
+        Request: Serialize,
+        Response: DeserializeOwned,
+    {
+        let payload = encode_service_message(request)?;
+        let response = self.call_service_raw(capability, kind, interface_id, operation, payload)?;
+        decode_service_message(&response)
+    }
+}
+
+pub trait ServiceCaller {
+    fn call_service_raw(
+        &self,
+        capability: &str,
+        kind: ServiceKind,
+        interface_id: &str,
+        operation: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>>;
+
+    fn call_service<Request, Response>(
+        &self,
+        capability: &str,
+        kind: ServiceKind,
+        interface_id: &str,
+        operation: &str,
+        request: &Request,
+    ) -> Result<Response>
+    where
+        Request: Serialize,
+        Response: DeserializeOwned,
+    {
+        let payload = encode_service_message(request)?;
+        let response = self.call_service_raw(capability, kind, interface_id, operation, payload)?;
+        decode_service_message(&response)
+    }
+}
+
+impl ServiceCaller for NativeCommandContext {
+    fn call_service_raw(
+        &self,
+        capability: &str,
+        kind: ServiceKind,
+        interface_id: &str,
+        operation: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        NativeCommandContext::call_service_raw(
+            self,
+            capability,
+            kind,
+            interface_id,
+            operation,
+            payload,
+        )
+    }
+}
+
+impl ServiceCaller for NativeLifecycleContext {
+    fn call_service_raw(
+        &self,
+        capability: &str,
+        kind: ServiceKind,
+        interface_id: &str,
+        operation: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        NativeLifecycleContext::call_service_raw(
+            self,
+            capability,
+            kind,
+            interface_id,
+            operation,
+            payload,
+        )
+    }
+}
+
+impl ServiceCaller for NativeServiceContext {
+    fn call_service_raw(
+        &self,
+        capability: &str,
+        kind: ServiceKind,
+        interface_id: &str,
+        operation: &str,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        NativeServiceContext::call_service_raw(
+            self,
             capability,
             kind,
             interface_id,
@@ -504,6 +626,11 @@ pub struct NativeDescriptor {
 }
 
 impl NativeDescriptor {
+    #[must_use]
+    pub fn builder(id: impl Into<String>, display_name: impl Into<String>) -> crate::PluginBuilder {
+        crate::PluginBuilder::new(id, display_name)
+    }
+
     /// # Errors
     ///
     /// Returns an error when the descriptor cannot be converted into a checked

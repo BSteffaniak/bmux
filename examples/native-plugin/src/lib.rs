@@ -6,9 +6,8 @@ use bmux_cli_output::{Table, TableColumn, write_table};
 use bmux_plugin::{
     CommandExecutionKind, HostScope, NativeCommandContext, NativeDescriptor, PluginCommand,
     PluginCommandArgument, PluginCommandArgumentKind, PluginEvent, PluginEventKind,
-    PluginEventSubscription, PluginFeature, RustPlugin, ServiceKind,
+    PluginEventSubscription, PluginFeature, RustPlugin, ServiceCallerExt, SessionRoleValue,
 };
-use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 #[derive(Default)]
@@ -245,15 +244,7 @@ fn run_permissions_list(context: &NativeCommandContext) -> i32 {
         return 64;
     };
 
-    let response = match context.call_service::<ListPermissionsRequest, ListPermissionsResponse>(
-        "bmux.permissions.read",
-        ServiceKind::Query,
-        "permission-query/v1",
-        "list",
-        &ListPermissionsRequest {
-            session: session.to_string(),
-        },
-    ) {
+    let permissions = match context.permissions().list(session.as_str()) {
         Ok(response) => response,
         Err(error) => {
             eprintln!("example.native: failed listing permissions through service: {error}");
@@ -261,7 +252,7 @@ fn run_permissions_list(context: &NativeCommandContext) -> i32 {
         }
     };
 
-    if response.permissions.is_empty() {
+    if permissions.is_empty() {
         println!("example.native: no explicit role assignments");
     } else {
         println!("example.native permissions:");
@@ -269,7 +260,7 @@ fn run_permissions_list(context: &NativeCommandContext) -> i32 {
             TableColumn::new("CLIENT_ID").min_width(36),
             TableColumn::new("ROLE"),
         ]);
-        for permission in response.permissions {
+        for permission in permissions {
             table.push_row(vec![
                 permission.client_id.to_string(),
                 session_role_name(permission.role).to_string(),
@@ -324,17 +315,10 @@ fn run_permissions_grant(context: &NativeCommandContext) -> i32 {
         return 64;
     };
 
-    let response = match context.call_service::<GrantPermissionRequest, GrantPermissionResponse>(
-        "bmux.permissions.write",
-        ServiceKind::Command,
-        "permission-command/v1",
-        "grant",
-        &GrantPermissionRequest {
-            session: session.to_string(),
-            client_id,
-            role,
-        },
-    ) {
+    let response = match context
+        .permissions()
+        .grant(session.as_str(), client_id, role)
+    {
         Ok(response) => response,
         Err(error) => {
             eprintln!("example.native: failed granting role through service: {error}");
@@ -380,16 +364,7 @@ fn run_permissions_revoke(context: &NativeCommandContext) -> i32 {
         }
     };
 
-    let response = match context.call_service::<RevokePermissionRequest, RevokePermissionResponse>(
-        "bmux.permissions.write",
-        ServiceKind::Command,
-        "permission-command/v1",
-        "revoke",
-        &RevokePermissionRequest {
-            session: session.to_string(),
-            client_id,
-        },
-    ) {
+    let response = match context.permissions().revoke(session.as_str(), client_id) {
         Ok(response) => response,
         Err(error) => {
             eprintln!("example.native: failed revoking role through service: {error}");
@@ -407,15 +382,7 @@ fn run_windows_list(context: &NativeCommandContext) -> i32 {
         return 64;
     };
 
-    let response = match context.call_service::<ListWindowsRequest, ListWindowsResponse>(
-        "bmux.windows.read",
-        ServiceKind::Query,
-        "window-query/v1",
-        "list",
-        &ListWindowsRequest {
-            session: Some(session.to_string()),
-        },
-    ) {
+    let windows = match context.windows().list(Some(session.as_str())) {
         Ok(response) => response,
         Err(error) => {
             eprintln!("example.native: failed listing windows through service: {error}");
@@ -423,7 +390,7 @@ fn run_windows_list(context: &NativeCommandContext) -> i32 {
         }
     };
 
-    if response.windows.is_empty() {
+    if windows.is_empty() {
         println!("example.native: no windows");
     } else {
         println!("example.native windows:");
@@ -432,7 +399,7 @@ fn run_windows_list(context: &NativeCommandContext) -> i32 {
             TableColumn::new("WINDOW"),
             TableColumn::new("ACTIVE"),
         ]);
-        for window in response.windows {
+        for window in windows {
             table.push_row(vec![
                 window.id.to_string(),
                 window.name.unwrap_or_else(|| format!("#{}", window.number)),
@@ -469,16 +436,7 @@ fn run_windows_new(context: &NativeCommandContext) -> i32 {
         }
     }
 
-    let response = match context.call_service::<NewWindowRequest, NewWindowResponse>(
-        "bmux.windows.write",
-        ServiceKind::Command,
-        "window-command/v1",
-        "new",
-        &NewWindowRequest {
-            session: Some(session.to_string()),
-            name,
-        },
-    ) {
+    let response = match context.windows().new_window(Some(session.as_str()), name) {
         Ok(response) => response,
         Err(error) => {
             eprintln!("example.native: failed creating window through service: {error}");
@@ -498,15 +456,7 @@ fn run_windows_new(context: &NativeCommandContext) -> i32 {
 }
 
 fn run_settings_show(context: &NativeCommandContext) -> i32 {
-    let response = match context.call_service::<PluginSettingsRequest, PluginSettingsResponse>(
-        "bmux.config.read",
-        ServiceKind::Query,
-        "config-query/v1",
-        "plugin_settings",
-        &PluginSettingsRequest {
-            plugin_id: context.plugin_id.clone(),
-        },
-    ) {
+    let response = match context.config_client().plugin_settings(&context.plugin_id) {
         Ok(response) => response,
         Err(error) => {
             eprintln!("example.native: failed reading settings through service: {error}");
@@ -542,16 +492,7 @@ fn run_storage_put(context: &NativeCommandContext) -> i32 {
     }
     let value = context.arguments[1..].join(" ").into_bytes();
 
-    let result = context.call_service::<StorageSetRequest, ()>(
-        "bmux.storage",
-        ServiceKind::Command,
-        "storage-command/v1",
-        "set",
-        &StorageSetRequest {
-            key: key.to_string(),
-            value,
-        },
-    );
+    let result = context.storage().set(key, value);
     if let Err(error) = result {
         eprintln!("example.native: failed writing storage through service: {error}");
         return 1;
@@ -566,15 +507,7 @@ fn run_storage_get(context: &NativeCommandContext) -> i32 {
         eprintln!("example.native storage-get requires a key");
         return 64;
     };
-    let response = match context.call_service::<StorageGetRequest, StorageGetResponse>(
-        "bmux.storage",
-        ServiceKind::Query,
-        "storage-query/v1",
-        "get",
-        &StorageGetRequest {
-            key: key.to_string(),
-        },
-    ) {
+    let response = match context.storage().get(key) {
         Ok(response) => response,
         Err(error) => {
             eprintln!("example.native: failed reading storage through service: {error}");
@@ -597,100 +530,19 @@ fn write_stdout_table(table: &Table) -> std::io::Result<()> {
     write_table(&mut stdout, table)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ListPermissionsRequest {
-    session: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ListPermissionsResponse {
-    permissions: Vec<bmux_ipc::SessionPermissionSummary>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct GrantPermissionRequest {
-    session: String,
-    client_id: uuid::Uuid,
-    role: bmux_ipc::SessionRole,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct GrantPermissionResponse {
-    client_id: uuid::Uuid,
-    role: bmux_ipc::SessionRole,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct RevokePermissionRequest {
-    session: String,
-    client_id: uuid::Uuid,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct RevokePermissionResponse {
-    client_id: uuid::Uuid,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ListWindowsRequest {
-    session: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ListWindowsResponse {
-    windows: Vec<bmux_ipc::WindowSummary>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct NewWindowRequest {
-    session: Option<String>,
-    name: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct NewWindowResponse {
-    window: bmux_ipc::WindowSummary,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PluginSettingsRequest {
-    plugin_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct PluginSettingsResponse {
-    settings: std::collections::BTreeMap<String, String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct StorageSetRequest {
-    key: String,
-    value: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct StorageGetRequest {
-    key: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct StorageGetResponse {
-    value: Option<Vec<u8>>,
-}
-
-fn session_role_name(role: bmux_ipc::SessionRole) -> &'static str {
+fn session_role_name(role: SessionRoleValue) -> &'static str {
     match role {
-        bmux_ipc::SessionRole::Owner => "owner",
-        bmux_ipc::SessionRole::Writer => "writer",
-        bmux_ipc::SessionRole::Observer => "observer",
+        SessionRoleValue::Owner => "owner",
+        SessionRoleValue::Writer => "writer",
+        SessionRoleValue::Observer => "observer",
     }
 }
 
-fn parse_role(value: &str) -> Option<bmux_ipc::SessionRole> {
+fn parse_role(value: &str) -> Option<SessionRoleValue> {
     match value {
-        "owner" => Some(bmux_ipc::SessionRole::Owner),
-        "writer" => Some(bmux_ipc::SessionRole::Writer),
-        "observer" => Some(bmux_ipc::SessionRole::Observer),
+        "owner" => Some(SessionRoleValue::Owner),
+        "writer" => Some(SessionRoleValue::Writer),
+        "observer" => Some(SessionRoleValue::Observer),
         _ => None,
     }
 }
