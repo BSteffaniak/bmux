@@ -8,15 +8,8 @@ use crate::{
     decode_service_envelope, decode_service_message, discover_registered_plugins_in_roots,
     encode_service_envelope, encode_service_message,
 };
-use bmux_client::BmuxClient;
-use bmux_config::ConfigPaths;
-use bmux_ipc::{
-    Request as KernelRequest, Response as KernelResponse, decode as decode_kernel,
-    encode as encode_kernel,
-};
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, c_char};
 use std::fs;
@@ -80,6 +73,8 @@ pub struct NativeLifecycleContext {
     pub settings: Option<toml::Value>,
     #[serde(default)]
     pub plugin_settings_map: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    pub host_kernel_bridge: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -105,6 +100,8 @@ pub struct NativeCommandContext {
     pub settings: Option<toml::Value>,
     #[serde(default)]
     pub plugin_settings_map: BTreeMap<String, toml::Value>,
+    #[serde(default)]
+    pub host_kernel_bridge: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -144,132 +141,6 @@ type HostKernelBridgeFn = unsafe extern "C" fn(
 const KERNEL_STATUS_OK: i32 = 0;
 const KERNEL_STATUS_BUFFER_TOO_SMALL: i32 = 4;
 
-thread_local! {
-    static HOST_KERNEL_CONNECTION: RefCell<Option<HostConnectionInfo>> = const { RefCell::new(None) };
-}
-
-struct HostKernelConnectionGuard;
-
-impl Drop for HostKernelConnectionGuard {
-    fn drop(&mut self) {
-        HOST_KERNEL_CONNECTION.with(|slot| {
-            *slot.borrow_mut() = None;
-        });
-    }
-}
-
-fn enter_host_kernel_connection(connection: HostConnectionInfo) -> HostKernelConnectionGuard {
-    HOST_KERNEL_CONNECTION.with(|slot| {
-        *slot.borrow_mut() = Some(connection);
-    });
-    HostKernelConnectionGuard
-}
-
-unsafe extern "C" fn host_kernel_bridge(
-    input_ptr: *const u8,
-    input_len: usize,
-    output_ptr: *mut u8,
-    output_capacity: usize,
-    output_len: *mut usize,
-) -> i32 {
-    if input_ptr.is_null() || output_len.is_null() {
-        return 2;
-    }
-
-    let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-    let request: HostKernelBridgeRequest = match decode_service_message(input) {
-        Ok(value) => value,
-        Err(_) => return 3,
-    };
-
-    let connection = HOST_KERNEL_CONNECTION.with(|slot| slot.borrow().clone());
-    let Some(connection) = connection else {
-        return 5;
-    };
-
-    let response_payload = match call_host_kernel_via_client(&connection, request.payload) {
-        Ok(payload) => payload,
-        Err(_) => return 5,
-    };
-
-    let response = HostKernelBridgeResponse {
-        payload: response_payload,
-    };
-    let encoded = match encode_service_message(&response) {
-        Ok(value) => value,
-        Err(_) => return 5,
-    };
-
-    unsafe {
-        *output_len = encoded.len();
-    }
-    if output_ptr.is_null() || encoded.len() > output_capacity {
-        return 4;
-    }
-    unsafe {
-        std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
-    }
-    0
-}
-
-fn call_host_kernel_via_client(
-    connection: &HostConnectionInfo,
-    payload: Vec<u8>,
-) -> Result<Vec<u8>> {
-    let request: KernelRequest =
-        decode_kernel(&payload).map_err(|error| PluginError::ServiceProtocol {
-            details: format!("failed decoding kernel bridge request payload: {error}"),
-        })?;
-    let paths = ConfigPaths::new(
-        connection.config_dir.clone().into(),
-        connection.runtime_dir.clone().into(),
-        connection.data_dir.clone().into(),
-    );
-    let request_name = "bmux-plugin-host-kernel-bridge".to_string();
-
-    let response: KernelResponse =
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| {
-                handle.block_on(async {
-                    let mut client = BmuxClient::connect_with_paths(&paths, &request_name)
-                        .await
-                        .map_err(|error| PluginError::ServiceProtocol {
-                            details: format!("failed connecting kernel bridge client: {error}"),
-                        })?;
-                    client.request_raw(request).await.map_err(|error| {
-                        PluginError::ServiceProtocol {
-                            details: format!("kernel bridge request failed: {error}"),
-                        }
-                    })
-                })
-            }),
-            Err(_) => {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .map_err(|error| PluginError::ServiceProtocol {
-                        details: format!("failed creating kernel bridge runtime: {error}"),
-                    })?;
-                runtime.block_on(async {
-                    let mut client = BmuxClient::connect_with_paths(&paths, &request_name)
-                        .await
-                        .map_err(|error| PluginError::ServiceProtocol {
-                            details: format!("failed connecting kernel bridge client: {error}"),
-                        })?;
-                    client.request_raw(request).await.map_err(|error| {
-                        PluginError::ServiceProtocol {
-                            details: format!("kernel bridge request failed: {error}"),
-                        }
-                    })
-                })
-            }
-        }?;
-
-    encode_kernel(&response).map_err(|error| PluginError::ServiceProtocol {
-        details: format!("failed encoding kernel bridge response payload: {error}"),
-    })
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HostKernelBridgeRequest {
     pub payload: Vec<u8>,
@@ -299,6 +170,7 @@ impl NativeCommandContext {
             &self.plugin_search_roots,
             &self.host,
             &self.connection,
+            self.host_kernel_bridge,
             &self.plugin_settings_map,
             capability,
             kind,
@@ -345,6 +217,7 @@ impl NativeLifecycleContext {
             &self.plugin_search_roots,
             &self.host,
             &self.connection,
+            self.host_kernel_bridge,
             &self.plugin_settings_map,
             capability,
             kind,
@@ -392,6 +265,7 @@ impl NativeServiceContext {
             &self.plugin_search_roots,
             &self.host,
             &self.connection,
+            self.host_kernel_bridge,
             &plugin_settings_map,
             capability,
             kind,
@@ -565,6 +439,7 @@ fn call_service_raw(
     plugin_search_roots: &[String],
     host: &HostMetadata,
     connection: &HostConnectionInfo,
+    host_kernel_bridge: Option<u64>,
     plugin_settings_map: &BTreeMap<String, toml::Value>,
     capability: &str,
     kind: ServiceKind,
@@ -640,7 +515,6 @@ fn call_service_raw(
         .collect::<BTreeMap<_, _>>();
 
     let loaded = load_registered_plugin(registered, host, &available_capability_map)?;
-    let _host_kernel_connection_guard = enter_host_kernel_connection(connection.clone());
     let response = loaded.invoke_service(&NativeServiceContext {
         plugin_id: registered.declaration.id.as_str().to_string(),
         request: ServiceRequest {
@@ -671,7 +545,7 @@ fn call_service_raw(
             plugin_settings_map.get(registered.declaration.id.as_str()),
         ),
         plugin_settings_map: serialize_plugin_settings_map(plugin_settings_map),
-        host_kernel_bridge: Some(host_kernel_bridge as *const () as usize as u64),
+        host_kernel_bridge,
     })?;
 
     if let Some(error) = response.error {
@@ -1558,6 +1432,7 @@ minimum = "1.0"
             },
             settings: Some(toml::Value::String("enabled".to_string())),
             plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: None,
         };
 
         let json = serde_json::to_string(&context).expect("context should serialize");
@@ -1597,6 +1472,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: None,
         };
 
         let error = context
@@ -1636,6 +1512,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: None,
         };
 
         let error = context
@@ -1689,6 +1566,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map,
+            host_kernel_bridge: None,
         };
 
         let response = context
@@ -1753,6 +1631,7 @@ minimum = "1.0"
             },
             settings: None,
             plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: None,
         };
 
         context

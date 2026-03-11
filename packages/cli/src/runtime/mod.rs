@@ -18,9 +18,9 @@ use bmux_ipc::{
 };
 use bmux_keybind::action_to_name;
 use bmux_plugin::{
-    CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostMetadata, HostScope,
-    NativeCommandContext, NativeLifecycleContext, PluginEvent, PluginEventKind, PluginManifest,
-    PluginRegistry, RegisteredService, ServiceKind, ServiceRequest,
+    CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
+    HostScope, NativeCommandContext, NativeLifecycleContext, PluginEvent, PluginEventKind,
+    PluginManifest, PluginRegistry, RegisteredService, ServiceKind, ServiceRequest,
     load_registered_plugin as load_native_registered_plugin,
 };
 use bmux_server::BmuxServer;
@@ -44,13 +44,23 @@ use bmux_server::ServiceInvokeContext;
 
 thread_local! {
     static SERVICE_KERNEL_CONTEXT: RefCell<Option<ServiceInvokeContext>> = const { RefCell::new(None) };
+    static HOST_KERNEL_CONNECTION: RefCell<Option<HostConnectionInfo>> = const { RefCell::new(None) };
 }
 
 struct ServiceKernelContextGuard;
+struct HostKernelConnectionGuard;
 
 impl Drop for ServiceKernelContextGuard {
     fn drop(&mut self) {
         SERVICE_KERNEL_CONTEXT.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+    }
+}
+
+impl Drop for HostKernelConnectionGuard {
+    fn drop(&mut self) {
+        HOST_KERNEL_CONNECTION.with(|slot| {
             *slot.borrow_mut() = None;
         });
     }
@@ -61,6 +71,46 @@ fn enter_service_kernel_context(context: ServiceInvokeContext) -> ServiceKernelC
         *slot.borrow_mut() = Some(context);
     });
     ServiceKernelContextGuard
+}
+
+fn enter_host_kernel_connection(connection: HostConnectionInfo) -> HostKernelConnectionGuard {
+    HOST_KERNEL_CONNECTION.with(|slot| {
+        *slot.borrow_mut() = Some(connection);
+    });
+    HostKernelConnectionGuard
+}
+
+fn call_host_kernel_via_client(
+    connection: &HostConnectionInfo,
+    payload: Vec<u8>,
+) -> Result<Vec<u8>> {
+    let request: bmux_ipc::Request =
+        bmux_ipc::decode(&payload).context("failed decoding kernel bridge request payload")?;
+    let paths = ConfigPaths::new(
+        connection.config_dir.clone().into(),
+        connection.runtime_dir.clone().into(),
+        connection.data_dir.clone().into(),
+    );
+    let request_name = "bmux-cli-host-kernel-bridge".to_string();
+    let response: bmux_ipc::Response = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                let mut client = BmuxClient::connect_with_paths(&paths, &request_name).await?;
+                client.request_raw(request).await
+            })
+        }),
+        Err(_) => {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed creating kernel bridge runtime")?;
+            runtime.block_on(async {
+                let mut client = BmuxClient::connect_with_paths(&paths, &request_name).await?;
+                client.request_raw(request).await
+            })
+        }
+    }?;
+    bmux_ipc::encode(&response).context("failed encoding kernel bridge response payload")
 }
 
 unsafe extern "C" fn host_kernel_bridge(
@@ -81,25 +131,26 @@ unsafe extern "C" fn host_kernel_bridge(
             Err(_) => return 3,
         };
 
-    let context = SERVICE_KERNEL_CONTEXT.with(|slot| slot.borrow().clone());
-    let Some(context) = context else {
-        return 5;
-    };
-
-    let payload = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| {
-            handle.block_on(async { context.execute_raw(request.payload).await })
-        }),
-        Err(_) => {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(runtime) => runtime,
-                Err(_) => return 5,
-            };
-            runtime.block_on(async { context.execute_raw(request.payload).await })
+    let payload = if let Some(context) = SERVICE_KERNEL_CONTEXT.with(|slot| slot.borrow().clone()) {
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => tokio::task::block_in_place(|| {
+                handle.block_on(async { context.execute_raw(request.payload).await })
+            }),
+            Err(_) => {
+                let runtime = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(runtime) => runtime,
+                    Err(_) => return 5,
+                };
+                runtime.block_on(async { context.execute_raw(request.payload).await })
+            }
         }
+    } else if let Some(connection) = HOST_KERNEL_CONNECTION.with(|slot| slot.borrow().clone()) {
+        call_host_kernel_via_client(&connection, request.payload)
+    } else {
+        return 5;
     };
 
     let response = match payload {
@@ -309,6 +360,8 @@ fn register_plugin_service_handlers(
                             })?;
                     let _kernel_context_guard =
                         enter_service_kernel_context(invoke_context.clone());
+                    let _host_kernel_connection_guard =
+                        enter_host_kernel_connection(connection.clone());
                     let response = loaded.invoke_service(&bmux_plugin::NativeServiceContext {
                         plugin_id: provider.declaration.id.as_str().to_string(),
                         request: ServiceRequest {
@@ -1141,6 +1194,7 @@ fn plugin_lifecycle_context(
             .get(declaration.id.as_str())
             .cloned(),
         plugin_settings_map: config.plugins.settings.clone(),
+        host_kernel_bridge: Some(host_kernel_bridge as *const () as usize as u64),
     }
 }
 
@@ -1182,6 +1236,7 @@ fn plugin_command_context(
             .get(declaration.id.as_str())
             .cloned(),
         plugin_settings_map: config.plugins.settings.clone(),
+        host_kernel_bridge: Some(host_kernel_bridge as *const () as usize as u64),
     }
 }
 
@@ -1202,6 +1257,11 @@ fn activate_loaded_plugins(
     paths: &ConfigPaths,
 ) -> Result<()> {
     let mut activated: Vec<&bmux_plugin::LoadedPlugin> = Vec::new();
+    let connection_info = HostConnectionInfo {
+        config_dir: paths.config_dir.to_string_lossy().into_owned(),
+        runtime_dir: paths.runtime_dir.to_string_lossy().into_owned(),
+        data_dir: paths.data_dir.to_string_lossy().into_owned(),
+    };
     let plugin_search_roots = resolve_plugin_search_paths(config, paths)?
         .into_iter()
         .map(|path| path.to_string_lossy().into_owned())
@@ -1232,6 +1292,7 @@ fn activate_loaded_plugins(
             config.plugins.enabled.clone(),
             plugin_search_roots.clone(),
         );
+        let _host_kernel_connection_guard = enter_host_kernel_connection(connection_info.clone());
         if let Err(error) = plugin.activate(&context) {
             for activated_plugin in activated.into_iter().rev() {
                 let context = plugin_lifecycle_context(
@@ -1243,6 +1304,8 @@ fn activate_loaded_plugins(
                     config.plugins.enabled.clone(),
                     plugin_search_roots.clone(),
                 );
+                let _host_kernel_connection_guard =
+                    enter_host_kernel_connection(connection_info.clone());
                 if let Err(deactivate_error) = activated_plugin.deactivate(&context) {
                     warn!(
                         "failed rolling back plugin activation for {}: {deactivate_error}",
@@ -1269,6 +1332,11 @@ fn deactivate_loaded_plugins(
     config: &BmuxConfig,
     paths: &ConfigPaths,
 ) -> Result<()> {
+    let connection_info = HostConnectionInfo {
+        config_dir: paths.config_dir.to_string_lossy().into_owned(),
+        runtime_dir: paths.runtime_dir.to_string_lossy().into_owned(),
+        data_dir: paths.data_dir.to_string_lossy().into_owned(),
+    };
     let plugin_search_roots = resolve_plugin_search_paths(config, paths)?
         .into_iter()
         .map(|path| path.to_string_lossy().into_owned())
@@ -1299,6 +1367,7 @@ fn deactivate_loaded_plugins(
             config.plugins.enabled.clone(),
             plugin_search_roots.clone(),
         );
+        let _host_kernel_connection_guard = enter_host_kernel_connection(connection_info.clone());
         let _ = plugin.deactivate(&context).with_context(|| {
             format!(
                 "failed deactivating plugin '{}'",
@@ -1543,6 +1612,7 @@ async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]
         config.plugins.enabled.clone(),
         plugin_search_roots,
     );
+    let _host_kernel_connection_guard = enter_host_kernel_connection(context.connection.clone());
     let status = loaded
         .run_command_with_context(command_name, args, Some(&context))
         .with_context(|| format!("failed running plugin command '{plugin_id}:{command_name}'"))?;
@@ -3029,6 +3099,12 @@ fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
         )
     })?;
 
+    let connection = bmux_plugin::HostConnectionInfo {
+        config_dir: paths.config_dir.to_string_lossy().into_owned(),
+        runtime_dir: paths.runtime_dir.to_string_lossy().into_owned(),
+        data_dir: paths.data_dir.to_string_lossy().into_owned(),
+    };
+    let _host_kernel_connection_guard = enter_host_kernel_connection(connection.clone());
     let response = loaded.invoke_service(&bmux_plugin::NativeServiceContext {
         plugin_id: provider_plugin_id.to_string(),
         request: ServiceRequest {
@@ -3054,11 +3130,7 @@ fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
         enabled_plugins: config.plugins.enabled.clone(),
         plugin_search_roots,
         host: plugin_host_metadata(),
-        connection: bmux_plugin::HostConnectionInfo {
-            config_dir: paths.config_dir.to_string_lossy().into_owned(),
-            runtime_dir: paths.runtime_dir.to_string_lossy().into_owned(),
-            data_dir: paths.data_dir.to_string_lossy().into_owned(),
-        },
+        connection,
         settings: std::collections::BTreeMap::new(),
         plugin_settings_map: std::collections::BTreeMap::new(),
         host_kernel_bridge: Some(host_kernel_bridge as *const () as usize as u64),
