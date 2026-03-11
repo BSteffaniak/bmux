@@ -184,7 +184,7 @@ fn run_permission_query_service(context: &NativeServiceContext) -> ServiceRespon
     with_client(
         context,
         "bmux-permissions-plugin-service",
-        |mut client| async move {
+        move |mut client| async move {
             let permissions = client
                 .list_permissions(selector)
                 .await
@@ -210,7 +210,7 @@ fn run_permission_command_service(context: &NativeServiceContext) -> ServiceResp
             with_client(
                 context,
                 "bmux-permissions-plugin-service",
-                |mut client| async move {
+                move |mut client| async move {
                     client
                         .grant_role(selector, request.client_id, request.role)
                         .await
@@ -234,7 +234,7 @@ fn run_permission_command_service(context: &NativeServiceContext) -> ServiceResp
             with_client(
                 context,
                 "bmux-permissions-plugin-service",
-                |mut client| async move {
+                move |mut client| async move {
                     client
                         .revoke_role(selector, request.client_id)
                         .await
@@ -281,7 +281,12 @@ fn run_permissions_command(context: &NativeCommandContext) -> i32 {
     let permissions = match with_command_client(
         context,
         "bmux-permissions-plugin-command",
-        |mut client| async move { client.list_permissions(selector).await },
+        |mut client| async move {
+            client
+                .list_permissions(selector)
+                .await
+                .map_err(|error| error.to_string())
+        },
     ) {
         Ok(permissions) => permissions,
         Err(error) => {
@@ -301,7 +306,12 @@ fn watch_permissions(context: &NativeCommandContext, session: &str) -> i32 {
         match with_command_client(
             context,
             "bmux-permissions-plugin-command",
-            |mut client| async move { client.list_permissions(selector).await },
+            |mut client| async move {
+                client
+                    .list_permissions(selector)
+                    .await
+                    .map_err(|error| error.to_string())
+            },
         ) {
             Ok(permissions) => {
                 if last_permissions.as_ref() != Some(&permissions) {
@@ -356,11 +366,11 @@ fn run_grant_command(context: &NativeCommandContext) -> i32 {
         context,
         "bmux-permissions-plugin-command",
         |mut client| async move {
-            client.grant_role(selector, client_id, role).await?;
-            Ok::<GrantPermissionResponse, bmux_client::ClientError>(GrantPermissionResponse {
-                client_id,
-                role,
-            })
+            client
+                .grant_role(selector, client_id, role)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(GrantPermissionResponse { client_id, role })
         },
     ) {
         Ok(response) => {
@@ -407,10 +417,11 @@ fn run_revoke_command(context: &NativeCommandContext) -> i32 {
         context,
         "bmux-permissions-plugin-command",
         |mut client| async move {
-            client.revoke_role(selector, client_id).await?;
-            Ok::<RevokePermissionResponse, bmux_client::ClientError>(RevokePermissionResponse {
-                client_id,
-            })
+            client
+                .revoke_role(selector, client_id)
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(RevokePermissionResponse { client_id })
         },
     ) {
         Ok(response) => {
@@ -430,41 +441,40 @@ fn with_client<F, Fut>(
     operation: F,
 ) -> ServiceResponse
 where
-    F: FnOnce(BmuxClient) -> Fut,
-    Fut: std::future::Future<Output = bmux_plugin::Result<Vec<u8>>>,
+    F: FnOnce(BmuxClient) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = bmux_plugin::Result<Vec<u8>>> + Send + 'static,
 {
     let paths = ConfigPaths::new(
         context.connection.config_dir.clone().into(),
         context.connection.runtime_dir.clone().into(),
         context.connection.data_dir.clone().into(),
     );
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| {
-            handle.block_on(async move {
-                match BmuxClient::connect_with_paths(&paths, principal).await {
-                    Ok(client) => match operation(client).await {
-                        Ok(payload) => ServiceResponse::ok(payload),
-                        Err(error) => ServiceResponse::error("service_failed", error.to_string()),
-                    },
-                    Err(error) => ServiceResponse::error("connect_failed", error.to_string()),
-                }
-            })
-        }),
-        Err(_) => match tokio::runtime::Builder::new_current_thread()
+    let principal = principal.to_string();
+
+    match std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-        {
-            Ok(runtime) => runtime.block_on(async move {
-                match BmuxClient::connect_with_paths(&paths, principal).await {
-                    Ok(client) => match operation(client).await {
-                        Ok(payload) => ServiceResponse::ok(payload),
-                        Err(error) => ServiceResponse::error("service_failed", error.to_string()),
-                    },
-                    Err(error) => ServiceResponse::error("connect_failed", error.to_string()),
-                }
-            }),
-            Err(error) => ServiceResponse::error("runtime_error", error.to_string()),
-        },
+            .map_err(|error| format!("runtime_error: {error}"))?;
+        runtime.block_on(async move {
+            let client = BmuxClient::connect_with_paths(&paths, &principal)
+                .await
+                .map_err(|error| format!("connect_failed: {error}"))?;
+            operation(client)
+                .await
+                .map_err(|error| format!("service_failed: {error}"))
+        })
+    })
+    .join()
+    {
+        Ok(Ok(payload)) => ServiceResponse::ok(payload),
+        Ok(Err(error)) => {
+            let mut split = error.splitn(2, ':');
+            let code = split.next().unwrap_or("service_failed").trim();
+            let message = split.next().unwrap_or("service invocation failed").trim();
+            ServiceResponse::error(code, message)
+        }
+        Err(_) => ServiceResponse::error("runtime_error", "service worker thread panicked"),
     }
 }
 
@@ -474,7 +484,7 @@ fn with_command_client<T, Fut>(
     operation: impl FnOnce(BmuxClient) -> Fut,
 ) -> Result<T, String>
 where
-    Fut: std::future::Future<Output = std::result::Result<T, bmux_client::ClientError>>,
+    Fut: std::future::Future<Output = Result<T, String>>,
 {
     let paths = ConfigPaths::new(
         context.connection.config_dir.clone().into(),
@@ -487,7 +497,7 @@ where
                 let client = BmuxClient::connect_with_paths(&paths, principal)
                     .await
                     .map_err(|error| error.to_string())?;
-                operation(client).await.map_err(|error| error.to_string())
+                operation(client).await
             })
         }),
         Err(_) => {
@@ -499,7 +509,7 @@ where
                 let client = BmuxClient::connect_with_paths(&paths, principal)
                     .await
                     .map_err(|error| error.to_string())?;
-                operation(client).await.map_err(|error| error.to_string())
+                operation(client).await
             })
         }
     }

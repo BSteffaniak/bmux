@@ -250,15 +250,17 @@ fn run_new_window(context: &NativeCommandContext) -> i32 {
     let response = match with_command_client(
         context,
         "bmux-windows-plugin-command",
-        |mut client| async move {
+        move |mut client| async move {
             let selector = args.session.as_deref().map(parse_session_selector);
-            let window_id = client.new_window(selector.clone(), args.name).await?;
+            let window_id = client
+                .new_window(selector.clone(), args.name)
+                .await
+                .map_err(|error| error.to_string())?;
             let window = resolve_window_summary_by_id(&mut client, selector, window_id)
-                .await?
-                .ok_or(bmux_client::ClientError::UnexpectedResponse(
-                    "created window missing from list response",
-                ))?;
-            Ok::<NewWindowResponse, bmux_client::ClientError>(NewWindowResponse { window })
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "created window missing from list response".to_string())?;
+            Ok(NewWindowResponse { window })
         },
     ) {
         Ok(response) => response,
@@ -285,6 +287,7 @@ fn run_list_windows(context: &NativeCommandContext) -> i32 {
             client
                 .list_windows(args.session.as_deref().map(parse_session_selector))
                 .await
+                .map_err(|error| error.to_string())
         },
     ) {
         Ok(windows) => windows,
@@ -355,8 +358,9 @@ fn run_kill_window(context: &NativeCommandContext) -> i32 {
                     parse_window_selector(&target),
                     args.force_local,
                 )
-                .await?;
-            Ok::<KillWindowResponse, bmux_client::ClientError>(KillWindowResponse { window_id })
+                .await
+                .map_err(|error| error.to_string())?;
+            Ok(KillWindowResponse { window_id })
         },
     ) {
         Ok(response) => {
@@ -381,7 +385,10 @@ fn run_kill_all_windows(context: &NativeCommandContext) -> i32 {
         "bmux-windows-plugin-command",
         |mut client| async move {
             let selector = args.session.as_deref().map(parse_session_selector);
-            let windows = client.list_windows(selector.clone()).await?;
+            let windows = client
+                .list_windows(selector.clone())
+                .await
+                .map_err(|error| error.to_string())?;
             let mut killed_count = 0usize;
             let mut failed_count = 0usize;
             for window in windows {
@@ -397,7 +404,7 @@ fn run_kill_all_windows(context: &NativeCommandContext) -> i32 {
                     Err(_) => failed_count = failed_count.saturating_add(1),
                 }
             }
-            Ok::<KillAllWindowsResponse, bmux_client::ClientError>(KillAllWindowsResponse {
+            Ok(KillAllWindowsResponse {
                 killed_count,
                 failed_count,
             })
@@ -434,13 +441,13 @@ fn run_switch_window(context: &NativeCommandContext) -> i32 {
             let selector = args.session.as_deref().map(parse_session_selector);
             let window_id = client
                 .switch_window(selector.clone(), parse_window_selector(&target))
-                .await?;
+                .await
+                .map_err(|error| error.to_string())?;
             let window = resolve_window_summary_by_id(&mut client, selector, window_id)
-                .await?
-                .ok_or(bmux_client::ClientError::UnexpectedResponse(
-                    "active window missing from list response",
-                ))?;
-            Ok::<SwitchWindowResponse, bmux_client::ClientError>(SwitchWindowResponse { window })
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| "active window missing from list response".to_string())?;
+            Ok(SwitchWindowResponse { window })
         },
     ) {
         Ok(response) => {
@@ -485,7 +492,7 @@ fn run_window_command_service(context: &NativeServiceContext) -> ServiceResponse
             with_client(
                 context,
                 "bmux-windows-plugin-service",
-                |mut client| async move {
+                move |mut client| async move {
                     let window_id = client
                         .new_window(
                             request.session.as_deref().map(parse_session_selector),
@@ -521,7 +528,7 @@ fn run_window_command_service(context: &NativeServiceContext) -> ServiceResponse
             with_client(
                 context,
                 "bmux-windows-plugin-service",
-                |mut client| async move {
+                move |mut client| async move {
                     let window_id = client
                         .switch_window(
                             request.session.as_deref().map(parse_session_selector),
@@ -557,7 +564,7 @@ fn run_window_command_service(context: &NativeServiceContext) -> ServiceResponse
             with_client(
                 context,
                 "bmux-windows-plugin-service",
-                |mut client| async move {
+                move |mut client| async move {
                     let window_id = client
                         .kill_window_with_options(
                             request.session.as_deref().map(parse_session_selector),
@@ -582,7 +589,7 @@ fn run_window_command_service(context: &NativeServiceContext) -> ServiceResponse
             with_client(
                 context,
                 "bmux-windows-plugin-service",
-                |mut client| async move {
+                move |mut client| async move {
                     let selector = request.session.as_deref().map(parse_session_selector);
                     let windows = client
                         .list_windows(selector.clone())
@@ -626,41 +633,40 @@ fn with_client<F, Fut>(
     operation: F,
 ) -> ServiceResponse
 where
-    F: FnOnce(BmuxClient) -> Fut,
-    Fut: std::future::Future<Output = bmux_plugin::Result<Vec<u8>>>,
+    F: FnOnce(BmuxClient) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = bmux_plugin::Result<Vec<u8>>> + Send + 'static,
 {
     let paths = ConfigPaths::new(
         context.connection.config_dir.clone().into(),
         context.connection.runtime_dir.clone().into(),
         context.connection.data_dir.clone().into(),
     );
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| {
-            handle.block_on(async move {
-                match BmuxClient::connect_with_paths(&paths, principal).await {
-                    Ok(client) => match operation(client).await {
-                        Ok(payload) => ServiceResponse::ok(payload),
-                        Err(error) => ServiceResponse::error("service_failed", error.to_string()),
-                    },
-                    Err(error) => ServiceResponse::error("connect_failed", error.to_string()),
-                }
-            })
-        }),
-        Err(_) => match tokio::runtime::Builder::new_current_thread()
+    let principal = principal.to_string();
+
+    match std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-        {
-            Ok(runtime) => runtime.block_on(async move {
-                match BmuxClient::connect_with_paths(&paths, principal).await {
-                    Ok(client) => match operation(client).await {
-                        Ok(payload) => ServiceResponse::ok(payload),
-                        Err(error) => ServiceResponse::error("service_failed", error.to_string()),
-                    },
-                    Err(error) => ServiceResponse::error("connect_failed", error.to_string()),
-                }
-            }),
-            Err(error) => ServiceResponse::error("runtime_error", error.to_string()),
-        },
+            .map_err(|error| format!("runtime_error: {error}"))?;
+        runtime.block_on(async move {
+            let client = BmuxClient::connect_with_paths(&paths, &principal)
+                .await
+                .map_err(|error| format!("connect_failed: {error}"))?;
+            operation(client)
+                .await
+                .map_err(|error| format!("service_failed: {error}"))
+        })
+    })
+    .join()
+    {
+        Ok(Ok(payload)) => ServiceResponse::ok(payload),
+        Ok(Err(error)) => {
+            let mut split = error.splitn(2, ':');
+            let code = split.next().unwrap_or("service_failed").trim();
+            let message = split.next().unwrap_or("service invocation failed").trim();
+            ServiceResponse::error(code, message)
+        }
+        Err(_) => ServiceResponse::error("runtime_error", "service worker thread panicked"),
     }
 }
 
@@ -670,7 +676,7 @@ fn with_command_client<T, Fut>(
     operation: impl FnOnce(BmuxClient) -> Fut,
 ) -> Result<T, String>
 where
-    Fut: std::future::Future<Output = std::result::Result<T, bmux_client::ClientError>>,
+    Fut: std::future::Future<Output = Result<T, String>>,
 {
     let paths = ConfigPaths::new(
         context.connection.config_dir.clone().into(),
@@ -683,7 +689,7 @@ where
                 let client = BmuxClient::connect_with_paths(&paths, principal)
                     .await
                     .map_err(|error| error.to_string())?;
-                operation(client).await.map_err(|error| error.to_string())
+                operation(client).await
             })
         }),
         Err(_) => {
@@ -695,7 +701,7 @@ where
                 let client = BmuxClient::connect_with_paths(&paths, principal)
                     .await
                     .map_err(|error| error.to_string())?;
-                operation(client).await.map_err(|error| error.to_string())
+                operation(client).await
             })
         }
     }
