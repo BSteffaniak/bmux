@@ -413,7 +413,9 @@ fn register_plugin_service_handlers(
                                     .map(|settings| (plugin_id.clone(), settings))
                             })
                             .collect(),
-                        host_kernel_bridge: Some(host_kernel_bridge as *const () as usize as u64),
+                        host_kernel_bridge: Some(bmux_plugin::HostKernelBridge::from_fn(
+                            host_kernel_bridge,
+                        )),
                     })?;
                     if let Some(error) = response.error {
                         anyhow::bail!(error.message);
@@ -1194,7 +1196,7 @@ fn plugin_lifecycle_context(
             .get(declaration.id.as_str())
             .cloned(),
         plugin_settings_map: config.plugins.settings.clone(),
-        host_kernel_bridge: Some(host_kernel_bridge as *const () as usize as u64),
+        host_kernel_bridge: Some(bmux_plugin::HostKernelBridge::from_fn(host_kernel_bridge)),
     }
 }
 
@@ -1236,7 +1238,7 @@ fn plugin_command_context(
             .get(declaration.id.as_str())
             .cloned(),
         plugin_settings_map: config.plugins.settings.clone(),
-        host_kernel_bridge: Some(host_kernel_bridge as *const () as usize as u64),
+        host_kernel_bridge: Some(bmux_plugin::HostKernelBridge::from_fn(host_kernel_bridge)),
     }
 }
 
@@ -3133,7 +3135,7 @@ fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
         connection,
         settings: std::collections::BTreeMap::new(),
         plugin_settings_map: std::collections::BTreeMap::new(),
-        host_kernel_bridge: Some(host_kernel_bridge as *const () as usize as u64),
+        host_kernel_bridge: Some(bmux_plugin::HostKernelBridge::from_fn(host_kernel_bridge)),
     })?;
     if let Some(error) = response.error {
         anyhow::bail!(error.message);

@@ -74,7 +74,7 @@ pub struct NativeLifecycleContext {
     #[serde(default)]
     pub plugin_settings_map: BTreeMap<String, toml::Value>,
     #[serde(default)]
-    pub host_kernel_bridge: Option<u64>,
+    pub host_kernel_bridge: Option<HostKernelBridge>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -101,7 +101,7 @@ pub struct NativeCommandContext {
     #[serde(default)]
     pub plugin_settings_map: BTreeMap<String, toml::Value>,
     #[serde(default)]
-    pub host_kernel_bridge: Option<u64>,
+    pub host_kernel_bridge: Option<HostKernelBridge>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -127,7 +127,7 @@ pub struct NativeServiceContext {
     #[serde(default)]
     pub plugin_settings_map: BTreeMap<String, BTreeMap<String, String>>,
     #[serde(default)]
-    pub host_kernel_bridge: Option<u64>,
+    pub host_kernel_bridge: Option<HostKernelBridge>,
 }
 
 type HostKernelBridgeFn = unsafe extern "C" fn(
@@ -137,6 +137,37 @@ type HostKernelBridgeFn = unsafe extern "C" fn(
     output_capacity: usize,
     output_len: *mut usize,
 ) -> i32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct HostKernelBridge(u64);
+
+impl HostKernelBridge {
+    #[must_use]
+    pub fn from_fn(pointer: HostKernelBridgeFn) -> Self {
+        Self(pointer as usize as u64)
+    }
+
+    fn invoke(
+        self,
+        input_ptr: *const u8,
+        input_len: usize,
+        output_ptr: *mut u8,
+        output_capacity: usize,
+        output_len: *mut usize,
+    ) -> i32 {
+        let bridge: HostKernelBridgeFn = unsafe { std::mem::transmute(self.0 as usize) };
+        unsafe {
+            bridge(
+                input_ptr,
+                input_len,
+                output_ptr,
+                output_capacity,
+                output_len,
+            )
+        }
+    }
+}
 
 const KERNEL_STATUS_OK: i32 = 0;
 const KERNEL_STATUS_BUFFER_TOO_SMALL: i32 = 4;
@@ -293,37 +324,32 @@ impl NativeServiceContext {
     }
 
     pub fn call_host_kernel_raw(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
-        let Some(pointer) = self.host_kernel_bridge else {
+        let Some(bridge) = self.host_kernel_bridge else {
             return Err(PluginError::UnsupportedHostOperation {
                 operation: "call_host_kernel",
             });
         };
-        let bridge: HostKernelBridgeFn = unsafe { std::mem::transmute(pointer as usize) };
         let request = encode_service_message(&HostKernelBridgeRequest { payload })?;
         let mut output = vec![0u8; request.len().saturating_mul(4).max(1024)];
         let mut output_len = 0usize;
 
-        let status = unsafe {
-            bridge(
+        let status = bridge.invoke(
+            request.as_ptr(),
+            request.len(),
+            output.as_mut_ptr(),
+            output.len(),
+            &mut output_len,
+        );
+
+        if status == KERNEL_STATUS_BUFFER_TOO_SMALL {
+            output.resize(output_len, 0);
+            let status = bridge.invoke(
                 request.as_ptr(),
                 request.len(),
                 output.as_mut_ptr(),
                 output.len(),
                 &mut output_len,
-            )
-        };
-
-        if status == KERNEL_STATUS_BUFFER_TOO_SMALL {
-            output.resize(output_len, 0);
-            let status = unsafe {
-                bridge(
-                    request.as_ptr(),
-                    request.len(),
-                    output.as_mut_ptr(),
-                    output.len(),
-                    &mut output_len,
-                )
-            };
+            );
             if status != KERNEL_STATUS_OK {
                 return Err(PluginError::ServiceProtocol {
                     details: format!("kernel bridge invocation failed with status {status}"),
@@ -439,7 +465,7 @@ fn call_service_raw(
     plugin_search_roots: &[String],
     host: &HostMetadata,
     connection: &HostConnectionInfo,
-    host_kernel_bridge: Option<u64>,
+    host_kernel_bridge: Option<HostKernelBridge>,
     plugin_settings_map: &BTreeMap<String, toml::Value>,
     capability: &str,
     kind: ServiceKind,
