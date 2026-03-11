@@ -40,8 +40,9 @@ pub use error::{PluginError, Result};
 pub use event::{PluginEvent, PluginEventKind, PluginEventPayload, PluginEventSubscription};
 pub use host::{HostConnectionInfo, HostMetadata, PluginContext, PluginHost};
 pub use loader::{
-    LoadedPlugin, NativeCommandContext, NativeDescriptor, NativeLifecycleContext,
-    NativePluginLoader, NativeServiceContext, ServiceCaller, load_registered_plugin,
+    HostKernelBridgeRequest, HostKernelBridgeResponse, LoadedPlugin, NativeCommandContext,
+    NativeDescriptor, NativeLifecycleContext, NativePluginLoader, NativeServiceContext,
+    ServiceCaller, load_registered_plugin,
 };
 pub use manifest::{PluginManifest, PluginManifestCompatibility, PluginRuntime};
 pub use native_exports::RustPlugin;

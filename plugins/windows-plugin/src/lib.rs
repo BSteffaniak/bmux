@@ -5,7 +5,10 @@
 use bmux_cli_output::{Table, TableColumn, write_table};
 use bmux_client::BmuxClient;
 use bmux_config::ConfigPaths;
-use bmux_ipc::{SessionSelector, WindowSelector, WindowSummary};
+use bmux_ipc::{
+    ErrorCode, Request as KernelRequest, Response as KernelResponse,
+    ResponsePayload as KernelResponsePayload, SessionSelector, WindowSelector, WindowSummary,
+};
 use bmux_plugin::{
     CommandExecutionKind, HostScope, NativeCommandContext, NativeDescriptor, NativeServiceContext,
     PluginCommand, PluginCommandArgument, PluginCommandArgumentKind, PluginService, RustPlugin,
@@ -467,17 +470,24 @@ fn run_window_query_service(context: &NativeServiceContext) -> ServiceResponse {
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
     };
 
-    with_client(
+    match call_kernel_request(
         context,
-        "bmux-windows-plugin-service",
-        |mut client| async move {
-            let windows = client
-                .list_windows(request.session.as_deref().map(parse_session_selector))
-                .await
-                .map_err(client_error)?;
-            Ok(encode_service_message(&ListWindowsResponse { windows })?)
+        KernelRequest::ListWindows {
+            session: request.session.as_deref().map(parse_session_selector),
         },
-    )
+    ) {
+        Ok(KernelResponsePayload::WindowList { windows }) => {
+            match encode_service_message(&ListWindowsResponse { windows }) {
+                Ok(payload) => ServiceResponse::ok(payload),
+                Err(error) => ServiceResponse::error("encode_failed", error.to_string()),
+            }
+        }
+        Ok(other) => ServiceResponse::error(
+            "unexpected_response",
+            format!("unexpected kernel response: {other:?}"),
+        ),
+        Err(error) => ServiceResponse::error("service_failed", error),
+    }
 }
 
 fn run_window_command_service(context: &NativeServiceContext) -> ServiceResponse {
@@ -489,32 +499,37 @@ fn run_window_command_service(context: &NativeServiceContext) -> ServiceResponse
                 Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
             };
 
-            with_client(
+            match call_kernel_request(
                 context,
-                "bmux-windows-plugin-service",
-                move |mut client| async move {
-                    let window_id = client
-                        .new_window(
-                            request.session.as_deref().map(parse_session_selector),
-                            request.name,
-                        )
-                        .await
-                        .map_err(client_error)?;
-                    let window = resolve_window_summary_by_id(
-                        &mut client,
-                        request.session.as_deref().map(parse_session_selector),
-                        window_id,
-                    )
-                    .await
-                    .map_err(client_error)?
-                    .ok_or_else(|| {
-                        bmux_plugin::PluginError::ServiceProtocol {
-                            details: "created window missing from list response".to_string(),
-                        }
-                    })?;
-                    Ok(encode_service_message(&NewWindowResponse { window })?)
+                KernelRequest::NewWindow {
+                    session: request.session.as_deref().map(parse_session_selector),
+                    name: request.name,
                 },
-            )
+            ) {
+                Ok(KernelResponsePayload::WindowCreated {
+                    id,
+                    session_id,
+                    number,
+                    name,
+                }) => {
+                    let window = WindowSummary {
+                        id,
+                        session_id,
+                        number,
+                        name,
+                        active: false,
+                    };
+                    match encode_service_message(&NewWindowResponse { window }) {
+                        Ok(payload) => ServiceResponse::ok(payload),
+                        Err(error) => ServiceResponse::error("encode_failed", error.to_string()),
+                    }
+                }
+                Ok(other) => ServiceResponse::error(
+                    "unexpected_response",
+                    format!("unexpected kernel response: {other:?}"),
+                ),
+                Err(error) => ServiceResponse::error("service_failed", error),
+            }
         }
         "switch" => {
             let request =
@@ -525,32 +540,36 @@ fn run_window_command_service(context: &NativeServiceContext) -> ServiceResponse
                     }
                 };
 
-            with_client(
+            match call_kernel_request(
                 context,
-                "bmux-windows-plugin-service",
-                move |mut client| async move {
-                    let window_id = client
-                        .switch_window(
-                            request.session.as_deref().map(parse_session_selector),
-                            parse_window_selector(&request.target),
-                        )
-                        .await
-                        .map_err(client_error)?;
-                    let window = resolve_window_summary_by_id(
-                        &mut client,
-                        request.session.as_deref().map(parse_session_selector),
-                        window_id,
-                    )
-                    .await
-                    .map_err(client_error)?
-                    .ok_or_else(|| {
-                        bmux_plugin::PluginError::ServiceProtocol {
-                            details: "active window missing from list response".to_string(),
-                        }
-                    })?;
-                    Ok(encode_service_message(&SwitchWindowResponse { window })?)
+                KernelRequest::SwitchWindow {
+                    session: request.session.as_deref().map(parse_session_selector),
+                    target: parse_window_selector(&request.target),
                 },
-            )
+            ) {
+                Ok(KernelResponsePayload::WindowSwitched {
+                    id,
+                    session_id,
+                    number,
+                }) => {
+                    let window = WindowSummary {
+                        id,
+                        session_id,
+                        number,
+                        name: None,
+                        active: true,
+                    };
+                    match encode_service_message(&SwitchWindowResponse { window }) {
+                        Ok(payload) => ServiceResponse::ok(payload),
+                        Err(error) => ServiceResponse::error("encode_failed", error.to_string()),
+                    }
+                }
+                Ok(other) => ServiceResponse::error(
+                    "unexpected_response",
+                    format!("unexpected kernel response: {other:?}"),
+                ),
+                Err(error) => ServiceResponse::error("service_failed", error),
+            }
         }
         "kill" => {
             let request =
@@ -561,21 +580,26 @@ fn run_window_command_service(context: &NativeServiceContext) -> ServiceResponse
                     }
                 };
 
-            with_client(
+            match call_kernel_request(
                 context,
-                "bmux-windows-plugin-service",
-                move |mut client| async move {
-                    let window_id = client
-                        .kill_window_with_options(
-                            request.session.as_deref().map(parse_session_selector),
-                            parse_window_selector(&request.target),
-                            request.force_local,
-                        )
-                        .await
-                        .map_err(client_error)?;
-                    Ok(encode_service_message(&KillWindowResponse { window_id })?)
+                KernelRequest::KillWindow {
+                    session: request.session.as_deref().map(parse_session_selector),
+                    target: parse_window_selector(&request.target),
+                    force_local: request.force_local,
                 },
-            )
+            ) {
+                Ok(KernelResponsePayload::WindowKilled { id, .. }) => {
+                    match encode_service_message(&KillWindowResponse { window_id: id }) {
+                        Ok(payload) => ServiceResponse::ok(payload),
+                        Err(error) => ServiceResponse::error("encode_failed", error.to_string()),
+                    }
+                }
+                Ok(other) => ServiceResponse::error(
+                    "unexpected_response",
+                    format!("unexpected kernel response: {other:?}"),
+                ),
+                Err(error) => ServiceResponse::error("service_failed", error),
+            }
         }
         "kill_all" => {
             let request =
@@ -586,36 +610,46 @@ fn run_window_command_service(context: &NativeServiceContext) -> ServiceResponse
                     }
                 };
 
-            with_client(
+            let selector = request.session.as_deref().map(parse_session_selector);
+            let windows = match call_kernel_request(
                 context,
-                "bmux-windows-plugin-service",
-                move |mut client| async move {
-                    let selector = request.session.as_deref().map(parse_session_selector);
-                    let windows = client
-                        .list_windows(selector.clone())
-                        .await
-                        .map_err(client_error)?;
-                    let mut killed_count = 0usize;
-                    let mut failed_count = 0usize;
-                    for window in windows {
-                        match client
-                            .kill_window_with_options(
-                                selector.clone(),
-                                WindowSelector::ById(window.id),
-                                request.force_local,
-                            )
-                            .await
-                        {
-                            Ok(_) => killed_count = killed_count.saturating_add(1),
-                            Err(_) => failed_count = failed_count.saturating_add(1),
-                        }
-                    }
-                    Ok(encode_service_message(&KillAllWindowsResponse {
-                        killed_count,
-                        failed_count,
-                    })?)
+                KernelRequest::ListWindows {
+                    session: selector.clone(),
                 },
-            )
+            ) {
+                Ok(KernelResponsePayload::WindowList { windows }) => windows,
+                Ok(other) => {
+                    return ServiceResponse::error(
+                        "unexpected_response",
+                        format!("unexpected kernel response: {other:?}"),
+                    );
+                }
+                Err(error) => return ServiceResponse::error("service_failed", error),
+            };
+            let mut killed_count = 0usize;
+            let mut failed_count = 0usize;
+            for window in windows {
+                match call_kernel_request(
+                    context,
+                    KernelRequest::KillWindow {
+                        session: selector.clone(),
+                        target: WindowSelector::ById(window.id),
+                        force_local: request.force_local,
+                    },
+                ) {
+                    Ok(KernelResponsePayload::WindowKilled { .. }) => {
+                        killed_count = killed_count.saturating_add(1)
+                    }
+                    Ok(_) | Err(_) => failed_count = failed_count.saturating_add(1),
+                }
+            }
+            match encode_service_message(&KillAllWindowsResponse {
+                killed_count,
+                failed_count,
+            }) {
+                Ok(payload) => ServiceResponse::ok(payload),
+                Err(error) => ServiceResponse::error("encode_failed", error.to_string()),
+            }
         }
         _ => ServiceResponse::error(
             "unsupported_service_operation",
@@ -627,47 +661,111 @@ fn run_window_command_service(context: &NativeServiceContext) -> ServiceResponse
     }
 }
 
-fn with_client<F, Fut>(
+fn call_kernel_request(
     context: &NativeServiceContext,
-    principal: &str,
-    operation: F,
-) -> ServiceResponse
-where
-    F: FnOnce(BmuxClient) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = bmux_plugin::Result<Vec<u8>>> + Send + 'static,
-{
+    request: KernelRequest,
+) -> Result<KernelResponsePayload, String> {
+    let response: KernelResponse = match context
+        .call_host_kernel_raw(bmux_ipc::encode(&request).map_err(|error| error.to_string())?)
+    {
+        Ok(response_bytes) => {
+            bmux_ipc::decode(&response_bytes).map_err(|error| error.to_string())?
+        }
+        Err(bmux_plugin::PluginError::UnsupportedHostOperation { operation })
+            if operation == "call_host_kernel" =>
+        {
+            call_kernel_request_via_client(context, request)?
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    match response {
+        KernelResponse::Ok(payload) => Ok(payload),
+        KernelResponse::Err(error) => {
+            let code = match error.code {
+                ErrorCode::NotFound => "not_found",
+                ErrorCode::InvalidRequest => "invalid_request",
+                ErrorCode::AlreadyExists => "already_exists",
+                ErrorCode::Timeout => "timeout",
+                ErrorCode::Internal => "internal",
+                ErrorCode::VersionMismatch => "version_mismatch",
+            };
+            Err(format!("{code}: {}", error.message))
+        }
+    }
+}
+
+fn call_kernel_request_via_client(
+    context: &NativeServiceContext,
+    request: KernelRequest,
+) -> Result<KernelResponse, String> {
     let paths = ConfigPaths::new(
         context.connection.config_dir.clone().into(),
         context.connection.runtime_dir.clone().into(),
         context.connection.data_dir.clone().into(),
     );
-    let principal = principal.to_string();
-
-    match std::thread::spawn(move || {
+    let request_name = "bmux-windows-plugin-service-fallback".to_string();
+    std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|error| format!("runtime_error: {error}"))?;
+            .map_err(|error| error.to_string())?;
         runtime.block_on(async move {
-            let client = BmuxClient::connect_with_paths(&paths, &principal)
+            let mut client = BmuxClient::connect_with_paths(&paths, &request_name)
                 .await
-                .map_err(|error| format!("connect_failed: {error}"))?;
-            operation(client)
-                .await
-                .map_err(|error| format!("service_failed: {error}"))
+                .map_err(|error| error.to_string())?;
+            match request {
+                KernelRequest::ListWindows { session } => {
+                    let windows = client
+                        .list_windows(session)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    Ok(KernelResponse::Ok(KernelResponsePayload::WindowList {
+                        windows,
+                    }))
+                }
+                KernelRequest::NewWindow { session, name } => {
+                    let id = client
+                        .new_window(session.clone(), name.clone())
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    Ok(KernelResponse::Ok(KernelResponsePayload::WindowCreated {
+                        id,
+                        session_id: Uuid::nil(),
+                        number: 0,
+                        name,
+                    }))
+                }
+                KernelRequest::SwitchWindow { session, target } => {
+                    let id = client
+                        .switch_window(session.clone(), target)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    Ok(KernelResponse::Ok(KernelResponsePayload::WindowSwitched {
+                        id,
+                        session_id: Uuid::nil(),
+                        number: 0,
+                    }))
+                }
+                KernelRequest::KillWindow {
+                    session,
+                    target,
+                    force_local,
+                } => {
+                    let id = client
+                        .kill_window_with_options(session, target, force_local)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    Ok(KernelResponse::Ok(KernelResponsePayload::WindowKilled {
+                        id,
+                        session_id: Uuid::nil(),
+                    }))
+                }
+                _ => Err("unsupported kernel fallback request".to_string()),
+            }
         })
     })
     .join()
-    {
-        Ok(Ok(payload)) => ServiceResponse::ok(payload),
-        Ok(Err(error)) => {
-            let mut split = error.splitn(2, ':');
-            let code = split.next().unwrap_or("service_failed").trim();
-            let message = split.next().unwrap_or("service invocation failed").trim();
-            ServiceResponse::error(code, message)
-        }
-        Err(_) => ServiceResponse::error("runtime_error", "service worker thread panicked"),
-    }
+    .map_err(|_| "kernel fallback worker panicked".to_string())?
 }
 
 fn with_command_client<T, Fut>(
@@ -726,12 +824,6 @@ fn parse_window_selector(value: &str) -> WindowSelector {
     match Uuid::parse_str(value) {
         Ok(id) => WindowSelector::ById(id),
         Err(_) => WindowSelector::ByName(value.to_string()),
-    }
-}
-
-fn client_error(error: bmux_client::ClientError) -> bmux_plugin::PluginError {
-    bmux_plugin::PluginError::ServiceProtocol {
-        details: error.to_string(),
     }
 }
 

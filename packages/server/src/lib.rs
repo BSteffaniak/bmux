@@ -79,7 +79,8 @@ pub struct ServiceRoute {
 }
 
 type ServiceInvokeFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send>>;
-type ServiceInvokeHandler = dyn Fn(ServiceRoute, Vec<u8>) -> ServiceInvokeFuture + Send + Sync;
+type ServiceInvokeHandler =
+    dyn Fn(ServiceRoute, ServiceInvokeContext, Vec<u8>) -> ServiceInvokeFuture + Send + Sync;
 type ServiceResolverHandler = dyn Fn(ServiceRoute, Vec<u8>) -> ServiceInvokeFuture + Send + Sync;
 
 #[derive(Default)]
@@ -88,16 +89,58 @@ struct ServiceRegistry {
 }
 
 impl ServiceRegistry {
-    fn dispatch(&self, route: &ServiceRoute, payload: Vec<u8>) -> Option<ServiceInvokeFuture> {
+    fn dispatch(
+        &self,
+        route: &ServiceRoute,
+        context: ServiceInvokeContext,
+        payload: Vec<u8>,
+    ) -> Option<ServiceInvokeFuture> {
         if let Some(handler) = self.handlers.get(route).cloned() {
-            return Some(handler(route.clone(), payload));
+            return Some(handler(route.clone(), context, payload));
         }
         let mut wildcard = route.clone();
         wildcard.operation = "*".to_string();
         self.handlers
             .get(&wildcard)
             .cloned()
-            .map(|handler| handler(route.clone(), payload))
+            .map(|handler| handler(route.clone(), context, payload))
+    }
+}
+
+#[derive(Clone)]
+pub struct ServiceInvokeContext {
+    state: Arc<ServerState>,
+    shutdown_tx: watch::Sender<bool>,
+    client_id: ClientId,
+    client_principal_id: Uuid,
+    selection: Arc<AsyncMutex<(Option<SessionId>, Option<SessionId>)>>,
+}
+
+impl ServiceInvokeContext {
+    async fn execute_request(&self, request: Request) -> Result<Response> {
+        let mut selection = self.selection.lock().await;
+        let mut selected_session = selection.0;
+        let mut attached_stream_session = selection.1;
+        let response = handle_request(
+            &self.state,
+            &self.shutdown_tx,
+            self.client_id,
+            self.client_principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            request,
+        )
+        .await?;
+        selection.0 = selected_session;
+        selection.1 = attached_stream_session;
+        Ok(response)
+    }
+
+    pub async fn execute_raw(&self, request_payload: Vec<u8>) -> Result<Vec<u8>> {
+        let request: Request =
+            decode(&request_payload).context("failed decoding kernel bridge request payload")?;
+        let response = self.execute_request(request).await?;
+        encode(&response).context("failed encoding kernel bridge response payload")
     }
 }
 
@@ -2560,7 +2603,7 @@ impl BmuxServer {
         handler: F,
     ) -> Result<()>
     where
-        F: Fn(ServiceRoute, Vec<u8>) -> Fut + Send + Sync + 'static,
+        F: Fn(ServiceRoute, ServiceInvokeContext, Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
     {
         let route = ServiceRoute {
@@ -2570,7 +2613,7 @@ impl BmuxServer {
             operation: operation.into(),
         };
         let wrapped: Arc<ServiceInvokeHandler> =
-            Arc::new(move |route, payload| Box::pin(handler(route, payload)));
+            Arc::new(move |route, context, payload| Box::pin(handler(route, context, payload)));
 
         let mut registry = self
             .state
@@ -4061,12 +4104,22 @@ async fn handle_request(
                 interface_id: interface_id.clone(),
                 operation: operation.clone(),
             };
+            let invoke_context = ServiceInvokeContext {
+                state: Arc::clone(state),
+                shutdown_tx: shutdown_tx.clone(),
+                client_id,
+                client_principal_id,
+                selection: Arc::new(AsyncMutex::new((
+                    *selected_session,
+                    *attached_stream_session,
+                ))),
+            };
             let dispatch = {
                 let registry = state
                     .service_registry
                     .lock()
                     .map_err(|_| anyhow::anyhow!("service registry lock poisoned"))?;
-                registry.dispatch(&route, payload.clone())
+                registry.dispatch(&route, invoke_context.clone(), payload.clone())
             };
             let invocation = if let Some(invocation) = dispatch {
                 Some(invocation)

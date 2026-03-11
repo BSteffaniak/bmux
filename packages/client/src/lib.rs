@@ -1131,7 +1131,7 @@ mod tests {
                 InvokeServiceKind::Query,
                 "echo-query/v1",
                 "ping",
-                |_route, payload| async move { Ok(payload) },
+                |_route, _ctx, payload| async move { Ok(payload) },
             )
             .expect("service registration should succeed");
         let server_task = tokio::spawn(async move { server.run().await });

@@ -122,6 +122,29 @@ pub struct NativeServiceContext {
     pub settings: BTreeMap<String, String>,
     #[serde(default)]
     pub plugin_settings_map: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default)]
+    pub host_kernel_bridge: Option<u64>,
+}
+
+type HostKernelBridgeFn = unsafe extern "C" fn(
+    input_ptr: *const u8,
+    input_len: usize,
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32;
+
+const KERNEL_STATUS_OK: i32 = 0;
+const KERNEL_STATUS_BUFFER_TOO_SMALL: i32 = 4;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostKernelBridgeRequest {
+    pub payload: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostKernelBridgeResponse {
+    pub payload: Vec<u8>,
 }
 
 impl NativeCommandContext {
@@ -260,6 +283,54 @@ impl NativeServiceContext {
         let payload = encode_service_message(request)?;
         let response = self.call_service_raw(capability, kind, interface_id, operation, payload)?;
         decode_service_message(&response)
+    }
+
+    pub fn call_host_kernel_raw(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
+        let Some(pointer) = self.host_kernel_bridge else {
+            return Err(PluginError::UnsupportedHostOperation {
+                operation: "call_host_kernel",
+            });
+        };
+        let bridge: HostKernelBridgeFn = unsafe { std::mem::transmute(pointer as usize) };
+        let request = encode_service_message(&HostKernelBridgeRequest { payload })?;
+        let mut output = vec![0u8; request.len().saturating_mul(4).max(1024)];
+        let mut output_len = 0usize;
+
+        let status = unsafe {
+            bridge(
+                request.as_ptr(),
+                request.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                &mut output_len,
+            )
+        };
+
+        if status == KERNEL_STATUS_BUFFER_TOO_SMALL {
+            output.resize(output_len, 0);
+            let status = unsafe {
+                bridge(
+                    request.as_ptr(),
+                    request.len(),
+                    output.as_mut_ptr(),
+                    output.len(),
+                    &mut output_len,
+                )
+            };
+            if status != KERNEL_STATUS_OK {
+                return Err(PluginError::ServiceProtocol {
+                    details: format!("kernel bridge invocation failed with status {status}"),
+                });
+            }
+        } else if status != KERNEL_STATUS_OK {
+            return Err(PluginError::ServiceProtocol {
+                details: format!("kernel bridge invocation failed with status {status}"),
+            });
+        }
+
+        output.truncate(output_len);
+        let response: HostKernelBridgeResponse = decode_service_message(&output)?;
+        Ok(response.payload)
     }
 }
 
@@ -466,6 +537,7 @@ fn call_service_raw(
             plugin_settings_map.get(registered.declaration.id.as_str()),
         ),
         plugin_settings_map: serialize_plugin_settings_map(plugin_settings_map),
+        host_kernel_bridge: None,
     })?;
 
     if let Some(error) = response.error {
@@ -1620,6 +1692,7 @@ minimum = "1.0"
                 "example.native".to_string(),
                 BTreeMap::from([("mode".to_string(), "\"service\"".to_string())]),
             )]),
+            host_kernel_bridge: None,
         };
 
         let bytes = encode_service_envelope(7, ServiceEnvelopeKind::Request, &context)

@@ -32,12 +32,97 @@ use crossterm::style::Print;
 use crossterm::terminal;
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use std::cell::RefCell;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};
 use tracing::warn;
 use uuid::Uuid;
+
+use bmux_server::ServiceInvokeContext;
+
+thread_local! {
+    static SERVICE_KERNEL_CONTEXT: RefCell<Option<ServiceInvokeContext>> = const { RefCell::new(None) };
+}
+
+struct ServiceKernelContextGuard;
+
+impl Drop for ServiceKernelContextGuard {
+    fn drop(&mut self) {
+        SERVICE_KERNEL_CONTEXT.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+    }
+}
+
+fn enter_service_kernel_context(context: ServiceInvokeContext) -> ServiceKernelContextGuard {
+    SERVICE_KERNEL_CONTEXT.with(|slot| {
+        *slot.borrow_mut() = Some(context);
+    });
+    ServiceKernelContextGuard
+}
+
+unsafe extern "C" fn host_kernel_bridge(
+    input_ptr: *const u8,
+    input_len: usize,
+    output_ptr: *mut u8,
+    output_capacity: usize,
+    output_len: *mut usize,
+) -> i32 {
+    if input_ptr.is_null() || output_len.is_null() {
+        return 2;
+    }
+
+    let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+    let request: bmux_plugin::HostKernelBridgeRequest =
+        match bmux_plugin::decode_service_message(input) {
+            Ok(value) => value,
+            Err(_) => return 3,
+        };
+
+    let context = SERVICE_KERNEL_CONTEXT.with(|slot| slot.borrow().clone());
+    let Some(context) = context else {
+        return 5;
+    };
+
+    let payload = match tokio::runtime::Handle::try_current() {
+        Ok(handle) => tokio::task::block_in_place(|| {
+            handle.block_on(async { context.execute_raw(request.payload).await })
+        }),
+        Err(_) => {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(_) => return 5,
+            };
+            runtime.block_on(async { context.execute_raw(request.payload).await })
+        }
+    };
+
+    let response = match payload {
+        Ok(payload) => bmux_plugin::HostKernelBridgeResponse { payload },
+        Err(_) => return 5,
+    };
+
+    let encoded = match bmux_plugin::encode_service_message(&response) {
+        Ok(value) => value,
+        Err(_) => return 5,
+    };
+
+    unsafe {
+        *output_len = encoded.len();
+    }
+    if output_ptr.is_null() || encoded.len() > output_capacity {
+        return 4;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+    }
+    0
+}
 
 mod attach;
 mod built_in_commands;
@@ -204,7 +289,7 @@ fn register_plugin_service_handlers(
             invoke_kind,
             service.interface_id.clone(),
             "*",
-            move |route, payload| {
+            move |route, invoke_context, payload| {
                 let provider = provider.clone();
                 let host = host.clone();
                 let available_capabilities = available_capabilities_for_handler.clone();
@@ -222,6 +307,8 @@ fn register_plugin_service_handlers(
                                     provider.declaration.id.as_str()
                                 )
                             })?;
+                    let _kernel_context_guard =
+                        enter_service_kernel_context(invoke_context.clone());
                     let response = loaded.invoke_service(&bmux_plugin::NativeServiceContext {
                         plugin_id: provider.declaration.id.as_str().to_string(),
                         request: ServiceRequest {
@@ -273,8 +360,8 @@ fn register_plugin_service_handlers(
                                     .map(|settings| (plugin_id.clone(), settings))
                             })
                             .collect(),
+                        host_kernel_bridge: Some(host_kernel_bridge as *const () as usize as u64),
                     })?;
-
                     if let Some(error) = response.error {
                         anyhow::bail!(error.message);
                     }
@@ -2974,6 +3061,7 @@ fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
         },
         settings: std::collections::BTreeMap::new(),
         plugin_settings_map: std::collections::BTreeMap::new(),
+        host_kernel_bridge: Some(host_kernel_bridge as *const () as usize as u64),
     })?;
     if let Some(error) = response.error {
         anyhow::bail!(error.message);

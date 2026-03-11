@@ -5,7 +5,11 @@
 use bmux_cli_output::{Table, TableColumn, write_table};
 use bmux_client::BmuxClient;
 use bmux_config::ConfigPaths;
-use bmux_ipc::{SessionPermissionSummary, SessionRole, SessionSelector};
+use bmux_ipc::{
+    ErrorCode, Request as KernelRequest, Response as KernelResponse,
+    ResponsePayload as KernelResponsePayload, SessionPermissionSummary, SessionRole,
+    SessionSelector,
+};
 use bmux_plugin::{
     CommandExecutionKind, HostScope, NativeCommandContext, NativeDescriptor, NativeServiceContext,
     PluginCommand, PluginCommandArgument, PluginCommandArgumentKind, PluginService, RustPlugin,
@@ -181,19 +185,22 @@ fn run_permission_query_service(context: &NativeServiceContext) -> ServiceRespon
         Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
     };
     let selector = parse_session_selector(&request.session);
-    with_client(
+    match call_kernel_request(
         context,
-        "bmux-permissions-plugin-service",
-        move |mut client| async move {
-            let permissions = client
-                .list_permissions(selector)
-                .await
-                .map_err(client_error)?;
-            Ok(encode_service_message(&ListPermissionsResponse {
-                permissions,
-            })?)
-        },
-    )
+        KernelRequest::ListPermissions { session: selector },
+    ) {
+        Ok(KernelResponsePayload::PermissionsList { permissions, .. }) => {
+            match encode_service_message(&ListPermissionsResponse { permissions }) {
+                Ok(payload) => ServiceResponse::ok(payload),
+                Err(error) => ServiceResponse::error("encode_failed", error.to_string()),
+            }
+        }
+        Ok(other) => ServiceResponse::error(
+            "unexpected_response",
+            format!("unexpected kernel response: {other:?}"),
+        ),
+        Err(error) => ServiceResponse::error("service_failed", error),
+    }
 }
 
 fn run_permission_command_service(context: &NativeServiceContext) -> ServiceResponse {
@@ -207,20 +214,26 @@ fn run_permission_command_service(context: &NativeServiceContext) -> ServiceResp
                     }
                 };
             let selector = parse_session_selector(&request.session);
-            with_client(
+            match call_kernel_request(
                 context,
-                "bmux-permissions-plugin-service",
-                move |mut client| async move {
-                    client
-                        .grant_role(selector, request.client_id, request.role)
-                        .await
-                        .map_err(client_error)?;
-                    Ok(encode_service_message(&GrantPermissionResponse {
-                        client_id: request.client_id,
-                        role: request.role,
-                    })?)
+                KernelRequest::GrantRole {
+                    session: selector,
+                    client_id: request.client_id,
+                    role: request.role,
                 },
-            )
+            ) {
+                Ok(KernelResponsePayload::RoleGranted {
+                    client_id, role, ..
+                }) => match encode_service_message(&GrantPermissionResponse { client_id, role }) {
+                    Ok(payload) => ServiceResponse::ok(payload),
+                    Err(error) => ServiceResponse::error("encode_failed", error.to_string()),
+                },
+                Ok(other) => ServiceResponse::error(
+                    "unexpected_response",
+                    format!("unexpected kernel response: {other:?}"),
+                ),
+                Err(error) => ServiceResponse::error("service_failed", error),
+            }
         }
         "revoke" => {
             let request =
@@ -231,19 +244,25 @@ fn run_permission_command_service(context: &NativeServiceContext) -> ServiceResp
                     }
                 };
             let selector = parse_session_selector(&request.session);
-            with_client(
+            match call_kernel_request(
                 context,
-                "bmux-permissions-plugin-service",
-                move |mut client| async move {
-                    client
-                        .revoke_role(selector, request.client_id)
-                        .await
-                        .map_err(client_error)?;
-                    Ok(encode_service_message(&RevokePermissionResponse {
-                        client_id: request.client_id,
-                    })?)
+                KernelRequest::RevokeRole {
+                    session: selector,
+                    client_id: request.client_id,
                 },
-            )
+            ) {
+                Ok(KernelResponsePayload::RoleRevoked { client_id, .. }) => {
+                    match encode_service_message(&RevokePermissionResponse { client_id }) {
+                        Ok(payload) => ServiceResponse::ok(payload),
+                        Err(error) => ServiceResponse::error("encode_failed", error.to_string()),
+                    }
+                }
+                Ok(other) => ServiceResponse::error(
+                    "unexpected_response",
+                    format!("unexpected kernel response: {other:?}"),
+                ),
+                Err(error) => ServiceResponse::error("service_failed", error),
+            }
         }
         _ => ServiceResponse::error(
             "unsupported_service_operation",
@@ -435,47 +454,102 @@ fn run_revoke_command(context: &NativeCommandContext) -> i32 {
     }
 }
 
-fn with_client<F, Fut>(
+fn call_kernel_request(
     context: &NativeServiceContext,
-    principal: &str,
-    operation: F,
-) -> ServiceResponse
-where
-    F: FnOnce(BmuxClient) -> Fut + Send + 'static,
-    Fut: std::future::Future<Output = bmux_plugin::Result<Vec<u8>>> + Send + 'static,
-{
+    request: KernelRequest,
+) -> Result<KernelResponsePayload, String> {
+    let response: KernelResponse = match context
+        .call_host_kernel_raw(bmux_ipc::encode(&request).map_err(|error| error.to_string())?)
+    {
+        Ok(response_bytes) => {
+            bmux_ipc::decode(&response_bytes).map_err(|error| error.to_string())?
+        }
+        Err(bmux_plugin::PluginError::UnsupportedHostOperation { operation })
+            if operation == "call_host_kernel" =>
+        {
+            call_kernel_request_via_client(context, request)?
+        }
+        Err(error) => return Err(error.to_string()),
+    };
+    match response {
+        KernelResponse::Ok(payload) => Ok(payload),
+        KernelResponse::Err(error) => {
+            let code = match error.code {
+                ErrorCode::NotFound => "not_found",
+                ErrorCode::InvalidRequest => "invalid_request",
+                ErrorCode::AlreadyExists => "already_exists",
+                ErrorCode::Timeout => "timeout",
+                ErrorCode::Internal => "internal",
+                ErrorCode::VersionMismatch => "version_mismatch",
+            };
+            Err(format!("{code}: {}", error.message))
+        }
+    }
+}
+
+fn call_kernel_request_via_client(
+    context: &NativeServiceContext,
+    request: KernelRequest,
+) -> Result<KernelResponse, String> {
     let paths = ConfigPaths::new(
         context.connection.config_dir.clone().into(),
         context.connection.runtime_dir.clone().into(),
         context.connection.data_dir.clone().into(),
     );
-    let principal = principal.to_string();
-
-    match std::thread::spawn(move || {
+    let request_name = "bmux-permissions-plugin-service-fallback".to_string();
+    let worker = std::thread::spawn(move || {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-            .map_err(|error| format!("runtime_error: {error}"))?;
+            .map_err(|error| error.to_string())?;
         runtime.block_on(async move {
-            let client = BmuxClient::connect_with_paths(&paths, &principal)
+            let mut client = BmuxClient::connect_with_paths(&paths, &request_name)
                 .await
-                .map_err(|error| format!("connect_failed: {error}"))?;
-            operation(client)
-                .await
-                .map_err(|error| format!("service_failed: {error}"))
+                .map_err(|error| error.to_string())?;
+            match request {
+                KernelRequest::ListPermissions { session } => {
+                    let permissions = client
+                        .list_permissions(session)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    Ok(KernelResponse::Ok(KernelResponsePayload::PermissionsList {
+                        session_id: Uuid::nil(),
+                        permissions,
+                    }))
+                }
+                KernelRequest::GrantRole {
+                    session,
+                    client_id,
+                    role,
+                } => {
+                    client
+                        .grant_role(session, client_id, role)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    Ok(KernelResponse::Ok(KernelResponsePayload::RoleGranted {
+                        session_id: Uuid::nil(),
+                        client_id,
+                        role,
+                    }))
+                }
+                KernelRequest::RevokeRole { session, client_id } => {
+                    client
+                        .revoke_role(session, client_id)
+                        .await
+                        .map_err(|error| error.to_string())?;
+                    Ok(KernelResponse::Ok(KernelResponsePayload::RoleRevoked {
+                        session_id: Uuid::nil(),
+                        client_id,
+                        role: SessionRole::Observer,
+                    }))
+                }
+                _ => Err("unsupported kernel fallback request".to_string()),
+            }
         })
-    })
-    .join()
-    {
-        Ok(Ok(payload)) => ServiceResponse::ok(payload),
-        Ok(Err(error)) => {
-            let mut split = error.splitn(2, ':');
-            let code = split.next().unwrap_or("service_failed").trim();
-            let message = split.next().unwrap_or("service invocation failed").trim();
-            ServiceResponse::error(code, message)
-        }
-        Err(_) => ServiceResponse::error("runtime_error", "service worker thread panicked"),
-    }
+    });
+    worker
+        .join()
+        .map_err(|_| "kernel fallback worker panicked".to_string())?
 }
 
 fn with_command_client<T, Fut>(
@@ -567,12 +641,6 @@ fn parse_session_selector(value: &str) -> SessionSelector {
     match Uuid::parse_str(value) {
         Ok(id) => SessionSelector::ById(id),
         Err(_) => SessionSelector::ByName(value.to_string()),
-    }
-}
-
-fn client_error(error: bmux_client::ClientError) -> bmux_plugin::PluginError {
-    bmux_plugin::PluginError::ServiceProtocol {
-        details: error.to_string(),
     }
 }
 
