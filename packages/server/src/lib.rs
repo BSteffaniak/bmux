@@ -79,7 +79,7 @@ pub struct ServiceRoute {
 }
 
 type ServiceInvokeFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send>>;
-type ServiceInvokeHandler = dyn Fn(Vec<u8>) -> ServiceInvokeFuture + Send + Sync;
+type ServiceInvokeHandler = dyn Fn(ServiceRoute, Vec<u8>) -> ServiceInvokeFuture + Send + Sync;
 type ServiceResolverHandler = dyn Fn(ServiceRoute, Vec<u8>) -> ServiceInvokeFuture + Send + Sync;
 
 #[derive(Default)]
@@ -89,10 +89,15 @@ struct ServiceRegistry {
 
 impl ServiceRegistry {
     fn dispatch(&self, route: &ServiceRoute, payload: Vec<u8>) -> Option<ServiceInvokeFuture> {
+        if let Some(handler) = self.handlers.get(route).cloned() {
+            return Some(handler(route.clone(), payload));
+        }
+        let mut wildcard = route.clone();
+        wildcard.operation = "*".to_string();
         self.handlers
-            .get(route)
+            .get(&wildcard)
             .cloned()
-            .map(|handler| handler(payload))
+            .map(|handler| handler(route.clone(), payload))
     }
 }
 
@@ -2555,7 +2560,7 @@ impl BmuxServer {
         handler: F,
     ) -> Result<()>
     where
-        F: Fn(Vec<u8>) -> Fut + Send + Sync + 'static,
+        F: Fn(ServiceRoute, Vec<u8>) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = Result<Vec<u8>>> + Send + 'static,
     {
         let route = ServiceRoute {
@@ -2565,7 +2570,7 @@ impl BmuxServer {
             operation: operation.into(),
         };
         let wrapped: Arc<ServiceInvokeHandler> =
-            Arc::new(move |payload| Box::pin(handler(payload)));
+            Arc::new(move |route, payload| Box::pin(handler(route, payload)));
 
         let mut registry = self
             .state

@@ -13,8 +13,8 @@ use anyhow::{Context, Result};
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout, TerminfoAutoInstall};
 use bmux_ipc::{
-    AttachViewComponent, PaneFocusDirection, PaneSplitDirection, SessionRole, SessionSelector,
-    SessionSummary, WindowSelector,
+    AttachViewComponent, InvokeServiceKind, PaneFocusDirection, PaneSplitDirection, SessionRole,
+    SessionSelector, SessionSummary, WindowSelector,
 };
 use bmux_keybind::action_to_name;
 use bmux_plugin::{
@@ -147,6 +147,170 @@ fn available_service_descriptors(
             .map(|provider| provider.service),
     );
     Ok(services)
+}
+
+fn invoke_kind_from_service_kind(kind: ServiceKind) -> Option<InvokeServiceKind> {
+    match kind {
+        ServiceKind::Query => Some(InvokeServiceKind::Query),
+        ServiceKind::Command => Some(InvokeServiceKind::Command),
+        ServiceKind::Event => None,
+    }
+}
+
+fn register_plugin_service_handlers(
+    server: &BmuxServer,
+    config: &BmuxConfig,
+    paths: &ConfigPaths,
+    registry: &PluginRegistry,
+) -> Result<()> {
+    let available_capabilities = available_capability_providers(config, registry)?;
+    let services = available_service_descriptors(config, registry)?;
+    let plugin_search_roots = resolve_plugin_search_paths(config, paths)?
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let connection_info = bmux_plugin::HostConnectionInfo {
+        config_dir: paths.config_dir.to_string_lossy().into_owned(),
+        runtime_dir: paths.runtime_dir.to_string_lossy().into_owned(),
+        data_dir: paths.data_dir.to_string_lossy().into_owned(),
+    };
+    let available_capability_names = available_capabilities
+        .keys()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+
+    for service in services {
+        let Some(invoke_kind) = invoke_kind_from_service_kind(service.kind) else {
+            continue;
+        };
+        let bmux_plugin::ProviderId::Plugin(provider_plugin_id) = service.provider.clone() else {
+            continue;
+        };
+        let Some(provider) = registry.get(&provider_plugin_id) else {
+            continue;
+        };
+
+        let provider = provider.clone();
+        let host = plugin_host_metadata();
+        let available_capabilities_for_handler = available_capabilities.clone();
+        let services_for_handler = available_service_descriptors(config, registry)?;
+        let capability_names_for_handler = available_capability_names.clone();
+        let plugin_search_roots_for_handler = plugin_search_roots.clone();
+        let config_for_handler = config.clone();
+        let connection_info_for_handler = connection_info.clone();
+
+        server.register_service_handler(
+            service.capability.as_str().to_string(),
+            invoke_kind,
+            service.interface_id.clone(),
+            "*",
+            move |route, payload| {
+                let provider = provider.clone();
+                let host = host.clone();
+                let available_capabilities = available_capabilities_for_handler.clone();
+                let services = services_for_handler.clone();
+                let capability_names = capability_names_for_handler.clone();
+                let plugin_search_roots = plugin_search_roots_for_handler.clone();
+                let config = config_for_handler.clone();
+                let connection = connection_info_for_handler.clone();
+                async move {
+                    let loaded =
+                        load_native_registered_plugin(&provider, &host, &available_capabilities)
+                            .with_context(|| {
+                                format!(
+                                    "failed loading service provider plugin '{}'",
+                                    provider.declaration.id.as_str()
+                                )
+                            })?;
+                    let response = loaded.invoke_service(&bmux_plugin::NativeServiceContext {
+                        plugin_id: provider.declaration.id.as_str().to_string(),
+                        request: ServiceRequest {
+                            caller_plugin_id: "bmux.core".to_string(),
+                            service: RegisteredService {
+                                capability: HostScope::new(route.capability.as_str())?,
+                                kind: match route.kind {
+                                    InvokeServiceKind::Query => ServiceKind::Query,
+                                    InvokeServiceKind::Command => ServiceKind::Command,
+                                },
+                                interface_id: route.interface_id,
+                                provider: bmux_plugin::ProviderId::Plugin(
+                                    provider.declaration.id.as_str().to_string(),
+                                ),
+                            },
+                            operation: route.operation,
+                            payload,
+                        },
+                        required_capabilities: provider
+                            .declaration
+                            .required_capabilities
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect(),
+                        provided_capabilities: provider
+                            .declaration
+                            .provided_capabilities
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect(),
+                        services,
+                        available_capabilities: capability_names,
+                        enabled_plugins: config.plugins.enabled.clone(),
+                        plugin_search_roots,
+                        host,
+                        connection,
+                        settings: config
+                            .plugins
+                            .settings
+                            .get(provider.declaration.id.as_str())
+                            .and_then(parse_plugin_settings_value)
+                            .unwrap_or_default(),
+                        plugin_settings_map: config
+                            .plugins
+                            .settings
+                            .iter()
+                            .filter_map(|(plugin_id, value)| {
+                                parse_plugin_settings_value(value)
+                                    .map(|settings| (plugin_id.clone(), settings))
+                            })
+                            .collect(),
+                    })?;
+
+                    if let Some(error) = response.error {
+                        anyhow::bail!(error.message);
+                    }
+
+                    Ok(response.payload)
+                }
+            },
+        )?;
+    }
+
+    Ok(())
+}
+
+fn parse_plugin_settings_value(
+    value: &toml::Value,
+) -> Option<std::collections::BTreeMap<String, String>> {
+    let table = value.as_table()?;
+    let mut parsed = std::collections::BTreeMap::new();
+    for (key, entry) in table {
+        match entry {
+            toml::Value::String(v) => {
+                parsed.insert(key.clone(), v.clone());
+            }
+            toml::Value::Integer(v) => {
+                parsed.insert(key.clone(), v.to_string());
+            }
+            toml::Value::Float(v) => {
+                parsed.insert(key.clone(), v.to_string());
+            }
+            toml::Value::Boolean(v) => {
+                parsed.insert(key.clone(), v.to_string());
+            }
+            _ => {}
+        }
+    }
+    Some(parsed)
 }
 
 fn service_descriptors_from_declarations<'a>(
@@ -651,6 +815,7 @@ async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8>
     activate_loaded_plugins(&loaded_plugins, &config, &paths)?;
     dispatch_loaded_plugin_event(&loaded_plugins, plugin_system_event("server_starting"))?;
     let server = BmuxServer::from_default_paths();
+    register_plugin_service_handlers(&server, &config, &paths, &registry)?;
     write_server_pid_file(std::process::id())?;
     write_server_runtime_metadata(std::process::id())?;
     dispatch_loaded_plugin_event(&loaded_plugins, plugin_system_event("server_started"))?;
