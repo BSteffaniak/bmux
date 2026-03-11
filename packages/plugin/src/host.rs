@@ -238,7 +238,6 @@ pub trait PluginHost: Send + Sync {
     fn client_queries(&self) -> &dyn ClientQueryService;
     fn render(&self) -> &dyn RenderService;
     fn config(&self) -> &dyn ConfigService;
-    fn storage(&self) -> &dyn PluginStorage;
     fn clipboard(&self) -> &dyn ClipboardService;
 }
 
@@ -263,11 +262,6 @@ pub trait RenderService: Send + Sync {
 
 pub trait ConfigService: Send + Sync {
     fn plugin_settings(&self, plugin_id: &str) -> Result<BTreeMap<String, Value>>;
-}
-
-pub trait PluginStorage: Send + Sync {
-    fn get(&self, plugin_id: &str, key: &str) -> Result<Option<Vec<u8>>>;
-    fn set(&self, plugin_id: &str, key: &str, value: Vec<u8>) -> Result<()>;
 }
 
 pub trait ClipboardService: Send + Sync {
@@ -307,15 +301,6 @@ mod tests {
     impl ConfigService for MockNoop {
         fn plugin_settings(&self, _plugin_id: &str) -> Result<BTreeMap<String, Value>> {
             Ok(BTreeMap::new())
-        }
-    }
-
-    impl PluginStorage for MockNoop {
-        fn get(&self, _plugin_id: &str, _key: &str) -> Result<Option<Vec<u8>>> {
-            Ok(None)
-        }
-        fn set(&self, _plugin_id: &str, _key: &str, _value: Vec<u8>) -> Result<()> {
-            Ok(())
         }
     }
 
@@ -391,9 +376,6 @@ mod tests {
             &self.noop
         }
         fn config(&self) -> &dyn ConfigService {
-            &self.noop
-        }
-        fn storage(&self) -> &dyn PluginStorage {
             &self.noop
         }
         fn clipboard(&self) -> &dyn ClipboardService {

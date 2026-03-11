@@ -4,8 +4,7 @@ use bmux_ipc::SessionRole;
 use bmux_plugin::{
     ClientQueryService, ClientSummary, ClipboardService, ConfigService, EventService,
     HostConnectionInfo, HostMetadata, HostScope, PluginError, PluginEvent, PluginHost,
-    PluginStorage, PrincipalIdentityInfo, RegisteredService, RenderService, SessionHandle,
-    SessionRoleValue,
+    PrincipalIdentityInfo, RegisteredService, RenderService, SessionHandle, SessionRoleValue,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use toml::Value;
@@ -154,10 +153,6 @@ impl PluginHost for CliPluginHost {
         self
     }
 
-    fn storage(&self) -> &dyn PluginStorage {
-        self
-    }
-
     fn clipboard(&self) -> &dyn ClipboardService {
         self
     }
@@ -239,18 +234,6 @@ impl ConfigService for CliPluginHost {
     }
 }
 
-impl PluginStorage for CliPluginHost {
-    fn get(&self, _plugin_id: &str, _key: &str) -> bmux_plugin::Result<Option<Vec<u8>>> {
-        self.assert_capability("bmux.storage", "storage.get")?;
-        Err(unsupported_operation("storage_get"))
-    }
-
-    fn set(&self, _plugin_id: &str, _key: &str, _value: Vec<u8>) -> bmux_plugin::Result<()> {
-        self.assert_capability("bmux.storage", "storage.set")?;
-        Err(unsupported_operation("storage_set"))
-    }
-}
-
 impl ClipboardService for CliPluginHost {
     fn copy_text(&self, _text: &str) -> bmux_plugin::Result<()> {
         self.assert_capability("bmux.clipboard", "clipboard.copy")?;
@@ -264,7 +247,7 @@ mod tests {
     use bmux_config::{BmuxConfig, ConfigPaths};
     use bmux_plugin::{
         CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, ClipboardService, HostMetadata,
-        HostScope, PluginHost, PluginStorage, RegisteredService, ServiceKind,
+        HostScope, PluginHost, RegisteredService, ServiceKind,
     };
     use std::collections::BTreeSet;
     use std::path::PathBuf;
@@ -364,12 +347,8 @@ mod tests {
     }
 
     #[test]
-    fn storage_and_clipboard_checks_happen_before_unsupported_operation() {
+    fn clipboard_checks_happen_before_unsupported_operation() {
         let host = host(&[], &[], Vec::new());
-        let storage_error = PluginStorage::get(&host, "example.plugin", "key")
-            .expect_err("storage should require capability");
-        assert!(storage_error.to_string().contains("bmux.storage"));
-
         let clipboard_error = ClipboardService::copy_text(&host, "hello")
             .expect_err("clipboard should require capability");
         assert!(clipboard_error.to_string().contains("bmux.clipboard"));

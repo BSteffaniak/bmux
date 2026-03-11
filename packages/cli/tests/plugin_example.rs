@@ -666,6 +666,48 @@ fn installs_example_plugin_and_runs_command() {
         "config service output should include configured values: {settings_stdout}"
     );
 
+    let storage_put_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &["storage-put", "favorite", "neon"],
+    );
+    assert!(
+        storage_put_output.status.success(),
+        "storage put command should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&storage_put_output.stdout),
+        String::from_utf8_lossy(&storage_put_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&storage_put_output.stdout).contains("stored key: favorite"),
+        "storage put output should confirm key write: {}",
+        String::from_utf8_lossy(&storage_put_output.stdout)
+    );
+
+    let storage_get_output = run_bmux(
+        &root,
+        &home_dir,
+        &config_home,
+        &data_home,
+        &runtime_dir,
+        &tmp_dir,
+        &["storage-get", "favorite"],
+    );
+    assert!(
+        storage_get_output.status.success(),
+        "storage get command should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&storage_get_output.stdout),
+        String::from_utf8_lossy(&storage_get_output.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&storage_get_output.stdout).contains("favorite = neon"),
+        "storage get output should include stored value: {}",
+        String::from_utf8_lossy(&storage_get_output.stdout)
+    );
+
     shutdown_tx
         .send(())
         .expect("target client shutdown signal should send");

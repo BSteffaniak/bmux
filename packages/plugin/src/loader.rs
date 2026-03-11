@@ -12,6 +12,7 @@ use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, c_char};
+use std::fs;
 use std::path::{Path, PathBuf};
 
 type NativeDescriptorFn = unsafe extern "C" fn() -> *const c_char;
@@ -33,6 +34,22 @@ struct CorePluginSettingsRequest {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct CorePluginSettingsResponse {
     settings: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CoreStorageGetRequest {
+    key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CoreStorageGetResponse {
+    value: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CoreStorageSetRequest {
+    key: String,
+    value: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -256,7 +273,14 @@ fn call_service_raw(
         })?;
 
     if matches!(service.provider, crate::ProviderId::Host) {
-        return handle_core_service_call(service, operation, payload, plugin_settings_map);
+        return handle_core_service_call(
+            caller_plugin_id,
+            connection,
+            service,
+            operation,
+            payload,
+            plugin_settings_map,
+        );
     }
 
     let search_roots = plugin_search_roots
@@ -381,6 +405,8 @@ fn deserialize_plugin_settings_map(
 }
 
 fn handle_core_service_call(
+    caller_plugin_id: &str,
+    connection: &HostConnectionInfo,
     service: RegisteredService,
     operation: &str,
     payload: Vec<u8>,
@@ -392,10 +418,59 @@ fn handle_core_service_call(
             let settings = serialize_plugin_settings(plugin_settings_map.get(&request.plugin_id));
             encode_service_message(&CorePluginSettingsResponse { settings })
         }
+        ("storage-query/v1", "get") => {
+            let request: CoreStorageGetRequest = decode_service_message(&payload)?;
+            validate_storage_key(&request.key)?;
+            let path = storage_file_path(connection, caller_plugin_id, &request.key);
+            let value = match fs::read(path) {
+                Ok(bytes) => Some(bytes),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => {
+                    return Err(PluginError::ServiceProtocol {
+                        details: format!("failed reading storage value: {error}"),
+                    });
+                }
+            };
+            encode_service_message(&CoreStorageGetResponse { value })
+        }
+        ("storage-command/v1", "set") => {
+            let request: CoreStorageSetRequest = decode_service_message(&payload)?;
+            validate_storage_key(&request.key)?;
+            let path = storage_file_path(connection, caller_plugin_id, &request.key);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).map_err(|error| PluginError::ServiceProtocol {
+                    details: format!("failed creating storage directory: {error}"),
+                })?;
+            }
+            fs::write(path, request.value).map_err(|error| PluginError::ServiceProtocol {
+                details: format!("failed writing storage value: {error}"),
+            })?;
+            encode_service_message(&())
+        }
         _ => Err(PluginError::UnsupportedHostOperation {
             operation: "call_service",
         }),
     }
+}
+
+fn storage_file_path(connection: &HostConnectionInfo, plugin_id: &str, key: &str) -> PathBuf {
+    PathBuf::from(&connection.data_dir)
+        .join("plugin-storage")
+        .join(plugin_id)
+        .join(format!("{key}.bin"))
+}
+
+fn validate_storage_key(key: &str) -> Result<()> {
+    if key.is_empty()
+        || !key
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Err(PluginError::ServiceProtocol {
+            details: "storage key must be non-empty and use [A-Za-z0-9._-]".to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1292,6 +1367,83 @@ minimum = "1.0"
             response.settings.get("greeting"),
             Some(&"\"hello\"".to_string())
         );
+    }
+
+    #[test]
+    fn command_context_calls_core_storage_service() {
+        let storage_root =
+            std::env::temp_dir().join(format!("bmux-plugin-storage-test-{}", uuid::Uuid::new_v4()));
+        let context = super::NativeCommandContext {
+            plugin_id: "caller.plugin".to_string(),
+            command: "hello".to_string(),
+            arguments: Vec::new(),
+            required_capabilities: vec!["bmux.storage".to_string()],
+            provided_capabilities: Vec::new(),
+            services: vec![
+                crate::RegisteredService {
+                    capability: crate::HostScope::new("bmux.storage")
+                        .expect("capability should parse"),
+                    kind: crate::ServiceKind::Command,
+                    interface_id: "storage-command/v1".to_string(),
+                    provider: crate::ProviderId::Host,
+                },
+                crate::RegisteredService {
+                    capability: crate::HostScope::new("bmux.storage")
+                        .expect("capability should parse"),
+                    kind: crate::ServiceKind::Query,
+                    interface_id: "storage-query/v1".to_string(),
+                    provider: crate::ProviderId::Host,
+                },
+            ],
+            available_capabilities: vec!["bmux.storage".to_string()],
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: crate::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: storage_root.to_string_lossy().to_string(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+        };
+
+        context
+            .call_service_raw(
+                "bmux.storage",
+                crate::ServiceKind::Command,
+                "storage-command/v1",
+                "set",
+                encode_service_message(&super::CoreStorageSetRequest {
+                    key: "theme".to_string(),
+                    value: b"sunset".to_vec(),
+                })
+                .expect("set request should encode"),
+            )
+            .expect("core storage set should succeed");
+
+        let bytes = context
+            .call_service_raw(
+                "bmux.storage",
+                crate::ServiceKind::Query,
+                "storage-query/v1",
+                "get",
+                encode_service_message(&super::CoreStorageGetRequest {
+                    key: "theme".to_string(),
+                })
+                .expect("get request should encode"),
+            )
+            .expect("core storage get should succeed");
+        let response: super::CoreStorageGetResponse =
+            decode_service_message(&bytes).expect("get response should decode");
+        assert_eq!(response.value, Some(b"sunset".to_vec()));
+
+        let _ = std::fs::remove_dir_all(storage_root);
     }
 
     #[test]

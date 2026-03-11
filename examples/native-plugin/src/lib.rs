@@ -34,6 +34,7 @@ impl RustPlugin for ExamplePlugin {
                 HostScope::new("bmux.commands").expect("host scope should parse"),
                 HostScope::new("bmux.events.subscribe").expect("host scope should parse"),
                 HostScope::new("bmux.config.read").expect("host scope should parse"),
+                HostScope::new("bmux.storage").expect("host scope should parse"),
                 HostScope::new("bmux.permissions.read").expect("host scope should parse"),
                 HostScope::new("bmux.permissions.write").expect("host scope should parse"),
                 HostScope::new("bmux.windows.read").expect("host scope should parse"),
@@ -143,6 +144,34 @@ impl RustPlugin for ExamplePlugin {
                 )
                 .execution(CommandExecutionKind::ProviderExec)
                 .expose_in_cli(true),
+                PluginCommand::new(
+                    "storage-put",
+                    "Store a key/value through bmux storage service",
+                )
+                .argument(
+                    PluginCommandArgument::positional("key", PluginCommandArgumentKind::String)
+                        .required(true)
+                        .summary("Storage key"),
+                )
+                .argument(
+                    PluginCommandArgument::positional("value", PluginCommandArgumentKind::String)
+                        .position(1)
+                        .required(true)
+                        .multiple(true)
+                        .trailing_var_arg(true)
+                        .allow_hyphen_values(true)
+                        .summary("Storage value"),
+                )
+                .execution(CommandExecutionKind::ProviderExec)
+                .expose_in_cli(true),
+                PluginCommand::new("storage-get", "Read a key through bmux storage service")
+                    .argument(
+                        PluginCommandArgument::positional("key", PluginCommandArgumentKind::String)
+                            .required(true)
+                            .summary("Storage key"),
+                    )
+                    .execution(CommandExecutionKind::ProviderExec)
+                    .expose_in_cli(true),
             ],
             event_subscriptions: vec![PluginEventSubscription {
                 kinds: BTreeSet::from([PluginEventKind::System, PluginEventKind::Window]),
@@ -178,6 +207,8 @@ impl RustPlugin for ExamplePlugin {
             "windows-list" => run_windows_list(&context),
             "windows-new" => run_windows_new(&context),
             "settings-show" => run_settings_show(&context),
+            "storage-put" => run_storage_put(&context),
+            "storage-get" => run_storage_get(&context),
             "hello" => {
                 if context.arguments.is_empty() {
                     println!("example.native: hello from bmux plugin");
@@ -500,6 +531,67 @@ fn run_settings_show(context: &NativeCommandContext) -> i32 {
     0
 }
 
+fn run_storage_put(context: &NativeCommandContext) -> i32 {
+    let Some(key) = context.arguments.first() else {
+        eprintln!("example.native storage-put requires a key");
+        return 64;
+    };
+    if context.arguments.len() < 2 {
+        eprintln!("example.native storage-put requires a value");
+        return 64;
+    }
+    let value = context.arguments[1..].join(" ").into_bytes();
+
+    let result = context.call_service::<StorageSetRequest, ()>(
+        "bmux.storage",
+        ServiceKind::Command,
+        "storage-command/v1",
+        "set",
+        &StorageSetRequest {
+            key: key.to_string(),
+            value,
+        },
+    );
+    if let Err(error) = result {
+        eprintln!("example.native: failed writing storage through service: {error}");
+        return 1;
+    }
+
+    println!("stored key: {key}");
+    0
+}
+
+fn run_storage_get(context: &NativeCommandContext) -> i32 {
+    let Some(key) = context.arguments.first() else {
+        eprintln!("example.native storage-get requires a key");
+        return 64;
+    };
+    let response = match context.call_service::<StorageGetRequest, StorageGetResponse>(
+        "bmux.storage",
+        ServiceKind::Query,
+        "storage-query/v1",
+        "get",
+        &StorageGetRequest {
+            key: key.to_string(),
+        },
+    ) {
+        Ok(response) => response,
+        Err(error) => {
+            eprintln!("example.native: failed reading storage through service: {error}");
+            return 1;
+        }
+    };
+
+    match response.value {
+        Some(value) => {
+            let text = String::from_utf8_lossy(&value);
+            println!("{key} = {text}");
+        }
+        None => println!("{key} is not set"),
+    }
+    0
+}
+
 fn write_stdout_table(table: &Table) -> std::io::Result<()> {
     let mut stdout = std::io::stdout().lock();
     write_table(&mut stdout, table)
@@ -570,6 +662,22 @@ struct PluginSettingsResponse {
     settings: std::collections::BTreeMap<String, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StorageSetRequest {
+    key: String,
+    value: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StorageGetRequest {
+    key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StorageGetResponse {
+    value: Option<Vec<u8>>,
+}
+
 fn session_role_name(role: bmux_ipc::SessionRole) -> &'static str {
     match role {
         bmux_ipc::SessionRole::Owner => "owner",
@@ -601,6 +709,6 @@ mod tests {
         let reparsed = bmux_plugin::NativeDescriptor::from_toml_str(&serialized)
             .expect("descriptor should parse");
         assert_eq!(reparsed.id, "example.native");
-        assert_eq!(reparsed.commands.len(), 7);
+        assert_eq!(reparsed.commands.len(), 9);
     }
 }

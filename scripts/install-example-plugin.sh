@@ -112,7 +112,7 @@ name = "Example Native Plugin"
 version = "0.0.1-alpha.0"
 runtime = "native"
 entry = "${LIB_PATH}"
-required_capabilities = ["bmux.commands", "bmux.config.read", "bmux.events.subscribe", "bmux.permissions.read", "bmux.permissions.write", "bmux.windows.read", "bmux.windows.write"]
+required_capabilities = ["bmux.commands", "bmux.config.read", "bmux.events.subscribe", "bmux.storage", "bmux.permissions.read", "bmux.permissions.write", "bmux.windows.read", "bmux.windows.write"]
 provided_features = ["example.native"]
 
 [[dependencies]]
@@ -250,6 +250,45 @@ name = "settings-show"
 summary = "Show plugin settings through bmux config service"
 execution = "provider_exec"
 expose_in_cli = true
+
+[[commands]]
+name = "storage-put"
+summary = "Store a key/value through bmux storage service"
+execution = "provider_exec"
+expose_in_cli = true
+
+[[commands.arguments]]
+name = "key"
+kind = "string"
+position = 0
+required = true
+summary = "Storage key"
+value_name = "KEY"
+
+[[commands.arguments]]
+name = "value"
+kind = "string"
+position = 1
+required = true
+multiple = true
+trailing_var_arg = true
+allow_hyphen_values = true
+summary = "Storage value"
+value_name = "VALUE"
+
+[[commands]]
+name = "storage-get"
+summary = "Read a key through bmux storage service"
+execution = "provider_exec"
+expose_in_cli = true
+
+[[commands.arguments]]
+name = "key"
+kind = "string"
+position = 0
+required = true
+summary = "Storage key"
+value_name = "KEY"
 
 [[event_subscriptions]]
 kinds = ["system", "window"]

@@ -105,12 +105,26 @@ fn core_provided_capabilities() -> Vec<HostScope> {
 }
 
 fn core_service_descriptors() -> Vec<RegisteredService> {
-    vec![RegisteredService {
-        capability: HostScope::new("bmux.config.read").expect("capability should parse"),
-        kind: ServiceKind::Query,
-        interface_id: "config-query/v1".to_string(),
-        provider: bmux_plugin::ProviderId::Host,
-    }]
+    vec![
+        RegisteredService {
+            capability: HostScope::new("bmux.config.read").expect("capability should parse"),
+            kind: ServiceKind::Query,
+            interface_id: "config-query/v1".to_string(),
+            provider: bmux_plugin::ProviderId::Host,
+        },
+        RegisteredService {
+            capability: HostScope::new("bmux.storage").expect("capability should parse"),
+            kind: ServiceKind::Query,
+            interface_id: "storage-query/v1".to_string(),
+            provider: bmux_plugin::ProviderId::Host,
+        },
+        RegisteredService {
+            capability: HostScope::new("bmux.storage").expect("capability should parse"),
+            kind: ServiceKind::Command,
+            interface_id: "storage-command/v1".to_string(),
+            provider: bmux_plugin::ProviderId::Host,
+        },
+    ]
 }
 
 fn available_capability_providers(
@@ -5601,12 +5615,24 @@ mod tests {
             context.provided_capabilities,
             vec!["example.provider.write".to_string()]
         );
-        assert_eq!(context.services.len(), 2);
+        assert_eq!(context.services.len(), 4);
         assert!(
             context
                 .services
                 .iter()
                 .any(|service| service.interface_id == "config-query/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "storage-query/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "storage-command/v1")
         );
         assert!(
             context
@@ -5700,12 +5726,24 @@ mod tests {
                 "example.provider.write".to_string()
             ]
         );
-        assert_eq!(context.services.len(), 3);
+        assert_eq!(context.services.len(), 5);
         assert!(
             context
                 .services
                 .iter()
                 .any(|service| service.interface_id == "config-query/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "storage-query/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "storage-command/v1")
         );
     }
 

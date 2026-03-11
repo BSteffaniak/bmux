@@ -6,6 +6,7 @@ required_capabilities = [
     "bmux.commands",
     "bmux.config.read",
     "bmux.events.subscribe",
+    "bmux.storage",
     "bmux.permissions.read",
     "bmux.permissions.write",
     "bmux.windows.read",
@@ -141,6 +142,45 @@ execution     = "provider_exec"
 expose_in_cli = true
 name          = "settings-show"
 summary       = "Show plugin settings through bmux config service"
+
+[[commands]]
+execution     = "provider_exec"
+expose_in_cli = true
+name          = "storage-put"
+summary       = "Store a key/value through bmux storage service"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "key"
+position   = 0
+required   = true
+summary    = "Storage key"
+value_name = "KEY"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "value"
+position            = 1
+required            = true
+summary             = "Storage value"
+trailing_var_arg    = true
+value_name          = "VALUE"
+
+[[commands]]
+execution     = "provider_exec"
+expose_in_cli = true
+name          = "storage-get"
+summary       = "Read a key through bmux storage service"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "key"
+position   = 0
+required   = true
+summary    = "Storage key"
+value_name = "KEY"
 
 [[event_subscriptions]]
 kinds = ["system", "window"]
