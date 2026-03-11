@@ -37,7 +37,7 @@ pub use discovery::{
 pub use error::{PluginError, Result};
 pub use event::{PluginEvent, PluginEventKind, PluginEventPayload, PluginEventSubscription};
 pub use host::{
-    ClientQueryService, ClientSummary, ClipboardService, ConfigService, EventService, FollowState,
+    ClientQueryService, ClientSummary, ConfigService, EventService, FollowState,
     HostConnectionInfo, HostMetadata, PaneFocusDirection, PaneHandle, PaneLayoutNode, PaneRef,
     PaneSnapshot, PaneSplitDirection, PaneSummary, PermissionEntry, PersistenceRestorePreview,
     PersistenceRestoreResult, PersistenceStatus, PluginContext, PluginHost, PrincipalIdentityInfo,

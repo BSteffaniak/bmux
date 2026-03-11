@@ -2,9 +2,9 @@ use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::SessionRole;
 use bmux_plugin::{
-    ClientQueryService, ClientSummary, ClipboardService, ConfigService, EventService,
-    HostConnectionInfo, HostMetadata, HostScope, PluginError, PluginEvent, PluginHost,
-    PrincipalIdentityInfo, RegisteredService, RenderService, SessionHandle, SessionRoleValue,
+    ClientQueryService, ClientSummary, ConfigService, EventService, HostConnectionInfo,
+    HostMetadata, HostScope, PluginError, PluginEvent, PluginHost, PrincipalIdentityInfo,
+    RegisteredService, RenderService, SessionHandle, SessionRoleValue,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use toml::Value;
@@ -152,10 +152,6 @@ impl PluginHost for CliPluginHost {
     fn config(&self) -> &dyn ConfigService {
         self
     }
-
-    fn clipboard(&self) -> &dyn ClipboardService {
-        self
-    }
 }
 
 impl EventService for CliPluginHost {
@@ -234,20 +230,13 @@ impl ConfigService for CliPluginHost {
     }
 }
 
-impl ClipboardService for CliPluginHost {
-    fn copy_text(&self, _text: &str) -> bmux_plugin::Result<()> {
-        self.assert_capability("bmux.clipboard", "clipboard.copy")?;
-        Err(unsupported_operation("clipboard_copy"))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::CliPluginHost;
     use bmux_config::{BmuxConfig, ConfigPaths};
     use bmux_plugin::{
-        CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, ClipboardService, HostMetadata,
-        HostScope, PluginHost, RegisteredService, ServiceKind,
+        CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostMetadata, HostScope,
+        PluginHost, RegisteredService, ServiceKind,
     };
     use std::collections::BTreeSet;
     use std::path::PathBuf;
@@ -344,13 +333,5 @@ mod tests {
         )
         .expect_err("missing service registration should fail");
         assert!(error.to_string().contains("resolve_service"));
-    }
-
-    #[test]
-    fn clipboard_checks_happen_before_unsupported_operation() {
-        let host = host(&[], &[], Vec::new());
-        let clipboard_error = ClipboardService::copy_text(&host, "hello")
-            .expect_err("clipboard should require capability");
-        assert!(clipboard_error.to_string().contains("bmux.clipboard"));
     }
 }

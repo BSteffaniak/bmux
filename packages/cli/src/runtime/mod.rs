@@ -124,6 +124,12 @@ fn core_service_descriptors() -> Vec<RegisteredService> {
             interface_id: "storage-command/v1".to_string(),
             provider: bmux_plugin::ProviderId::Host,
         },
+        RegisteredService {
+            capability: HostScope::new("bmux.clipboard").expect("capability should parse"),
+            kind: ServiceKind::Command,
+            interface_id: "clipboard-command/v1".to_string(),
+            provider: bmux_plugin::ProviderId::Host,
+        },
     ]
 }
 
@@ -5615,7 +5621,7 @@ mod tests {
             context.provided_capabilities,
             vec!["example.provider.write".to_string()]
         );
-        assert_eq!(context.services.len(), 4);
+        assert_eq!(context.services.len(), 5);
         assert!(
             context
                 .services
@@ -5633,6 +5639,12 @@ mod tests {
                 .services
                 .iter()
                 .any(|service| service.interface_id == "storage-command/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "clipboard-command/v1")
         );
         assert!(
             context
@@ -5726,7 +5738,7 @@ mod tests {
                 "example.provider.write".to_string()
             ]
         );
-        assert_eq!(context.services.len(), 5);
+        assert_eq!(context.services.len(), 6);
         assert!(
             context
                 .services
@@ -5744,6 +5756,12 @@ mod tests {
                 .services
                 .iter()
                 .any(|service| service.interface_id == "storage-command/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "clipboard-command/v1")
         );
     }
 

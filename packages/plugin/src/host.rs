@@ -238,7 +238,6 @@ pub trait PluginHost: Send + Sync {
     fn client_queries(&self) -> &dyn ClientQueryService;
     fn render(&self) -> &dyn RenderService;
     fn config(&self) -> &dyn ConfigService;
-    fn clipboard(&self) -> &dyn ClipboardService;
 }
 
 pub struct PluginContext<'a> {
@@ -262,10 +261,6 @@ pub trait RenderService: Send + Sync {
 
 pub trait ConfigService: Send + Sync {
     fn plugin_settings(&self, plugin_id: &str) -> Result<BTreeMap<String, Value>>;
-}
-
-pub trait ClipboardService: Send + Sync {
-    fn copy_text(&self, text: &str) -> Result<()>;
 }
 
 #[cfg(test)]
@@ -301,12 +296,6 @@ mod tests {
     impl ConfigService for MockNoop {
         fn plugin_settings(&self, _plugin_id: &str) -> Result<BTreeMap<String, Value>> {
             Ok(BTreeMap::new())
-        }
-    }
-
-    impl ClipboardService for MockNoop {
-        fn copy_text(&self, _text: &str) -> Result<()> {
-            Ok(())
         }
     }
 
@@ -376,9 +365,6 @@ mod tests {
             &self.noop
         }
         fn config(&self) -> &dyn ConfigService {
-            &self.noop
-        }
-        fn clipboard(&self) -> &dyn ClipboardService {
             &self.noop
         }
     }

@@ -12,14 +12,15 @@ version     = { workspace = true }
 
 [dependencies]
 # External dependencies
-libloading = { workspace = true }
-postcard   = { workspace = true, features = ["alloc"] }
-semver     = { workspace = true }
-serde      = { workspace = true, features = ["derive", "std"] }
-serde_json = { workspace = true }
-thiserror  = { workspace = true }
-toml       = { workspace = true, features = ["parse"] }
-uuid       = { workspace = true, features = ["serde", "std"] }
+bmux_clipboard = { workspace = true }
+libloading     = { workspace = true }
+postcard       = { workspace = true, features = ["alloc"] }
+semver         = { workspace = true }
+serde          = { workspace = true, features = ["derive", "std"] }
+serde_json     = { workspace = true }
+thiserror      = { workspace = true }
+toml           = { workspace = true, features = ["parse"] }
+uuid           = { workspace = true, features = ["serde", "std"] }
 
 
 [features]
