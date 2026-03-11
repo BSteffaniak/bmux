@@ -5426,11 +5426,11 @@ mod tests {
     #[test]
     fn validate_enabled_plugins_accepts_plugin_provided_capabilities() {
         let dir = temp_dir();
-        let provider_dir = dir.join("windows");
+        let provider_dir = dir.join("provider");
         let dependent_dir = dir.join("consumer");
         fs::create_dir_all(&provider_dir).expect("provider dir should exist");
         fs::create_dir_all(&dependent_dir).expect("dependent dir should exist");
-        fs::write(provider_dir.join("windows.dylib"), []).expect("provider entry should exist");
+        fs::write(provider_dir.join("provider.dylib"), []).expect("provider entry should exist");
         fs::write(dependent_dir.join("consumer.dylib"), []).expect("dependent entry should exist");
 
         let mut registry = PluginRegistry::new();
@@ -5438,7 +5438,7 @@ mod tests {
             .register_manifest(
                 &provider_dir.join("plugin.toml"),
                 PluginManifest::from_toml_str(
-                    "id='bmux.windows'\nname='Windows'\nversion='0.1.0'\nentry='windows.dylib'\nrequired_capabilities=['bmux.commands']\nprovided_capabilities=['bmux.windows.read','bmux.windows.write']\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n",
+                    "id='provider.plugin'\nname='Provider'\nversion='0.1.0'\nentry='provider.dylib'\nrequired_capabilities=['bmux.commands']\nprovided_capabilities=['example.cap.read','example.cap.write']\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n",
                 )
                 .expect("provider manifest should parse"),
             )
@@ -5447,14 +5447,14 @@ mod tests {
             .register_manifest(
                 &dependent_dir.join("plugin.toml"),
                 PluginManifest::from_toml_str(
-                    "id='consumer.plugin'\nname='Consumer'\nversion='0.1.0'\nentry='consumer.dylib'\nrequired_capabilities=['bmux.windows.read']\n[[dependencies]]\nplugin_id='bmux.windows'\nversion_req='^0.1'\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n",
+                    "id='consumer.plugin'\nname='Consumer'\nversion='0.1.0'\nentry='consumer.dylib'\nrequired_capabilities=['example.cap.read']\n[[dependencies]]\nplugin_id='provider.plugin'\nversion_req='^0.1'\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n",
                 )
                 .expect("dependent manifest should parse"),
             )
             .expect("dependent should register");
 
         let mut config = BmuxConfig::default();
-        config.plugins.enabled.push("bmux.windows".to_string());
+        config.plugins.enabled.push("provider.plugin".to_string());
         config.plugins.enabled.push("consumer.plugin".to_string());
 
         assert!(super::validate_enabled_plugins(&config, &registry).is_ok());
@@ -5492,28 +5492,28 @@ mod tests {
     #[test]
     fn runtime_cli_prefers_dynamic_session_plugin_aliases_over_static_cli_rejection() {
         let dir = temp_dir();
-        let plugin_dir = dir.join("permissions");
+        let plugin_dir = dir.join("policy");
         fs::create_dir_all(&plugin_dir).expect("plugin dir should exist");
-        fs::write(plugin_dir.join("permissions.dylib"), []).expect("entry should be written");
+        fs::write(plugin_dir.join("policy.dylib"), []).expect("entry should be written");
 
         let mut registry = PluginRegistry::new();
         registry
             .register_manifest(
                 &plugin_dir.join("plugin.toml"),
                 plugin_manifest_with_commands(
-                    "bmux.permissions",
-                    "permissions.dylib",
-                    "[[commands]]\nname='permissions'\npath=['permissions']\naliases=[[\"session\",\"permissions\"]]\nsummary='list'\nexecution='provider_exec'\nexpose_in_cli=true\n[[commands.arguments]]\nname='session'\nkind='string'\nlong='session'\nrequired=true\n",
+                    "policy.plugin",
+                    "policy.dylib",
+                    "[[commands]]\nname='roles'\npath=['roles']\naliases=[[\"session\",\"roles\"]]\nsummary='list'\nexecution='provider_exec'\nexpose_in_cli=true\n[[commands.arguments]]\nname='session'\nkind='string'\nlong='session'\nrequired=true\n",
                 ),
             )
             .expect("plugin should register");
 
         let mut config = BmuxConfig::default();
-        config.plugins.enabled.push("bmux.permissions".to_string());
+        config.plugins.enabled.push("policy.plugin".to_string());
         let argv = vec![
             OsString::from("bmux"),
             OsString::from("session"),
-            OsString::from("permissions"),
+            OsString::from("roles"),
             OsString::from("--session"),
             OsString::from("dev"),
         ];
@@ -5527,8 +5527,8 @@ mod tests {
                 arguments,
                 ..
             } => {
-                assert_eq!(plugin_id, "bmux.permissions");
-                assert_eq!(command_name, "permissions");
+                assert_eq!(plugin_id, "policy.plugin");
+                assert_eq!(command_name, "roles");
                 assert_eq!(arguments, vec!["--session".to_string(), "dev".to_string()]);
             }
             other => panic!("expected plugin runtime parse, got {other:?}"),
@@ -5564,15 +5564,15 @@ mod tests {
             )
             .expect("capability should parse")]),
             provided_capabilities: std::collections::BTreeSet::from([bmux_plugin::HostScope::new(
-                "bmux.windows.write",
+                "example.provider.write",
             )
             .expect("capability should parse")]),
             provided_features: std::collections::BTreeSet::new(),
             services: vec![bmux_plugin::PluginService {
-                capability: bmux_plugin::HostScope::new("bmux.windows.write")
+                capability: bmux_plugin::HostScope::new("example.provider.write")
                     .expect("capability should parse"),
                 kind: bmux_plugin::ServiceKind::Command,
-                interface_id: "window-command/v1".to_string(),
+                interface_id: "provider-command/v1".to_string(),
             }],
             commands: Vec::new(),
             event_subscriptions: Vec::new(),
@@ -5586,7 +5586,7 @@ mod tests {
             super::service_descriptors_from_declarations([&declaration]),
             vec![
                 "bmux.commands".to_string(),
-                "bmux.windows.write".to_string(),
+                "example.provider.write".to_string(),
             ],
             vec!["example.plugin".to_string()],
             vec!["/plugins".to_string()],
@@ -5599,7 +5599,7 @@ mod tests {
         );
         assert_eq!(
             context.provided_capabilities,
-            vec!["bmux.windows.write".to_string()]
+            vec!["example.provider.write".to_string()]
         );
         assert_eq!(context.services.len(), 2);
         assert!(
@@ -5612,7 +5612,7 @@ mod tests {
             context
                 .services
                 .iter()
-                .any(|service| service.interface_id == "window-command/v1")
+                .any(|service| service.interface_id == "provider-command/v1")
         );
         assert_eq!(
             context.settings.as_ref().and_then(|value| value.as_str()),
@@ -5629,8 +5629,8 @@ mod tests {
             std::path::PathBuf::from("/data"),
         );
         let declaration = bmux_plugin::PluginDeclaration {
-            id: bmux_plugin::PluginId::new("bmux.windows").expect("id should parse"),
-            display_name: "Windows".to_string(),
+            id: bmux_plugin::PluginId::new("provider.plugin").expect("id should parse"),
+            display_name: "Provider".to_string(),
             plugin_version: "0.1.0".to_string(),
             plugin_api: bmux_plugin::VersionRange::at_least(bmux_plugin::ApiVersion::new(1, 0)),
             native_abi: bmux_plugin::VersionRange::at_least(bmux_plugin::ApiVersion::new(1, 0)),
@@ -5641,25 +5641,27 @@ mod tests {
             homepage: None,
             required_capabilities: std::collections::BTreeSet::from([
                 bmux_plugin::HostScope::new("bmux.commands").expect("capability should parse"),
-                bmux_plugin::HostScope::new("bmux.sessions.read").expect("capability should parse"),
+                bmux_plugin::HostScope::new("example.base.read").expect("capability should parse"),
             ]),
             provided_capabilities: std::collections::BTreeSet::from([
-                bmux_plugin::HostScope::new("bmux.windows.read").expect("capability should parse"),
-                bmux_plugin::HostScope::new("bmux.windows.write").expect("capability should parse"),
+                bmux_plugin::HostScope::new("example.provider.read")
+                    .expect("capability should parse"),
+                bmux_plugin::HostScope::new("example.provider.write")
+                    .expect("capability should parse"),
             ]),
             provided_features: std::collections::BTreeSet::new(),
             services: vec![
                 bmux_plugin::PluginService {
-                    capability: bmux_plugin::HostScope::new("bmux.windows.read")
+                    capability: bmux_plugin::HostScope::new("example.provider.read")
                         .expect("capability should parse"),
                     kind: bmux_plugin::ServiceKind::Query,
-                    interface_id: "window-query/v1".to_string(),
+                    interface_id: "provider-query/v1".to_string(),
                 },
                 bmux_plugin::PluginService {
-                    capability: bmux_plugin::HostScope::new("bmux.windows.write")
+                    capability: bmux_plugin::HostScope::new("example.provider.write")
                         .expect("capability should parse"),
                     kind: bmux_plugin::ServiceKind::Command,
-                    interface_id: "window-command/v1".to_string(),
+                    interface_id: "provider-command/v1".to_string(),
                 },
             ],
             commands: Vec::new(),
@@ -5672,33 +5674,30 @@ mod tests {
             &config,
             &paths,
             &declaration,
-            "new-window",
+            "run-action",
             &["--name".to_string(), "editor".to_string()],
             super::service_descriptors_from_declarations([&declaration]),
             vec![
                 "bmux.commands".to_string(),
-                "bmux.sessions.read".to_string(),
-                "bmux.windows.read".to_string(),
-                "bmux.windows.write".to_string(),
+                "example.base.read".to_string(),
+                "example.provider.read".to_string(),
+                "example.provider.write".to_string(),
             ],
-            vec!["bmux.windows".to_string()],
+            vec!["provider.plugin".to_string()],
             vec!["/plugins".to_string()],
         );
 
-        assert_eq!(context.plugin_id, "bmux.windows");
-        assert_eq!(context.command, "new-window");
+        assert_eq!(context.plugin_id, "provider.plugin");
+        assert_eq!(context.command, "run-action");
         assert_eq!(
             context.required_capabilities,
-            vec![
-                "bmux.commands".to_string(),
-                "bmux.sessions.read".to_string()
-            ]
+            vec!["bmux.commands".to_string(), "example.base.read".to_string()]
         );
         assert_eq!(
             context.provided_capabilities,
             vec![
-                "bmux.windows.read".to_string(),
-                "bmux.windows.write".to_string()
+                "example.provider.read".to_string(),
+                "example.provider.write".to_string()
             ]
         );
         assert_eq!(context.services.len(), 3);

@@ -449,9 +449,9 @@ version = "0.1.0"
 entry = "plugin.dylib"
 
 [[commands]]
-name = "permissions"
+name = "roles"
 path = ["acl", "list"]
-aliases = [["acl", "permissions"]]
+aliases = [["acl", "roles"]]
 summary = "list"
 execution = "provider_exec"
 
@@ -475,35 +475,35 @@ minimum = "1.0"
             PluginCommandRegistry::build(&config_with_enabled("example.plugin"), &registry)
                 .expect("command registry should build");
         let resolved = commands
-            .resolve(&["acl".into(), "permissions".into(), "dev".into()])
+            .resolve(&["acl".into(), "roles".into(), "dev".into()])
             .expect("command should resolve");
-        assert_eq!(resolved.command_name, "permissions");
+        assert_eq!(resolved.command_name, "roles");
         assert_eq!(resolved.arguments, vec!["dev"]);
     }
 
     #[test]
-    fn shipped_permissions_aliases_build_without_collision() {
+    fn plugin_aliases_build_without_collision_for_session_namespace() {
         let manifest = PluginManifest::from_toml_str(
             r#"
-id = "bmux.permissions"
-name = "Permissions"
+id = "policy.plugin"
+name = "Policy"
 version = "0.1.0"
 entry = "plugin.dylib"
 required_capabilities = ["bmux.commands"]
 
 [[commands]]
-name = "permissions"
-path = ["permissions"]
-aliases = [["session", "permissions"]]
+name = "roles"
+path = ["roles"]
+aliases = [["session", "roles"]]
 summary = "list"
 execution = "provider_exec"
 expose_in_cli = true
 
 [[commands]]
-name = "grant"
-path = ["grant"]
-aliases = [["session", "grant"]]
-summary = "grant"
+name = "assign"
+path = ["assign"]
+aliases = [["session", "assign"]]
+summary = "assign"
 execution = "provider_exec"
 expose_in_cli = true
 
@@ -523,33 +523,33 @@ minimum = "1.0"
                 manifest,
             )
             .expect("manifest should register");
-        PluginCommandRegistry::build(&config_with_enabled("bmux.permissions"), &registry)
-            .expect("permissions command registry should build");
+        PluginCommandRegistry::build(&config_with_enabled("policy.plugin"), &registry)
+            .expect("policy command registry should build");
     }
 
     #[test]
-    fn shipped_windows_aliases_build_without_collision() {
+    fn plugin_aliases_build_without_collision_for_dynamic_namespace() {
         let manifest = PluginManifest::from_toml_str(
             r#"
-id = "bmux.windows"
-name = "Windows"
+id = "workspace.plugin"
+name = "Workspace"
 version = "0.1.0"
 entry = "plugin.dylib"
 required_capabilities = ["bmux.commands"]
 
 [[commands]]
-name = "new-window"
-path = ["new-window"]
-aliases = [["window", "new"]]
-summary = "new"
+name = "item-open"
+path = ["item-open"]
+aliases = [["item", "open"]]
+summary = "open"
 execution = "provider_exec"
 expose_in_cli = true
 
 [[commands]]
-name = "switch-window"
-path = ["switch-window"]
-aliases = [["window", "switch"]]
-summary = "switch"
+name = "item-focus"
+path = ["item-focus"]
+aliases = [["item", "focus"]]
+summary = "focus"
 execution = "provider_exec"
 expose_in_cli = true
 
@@ -569,8 +569,8 @@ minimum = "1.0"
                 manifest,
             )
             .expect("manifest should register");
-        PluginCommandRegistry::build(&config_with_enabled("bmux.windows"), &registry)
-            .expect("windows command registry should build");
+        PluginCommandRegistry::build(&config_with_enabled("workspace.plugin"), &registry)
+            .expect("workspace command registry should build");
     }
 
     #[test]
@@ -616,17 +616,17 @@ minimum = "1.0"
     fn augment_clap_command_creates_missing_namespace_roots() {
         let manifest = PluginManifest::from_toml_str(
             r#"
-id = "bmux.windows"
-name = "Windows"
+id = "workspace.plugin"
+name = "Workspace"
 version = "0.1.0"
 entry = "plugin.dylib"
 required_capabilities = ["bmux.commands"]
 
 [[commands]]
-name = "new-window"
-path = ["new-window"]
-aliases = [["window", "new"]]
-summary = "new"
+name = "item-open"
+path = ["item-open"]
+aliases = [["item", "open"]]
+summary = "open"
 execution = "provider_exec"
 expose_in_cli = true
 
@@ -647,33 +647,33 @@ minimum = "1.0"
             )
             .expect("manifest should register");
         let commands =
-            PluginCommandRegistry::build(&config_with_enabled("bmux.windows"), &registry)
-                .expect("windows command registry should build");
+            PluginCommandRegistry::build(&config_with_enabled("workspace.plugin"), &registry)
+                .expect("workspace command registry should build");
 
         let clap = commands
             .augment_clap_command(Command::new("bmux"))
             .expect("dynamic namespace should be created");
         let matches = clap
-            .try_get_matches_from(["bmux", "window", "new"])
-            .expect("window namespace path should parse");
+            .try_get_matches_from(["bmux", "item", "open"])
+            .expect("dynamic namespace path should parse");
         let (path, _) = super::selected_subcommand_path(&matches);
-        assert_eq!(path, vec!["window".to_string(), "new".to_string()]);
+        assert_eq!(path, vec!["item".to_string(), "open".to_string()]);
     }
 
     #[test]
     fn augment_clap_command_extends_existing_session_namespace() {
         let manifest = PluginManifest::from_toml_str(
             r#"
-id = "bmux.permissions"
-name = "Permissions"
+id = "policy.plugin"
+name = "Policy"
 version = "0.1.0"
 entry = "plugin.dylib"
 required_capabilities = ["bmux.commands"]
 
 [[commands]]
-name = "permissions"
-path = ["permissions"]
-aliases = [["session", "permissions"]]
+name = "roles"
+path = ["roles"]
+aliases = [["session", "roles"]]
 summary = "list"
 execution = "provider_exec"
 expose_in_cli = true
@@ -695,16 +695,16 @@ minimum = "1.0"
             )
             .expect("manifest should register");
         let commands =
-            PluginCommandRegistry::build(&config_with_enabled("bmux.permissions"), &registry)
-                .expect("permissions command registry should build");
+            PluginCommandRegistry::build(&config_with_enabled("policy.plugin"), &registry)
+                .expect("policy command registry should build");
 
         let clap = commands
             .augment_clap_command(Cli::command())
             .expect("existing session namespace should be extended");
         let matches = clap
-            .try_get_matches_from(["bmux", "session", "permissions"])
+            .try_get_matches_from(["bmux", "session", "roles"])
             .expect("plugin session alias should parse under mixed namespace");
         let (path, _) = super::selected_subcommand_path(&matches);
-        assert_eq!(path, vec!["session".to_string(), "permissions".to_string()]);
+        assert_eq!(path, vec!["session".to_string(), "roles".to_string()]);
     }
 }

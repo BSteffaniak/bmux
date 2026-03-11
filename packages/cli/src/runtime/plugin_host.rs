@@ -311,15 +311,19 @@ mod tests {
 
     #[test]
     fn reports_required_and_provided_capabilities() {
-        let host = host(&["bmux.sessions.read"], &["bmux.windows.write"], Vec::new());
+        let host = host(
+            &["example.base.read"],
+            &["example.provider.write"],
+            Vec::new(),
+        );
         assert_eq!(PluginHost::plugin_id(&host), "example.plugin");
         assert!(PluginHost::has_capability(
             &host,
-            &HostScope::new("bmux.sessions.read").expect("capability should parse")
+            &HostScope::new("example.base.read").expect("capability should parse")
         ));
         assert!(PluginHost::has_capability(
             &host,
-            &HostScope::new("bmux.windows.write").expect("capability should parse")
+            &HostScope::new("example.provider.write").expect("capability should parse")
         ));
     }
 
@@ -327,33 +331,33 @@ mod tests {
     fn provider_owned_service_registration_is_resolvable() {
         let host = host(
             &[],
-            &["bmux.windows.write"],
+            &["example.provider.write"],
             vec![service(
-                "bmux.windows.write",
+                "example.provider.write",
                 ServiceKind::Command,
-                "window-command/v1",
+                "provider-command/v1",
             )],
         );
-        let capability = HostScope::new("bmux.windows.write").expect("capability should parse");
+        let capability = HostScope::new("example.provider.write").expect("capability should parse");
         let service = PluginHost::resolve_service(
             &host,
             &capability,
             ServiceKind::Command,
-            "window-command/v1",
+            "provider-command/v1",
         )
         .expect("provider-owned service should resolve");
-        assert_eq!(service.interface_id, "window-command/v1");
+        assert_eq!(service.interface_id, "provider-command/v1");
     }
 
     #[test]
     fn missing_registered_service_is_rejected() {
-        let host = host(&[], &["bmux.windows.write"], Vec::new());
-        let capability = HostScope::new("bmux.windows.write").expect("capability should parse");
+        let host = host(&[], &["example.provider.write"], Vec::new());
+        let capability = HostScope::new("example.provider.write").expect("capability should parse");
         let error = PluginHost::resolve_service(
             &host,
             &capability,
             ServiceKind::Command,
-            "window-command/v1",
+            "provider-command/v1",
         )
         .expect_err("missing service registration should fail");
         assert!(error.to_string().contains("resolve_service"));

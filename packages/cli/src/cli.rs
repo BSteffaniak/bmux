@@ -550,72 +550,71 @@ mod tests {
     }
 
     #[test]
-    fn parses_top_level_new_window_command() {
-        let cli =
-            Cli::try_parse_from(["bmux", "new-window", "--name", "editor", "--session", "dev"])
-                .expect("valid CLI args");
-        assert!(matches!(
-            cli.command,
-            Some(Command::External(args))
-                if args == vec!["new-window", "--name", "editor", "--session", "dev"]
-        ));
-    }
-
-    #[test]
-    fn parses_top_level_list_windows_json_flag() {
-        let cli = Cli::try_parse_from(["bmux", "list-windows", "--json"]).expect("valid CLI args");
-        assert!(matches!(
-            cli.command,
-            Some(Command::External(args)) if args == vec!["list-windows", "--json"]
-        ));
-    }
-
-    #[test]
-    fn parses_top_level_kill_window_command() {
-        let cli = Cli::try_parse_from(["bmux", "kill-window", "active", "--session", "dev"])
+    fn parses_top_level_external_hyphenated_command() {
+        let cli = Cli::try_parse_from(["bmux", "tool-open", "--name", "editor", "--scope", "dev"])
             .expect("valid CLI args");
         assert!(matches!(
             cli.command,
             Some(Command::External(args))
-                if args == vec!["kill-window", "active", "--session", "dev"]
+                if args == vec!["tool-open", "--name", "editor", "--scope", "dev"]
         ));
     }
 
     #[test]
-    fn parses_top_level_kill_all_windows_command() {
-        let cli = Cli::try_parse_from(["bmux", "kill-all-windows", "--session", "dev"])
+    fn parses_top_level_external_json_flag() {
+        let cli = Cli::try_parse_from(["bmux", "tool-list", "--json"]).expect("valid CLI args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::External(args)) if args == vec!["tool-list", "--json"]
+        ));
+    }
+
+    #[test]
+    fn parses_top_level_external_positional_and_option_args() {
+        let cli = Cli::try_parse_from(["bmux", "tool-close", "active", "--scope", "dev"])
             .expect("valid CLI args");
         assert!(matches!(
             cli.command,
-            Some(Command::External(args)) if args == vec!["kill-all-windows", "--session", "dev"]
+            Some(Command::External(args))
+                if args == vec!["tool-close", "active", "--scope", "dev"]
         ));
     }
 
     #[test]
-    fn parses_top_level_kill_all_windows_without_session_command() {
-        let cli = Cli::try_parse_from(["bmux", "kill-all-windows"]).expect("valid CLI args");
-        assert!(matches!(
-            cli.command,
-            Some(Command::External(args)) if args == vec!["kill-all-windows"]
-        ));
-    }
-
-    #[test]
-    fn parses_top_level_kill_all_windows_force_local_flag() {
-        let cli = Cli::try_parse_from(["bmux", "kill-all-windows", "--force-local"])
+    fn parses_top_level_external_multiword_flag_command() {
+        let cli = Cli::try_parse_from(["bmux", "tool-close-all", "--scope", "dev"])
             .expect("valid CLI args");
         assert!(matches!(
             cli.command,
-            Some(Command::External(args)) if args == vec!["kill-all-windows", "--force-local"]
+            Some(Command::External(args)) if args == vec!["tool-close-all", "--scope", "dev"]
         ));
     }
 
     #[test]
-    fn parses_top_level_switch_window_command() {
-        let cli = Cli::try_parse_from(["bmux", "switch-window", "editor"]).expect("valid CLI args");
+    fn parses_top_level_external_single_token_command() {
+        let cli = Cli::try_parse_from(["bmux", "tool-close-all"]).expect("valid CLI args");
         assert!(matches!(
             cli.command,
-            Some(Command::External(args)) if args == vec!["switch-window", "editor"]
+            Some(Command::External(args)) if args == vec!["tool-close-all"]
+        ));
+    }
+
+    #[test]
+    fn parses_top_level_external_boolean_flag() {
+        let cli = Cli::try_parse_from(["bmux", "tool-close-all", "--force-local"])
+            .expect("valid CLI args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::External(args)) if args == vec!["tool-close-all", "--force-local"]
+        ));
+    }
+
+    #[test]
+    fn parses_top_level_external_target_selector_command() {
+        let cli = Cli::try_parse_from(["bmux", "tool-focus", "editor"]).expect("valid CLI args");
+        assert!(matches!(
+            cli.command,
+            Some(Command::External(args)) if args == vec!["tool-focus", "editor"]
         ));
     }
 
@@ -669,36 +668,35 @@ mod tests {
     }
 
     #[test]
-    fn parses_top_level_permissions_command() {
-        let cli = Cli::try_parse_from(["bmux", "permissions", "--session", "dev"])
-            .expect("valid CLI args");
+    fn parses_top_level_external_policy_command() {
+        let cli = Cli::try_parse_from(["bmux", "roles", "--scope", "dev"]).expect("valid CLI args");
         assert!(matches!(
             cli.command,
-            Some(Command::External(args)) if args == vec!["permissions", "--session", "dev"]
+            Some(Command::External(args)) if args == vec!["roles", "--scope", "dev"]
         ));
     }
 
     #[test]
-    fn parses_top_level_permissions_watch_command() {
-        let cli = Cli::try_parse_from(["bmux", "permissions", "--session", "dev", "--watch"])
+    fn parses_top_level_external_policy_watch_command() {
+        let cli = Cli::try_parse_from(["bmux", "roles", "--scope", "dev", "--watch"])
             .expect("valid CLI args");
         assert!(matches!(
             cli.command,
             Some(Command::External(args))
-                if args == vec!["permissions", "--session", "dev", "--watch"]
+                if args == vec!["roles", "--scope", "dev", "--watch"]
         ));
     }
 
     #[test]
-    fn parses_top_level_grant_command() {
+    fn parses_top_level_external_assign_command() {
         let cli = Cli::try_parse_from([
             "bmux",
-            "grant",
-            "--session",
+            "assign",
+            "--scope",
             "dev",
-            "--client",
+            "--subject",
             "550e8400-e29b-41d4-a716-446655440000",
-            "--role",
+            "--level",
             "writer",
         ])
         .expect("valid CLI args");
@@ -706,25 +704,25 @@ mod tests {
             cli.command,
             Some(Command::External(args))
                 if args == vec![
-                    "grant",
-                    "--session",
+                    "assign",
+                    "--scope",
                     "dev",
-                    "--client",
+                    "--subject",
                     "550e8400-e29b-41d4-a716-446655440000",
-                    "--role",
+                    "--level",
                     "writer",
                 ]
         ));
     }
 
     #[test]
-    fn parses_top_level_revoke_command() {
+    fn parses_top_level_external_unassign_command() {
         let cli = Cli::try_parse_from([
             "bmux",
-            "revoke",
-            "--session",
+            "unassign",
+            "--scope",
             "dev",
-            "--client",
+            "--subject",
             "550e8400-e29b-41d4-a716-446655440000",
         ])
         .expect("valid CLI args");
@@ -732,10 +730,10 @@ mod tests {
             cli.command,
             Some(Command::External(args))
                 if args == vec![
-                    "revoke",
-                    "--session",
+                    "unassign",
+                    "--scope",
                     "dev",
-                    "--client",
+                    "--subject",
                     "550e8400-e29b-41d4-a716-446655440000",
                 ]
         ));
@@ -762,7 +760,7 @@ mod tests {
 
     #[test]
     fn static_session_namespace_rejects_plugin_owned_subcommands() {
-        let error = Cli::try_parse_from(["bmux", "session", "permissions", "--session", "dev"])
+        let error = Cli::try_parse_from(["bmux", "session", "roles", "--scope", "dev"])
             .expect_err("static CLI should reject plugin-owned session descendant");
         assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
     }
@@ -1056,11 +1054,10 @@ mod tests {
 
     #[test]
     fn parses_external_plugin_command_path() {
-        let cli =
-            Cli::try_parse_from(["bmux", "acl", "permissions", "dev"]).expect("valid CLI args");
+        let cli = Cli::try_parse_from(["bmux", "vendor", "roles", "dev"]).expect("valid CLI args");
         let Some(Command::External(args)) = cli.command else {
             panic!("expected external plugin command path");
         };
-        assert_eq!(args, vec!["acl", "permissions", "dev"]);
+        assert_eq!(args, vec!["vendor", "roles", "dev"]);
     }
 }
