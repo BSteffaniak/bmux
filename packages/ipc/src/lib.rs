@@ -128,7 +128,7 @@ pub enum PaneSelector {
 }
 
 /// Generic service invocation kind for plugin-dispatched RPC calls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum InvokeServiceKind {
     Query,

@@ -29,7 +29,9 @@ use persistence::{
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::future::Future;
 use std::io::{Read, Write};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -64,6 +66,45 @@ struct ServerState {
     server_owner_principal_id: Uuid,
     handshake_timeout: Duration,
     pane_exit_rx: AsyncMutex<mpsc::UnboundedReceiver<PaneExitEvent>>,
+    service_registry: Mutex<ServiceRegistry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ServiceRoute {
+    capability: String,
+    kind: bmux_ipc::InvokeServiceKind,
+    interface_id: String,
+    operation: String,
+}
+
+type ServiceInvokeFuture = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send>>;
+type ServiceInvokeHandler = dyn Fn(Vec<u8>) -> ServiceInvokeFuture + Send + Sync;
+
+#[derive(Default)]
+struct ServiceRegistry {
+    handlers: BTreeMap<ServiceRoute, Arc<ServiceInvokeHandler>>,
+}
+
+impl ServiceRegistry {
+    fn dispatch(
+        &self,
+        capability: String,
+        kind: bmux_ipc::InvokeServiceKind,
+        interface_id: String,
+        operation: String,
+        payload: Vec<u8>,
+    ) -> Option<ServiceInvokeFuture> {
+        let route = ServiceRoute {
+            capability,
+            kind,
+            interface_id,
+            operation,
+        };
+        self.handlers
+            .get(&route)
+            .cloned()
+            .map(|handler| handler(payload))
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2476,6 +2517,7 @@ impl BmuxServer {
                 server_owner_principal_id,
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
                 pane_exit_rx: AsyncMutex::new(pane_exit_rx),
+                service_registry: Mutex::new(ServiceRegistry::default()),
             }),
             shutdown_tx,
         }
@@ -3965,13 +4007,38 @@ async fn handle_request(
             kind,
             interface_id,
             operation,
-            ..
-        } => Response::Err(ErrorResponse {
-            code: ErrorCode::NotFound,
-            message: format!(
-                "no provider for service capability='{capability}' kind='{kind:?}' interface='{interface_id}' operation='{operation}'"
-            ),
-        }),
+            payload,
+        } => {
+            let dispatch = {
+                let registry = state
+                    .service_registry
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("service registry lock poisoned"))?;
+                registry.dispatch(
+                    capability.clone(),
+                    kind,
+                    interface_id.clone(),
+                    operation.clone(),
+                    payload,
+                )
+            };
+            if let Some(invocation) = dispatch {
+                match invocation.await {
+                    Ok(payload) => Response::Ok(ResponsePayload::ServiceInvoked { payload }),
+                    Err(error) => Response::Err(ErrorResponse {
+                        code: ErrorCode::Internal,
+                        message: format!("service invocation failed: {error:#}"),
+                    }),
+                }
+            } else {
+                Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!(
+                        "no provider for service capability='{capability}' kind='{kind:?}' interface='{interface_id}' operation='{operation}'"
+                    ),
+                })
+            }
+        }
         Request::NewSession { name } => {
             let mut manager = state
                 .session_manager
