@@ -11,7 +11,6 @@ use crate::input::{InputProcessor, Keymap, RuntimeAction};
 use crate::status::{AttachTab, build_attach_status_line};
 use anyhow::{Context, Result};
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
-use bmux_clipboard::ClipboardError;
 use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout, TerminfoAutoInstall};
 use bmux_ipc::{
     AttachViewComponent, PaneFocusDirection, PaneSplitDirection, SessionRole, SessionSelector,
@@ -21,7 +20,7 @@ use bmux_keybind::action_to_name;
 use bmux_plugin::{
     CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostMetadata, HostScope,
     NativeCommandContext, NativeLifecycleContext, PluginEvent, PluginEventKind, PluginManifest,
-    PluginRegistry, RegisteredService, ServiceKind,
+    PluginRegistry, RegisteredService, ServiceKind, ServiceRequest,
     load_registered_plugin as load_native_registered_plugin,
 };
 use bmux_server::BmuxServer;
@@ -85,7 +84,6 @@ fn core_provided_capabilities() -> Vec<HostScope> {
         "bmux.key_actions",
         "bmux.status_bar_items",
         "bmux.storage",
-        "bmux.clipboard",
         "bmux.sessions.read",
         "bmux.sessions.write",
         "bmux.panes.read",
@@ -122,12 +120,6 @@ fn core_service_descriptors() -> Vec<RegisteredService> {
             capability: HostScope::new("bmux.storage").expect("capability should parse"),
             kind: ServiceKind::Command,
             interface_id: "storage-command/v1".to_string(),
-            provider: bmux_plugin::ProviderId::Host,
-        },
-        RegisteredService {
-            capability: HostScope::new("bmux.clipboard").expect("capability should parse"),
-            kind: ServiceKind::Command,
-            interface_id: "clipboard-command/v1".to_string(),
             provider: bmux_plugin::ProviderId::Host,
         },
     ]
@@ -2704,7 +2696,7 @@ fn copy_attach_selection(view_state: &mut AttachViewState, exit_after_copy: bool
         return;
     };
 
-    match bmux_clipboard::copy_text(&text) {
+    match copy_text_with_clipboard_plugin(&text) {
         Ok(()) => {
             view_state.set_transient_status(
                 ATTACH_SELECTION_COPIED_STATUS,
@@ -2717,7 +2709,7 @@ fn copy_attach_selection(view_state: &mut AttachViewState, exit_after_copy: bool
         }
         Err(error) => {
             view_state.set_transient_status(
-                format_clipboard_error(&error),
+                format_clipboard_service_error(&error),
                 Instant::now(),
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
@@ -2729,13 +2721,113 @@ fn confirm_attach_scrollback(view_state: &mut AttachViewState) {
     copy_attach_selection(view_state, true);
 }
 
-fn format_clipboard_error(error: &ClipboardError) -> String {
-    match error {
-        ClipboardError::BackendUnavailable { .. } => "clipboard backend unavailable".to_string(),
-        ClipboardError::BackendFailed { message, .. } => {
-            format!("clipboard copy failed: {message}")
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ClipboardWriteRequest {
+    text: String,
+}
+
+fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
+    let config = BmuxConfig::load()?;
+    let paths = ConfigPaths::default();
+    let registry = scan_available_plugins(&config, &paths)?;
+    let services = available_service_descriptors(&config, &registry)?;
+    let capability = HostScope::new("bmux.clipboard.write")?;
+    let service = services
+        .into_iter()
+        .find(|entry| {
+            entry.capability == capability
+                && entry.kind == ServiceKind::Command
+                && entry.interface_id == "clipboard-write/v1"
+        })
+        .context("clipboard service unavailable; ensure a provider is enabled and discoverable")?;
+
+    let provider_plugin_id = match &service.provider {
+        bmux_plugin::ProviderId::Plugin(plugin_id) => plugin_id,
+        bmux_plugin::ProviderId::Host => {
+            anyhow::bail!("clipboard service provider must be plugin-owned")
         }
+    };
+    let provider = registry.get(provider_plugin_id).with_context(|| {
+        format!(
+            "clipboard service provider '{}' was not found",
+            provider_plugin_id
+        )
+    })?;
+
+    let payload = bmux_plugin::encode_service_message(&ClipboardWriteRequest {
+        text: text.to_string(),
+    })?;
+    let available_capabilities = available_capability_providers(&config, &registry)?
+        .into_keys()
+        .map(|entry| entry.to_string())
+        .collect::<Vec<_>>();
+    let plugin_search_roots = resolve_plugin_search_paths(&config, &paths)?
+        .into_iter()
+        .map(|path| path.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let loaded = load_native_registered_plugin(
+        provider,
+        &plugin_host_metadata(),
+        &available_capability_providers(&config, &registry)?,
+    )
+    .with_context(|| {
+        format!(
+            "failed loading clipboard service provider '{}'",
+            provider_plugin_id
+        )
+    })?;
+
+    let response = loaded.invoke_service(&bmux_plugin::NativeServiceContext {
+        plugin_id: provider_plugin_id.to_string(),
+        request: ServiceRequest {
+            caller_plugin_id: "bmux.core".to_string(),
+            service,
+            operation: "copy_text".to_string(),
+            payload,
+        },
+        required_capabilities: provider
+            .declaration
+            .required_capabilities
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        provided_capabilities: provider
+            .declaration
+            .provided_capabilities
+            .iter()
+            .map(ToString::to_string)
+            .collect(),
+        services: available_service_descriptors(&config, &registry)?,
+        available_capabilities,
+        enabled_plugins: config.plugins.enabled.clone(),
+        plugin_search_roots,
+        host: plugin_host_metadata(),
+        connection: bmux_plugin::HostConnectionInfo {
+            config_dir: paths.config_dir.to_string_lossy().into_owned(),
+            runtime_dir: paths.runtime_dir.to_string_lossy().into_owned(),
+            data_dir: paths.data_dir.to_string_lossy().into_owned(),
+        },
+        settings: std::collections::BTreeMap::new(),
+        plugin_settings_map: std::collections::BTreeMap::new(),
+    })?;
+    if let Some(error) = response.error {
+        anyhow::bail!(error.message);
     }
+
+    let _: () = bmux_plugin::decode_service_message(&response.payload)
+        .context("failed decoding clipboard service response payload")?;
+    Ok(())
+}
+
+fn format_clipboard_service_error(error: &anyhow::Error) -> String {
+    let message = error.to_string();
+    if message.contains("clipboard backend unavailable") {
+        return "clipboard backend unavailable".to_string();
+    }
+    if message.starts_with("clipboard copy failed:") {
+        return message;
+    }
+    format!("clipboard copy failed: {message}")
 }
 
 fn selected_attach_text(view_state: &mut AttachViewState) -> Option<String> {
@@ -5621,7 +5713,7 @@ mod tests {
             context.provided_capabilities,
             vec!["example.provider.write".to_string()]
         );
-        assert_eq!(context.services.len(), 5);
+        assert_eq!(context.services.len(), 4);
         assert!(
             context
                 .services
@@ -5639,12 +5731,6 @@ mod tests {
                 .services
                 .iter()
                 .any(|service| service.interface_id == "storage-command/v1")
-        );
-        assert!(
-            context
-                .services
-                .iter()
-                .any(|service| service.interface_id == "clipboard-command/v1")
         );
         assert!(
             context
@@ -5738,7 +5824,7 @@ mod tests {
                 "example.provider.write".to_string()
             ]
         );
-        assert_eq!(context.services.len(), 6);
+        assert_eq!(context.services.len(), 5);
         assert!(
             context
                 .services
@@ -5756,12 +5842,6 @@ mod tests {
                 .services
                 .iter()
                 .any(|service| service.interface_id == "storage-command/v1")
-        );
-        assert!(
-            context
-                .services
-                .iter()
-                .any(|service| service.interface_id == "clipboard-command/v1")
         );
     }
 

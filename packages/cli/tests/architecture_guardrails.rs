@@ -20,5 +20,13 @@ fn runtime_production_code_does_not_reference_bundled_plugin_ids() {
             !source.contains("bmux.windows"),
             "production runtime source should not reference bundled plugin id bmux.windows",
         );
+        assert!(
+            !source.contains("bmux_clipboard::"),
+            "production runtime source should not directly reference clipboard backend crate APIs",
+        );
+        assert!(
+            !source.contains("clipboard-command/v1"),
+            "production runtime source should not retain deprecated clipboard service interface clipboard-command/v1",
+        );
     }
 }

@@ -1,0 +1,20 @@
+[package]
+authors     = { workspace = true }
+description = "Shipped clipboard plugin for bmux"
+edition     = { workspace = true }
+license     = { workspace = true }
+name        = "bmux_clipboard_plugin"
+publish     = false
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bmux_clipboard = { workspace = true }
+bmux_plugin    = { workspace = true }
+serde          = { workspace = true, features = ["derive", "std"] }
+
+[features]
+fail-on-warnings = []

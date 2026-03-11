@@ -52,11 +52,6 @@ struct CoreStorageSetRequest {
     value: Vec<u8>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct CoreClipboardCopyRequest {
-    text: String,
-}
-
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeLifecycleContext {
     pub plugin_id: String,
@@ -449,15 +444,6 @@ fn handle_core_service_call(
             }
             fs::write(path, request.value).map_err(|error| PluginError::ServiceProtocol {
                 details: format!("failed writing storage value: {error}"),
-            })?;
-            encode_service_message(&())
-        }
-        ("clipboard-command/v1", "copy_text") => {
-            let request: CoreClipboardCopyRequest = decode_service_message(&payload)?;
-            bmux_clipboard::copy_text(&request.text).map_err(|error| {
-                PluginError::ServiceProtocol {
-                    details: format!("failed copying clipboard text: {error}"),
-                }
             })?;
             encode_service_message(&())
         }

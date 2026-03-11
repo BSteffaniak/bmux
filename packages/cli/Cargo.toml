@@ -16,7 +16,6 @@ path = "src/main.rs"
 [dependencies]
 # Internal bmux packages
 bmux_client            = { workspace = true }
-bmux_clipboard         = { workspace = true }
 bmux_config            = { workspace = true }
 bmux_event             = { workspace = true }
 bmux_ipc               = { workspace = true }
