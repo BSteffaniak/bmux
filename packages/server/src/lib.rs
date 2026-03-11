@@ -5881,6 +5881,20 @@ mod tests {
 
     const TEST_STARTUP_TIMEOUT: Duration = Duration::from_secs(5);
 
+    #[test]
+    fn production_server_code_does_not_hardcode_plugin_domain_interfaces() {
+        let source = include_str!("lib.rs")
+            .split("\n#[cfg(test)]")
+            .next()
+            .unwrap_or_default();
+        assert!(!source.contains("permission-query/v1"));
+        assert!(!source.contains("permission-command/v1"));
+        assert!(!source.contains("window-query/v1"));
+        assert!(!source.contains("window-command/v1"));
+        assert!(!source.contains("bmux.permissions"));
+        assert!(!source.contains("bmux.windows"));
+    }
+
     #[cfg(unix)]
     async fn spawn_server_with_ready(
         server: BmuxServer,
