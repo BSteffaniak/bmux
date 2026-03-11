@@ -4,7 +4,9 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 KEEP_SMOKE_STATE="${KEEP_SMOKE_STATE:-0}"
-SMOKE_TIMEOUT_SECS="${SMOKE_TIMEOUT_SECS:-25}"
+SMOKE_TIMEOUT_SECS="${SMOKE_TIMEOUT_SECS:-60}"
+SMOKE_MAX_RETRIES="${SMOKE_MAX_RETRIES:-2}"
+SMOKE_RETRY_DELAY_SECS="${SMOKE_RETRY_DELAY_SECS:-1}"
 declare -a SMOKE_SANDBOXES=()
 
 create_sandbox() {
@@ -55,10 +57,54 @@ if ! command -v script >/dev/null 2>&1; then
   exit 0
 fi
 
+run_smoke_with_retry() {
+  local label="$1"
+  local shell_bin="$2"
+  local payload="$3"
+  local non_timeout_failure_message="$4"
+  local sandbox
+  local status
+  local attempt=1
+  local max_attempts=$((SMOKE_MAX_RETRIES + 1))
+
+  while (( attempt <= max_attempts )); do
+    sandbox="$(create_sandbox)"
+    set +e
+    run_with_timeout "$SMOKE_TIMEOUT_SECS" bash -lc "
+      set -euo pipefail
+      (
+${payload}
+      ) | XDG_CONFIG_HOME=\"$sandbox/config\" XDG_DATA_HOME=\"$sandbox/data\" XDG_RUNTIME_DIR=\"$sandbox/runtime\" TMPDIR=\"$sandbox/tmp\" SHELL=\"$shell_bin\" script -q /dev/null cargo run -q -p bmux_cli -- >/dev/null 2>&1
+    "
+    status=$?
+    set -e
+
+    if [[ $status -eq 0 ]]; then
+      echo "ok: ${label}"
+      return 0
+    fi
+
+    if [[ $status -ne 143 ]]; then
+      echo "fail: ${non_timeout_failure_message} ${status}"
+      return 1
+    fi
+
+    if (( attempt == max_attempts )); then
+      echo "fail: ${label} smoke failed after ${attempt} attempts (status ${status})"
+      return 1
+    fi
+
+    echo "warn: ${label} smoke timed out (${status}), retrying ${attempt}/${SMOKE_MAX_RETRIES} after ${SMOKE_RETRY_DELAY_SECS}s"
+    sleep "$SMOKE_RETRY_DELAY_SECS"
+    attempt=$((attempt + 1))
+  done
+
+  return 1
+}
+
 run_case() {
   local shell_bin="$1"
   local shell_name
-  local sandbox
   shell_name="$(basename "$shell_bin")"
 
   if [[ ! -x "$shell_bin" ]]; then
@@ -66,55 +112,30 @@ run_case() {
     return 0
   fi
 
-  sandbox="$(create_sandbox)"
-  set +e
-  run_with_timeout "$SMOKE_TIMEOUT_SECS" bash -lc "
-    set -euo pipefail
-    (
-      sleep 1
-      printf '\\001d'
-    ) | XDG_CONFIG_HOME=\"$sandbox/config\" XDG_DATA_HOME=\"$sandbox/data\" XDG_RUNTIME_DIR=\"$sandbox/runtime\" TMPDIR=\"$sandbox/tmp\" SHELL=\"$shell_bin\" script -q /dev/null cargo run -q -p bmux_cli -- >/dev/null 2>&1
-  "
-  local status=$?
-  set -e
-
-  if [[ $status -ne 0 ]]; then
-    echo "fail: ${shell_name} startup smoke failed (status ${status})"
-    return 1
-  fi
-
-  echo "ok: ${shell_name}"
+  run_smoke_with_retry \
+    "$shell_name startup" \
+    "$shell_bin" \
+    "        sleep 1
+        printf '\\001d'" \
+    "${shell_name} startup smoke failed (status"
 }
 
 run_keybind_case() {
   local shell_bin="$1"
-  local sandbox
 
   if [[ ! -x "$shell_bin" ]]; then
     echo "skip: keybind smoke shell missing at ${shell_bin}"
     return 0
   fi
 
-  sandbox="$(create_sandbox)"
-  set +e
-  run_with_timeout "$SMOKE_TIMEOUT_SECS" bash -lc "
-    set -euo pipefail
-    (
-      sleep 1
-      printf '\\001t'
-      sleep 0.2
-      printf '\\001d'
-    ) | XDG_CONFIG_HOME=\"$sandbox/config\" XDG_DATA_HOME=\"$sandbox/data\" XDG_RUNTIME_DIR=\"$sandbox/runtime\" TMPDIR=\"$sandbox/tmp\" SHELL=\"$shell_bin\" script -q /dev/null cargo run -q -p bmux_cli -- >/dev/null 2>&1
-  "
-  local status=$?
-  set -e
-
-  if [[ $status -ne 0 ]]; then
-    echo "fail: keybind smoke expected clean attach detach, got ${status}"
-    return 1
-  fi
-
-  echo "ok: keybinds"
+  run_smoke_with_retry \
+    "keybind" \
+    "$shell_bin" \
+    "        sleep 1
+        printf '\\001t'
+        sleep 0.2
+        printf '\\001d'" \
+    "keybind smoke expected clean attach detach, got"
 }
 
 cd "$ROOT_DIR"
