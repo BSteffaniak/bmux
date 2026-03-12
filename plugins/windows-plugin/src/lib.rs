@@ -22,6 +22,12 @@ impl RustPlugin for WindowsPlugin {
             .description("Shipped bmux windows command plugin")
             .require_capability("bmux.commands")
             .expect("capability should parse")
+            .require_capability("bmux.sessions.read")
+            .expect("capability should parse")
+            .require_capability("bmux.sessions.write")
+            .expect("capability should parse")
+            .require_capability("bmux.panes.read")
+            .expect("capability should parse")
             .provide_capability("bmux.windows.read")
             .expect("capability should parse")
             .provide_capability("bmux.windows.write")
@@ -540,9 +546,189 @@ bmux_plugin::export_plugin!(WindowsPlugin);
 mod tests {
     use super::*;
     use bmux_plugin::{
-        PaneListResponse, PaneSummary, ServiceCaller, SessionListResponse, SessionSummary,
+        ApiVersion, HostConnectionInfo, HostKernelBridge, HostMetadata, NativeServiceContext,
+        PaneListResponse, PaneSummary, ProviderId, RegisteredService, ServiceCaller,
+        ServiceRequest, SessionListResponse, SessionSummary,
     };
     use std::sync::Mutex;
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct BridgeRequest {
+        payload: Vec<u8>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct BridgeResponse {
+        payload: Vec<u8>,
+    }
+
+    unsafe extern "C" fn service_test_kernel_bridge(
+        input_ptr: *const u8,
+        input_len: usize,
+        output_ptr: *mut u8,
+        output_capacity: usize,
+        output_len: *mut usize,
+    ) -> i32 {
+        let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+        let bridge_request: BridgeRequest = match decode_service_message(input) {
+            Ok(request) => request,
+            Err(_) => return 1,
+        };
+        let request: bmux_ipc::Request = match bmux_ipc::decode(&bridge_request.payload) {
+            Ok(request) => request,
+            Err(_) => return 1,
+        };
+
+        let response = match request {
+            bmux_ipc::Request::NewSession { name: Some(name) } if name == "deny" => {
+                bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
+                    code: bmux_ipc::ErrorCode::InvalidRequest,
+                    message: "session policy denied for this operation".to_string(),
+                })
+            }
+            bmux_ipc::Request::NewSession { .. } => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionCreated {
+                    id: Uuid::new_v4(),
+                    name: Some("created".to_string()),
+                })
+            }
+            bmux_ipc::Request::ListSessions => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionList {
+                    sessions: vec![bmux_ipc::SessionSummary {
+                        id: Uuid::new_v4(),
+                        name: Some("alpha".to_string()),
+                        client_count: 1,
+                    }],
+                })
+            }
+            bmux_ipc::Request::KillSession { selector, .. } => {
+                let id = match selector {
+                    bmux_ipc::SessionSelector::ById(id) => id,
+                    bmux_ipc::SessionSelector::ByName(_) => Uuid::new_v4(),
+                };
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionKilled { id })
+            }
+            bmux_ipc::Request::ListPanes { .. } => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::PaneList {
+                    panes: vec![bmux_ipc::PaneSummary {
+                        id: Uuid::new_v4(),
+                        index: 1,
+                        name: Some("pane-1".to_string()),
+                        focused: true,
+                    }],
+                })
+            }
+            _ => bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
+                code: bmux_ipc::ErrorCode::InvalidRequest,
+                message: "unsupported request in service bridge test".to_string(),
+            }),
+        };
+
+        let encoded = match bmux_ipc::encode(&response) {
+            Ok(encoded) => encoded,
+            Err(_) => return 1,
+        };
+        let output = match encode_service_message(&BridgeResponse { payload: encoded }) {
+            Ok(output) => output,
+            Err(_) => return 1,
+        };
+
+        if output.len() > output_capacity {
+            unsafe {
+                *output_len = output.len();
+            }
+            return 4;
+        }
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(output.as_ptr(), output_ptr, output.len());
+            *output_len = output.len();
+        }
+        0
+    }
+
+    fn service_test_context(
+        interface_id: &str,
+        operation: &str,
+        payload: Vec<u8>,
+        capability: &str,
+        kind: ServiceKind,
+    ) -> NativeServiceContext {
+        let host_services = vec![
+            RegisteredService {
+                capability: HostScope::new("bmux.sessions.read").expect("capability should parse"),
+                kind: ServiceKind::Query,
+                interface_id: "session-query/v1".to_string(),
+                provider: ProviderId::Host,
+            },
+            RegisteredService {
+                capability: HostScope::new("bmux.sessions.write").expect("capability should parse"),
+                kind: ServiceKind::Command,
+                interface_id: "session-command/v1".to_string(),
+                provider: ProviderId::Host,
+            },
+            RegisteredService {
+                capability: HostScope::new("bmux.panes.read").expect("capability should parse"),
+                kind: ServiceKind::Query,
+                interface_id: "pane-query/v1".to_string(),
+                provider: ProviderId::Host,
+            },
+            RegisteredService {
+                capability: HostScope::new("bmux.panes.write").expect("capability should parse"),
+                kind: ServiceKind::Command,
+                interface_id: "pane-command/v1".to_string(),
+                provider: ProviderId::Host,
+            },
+        ];
+
+        NativeServiceContext {
+            plugin_id: "bmux.windows".to_string(),
+            request: ServiceRequest {
+                caller_plugin_id: "test.caller".to_string(),
+                service: RegisteredService {
+                    capability: HostScope::new(capability).expect("capability should parse"),
+                    kind,
+                    interface_id: interface_id.to_string(),
+                    provider: ProviderId::Plugin("bmux.windows".to_string()),
+                },
+                operation: operation.to_string(),
+                payload,
+            },
+            required_capabilities: vec![
+                "bmux.commands".to_string(),
+                "bmux.sessions.read".to_string(),
+                "bmux.sessions.write".to_string(),
+                "bmux.panes.read".to_string(),
+            ],
+            provided_capabilities: vec![
+                "bmux.windows.read".to_string(),
+                "bmux.windows.write".to_string(),
+            ],
+            services: host_services,
+            available_capabilities: vec![
+                "bmux.sessions.read".to_string(),
+                "bmux.sessions.write".to_string(),
+                "bmux.panes.read".to_string(),
+                "bmux.panes.write".to_string(),
+            ],
+            enabled_plugins: vec!["bmux.windows".to_string()],
+            plugin_search_roots: vec!["/plugins".to_string()],
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+            },
+            settings: std::collections::BTreeMap::new(),
+            plugin_settings_map: std::collections::BTreeMap::new(),
+            host_kernel_bridge: Some(HostKernelBridge::from_fn(service_test_kernel_bridge)),
+        }
+    }
 
     struct MockHost {
         sessions: Vec<SessionSummary>,
@@ -858,5 +1044,93 @@ mod tests {
         let error = switch_window(&host, SessionSelector::ById(target))
             .expect_err("switch should fail when pane list fails");
         assert!(error.contains("mock pane list failure"));
+    }
+
+    #[test]
+    fn invoke_service_new_returns_ack_with_id() {
+        let mut plugin = WindowsPlugin;
+        let context = service_test_context(
+            "window-command/v1",
+            "new",
+            encode_service_message(&NewWindowRequest {
+                name: Some("ok".to_string()),
+            })
+            .expect("request should encode"),
+            "bmux.windows.write",
+            ServiceKind::Command,
+        );
+
+        let response = plugin.invoke_service(context);
+        assert!(
+            response.error.is_none(),
+            "unexpected error: {:?}",
+            response.error
+        );
+        let ack: WindowCommandAck =
+            decode_service_message(&response.payload).expect("ack should decode");
+        assert!(ack.ok);
+        assert!(ack.id.is_some());
+    }
+
+    #[test]
+    fn invoke_service_new_surfaces_denied_error() {
+        let mut plugin = WindowsPlugin;
+        let context = service_test_context(
+            "window-command/v1",
+            "new",
+            encode_service_message(&NewWindowRequest {
+                name: Some("deny".to_string()),
+            })
+            .expect("request should encode"),
+            "bmux.windows.write",
+            ServiceKind::Command,
+        );
+
+        let response = plugin.invoke_service(context);
+        let error = response.error.expect("expected service error");
+        assert_eq!(error.code, "new_failed");
+        assert!(error.message.contains("session policy denied"));
+    }
+
+    #[test]
+    fn invoke_service_switch_returns_ack_with_selected_id() {
+        let mut plugin = WindowsPlugin;
+        let context = service_test_context(
+            "window-command/v1",
+            "switch",
+            encode_service_message(&SwitchWindowRequest {
+                target: "alpha".to_string(),
+            })
+            .expect("request should encode"),
+            "bmux.windows.write",
+            ServiceKind::Command,
+        );
+
+        let response = plugin.invoke_service(context);
+        assert!(
+            response.error.is_none(),
+            "unexpected error: {:?}",
+            response.error
+        );
+        let ack: WindowCommandAck =
+            decode_service_message(&response.payload).expect("ack should decode");
+        assert!(ack.ok);
+        assert!(ack.id.is_some_and(|id| !id.is_empty()));
+    }
+
+    #[test]
+    fn invoke_service_rejects_invalid_payload() {
+        let mut plugin = WindowsPlugin;
+        let context = service_test_context(
+            "window-command/v1",
+            "kill",
+            vec![1, 2, 3],
+            "bmux.windows.write",
+            ServiceKind::Command,
+        );
+
+        let response = plugin.invoke_service(context);
+        let error = response.error.expect("expected service error");
+        assert_eq!(error.code, "invalid_request");
     }
 }
