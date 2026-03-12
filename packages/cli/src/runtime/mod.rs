@@ -288,8 +288,9 @@ fn available_capability_providers(
     config: &BmuxConfig,
     registry: &PluginRegistry,
 ) -> Result<std::collections::BTreeMap<HostScope, bmux_plugin::CapabilityProvider>> {
+    let enabled_plugins = effective_enabled_plugins(config, registry);
     registry
-        .capability_providers_for(&config.plugins.enabled, &core_provided_capabilities())
+        .capability_providers_for(&enabled_plugins, &core_provided_capabilities())
         .context("failed resolving capability providers")
 }
 
@@ -297,10 +298,11 @@ fn available_service_descriptors(
     config: &BmuxConfig,
     registry: &PluginRegistry,
 ) -> Result<Vec<RegisteredService>> {
+    let enabled_plugins = effective_enabled_plugins(config, registry);
     let mut services = core_service_descriptors();
     services.extend(
         registry
-            .service_providers_for(&config.plugins.enabled)
+            .service_providers_for(&enabled_plugins)
             .context("failed resolving service providers")?
             .into_values()
             .map(|provider| provider.service),
@@ -322,6 +324,7 @@ fn register_plugin_service_handlers(
     paths: &ConfigPaths,
     registry: &PluginRegistry,
 ) -> Result<()> {
+    let enabled_plugins = effective_enabled_plugins(config, registry);
     let available_capabilities = available_capability_providers(config, registry)?;
     let services = available_service_descriptors(config, registry)?;
     let plugin_search_roots = resolve_plugin_search_paths(config, paths)?
@@ -357,6 +360,7 @@ fn register_plugin_service_handlers(
         let plugin_search_roots_for_handler = plugin_search_roots.clone();
         let config_for_handler = config.clone();
         let connection_info_for_handler = connection_info.clone();
+        let enabled_plugins_for_handler = enabled_plugins.clone();
 
         server.register_service_handler(
             service.capability.as_str().to_string(),
@@ -372,6 +376,7 @@ fn register_plugin_service_handlers(
                 let plugin_search_roots = plugin_search_roots_for_handler.clone();
                 let config = config_for_handler.clone();
                 let connection = connection_info_for_handler.clone();
+                let enabled_plugins = enabled_plugins_for_handler.clone();
                 async move {
                     let loaded =
                         load_native_registered_plugin(&provider, &host, &available_capabilities)
@@ -417,7 +422,7 @@ fn register_plugin_service_handlers(
                             .collect(),
                         services,
                         available_capabilities: capability_names,
-                        enabled_plugins: config.plugins.enabled.clone(),
+                        enabled_plugins,
                         plugin_search_roots,
                         host,
                         connection,
@@ -568,7 +573,9 @@ fn parse_runtime_cli_with_registry(
     config: &BmuxConfig,
     registry: &PluginRegistry,
 ) -> Result<ParsedRuntimeCli> {
-    let command_registry = PluginCommandRegistry::build(&config, &registry)
+    let mut command_config = config.clone();
+    command_config.plugins.enabled = effective_enabled_plugins(config, registry);
+    let command_registry = PluginCommandRegistry::build(&command_config, registry)
         .context("failed building plugin CLI command registry")?;
     let clap_command = command_registry
         .augment_clap_command(Cli::command())
@@ -1036,13 +1043,33 @@ fn validate_configured_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Resu
 }
 
 fn scan_available_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Result<PluginRegistry> {
+    let workspace_bundled_root = workspace_bundled_plugin_root();
     let search_paths = resolve_plugin_search_paths(config, paths)?;
     let reports = bmux_plugin::discover_plugin_manifests_in_roots(&search_paths)?;
     let mut registry = PluginRegistry::new();
     for report in reports {
         for manifest_path in report.manifest_paths {
             match PluginManifest::from_path(&manifest_path) {
-                Ok(manifest) => {
+                Ok(mut manifest) => {
+                    let entry_path = manifest.resolve_entry_path(
+                        manifest_path
+                            .parent()
+                            .unwrap_or_else(|| std::path::Path::new(".")),
+                    );
+                    if !entry_path.exists()
+                        && workspace_bundled_root
+                            .as_ref()
+                            .is_some_and(|root| report.search_root == *root)
+                    {
+                        if let Ok(executable) = std::env::current_exe() {
+                            if let Some(executable_dir) = executable.parent() {
+                                let executable_candidate = executable_dir.join(&manifest.entry);
+                                if executable_candidate.exists() {
+                                    manifest.entry = executable_candidate;
+                                }
+                            }
+                        }
+                    }
                     if let Err(error) = registry.register_manifest_from_root(
                         &report.search_root,
                         &manifest_path,
@@ -1070,12 +1097,9 @@ fn resolve_plugin_search_paths(config: &BmuxConfig, paths: &ConfigPaths) -> Resu
     let mut resolved = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
 
-    if let Ok(executable) = std::env::current_exe() {
-        if let Some(parent) = executable.parent() {
-            let bundled = parent.join("plugins");
-            if seen.insert(bundled.clone()) {
-                resolved.push(bundled);
-            }
+    for bundled in bundled_plugin_roots() {
+        if seen.insert(bundled.clone()) {
+            resolved.push(bundled);
         }
     }
 
@@ -1100,12 +1124,105 @@ fn resolve_plugin_search_paths(config: &BmuxConfig, paths: &ConfigPaths) -> Resu
     Ok(resolved)
 }
 
+fn bundled_plugin_root() -> Option<PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let parent = executable.parent()?;
+    Some(parent.join("plugins"))
+}
+
+fn workspace_bundled_plugin_root() -> Option<PathBuf> {
+    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let root = manifest_dir.parent()?.parent()?;
+    let bundled = root.join("plugins").join("bundled");
+    bundled.exists().then_some(bundled)
+}
+
+fn bundled_plugin_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    if let Some(root) = bundled_plugin_root() {
+        if seen.insert(root.clone()) {
+            roots.push(root);
+        }
+    }
+    if let Some(root) = workspace_bundled_plugin_root() {
+        if seen.insert(root.clone()) {
+            roots.push(root);
+        }
+    }
+    roots
+}
+
+fn registered_plugin_entry_exists(plugin: &bmux_plugin::RegisteredPlugin) -> bool {
+    plugin
+        .manifest
+        .resolve_entry_path(
+            plugin
+                .manifest_path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new(".")),
+        )
+        .exists()
+}
+
+fn effective_enabled_plugins(config: &BmuxConfig, registry: &PluginRegistry) -> Vec<String> {
+    let disabled = config
+        .plugins
+        .disabled
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let bundled_roots = bundled_plugin_roots()
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut enabled = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+
+    let mut bundled_defaults = registry
+        .iter()
+        .filter_map(|plugin| {
+            (bundled_roots.contains(&plugin.search_root) && registered_plugin_entry_exists(plugin))
+                .then(|| plugin.declaration.id.as_str().to_string())
+        })
+        .collect::<Vec<_>>();
+    bundled_defaults.sort();
+    for plugin_id in bundled_defaults {
+        if disabled.contains(plugin_id.as_str()) {
+            continue;
+        }
+        if seen.insert(plugin_id.clone()) {
+            enabled.push(plugin_id);
+        }
+    }
+
+    for plugin_id in &config.plugins.enabled {
+        if disabled.contains(plugin_id.as_str()) {
+            continue;
+        }
+        if seen.insert(plugin_id.clone()) {
+            enabled.push(plugin_id.clone());
+        }
+    }
+
+    enabled
+}
+
 fn validate_enabled_plugins(config: &BmuxConfig, registry: &PluginRegistry) -> Result<()> {
-    if config.plugins.enabled.is_empty() {
+    let disabled = config
+        .plugins
+        .disabled
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let enabled_plugins = effective_enabled_plugins(config, registry);
+    if enabled_plugins.is_empty() {
         return Ok(());
     }
 
     for plugin_id in &config.plugins.enabled {
+        if disabled.contains(plugin_id.as_str()) {
+            continue;
+        }
         let _ = registry.get(plugin_id).with_context(|| {
             let available = registry.plugin_ids();
             if available.is_empty() {
@@ -1121,22 +1238,13 @@ fn validate_enabled_plugins(config: &BmuxConfig, registry: &PluginRegistry) -> R
         })?;
     }
 
-    let host = plugin_host_metadata();
-    let available_capabilities = available_capability_providers(config, registry)?;
-    let ordered_plugins = registry
-        .activation_order_for(&config.plugins.enabled)
+    let _ = registry
+        .activation_order_for(&enabled_plugins)
         .context("enabled plugin dependency graph is invalid")?;
-    for plugin in ordered_plugins {
-        let plugin_id = plugin.declaration.id.as_str();
-        bmux_plugin::PluginRegistry::validate_registered_plugin(
-            plugin,
-            &host,
-            &available_capabilities,
-        )
-        .with_context(|| format!("failed validating enabled plugin '{plugin_id}'"))?;
-    }
 
-    PluginCommandRegistry::build(config, registry)
+    let mut command_config = config.clone();
+    command_config.plugins.enabled = enabled_plugins;
+    PluginCommandRegistry::build(&command_config, registry)
         .context("failed building plugin CLI command registry")?;
 
     Ok(())
@@ -1146,26 +1254,54 @@ fn load_enabled_plugins(
     config: &BmuxConfig,
     registry: &PluginRegistry,
 ) -> Result<Vec<bmux_plugin::LoadedPlugin>> {
-    if config.plugins.enabled.is_empty() {
+    let enabled_plugins = effective_enabled_plugins(config, registry);
+    if enabled_plugins.is_empty() {
         return Ok(Vec::new());
     }
 
-    for plugin_id in &config.plugins.enabled {
-        let _ = registry.get(plugin_id).with_context(|| {
-            format!("enabled plugin '{plugin_id}' disappeared during native load")
-        })?;
+    let disabled = config
+        .plugins
+        .disabled
+        .iter()
+        .map(String::as_str)
+        .collect::<std::collections::BTreeSet<_>>();
+    let explicitly_enabled = config
+        .plugins
+        .enabled
+        .iter()
+        .filter(|plugin_id| !disabled.contains(plugin_id.as_str()))
+        .cloned()
+        .collect::<std::collections::BTreeSet<_>>();
+
+    for plugin_id in &enabled_plugins {
+        if registry.get(plugin_id).is_some() {
+            continue;
+        }
+        if explicitly_enabled.contains(plugin_id) {
+            anyhow::bail!("enabled plugin '{plugin_id}' disappeared during native load");
+        }
+        warn!("skipping bundled plugin '{plugin_id}' because it is no longer discoverable");
     }
 
     let host = plugin_host_metadata();
     let available_capabilities = available_capability_providers(config, registry)?;
     let ordered_plugins = registry
-        .activation_order_for(&config.plugins.enabled)
+        .activation_order_for(&enabled_plugins)
         .context("enabled plugin dependency graph is invalid")?;
     let mut loaded_plugins = Vec::with_capacity(ordered_plugins.len());
     for plugin in ordered_plugins {
         let plugin_id = plugin.declaration.id.as_str();
-        let loaded = load_native_registered_plugin(plugin, &host, &available_capabilities)
-            .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"))?;
+        let loaded = match load_native_registered_plugin(plugin, &host, &available_capabilities) {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                if explicitly_enabled.contains(plugin_id) {
+                    return Err(error)
+                        .with_context(|| format!("failed loading enabled plugin '{plugin_id}'"));
+                }
+                warn!("skipping bundled plugin '{plugin_id}': {error}");
+                continue;
+            }
+        };
         loaded_plugins.push(loaded);
     }
 
@@ -1290,6 +1426,10 @@ fn activate_loaded_plugins(
     let available_services = service_descriptors_from_declarations(
         loaded_plugins.iter().map(|plugin| &plugin.declaration),
     );
+    let enabled_plugins = loaded_plugins
+        .iter()
+        .map(|plugin| plugin.declaration.id.as_str().to_string())
+        .collect::<Vec<_>>();
     for plugin in loaded_plugins {
         if !plugin.declaration.lifecycle.activate_on_startup {
             continue;
@@ -1301,7 +1441,7 @@ fn activate_loaded_plugins(
             &plugin.declaration,
             available_services.clone(),
             available_capabilities.clone(),
-            config.plugins.enabled.clone(),
+            enabled_plugins.clone(),
             plugin_search_roots.clone(),
         );
         let _host_kernel_connection_guard = enter_host_kernel_connection(connection_info.clone());
@@ -1313,7 +1453,7 @@ fn activate_loaded_plugins(
                     &activated_plugin.declaration,
                     available_services.clone(),
                     available_capabilities.clone(),
-                    config.plugins.enabled.clone(),
+                    enabled_plugins.clone(),
                     plugin_search_roots.clone(),
                 );
                 let _host_kernel_connection_guard =
@@ -1365,6 +1505,10 @@ fn deactivate_loaded_plugins(
     let available_services = service_descriptors_from_declarations(
         loaded_plugins.iter().map(|plugin| &plugin.declaration),
     );
+    let enabled_plugins = loaded_plugins
+        .iter()
+        .map(|plugin| plugin.declaration.id.as_str().to_string())
+        .collect::<Vec<_>>();
     for plugin in loaded_plugins.iter().rev() {
         if !plugin.declaration.lifecycle.activate_on_startup {
             continue;
@@ -1376,7 +1520,7 @@ fn deactivate_loaded_plugins(
             &plugin.declaration,
             available_services.clone(),
             available_capabilities.clone(),
-            config.plugins.enabled.clone(),
+            enabled_plugins.clone(),
             plugin_search_roots.clone(),
         );
         let _host_kernel_connection_guard = enter_host_kernel_connection(connection_info.clone());
@@ -1497,10 +1641,8 @@ async fn run_plugin_list(as_json: bool) -> Result<u8> {
     let config = BmuxConfig::load()?;
     let paths = ConfigPaths::default();
     let registry = scan_available_plugins(&config, &paths)?;
-    let enabled = config
-        .plugins
-        .enabled
-        .iter()
+    let enabled = effective_enabled_plugins(&config, &registry)
+        .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
     let mut entries = registry
         .iter()
@@ -1508,7 +1650,7 @@ async fn run_plugin_list(as_json: bool) -> Result<u8> {
             id: plugin.declaration.id.as_str().to_string(),
             display_name: plugin.declaration.display_name.clone(),
             version: plugin.declaration.plugin_version.clone(),
-            enabled: enabled.contains(&plugin.declaration.id.as_str().to_string()),
+            enabled: enabled.contains(plugin.declaration.id.as_str()),
             required_capabilities: plugin
                 .declaration
                 .required_capabilities
@@ -1576,13 +1718,9 @@ async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]
     let plugin = registry
         .get(plugin_id)
         .with_context(|| format_plugin_not_found_message(plugin_id, &available))?;
+    let enabled_plugins = effective_enabled_plugins(&config, &registry);
 
-    if !config
-        .plugins
-        .enabled
-        .iter()
-        .any(|enabled| enabled == plugin_id)
-    {
+    if !enabled_plugins.iter().any(|enabled| enabled == plugin_id) {
         anyhow::bail!(format_plugin_not_enabled_message(plugin_id));
     }
 
@@ -1608,7 +1746,7 @@ async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]
         args,
         available_service_descriptors(&config, &registry)?,
         available_capabilities,
-        config.plugins.enabled.clone(),
+        enabled_plugins,
         plugin_search_roots,
     );
     let _host_kernel_connection_guard = enter_host_kernel_connection(context.connection.clone());
@@ -1656,7 +1794,7 @@ fn format_plugin_not_found_message<S: AsRef<str>>(plugin_id: &str, available: &[
 
 fn format_plugin_not_enabled_message(plugin_id: &str) -> String {
     format!(
-        "plugin '{plugin_id}' is not enabled in config; add it under plugins.enabled to run commands"
+        "plugin '{plugin_id}' is not enabled; remove it from plugins.disabled or add it under plugins.enabled to run commands"
     )
 }
 
@@ -1686,7 +1824,9 @@ async fn run_external_plugin_command(args: &[String]) -> Result<u8> {
     let config = BmuxConfig::load()?;
     let paths = ConfigPaths::default();
     let registry = scan_available_plugins(&config, &paths)?;
-    let command_registry = PluginCommandRegistry::build(&config, &registry)
+    let mut command_config = config.clone();
+    command_config.plugins.enabled = effective_enabled_plugins(&config, &registry);
+    let command_registry = PluginCommandRegistry::build(&command_config, &registry)
         .context("failed building plugin CLI command registry")?;
     let resolved = command_registry
         .resolve(args)
@@ -2565,16 +2705,7 @@ async fn handle_attach_runtime_action(
     view_state: &mut AttachViewState,
 ) -> std::result::Result<(), ClientError> {
     match action {
-        RuntimeAction::NewWindow => {
-            let status = attach_context_status(client, view_state.attached_id).await?;
-            set_attach_context_status(
-                view_state,
-                format!("{status} | workspace unavailable in core baseline"),
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
-        }
-        RuntimeAction::NewSession => {
+        RuntimeAction::NewWindow | RuntimeAction::NewSession => {
             let session_id = client.new_session(None).await?;
             let attach_info = open_attach_for_session(client, session_id).await?;
             view_state.attached_id = attach_info.session_id;
@@ -3008,6 +3139,7 @@ fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
     let payload = bmux_plugin::encode_service_message(&ClipboardWriteRequest {
         text: text.to_string(),
     })?;
+    let enabled_plugins = effective_enabled_plugins(&config, &registry);
     let available_capabilities = available_capability_providers(&config, &registry)?
         .into_keys()
         .map(|entry| entry.to_string())
@@ -3056,7 +3188,7 @@ fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
             .collect(),
         services: available_service_descriptors(&config, &registry)?,
         available_capabilities,
-        enabled_plugins: config.plugins.enabled.clone(),
+        enabled_plugins,
         plugin_search_roots,
         host: plugin_host_metadata(),
         connection,
@@ -5521,6 +5653,69 @@ mod tests {
     }
 
     #[test]
+    fn effective_enabled_plugins_includes_bundled_plugins_by_default() {
+        let Some(bundled_root) = super::bundled_plugin_root() else {
+            return;
+        };
+        let dir = temp_dir();
+        fs::write(dir.join("windows.dylib"), []).expect("entry should be written");
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest_from_root(
+                &bundled_root,
+                &dir.join("plugin.toml"),
+                plugin_manifest("bmux.windows", "windows.dylib"),
+            )
+            .expect("bundled plugin should register");
+
+        let config = BmuxConfig::default();
+        let enabled = super::effective_enabled_plugins(&config, &registry);
+        assert!(enabled.iter().any(|plugin_id| plugin_id == "bmux.windows"));
+    }
+
+    #[test]
+    fn effective_enabled_plugins_honors_disabled_overrides() {
+        let Some(bundled_root) = super::bundled_plugin_root() else {
+            return;
+        };
+        let dir = temp_dir();
+        fs::write(dir.join("windows.dylib"), []).expect("entry should be written");
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest_from_root(
+                &bundled_root,
+                &dir.join("plugin.toml"),
+                plugin_manifest("bmux.windows", "windows.dylib"),
+            )
+            .expect("bundled plugin should register");
+
+        let mut config = BmuxConfig::default();
+        config.plugins.disabled.push("bmux.windows".to_string());
+        let enabled = super::effective_enabled_plugins(&config, &registry);
+        assert!(!enabled.iter().any(|plugin_id| plugin_id == "bmux.windows"));
+    }
+
+    #[test]
+    fn effective_enabled_plugins_skips_bundled_plugins_with_missing_entry() {
+        let Some(bundled_root) = super::bundled_plugin_root() else {
+            return;
+        };
+        let dir = temp_dir();
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest_from_root(
+                &bundled_root,
+                &dir.join("plugin.toml"),
+                plugin_manifest("bmux.windows", "windows.dylib"),
+            )
+            .expect("bundled plugin should register");
+
+        let config = BmuxConfig::default();
+        let enabled = super::effective_enabled_plugins(&config, &registry);
+        assert!(!enabled.iter().any(|plugin_id| plugin_id == "bmux.windows"));
+    }
+
+    #[test]
     fn validate_enabled_plugins_accepts_plugin_provided_capabilities() {
         let dir = temp_dir();
         let provider_dir = dir.join("provider");
@@ -5627,6 +5822,38 @@ mod tests {
                 assert_eq!(plugin_id, "policy.plugin");
                 assert_eq!(command_name, "roles");
                 assert_eq!(arguments, vec!["--session".to_string(), "dev".to_string()]);
+            }
+            other => panic!("expected plugin runtime parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_cli_parses_bundled_plugin_command_without_explicit_enable() {
+        let Some(bundled_root) = super::bundled_plugin_root() else {
+            return;
+        };
+        let dir = temp_dir();
+        fs::write(dir.join("windows.dylib"), []).expect("entry should be written");
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest_from_root(
+                &bundled_root,
+                &dir.join("plugin.toml"),
+                plugin_manifest_with_commands(
+                    "bmux.windows",
+                    "windows.dylib",
+                    "[[commands]]\nname='new-window'\npath=['new-window']\nsummary='new'\nexecution='provider_exec'\nexpose_in_cli=true\n",
+                ),
+            )
+            .expect("plugin should register");
+
+        let config = BmuxConfig::default();
+        let argv = vec![OsString::from("bmux"), OsString::from("new-window")];
+        let parsed = super::parse_runtime_cli_with_registry(&argv, &config, &registry)
+            .expect("runtime CLI should parse bundled plugin command");
+        match parsed {
+            super::ParsedRuntimeCli::Plugin { plugin_id, .. } => {
+                assert_eq!(plugin_id, "bmux.windows");
             }
             other => panic!("expected plugin runtime parse, got {other:?}"),
         }
@@ -6266,7 +6493,8 @@ mod tests {
     #[test]
     fn format_plugin_not_enabled_message_points_to_plugins_enabled() {
         let message = super::format_plugin_not_enabled_message("bmux.windows");
-        assert!(message.contains("plugin 'bmux.windows' is not enabled in config"));
+        assert!(message.contains("plugin 'bmux.windows' is not enabled"));
+        assert!(message.contains("plugins.disabled"));
         assert!(message.contains("plugins.enabled"));
     }
 

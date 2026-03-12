@@ -207,6 +207,24 @@ bmux session unfollow
 
 `follow` target must be a client UUID.
 
+## Bundled Plugins
+
+Plugins bundled next to the `bmux` executable are enabled by default.
+
+Use config opt-out when you want to disable specific bundled plugins:
+
+```toml
+[plugins]
+disabled = ["bmux.windows", "bmux.permissions", "bmux.clipboard"]
+```
+
+You can still explicitly enable additional non-bundled plugins:
+
+```toml
+[plugins]
+enabled = ["example.native"]
+```
+
 ## Permission Commands
 
 Top-level and grouped forms are exact aliases.

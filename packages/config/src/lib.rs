@@ -196,6 +196,8 @@ pub struct MultiClientConfig {
 pub struct PluginConfig {
     /// Enabled plugins
     pub enabled: Vec<String>,
+    /// Bundled or explicitly enabled plugins to disable
+    pub disabled: Vec<String>,
     /// Additional plugin search roots
     pub search_paths: Vec<PathBuf>,
     /// Plugin-specific settings
@@ -443,6 +445,8 @@ mod tests {
         let config = BmuxConfig::default();
         assert!(config.validate().is_ok());
         assert_eq!(config.behavior.stale_build_action, StaleBuildAction::Error);
+        assert!(config.plugins.enabled.is_empty());
+        assert!(config.plugins.disabled.is_empty());
         assert_eq!(
             config
                 .keybindings
@@ -477,6 +481,27 @@ mod tests {
         assert_eq!(
             config.keybindings.timeout_profile,
             defaults.keybindings.timeout_profile
+        );
+        assert!(config.plugins.disabled.is_empty());
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn load_parses_plugin_disabled_list() {
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        std::fs::write(
+            &path,
+            "[plugins]\nenabled = ['bmux.windows']\ndisabled = ['bmux.permissions']\n",
+        )
+        .expect("failed writing config fixture");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(config.plugins.enabled, vec!["bmux.windows".to_string()]);
+        assert_eq!(
+            config.plugins.disabled,
+            vec!["bmux.permissions".to_string()]
         );
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
