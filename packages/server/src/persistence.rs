@@ -27,18 +27,6 @@ pub struct OwnerPrincipalSnapshotV2 {
 pub struct SessionSnapshotV3 {
     pub id: Uuid,
     pub name: Option<String>,
-    pub windows: Vec<WindowSnapshotV3>,
-    pub active_window_id: Option<Uuid>,
-    #[serde(default)]
-    pub next_window_number: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WindowSnapshotV3 {
-    pub id: Uuid,
-    #[serde(default)]
-    pub number: u32,
-    pub name: Option<String>,
     pub panes: Vec<PaneSnapshotV2>,
     pub focused_pane_id: Option<Uuid>,
     #[serde(default)]
@@ -248,7 +236,6 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 
 fn validate_snapshot_v3(snapshot: &SnapshotV3) -> Result<(), SnapshotError> {
     let mut session_ids = BTreeSet::new();
-    let mut all_window_ids = BTreeSet::new();
     let mut all_pane_ids = BTreeSet::new();
     let mut owner_sessions = BTreeSet::new();
     let mut surface_ids = BTreeSet::new();
@@ -261,115 +248,69 @@ fn validate_snapshot_v3(snapshot: &SnapshotV3) -> Result<(), SnapshotError> {
             )));
         }
 
-        let mut session_window_numbers = BTreeSet::new();
-        let mut session_window_ids = BTreeSet::new();
-        let mut max_window_number = 0u32;
-        for window in &session.windows {
-            if !session_window_ids.insert(window.id) {
+        if session.panes.is_empty() {
+            return Err(SnapshotError::Validation(format!(
+                "session {} must contain at least one pane",
+                session.id
+            )));
+        }
+        let session_pane_ids = session
+            .panes
+            .iter()
+            .map(|pane| pane.id)
+            .collect::<BTreeSet<_>>();
+        for pane in &session.panes {
+            if !all_pane_ids.insert(pane.id) {
                 return Err(SnapshotError::Validation(format!(
-                    "duplicate window id {} in session {}",
-                    window.id, session.id
+                    "pane id {} reused across sessions",
+                    pane.id
                 )));
             }
-            if !all_window_ids.insert(window.id) {
+            if pane.shell.trim().is_empty() {
                 return Err(SnapshotError::Validation(format!(
-                    "window id {} reused across sessions",
-                    window.id
+                    "pane {} in session {} has empty shell",
+                    pane.id, session.id
                 )));
-            }
-
-            if window.number == 0 {
-                return Err(SnapshotError::Validation(format!(
-                    "window {} in session {} has invalid number 0",
-                    window.id, session.id
-                )));
-            }
-            if !session_window_numbers.insert(window.number) {
-                return Err(SnapshotError::Validation(format!(
-                    "duplicate window number {} in session {}",
-                    window.number, session.id
-                )));
-            }
-            max_window_number = max_window_number.max(window.number);
-            let window_pane_ids = window
-                .panes
-                .iter()
-                .map(|pane| pane.id)
-                .collect::<BTreeSet<_>>();
-            if window.panes.is_empty() {
-                return Err(SnapshotError::Validation(format!(
-                    "window {} must contain at least one pane",
-                    window.id
-                )));
-            }
-            for pane in &window.panes {
-                if !all_pane_ids.insert(pane.id) {
-                    return Err(SnapshotError::Validation(format!(
-                        "pane id {} reused across windows",
-                        pane.id
-                    )));
-                }
-                if pane.shell.trim().is_empty() {
-                    return Err(SnapshotError::Validation(format!(
-                        "pane {} in window {} has empty shell",
-                        pane.id, window.id
-                    )));
-                }
-            }
-            if let Some(focused_pane_id) = window.focused_pane_id
-                && !window_pane_ids.contains(&focused_pane_id)
-            {
-                return Err(SnapshotError::Validation(format!(
-                    "focused pane {} missing from window {}",
-                    focused_pane_id, window.id
-                )));
-            }
-            if let Some(layout_root) = &window.layout_root {
-                let mut layout_pane_ids = BTreeSet::new();
-                collect_layout_pane_ids(layout_root, &mut layout_pane_ids)?;
-                if layout_pane_ids != window_pane_ids {
-                    return Err(SnapshotError::Validation(format!(
-                        "layout panes do not match pane set for window {}",
-                        window.id
-                    )));
-                }
-            }
-
-            for surface in &window.floating_surfaces {
-                if !surface_ids.insert(surface.id) {
-                    return Err(SnapshotError::Validation(format!(
-                        "duplicate floating surface id {}",
-                        surface.id
-                    )));
-                }
-                if !window_pane_ids.contains(&surface.pane_id) {
-                    return Err(SnapshotError::Validation(format!(
-                        "floating surface {} references missing pane {} in window {}",
-                        surface.id, surface.pane_id, window.id
-                    )));
-                }
-                if surface.w == 0 || surface.h == 0 {
-                    return Err(SnapshotError::Validation(format!(
-                        "floating surface {} in window {} has zero-sized rect",
-                        surface.id, window.id
-                    )));
-                }
             }
         }
-        if let Some(active_window_id) = session.active_window_id
-            && !session_window_ids.contains(&active_window_id)
+        if let Some(focused_pane_id) = session.focused_pane_id
+            && !session_pane_ids.contains(&focused_pane_id)
         {
             return Err(SnapshotError::Validation(format!(
-                "active window {} missing from session {}",
-                active_window_id, session.id
+                "focused pane {} missing from session {}",
+                focused_pane_id, session.id
             )));
         }
-        let min_next_window_number = max_window_number.saturating_add(1);
-        if session.next_window_number < min_next_window_number {
-            return Err(SnapshotError::Validation(format!(
-                "session {} next_window_number {} must be at least {}",
-                session.id, session.next_window_number, min_next_window_number
-            )));
+        if let Some(layout_root) = &session.layout_root {
+            let mut layout_pane_ids = BTreeSet::new();
+            collect_layout_pane_ids(layout_root, &mut layout_pane_ids)?;
+            if layout_pane_ids != session_pane_ids {
+                return Err(SnapshotError::Validation(format!(
+                    "layout panes do not match pane set for session {}",
+                    session.id
+                )));
+            }
+        }
+
+        for surface in &session.floating_surfaces {
+            if !surface_ids.insert(surface.id) {
+                return Err(SnapshotError::Validation(format!(
+                    "duplicate floating surface id {}",
+                    surface.id
+                )));
+            }
+            if !session_pane_ids.contains(&surface.pane_id) {
+                return Err(SnapshotError::Validation(format!(
+                    "floating surface {} references missing pane {} in session {}",
+                    surface.id, surface.pane_id, session.id
+                )));
+            }
+            if surface.w == 0 || surface.h == 0 {
+                return Err(SnapshotError::Validation(format!(
+                    "floating surface {} in session {} has zero-sized rect",
+                    surface.id, session.id
+                )));
+            }
         }
     }
 
@@ -438,20 +379,7 @@ fn collect_layout_pane_ids(
     Ok(())
 }
 
-fn normalize_snapshot_v3_numbering(mut snapshot: SnapshotV3) -> SnapshotV3 {
-    for session in &mut snapshot.sessions {
-        let mut max_number = 0u32;
-        for (index, window) in session.windows.iter_mut().enumerate() {
-            if window.number == 0 {
-                window.number = index as u32 + 1;
-            }
-            max_number = max_number.max(window.number);
-        }
-        let min_next_window_number = max_number.saturating_add(1);
-        if session.next_window_number < min_next_window_number {
-            session.next_window_number = min_next_window_number.max(1);
-        }
-    }
+fn normalize_snapshot_v3_numbering(snapshot: SnapshotV3) -> SnapshotV3 {
     snapshot
 }
 
@@ -460,7 +388,6 @@ mod tests {
     use super::{
         ClientSelectedSessionSnapshotV2, FollowEdgeSnapshotV2, PaneLayoutNodeSnapshotV2,
         PaneSnapshotV2, SessionSnapshotV3, SnapshotError, SnapshotManager, SnapshotV3,
-        WindowSnapshotV3,
     };
     use uuid::Uuid;
 
@@ -475,21 +402,14 @@ mod tests {
             sessions: vec![SessionSnapshotV3 {
                 id: session_id,
                 name: Some("dev".to_string()),
-                windows: vec![WindowSnapshotV3 {
+                panes: vec![PaneSnapshotV2 {
                     id: window_id,
-                    number: 1,
-                    name: Some("main".to_string()),
-                    panes: vec![PaneSnapshotV2 {
-                        id: window_id,
-                        name: Some("pane-1".to_string()),
-                        shell: "/bin/sh".to_string(),
-                    }],
-                    focused_pane_id: Some(window_id),
-                    layout_root: Some(PaneLayoutNodeSnapshotV2::Leaf { pane_id: window_id }),
-                    floating_surfaces: vec![],
+                    name: Some("pane-1".to_string()),
+                    shell: "/bin/sh".to_string(),
                 }],
-                active_window_id: Some(window_id),
-                next_window_number: 2,
+                focused_pane_id: Some(window_id),
+                layout_root: Some(PaneLayoutNodeSnapshotV2::Leaf { pane_id: window_id }),
+                floating_surfaces: vec![],
             }],
             owner_principals: vec![],
             follows: vec![FollowEdgeSnapshotV2 {
@@ -508,7 +428,7 @@ mod tests {
 
         assert_eq!(decoded, snapshot);
         assert_eq!(decoded.sessions[0].id, session_id);
-        assert_eq!(decoded.sessions[0].windows[0].id, window_id);
+        assert_eq!(decoded.sessions[0].panes[0].id, window_id);
     }
 
     #[test]
@@ -534,21 +454,14 @@ mod tests {
             sessions: vec![SessionSnapshotV3 {
                 id: Uuid::new_v4(),
                 name: Some("valid".to_string()),
-                windows: vec![WindowSnapshotV3 {
+                panes: vec![PaneSnapshotV2 {
                     id: Uuid::new_v4(),
-                    number: 1,
-                    name: Some("w1".to_string()),
-                    panes: vec![PaneSnapshotV2 {
-                        id: Uuid::new_v4(),
-                        name: Some("pane-1".to_string()),
-                        shell: "/bin/sh".to_string(),
-                    }],
-                    focused_pane_id: None,
-                    layout_root: None,
-                    floating_surfaces: vec![],
+                    name: Some("pane-1".to_string()),
+                    shell: "/bin/sh".to_string(),
                 }],
-                active_window_id: None,
-                next_window_number: 2,
+                focused_pane_id: None,
+                layout_root: None,
+                floating_surfaces: vec![],
             }],
             owner_principals: vec![],
             follows: vec![],

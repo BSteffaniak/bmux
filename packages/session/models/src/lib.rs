@@ -229,7 +229,6 @@ impl Session {
 pub struct SessionInfo {
     pub id: SessionId,
     pub name: Option<String>,
-    pub window_count: usize,
     pub client_count: usize,
     pub created_at: std::time::SystemTime,
     pub last_activity: std::time::SystemTime,
@@ -240,7 +239,6 @@ impl From<&Session> for SessionInfo {
         Self {
             id: session.id,
             name: session.name.clone(),
-            window_count: 1,
             client_count: session.clients.len(),
             created_at: session.created_at,
             last_activity: session.last_activity,

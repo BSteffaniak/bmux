@@ -110,15 +110,6 @@ pub enum SessionSelector {
     ByName(String),
 }
 
-/// Window selector accepted by commands and protocol requests.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum WindowSelector {
-    ById(Uuid),
-    ByNumber(u32),
-    ByName(String),
-    Active,
-}
-
 /// Pane selector accepted by commands and protocol requests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PaneSelector {
