@@ -712,33 +712,6 @@ impl SessionRuntimeManager {
         runtime.attach_view_revision = runtime.attach_view_revision.saturating_add(1);
         Some(runtime.attach_view_revision)
     }
-
-    fn reset_attached_clients_to_active_pane_tail(
-        &mut self,
-        session_id: SessionId,
-    ) -> Result<(), SessionRuntimeError> {
-        let runtime = self
-            .runtimes
-            .get_mut(&session_id)
-            .ok_or(SessionRuntimeError::NotFound)?;
-        let attached_clients = runtime.attached_clients.iter().copied().collect::<Vec<_>>();
-        let window = runtime
-            .windows
-            .get_mut(&runtime.active_window)
-            .ok_or(SessionRuntimeError::NotFound)?;
-        let pane = window
-            .panes
-            .get_mut(&window.focused_pane_id)
-            .ok_or(SessionRuntimeError::NotFound)?;
-        let mut output = pane
-            .output_buffer
-            .lock()
-            .map_err(|_| SessionRuntimeError::Closed)?;
-        for client_id in attached_clients {
-            output.reset_client_to_tail(client_id);
-        }
-        Ok(())
-    }
 }
 
 struct OutputFanoutBuffer {
@@ -764,10 +737,6 @@ impl OutputFanoutBuffer {
 
     fn register_client_at_tail(&mut self, client_id: ClientId) {
         self.cursors.insert(client_id, self.end_offset());
-    }
-
-    fn reset_client_to_tail(&mut self, client_id: ClientId) {
-        self.register_client_at_tail(client_id);
     }
 
     fn unregister_client(&mut self, client_id: ClientId) {
@@ -842,13 +811,6 @@ struct RemovedWindowRuntime {
     session_removed: Option<RemovedRuntime>,
 }
 
-struct WindowRuntimeSummary {
-    id: bmux_session::WindowId,
-    number: u32,
-    name: Option<String>,
-    active: bool,
-}
-
 struct AttachLayoutState {
     window_id: bmux_session::WindowId,
     focused_pane_id: Uuid,
@@ -889,14 +851,6 @@ enum PaneLayoutNode {
         first: Box<Self>,
         second: Box<Self>,
     },
-}
-
-#[derive(Debug, Clone)]
-enum WindowSelection {
-    Active,
-    Id(bmux_session::WindowId),
-    Number(u32),
-    Name(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1645,58 +1599,6 @@ impl SessionRuntimeManager {
         })
     }
 
-    fn new_window(
-        &mut self,
-        session_id: SessionId,
-        name: Option<String>,
-    ) -> Result<(bmux_session::WindowId, u32, Option<String>)> {
-        let number = self
-            .runtimes
-            .get(&session_id)
-            .map(|session| session.next_window_number)
-            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
-        let resolved_name = name.or_else(|| Some(format!("window-{number}")));
-        let window = self.spawn_window_runtime(
-            session_id,
-            None,
-            number,
-            resolved_name.clone(),
-            None,
-            Some("pane-1".to_string()),
-            None,
-        )?;
-        let window_id = window.id;
-
-        let session = self
-            .runtimes
-            .get_mut(&session_id)
-            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
-        session.windows.insert(window_id, window);
-        session.next_window_number = session.next_window_number.saturating_add(1);
-        self.apply_stored_attach_viewport(session_id);
-        Ok((window_id, number, resolved_name))
-    }
-
-    fn list_windows(&self, session_id: SessionId) -> Result<Vec<WindowRuntimeSummary>> {
-        let session = self
-            .runtimes
-            .get(&session_id)
-            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
-
-        let mut windows = session
-            .windows
-            .values()
-            .map(|window| WindowRuntimeSummary {
-                id: window.id,
-                number: window.number,
-                name: window.name.clone(),
-                active: window.id == session.active_window,
-            })
-            .collect::<Vec<_>>();
-        windows.sort_by_key(|window| (window.number, window.id));
-        Ok(windows)
-    }
-
     fn split_pane(
         &mut self,
         session_id: SessionId,
@@ -1836,7 +1738,7 @@ impl SessionRuntimeManager {
         };
 
         if remove_window {
-            let removed = self.kill_window(session_id, WindowSelection::Id(window_id))?;
+            let removed = self.kill_window(session_id, window_id)?;
             return Ok((pane_id, Some(removed)));
         }
 
@@ -2092,46 +1994,23 @@ impl SessionRuntimeManager {
         Ok(chunks)
     }
 
-    fn switch_window(
-        &mut self,
-        session_id: SessionId,
-        selector: WindowSelection,
-    ) -> Result<bmux_session::WindowId> {
-        let session = self
-            .runtimes
-            .get_mut(&session_id)
-            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
-        let lookup_selector = selector.clone();
-        let window_id = resolve_window_id_from_selector(session, selector).ok_or_else(|| {
-            anyhow::anyhow!(window_not_found_in_session_message(
-                &lookup_selector,
-                session_id
-            ))
-        })?;
-        session.active_window = window_id;
-        self.reset_attached_clients_to_active_pane_tail(session_id)
-            .map_err(|error| anyhow::anyhow!("failed resetting attach cursors: {error:?}"))?;
-        self.apply_stored_attach_viewport(session_id);
-        Ok(window_id)
-    }
-
     fn kill_window(
         &mut self,
         session_id: SessionId,
-        selector: WindowSelection,
+        window_id: bmux_session::WindowId,
     ) -> Result<RemovedWindowRuntime> {
-        let (window_id, is_last_window) = {
+        let is_last_window = {
             let session = self
                 .runtimes
                 .get_mut(&session_id)
                 .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
-            let lookup_selector = selector.clone();
-            let Some(window_id) = resolve_window_id_from_selector(session, selector) else {
+            if !session.windows.contains_key(&window_id) {
                 anyhow::bail!(
-                    "{}",
-                    window_not_found_in_session_message(&lookup_selector, session_id)
+                    "window not found in session {} for id {}",
+                    session_id.0,
+                    window_id.0
                 );
-            };
+            }
             let is_last_window = session.windows.len() == 1;
             if !is_last_window && session.active_window == window_id {
                 let next_active = session
@@ -2143,7 +2022,7 @@ impl SessionRuntimeManager {
                     .ok_or_else(|| anyhow::anyhow!("failed selecting next active window"))?;
                 session.active_window = next_active;
             }
-            (window_id, is_last_window)
+            is_last_window
         };
 
         if is_last_window {
@@ -2383,56 +2262,6 @@ impl SessionRuntimeManager {
     }
 }
 
-fn resolve_window_id_from_selector(
-    session: &SessionRuntimeHandle,
-    selector: WindowSelection,
-) -> Option<bmux_session::WindowId> {
-    let sorted_windows = || {
-        let mut windows = session.windows.values().collect::<Vec<_>>();
-        windows.sort_by_key(|window| (window.number, window.id));
-        windows
-    };
-
-    match selector {
-        WindowSelection::Active => Some(session.active_window),
-        WindowSelection::Id(id) => session.windows.contains_key(&id).then_some(id),
-        WindowSelection::Number(number) => session
-            .windows
-            .values()
-            .find(|window| window.number == number)
-            .map(|window| window.id),
-        WindowSelection::Name(value) => {
-            let windows = sorted_windows();
-
-            if let Some(window) = windows
-                .iter()
-                .find(|window| window.name.as_deref() == Some(value.as_str()))
-            {
-                return Some(window.id);
-            }
-
-            if let Some(window) = windows
-                .iter()
-                .find(|window| window.id.to_string().eq_ignore_ascii_case(&value))
-            {
-                return Some(window.id);
-            }
-
-            let value_lower = value.to_ascii_lowercase();
-            windows
-                .iter()
-                .find(|window| {
-                    window
-                        .id
-                        .to_string()
-                        .to_ascii_lowercase()
-                        .starts_with(&value_lower)
-                })
-                .map(|window| window.id)
-        }
-    }
-}
-
 fn resolve_pane_id_from_selector(
     window: &WindowRuntimeHandle,
     selector: PaneSelector,
@@ -2453,22 +2282,6 @@ fn resolve_pane_id_from_selector(
             let pane_id = pane_ids.get(position).copied()?;
             window.panes.contains_key(&pane_id).then_some(pane_id)
         }
-    }
-}
-
-fn window_not_found_in_session_message(
-    selector: &WindowSelection,
-    session_id: SessionId,
-) -> String {
-    match selector {
-        WindowSelection::Name(_) => format!(
-            "window not found in session {} for selector {selector:?} (lookup order: exact name -> exact UUID -> UUID prefix)",
-            session_id.0
-        ),
-        _ => format!(
-            "window not found in session {} for selector {selector:?}",
-            session_id.0
-        ),
     }
 }
 
@@ -4104,23 +3917,7 @@ async fn handle_request(
                             message: format!("failed creating session runtime: {error:#}"),
                         }));
                     }
-                    let initial_windows = runtime_manager
-                        .list_windows(session_id)
-                        .map(|windows| {
-                            windows
-                                .into_iter()
-                                .map(|window| (window.id, window.number))
-                                .collect::<Vec<_>>()
-                        })
-                        .unwrap_or_default();
                     drop(runtime_manager);
-
-                    let mut manager = state
-                        .session_manager
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                    let _ = (manager.get_session_mut(&session_id), initial_windows);
-                    drop(manager);
 
                     let mut permission_state = state
                         .permission_state
@@ -4434,20 +4231,13 @@ async fn handle_request(
                 .session_manager
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            let runtime_manager = state
-                .session_runtimes
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
             let sessions = manager
                 .list_sessions()
                 .into_iter()
                 .map(|session| SessionSummary {
                     id: session.id.0,
                     name: session.name,
-                    window_count: runtime_manager
-                        .list_windows(session.id)
-                        .map(|windows| windows.len())
-                        .unwrap_or(session.window_count),
+                    window_count: session.window_count,
                     client_count: session.client_count,
                 })
                 .collect::<Vec<_>>();

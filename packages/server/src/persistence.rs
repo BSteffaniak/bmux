@@ -7,19 +7,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SNAPSHOT_VERSION_V1: u32 = 1;
-const SNAPSHOT_VERSION_V2: u32 = 2;
 const SNAPSHOT_VERSION_V3: u32 = 3;
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SnapshotV2 {
-    pub sessions: Vec<SessionSnapshotV2>,
-    #[serde(default)]
-    pub owner_principals: Vec<OwnerPrincipalSnapshotV2>,
-    pub roles: Vec<RoleAssignmentSnapshotV2>,
-    pub follows: Vec<FollowEdgeSnapshotV2>,
-    pub selected_sessions: Vec<ClientSelectedSessionSnapshotV2>,
-}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotV3 {
@@ -35,24 +23,6 @@ pub struct SnapshotV3 {
 pub struct OwnerPrincipalSnapshotV2 {
     pub session_id: Uuid,
     pub principal_id: Uuid,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SessionSnapshotV2 {
-    pub id: Uuid,
-    pub name: Option<String>,
-    pub windows: Vec<WindowSnapshotV2>,
-    pub active_window_id: Option<Uuid>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct WindowSnapshotV2 {
-    pub id: Uuid,
-    pub name: Option<String>,
-    pub panes: Vec<PaneSnapshotV2>,
-    pub focused_pane_id: Option<Uuid>,
-    #[serde(default)]
-    pub layout_root: Option<PaneLayoutNodeSnapshotV2>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -140,62 +110,6 @@ pub struct FollowEdgeSnapshotV2 {
 pub struct ClientSelectedSessionSnapshotV2 {
     pub client_id: Uuid,
     pub session_id: Option<Uuid>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SnapshotV1 {
-    sessions: Vec<SessionSnapshotV1>,
-    roles: Vec<RoleAssignmentSnapshotV1>,
-    follows: Vec<FollowEdgeSnapshotV1>,
-    selected_sessions: Vec<ClientSelectedSessionSnapshotV1>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SessionSnapshotV1 {
-    id: Uuid,
-    name: Option<String>,
-    windows: Vec<WindowSnapshotV1>,
-    active_window_id: Option<Uuid>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct WindowSnapshotV1 {
-    id: Uuid,
-    name: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct RoleAssignmentSnapshotV1 {
-    session_id: Uuid,
-    client_id: Uuid,
-    role: SessionRole,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct FollowEdgeSnapshotV1 {
-    follower_client_id: Uuid,
-    leader_client_id: Uuid,
-    global: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ClientSelectedSessionSnapshotV1 {
-    client_id: Uuid,
-    session_id: Option<Uuid>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SnapshotEnvelopeV1 {
-    version: u32,
-    checksum: u64,
-    snapshot: SnapshotV1,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct SnapshotEnvelopeV2 {
-    version: u32,
-    checksum: u64,
-    snapshot: SnapshotV2,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -327,17 +241,7 @@ impl SnapshotManager {
     }
 }
 
-fn snapshot_checksum(snapshot: &SnapshotV2) -> Result<u64, serde_json::Error> {
-    let bytes = serde_json::to_vec(snapshot)?;
-    Ok(fnv1a64(&bytes))
-}
-
 fn snapshot_checksum_v3(snapshot: &SnapshotV3) -> Result<u64, serde_json::Error> {
-    let bytes = serde_json::to_vec(snapshot)?;
-    Ok(fnv1a64(&bytes))
-}
-
-fn snapshot_checksum_v1(snapshot: &SnapshotV1) -> Result<u64, serde_json::Error> {
     let bytes = serde_json::to_vec(snapshot)?;
     Ok(fnv1a64(&bytes))
 }
@@ -351,10 +255,12 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn validate_snapshot(snapshot: &SnapshotV2) -> Result<(), SnapshotError> {
+fn validate_snapshot_v3(snapshot: &SnapshotV3) -> Result<(), SnapshotError> {
     let mut session_ids = BTreeSet::new();
     let mut all_window_ids = BTreeSet::new();
     let mut all_pane_ids = BTreeSet::new();
+    let mut owner_sessions = BTreeSet::new();
+    let mut surface_ids = BTreeSet::new();
 
     for session in &snapshot.sessions {
         if !session_ids.insert(session.id) {
@@ -364,7 +270,9 @@ fn validate_snapshot(snapshot: &SnapshotV2) -> Result<(), SnapshotError> {
             )));
         }
 
+        let mut session_window_numbers = BTreeSet::new();
         let mut session_window_ids = BTreeSet::new();
+        let mut max_window_number = 0u32;
         for window in &session.windows {
             if !session_window_ids.insert(window.id) {
                 return Err(SnapshotError::Validation(format!(
@@ -379,148 +287,6 @@ fn validate_snapshot(snapshot: &SnapshotV2) -> Result<(), SnapshotError> {
                 )));
             }
 
-            let mut window_pane_ids = BTreeSet::new();
-            for pane in &window.panes {
-                if !window_pane_ids.insert(pane.id) {
-                    return Err(SnapshotError::Validation(format!(
-                        "duplicate pane id {} in window {}",
-                        pane.id, window.id
-                    )));
-                }
-                if !all_pane_ids.insert(pane.id) {
-                    return Err(SnapshotError::Validation(format!(
-                        "pane id {} reused across windows",
-                        pane.id
-                    )));
-                }
-                if pane.shell.trim().is_empty() {
-                    return Err(SnapshotError::Validation(format!(
-                        "pane {} in window {} has empty shell",
-                        pane.id, window.id
-                    )));
-                }
-            }
-
-            if window.panes.is_empty() {
-                return Err(SnapshotError::Validation(format!(
-                    "window {} must contain at least one pane",
-                    window.id
-                )));
-            }
-
-            if let Some(focused_pane_id) = window.focused_pane_id
-                && !window_pane_ids.contains(&focused_pane_id)
-            {
-                return Err(SnapshotError::Validation(format!(
-                    "focused pane {} missing from window {}",
-                    focused_pane_id, window.id
-                )));
-            }
-
-            if let Some(layout_root) = &window.layout_root {
-                let mut layout_pane_ids = BTreeSet::new();
-                collect_layout_pane_ids(layout_root, &mut layout_pane_ids)?;
-                if layout_pane_ids != window_pane_ids {
-                    return Err(SnapshotError::Validation(format!(
-                        "layout panes do not match pane set for window {}",
-                        window.id
-                    )));
-                }
-            }
-        }
-
-        if let Some(active_window_id) = session.active_window_id
-            && !session_window_ids.contains(&active_window_id)
-        {
-            return Err(SnapshotError::Validation(format!(
-                "active window {} missing from session {}",
-                active_window_id, session.id
-            )));
-        }
-    }
-
-    for role in &snapshot.roles {
-        if !session_ids.contains(&role.session_id) {
-            return Err(SnapshotError::Validation(format!(
-                "role assignment references missing session {}",
-                role.session_id
-            )));
-        }
-    }
-
-    let mut owner_sessions = BTreeSet::new();
-    for owner in &snapshot.owner_principals {
-        if !session_ids.contains(&owner.session_id) {
-            return Err(SnapshotError::Validation(format!(
-                "owner principal references missing session {}",
-                owner.session_id
-            )));
-        }
-        if !owner_sessions.insert(owner.session_id) {
-            return Err(SnapshotError::Validation(format!(
-                "duplicate owner principal assignment for session {}",
-                owner.session_id
-            )));
-        }
-    }
-
-    for follow in &snapshot.follows {
-        if follow.follower_client_id == follow.leader_client_id {
-            return Err(SnapshotError::Validation(format!(
-                "follow edge cannot self-reference client {}",
-                follow.follower_client_id
-            )));
-        }
-    }
-
-    for selected in &snapshot.selected_sessions {
-        if let Some(session_id) = selected.session_id
-            && !session_ids.contains(&session_id)
-        {
-            return Err(SnapshotError::Validation(format!(
-                "selected session references missing session {} for client {}",
-                session_id, selected.client_id
-            )));
-        }
-    }
-
-    Ok(())
-}
-
-fn validate_snapshot_v3(snapshot: &SnapshotV3) -> Result<(), SnapshotError> {
-    let legacy_equivalent = SnapshotV2 {
-        sessions: snapshot
-            .sessions
-            .iter()
-            .map(|session| SessionSnapshotV2 {
-                id: session.id,
-                name: session.name.clone(),
-                windows: session
-                    .windows
-                    .iter()
-                    .map(|window| WindowSnapshotV2 {
-                        id: window.id,
-                        name: window.name.clone(),
-                        panes: window.panes.clone(),
-                        focused_pane_id: window.focused_pane_id,
-                        layout_root: window.layout_root.clone(),
-                    })
-                    .collect(),
-                active_window_id: session.active_window_id,
-            })
-            .collect(),
-        owner_principals: snapshot.owner_principals.clone(),
-        roles: snapshot.roles.clone(),
-        follows: snapshot.follows.clone(),
-        selected_sessions: snapshot.selected_sessions.clone(),
-    };
-    validate_snapshot(&legacy_equivalent)?;
-
-    let mut surface_ids = BTreeSet::new();
-    for session in &snapshot.sessions {
-        let mut session_window_numbers = BTreeSet::new();
-        let mut max_window_number = 0u32;
-        for window in &session.windows {
             if window.number == 0 {
                 return Err(SnapshotError::Validation(format!(
                     "window {} in session {} has invalid number 0",
@@ -539,6 +305,45 @@ fn validate_snapshot_v3(snapshot: &SnapshotV3) -> Result<(), SnapshotError> {
                 .iter()
                 .map(|pane| pane.id)
                 .collect::<BTreeSet<_>>();
+            if window.panes.is_empty() {
+                return Err(SnapshotError::Validation(format!(
+                    "window {} must contain at least one pane",
+                    window.id
+                )));
+            }
+            for pane in &window.panes {
+                if !all_pane_ids.insert(pane.id) {
+                    return Err(SnapshotError::Validation(format!(
+                        "pane id {} reused across windows",
+                        pane.id
+                    )));
+                }
+                if pane.shell.trim().is_empty() {
+                    return Err(SnapshotError::Validation(format!(
+                        "pane {} in window {} has empty shell",
+                        pane.id, window.id
+                    )));
+                }
+            }
+            if let Some(focused_pane_id) = window.focused_pane_id
+                && !window_pane_ids.contains(&focused_pane_id)
+            {
+                return Err(SnapshotError::Validation(format!(
+                    "focused pane {} missing from window {}",
+                    focused_pane_id, window.id
+                )));
+            }
+            if let Some(layout_root) = &window.layout_root {
+                let mut layout_pane_ids = BTreeSet::new();
+                collect_layout_pane_ids(layout_root, &mut layout_pane_ids)?;
+                if layout_pane_ids != window_pane_ids {
+                    return Err(SnapshotError::Validation(format!(
+                        "layout panes do not match pane set for window {}",
+                        window.id
+                    )));
+                }
+            }
+
             for surface in &window.floating_surfaces {
                 if !surface_ids.insert(surface.id) {
                     return Err(SnapshotError::Validation(format!(
@@ -560,51 +365,19 @@ fn validate_snapshot_v3(snapshot: &SnapshotV3) -> Result<(), SnapshotError> {
                 }
             }
         }
-        let min_next_window_number = max_window_number.saturating_add(1);
-        if session.next_window_number < min_next_window_number {
-            return Err(SnapshotError::Validation(format!(
-                "session {} next_window_number {} must be at least {}",
-                session.id, session.next_window_number, min_next_window_number
-            )));
-        }
-    }
-    Ok(())
-}
-
-fn validate_snapshot_v1(snapshot: &SnapshotV1) -> Result<(), SnapshotError> {
-    let mut session_ids = BTreeSet::new();
-    let mut all_window_ids = BTreeSet::new();
-
-    for session in &snapshot.sessions {
-        if !session_ids.insert(session.id) {
-            return Err(SnapshotError::Validation(format!(
-                "duplicate session id {}",
-                session.id
-            )));
-        }
-
-        let mut session_window_ids = BTreeSet::new();
-        for window in &session.windows {
-            if !session_window_ids.insert(window.id) {
-                return Err(SnapshotError::Validation(format!(
-                    "duplicate window id {} in session {}",
-                    window.id, session.id
-                )));
-            }
-            if !all_window_ids.insert(window.id) {
-                return Err(SnapshotError::Validation(format!(
-                    "window id {} reused across sessions",
-                    window.id
-                )));
-            }
-        }
-
         if let Some(active_window_id) = session.active_window_id
             && !session_window_ids.contains(&active_window_id)
         {
             return Err(SnapshotError::Validation(format!(
                 "active window {} missing from session {}",
                 active_window_id, session.id
+            )));
+        }
+        let min_next_window_number = max_window_number.saturating_add(1);
+        if session.next_window_number < min_next_window_number {
+            return Err(SnapshotError::Validation(format!(
+                "session {} next_window_number {} must be at least {}",
+                session.id, session.next_window_number, min_next_window_number
             )));
         }
     }
@@ -617,7 +390,20 @@ fn validate_snapshot_v1(snapshot: &SnapshotV1) -> Result<(), SnapshotError> {
             )));
         }
     }
-
+    for owner in &snapshot.owner_principals {
+        if !session_ids.contains(&owner.session_id) {
+            return Err(SnapshotError::Validation(format!(
+                "owner principal references missing session {}",
+                owner.session_id
+            )));
+        }
+        if !owner_sessions.insert(owner.session_id) {
+            return Err(SnapshotError::Validation(format!(
+                "duplicate owner principal assignment for session {}",
+                owner.session_id
+            )));
+        }
+    }
     for follow in &snapshot.follows {
         if follow.follower_client_id == follow.leader_client_id {
             return Err(SnapshotError::Validation(format!(
@@ -626,7 +412,6 @@ fn validate_snapshot_v1(snapshot: &SnapshotV1) -> Result<(), SnapshotError> {
             )));
         }
     }
-
     for selected in &snapshot.selected_sessions {
         if let Some(session_id) = selected.session_id
             && !session_ids.contains(&session_id)
@@ -637,7 +422,6 @@ fn validate_snapshot_v1(snapshot: &SnapshotV1) -> Result<(), SnapshotError> {
             )));
         }
     }
-
     Ok(())
 }
 
@@ -671,98 +455,6 @@ fn collect_layout_pane_ids(
     Ok(())
 }
 
-fn upgrade_snapshot_v1(snapshot: SnapshotV1) -> SnapshotV2 {
-    SnapshotV2 {
-        sessions: snapshot
-            .sessions
-            .into_iter()
-            .map(|session| SessionSnapshotV2 {
-                id: session.id,
-                name: session.name,
-                windows: session
-                    .windows
-                    .into_iter()
-                    .map(|window| WindowSnapshotV2 {
-                        id: window.id,
-                        name: window.name,
-                        panes: vec![PaneSnapshotV2 {
-                            id: window.id,
-                            name: Some("pane-1".to_string()),
-                            shell: default_shell_for_upgrade(),
-                        }],
-                        focused_pane_id: Some(window.id),
-                        layout_root: Some(PaneLayoutNodeSnapshotV2::Leaf { pane_id: window.id }),
-                    })
-                    .collect(),
-                active_window_id: session.active_window_id,
-            })
-            .collect(),
-        owner_principals: Vec::new(),
-        roles: snapshot
-            .roles
-            .into_iter()
-            .map(|role| RoleAssignmentSnapshotV2 {
-                session_id: role.session_id,
-                client_id: role.client_id,
-                role: role.role,
-            })
-            .collect(),
-        follows: snapshot
-            .follows
-            .into_iter()
-            .map(|follow| FollowEdgeSnapshotV2 {
-                follower_client_id: follow.follower_client_id,
-                leader_client_id: follow.leader_client_id,
-                global: follow.global,
-            })
-            .collect(),
-        selected_sessions: snapshot
-            .selected_sessions
-            .into_iter()
-            .map(|selected| ClientSelectedSessionSnapshotV2 {
-                client_id: selected.client_id,
-                session_id: selected.session_id,
-            })
-            .collect(),
-    }
-}
-
-fn upgrade_snapshot_v2(snapshot: SnapshotV2) -> SnapshotV3 {
-    SnapshotV3 {
-        sessions: snapshot
-            .sessions
-            .into_iter()
-            .map(|session| {
-                let window_count = session.windows.len() as u32;
-                SessionSnapshotV3 {
-                    id: session.id,
-                    name: session.name,
-                    windows: session
-                        .windows
-                        .into_iter()
-                        .enumerate()
-                        .map(|(index, window)| WindowSnapshotV3 {
-                            id: window.id,
-                            number: index as u32 + 1,
-                            name: window.name,
-                            panes: window.panes,
-                            focused_pane_id: window.focused_pane_id,
-                            layout_root: window.layout_root,
-                            floating_surfaces: Vec::new(),
-                        })
-                        .collect(),
-                    active_window_id: session.active_window_id,
-                    next_window_number: window_count.saturating_add(1),
-                }
-            })
-            .collect(),
-        owner_principals: snapshot.owner_principals,
-        roles: snapshot.roles,
-        follows: snapshot.follows,
-        selected_sessions: snapshot.selected_sessions,
-    }
-}
-
 fn normalize_snapshot_v3_numbering(mut snapshot: SnapshotV3) -> SnapshotV3 {
     for session in &mut snapshot.sessions {
         let mut max_number = 0u32;
@@ -778,16 +470,6 @@ fn normalize_snapshot_v3_numbering(mut snapshot: SnapshotV3) -> SnapshotV3 {
         }
     }
     snapshot
-}
-
-fn default_shell_for_upgrade() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| {
-        if cfg!(windows) {
-            "cmd.exe".to_string()
-        } else {
-            "/bin/sh".to_string()
-        }
-    })
 }
 
 #[cfg(test)]
@@ -923,27 +605,10 @@ mod tests {
 
     #[test]
     fn decode_v1_is_rejected_after_hard_cut() {
-        let session_id = Uuid::new_v4();
-        let window_id = Uuid::new_v4();
-        let legacy_snapshot = super::SnapshotV1 {
-            sessions: vec![super::SessionSnapshotV1 {
-                id: session_id,
-                name: Some("legacy".to_string()),
-                windows: vec![super::WindowSnapshotV1 {
-                    id: window_id,
-                    name: Some("main".to_string()),
-                }],
-                active_window_id: Some(window_id),
-            }],
-            roles: vec![],
-            follows: vec![],
-            selected_sessions: vec![],
-        };
-        let checksum = super::snapshot_checksum_v1(&legacy_snapshot).expect("checksum");
         let payload = serde_json::json!({
             "version": 1,
-            "checksum": checksum,
-            "snapshot": legacy_snapshot,
+            "checksum": 0,
+            "snapshot": {},
         });
 
         let bytes = serde_json::to_vec(&payload).expect("json should encode");
