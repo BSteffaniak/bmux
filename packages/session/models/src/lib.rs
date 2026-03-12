@@ -5,7 +5,7 @@
 
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -177,9 +177,6 @@ pub enum ClientError {
 pub struct Session {
     pub id: SessionId,
     pub name: Option<String>,
-    pub windows: BTreeMap<WindowId, u32>,
-    pub active_window: Option<WindowId>,
-    pub next_window_number: u32,
     pub clients: BTreeSet<ClientId>,
     pub created_at: std::time::SystemTime,
     pub last_activity: std::time::SystemTime,
@@ -192,9 +189,6 @@ impl Session {
         Self {
             id: SessionId::new(),
             name,
-            windows: BTreeMap::new(),
-            active_window: None,
-            next_window_number: 1,
             clients: BTreeSet::new(),
             created_at: now,
             last_activity: now,
@@ -224,52 +218,8 @@ impl Session {
         self.clients.is_empty()
     }
 
-    pub fn add_window(&mut self, window_id: WindowId, number: u32) {
-        self.windows.insert(window_id, number);
-        if self.active_window.is_none() {
-            self.active_window = Some(window_id);
-        }
-        self.next_window_number = self.next_window_number.max(number.saturating_add(1));
-        self.update_activity();
-    }
-
-    pub fn remove_window(&mut self, window_id: &WindowId) -> bool {
-        let removed = self.windows.remove(window_id).is_some();
-        if removed {
-            if self.active_window == Some(*window_id) {
-                self.active_window = self
-                    .windows
-                    .iter()
-                    .min_by_key(|(_id, number)| *number)
-                    .map(|(id, _number)| *id);
-            }
-            self.update_activity();
-        }
-        removed
-    }
-
-    /// Set the active window for this session
-    ///
-    /// # Errors
-    ///
-    /// Returns `WindowError::NotFound` if the window doesn't exist in this session
-    pub fn set_active_window(&mut self, window_id: WindowId) -> Result<(), WindowError> {
-        if self.windows.contains_key(&window_id) {
-            self.active_window = Some(window_id);
-            self.update_activity();
-            Ok(())
-        } else {
-            Err(WindowError::NotFound(window_id))
-        }
-    }
-
     fn update_activity(&mut self) {
         self.last_activity = std::time::SystemTime::now();
-    }
-
-    #[must_use]
-    pub fn window_number(&self, window_id: WindowId) -> Option<u32> {
-        self.windows.get(&window_id).copied()
     }
 }
 
@@ -290,7 +240,7 @@ impl From<&Session> for SessionInfo {
         Self {
             id: session.id,
             name: session.name.clone(),
-            window_count: session.windows.len(),
+            window_count: 1,
             client_count: session.clients.len(),
             created_at: session.created_at,
             last_activity: session.last_activity,

@@ -3461,14 +3461,6 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV3) -> Resu
             let session_id = SessionId(session_snapshot.id);
             let mut session = Session::new(session_snapshot.name.clone());
             session.id = session_id;
-            session.next_window_number = session_snapshot.next_window_number;
-            for window_snapshot in &session_snapshot.windows {
-                session.add_window(WindowId(window_snapshot.id), window_snapshot.number);
-            }
-
-            if let Some(active_window_id) = session_snapshot.active_window_id {
-                let _ = session.set_active_window(WindowId(active_window_id));
-            }
 
             if let Err(error) = session_manager.insert_session(session) {
                 warn!(
@@ -3700,9 +3692,7 @@ async fn reap_closed_active_pane(
                 .session_manager
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            if let Some(session_model) = manager.get_session_mut(&removed_window_session_id) {
-                session_model.remove_window(&removed_window_id);
-            }
+            let _ = manager.get_session_mut(&removed_window_session_id);
         }
         emit_event(
             state,
@@ -3802,9 +3792,7 @@ async fn reap_exited_pane(
                 .session_manager
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            if let Some(session_model) = manager.get_session_mut(&removed_window_session_id) {
-                session_model.remove_window(&removed_window_id);
-            }
+            let _ = manager.get_session_mut(&removed_window_session_id);
         }
         emit_event(
             state,
@@ -4162,11 +4150,7 @@ async fn handle_request(
                         .session_manager
                         .lock()
                         .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                    if let Some(session_model) = manager.get_session_mut(&session_id) {
-                        for (window_id, window_number) in initial_windows {
-                            session_model.add_window(window_id, window_number);
-                        }
-                    }
+                    let _ = (manager.get_session_mut(&session_id), initial_windows);
                     drop(manager);
 
                     let mut permission_state = state
@@ -4402,10 +4386,7 @@ async fn handle_request(
                         .session_manager
                         .lock()
                         .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                    if let Some(session_model) = manager.get_session_mut(&removed_window_session_id)
-                    {
-                        session_model.remove_window(&removed_window_id);
-                    }
+                    let _ = manager.get_session_mut(&removed_window_session_id);
                 }
                 emit_event(
                     state,
