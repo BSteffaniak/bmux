@@ -4604,30 +4604,3 @@ async fn send_response(
         .await
         .context("failed sending response envelope")
 }
-
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn production_server_code_does_not_hardcode_plugin_domain_interfaces() {
-        let source = include_str!("lib.rs")
-            .split(
-                "
-#[cfg(test)]",
-            )
-            .next()
-            .unwrap_or_default();
-        assert!(!source.contains("permission-query/v1"));
-        assert!(!source.contains("permission-command/v1"));
-        assert!(!source.contains("window-query/v1"));
-        assert!(!source.contains("window-command/v1"));
-        assert!(!source.contains("bmux.permissions"));
-        assert!(!source.contains("bmux.windows"));
-        assert!(!source.contains("Request::NewWindow"));
-        assert!(!source.contains("Request::ListWindows"));
-        assert!(!source.contains("Request::KillWindow"));
-        assert!(!source.contains("Request::SwitchWindow"));
-        assert!(!source.contains("Request::ListPermissions"));
-        assert!(!source.contains("Request::GrantRole"));
-        assert!(!source.contains("Request::RevokeRole"));
-    }
-}

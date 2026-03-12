@@ -688,7 +688,7 @@ impl BmuxClient {
         Ok(info.session_id)
     }
 
-    /// Validate and consume attach grant token and return role metadata.
+    /// Validate and consume attach grant token and return attach metadata.
     ///
     /// # Errors
     ///

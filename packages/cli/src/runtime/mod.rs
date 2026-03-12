@@ -2060,7 +2060,7 @@ fn classify_destructive_op_error(error: &ClientError) -> DestructiveOpErrorKind 
     match error {
         ClientError::ServerError { code, message } => match code {
             bmux_ipc::ErrorCode::InvalidRequest
-                if message.contains("owner role required for this operation") =>
+                if message.contains("session policy denied for this operation") =>
             {
                 DestructiveOpErrorKind::SessionPolicyDenied
             }
@@ -6063,7 +6063,7 @@ mod tests {
             "session",
             ClientError::ServerError {
                 code: ErrorCode::InvalidRequest,
-                message: "owner role required for this operation".to_string(),
+                message: "session policy denied for this operation".to_string(),
             },
             false,
         );
@@ -6090,7 +6090,7 @@ mod tests {
     fn attach_quit_failure_status_is_actionable_for_policy_errors() {
         let status = super::attach_quit_failure_status(&ClientError::ServerError {
             code: ErrorCode::InvalidRequest,
-            message: "owner role required for this operation".to_string(),
+            message: "session policy denied for this operation".to_string(),
         });
 
         assert_eq!(status, "quit blocked by session policy");

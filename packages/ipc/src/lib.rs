@@ -336,7 +336,7 @@ pub struct SessionSummary {
     pub client_count: usize,
 }
 
-/// Summary returned when listing panes in the active window.
+/// Summary returned when listing panes in the active session runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSummary {
     pub id: Uuid,

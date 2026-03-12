@@ -397,15 +397,15 @@ pub struct PaneGroupInfo {
 }
 
 impl From<&PaneGroup> for PaneGroupInfo {
-    fn from(window: &PaneGroup) -> Self {
+    fn from(group: &PaneGroup) -> Self {
         Self {
-            id: window.id,
-            name: window.name.clone(),
-            pane_count: window.panes.len(),
-            active_pane: window.active_pane,
-            size: window.size,
-            created_at: window.created_at,
-            last_activity: window.last_activity,
+            id: group.id,
+            name: group.name.clone(),
+            pane_count: group.panes.len(),
+            active_pane: group.active_pane,
+            size: group.size,
+            created_at: group.created_at,
+            last_activity: group.last_activity,
         }
     }
 }
