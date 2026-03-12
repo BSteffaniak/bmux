@@ -1619,6 +1619,17 @@ mod tests {
             .push(kernel_request.clone());
 
         let kernel_response = match kernel_request {
+            bmux_ipc::Request::NewSession { .. } => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionCreated {
+                    id: uuid::Uuid::new_v4(),
+                    name: Some("created".to_string()),
+                })
+            }
+            bmux_ipc::Request::KillSession { .. } => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionKilled {
+                    id: uuid::Uuid::new_v4(),
+                })
+            }
             bmux_ipc::Request::ListSessions => {
                 bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionList {
                     sessions: vec![bmux_ipc::SessionSummary {
@@ -1628,10 +1639,38 @@ mod tests {
                     }],
                 })
             }
+            bmux_ipc::Request::ListPanes { .. } => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::PaneList {
+                    panes: vec![bmux_ipc::PaneSummary {
+                        id: uuid::Uuid::new_v4(),
+                        index: 1,
+                        name: Some("pane-1".to_string()),
+                        focused: true,
+                    }],
+                })
+            }
             bmux_ipc::Request::SplitPane { .. } => {
                 bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::PaneSplit {
                     id: uuid::Uuid::new_v4(),
                     session_id: uuid::Uuid::new_v4(),
+                })
+            }
+            bmux_ipc::Request::FocusPane { .. } => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::PaneFocused {
+                    id: uuid::Uuid::new_v4(),
+                    session_id: uuid::Uuid::new_v4(),
+                })
+            }
+            bmux_ipc::Request::ResizePane { .. } => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::PaneResized {
+                    session_id: uuid::Uuid::new_v4(),
+                })
+            }
+            bmux_ipc::Request::ClosePane { .. } => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::PaneClosed {
+                    id: uuid::Uuid::new_v4(),
+                    session_id: uuid::Uuid::new_v4(),
+                    session_closed: false,
                 })
             }
             _ => bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
@@ -2150,6 +2189,225 @@ minimum = "1.0"
             requests.last(),
             Some(bmux_ipc::Request::SplitPane { .. })
         ));
+    }
+
+    #[test]
+    fn command_context_calls_core_session_command_via_kernel_bridge() {
+        KERNEL_REQUESTS
+            .lock()
+            .expect("kernel request log lock should succeed")
+            .clear();
+
+        let context = super::NativeCommandContext {
+            plugin_id: "caller.plugin".to_string(),
+            command: "new-session".to_string(),
+            arguments: Vec::new(),
+            required_capabilities: vec!["bmux.sessions.write".to_string()],
+            provided_capabilities: Vec::new(),
+            services: vec![crate::RegisteredService {
+                capability: crate::HostScope::new("bmux.sessions.write")
+                    .expect("capability should parse"),
+                kind: crate::ServiceKind::Command,
+                interface_id: "session-command/v1".to_string(),
+                provider: crate::ProviderId::Host,
+            }],
+            available_capabilities: vec!["bmux.sessions.write".to_string()],
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: crate::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
+        };
+
+        let _response: crate::SessionCreateResponse = context
+            .call_service(
+                "bmux.sessions.write",
+                crate::ServiceKind::Command,
+                "session-command/v1",
+                "new",
+                &crate::SessionCreateRequest {
+                    name: Some("created".to_string()),
+                },
+            )
+            .expect("core session command should succeed");
+
+        let requests = KERNEL_REQUESTS
+            .lock()
+            .expect("kernel request log lock should succeed");
+        assert!(matches!(
+            requests.last(),
+            Some(bmux_ipc::Request::NewSession { .. })
+        ));
+    }
+
+    #[test]
+    fn command_context_calls_core_pane_query_via_kernel_bridge() {
+        KERNEL_REQUESTS
+            .lock()
+            .expect("kernel request log lock should succeed")
+            .clear();
+
+        let context = super::NativeCommandContext {
+            plugin_id: "caller.plugin".to_string(),
+            command: "list-panes".to_string(),
+            arguments: Vec::new(),
+            required_capabilities: vec!["bmux.panes.read".to_string()],
+            provided_capabilities: Vec::new(),
+            services: vec![crate::RegisteredService {
+                capability: crate::HostScope::new("bmux.panes.read")
+                    .expect("capability should parse"),
+                kind: crate::ServiceKind::Query,
+                interface_id: "pane-query/v1".to_string(),
+                provider: crate::ProviderId::Host,
+            }],
+            available_capabilities: vec!["bmux.panes.read".to_string()],
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: crate::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
+        };
+
+        let response: crate::PaneListResponse = context
+            .call_service(
+                "bmux.panes.read",
+                crate::ServiceKind::Query,
+                "pane-query/v1",
+                "list",
+                &crate::PaneListRequest { session: None },
+            )
+            .expect("core pane query should succeed");
+        assert_eq!(response.panes.len(), 1);
+
+        let requests = KERNEL_REQUESTS
+            .lock()
+            .expect("kernel request log lock should succeed");
+        assert!(matches!(
+            requests.last(),
+            Some(bmux_ipc::Request::ListPanes { .. })
+        ));
+    }
+
+    #[test]
+    fn command_context_calls_focus_resize_close_via_kernel_bridge() {
+        KERNEL_REQUESTS
+            .lock()
+            .expect("kernel request log lock should succeed")
+            .clear();
+
+        let context = super::NativeCommandContext {
+            plugin_id: "caller.plugin".to_string(),
+            command: "pane-ops".to_string(),
+            arguments: Vec::new(),
+            required_capabilities: vec!["bmux.panes.write".to_string()],
+            provided_capabilities: Vec::new(),
+            services: vec![crate::RegisteredService {
+                capability: crate::HostScope::new("bmux.panes.write")
+                    .expect("capability should parse"),
+                kind: crate::ServiceKind::Command,
+                interface_id: "pane-command/v1".to_string(),
+                provider: crate::ProviderId::Host,
+            }],
+            available_capabilities: vec!["bmux.panes.write".to_string()],
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: crate::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
+        };
+
+        let _focused: crate::PaneFocusResponse = context
+            .call_service(
+                "bmux.panes.write",
+                crate::ServiceKind::Command,
+                "pane-command/v1",
+                "focus",
+                &crate::PaneFocusRequest {
+                    session: None,
+                    target: Some(crate::PaneSelector::Active),
+                    direction: Some(crate::PaneFocusDirection::Next),
+                },
+            )
+            .expect("focus command should succeed");
+
+        let _resized: crate::PaneResizeResponse = context
+            .call_service(
+                "bmux.panes.write",
+                crate::ServiceKind::Command,
+                "pane-command/v1",
+                "resize",
+                &crate::PaneResizeRequest {
+                    session: None,
+                    target: Some(crate::PaneSelector::Active),
+                    delta: 1,
+                },
+            )
+            .expect("resize command should succeed");
+
+        let _closed: crate::PaneCloseResponse = context
+            .call_service(
+                "bmux.panes.write",
+                crate::ServiceKind::Command,
+                "pane-command/v1",
+                "close",
+                &crate::PaneCloseRequest {
+                    session: None,
+                    target: Some(crate::PaneSelector::Active),
+                },
+            )
+            .expect("close command should succeed");
+
+        let requests = KERNEL_REQUESTS
+            .lock()
+            .expect("kernel request log lock should succeed");
+        assert!(
+            requests
+                .iter()
+                .any(|request| matches!(request, bmux_ipc::Request::FocusPane { .. }))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| matches!(request, bmux_ipc::Request::ResizePane { .. }))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| matches!(request, bmux_ipc::Request::ClosePane { .. }))
+        );
     }
 
     #[test]
