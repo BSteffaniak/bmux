@@ -466,3 +466,123 @@ struct WindowCommandAck {
 }
 
 bmux_plugin::export_plugin!(WindowsPlugin);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bmux_plugin::{ServiceCaller, SessionListResponse, SessionSummary};
+    use std::sync::Mutex;
+
+    struct MockHost {
+        sessions: Vec<SessionSummary>,
+        kills: Mutex<Vec<SessionKillRequest>>,
+    }
+
+    impl MockHost {
+        fn with_sessions(sessions: Vec<SessionSummary>) -> Self {
+            Self {
+                sessions,
+                kills: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl ServiceCaller for MockHost {
+        fn call_service_raw(
+            &self,
+            _capability: &str,
+            _kind: ServiceKind,
+            interface_id: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin::Result<Vec<u8>> {
+            match (interface_id, operation) {
+                ("session-query/v1", "list") => encode_service_message(&SessionListResponse {
+                    sessions: self.sessions.clone(),
+                })
+                .map_err(Into::into),
+                ("session-command/v1", "kill") => {
+                    let request: SessionKillRequest = decode_service_message(&payload)?;
+                    self.kills
+                        .lock()
+                        .expect("kill log lock should succeed")
+                        .push(request.clone());
+                    encode_service_message(&bmux_plugin::SessionKillResponse {
+                        id: match request.selector {
+                            SessionSelector::ById(id) => id,
+                            SessionSelector::ByName(_) => Uuid::new_v4(),
+                        },
+                    })
+                    .map_err(Into::into)
+                }
+                _ => Err(bmux_plugin::PluginError::UnsupportedHostOperation {
+                    operation: "mock_service",
+                }),
+            }
+        }
+    }
+
+    fn sample_sessions() -> Vec<SessionSummary> {
+        vec![
+            SessionSummary {
+                id: Uuid::new_v4(),
+                name: Some("alpha".to_string()),
+                client_count: 1,
+            },
+            SessionSummary {
+                id: Uuid::new_v4(),
+                name: Some("beta".to_string()),
+                client_count: 2,
+            },
+        ]
+    }
+
+    #[test]
+    fn list_windows_projects_sessions_and_marks_first_active() {
+        let host = MockHost::with_sessions(sample_sessions());
+        let windows = list_windows(&host, None).expect("list should succeed");
+
+        assert_eq!(windows.len(), 2);
+        assert!(windows[0].active);
+        assert!(!windows[1].active);
+        assert_eq!(windows[0].name, "alpha");
+        assert_eq!(windows[1].name, "beta");
+    }
+
+    #[test]
+    fn list_windows_filters_by_session_selector() {
+        let sessions = sample_sessions();
+        let beta_id = sessions[1].id;
+        let host = MockHost::with_sessions(sessions);
+
+        let by_name = list_windows(&host, Some("beta")).expect("list by name should succeed");
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].name, "beta");
+
+        let by_id =
+            list_windows(&host, Some(&beta_id.to_string())).expect("list by id should succeed");
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id[0].id, beta_id.to_string());
+    }
+
+    #[test]
+    fn resolve_session_id_finds_name_and_id() {
+        let sessions = sample_sessions();
+        let alpha_id = sessions[0].id;
+        let host = MockHost::with_sessions(sessions);
+
+        let resolved_name = resolve_session_id(&host, SessionSelector::ByName("alpha".to_string()))
+            .expect("resolve by name should succeed");
+        assert_eq!(resolved_name, alpha_id);
+
+        let resolved_id = resolve_session_id(&host, SessionSelector::ById(alpha_id))
+            .expect("resolve by id should succeed");
+        assert_eq!(resolved_id, alpha_id);
+    }
+
+    #[test]
+    fn parse_selector_rejects_blank_values() {
+        let error = parse_selector("   ").expect_err("blank selector should fail");
+        assert!(error.contains("must not be empty"));
+    }
+}
