@@ -22,6 +22,10 @@ impl RustPlugin for PermissionsPlugin {
             .description("Shipped bmux permissions command plugin")
             .require_capability("bmux.commands")
             .expect("capability should parse")
+            .require_capability("bmux.sessions.read")
+            .expect("capability should parse")
+            .require_capability("bmux.storage")
+            .expect("capability should parse")
             .provide_capability("bmux.permissions.read")
             .expect("capability should parse")
             .provide_capability("bmux.permissions.write")
@@ -518,7 +522,12 @@ bmux_plugin::export_plugin!(PermissionsPlugin);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bmux_plugin::{ServiceCaller, SessionListResponse, SessionSummary};
+    use bmux_plugin::{
+        ApiVersion, HostConnectionInfo, HostKernelBridge, HostMetadata, NativeServiceContext,
+        ProviderId, RegisteredService, ServiceCaller, ServiceRequest, SessionListResponse,
+        SessionSummary,
+    };
+    use std::path::PathBuf;
     use std::sync::Mutex;
 
     struct MockHost {
@@ -576,6 +585,159 @@ mod tests {
                 }),
             }
         }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct BridgeRequest {
+        payload: Vec<u8>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    struct BridgeResponse {
+        payload: Vec<u8>,
+    }
+
+    unsafe extern "C" fn service_test_kernel_bridge(
+        input_ptr: *const u8,
+        input_len: usize,
+        output_ptr: *mut u8,
+        output_capacity: usize,
+        output_len: *mut usize,
+    ) -> i32 {
+        let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+        let request: BridgeRequest = match decode_service_message(input) {
+            Ok(request) => request,
+            Err(_) => return 1,
+        };
+        let kernel_request: bmux_ipc::Request = match bmux_ipc::decode(&request.payload) {
+            Ok(request) => request,
+            Err(_) => return 1,
+        };
+
+        let response = match kernel_request {
+            bmux_ipc::Request::ListSessions => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionList {
+                    sessions: vec![bmux_ipc::SessionSummary {
+                        id: service_test_session_id(),
+                        name: Some("alpha".to_string()),
+                        client_count: 1,
+                    }],
+                })
+            }
+            _ => bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
+                code: bmux_ipc::ErrorCode::InvalidRequest,
+                message: "unsupported request in permissions service test bridge".to_string(),
+            }),
+        };
+
+        let encoded = match bmux_ipc::encode(&response) {
+            Ok(encoded) => encoded,
+            Err(_) => return 1,
+        };
+        let output = match encode_service_message(&BridgeResponse { payload: encoded }) {
+            Ok(output) => output,
+            Err(_) => return 1,
+        };
+
+        if output.len() > output_capacity {
+            unsafe {
+                *output_len = output.len();
+            }
+            return 4;
+        }
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(output.as_ptr(), output_ptr, output.len());
+            *output_len = output.len();
+        }
+        0
+    }
+
+    fn service_test_session_id() -> Uuid {
+        Uuid::from_u128(0xaaaaaaaa_aaaa_aaaa_aaaa_aaaaaaaaaaaa)
+    }
+
+    fn service_test_context(
+        interface_id: &str,
+        operation: &str,
+        payload: Vec<u8>,
+        capability: &str,
+        kind: ServiceKind,
+        data_dir: &PathBuf,
+    ) -> NativeServiceContext {
+        let host_services = vec![
+            RegisteredService {
+                capability: HostScope::new("bmux.sessions.read").expect("capability should parse"),
+                kind: ServiceKind::Query,
+                interface_id: "session-query/v1".to_string(),
+                provider: ProviderId::Host,
+            },
+            RegisteredService {
+                capability: HostScope::new("bmux.storage").expect("capability should parse"),
+                kind: ServiceKind::Query,
+                interface_id: "storage-query/v1".to_string(),
+                provider: ProviderId::Host,
+            },
+            RegisteredService {
+                capability: HostScope::new("bmux.storage").expect("capability should parse"),
+                kind: ServiceKind::Command,
+                interface_id: "storage-command/v1".to_string(),
+                provider: ProviderId::Host,
+            },
+        ];
+
+        NativeServiceContext {
+            plugin_id: "bmux.permissions".to_string(),
+            request: ServiceRequest {
+                caller_plugin_id: "test.caller".to_string(),
+                service: RegisteredService {
+                    capability: HostScope::new(capability).expect("capability should parse"),
+                    kind,
+                    interface_id: interface_id.to_string(),
+                    provider: ProviderId::Plugin("bmux.permissions".to_string()),
+                },
+                operation: operation.to_string(),
+                payload,
+            },
+            required_capabilities: vec![
+                "bmux.commands".to_string(),
+                "bmux.sessions.read".to_string(),
+                "bmux.storage".to_string(),
+            ],
+            provided_capabilities: vec![
+                "bmux.permissions.read".to_string(),
+                "bmux.permissions.write".to_string(),
+                "bmux.sessions.policy".to_string(),
+            ],
+            services: host_services,
+            available_capabilities: vec![
+                "bmux.sessions.read".to_string(),
+                "bmux.storage".to_string(),
+            ],
+            enabled_plugins: vec!["bmux.permissions".to_string()],
+            plugin_search_roots: vec!["/plugins".to_string()],
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: data_dir.to_string_lossy().into_owned(),
+            },
+            settings: std::collections::BTreeMap::new(),
+            plugin_settings_map: std::collections::BTreeMap::new(),
+            host_kernel_bridge: Some(HostKernelBridge::from_fn(service_test_kernel_bridge)),
+        }
+    }
+
+    fn service_test_data_dir() -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("bmux-permissions-service-test-{}", Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("test data dir should be creatable");
+        dir
     }
 
     #[test]
@@ -714,5 +876,171 @@ mod tests {
         )
         .expect("policy evaluation should succeed");
         assert!(decision.allowed);
+    }
+
+    #[test]
+    fn invoke_service_grant_list_and_revoke_roundtrip() {
+        let mut plugin = PermissionsPlugin;
+        let data_dir = service_test_data_dir();
+        let client_id = Uuid::new_v4().to_string();
+
+        let grant_context = service_test_context(
+            "permission-command/v1",
+            "grant",
+            encode_service_message(&GrantRequest {
+                session: "alpha".to_string(),
+                client: client_id.clone(),
+                role: "observer".to_string(),
+            })
+            .expect("grant request should encode"),
+            "bmux.permissions.write",
+            ServiceKind::Command,
+            &data_dir,
+        );
+        let grant = plugin.invoke_service(grant_context);
+        assert!(
+            grant.error.is_none(),
+            "unexpected grant error: {:?}",
+            grant.error
+        );
+
+        let list_context = service_test_context(
+            "permission-query/v1",
+            "list",
+            encode_service_message(&ListPermissionsRequest {
+                session: "alpha".to_string(),
+            })
+            .expect("list request should encode"),
+            "bmux.permissions.read",
+            ServiceKind::Query,
+            &data_dir,
+        );
+        let listed = plugin.invoke_service(list_context);
+        assert!(
+            listed.error.is_none(),
+            "unexpected list error: {:?}",
+            listed.error
+        );
+        let listed_payload: ListPermissionsResponse =
+            decode_service_message(&listed.payload).expect("list response should decode");
+        assert_eq!(listed_payload.entries.len(), 1);
+        assert_eq!(listed_payload.entries[0].client_id, client_id);
+        assert_eq!(listed_payload.entries[0].role, "observer");
+
+        let revoke_context = service_test_context(
+            "permission-command/v1",
+            "revoke",
+            encode_service_message(&RevokeRequest {
+                session: "alpha".to_string(),
+                client: listed_payload.entries[0].client_id.clone(),
+            })
+            .expect("revoke request should encode"),
+            "bmux.permissions.write",
+            ServiceKind::Command,
+            &data_dir,
+        );
+        let revoke = plugin.invoke_service(revoke_context);
+        assert!(
+            revoke.error.is_none(),
+            "unexpected revoke error: {:?}",
+            revoke.error
+        );
+
+        let relist_context = service_test_context(
+            "permission-query/v1",
+            "list",
+            encode_service_message(&ListPermissionsRequest {
+                session: "alpha".to_string(),
+            })
+            .expect("list request should encode"),
+            "bmux.permissions.read",
+            ServiceKind::Query,
+            &data_dir,
+        );
+        let relisted = plugin.invoke_service(relist_context);
+        assert!(
+            relisted.error.is_none(),
+            "unexpected relist error: {:?}",
+            relisted.error
+        );
+        let relisted_payload: ListPermissionsResponse =
+            decode_service_message(&relisted.payload).expect("relist response should decode");
+        assert!(relisted_payload.entries.is_empty());
+    }
+
+    #[test]
+    fn invoke_service_policy_check_denies_observer_mutation() {
+        let mut plugin = PermissionsPlugin;
+        let data_dir = service_test_data_dir();
+        let client_id = Uuid::new_v4();
+
+        let grant_context = service_test_context(
+            "permission-command/v1",
+            "grant",
+            encode_service_message(&GrantRequest {
+                session: "alpha".to_string(),
+                client: client_id.to_string(),
+                role: "observer".to_string(),
+            })
+            .expect("grant request should encode"),
+            "bmux.permissions.write",
+            ServiceKind::Command,
+            &data_dir,
+        );
+        let grant = plugin.invoke_service(grant_context);
+        assert!(
+            grant.error.is_none(),
+            "unexpected grant error: {:?}",
+            grant.error
+        );
+
+        let policy_context = service_test_context(
+            "session-policy-query/v1",
+            "check",
+            encode_service_message(&SessionPolicyCheckRequest {
+                session_id: service_test_session_id(),
+                client_id,
+                principal_id: Uuid::new_v4(),
+                action: "mutation".to_string(),
+            })
+            .expect("policy request should encode"),
+            "bmux.sessions.policy",
+            ServiceKind::Query,
+            &data_dir,
+        );
+        let policy = plugin.invoke_service(policy_context);
+        assert!(
+            policy.error.is_none(),
+            "unexpected policy error: {:?}",
+            policy.error
+        );
+        let decision: SessionPolicyCheckResponse =
+            decode_service_message(&policy.payload).expect("policy response should decode");
+        assert!(!decision.allowed);
+        assert!(decision.reason.is_some());
+    }
+
+    #[test]
+    fn invoke_service_grant_rejects_invalid_role() {
+        let mut plugin = PermissionsPlugin;
+        let data_dir = service_test_data_dir();
+        let context = service_test_context(
+            "permission-command/v1",
+            "grant",
+            encode_service_message(&GrantRequest {
+                session: "alpha".to_string(),
+                client: Uuid::new_v4().to_string(),
+                role: "invalid".to_string(),
+            })
+            .expect("grant request should encode"),
+            "bmux.permissions.write",
+            ServiceKind::Command,
+            &data_dir,
+        );
+
+        let response = plugin.invoke_service(context);
+        let error = response.error.expect("expected grant failure");
+        assert_eq!(error.code, "grant_failed");
+        assert!(error.message.contains("invalid role"));
     }
 }

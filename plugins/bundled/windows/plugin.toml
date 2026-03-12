@@ -1,11 +1,16 @@
-entry                 = "libbmux_windows_plugin.dylib"
-id                    = "bmux.windows"
-name                  = "bmux Windows"
+entry = "libbmux_windows_plugin.dylib"
+id = "bmux.windows"
+name = "bmux Windows"
 provided_capabilities = ["bmux.windows.read", "bmux.windows.write"]
-provided_features     = ["bmux.windows"]
-required_capabilities = ["bmux.commands", "bmux.sessions.read"]
-runtime               = "native"
-version               = "0.0.1-alpha.0"
+provided_features = ["bmux.windows"]
+required_capabilities = [
+    "bmux.commands",
+    "bmux.sessions.read",
+    "bmux.sessions.write",
+    "bmux.panes.read",
+]
+runtime = "native"
+version = "0.0.1-alpha.0"
 
 [[services]]
 capability   = "bmux.windows.read"

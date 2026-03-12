@@ -7,7 +7,7 @@ provided_capabilities = [
     "bmux.sessions.policy",
 ]
 provided_features = ["bmux.permissions"]
-required_capabilities = ["bmux.commands"]
+required_capabilities = ["bmux.commands", "bmux.sessions.read", "bmux.storage"]
 runtime = "native"
 version = "0.0.1-alpha.0"
 
