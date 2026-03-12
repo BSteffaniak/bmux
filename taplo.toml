@@ -1,5 +1,14 @@
 exclude = [".direnv/**", "target/**"]
-include = ["**/*.toml"]
+include = [
+    "Cargo.toml",
+    "clippy.toml",
+    "deny.toml",
+    "rust-toolchain.toml",
+    "taplo.toml",
+    "examples/**/*.toml",
+    "packages/**/*.toml",
+    "plugins/**/*.toml",
+]
 
 [formatting]
 align_entries  = true
