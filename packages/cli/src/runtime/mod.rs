@@ -1623,8 +1623,36 @@ async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]
     let _host_kernel_connection_guard = enter_host_kernel_connection(context.connection.clone());
     let status = loaded
         .run_command_with_context(command_name, args, Some(&context))
-        .with_context(|| format!("failed running plugin command '{plugin_id}:{command_name}'"))?;
+        .map_err(|error| {
+            anyhow::anyhow!(format_plugin_command_run_error(
+                plugin_id,
+                command_name,
+                &error
+            ))
+        })?;
     Ok(status.clamp(0, i32::from(u8::MAX)) as u8)
+}
+
+fn format_plugin_command_run_error(
+    plugin_id: &str,
+    command_name: &str,
+    error: &dyn std::fmt::Display,
+) -> String {
+    let base = format!("failed running plugin command '{plugin_id}:{command_name}': {error}");
+    if base.contains("session policy denied for this operation") {
+        format!(
+            "{base}\nHint: operation denied by session policy. Use the permissions plugin to grant an appropriate role or run with an authorized principal."
+        )
+    } else {
+        base
+    }
+}
+
+fn unknown_external_command_message(args: &[String]) -> String {
+    format!(
+        "unknown command '{}'; run 'bmux plugin list' to inspect available plugins",
+        args.join(" ")
+    )
 }
 
 async fn run_external_plugin_command(args: &[String]) -> Result<u8> {
@@ -1633,12 +1661,9 @@ async fn run_external_plugin_command(args: &[String]) -> Result<u8> {
     let registry = scan_available_plugins(&config, &paths)?;
     let command_registry = PluginCommandRegistry::build(&config, &registry)
         .context("failed building plugin CLI command registry")?;
-    let resolved = command_registry.resolve(args).with_context(|| {
-        format!(
-            "unknown command '{}'; run 'bmux plugin list' to inspect available plugins",
-            args.join(" ")
-        )
-    })?;
+    let resolved = command_registry
+        .resolve(args)
+        .with_context(|| unknown_external_command_message(args))?;
     let validated_arguments =
         PluginCommandRegistry::validate_arguments(&resolved.schema, &resolved.arguments)
             .context("failed validating plugin command arguments")?;
@@ -6166,6 +6191,31 @@ mod tests {
         });
 
         assert_eq!(status, "quit blocked by session policy");
+    }
+
+    #[test]
+    fn format_plugin_command_run_error_adds_policy_hint_when_denied() {
+        let error = anyhow::anyhow!("session policy denied for this operation");
+        let message = super::format_plugin_command_run_error("bmux.windows", "kill", &error);
+        assert!(message.contains("failed running plugin command 'bmux.windows:kill'"));
+        assert!(message.contains("operation denied by session policy"));
+        assert!(message.contains("permissions plugin"));
+    }
+
+    #[test]
+    fn format_plugin_command_run_error_keeps_generic_failures_without_hint() {
+        let error = anyhow::anyhow!("unsupported service operation");
+        let message = super::format_plugin_command_run_error("bmux.permissions", "grant", &error);
+        assert!(message.contains("failed running plugin command 'bmux.permissions:grant'"));
+        assert!(!message.contains("operation denied by session policy"));
+    }
+
+    #[test]
+    fn unknown_external_command_message_points_to_plugin_list_help() {
+        let message =
+            super::unknown_external_command_message(&["session".to_string(), "roles".to_string()]);
+        assert!(message.contains("unknown command 'session roles'"));
+        assert!(message.contains("bmux plugin list"));
     }
 
     #[test]
