@@ -1572,17 +1572,10 @@ async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]
     let config = BmuxConfig::load()?;
     let paths = ConfigPaths::default();
     let registry = scan_available_plugins(&config, &paths)?;
-    let plugin = registry.get(plugin_id).with_context(|| {
-        let available = registry.plugin_ids();
-        if available.is_empty() {
-            format!("plugin '{plugin_id}' was not found")
-        } else {
-            format!(
-                "plugin '{plugin_id}' was not found (available: {})",
-                available.join(", ")
-            )
-        }
-    })?;
+    let available = registry.plugin_ids();
+    let plugin = registry
+        .get(plugin_id)
+        .with_context(|| format_plugin_not_found_message(plugin_id, &available))?;
 
     if !config
         .plugins
@@ -1590,9 +1583,7 @@ async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]
         .iter()
         .any(|enabled| enabled == plugin_id)
     {
-        anyhow::bail!(
-            "plugin '{plugin_id}' is not enabled in config; add it under plugins.enabled to run commands"
-        );
+        anyhow::bail!(format_plugin_not_enabled_message(plugin_id));
     }
 
     let loaded = load_native_registered_plugin(
@@ -1646,6 +1637,27 @@ fn format_plugin_command_run_error(
     } else {
         base
     }
+}
+
+fn format_plugin_not_found_message<S: AsRef<str>>(plugin_id: &str, available: &[S]) -> String {
+    if available.is_empty() {
+        format!("plugin '{plugin_id}' was not found")
+    } else {
+        let available = available
+            .iter()
+            .map(|entry| entry.as_ref())
+            .collect::<Vec<_>>();
+        format!(
+            "plugin '{plugin_id}' was not found (available: {})",
+            available.join(", ")
+        )
+    }
+}
+
+fn format_plugin_not_enabled_message(plugin_id: &str) -> String {
+    format!(
+        "plugin '{plugin_id}' is not enabled in config; add it under plugins.enabled to run commands"
+    )
 }
 
 fn unknown_external_command_message(args: &[String]) -> String {
@@ -6216,6 +6228,30 @@ mod tests {
             super::unknown_external_command_message(&["session".to_string(), "roles".to_string()]);
         assert!(message.contains("unknown command 'session roles'"));
         assert!(message.contains("bmux plugin list"));
+    }
+
+    #[test]
+    fn format_plugin_not_found_message_lists_available_plugins() {
+        let message = super::format_plugin_not_found_message(
+            "missing.plugin",
+            &["bmux.windows".to_string(), "bmux.permissions".to_string()],
+        );
+        assert!(message.contains("plugin 'missing.plugin' was not found"));
+        assert!(message.contains("bmux.windows, bmux.permissions"));
+    }
+
+    #[test]
+    fn format_plugin_not_found_message_handles_empty_registry() {
+        let empty: [&str; 0] = [];
+        let message = super::format_plugin_not_found_message("missing.plugin", &empty);
+        assert_eq!(message, "plugin 'missing.plugin' was not found");
+    }
+
+    #[test]
+    fn format_plugin_not_enabled_message_points_to_plugins_enabled() {
+        let message = super::format_plugin_not_enabled_message("bmux.windows");
+        assert!(message.contains("plugin 'bmux.windows' is not enabled in config"));
+        assert!(message.contains("plugins.enabled"));
     }
 
     #[test]
