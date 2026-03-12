@@ -203,7 +203,7 @@ const SERVER_STATUS_TIMEOUT: Duration = Duration::from_millis(1000);
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_millis(5000);
 const ATTACH_IO_POLL_INTERVAL: Duration = Duration::from_millis(15);
 const ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE: usize = 1_048_576;
-const ATTACH_WINDOW_MODE_UNBOUND_STATUS: &str = "window mode: unbound key (Esc/Enter to exit)";
+const ATTACH_WINDOW_MODE_UNBOUND_STATUS: &str = "workspace mode: unbound key (Esc/Enter to exit)";
 const ATTACH_SCROLLBACK_UNAVAILABLE_STATUS: &str = "scrollback unavailable for focused pane";
 const ATTACH_SELECTION_STARTED_STATUS: &str = "selection started";
 const ATTACH_SELECTION_CLEARED_STATUS: &str = "selection cleared";
@@ -3209,7 +3209,7 @@ async fn build_attach_status_line_for_draw(
     } else {
         match ui_mode {
             AttachUiMode::Normal => "NORMAL",
-            AttachUiMode::Window => "WINDOW",
+            AttachUiMode::Window => "WORKSPACE",
         }
     };
     let role_label = if can_write { "write" } else { "read-only" };
@@ -3263,7 +3263,7 @@ fn attach_mode_hint(ui_mode: AttachUiMode, keymap: &Keymap) -> String {
             let detach = key_hint_or_unbound(keymap, RuntimeAction::Detach);
             let quit = key_hint_or_unbound(keymap, RuntimeAction::Quit);
             let help = key_hint_or_unbound(keymap, RuntimeAction::ShowHelp);
-            format!("{window_mode} window mode | {detach} detach | {quit} quit | {help} help")
+            format!("{window_mode} workspace mode | {detach} detach | {quit} quit | {help} help")
         }
         AttachUiMode::Window => {
             let session_prev = key_hint_or_unbound(keymap, RuntimeAction::SessionPrev);
@@ -3276,7 +3276,7 @@ fn attach_mode_hint(ui_mode: AttachUiMode, keymap: &Keymap) -> String {
             let exit = key_hint_or_unbound(keymap, RuntimeAction::ExitMode);
             let help = key_hint_or_unbound(keymap, RuntimeAction::ShowHelp);
             format!(
-                "{session_prev}/{session_next} prev/next session | {prev}/{next} prev/next window | {goto_one} goto-1 | {new_window} new | {close} close | {exit} exit | {help} help"
+                "{session_prev}/{session_next} prev/next session | {prev}/{next} prev/next workspace | {goto_one} goto-1 | {new_window} new | {close} close | {exit} exit | {help} help"
             )
         }
     }
@@ -3286,14 +3286,14 @@ fn initial_attach_status(keymap: &Keymap, can_write: bool) -> String {
     let help = key_hint_or_unbound(keymap, RuntimeAction::ShowHelp);
     let window_mode = key_hint_or_unbound(keymap, RuntimeAction::EnterWindowMode);
     if can_write {
-        format!("{help} help | {window_mode} window mode | typing goes to pane")
+        format!("{help} help | {window_mode} workspace mode | typing goes to pane")
     } else {
-        format!("read-only attach | {help} help | {window_mode} window mode")
+        format!("read-only attach | {help} help | {window_mode} workspace mode")
     }
 }
 
 fn window_mode_enter_status() -> String {
-    "window mode: use window bindings, Esc/Enter exits".to_string()
+    "workspace mode: use workspace bindings, Esc/Enter exits".to_string()
 }
 
 fn attach_exit_message(reason: AttachExitReason) -> Option<&'static str> {
@@ -3829,7 +3829,7 @@ fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
     let scroll = key_hint_or_unbound(&keymap, RuntimeAction::EnterScrollMode);
     let mut groups: Vec<(&str, Vec<AttachKeybindingEntry>)> = vec![
         ("Session", Vec::new()),
-        ("Window", Vec::new()),
+        ("Workspace", Vec::new()),
         ("Pane", Vec::new()),
         ("Mode", Vec::new()),
         ("Other", Vec::new()),
@@ -3854,7 +3854,7 @@ fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
             | RuntimeAction::WindowGoto7
             | RuntimeAction::WindowGoto8
             | RuntimeAction::WindowGoto9
-            | RuntimeAction::WindowClose => "Window",
+            | RuntimeAction::WindowClose => "Workspace",
             RuntimeAction::SplitFocusedVertical
             | RuntimeAction::SplitFocusedHorizontal
             | RuntimeAction::FocusNext
@@ -3894,9 +3894,11 @@ fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push("Attach Help".to_string());
     lines.push(format!(
-        "Normal mode sends typing to the pane. Use {window_mode} for window mode, {scroll} for scrollback, {detach} to detach, and {help} to toggle help."
+        "Normal mode sends typing to the pane. Use {window_mode} for workspace mode, {scroll} for scrollback, {detach} to detach, and {help} to toggle help."
     ));
-    lines.push("Window mode captures window/session keys until Esc or Enter exits it.".to_string());
+    lines.push(
+        "Workspace mode captures workspace/session keys until Esc or Enter exits it.".to_string(),
+    );
     lines.push(String::new());
     for (category, mut entries) in groups {
         if entries.is_empty() {
@@ -6770,7 +6772,7 @@ mod tests {
 
         let keymap = attach_keymap_from_config(&config);
         let hint = super::attach_mode_hint(super::AttachUiMode::Normal, &keymap);
-        assert!(hint.contains("Ctrl-W window mode"));
+        assert!(hint.contains("Ctrl-W workspace mode"));
         assert!(hint.contains("Ctrl-A z detach"));
         assert!(hint.contains("Ctrl-A d quit"));
     }
@@ -6842,7 +6844,7 @@ mod tests {
         let keymap = attach_keymap_from_config(&config);
         let hint = super::attach_mode_hint(super::AttachUiMode::Window, &keymap);
         assert!(hint.contains("unbound/unbound prev/next session"));
-        assert!(hint.contains("u/i prev/next window"));
+        assert!(hint.contains("u/i prev/next workspace"));
         assert!(hint.contains("0 goto-1"));
         assert!(hint.contains("m new"));
         assert!(hint.contains("k close"));
@@ -7160,7 +7162,7 @@ mod tests {
         assert_eq!(lines.first().map(String::as_str), Some("Attach Help"));
         assert!(lines[1].contains("Normal mode sends typing to the pane"));
         assert!(lines.iter().any(|line| line == "-- Session --"));
-        assert!(lines.iter().any(|line| line == "-- Window --"));
+        assert!(lines.iter().any(|line| line == "-- Workspace --"));
         assert!(lines.iter().any(|line| line == "-- Pane --"));
         assert!(lines.iter().any(|line| line == "-- Mode --"));
     }
@@ -7182,11 +7184,11 @@ mod tests {
     }
 
     #[test]
-    fn initial_attach_status_mentions_help_and_window_mode() {
+    fn initial_attach_status_mentions_help_and_workspace_mode() {
         let keymap = attach_keymap_from_config(&BmuxConfig::default());
         let status = super::initial_attach_status(&keymap, true);
         assert!(status.contains("help"));
-        assert!(status.contains("window mode"));
+        assert!(status.contains("workspace mode"));
         assert!(status.contains("typing goes to pane"));
     }
 
