@@ -1619,6 +1619,12 @@ mod tests {
             .push(kernel_request.clone());
 
         let kernel_response = match kernel_request {
+            bmux_ipc::Request::NewSession { name: Some(name) } if name == "deny" => {
+                bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
+                    code: bmux_ipc::ErrorCode::InvalidRequest,
+                    message: "session policy denied for this operation".to_string(),
+                })
+            }
             bmux_ipc::Request::NewSession { .. } => {
                 bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionCreated {
                     id: uuid::Uuid::new_v4(),
@@ -2249,6 +2255,59 @@ minimum = "1.0"
             requests.last(),
             Some(bmux_ipc::Request::NewSession { .. })
         ));
+    }
+
+    #[test]
+    fn command_context_surfaces_kernel_error_for_session_command() {
+        let context = super::NativeCommandContext {
+            plugin_id: "caller.plugin".to_string(),
+            command: "new-session".to_string(),
+            arguments: Vec::new(),
+            required_capabilities: vec!["bmux.sessions.write".to_string()],
+            provided_capabilities: Vec::new(),
+            services: vec![crate::RegisteredService {
+                capability: crate::HostScope::new("bmux.sessions.write")
+                    .expect("capability should parse"),
+                kind: crate::ServiceKind::Command,
+                interface_id: "session-command/v1".to_string(),
+                provider: crate::ProviderId::Host,
+            }],
+            available_capabilities: vec!["bmux.sessions.write".to_string()],
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: crate::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
+        };
+
+        let error = context
+            .call_service::<crate::SessionCreateRequest, crate::SessionCreateResponse>(
+                "bmux.sessions.write",
+                crate::ServiceKind::Command,
+                "session-command/v1",
+                "new",
+                &crate::SessionCreateRequest {
+                    name: Some("deny".to_string()),
+                },
+            )
+            .expect_err("kernel denial should propagate as service error");
+
+        assert!(
+            error
+                .to_string()
+                .contains("session policy denied for this operation")
+        );
     }
 
     #[test]
