@@ -782,12 +782,46 @@ mod tests {
     }
 
     #[test]
+    fn kill_window_passes_selector_and_force_local() {
+        let host = MockHost::with_sessions(sample_sessions());
+        let target = host
+            .sessions
+            .first()
+            .expect("sample sessions should exist")
+            .id;
+
+        let ack =
+            kill_window(&host, SessionSelector::ById(target), true).expect("kill should succeed");
+        assert!(ack.ok);
+        let target_text = target.to_string();
+        assert_eq!(ack.id.as_deref(), Some(target_text.as_str()));
+
+        let kills = host.kills.lock().expect("kill log lock should succeed");
+        assert_eq!(kills.len(), 1);
+        assert!(matches!(kills[0].selector, SessionSelector::ById(id) if id == target));
+        assert!(kills[0].force_local);
+    }
+
+    #[test]
     fn switch_window_requires_target_session_to_have_panes() {
         let target_id = Uuid::new_v4();
         let host = MockHost::with_empty_target_session(target_id);
         let error = switch_window(&host, SessionSelector::ById(target_id))
             .expect_err("switch should fail when target has no panes");
         assert!(error.contains("no panes"));
+    }
+
+    #[test]
+    fn switch_window_returns_selected_session_id() {
+        let sessions = sample_sessions();
+        let target_id = sessions[1].id;
+        let host = MockHost::with_sessions(sessions);
+
+        let ack =
+            switch_window(&host, SessionSelector::ById(target_id)).expect("switch should succeed");
+        assert!(ack.ok);
+        let target_text = target_id.to_string();
+        assert_eq!(ack.id.as_deref(), Some(target_text.as_str()));
     }
 
     #[test]
