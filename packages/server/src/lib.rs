@@ -4761,3 +4761,95 @@ async fn send_response(
         .await
         .context("failed sending response envelope")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn test_endpoint() -> IpcEndpoint {
+        #[cfg(unix)]
+        {
+            IpcEndpoint::unix_socket(PathBuf::from("/tmp/bmux-server-policy-test.sock"))
+        }
+        #[cfg(windows)]
+        {
+            IpcEndpoint::windows_named_pipe(PathBuf::from(r"\\.\pipe\bmux-server-policy-test"))
+        }
+    }
+
+    #[tokio::test]
+    async fn session_policy_fallback_is_permissive_without_provider() {
+        let server = BmuxServer::new(test_endpoint());
+        let result = ensure_session_mutation_allowed(
+            &server.state,
+            &server.shutdown_tx,
+            SessionId::new(),
+            ClientId::new(),
+            Uuid::new_v4(),
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn session_policy_denial_blocks_mutation() {
+        let server = BmuxServer::new(test_endpoint());
+        server
+            .set_service_resolver(|route, payload| async move {
+                if route.interface_id == "session-policy-query/v1" && route.operation == "check" {
+                    let request: SessionPolicyCheckRequest = decode(&payload)?;
+                    assert_eq!(request.action, "mutation");
+                    return encode(&SessionPolicyCheckResponse {
+                        allowed: false,
+                        reason: Some("session policy denied for this operation".to_string()),
+                    })
+                    .map_err(anyhow::Error::from);
+                }
+                anyhow::bail!("unexpected policy route")
+            })
+            .expect("resolver registration should succeed");
+
+        let result = ensure_session_mutation_allowed(
+            &server.state,
+            &server.shutdown_tx,
+            SessionId::new(),
+            ClientId::new(),
+            Uuid::new_v4(),
+        )
+        .await;
+
+        let error = result.expect_err("mutation should be denied by policy provider");
+        assert_eq!(error.code, ErrorCode::InvalidRequest);
+        assert!(error.message.contains("session policy denied"));
+    }
+
+    #[tokio::test]
+    async fn session_policy_allows_admin_when_provider_approves() {
+        let server = BmuxServer::new(test_endpoint());
+        server
+            .set_service_resolver(|route, payload| async move {
+                if route.interface_id == "session-policy-query/v1" && route.operation == "check" {
+                    let request: SessionPolicyCheckRequest = decode(&payload)?;
+                    assert_eq!(request.action, "admin");
+                    return encode(&SessionPolicyCheckResponse {
+                        allowed: true,
+                        reason: None,
+                    })
+                    .map_err(anyhow::Error::from);
+                }
+                anyhow::bail!("unexpected policy route")
+            })
+            .expect("resolver registration should succeed");
+
+        let result = ensure_session_admin_allowed(
+            &server.state,
+            &server.shutdown_tx,
+            SessionId::new(),
+            ClientId::new(),
+            Uuid::new_v4(),
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+}
