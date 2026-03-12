@@ -11,16 +11,8 @@ const SNAPSHOT_VERSION_V3: u32 = 3;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotV3 {
     pub sessions: Vec<SessionSnapshotV3>,
-    #[serde(default)]
-    pub owner_principals: Vec<OwnerPrincipalSnapshotV2>,
     pub follows: Vec<FollowEdgeSnapshotV2>,
     pub selected_sessions: Vec<ClientSelectedSessionSnapshotV2>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OwnerPrincipalSnapshotV2 {
-    pub session_id: Uuid,
-    pub principal_id: Uuid,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -237,7 +229,6 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 fn validate_snapshot_v3(snapshot: &SnapshotV3) -> Result<(), SnapshotError> {
     let mut session_ids = BTreeSet::new();
     let mut all_pane_ids = BTreeSet::new();
-    let mut owner_sessions = BTreeSet::new();
     let mut surface_ids = BTreeSet::new();
 
     for session in &snapshot.sessions {
@@ -314,20 +305,6 @@ fn validate_snapshot_v3(snapshot: &SnapshotV3) -> Result<(), SnapshotError> {
         }
     }
 
-    for owner in &snapshot.owner_principals {
-        if !session_ids.contains(&owner.session_id) {
-            return Err(SnapshotError::Validation(format!(
-                "owner principal references missing session {}",
-                owner.session_id
-            )));
-        }
-        if !owner_sessions.insert(owner.session_id) {
-            return Err(SnapshotError::Validation(format!(
-                "duplicate owner principal assignment for session {}",
-                owner.session_id
-            )));
-        }
-    }
     for follow in &snapshot.follows {
         if follow.follower_client_id == follow.leader_client_id {
             return Err(SnapshotError::Validation(format!(
@@ -411,7 +388,6 @@ mod tests {
                 layout_root: Some(PaneLayoutNodeSnapshotV2::Leaf { pane_id: window_id }),
                 floating_surfaces: vec![],
             }],
-            owner_principals: vec![],
             follows: vec![FollowEdgeSnapshotV2 {
                 follower_client_id: client_id,
                 leader_client_id: leader_id,
@@ -463,7 +439,6 @@ mod tests {
                 layout_root: None,
                 floating_surfaces: vec![],
             }],
-            owner_principals: vec![],
             follows: vec![],
             selected_sessions: vec![],
         };

@@ -22,8 +22,8 @@ use bmux_session::{ClientId, Session, SessionId, SessionManager};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
 use persistence::{
     ClientSelectedSessionSnapshotV2, FloatingSurfaceSnapshotV3, FollowEdgeSnapshotV2,
-    OwnerPrincipalSnapshotV2, PaneLayoutNodeSnapshotV2, PaneSnapshotV2,
-    PaneSplitDirectionSnapshotV2, SessionSnapshotV3, SnapshotManager, SnapshotV3,
+    PaneLayoutNodeSnapshotV2, PaneSnapshotV2, PaneSplitDirectionSnapshotV2, SessionSnapshotV3,
+    SnapshotManager, SnapshotV3,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -56,7 +56,6 @@ struct ServerState {
     session_runtimes: Mutex<SessionRuntimeManager>,
     attach_tokens: Mutex<AttachTokenManager>,
     follow_state: Mutex<FollowState>,
-    permission_state: Mutex<PermissionState>,
     snapshot_runtime: Mutex<SnapshotRuntime>,
     operation_lock: AsyncMutex<()>,
     event_hub: Mutex<EventHub>,
@@ -162,8 +161,6 @@ struct SnapshotRuntime {
 #[derive(Debug, Clone, Copy, Default)]
 struct RestoreSummary {
     sessions: usize,
-    windows: usize,
-    owners: usize,
     follows: usize,
     selected_sessions: usize,
 }
@@ -360,25 +357,6 @@ struct FollowState {
     connected_clients: std::collections::BTreeSet<ClientId>,
     selected_sessions: BTreeMap<ClientId, Option<SessionId>>,
     follows: BTreeMap<ClientId, FollowEntry>,
-}
-
-#[derive(Debug, Default)]
-struct PermissionState {
-    owner_principals: BTreeMap<SessionId, Uuid>,
-}
-
-impl PermissionState {
-    fn ensure_owner(&mut self, session_id: SessionId, owner_principal_id: Uuid) {
-        self.owner_principals.insert(session_id, owner_principal_id);
-    }
-
-    fn set_owner_principal(&mut self, session_id: SessionId, principal_id: Uuid) {
-        self.owner_principals.insert(session_id, principal_id);
-    }
-
-    fn remove_session(&mut self, session_id: SessionId) {
-        self.owner_principals.remove(&session_id);
-    }
 }
 
 impl FollowState {
@@ -2028,7 +2006,6 @@ impl BmuxServer {
                 )),
                 attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
                 follow_state: Mutex::new(FollowState::default()),
-                permission_state: Mutex::new(PermissionState::default()),
                 snapshot_runtime: Mutex::new(snapshot_runtime),
                 operation_lock: AsyncMutex::new(()),
                 event_hub: Mutex::new(EventHub::new(1024)),
@@ -2233,9 +2210,6 @@ impl BmuxServer {
         if let Ok(mut session_manager) = self.state.session_manager.lock() {
             *session_manager = SessionManager::new();
         }
-        if let Ok(mut permission_state) = self.state.permission_state.lock() {
-            *permission_state = PermissionState::default();
-        }
         let _ = emit_event(&self.state, Event::ServerStopping);
         if let Ok(mut attach_tokens) = self.state.attach_tokens.lock() {
             attach_tokens.clear();
@@ -2372,7 +2346,6 @@ async fn handle_connection(
         &mut attached_stream_session,
     )?;
     disconnect_follow_state(&state, client_id)?;
-    rebalance_owner_roles_after_disconnect(&state, client_id)?;
     {
         let mut principals = state
             .client_principals
@@ -2590,13 +2563,6 @@ fn clear_selected_session_for_all(
     Ok(())
 }
 
-fn rebalance_owner_roles_after_disconnect(
-    _state: &Arc<ServerState>,
-    _disconnected_client_id: ClientId,
-) -> Result<()> {
-    Ok(())
-}
-
 fn mark_snapshot_dirty(state: &Arc<ServerState>) -> Result<()> {
     let mut runtime = state
         .snapshot_runtime
@@ -2787,21 +2753,6 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV3> {
             .collect::<Result<Vec<_>>>()?
     };
 
-    let owner_principals = {
-        let permission_state = state
-            .permission_state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-        permission_state
-            .owner_principals
-            .iter()
-            .map(|(session_id, principal_id)| OwnerPrincipalSnapshotV2 {
-                session_id: session_id.0,
-                principal_id: *principal_id,
-            })
-            .collect::<Vec<_>>()
-    };
-
     let (follows, selected_sessions) = {
         let follow_state = state
             .follow_state
@@ -2831,7 +2782,6 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV3> {
 
     Ok(SnapshotV3 {
         sessions: session_snapshots,
-        owner_principals,
         follows,
         selected_sessions,
     })
@@ -2972,27 +2922,6 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV3) -> Resu
             }
 
             summary.sessions += 1;
-            summary.windows += 1;
-        }
-    }
-
-    {
-        let mut permission_state = state
-            .permission_state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-        permission_state.owner_principals.clear();
-
-        let session_manager = state
-            .session_manager
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-        for owner in &snapshot.owner_principals {
-            let session_id = SessionId(owner.session_id);
-            if session_manager.get_session(&session_id).is_some() {
-                permission_state.set_owner_principal(session_id, owner.principal_id);
-                summary.owners += 1;
-            }
         }
     }
 
@@ -3057,13 +2986,6 @@ async fn restore_snapshot_replace(
             .lock()
             .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
         *session_manager = SessionManager::new();
-    }
-    {
-        let mut permission_state = state
-            .permission_state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-        *permission_state = PermissionState::default();
     }
     {
         let mut follow_state = state
@@ -3136,13 +3058,6 @@ async fn reap_closed_active_pane(
 
         clear_selected_session_for_all(state, removed_session_id)?;
 
-        let mut permission_state = state
-            .permission_state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-        permission_state.remove_session(removed_session_id);
-        drop(permission_state);
-
         emit_event(
             state,
             Event::SessionRemoved {
@@ -3205,13 +3120,6 @@ async fn reap_exited_pane(
         drop(attach_tokens);
 
         clear_selected_session_for_all(state, removed_session_id)?;
-
-        let mut permission_state = state
-            .permission_state
-            .lock()
-            .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-        permission_state.remove_session(removed_session_id);
-        drop(permission_state);
 
         emit_event(
             state,
@@ -3352,9 +3260,8 @@ async fn handle_request(
                 Ok(snapshot) => Response::Ok(ResponsePayload::ServerSnapshotRestoreDryRun {
                     ok: true,
                     message: format!(
-                        "snapshot is valid (sessions={}, owners={}, follows={}, selected={})",
+                        "snapshot is valid (sessions={}, follows={}, selected={})",
                         snapshot.sessions.len(),
-                        snapshot.owner_principals.len(),
                         snapshot.follows.len(),
                         snapshot.selected_sessions.len()
                     ),
@@ -3509,12 +3416,6 @@ async fn handle_request(
                     }
                     drop(runtime_manager);
 
-                    let mut permission_state = state
-                        .permission_state
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-                    permission_state.ensure_owner(session_id, client_principal_id);
-
                     Response::Ok(ResponsePayload::SessionCreated {
                         id: session_id.0,
                         name,
@@ -3532,7 +3433,7 @@ async fn handle_request(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
             let session_id =
-                match resolve_window_request_session_id(&manager, &session, selected_session) {
+                match resolve_session_request_session_id(&manager, &session, selected_session) {
                     Ok(session_id) => session_id,
                     Err(response) => return Ok(Response::Err(response)),
                 };
@@ -3563,13 +3464,13 @@ async fn handle_request(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
             let session_id =
-                match resolve_window_request_session_id(&manager, &session, selected_session) {
+                match resolve_session_request_session_id(&manager, &session, selected_session) {
                     Ok(session_id) => session_id,
                     Err(response) => return Ok(Response::Err(response)),
                 };
             drop(manager);
             if let Err(response) =
-                ensure_writer_for_session(state, session_id, client_id, client_principal_id)
+                ensure_session_mutation_allowed(state, session_id, client_id, client_principal_id)
             {
                 return Ok(Response::Err(response));
             }
@@ -3603,13 +3504,13 @@ async fn handle_request(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
             let session_id =
-                match resolve_window_request_session_id(&manager, &session, selected_session) {
+                match resolve_session_request_session_id(&manager, &session, selected_session) {
                     Ok(session_id) => session_id,
                     Err(response) => return Ok(Response::Err(response)),
                 };
             drop(manager);
             if let Err(response) =
-                ensure_writer_for_session(state, session_id, client_id, client_principal_id)
+                ensure_session_mutation_allowed(state, session_id, client_id, client_principal_id)
             {
                 return Ok(Response::Err(response));
             }
@@ -3654,13 +3555,13 @@ async fn handle_request(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
             let session_id =
-                match resolve_window_request_session_id(&manager, &session, selected_session) {
+                match resolve_session_request_session_id(&manager, &session, selected_session) {
                     Ok(session_id) => session_id,
                     Err(response) => return Ok(Response::Err(response)),
                 };
             drop(manager);
             if let Err(response) =
-                ensure_writer_for_session(state, session_id, client_id, client_principal_id)
+                ensure_session_mutation_allowed(state, session_id, client_id, client_principal_id)
             {
                 return Ok(Response::Err(response));
             }
@@ -3686,13 +3587,13 @@ async fn handle_request(
                     .session_manager
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                match resolve_window_request_session_id(&manager, &session, selected_session) {
+                match resolve_session_request_session_id(&manager, &session, selected_session) {
                     Ok(session_id) => session_id,
                     Err(response) => return Ok(Response::Err(response)),
                 }
             };
             if let Err(response) =
-                ensure_writer_for_session(state, session_id, client_id, client_principal_id)
+                ensure_session_mutation_allowed(state, session_id, client_id, client_principal_id)
             {
                 return Ok(Response::Err(response));
             }
@@ -3743,13 +3644,6 @@ async fn handle_request(
                 drop(attach_tokens);
 
                 clear_selected_session_for_all(state, removed_session_id)?;
-
-                let mut permission_state = state
-                    .permission_state
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-                permission_state.remove_session(removed_session_id);
-                drop(permission_state);
 
                 emit_event(
                     state,
@@ -3816,8 +3710,12 @@ async fn handle_request(
                 }
 
                 if !force_local
-                    && let Err(response) =
-                        ensure_owner_for_session(state, session_id, client_id, client_principal_id)
+                    && let Err(response) = ensure_session_admin_allowed(
+                        state,
+                        session_id,
+                        client_id,
+                        client_principal_id,
+                    )
                 {
                     return Ok(Response::Err(response));
                 }
@@ -3866,13 +3764,6 @@ async fn handle_request(
             drop(attach_tokens);
 
             clear_selected_session_for_all(state, session_id)?;
-
-            let mut permission_state = state
-                .permission_state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-            permission_state.remove_session(session_id);
-            drop(permission_state);
 
             emit_event(state, Event::SessionRemoved { id: session_id.0 })?;
 
@@ -4602,7 +4493,7 @@ fn session_not_found_message(selector: &SessionSelector) -> String {
     )
 }
 
-fn resolve_window_request_session_id(
+fn resolve_session_request_session_id(
     manager: &SessionManager,
     selector: &Option<SessionSelector>,
     selected_session: &Option<SessionId>,
@@ -4629,7 +4520,7 @@ fn resolve_window_request_session_id(
     })
 }
 
-fn ensure_owner_for_session(
+fn ensure_session_admin_allowed(
     _state: &Arc<ServerState>,
     _session_id: SessionId,
     _client_id: ClientId,
@@ -4638,7 +4529,7 @@ fn ensure_owner_for_session(
     Ok(())
 }
 
-fn ensure_writer_for_session(
+fn ensure_session_mutation_allowed(
     _state: &Arc<ServerState>,
     _session_id: SessionId,
     _client_id: ClientId,
