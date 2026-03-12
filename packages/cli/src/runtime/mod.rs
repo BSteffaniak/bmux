@@ -1667,6 +1667,21 @@ fn unknown_external_command_message(args: &[String]) -> String {
     )
 }
 
+fn format_plugin_argument_validation_error(
+    command_path: &[String],
+    error: &dyn std::fmt::Display,
+) -> String {
+    let base = format!(
+        "failed validating plugin command arguments for '{}': {error}",
+        command_path.join(" ")
+    );
+    if base.contains("missing required") {
+        format!("{base}\nHint: run '<command> --help' to inspect required plugin options.")
+    } else {
+        base
+    }
+}
+
 async fn run_external_plugin_command(args: &[String]) -> Result<u8> {
     let config = BmuxConfig::load()?;
     let paths = ConfigPaths::default();
@@ -1677,8 +1692,9 @@ async fn run_external_plugin_command(args: &[String]) -> Result<u8> {
         .resolve(args)
         .with_context(|| unknown_external_command_message(args))?;
     let validated_arguments =
-        PluginCommandRegistry::validate_arguments(&resolved.schema, &resolved.arguments)
-            .context("failed validating plugin command arguments")?;
+        PluginCommandRegistry::validate_arguments(&resolved.schema, &resolved.arguments).map_err(
+            |error| anyhow::anyhow!(format_plugin_argument_validation_error(args, &error)),
+        )?;
     run_plugin_command(
         &resolved.plugin_id,
         &resolved.command_name,
@@ -6252,6 +6268,30 @@ mod tests {
         let message = super::format_plugin_not_enabled_message("bmux.windows");
         assert!(message.contains("plugin 'bmux.windows' is not enabled in config"));
         assert!(message.contains("plugins.enabled"));
+    }
+
+    #[test]
+    fn format_plugin_argument_validation_error_adds_help_hint_for_missing_required() {
+        let error = anyhow::anyhow!("missing required option '--session'");
+        let message = super::format_plugin_argument_validation_error(
+            &["session".to_string(), "roles".to_string()],
+            &error,
+        );
+        assert!(message.contains("failed validating plugin command arguments for 'session roles'"));
+        assert!(message.contains("missing required option '--session'"));
+        assert!(message.contains("--help"));
+    }
+
+    #[test]
+    fn format_plugin_argument_validation_error_keeps_non_required_errors_without_hint() {
+        let error = anyhow::anyhow!("unknown option '--wat'");
+        let message = super::format_plugin_argument_validation_error(
+            &["session".to_string(), "roles".to_string()],
+            &error,
+        );
+        assert!(message.contains("failed validating plugin command arguments for 'session roles'"));
+        assert!(message.contains("unknown option '--wat'"));
+        assert!(!message.contains("--help"));
     }
 
     #[test]
