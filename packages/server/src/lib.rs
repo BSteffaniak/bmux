@@ -4767,6 +4767,27 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
+    async fn execute_request(
+        server: &BmuxServer,
+        client_id: ClientId,
+        principal_id: Uuid,
+        selected_session: &mut Option<SessionId>,
+        attached_stream_session: &mut Option<SessionId>,
+        request: Request,
+    ) -> Response {
+        handle_request(
+            &server.state,
+            &server.shutdown_tx,
+            client_id,
+            principal_id,
+            selected_session,
+            attached_stream_session,
+            request,
+        )
+        .await
+        .expect("request should complete")
+    }
+
     fn test_endpoint() -> IpcEndpoint {
         #[cfg(unix)]
         {
@@ -4851,5 +4872,124 @@ mod tests {
         )
         .await;
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn kill_session_is_blocked_when_admin_policy_denies() {
+        let server = BmuxServer::new(test_endpoint());
+        server
+            .set_service_resolver(|route, payload| async move {
+                if route.interface_id == "session-policy-query/v1" && route.operation == "check" {
+                    let request: SessionPolicyCheckRequest = decode(&payload)?;
+                    assert_eq!(request.action, "admin");
+                    return encode(&SessionPolicyCheckResponse {
+                        allowed: false,
+                        reason: Some("session policy denied for this operation".to_string()),
+                    })
+                    .map_err(anyhow::Error::from);
+                }
+                anyhow::bail!("unexpected policy route")
+            })
+            .expect("resolver registration should succeed");
+
+        let client_id = ClientId::new();
+        let principal_id = Uuid::new_v4();
+        let mut selected_session = None;
+        let mut attached_stream_session = None;
+
+        let created = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::NewSession { name: None },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            response => panic!("expected session created response, got {response:?}"),
+        };
+
+        let killed = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::KillSession {
+                selector: SessionSelector::ById(session_id),
+                force_local: false,
+            },
+        )
+        .await;
+
+        match killed {
+            Response::Err(error) => {
+                assert_eq!(error.code, ErrorCode::InvalidRequest);
+                assert!(error.message.contains("session policy denied"));
+            }
+            response => panic!("expected denied kill response, got {response:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn split_pane_is_blocked_when_mutation_policy_denies() {
+        let server = BmuxServer::new(test_endpoint());
+        server
+            .set_service_resolver(|route, payload| async move {
+                if route.interface_id == "session-policy-query/v1" && route.operation == "check" {
+                    let request: SessionPolicyCheckRequest = decode(&payload)?;
+                    assert_eq!(request.action, "mutation");
+                    return encode(&SessionPolicyCheckResponse {
+                        allowed: false,
+                        reason: Some("session policy denied for this operation".to_string()),
+                    })
+                    .map_err(anyhow::Error::from);
+                }
+                anyhow::bail!("unexpected policy route")
+            })
+            .expect("resolver registration should succeed");
+
+        let client_id = ClientId::new();
+        let principal_id = Uuid::new_v4();
+        let mut selected_session = None;
+        let mut attached_stream_session = None;
+
+        let created = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::NewSession { name: None },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            response => panic!("expected session created response, got {response:?}"),
+        };
+
+        let split = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::SplitPane {
+                session: Some(SessionSelector::ById(session_id)),
+                target: None,
+                direction: PaneSplitDirection::Vertical,
+            },
+        )
+        .await;
+
+        match split {
+            Response::Err(error) => {
+                assert_eq!(error.code, ErrorCode::InvalidRequest);
+                assert!(error.message.contains("session policy denied"));
+            }
+            response => panic!("expected denied split response, got {response:?}"),
+        }
     }
 }
