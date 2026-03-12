@@ -1544,6 +1544,9 @@ mod tests {
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::c_char;
     use std::ptr;
+    use std::sync::Mutex;
+
+    static KERNEL_REQUESTS: Mutex<Vec<bmux_ipc::Request>> = Mutex::new(Vec::new());
 
     const TEST_DESCRIPTOR_TEXT: &str = concat!(
         "id = \"test.plugin\"\n",
@@ -1589,6 +1592,75 @@ mod tests {
         }
         unsafe {
             ptr::copy_nonoverlapping(encoded.as_ptr(), output_ptr, encoded.len());
+        }
+        0
+    }
+
+    unsafe extern "C" fn test_host_kernel_bridge(
+        input_ptr: *const u8,
+        input_len: usize,
+        output_ptr: *mut u8,
+        output_capacity: usize,
+        output_len: *mut usize,
+    ) -> i32 {
+        let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
+        let bridge_request: super::HostKernelBridgeRequest = match decode_service_message(input) {
+            Ok(request) => request,
+            Err(_) => return 1,
+        };
+        let kernel_request: bmux_ipc::Request = match bmux_ipc::decode(&bridge_request.payload) {
+            Ok(request) => request,
+            Err(_) => return 1,
+        };
+
+        KERNEL_REQUESTS
+            .lock()
+            .expect("kernel request log lock should succeed")
+            .push(kernel_request.clone());
+
+        let kernel_response = match kernel_request {
+            bmux_ipc::Request::ListSessions => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionList {
+                    sessions: vec![bmux_ipc::SessionSummary {
+                        id: uuid::Uuid::new_v4(),
+                        name: Some("alpha".to_string()),
+                        client_count: 1,
+                    }],
+                })
+            }
+            bmux_ipc::Request::SplitPane { .. } => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::PaneSplit {
+                    id: uuid::Uuid::new_v4(),
+                    session_id: uuid::Uuid::new_v4(),
+                })
+            }
+            _ => bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
+                code: bmux_ipc::ErrorCode::InvalidRequest,
+                message: "unsupported kernel request in test bridge".to_string(),
+            }),
+        };
+        let encoded_kernel_response = match bmux_ipc::encode(&kernel_response) {
+            Ok(payload) => payload,
+            Err(_) => return 1,
+        };
+        let output_message = match encode_service_message(&super::HostKernelBridgeResponse {
+            payload: encoded_kernel_response,
+        }) {
+            Ok(message) => message,
+            Err(_) => return 1,
+        };
+
+        let required_len = output_message.len();
+        if required_len > output_capacity {
+            unsafe {
+                *output_len = required_len;
+            }
+            return 4;
+        }
+
+        unsafe {
+            ptr::copy_nonoverlapping(output_message.as_ptr(), output_ptr, required_len);
+            *output_len = required_len;
         }
         0
     }
@@ -1957,6 +2029,127 @@ minimum = "1.0"
         assert_eq!(response.value, Some(b"sunset".to_vec()));
 
         let _ = std::fs::remove_dir_all(storage_root);
+    }
+
+    #[test]
+    fn command_context_calls_core_session_query_via_kernel_bridge() {
+        KERNEL_REQUESTS
+            .lock()
+            .expect("kernel request log lock should succeed")
+            .clear();
+
+        let context = super::NativeCommandContext {
+            plugin_id: "caller.plugin".to_string(),
+            command: "list-sessions".to_string(),
+            arguments: Vec::new(),
+            required_capabilities: vec!["bmux.sessions.read".to_string()],
+            provided_capabilities: Vec::new(),
+            services: vec![crate::RegisteredService {
+                capability: crate::HostScope::new("bmux.sessions.read")
+                    .expect("capability should parse"),
+                kind: crate::ServiceKind::Query,
+                interface_id: "session-query/v1".to_string(),
+                provider: crate::ProviderId::Host,
+            }],
+            available_capabilities: vec!["bmux.sessions.read".to_string()],
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: crate::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
+        };
+
+        let response: crate::SessionListResponse = context
+            .call_service(
+                "bmux.sessions.read",
+                crate::ServiceKind::Query,
+                "session-query/v1",
+                "list",
+                &(),
+            )
+            .expect("core session query should succeed");
+        assert_eq!(response.sessions.len(), 1);
+
+        let requests = KERNEL_REQUESTS
+            .lock()
+            .expect("kernel request log lock should succeed");
+        assert!(matches!(
+            requests.last(),
+            Some(bmux_ipc::Request::ListSessions)
+        ));
+    }
+
+    #[test]
+    fn command_context_calls_core_pane_command_via_kernel_bridge() {
+        KERNEL_REQUESTS
+            .lock()
+            .expect("kernel request log lock should succeed")
+            .clear();
+
+        let context = super::NativeCommandContext {
+            plugin_id: "caller.plugin".to_string(),
+            command: "split-pane".to_string(),
+            arguments: Vec::new(),
+            required_capabilities: vec!["bmux.panes.write".to_string()],
+            provided_capabilities: Vec::new(),
+            services: vec![crate::RegisteredService {
+                capability: crate::HostScope::new("bmux.panes.write")
+                    .expect("capability should parse"),
+                kind: crate::ServiceKind::Command,
+                interface_id: "pane-command/v1".to_string(),
+                provider: crate::ProviderId::Host,
+            }],
+            available_capabilities: vec!["bmux.panes.write".to_string()],
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: crate::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
+        };
+
+        let _response: crate::PaneSplitResponse = context
+            .call_service(
+                "bmux.panes.write",
+                crate::ServiceKind::Command,
+                "pane-command/v1",
+                "split",
+                &crate::PaneSplitRequest {
+                    session: None,
+                    target: None,
+                    direction: crate::PaneSplitDirection::Vertical,
+                },
+            )
+            .expect("core pane command should succeed");
+
+        let requests = KERNEL_REQUESTS
+            .lock()
+            .expect("kernel request log lock should succeed");
+        assert!(matches!(
+            requests.last(),
+            Some(bmux_ipc::Request::SplitPane { .. })
+        ));
     }
 
     #[test]
