@@ -26,6 +26,7 @@ use persistence::{
     SnapshotManager, SnapshotV3,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::io::{Read, Write};
@@ -3463,18 +3464,24 @@ async fn handle_request(
             target,
             direction,
         } => {
-            let manager = state
-                .session_manager
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            let session_id =
+            let session_id = {
+                let manager = state
+                    .session_manager
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
                 match resolve_session_request_session_id(&manager, &session, selected_session) {
                     Ok(session_id) => session_id,
                     Err(response) => return Ok(Response::Err(response)),
-                };
-            drop(manager);
-            if let Err(response) =
-                ensure_session_mutation_allowed(state, session_id, client_id, client_principal_id)
+                }
+            };
+            if let Err(response) = ensure_session_mutation_allowed(
+                state,
+                shutdown_tx,
+                session_id,
+                client_id,
+                client_principal_id,
+            )
+            .await
             {
                 return Ok(Response::Err(response));
             }
@@ -3503,18 +3510,24 @@ async fn handle_request(
             target,
             direction,
         } => {
-            let manager = state
-                .session_manager
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            let session_id =
+            let session_id = {
+                let manager = state
+                    .session_manager
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
                 match resolve_session_request_session_id(&manager, &session, selected_session) {
                     Ok(session_id) => session_id,
                     Err(response) => return Ok(Response::Err(response)),
-                };
-            drop(manager);
-            if let Err(response) =
-                ensure_session_mutation_allowed(state, session_id, client_id, client_principal_id)
+                }
+            };
+            if let Err(response) = ensure_session_mutation_allowed(
+                state,
+                shutdown_tx,
+                session_id,
+                client_id,
+                client_principal_id,
+            )
+            .await
             {
                 return Ok(Response::Err(response));
             }
@@ -3554,18 +3567,24 @@ async fn handle_request(
             target,
             delta,
         } => {
-            let manager = state
-                .session_manager
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            let session_id =
+            let session_id = {
+                let manager = state
+                    .session_manager
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
                 match resolve_session_request_session_id(&manager, &session, selected_session) {
                     Ok(session_id) => session_id,
                     Err(response) => return Ok(Response::Err(response)),
-                };
-            drop(manager);
-            if let Err(response) =
-                ensure_session_mutation_allowed(state, session_id, client_id, client_principal_id)
+                }
+            };
+            if let Err(response) = ensure_session_mutation_allowed(
+                state,
+                shutdown_tx,
+                session_id,
+                client_id,
+                client_principal_id,
+            )
+            .await
             {
                 return Ok(Response::Err(response));
             }
@@ -3596,8 +3615,14 @@ async fn handle_request(
                     Err(response) => return Ok(Response::Err(response)),
                 }
             };
-            if let Err(response) =
-                ensure_session_mutation_allowed(state, session_id, client_id, client_principal_id)
+            if let Err(response) = ensure_session_mutation_allowed(
+                state,
+                shutdown_tx,
+                session_id,
+                client_id,
+                client_principal_id,
+            )
+            .await
             {
                 return Ok(Response::Err(response));
             }
@@ -3693,8 +3718,8 @@ async fn handle_request(
             selector,
             force_local,
         } => {
-            let (session_id, removed_runtime) = {
-                let mut manager = state
+            let session_id = {
+                let manager = state
                     .session_manager
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
@@ -3705,25 +3730,35 @@ async fn handle_request(
                     }));
                 };
 
-                if force_local && client_principal_id != state.server_control_principal_id {
-                    return Ok(Response::Err(ErrorResponse {
-                        code: ErrorCode::InvalidRequest,
-                        message: "force-local is only allowed for the server control principal"
-                            .to_string(),
-                    }));
-                }
+                session_id
+            };
 
-                if !force_local
-                    && let Err(response) = ensure_session_admin_allowed(
-                        state,
-                        session_id,
-                        client_id,
-                        client_principal_id,
-                    )
-                {
-                    return Ok(Response::Err(response));
-                }
+            if force_local && client_principal_id != state.server_control_principal_id {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "force-local is only allowed for the server control principal"
+                        .to_string(),
+                }));
+            }
 
+            if !force_local
+                && let Err(response) = ensure_session_admin_allowed(
+                    state,
+                    shutdown_tx,
+                    session_id,
+                    client_id,
+                    client_principal_id,
+                )
+                .await
+            {
+                return Ok(Response::Err(response));
+            }
+
+            let removed_runtime = {
+                let mut manager = state
+                    .session_manager
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
                 if manager.remove_session(&session_id).is_err() {
                     return Ok(Response::Err(ErrorResponse {
                         code: ErrorCode::Internal,
@@ -3743,7 +3778,7 @@ async fn handle_request(
                     .session_runtimes
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                let removed_runtime = match runtime_manager.remove_runtime(session_id) {
+                match runtime_manager.remove_runtime(session_id) {
                     Ok(removed) => removed,
                     Err(error) => {
                         return Ok(Response::Err(ErrorResponse {
@@ -3751,8 +3786,7 @@ async fn handle_request(
                             message: format!("failed stopping session runtime: {error:#}"),
                         }));
                     }
-                };
-                (session_id, removed_runtime)
+                }
             };
 
             if removed_runtime.had_attached_clients {
@@ -4524,21 +4558,144 @@ fn resolve_session_request_session_id(
     })
 }
 
-fn ensure_session_admin_allowed(
-    _state: &Arc<ServerState>,
-    _session_id: SessionId,
-    _client_id: ClientId,
-    _client_principal_id: Uuid,
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionPolicyCheckRequest {
+    session_id: Uuid,
+    client_id: Uuid,
+    principal_id: Uuid,
+    action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionPolicyCheckResponse {
+    allowed: bool,
+    reason: Option<String>,
+}
+
+async fn check_session_policy(
+    state: &Arc<ServerState>,
+    shutdown_tx: &watch::Sender<bool>,
+    session_id: SessionId,
+    client_id: ClientId,
+    client_principal_id: Uuid,
+    action: &str,
+) -> std::result::Result<Option<SessionPolicyCheckResponse>, ErrorResponse> {
+    let route = ServiceRoute {
+        capability: "bmux.sessions.policy".to_string(),
+        kind: bmux_ipc::InvokeServiceKind::Query,
+        interface_id: "session-policy-query/v1".to_string(),
+        operation: "check".to_string(),
+    };
+    let payload = encode(&SessionPolicyCheckRequest {
+        session_id: session_id.0,
+        client_id: client_id.0,
+        principal_id: client_principal_id,
+        action: action.to_string(),
+    })
+    .map_err(|error| ErrorResponse {
+        code: ErrorCode::Internal,
+        message: format!("failed encoding session policy request: {error}"),
+    })?;
+
+    let invoke_context = ServiceInvokeContext {
+        state: Arc::clone(state),
+        shutdown_tx: shutdown_tx.clone(),
+        client_id,
+        client_principal_id,
+        selection: Arc::new(AsyncMutex::new((Some(session_id), None))),
+    };
+
+    let dispatch = {
+        let registry = state.service_registry.lock().map_err(|_| ErrorResponse {
+            code: ErrorCode::Internal,
+            message: "service registry lock poisoned".to_string(),
+        })?;
+        registry.dispatch(&route, invoke_context.clone(), payload.clone())
+    };
+    let invocation = if let Some(invocation) = dispatch {
+        Some(invocation)
+    } else {
+        let resolver = state
+            .service_resolver
+            .lock()
+            .map_err(|_| ErrorResponse {
+                code: ErrorCode::Internal,
+                message: "service resolver lock poisoned".to_string(),
+            })?
+            .clone();
+        resolver.map(|resolver| resolver(route, payload))
+    };
+
+    let Some(invocation) = invocation else {
+        return Ok(None);
+    };
+    let payload = invocation.await.map_err(|error| ErrorResponse {
+        code: ErrorCode::Internal,
+        message: format!("session policy invocation failed: {error:#}"),
+    })?;
+    let response =
+        decode::<SessionPolicyCheckResponse>(&payload).map_err(|error| ErrorResponse {
+            code: ErrorCode::Internal,
+            message: format!("failed decoding session policy response: {error}"),
+        })?;
+    Ok(Some(response))
+}
+
+async fn ensure_session_admin_allowed(
+    state: &Arc<ServerState>,
+    shutdown_tx: &watch::Sender<bool>,
+    session_id: SessionId,
+    client_id: ClientId,
+    client_principal_id: Uuid,
 ) -> std::result::Result<(), ErrorResponse> {
+    let decision = check_session_policy(
+        state,
+        shutdown_tx,
+        session_id,
+        client_id,
+        client_principal_id,
+        "admin",
+    )
+    .await?;
+    if let Some(decision) = decision
+        && !decision.allowed
+    {
+        return Err(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: decision
+                .reason
+                .unwrap_or_else(|| "session policy denied for this operation".to_string()),
+        });
+    }
     Ok(())
 }
 
-fn ensure_session_mutation_allowed(
-    _state: &Arc<ServerState>,
-    _session_id: SessionId,
-    _client_id: ClientId,
-    _client_principal_id: Uuid,
+async fn ensure_session_mutation_allowed(
+    state: &Arc<ServerState>,
+    shutdown_tx: &watch::Sender<bool>,
+    session_id: SessionId,
+    client_id: ClientId,
+    client_principal_id: Uuid,
 ) -> std::result::Result<(), ErrorResponse> {
+    let decision = check_session_policy(
+        state,
+        shutdown_tx,
+        session_id,
+        client_id,
+        client_principal_id,
+        "mutation",
+    )
+    .await?;
+    if let Some(decision) = decision
+        && !decision.allowed
+    {
+        return Err(ErrorResponse {
+            code: ErrorCode::InvalidRequest,
+            message: decision
+                .reason
+                .unwrap_or_else(|| "session policy denied for this operation".to_string()),
+        });
+    }
     Ok(())
 }
 

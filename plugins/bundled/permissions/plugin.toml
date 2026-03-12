@@ -1,11 +1,15 @@
-entry                 = "libbmux_permissions_plugin.dylib"
-id                    = "bmux.permissions"
-name                  = "bmux Permissions"
-provided_capabilities = ["bmux.permissions.read", "bmux.permissions.write"]
-provided_features     = ["bmux.permissions"]
+entry = "libbmux_permissions_plugin.dylib"
+id = "bmux.permissions"
+name = "bmux Permissions"
+provided_capabilities = [
+    "bmux.permissions.read",
+    "bmux.permissions.write",
+    "bmux.sessions.policy",
+]
+provided_features = ["bmux.permissions"]
 required_capabilities = ["bmux.commands"]
-runtime               = "native"
-version               = "0.0.1-alpha.0"
+runtime = "native"
+version = "0.0.1-alpha.0"
 
 [[services]]
 capability   = "bmux.permissions.read"
@@ -16,6 +20,11 @@ kind         = "query"
 capability   = "bmux.permissions.write"
 interface_id = "permission-command/v1"
 kind         = "command"
+
+[[services]]
+capability   = "bmux.sessions.policy"
+interface_id = "session-policy-query/v1"
+kind         = "query"
 
 [[commands]]
 aliases       = [["session", "permissions"]]

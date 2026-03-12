@@ -26,6 +26,8 @@ impl RustPlugin for PermissionsPlugin {
             .expect("capability should parse")
             .provide_capability("bmux.permissions.write")
             .expect("capability should parse")
+            .provide_capability("bmux.sessions.policy")
+            .expect("capability should parse")
             .provide_feature("bmux.permissions")
             .expect("feature should parse")
             .service(PluginService {
@@ -39,6 +41,12 @@ impl RustPlugin for PermissionsPlugin {
                     .expect("host scope should parse"),
                 kind: ServiceKind::Command,
                 interface_id: "permission-command/v1".to_string(),
+            })
+            .service(PluginService {
+                capability: HostScope::new("bmux.sessions.policy")
+                    .expect("host scope should parse"),
+                kind: ServiceKind::Query,
+                interface_id: "session-policy-query/v1".to_string(),
             })
             .command(
                 PluginCommand::new("permissions", "Permissions provider status")
@@ -173,6 +181,29 @@ impl RustPlugin for PermissionsPlugin {
                 };
                 ServiceResponse::ok(payload)
             }
+            ("session-policy-query/v1", "check") => {
+                let request = match decode_service_message::<SessionPolicyCheckRequest>(
+                    &context.request.payload,
+                ) {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return ServiceResponse::error("invalid_request", error.to_string());
+                    }
+                };
+                let decision = match evaluate_policy(&context, &request) {
+                    Ok(decision) => decision,
+                    Err(error) => {
+                        return ServiceResponse::error("policy_failed", error.to_string());
+                    }
+                };
+                let payload = match encode_service_message(&decision) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        return ServiceResponse::error("encode_failed", error.to_string());
+                    }
+                };
+                ServiceResponse::ok(payload)
+            }
             _ => ServiceResponse::error(
                 "unsupported_service_operation",
                 format!(
@@ -280,6 +311,53 @@ fn revoke_entry(caller: &impl HostRuntimeApi, request: RevokeRequest) -> Result<
         entries.retain(|entry| entry.client_id != request.client);
     }
     save_state(caller, &state)
+}
+
+fn evaluate_policy(
+    caller: &impl HostRuntimeApi,
+    request: &SessionPolicyCheckRequest,
+) -> Result<SessionPolicyCheckResponse, String> {
+    let state = load_state(caller)?;
+    let entries = state
+        .by_session_id
+        .get(&request.session_id)
+        .cloned()
+        .unwrap_or_default();
+    let client_key = request.client_id.to_string();
+    let entry = entries
+        .into_iter()
+        .find(|entry| entry.client_id == client_key);
+
+    let decision = match (
+        request.action.as_str(),
+        entry.as_ref().map(|entry| entry.role.as_str()),
+    ) {
+        (_, None) => SessionPolicyCheckResponse {
+            allowed: true,
+            reason: None,
+        },
+        ("admin", Some("owner")) => SessionPolicyCheckResponse {
+            allowed: true,
+            reason: None,
+        },
+        ("admin", Some("writer" | "observer")) => SessionPolicyCheckResponse {
+            allowed: false,
+            reason: Some("session policy denied for this operation".to_string()),
+        },
+        ("mutation", Some("observer")) => SessionPolicyCheckResponse {
+            allowed: false,
+            reason: Some("session policy denied for this operation".to_string()),
+        },
+        ("mutation", Some("owner" | "writer")) => SessionPolicyCheckResponse {
+            allowed: true,
+            reason: None,
+        },
+        (_, Some(_)) => SessionPolicyCheckResponse {
+            allowed: false,
+            reason: Some("invalid session policy action or role mapping".to_string()),
+        },
+    };
+    Ok(decision)
 }
 
 fn load_state(caller: &impl HostRuntimeApi) -> Result<StoredPermissions, String> {
@@ -403,6 +481,20 @@ struct StorageGetResponse {
 struct StorageSetRequest {
     key: String,
     value: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionPolicyCheckRequest {
+    session_id: Uuid,
+    client_id: Uuid,
+    principal_id: Uuid,
+    action: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionPolicyCheckResponse {
+    allowed: bool,
+    reason: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
