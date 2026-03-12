@@ -1114,4 +1114,42 @@ mod tests {
         assert!(decision.allowed);
         assert!(decision.reason.is_none());
     }
+
+    #[test]
+    fn invoke_service_rejects_invalid_policy_payload() {
+        let mut plugin = PermissionsPlugin;
+        let data_dir = service_test_data_dir();
+        let context = service_test_context(
+            "session-policy-query/v1",
+            "check",
+            vec![1, 2, 3],
+            "bmux.sessions.policy",
+            ServiceKind::Query,
+            &data_dir,
+        );
+
+        let response = plugin.invoke_service(context);
+        let error = response.error.expect("expected invalid request");
+        assert_eq!(error.code, "invalid_request");
+    }
+
+    #[test]
+    fn invoke_service_rejects_unsupported_operation() {
+        let mut plugin = PermissionsPlugin;
+        let data_dir = service_test_data_dir();
+        let context = service_test_context(
+            "permission-command/v1",
+            "unknown",
+            Vec::new(),
+            "bmux.permissions.write",
+            ServiceKind::Command,
+            &data_dir,
+        );
+
+        let response = plugin.invoke_service(context);
+        let error = response
+            .error
+            .expect("expected unsupported operation error");
+        assert_eq!(error.code, "unsupported_service_operation");
+    }
 }

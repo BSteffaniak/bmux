@@ -602,11 +602,19 @@ mod tests {
                 })
             }
             bmux_ipc::Request::KillSession { selector, .. } => {
-                let id = match selector {
-                    bmux_ipc::SessionSelector::ById(id) => id,
-                    bmux_ipc::SessionSelector::ByName(_) => Uuid::new_v4(),
-                };
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionKilled { id })
+                if matches!(selector, bmux_ipc::SessionSelector::ByName(ref name) if name == "deny")
+                {
+                    bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
+                        code: bmux_ipc::ErrorCode::InvalidRequest,
+                        message: "session policy denied for this operation".to_string(),
+                    })
+                } else {
+                    let id = match selector {
+                        bmux_ipc::SessionSelector::ById(id) => id,
+                        bmux_ipc::SessionSelector::ByName(_) => Uuid::new_v4(),
+                    };
+                    bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionKilled { id })
+                }
             }
             bmux_ipc::Request::ListPanes { .. } => {
                 bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::PaneList {
@@ -1132,5 +1140,26 @@ mod tests {
         let response = plugin.invoke_service(context);
         let error = response.error.expect("expected service error");
         assert_eq!(error.code, "invalid_request");
+    }
+
+    #[test]
+    fn invoke_service_kill_surfaces_denied_error() {
+        let mut plugin = WindowsPlugin;
+        let context = service_test_context(
+            "window-command/v1",
+            "kill",
+            encode_service_message(&KillWindowRequest {
+                target: "deny".to_string(),
+                force_local: false,
+            })
+            .expect("request should encode"),
+            "bmux.windows.write",
+            ServiceKind::Command,
+        );
+
+        let response = plugin.invoke_service(context);
+        let error = response.error.expect("expected kill failure");
+        assert_eq!(error.code, "kill_failed");
+        assert!(error.message.contains("session policy denied"));
     }
 }
