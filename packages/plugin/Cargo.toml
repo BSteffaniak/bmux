@@ -12,6 +12,7 @@ version     = { workspace = true }
 
 [dependencies]
 # External dependencies
+bmux_ipc   = { workspace = true }
 libloading = { workspace = true }
 postcard   = { workspace = true, features = ["alloc"] }
 semver     = { workspace = true }

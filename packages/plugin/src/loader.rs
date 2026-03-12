@@ -7,6 +7,20 @@ use crate::{
     RegisteredService, Result, ServiceEnvelopeKind, ServiceKind, ServiceRequest, ServiceResponse,
     decode_service_envelope, decode_service_message, discover_registered_plugins_in_roots,
     encode_service_envelope, encode_service_message,
+    host_services::{
+        PaneCloseRequest, PaneCloseResponse, PaneFocusDirection as HostPaneFocusDirection,
+        PaneFocusRequest, PaneFocusResponse, PaneListRequest, PaneListResponse, PaneResizeRequest,
+        PaneResizeResponse, PaneSelector as HostPaneSelector,
+        PaneSplitDirection as HostPaneSplitDirection, PaneSplitRequest, PaneSplitResponse,
+        PaneSummary as HostPaneSummary, SessionCreateRequest, SessionCreateResponse,
+        SessionKillRequest, SessionKillResponse, SessionListResponse,
+        SessionSelector as HostSessionSelector, SessionSummary as HostSessionSummary,
+    },
+};
+use bmux_ipc::{
+    PaneFocusDirection as IpcPaneFocusDirection, PaneSelector as IpcPaneSelector,
+    PaneSplitDirection as IpcPaneSplitDirection, Request as IpcRequest, Response as IpcResponse,
+    ResponsePayload as IpcResponsePayload, SessionSelector as IpcSessionSelector,
 };
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -506,6 +520,7 @@ fn call_service_raw(
             service,
             operation,
             payload,
+            host_kernel_bridge,
             plugin_settings_map,
         );
     }
@@ -638,6 +653,7 @@ fn handle_core_service_call(
     service: RegisteredService,
     operation: &str,
     payload: Vec<u8>,
+    host_kernel_bridge: Option<HostKernelBridge>,
     plugin_settings_map: &BTreeMap<String, toml::Value>,
 ) -> Result<Vec<u8>> {
     match (service.interface_id.as_str(), operation) {
@@ -675,10 +691,260 @@ fn handle_core_service_call(
             })?;
             encode_service_message(&())
         }
+        ("session-query/v1", "list") => {
+            let response = execute_kernel_request(host_kernel_bridge, IpcRequest::ListSessions)?;
+            match response {
+                IpcResponsePayload::SessionList { sessions } => {
+                    let sessions = sessions
+                        .into_iter()
+                        .map(|entry| HostSessionSummary {
+                            id: entry.id,
+                            name: entry.name,
+                            client_count: entry.client_count,
+                        })
+                        .collect();
+                    encode_service_message(&SessionListResponse { sessions })
+                }
+                _ => Err(PluginError::ServiceProtocol {
+                    details: "unexpected response payload for session-query/v1:list".to_string(),
+                }),
+            }
+        }
+        ("session-command/v1", "new") => {
+            let request: SessionCreateRequest = decode_service_message(&payload)?;
+            let response = execute_kernel_request(
+                host_kernel_bridge,
+                IpcRequest::NewSession { name: request.name },
+            )?;
+            match response {
+                IpcResponsePayload::SessionCreated { id, name } => {
+                    encode_service_message(&SessionCreateResponse { id, name })
+                }
+                _ => Err(PluginError::ServiceProtocol {
+                    details: "unexpected response payload for session-command/v1:new".to_string(),
+                }),
+            }
+        }
+        ("session-command/v1", "kill") => {
+            let request: SessionKillRequest = decode_service_message(&payload)?;
+            let response = execute_kernel_request(
+                host_kernel_bridge,
+                IpcRequest::KillSession {
+                    selector: session_selector_to_ipc(request.selector),
+                    force_local: request.force_local,
+                },
+            )?;
+            match response {
+                IpcResponsePayload::SessionKilled { id } => {
+                    encode_service_message(&SessionKillResponse { id })
+                }
+                _ => Err(PluginError::ServiceProtocol {
+                    details: "unexpected response payload for session-command/v1:kill".to_string(),
+                }),
+            }
+        }
+        ("pane-query/v1", "list") => {
+            let request: PaneListRequest = decode_service_message(&payload)?;
+            let response = execute_kernel_request(
+                host_kernel_bridge,
+                IpcRequest::ListPanes {
+                    session: request.session.map(session_selector_to_ipc),
+                },
+            )?;
+            match response {
+                IpcResponsePayload::PaneList { panes } => {
+                    let panes = panes
+                        .into_iter()
+                        .map(|entry| HostPaneSummary {
+                            id: entry.id,
+                            index: entry.index,
+                            name: entry.name,
+                            focused: entry.focused,
+                        })
+                        .collect();
+                    encode_service_message(&PaneListResponse { panes })
+                }
+                _ => Err(PluginError::ServiceProtocol {
+                    details: "unexpected response payload for pane-query/v1:list".to_string(),
+                }),
+            }
+        }
+        ("pane-command/v1", "split") => {
+            let request: PaneSplitRequest = decode_service_message(&payload)?;
+            let response = execute_kernel_request(
+                host_kernel_bridge,
+                IpcRequest::SplitPane {
+                    session: request.session.map(session_selector_to_ipc),
+                    target: request.target.map(pane_selector_to_ipc),
+                    direction: pane_split_direction_to_ipc(request.direction),
+                },
+            )?;
+            match response {
+                IpcResponsePayload::PaneSplit { id, session_id } => {
+                    encode_service_message(&PaneSplitResponse { id, session_id })
+                }
+                _ => Err(PluginError::ServiceProtocol {
+                    details: "unexpected response payload for pane-command/v1:split".to_string(),
+                }),
+            }
+        }
+        ("pane-command/v1", "focus") => {
+            let request: PaneFocusRequest = decode_service_message(&payload)?;
+            let response = execute_kernel_request(
+                host_kernel_bridge,
+                IpcRequest::FocusPane {
+                    session: request.session.map(session_selector_to_ipc),
+                    target: request.target.map(pane_selector_to_ipc),
+                    direction: request.direction.map(pane_focus_direction_to_ipc),
+                },
+            )?;
+            match response {
+                IpcResponsePayload::PaneFocused { id, session_id } => {
+                    encode_service_message(&PaneFocusResponse { id, session_id })
+                }
+                _ => Err(PluginError::ServiceProtocol {
+                    details: "unexpected response payload for pane-command/v1:focus".to_string(),
+                }),
+            }
+        }
+        ("pane-command/v1", "resize") => {
+            let request: PaneResizeRequest = decode_service_message(&payload)?;
+            let response = execute_kernel_request(
+                host_kernel_bridge,
+                IpcRequest::ResizePane {
+                    session: request.session.map(session_selector_to_ipc),
+                    target: request.target.map(pane_selector_to_ipc),
+                    delta: request.delta,
+                },
+            )?;
+            match response {
+                IpcResponsePayload::PaneResized { session_id } => {
+                    encode_service_message(&PaneResizeResponse { session_id })
+                }
+                _ => Err(PluginError::ServiceProtocol {
+                    details: "unexpected response payload for pane-command/v1:resize".to_string(),
+                }),
+            }
+        }
+        ("pane-command/v1", "close") => {
+            let request: PaneCloseRequest = decode_service_message(&payload)?;
+            let response = execute_kernel_request(
+                host_kernel_bridge,
+                IpcRequest::ClosePane {
+                    session: request.session.map(session_selector_to_ipc),
+                    target: request.target.map(pane_selector_to_ipc),
+                },
+            )?;
+            match response {
+                IpcResponsePayload::PaneClosed {
+                    id,
+                    session_id,
+                    session_closed,
+                } => encode_service_message(&PaneCloseResponse {
+                    id,
+                    session_id,
+                    session_closed,
+                }),
+                _ => Err(PluginError::ServiceProtocol {
+                    details: "unexpected response payload for pane-command/v1:close".to_string(),
+                }),
+            }
+        }
         _ => Err(PluginError::UnsupportedHostOperation {
             operation: "call_service",
         }),
     }
+}
+
+fn session_selector_to_ipc(selector: HostSessionSelector) -> IpcSessionSelector {
+    match selector {
+        HostSessionSelector::ById(id) => IpcSessionSelector::ById(id),
+        HostSessionSelector::ByName(name) => IpcSessionSelector::ByName(name),
+    }
+}
+
+fn pane_selector_to_ipc(selector: HostPaneSelector) -> IpcPaneSelector {
+    match selector {
+        HostPaneSelector::ById(id) => IpcPaneSelector::ById(id),
+        HostPaneSelector::ByIndex(index) => IpcPaneSelector::ByIndex(index),
+        HostPaneSelector::Active => IpcPaneSelector::Active,
+    }
+}
+
+fn pane_split_direction_to_ipc(direction: HostPaneSplitDirection) -> IpcPaneSplitDirection {
+    match direction {
+        HostPaneSplitDirection::Vertical => IpcPaneSplitDirection::Vertical,
+        HostPaneSplitDirection::Horizontal => IpcPaneSplitDirection::Horizontal,
+    }
+}
+
+fn pane_focus_direction_to_ipc(direction: HostPaneFocusDirection) -> IpcPaneFocusDirection {
+    match direction {
+        HostPaneFocusDirection::Next => IpcPaneFocusDirection::Next,
+        HostPaneFocusDirection::Prev => IpcPaneFocusDirection::Prev,
+    }
+}
+
+fn execute_kernel_request(
+    host_kernel_bridge: Option<HostKernelBridge>,
+    request: IpcRequest,
+) -> Result<IpcResponsePayload> {
+    let bridge = host_kernel_bridge.ok_or(PluginError::UnsupportedHostOperation {
+        operation: "call_host_kernel",
+    })?;
+    let encoded_request =
+        bmux_ipc::encode(&request).map_err(|error| PluginError::ServiceProtocol {
+            details: format!("failed encoding kernel request: {error}"),
+        })?;
+    let encoded_response = invoke_host_kernel_bridge(bridge, encoded_request)?;
+    let response: IpcResponse =
+        bmux_ipc::decode(&encoded_response).map_err(|error| PluginError::ServiceProtocol {
+            details: format!("failed decoding kernel response: {error}"),
+        })?;
+    match response {
+        IpcResponse::Ok(payload) => Ok(payload),
+        IpcResponse::Err(error) => Err(PluginError::ServiceProtocol {
+            details: format!("kernel request failed: {}", error.message),
+        }),
+    }
+}
+
+fn invoke_host_kernel_bridge(bridge: HostKernelBridge, payload: Vec<u8>) -> Result<Vec<u8>> {
+    let request = encode_service_message(&HostKernelBridgeRequest { payload })?;
+    let mut output = vec![0u8; request.len().saturating_mul(4).max(1024)];
+    let mut output_len = 0usize;
+
+    let status = bridge.invoke(
+        request.as_ptr(),
+        request.len(),
+        output.as_mut_ptr(),
+        output.len(),
+        &mut output_len,
+    );
+
+    if status == KERNEL_STATUS_BUFFER_TOO_SMALL {
+        output.resize(output_len, 0);
+        let status = bridge.invoke(
+            request.as_ptr(),
+            request.len(),
+            output.as_mut_ptr(),
+            output.len(),
+            &mut output_len,
+        );
+        if status != KERNEL_STATUS_OK {
+            return Err(PluginError::ServiceProtocol {
+                details: format!("kernel bridge invocation failed with status {status}"),
+            });
+        }
+    } else if status != KERNEL_STATUS_OK {
+        return Err(PluginError::ServiceProtocol {
+            details: format!("kernel bridge invocation failed with status {status}"),
+        });
+    }
+
+    output.truncate(output_len);
+    let response: HostKernelBridgeResponse = decode_service_message(&output)?;
+    Ok(response.payload)
 }
 
 fn storage_file_path(connection: &HostConnectionInfo, plugin_id: &str, key: &str) -> PathBuf {
