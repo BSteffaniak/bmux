@@ -514,3 +514,205 @@ struct CommandAckResponse {
 }
 
 bmux_plugin::export_plugin!(PermissionsPlugin);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bmux_plugin::{ServiceCaller, SessionListResponse, SessionSummary};
+    use std::sync::Mutex;
+
+    struct MockHost {
+        sessions: Vec<SessionSummary>,
+        storage: Mutex<BTreeMap<String, Vec<u8>>>,
+    }
+
+    impl MockHost {
+        fn with_session(id: Uuid, name: &str) -> Self {
+            Self {
+                sessions: vec![SessionSummary {
+                    id,
+                    name: Some(name.to_string()),
+                    client_count: 1,
+                }],
+                storage: Mutex::new(BTreeMap::new()),
+            }
+        }
+    }
+
+    impl ServiceCaller for MockHost {
+        fn call_service_raw(
+            &self,
+            _capability: &str,
+            _kind: ServiceKind,
+            interface_id: &str,
+            operation: &str,
+            payload: Vec<u8>,
+        ) -> bmux_plugin::Result<Vec<u8>> {
+            match (interface_id, operation) {
+                ("session-query/v1", "list") => encode_service_message(&SessionListResponse {
+                    sessions: self.sessions.clone(),
+                })
+                .map_err(Into::into),
+                ("storage-query/v1", "get") => {
+                    let request: StorageGetRequest = decode_service_message(&payload)?;
+                    let value = self
+                        .storage
+                        .lock()
+                        .expect("storage lock should succeed")
+                        .get(&request.key)
+                        .cloned();
+                    encode_service_message(&StorageGetResponse { value }).map_err(Into::into)
+                }
+                ("storage-command/v1", "set") => {
+                    let request: StorageSetRequest = decode_service_message(&payload)?;
+                    self.storage
+                        .lock()
+                        .expect("storage lock should succeed")
+                        .insert(request.key, request.value);
+                    encode_service_message(&()).map_err(Into::into)
+                }
+                _ => Err(bmux_plugin::PluginError::UnsupportedHostOperation {
+                    operation: "mock_service",
+                }),
+            }
+        }
+    }
+
+    #[test]
+    fn observer_role_denies_mutation_and_admin() {
+        let session_id = Uuid::new_v4();
+        let client_id = Uuid::new_v4();
+        let host = MockHost::with_session(session_id, "alpha");
+
+        grant_entry(
+            &host,
+            GrantRequest {
+                session: "alpha".to_string(),
+                client: client_id.to_string(),
+                role: "observer".to_string(),
+            },
+        )
+        .expect("grant should succeed");
+
+        let mutation = evaluate_policy(
+            &host,
+            &SessionPolicyCheckRequest {
+                session_id,
+                client_id,
+                principal_id: Uuid::new_v4(),
+                action: "mutation".to_string(),
+            },
+        )
+        .expect("policy evaluation should succeed");
+        assert!(!mutation.allowed);
+
+        let admin = evaluate_policy(
+            &host,
+            &SessionPolicyCheckRequest {
+                session_id,
+                client_id,
+                principal_id: Uuid::new_v4(),
+                action: "admin".to_string(),
+            },
+        )
+        .expect("policy evaluation should succeed");
+        assert!(!admin.allowed);
+    }
+
+    #[test]
+    fn writer_role_allows_mutation_but_denies_admin() {
+        let session_id = Uuid::new_v4();
+        let client_id = Uuid::new_v4();
+        let host = MockHost::with_session(session_id, "alpha");
+
+        grant_entry(
+            &host,
+            GrantRequest {
+                session: "alpha".to_string(),
+                client: client_id.to_string(),
+                role: "writer".to_string(),
+            },
+        )
+        .expect("grant should succeed");
+
+        let mutation = evaluate_policy(
+            &host,
+            &SessionPolicyCheckRequest {
+                session_id,
+                client_id,
+                principal_id: Uuid::new_v4(),
+                action: "mutation".to_string(),
+            },
+        )
+        .expect("policy evaluation should succeed");
+        assert!(mutation.allowed);
+
+        let admin = evaluate_policy(
+            &host,
+            &SessionPolicyCheckRequest {
+                session_id,
+                client_id,
+                principal_id: Uuid::new_v4(),
+                action: "admin".to_string(),
+            },
+        )
+        .expect("policy evaluation should succeed");
+        assert!(!admin.allowed);
+    }
+
+    #[test]
+    fn missing_entry_defaults_to_allow() {
+        let session_id = Uuid::new_v4();
+        let client_id = Uuid::new_v4();
+        let host = MockHost::with_session(session_id, "alpha");
+
+        let decision = evaluate_policy(
+            &host,
+            &SessionPolicyCheckRequest {
+                session_id,
+                client_id,
+                principal_id: Uuid::new_v4(),
+                action: "mutation".to_string(),
+            },
+        )
+        .expect("policy evaluation should succeed");
+        assert!(decision.allowed);
+    }
+
+    #[test]
+    fn revoke_removes_entry_from_policy_state() {
+        let session_id = Uuid::new_v4();
+        let client_id = Uuid::new_v4();
+        let host = MockHost::with_session(session_id, "alpha");
+
+        grant_entry(
+            &host,
+            GrantRequest {
+                session: "alpha".to_string(),
+                client: client_id.to_string(),
+                role: "observer".to_string(),
+            },
+        )
+        .expect("grant should succeed");
+        revoke_entry(
+            &host,
+            RevokeRequest {
+                session: "alpha".to_string(),
+                client: client_id.to_string(),
+            },
+        )
+        .expect("revoke should succeed");
+
+        let decision = evaluate_policy(
+            &host,
+            &SessionPolicyCheckRequest {
+                session_id,
+                client_id,
+                principal_id: Uuid::new_v4(),
+                action: "admin".to_string(),
+            },
+        )
+        .expect("policy evaluation should succeed");
+        assert!(decision.allowed);
+    }
+}
