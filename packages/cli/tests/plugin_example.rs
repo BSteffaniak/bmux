@@ -75,3 +75,37 @@ fn bundled_permissions_manifest_requires_generic_runtime_capabilities() {
     assert!(required.contains(&"bmux.sessions.read".to_string()));
     assert!(required.contains(&"bmux.storage".to_string()));
 }
+
+#[test]
+fn bundled_permissions_manifest_exposes_policy_service_interface() {
+    let bundled_root = workspace_root().join("plugins").join("bundled");
+    let report = discover_plugin_manifests(&bundled_root).expect("manifest discovery should work");
+    let permissions = report
+        .manifest_paths
+        .iter()
+        .map(|path| PluginManifest::from_path(path).expect("manifest should parse"))
+        .find(|manifest| manifest.id.as_str() == "bmux.permissions")
+        .expect("permissions bundled manifest should exist");
+
+    assert!(permissions.services.iter().any(|service| {
+        service.interface_id == "session-policy-query/v1"
+            && service.kind == bmux_plugin::ServiceKind::Query
+    }));
+}
+
+#[test]
+fn bundled_windows_manifest_exposes_window_command_service_interface() {
+    let bundled_root = workspace_root().join("plugins").join("bundled");
+    let report = discover_plugin_manifests(&bundled_root).expect("manifest discovery should work");
+    let windows = report
+        .manifest_paths
+        .iter()
+        .map(|path| PluginManifest::from_path(path).expect("manifest should parse"))
+        .find(|manifest| manifest.id.as_str() == "bmux.windows")
+        .expect("windows bundled manifest should exist");
+
+    assert!(windows.services.iter().any(|service| {
+        service.interface_id == "window-command/v1"
+            && service.kind == bmux_plugin::ServiceKind::Command
+    }));
+}
