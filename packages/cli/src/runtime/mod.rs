@@ -1630,8 +1630,8 @@ async fn run_external_plugin_command(args: &[String]) -> Result<u8> {
 struct ServerStatusJsonPayload {
     running: bool,
     principal_id: Option<Uuid>,
-    server_owner_principal_id: Option<Uuid>,
-    force_local_authorized: bool,
+    server_control_principal_id: Option<Uuid>,
+    force_local_permitted: bool,
     latest_server_event: Option<String>,
     snapshot: Option<bmux_ipc::ServerSnapshotStatus>,
     server_metadata: Option<ServerRuntimeMetadata>,
@@ -1667,10 +1667,12 @@ async fn run_server_status(as_json: bool) -> Result<u8> {
         let payload = ServerStatusJsonPayload {
             running: matches!(status, Some(ref s) if s.running),
             principal_id: status.as_ref().map(|entry| entry.principal_id),
-            server_owner_principal_id: status.as_ref().map(|entry| entry.server_owner_principal_id),
-            force_local_authorized: status
+            server_control_principal_id: status
                 .as_ref()
-                .is_some_and(|entry| entry.principal_id == entry.server_owner_principal_id),
+                .map(|entry| entry.server_control_principal_id),
+            force_local_permitted: status
+                .as_ref()
+                .is_some_and(|entry| entry.principal_id == entry.server_control_principal_id),
             latest_server_event: latest_event,
             snapshot: status.as_ref().map(|entry| entry.snapshot.clone()),
             server_metadata: metadata,
@@ -1707,12 +1709,12 @@ async fn run_server_status(as_json: bool) -> Result<u8> {
             }
             println!("principal id: {}", status.principal_id);
             println!(
-                "server owner principal id: {}",
-                status.server_owner_principal_id
+                "server control principal id: {}",
+                status.server_control_principal_id
             );
             println!(
-                "force-local authorized: {}",
-                if status.principal_id == status.server_owner_principal_id {
+                "force-local permitted: {}",
+                if status.principal_id == status.server_control_principal_id {
                     "yes"
                 } else {
                     "no"
@@ -1763,8 +1765,8 @@ async fn run_server_status(as_json: bool) -> Result<u8> {
 #[derive(Debug, serde::Serialize)]
 struct ServerWhoAmIPrincipalJsonPayload {
     principal_id: Uuid,
-    server_owner_principal_id: Uuid,
-    force_local_authorized: bool,
+    server_control_principal_id: Uuid,
+    force_local_permitted: bool,
 }
 
 async fn run_server_whoami_principal(as_json: bool) -> Result<u8> {
@@ -1778,8 +1780,8 @@ async fn run_server_whoami_principal(as_json: bool) -> Result<u8> {
     if as_json {
         let payload = ServerWhoAmIPrincipalJsonPayload {
             principal_id: identity.principal_id,
-            server_owner_principal_id: identity.server_owner_principal_id,
-            force_local_authorized: identity.force_local_authorized,
+            server_control_principal_id: identity.server_control_principal_id,
+            force_local_permitted: identity.force_local_permitted,
         };
         println!(
             "{}",
@@ -1791,12 +1793,12 @@ async fn run_server_whoami_principal(as_json: bool) -> Result<u8> {
 
     println!("principal id: {}", identity.principal_id);
     println!(
-        "server owner principal id: {}",
-        identity.server_owner_principal_id
+        "server control principal id: {}",
+        identity.server_control_principal_id
     );
     println!(
-        "force-local authorized: {}",
-        if identity.force_local_authorized {
+        "force-local permitted: {}",
+        if identity.force_local_permitted {
             "yes"
         } else {
             "no"
@@ -2024,7 +2026,7 @@ async fn run_client_list(as_json: bool) -> Result<u8> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DestructiveOpErrorKind {
-    OwnerRoleRequired,
+    SessionPolicyDenied,
     ForceLocalUnauthorized,
     NotFound,
     Other,
@@ -2040,7 +2042,7 @@ struct KillFailureSummary {
 impl KillFailureSummary {
     const fn record(&mut self, kind: DestructiveOpErrorKind) {
         match kind {
-            DestructiveOpErrorKind::OwnerRoleRequired
+            DestructiveOpErrorKind::SessionPolicyDenied
             | DestructiveOpErrorKind::ForceLocalUnauthorized => {
                 self.permission_denied = self.permission_denied.saturating_add(1);
             }
@@ -2060,11 +2062,11 @@ fn classify_destructive_op_error(error: &ClientError) -> DestructiveOpErrorKind 
             bmux_ipc::ErrorCode::InvalidRequest
                 if message.contains("owner role required for this operation") =>
             {
-                DestructiveOpErrorKind::OwnerRoleRequired
+                DestructiveOpErrorKind::SessionPolicyDenied
             }
             bmux_ipc::ErrorCode::InvalidRequest
                 if message
-                    .contains("force-local is only allowed for the server owner principal") =>
+                    .contains("force-local is only allowed for the server control principal") =>
             {
                 DestructiveOpErrorKind::ForceLocalUnauthorized
             }
@@ -2077,16 +2079,16 @@ fn classify_destructive_op_error(error: &ClientError) -> DestructiveOpErrorKind 
 
 fn format_destructive_op_error(noun: &str, error: ClientError, force_local: bool) -> String {
     match classify_destructive_op_error(&error) {
-        DestructiveOpErrorKind::OwnerRoleRequired => format!(
+        DestructiveOpErrorKind::SessionPolicyDenied => format!(
             "{noun} kill is not permitted by current session policy.{}",
             if force_local {
-                " If you intended to override locally, use `--force-local` only from the server owner principal."
+                " If you intended to override locally, use `--force-local` only from the server control principal."
             } else {
                 ""
             }
         ),
         DestructiveOpErrorKind::ForceLocalUnauthorized =>
-            "`--force-local` is only available to the server owner principal. Check `bmux server whoami-principal`."
+            "`--force-local` is only available to the server control principal. Check `bmux server whoami-principal`."
                 .to_string(),
         DestructiveOpErrorKind::NotFound => map_cli_client_error(error).to_string(),
         DestructiveOpErrorKind::Other => map_cli_client_error(error).to_string(),
@@ -2104,11 +2106,11 @@ async fn kill_preflight_identity(
         .whoami_principal()
         .await
         .map_err(map_cli_client_error)?;
-    if !identity.force_local_authorized {
+    if !identity.force_local_permitted {
         anyhow::bail!(
-            "`--force-local` is only available to the server owner principal.\ncurrent principal: {}\nserver owner principal: {}\nInspect with `bmux server whoami-principal`.",
+            "`--force-local` is only available to the server control principal.\ncurrent principal: {}\nserver control principal: {}\nInspect with `bmux server whoami-principal`.",
             identity.principal_id,
-            identity.server_owner_principal_id
+            identity.server_control_principal_id
         );
     }
     Ok(Some(identity))
@@ -2124,11 +2126,11 @@ async fn print_bulk_kill_preflight(
         .await
         .map_err(map_cli_client_error)?;
     if force_local {
-        if !identity.force_local_authorized {
+        if !identity.force_local_permitted {
             anyhow::bail!(
-                "`--force-local` is only available to the server owner principal.\ncurrent principal: {}\nserver owner principal: {}\nInspect with `bmux server whoami-principal`.",
+                "`--force-local` is only available to the server control principal.\ncurrent principal: {}\nserver control principal: {}\nInspect with `bmux server whoami-principal`.",
                 identity.principal_id,
-                identity.server_owner_principal_id
+                identity.server_control_principal_id
             );
         }
         println!(
@@ -2139,8 +2141,8 @@ async fn print_bulk_kill_preflight(
     }
 
     println!(
-        "kill-all {noun}: principal {} (server owner: {})",
-        identity.principal_id, identity.server_owner_principal_id
+        "kill-all {noun}: principal {} (server control: {})",
+        identity.principal_id, identity.server_control_principal_id
     );
     println!("note: {noun} operations may fail depending on active session policy provider");
     Ok(Some(identity))
@@ -2163,9 +2165,9 @@ fn print_bulk_kill_failure_summary(noun: &str, summary: KillFailureSummary) {
 
 fn attach_quit_failure_status(error: &ClientError) -> &'static str {
     match classify_destructive_op_error(error) {
-        DestructiveOpErrorKind::OwnerRoleRequired => "quit requires session owner",
+        DestructiveOpErrorKind::SessionPolicyDenied => "quit blocked by session policy",
         DestructiveOpErrorKind::ForceLocalUnauthorized => {
-            "quit requires server owner for --force-local"
+            "quit requires server control principal for --force-local"
         }
         DestructiveOpErrorKind::NotFound => "quit failed: session not found",
         DestructiveOpErrorKind::Other => "quit failed",
@@ -6056,7 +6058,7 @@ mod tests {
     }
 
     #[test]
-    fn destructive_op_error_formats_owner_role_guidance() {
+    fn destructive_op_error_formats_session_policy_guidance() {
         let message = super::format_destructive_op_error(
             "session",
             ClientError::ServerError {
@@ -6075,7 +6077,7 @@ mod tests {
             "window",
             ClientError::ServerError {
                 code: ErrorCode::InvalidRequest,
-                message: "force-local is only allowed for the server owner principal".to_string(),
+                message: "force-local is only allowed for the server control principal".to_string(),
             },
             true,
         );
@@ -6085,13 +6087,13 @@ mod tests {
     }
 
     #[test]
-    fn attach_quit_failure_status_is_actionable_for_owner_errors() {
+    fn attach_quit_failure_status_is_actionable_for_policy_errors() {
         let status = super::attach_quit_failure_status(&ClientError::ServerError {
             code: ErrorCode::InvalidRequest,
             message: "owner role required for this operation".to_string(),
         });
 
-        assert_eq!(status, "quit requires session owner");
+        assert_eq!(status, "quit blocked by session policy");
     }
 
     #[test]

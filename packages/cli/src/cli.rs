@@ -13,13 +13,6 @@ pub enum TraceFamily {
     Dcs,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum RoleValue {
-    Owner,
-    Writer,
-    Observer,
-}
-
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(name = "bmux")]
@@ -56,13 +49,13 @@ pub enum Command {
     KillSession {
         /// Session name or UUID
         target: String,
-        /// Bypass ownership checks for local kill operations
+        /// Bypass policy checks for local kill operations
         #[arg(long)]
         force_local: bool,
     },
     /// Kill all sessions
     KillAllSessions {
-        /// Bypass ownership checks for local kill operations
+        /// Bypass policy checks for local kill operations
         #[arg(long)]
         force_local: bool,
     },
@@ -141,13 +134,13 @@ pub enum SessionCommand {
     Kill {
         /// Session name or UUID
         target: String,
-        /// Bypass ownership checks for local kill operations
+        /// Bypass policy checks for local kill operations
         #[arg(long)]
         force_local: bool,
     },
     /// Kill all sessions
     KillAll {
-        /// Bypass ownership checks for local kill operations
+        /// Bypass policy checks for local kill operations
         #[arg(long)]
         force_local: bool,
     },
@@ -193,7 +186,7 @@ pub enum ServerCommand {
         #[arg(long)]
         json: bool,
     },
-    /// Show caller and server owner principal identities
+    /// Show caller and server control principal identities
     WhoamiPrincipal {
         /// Print principal identity as JSON
         #[arg(long)]

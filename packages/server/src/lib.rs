@@ -60,7 +60,7 @@ struct ServerState {
     operation_lock: AsyncMutex<()>,
     event_hub: Mutex<EventHub>,
     client_principals: Mutex<BTreeMap<ClientId, Uuid>>,
-    server_owner_principal_id: Uuid,
+    server_control_principal_id: Uuid,
     handshake_timeout: Duration,
     pane_exit_rx: AsyncMutex<mpsc::UnboundedReceiver<PaneExitEvent>>,
     service_registry: Mutex<ServiceRegistry>,
@@ -1981,7 +1981,7 @@ impl BmuxServer {
     fn new_with_snapshot(
         endpoint: IpcEndpoint,
         snapshot_manager: Option<SnapshotManager>,
-        server_owner_principal_id: Uuid,
+        server_control_principal_id: Uuid,
     ) -> Self {
         let snapshot_runtime = match snapshot_manager {
             Some(manager) => SnapshotRuntime::with_manager(manager),
@@ -2010,7 +2010,7 @@ impl BmuxServer {
                 operation_lock: AsyncMutex::new(()),
                 event_hub: Mutex::new(EventHub::new(1024)),
                 client_principals: Mutex::new(BTreeMap::new()),
-                server_owner_principal_id,
+                server_control_principal_id,
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
                 pane_exit_rx: AsyncMutex::new(pane_exit_rx),
                 service_registry: Mutex::new(ServiceRegistry::default()),
@@ -2036,12 +2036,16 @@ impl BmuxServer {
         let endpoint = IpcEndpoint::windows_named_pipe(paths.server_named_pipe());
 
         let snapshot_manager = SnapshotManager::from_paths(paths);
-        let server_owner_principal_id =
+        let server_control_principal_id =
             load_or_create_principal_id(paths).unwrap_or_else(|error| {
-                warn!("failed loading server owner principal id: {error}");
+                warn!("failed loading server control principal id: {error}");
                 Uuid::new_v4()
             });
-        Self::new_with_snapshot(endpoint, Some(snapshot_manager), server_owner_principal_id)
+        Self::new_with_snapshot(
+            endpoint,
+            Some(snapshot_manager),
+            server_control_principal_id,
+        )
     }
 
     /// Create a server using default bmux config paths.
@@ -2271,7 +2275,7 @@ async fn handle_connection(
                 running: true,
                 snapshot,
                 principal_id,
-                server_owner_principal_id: state.server_owner_principal_id,
+                server_control_principal_id: state.server_control_principal_id,
             },
         )
         .await?;
@@ -3225,8 +3229,8 @@ async fn handle_request(
         Request::WhoAmI => Response::Ok(ResponsePayload::ClientIdentity { id: client_id.0 }),
         Request::WhoAmIPrincipal => Response::Ok(ResponsePayload::PrincipalIdentity {
             principal_id: client_principal_id,
-            server_owner_principal_id: state.server_owner_principal_id,
-            force_local_authorized: client_principal_id == state.server_owner_principal_id,
+            server_control_principal_id: state.server_control_principal_id,
+            force_local_permitted: client_principal_id == state.server_control_principal_id,
         }),
         Request::ServerStatus => {
             let snapshot = snapshot_status(state)?;
@@ -3234,7 +3238,7 @@ async fn handle_request(
                 running: true,
                 snapshot,
                 principal_id: client_principal_id,
-                server_owner_principal_id: state.server_owner_principal_id,
+                server_control_principal_id: state.server_control_principal_id,
             })
         }
         Request::ServerSave => {
@@ -3701,10 +3705,10 @@ async fn handle_request(
                     }));
                 };
 
-                if force_local && client_principal_id != state.server_owner_principal_id {
+                if force_local && client_principal_id != state.server_control_principal_id {
                     return Ok(Response::Err(ErrorResponse {
                         code: ErrorCode::InvalidRequest,
-                        message: "force-local is only allowed for the server owner principal"
+                        message: "force-local is only allowed for the server control principal"
                             .to_string(),
                     }));
                 }

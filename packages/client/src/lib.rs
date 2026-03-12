@@ -54,15 +54,15 @@ pub struct ServerStatusInfo {
     pub running: bool,
     pub snapshot: ServerSnapshotStatus,
     pub principal_id: Uuid,
-    pub server_owner_principal_id: Uuid,
+    pub server_control_principal_id: Uuid,
 }
 
 /// Principal identity details returned by whoami-principal RPC.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PrincipalIdentityInfo {
     pub principal_id: Uuid,
-    pub server_owner_principal_id: Uuid,
-    pub force_local_authorized: bool,
+    pub server_control_principal_id: Uuid,
+    pub force_local_permitted: bool,
 }
 
 /// Summary returned by apply-restore operation.
@@ -222,7 +222,7 @@ impl BmuxClient {
         self.principal_id
     }
 
-    /// Return principal identity information for this client and server owner.
+    /// Return principal identity information for this client and server control principal.
     ///
     /// # Errors
     ///
@@ -231,12 +231,12 @@ impl BmuxClient {
         match self.request(Request::WhoAmIPrincipal).await? {
             ResponsePayload::PrincipalIdentity {
                 principal_id,
-                server_owner_principal_id,
-                force_local_authorized,
+                server_control_principal_id,
+                force_local_permitted,
             } => Ok(PrincipalIdentityInfo {
                 principal_id,
-                server_owner_principal_id,
-                force_local_authorized,
+                server_control_principal_id,
+                force_local_permitted,
             }),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected principal identity",
@@ -255,12 +255,12 @@ impl BmuxClient {
                 running,
                 snapshot,
                 principal_id,
-                server_owner_principal_id,
+                server_control_principal_id,
             } => Ok(ServerStatusInfo {
                 running,
                 snapshot,
                 principal_id,
-                server_owner_principal_id,
+                server_control_principal_id,
             }),
             _ => Err(ClientError::UnexpectedResponse("expected server status")),
         }
@@ -333,12 +333,12 @@ impl BmuxClient {
     /// # Errors
     ///
     /// Returns an error if request or response validation fails.
-    pub async fn force_local_authorized(&mut self) -> Result<bool> {
+    pub async fn force_local_permitted(&mut self) -> Result<bool> {
         match self.request(Request::WhoAmIPrincipal).await? {
             ResponsePayload::PrincipalIdentity {
-                force_local_authorized,
+                force_local_permitted,
                 ..
-            } => Ok(force_local_authorized),
+            } => Ok(force_local_permitted),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected principal identity",
             )),

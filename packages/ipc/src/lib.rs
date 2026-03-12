@@ -381,14 +381,14 @@ pub enum ResponsePayload {
     },
     PrincipalIdentity {
         principal_id: Uuid,
-        server_owner_principal_id: Uuid,
-        force_local_authorized: bool,
+        server_control_principal_id: Uuid,
+        force_local_permitted: bool,
     },
     ServerStatus {
         running: bool,
         snapshot: ServerSnapshotStatus,
         principal_id: Uuid,
-        server_owner_principal_id: Uuid,
+        server_control_principal_id: Uuid,
     },
     ServerSnapshotSaved {
         path: Option<String>,
