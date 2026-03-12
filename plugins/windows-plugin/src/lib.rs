@@ -547,6 +547,9 @@ mod tests {
     struct MockHost {
         sessions: Vec<SessionSummary>,
         pane_count_by_session: std::collections::BTreeMap<Uuid, usize>,
+        fail_create: bool,
+        fail_kill: bool,
+        fail_pane_list: bool,
         creates: Mutex<Vec<Option<String>>>,
         kills: Mutex<Vec<SessionKillRequest>>,
     }
@@ -560,6 +563,9 @@ mod tests {
             Self {
                 sessions,
                 pane_count_by_session,
+                fail_create: false,
+                fail_kill: false,
+                fail_pane_list: false,
                 creates: Mutex::new(Vec::new()),
                 kills: Mutex::new(Vec::new()),
             }
@@ -576,6 +582,26 @@ mod tests {
             Self {
                 sessions,
                 pane_count_by_session,
+                fail_create: false,
+                fail_kill: false,
+                fail_pane_list: false,
+                creates: Mutex::new(Vec::new()),
+                kills: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_failures(fail_create: bool, fail_kill: bool, fail_pane_list: bool) -> Self {
+            let sessions = sample_sessions();
+            let pane_count_by_session = sessions
+                .iter()
+                .map(|session| (session.id, 1usize))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            Self {
+                sessions,
+                pane_count_by_session,
+                fail_create,
+                fail_kill,
+                fail_pane_list,
                 creates: Mutex::new(Vec::new()),
                 kills: Mutex::new(Vec::new()),
             }
@@ -597,6 +623,11 @@ mod tests {
                 })
                 .map_err(Into::into),
                 ("session-command/v1", "new") => {
+                    if self.fail_create {
+                        return Err(bmux_plugin::PluginError::ServiceProtocol {
+                            details: "mock create failure".to_string(),
+                        });
+                    }
                     let request: SessionCreateRequest = decode_service_message(&payload)?;
                     self.creates
                         .lock()
@@ -609,6 +640,11 @@ mod tests {
                     .map_err(Into::into)
                 }
                 ("session-command/v1", "kill") => {
+                    if self.fail_kill {
+                        return Err(bmux_plugin::PluginError::ServiceProtocol {
+                            details: "mock kill failure".to_string(),
+                        });
+                    }
                     let request: SessionKillRequest = decode_service_message(&payload)?;
                     self.kills
                         .lock()
@@ -623,6 +659,11 @@ mod tests {
                     .map_err(Into::into)
                 }
                 ("pane-query/v1", "list") => {
+                    if self.fail_pane_list {
+                        return Err(bmux_plugin::PluginError::ServiceProtocol {
+                            details: "mock pane list failure".to_string(),
+                        });
+                    }
                     let request: PaneListRequest = decode_service_message(&payload)?;
                     let pane_count = request
                         .session
@@ -747,5 +788,41 @@ mod tests {
         let error = switch_window(&host, SessionSelector::ById(target_id))
             .expect_err("switch should fail when target has no panes");
         assert!(error.contains("no panes"));
+    }
+
+    #[test]
+    fn create_window_propagates_host_error() {
+        let host = MockHost::with_failures(true, false, false);
+        let error = create_window(&host, Some("dev".to_string()))
+            .expect_err("create should surface host failure");
+        assert!(error.contains("mock create failure"));
+    }
+
+    #[test]
+    fn kill_window_propagates_host_error() {
+        let host = MockHost::with_failures(false, true, false);
+        let error = kill_window(&host, SessionSelector::ByName("alpha".to_string()), false)
+            .expect_err("kill should surface host failure");
+        assert!(error.contains("mock kill failure"));
+    }
+
+    #[test]
+    fn kill_all_windows_propagates_host_error() {
+        let host = MockHost::with_failures(false, true, false);
+        let error = kill_all_windows(&host, true).expect_err("kill all should fail on host error");
+        assert!(error.contains("mock kill failure"));
+    }
+
+    #[test]
+    fn switch_window_propagates_pane_list_error() {
+        let host = MockHost::with_failures(false, false, true);
+        let target = host
+            .sessions
+            .first()
+            .expect("sample sessions should exist")
+            .id;
+        let error = switch_window(&host, SessionSelector::ById(target))
+            .expect_err("switch should fail when pane list fails");
+        assert!(error.contains("mock pane list failure"));
     }
 }
