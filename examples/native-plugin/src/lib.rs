@@ -611,20 +611,28 @@ struct ListPermissionsResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct PermissionSummary {
     client_id: uuid::Uuid,
-    role: bmux_ipc::SessionRole,
+    role: SessionRole,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SessionRole {
+    Owner,
+    Writer,
+    Observer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct GrantPermissionRequest {
     session: String,
     client_id: uuid::Uuid,
-    role: bmux_ipc::SessionRole,
+    role: SessionRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct GrantPermissionResponse {
     client_id: uuid::Uuid,
-    role: bmux_ipc::SessionRole,
+    role: SessionRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -694,19 +702,19 @@ struct StorageGetResponse {
     value: Option<Vec<u8>>,
 }
 
-fn session_role_name(role: bmux_ipc::SessionRole) -> &'static str {
+fn session_role_name(role: SessionRole) -> &'static str {
     match role {
-        bmux_ipc::SessionRole::Owner => "owner",
-        bmux_ipc::SessionRole::Writer => "writer",
-        bmux_ipc::SessionRole::Observer => "observer",
+        SessionRole::Owner => "owner",
+        SessionRole::Writer => "writer",
+        SessionRole::Observer => "observer",
     }
 }
 
-fn parse_role(value: &str) -> Option<bmux_ipc::SessionRole> {
+fn parse_role(value: &str) -> Option<SessionRole> {
     match value {
-        "owner" => Some(bmux_ipc::SessionRole::Owner),
-        "writer" => Some(bmux_ipc::SessionRole::Writer),
-        "observer" => Some(bmux_ipc::SessionRole::Observer),
+        "owner" => Some(SessionRole::Owner),
+        "writer" => Some(SessionRole::Writer),
+        "observer" => Some(SessionRole::Observer),
         _ => None,
     }
 }

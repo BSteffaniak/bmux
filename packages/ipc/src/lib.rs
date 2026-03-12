@@ -163,22 +163,12 @@ pub enum PaneLayoutNode {
     },
 }
 
-/// Session role used for collaborative permission controls.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SessionRole {
-    Owner,
-    Writer,
-    Observer,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachViewComponent {
     Scene,
     SurfaceContent,
     Layout,
-    Tabs,
     Status,
 }
 
@@ -236,7 +226,6 @@ pub struct AttachSurface {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachScene {
     pub session_id: Uuid,
-    pub window_id: Uuid,
     pub focus: AttachFocusTarget,
     pub surfaces: Vec<AttachSurface>,
 }
@@ -353,7 +342,6 @@ pub struct AttachGrant {
 pub struct SessionSummary {
     pub id: Uuid,
     pub name: Option<String>,
-    pub window_count: usize,
     pub client_count: usize,
 }
 
@@ -379,7 +367,6 @@ pub struct ClientSummary {
     pub selected_session_id: Option<Uuid>,
     pub following_client_id: Option<Uuid>,
     pub following_global: bool,
-    pub session_role: Option<SessionRole>,
 }
 
 /// Snapshot persistence status returned by server-status.
@@ -421,8 +408,6 @@ pub enum ResponsePayload {
     },
     ServerSnapshotRestored {
         sessions: usize,
-        windows: usize,
-        roles: usize,
         follows: usize,
         selected_sessions: usize,
     },
@@ -442,22 +427,17 @@ pub enum ResponsePayload {
     PaneSplit {
         id: Uuid,
         session_id: Uuid,
-        window_id: Uuid,
     },
     PaneFocused {
         id: Uuid,
         session_id: Uuid,
-        window_id: Uuid,
     },
     PaneResized {
         session_id: Uuid,
-        window_id: Uuid,
     },
     PaneClosed {
         id: Uuid,
         session_id: Uuid,
-        window_id: Uuid,
-        window_closed: bool,
         session_closed: bool,
     },
     PaneList {
@@ -491,7 +471,6 @@ pub enum ResponsePayload {
     },
     AttachLayout {
         session_id: Uuid,
-        window_id: Uuid,
         focused_pane_id: Uuid,
         panes: Vec<PaneSummary>,
         layout_root: PaneLayoutNode,
@@ -502,7 +481,6 @@ pub enum ResponsePayload {
     },
     AttachSnapshot {
         session_id: Uuid,
-        window_id: Uuid,
         focused_pane_id: Uuid,
         panes: Vec<PaneSummary>,
         layout_root: PaneLayoutNode,
@@ -560,20 +538,6 @@ pub enum Event {
     SessionRemoved {
         id: Uuid,
     },
-    WindowCreated {
-        id: Uuid,
-        session_id: Uuid,
-        name: Option<String>,
-    },
-    WindowRemoved {
-        id: Uuid,
-        session_id: Uuid,
-    },
-    WindowSwitched {
-        id: Uuid,
-        session_id: Uuid,
-        by_client_id: Uuid,
-    },
     ClientAttached {
         id: Uuid,
     },
@@ -596,12 +560,6 @@ pub enum Event {
         follower_client_id: Uuid,
         leader_client_id: Uuid,
         session_id: Uuid,
-    },
-    RoleChanged {
-        session_id: Uuid,
-        client_id: Uuid,
-        role: SessionRole,
-        by_client_id: Uuid,
     },
     AttachViewChanged {
         session_id: Uuid,
@@ -639,8 +597,8 @@ mod tests {
     use super::{
         AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
         AttachViewComponent, Envelope, EnvelopeKind, ErrorCode, Event, IpcEndpoint,
-        ProtocolVersion, Request, Response, ResponsePayload, SessionRole, SessionSelector,
-        SessionSummary, decode, encode,
+        ProtocolVersion, Request, Response, ResponsePayload, SessionSelector, SessionSummary,
+        decode, encode,
     };
     use std::path::Path;
     use uuid::Uuid;
@@ -662,7 +620,6 @@ mod tests {
             sessions: vec![SessionSummary {
                 id: Uuid::new_v4(),
                 name: Some("work".to_string()),
-                window_count: 2,
                 client_count: 1,
             }],
         });
@@ -675,16 +632,13 @@ mod tests {
     fn serializes_attach_scene_response_roundtrip() {
         let pane_id = Uuid::new_v4();
         let session_id = Uuid::new_v4();
-        let window_id = Uuid::new_v4();
         let response = Response::Ok(ResponsePayload::AttachLayout {
             session_id,
-            window_id,
             focused_pane_id: pane_id,
             panes: vec![],
             layout_root: super::PaneLayoutNode::Leaf { pane_id },
             scene: AttachScene {
                 session_id,
-                window_id,
                 focus: AttachFocusTarget::Pane { pane_id },
                 surfaces: vec![AttachSurface {
                     id: pane_id,
@@ -726,7 +680,7 @@ mod tests {
         let event = Event::AttachViewChanged {
             session_id: Uuid::new_v4(),
             revision: 7,
-            components: vec![AttachViewComponent::Layout, AttachViewComponent::Tabs],
+            components: vec![AttachViewComponent::Layout, AttachViewComponent::Status],
         };
         let bytes = encode(&event).expect("event should encode");
         let decoded: Event = decode(&bytes).expect("event should decode");
@@ -766,27 +720,6 @@ mod tests {
         let bytes = encode(&code).expect("error code should encode");
         let decoded: ErrorCode = decode(&bytes).expect("error code should decode");
         assert_eq!(decoded, code);
-    }
-
-    #[test]
-    fn session_role_serializes_roundtrip() {
-        let role = SessionRole::Writer;
-        let bytes = encode(&role).expect("session role should encode");
-        let decoded: SessionRole = decode(&bytes).expect("session role should decode");
-        assert_eq!(decoded, role);
-    }
-
-    #[test]
-    fn serializes_role_changed_event_roundtrip() {
-        let event = Event::RoleChanged {
-            session_id: Uuid::new_v4(),
-            client_id: Uuid::new_v4(),
-            role: SessionRole::Observer,
-            by_client_id: Uuid::new_v4(),
-        };
-        let bytes = encode(&event).expect("role changed event should encode");
-        let decoded: Event = decode(&bytes).expect("role changed event should decode");
-        assert_eq!(decoded, event);
     }
 
     #[test]

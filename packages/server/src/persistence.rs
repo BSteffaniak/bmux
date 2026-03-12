@@ -1,5 +1,4 @@
 use bmux_config::ConfigPaths;
-use bmux_ipc::SessionRole;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 use std::io::Write;
@@ -14,7 +13,6 @@ pub struct SnapshotV3 {
     pub sessions: Vec<SessionSnapshotV3>,
     #[serde(default)]
     pub owner_principals: Vec<OwnerPrincipalSnapshotV2>,
-    pub roles: Vec<RoleAssignmentSnapshotV2>,
     pub follows: Vec<FollowEdgeSnapshotV2>,
     pub selected_sessions: Vec<ClientSelectedSessionSnapshotV2>,
 }
@@ -90,13 +88,6 @@ pub enum PaneLayoutNodeSnapshotV2 {
 pub enum PaneSplitDirectionSnapshotV2 {
     Vertical,
     Horizontal,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RoleAssignmentSnapshotV2 {
-    pub session_id: Uuid,
-    pub client_id: Uuid,
-    pub role: SessionRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -382,14 +373,6 @@ fn validate_snapshot_v3(snapshot: &SnapshotV3) -> Result<(), SnapshotError> {
         }
     }
 
-    for role in &snapshot.roles {
-        if !session_ids.contains(&role.session_id) {
-            return Err(SnapshotError::Validation(format!(
-                "role assignment references missing session {}",
-                role.session_id
-            )));
-        }
-    }
     for owner in &snapshot.owner_principals {
         if !session_ids.contains(&owner.session_id) {
             return Err(SnapshotError::Validation(format!(
@@ -476,10 +459,9 @@ fn normalize_snapshot_v3_numbering(mut snapshot: SnapshotV3) -> SnapshotV3 {
 mod tests {
     use super::{
         ClientSelectedSessionSnapshotV2, FollowEdgeSnapshotV2, PaneLayoutNodeSnapshotV2,
-        PaneSnapshotV2, RoleAssignmentSnapshotV2, SessionSnapshotV3, SnapshotError,
-        SnapshotManager, SnapshotV3, WindowSnapshotV3,
+        PaneSnapshotV2, SessionSnapshotV3, SnapshotError, SnapshotManager, SnapshotV3,
+        WindowSnapshotV3,
     };
-    use bmux_ipc::SessionRole;
     use uuid::Uuid;
 
     #[test]
@@ -510,11 +492,6 @@ mod tests {
                 next_window_number: 2,
             }],
             owner_principals: vec![],
-            roles: vec![RoleAssignmentSnapshotV2 {
-                session_id,
-                client_id,
-                role: SessionRole::Owner,
-            }],
             follows: vec![FollowEdgeSnapshotV2 {
                 follower_client_id: client_id,
                 leader_client_id: leader_id,
@@ -541,7 +518,6 @@ mod tests {
             "checksum": 0,
             "snapshot": {
                 "sessions": [],
-                "roles": [],
                 "follows": [],
                 "selected_sessions": []
             }
@@ -575,7 +551,6 @@ mod tests {
                 next_window_number: 2,
             }],
             owner_principals: vec![],
-            roles: vec![],
             follows: vec![],
             selected_sessions: vec![],
         };

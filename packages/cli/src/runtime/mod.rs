@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout, TerminfoAutoInstall};
 use bmux_ipc::{
-    AttachViewComponent, InvokeServiceKind, PaneFocusDirection, PaneSplitDirection, SessionRole,
+    AttachViewComponent, InvokeServiceKind, PaneFocusDirection, PaneSplitDirection,
     SessionSelector, SessionSummary,
 };
 use bmux_keybind::action_to_name;
@@ -1451,11 +1451,7 @@ const fn plugin_event_kind_from_server_event(event: &bmux_client::ServerEvent) -
         | bmux_client::ServerEvent::FollowStarted { .. }
         | bmux_client::ServerEvent::FollowStopped { .. }
         | bmux_client::ServerEvent::FollowTargetGone { .. }
-        | bmux_client::ServerEvent::FollowTargetChanged { .. }
-        | bmux_client::ServerEvent::RoleChanged { .. } => PluginEventKind::Session,
-        bmux_client::ServerEvent::WindowCreated { .. }
-        | bmux_client::ServerEvent::WindowRemoved { .. }
-        | bmux_client::ServerEvent::WindowSwitched { .. } => PluginEventKind::Window,
+        | bmux_client::ServerEvent::FollowTargetChanged { .. } => PluginEventKind::Session,
         bmux_client::ServerEvent::ClientAttached { .. }
         | bmux_client::ServerEvent::ClientDetached { .. } => PluginEventKind::Client,
         bmux_client::ServerEvent::AttachViewChanged { .. } => PluginEventKind::Pane,
@@ -1857,12 +1853,8 @@ async fn run_server_restore(dry_run: bool, yes: bool) -> Result<u8> {
         .map_err(map_cli_client_error)?;
 
     println!(
-        "restore applied: sessions={}, windows={}, roles={}, follows={}, selected_sessions={}",
-        summary.sessions,
-        summary.windows,
-        summary.roles,
-        summary.follows,
-        summary.selected_sessions
+        "restore applied: sessions={}, follows={}, selected_sessions={}",
+        summary.sessions, summary.follows, summary.selected_sessions
     );
     Ok(0)
 }
@@ -1890,16 +1882,12 @@ const fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
         bmux_client::ServerEvent::ServerStopping => "server_stopping",
         bmux_client::ServerEvent::SessionCreated { .. } => "session_created",
         bmux_client::ServerEvent::SessionRemoved { .. } => "session_removed",
-        bmux_client::ServerEvent::WindowCreated { .. } => "window_created",
-        bmux_client::ServerEvent::WindowRemoved { .. } => "window_removed",
-        bmux_client::ServerEvent::WindowSwitched { .. } => "window_switched",
         bmux_client::ServerEvent::ClientAttached { .. } => "client_attached",
         bmux_client::ServerEvent::ClientDetached { .. } => "client_detached",
         bmux_client::ServerEvent::FollowStarted { .. } => "follow_started",
         bmux_client::ServerEvent::FollowStopped { .. } => "follow_stopped",
         bmux_client::ServerEvent::FollowTargetGone { .. } => "follow_target_gone",
         bmux_client::ServerEvent::FollowTargetChanged { .. } => "follow_target_changed",
-        bmux_client::ServerEvent::RoleChanged { .. } => "role_changed",
         bmux_client::ServerEvent::AttachViewChanged { .. } => "attach_view_changed",
     }
 }
@@ -1964,13 +1952,10 @@ async fn run_session_list(as_json: bool) -> Result<u8> {
         return Ok(0);
     }
 
-    println!("ID                                   NAME            WINDOWS CLIENTS");
+    println!("ID                                   NAME            CLIENTS");
     for session in sessions {
         let name = session.name.unwrap_or_else(|| "-".to_string());
-        println!(
-            "{:<36} {:<15} {:<7} {}",
-            session.id, name, session.window_count, session.client_count
-        );
+        println!("{:<36} {:<15} {}", session.id, name, session.client_count);
     }
 
     Ok(0)
@@ -1998,10 +1983,9 @@ async fn run_client_list(as_json: bool) -> Result<u8> {
 
     let sessions = api.list_sessions().await.map_err(map_cli_client_error)?;
     println!(
-        "ID                                   SELF ROLE      SESSION          WINDOW       FOLLOWING_CLIENT                     GLOBAL"
+        "ID                                   SELF SESSION          WORKSPACE    FOLLOWING_CLIENT                     GLOBAL"
     );
     for client_summary in clients {
-        let role = client_summary.session_role.map_or("-", session_role_label);
         let selected_session = client_summary.selected_session_id.map_or_else(
             || "-".to_string(),
             |id| {
@@ -2017,14 +2001,13 @@ async fn run_client_list(as_json: bool) -> Result<u8> {
             .following_client_id
             .map_or_else(|| "-".to_string(), |id| id.to_string());
         println!(
-            "{:<36} {:<4} {:<9} {:<16} {:<12} {:<36} {}",
+            "{:<36} {:<4} {:<16} {:<12} {:<36} {}",
             client_summary.id,
             if client_summary.id == self_id {
                 "yes"
             } else {
                 "no"
             },
-            role,
             selected_session,
             selected_window,
             following_client,
@@ -4026,7 +4009,6 @@ async fn hydrate_attach_state_from_snapshot(
 ) -> std::result::Result<(), ClientError> {
     let AttachSnapshotState {
         session_id,
-        window_id,
         focused_pane_id,
         panes,
         layout_root,
@@ -4038,7 +4020,6 @@ async fn hydrate_attach_state_from_snapshot(
 
     view_state.cached_layout_state = Some(AttachLayoutState {
         session_id,
-        window_id,
         focused_pane_id,
         panes,
         layout_root,
@@ -4200,30 +4181,10 @@ async fn handle_attach_server_event(
         } if session_id == view_state.attached_id => {
             apply_attach_view_change_components(&components, view_state);
         }
-        bmux_client::ServerEvent::RoleChanged {
-            session_id,
-            client_id,
-            role,
-            ..
-        } if session_id == view_state.attached_id && Some(client_id) == self_client_id => {
-            apply_attach_role_change(role, view_state);
-        }
         _ => {}
     }
 
     Ok(AttachLoopControl::Continue)
-}
-
-fn role_allows_attach_input(role: SessionRole) -> bool {
-    matches!(role, SessionRole::Owner | SessionRole::Writer)
-}
-
-fn apply_attach_role_change(role: SessionRole, view_state: &mut AttachViewState) {
-    let can_write = role_allows_attach_input(role);
-    if view_state.can_write != can_write {
-        view_state.can_write = can_write;
-        view_state.dirty.status_needs_redraw = true;
-    }
 }
 
 fn apply_attach_view_change_components(
@@ -4247,10 +4208,6 @@ fn apply_attach_view_change_components(
             AttachViewComponent::Layout => {
                 view_state.dirty.layout_needs_refresh = true;
                 view_state.dirty.full_pane_redraw = true;
-                view_state.dirty.status_needs_redraw = true;
-            }
-            AttachViewComponent::Tabs => {
-                view_state.dirty.layout_needs_refresh = true;
                 view_state.dirty.status_needs_redraw = true;
             }
             AttachViewComponent::Status => {
@@ -4573,14 +4530,6 @@ fn parse_session_selector(target: &str) -> SessionSelector {
 
 fn parse_uuid_value(value: &str, label: &str) -> Result<Uuid> {
     Uuid::parse_str(value).with_context(|| format!("{label} must be a UUID, got '{value}'"))
-}
-
-const fn session_role_label(role: SessionRole) -> &'static str {
-    match role {
-        SessionRole::Owner => "owner",
-        SessionRole::Writer => "writer",
-        SessionRole::Observer => "observer",
-    }
 }
 
 async fn server_is_running() -> Result<bool> {
@@ -5375,10 +5324,10 @@ fn init_logging(verbose: bool) {
 mod tests {
     use super::{
         ProtocolDirection, ProtocolTraceEvent, TerminalProfile, TraceFamily,
-        apply_attach_role_change, apply_attach_view_change_components, attach_keymap_from_config,
-        filter_trace_events, map_attach_client_error, map_cli_client_error,
-        merged_runtime_keybindings, parse_pid_content, profile_for_term,
-        protocol_profile_for_terminal_profile, resolve_pane_term_with_checker,
+        apply_attach_view_change_components, attach_keymap_from_config, filter_trace_events,
+        map_attach_client_error, map_cli_client_error, merged_runtime_keybindings,
+        parse_pid_content, profile_for_term, protocol_profile_for_terminal_profile,
+        resolve_pane_term_with_checker,
     };
     use crate::cli::Command;
     use crate::input::InputProcessor;
@@ -5388,7 +5337,7 @@ mod tests {
     use bmux_ipc::transport::IpcTransportError;
     use bmux_ipc::{
         AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
-        AttachViewComponent, ErrorCode, PaneLayoutNode, PaneSummary, SessionRole, SessionSummary,
+        AttachViewComponent, ErrorCode, PaneLayoutNode, PaneSummary, SessionSummary,
     };
     use bmux_plugin::{PluginManifest, PluginRegistry};
     use crossterm::event::{
@@ -5434,7 +5383,6 @@ mod tests {
         });
         view_state.cached_layout_state = Some(AttachLayoutState {
             session_id: Uuid::from_u128(12),
-            window_id: Uuid::from_u128(13),
             focused_pane_id: pane_id,
             panes: vec![PaneSummary {
                 id: pane_id,
@@ -5445,7 +5393,6 @@ mod tests {
             layout_root: PaneLayoutNode::Leaf { pane_id },
             scene: AttachScene {
                 session_id: Uuid::from_u128(12),
-                window_id: Uuid::from_u128(13),
                 focus: AttachFocusTarget::Pane { pane_id },
                 surfaces: vec![AttachSurface {
                     id: pane_id,
@@ -5822,17 +5769,16 @@ mod tests {
 
     #[test]
     fn plugin_event_from_server_event_maps_kind_and_payload() {
-        let session_id = Uuid::from_u128(2);
+        let session_id = Uuid::from_u128(1);
         let event =
-            super::plugin_event_from_server_event(&bmux_client::ServerEvent::WindowCreated {
-                id: Uuid::from_u128(1),
-                session_id,
+            super::plugin_event_from_server_event(&bmux_client::ServerEvent::SessionCreated {
+                id: session_id,
                 name: Some("editor".to_string()),
             })
             .expect("plugin event should build");
         let session_id_text = session_id.to_string();
-        assert_eq!(event.kind, bmux_plugin::PluginEventKind::Window);
-        assert_eq!(event.name, "window_created");
+        assert_eq!(event.kind, bmux_plugin::PluginEventKind::Session);
+        assert_eq!(event.name, "session_created");
         assert!(event.payload.to_string().contains(&session_id_text));
     }
 
@@ -5985,42 +5931,20 @@ mod tests {
         assert!(!view_state.dirty.full_pane_redraw);
 
         view_state.dirty.status_needs_redraw = false;
-        apply_attach_view_change_components(&[AttachViewComponent::Tabs], &mut view_state);
+        apply_attach_view_change_components(&[AttachViewComponent::Layout], &mut view_state);
         assert!(view_state.dirty.status_needs_redraw);
         assert!(view_state.dirty.layout_needs_refresh);
-        assert!(!view_state.dirty.full_pane_redraw);
+        assert!(view_state.dirty.full_pane_redraw);
 
         view_state.dirty.status_needs_redraw = false;
         view_state.dirty.layout_needs_refresh = false;
         apply_attach_view_change_components(
-            &[AttachViewComponent::Scene, AttachViewComponent::Tabs],
+            &[AttachViewComponent::Scene, AttachViewComponent::Layout],
             &mut view_state,
         );
         assert!(view_state.dirty.status_needs_redraw);
         assert!(view_state.dirty.layout_needs_refresh);
         assert!(view_state.dirty.full_pane_redraw);
-    }
-
-    #[test]
-    fn attach_role_change_updates_write_status_only_when_needed() {
-        let mut view_state = AttachViewState::new(AttachOpenInfo {
-            session_id: uuid::Uuid::new_v4(),
-            can_write: true,
-        });
-        view_state.dirty.status_needs_redraw = false;
-
-        apply_attach_role_change(SessionRole::Writer, &mut view_state);
-        assert!(view_state.can_write);
-        assert!(!view_state.dirty.status_needs_redraw);
-
-        apply_attach_role_change(SessionRole::Observer, &mut view_state);
-        assert!(!view_state.can_write);
-        assert!(view_state.dirty.status_needs_redraw);
-
-        view_state.dirty.status_needs_redraw = false;
-        apply_attach_role_change(SessionRole::Observer, &mut view_state);
-        assert!(!view_state.can_write);
-        assert!(!view_state.dirty.status_needs_redraw);
     }
 
     #[test]
@@ -6556,13 +6480,11 @@ mod tests {
             SessionSummary {
                 id: session_a,
                 name: Some("a".to_string()),
-                window_count: 1,
                 client_count: 1,
             },
             SessionSummary {
                 id: session_b,
                 name: Some("b".to_string()),
-                window_count: 1,
                 client_count: 1,
             },
         ];
@@ -6892,7 +6814,6 @@ mod tests {
         let pane_id = uuid::Uuid::new_v4();
         let scene = bmux_ipc::AttachScene {
             session_id: uuid::Uuid::new_v4(),
-            window_id: uuid::Uuid::new_v4(),
             focus: bmux_ipc::AttachFocusTarget::Pane { pane_id },
             surfaces: vec![bmux_ipc::AttachSurface {
                 id: pane_id,

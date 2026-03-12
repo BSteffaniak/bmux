@@ -509,7 +509,6 @@ mod tests {
         let pane_id = Uuid::from_u128(1);
         let scene = AttachScene {
             session_id: Uuid::from_u128(2),
-            window_id: Uuid::from_u128(3),
             focus: AttachFocusTarget::Pane { pane_id },
             surfaces: vec![AttachSurface {
                 id: pane_id,
@@ -560,7 +559,6 @@ mod tests {
         let pane_id = Uuid::from_u128(21);
         let scene = AttachScene {
             session_id: Uuid::from_u128(22),
-            window_id: Uuid::from_u128(23),
             focus: AttachFocusTarget::Pane { pane_id },
             surfaces: vec![AttachSurface {
                 id: pane_id,

@@ -15,16 +15,15 @@ use bmux_ipc::{
     AttachSurface, AttachSurfaceKind, AttachViewComponent, CURRENT_PROTOCOL_VERSION, ClientSummary,
     Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, PaneFocusDirection,
     PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection, PaneSummary,
-    ProtocolVersion, Request, Response, ResponsePayload, ServerSnapshotStatus, SessionRole,
-    SessionSelector, SessionSummary, decode, encode,
+    ProtocolVersion, Request, Response, ResponsePayload, ServerSnapshotStatus, SessionSelector,
+    SessionSummary, decode, encode,
 };
 use bmux_session::{ClientId, Session, SessionId, SessionManager, WindowId};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
 use persistence::{
     ClientSelectedSessionSnapshotV2, FloatingSurfaceSnapshotV3, FollowEdgeSnapshotV2,
     OwnerPrincipalSnapshotV2, PaneLayoutNodeSnapshotV2, PaneSnapshotV2,
-    PaneSplitDirectionSnapshotV2, RoleAssignmentSnapshotV2, SessionSnapshotV3, SnapshotManager,
-    SnapshotV3, WindowSnapshotV3,
+    PaneSplitDirectionSnapshotV2, SessionSnapshotV3, SnapshotManager, SnapshotV3, WindowSnapshotV3,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -164,7 +163,7 @@ struct SnapshotRuntime {
 struct RestoreSummary {
     sessions: usize,
     windows: usize,
-    roles: usize,
+    owners: usize,
     follows: usize,
     selected_sessions: usize,
 }
@@ -366,7 +365,6 @@ struct FollowState {
 #[derive(Debug, Default)]
 struct PermissionState {
     owner_principals: BTreeMap<SessionId, Uuid>,
-    roles: BTreeMap<SessionId, BTreeMap<ClientId, SessionRole>>,
 }
 
 impl PermissionState {
@@ -374,43 +372,12 @@ impl PermissionState {
         self.owner_principals.insert(session_id, owner_principal_id);
     }
 
-    fn owner_principal_for(&self, session_id: SessionId) -> Option<Uuid> {
-        self.owner_principals.get(&session_id).copied()
-    }
-
-    fn role_for(
-        &self,
-        session_id: SessionId,
-        client_id: ClientId,
-        principal_id: Uuid,
-    ) -> SessionRole {
-        if self.owner_principal_for(session_id) == Some(principal_id) {
-            return SessionRole::Owner;
-        }
-        self.roles
-            .get(&session_id)
-            .and_then(|session_roles| session_roles.get(&client_id).copied())
-            .unwrap_or(SessionRole::Observer)
-    }
-
     fn set_owner_principal(&mut self, session_id: SessionId, principal_id: Uuid) {
         self.owner_principals.insert(session_id, principal_id);
     }
 
-    fn set_role(&mut self, session_id: SessionId, client_id: ClientId, role: SessionRole) {
-        let session_roles = self.roles.entry(session_id).or_default();
-        session_roles.insert(client_id, role);
-    }
-
     fn remove_session(&mut self, session_id: SessionId) {
         self.owner_principals.remove(&session_id);
-        self.roles.remove(&session_id);
-    }
-
-    fn clear_client_roles(&mut self, client_id: ClientId) {
-        for roles in self.roles.values_mut() {
-            roles.remove(&client_id);
-        }
     }
 }
 
@@ -546,7 +513,6 @@ impl FollowState {
                     selected_session_id,
                     following_client_id,
                     following_global,
-                    session_role: None,
                 }
             })
             .collect()
@@ -804,15 +770,7 @@ struct RemovedRuntime {
     handle: SessionRuntimeHandle,
 }
 
-struct RemovedWindowRuntime {
-    session_id: SessionId,
-    window_id: bmux_session::WindowId,
-    handle: WindowRuntimeHandle,
-    session_removed: Option<RemovedRuntime>,
-}
-
 struct AttachLayoutState {
-    window_id: bmux_session::WindowId,
     focused_pane_id: Uuid,
     panes: Vec<PaneSummary>,
     layout_root: IpcPaneLayoutNode,
@@ -821,7 +779,6 @@ struct AttachLayoutState {
 
 struct AttachSnapshotState {
     session_id: SessionId,
-    window_id: bmux_session::WindowId,
     focused_pane_id: Uuid,
     panes: Vec<PaneSummary>,
     layout_root: IpcPaneLayoutNode,
@@ -1169,7 +1126,6 @@ fn build_attach_scene(
 
     AttachScene {
         session_id: session_id.0,
-        window_id: window.id.0,
         focus: AttachFocusTarget::Pane {
             pane_id: window.focused_pane_id,
         },
@@ -1720,7 +1676,7 @@ impl SessionRuntimeManager {
         &mut self,
         session_id: SessionId,
         target: Option<PaneSelector>,
-    ) -> Result<(Uuid, Option<RemovedWindowRuntime>)> {
+    ) -> Result<(Uuid, Option<RemovedRuntime>)> {
         let (window_id, pane_id, remove_window) = {
             let session = self
                 .runtimes
@@ -1738,7 +1694,7 @@ impl SessionRuntimeManager {
         };
 
         if remove_window {
-            let removed = self.kill_window(session_id, window_id)?;
+            let removed = self.remove_runtime(session_id)?;
             return Ok((pane_id, Some(removed)));
         }
 
@@ -1854,7 +1810,6 @@ impl SessionRuntimeManager {
             })
             .collect::<Vec<_>>();
         Ok(AttachLayoutState {
-            window_id: window.id,
             focused_pane_id: window.focused_pane_id,
             panes,
             layout_root: ipc_layout_from_runtime(&window.layout_root),
@@ -1933,7 +1888,6 @@ impl SessionRuntimeManager {
 
         Ok(AttachSnapshotState {
             session_id,
-            window_id: window.id,
             focused_pane_id: window.focused_pane_id,
             panes,
             layout_root: ipc_layout_from_runtime(&window.layout_root),
@@ -1992,68 +1946,6 @@ impl SessionRuntimeManager {
         }
 
         Ok(chunks)
-    }
-
-    fn kill_window(
-        &mut self,
-        session_id: SessionId,
-        window_id: bmux_session::WindowId,
-    ) -> Result<RemovedWindowRuntime> {
-        let is_last_window = {
-            let session = self
-                .runtimes
-                .get_mut(&session_id)
-                .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
-            if !session.windows.contains_key(&window_id) {
-                anyhow::bail!(
-                    "window not found in session {} for id {}",
-                    session_id.0,
-                    window_id.0
-                );
-            }
-            let is_last_window = session.windows.len() == 1;
-            if !is_last_window && session.active_window == window_id {
-                let next_active = session
-                    .windows
-                    .values()
-                    .filter(|window| window.id != window_id)
-                    .min_by_key(|window| window.number)
-                    .map(|window| window.id)
-                    .ok_or_else(|| anyhow::anyhow!("failed selecting next active window"))?;
-                session.active_window = next_active;
-            }
-            is_last_window
-        };
-
-        if is_last_window {
-            let mut removed_session = self.remove_runtime(session_id)?;
-            let window = removed_session
-                .handle
-                .windows
-                .remove(&window_id)
-                .ok_or_else(|| anyhow::anyhow!("window missing during session removal"))?;
-            return Ok(RemovedWindowRuntime {
-                session_id,
-                window_id,
-                handle: window,
-                session_removed: Some(removed_session),
-            });
-        }
-
-        let session = self
-            .runtimes
-            .get_mut(&session_id)
-            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
-        let window = session
-            .windows
-            .remove(&window_id)
-            .ok_or_else(|| anyhow::anyhow!("window not found in session {}", session_id.0))?;
-        Ok(RemovedWindowRuntime {
-            session_id,
-            window_id,
-            handle: window,
-            session_removed: None,
-        })
     }
 
     fn remove_runtime(&mut self, session_id: SessionId) -> Result<RemovedRuntime> {
@@ -2724,7 +2616,6 @@ fn normalize_attach_view_components(
         AttachViewComponent::Scene,
         AttachViewComponent::SurfaceContent,
         AttachViewComponent::Layout,
-        AttachViewComponent::Tabs,
         AttachViewComponent::Status,
     ] {
         if components.contains(&component) {
@@ -2734,28 +2625,15 @@ fn normalize_attach_view_components(
     normalized
 }
 
-fn attach_view_components_for_pane_close(window_closed: bool) -> &'static [AttachViewComponent] {
-    if window_closed {
-        &[AttachViewComponent::Scene, AttachViewComponent::Tabs]
-    } else {
-        &[AttachViewComponent::Scene]
-    }
-}
-
 fn emit_attach_view_changed_for_pane_close(
     state: &Arc<ServerState>,
     session_id: SessionId,
-    window_closed: bool,
     session_closed: bool,
 ) -> Result<()> {
     if session_closed {
         return Ok(());
     }
-    emit_attach_view_changed(
-        state,
-        session_id,
-        attach_view_components_for_pane_close(window_closed),
-    )
+    emit_attach_view_changed(state, session_id, &[AttachViewComponent::Scene])
 }
 
 fn emit_attach_view_changed_for_layout(
@@ -2891,15 +2769,9 @@ fn clear_selected_session_for_all(
 }
 
 fn rebalance_owner_roles_after_disconnect(
-    state: &Arc<ServerState>,
-    disconnected_client_id: ClientId,
+    _state: &Arc<ServerState>,
+    _disconnected_client_id: ClientId,
 ) -> Result<()> {
-    let mut permission_state = state
-        .permission_state
-        .lock()
-        .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-    permission_state.clear_client_roles(disconnected_client_id);
-
     Ok(())
 }
 
@@ -3102,35 +2974,19 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV3> {
             .collect::<Result<Vec<_>>>()?
     };
 
-    let (owner_principals, roles) = {
+    let owner_principals = {
         let permission_state = state
             .permission_state
             .lock()
             .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-        let owner_principals = permission_state
+        permission_state
             .owner_principals
             .iter()
             .map(|(session_id, principal_id)| OwnerPrincipalSnapshotV2 {
                 session_id: session_id.0,
                 principal_id: *principal_id,
             })
-            .collect::<Vec<_>>();
-        let roles = permission_state
-            .roles
-            .iter()
-            .flat_map(|(session_id, assignments)| {
-                assignments
-                    .iter()
-                    .filter(|(_, role)| **role != SessionRole::Owner)
-                    .map(|(client_id, role)| RoleAssignmentSnapshotV2 {
-                        session_id: session_id.0,
-                        client_id: client_id.0,
-                        role: *role,
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        (owner_principals, roles)
+            .collect::<Vec<_>>()
     };
 
     let (follows, selected_sessions) = {
@@ -3163,7 +3019,6 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV3> {
     Ok(SnapshotV3 {
         sessions: session_snapshots,
         owner_principals,
-        roles,
         follows,
         selected_sessions,
     })
@@ -3331,7 +3186,6 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV3) -> Resu
             .lock()
             .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
         permission_state.owner_principals.clear();
-        permission_state.roles.clear();
 
         let session_manager = state
             .session_manager
@@ -3341,18 +3195,7 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV3) -> Resu
             let session_id = SessionId(owner.session_id);
             if session_manager.get_session(&session_id).is_some() {
                 permission_state.set_owner_principal(session_id, owner.principal_id);
-                summary.roles += 1;
-            }
-        }
-
-        for role in &snapshot.roles {
-            let session_id = SessionId(role.session_id);
-            if session_manager.get_session(&session_id).is_some() {
-                if role.role == SessionRole::Owner {
-                    continue;
-                }
-                permission_state.set_role(session_id, ClientId(role.client_id), role.role);
-                summary.roles += 1;
+                summary.owners += 1;
             }
         }
     }
@@ -3452,89 +3295,66 @@ async fn reap_closed_active_pane(
     selected_session: &mut Option<SessionId>,
     attached_stream_session: &mut Option<SessionId>,
 ) -> Result<()> {
-    let removed_window = {
+    let removed_session = {
         let mut runtime_manager = state
             .session_runtimes
             .lock()
             .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
         match runtime_manager.close_pane(session_id, Some(PaneSelector::Active)) {
-            Ok((_, removed_window)) => removed_window,
+            Ok((_, removed_session)) => removed_session,
             Err(_) => None,
         }
     };
 
-    if let Some(removed_window) = removed_window {
-        let removed_window_session_id = removed_window.session_id;
-        let removed_window_id = removed_window.window_id;
-        let removed_window_handle = removed_window.handle;
-        let session_removed = removed_window.session_removed;
-        shutdown_window_handle(removed_window_handle).await;
-        {
-            let mut manager = state
-                .session_manager
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            let _ = manager.get_session_mut(&removed_window_session_id);
-        }
-        emit_event(
-            state,
-            Event::WindowRemoved {
-                id: removed_window_id.0,
-                session_id: removed_window_session_id.0,
-            },
-        )?;
-
-        if let Some(removed_session) = session_removed {
-            if removed_session.had_attached_clients {
-                emit_event(
-                    state,
-                    Event::ClientDetached {
-                        id: removed_window_session_id.0,
-                    },
-                )?;
-            }
-            shutdown_runtime_handle(removed_session).await;
-            let mut manager = state
-                .session_manager
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            let _ = manager.remove_session(&removed_window_session_id);
-            if *selected_session == Some(removed_window_session_id) {
-                *selected_session = None;
-                persist_selected_session(state, client_id, None)?;
-            }
-            if *attached_stream_session == Some(removed_window_session_id) {
-                *attached_stream_session = None;
-            }
-            drop(manager);
-
-            let mut attach_tokens = state
-                .attach_tokens
-                .lock()
-                .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
-            attach_tokens.remove_for_session(removed_window_session_id);
-            drop(attach_tokens);
-
-            clear_selected_session_for_all(state, removed_window_session_id)?;
-
-            let mut permission_state = state
-                .permission_state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-            permission_state.remove_session(removed_window_session_id);
-            drop(permission_state);
-
+    if let Some(removed_session) = removed_session {
+        let removed_session_id = removed_session.session_id;
+        if removed_session.had_attached_clients {
             emit_event(
                 state,
-                Event::SessionRemoved {
-                    id: removed_window_session_id.0,
+                Event::ClientDetached {
+                    id: removed_session_id.0,
                 },
             )?;
-        } else {
-            emit_attach_view_changed_for_pane_close(state, removed_window_session_id, true, false)?;
         }
+        shutdown_runtime_handle(removed_session).await;
+        let mut manager = state
+            .session_manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+        let _ = manager.remove_session(&removed_session_id);
+        if *selected_session == Some(removed_session_id) {
+            *selected_session = None;
+            persist_selected_session(state, client_id, None)?;
+        }
+        if *attached_stream_session == Some(removed_session_id) {
+            *attached_stream_session = None;
+        }
+        drop(manager);
+
+        let mut attach_tokens = state
+            .attach_tokens
+            .lock()
+            .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
+        attach_tokens.remove_for_session(removed_session_id);
+        drop(attach_tokens);
+
+        clear_selected_session_for_all(state, removed_session_id)?;
+
+        let mut permission_state = state
+            .permission_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
+        permission_state.remove_session(removed_session_id);
+        drop(permission_state);
+
+        emit_event(
+            state,
+            Event::SessionRemoved {
+                id: removed_session_id.0,
+            },
+        )?;
     } else {
-        emit_attach_view_changed_for_pane_close(state, session_id, false, false)?;
+        emit_attach_view_changed_for_pane_close(state, session_id, false)?;
     }
 
     Ok(())
@@ -3545,7 +3365,7 @@ async fn reap_exited_pane(
     session_id: SessionId,
     pane_id: Uuid,
 ) -> Result<()> {
-    let removed_window = {
+    let removed_session = {
         let mut runtime_manager = state
             .session_runtimes
             .lock()
@@ -3557,78 +3377,54 @@ async fn reap_exited_pane(
             return Ok(());
         }
         match runtime_manager.close_pane(session_id, Some(PaneSelector::ById(pane_id))) {
-            Ok((_, removed_window)) => removed_window,
+            Ok((_, removed_session)) => removed_session,
             Err(_) => None,
         }
     };
 
-    if let Some(removed_window) = removed_window {
-        let removed_window_session_id = removed_window.session_id;
-        let removed_window_id = removed_window.window_id;
-        let removed_window_handle = removed_window.handle;
-        let session_removed = removed_window.session_removed;
-        shutdown_window_handle(removed_window_handle).await;
-
-        {
-            let mut manager = state
-                .session_manager
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            let _ = manager.get_session_mut(&removed_window_session_id);
-        }
-        emit_event(
-            state,
-            Event::WindowRemoved {
-                id: removed_window_id.0,
-                session_id: removed_window_session_id.0,
-            },
-        )?;
-
-        if let Some(removed_session) = session_removed {
-            if removed_session.had_attached_clients {
-                emit_event(
-                    state,
-                    Event::ClientDetached {
-                        id: removed_window_session_id.0,
-                    },
-                )?;
-            }
-            shutdown_runtime_handle(removed_session).await;
-
-            let mut manager = state
-                .session_manager
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            let _ = manager.remove_session(&removed_window_session_id);
-            drop(manager);
-
-            let mut attach_tokens = state
-                .attach_tokens
-                .lock()
-                .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
-            attach_tokens.remove_for_session(removed_window_session_id);
-            drop(attach_tokens);
-
-            clear_selected_session_for_all(state, removed_window_session_id)?;
-
-            let mut permission_state = state
-                .permission_state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-            permission_state.remove_session(removed_window_session_id);
-            drop(permission_state);
-
+    if let Some(removed_session) = removed_session {
+        let removed_session_id = removed_session.session_id;
+        if removed_session.had_attached_clients {
             emit_event(
                 state,
-                Event::SessionRemoved {
-                    id: removed_window_session_id.0,
+                Event::ClientDetached {
+                    id: removed_session_id.0,
                 },
             )?;
-        } else {
-            emit_attach_view_changed_for_pane_close(state, removed_window_session_id, true, false)?;
         }
+        shutdown_runtime_handle(removed_session).await;
+
+        let mut manager = state
+            .session_manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+        let _ = manager.remove_session(&removed_session_id);
+        drop(manager);
+
+        let mut attach_tokens = state
+            .attach_tokens
+            .lock()
+            .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
+        attach_tokens.remove_for_session(removed_session_id);
+        drop(attach_tokens);
+
+        clear_selected_session_for_all(state, removed_session_id)?;
+
+        let mut permission_state = state
+            .permission_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
+        permission_state.remove_session(removed_session_id);
+        drop(permission_state);
+
+        emit_event(
+            state,
+            Event::SessionRemoved {
+                id: removed_session_id.0,
+            },
+        )?;
     } else {
-        emit_attach_view_changed_for_pane_close(state, session_id, false, false)?;
+        emit_attach_view_changed_for_pane_close(state, session_id, false)?;
     }
 
     Ok(())
@@ -3760,9 +3556,9 @@ async fn handle_request(
                 Ok(snapshot) => Response::Ok(ResponsePayload::ServerSnapshotRestoreDryRun {
                     ok: true,
                     message: format!(
-                        "snapshot is valid (sessions={}, roles={}, follows={}, selected={})",
+                        "snapshot is valid (sessions={}, owners={}, follows={}, selected={})",
                         snapshot.sessions.len(),
-                        snapshot.roles.len(),
+                        snapshot.owner_principals.len(),
                         snapshot.follows.len(),
                         snapshot.selected_sessions.len()
                     ),
@@ -3812,8 +3608,6 @@ async fn handle_request(
 
             Response::Ok(ResponsePayload::ServerSnapshotRestored {
                 sessions: summary.sessions,
-                windows: summary.windows,
-                roles: summary.roles,
                 follows: summary.follows,
                 selected_sessions: summary.selected_sessions,
             })
@@ -3996,16 +3790,11 @@ async fn handle_request(
                     }));
                 }
             };
-            let window_id = runtime_manager
-                .runtimes
-                .get(&session_id)
-                .map_or(WindowId(Uuid::nil()), |runtime| runtime.active_window);
             drop(runtime_manager);
             emit_attach_view_changed_for_layout(state, session_id)?;
             Response::Ok(ResponsePayload::PaneSplit {
                 id: pane_id,
                 session_id: session_id.0,
-                window_id: window_id.0,
             })
         }
         Request::FocusPane {
@@ -4052,16 +3841,11 @@ async fn handle_request(
                     }));
                 }
             };
-            let window_id = runtime_manager
-                .runtimes
-                .get(&session_id)
-                .map_or(WindowId(Uuid::nil()), |runtime| runtime.active_window);
             drop(runtime_manager);
             emit_attach_view_changed_for_layout(state, session_id)?;
             Response::Ok(ResponsePayload::PaneFocused {
                 id: pane_id,
                 session_id: session_id.0,
-                window_id: window_id.0,
             })
         }
         Request::ResizePane {
@@ -4094,15 +3878,10 @@ async fn handle_request(
                     message: format!("failed resizing pane: {error:#}"),
                 }));
             }
-            let window_id = runtime_manager
-                .runtimes
-                .get(&session_id)
-                .map_or(WindowId(Uuid::nil()), |runtime| runtime.active_window);
             drop(runtime_manager);
             emit_attach_view_changed_for_layout(state, session_id)?;
             Response::Ok(ResponsePayload::PaneResized {
                 session_id: session_id.0,
-                window_id: window_id.0,
             })
         }
         Request::ClosePane { session, target } => {
@@ -4122,107 +3901,73 @@ async fn handle_request(
                 return Ok(Response::Err(response));
             }
 
-            let (closed_pane_id, active_window_id, removed_window) = {
+            let (closed_pane_id, removed_session) = {
                 let mut runtime_manager = state
                     .session_runtimes
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                let active_window_id = runtime_manager
-                    .runtimes
-                    .get(&session_id)
-                    .map(|runtime| runtime.active_window)
-                    .ok_or_else(|| anyhow::anyhow!("runtime not found"))?;
-                let (closed_pane_id, removed_window) = runtime_manager
+                let (closed_pane_id, removed_session) = runtime_manager
                     .close_pane(session_id, target)
                     .map_err(|error| anyhow::anyhow!("failed closing pane: {error:#}"))?;
-                (closed_pane_id, active_window_id, removed_window)
+                (closed_pane_id, removed_session)
             };
 
-            let mut window_closed = false;
             let mut session_closed = false;
-            if let Some(removed_window) = removed_window {
-                window_closed = true;
-                let removed_window_session_id = removed_window.session_id;
-                let removed_window_id = removed_window.window_id;
-                let removed_window_handle = removed_window.handle;
-                let session_removed = removed_window.session_removed;
-                shutdown_window_handle(removed_window_handle).await;
-                {
-                    let mut manager = state
-                        .session_manager
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                    let _ = manager.get_session_mut(&removed_window_session_id);
-                }
-                emit_event(
-                    state,
-                    Event::WindowRemoved {
-                        id: removed_window_id.0,
-                        session_id: removed_window_session_id.0,
-                    },
-                )?;
-                if let Some(removed_session) = session_removed {
-                    session_closed = true;
-                    if removed_session.had_attached_clients {
-                        emit_event(
-                            state,
-                            Event::ClientDetached {
-                                id: removed_window_session_id.0,
-                            },
-                        )?;
-                    }
-                    shutdown_runtime_handle(removed_session).await;
-                    let mut manager = state
-                        .session_manager
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                    let _ = manager.remove_session(&removed_window_session_id);
-                    if *selected_session == Some(removed_window_session_id) {
-                        *selected_session = None;
-                        persist_selected_session(state, client_id, None)?;
-                    }
-                    if *attached_stream_session == Some(removed_window_session_id) {
-                        *attached_stream_session = None;
-                    }
-                    drop(manager);
-
-                    let mut attach_tokens = state
-                        .attach_tokens
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
-                    attach_tokens.remove_for_session(removed_window_session_id);
-                    drop(attach_tokens);
-
-                    clear_selected_session_for_all(state, removed_window_session_id)?;
-
-                    let mut permission_state = state
-                        .permission_state
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-                    permission_state.remove_session(removed_window_session_id);
-                    drop(permission_state);
-
+            if let Some(removed_session) = removed_session {
+                session_closed = true;
+                let removed_session_id = removed_session.session_id;
+                if removed_session.had_attached_clients {
                     emit_event(
                         state,
-                        Event::SessionRemoved {
-                            id: removed_window_session_id.0,
+                        Event::ClientDetached {
+                            id: removed_session_id.0,
                         },
                     )?;
                 }
+                shutdown_runtime_handle(removed_session).await;
+                let mut manager = state
+                    .session_manager
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                let _ = manager.remove_session(&removed_session_id);
+                if *selected_session == Some(removed_session_id) {
+                    *selected_session = None;
+                    persist_selected_session(state, client_id, None)?;
+                }
+                if *attached_stream_session == Some(removed_session_id) {
+                    *attached_stream_session = None;
+                }
+                drop(manager);
+
+                let mut attach_tokens = state
+                    .attach_tokens
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
+                attach_tokens.remove_for_session(removed_session_id);
+                drop(attach_tokens);
+
+                clear_selected_session_for_all(state, removed_session_id)?;
+
+                let mut permission_state = state
+                    .permission_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
+                permission_state.remove_session(removed_session_id);
+                drop(permission_state);
+
+                emit_event(
+                    state,
+                    Event::SessionRemoved {
+                        id: removed_session_id.0,
+                    },
+                )?;
             }
 
-            emit_attach_view_changed_for_pane_close(
-                state,
-                session_id,
-                window_closed,
-                session_closed,
-            )?;
+            emit_attach_view_changed_for_pane_close(state, session_id, session_closed)?;
 
             Response::Ok(ResponsePayload::PaneClosed {
                 id: closed_pane_id,
                 session_id: session_id.0,
-                window_id: active_window_id.0,
-                window_closed,
                 session_closed,
             })
         }
@@ -4237,7 +3982,6 @@ async fn handle_request(
                 .map(|session| SessionSummary {
                     id: session.id.0,
                     name: session.name,
-                    window_count: session.window_count,
                     client_count: session.client_count,
                 })
                 .collect::<Vec<_>>();
@@ -4248,32 +3992,7 @@ async fn handle_request(
                 .follow_state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
-            let client_principals = state
-                .client_principals
-                .lock()
-                .map_err(|_| anyhow::anyhow!("client principal map lock poisoned"))?;
-            let permission_state = state
-                .permission_state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-            let clients = follow_state
-                .list_clients()
-                .into_iter()
-                .map(|mut client| {
-                    client.session_role = client.selected_session_id.map(|session_id| {
-                        let principal_id = client_principals
-                            .get(&ClientId(client.id))
-                            .copied()
-                            .unwrap_or(Uuid::nil());
-                        permission_state.role_for(
-                            SessionId(session_id),
-                            ClientId(client.id),
-                            principal_id,
-                        )
-                    });
-                    client
-                })
-                .collect::<Vec<_>>();
+            let clients = follow_state.list_clients();
             Response::Ok(ResponsePayload::ClientList { clients })
         }
         Request::KillSession {
@@ -4586,20 +4305,6 @@ async fn handle_request(
                     message: format!("session runtime not found: {}", session_id.0),
                 }));
             }
-            let role = {
-                let permission_state = state
-                    .permission_state
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-                permission_state.role_for(session_id, client_id, client_principal_id)
-            };
-            if role == SessionRole::Observer {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::InvalidRequest,
-                    message: "attach input denied: observer role is read-only".to_string(),
-                }));
-            }
-
             let write_result = {
                 let mut runtime_manager = state
                     .session_runtimes
@@ -4774,7 +4479,6 @@ async fn handle_request(
             match state_snapshot {
                 Ok(snapshot) => Response::Ok(ResponsePayload::AttachLayout {
                     session_id: session_id.0,
-                    window_id: snapshot.window_id.0,
                     focused_pane_id: snapshot.focused_pane_id,
                     panes: snapshot.panes,
                     layout_root: snapshot.layout_root,
@@ -4827,7 +4531,6 @@ async fn handle_request(
             match snapshot {
                 Ok(snapshot) => Response::Ok(ResponsePayload::AttachSnapshot {
                     session_id: snapshot.session_id.0,
-                    window_id: snapshot.window_id.0,
                     focused_pane_id: snapshot.focused_pane_id,
                     panes: snapshot.panes,
                     layout_root: snapshot.layout_root,

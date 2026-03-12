@@ -32,7 +32,6 @@ pub struct AttachOpenInfo {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachLayoutState {
     pub session_id: Uuid,
-    pub window_id: Uuid,
     pub focused_pane_id: Uuid,
     pub panes: Vec<PaneSummary>,
     pub layout_root: PaneLayoutNode,
@@ -42,7 +41,6 @@ pub struct AttachLayoutState {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachSnapshotState {
     pub session_id: Uuid,
-    pub window_id: Uuid,
     pub focused_pane_id: Uuid,
     pub panes: Vec<PaneSummary>,
     pub layout_root: PaneLayoutNode,
@@ -71,8 +69,6 @@ pub struct PrincipalIdentityInfo {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ServerRestoreSummary {
     pub sessions: usize,
-    pub windows: usize,
-    pub roles: usize,
     pub follows: usize,
     pub selected_sessions: usize,
 }
@@ -386,14 +382,10 @@ impl BmuxClient {
         match self.request(Request::ServerRestoreApply).await? {
             ResponsePayload::ServerSnapshotRestored {
                 sessions,
-                windows,
-                roles,
                 follows,
                 selected_sessions,
             } => Ok(ServerRestoreSummary {
                 sessions,
-                windows,
-                roles,
                 follows,
                 selected_sessions,
             }),
@@ -803,14 +795,12 @@ impl BmuxClient {
         match self.request(Request::AttachLayout { session_id }).await? {
             ResponsePayload::AttachLayout {
                 session_id,
-                window_id,
                 focused_pane_id,
                 panes,
                 layout_root,
                 scene,
             } => Ok(AttachLayoutState {
                 session_id,
-                window_id,
                 focused_pane_id,
                 panes,
                 layout_root,
@@ -857,7 +847,6 @@ impl BmuxClient {
         {
             ResponsePayload::AttachSnapshot {
                 session_id,
-                window_id,
                 focused_pane_id,
                 panes,
                 layout_root,
@@ -865,7 +854,6 @@ impl BmuxClient {
                 chunks,
             } => Ok(AttachSnapshotState {
                 session_id,
-                window_id,
                 focused_pane_id,
                 panes,
                 layout_root,
