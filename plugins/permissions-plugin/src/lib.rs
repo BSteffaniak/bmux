@@ -1152,4 +1152,61 @@ mod tests {
             .expect("expected unsupported operation error");
         assert_eq!(error.code, "unsupported_service_operation");
     }
+
+    #[test]
+    fn invoke_service_policy_denies_unknown_action() {
+        let mut plugin = PermissionsPlugin;
+        let data_dir = service_test_data_dir();
+        let client_id = Uuid::new_v4();
+
+        let grant_context = service_test_context(
+            "permission-command/v1",
+            "grant",
+            encode_service_message(&GrantRequest {
+                session: "alpha".to_string(),
+                client: client_id.to_string(),
+                role: "observer".to_string(),
+            })
+            .expect("grant request should encode"),
+            "bmux.permissions.write",
+            ServiceKind::Command,
+            &data_dir,
+        );
+        let grant = plugin.invoke_service(grant_context);
+        assert!(
+            grant.error.is_none(),
+            "unexpected grant error: {:?}",
+            grant.error
+        );
+
+        let context = service_test_context(
+            "session-policy-query/v1",
+            "check",
+            encode_service_message(&SessionPolicyCheckRequest {
+                session_id: service_test_session_id(),
+                client_id,
+                principal_id: Uuid::new_v4(),
+                action: "unknown-action".to_string(),
+            })
+            .expect("policy request should encode"),
+            "bmux.sessions.policy",
+            ServiceKind::Query,
+            &data_dir,
+        );
+
+        let response = plugin.invoke_service(context);
+        assert!(
+            response.error.is_none(),
+            "unexpected policy error: {:?}",
+            response.error
+        );
+        let decision: SessionPolicyCheckResponse =
+            decode_service_message(&response.payload).expect("policy response should decode");
+        assert!(!decision.allowed);
+        assert!(
+            decision
+                .reason
+                .is_some_and(|reason| reason.contains("invalid session policy action"))
+        );
+    }
 }

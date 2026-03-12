@@ -1162,4 +1162,22 @@ mod tests {
         assert_eq!(error.code, "kill_failed");
         assert!(error.message.contains("session policy denied"));
     }
+
+    #[test]
+    fn invoke_service_rejects_unsupported_operation() {
+        let mut plugin = WindowsPlugin;
+        let context = service_test_context(
+            "window-command/v1",
+            "unknown",
+            Vec::new(),
+            "bmux.windows.write",
+            ServiceKind::Command,
+        );
+
+        let response = plugin.invoke_service(context);
+        let error = response
+            .error
+            .expect("expected unsupported operation error");
+        assert_eq!(error.code, "unsupported_service_operation");
+    }
 }
