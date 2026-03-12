@@ -262,30 +262,6 @@ impl SnapshotManager {
             .ok_or_else(|| SnapshotError::Validation("snapshot missing version".to_string()))?;
 
         match version as u32 {
-            SNAPSHOT_VERSION_V1 => {
-                let envelope: SnapshotEnvelopeV1 = serde_json::from_value(value)?;
-                let expected_checksum =
-                    snapshot_checksum_v1(&envelope.snapshot).map_err(SnapshotError::Encode)?;
-                if expected_checksum != envelope.checksum {
-                    return Err(SnapshotError::Validation(
-                        "snapshot checksum mismatch".to_string(),
-                    ));
-                }
-                validate_snapshot_v1(&envelope.snapshot)?;
-                Ok(upgrade_snapshot_v2(upgrade_snapshot_v1(envelope.snapshot)))
-            }
-            SNAPSHOT_VERSION_V2 => {
-                let envelope: SnapshotEnvelopeV2 = serde_json::from_value(value)?;
-                let expected_checksum =
-                    snapshot_checksum(&envelope.snapshot).map_err(SnapshotError::Encode)?;
-                if expected_checksum != envelope.checksum {
-                    return Err(SnapshotError::Validation(
-                        "snapshot checksum mismatch".to_string(),
-                    ));
-                }
-                validate_snapshot(&envelope.snapshot)?;
-                Ok(upgrade_snapshot_v2(envelope.snapshot))
-            }
             SNAPSHOT_VERSION_V3 => {
                 let envelope: SnapshotEnvelopeV3 = serde_json::from_value(value)?;
                 let expected_checksum =
@@ -946,7 +922,7 @@ mod tests {
     }
 
     #[test]
-    fn decode_v1_upgrades_window_to_single_pane_with_stable_ids() {
+    fn decode_v1_is_rejected_after_hard_cut() {
         let session_id = Uuid::new_v4();
         let window_id = Uuid::new_v4();
         let legacy_snapshot = super::SnapshotV1 {
@@ -971,13 +947,7 @@ mod tests {
         });
 
         let bytes = serde_json::to_vec(&payload).expect("json should encode");
-        let decoded = SnapshotManager::decode_snapshot(&bytes).expect("legacy snapshot decodes");
-        assert_eq!(decoded.sessions.len(), 1);
-        assert_eq!(decoded.sessions[0].windows.len(), 1);
-        let window = &decoded.sessions[0].windows[0];
-        assert_eq!(window.id, window_id);
-        assert_eq!(window.panes.len(), 1);
-        assert_eq!(window.panes[0].id, window_id);
-        assert_eq!(window.focused_pane_id, Some(window_id));
+        let error = SnapshotManager::decode_snapshot(&bytes).expect_err("legacy snapshot rejected");
+        assert!(matches!(error, SnapshotError::UnsupportedVersion(1)));
     }
 }

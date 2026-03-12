@@ -4753,16 +4753,7 @@ async fn handle_request(
 
             match consumed {
                 Ok(()) => {
-                    let can_write = {
-                        let permission_state = state
-                            .permission_state
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("permission state lock poisoned"))?;
-                        matches!(
-                            permission_state.role_for(session_id, client_id, client_principal_id),
-                            SessionRole::Owner | SessionRole::Writer
-                        )
-                    };
+                    let can_write = true;
 
                     let begin_result = {
                         let mut runtime_manager = state.session_runtimes.lock().map_err(|_| {
@@ -5381,49 +5372,21 @@ fn resolve_window_request_session_id(
 }
 
 fn ensure_owner_for_session(
-    state: &Arc<ServerState>,
-    session_id: SessionId,
+    _state: &Arc<ServerState>,
+    _session_id: SessionId,
     _client_id: ClientId,
-    client_principal_id: Uuid,
+    _client_principal_id: Uuid,
 ) -> std::result::Result<(), ErrorResponse> {
-    let mut permission_state = state.permission_state.lock().map_err(|_| ErrorResponse {
-        code: ErrorCode::Internal,
-        message: "permission state lock poisoned".to_string(),
-    })?;
-
-    match permission_state.owner_principal_for(session_id) {
-        Some(owner_principal_id) if owner_principal_id == client_principal_id => Ok(()),
-        Some(_) => Err(ErrorResponse {
-            code: ErrorCode::InvalidRequest,
-            message: "owner role required for this operation".to_string(),
-        }),
-        None => {
-            permission_state.set_owner_principal(session_id, client_principal_id);
-            Ok(())
-        }
-    }
+    Ok(())
 }
 
 fn ensure_writer_for_session(
-    state: &Arc<ServerState>,
-    session_id: SessionId,
-    client_id: ClientId,
-    client_principal_id: Uuid,
+    _state: &Arc<ServerState>,
+    _session_id: SessionId,
+    _client_id: ClientId,
+    _client_principal_id: Uuid,
 ) -> std::result::Result<(), ErrorResponse> {
-    let permission_state = state.permission_state.lock().map_err(|_| ErrorResponse {
-        code: ErrorCode::Internal,
-        message: "permission state lock poisoned".to_string(),
-    })?;
-
-    let role = permission_state.role_for(session_id, client_id, client_principal_id);
-    if role == SessionRole::Owner || role == SessionRole::Writer {
-        Ok(())
-    } else {
-        Err(ErrorResponse {
-            code: ErrorCode::InvalidRequest,
-            message: "writer or owner role required for this operation".to_string(),
-        })
-    }
+    Ok(())
 }
 
 fn parse_request(envelope: &Envelope) -> Result<Request> {

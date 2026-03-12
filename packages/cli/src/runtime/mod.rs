@@ -2096,7 +2096,7 @@ fn classify_destructive_op_error(error: &ClientError) -> DestructiveOpErrorKind 
 fn format_destructive_op_error(noun: &str, error: ClientError, force_local: bool) -> String {
     match classify_destructive_op_error(&error) {
         DestructiveOpErrorKind::OwnerRoleRequired => format!(
-            "{noun} kill requires the session owner role. Inspect roles with `bmux session permissions <session>`.{}",
+            "{noun} kill is not permitted by current session policy.{}",
             if force_local {
                 " If you intended to override locally, use `--force-local` only from the server owner principal."
             } else {
@@ -2160,9 +2160,7 @@ async fn print_bulk_kill_preflight(
         "kill-all {noun}: principal {} (server owner: {})",
         identity.principal_id, identity.server_owner_principal_id
     );
-    println!(
-        "note: non-owned {noun} may fail; inspect roles with `bmux session permissions <session>`"
-    );
+    println!("note: {noun} operations may fail depending on active session policy provider");
     Ok(Some(identity))
 }
 
@@ -2176,7 +2174,7 @@ fn print_bulk_kill_failure_summary(noun: &str, summary: KillFailureSummary) {
     );
     if summary.permission_denied > 0 {
         println!(
-            "hint: inspect roles with `bmux session permissions <session>` or identity with `bmux server whoami-principal`"
+            "hint: inspect active policy provider configuration or identity with `bmux server whoami-principal`"
         );
     }
 }
@@ -6310,8 +6308,7 @@ mod tests {
             false,
         );
 
-        assert!(message.contains("requires the session owner role"));
-        assert!(message.contains("bmux session permissions <session>"));
+        assert!(message.contains("not permitted by current session policy"));
     }
 
     #[test]
