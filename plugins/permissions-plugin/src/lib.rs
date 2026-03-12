@@ -1043,4 +1043,75 @@ mod tests {
         assert_eq!(error.code, "grant_failed");
         assert!(error.message.contains("invalid role"));
     }
+
+    #[test]
+    fn invoke_service_rejects_invalid_grant_payload() {
+        let mut plugin = PermissionsPlugin;
+        let data_dir = service_test_data_dir();
+        let context = service_test_context(
+            "permission-command/v1",
+            "grant",
+            vec![1, 2, 3],
+            "bmux.permissions.write",
+            ServiceKind::Command,
+            &data_dir,
+        );
+
+        let response = plugin.invoke_service(context);
+        let error = response.error.expect("expected invalid request error");
+        assert_eq!(error.code, "invalid_request");
+    }
+
+    #[test]
+    fn invoke_service_list_reports_missing_session() {
+        let mut plugin = PermissionsPlugin;
+        let data_dir = service_test_data_dir();
+        let context = service_test_context(
+            "permission-query/v1",
+            "list",
+            encode_service_message(&ListPermissionsRequest {
+                session: "missing-session".to_string(),
+            })
+            .expect("list request should encode"),
+            "bmux.permissions.read",
+            ServiceKind::Query,
+            &data_dir,
+        );
+
+        let response = plugin.invoke_service(context);
+        let error = response.error.expect("expected list failure");
+        assert_eq!(error.code, "list_failed");
+        assert!(error.message.contains("not found"));
+    }
+
+    #[test]
+    fn invoke_service_policy_defaults_to_allow_without_entry() {
+        let mut plugin = PermissionsPlugin;
+        let data_dir = service_test_data_dir();
+        let context = service_test_context(
+            "session-policy-query/v1",
+            "check",
+            encode_service_message(&SessionPolicyCheckRequest {
+                session_id: service_test_session_id(),
+                client_id: Uuid::new_v4(),
+                principal_id: Uuid::new_v4(),
+                action: "mutation".to_string(),
+            })
+            .expect("policy request should encode"),
+            "bmux.sessions.policy",
+            ServiceKind::Query,
+            &data_dir,
+        );
+
+        let response = plugin.invoke_service(context);
+        assert!(
+            response.error.is_none(),
+            "unexpected policy error: {:?}",
+            response.error
+        );
+        let decision: SessionPolicyCheckResponse =
+            decode_service_message(&response.payload).expect("policy response should decode");
+        assert!(decision.allowed);
+        assert!(decision.reason.is_none());
+    }
 }
