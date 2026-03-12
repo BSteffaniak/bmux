@@ -26,7 +26,7 @@ use bmux_plugin::{
 use bmux_server::BmuxServer;
 use clap::{CommandFactory, FromArgMatches};
 use crossterm::cursor::{MoveTo, SavePosition, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use crossterm::queue;
 use crossterm::style::Print;
 use crossterm::terminal;
@@ -3107,14 +3107,6 @@ fn focused_attach_pane_inner_size(view_state: &AttachViewState) -> Option<(usize
         })
 }
 
-async fn switch_attach_window_relative(
-    _client: &mut BmuxClient,
-    _session_id: Uuid,
-    _step: isize,
-) -> std::result::Result<(), ClientError> {
-    Ok(())
-}
-
 async fn switch_attach_session_relative(
     client: &mut BmuxClient,
     view_state: &mut AttachViewState,
@@ -3156,25 +3148,6 @@ fn relative_session_id(
     sessions
         .get(target_index as usize)
         .map(|session| session.id)
-}
-
-async fn switch_attach_window_number(
-    _client: &mut BmuxClient,
-    _session_id: Uuid,
-    _target_number: u32,
-) -> std::result::Result<(), ClientError> {
-    Ok(())
-}
-
-fn window_has_default_title(number: u32, name: &str) -> bool {
-    name == format!("window-{number}")
-}
-
-fn window_display_label(number: u32, name: Option<&str>) -> String {
-    match name {
-        Some(name) if !window_has_default_title(number, name) => format!("{number}:{name}"),
-        _ => number.to_string(),
-    }
 }
 
 async fn build_attach_status_line_for_draw(
@@ -4543,54 +4516,6 @@ const fn is_attach_stream_closed_error(error: &ClientError) -> bool {
             ..
         }
     )
-}
-
-fn attach_key_event_to_bytes(key: &KeyEvent) -> Option<Vec<u8>> {
-    let modifiers = key.modifiers;
-    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
-    let alt = modifiers.contains(KeyModifiers::ALT);
-
-    let mut out = Vec::new();
-    if alt {
-        out.push(0x1b);
-    }
-
-    match key.code {
-        KeyCode::Char(c) => {
-            if ctrl {
-                let lower = c.to_ascii_lowercase();
-                if lower.is_ascii_lowercase() {
-                    out.push((lower as u8 - b'a') + 1);
-                    return Some(out);
-                }
-            }
-            if c.is_ascii() {
-                out.push(c as u8);
-            } else {
-                let mut buf = [0_u8; 4];
-                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-            }
-            Some(out)
-        }
-        KeyCode::Enter => {
-            out.push(b'\r');
-            Some(out)
-        }
-        KeyCode::Tab => {
-            out.push(b'\t');
-            Some(out)
-        }
-        KeyCode::Backspace => {
-            out.push(0x7f);
-            Some(out)
-        }
-        KeyCode::Esc => Some(vec![0x1b]),
-        KeyCode::Up => Some(vec![0x1b, b'[', b'A']),
-        KeyCode::Down => Some(vec![0x1b, b'[', b'B']),
-        KeyCode::Right => Some(vec![0x1b, b'[', b'C']),
-        KeyCode::Left => Some(vec![0x1b, b'[', b'D']),
-        _ => None,
-    }
 }
 
 fn map_attach_client_error(error: ClientError) -> anyhow::Error {

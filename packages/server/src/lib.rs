@@ -402,12 +402,6 @@ impl PermissionState {
         session_roles.insert(client_id, role);
     }
 
-    fn clear_to_observer(&mut self, session_id: SessionId, client_id: ClientId) {
-        if let Some(session_roles) = self.roles.get_mut(&session_id) {
-            session_roles.remove(&client_id);
-        }
-    }
-
     fn remove_session(&mut self, session_id: SessionId) {
         self.owner_principals.remove(&session_id);
         self.roles.remove(&session_id);
@@ -2956,31 +2950,6 @@ fn emit_attach_view_changed_for_layout(
     session_id: SessionId,
 ) -> Result<()> {
     emit_attach_view_changed(state, session_id, &[AttachViewComponent::Scene])
-}
-
-fn emit_attach_view_changed_for_window_tabs(
-    state: &Arc<ServerState>,
-    session_id: SessionId,
-) -> Result<()> {
-    emit_attach_view_changed(state, session_id, &[AttachViewComponent::Tabs])
-}
-
-fn emit_attach_view_changed_for_window_switch(
-    state: &Arc<ServerState>,
-    session_id: SessionId,
-) -> Result<()> {
-    emit_attach_view_changed(
-        state,
-        session_id,
-        &[AttachViewComponent::Scene, AttachViewComponent::Tabs],
-    )
-}
-
-fn emit_attach_view_changed_for_status(
-    state: &Arc<ServerState>,
-    session_id: SessionId,
-) -> Result<()> {
-    emit_attach_view_changed(state, session_id, &[AttachViewComponent::Status])
 }
 
 fn unsubscribe_events(state: &Arc<ServerState>, client_id: ClientId) -> Result<()> {
