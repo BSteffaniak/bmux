@@ -13,7 +13,7 @@ pub use bmux_event_models as models;
 // Re-export commonly used types
 pub use models::{
     ClientEvent, Event, InputEvent, KeyCode, KeyEvent, KeyModifiers, Mode, MouseEvent, PaneEvent,
-    SessionEvent, SystemEvent, WindowEvent,
+    SessionEvent, SystemEvent,
 };
 
 use anyhow::Result;

@@ -3,8 +3,8 @@
 #![allow(clippy::multiple_crate_versions)]
 #![allow(clippy::cargo_common_metadata)] // Internal packages don't need README metadata
 
-use bmux_session_models::{ClientId, PaneId, SessionId, WindowId};
-use bmux_terminal_models::{PaneSize, SplitDirection};
+use bmux_session_models::{ClientId, PaneId, SessionId};
+use bmux_terminal_models::PaneSize;
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 
@@ -194,64 +194,10 @@ pub enum SessionEvent {
         session_id: SessionId,
         client_id: ClientId,
     },
-    WindowAdded {
-        session_id: SessionId,
-        window_id: WindowId,
-    },
-    WindowRemoved {
-        session_id: SessionId,
-        window_id: WindowId,
-    },
-    ActiveWindowChanged {
-        session_id: SessionId,
-        window_id: Option<WindowId>,
-    },
     Renamed {
         session_id: SessionId,
         old_name: Option<String>,
         new_name: Option<String>,
-    },
-}
-
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
-pub enum WindowEvent {
-    Created {
-        window_id: WindowId,
-        name: Option<String>,
-        size: PaneSize,
-    },
-    Destroyed {
-        window_id: WindowId,
-    },
-    Renamed {
-        window_id: WindowId,
-        old_name: Option<String>,
-        new_name: Option<String>,
-    },
-    Resized {
-        window_id: WindowId,
-        old_size: PaneSize,
-        new_size: PaneSize,
-    },
-    PaneAdded {
-        window_id: WindowId,
-        pane_id: PaneId,
-    },
-    PaneRemoved {
-        window_id: WindowId,
-        pane_id: PaneId,
-    },
-    ActivePaneChanged {
-        window_id: WindowId,
-        pane_id: Option<PaneId>,
-    },
-    PaneSplit {
-        window_id: WindowId,
-        original_pane: PaneId,
-        new_pane: PaneId,
-        direction: SplitDirection,
     },
 }
 
@@ -329,7 +275,6 @@ pub enum ClientEvent {
     ViewChanged {
         client_id: ClientId,
         session_id: SessionId,
-        window_id: WindowId,
         pane_id: PaneId,
     },
 }
@@ -378,7 +323,6 @@ pub enum SystemEvent {
 
 pub enum Event {
     Session(SessionEvent),
-    Window(WindowEvent),
     Pane(PaneEvent),
     Client(ClientEvent),
     Input(InputEvent),
@@ -390,16 +334,6 @@ impl Event {
     #[must_use]
     pub const fn session_created(session_id: SessionId, name: Option<String>) -> Self {
         Self::Session(SessionEvent::Created { session_id, name })
-    }
-
-    /// Create a window created event
-    #[must_use]
-    pub const fn window_created(window_id: WindowId, name: Option<String>, size: PaneSize) -> Self {
-        Self::Window(WindowEvent::Created {
-            window_id,
-            name,
-            size,
-        })
     }
 
     /// Create a pane created event

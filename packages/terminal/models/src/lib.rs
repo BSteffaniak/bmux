@@ -2,7 +2,7 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use bmux_session_models::{PaneId, WindowId};
+use bmux_session_models::{LayoutError, PaneId};
 #[cfg(feature = "serde")]
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -206,8 +206,8 @@ impl Pane {
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
-pub struct Window {
-    pub id: WindowId,
+pub struct PaneGroup {
+    pub id: PaneId,
     pub name: Option<String>,
     pub panes: BTreeMap<PaneId, Pane>,
     pub layout: PaneLayout,
@@ -217,12 +217,12 @@ pub struct Window {
     pub last_activity: std::time::SystemTime,
 }
 
-impl Window {
+impl PaneGroup {
     #[must_use]
     pub fn new(size: PaneSize, name: Option<String>) -> Self {
         let now = std::time::SystemTime::now();
-        let mut window = Self {
-            id: WindowId::new(),
+        let mut pane_group = Self {
+            id: PaneId::new(),
             name,
             panes: BTreeMap::new(),
             layout: PaneLayout::Single(PaneId::new()), // Temporary, will be replaced
@@ -235,11 +235,11 @@ impl Window {
         // Create initial pane
         let pane = Pane::new(size);
         let pane_id = pane.id;
-        window.panes.insert(pane_id, pane);
-        window.layout = PaneLayout::Single(pane_id);
-        window.active_pane = Some(pane_id);
+        pane_group.panes.insert(pane_id, pane);
+        pane_group.layout = PaneLayout::Single(pane_id);
+        pane_group.active_pane = Some(pane_id);
 
-        window
+        pane_group
     }
 
     #[must_use]
@@ -274,11 +274,11 @@ impl Window {
         pane
     }
 
-    /// Set the active pane in this window
+    /// Set the active pane in this pane group
     ///
     /// # Errors
     ///
-    /// * Pane not found in this window
+    /// * Pane not found in this pane group
     pub fn set_active_pane(
         &mut self,
         pane_id: PaneId,
@@ -308,16 +308,16 @@ impl Window {
     ///
     /// # Errors
     ///
-    /// * Pane not found in this window
+    /// * Pane not found in this pane group
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     pub fn split_pane(
         &mut self,
         pane_id: PaneId,
         direction: SplitDirection,
         ratio: f32,
-    ) -> Result<PaneId, bmux_session_models::WindowError> {
+    ) -> Result<PaneId, LayoutError> {
         if !self.panes.contains_key(&pane_id) {
-            return Err(bmux_session_models::WindowError::PaneNotFound(pane_id));
+            return Err(LayoutError::PaneNotFound(pane_id));
         }
 
         // Create new pane with appropriate size
@@ -358,15 +358,15 @@ impl Window {
         Ok(new_pane_id)
     }
 
-    /// Resize the window to a new size
+    /// Resize the pane group to a new size
     ///
     /// # Errors
     ///
-    /// * Invalid window dimensions (width or height is 0)
-    pub fn resize(&mut self, new_size: PaneSize) -> Result<(), bmux_session_models::WindowError> {
+    /// * Invalid pane group dimensions (width or height is 0)
+    pub fn resize(&mut self, new_size: PaneSize) -> Result<(), LayoutError> {
         if !new_size.is_valid() {
-            return Err(bmux_session_models::WindowError::InvalidLayout(format!(
-                "Invalid window size: {}x{}",
+            return Err(LayoutError::InvalidLayout(format!(
+                "Invalid pane group size: {}x{}",
                 new_size.width, new_size.height
             )));
         }
@@ -386,8 +386,8 @@ impl Window {
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
-pub struct WindowInfo {
-    pub id: WindowId,
+pub struct PaneGroupInfo {
+    pub id: PaneId,
     pub name: Option<String>,
     pub pane_count: usize,
     pub active_pane: Option<PaneId>,
@@ -396,8 +396,8 @@ pub struct WindowInfo {
     pub last_activity: std::time::SystemTime,
 }
 
-impl From<&Window> for WindowInfo {
-    fn from(window: &Window) -> Self {
+impl From<&PaneGroup> for PaneGroupInfo {
+    fn from(window: &PaneGroup) -> Self {
         Self {
             id: window.id,
             name: window.name.clone(),

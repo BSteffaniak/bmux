@@ -2,6 +2,41 @@
 
 This file defines REQUIRED validation steps for coding agents working in this repo.
 
+## Core Architecture Boundary (REQUIRED)
+
+BMUX core must remain domain-agnostic. Windows and permissions are plugin domains, not core architecture.
+
+### Hard Rules
+
+- Do not add or keep windows-domain or permissions-domain logic in core architecture layers.
+- Core architecture includes at least:
+  - `packages/server/**`
+  - `packages/client/**`
+  - `packages/ipc/**`
+  - `packages/session/**`
+  - `packages/terminal/**`
+  - `packages/event/**`
+- In core architecture, avoid domain-specific types/fields/events/APIs for windows or roles/permissions.
+- Domain behavior must be implemented through plugins and generic plugin/service invoke paths.
+- Core defaults when plugins are missing:
+  - Missing windows plugin: baseline single terminal attach/session/pane flow still works.
+  - Missing permissions plugin: permissive single-user behavior.
+
+### Plugin Power Expectations
+
+- Plugins are first-class and may implement critical product behavior.
+- Prefer extending generic plugin APIs/capabilities over adding core-special-case code.
+- If a feature seems domain-specific, place it in a plugin unless there is a strong, documented reason it must be core-agnostic runtime plumbing.
+
+### Review Gate Before Finishing (REQUIRED)
+
+For any non-doc code change, verify no forbidden domain leakage was introduced in core architecture:
+
+- Run content checks (or equivalent) to confirm no new core references to windows/permissions domain concepts.
+- If any are found, treat as blocking and refactor before finishing.
+
+These boundary rules are strict and take precedence over convenience.
+
 ## Core Rule
 
 If you change code, run the relevant tests before finishing and report exactly what you ran and whether it passed.

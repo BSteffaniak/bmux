@@ -12,8 +12,8 @@ pub use bmux_session_models as models;
 
 // Re-export commonly used types
 pub use models::{
-    ClientError, ClientId, ClientInfo, PaneError, PaneId, Session, SessionError, SessionId,
-    SessionInfo, WindowError, WindowId,
+    ClientError, ClientId, ClientInfo, LayoutError, PaneError, PaneId, Session, SessionError,
+    SessionId, SessionInfo,
 };
 
 use anyhow::Result;

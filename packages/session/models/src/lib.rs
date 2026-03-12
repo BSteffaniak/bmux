@@ -40,30 +40,6 @@ impl std::fmt::Display for SessionId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 
-pub struct WindowId(pub Uuid);
-
-impl WindowId {
-    #[must_use]
-    pub fn new() -> Self {
-        Self(Uuid::new_v4())
-    }
-}
-
-impl Default for WindowId {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl std::fmt::Display for WindowId {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub struct PaneId(pub Uuid);
 
 impl PaneId {
@@ -117,8 +93,6 @@ impl std::fmt::Display for ClientId {
 pub enum SessionError {
     #[error("Session not found: {0}")]
     NotFound(SessionId),
-    #[error("Window not found: {0}")]
-    WindowNotFound(WindowId),
     #[error("Client not found: {0}")]
     ClientNotFound(ClientId),
     #[error("Session already exists: {0}")]
@@ -130,13 +104,9 @@ pub enum SessionError {
 }
 
 #[derive(Error, Debug)]
-pub enum WindowError {
-    #[error("Window not found: {0}")]
-    NotFound(WindowId),
+pub enum LayoutError {
     #[error("Pane not found: {0}")]
     PaneNotFound(PaneId),
-    #[error("Window already exists: {0}")]
-    AlreadyExists(WindowId),
     #[error("Invalid layout configuration: {0}")]
     InvalidLayout(String),
     #[error("Cannot split pane: {reason}")]

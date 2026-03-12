@@ -11,7 +11,7 @@
 pub use bmux_terminal_models as models;
 
 // Re-export commonly used types
-pub use models::{Pane, PaneLayout, PaneSize, SplitDirection, Window, WindowInfo};
+pub use models::{Pane, PaneGroup, PaneGroupInfo, PaneLayout, PaneSize, SplitDirection};
 
 use anyhow::Result;
 use bmux_session::PaneId;
