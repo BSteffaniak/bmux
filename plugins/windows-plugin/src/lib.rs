@@ -112,16 +112,11 @@ impl RustPlugin for WindowsPlugin {
                             return ServiceResponse::error("invalid_request", error.to_string());
                         }
                     };
-                let response = match context
-                    .session_create(&SessionCreateRequest { name: request.name })
-                {
-                    Ok(response) => response,
-                    Err(error) => return ServiceResponse::error("new_failed", error.to_string()),
+                let ack = match create_window(&context, request.name) {
+                    Ok(ack) => ack,
+                    Err(error) => return ServiceResponse::error("new_failed", error),
                 };
-                let payload = match encode_service_message(&WindowCommandAck {
-                    ok: true,
-                    id: Some(response.id.to_string()),
-                }) {
+                let payload = match encode_service_message(&ack) {
                     Ok(payload) => payload,
                     Err(error) => {
                         return ServiceResponse::error("encode_failed", error.to_string());
@@ -143,17 +138,11 @@ impl RustPlugin for WindowsPlugin {
                         return ServiceResponse::error("invalid_request", error.to_string());
                     }
                 };
-                let response = match context.session_kill(&SessionKillRequest {
-                    selector,
-                    force_local: request.force_local,
-                }) {
-                    Ok(response) => response,
-                    Err(error) => return ServiceResponse::error("kill_failed", error.to_string()),
+                let ack = match kill_window(&context, selector, request.force_local) {
+                    Ok(ack) => ack,
+                    Err(error) => return ServiceResponse::error("kill_failed", error),
                 };
-                let payload = match encode_service_message(&WindowCommandAck {
-                    ok: true,
-                    id: Some(response.id.to_string()),
-                }) {
+                let payload = match encode_service_message(&ack) {
                     Ok(payload) => payload,
                     Err(error) => {
                         return ServiceResponse::error("encode_failed", error.to_string());
@@ -170,20 +159,11 @@ impl RustPlugin for WindowsPlugin {
                             return ServiceResponse::error("invalid_request", error.to_string());
                         }
                     };
-                let sessions = match context.session_list() {
-                    Ok(response) => response.sessions,
-                    Err(error) => return ServiceResponse::error("kill_failed", error.to_string()),
+                let ack = match kill_all_windows(&context, request.force_local) {
+                    Ok(ack) => ack,
+                    Err(error) => return ServiceResponse::error("kill_failed", error),
                 };
-                for session in sessions {
-                    if let Err(error) = context.session_kill(&SessionKillRequest {
-                        selector: SessionSelector::ById(session.id),
-                        force_local: request.force_local,
-                    }) {
-                        return ServiceResponse::error("kill_failed", error.to_string());
-                    }
-                }
-                let payload = match encode_service_message(&WindowCommandAck { ok: true, id: None })
-                {
+                let payload = match encode_service_message(&ack) {
                     Ok(payload) => payload,
                     Err(error) => {
                         return ServiceResponse::error("encode_failed", error.to_string());
@@ -192,8 +172,24 @@ impl RustPlugin for WindowsPlugin {
                 ServiceResponse::ok(payload)
             }
             ("window-command/v1", "switch") => {
-                let payload = match encode_service_message(&WindowCommandAck { ok: true, id: None })
-                {
+                let request =
+                    match decode_service_message::<SwitchWindowRequest>(&context.request.payload) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            return ServiceResponse::error("invalid_request", error.to_string());
+                        }
+                    };
+                let selector = match parse_selector(&request.target) {
+                    Ok(selector) => selector,
+                    Err(error) => {
+                        return ServiceResponse::error("invalid_request", error.to_string());
+                    }
+                };
+                let ack = match switch_window(&context, selector) {
+                    Ok(ack) => ack,
+                    Err(error) => return ServiceResponse::error("switch_failed", error),
+                };
+                let payload = match encode_service_message(&ack) {
                     Ok(payload) => payload,
                     Err(error) => {
                         return ServiceResponse::error("encode_failed", error.to_string());
@@ -336,6 +332,74 @@ fn list_windows(
         .collect())
 }
 
+fn create_window(
+    caller: &impl HostRuntimeApi,
+    name: Option<String>,
+) -> Result<WindowCommandAck, String> {
+    let response = caller
+        .session_create(&SessionCreateRequest { name })
+        .map_err(|error| error.to_string())?;
+    Ok(WindowCommandAck {
+        ok: true,
+        id: Some(response.id.to_string()),
+    })
+}
+
+fn kill_window(
+    caller: &impl HostRuntimeApi,
+    selector: SessionSelector,
+    force_local: bool,
+) -> Result<WindowCommandAck, String> {
+    let response = caller
+        .session_kill(&SessionKillRequest {
+            selector,
+            force_local,
+        })
+        .map_err(|error| error.to_string())?;
+    Ok(WindowCommandAck {
+        ok: true,
+        id: Some(response.id.to_string()),
+    })
+}
+
+fn kill_all_windows(
+    caller: &impl HostRuntimeApi,
+    force_local: bool,
+) -> Result<WindowCommandAck, String> {
+    let sessions = caller
+        .session_list()
+        .map_err(|error| error.to_string())?
+        .sessions;
+    for session in sessions {
+        caller
+            .session_kill(&SessionKillRequest {
+                selector: SessionSelector::ById(session.id),
+                force_local,
+            })
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(WindowCommandAck { ok: true, id: None })
+}
+
+fn switch_window(
+    caller: &impl HostRuntimeApi,
+    selector: SessionSelector,
+) -> Result<WindowCommandAck, String> {
+    let session_id = resolve_session_id(caller, selector)?;
+    let pane_response = caller
+        .pane_list(&PaneListRequest {
+            session: Some(SessionSelector::ById(session_id)),
+        })
+        .map_err(|error| error.to_string())?;
+    if pane_response.panes.is_empty() {
+        return Err("target window has no panes".to_string());
+    }
+    Ok(WindowCommandAck {
+        ok: true,
+        id: Some(session_id.to_string()),
+    })
+}
+
 fn resolve_session_id(
     caller: &impl HostRuntimeApi,
     selector: SessionSelector,
@@ -447,6 +511,11 @@ struct KillAllWindowsRequest {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SwitchWindowRequest {
+    target: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct WindowEntry {
     id: String,
     name: String,
@@ -470,18 +539,44 @@ bmux_plugin::export_plugin!(WindowsPlugin);
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bmux_plugin::{ServiceCaller, SessionListResponse, SessionSummary};
+    use bmux_plugin::{
+        PaneListResponse, PaneSummary, ServiceCaller, SessionListResponse, SessionSummary,
+    };
     use std::sync::Mutex;
 
     struct MockHost {
         sessions: Vec<SessionSummary>,
+        pane_count_by_session: std::collections::BTreeMap<Uuid, usize>,
+        creates: Mutex<Vec<Option<String>>>,
         kills: Mutex<Vec<SessionKillRequest>>,
     }
 
     impl MockHost {
         fn with_sessions(sessions: Vec<SessionSummary>) -> Self {
+            let pane_count_by_session = sessions
+                .iter()
+                .map(|session| (session.id, 1usize))
+                .collect::<std::collections::BTreeMap<_, _>>();
             Self {
                 sessions,
+                pane_count_by_session,
+                creates: Mutex::new(Vec::new()),
+                kills: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_empty_target_session(target_id: Uuid) -> Self {
+            let sessions = vec![SessionSummary {
+                id: target_id,
+                name: Some("target".to_string()),
+                client_count: 1,
+            }];
+            let mut pane_count_by_session = std::collections::BTreeMap::new();
+            pane_count_by_session.insert(target_id, 0);
+            Self {
+                sessions,
+                pane_count_by_session,
+                creates: Mutex::new(Vec::new()),
                 kills: Mutex::new(Vec::new()),
             }
         }
@@ -501,6 +596,18 @@ mod tests {
                     sessions: self.sessions.clone(),
                 })
                 .map_err(Into::into),
+                ("session-command/v1", "new") => {
+                    let request: SessionCreateRequest = decode_service_message(&payload)?;
+                    self.creates
+                        .lock()
+                        .expect("create log lock should succeed")
+                        .push(request.name.clone());
+                    encode_service_message(&bmux_plugin::SessionCreateResponse {
+                        id: Uuid::new_v4(),
+                        name: request.name,
+                    })
+                    .map_err(Into::into)
+                }
                 ("session-command/v1", "kill") => {
                     let request: SessionKillRequest = decode_service_message(&payload)?;
                     self.kills
@@ -514,6 +621,33 @@ mod tests {
                         },
                     })
                     .map_err(Into::into)
+                }
+                ("pane-query/v1", "list") => {
+                    let request: PaneListRequest = decode_service_message(&payload)?;
+                    let pane_count = request
+                        .session
+                        .and_then(|selector| match selector {
+                            SessionSelector::ById(id) => {
+                                self.pane_count_by_session.get(&id).copied()
+                            }
+                            SessionSelector::ByName(name) => self
+                                .sessions
+                                .iter()
+                                .find(|session| session.name.as_deref() == Some(name.as_str()))
+                                .and_then(|session| {
+                                    self.pane_count_by_session.get(&session.id).copied()
+                                }),
+                        })
+                        .unwrap_or(0);
+                    let panes = (0..pane_count)
+                        .map(|index| PaneSummary {
+                            id: Uuid::new_v4(),
+                            index: (index + 1) as u32,
+                            name: Some(format!("pane-{}", index + 1)),
+                            focused: index == 0,
+                        })
+                        .collect::<Vec<_>>();
+                    encode_service_message(&PaneListResponse { panes }).map_err(Into::into)
                 }
                 _ => Err(bmux_plugin::PluginError::UnsupportedHostOperation {
                     operation: "mock_service",
@@ -584,5 +718,34 @@ mod tests {
     fn parse_selector_rejects_blank_values() {
         let error = parse_selector("   ").expect_err("blank selector should fail");
         assert!(error.contains("must not be empty"));
+    }
+
+    #[test]
+    fn create_window_calls_session_create() {
+        let host = MockHost::with_sessions(sample_sessions());
+        let ack = create_window(&host, Some("dev".to_string())).expect("create should succeed");
+        assert!(ack.ok);
+        assert!(ack.id.is_some());
+        let creates = host.creates.lock().expect("create log lock should succeed");
+        assert_eq!(creates.as_slice(), &[Some("dev".to_string())]);
+    }
+
+    #[test]
+    fn kill_all_windows_calls_kill_for_each_session() {
+        let host = MockHost::with_sessions(sample_sessions());
+        let ack = kill_all_windows(&host, true).expect("kill all should succeed");
+        assert!(ack.ok);
+        let kills = host.kills.lock().expect("kill log lock should succeed");
+        assert_eq!(kills.len(), 2);
+        assert!(kills.iter().all(|request| request.force_local));
+    }
+
+    #[test]
+    fn switch_window_requires_target_session_to_have_panes() {
+        let target_id = Uuid::new_v4();
+        let host = MockHost::with_empty_target_session(target_id);
+        let error = switch_window(&host, SessionSelector::ById(target_id))
+            .expect_err("switch should fail when target has no panes");
+        assert!(error.contains("no panes"));
     }
 }
