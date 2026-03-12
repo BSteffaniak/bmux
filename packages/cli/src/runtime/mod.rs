@@ -203,7 +203,6 @@ const SERVER_STATUS_TIMEOUT: Duration = Duration::from_millis(1000);
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_millis(5000);
 const ATTACH_IO_POLL_INTERVAL: Duration = Duration::from_millis(15);
 const ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE: usize = 1_048_576;
-const ATTACH_WINDOW_MODE_UNBOUND_STATUS: &str = "workspace mode: unbound key (Esc/Enter to exit)";
 const ATTACH_SCROLLBACK_UNAVAILABLE_STATUS: &str = "scrollback unavailable for focused pane";
 const ATTACH_SELECTION_STARTED_STATUS: &str = "selection started";
 const ATTACH_SELECTION_CLEARED_STATUS: &str = "selection cleared";
@@ -2544,20 +2543,17 @@ async fn handle_attach_ui_action(
 ) -> std::result::Result<(), ClientError> {
     match action {
         RuntimeAction::EnterWindowMode => {
-            view_state.exit_scrollback();
-            view_state.ui_mode = AttachUiMode::Window;
             view_state.set_transient_status(
-                window_mode_enter_status(),
+                "workspace mode unavailable in core baseline",
                 Instant::now(),
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
         }
         RuntimeAction::ExitMode => {
-            view_state.ui_mode = AttachUiMode::Normal;
+            let _ = view_state;
         }
         RuntimeAction::EnterScrollMode => {
             if enter_attach_scrollback(view_state) {
-                view_state.ui_mode = AttachUiMode::Normal;
             } else {
                 view_state.set_transient_status(
                     ATTACH_SCROLLBACK_UNAVAILABLE_STATUS,
@@ -3207,10 +3203,8 @@ async fn build_attach_status_line_for_draw(
     } else if scrollback_active {
         "SCROLL"
     } else {
-        match ui_mode {
-            AttachUiMode::Normal => "NORMAL",
-            AttachUiMode::Window => "WORKSPACE",
-        }
+        let _ = ui_mode;
+        "NORMAL"
     };
     let role_label = if can_write { "write" } else { "read-only" };
     let follow_label = follow_target_id.map(|id| {
@@ -3256,44 +3250,20 @@ fn format_status_line_for_width(status_line: &str, cols: u16) -> String {
     rendered
 }
 
-fn attach_mode_hint(ui_mode: AttachUiMode, keymap: &Keymap) -> String {
-    match ui_mode {
-        AttachUiMode::Normal => {
-            let window_mode = key_hint_or_unbound(keymap, RuntimeAction::EnterWindowMode);
-            let detach = key_hint_or_unbound(keymap, RuntimeAction::Detach);
-            let quit = key_hint_or_unbound(keymap, RuntimeAction::Quit);
-            let help = key_hint_or_unbound(keymap, RuntimeAction::ShowHelp);
-            format!("{window_mode} workspace mode | {detach} detach | {quit} quit | {help} help")
-        }
-        AttachUiMode::Window => {
-            let session_prev = key_hint_or_unbound(keymap, RuntimeAction::SessionPrev);
-            let session_next = key_hint_or_unbound(keymap, RuntimeAction::SessionNext);
-            let prev = key_hint_or_unbound(keymap, RuntimeAction::WindowPrev);
-            let next = key_hint_or_unbound(keymap, RuntimeAction::WindowNext);
-            let goto_one = key_hint_or_unbound(keymap, RuntimeAction::WindowGoto1);
-            let new_window = key_hint_or_unbound(keymap, RuntimeAction::NewWindow);
-            let close = key_hint_or_unbound(keymap, RuntimeAction::WindowClose);
-            let exit = key_hint_or_unbound(keymap, RuntimeAction::ExitMode);
-            let help = key_hint_or_unbound(keymap, RuntimeAction::ShowHelp);
-            format!(
-                "{session_prev}/{session_next} prev/next session | {prev}/{next} prev/next workspace | {goto_one} goto-1 | {new_window} new | {close} close | {exit} exit | {help} help"
-            )
-        }
-    }
+fn attach_mode_hint(_ui_mode: AttachUiMode, keymap: &Keymap) -> String {
+    let detach = key_hint_or_unbound(keymap, RuntimeAction::Detach);
+    let quit = key_hint_or_unbound(keymap, RuntimeAction::Quit);
+    let help = key_hint_or_unbound(keymap, RuntimeAction::ShowHelp);
+    format!("{detach} detach | {quit} quit | {help} help")
 }
 
 fn initial_attach_status(keymap: &Keymap, can_write: bool) -> String {
     let help = key_hint_or_unbound(keymap, RuntimeAction::ShowHelp);
-    let window_mode = key_hint_or_unbound(keymap, RuntimeAction::EnterWindowMode);
     if can_write {
-        format!("{help} help | {window_mode} workspace mode | typing goes to pane")
+        format!("{help} help | typing goes to pane")
     } else {
-        format!("read-only attach | {help} help | {window_mode} workspace mode")
+        format!("read-only attach | {help} help")
     }
-}
-
-fn window_mode_enter_status() -> String {
-    "workspace mode: use workspace bindings, Esc/Enter exits".to_string()
 }
 
 fn attach_exit_message(reason: AttachExitReason) -> Option<&'static str> {
@@ -3824,12 +3794,10 @@ fn effective_attach_keybindings(config: &BmuxConfig) -> Vec<AttachKeybindingEntr
 fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
     let keymap = attach_keymap_from_config(config);
     let help = key_hint_or_unbound(&keymap, RuntimeAction::ShowHelp);
-    let window_mode = key_hint_or_unbound(&keymap, RuntimeAction::EnterWindowMode);
     let detach = key_hint_or_unbound(&keymap, RuntimeAction::Detach);
     let scroll = key_hint_or_unbound(&keymap, RuntimeAction::EnterScrollMode);
     let mut groups: Vec<(&str, Vec<AttachKeybindingEntry>)> = vec![
         ("Session", Vec::new()),
-        ("Workspace", Vec::new()),
         ("Pane", Vec::new()),
         ("Mode", Vec::new()),
         ("Other", Vec::new()),
@@ -3854,7 +3822,7 @@ fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
             | RuntimeAction::WindowGoto7
             | RuntimeAction::WindowGoto8
             | RuntimeAction::WindowGoto9
-            | RuntimeAction::WindowClose => "Workspace",
+            | RuntimeAction::WindowClose => "Other",
             RuntimeAction::SplitFocusedVertical
             | RuntimeAction::SplitFocusedHorizontal
             | RuntimeAction::FocusNext
@@ -3894,11 +3862,8 @@ fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
     let mut lines = Vec::new();
     lines.push("Attach Help".to_string());
     lines.push(format!(
-        "Normal mode sends typing to the pane. Use {window_mode} for workspace mode, {scroll} for scrollback, {detach} to detach, and {help} to toggle help."
+        "Normal mode sends typing to the pane. Use {scroll} for scrollback, {detach} to detach, and {help} to toggle help."
     ));
-    lines.push(
-        "Workspace mode captures workspace/session keys until Esc or Enter exits it.".to_string(),
-    );
     lines.push(String::new());
     for (category, mut entries) in groups {
         if entries.is_empty() {
@@ -3953,24 +3918,8 @@ fn normalize_attach_keybindings(
 
 fn inject_attach_global_defaults(global: &mut std::collections::BTreeMap<String, String>) {
     let defaults = [
-        ("ctrl+t", RuntimeAction::EnterWindowMode),
-        ("escape", RuntimeAction::ExitMode),
-        ("enter", RuntimeAction::ExitMode),
         ("shift+h", RuntimeAction::SessionPrev),
         ("shift+l", RuntimeAction::SessionNext),
-        ("h", RuntimeAction::WindowPrev),
-        ("l", RuntimeAction::WindowNext),
-        ("1", RuntimeAction::WindowGoto1),
-        ("2", RuntimeAction::WindowGoto2),
-        ("3", RuntimeAction::WindowGoto3),
-        ("4", RuntimeAction::WindowGoto4),
-        ("5", RuntimeAction::WindowGoto5),
-        ("6", RuntimeAction::WindowGoto6),
-        ("7", RuntimeAction::WindowGoto7),
-        ("8", RuntimeAction::WindowGoto8),
-        ("9", RuntimeAction::WindowGoto9),
-        ("x", RuntimeAction::WindowClose),
-        ("n", RuntimeAction::NewWindow),
     ];
 
     for (key, action) in defaults {
@@ -4478,13 +4427,6 @@ async fn handle_attach_terminal_event(
                 view_state.dirty.full_pane_redraw = true;
             }
             AttachEventAction::Ignore => {}
-            AttachEventAction::WindowModeUnboundKey => {
-                view_state.set_transient_status(
-                    ATTACH_WINDOW_MODE_UNBOUND_STATUS,
-                    Instant::now(),
-                    ATTACH_TRANSIENT_STATUS_TTL,
-                );
-            }
         }
     }
 
@@ -4524,7 +4466,7 @@ fn attach_event_actions(
 fn attach_key_event_actions(
     key: &KeyEvent,
     attach_input_processor: &mut InputProcessor,
-    ui_mode: AttachUiMode,
+    _ui_mode: AttachUiMode,
 ) -> Result<Vec<AttachEventAction>> {
     if key.kind != KeyEventKind::Press {
         return Ok(vec![AttachEventAction::Ignore]);
@@ -4535,34 +4477,12 @@ fn attach_key_event_actions(
         .into_iter()
         .map(|action| match action {
             RuntimeAction::Detach => AttachEventAction::Detach,
-            RuntimeAction::ForwardToPane(bytes) => {
-                if ui_mode == AttachUiMode::Window {
-                    AttachEventAction::WindowModeUnboundKey
-                } else {
-                    AttachEventAction::Send(bytes)
-                }
-            }
+            RuntimeAction::ForwardToPane(bytes) => AttachEventAction::Send(bytes),
             RuntimeAction::NewWindow | RuntimeAction::NewSession => {
-                if ui_mode == AttachUiMode::Window {
-                    AttachEventAction::Runtime(action)
-                } else if matches!(key.code, KeyCode::Char('n'))
-                    && !key.modifiers.contains(KeyModifiers::CONTROL)
-                    && !key.modifiers.contains(KeyModifiers::ALT)
-                    && !key.modifiers.contains(KeyModifiers::SUPER)
-                {
-                    attach_key_event_to_bytes(key)
-                        .map_or(AttachEventAction::Ignore, AttachEventAction::Send)
-                } else {
-                    AttachEventAction::Runtime(action)
-                }
+                AttachEventAction::Runtime(action)
             }
             RuntimeAction::SessionPrev | RuntimeAction::SessionNext => {
-                if ui_mode == AttachUiMode::Window {
-                    AttachEventAction::Ui(action)
-                } else {
-                    attach_key_event_to_bytes(key)
-                        .map_or(AttachEventAction::Ignore, AttachEventAction::Send)
-                }
+                AttachEventAction::Ui(action)
             }
             RuntimeAction::EnterWindowMode
             | RuntimeAction::SplitFocusedVertical
@@ -4578,13 +4498,7 @@ fn attach_key_event_actions(
             | RuntimeAction::ResizeRight
             | RuntimeAction::ResizeUp
             | RuntimeAction::ResizeDown
-            | RuntimeAction::CloseFocusedPane => {
-                if ui_mode == AttachUiMode::Window {
-                    AttachEventAction::WindowModeUnboundKey
-                } else {
-                    AttachEventAction::Ui(action)
-                }
-            }
+            | RuntimeAction::CloseFocusedPane => AttachEventAction::Ui(action),
             RuntimeAction::ExitMode
             | RuntimeAction::WindowPrev
             | RuntimeAction::WindowNext
@@ -4597,14 +4511,7 @@ fn attach_key_event_actions(
             | RuntimeAction::WindowGoto7
             | RuntimeAction::WindowGoto8
             | RuntimeAction::WindowGoto9
-            | RuntimeAction::WindowClose => {
-                if ui_mode == AttachUiMode::Window {
-                    AttachEventAction::Ui(action)
-                } else {
-                    attach_key_event_to_bytes(key)
-                        .map_or(AttachEventAction::Ignore, AttachEventAction::Send)
-                }
-            }
+            | RuntimeAction::WindowClose => AttachEventAction::Ui(action),
             RuntimeAction::Quit => AttachEventAction::Ui(action),
             RuntimeAction::ShowHelp => AttachEventAction::Ui(action),
             RuntimeAction::ToggleSplitDirection
@@ -6532,7 +6439,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_key_event_action_enters_window_mode_with_ctrl_t() {
+    fn attach_key_event_action_forwards_ctrl_t_to_pane_by_default() {
         let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
         let actions = super::attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
@@ -6547,14 +6454,12 @@ mod tests {
 
         assert!(matches!(
             actions.first(),
-            Some(super::AttachEventAction::Ui(
-                crate::input::RuntimeAction::EnterWindowMode
-            ))
+            Some(super::AttachEventAction::Send(bytes)) if bytes.as_slice() == &[0x14]
         ));
     }
 
     #[test]
-    fn attach_key_event_action_routes_h_as_ui_only_in_window_mode() {
+    fn attach_key_event_action_routes_h_to_pane_in_normal_mode() {
         let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
 
         let normal_actions = super::attach_key_event_actions(
@@ -6572,22 +6477,7 @@ mod tests {
             Some(super::AttachEventAction::Send(bytes)) if bytes.as_slice() == b"h"
         ));
 
-        let window_actions = super::attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('h'),
-                KeyModifiers::NONE,
-                CrosstermKeyEventKind::Press,
-            ),
-            &mut processor,
-            super::AttachUiMode::Window,
-        )
-        .expect("attach key action should parse");
-        assert!(matches!(
-            window_actions.first(),
-            Some(super::AttachEventAction::Ui(
-                crate::input::RuntimeAction::WindowPrev
-            ))
-        ));
+        let _ = processor;
     }
 
     #[test]
@@ -6624,10 +6514,10 @@ mod tests {
     }
 
     #[test]
-    fn attach_key_event_action_routes_shift_h_as_session_ui_only_in_window_mode() {
+    fn attach_key_event_action_routes_shift_h_as_session_ui() {
         let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
 
-        let normal_actions = super::attach_key_event_actions(
+        let actions = super::attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('H'),
                 KeyModifiers::SHIFT,
@@ -6638,22 +6528,7 @@ mod tests {
         )
         .expect("attach key action should parse");
         assert!(matches!(
-            normal_actions.first(),
-            Some(super::AttachEventAction::Send(bytes)) if bytes.as_slice() == b"H"
-        ));
-
-        let window_actions = super::attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('H'),
-                KeyModifiers::SHIFT,
-                CrosstermKeyEventKind::Press,
-            ),
-            &mut processor,
-            super::AttachUiMode::Window,
-        )
-        .expect("attach key action should parse");
-        assert!(matches!(
-            window_actions.first(),
+            actions.first(),
             Some(super::AttachEventAction::Ui(
                 crate::input::RuntimeAction::SessionPrev
             ))
@@ -6681,49 +6556,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_key_event_action_routes_n_to_new_window_in_window_mode() {
-        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
-
-        let window_actions = super::attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('n'),
-                KeyModifiers::NONE,
-                CrosstermKeyEventKind::Press,
-            ),
-            &mut processor,
-            super::AttachUiMode::Window,
-        )
-        .expect("attach key action should parse");
-        assert!(matches!(
-            window_actions.first(),
-            Some(super::AttachEventAction::Runtime(
-                crate::input::RuntimeAction::NewWindow
-            ))
-        ));
-    }
-
-    #[test]
-    fn attach_key_event_action_eats_unbound_plain_key_in_window_mode() {
-        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
-
-        let window_actions = super::attach_key_event_actions(
-            &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('z'),
-                KeyModifiers::NONE,
-                CrosstermKeyEventKind::Press,
-            ),
-            &mut processor,
-            super::AttachUiMode::Window,
-        )
-        .expect("attach key action should parse");
-        assert!(matches!(
-            window_actions.first(),
-            Some(super::AttachEventAction::WindowModeUnboundKey)
-        ));
-    }
-
-    #[test]
-    fn attach_keybindings_allow_global_override_of_default_window_mode_key() {
+    fn attach_keybindings_allow_global_override_of_default_session_key() {
         let mut config = BmuxConfig::default();
         config
             .keybindings
@@ -6759,26 +6592,17 @@ mod tests {
             .insert("d".to_string(), "quit".to_string());
         config
             .keybindings
-            .global
-            .insert("ctrl+t".to_string(), "new_session".to_string());
-        config
-            .keybindings
             .runtime
             .insert("z".to_string(), "detach".to_string());
-        config
-            .keybindings
-            .global
-            .insert("ctrl+w".to_string(), "enter_window_mode".to_string());
 
         let keymap = attach_keymap_from_config(&config);
         let hint = super::attach_mode_hint(super::AttachUiMode::Normal, &keymap);
-        assert!(hint.contains("Ctrl-W workspace mode"));
         assert!(hint.contains("Ctrl-A z detach"));
         assert!(hint.contains("Ctrl-A d quit"));
     }
 
     #[test]
-    fn attach_mode_hint_reflects_window_mode_overrides() {
+    fn attach_mode_hint_includes_session_navigation_overrides() {
         let mut config = BmuxConfig::default();
         config
             .keybindings
@@ -6791,64 +6615,12 @@ mod tests {
         config
             .keybindings
             .global
-            .insert("h".to_string(), "new_session".to_string());
-        config
-            .keybindings
-            .global
-            .insert("l".to_string(), "detach".to_string());
-        config
-            .keybindings
-            .global
-            .insert("1".to_string(), "new_session".to_string());
-        config
-            .keybindings
-            .global
-            .insert("n".to_string(), "new_session".to_string());
-        config
-            .keybindings
-            .global
-            .insert("x".to_string(), "new_session".to_string());
-        config
-            .keybindings
-            .global
-            .insert("escape".to_string(), "new_session".to_string());
-        config
-            .keybindings
-            .global
-            .insert("enter".to_string(), "new_session".to_string());
-        config
-            .keybindings
-            .global
-            .insert("u".to_string(), "window_prev".to_string());
-        config
-            .keybindings
-            .global
-            .insert("i".to_string(), "window_next".to_string());
-        config
-            .keybindings
-            .global
-            .insert("0".to_string(), "window_goto_1".to_string());
-        config
-            .keybindings
-            .global
-            .insert("m".to_string(), "new_window".to_string());
-        config
-            .keybindings
-            .global
-            .insert("k".to_string(), "window_close".to_string());
-        config
-            .keybindings
-            .global
-            .insert("ctrl+g".to_string(), "exit_mode".to_string());
+            .insert("q".to_string(), "quit".to_string());
 
         let keymap = attach_keymap_from_config(&config);
-        let hint = super::attach_mode_hint(super::AttachUiMode::Window, &keymap);
-        assert!(hint.contains("unbound/unbound prev/next session"));
-        assert!(hint.contains("u/i prev/next workspace"));
-        assert!(hint.contains("0 goto-1"));
-        assert!(hint.contains("m new"));
-        assert!(hint.contains("k close"));
-        assert!(hint.contains("Ctrl-G exit"));
+        let hint = super::attach_mode_hint(super::AttachUiMode::Normal, &keymap);
+        assert!(hint.contains("Ctrl-A d quit") || hint.contains("q quit"));
+        assert!(hint.contains("detach"));
     }
 
     #[test]
@@ -7092,9 +6864,9 @@ mod tests {
         }));
         assert!(entries.iter().any(|entry| {
             entry.scope == super::AttachKeybindingScope::Global
-                && entry.chord == "ctrl+t"
-                && entry.action_name == "enter_window_mode"
-                && entry.action == crate::input::RuntimeAction::EnterWindowMode
+                && entry.chord == "shift+h"
+                && entry.action_name == "session_prev"
+                && entry.action == crate::input::RuntimeAction::SessionPrev
         }));
     }
 
@@ -7162,7 +6934,6 @@ mod tests {
         assert_eq!(lines.first().map(String::as_str), Some("Attach Help"));
         assert!(lines[1].contains("Normal mode sends typing to the pane"));
         assert!(lines.iter().any(|line| line == "-- Session --"));
-        assert!(lines.iter().any(|line| line == "-- Workspace --"));
         assert!(lines.iter().any(|line| line == "-- Pane --"));
         assert!(lines.iter().any(|line| line == "-- Mode --"));
     }
@@ -7184,11 +6955,10 @@ mod tests {
     }
 
     #[test]
-    fn initial_attach_status_mentions_help_and_workspace_mode() {
+    fn initial_attach_status_mentions_help_and_typing() {
         let keymap = attach_keymap_from_config(&BmuxConfig::default());
         let status = super::initial_attach_status(&keymap, true);
         assert!(status.contains("help"));
-        assert!(status.contains("workspace mode"));
         assert!(status.contains("typing goes to pane"));
     }
 

@@ -10,14 +10,12 @@ pub enum AttachEventAction {
     Ui(RuntimeAction),
     Redraw,
     Detach,
-    WindowModeUnboundKey,
     Ignore,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AttachUiMode {
     Normal,
-    Window,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
