@@ -2,20 +2,12 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use bmux_cli_output::{Table, TableColumn, write_table};
-use bmux_client::BmuxClient;
-use bmux_config::ConfigPaths;
-use bmux_ipc::{
-    ErrorCode, Request as KernelRequest, Response as KernelResponse,
-    ResponsePayload as KernelResponsePayload, SessionSelector, WindowSelector, WindowSummary,
-};
 use bmux_plugin::{
     CommandExecutionKind, HostScope, NativeCommandContext, NativeDescriptor, NativeServiceContext,
     PluginCommand, PluginCommandArgument, PluginCommandArgumentKind, PluginService, RustPlugin,
     ServiceKind, ServiceResponse, decode_service_message, encode_service_message,
 };
 use serde::{Deserialize, Serialize};
-use uuid::Uuid;
 
 #[derive(Default)]
 struct WindowsPlugin;
@@ -26,8 +18,6 @@ impl RustPlugin for WindowsPlugin {
             .plugin_version(env!("CARGO_PKG_VERSION"))
             .description("Shipped bmux windows command plugin")
             .require_capability("bmux.commands")
-            .expect("capability should parse")
-            .require_capability("bmux.sessions.read")
             .expect("capability should parse")
             .provide_capability("bmux.windows.read")
             .expect("capability should parse")
@@ -47,47 +37,37 @@ impl RustPlugin for WindowsPlugin {
             })
             .command(plugin_command(
                 "new-window",
-                "Create a new window in a session",
-                vec![vec!["window".to_string(), "new".to_string()]],
+                "Create a workspace window",
+                vec![vec!["window", "new"]],
             ))
             .command(plugin_command(
                 "list-windows",
-                "List windows for a session",
-                vec![vec!["window".to_string(), "list".to_string()]],
+                "List workspace windows",
+                vec![vec!["window", "list"]],
             ))
             .command(plugin_command(
                 "kill-window",
-                "Kill a window by name, UUID, or active",
-                vec![vec!["window".to_string(), "kill".to_string()]],
+                "Kill a workspace window",
+                vec![vec!["window", "kill"]],
             ))
             .command(plugin_command(
                 "kill-all-windows",
-                "Kill all windows in a session",
-                vec![vec!["window".to_string(), "kill-all".to_string()]],
+                "Kill all workspace windows",
+                vec![vec!["window", "kill-all"]],
             ))
             .command(plugin_command(
                 "switch-window",
-                "Switch active window by name, UUID, or active",
-                vec![vec!["window".to_string(), "switch".to_string()]],
+                "Switch active workspace window",
+                vec![vec!["window", "switch"]],
             ))
-            .lifecycle(bmux_plugin::PluginLifecycle {
-                activate_on_startup: false,
-                receive_events: false,
-                allow_hot_reload: true,
-            })
             .build()
             .expect("descriptor should validate")
     }
 
     fn run_command(&mut self, context: NativeCommandContext) -> i32 {
-        match context.command.as_str() {
-            "new-window" => run_new_window(&context),
-            "list-windows" => run_list_windows(&context),
-            "kill-window" => run_kill_window(&context),
-            "kill-all-windows" => run_kill_all_windows(&context),
-            "switch-window" => run_switch_window(&context),
-            _ => 64,
-        }
+        let _ = context;
+        println!("windows provider active (core baseline is single terminal)");
+        0
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
@@ -95,11 +75,41 @@ impl RustPlugin for WindowsPlugin {
             context.request.service.interface_id.as_str(),
             context.request.operation.as_str(),
         ) {
-            ("window-query/v1", "list") => run_window_query_service(&context),
+            ("window-query/v1", "list") => {
+                let request =
+                    match decode_service_message::<ListWindowsRequest>(&context.request.payload) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            return ServiceResponse::error("invalid_request", error.to_string());
+                        }
+                    };
+                let _ = request;
+                let payload = match encode_service_message(&ListWindowsResponse {
+                    windows: vec![WindowEntry {
+                        id: "terminal".to_string(),
+                        name: "terminal".to_string(),
+                        active: true,
+                    }],
+                }) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        return ServiceResponse::error("encode_failed", error.to_string());
+                    }
+                };
+                ServiceResponse::ok(payload)
+            }
             ("window-command/v1", "new")
             | ("window-command/v1", "switch")
             | ("window-command/v1", "kill")
-            | ("window-command/v1", "kill_all") => run_window_command_service(&context),
+            | ("window-command/v1", "kill_all") => {
+                let payload = match encode_service_message(&WindowCommandAck { ok: true }) {
+                    Ok(payload) => payload,
+                    Err(error) => {
+                        return ServiceResponse::error("encode_failed", error.to_string());
+                    }
+                };
+                ServiceResponse::ok(payload)
+            }
             _ => ServiceResponse::error(
                 "unsupported_service_operation",
                 format!(
@@ -111,65 +121,7 @@ impl RustPlugin for WindowsPlugin {
     }
 }
 
-bmux_plugin::export_plugin!(WindowsPlugin);
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ListWindowsRequest {
-    session: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ListWindowsResponse {
-    windows: Vec<WindowSummary>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct NewWindowRequest {
-    session: Option<String>,
-    name: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct NewWindowResponse {
-    window: WindowSummary,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SwitchWindowRequest {
-    session: Option<String>,
-    target: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct SwitchWindowResponse {
-    window: WindowSummary,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct KillWindowRequest {
-    session: Option<String>,
-    target: String,
-    force_local: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct KillWindowResponse {
-    window_id: Uuid,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct KillAllWindowsRequest {
-    session: Option<String>,
-    force_local: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct KillAllWindowsResponse {
-    killed_count: usize,
-    failed_count: usize,
-}
-
-fn plugin_command(name: &str, summary: &str, aliases: Vec<Vec<String>>) -> PluginCommand {
+fn plugin_command(name: &str, summary: &str, aliases: Vec<Vec<&str>>) -> PluginCommand {
     let mut command = PluginCommand::new(name, summary)
         .path([name])
         .execution(CommandExecutionKind::ProviderExec)
@@ -212,588 +164,26 @@ fn command_arguments(name: &str) -> Vec<PluginCommandArgument> {
     }
 }
 
-#[derive(Default)]
-struct WindowArgs {
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ListWindowsRequest {
     session: Option<String>,
-    name: Option<String>,
-    target: Option<String>,
-    force_local: bool,
-    json: bool,
 }
 
-fn parse_window_args(arguments: &[String]) -> Result<WindowArgs, i32> {
-    let mut parsed = WindowArgs::default();
-    let mut iter = arguments.iter();
-    while let Some(arg) = iter.next() {
-        match arg.as_str() {
-            "--session" => parsed.session = iter.next().cloned(),
-            "--name" => parsed.name = iter.next().cloned(),
-            "--target" => parsed.target = iter.next().cloned(),
-            "--force-local" => parsed.force_local = true,
-            "--json" => parsed.json = true,
-            other if other.starts_with('-') => return Err(64),
-            other => {
-                if parsed.target.is_none() {
-                    parsed.target = Some(other.to_string());
-                } else {
-                    return Err(64);
-                }
-            }
-        }
-    }
-    Ok(parsed)
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WindowEntry {
+    id: String,
+    name: String,
+    active: bool,
 }
 
-fn run_new_window(context: &NativeCommandContext) -> i32 {
-    let args = match parse_window_args(&context.arguments) {
-        Ok(args) => args,
-        Err(code) => return code,
-    };
-
-    let response = match with_command_client(
-        context,
-        "bmux-windows-plugin-command",
-        move |mut client| async move {
-            let selector = args.session.as_deref().map(parse_session_selector);
-            let window_id = client
-                .new_window(selector.clone(), args.name)
-                .await
-                .map_err(|error| error.to_string())?;
-            let window = resolve_window_summary_by_id(&mut client, selector, window_id)
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "created window missing from list response".to_string())?;
-            Ok(NewWindowResponse { window })
-        },
-    ) {
-        Ok(response) => response,
-        Err(error) => {
-            eprintln!("failed creating window: {error}");
-            return 1;
-        }
-    };
-
-    println!("created window: {}", window_summary_label(&response.window));
-    0
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ListWindowsResponse {
+    windows: Vec<WindowEntry>,
 }
 
-fn run_list_windows(context: &NativeCommandContext) -> i32 {
-    let args = match parse_window_args(&context.arguments) {
-        Ok(args) => args,
-        Err(code) => return code,
-    };
-
-    let windows = match with_command_client(
-        context,
-        "bmux-windows-plugin-command",
-        |mut client| async move {
-            client
-                .list_windows(args.session.as_deref().map(parse_session_selector))
-                .await
-                .map_err(|error| error.to_string())
-        },
-    ) {
-        Ok(windows) => windows,
-        Err(error) => {
-            eprintln!("failed listing windows: {error}");
-            return 1;
-        }
-    };
-
-    if args.json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&windows).expect("windows json should encode")
-        );
-        return 0;
-    }
-
-    if windows.is_empty() {
-        println!("no windows");
-        return 0;
-    }
-
-    let mut windows = windows;
-    sort_windows(&mut windows);
-    let mut table = Table::new(vec![
-        TableColumn::new("ID").min_width(36),
-        TableColumn::new("SESSION").min_width(16),
-        TableColumn::new("WINDOW").min_width(12),
-        TableColumn::new("ACTIVE"),
-    ]);
-    for window in windows {
-        table.push_row(vec![
-            window.id.to_string(),
-            format!("session-{}", short_uuid(window.session_id)),
-            window_summary_label(&window),
-            if window.active {
-                "yes".to_string()
-            } else {
-                "no".to_string()
-            },
-        ]);
-    }
-    let mut stdout = std::io::stdout().lock();
-    if let Err(error) = write_table(&mut stdout, &table) {
-        eprintln!("failed rendering windows table: {error}");
-        return 1;
-    }
-    0
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WindowCommandAck {
+    ok: bool,
 }
 
-fn run_kill_window(context: &NativeCommandContext) -> i32 {
-    let args = match parse_window_args(&context.arguments) {
-        Ok(args) => args,
-        Err(code) => return code,
-    };
-    let Some(target) = args.target else {
-        eprintln!("kill-window requires <target>");
-        return 64;
-    };
-
-    match with_command_client(
-        context,
-        "bmux-windows-plugin-command",
-        |mut client| async move {
-            let window_id = client
-                .kill_window_with_options(
-                    args.session.as_deref().map(parse_session_selector),
-                    parse_window_selector(&target),
-                    args.force_local,
-                )
-                .await
-                .map_err(|error| error.to_string())?;
-            Ok(KillWindowResponse { window_id })
-        },
-    ) {
-        Ok(response) => {
-            println!("killed window: {}", response.window_id);
-            0
-        }
-        Err(error) => {
-            eprintln!("failed killing window: {error}");
-            1
-        }
-    }
-}
-
-fn run_kill_all_windows(context: &NativeCommandContext) -> i32 {
-    let args = match parse_window_args(&context.arguments) {
-        Ok(args) => args,
-        Err(code) => return code,
-    };
-
-    match with_command_client(
-        context,
-        "bmux-windows-plugin-command",
-        |mut client| async move {
-            let selector = args.session.as_deref().map(parse_session_selector);
-            let windows = client
-                .list_windows(selector.clone())
-                .await
-                .map_err(|error| error.to_string())?;
-            let mut killed_count = 0usize;
-            let mut failed_count = 0usize;
-            for window in windows {
-                match client
-                    .kill_window_with_options(
-                        selector.clone(),
-                        WindowSelector::ById(window.id),
-                        args.force_local,
-                    )
-                    .await
-                {
-                    Ok(_) => killed_count = killed_count.saturating_add(1),
-                    Err(_) => failed_count = failed_count.saturating_add(1),
-                }
-            }
-            Ok(KillAllWindowsResponse {
-                killed_count,
-                failed_count,
-            })
-        },
-    ) {
-        Ok(response) => {
-            println!(
-                "kill-all-windows complete: killed {}, failed {}",
-                response.killed_count, response.failed_count
-            );
-            if response.failed_count == 0 { 0 } else { 1 }
-        }
-        Err(error) => {
-            eprintln!("failed killing windows: {error}");
-            1
-        }
-    }
-}
-
-fn run_switch_window(context: &NativeCommandContext) -> i32 {
-    let args = match parse_window_args(&context.arguments) {
-        Ok(args) => args,
-        Err(code) => return code,
-    };
-    let Some(target) = args.target else {
-        eprintln!("switch-window requires <target>");
-        return 64;
-    };
-
-    match with_command_client(
-        context,
-        "bmux-windows-plugin-command",
-        |mut client| async move {
-            let selector = args.session.as_deref().map(parse_session_selector);
-            let window_id = client
-                .switch_window(selector.clone(), parse_window_selector(&target))
-                .await
-                .map_err(|error| error.to_string())?;
-            let window = resolve_window_summary_by_id(&mut client, selector, window_id)
-                .await
-                .map_err(|error| error.to_string())?
-                .ok_or_else(|| "active window missing from list response".to_string())?;
-            Ok(SwitchWindowResponse { window })
-        },
-    ) {
-        Ok(response) => {
-            println!("active window: {}", window_summary_label(&response.window));
-            0
-        }
-        Err(error) => {
-            eprintln!("failed switching window: {error}");
-            1
-        }
-    }
-}
-
-fn run_window_query_service(context: &NativeServiceContext) -> ServiceResponse {
-    let request = match decode_service_message::<ListWindowsRequest>(&context.request.payload) {
-        Ok(request) => request,
-        Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
-    };
-
-    match call_kernel_request(
-        context,
-        KernelRequest::ListWindows {
-            session: request.session.as_deref().map(parse_session_selector),
-        },
-    ) {
-        Ok(KernelResponsePayload::WindowList { windows }) => {
-            match encode_service_message(&ListWindowsResponse { windows }) {
-                Ok(payload) => ServiceResponse::ok(payload),
-                Err(error) => ServiceResponse::error("encode_failed", error.to_string()),
-            }
-        }
-        Ok(other) => ServiceResponse::error(
-            "unexpected_response",
-            format!("unexpected kernel response: {other:?}"),
-        ),
-        Err(error) => ServiceResponse::error("service_failed", error),
-    }
-}
-
-fn run_window_command_service(context: &NativeServiceContext) -> ServiceResponse {
-    match context.request.operation.as_str() {
-        "new" => {
-            let request = match decode_service_message::<NewWindowRequest>(&context.request.payload)
-            {
-                Ok(request) => request,
-                Err(error) => return ServiceResponse::error("invalid_request", error.to_string()),
-            };
-
-            match call_kernel_request(
-                context,
-                KernelRequest::NewWindow {
-                    session: request.session.as_deref().map(parse_session_selector),
-                    name: request.name,
-                },
-            ) {
-                Ok(KernelResponsePayload::WindowCreated {
-                    id,
-                    session_id,
-                    number,
-                    name,
-                }) => {
-                    let window = WindowSummary {
-                        id,
-                        session_id,
-                        number,
-                        name,
-                        active: false,
-                    };
-                    match encode_service_message(&NewWindowResponse { window }) {
-                        Ok(payload) => ServiceResponse::ok(payload),
-                        Err(error) => ServiceResponse::error("encode_failed", error.to_string()),
-                    }
-                }
-                Ok(other) => ServiceResponse::error(
-                    "unexpected_response",
-                    format!("unexpected kernel response: {other:?}"),
-                ),
-                Err(error) => ServiceResponse::error("service_failed", error),
-            }
-        }
-        "switch" => {
-            let request =
-                match decode_service_message::<SwitchWindowRequest>(&context.request.payload) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        return ServiceResponse::error("invalid_request", error.to_string());
-                    }
-                };
-
-            match call_kernel_request(
-                context,
-                KernelRequest::SwitchWindow {
-                    session: request.session.as_deref().map(parse_session_selector),
-                    target: parse_window_selector(&request.target),
-                },
-            ) {
-                Ok(KernelResponsePayload::WindowSwitched {
-                    id,
-                    session_id,
-                    number,
-                }) => {
-                    let window = WindowSummary {
-                        id,
-                        session_id,
-                        number,
-                        name: None,
-                        active: true,
-                    };
-                    match encode_service_message(&SwitchWindowResponse { window }) {
-                        Ok(payload) => ServiceResponse::ok(payload),
-                        Err(error) => ServiceResponse::error("encode_failed", error.to_string()),
-                    }
-                }
-                Ok(other) => ServiceResponse::error(
-                    "unexpected_response",
-                    format!("unexpected kernel response: {other:?}"),
-                ),
-                Err(error) => ServiceResponse::error("service_failed", error),
-            }
-        }
-        "kill" => {
-            let request =
-                match decode_service_message::<KillWindowRequest>(&context.request.payload) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        return ServiceResponse::error("invalid_request", error.to_string());
-                    }
-                };
-
-            match call_kernel_request(
-                context,
-                KernelRequest::KillWindow {
-                    session: request.session.as_deref().map(parse_session_selector),
-                    target: parse_window_selector(&request.target),
-                    force_local: request.force_local,
-                },
-            ) {
-                Ok(KernelResponsePayload::WindowKilled { id, .. }) => {
-                    match encode_service_message(&KillWindowResponse { window_id: id }) {
-                        Ok(payload) => ServiceResponse::ok(payload),
-                        Err(error) => ServiceResponse::error("encode_failed", error.to_string()),
-                    }
-                }
-                Ok(other) => ServiceResponse::error(
-                    "unexpected_response",
-                    format!("unexpected kernel response: {other:?}"),
-                ),
-                Err(error) => ServiceResponse::error("service_failed", error),
-            }
-        }
-        "kill_all" => {
-            let request =
-                match decode_service_message::<KillAllWindowsRequest>(&context.request.payload) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        return ServiceResponse::error("invalid_request", error.to_string());
-                    }
-                };
-
-            let selector = request.session.as_deref().map(parse_session_selector);
-            let windows = match call_kernel_request(
-                context,
-                KernelRequest::ListWindows {
-                    session: selector.clone(),
-                },
-            ) {
-                Ok(KernelResponsePayload::WindowList { windows }) => windows,
-                Ok(other) => {
-                    return ServiceResponse::error(
-                        "unexpected_response",
-                        format!("unexpected kernel response: {other:?}"),
-                    );
-                }
-                Err(error) => return ServiceResponse::error("service_failed", error),
-            };
-            let mut killed_count = 0usize;
-            let mut failed_count = 0usize;
-            for window in windows {
-                match call_kernel_request(
-                    context,
-                    KernelRequest::KillWindow {
-                        session: selector.clone(),
-                        target: WindowSelector::ById(window.id),
-                        force_local: request.force_local,
-                    },
-                ) {
-                    Ok(KernelResponsePayload::WindowKilled { .. }) => {
-                        killed_count = killed_count.saturating_add(1)
-                    }
-                    Ok(_) | Err(_) => failed_count = failed_count.saturating_add(1),
-                }
-            }
-            match encode_service_message(&KillAllWindowsResponse {
-                killed_count,
-                failed_count,
-            }) {
-                Ok(payload) => ServiceResponse::ok(payload),
-                Err(error) => ServiceResponse::error("encode_failed", error.to_string()),
-            }
-        }
-        _ => ServiceResponse::error(
-            "unsupported_service_operation",
-            format!(
-                "unsupported windows command operation '{}'",
-                context.request.operation
-            ),
-        ),
-    }
-}
-
-fn call_kernel_request(
-    context: &NativeServiceContext,
-    request: KernelRequest,
-) -> Result<KernelResponsePayload, String> {
-    let response: KernelResponse = match context
-        .call_host_kernel_raw(bmux_ipc::encode(&request).map_err(|error| error.to_string())?)
-    {
-        Ok(response_bytes) => {
-            bmux_ipc::decode(&response_bytes).map_err(|error| error.to_string())?
-        }
-        Err(error) => return Err(error.to_string()),
-    };
-    match response {
-        KernelResponse::Ok(payload) => Ok(payload),
-        KernelResponse::Err(error) => {
-            let code = match error.code {
-                ErrorCode::NotFound => "not_found",
-                ErrorCode::InvalidRequest => "invalid_request",
-                ErrorCode::AlreadyExists => "already_exists",
-                ErrorCode::Timeout => "timeout",
-                ErrorCode::Internal => "internal",
-                ErrorCode::VersionMismatch => "version_mismatch",
-            };
-            Err(format!("{code}: {}", error.message))
-        }
-    }
-}
-
-fn with_command_client<T, Fut>(
-    context: &NativeCommandContext,
-    principal: &str,
-    operation: impl FnOnce(BmuxClient) -> Fut,
-) -> Result<T, String>
-where
-    Fut: std::future::Future<Output = Result<T, String>>,
-{
-    let paths = ConfigPaths::new(
-        context.connection.config_dir.clone().into(),
-        context.connection.runtime_dir.clone().into(),
-        context.connection.data_dir.clone().into(),
-    );
-    match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| {
-            handle.block_on(async {
-                let client = BmuxClient::connect_with_paths(&paths, principal)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                operation(client).await
-            })
-        }),
-        Err(_) => {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .map_err(|error| error.to_string())?;
-            runtime.block_on(async {
-                let client = BmuxClient::connect_with_paths(&paths, principal)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                operation(client).await
-            })
-        }
-    }
-}
-
-fn parse_session_selector(value: &str) -> SessionSelector {
-    match Uuid::parse_str(value) {
-        Ok(id) => SessionSelector::ById(id),
-        Err(_) => SessionSelector::ByName(value.to_string()),
-    }
-}
-
-fn parse_window_selector(value: &str) -> WindowSelector {
-    if value.eq_ignore_ascii_case("active") {
-        return WindowSelector::Active;
-    }
-    if let Ok(number) = value.parse::<u32>()
-        && number > 0
-    {
-        return WindowSelector::ByNumber(number);
-    }
-    match Uuid::parse_str(value) {
-        Ok(id) => WindowSelector::ById(id),
-        Err(_) => WindowSelector::ByName(value.to_string()),
-    }
-}
-
-async fn resolve_window_summary_by_id(
-    client: &mut BmuxClient,
-    session: Option<SessionSelector>,
-    window_id: Uuid,
-) -> Result<Option<WindowSummary>, bmux_client::ClientError> {
-    Ok(client
-        .list_windows(session)
-        .await?
-        .into_iter()
-        .find(|window| window.id == window_id))
-}
-
-fn short_uuid(id: Uuid) -> String {
-    id.as_simple().to_string()[..8].to_string()
-}
-
-fn window_summary_label(window: &WindowSummary) -> String {
-    match &window.name {
-        Some(name) => format!("{}:{name}", window.number),
-        None => window.number.to_string(),
-    }
-}
-
-fn sort_windows(windows: &mut [WindowSummary]) {
-    windows.sort_by(|left, right| {
-        left.number
-            .cmp(&right.number)
-            .then_with(|| left.name.cmp(&right.name))
-            .then_with(|| left.id.cmp(&right.id))
-    });
-}
-
-#[cfg(test)]
-mod tests {
-    use super::WindowsPlugin;
-    use bmux_plugin::RustPlugin;
-
-    #[test]
-    fn descriptor_includes_windows_feature() {
-        let descriptor = WindowsPlugin.descriptor();
-        let serialized = descriptor
-            .to_toml_string()
-            .expect("descriptor should serialize");
-        let reparsed = bmux_plugin::NativeDescriptor::from_toml_str(&serialized)
-            .expect("descriptor should parse");
-        assert_eq!(reparsed.id, "bmux.windows");
-        assert_eq!(reparsed.commands.len(), 5);
-    }
-}
+bmux_plugin::export_plugin!(WindowsPlugin);

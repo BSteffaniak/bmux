@@ -268,39 +268,11 @@ pub enum Request {
     NewSession {
         name: Option<String>,
     },
-    NewWindow {
-        session: Option<SessionSelector>,
-        name: Option<String>,
-    },
     ListSessions,
     ListClients,
-    ListPermissions {
-        session: SessionSelector,
-    },
-    ListWindows {
-        session: Option<SessionSelector>,
-    },
-    GrantRole {
-        session: SessionSelector,
-        client_id: Uuid,
-        role: SessionRole,
-    },
-    RevokeRole {
-        session: SessionSelector,
-        client_id: Uuid,
-    },
     KillSession {
         selector: SessionSelector,
         force_local: bool,
-    },
-    KillWindow {
-        session: Option<SessionSelector>,
-        target: WindowSelector,
-        force_local: bool,
-    },
-    SwitchWindow {
-        session: Option<SessionSelector>,
-        target: WindowSelector,
     },
     SplitPane {
         session: Option<SessionSelector>,
@@ -385,16 +357,6 @@ pub struct SessionSummary {
     pub client_count: usize,
 }
 
-/// Summary returned when listing windows.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct WindowSummary {
-    pub id: Uuid,
-    pub session_id: Uuid,
-    pub number: u32,
-    pub name: Option<String>,
-    pub active: bool,
-}
-
 /// Summary returned when listing panes in the active window.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSummary {
@@ -418,13 +380,6 @@ pub struct ClientSummary {
     pub following_client_id: Option<Uuid>,
     pub following_global: bool,
     pub session_role: Option<SessionRole>,
-}
-
-/// Permission assignment summary for one client in a session.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SessionPermissionSummary {
-    pub client_id: Uuid,
-    pub role: SessionRole,
 }
 
 /// Snapshot persistence status returned by server-status.
@@ -475,36 +430,14 @@ pub enum ResponsePayload {
         id: Uuid,
         name: Option<String>,
     },
-    WindowCreated {
-        id: Uuid,
-        session_id: Uuid,
-        number: u32,
-        name: Option<String>,
-    },
     SessionList {
         sessions: Vec<SessionSummary>,
     },
     ClientList {
         clients: Vec<ClientSummary>,
     },
-    PermissionsList {
-        session_id: Uuid,
-        permissions: Vec<SessionPermissionSummary>,
-    },
-    WindowList {
-        windows: Vec<WindowSummary>,
-    },
     SessionKilled {
         id: Uuid,
-    },
-    WindowKilled {
-        id: Uuid,
-        session_id: Uuid,
-    },
-    WindowSwitched {
-        id: Uuid,
-        session_id: Uuid,
-        number: u32,
     },
     PaneSplit {
         id: Uuid,
@@ -537,16 +470,6 @@ pub enum ResponsePayload {
     },
     FollowStopped {
         follower_client_id: Uuid,
-    },
-    RoleGranted {
-        session_id: Uuid,
-        client_id: Uuid,
-        role: SessionRole,
-    },
-    RoleRevoked {
-        session_id: Uuid,
-        client_id: Uuid,
-        role: SessionRole,
     },
     Attached {
         grant: AttachGrant,
@@ -716,8 +639,8 @@ mod tests {
     use super::{
         AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
         AttachViewComponent, Envelope, EnvelopeKind, ErrorCode, Event, IpcEndpoint,
-        ProtocolVersion, Request, Response, ResponsePayload, SessionPermissionSummary, SessionRole,
-        SessionSelector, SessionSummary, decode, encode,
+        ProtocolVersion, Request, Response, ResponsePayload, SessionRole, SessionSelector,
+        SessionSummary, decode, encode,
     };
     use std::path::Path;
     use uuid::Uuid;
@@ -851,20 +774,6 @@ mod tests {
         let bytes = encode(&role).expect("session role should encode");
         let decoded: SessionRole = decode(&bytes).expect("session role should decode");
         assert_eq!(decoded, role);
-    }
-
-    #[test]
-    fn serializes_permissions_response_roundtrip() {
-        let response = Response::Ok(ResponsePayload::PermissionsList {
-            session_id: Uuid::new_v4(),
-            permissions: vec![SessionPermissionSummary {
-                client_id: Uuid::new_v4(),
-                role: SessionRole::Owner,
-            }],
-        });
-        let bytes = encode(&response).expect("permissions response should encode");
-        let decoded: Response = decode(&bytes).expect("permissions response should decode");
-        assert_eq!(decoded, response);
     }
 
     #[test]

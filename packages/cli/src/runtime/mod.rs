@@ -14,7 +14,7 @@ use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientErro
 use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout, TerminfoAutoInstall};
 use bmux_ipc::{
     AttachViewComponent, InvokeServiceKind, PaneFocusDirection, PaneSplitDirection, SessionRole,
-    SessionSelector, SessionSummary, WindowSelector,
+    SessionSelector, SessionSummary,
 };
 use bmux_keybind::action_to_name;
 use bmux_plugin::{
@@ -619,21 +619,8 @@ async fn resolve_default_attach_target(client: &mut BmuxClient) -> Result<Uuid> 
         return Ok(id);
     }
 
-    let client_id = client.whoami().await.map_err(map_cli_client_error)?;
-    let mut writable_sessions = Vec::new();
-    for session in &sessions {
-        let permissions = client
-            .list_permissions(SessionSelector::ById(session.id))
-            .await
-            .map_err(map_cli_client_error)?;
-        let role = permissions
-            .iter()
-            .find(|permission| permission.client_id == client_id)
-            .map_or(SessionRole::Observer, |permission| permission.role);
-        if role == SessionRole::Owner || role == SessionRole::Writer {
-            writable_sessions.push(session.clone());
-        }
-    }
+    let _client_id = client.whoami().await.map_err(map_cli_client_error)?;
+    let writable_sessions = sessions.clone();
 
     if writable_sessions.is_empty() {
         let name = next_default_session_name(&sessions);
@@ -2026,20 +2013,7 @@ async fn run_client_list(as_json: bool) -> Result<u8> {
                     .unwrap_or_else(|| format!("session-{}", short_uuid(id)))
             },
         );
-        let selected_window = if let Some(session_id) = client_summary.selected_session_id {
-            let mut windows = api
-                .list_windows(Some(SessionSelector::ById(session_id)))
-                .await
-                .map_err(map_cli_client_error)?;
-            sort_attach_windows(&mut windows);
-            windows
-                .iter()
-                .find(|window| window.active)
-                .map(window_summary_label)
-                .unwrap_or_else(|| "-".to_string())
-        } else {
-            "-".to_string()
-        };
+        let selected_window = "-".to_string();
         let following_client = client_summary
             .following_client_id
             .map_or_else(|| "-".to_string(), |id| id.to_string());
@@ -2533,19 +2507,10 @@ async fn handle_attach_runtime_action(
 ) -> std::result::Result<(), ClientError> {
     match action {
         RuntimeAction::NewWindow => {
-            let window_id = client
-                .new_window(Some(SessionSelector::ById(view_state.attached_id)), None)
-                .await?;
-            let _active_window_id = client
-                .switch_window(
-                    Some(SessionSelector::ById(view_state.attached_id)),
-                    WindowSelector::ById(window_id),
-                )
-                .await?;
             let status = attach_context_status(client, view_state.attached_id).await?;
             set_attach_context_status(
                 view_state,
-                status,
+                format!("{status} | workspace unavailable in core baseline"),
                 Instant::now(),
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
@@ -2688,133 +2653,39 @@ async fn handle_attach_ui_action(
         }
         RuntimeAction::WindowPrev => {
             view_state.exit_scrollback();
-            switch_attach_window_relative(client, view_state.attached_id, -1).await?;
-            let status = attach_context_status(client, view_state.attached_id).await?;
-            set_attach_context_status(
-                view_state,
-                status,
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
         }
         RuntimeAction::WindowNext => {
             view_state.exit_scrollback();
-            switch_attach_window_relative(client, view_state.attached_id, 1).await?;
-            let status = attach_context_status(client, view_state.attached_id).await?;
-            set_attach_context_status(
-                view_state,
-                status,
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
         }
         RuntimeAction::WindowGoto1 => {
             view_state.exit_scrollback();
-            switch_attach_window_number(client, view_state.attached_id, 1).await?;
-            let status = attach_context_status(client, view_state.attached_id).await?;
-            set_attach_context_status(
-                view_state,
-                status,
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
         }
         RuntimeAction::WindowGoto2 => {
             view_state.exit_scrollback();
-            switch_attach_window_number(client, view_state.attached_id, 2).await?;
-            let status = attach_context_status(client, view_state.attached_id).await?;
-            set_attach_context_status(
-                view_state,
-                status,
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
         }
         RuntimeAction::WindowGoto3 => {
             view_state.exit_scrollback();
-            switch_attach_window_number(client, view_state.attached_id, 3).await?;
-            let status = attach_context_status(client, view_state.attached_id).await?;
-            set_attach_context_status(
-                view_state,
-                status,
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
         }
         RuntimeAction::WindowGoto4 => {
             view_state.exit_scrollback();
-            switch_attach_window_number(client, view_state.attached_id, 4).await?;
-            let status = attach_context_status(client, view_state.attached_id).await?;
-            set_attach_context_status(
-                view_state,
-                status,
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
         }
         RuntimeAction::WindowGoto5 => {
             view_state.exit_scrollback();
-            switch_attach_window_number(client, view_state.attached_id, 5).await?;
-            let status = attach_context_status(client, view_state.attached_id).await?;
-            set_attach_context_status(
-                view_state,
-                status,
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
         }
         RuntimeAction::WindowGoto6 => {
             view_state.exit_scrollback();
-            switch_attach_window_number(client, view_state.attached_id, 6).await?;
-            let status = attach_context_status(client, view_state.attached_id).await?;
-            set_attach_context_status(
-                view_state,
-                status,
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
         }
         RuntimeAction::WindowGoto7 => {
             view_state.exit_scrollback();
-            switch_attach_window_number(client, view_state.attached_id, 7).await?;
-            let status = attach_context_status(client, view_state.attached_id).await?;
-            set_attach_context_status(
-                view_state,
-                status,
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
         }
         RuntimeAction::WindowGoto8 => {
             view_state.exit_scrollback();
-            switch_attach_window_number(client, view_state.attached_id, 8).await?;
-            let status = attach_context_status(client, view_state.attached_id).await?;
-            set_attach_context_status(
-                view_state,
-                status,
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
         }
         RuntimeAction::WindowGoto9 => {
             view_state.exit_scrollback();
-            switch_attach_window_number(client, view_state.attached_id, 9).await?;
-            let status = attach_context_status(client, view_state.attached_id).await?;
-            set_attach_context_status(
-                view_state,
-                status,
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
         }
         RuntimeAction::WindowClose => {
             view_state.exit_scrollback();
-            let _ = client
-                .kill_window(
-                    Some(SessionSelector::ById(view_state.attached_id)),
-                    WindowSelector::Active,
-                )
-                .await?;
         }
         RuntimeAction::SplitFocusedVertical => {
             let _ = client
@@ -3243,30 +3114,10 @@ fn focused_attach_pane_inner_size(view_state: &AttachViewState) -> Option<(usize
 }
 
 async fn switch_attach_window_relative(
-    client: &mut BmuxClient,
-    session_id: Uuid,
-    step: isize,
+    _client: &mut BmuxClient,
+    _session_id: Uuid,
+    _step: isize,
 ) -> std::result::Result<(), ClientError> {
-    let windows = ordered_session_windows(client, session_id).await?;
-    if windows.is_empty() {
-        return Ok(());
-    }
-
-    let current_index = windows.iter().position(|window| window.active).unwrap_or(0);
-    let len = windows.len() as isize;
-    let mut target_index = current_index as isize + step;
-    while target_index < 0 {
-        target_index += len;
-    }
-    target_index %= len;
-
-    let target_window_id = windows[target_index as usize].id;
-    let _ = client
-        .switch_window(
-            Some(SessionSelector::ById(session_id)),
-            WindowSelector::ById(target_window_id),
-        )
-        .await?;
     Ok(())
 }
 
@@ -3314,49 +3165,11 @@ fn relative_session_id(
 }
 
 async fn switch_attach_window_number(
-    client: &mut BmuxClient,
-    session_id: Uuid,
-    target_number: u32,
+    _client: &mut BmuxClient,
+    _session_id: Uuid,
+    _target_number: u32,
 ) -> std::result::Result<(), ClientError> {
-    let _ = client
-        .switch_window(
-            Some(SessionSelector::ById(session_id)),
-            WindowSelector::ByNumber(target_number),
-        )
-        .await?;
     Ok(())
-}
-
-async fn ordered_session_windows(
-    client: &mut BmuxClient,
-    session_id: Uuid,
-) -> std::result::Result<Vec<bmux_ipc::WindowSummary>, ClientError> {
-    let mut windows = client
-        .list_windows(Some(SessionSelector::ById(session_id)))
-        .await?;
-    sort_attach_windows(&mut windows);
-    Ok(windows)
-}
-
-fn sort_attach_windows(windows: &mut [bmux_ipc::WindowSummary]) {
-    windows.sort_by(|left, right| {
-        let left_rank = window_sort_rank(left);
-        let right_rank = window_sort_rank(right);
-        left_rank
-            .cmp(&right_rank)
-            .then_with(|| left.id.cmp(&right.id))
-    });
-}
-
-fn window_sort_rank(window: &bmux_ipc::WindowSummary) -> (u32, String) {
-    (
-        window.number,
-        window
-            .name
-            .as_deref()
-            .map(str::to_ascii_lowercase)
-            .unwrap_or_default(),
-    )
 }
 
 fn window_has_default_title(number: u32, name: &str) -> bool {
@@ -3368,10 +3181,6 @@ fn window_display_label(number: u32, name: Option<&str>) -> String {
         Some(name) if !window_has_default_title(number, name) => format!("{number}:{name}"),
         _ => number.to_string(),
     }
-}
-
-fn window_summary_label(window: &bmux_ipc::WindowSummary) -> String {
-    window_display_label(window.number, window.name.as_deref())
 }
 
 async fn build_attach_status_line_for_draw(
@@ -3840,29 +3649,20 @@ async fn render_attach_frame(
 }
 
 async fn build_attach_tabs(
-    client: &mut BmuxClient,
-    session_id: Uuid,
+    _client: &mut BmuxClient,
+    _session_id: Uuid,
 ) -> std::result::Result<Vec<AttachTab>, ClientError> {
-    let windows = ordered_session_windows(client, session_id).await?;
-    Ok(windows
-        .into_iter()
-        .map(|window| AttachTab {
-            label: window_summary_label(&window),
-            active: window.active,
-        })
-        .collect())
+    Ok(vec![AttachTab {
+        label: "terminal".to_string(),
+        active: true,
+    }])
 }
 
 async fn resolve_attach_window_label(
-    client: &mut BmuxClient,
-    session_id: Uuid,
+    _client: &mut BmuxClient,
+    _session_id: Uuid,
 ) -> std::result::Result<String, ClientError> {
-    let windows = ordered_session_windows(client, session_id).await?;
-    Ok(windows
-        .iter()
-        .find(|window| window.active)
-        .map(window_summary_label)
-        .unwrap_or_else(|| "-".to_string()))
+    Ok("terminal".to_string())
 }
 
 async fn resolve_attach_session_label(
@@ -7391,52 +7191,6 @@ mod tests {
         assert!(status.contains("help"));
         assert!(status.contains("window mode"));
         assert!(status.contains("typing goes to pane"));
-    }
-
-    #[test]
-    fn sort_attach_windows_prefers_window_number_then_name() {
-        let mut windows = vec![
-            bmux_ipc::WindowSummary {
-                id: uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000003")
-                    .expect("valid uuid"),
-                session_id: uuid::Uuid::nil(),
-                number: 3,
-                name: Some("editor".to_string()),
-                active: false,
-            },
-            bmux_ipc::WindowSummary {
-                id: uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000001")
-                    .expect("valid uuid"),
-                session_id: uuid::Uuid::nil(),
-                number: 10,
-                name: Some("window-10".to_string()),
-                active: false,
-            },
-            bmux_ipc::WindowSummary {
-                id: uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000002")
-                    .expect("valid uuid"),
-                session_id: uuid::Uuid::nil(),
-                number: 2,
-                name: Some("window-2".to_string()),
-                active: true,
-            },
-            bmux_ipc::WindowSummary {
-                id: uuid::Uuid::parse_str("00000000-0000-0000-0000-000000000004")
-                    .expect("valid uuid"),
-                session_id: uuid::Uuid::nil(),
-                number: 99,
-                name: Some("zeta".to_string()),
-                active: false,
-            },
-        ];
-
-        super::sort_attach_windows(&mut windows);
-
-        let ordered_names: Vec<String> = windows
-            .into_iter()
-            .map(|window| super::window_summary_label(&window))
-            .collect();
-        assert_eq!(ordered_names, vec!["2", "3:editor", "10", "99:zeta"]);
     }
 
     #[test]

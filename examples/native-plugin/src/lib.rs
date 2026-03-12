@@ -605,7 +605,13 @@ struct ListPermissionsRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ListPermissionsResponse {
-    permissions: Vec<bmux_ipc::SessionPermissionSummary>,
+    permissions: Vec<PermissionSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct PermissionSummary {
+    client_id: uuid::Uuid,
+    role: bmux_ipc::SessionRole,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -639,7 +645,7 @@ struct ListWindowsRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ListWindowsResponse {
-    windows: Vec<bmux_ipc::WindowSummary>,
+    windows: Vec<WorkspaceWindowSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -650,7 +656,16 @@ struct NewWindowRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct NewWindowResponse {
-    window: bmux_ipc::WindowSummary,
+    window: WorkspaceWindowSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WorkspaceWindowSummary {
+    id: uuid::Uuid,
+    session_id: uuid::Uuid,
+    number: u32,
+    name: Option<String>,
+    active: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
