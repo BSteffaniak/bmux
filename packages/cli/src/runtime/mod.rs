@@ -1795,7 +1795,7 @@ fn format_plugin_command_run_error(
     let base = format!("failed running plugin command '{plugin_id}:{command_name}': {error}");
     if base.contains("session policy denied for this operation") {
         format!(
-            "{base}\nHint: operation denied by session policy. Use the permissions plugin to grant an appropriate role or run with an authorized principal."
+            "{base}\nHint: operation denied by an active policy provider. Verify policy state or run with an authorized principal."
         )
     } else {
         base
@@ -2227,7 +2227,7 @@ async fn run_client_list(as_json: bool) -> Result<u8> {
 
     let sessions = api.list_sessions().await.map_err(map_cli_client_error)?;
     println!(
-        "ID                                   SELF SESSION          WORKSPACE    FOLLOWING_CLIENT                     GLOBAL"
+        "ID                                   SELF SESSION          CONTEXT      FOLLOWING_CLIENT                     GLOBAL"
     );
     for client_summary in clients {
         let selected_session = client_summary.selected_session_id.map_or_else(
@@ -2240,7 +2240,7 @@ async fn run_client_list(as_json: bool) -> Result<u8> {
                     .unwrap_or_else(|| format!("session-{}", short_uuid(id)))
             },
         );
-        let selected_window = "-".to_string();
+        let selected_context = "-".to_string();
         let following_client = client_summary
             .following_client_id
             .map_or_else(|| "-".to_string(), |id| id.to_string());
@@ -2253,7 +2253,7 @@ async fn run_client_list(as_json: bool) -> Result<u8> {
                 "no"
             },
             selected_session,
-            selected_window,
+            selected_context,
             following_client,
             if client_summary.following_global {
                 "yes"
@@ -2276,7 +2276,7 @@ enum DestructiveOpErrorKind {
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct KillFailureSummary {
-    permission_denied: usize,
+    policy_denied: usize,
     not_found: usize,
     other: usize,
 }
@@ -2286,7 +2286,7 @@ impl KillFailureSummary {
         match kind {
             DestructiveOpErrorKind::SessionPolicyDenied
             | DestructiveOpErrorKind::ForceLocalUnauthorized => {
-                self.permission_denied = self.permission_denied.saturating_add(1);
+                self.policy_denied = self.policy_denied.saturating_add(1);
             }
             DestructiveOpErrorKind::NotFound => {
                 self.not_found = self.not_found.saturating_add(1);
@@ -2395,10 +2395,10 @@ fn print_bulk_kill_failure_summary(noun: &str, summary: KillFailureSummary) {
         return;
     }
     println!(
-        "{noun} kill failures: permission_denied={}, not_found={}, other={}",
-        summary.permission_denied, summary.not_found, summary.other
+        "{noun} kill failures: policy_denied={}, not_found={}, other={}",
+        summary.policy_denied, summary.not_found, summary.other
     );
-    if summary.permission_denied > 0 {
+    if summary.policy_denied > 0 {
         println!(
             "hint: inspect active policy provider configuration or identity with `bmux server whoami-principal`"
         );
@@ -3389,7 +3389,7 @@ async fn build_attach_status_line_for_draw(
 
     let tabs = build_attach_tabs(client, session_id).await?;
     let session_label = resolve_attach_session_label(client, session_id).await?;
-    let current_window_label = resolve_attach_window_label(client, session_id).await?;
+    let current_context_label = resolve_attach_context_label(client, session_id).await?;
     let mode_label = if help_overlay_open {
         "HELP"
     } else if scrollback_active {
@@ -3420,7 +3420,7 @@ async fn build_attach_status_line_for_draw(
 
     let status_line = build_attach_status_line(
         &session_label,
-        &current_window_label,
+        &current_context_label,
         &tabs,
         mode_label,
         role_label,
@@ -3818,7 +3818,7 @@ async fn build_attach_tabs(
     }])
 }
 
-async fn resolve_attach_window_label(
+async fn resolve_attach_context_label(
     _client: &mut BmuxClient,
     _session_id: Uuid,
 ) -> std::result::Result<String, ClientError> {
@@ -3849,8 +3849,10 @@ async fn attach_context_status(
     session_id: Uuid,
 ) -> std::result::Result<String, ClientError> {
     let session_label = resolve_attach_session_label(client, session_id).await?;
-    let window_label = resolve_attach_window_label(client, session_id).await?;
-    Ok(format!("session: {session_label} | window: {window_label}"))
+    let context_label = resolve_attach_context_label(client, session_id).await?;
+    Ok(format!(
+        "session: {session_label} | context: {context_label}"
+    ))
 }
 
 fn set_attach_context_status(
@@ -6651,8 +6653,8 @@ mod tests {
         let error = anyhow::anyhow!("session policy denied for this operation");
         let message = super::format_plugin_command_run_error("bmux.windows", "kill", &error);
         assert!(message.contains("failed running plugin command 'bmux.windows:kill'"));
-        assert!(message.contains("operation denied by session policy"));
-        assert!(message.contains("permissions plugin"));
+        assert!(message.contains("operation denied by an active policy provider"));
+        assert!(message.contains("authorized principal"));
     }
 
     #[test]
