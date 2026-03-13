@@ -9,22 +9,21 @@ This package defines the core data structures and types used throughout the bmux
 ## Features
 
 - Session data model definitions
-- Window and pane identifiers
+- Pane identifiers
 - Error types for session operations
 - Serialization support
 
 ## Core Types
 
 - **SessionId**: Unique session identifier
-- **WindowId**: Unique window identifier
 - **PaneId**: Unique pane identifier
 - **SessionError**: Session-specific error types
 
 ## Usage
 
 ```rust
-use bmux_session_models::{SessionId, WindowId, PaneId};
+use bmux_session_models::{SessionId, PaneId};
 
 let session_id = SessionId::new();
-let window_id = WindowId::new();
+let pane_id = PaneId::new();
 ```

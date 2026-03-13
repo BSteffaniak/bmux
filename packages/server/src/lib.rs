@@ -4030,6 +4030,17 @@ async fn handle_request(
                     message: format!("session runtime not found: {}", session_id.0),
                 }));
             }
+            if let Err(response) = ensure_session_mutation_allowed(
+                state,
+                shutdown_tx,
+                session_id,
+                client_id,
+                client_principal_id,
+            )
+            .await
+            {
+                return Ok(Response::Err(response));
+            }
             let write_result = {
                 let mut runtime_manager = state
                     .session_runtimes
@@ -4990,6 +5001,65 @@ mod tests {
                 assert!(error.message.contains("session policy denied"));
             }
             response => panic!("expected denied split response, got {response:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn attach_input_is_blocked_when_mutation_policy_denies() {
+        let server = BmuxServer::new(test_endpoint());
+        server
+            .set_service_resolver(|route, payload| async move {
+                if route.interface_id == "session-policy-query/v1" && route.operation == "check" {
+                    let request: SessionPolicyCheckRequest = decode(&payload)?;
+                    assert_eq!(request.action, "mutation");
+                    return encode(&SessionPolicyCheckResponse {
+                        allowed: false,
+                        reason: Some("session policy denied for this operation".to_string()),
+                    })
+                    .map_err(anyhow::Error::from);
+                }
+                anyhow::bail!("unexpected policy route")
+            })
+            .expect("resolver registration should succeed");
+
+        let client_id = ClientId::new();
+        let principal_id = Uuid::new_v4();
+        let mut selected_session = None;
+        let mut attached_stream_session = None;
+
+        let created = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::NewSession { name: None },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            response => panic!("expected session created response, got {response:?}"),
+        };
+
+        let attach_input = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::AttachInput {
+                session_id,
+                data: b"echo hi\n".to_vec(),
+            },
+        )
+        .await;
+
+        match attach_input {
+            Response::Err(error) => {
+                assert_eq!(error.code, ErrorCode::InvalidRequest);
+                assert!(error.message.contains("session policy denied"));
+            }
+            response => panic!("expected denied attach input response, got {response:?}"),
         }
     }
 }
