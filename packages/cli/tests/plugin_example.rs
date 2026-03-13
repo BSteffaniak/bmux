@@ -74,6 +74,7 @@ fn bundled_permissions_manifest_requires_generic_runtime_capabilities() {
 
     assert!(required.contains(&"bmux.commands".to_string()));
     assert!(required.contains(&"bmux.sessions.read".to_string()));
+    assert!(required.contains(&"bmux.clients.read".to_string()));
     assert!(required.contains(&"bmux.storage".to_string()));
 }
 

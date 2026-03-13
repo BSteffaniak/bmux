@@ -24,6 +24,8 @@ impl RustPlugin for PermissionsPlugin {
             .expect("capability should parse")
             .require_capability("bmux.sessions.read")
             .expect("capability should parse")
+            .require_capability("bmux.clients.read")
+            .expect("capability should parse")
             .require_capability("bmux.storage")
             .expect("capability should parse")
             .provide_capability("bmux.permissions.read")
@@ -290,13 +292,19 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
 }
 
 fn resolve_current_session(caller: &impl HostRuntimeApi) -> Result<String, String> {
+    let current_client = caller.current_client().map_err(|error| error.to_string())?;
     let sessions = caller
         .session_list()
         .map_err(|error| error.to_string())?
         .sessions;
-    let session = sessions
-        .into_iter()
-        .next()
+    let preferred = current_client.selected_session_id.and_then(|selected_id| {
+        sessions
+            .iter()
+            .find(|session| session.id == selected_id)
+            .cloned()
+    });
+    let session = preferred
+        .or_else(|| sessions.into_iter().next())
         .ok_or_else(|| "no active session available".to_string())?;
     Ok(session.name.unwrap_or_else(|| session.id.to_string()))
 }
@@ -372,36 +380,96 @@ fn evaluate_policy(
         .into_iter()
         .find(|entry| entry.client_id == client_key);
 
-    let decision = match (
-        request.action.as_str(),
-        entry.as_ref().map(|entry| entry.role.as_str()),
-    ) {
-        (_, None) => SessionPolicyCheckResponse {
+    let decision = match entry.as_ref().map(|entry| entry.role.as_str()) {
+        None => SessionPolicyCheckResponse {
             allowed: true,
             reason: None,
         },
-        ("admin", Some("owner")) => SessionPolicyCheckResponse {
-            allowed: true,
-            reason: None,
-        },
-        ("admin", Some("writer" | "observer")) => SessionPolicyCheckResponse {
-            allowed: false,
-            reason: Some("session policy denied for this operation".to_string()),
-        },
-        ("mutation", Some("observer")) => SessionPolicyCheckResponse {
-            allowed: false,
-            reason: Some("session policy denied for this operation".to_string()),
-        },
-        ("mutation", Some("owner" | "writer")) => SessionPolicyCheckResponse {
-            allowed: true,
-            reason: None,
-        },
-        (_, Some(_)) => SessionPolicyCheckResponse {
-            allowed: false,
-            reason: Some("invalid session policy action or role mapping".to_string()),
-        },
+        Some(role) => evaluate_role_action(role, request.action.as_str()),
     };
     Ok(decision)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PolicyActionKind {
+    Admin,
+    Mutation,
+    Read,
+    Unknown,
+}
+
+fn evaluate_role_action(role: &str, action: &str) -> SessionPolicyCheckResponse {
+    let action_kind = classify_action(action);
+    match (role, action_kind) {
+        (
+            "owner",
+            PolicyActionKind::Admin | PolicyActionKind::Mutation | PolicyActionKind::Read,
+        ) => SessionPolicyCheckResponse {
+            allowed: true,
+            reason: None,
+        },
+        ("writer", PolicyActionKind::Mutation | PolicyActionKind::Read) => {
+            SessionPolicyCheckResponse {
+                allowed: true,
+                reason: None,
+            }
+        }
+        ("observer", PolicyActionKind::Read) => SessionPolicyCheckResponse {
+            allowed: true,
+            reason: None,
+        },
+        ("writer" | "observer", PolicyActionKind::Admin)
+        | ("observer", PolicyActionKind::Mutation) => SessionPolicyCheckResponse {
+            allowed: false,
+            reason: Some(format!(
+                "session policy denied for action '{}' with role '{}'",
+                action, role
+            )),
+        },
+        (_, PolicyActionKind::Unknown) => SessionPolicyCheckResponse {
+            allowed: false,
+            reason: Some(format!("invalid session policy action '{}'", action)),
+        },
+        (_, _) => SessionPolicyCheckResponse {
+            allowed: false,
+            reason: Some(format!("invalid session policy role mapping '{}'", role)),
+        },
+    }
+}
+
+fn classify_action(action: &str) -> PolicyActionKind {
+    let normalized = action.trim().to_ascii_lowercase().replace('-', "_");
+    match normalized.as_str() {
+        "admin" | "session_admin" | "session_kill" | "kill_session" => PolicyActionKind::Admin,
+        "mutation" | "write" | "session_mutation" | "attach_input" | "session_select"
+        | "pane_split" | "pane_focus" | "pane_resize" | "pane_close" | "follow" | "unfollow" => {
+            PolicyActionKind::Mutation
+        }
+        "read" | "query" | "list" | "status" => PolicyActionKind::Read,
+        _ if normalized.contains("admin")
+            || normalized.contains("kill_session")
+            || normalized.contains("session_kill") =>
+        {
+            PolicyActionKind::Admin
+        }
+        _ if normalized.contains("mutat")
+            || normalized.contains("write")
+            || normalized.contains("attach")
+            || normalized.contains("pane")
+            || normalized.contains("select")
+            || normalized.contains("follow") =>
+        {
+            PolicyActionKind::Mutation
+        }
+        _ if normalized.contains("read")
+            || normalized.contains("query")
+            || normalized.contains("list")
+            || normalized.contains("status") =>
+        {
+            PolicyActionKind::Read
+        }
+        _ => PolicyActionKind::Unknown,
+    }
 }
 
 fn load_state(caller: &impl HostRuntimeApi) -> Result<StoredPermissions, String> {
@@ -572,6 +640,7 @@ mod tests {
 
     struct MockHost {
         sessions: Vec<SessionSummary>,
+        selected_session_id: Option<Uuid>,
         storage: Mutex<BTreeMap<String, Vec<u8>>>,
     }
 
@@ -583,13 +652,26 @@ mod tests {
                     name: Some(name.to_string()),
                     client_count: 1,
                 }],
+                selected_session_id: Some(id),
                 storage: Mutex::new(BTreeMap::new()),
             }
         }
 
         fn with_sessions(sessions: Vec<SessionSummary>) -> Self {
             Self {
+                selected_session_id: sessions.first().map(|session| session.id),
                 sessions,
+                storage: Mutex::new(BTreeMap::new()),
+            }
+        }
+
+        fn with_sessions_and_selected(
+            sessions: Vec<SessionSummary>,
+            selected_session_id: Option<Uuid>,
+        ) -> Self {
+            Self {
+                sessions,
+                selected_session_id,
                 storage: Mutex::new(BTreeMap::new()),
             }
         }
@@ -609,6 +691,15 @@ mod tests {
                     sessions: self.sessions.clone(),
                 })
                 .map_err(Into::into),
+                ("client-query/v1", "current") => {
+                    encode_service_message(&bmux_plugin::CurrentClientResponse {
+                        id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
+                        selected_session_id: self.selected_session_id,
+                        following_client_id: None,
+                        following_global: false,
+                    })
+                    .map_err(Into::into)
+                }
                 ("storage-query/v1", "get") => {
                     let request: StorageGetRequest = decode_service_message(&payload)?;
                     let value = self
@@ -662,6 +753,21 @@ mod tests {
         };
 
         let response = match kernel_request {
+            bmux_ipc::Request::WhoAmI => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ClientIdentity {
+                    id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
+                })
+            }
+            bmux_ipc::Request::ListClients => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ClientList {
+                    clients: vec![bmux_ipc::ClientSummary {
+                        id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
+                        selected_session_id: Some(service_test_session_id()),
+                        following_client_id: None,
+                        following_global: false,
+                    }],
+                })
+            }
             bmux_ipc::Request::ListSessions => {
                 bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionList {
                     sessions: vec![bmux_ipc::SessionSummary {
@@ -720,6 +826,12 @@ mod tests {
                 provider: ProviderId::Host,
             },
             RegisteredService {
+                capability: HostScope::new("bmux.clients.read").expect("capability should parse"),
+                kind: ServiceKind::Query,
+                interface_id: "client-query/v1".to_string(),
+                provider: ProviderId::Host,
+            },
+            RegisteredService {
                 capability: HostScope::new("bmux.storage").expect("capability should parse"),
                 kind: ServiceKind::Query,
                 interface_id: "storage-query/v1".to_string(),
@@ -749,6 +861,7 @@ mod tests {
             required_capabilities: vec![
                 "bmux.commands".to_string(),
                 "bmux.sessions.read".to_string(),
+                "bmux.clients.read".to_string(),
                 "bmux.storage".to_string(),
             ],
             provided_capabilities: vec![
@@ -759,6 +872,7 @@ mod tests {
             services: host_services,
             available_capabilities: vec![
                 "bmux.sessions.read".to_string(),
+                "bmux.clients.read".to_string(),
                 "bmux.storage".to_string(),
             ],
             enabled_plugins: vec!["bmux.permissions".to_string()],
@@ -788,9 +902,41 @@ mod tests {
     }
 
     #[test]
-    fn resolve_current_session_uses_active_session_name() {
-        let host = MockHost::with_session(Uuid::new_v4(), "alpha");
+    fn resolve_current_session_uses_selected_session_name() {
+        let alpha_id = Uuid::new_v4();
+        let beta_id = Uuid::new_v4();
+        let host = MockHost::with_sessions_and_selected(
+            vec![
+                SessionSummary {
+                    id: alpha_id,
+                    name: Some("alpha".to_string()),
+                    client_count: 1,
+                },
+                SessionSummary {
+                    id: beta_id,
+                    name: Some("beta".to_string()),
+                    client_count: 1,
+                },
+            ],
+            Some(beta_id),
+        );
         let session = resolve_current_session(&host).expect("active session should resolve");
+        assert_eq!(session, "beta");
+    }
+
+    #[test]
+    fn resolve_current_session_falls_back_when_selected_session_missing() {
+        let alpha_id = Uuid::new_v4();
+        let host = MockHost::with_sessions_and_selected(
+            vec![SessionSummary {
+                id: alpha_id,
+                name: Some("alpha".to_string()),
+                client_count: 1,
+            }],
+            Some(Uuid::new_v4()),
+        );
+        let session =
+            resolve_current_session(&host).expect("fallback to first listed session should work");
         assert_eq!(session, "alpha");
     }
 
@@ -882,6 +1028,93 @@ mod tests {
         )
         .expect("policy evaluation should succeed");
         assert!(!admin.allowed);
+    }
+
+    #[test]
+    fn owner_role_allows_admin() {
+        let session_id = Uuid::new_v4();
+        let client_id = Uuid::new_v4();
+        let host = MockHost::with_session(session_id, "alpha");
+
+        grant_entry(
+            &host,
+            GrantRequest {
+                session: "alpha".to_string(),
+                client: client_id.to_string(),
+                role: "owner".to_string(),
+            },
+        )
+        .expect("grant should succeed");
+
+        let admin = evaluate_policy(
+            &host,
+            &SessionPolicyCheckRequest {
+                session_id,
+                client_id,
+                principal_id: Uuid::new_v4(),
+                action: "admin".to_string(),
+            },
+        )
+        .expect("policy evaluation should succeed");
+        assert!(admin.allowed);
+    }
+
+    #[test]
+    fn observer_role_denies_granular_mutation_action() {
+        let session_id = Uuid::new_v4();
+        let client_id = Uuid::new_v4();
+        let host = MockHost::with_session(session_id, "alpha");
+
+        grant_entry(
+            &host,
+            GrantRequest {
+                session: "alpha".to_string(),
+                client: client_id.to_string(),
+                role: "observer".to_string(),
+            },
+        )
+        .expect("grant should succeed");
+
+        let decision = evaluate_policy(
+            &host,
+            &SessionPolicyCheckRequest {
+                session_id,
+                client_id,
+                principal_id: Uuid::new_v4(),
+                action: "attach-input".to_string(),
+            },
+        )
+        .expect("policy evaluation should succeed");
+        assert!(!decision.allowed);
+    }
+
+    #[test]
+    fn writer_role_allows_granular_mutation_action() {
+        let session_id = Uuid::new_v4();
+        let client_id = Uuid::new_v4();
+        let host = MockHost::with_session(session_id, "alpha");
+
+        grant_entry(
+            &host,
+            GrantRequest {
+                session: "alpha".to_string(),
+                client: client_id.to_string(),
+                role: "writer".to_string(),
+            },
+        )
+        .expect("grant should succeed");
+
+        let decision = evaluate_policy(
+            &host,
+            &SessionPolicyCheckRequest {
+                session_id,
+                client_id,
+                principal_id: Uuid::new_v4(),
+                action: "pane_split".to_string(),
+            },
+        )
+        .expect("policy evaluation should succeed");
+        assert!(decision.allowed);
     }
 
     #[test]
