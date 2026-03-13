@@ -28,7 +28,104 @@ execution     = "provider_exec"
 expose_in_cli = true
 name          = "new-window"
 path          = ["new-window"]
-summary       = "Create a new window in a session"
+summary       = "Create a workspace window"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+short      = "s"
+value_name = "SESSION"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "name"
+name       = "name"
+short      = "n"
+value_name = "NAME"
+
+[[commands]]
+aliases       = [["window", "list"]]
+execution     = "provider_exec"
+expose_in_cli = true
+name          = "list-windows"
+path          = ["list-windows"]
+summary       = "List workspace windows"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+short      = "s"
+value_name = "SESSION"
+
+[[commands.arguments]]
+kind  = "boolean"
+long  = "json"
+name  = "json"
+short = "j"
+
+[[commands]]
+aliases       = [["window", "kill"]]
+execution     = "provider_exec"
+expose_in_cli = true
+name          = "kill-window"
+path          = ["kill-window"]
+summary       = "Kill a workspace window"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "target"
+position   = 0
+required   = true
+value_name = "TARGET"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+short      = "s"
+value_name = "SESSION"
+
+[[commands.arguments]]
+kind = "boolean"
+long = "force-local"
+name = "force-local"
+
+[[commands]]
+aliases       = [["window", "kill-all"]]
+execution     = "provider_exec"
+expose_in_cli = true
+name          = "kill-all-windows"
+path          = ["kill-all-windows"]
+summary       = "Kill all workspace windows"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+short      = "s"
+value_name = "SESSION"
+
+[[commands.arguments]]
+kind = "boolean"
+long = "force-local"
+name = "force-local"
+
+[[commands]]
+aliases       = [["window", "switch"]]
+execution     = "provider_exec"
+expose_in_cli = true
+name          = "switch-window"
+path          = ["switch-window"]
+summary       = "Switch active workspace window"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "target"
+position   = 0
+required   = true
+value_name = "TARGET"
 
 [[commands.arguments]]
 kind       = "string"
@@ -60,103 +157,6 @@ expose_in_cli = true
 name          = "last-window"
 path          = ["last-window"]
 summary       = "Switch to the previously active workspace window"
-
-[[commands.arguments]]
-kind       = "string"
-long       = "name"
-name       = "name"
-short      = "n"
-value_name = "NAME"
-
-[[commands]]
-aliases       = [["window", "list"]]
-execution     = "provider_exec"
-expose_in_cli = true
-name          = "list-windows"
-path          = ["list-windows"]
-summary       = "List windows for a session"
-
-[[commands.arguments]]
-kind       = "string"
-long       = "session"
-name       = "session"
-short      = "s"
-value_name = "SESSION"
-
-[[commands.arguments]]
-kind  = "boolean"
-long  = "json"
-name  = "json"
-short = "j"
-
-[[commands]]
-aliases       = [["window", "kill"]]
-execution     = "provider_exec"
-expose_in_cli = true
-name          = "kill-window"
-path          = ["kill-window"]
-summary       = "Kill a window by name, UUID, or active"
-
-[[commands.arguments]]
-kind       = "string"
-name       = "target"
-position   = 0
-required   = true
-value_name = "TARGET"
-
-[[commands.arguments]]
-kind       = "string"
-long       = "session"
-name       = "session"
-short      = "s"
-value_name = "SESSION"
-
-[[commands.arguments]]
-kind = "boolean"
-long = "force-local"
-name = "force-local"
-
-[[commands]]
-aliases       = [["window", "kill-all"]]
-execution     = "provider_exec"
-expose_in_cli = true
-name          = "kill-all-windows"
-path          = ["kill-all-windows"]
-summary       = "Kill all windows in a session"
-
-[[commands.arguments]]
-kind       = "string"
-long       = "session"
-name       = "session"
-short      = "s"
-value_name = "SESSION"
-
-[[commands.arguments]]
-kind = "boolean"
-long = "force-local"
-name = "force-local"
-
-[[commands]]
-aliases       = [["window", "switch"]]
-execution     = "provider_exec"
-expose_in_cli = true
-name          = "switch-window"
-path          = ["switch-window"]
-summary       = "Switch active window by name, UUID, or active"
-
-[[commands.arguments]]
-kind       = "string"
-name       = "target"
-position   = 0
-required   = true
-value_name = "TARGET"
-
-[[commands.arguments]]
-kind       = "string"
-long       = "session"
-name       = "session"
-short      = "s"
-value_name = "SESSION"
 
 [plugin_api]
 minimum = "1.0"

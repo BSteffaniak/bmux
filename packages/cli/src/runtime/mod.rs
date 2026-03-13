@@ -219,6 +219,7 @@ fn core_provided_capabilities() -> Vec<HostScope> {
         "bmux.key_actions",
         "bmux.status_bar_items",
         "bmux.storage",
+        "bmux.clients.read",
         "bmux.sessions.read",
         "bmux.sessions.write",
         "bmux.panes.read",
@@ -255,6 +256,12 @@ fn core_service_descriptors() -> Vec<RegisteredService> {
             capability: HostScope::new("bmux.storage").expect("capability should parse"),
             kind: ServiceKind::Command,
             interface_id: "storage-command/v1".to_string(),
+            provider: bmux_plugin::ProviderId::Host,
+        },
+        RegisteredService {
+            capability: HostScope::new("bmux.clients.read").expect("capability should parse"),
+            kind: ServiceKind::Query,
+            interface_id: "client-query/v1".to_string(),
             provider: bmux_plugin::ProviderId::Host,
         },
         RegisteredService {
@@ -6042,7 +6049,7 @@ mod tests {
             context.provided_capabilities,
             vec!["example.provider.write".to_string()]
         );
-        assert_eq!(context.services.len(), 8);
+        assert_eq!(context.services.len(), 9);
         assert!(
             context
                 .services
@@ -6060,6 +6067,12 @@ mod tests {
                 .services
                 .iter()
                 .any(|service| service.interface_id == "storage-command/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "client-query/v1")
         );
         assert!(
             context
@@ -6178,7 +6191,7 @@ mod tests {
                 "example.provider.write".to_string()
             ]
         );
-        assert_eq!(context.services.len(), 9);
+        assert_eq!(context.services.len(), 10);
         assert!(
             context
                 .services
@@ -6196,6 +6209,12 @@ mod tests {
                 .services
                 .iter()
                 .any(|service| service.interface_id == "storage-command/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "client-query/v1")
         );
         assert!(
             context

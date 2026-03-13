@@ -32,7 +32,7 @@ execution     = "provider_exec"
 expose_in_cli = true
 name          = "permissions"
 path          = ["permissions"]
-summary       = "List explicit role assignments for a session"
+summary       = "Permissions provider status"
 
 [[commands.arguments]]
 kind       = "string"
@@ -48,11 +48,19 @@ long  = "json"
 name  = "json"
 short = "j"
 
+[[commands]]
+aliases       = [["session", "permissions-current"]]
+execution     = "provider_exec"
+expose_in_cli = true
+name          = "permissions-current"
+path          = ["permissions-current"]
+summary       = "Permissions for the currently active session"
+
 [[commands.arguments]]
 kind  = "boolean"
-long  = "watch"
-name  = "watch"
-short = "w"
+long  = "json"
+name  = "json"
+short = "j"
 
 [[commands]]
 aliases       = [["session", "grant"]]
@@ -60,7 +68,7 @@ execution     = "provider_exec"
 expose_in_cli = true
 name          = "grant"
 path          = ["grant"]
-summary       = "Grant a role to a client in a session"
+summary       = "Grant command handled by permissions provider"
 
 [[commands.arguments]]
 kind       = "string"
@@ -93,7 +101,7 @@ execution     = "provider_exec"
 expose_in_cli = true
 name          = "revoke"
 path          = ["revoke"]
-summary       = "Revoke an explicit role from a client in a session"
+summary       = "Revoke command handled by permissions provider"
 
 [[commands.arguments]]
 kind       = "string"
@@ -110,20 +118,6 @@ name       = "client"
 required   = true
 short      = "c"
 value_name = "CLIENT"
-
-[[commands]]
-aliases       = [["session", "permissions-current"]]
-execution     = "provider_exec"
-expose_in_cli = true
-name          = "permissions-current"
-path          = ["permissions-current"]
-summary       = "List explicit role assignments for the active session"
-
-[[commands.arguments]]
-kind  = "boolean"
-long  = "json"
-name  = "json"
-short = "j"
 
 [keybindings.runtime]
 "shift+p" = "plugin:bmux.permissions:permissions-current"

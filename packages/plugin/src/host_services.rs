@@ -72,6 +72,26 @@ pub struct SessionListResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSelectRequest {
+    pub selector: SessionSelector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionSelectResponse {
+    pub session_id: Uuid,
+    pub attach_token: Uuid,
+    pub expires_at_epoch_ms: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CurrentClientResponse {
+    pub id: Uuid,
+    pub selected_session_id: Option<Uuid>,
+    pub following_client_id: Option<Uuid>,
+    pub following_global: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneListRequest {
     pub session: Option<SessionSelector>,
 }
@@ -160,6 +180,26 @@ pub trait HostRuntimeApi: ServiceCaller {
             "session-command/v1",
             "kill",
             request,
+        )
+    }
+
+    fn session_select(&self, request: &SessionSelectRequest) -> Result<SessionSelectResponse> {
+        self.call_service(
+            "bmux.sessions.write",
+            ServiceKind::Command,
+            "session-command/v1",
+            "select",
+            request,
+        )
+    }
+
+    fn current_client(&self) -> Result<CurrentClientResponse> {
+        self.call_service(
+            "bmux.clients.read",
+            ServiceKind::Query,
+            "client-query/v1",
+            "current",
+            &(),
         )
     }
 

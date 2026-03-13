@@ -41,11 +41,12 @@ pub use error::{PluginError, Result};
 pub use event::{PluginEvent, PluginEventKind, PluginEventPayload, PluginEventSubscription};
 pub use host::{HostConnectionInfo, HostMetadata, PluginContext, PluginHost};
 pub use host_services::{
-    HostRuntimeApi, PaneCloseRequest, PaneCloseResponse, PaneFocusDirection, PaneFocusRequest,
-    PaneFocusResponse, PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse,
-    PaneSelector, PaneSplitDirection, PaneSplitRequest, PaneSplitResponse, PaneSummary,
-    SessionCreateRequest, SessionCreateResponse, SessionKillRequest, SessionKillResponse,
-    SessionListResponse, SessionSelector, SessionSummary,
+    CurrentClientResponse, HostRuntimeApi, PaneCloseRequest, PaneCloseResponse, PaneFocusDirection,
+    PaneFocusRequest, PaneFocusResponse, PaneListRequest, PaneListResponse, PaneResizeRequest,
+    PaneResizeResponse, PaneSelector, PaneSplitDirection, PaneSplitRequest, PaneSplitResponse,
+    PaneSummary, SessionCreateRequest, SessionCreateResponse, SessionKillRequest,
+    SessionKillResponse, SessionListResponse, SessionSelectRequest, SessionSelectResponse,
+    SessionSelector, SessionSummary,
 };
 pub use loader::{
     HostKernelBridge, HostKernelBridgeRequest, HostKernelBridgeResponse, LoadedPlugin,

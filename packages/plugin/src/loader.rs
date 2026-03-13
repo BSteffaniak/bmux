@@ -8,13 +8,14 @@ use crate::{
     decode_service_envelope, decode_service_message, discover_registered_plugins_in_roots,
     encode_service_envelope, encode_service_message,
     host_services::{
-        PaneCloseRequest, PaneCloseResponse, PaneFocusDirection as HostPaneFocusDirection,
-        PaneFocusRequest, PaneFocusResponse, PaneListRequest, PaneListResponse, PaneResizeRequest,
-        PaneResizeResponse, PaneSelector as HostPaneSelector,
-        PaneSplitDirection as HostPaneSplitDirection, PaneSplitRequest, PaneSplitResponse,
-        PaneSummary as HostPaneSummary, SessionCreateRequest, SessionCreateResponse,
-        SessionKillRequest, SessionKillResponse, SessionListResponse,
-        SessionSelector as HostSessionSelector, SessionSummary as HostSessionSummary,
+        CurrentClientResponse, PaneCloseRequest, PaneCloseResponse,
+        PaneFocusDirection as HostPaneFocusDirection, PaneFocusRequest, PaneFocusResponse,
+        PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse,
+        PaneSelector as HostPaneSelector, PaneSplitDirection as HostPaneSplitDirection,
+        PaneSplitRequest, PaneSplitResponse, PaneSummary as HostPaneSummary, SessionCreateRequest,
+        SessionCreateResponse, SessionKillRequest, SessionKillResponse, SessionListResponse,
+        SessionSelectRequest, SessionSelectResponse, SessionSelector as HostSessionSelector,
+        SessionSummary as HostSessionSummary,
     },
 };
 use bmux_ipc::{
@@ -710,6 +711,39 @@ fn handle_core_service_call(
                 }),
             }
         }
+        ("client-query/v1", "current") => {
+            let client_id = match execute_kernel_request(host_kernel_bridge, IpcRequest::WhoAmI)? {
+                IpcResponsePayload::ClientIdentity { id } => id,
+                _ => {
+                    return Err(PluginError::ServiceProtocol {
+                        details: "unexpected response payload for client-query/v1:current whoami"
+                            .to_string(),
+                    });
+                }
+            };
+            let response = execute_kernel_request(host_kernel_bridge, IpcRequest::ListClients)?;
+            match response {
+                IpcResponsePayload::ClientList { clients } => {
+                    let current = clients
+                        .into_iter()
+                        .find(|entry| entry.id == client_id)
+                        .ok_or(PluginError::ServiceProtocol {
+                            details: "current client missing from list-clients response"
+                                .to_string(),
+                        })?;
+                    encode_service_message(&CurrentClientResponse {
+                        id: current.id,
+                        selected_session_id: current.selected_session_id,
+                        following_client_id: current.following_client_id,
+                        following_global: current.following_global,
+                    })
+                }
+                _ => Err(PluginError::ServiceProtocol {
+                    details: "unexpected response payload for client-query/v1:current list-clients"
+                        .to_string(),
+                }),
+            }
+        }
         ("session-command/v1", "new") => {
             let request: SessionCreateRequest = decode_service_message(&payload)?;
             let response = execute_kernel_request(
@@ -740,6 +774,28 @@ fn handle_core_service_call(
                 }
                 _ => Err(PluginError::ServiceProtocol {
                     details: "unexpected response payload for session-command/v1:kill".to_string(),
+                }),
+            }
+        }
+        ("session-command/v1", "select") => {
+            let request: SessionSelectRequest = decode_service_message(&payload)?;
+            let response = execute_kernel_request(
+                host_kernel_bridge,
+                IpcRequest::Attach {
+                    selector: session_selector_to_ipc(request.selector),
+                },
+            )?;
+            match response {
+                IpcResponsePayload::Attached { grant } => {
+                    encode_service_message(&SessionSelectResponse {
+                        session_id: grant.session_id,
+                        attach_token: grant.attach_token,
+                        expires_at_epoch_ms: grant.expires_at_epoch_ms,
+                    })
+                }
+                _ => Err(PluginError::ServiceProtocol {
+                    details: "unexpected response payload for session-command/v1:select"
+                        .to_string(),
                 }),
             }
         }
@@ -1645,6 +1701,36 @@ mod tests {
                     }],
                 })
             }
+            bmux_ipc::Request::WhoAmI => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ClientIdentity {
+                    id: uuid::Uuid::from_u128(0x11111111_1111_1111_1111_111111111111),
+                })
+            }
+            bmux_ipc::Request::ListClients => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ClientList {
+                    clients: vec![bmux_ipc::ClientSummary {
+                        id: uuid::Uuid::from_u128(0x11111111_1111_1111_1111_111111111111),
+                        selected_session_id: Some(uuid::Uuid::from_u128(
+                            0x22222222_2222_2222_2222_222222222222,
+                        )),
+                        following_client_id: None,
+                        following_global: false,
+                    }],
+                })
+            }
+            bmux_ipc::Request::Attach { selector } => {
+                let session_id = match selector {
+                    bmux_ipc::SessionSelector::ById(id) => id,
+                    bmux_ipc::SessionSelector::ByName(_) => uuid::Uuid::new_v4(),
+                };
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::Attached {
+                    grant: bmux_ipc::AttachGrant {
+                        session_id,
+                        attach_token: uuid::Uuid::new_v4(),
+                        expires_at_epoch_ms: 42,
+                    },
+                })
+            }
             bmux_ipc::Request::ListPanes { .. } => {
                 bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::PaneList {
                     panes: vec![bmux_ipc::PaneSummary {
@@ -2255,6 +2341,147 @@ minimum = "1.0"
             requests.last(),
             Some(bmux_ipc::Request::NewSession { .. })
         ));
+    }
+
+    #[test]
+    fn command_context_calls_core_client_query_via_kernel_bridge() {
+        KERNEL_REQUESTS
+            .lock()
+            .expect("kernel request log lock should succeed")
+            .clear();
+
+        let context = super::NativeCommandContext {
+            plugin_id: "caller.plugin".to_string(),
+            command: "current-client".to_string(),
+            arguments: Vec::new(),
+            required_capabilities: vec!["bmux.clients.read".to_string()],
+            provided_capabilities: Vec::new(),
+            services: vec![crate::RegisteredService {
+                capability: crate::HostScope::new("bmux.clients.read")
+                    .expect("capability should parse"),
+                kind: crate::ServiceKind::Query,
+                interface_id: "client-query/v1".to_string(),
+                provider: crate::ProviderId::Host,
+            }],
+            available_capabilities: vec!["bmux.clients.read".to_string()],
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: crate::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
+        };
+
+        let response: crate::CurrentClientResponse = context
+            .call_service(
+                "bmux.clients.read",
+                crate::ServiceKind::Query,
+                "client-query/v1",
+                "current",
+                &(),
+            )
+            .expect("core client query should succeed");
+        assert_eq!(
+            response.id,
+            uuid::Uuid::from_u128(0x11111111_1111_1111_1111_111111111111)
+        );
+        assert_eq!(
+            response.selected_session_id,
+            Some(uuid::Uuid::from_u128(
+                0x22222222_2222_2222_2222_222222222222
+            ))
+        );
+
+        let requests = KERNEL_REQUESTS
+            .lock()
+            .expect("kernel request log lock should succeed");
+        assert!(
+            requests
+                .iter()
+                .any(|request| matches!(request, bmux_ipc::Request::WhoAmI))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|request| matches!(request, bmux_ipc::Request::ListClients))
+        );
+    }
+
+    #[test]
+    fn command_context_calls_core_session_select_via_kernel_bridge() {
+        KERNEL_REQUESTS
+            .lock()
+            .expect("kernel request log lock should succeed")
+            .clear();
+
+        let target_session_id = uuid::Uuid::new_v4();
+        let context = super::NativeCommandContext {
+            plugin_id: "caller.plugin".to_string(),
+            command: "select-session".to_string(),
+            arguments: Vec::new(),
+            required_capabilities: vec!["bmux.sessions.write".to_string()],
+            provided_capabilities: Vec::new(),
+            services: vec![crate::RegisteredService {
+                capability: crate::HostScope::new("bmux.sessions.write")
+                    .expect("capability should parse"),
+                kind: crate::ServiceKind::Command,
+                interface_id: "session-command/v1".to_string(),
+                provider: crate::ProviderId::Host,
+            }],
+            available_capabilities: vec!["bmux.sessions.write".to_string()],
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: crate::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
+        };
+
+        let response: crate::SessionSelectResponse = context
+            .call_service(
+                "bmux.sessions.write",
+                crate::ServiceKind::Command,
+                "session-command/v1",
+                "select",
+                &crate::SessionSelectRequest {
+                    selector: crate::SessionSelector::ById(target_session_id),
+                },
+            )
+            .expect("core session select should succeed");
+        assert_eq!(response.session_id, target_session_id);
+        assert_eq!(response.expires_at_epoch_ms, 42);
+
+        let requests = KERNEL_REQUESTS
+            .lock()
+            .expect("kernel request log lock should succeed");
+        assert!(requests.iter().any(|request| {
+            matches!(
+                request,
+                bmux_ipc::Request::Attach {
+                    selector: bmux_ipc::SessionSelector::ById(id)
+                } if *id == target_session_id
+            )
+        }));
     }
 
     #[test]
