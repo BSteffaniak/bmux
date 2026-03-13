@@ -152,6 +152,22 @@ pub struct PaneCloseResponse {
     pub session_closed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageGetRequest {
+    pub key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageGetResponse {
+    pub value: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageSetRequest {
+    pub key: String,
+    pub value: Vec<u8>,
+}
+
 pub trait HostRuntimeApi: ServiceCaller {
     fn session_list(&self) -> Result<SessionListResponse> {
         self.call_service(
@@ -249,6 +265,26 @@ pub trait HostRuntimeApi: ServiceCaller {
             ServiceKind::Command,
             "pane-command/v1",
             "close",
+            request,
+        )
+    }
+
+    fn storage_get(&self, request: &StorageGetRequest) -> Result<StorageGetResponse> {
+        self.call_service(
+            "bmux.storage",
+            ServiceKind::Query,
+            "storage-query/v1",
+            "get",
+            request,
+        )
+    }
+
+    fn storage_set(&self, request: &StorageSetRequest) -> Result<()> {
+        self.call_service(
+            "bmux.storage",
+            ServiceKind::Command,
+            "storage-command/v1",
+            "set",
             request,
         )
     }

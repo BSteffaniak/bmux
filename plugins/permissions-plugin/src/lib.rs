@@ -5,8 +5,8 @@
 use bmux_plugin::{
     CommandExecutionKind, HostRuntimeApi, HostScope, NativeCommandContext, NativeDescriptor,
     NativeServiceContext, PluginCommand, PluginCommandArgument, PluginCommandArgumentKind,
-    PluginService, RustPlugin, ServiceKind, ServiceResponse, SessionSelector,
-    decode_service_message, encode_service_message,
+    PluginService, RustPlugin, ServiceKind, ServiceResponse, SessionSelector, StorageGetRequest,
+    StorageSetRequest, decode_service_message, encode_service_message,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -473,20 +473,11 @@ fn classify_action(action: &str) -> PolicyActionKind {
 }
 
 fn load_state(caller: &impl HostRuntimeApi) -> Result<StoredPermissions, String> {
-    let payload = caller
-        .call_service_raw(
-            "bmux.storage",
-            ServiceKind::Query,
-            "storage-query/v1",
-            "get",
-            encode_service_message(&StorageGetRequest {
-                key: PERMISSIONS_STORAGE_KEY.to_string(),
-            })
-            .map_err(|error| error.to_string())?,
-        )
+    let response = caller
+        .storage_get(&StorageGetRequest {
+            key: PERMISSIONS_STORAGE_KEY.to_string(),
+        })
         .map_err(|error| error.to_string())?;
-    let response: StorageGetResponse =
-        decode_service_message(&payload).map_err(|error| error.to_string())?;
     match response.value {
         Some(value) => decode_service_message(&value).map_err(|error| error.to_string()),
         None => Ok(StoredPermissions::with_default()),
@@ -496,17 +487,10 @@ fn load_state(caller: &impl HostRuntimeApi) -> Result<StoredPermissions, String>
 fn save_state(caller: &impl HostRuntimeApi, state: &StoredPermissions) -> Result<(), String> {
     let value = encode_service_message(state).map_err(|error| error.to_string())?;
     caller
-        .call_service_raw(
-            "bmux.storage",
-            ServiceKind::Command,
-            "storage-command/v1",
-            "set",
-            encode_service_message(&StorageSetRequest {
-                key: PERMISSIONS_STORAGE_KEY.to_string(),
-                value,
-            })
-            .map_err(|error| error.to_string())?,
-        )
+        .storage_set(&StorageSetRequest {
+            key: PERMISSIONS_STORAGE_KEY.to_string(),
+            value,
+        })
         .map_err(|error| error.to_string())?;
     Ok(())
 }
@@ -577,22 +561,6 @@ struct GrantRequest {
 struct RevokeRequest {
     session: String,
     client: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct StorageGetRequest {
-    key: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct StorageGetResponse {
-    value: Option<Vec<u8>>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct StorageSetRequest {
-    key: String,
-    value: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -708,7 +676,8 @@ mod tests {
                         .expect("storage lock should succeed")
                         .get(&request.key)
                         .cloned();
-                    encode_service_message(&StorageGetResponse { value }).map_err(Into::into)
+                    encode_service_message(&bmux_plugin::StorageGetResponse { value })
+                        .map_err(Into::into)
                 }
                 ("storage-command/v1", "set") => {
                     let request: StorageSetRequest = decode_service_message(&payload)?;

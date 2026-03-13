@@ -30,6 +30,28 @@ fn assert_no_domain_markers(source: &str, context: &str) {
     }
 }
 
+fn assert_no_raw_host_kernel_coupling(source: &str, context: &str) {
+    let denied = [
+        "bmux_ipc::",
+        "HostKernelBridge",
+        "call_service(",
+        "\"session-query/v1\"",
+        "\"session-command/v1\"",
+        "\"pane-query/v1\"",
+        "\"pane-command/v1\"",
+        "\"client-query/v1\"",
+        "\"storage-query/v1\"",
+        "\"storage-command/v1\"",
+    ];
+
+    for marker in denied {
+        assert!(
+            !source.contains(marker),
+            "{context} should not contain raw host coupling marker {marker}",
+        );
+    }
+}
+
 fn runtime_sources() -> [(&'static str, &'static str); 11] {
     [
         (
@@ -142,5 +164,23 @@ fn core_packages_do_not_reference_domain_plugin_markers() {
 
     for (path, source) in core_sources {
         assert_no_domain_markers(production_section(source), path);
+    }
+}
+
+#[test]
+fn plugin_production_code_uses_generic_host_api_only() {
+    let plugin_sources = [
+        (
+            "plugins/windows-plugin/src/lib.rs",
+            include_str!("../../../plugins/windows-plugin/src/lib.rs"),
+        ),
+        (
+            "plugins/permissions-plugin/src/lib.rs",
+            include_str!("../../../plugins/permissions-plugin/src/lib.rs"),
+        ),
+    ];
+
+    for (path, source) in plugin_sources {
+        assert_no_raw_host_kernel_coupling(production_section(source), path);
     }
 }

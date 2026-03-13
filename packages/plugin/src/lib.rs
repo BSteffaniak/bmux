@@ -46,7 +46,7 @@ pub use host_services::{
     PaneResizeResponse, PaneSelector, PaneSplitDirection, PaneSplitRequest, PaneSplitResponse,
     PaneSummary, SessionCreateRequest, SessionCreateResponse, SessionKillRequest,
     SessionKillResponse, SessionListResponse, SessionSelectRequest, SessionSelectResponse,
-    SessionSelector, SessionSummary,
+    SessionSelector, SessionSummary, StorageGetRequest, StorageGetResponse, StorageSetRequest,
 };
 pub use loader::{
     HostKernelBridge, HostKernelBridgeRequest, HostKernelBridgeResponse, LoadedPlugin,
