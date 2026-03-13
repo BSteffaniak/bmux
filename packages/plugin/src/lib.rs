@@ -52,7 +52,9 @@ pub use loader::{
     NativeCommandContext, NativeDescriptor, NativeLifecycleContext, NativePluginLoader,
     NativeServiceContext, ServiceCaller, load_registered_plugin,
 };
-pub use manifest::{PluginManifest, PluginManifestCompatibility, PluginRuntime};
+pub use manifest::{
+    PluginManifest, PluginManifestCompatibility, PluginManifestKeybindings, PluginRuntime,
+};
 pub use native_exports::RustPlugin;
 pub use registry::{
     CapabilityProvider, PluginCompatibilityReport, PluginRegistry, RegisteredPlugin,

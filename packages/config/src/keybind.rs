@@ -84,7 +84,6 @@ const fn default_global_runtime_bindings() -> BTreeMap<String, String> {
 
 fn default_runtime_bindings() -> BTreeMap<String, String> {
     action_bindings(&[
-        ("c", RuntimeAction::NewWindow),
         ("shift+c", RuntimeAction::NewSession),
         ("o", RuntimeAction::FocusNext),
         ("h", RuntimeAction::FocusLeft),

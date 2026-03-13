@@ -139,3 +139,6 @@ minimum = "1.0"
 
 [native_abi]
 minimum = "1.0"
+
+[keybindings.runtime]
+c = "plugin:bmux.windows:new-window"

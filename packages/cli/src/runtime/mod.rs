@@ -16,7 +16,7 @@ use bmux_ipc::{
     AttachViewComponent, InvokeServiceKind, PaneFocusDirection, PaneSplitDirection,
     SessionSelector, SessionSummary,
 };
-use bmux_keybind::action_to_name;
+use bmux_keybind::action_to_config_name;
 use bmux_plugin::{
     CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
     HostScope, NativeCommandContext, NativeLifecycleContext, PluginEvent, PluginEventKind,
@@ -1711,6 +1711,24 @@ async fn run_plugin_list(as_json: bool) -> Result<u8> {
 }
 
 async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]) -> Result<u8> {
+    let status = run_plugin_command_internal(plugin_id, command_name, args)?;
+    Ok(status.clamp(0, i32::from(u8::MAX)) as u8)
+}
+
+fn run_plugin_keybinding_command(
+    plugin_id: &str,
+    command_name: &str,
+    args: &[String],
+) -> Result<()> {
+    let _ = run_plugin_command_internal(plugin_id, command_name, args)?;
+    Ok(())
+}
+
+fn run_plugin_command_internal(
+    plugin_id: &str,
+    command_name: &str,
+    args: &[String],
+) -> Result<i32> {
     let config = BmuxConfig::load()?;
     let paths = ConfigPaths::default();
     let registry = scan_available_plugins(&config, &paths)?;
@@ -1759,7 +1777,7 @@ async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]
                 &error
             ))
         })?;
-    Ok(status.clamp(0, i32::from(u8::MAX)) as u8)
+    Ok(status)
 }
 
 fn format_plugin_command_run_error(
@@ -3866,7 +3884,7 @@ async fn open_attach_for_session(
 }
 
 fn attach_keymap_from_config(config: &BmuxConfig) -> crate::input::Keymap {
-    let (runtime_bindings, global_bindings) = filtered_attach_keybindings(config);
+    let (runtime_bindings, global_bindings, scroll_bindings) = filtered_attach_keybindings(config);
     let timeout_ms = config
         .keybindings
         .resolve_timeout()
@@ -3877,7 +3895,7 @@ fn attach_keymap_from_config(config: &BmuxConfig) -> crate::input::Keymap {
         timeout_ms,
         &runtime_bindings,
         &global_bindings,
-        &config.keybindings.scroll,
+        &scroll_bindings,
     ) {
         Ok(keymap) => keymap,
         Err(error) => {
@@ -3892,13 +3910,15 @@ fn filtered_attach_keybindings(
 ) -> (
     std::collections::BTreeMap<String, String>,
     std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
 ) {
-    let (runtime, global) = merged_runtime_keybindings(config);
+    let (runtime, global, scroll) = merged_runtime_keybindings(config);
     let runtime = normalize_attach_keybindings(runtime, "runtime");
     let mut global = normalize_attach_keybindings(global, "global");
+    let scroll = normalize_attach_keybindings(scroll, "scroll");
 
     inject_attach_global_defaults(&mut global);
-    (runtime, global)
+    (runtime, global, scroll)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3925,7 +3945,7 @@ struct AttachKeybindingEntry {
 }
 
 fn effective_attach_keybindings(config: &BmuxConfig) -> Vec<AttachKeybindingEntry> {
-    let (runtime, global) = filtered_attach_keybindings(config);
+    let (runtime, global, _) = filtered_attach_keybindings(config);
     let mut entries = Vec::new();
 
     for (chord, action_name) in runtime {
@@ -4069,7 +4089,7 @@ fn normalize_attach_keybindings(
         .filter_map(
             |(chord, action_name)| match crate::input::parse_runtime_action_name(&action_name) {
                 Ok(action) if is_attach_runtime_action(&action) => {
-                    Some((chord, action_to_name(&action).to_string()))
+                    Some((chord, action_to_config_name(&action)))
                 }
                 Ok(_) => None,
                 Err(error) => {
@@ -4092,7 +4112,7 @@ fn inject_attach_global_defaults(global: &mut std::collections::BTreeMap<String,
     for (key, action) in defaults {
         global
             .entry(key.to_string())
-            .or_insert_with(|| action_to_name(&action).to_string());
+            .or_insert_with(|| action_to_config_name(&action));
     }
 }
 
@@ -4130,6 +4150,7 @@ const fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
             | RuntimeAction::WindowGoto8
             | RuntimeAction::WindowGoto9
             | RuntimeAction::WindowClose
+            | RuntimeAction::PluginCommand { .. }
             | RuntimeAction::SplitFocusedVertical
             | RuntimeAction::SplitFocusedHorizontal
             | RuntimeAction::FocusNext
@@ -4150,7 +4171,8 @@ const fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
 
 fn default_attach_keymap() -> crate::input::Keymap {
     let defaults = BmuxConfig::default();
-    let (runtime_bindings, global_bindings) = filtered_attach_keybindings(&defaults);
+    let (runtime_bindings, global_bindings, scroll_bindings) =
+        filtered_attach_keybindings(&defaults);
     let timeout_ms = defaults
         .keybindings
         .resolve_timeout()
@@ -4161,7 +4183,7 @@ fn default_attach_keymap() -> crate::input::Keymap {
         timeout_ms,
         &runtime_bindings,
         &global_bindings,
-        &defaults.keybindings.scroll,
+        &scroll_bindings,
     )
     .expect("default attach keymap must be valid")
 }
@@ -4527,6 +4549,30 @@ async fn handle_attach_terminal_event(
                 }
                 attach_input_processor.set_scroll_mode(view_state.scrollback_active);
             }
+            AttachEventAction::PluginCommand {
+                plugin_id,
+                command_name,
+            } => {
+                if view_state.help_overlay_open {
+                    continue;
+                }
+                if let Err(error) = run_plugin_keybinding_command(&plugin_id, &command_name, &[]) {
+                    view_state.set_transient_status(
+                        format!("plugin action failed: {error}"),
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                } else {
+                    view_state.set_transient_status(
+                        format!("plugin action: {plugin_id}:{command_name}"),
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                    view_state.dirty.layout_needs_refresh = true;
+                    view_state.dirty.full_pane_redraw = true;
+                }
+                attach_input_processor.set_scroll_mode(view_state.scrollback_active);
+            }
             AttachEventAction::Ui(action) => {
                 if matches!(action, RuntimeAction::ShowHelp) {
                     view_state.help_overlay_open = !view_state.help_overlay_open;
@@ -4622,6 +4668,13 @@ fn attach_key_event_actions(
             RuntimeAction::NewWindow | RuntimeAction::NewSession => {
                 AttachEventAction::Runtime(action)
             }
+            RuntimeAction::PluginCommand {
+                plugin_id,
+                command_name,
+            } => AttachEventAction::PluginCommand {
+                plugin_id,
+                command_name,
+            },
             RuntimeAction::SessionPrev | RuntimeAction::SessionNext => {
                 AttachEventAction::Ui(action)
             }
@@ -5154,19 +5207,81 @@ fn run_terminal_doctor(
     Ok(0)
 }
 
+fn plugin_keybinding_proposals(
+    config: &BmuxConfig,
+) -> (
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
+) {
+    let paths = ConfigPaths::default();
+    let registry = match scan_available_plugins(config, &paths) {
+        Ok(registry) => registry,
+        Err(error) => {
+            eprintln!(
+                "bmux warning: failed loading plugin keybinding proposals ({error}); continuing without plugin keybinding defaults"
+            );
+            return (
+                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::new(),
+                std::collections::BTreeMap::new(),
+            );
+        }
+    };
+    let enabled_plugins = effective_enabled_plugins(config, &registry)
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut runtime = std::collections::BTreeMap::new();
+    let mut global = std::collections::BTreeMap::new();
+    let mut scroll = std::collections::BTreeMap::new();
+
+    for plugin in registry.iter() {
+        if !enabled_plugins.contains(plugin.declaration.id.as_str()) {
+            continue;
+        }
+        for (chord, action) in &plugin.manifest.keybindings.runtime {
+            runtime
+                .entry(chord.clone())
+                .or_insert_with(|| action.clone());
+        }
+        for (chord, action) in &plugin.manifest.keybindings.global {
+            global
+                .entry(chord.clone())
+                .or_insert_with(|| action.clone());
+        }
+        for (chord, action) in &plugin.manifest.keybindings.scroll {
+            scroll
+                .entry(chord.clone())
+                .or_insert_with(|| action.clone());
+        }
+    }
+
+    (runtime, global, scroll)
+}
+
 fn merged_runtime_keybindings(
     config: &BmuxConfig,
 ) -> (
     std::collections::BTreeMap<String, String>,
     std::collections::BTreeMap<String, String>,
+    std::collections::BTreeMap<String, String>,
 ) {
-    let mut runtime = BmuxConfig::default().keybindings.runtime;
+    let defaults = BmuxConfig::default();
+    let (plugin_runtime, plugin_global, plugin_scroll) = plugin_keybinding_proposals(config);
+
+    let mut runtime = defaults.keybindings.runtime;
+    runtime.extend(plugin_runtime);
     runtime.extend(config.keybindings.runtime.clone());
 
-    let mut global = BmuxConfig::default().keybindings.global;
+    let mut global = defaults.keybindings.global;
+    global.extend(plugin_global);
     global.extend(config.keybindings.global.clone());
 
-    (runtime, global)
+    let mut scroll = defaults.keybindings.scroll;
+    scroll.extend(plugin_scroll);
+    scroll.extend(config.keybindings.scroll.clone());
+
+    (runtime, global, scroll)
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
@@ -5419,17 +5534,18 @@ fn run_keymap_doctor(as_json: bool) -> Result<u8> {
             BmuxConfig::default()
         }
     };
-    let (runtime_bindings, global_bindings) = merged_runtime_keybindings(&config);
+    let (runtime_bindings, global_bindings, scroll_bindings) = merged_runtime_keybindings(&config);
     let resolved_timeout = config
         .keybindings
         .resolve_timeout()
         .map_err(anyhow::Error::msg)
         .context("failed resolving keymap timeout")?;
-    let keymap = crate::input::Keymap::from_parts(
+    let keymap = crate::input::Keymap::from_parts_with_scroll(
         &config.keybindings.prefix,
         resolved_timeout.timeout_ms(),
         &runtime_bindings,
         &global_bindings,
+        &scroll_bindings,
     )
     .context("failed to compile keymap")?;
 
@@ -6240,7 +6356,7 @@ mod tests {
             .runtime
             .insert("o".to_string(), "quit".to_string());
 
-        let (runtime, _global) = merged_runtime_keybindings(&config);
+        let (runtime, _global, _scroll) = merged_runtime_keybindings(&config);
 
         assert_eq!(runtime.get("o"), Some(&"quit".to_string()));
         assert_eq!(
@@ -6628,9 +6744,8 @@ mod tests {
         .expect("attach key action should parse");
         assert!(matches!(
             new_window.first(),
-            Some(super::AttachEventAction::Runtime(
-                crate::input::RuntimeAction::NewWindow
-            ))
+            Some(super::AttachEventAction::PluginCommand { plugin_id, command_name })
+                if plugin_id == "bmux.windows" && command_name == "new-window"
         ));
 
         let _ = super::attach_key_event_actions(
@@ -7066,7 +7181,8 @@ mod tests {
 
     #[test]
     fn attach_keybindings_keep_focus_next_pane_binding() {
-        let (runtime, _global) = super::filtered_attach_keybindings(&BmuxConfig::default());
+        let (runtime, _global, _scroll) =
+            super::filtered_attach_keybindings(&BmuxConfig::default());
         assert_eq!(runtime.get("o"), Some(&"focus_next_pane".to_string()));
     }
 

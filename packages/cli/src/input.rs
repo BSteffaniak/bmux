@@ -1,7 +1,9 @@
 use anyhow::{Result, anyhow, bail};
 use bmux_config::{MAX_TIMEOUT_MS, MIN_TIMEOUT_MS};
 pub use bmux_keybind::RuntimeAction;
-use bmux_keybind::{action_to_name, parse_action};
+#[cfg(test)]
+use bmux_keybind::action_to_name;
+use bmux_keybind::{action_to_config_name, parse_action};
 use crossterm::event::{
     Event, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent, KeyEventKind, KeyModifiers,
 };
@@ -101,7 +103,6 @@ impl Keymap {
     #[cfg(test)]
     pub(crate) fn default_runtime() -> Self {
         let runtime = [
-            ("c", RuntimeAction::NewWindow),
             ("shift+c", RuntimeAction::NewSession),
             ("o", RuntimeAction::FocusNext),
             ("h", RuntimeAction::FocusLeft),
@@ -151,6 +152,7 @@ impl Keymap {
             .expect("default keymap must be valid")
     }
 
+    #[cfg(test)]
     pub(crate) fn from_parts(
         prefix: &str,
         timeout_ms: Option<u64>,
@@ -299,7 +301,7 @@ impl Keymap {
             .iter()
             .map(|binding| DoctorBinding {
                 chord: chord_to_string(&binding.chord),
-                action: action_to_name(&binding.action).to_string(),
+                action: action_to_config_name(&binding.action),
             })
             .collect();
 
@@ -308,7 +310,7 @@ impl Keymap {
             .iter()
             .map(|binding| DoctorBinding {
                 chord: chord_to_string(&binding.chord),
-                action: action_to_name(&binding.action).to_string(),
+                action: action_to_config_name(&binding.action),
             })
             .collect();
 
@@ -317,7 +319,7 @@ impl Keymap {
             .iter()
             .map(|binding| DoctorBinding {
                 chord: chord_to_string(&binding.chord),
-                action: action_to_name(&binding.action).to_string(),
+                action: action_to_config_name(&binding.action),
             })
             .collect();
 
@@ -369,6 +371,7 @@ impl Keymap {
     }
 }
 
+#[cfg(test)]
 fn default_scroll_bindings() -> BTreeMap<String, String> {
     [
         ("escape", RuntimeAction::ExitScrollMode),
@@ -1207,8 +1210,7 @@ impl KeyStroke {
 
 #[cfg(test)]
 mod tests {
-    use super::{InputEvent, InputProcessor, Keymap, RuntimeAction};
-    use bmux_keybind::action_to_name;
+    use super::{InputEvent, InputProcessor, Keymap, RuntimeAction, action_to_config_name};
     use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use std::collections::BTreeMap;
     use std::thread;
@@ -1234,7 +1236,7 @@ mod tests {
     fn action_bindings(pairs: &[(&str, RuntimeAction)]) -> BTreeMap<String, String> {
         pairs
             .iter()
-            .map(|(key, action)| ((*key).to_string(), action_to_name(action).to_string()))
+            .map(|(key, action)| ((*key).to_string(), action_to_config_name(action)))
             .collect()
     }
 
@@ -1243,10 +1245,6 @@ mod tests {
         let mut processor = InputProcessor::new(Keymap::default_runtime());
         let actions = processor.process_chunk(&[0x01, b'r']);
         assert_eq!(actions, vec![RuntimeAction::RestartFocusedPane]);
-        assert_eq!(
-            processor.process_chunk(&[0x01, b'c']),
-            vec![RuntimeAction::NewWindow]
-        );
         assert_eq!(
             processor.process_chunk(&[0x01, b'C']),
             vec![RuntimeAction::NewSession]
@@ -1756,6 +1754,18 @@ mod tests {
         assert_eq!(
             processor.process_terminal_event(key_event(KeyCode::Char('"'), KeyModifiers::SHIFT)),
             vec![RuntimeAction::SplitFocusedHorizontal]
+        );
+    }
+
+    #[test]
+    fn parse_runtime_action_name_accepts_plugin_command_action() {
+        assert_eq!(
+            super::parse_runtime_action_name("plugin:bmux.windows:new-window")
+                .expect("plugin action should parse"),
+            RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "new-window".to_string(),
+            }
         );
     }
 }

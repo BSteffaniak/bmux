@@ -7,6 +7,10 @@ use uuid::Uuid;
 pub enum AttachEventAction {
     Send(Vec<u8>),
     Runtime(RuntimeAction),
+    PluginCommand {
+        plugin_id: String,
+        command_name: String,
+    },
     Ui(RuntimeAction),
     Redraw,
     Detach,

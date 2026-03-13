@@ -59,6 +59,10 @@ pub enum RuntimeAction {
     WindowGoto8,
     WindowGoto9,
     WindowClose,
+    PluginCommand {
+        plugin_id: String,
+        command_name: String,
+    },
     ForwardToPane(Vec<u8>),
 }
 
@@ -116,12 +120,28 @@ pub const fn action_to_name(action: &RuntimeAction) -> &'static str {
         RuntimeAction::WindowGoto8 => "window_goto_8",
         RuntimeAction::WindowGoto9 => "window_goto_9",
         RuntimeAction::WindowClose => "window_close",
+        RuntimeAction::PluginCommand { .. } => "plugin_command",
         RuntimeAction::ForwardToPane(_) => "forward_to_pane",
     }
 }
 
+#[must_use]
+pub fn action_to_config_name(action: &RuntimeAction) -> String {
+    match action {
+        RuntimeAction::PluginCommand {
+            plugin_id,
+            command_name,
+        } => format!("plugin:{plugin_id}:{command_name}"),
+        _ => action_to_name(action).to_string(),
+    }
+}
+
 pub fn parse_action(value: &str) -> Result<RuntimeAction> {
-    match value.trim().to_ascii_lowercase().as_str() {
+    let normalized = value.trim().to_ascii_lowercase();
+    if let Some(plugin_action) = parse_plugin_action(&normalized) {
+        return plugin_action;
+    }
+    match normalized.as_str() {
         "quit" | "quit_destroy" => Ok(RuntimeAction::Quit),
         "detach" => Ok(RuntimeAction::Detach),
         "new_window" => Ok(RuntimeAction::NewWindow),
@@ -178,15 +198,61 @@ pub fn parse_action(value: &str) -> Result<RuntimeAction> {
     }
 }
 
+fn parse_plugin_action(value: &str) -> Option<Result<RuntimeAction>> {
+    let rest = value.strip_prefix("plugin:")?;
+    let (plugin_id, command_name) = match rest.split_once(':') {
+        Some(parts) => parts,
+        None => {
+            return Some(Err(anyhow::anyhow!(
+                "invalid plugin keymap action '{value}' (expected plugin:<plugin-id>:<command>)"
+            )));
+        }
+    };
+    if plugin_id.trim().is_empty() || command_name.trim().is_empty() {
+        return Some(Err(anyhow::anyhow!(
+            "invalid plugin keymap action '{value}' (plugin id and command are required)"
+        )));
+    }
+    Some(Ok(RuntimeAction::PluginCommand {
+        plugin_id: plugin_id.to_string(),
+        command_name: command_name.to_string(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RuntimeAction, parse_action};
+    use super::{RuntimeAction, action_to_config_name, parse_action};
 
     #[test]
     fn parse_action_accepts_quit_destroy_alias() {
         assert_eq!(
             parse_action("quit_destroy").expect("alias should parse"),
             RuntimeAction::Quit
+        );
+    }
+
+    #[test]
+    fn parse_action_accepts_plugin_command_action() {
+        let action =
+            parse_action("plugin:bmux.windows:new-window").expect("plugin action should parse");
+        assert_eq!(
+            action,
+            RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "new-window".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn action_to_config_name_serializes_plugin_command_action() {
+        let action = RuntimeAction::PluginCommand {
+            plugin_id: "bmux.windows".to_string(),
+            command_name: "new-window".to_string(),
+        };
+        assert_eq!(
+            action_to_config_name(&action),
+            "plugin:bmux.windows:new-window"
         );
     }
 }

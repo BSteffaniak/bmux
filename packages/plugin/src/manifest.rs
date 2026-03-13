@@ -4,7 +4,7 @@ use crate::{
     VersionRange,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -84,6 +84,18 @@ pub struct PluginManifest {
     pub event_subscriptions: Vec<PluginEventSubscription>,
     #[serde(default)]
     pub dependencies: Vec<PluginManifestDependency>,
+    #[serde(default)]
+    pub keybindings: PluginManifestKeybindings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct PluginManifestKeybindings {
+    #[serde(default)]
+    pub runtime: BTreeMap<String, String>,
+    #[serde(default)]
+    pub global: BTreeMap<String, String>,
+    #[serde(default)]
+    pub scroll: BTreeMap<String, String>,
 }
 
 impl PluginManifest {
@@ -218,5 +230,37 @@ minimum = "1.0"
         );
         assert_eq!(manifest.commands.len(), 1);
         assert_eq!(manifest.event_subscriptions.len(), 1);
+        assert!(manifest.keybindings.runtime.is_empty());
+        assert!(manifest.keybindings.global.is_empty());
+        assert!(manifest.keybindings.scroll.is_empty());
+    }
+
+    #[test]
+    fn parses_manifest_keybinding_proposals() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "bmux.windows"
+name = "Windows"
+version = "0.1.0"
+runtime = "native"
+entry = "libwindows.dylib"
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"
+
+[keybindings.runtime]
+c = "plugin:bmux.windows:new-window"
+"alt+w" = "plugin:bmux.windows:switch-window"
+"#,
+        )
+        .expect("manifest should parse");
+
+        assert_eq!(
+            manifest.keybindings.runtime.get("c").map(String::as_str),
+            Some("plugin:bmux.windows:new-window")
+        );
     }
 }
