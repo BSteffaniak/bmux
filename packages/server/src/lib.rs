@@ -4825,6 +4825,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_admin_policy_fallback_is_permissive_without_provider() {
+        let server = BmuxServer::new(test_endpoint());
+        let result = ensure_session_admin_allowed(
+            &server.state,
+            &server.shutdown_tx,
+            SessionId::new(),
+            ClientId::new(),
+            Uuid::new_v4(),
+        )
+        .await;
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn split_pane_succeeds_without_policy_provider() {
+        let server = BmuxServer::new(test_endpoint());
+        let client_id = ClientId::new();
+        let principal_id = Uuid::new_v4();
+        let mut selected_session = None;
+        let mut attached_stream_session = None;
+
+        let created = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::NewSession { name: None },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            response => panic!("expected session created response, got {response:?}"),
+        };
+
+        let split = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::SplitPane {
+                session: Some(SessionSelector::ById(session_id)),
+                target: None,
+                direction: PaneSplitDirection::Vertical,
+            },
+        )
+        .await;
+
+        match split {
+            Response::Ok(ResponsePayload::PaneSplit {
+                session_id: split_session_id,
+                ..
+            }) => {
+                assert_eq!(split_session_id, session_id);
+            }
+            response => panic!("expected successful split response, got {response:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn session_policy_denial_blocks_mutation() {
         let server = BmuxServer::new(test_endpoint());
         server

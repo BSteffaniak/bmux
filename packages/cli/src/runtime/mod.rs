@@ -5797,6 +5797,41 @@ mod tests {
     }
 
     #[test]
+    fn effective_enabled_plugins_include_windows_and_permissions_by_default() {
+        let Some(bundled_root) = super::bundled_plugin_root() else {
+            return;
+        };
+        let dir = temp_dir();
+        fs::write(dir.join("windows.dylib"), []).expect("windows entry should be written");
+        fs::write(dir.join("permissions.dylib"), []).expect("permissions entry should be written");
+
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest_from_root(
+                &bundled_root,
+                &dir.join("windows.toml"),
+                plugin_manifest("bmux.windows", "windows.dylib"),
+            )
+            .expect("windows plugin should register");
+        registry
+            .register_manifest_from_root(
+                &bundled_root,
+                &dir.join("permissions.toml"),
+                plugin_manifest("bmux.permissions", "permissions.dylib"),
+            )
+            .expect("permissions plugin should register");
+
+        let config = BmuxConfig::default();
+        let enabled = super::effective_enabled_plugins(&config, &registry);
+        assert!(enabled.iter().any(|plugin_id| plugin_id == "bmux.windows"));
+        assert!(
+            enabled
+                .iter()
+                .any(|plugin_id| plugin_id == "bmux.permissions")
+        );
+    }
+
+    #[test]
     fn effective_enabled_plugins_honors_disabled_overrides() {
         let Some(bundled_root) = super::bundled_plugin_root() else {
             return;
@@ -5979,6 +6014,34 @@ mod tests {
                 assert_eq!(plugin_id, "bmux.windows");
             }
             other => panic!("expected plugin runtime parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_cli_attach_remains_builtin_without_windows_plugin() {
+        let config = BmuxConfig::default();
+        let registry = PluginRegistry::new();
+        let argv = vec![
+            OsString::from("bmux"),
+            OsString::from("attach"),
+            OsString::from("dev"),
+        ];
+
+        let parsed = super::parse_runtime_cli_with_registry(&argv, &config, &registry)
+            .expect("runtime CLI should parse built-in attach command");
+
+        match parsed {
+            super::ParsedRuntimeCli::BuiltIn(cli) => {
+                assert!(matches!(
+                    cli.command,
+                    Some(Command::Attach {
+                        target: Some(ref target),
+                        follow: None,
+                        global: false,
+                    }) if target == "dev"
+                ));
+            }
+            other => panic!("expected built-in CLI parse, got {other:?}"),
         }
     }
 
