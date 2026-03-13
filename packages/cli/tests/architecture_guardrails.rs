@@ -17,6 +17,9 @@ fn assert_no_domain_markers(source: &str, context: &str) {
         "Request::ListPermissions",
         "Request::GrantRole",
         "Request::RevokeRole",
+        "permissions plugin",
+        "permission_denied",
+        "session: {session_label} | window:",
     ];
 
     for marker in denied {
@@ -27,24 +30,67 @@ fn assert_no_domain_markers(source: &str, context: &str) {
     }
 }
 
-#[test]
-fn runtime_production_code_does_not_reference_bundled_plugin_ids() {
-    let sources = [
-        production_section(include_str!("../src/runtime/mod.rs")),
-        production_section(include_str!("../src/runtime/plugin_commands.rs")),
-        production_section(include_str!("../src/runtime/built_in_commands.rs")),
-        production_section(include_str!("../src/runtime/plugin_host.rs")),
-    ];
+fn runtime_sources() -> [(&'static str, &'static str); 11] {
+    [
+        (
+            "packages/cli/src/runtime/mod.rs",
+            include_str!("../src/runtime/mod.rs"),
+        ),
+        (
+            "packages/cli/src/runtime/plugin_commands.rs",
+            include_str!("../src/runtime/plugin_commands.rs"),
+        ),
+        (
+            "packages/cli/src/runtime/built_in_commands.rs",
+            include_str!("../src/runtime/built_in_commands.rs"),
+        ),
+        (
+            "packages/cli/src/runtime/plugin_host.rs",
+            include_str!("../src/runtime/plugin_host.rs"),
+        ),
+        (
+            "packages/cli/src/runtime/attach/mod.rs",
+            include_str!("../src/runtime/attach/mod.rs"),
+        ),
+        (
+            "packages/cli/src/runtime/attach/cursor.rs",
+            include_str!("../src/runtime/attach/cursor.rs"),
+        ),
+        (
+            "packages/cli/src/runtime/attach/events.rs",
+            include_str!("../src/runtime/attach/events.rs"),
+        ),
+        (
+            "packages/cli/src/runtime/attach/layout.rs",
+            include_str!("../src/runtime/attach/layout.rs"),
+        ),
+        (
+            "packages/cli/src/runtime/attach/render.rs",
+            include_str!("../src/runtime/attach/render.rs"),
+        ),
+        (
+            "packages/cli/src/runtime/attach/state.rs",
+            include_str!("../src/runtime/attach/state.rs"),
+        ),
+        (
+            "packages/cli/src/runtime/terminal_protocol.rs",
+            include_str!("../src/runtime/terminal_protocol.rs"),
+        ),
+    ]
+}
 
-    for source in sources {
-        assert_no_domain_markers(source, "production runtime source");
+#[test]
+fn runtime_production_code_is_domain_agnostic() {
+    for (path, source) in runtime_sources() {
+        let source = production_section(source);
+        assert_no_domain_markers(source, path);
         assert!(
             !source.contains("bmux_clipboard::"),
-            "production runtime source should not directly reference clipboard backend crate APIs",
+            "{path} should not directly reference clipboard backend crate APIs",
         );
         assert!(
             !source.contains("clipboard-command/v1"),
-            "production runtime source should not retain deprecated clipboard service interface clipboard-command/v1",
+            "{path} should not retain deprecated clipboard service interface clipboard-command/v1",
         );
     }
 }
