@@ -6758,6 +6758,84 @@ mod tests {
             super::AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
+        let next_window = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('n'),
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+        assert!(matches!(
+            next_window.first(),
+            Some(super::AttachEventAction::PluginCommand { plugin_id, command_name })
+                if plugin_id == "bmux.windows" && command_name == "next-window"
+        ));
+
+        let _ = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+        let previous_window = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('p'),
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+        assert!(matches!(
+            previous_window.first(),
+            Some(super::AttachEventAction::PluginCommand { plugin_id, command_name })
+                if plugin_id == "bmux.windows" && command_name == "prev-window"
+        ));
+
+        let _ = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+        let last_window = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('w'),
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+        assert!(matches!(
+            last_window.first(),
+            Some(super::AttachEventAction::PluginCommand { plugin_id, command_name })
+                if plugin_id == "bmux.windows" && command_name == "last-window"
+        ));
+
+        let _ = super::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('a'),
+                KeyModifiers::CONTROL,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            super::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
         let split_vertical = super::attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('%'),

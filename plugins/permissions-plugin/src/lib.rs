@@ -66,6 +66,17 @@ impl RustPlugin for PermissionsPlugin {
                     .expose_in_cli(true),
             )
             .command(
+                PluginCommand::new(
+                    "permissions-current",
+                    "Permissions for the currently active session",
+                )
+                .path(["permissions-current"])
+                .alias(["session", "permissions-current"])
+                .argument(PluginCommandArgument::flag("json").short('j'))
+                .execution(CommandExecutionKind::ProviderExec)
+                .expose_in_cli(true),
+            )
+            .command(
                 PluginCommand::new("grant", "Grant command handled by permissions provider")
                     .path(["grant"])
                     .alias(["session", "grant"])
@@ -238,6 +249,23 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
             }
             Ok(())
         }
+        "permissions-current" => {
+            let session = resolve_current_session(context)?;
+            let as_json = has_flag(&context.arguments, "json");
+            let entries = list_entries(context, &session)?;
+            if as_json {
+                let output = serde_json::to_string_pretty(&ListPermissionsResponse { entries })
+                    .map_err(|error| error.to_string())?;
+                println!("{output}");
+            } else if entries.is_empty() {
+                println!("no explicit permissions for session {session}");
+            } else {
+                for entry in entries {
+                    println!("{}\t{}", entry.client_id, entry.role);
+                }
+            }
+            Ok(())
+        }
         "grant" => {
             let request = GrantRequest {
                 session: required_option_value(&context.arguments, "session")?,
@@ -259,6 +287,18 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
         }
         _ => Err(format!("unsupported command '{}'", context.command)),
     }
+}
+
+fn resolve_current_session(caller: &impl HostRuntimeApi) -> Result<String, String> {
+    let sessions = caller
+        .session_list()
+        .map_err(|error| error.to_string())?
+        .sessions;
+    let session = sessions
+        .into_iter()
+        .next()
+        .ok_or_else(|| "no active session available".to_string())?;
+    Ok(session.name.unwrap_or_else(|| session.id.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -546,6 +586,13 @@ mod tests {
                 storage: Mutex::new(BTreeMap::new()),
             }
         }
+
+        fn with_sessions(sessions: Vec<SessionSummary>) -> Self {
+            Self {
+                sessions,
+                storage: Mutex::new(BTreeMap::new()),
+            }
+        }
     }
 
     impl ServiceCaller for MockHost {
@@ -738,6 +785,21 @@ mod tests {
             std::env::temp_dir().join(format!("bmux-permissions-service-test-{}", Uuid::new_v4()));
         std::fs::create_dir_all(&dir).expect("test data dir should be creatable");
         dir
+    }
+
+    #[test]
+    fn resolve_current_session_uses_active_session_name() {
+        let host = MockHost::with_session(Uuid::new_v4(), "alpha");
+        let session = resolve_current_session(&host).expect("active session should resolve");
+        assert_eq!(session, "alpha");
+    }
+
+    #[test]
+    fn resolve_current_session_requires_available_sessions() {
+        let host = MockHost::with_sessions(Vec::new());
+        let error = resolve_current_session(&host)
+            .expect_err("missing sessions should produce an actionable error");
+        assert!(error.contains("no active session"));
     }
 
     #[test]

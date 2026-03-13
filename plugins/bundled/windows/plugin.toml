@@ -37,6 +37,30 @@ name       = "session"
 short      = "s"
 value_name = "SESSION"
 
+[[commands]]
+aliases       = [["window", "next"]]
+execution     = "provider_exec"
+expose_in_cli = true
+name          = "next-window"
+path          = ["next-window"]
+summary       = "Switch to the next workspace window"
+
+[[commands]]
+aliases       = [["window", "prev"]]
+execution     = "provider_exec"
+expose_in_cli = true
+name          = "prev-window"
+path          = ["prev-window"]
+summary       = "Switch to the previous workspace window"
+
+[[commands]]
+aliases       = [["window", "last"]]
+execution     = "provider_exec"
+expose_in_cli = true
+name          = "last-window"
+path          = ["last-window"]
+summary       = "Switch to the previously active workspace window"
+
 [[commands.arguments]]
 kind       = "string"
 long       = "name"
@@ -142,3 +166,6 @@ minimum = "1.0"
 
 [keybindings.runtime]
 c = "plugin:bmux.windows:new-window"
+n = "plugin:bmux.windows:next-window"
+p = "plugin:bmux.windows:prev-window"
+w = "plugin:bmux.windows:last-window"

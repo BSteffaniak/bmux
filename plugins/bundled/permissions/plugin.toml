@@ -111,6 +111,23 @@ required   = true
 short      = "c"
 value_name = "CLIENT"
 
+[[commands]]
+aliases       = [["session", "permissions-current"]]
+execution     = "provider_exec"
+expose_in_cli = true
+name          = "permissions-current"
+path          = ["permissions-current"]
+summary       = "List explicit role assignments for the active session"
+
+[[commands.arguments]]
+kind  = "boolean"
+long  = "json"
+name  = "json"
+short = "j"
+
+[keybindings.runtime]
+"shift+p" = "plugin:bmux.permissions:permissions-current"
+
 [plugin_api]
 minimum = "1.0"
 

@@ -69,6 +69,21 @@ impl RustPlugin for WindowsPlugin {
                 "Switch active workspace window",
                 vec![vec!["window", "switch"]],
             ))
+            .command(plugin_command(
+                "next-window",
+                "Switch to the next workspace window",
+                vec![vec!["window", "next"]],
+            ))
+            .command(plugin_command(
+                "prev-window",
+                "Switch to the previous workspace window",
+                vec![vec!["window", "prev"]],
+            ))
+            .command(plugin_command(
+                "last-window",
+                "Switch to the previously active workspace window",
+                vec![vec!["window", "last"]],
+            ))
             .build()
             .expect("descriptor should validate")
     }
@@ -300,8 +315,35 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
             );
             Ok(())
         }
+        "next-window" => {
+            let ack = cycle_window(context, WindowCycleDirection::Next)?;
+            if let Some(id) = ack.id {
+                println!("next-window selected session {id}");
+            }
+            Ok(())
+        }
+        "prev-window" => {
+            let ack = cycle_window(context, WindowCycleDirection::Previous)?;
+            if let Some(id) = ack.id {
+                println!("prev-window selected session {id}");
+            }
+            Ok(())
+        }
+        "last-window" => {
+            let ack = cycle_window(context, WindowCycleDirection::Last)?;
+            if let Some(id) = ack.id {
+                println!("last-window selected session {id}");
+            }
+            Ok(())
+        }
         _ => Err(format!("unsupported command '{}'", context.command)),
     }
+}
+
+enum WindowCycleDirection {
+    Next,
+    Previous,
+    Last,
 }
 
 fn list_windows(
@@ -404,6 +446,24 @@ fn switch_window(
         ok: true,
         id: Some(session_id.to_string()),
     })
+}
+
+fn cycle_window(
+    caller: &impl HostRuntimeApi,
+    direction: WindowCycleDirection,
+) -> Result<WindowCommandAck, String> {
+    let sessions = caller
+        .session_list()
+        .map_err(|error| error.to_string())?
+        .sessions;
+    if sessions.len() < 2 {
+        return Err("no alternate window available".to_string());
+    }
+    let target_id = match direction {
+        WindowCycleDirection::Next | WindowCycleDirection::Last => sessions[1].id,
+        WindowCycleDirection::Previous => sessions[sessions.len().saturating_sub(1)].id,
+    };
+    switch_window(caller, SessionSelector::ById(target_id))
 }
 
 fn resolve_session_id(
@@ -1016,6 +1076,61 @@ mod tests {
         assert!(ack.ok);
         let target_text = target_id.to_string();
         assert_eq!(ack.id.as_deref(), Some(target_text.as_str()));
+    }
+
+    #[test]
+    fn next_window_selects_second_session() {
+        let sessions = sample_sessions();
+        let target_id = sessions[1].id;
+        let host = MockHost::with_sessions(sessions);
+
+        let ack =
+            cycle_window(&host, WindowCycleDirection::Next).expect("next window should succeed");
+        assert!(ack.ok);
+        let target_text = target_id.to_string();
+        assert_eq!(ack.id.as_deref(), Some(target_text.as_str()));
+    }
+
+    #[test]
+    fn prev_window_selects_last_session() {
+        let sessions = vec![
+            SessionSummary {
+                id: Uuid::new_v4(),
+                name: Some("alpha".to_string()),
+                client_count: 1,
+            },
+            SessionSummary {
+                id: Uuid::new_v4(),
+                name: Some("beta".to_string()),
+                client_count: 1,
+            },
+            SessionSummary {
+                id: Uuid::new_v4(),
+                name: Some("gamma".to_string()),
+                client_count: 1,
+            },
+        ];
+        let target_id = sessions[2].id;
+        let host = MockHost::with_sessions(sessions);
+
+        let ack = cycle_window(&host, WindowCycleDirection::Previous)
+            .expect("previous window should succeed");
+        assert!(ack.ok);
+        let target_text = target_id.to_string();
+        assert_eq!(ack.id.as_deref(), Some(target_text.as_str()));
+    }
+
+    #[test]
+    fn last_window_requires_alternate_session() {
+        let sessions = vec![SessionSummary {
+            id: Uuid::new_v4(),
+            name: Some("solo".to_string()),
+            client_count: 1,
+        }];
+        let host = MockHost::with_sessions(sessions);
+        let error = cycle_window(&host, WindowCycleDirection::Last)
+            .expect_err("last window should require alternate session");
+        assert!(error.contains("no alternate window"));
     }
 
     #[test]

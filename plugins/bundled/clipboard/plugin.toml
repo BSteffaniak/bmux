@@ -16,3 +16,9 @@ minimum = "1.0"
 
 [native_abi]
 minimum = "1.0"
+
+[keybindings.runtime]
+y = "copy_scrollback"
+
+[keybindings.scroll]
+y = "copy_scrollback"
