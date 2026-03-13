@@ -10,10 +10,13 @@ use bmux_plugin::{
     encode_service_message,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 #[derive(Default)]
-struct WindowsPlugin;
+struct WindowsPlugin {
+    last_selected_by_client: BTreeMap<Uuid, Uuid>,
+}
 
 impl RustPlugin for WindowsPlugin {
     fn descriptor(&self) -> NativeDescriptor {
@@ -27,6 +30,8 @@ impl RustPlugin for WindowsPlugin {
             .require_capability("bmux.sessions.write")
             .expect("capability should parse")
             .require_capability("bmux.panes.read")
+            .expect("capability should parse")
+            .require_capability("bmux.clients.read")
             .expect("capability should parse")
             .provide_capability("bmux.windows.read")
             .expect("capability should parse")
@@ -89,7 +94,7 @@ impl RustPlugin for WindowsPlugin {
     }
 
     fn run_command(&mut self, context: NativeCommandContext) -> i32 {
-        match handle_command(&context) {
+        match handle_command(self, &context) {
             Ok(()) => 0,
             Err(error) => {
                 eprintln!("{error}");
@@ -206,7 +211,8 @@ impl RustPlugin for WindowsPlugin {
                         return ServiceResponse::error("invalid_request", error.to_string());
                     }
                 };
-                let ack = match switch_window(&context, selector) {
+                let ack = match switch_window(&context, selector, &mut self.last_selected_by_client)
+                {
                     Ok(ack) => ack,
                     Err(error) => return ServiceResponse::error("switch_failed", error),
                 };
@@ -229,7 +235,10 @@ impl RustPlugin for WindowsPlugin {
     }
 }
 
-fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
+fn handle_command(
+    plugin: &mut WindowsPlugin,
+    context: &NativeCommandContext,
+) -> Result<(), String> {
     match context.command.as_str() {
         "new-window" => {
             let name = option_value(&context.arguments, "name");
@@ -300,37 +309,41 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
             let target = positional_value(&context.arguments)
                 .ok_or_else(|| "missing required TARGET argument".to_string())?;
             let selector = parse_selector(&target)?;
-            let session_id = resolve_session_id(context, selector)?;
-            let pane_response = context
-                .pane_list(&PaneListRequest {
-                    session: Some(SessionSelector::ById(session_id)),
-                })
-                .map_err(|error| error.to_string())?;
-            if pane_response.panes.is_empty() {
-                return Err("target window has no panes".to_string());
-            }
-            println!(
-                "switch-window selected session {} (attach command will enter it)",
-                session_id
-            );
+            let ack = switch_window(context, selector, &mut plugin.last_selected_by_client)?;
+            let session_id = ack
+                .id
+                .ok_or_else(|| "switch-window did not return selected session id".to_string())?;
+            println!("active window session: {session_id}");
             Ok(())
         }
         "next-window" => {
-            let ack = cycle_window(context, WindowCycleDirection::Next)?;
+            let ack = cycle_window(
+                context,
+                WindowCycleDirection::Next,
+                &mut plugin.last_selected_by_client,
+            )?;
             if let Some(id) = ack.id {
                 println!("next-window selected session {id}");
             }
             Ok(())
         }
         "prev-window" => {
-            let ack = cycle_window(context, WindowCycleDirection::Previous)?;
+            let ack = cycle_window(
+                context,
+                WindowCycleDirection::Previous,
+                &mut plugin.last_selected_by_client,
+            )?;
             if let Some(id) = ack.id {
                 println!("prev-window selected session {id}");
             }
             Ok(())
         }
         "last-window" => {
-            let ack = cycle_window(context, WindowCycleDirection::Last)?;
+            let ack = cycle_window(
+                context,
+                WindowCycleDirection::Last,
+                &mut plugin.last_selected_by_client,
+            )?;
             if let Some(id) = ack.id {
                 println!("last-window selected session {id}");
             }
@@ -432,7 +445,10 @@ fn kill_all_windows(
 fn switch_window(
     caller: &impl HostRuntimeApi,
     selector: SessionSelector,
+    last_selected_by_client: &mut BTreeMap<Uuid, Uuid>,
 ) -> Result<WindowCommandAck, String> {
+    let client = caller.current_client().map_err(|error| error.to_string())?;
+    let previous_session = client.selected_session_id;
     let session_id = resolve_session_id(caller, selector)?;
     let pane_response = caller
         .pane_list(&PaneListRequest {
@@ -441,6 +457,16 @@ fn switch_window(
         .map_err(|error| error.to_string())?;
     if pane_response.panes.is_empty() {
         return Err("target window has no panes".to_string());
+    }
+    caller
+        .session_select(&bmux_plugin::SessionSelectRequest {
+            selector: SessionSelector::ById(session_id),
+        })
+        .map_err(|error| error.to_string())?;
+    if let Some(previous) = previous_session
+        && previous != session_id
+    {
+        last_selected_by_client.insert(client.id, previous);
     }
     Ok(WindowCommandAck {
         ok: true,
@@ -451,6 +477,7 @@ fn switch_window(
 fn cycle_window(
     caller: &impl HostRuntimeApi,
     direction: WindowCycleDirection,
+    last_selected_by_client: &mut BTreeMap<Uuid, Uuid>,
 ) -> Result<WindowCommandAck, String> {
     let sessions = caller
         .session_list()
@@ -459,11 +486,33 @@ fn cycle_window(
     if sessions.len() < 2 {
         return Err("no alternate window available".to_string());
     }
+    let client = caller.current_client().map_err(|error| error.to_string())?;
+    let current_session = client.selected_session_id.unwrap_or(sessions[0].id);
+    let current_index = sessions
+        .iter()
+        .position(|session| session.id == current_session)
+        .unwrap_or(0);
     let target_id = match direction {
-        WindowCycleDirection::Next | WindowCycleDirection::Last => sessions[1].id,
-        WindowCycleDirection::Previous => sessions[sessions.len().saturating_sub(1)].id,
+        WindowCycleDirection::Next => sessions[(current_index + 1) % sessions.len()].id,
+        WindowCycleDirection::Previous => {
+            sessions[(current_index + sessions.len() - 1) % sessions.len()].id
+        }
+        WindowCycleDirection::Last => {
+            let remembered = last_selected_by_client
+                .get(&client.id)
+                .copied()
+                .ok_or_else(|| "no previously active window available".to_string())?;
+            if remembered == current_session {
+                return Err("no previously active window available".to_string());
+            }
+            remembered
+        }
     };
-    switch_window(caller, SessionSelector::ById(target_id))
+    switch_window(
+        caller,
+        SessionSelector::ById(target_id),
+        last_selected_by_client,
+    )
 }
 
 fn resolve_session_id(
@@ -608,7 +657,8 @@ mod tests {
     use bmux_plugin::{
         ApiVersion, HostConnectionInfo, HostKernelBridge, HostMetadata, NativeServiceContext,
         PaneListResponse, PaneSummary, ProviderId, RegisteredService, ServiceCaller,
-        ServiceRequest, SessionListResponse, SessionSummary,
+        ServiceRequest, SessionListResponse, SessionSelectRequest, SessionSelectResponse,
+        SessionSummary,
     };
     use std::sync::Mutex;
 
@@ -640,6 +690,21 @@ mod tests {
         };
 
         let response = match request {
+            bmux_ipc::Request::WhoAmI => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ClientIdentity {
+                    id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
+                })
+            }
+            bmux_ipc::Request::ListClients => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ClientList {
+                    clients: vec![bmux_ipc::ClientSummary {
+                        id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
+                        selected_session_id: None,
+                        following_client_id: None,
+                        following_global: false,
+                    }],
+                })
+            }
             bmux_ipc::Request::NewSession { name: Some(name) } if name == "deny" => {
                 bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
                     code: bmux_ipc::ErrorCode::InvalidRequest,
@@ -684,6 +749,19 @@ mod tests {
                         name: Some("pane-1".to_string()),
                         focused: true,
                     }],
+                })
+            }
+            bmux_ipc::Request::Attach { selector } => {
+                let session_id = match selector {
+                    bmux_ipc::SessionSelector::ById(id) => id,
+                    bmux_ipc::SessionSelector::ByName(_) => Uuid::new_v4(),
+                };
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::Attached {
+                    grant: bmux_ipc::AttachGrant {
+                        session_id,
+                        attach_token: Uuid::new_v4(),
+                        expires_at_epoch_ms: 0,
+                    },
                 })
             }
             _ => bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
@@ -747,6 +825,12 @@ mod tests {
                 interface_id: "pane-command/v1".to_string(),
                 provider: ProviderId::Host,
             },
+            RegisteredService {
+                capability: HostScope::new("bmux.clients.read").expect("capability should parse"),
+                kind: ServiceKind::Query,
+                interface_id: "client-query/v1".to_string(),
+                provider: ProviderId::Host,
+            },
         ];
 
         NativeServiceContext {
@@ -767,6 +851,7 @@ mod tests {
                 "bmux.sessions.read".to_string(),
                 "bmux.sessions.write".to_string(),
                 "bmux.panes.read".to_string(),
+                "bmux.clients.read".to_string(),
             ],
             provided_capabilities: vec![
                 "bmux.windows.read".to_string(),
@@ -778,6 +863,7 @@ mod tests {
                 "bmux.sessions.write".to_string(),
                 "bmux.panes.read".to_string(),
                 "bmux.panes.write".to_string(),
+                "bmux.clients.read".to_string(),
             ],
             enabled_plugins: vec!["bmux.windows".to_string()],
             plugin_search_roots: vec!["/plugins".to_string()],
@@ -804,8 +890,11 @@ mod tests {
         fail_create: bool,
         fail_kill: bool,
         fail_pane_list: bool,
+        current_client_id: Uuid,
+        selected_session_id: Mutex<Option<Uuid>>,
         creates: Mutex<Vec<Option<String>>>,
         kills: Mutex<Vec<SessionKillRequest>>,
+        selects: Mutex<Vec<Uuid>>,
     }
 
     impl MockHost {
@@ -815,6 +904,8 @@ mod tests {
                 .map(|session| (session.id, 1usize))
                 .collect::<std::collections::BTreeMap<_, _>>();
             Self {
+                current_client_id: Uuid::new_v4(),
+                selected_session_id: Mutex::new(sessions.first().map(|session| session.id)),
                 sessions,
                 pane_count_by_session,
                 fail_create: false,
@@ -822,6 +913,7 @@ mod tests {
                 fail_pane_list: false,
                 creates: Mutex::new(Vec::new()),
                 kills: Mutex::new(Vec::new()),
+                selects: Mutex::new(Vec::new()),
             }
         }
 
@@ -834,6 +926,8 @@ mod tests {
             let mut pane_count_by_session = std::collections::BTreeMap::new();
             pane_count_by_session.insert(target_id, 0);
             Self {
+                current_client_id: Uuid::new_v4(),
+                selected_session_id: Mutex::new(Some(target_id)),
                 sessions,
                 pane_count_by_session,
                 fail_create: false,
@@ -841,6 +935,7 @@ mod tests {
                 fail_pane_list: false,
                 creates: Mutex::new(Vec::new()),
                 kills: Mutex::new(Vec::new()),
+                selects: Mutex::new(Vec::new()),
             }
         }
 
@@ -851,6 +946,8 @@ mod tests {
                 .map(|session| (session.id, 1usize))
                 .collect::<std::collections::BTreeMap<_, _>>();
             Self {
+                current_client_id: Uuid::new_v4(),
+                selected_session_id: Mutex::new(sessions.first().map(|session| session.id)),
                 sessions,
                 pane_count_by_session,
                 fail_create,
@@ -858,6 +955,7 @@ mod tests {
                 fail_pane_list,
                 creates: Mutex::new(Vec::new()),
                 kills: Mutex::new(Vec::new()),
+                selects: Mutex::new(Vec::new()),
             }
         }
     }
@@ -912,6 +1010,34 @@ mod tests {
                     })
                     .map_err(Into::into)
                 }
+                ("session-command/v1", "select") => {
+                    let request: SessionSelectRequest = decode_service_message(&payload)?;
+                    let selected = match request.selector {
+                        SessionSelector::ById(id) => id,
+                        SessionSelector::ByName(name) => self
+                            .sessions
+                            .iter()
+                            .find(|session| session.name.as_deref() == Some(name.as_str()))
+                            .map(|session| session.id)
+                            .ok_or_else(|| bmux_plugin::PluginError::ServiceProtocol {
+                                details: "mock select target not found".to_string(),
+                            })?,
+                    };
+                    *self
+                        .selected_session_id
+                        .lock()
+                        .expect("selected session lock should succeed") = Some(selected);
+                    self.selects
+                        .lock()
+                        .expect("select log lock should succeed")
+                        .push(selected);
+                    encode_service_message(&SessionSelectResponse {
+                        session_id: selected,
+                        attach_token: Uuid::new_v4(),
+                        expires_at_epoch_ms: 0,
+                    })
+                    .map_err(Into::into)
+                }
                 ("pane-query/v1", "list") => {
                     if self.fail_pane_list {
                         return Err(bmux_plugin::PluginError::ServiceProtocol {
@@ -943,6 +1069,19 @@ mod tests {
                         })
                         .collect::<Vec<_>>();
                     encode_service_message(&PaneListResponse { panes }).map_err(Into::into)
+                }
+                ("client-query/v1", "current") => {
+                    let selected_session_id = *self
+                        .selected_session_id
+                        .lock()
+                        .expect("selected session lock should succeed");
+                    encode_service_message(&bmux_plugin::CurrentClientResponse {
+                        id: self.current_client_id,
+                        selected_session_id,
+                        following_client_id: None,
+                        following_global: false,
+                    })
+                    .map_err(Into::into)
                 }
                 _ => Err(bmux_plugin::PluginError::UnsupportedHostOperation {
                     operation: "mock_service",
@@ -1060,8 +1199,13 @@ mod tests {
     fn switch_window_requires_target_session_to_have_panes() {
         let target_id = Uuid::new_v4();
         let host = MockHost::with_empty_target_session(target_id);
-        let error = switch_window(&host, SessionSelector::ById(target_id))
-            .expect_err("switch should fail when target has no panes");
+        let mut last_selected_by_client = BTreeMap::new();
+        let error = switch_window(
+            &host,
+            SessionSelector::ById(target_id),
+            &mut last_selected_by_client,
+        )
+        .expect_err("switch should fail when target has no panes");
         assert!(error.contains("no panes"));
     }
 
@@ -1070,12 +1214,20 @@ mod tests {
         let sessions = sample_sessions();
         let target_id = sessions[1].id;
         let host = MockHost::with_sessions(sessions);
+        let mut last_selected_by_client = BTreeMap::new();
 
-        let ack =
-            switch_window(&host, SessionSelector::ById(target_id)).expect("switch should succeed");
+        let ack = switch_window(
+            &host,
+            SessionSelector::ById(target_id),
+            &mut last_selected_by_client,
+        )
+        .expect("switch should succeed");
         assert!(ack.ok);
         let target_text = target_id.to_string();
         assert_eq!(ack.id.as_deref(), Some(target_text.as_str()));
+
+        let selects = host.selects.lock().expect("select log lock should succeed");
+        assert_eq!(selects.as_slice(), &[target_id]);
     }
 
     #[test]
@@ -1083,9 +1235,14 @@ mod tests {
         let sessions = sample_sessions();
         let target_id = sessions[1].id;
         let host = MockHost::with_sessions(sessions);
+        let mut last_selected_by_client = BTreeMap::new();
 
-        let ack =
-            cycle_window(&host, WindowCycleDirection::Next).expect("next window should succeed");
+        let ack = cycle_window(
+            &host,
+            WindowCycleDirection::Next,
+            &mut last_selected_by_client,
+        )
+        .expect("next window should succeed");
         assert!(ack.ok);
         let target_text = target_id.to_string();
         assert_eq!(ack.id.as_deref(), Some(target_text.as_str()));
@@ -1112,9 +1269,14 @@ mod tests {
         ];
         let target_id = sessions[2].id;
         let host = MockHost::with_sessions(sessions);
+        let mut last_selected_by_client = BTreeMap::new();
 
-        let ack = cycle_window(&host, WindowCycleDirection::Previous)
-            .expect("previous window should succeed");
+        let ack = cycle_window(
+            &host,
+            WindowCycleDirection::Previous,
+            &mut last_selected_by_client,
+        )
+        .expect("previous window should succeed");
         assert!(ack.ok);
         let target_text = target_id.to_string();
         assert_eq!(ack.id.as_deref(), Some(target_text.as_str()));
@@ -1128,9 +1290,40 @@ mod tests {
             client_count: 1,
         }];
         let host = MockHost::with_sessions(sessions);
-        let error = cycle_window(&host, WindowCycleDirection::Last)
-            .expect_err("last window should require alternate session");
+        let mut last_selected_by_client = BTreeMap::new();
+        let error = cycle_window(
+            &host,
+            WindowCycleDirection::Last,
+            &mut last_selected_by_client,
+        )
+        .expect_err("last window should require alternate session");
         assert!(error.contains("no alternate window"));
+    }
+
+    #[test]
+    fn last_window_selects_recorded_previous_session() {
+        let sessions = sample_sessions();
+        let target_id = sessions[0].id;
+        let host = MockHost::with_sessions(sessions);
+        let mut last_selected_by_client = BTreeMap::new();
+
+        let _ = cycle_window(
+            &host,
+            WindowCycleDirection::Next,
+            &mut last_selected_by_client,
+        )
+        .expect("next window should succeed");
+
+        let ack = cycle_window(
+            &host,
+            WindowCycleDirection::Last,
+            &mut last_selected_by_client,
+        )
+        .expect("last window should use remembered selection");
+
+        assert!(ack.ok);
+        let target_text = target_id.to_string();
+        assert_eq!(ack.id.as_deref(), Some(target_text.as_str()));
     }
 
     #[test]
@@ -1164,14 +1357,19 @@ mod tests {
             .first()
             .expect("sample sessions should exist")
             .id;
-        let error = switch_window(&host, SessionSelector::ById(target))
-            .expect_err("switch should fail when pane list fails");
+        let mut last_selected_by_client = BTreeMap::new();
+        let error = switch_window(
+            &host,
+            SessionSelector::ById(target),
+            &mut last_selected_by_client,
+        )
+        .expect_err("switch should fail when pane list fails");
         assert!(error.contains("mock pane list failure"));
     }
 
     #[test]
     fn invoke_service_new_returns_ack_with_id() {
-        let mut plugin = WindowsPlugin;
+        let mut plugin = WindowsPlugin::default();
         let context = service_test_context(
             "window-command/v1",
             "new",
@@ -1197,7 +1395,7 @@ mod tests {
 
     #[test]
     fn invoke_service_new_surfaces_denied_error() {
-        let mut plugin = WindowsPlugin;
+        let mut plugin = WindowsPlugin::default();
         let context = service_test_context(
             "window-command/v1",
             "new",
@@ -1217,7 +1415,7 @@ mod tests {
 
     #[test]
     fn invoke_service_switch_returns_ack_with_selected_id() {
-        let mut plugin = WindowsPlugin;
+        let mut plugin = WindowsPlugin::default();
         let context = service_test_context(
             "window-command/v1",
             "switch",
@@ -1243,7 +1441,7 @@ mod tests {
 
     #[test]
     fn invoke_service_rejects_invalid_payload() {
-        let mut plugin = WindowsPlugin;
+        let mut plugin = WindowsPlugin::default();
         let context = service_test_context(
             "window-command/v1",
             "kill",
@@ -1259,7 +1457,7 @@ mod tests {
 
     #[test]
     fn invoke_service_kill_surfaces_denied_error() {
-        let mut plugin = WindowsPlugin;
+        let mut plugin = WindowsPlugin::default();
         let context = service_test_context(
             "window-command/v1",
             "kill",
@@ -1280,7 +1478,7 @@ mod tests {
 
     #[test]
     fn invoke_service_rejects_unsupported_operation() {
-        let mut plugin = WindowsPlugin;
+        let mut plugin = WindowsPlugin::default();
         let context = service_test_context(
             "window-command/v1",
             "unknown",

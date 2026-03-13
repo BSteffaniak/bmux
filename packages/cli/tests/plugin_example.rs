@@ -52,6 +52,7 @@ fn bundled_windows_manifest_requires_generic_runtime_capabilities() {
     assert!(required.contains(&"bmux.sessions.read".to_string()));
     assert!(required.contains(&"bmux.sessions.write".to_string()));
     assert!(required.contains(&"bmux.panes.read".to_string()));
+    assert!(required.contains(&"bmux.clients.read".to_string()));
 }
 
 #[test]
