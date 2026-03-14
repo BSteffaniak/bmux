@@ -29,6 +29,7 @@ use bmux_ipc::{
 };
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, c_char};
 use std::fs;
@@ -44,6 +45,34 @@ type NativeInvokeServiceFn =
 
 const NATIVE_SERVICE_STATUS_OK: i32 = 0;
 const NATIVE_SERVICE_STATUS_BUFFER_TOO_SMALL: i32 = 4;
+
+thread_local! {
+    static COMMAND_OUTCOME_CAPTURE: RefCell<Option<crate::host_services::PluginCommandOutcome>> = const { RefCell::new(None) };
+}
+
+fn begin_command_outcome_capture() {
+    COMMAND_OUTCOME_CAPTURE.with(|slot| {
+        *slot.borrow_mut() = Some(crate::host_services::PluginCommandOutcome {
+            effects: Vec::new(),
+        });
+    });
+}
+
+fn record_command_effect(effect: crate::host_services::PluginCommandEffect) {
+    COMMAND_OUTCOME_CAPTURE.with(|slot| {
+        if let Some(outcome) = slot.borrow_mut().as_mut() {
+            outcome.effects.push(effect);
+        }
+    });
+}
+
+fn finish_command_outcome_capture() -> crate::host_services::PluginCommandOutcome {
+    COMMAND_OUTCOME_CAPTURE
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap_or(crate::host_services::PluginCommandOutcome {
+            effects: Vec::new(),
+        })
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct CorePluginSettingsRequest {
@@ -794,6 +823,11 @@ fn handle_core_service_call(
             )?;
             match response {
                 IpcResponsePayload::ContextCreated { context } => {
+                    record_command_effect(
+                        crate::host_services::PluginCommandEffect::SelectContext {
+                            context_id: context.id,
+                        },
+                    );
                     encode_service_message(&ContextCreateResponse {
                         context: HostContextSummary {
                             id: context.id,
@@ -818,6 +852,11 @@ fn handle_core_service_call(
             )?;
             match response {
                 IpcResponsePayload::ContextSelected { context } => {
+                    record_command_effect(
+                        crate::host_services::PluginCommandEffect::SelectContext {
+                            context_id: context.id,
+                        },
+                    );
                     encode_service_message(&ContextSelectResponse {
                         context: HostContextSummary {
                             id: context.id,
@@ -1270,6 +1309,22 @@ impl LoadedPlugin {
         arguments: &[String],
         context: Option<&NativeCommandContext>,
     ) -> Result<i32> {
+        let (status, _) =
+            self.run_command_with_context_and_outcome(command_name, arguments, context)?;
+        Ok(status)
+    }
+
+    /// # Errors
+    ///
+    /// Returns an error when the plugin does not declare the command, the
+    /// command symbol cannot be loaded, or any command input contains an
+    /// interior NUL byte.
+    pub fn run_command_with_context_and_outcome(
+        &self,
+        command_name: &str,
+        arguments: &[String],
+        context: Option<&NativeCommandContext>,
+    ) -> Result<(i32, crate::host_services::PluginCommandOutcome)> {
         if !self.supports_command(command_name) {
             return Err(PluginError::UnknownPluginCommand {
                 plugin_id: self.declaration.id.as_str().to_string(),
@@ -1291,7 +1346,10 @@ impl LoadedPlugin {
                     DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL.as_bytes(),
                 )
             } {
-                return Ok(unsafe { command_symbol(payload.as_ptr()) });
+                begin_command_outcome_capture();
+                let status = unsafe { command_symbol(payload.as_ptr()) };
+                let outcome = finish_command_outcome_capture();
+                return Ok((status, outcome));
             }
         }
 
@@ -1325,13 +1383,20 @@ impl LoadedPlugin {
                 },
             )?;
 
-        Ok(unsafe {
+        let status = unsafe {
             command_symbol(
                 command_name.as_ptr(),
                 argument_ptrs.len(),
                 argument_ptrs.as_ptr(),
             )
-        })
+        };
+
+        Ok((
+            status,
+            crate::host_services::PluginCommandOutcome {
+                effects: Vec::new(),
+            },
+        ))
     }
 
     /// # Errors

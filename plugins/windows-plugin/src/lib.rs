@@ -3,11 +3,10 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_plugin::{
-    CommandExecutionKind, HostRuntimeApi, HostScope, NativeCommandContext, NativeDescriptor,
-    NativeServiceContext, PaneListRequest, PluginCommand, PluginCommandArgument,
-    PluginCommandArgumentKind, PluginService, RustPlugin, ServiceKind, ServiceResponse,
-    SessionCreateRequest, SessionKillRequest, SessionSelector, decode_service_message,
-    encode_service_message,
+    CommandExecutionKind, ContextCloseRequest, ContextCreateRequest, ContextSelector,
+    HostRuntimeApi, HostScope, NativeCommandContext, NativeDescriptor, NativeServiceContext,
+    PluginCommand, PluginCommandArgument, PluginCommandArgumentKind, PluginService, RustPlugin,
+    ServiceKind, ServiceResponse, decode_service_message, encode_service_message,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -25,11 +24,9 @@ impl RustPlugin for WindowsPlugin {
             .description("Shipped bmux windows command plugin")
             .require_capability("bmux.commands")
             .expect("capability should parse")
-            .require_capability("bmux.sessions.read")
+            .require_capability("bmux.contexts.read")
             .expect("capability should parse")
-            .require_capability("bmux.sessions.write")
-            .expect("capability should parse")
-            .require_capability("bmux.panes.read")
+            .require_capability("bmux.contexts.write")
             .expect("capability should parse")
             .require_capability("bmux.clients.read")
             .expect("capability should parse")
@@ -243,9 +240,12 @@ fn handle_command(
         "new-window" => {
             let name = option_value(&context.arguments, "name");
             let response = context
-                .session_create(&SessionCreateRequest { name })
+                .context_create(&ContextCreateRequest {
+                    name,
+                    attributes: BTreeMap::new(),
+                })
                 .map_err(|error| error.to_string())?;
-            println!("created window session: {}", response.id);
+            println!("created window context: {}", response.context.id);
             Ok(())
         }
         "list-windows" => {
@@ -276,32 +276,32 @@ fn handle_command(
             let selector = parse_selector(&target)?;
             let force_local = has_flag(&context.arguments, "force-local");
             let response = context
-                .session_kill(&SessionKillRequest {
+                .context_close(&ContextCloseRequest {
                     selector,
-                    force_local,
+                    force: force_local,
                 })
                 .map_err(|error| error.to_string())?;
-            println!("killed window session: {}", response.id);
+            println!("killed window context: {}", response.id);
             Ok(())
         }
         "kill-all-windows" => {
             let force_local = has_flag(&context.arguments, "force-local");
-            let sessions = context
-                .session_list()
+            let contexts = context
+                .context_list()
                 .map_err(|error| error.to_string())?
-                .sessions;
-            if sessions.is_empty() {
+                .contexts;
+            if contexts.is_empty() {
                 println!("no windows");
                 return Ok(());
             }
-            for session in sessions {
+            for context_summary in contexts {
                 let response = context
-                    .session_kill(&SessionKillRequest {
-                        selector: SessionSelector::ById(session.id),
-                        force_local,
+                    .context_close(&ContextCloseRequest {
+                        selector: ContextSelector::ById(context_summary.id),
+                        force: force_local,
                     })
                     .map_err(|error| error.to_string())?;
-                println!("killed window session: {}", response.id);
+                println!("killed window context: {}", response.id);
             }
             Ok(())
         }
@@ -310,10 +310,10 @@ fn handle_command(
                 .ok_or_else(|| "missing required TARGET argument".to_string())?;
             let selector = parse_selector(&target)?;
             let ack = switch_window(context, selector, &mut plugin.last_selected_by_client)?;
-            let session_id = ack
+            let context_id = ack
                 .id
-                .ok_or_else(|| "switch-window did not return selected session id".to_string())?;
-            println!("active window session: {session_id}");
+                .ok_or_else(|| "switch-window did not return selected context id".to_string())?;
+            println!("active window context: {context_id}");
             Ok(())
         }
         "next-window" => {
@@ -323,7 +323,7 @@ fn handle_command(
                 &mut plugin.last_selected_by_client,
             )?;
             if let Some(id) = ack.id {
-                println!("next-window selected session {id}");
+                println!("next-window selected context {id}");
             }
             Ok(())
         }
@@ -334,7 +334,7 @@ fn handle_command(
                 &mut plugin.last_selected_by_client,
             )?;
             if let Some(id) = ack.id {
-                println!("prev-window selected session {id}");
+                println!("prev-window selected context {id}");
             }
             Ok(())
         }
@@ -345,7 +345,7 @@ fn handle_command(
                 &mut plugin.last_selected_by_client,
             )?;
             if let Some(id) = ack.id {
-                println!("last-window selected session {id}");
+                println!("last-window selected context {id}");
             }
             Ok(())
         }
@@ -363,31 +363,31 @@ fn list_windows(
     caller: &impl HostRuntimeApi,
     session_filter: Option<&str>,
 ) -> Result<Vec<WindowEntry>, String> {
-    let sessions = caller
-        .session_list()
+    let contexts = caller
+        .context_list()
         .map_err(|error| error.to_string())?
-        .sessions;
+        .contexts;
     let selected = if let Some(filter) = session_filter {
         let selector = parse_selector(filter)?;
-        sessions
+        contexts
             .into_iter()
-            .filter(|session| match &selector {
-                SessionSelector::ById(id) => &session.id == id,
-                SessionSelector::ByName(name) => session.name.as_deref() == Some(name.as_str()),
+            .filter(|context| match &selector {
+                ContextSelector::ById(id) => &context.id == id,
+                ContextSelector::ByName(name) => context.name.as_deref() == Some(name.as_str()),
             })
             .collect::<Vec<_>>()
     } else {
-        sessions
+        contexts
     };
 
     Ok(selected
         .into_iter()
         .enumerate()
-        .map(|(index, session)| WindowEntry {
-            id: session.id.to_string(),
-            name: session
+        .map(|(index, context)| WindowEntry {
+            id: context.id.to_string(),
+            name: context
                 .name
-                .unwrap_or_else(|| format!("session-{}", index.saturating_add(1))),
+                .unwrap_or_else(|| format!("context-{}", index.saturating_add(1))),
             active: index == 0,
         })
         .collect())
@@ -398,23 +398,26 @@ fn create_window(
     name: Option<String>,
 ) -> Result<WindowCommandAck, String> {
     let response = caller
-        .session_create(&SessionCreateRequest { name })
+        .context_create(&ContextCreateRequest {
+            name,
+            attributes: BTreeMap::new(),
+        })
         .map_err(|error| error.to_string())?;
     Ok(WindowCommandAck {
         ok: true,
-        id: Some(response.id.to_string()),
+        id: Some(response.context.id.to_string()),
     })
 }
 
 fn kill_window(
     caller: &impl HostRuntimeApi,
-    selector: SessionSelector,
+    selector: ContextSelector,
     force_local: bool,
 ) -> Result<WindowCommandAck, String> {
     let response = caller
-        .session_kill(&SessionKillRequest {
+        .context_close(&ContextCloseRequest {
             selector,
-            force_local,
+            force: force_local,
         })
         .map_err(|error| error.to_string())?;
     Ok(WindowCommandAck {
@@ -427,15 +430,15 @@ fn kill_all_windows(
     caller: &impl HostRuntimeApi,
     force_local: bool,
 ) -> Result<WindowCommandAck, String> {
-    let sessions = caller
-        .session_list()
+    let contexts = caller
+        .context_list()
         .map_err(|error| error.to_string())?
-        .sessions;
-    for session in sessions {
+        .contexts;
+    for context in contexts {
         caller
-            .session_kill(&SessionKillRequest {
-                selector: SessionSelector::ById(session.id),
-                force_local,
+            .context_close(&ContextCloseRequest {
+                selector: ContextSelector::ById(context.id),
+                force: force_local,
             })
             .map_err(|error| error.to_string())?;
     }
@@ -444,33 +447,28 @@ fn kill_all_windows(
 
 fn switch_window(
     caller: &impl HostRuntimeApi,
-    selector: SessionSelector,
+    selector: ContextSelector,
     last_selected_by_client: &mut BTreeMap<Uuid, Uuid>,
 ) -> Result<WindowCommandAck, String> {
-    let client = caller.current_client().map_err(|error| error.to_string())?;
-    let previous_session = client.selected_session_id;
-    let session_id = resolve_session_id(caller, selector)?;
-    let pane_response = caller
-        .pane_list(&PaneListRequest {
-            session: Some(SessionSelector::ById(session_id)),
-        })
+    let current = caller
+        .context_current()
         .map_err(|error| error.to_string())?;
-    if pane_response.panes.is_empty() {
-        return Err("target window has no panes".to_string());
-    }
+    let previous_context = current.context.map(|context| context.id);
+    let context_id = resolve_context_id(caller, selector)?;
     caller
-        .session_select(&bmux_plugin::SessionSelectRequest {
-            selector: SessionSelector::ById(session_id),
+        .context_select(&bmux_plugin::ContextSelectRequest {
+            selector: ContextSelector::ById(context_id),
         })
         .map_err(|error| error.to_string())?;
-    if let Some(previous) = previous_session
-        && previous != session_id
+    let client = caller.current_client().map_err(|error| error.to_string())?;
+    if let Some(previous) = previous_context
+        && previous != context_id
     {
         last_selected_by_client.insert(client.id, previous);
     }
     Ok(WindowCommandAck {
         ok: true,
-        id: Some(session_id.to_string()),
+        id: Some(context_id.to_string()),
     })
 }
 
@@ -479,30 +477,36 @@ fn cycle_window(
     direction: WindowCycleDirection,
     last_selected_by_client: &mut BTreeMap<Uuid, Uuid>,
 ) -> Result<WindowCommandAck, String> {
-    let sessions = caller
-        .session_list()
+    let contexts = caller
+        .context_list()
         .map_err(|error| error.to_string())?
-        .sessions;
-    if sessions.len() < 2 {
+        .contexts;
+    if contexts.len() < 2 {
         return Err("no alternate window available".to_string());
     }
-    let client = caller.current_client().map_err(|error| error.to_string())?;
-    let current_session = client.selected_session_id.unwrap_or(sessions[0].id);
-    let current_index = sessions
+    let current = caller
+        .context_current()
+        .map_err(|error| error.to_string())?;
+    let current_context = current
+        .context
+        .map(|context| context.id)
+        .unwrap_or(contexts[0].id);
+    let current_index = contexts
         .iter()
-        .position(|session| session.id == current_session)
+        .position(|context| context.id == current_context)
         .unwrap_or(0);
+    let client = caller.current_client().map_err(|error| error.to_string())?;
     let target_id = match direction {
-        WindowCycleDirection::Next => sessions[(current_index + 1) % sessions.len()].id,
+        WindowCycleDirection::Next => contexts[(current_index + 1) % contexts.len()].id,
         WindowCycleDirection::Previous => {
-            sessions[(current_index + sessions.len() - 1) % sessions.len()].id
+            contexts[(current_index + contexts.len() - 1) % contexts.len()].id
         }
         WindowCycleDirection::Last => {
             let remembered = last_selected_by_client
                 .get(&client.id)
                 .copied()
                 .ok_or_else(|| "no previously active window available".to_string())?;
-            if remembered == current_session {
+            if remembered == current_context {
                 return Err("no previously active window available".to_string());
             }
             remembered
@@ -510,36 +514,44 @@ fn cycle_window(
     };
     switch_window(
         caller,
-        SessionSelector::ById(target_id),
+        ContextSelector::ById(target_id),
         last_selected_by_client,
     )
 }
 
-fn resolve_session_id(
+fn resolve_context_id(
     caller: &impl HostRuntimeApi,
-    selector: SessionSelector,
+    selector: ContextSelector,
 ) -> Result<Uuid, String> {
-    let sessions = caller
-        .session_list()
+    let contexts = caller
+        .context_list()
         .map_err(|error| error.to_string())?
-        .sessions;
-    let session = sessions.into_iter().find(|session| match &selector {
-        SessionSelector::ById(id) => session.id == *id,
-        SessionSelector::ByName(name) => session.name.as_deref() == Some(name.as_str()),
+        .contexts;
+    let context = contexts.into_iter().find(|context| match &selector {
+        ContextSelector::ById(id) => context.id == *id,
+        ContextSelector::ByName(name) => context.name.as_deref() == Some(name.as_str()),
     });
-    session
-        .map(|session| session.id)
-        .ok_or_else(|| "target session not found".to_string())
+    context
+        .map(|context| context.id)
+        .ok_or_else(|| "target context not found".to_string())
 }
 
-fn parse_selector(value: &str) -> Result<SessionSelector, String> {
+#[cfg(test)]
+fn resolve_session_id(
+    caller: &impl HostRuntimeApi,
+    selector: ContextSelector,
+) -> Result<Uuid, String> {
+    resolve_context_id(caller, selector)
+}
+
+fn parse_selector(value: &str) -> Result<ContextSelector, String> {
     if let Ok(id) = Uuid::parse_str(value) {
-        return Ok(SessionSelector::ById(id));
+        return Ok(ContextSelector::ById(id));
     }
     if value.trim().is_empty() {
         return Err("target must not be empty".to_string());
     }
-    Ok(SessionSelector::ByName(value.to_string()))
+    Ok(ContextSelector::ByName(value.to_string()))
 }
 
 fn option_value(arguments: &[String], long_name: &str) -> Option<String> {
@@ -655,10 +667,10 @@ bmux_plugin::export_plugin!(WindowsPlugin);
 mod tests {
     use super::*;
     use bmux_plugin::{
-        ApiVersion, HostConnectionInfo, HostKernelBridge, HostMetadata, NativeServiceContext,
-        PaneListResponse, PaneSummary, ProviderId, RegisteredService, ServiceCaller,
-        ServiceRequest, SessionListResponse, SessionSelectRequest, SessionSelectResponse,
-        SessionSummary,
+        ApiVersion, ContextCloseRequest, ContextCreateRequest, ContextListResponse,
+        ContextSelectRequest, ContextSelectResponse, ContextSelector as SessionSelector,
+        ContextSummary as SessionSummary, HostConnectionInfo, HostKernelBridge, HostMetadata,
+        NativeServiceContext, ProviderId, RegisteredService, ServiceCaller, ServiceRequest,
     };
     use std::sync::Mutex;
 
@@ -705,29 +717,32 @@ mod tests {
                     }],
                 })
             }
-            bmux_ipc::Request::NewSession { name: Some(name) } if name == "deny" => {
-                bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
-                    code: bmux_ipc::ErrorCode::InvalidRequest,
-                    message: "session policy denied for this operation".to_string(),
+            bmux_ipc::Request::CreateContext {
+                name: Some(name), ..
+            } if name == "deny" => bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
+                code: bmux_ipc::ErrorCode::InvalidRequest,
+                message: "session policy denied for this operation".to_string(),
+            }),
+            bmux_ipc::Request::CreateContext { name, attributes } => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextCreated {
+                    context: bmux_ipc::ContextSummary {
+                        id: Uuid::new_v4(),
+                        name,
+                        attributes,
+                    },
                 })
             }
-            bmux_ipc::Request::NewSession { .. } => {
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionCreated {
-                    id: Uuid::new_v4(),
-                    name: Some("created".to_string()),
-                })
-            }
-            bmux_ipc::Request::ListSessions => {
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionList {
-                    sessions: vec![bmux_ipc::SessionSummary {
+            bmux_ipc::Request::ListContexts => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextList {
+                    contexts: vec![bmux_ipc::ContextSummary {
                         id: Uuid::new_v4(),
                         name: Some("alpha".to_string()),
-                        client_count: 1,
+                        attributes: BTreeMap::new(),
                     }],
                 })
             }
-            bmux_ipc::Request::KillSession { selector, .. } => {
-                if matches!(selector, bmux_ipc::SessionSelector::ByName(ref name) if name == "deny")
+            bmux_ipc::Request::CloseContext { selector, .. } => {
+                if matches!(selector, bmux_ipc::ContextSelector::ByName(ref name) if name == "deny")
                 {
                     bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
                         code: bmux_ipc::ErrorCode::InvalidRequest,
@@ -735,33 +750,32 @@ mod tests {
                     })
                 } else {
                     let id = match selector {
-                        bmux_ipc::SessionSelector::ById(id) => id,
-                        bmux_ipc::SessionSelector::ByName(_) => Uuid::new_v4(),
+                        bmux_ipc::ContextSelector::ById(id) => id,
+                        bmux_ipc::ContextSelector::ByName(_) => Uuid::new_v4(),
                     };
-                    bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionKilled { id })
+                    bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextClosed { id })
                 }
             }
-            bmux_ipc::Request::ListPanes { .. } => {
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::PaneList {
-                    panes: vec![bmux_ipc::PaneSummary {
-                        id: Uuid::new_v4(),
-                        index: 1,
-                        name: Some("pane-1".to_string()),
-                        focused: true,
-                    }],
+            bmux_ipc::Request::SelectContext { selector } => {
+                let id = match selector {
+                    bmux_ipc::ContextSelector::ById(id) => id,
+                    bmux_ipc::ContextSelector::ByName(_) => Uuid::new_v4(),
+                };
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextSelected {
+                    context: bmux_ipc::ContextSummary {
+                        id,
+                        name: Some("selected".to_string()),
+                        attributes: BTreeMap::new(),
+                    },
                 })
             }
-            bmux_ipc::Request::Attach { selector } => {
-                let session_id = match selector {
-                    bmux_ipc::SessionSelector::ById(id) => id,
-                    bmux_ipc::SessionSelector::ByName(_) => Uuid::new_v4(),
-                };
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::Attached {
-                    grant: bmux_ipc::AttachGrant {
-                        session_id,
-                        attach_token: Uuid::new_v4(),
-                        expires_at_epoch_ms: 0,
-                    },
+            bmux_ipc::Request::CurrentContext => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::CurrentContext {
+                    context: Some(bmux_ipc::ContextSummary {
+                        id: Uuid::new_v4(),
+                        name: Some("current".to_string()),
+                        attributes: BTreeMap::new(),
+                    }),
                 })
             }
             _ => bmux_ipc::Response::Err(bmux_ipc::ErrorResponse {
@@ -802,27 +816,15 @@ mod tests {
     ) -> NativeServiceContext {
         let host_services = vec![
             RegisteredService {
-                capability: HostScope::new("bmux.sessions.read").expect("capability should parse"),
+                capability: HostScope::new("bmux.contexts.read").expect("capability should parse"),
                 kind: ServiceKind::Query,
-                interface_id: "session-query/v1".to_string(),
+                interface_id: "context-query/v1".to_string(),
                 provider: ProviderId::Host,
             },
             RegisteredService {
-                capability: HostScope::new("bmux.sessions.write").expect("capability should parse"),
+                capability: HostScope::new("bmux.contexts.write").expect("capability should parse"),
                 kind: ServiceKind::Command,
-                interface_id: "session-command/v1".to_string(),
-                provider: ProviderId::Host,
-            },
-            RegisteredService {
-                capability: HostScope::new("bmux.panes.read").expect("capability should parse"),
-                kind: ServiceKind::Query,
-                interface_id: "pane-query/v1".to_string(),
-                provider: ProviderId::Host,
-            },
-            RegisteredService {
-                capability: HostScope::new("bmux.panes.write").expect("capability should parse"),
-                kind: ServiceKind::Command,
-                interface_id: "pane-command/v1".to_string(),
+                interface_id: "context-command/v1".to_string(),
                 provider: ProviderId::Host,
             },
             RegisteredService {
@@ -848,9 +850,8 @@ mod tests {
             },
             required_capabilities: vec![
                 "bmux.commands".to_string(),
-                "bmux.sessions.read".to_string(),
-                "bmux.sessions.write".to_string(),
-                "bmux.panes.read".to_string(),
+                "bmux.contexts.read".to_string(),
+                "bmux.contexts.write".to_string(),
                 "bmux.clients.read".to_string(),
             ],
             provided_capabilities: vec![
@@ -859,10 +860,8 @@ mod tests {
             ],
             services: host_services,
             available_capabilities: vec![
-                "bmux.sessions.read".to_string(),
-                "bmux.sessions.write".to_string(),
-                "bmux.panes.read".to_string(),
-                "bmux.panes.write".to_string(),
+                "bmux.contexts.read".to_string(),
+                "bmux.contexts.write".to_string(),
                 "bmux.clients.read".to_string(),
             ],
             enabled_plugins: vec!["bmux.windows".to_string()],
@@ -886,31 +885,23 @@ mod tests {
 
     struct MockHost {
         sessions: Vec<SessionSummary>,
-        pane_count_by_session: std::collections::BTreeMap<Uuid, usize>,
         fail_create: bool,
         fail_kill: bool,
-        fail_pane_list: bool,
         current_client_id: Uuid,
         selected_session_id: Mutex<Option<Uuid>>,
         creates: Mutex<Vec<Option<String>>>,
-        kills: Mutex<Vec<SessionKillRequest>>,
+        kills: Mutex<Vec<ContextCloseRequest>>,
         selects: Mutex<Vec<Uuid>>,
     }
 
     impl MockHost {
         fn with_sessions(sessions: Vec<SessionSummary>) -> Self {
-            let pane_count_by_session = sessions
-                .iter()
-                .map(|session| (session.id, 1usize))
-                .collect::<std::collections::BTreeMap<_, _>>();
             Self {
                 current_client_id: Uuid::new_v4(),
                 selected_session_id: Mutex::new(sessions.first().map(|session| session.id)),
                 sessions,
-                pane_count_by_session,
                 fail_create: false,
                 fail_kill: false,
-                fail_pane_list: false,
                 creates: Mutex::new(Vec::new()),
                 kills: Mutex::new(Vec::new()),
                 selects: Mutex::new(Vec::new()),
@@ -921,38 +912,28 @@ mod tests {
             let sessions = vec![SessionSummary {
                 id: target_id,
                 name: Some("target".to_string()),
-                client_count: 1,
+                attributes: BTreeMap::new(),
             }];
-            let mut pane_count_by_session = std::collections::BTreeMap::new();
-            pane_count_by_session.insert(target_id, 0);
             Self {
                 current_client_id: Uuid::new_v4(),
                 selected_session_id: Mutex::new(Some(target_id)),
                 sessions,
-                pane_count_by_session,
                 fail_create: false,
                 fail_kill: false,
-                fail_pane_list: false,
                 creates: Mutex::new(Vec::new()),
                 kills: Mutex::new(Vec::new()),
                 selects: Mutex::new(Vec::new()),
             }
         }
 
-        fn with_failures(fail_create: bool, fail_kill: bool, fail_pane_list: bool) -> Self {
+        fn with_failures(fail_create: bool, fail_kill: bool, _fail_pane_list: bool) -> Self {
             let sessions = sample_sessions();
-            let pane_count_by_session = sessions
-                .iter()
-                .map(|session| (session.id, 1usize))
-                .collect::<std::collections::BTreeMap<_, _>>();
             Self {
                 current_client_id: Uuid::new_v4(),
                 selected_session_id: Mutex::new(sessions.first().map(|session| session.id)),
                 sessions,
-                pane_count_by_session,
                 fail_create,
                 fail_kill,
-                fail_pane_list,
                 creates: Mutex::new(Vec::new()),
                 kills: Mutex::new(Vec::new()),
                 selects: Mutex::new(Vec::new()),
@@ -970,39 +951,42 @@ mod tests {
             payload: Vec<u8>,
         ) -> bmux_plugin::Result<Vec<u8>> {
             match (interface_id, operation) {
-                ("session-query/v1", "list") => encode_service_message(&SessionListResponse {
-                    sessions: self.sessions.clone(),
+                ("context-query/v1", "list") => encode_service_message(&ContextListResponse {
+                    contexts: self.sessions.clone(),
                 })
                 .map_err(Into::into),
-                ("session-command/v1", "new") => {
+                ("context-command/v1", "create") => {
                     if self.fail_create {
                         return Err(bmux_plugin::PluginError::ServiceProtocol {
                             details: "mock create failure".to_string(),
                         });
                     }
-                    let request: SessionCreateRequest = decode_service_message(&payload)?;
+                    let request: ContextCreateRequest = decode_service_message(&payload)?;
                     self.creates
                         .lock()
                         .expect("create log lock should succeed")
                         .push(request.name.clone());
-                    encode_service_message(&bmux_plugin::SessionCreateResponse {
-                        id: Uuid::new_v4(),
-                        name: request.name,
+                    encode_service_message(&bmux_plugin::ContextCreateResponse {
+                        context: SessionSummary {
+                            id: Uuid::new_v4(),
+                            name: request.name,
+                            attributes: request.attributes,
+                        },
                     })
                     .map_err(Into::into)
                 }
-                ("session-command/v1", "kill") => {
+                ("context-command/v1", "close") => {
                     if self.fail_kill {
                         return Err(bmux_plugin::PluginError::ServiceProtocol {
                             details: "mock kill failure".to_string(),
                         });
                     }
-                    let request: SessionKillRequest = decode_service_message(&payload)?;
+                    let request: ContextCloseRequest = decode_service_message(&payload)?;
                     self.kills
                         .lock()
                         .expect("kill log lock should succeed")
                         .push(request.clone());
-                    encode_service_message(&bmux_plugin::SessionKillResponse {
+                    encode_service_message(&bmux_plugin::ContextCloseResponse {
                         id: match request.selector {
                             SessionSelector::ById(id) => id,
                             SessionSelector::ByName(_) => Uuid::new_v4(),
@@ -1010,8 +994,13 @@ mod tests {
                     })
                     .map_err(Into::into)
                 }
-                ("session-command/v1", "select") => {
-                    let request: SessionSelectRequest = decode_service_message(&payload)?;
+                ("context-command/v1", "select") => {
+                    if self.fail_kill {
+                        return Err(bmux_plugin::PluginError::ServiceProtocol {
+                            details: "mock select failure".to_string(),
+                        });
+                    }
+                    let request: ContextSelectRequest = decode_service_message(&payload)?;
                     let selected = match request.selector {
                         SessionSelector::ById(id) => id,
                         SessionSelector::ByName(name) => self
@@ -1031,44 +1020,24 @@ mod tests {
                         .lock()
                         .expect("select log lock should succeed")
                         .push(selected);
-                    encode_service_message(&SessionSelectResponse {
-                        session_id: selected,
-                        attach_token: Uuid::new_v4(),
-                        expires_at_epoch_ms: 0,
+                    encode_service_message(&ContextSelectResponse {
+                        context: SessionSummary {
+                            id: selected,
+                            name: Some("selected".to_string()),
+                            attributes: BTreeMap::new(),
+                        },
                     })
                     .map_err(Into::into)
                 }
-                ("pane-query/v1", "list") => {
-                    if self.fail_pane_list {
-                        return Err(bmux_plugin::PluginError::ServiceProtocol {
-                            details: "mock pane list failure".to_string(),
-                        });
-                    }
-                    let request: PaneListRequest = decode_service_message(&payload)?;
-                    let pane_count = request
-                        .session
-                        .and_then(|selector| match selector {
-                            SessionSelector::ById(id) => {
-                                self.pane_count_by_session.get(&id).copied()
-                            }
-                            SessionSelector::ByName(name) => self
-                                .sessions
-                                .iter()
-                                .find(|session| session.name.as_deref() == Some(name.as_str()))
-                                .and_then(|session| {
-                                    self.pane_count_by_session.get(&session.id).copied()
-                                }),
-                        })
-                        .unwrap_or(0);
-                    let panes = (0..pane_count)
-                        .map(|index| PaneSummary {
-                            id: Uuid::new_v4(),
-                            index: (index + 1) as u32,
-                            name: Some(format!("pane-{}", index + 1)),
-                            focused: index == 0,
-                        })
-                        .collect::<Vec<_>>();
-                    encode_service_message(&PaneListResponse { panes }).map_err(Into::into)
+                ("context-query/v1", "current") => {
+                    let current_context_id = *self
+                        .selected_session_id
+                        .lock()
+                        .expect("selected context lock should succeed");
+                    let context = current_context_id
+                        .and_then(|id| self.sessions.iter().find(|entry| entry.id == id).cloned());
+                    encode_service_message(&bmux_plugin::ContextCurrentResponse { context })
+                        .map_err(Into::into)
                 }
                 ("client-query/v1", "current") => {
                     let selected_session_id = *self
@@ -1095,12 +1064,12 @@ mod tests {
             SessionSummary {
                 id: Uuid::new_v4(),
                 name: Some("alpha".to_string()),
-                client_count: 1,
+                attributes: BTreeMap::new(),
             },
             SessionSummary {
                 id: Uuid::new_v4(),
                 name: Some("beta".to_string()),
-                client_count: 2,
+                attributes: BTreeMap::new(),
             },
         ]
     }
@@ -1171,7 +1140,7 @@ mod tests {
         assert!(ack.ok);
         let kills = host.kills.lock().expect("kill log lock should succeed");
         assert_eq!(kills.len(), 2);
-        assert!(kills.iter().all(|request| request.force_local));
+        assert!(kills.iter().all(|request| request.force));
     }
 
     #[test]
@@ -1192,21 +1161,20 @@ mod tests {
         let kills = host.kills.lock().expect("kill log lock should succeed");
         assert_eq!(kills.len(), 1);
         assert!(matches!(kills[0].selector, SessionSelector::ById(id) if id == target));
-        assert!(kills[0].force_local);
+        assert!(kills[0].force);
     }
 
     #[test]
-    fn switch_window_requires_target_session_to_have_panes() {
-        let target_id = Uuid::new_v4();
-        let host = MockHost::with_empty_target_session(target_id);
+    fn switch_window_requires_target_context_to_exist() {
+        let host = MockHost::with_sessions(sample_sessions());
         let mut last_selected_by_client = BTreeMap::new();
         let error = switch_window(
             &host,
-            SessionSelector::ById(target_id),
+            SessionSelector::ById(Uuid::new_v4()),
             &mut last_selected_by_client,
         )
-        .expect_err("switch should fail when target has no panes");
-        assert!(error.contains("no panes"));
+        .expect_err("switch should fail when context is missing");
+        assert!(error.contains("not found"));
     }
 
     #[test]
@@ -1254,17 +1222,17 @@ mod tests {
             SessionSummary {
                 id: Uuid::new_v4(),
                 name: Some("alpha".to_string()),
-                client_count: 1,
+                attributes: BTreeMap::new(),
             },
             SessionSummary {
                 id: Uuid::new_v4(),
                 name: Some("beta".to_string()),
-                client_count: 1,
+                attributes: BTreeMap::new(),
             },
             SessionSummary {
                 id: Uuid::new_v4(),
                 name: Some("gamma".to_string()),
-                client_count: 1,
+                attributes: BTreeMap::new(),
             },
         ];
         let target_id = sessions[2].id;
@@ -1287,7 +1255,7 @@ mod tests {
         let sessions = vec![SessionSummary {
             id: Uuid::new_v4(),
             name: Some("solo".to_string()),
-            client_count: 1,
+            attributes: BTreeMap::new(),
         }];
         let host = MockHost::with_sessions(sessions);
         let mut last_selected_by_client = BTreeMap::new();
@@ -1350,8 +1318,8 @@ mod tests {
     }
 
     #[test]
-    fn switch_window_propagates_pane_list_error() {
-        let host = MockHost::with_failures(false, false, true);
+    fn switch_window_propagates_context_select_error() {
+        let host = MockHost::with_failures(false, true, false);
         let target = host
             .sessions
             .first()
@@ -1363,8 +1331,8 @@ mod tests {
             SessionSelector::ById(target),
             &mut last_selected_by_client,
         )
-        .expect_err("switch should fail when pane list fails");
-        assert!(error.contains("mock pane list failure"));
+        .expect_err("switch should fail when select fails");
+        assert!(error.contains("mock select failure"));
     }
 
     #[test]

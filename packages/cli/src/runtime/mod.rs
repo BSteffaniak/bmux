@@ -13,14 +13,15 @@ use anyhow::{Context, Result};
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout, TerminfoAutoInstall};
 use bmux_ipc::{
-    AttachViewComponent, InvokeServiceKind, PaneFocusDirection, PaneSplitDirection,
-    SessionSelector, SessionSummary,
+    AttachViewComponent, ContextSelector, InvokeServiceKind, PaneFocusDirection,
+    PaneSplitDirection, SessionSelector, SessionSummary,
 };
 use bmux_keybind::action_to_config_name;
 use bmux_plugin::{
     CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
-    HostScope, NativeCommandContext, NativeLifecycleContext, PluginEvent, PluginEventKind,
-    PluginManifest, PluginRegistry, RegisteredService, ServiceKind, ServiceRequest,
+    HostScope, NativeCommandContext, NativeLifecycleContext, PluginCommandEffect,
+    PluginCommandOutcome, PluginEvent, PluginEventKind, PluginManifest, PluginRegistry,
+    RegisteredService, ServiceKind, ServiceRequest,
     load_registered_plugin as load_native_registered_plugin,
 };
 use bmux_server::BmuxServer;
@@ -1732,7 +1733,7 @@ async fn run_plugin_list(as_json: bool) -> Result<u8> {
 }
 
 async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]) -> Result<u8> {
-    let status = run_plugin_command_internal(plugin_id, command_name, args)?;
+    let status = run_plugin_command_internal(plugin_id, command_name, args)?.status;
     Ok(status.clamp(0, i32::from(u8::MAX)) as u8)
 }
 
@@ -1740,16 +1741,21 @@ fn run_plugin_keybinding_command(
     plugin_id: &str,
     command_name: &str,
     args: &[String],
-) -> Result<()> {
-    let _ = run_plugin_command_internal(plugin_id, command_name, args)?;
-    Ok(())
+) -> Result<PluginCommandOutcome> {
+    let execution = run_plugin_command_internal(plugin_id, command_name, args)?;
+    Ok(execution.outcome)
+}
+
+struct PluginCommandExecution {
+    status: i32,
+    outcome: PluginCommandOutcome,
 }
 
 fn run_plugin_command_internal(
     plugin_id: &str,
     command_name: &str,
     args: &[String],
-) -> Result<i32> {
+) -> Result<PluginCommandExecution> {
     let config = BmuxConfig::load()?;
     let paths = ConfigPaths::default();
     let registry = scan_available_plugins(&config, &paths)?;
@@ -1789,8 +1795,8 @@ fn run_plugin_command_internal(
         plugin_search_roots,
     );
     let _host_kernel_connection_guard = enter_host_kernel_connection(context.connection.clone());
-    let status = loaded
-        .run_command_with_context(command_name, args, Some(&context))
+    let (status, outcome) = loaded
+        .run_command_with_context_and_outcome(command_name, args, Some(&context))
         .map_err(|error| {
             anyhow::anyhow!(format_plugin_command_run_error(
                 plugin_id,
@@ -1798,7 +1804,7 @@ fn run_plugin_command_internal(
                 &error
             ))
         })?;
-    Ok(status)
+    Ok(PluginCommandExecution { status, outcome })
 }
 
 fn format_plugin_command_run_error(
@@ -2765,6 +2771,30 @@ async fn handle_attach_runtime_action(
         _ => {}
     }
 
+    Ok(())
+}
+
+async fn apply_plugin_command_outcome(
+    client: &mut BmuxClient,
+    view_state: &mut AttachViewState,
+    outcome: PluginCommandOutcome,
+) -> std::result::Result<(), ClientError> {
+    for effect in outcome.effects {
+        match effect {
+            PluginCommandEffect::SelectContext { context_id } => {
+                let _ = client
+                    .select_context(ContextSelector::ById(context_id))
+                    .await?;
+                let status = attach_context_status(client, view_state.attached_id).await?;
+                set_attach_context_status(
+                    view_state,
+                    status,
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -4579,20 +4609,37 @@ async fn handle_attach_terminal_event(
                 if view_state.help_overlay_open {
                     continue;
                 }
-                if let Err(error) = run_plugin_keybinding_command(&plugin_id, &command_name, &[]) {
-                    view_state.set_transient_status(
-                        format!("plugin action failed: {error}"),
-                        Instant::now(),
-                        ATTACH_TRANSIENT_STATUS_TTL,
-                    );
-                } else {
-                    view_state.set_transient_status(
-                        format!("plugin action: {plugin_id}:{command_name}"),
-                        Instant::now(),
-                        ATTACH_TRANSIENT_STATUS_TTL,
-                    );
-                    view_state.dirty.layout_needs_refresh = true;
-                    view_state.dirty.full_pane_redraw = true;
+                match run_plugin_keybinding_command(&plugin_id, &command_name, &[]) {
+                    Err(error) => {
+                        view_state.set_transient_status(
+                            format!("plugin action failed: {error}"),
+                            Instant::now(),
+                            ATTACH_TRANSIENT_STATUS_TTL,
+                        );
+                    }
+                    Ok(outcome) => {
+                        if let Err(error) =
+                            apply_plugin_command_outcome(client, view_state, outcome).await
+                        {
+                            view_state.set_transient_status(
+                                format!(
+                                    "plugin outcome apply failed: {}",
+                                    map_attach_client_error(error)
+                                ),
+                                Instant::now(),
+                                ATTACH_TRANSIENT_STATUS_TTL,
+                            );
+                            attach_input_processor.set_scroll_mode(view_state.scrollback_active);
+                            continue;
+                        }
+                        view_state.set_transient_status(
+                            format!("plugin action: {plugin_id}:{command_name}"),
+                            Instant::now(),
+                            ATTACH_TRANSIENT_STATUS_TTL,
+                        );
+                        view_state.dirty.layout_needs_refresh = true;
+                        view_state.dirty.full_pane_redraw = true;
+                    }
                 }
                 attach_input_processor.set_scroll_mode(view_state.scrollback_active);
             }

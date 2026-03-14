@@ -223,6 +223,17 @@ pub struct StorageSetRequest {
     pub value: Vec<u8>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PluginCommandEffect {
+    SelectContext { context_id: Uuid },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginCommandOutcome {
+    pub effects: Vec<PluginCommandEffect>,
+}
+
 pub trait HostRuntimeApi: ServiceCaller {
     fn session_list(&self) -> Result<SessionListResponse> {
         self.call_service(

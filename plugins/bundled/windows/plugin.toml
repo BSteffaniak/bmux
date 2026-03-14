@@ -5,9 +5,8 @@ provided_capabilities = ["bmux.windows.read", "bmux.windows.write"]
 provided_features = ["bmux.windows"]
 required_capabilities = [
     "bmux.commands",
-    "bmux.sessions.read",
-    "bmux.sessions.write",
-    "bmux.panes.read",
+    "bmux.contexts.read",
+    "bmux.contexts.write",
     "bmux.clients.read",
 ]
 runtime = "native"
