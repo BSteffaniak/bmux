@@ -3635,6 +3635,7 @@ async fn handle_request(
                 session_id,
                 client_id,
                 client_principal_id,
+                "pane.split",
             )
             .await
             {
@@ -3681,6 +3682,7 @@ async fn handle_request(
                 session_id,
                 client_id,
                 client_principal_id,
+                "pane.focus",
             )
             .await
             {
@@ -3738,6 +3740,7 @@ async fn handle_request(
                 session_id,
                 client_id,
                 client_principal_id,
+                "pane.resize",
             )
             .await
             {
@@ -3776,6 +3779,7 @@ async fn handle_request(
                 session_id,
                 client_id,
                 client_principal_id,
+                "pane.close",
             )
             .await
             {
@@ -3953,6 +3957,7 @@ async fn handle_request(
                     session_id,
                     client_id,
                     client_principal_id,
+                    "session.kill",
                 )
                 .await
             {
@@ -4241,6 +4246,7 @@ async fn handle_request(
                 session_id,
                 client_id,
                 client_principal_id,
+                "attach.input",
             )
             .await
             {
@@ -4877,6 +4883,7 @@ async fn ensure_session_admin_allowed(
     session_id: SessionId,
     client_id: ClientId,
     client_principal_id: Uuid,
+    action: &str,
 ) -> std::result::Result<(), ErrorResponse> {
     let decision = check_session_policy(
         state,
@@ -4884,7 +4891,7 @@ async fn ensure_session_admin_allowed(
         session_id,
         client_id,
         client_principal_id,
-        "admin",
+        action,
     )
     .await?;
     if let Some(decision) = decision
@@ -4906,6 +4913,7 @@ async fn ensure_session_mutation_allowed(
     session_id: SessionId,
     client_id: ClientId,
     client_principal_id: Uuid,
+    action: &str,
 ) -> std::result::Result<(), ErrorResponse> {
     let decision = check_session_policy(
         state,
@@ -4913,7 +4921,7 @@ async fn ensure_session_mutation_allowed(
         session_id,
         client_id,
         client_principal_id,
-        "mutation",
+        action,
     )
     .await?;
     if let Some(decision) = decision
@@ -5039,6 +5047,7 @@ mod tests {
             SessionId::new(),
             ClientId::new(),
             Uuid::new_v4(),
+            "pane.split",
         )
         .await;
         assert!(result.is_ok());
@@ -5053,6 +5062,7 @@ mod tests {
             SessionId::new(),
             ClientId::new(),
             Uuid::new_v4(),
+            "session.kill",
         )
         .await;
         assert!(result.is_ok());
@@ -5249,7 +5259,7 @@ mod tests {
             .set_service_resolver(|route, payload| async move {
                 if route.interface_id == "session-policy-query/v1" && route.operation == "check" {
                     let request: SessionPolicyCheckRequest = decode(&payload)?;
-                    assert_eq!(request.action, "mutation");
+                    assert_eq!(request.action, "pane.split");
                     return encode(&SessionPolicyCheckResponse {
                         allowed: false,
                         reason: Some("session policy denied for this operation".to_string()),
@@ -5266,6 +5276,7 @@ mod tests {
             SessionId::new(),
             ClientId::new(),
             Uuid::new_v4(),
+            "pane.split",
         )
         .await;
 
@@ -5281,7 +5292,7 @@ mod tests {
             .set_service_resolver(|route, payload| async move {
                 if route.interface_id == "session-policy-query/v1" && route.operation == "check" {
                     let request: SessionPolicyCheckRequest = decode(&payload)?;
-                    assert_eq!(request.action, "admin");
+                    assert_eq!(request.action, "session.kill");
                     return encode(&SessionPolicyCheckResponse {
                         allowed: true,
                         reason: None,
@@ -5298,6 +5309,7 @@ mod tests {
             SessionId::new(),
             ClientId::new(),
             Uuid::new_v4(),
+            "session.kill",
         )
         .await;
         assert!(result.is_ok());
@@ -5310,7 +5322,7 @@ mod tests {
             .set_service_resolver(|route, payload| async move {
                 if route.interface_id == "session-policy-query/v1" && route.operation == "check" {
                     let request: SessionPolicyCheckRequest = decode(&payload)?;
-                    assert_eq!(request.action, "admin");
+                    assert_eq!(request.action, "session.kill");
                     return encode(&SessionPolicyCheckResponse {
                         allowed: false,
                         reason: Some("session policy denied for this operation".to_string()),
@@ -5369,7 +5381,7 @@ mod tests {
             .set_service_resolver(|route, payload| async move {
                 if route.interface_id == "session-policy-query/v1" && route.operation == "check" {
                     let request: SessionPolicyCheckRequest = decode(&payload)?;
-                    assert_eq!(request.action, "mutation");
+                    assert_eq!(request.action, "pane.split");
                     return encode(&SessionPolicyCheckResponse {
                         allowed: false,
                         reason: Some("session policy denied for this operation".to_string()),
@@ -5429,7 +5441,7 @@ mod tests {
             .set_service_resolver(|route, payload| async move {
                 if route.interface_id == "session-policy-query/v1" && route.operation == "check" {
                     let request: SessionPolicyCheckRequest = decode(&payload)?;
-                    assert_eq!(request.action, "mutation");
+                    assert_eq!(request.action, "attach.input");
                     return encode(&SessionPolicyCheckResponse {
                         allowed: false,
                         reason: Some("session policy denied for this operation".to_string()),

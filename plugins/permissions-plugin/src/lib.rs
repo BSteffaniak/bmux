@@ -438,36 +438,13 @@ fn evaluate_role_action(role: &str, action: &str) -> SessionPolicyCheckResponse 
 }
 
 fn classify_action(action: &str) -> PolicyActionKind {
-    let normalized = action.trim().to_ascii_lowercase().replace('-', "_");
+    let normalized = action.trim().to_ascii_lowercase();
     match normalized.as_str() {
-        "admin" | "session_admin" | "session_kill" | "kill_session" => PolicyActionKind::Admin,
-        "mutation" | "write" | "session_mutation" | "attach_input" | "session_select"
-        | "pane_split" | "pane_focus" | "pane_resize" | "pane_close" | "follow" | "unfollow" => {
-            PolicyActionKind::Mutation
-        }
-        "read" | "query" | "list" | "status" => PolicyActionKind::Read,
-        _ if normalized.contains("admin")
-            || normalized.contains("kill_session")
-            || normalized.contains("session_kill") =>
-        {
-            PolicyActionKind::Admin
-        }
-        _ if normalized.contains("mutat")
-            || normalized.contains("write")
-            || normalized.contains("attach")
-            || normalized.contains("pane")
-            || normalized.contains("select")
-            || normalized.contains("follow") =>
-        {
-            PolicyActionKind::Mutation
-        }
-        _ if normalized.contains("read")
-            || normalized.contains("query")
-            || normalized.contains("list")
-            || normalized.contains("status") =>
-        {
-            PolicyActionKind::Read
-        }
+        "admin" | "session.kill" => PolicyActionKind::Admin,
+        "mutation" | "attach.input" | "session.select" | "pane.split" | "pane.focus"
+        | "pane.resize" | "pane.close" | "follow" | "unfollow" | "context.create"
+        | "context.select" | "context.close" => PolicyActionKind::Mutation,
+        "read" | "list" | "status" | "context.list" => PolicyActionKind::Read,
         _ => PolicyActionKind::Unknown,
     }
 }
@@ -1050,7 +1027,7 @@ mod tests {
                 session_id,
                 client_id,
                 principal_id: Uuid::new_v4(),
-                action: "attach-input".to_string(),
+                action: "context.close".to_string(),
             },
         )
         .expect("policy evaluation should succeed");
@@ -1079,11 +1056,46 @@ mod tests {
                 session_id,
                 client_id,
                 principal_id: Uuid::new_v4(),
-                action: "pane_split".to_string(),
+                action: "context.select".to_string(),
             },
         )
         .expect("policy evaluation should succeed");
         assert!(decision.allowed);
+    }
+
+    #[test]
+    fn policy_rejects_legacy_alias_action_names() {
+        let session_id = Uuid::new_v4();
+        let client_id = Uuid::new_v4();
+        let host = MockHost::with_session(session_id, "alpha");
+
+        grant_entry(
+            &host,
+            GrantRequest {
+                session: "alpha".to_string(),
+                client: client_id.to_string(),
+                role: "writer".to_string(),
+            },
+        )
+        .expect("grant should succeed");
+
+        let decision = evaluate_policy(
+            &host,
+            &SessionPolicyCheckRequest {
+                session_id,
+                client_id,
+                principal_id: Uuid::new_v4(),
+                action: "pane_split".to_string(),
+            },
+        )
+        .expect("policy evaluation should succeed");
+
+        assert!(!decision.allowed);
+        assert!(
+            decision
+                .reason
+                .is_some_and(|reason| reason.contains("invalid session policy action"))
+        );
     }
 
     #[test]
