@@ -5,6 +5,7 @@
 //! Cross-platform IPC protocol models for bmux.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -106,6 +107,13 @@ impl Envelope {
 /// Session selector accepted by commands and protocol requests.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionSelector {
+    ById(Uuid),
+    ByName(String),
+}
+
+/// Generic context selector accepted by context protocol requests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextSelector {
     ById(Uuid),
     ByName(String),
 }
@@ -250,6 +258,20 @@ pub enum Request {
     },
     ListSessions,
     ListClients,
+    CreateContext {
+        name: Option<String>,
+        #[serde(default)]
+        attributes: BTreeMap<String, String>,
+    },
+    ListContexts,
+    SelectContext {
+        selector: ContextSelector,
+    },
+    CloseContext {
+        selector: ContextSelector,
+        force: bool,
+    },
+    CurrentContext,
     KillSession {
         selector: SessionSelector,
         force_local: bool,
@@ -336,6 +358,15 @@ pub struct SessionSummary {
     pub client_count: usize,
 }
 
+/// Summary returned when listing generic runtime contexts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSummary {
+    pub id: Uuid,
+    pub name: Option<String>,
+    #[serde(default)]
+    pub attributes: BTreeMap<String, String>,
+}
+
 /// Summary returned when listing panes in the active session runtime.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSummary {
@@ -411,6 +442,21 @@ pub enum ResponsePayload {
     },
     ClientList {
         clients: Vec<ClientSummary>,
+    },
+    ContextCreated {
+        context: ContextSummary,
+    },
+    ContextList {
+        contexts: Vec<ContextSummary>,
+    },
+    ContextSelected {
+        context: ContextSummary,
+    },
+    ContextClosed {
+        id: Uuid,
+    },
+    CurrentContext {
+        context: Option<ContextSummary>,
     },
     SessionKilled {
         id: Uuid,

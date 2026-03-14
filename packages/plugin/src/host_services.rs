@@ -10,6 +10,13 @@ pub struct SessionSummary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSummary {
+    pub id: Uuid,
+    pub name: Option<String>,
+    pub attributes: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PaneSummary {
     pub id: Uuid,
     pub index: u32,
@@ -19,6 +26,12 @@ pub struct PaneSummary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SessionSelector {
+    ById(Uuid),
+    ByName(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ContextSelector {
     ById(Uuid),
     ByName(String),
 }
@@ -89,6 +102,48 @@ pub struct CurrentClientResponse {
     pub selected_session_id: Option<Uuid>,
     pub following_client_id: Option<Uuid>,
     pub following_global: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCreateRequest {
+    pub name: Option<String>,
+    pub attributes: std::collections::BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCreateResponse {
+    pub context: ContextSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextListResponse {
+    pub contexts: Vec<ContextSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSelectRequest {
+    pub selector: ContextSelector,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSelectResponse {
+    pub context: ContextSummary,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCloseRequest {
+    pub selector: ContextSelector,
+    pub force: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCloseResponse {
+    pub id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextCurrentResponse {
+    pub context: Option<ContextSummary>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -216,6 +271,56 @@ pub trait HostRuntimeApi: ServiceCaller {
             "client-query/v1",
             "current",
             &(),
+        )
+    }
+
+    fn context_list(&self) -> Result<ContextListResponse> {
+        self.call_service(
+            "bmux.contexts.read",
+            ServiceKind::Query,
+            "context-query/v1",
+            "list",
+            &(),
+        )
+    }
+
+    fn context_current(&self) -> Result<ContextCurrentResponse> {
+        self.call_service(
+            "bmux.contexts.read",
+            ServiceKind::Query,
+            "context-query/v1",
+            "current",
+            &(),
+        )
+    }
+
+    fn context_create(&self, request: &ContextCreateRequest) -> Result<ContextCreateResponse> {
+        self.call_service(
+            "bmux.contexts.write",
+            ServiceKind::Command,
+            "context-command/v1",
+            "create",
+            request,
+        )
+    }
+
+    fn context_select(&self, request: &ContextSelectRequest) -> Result<ContextSelectResponse> {
+        self.call_service(
+            "bmux.contexts.write",
+            ServiceKind::Command,
+            "context-command/v1",
+            "select",
+            request,
+        )
+    }
+
+    fn context_close(&self, request: &ContextCloseRequest) -> Result<ContextCloseResponse> {
+        self.call_service(
+            "bmux.contexts.write",
+            ServiceKind::Command,
+            "context-command/v1",
+            "close",
+            request,
         )
     }
 

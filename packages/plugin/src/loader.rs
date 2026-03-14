@@ -8,6 +8,9 @@ use crate::{
     decode_service_envelope, decode_service_message, discover_registered_plugins_in_roots,
     encode_service_envelope, encode_service_message,
     host_services::{
+        ContextCloseRequest, ContextCloseResponse, ContextCreateRequest, ContextCreateResponse,
+        ContextCurrentResponse, ContextListResponse, ContextSelectRequest, ContextSelectResponse,
+        ContextSelector as HostContextSelector, ContextSummary as HostContextSummary,
         CurrentClientResponse, PaneCloseRequest, PaneCloseResponse,
         PaneFocusDirection as HostPaneFocusDirection, PaneFocusRequest, PaneFocusResponse,
         PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse,
@@ -19,9 +22,10 @@ use crate::{
     },
 };
 use bmux_ipc::{
-    PaneFocusDirection as IpcPaneFocusDirection, PaneSelector as IpcPaneSelector,
-    PaneSplitDirection as IpcPaneSplitDirection, Request as IpcRequest, Response as IpcResponse,
-    ResponsePayload as IpcResponsePayload, SessionSelector as IpcSessionSelector,
+    ContextSelector as IpcContextSelector, PaneFocusDirection as IpcPaneFocusDirection,
+    PaneSelector as IpcPaneSelector, PaneSplitDirection as IpcPaneSplitDirection,
+    Request as IpcRequest, Response as IpcResponse, ResponsePayload as IpcResponsePayload,
+    SessionSelector as IpcSessionSelector,
 };
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -744,6 +748,108 @@ fn handle_core_service_call(
                 }),
             }
         }
+        ("context-query/v1", "list") => {
+            let response = execute_kernel_request(host_kernel_bridge, IpcRequest::ListContexts)?;
+            match response {
+                IpcResponsePayload::ContextList { contexts } => {
+                    let contexts = contexts
+                        .into_iter()
+                        .map(|entry| HostContextSummary {
+                            id: entry.id,
+                            name: entry.name,
+                            attributes: entry.attributes,
+                        })
+                        .collect();
+                    encode_service_message(&ContextListResponse { contexts })
+                }
+                _ => Err(PluginError::ServiceProtocol {
+                    details: "unexpected response payload for context-query/v1:list".to_string(),
+                }),
+            }
+        }
+        ("context-query/v1", "current") => {
+            let response = execute_kernel_request(host_kernel_bridge, IpcRequest::CurrentContext)?;
+            match response {
+                IpcResponsePayload::CurrentContext { context } => {
+                    let context = context.map(|entry| HostContextSummary {
+                        id: entry.id,
+                        name: entry.name,
+                        attributes: entry.attributes,
+                    });
+                    encode_service_message(&ContextCurrentResponse { context })
+                }
+                _ => Err(PluginError::ServiceProtocol {
+                    details: "unexpected response payload for context-query/v1:current".to_string(),
+                }),
+            }
+        }
+        ("context-command/v1", "create") => {
+            let request: ContextCreateRequest = decode_service_message(&payload)?;
+            let response = execute_kernel_request(
+                host_kernel_bridge,
+                IpcRequest::CreateContext {
+                    name: request.name,
+                    attributes: request.attributes,
+                },
+            )?;
+            match response {
+                IpcResponsePayload::ContextCreated { context } => {
+                    encode_service_message(&ContextCreateResponse {
+                        context: HostContextSummary {
+                            id: context.id,
+                            name: context.name,
+                            attributes: context.attributes,
+                        },
+                    })
+                }
+                _ => Err(PluginError::ServiceProtocol {
+                    details: "unexpected response payload for context-command/v1:create"
+                        .to_string(),
+                }),
+            }
+        }
+        ("context-command/v1", "select") => {
+            let request: ContextSelectRequest = decode_service_message(&payload)?;
+            let response = execute_kernel_request(
+                host_kernel_bridge,
+                IpcRequest::SelectContext {
+                    selector: context_selector_to_ipc(request.selector),
+                },
+            )?;
+            match response {
+                IpcResponsePayload::ContextSelected { context } => {
+                    encode_service_message(&ContextSelectResponse {
+                        context: HostContextSummary {
+                            id: context.id,
+                            name: context.name,
+                            attributes: context.attributes,
+                        },
+                    })
+                }
+                _ => Err(PluginError::ServiceProtocol {
+                    details: "unexpected response payload for context-command/v1:select"
+                        .to_string(),
+                }),
+            }
+        }
+        ("context-command/v1", "close") => {
+            let request: ContextCloseRequest = decode_service_message(&payload)?;
+            let response = execute_kernel_request(
+                host_kernel_bridge,
+                IpcRequest::CloseContext {
+                    selector: context_selector_to_ipc(request.selector),
+                    force: request.force,
+                },
+            )?;
+            match response {
+                IpcResponsePayload::ContextClosed { id } => {
+                    encode_service_message(&ContextCloseResponse { id })
+                }
+                _ => Err(PluginError::ServiceProtocol {
+                    details: "unexpected response payload for context-command/v1:close".to_string(),
+                }),
+            }
+        }
         ("session-command/v1", "new") => {
             let request: SessionCreateRequest = decode_service_message(&payload)?;
             let response = execute_kernel_request(
@@ -916,6 +1022,13 @@ fn session_selector_to_ipc(selector: HostSessionSelector) -> IpcSessionSelector 
     match selector {
         HostSessionSelector::ById(id) => IpcSessionSelector::ById(id),
         HostSessionSelector::ByName(name) => IpcSessionSelector::ByName(name),
+    }
+}
+
+fn context_selector_to_ipc(selector: HostContextSelector) -> IpcContextSelector {
+    match selector {
+        HostContextSelector::ById(id) => IpcContextSelector::ById(id),
+        HostContextSelector::ByName(name) => IpcContextSelector::ByName(name),
     }
 }
 
@@ -1717,6 +1830,56 @@ mod tests {
                         following_global: false,
                     }],
                 })
+            }
+            bmux_ipc::Request::ListContexts => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextList {
+                    contexts: vec![bmux_ipc::ContextSummary {
+                        id: uuid::Uuid::from_u128(0x33333333_3333_3333_3333_333333333333),
+                        name: Some("ctx-alpha".to_string()),
+                        attributes: BTreeMap::from([(
+                            "core.kind".to_string(),
+                            "workspace".to_string(),
+                        )]),
+                    }],
+                })
+            }
+            bmux_ipc::Request::CurrentContext => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::CurrentContext {
+                    context: Some(bmux_ipc::ContextSummary {
+                        id: uuid::Uuid::from_u128(0x33333333_3333_3333_3333_333333333333),
+                        name: Some("ctx-alpha".to_string()),
+                        attributes: BTreeMap::new(),
+                    }),
+                })
+            }
+            bmux_ipc::Request::CreateContext { name, attributes } => {
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextCreated {
+                    context: bmux_ipc::ContextSummary {
+                        id: uuid::Uuid::new_v4(),
+                        name,
+                        attributes,
+                    },
+                })
+            }
+            bmux_ipc::Request::SelectContext { selector } => {
+                let id = match selector {
+                    bmux_ipc::ContextSelector::ById(id) => id,
+                    bmux_ipc::ContextSelector::ByName(_) => uuid::Uuid::new_v4(),
+                };
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextSelected {
+                    context: bmux_ipc::ContextSummary {
+                        id,
+                        name: Some("ctx-selected".to_string()),
+                        attributes: BTreeMap::new(),
+                    },
+                })
+            }
+            bmux_ipc::Request::CloseContext { selector, .. } => {
+                let id = match selector {
+                    bmux_ipc::ContextSelector::ById(id) => id,
+                    bmux_ipc::ContextSelector::ByName(_) => uuid::Uuid::new_v4(),
+                };
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextClosed { id })
             }
             bmux_ipc::Request::Attach { selector } => {
                 let session_id = match selector {

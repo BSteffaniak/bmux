@@ -13,10 +13,10 @@ use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
     AttachFocusTarget, AttachGrant, AttachLayer, AttachPaneChunk, AttachRect, AttachScene,
     AttachSurface, AttachSurfaceKind, AttachViewComponent, CURRENT_PROTOCOL_VERSION, ClientSummary,
-    Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, PaneFocusDirection,
-    PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection, PaneSummary,
-    ProtocolVersion, Request, Response, ResponsePayload, ServerSnapshotStatus, SessionSelector,
-    SessionSummary, decode, encode,
+    ContextSelector, ContextSummary, Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event,
+    IpcEndpoint, PaneFocusDirection, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector,
+    PaneSplitDirection, PaneSummary, ProtocolVersion, Request, Response, ResponsePayload,
+    ServerSnapshotStatus, SessionSelector, SessionSummary, decode, encode,
 };
 use bmux_session::{ClientId, Session, SessionId, SessionManager};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
@@ -57,6 +57,7 @@ struct ServerState {
     session_runtimes: Mutex<SessionRuntimeManager>,
     attach_tokens: Mutex<AttachTokenManager>,
     follow_state: Mutex<FollowState>,
+    context_state: Mutex<ContextState>,
     snapshot_runtime: Mutex<SnapshotRuntime>,
     operation_lock: AsyncMutex<()>,
     event_hub: Mutex<EventHub>,
@@ -495,6 +496,159 @@ impl FollowState {
                 }
             })
             .collect()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuntimeContext {
+    id: Uuid,
+    name: Option<String>,
+    attributes: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Default)]
+struct ContextState {
+    contexts: BTreeMap<Uuid, RuntimeContext>,
+    selected_by_client: BTreeMap<ClientId, Uuid>,
+    mru_contexts: VecDeque<Uuid>,
+}
+
+impl ContextState {
+    fn list(&self) -> Vec<ContextSummary> {
+        let mut ordered_ids = self.mru_contexts.iter().copied().collect::<Vec<_>>();
+        for id in self.contexts.keys().copied() {
+            if !ordered_ids.contains(&id) {
+                ordered_ids.push(id);
+            }
+        }
+
+        ordered_ids
+            .into_iter()
+            .filter_map(|id| self.contexts.get(&id))
+            .map(Self::to_summary)
+            .collect()
+    }
+
+    fn create(
+        &mut self,
+        client_id: ClientId,
+        name: Option<String>,
+        attributes: BTreeMap<String, String>,
+    ) -> ContextSummary {
+        let context = RuntimeContext {
+            id: Uuid::new_v4(),
+            name,
+            attributes,
+        };
+        let id = context.id;
+        self.contexts.insert(id, context.clone());
+        self.selected_by_client.insert(client_id, id);
+        self.touch_mru(id);
+        Self::to_summary(&context)
+    }
+
+    fn current_for_client(&self, client_id: ClientId) -> Option<ContextSummary> {
+        let selected = self
+            .selected_by_client
+            .get(&client_id)
+            .copied()
+            .or_else(|| self.mru_contexts.front().copied())?;
+        self.contexts.get(&selected).map(Self::to_summary)
+    }
+
+    fn select_for_client(
+        &mut self,
+        client_id: ClientId,
+        selector: &ContextSelector,
+    ) -> std::result::Result<ContextSummary, &'static str> {
+        let id = self.resolve_id(selector)?;
+        self.selected_by_client.insert(client_id, id);
+        self.touch_mru(id);
+        self.contexts
+            .get(&id)
+            .map(Self::to_summary)
+            .ok_or("context not found")
+    }
+
+    fn close(
+        &mut self,
+        client_id: ClientId,
+        selector: &ContextSelector,
+        _force: bool,
+    ) -> std::result::Result<Uuid, &'static str> {
+        let id = self.resolve_id(selector)?;
+        let removed = self.contexts.remove(&id).ok_or("context not found")?;
+        self.mru_contexts.retain(|entry| *entry != id);
+
+        let replacement = self
+            .mru_contexts
+            .iter()
+            .copied()
+            .find(|candidate| self.contexts.contains_key(candidate));
+
+        let impacted = self
+            .selected_by_client
+            .iter()
+            .filter_map(|(id_key, selected)| (*selected == removed.id).then_some(*id_key))
+            .collect::<Vec<_>>();
+        for impacted_client in impacted {
+            if let Some(next_id) = replacement {
+                self.selected_by_client.insert(impacted_client, next_id);
+            } else {
+                self.selected_by_client.remove(&impacted_client);
+            }
+        }
+
+        if self.selected_by_client.get(&client_id).is_none()
+            && let Some(next_id) = replacement
+        {
+            self.selected_by_client.insert(client_id, next_id);
+        }
+
+        Ok(removed.id)
+    }
+
+    fn disconnect_client(&mut self, client_id: ClientId) {
+        self.selected_by_client.remove(&client_id);
+    }
+
+    fn resolve_id(&self, selector: &ContextSelector) -> std::result::Result<Uuid, &'static str> {
+        match selector {
+            ContextSelector::ById(id) => {
+                if self.contexts.contains_key(id) {
+                    Ok(*id)
+                } else {
+                    Err("context not found")
+                }
+            }
+            ContextSelector::ByName(name) => {
+                let mut matches = self
+                    .contexts
+                    .values()
+                    .filter(|context| context.name.as_deref() == Some(name.as_str()))
+                    .map(|context| context.id);
+                let Some(first) = matches.next() else {
+                    return Err("context not found");
+                };
+                if matches.next().is_some() {
+                    return Err("context selector by name is ambiguous");
+                }
+                Ok(first)
+            }
+        }
+    }
+
+    fn touch_mru(&mut self, id: Uuid) {
+        self.mru_contexts.retain(|entry| *entry != id);
+        self.mru_contexts.push_front(id);
+    }
+
+    fn to_summary(context: &RuntimeContext) -> ContextSummary {
+        ContextSummary {
+            id: context.id,
+            name: context.name.clone(),
+            attributes: context.attributes.clone(),
+        }
     }
 }
 
@@ -2007,6 +2161,7 @@ impl BmuxServer {
                 )),
                 attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
                 follow_state: Mutex::new(FollowState::default()),
+                context_state: Mutex::new(ContextState::default()),
                 snapshot_runtime: Mutex::new(snapshot_runtime),
                 operation_lock: AsyncMutex::new(()),
                 event_hub: Mutex::new(EventHub::new(1024)),
@@ -3714,6 +3869,56 @@ async fn handle_request(
             let clients = follow_state.list_clients();
             Response::Ok(ResponsePayload::ClientList { clients })
         }
+        Request::CreateContext { name, attributes } => {
+            let mut context_state = state
+                .context_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
+            let context = context_state.create(client_id, name, attributes);
+            Response::Ok(ResponsePayload::ContextCreated { context })
+        }
+        Request::ListContexts => {
+            let context_state = state
+                .context_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
+            let contexts = context_state.list();
+            Response::Ok(ResponsePayload::ContextList { contexts })
+        }
+        Request::SelectContext { selector } => {
+            let mut context_state = state
+                .context_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
+            match context_state.select_for_client(client_id, &selector) {
+                Ok(context) => Response::Ok(ResponsePayload::ContextSelected { context }),
+                Err(message) => Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: message.to_string(),
+                }),
+            }
+        }
+        Request::CloseContext { selector, force } => {
+            let mut context_state = state
+                .context_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
+            match context_state.close(client_id, &selector, force) {
+                Ok(id) => Response::Ok(ResponsePayload::ContextClosed { id }),
+                Err(message) => Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: message.to_string(),
+                }),
+            }
+        }
+        Request::CurrentContext => {
+            let context_state = state
+                .context_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
+            let context = context_state.current_for_client(client_id);
+            Response::Ok(ResponsePayload::CurrentContext { context })
+        }
         Request::KillSession {
             selector,
             force_local,
@@ -4422,6 +4627,9 @@ const fn request_requires_exclusive(request: &Request) -> bool {
             | Request::ServerStop
             | Request::ServerRestoreApply
             | Request::NewSession { .. }
+            | Request::CreateContext { .. }
+            | Request::SelectContext { .. }
+            | Request::CloseContext { .. }
             | Request::KillSession { .. }
             | Request::SplitPane { .. }
             | Request::FocusPane { .. }
@@ -4442,6 +4650,9 @@ const fn response_requires_snapshot(response: &Response) -> bool {
         response,
         Response::Ok(
             ResponsePayload::SessionCreated { .. }
+                | ResponsePayload::ContextCreated { .. }
+                | ResponsePayload::ContextSelected { .. }
+                | ResponsePayload::ContextClosed { .. }
                 | ResponsePayload::PaneSplit { .. }
                 | ResponsePayload::PaneFocused { .. }
                 | ResponsePayload::PaneResized { .. }
@@ -4463,6 +4674,14 @@ fn detach_client_state_on_disconnect(
 ) -> Result<()> {
     let previous_selected = selected_session.take();
     let previous_stream = attached_stream_session.take();
+
+    {
+        let mut context_state = state
+            .context_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
+        context_state.disconnect_client(client_id);
+    }
 
     if previous_selected.is_none() && previous_stream.is_none() {
         return Ok(());
@@ -4776,6 +4995,7 @@ async fn send_response(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     async fn execute_request(
@@ -4882,6 +5102,143 @@ mod tests {
                 assert_eq!(split_session_id, session_id);
             }
             response => panic!("expected successful split response, got {response:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_context_sets_current_context_for_client() {
+        let server = BmuxServer::new(test_endpoint());
+        let client_id = ClientId::new();
+        let principal_id = Uuid::new_v4();
+        let mut selected_session = None;
+        let mut attached_stream_session = None;
+
+        let mut attributes = BTreeMap::new();
+        attributes.insert("core.kind".to_string(), "editor".to_string());
+        let created = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::CreateContext {
+                name: Some("alpha".to_string()),
+                attributes,
+            },
+        )
+        .await;
+        let context_id = match created {
+            Response::Ok(ResponsePayload::ContextCreated { context }) => context.id,
+            response => panic!("expected context created response, got {response:?}"),
+        };
+
+        let current = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::CurrentContext,
+        )
+        .await;
+        match current {
+            Response::Ok(ResponsePayload::CurrentContext {
+                context: Some(context),
+            }) => {
+                assert_eq!(context.id, context_id);
+                assert_eq!(context.name.as_deref(), Some("alpha"));
+            }
+            response => panic!("expected current context response, got {response:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn close_active_context_promotes_most_recent_active_context() {
+        let server = BmuxServer::new(test_endpoint());
+        let client_id = ClientId::new();
+        let principal_id = Uuid::new_v4();
+        let mut selected_session = None;
+        let mut attached_stream_session = None;
+
+        let first = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::CreateContext {
+                name: Some("first".to_string()),
+                attributes: BTreeMap::new(),
+            },
+        )
+        .await;
+        let first_id = match first {
+            Response::Ok(ResponsePayload::ContextCreated { context }) => context.id,
+            response => panic!("expected first context created response, got {response:?}"),
+        };
+
+        let second = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::CreateContext {
+                name: Some("second".to_string()),
+                attributes: BTreeMap::new(),
+            },
+        )
+        .await;
+        let second_id = match second {
+            Response::Ok(ResponsePayload::ContextCreated { context }) => context.id,
+            response => panic!("expected second context created response, got {response:?}"),
+        };
+
+        let _selected_first = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::SelectContext {
+                selector: ContextSelector::ById(first_id),
+            },
+        )
+        .await;
+
+        let closed = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::CloseContext {
+                selector: ContextSelector::ById(first_id),
+                force: true,
+            },
+        )
+        .await;
+        match closed {
+            Response::Ok(ResponsePayload::ContextClosed { id }) => assert_eq!(id, first_id),
+            response => panic!("expected context closed response, got {response:?}"),
+        }
+
+        let current = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::CurrentContext,
+        )
+        .await;
+        match current {
+            Response::Ok(ResponsePayload::CurrentContext {
+                context: Some(context),
+            }) => {
+                assert_eq!(context.id, second_id);
+            }
+            response => panic!("expected current context response, got {response:?}"),
         }
     }
 

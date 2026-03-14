@@ -9,11 +9,13 @@ use bmux_config::{BmuxConfig, ConfigPaths};
 pub use bmux_ipc::Event as ServerEvent;
 use bmux_ipc::transport::{IpcTransportError, LocalIpcStream};
 use bmux_ipc::{
-    AttachGrant, AttachPaneChunk, AttachScene, ClientSummary, Envelope, EnvelopeKind, ErrorCode,
-    InvokeServiceKind, IpcEndpoint, PaneFocusDirection, PaneLayoutNode, PaneSelector,
-    PaneSplitDirection, PaneSummary, ProtocolVersion, Request, Response, ResponsePayload,
-    ServerSnapshotStatus, SessionSelector, SessionSummary, decode, encode,
+    AttachGrant, AttachPaneChunk, AttachScene, ClientSummary, ContextSelector, ContextSummary,
+    Envelope, EnvelopeKind, ErrorCode, InvokeServiceKind, IpcEndpoint, PaneFocusDirection,
+    PaneLayoutNode, PaneSelector, PaneSplitDirection, PaneSummary, ProtocolVersion, Request,
+    Response, ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary, decode,
+    encode,
 };
+use std::collections::BTreeMap;
 use std::time::Duration;
 use thiserror::Error;
 use tracing::debug;
@@ -440,6 +442,76 @@ impl BmuxClient {
         match self.request(Request::ListClients).await? {
             ResponsePayload::ClientList { clients } => Ok(clients),
             _ => Err(ClientError::UnexpectedResponse("expected client list")),
+        }
+    }
+
+    /// Create a new generic runtime context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn create_context(
+        &mut self,
+        name: Option<String>,
+        attributes: BTreeMap<String, String>,
+    ) -> Result<ContextSummary> {
+        match self
+            .request(Request::CreateContext { name, attributes })
+            .await?
+        {
+            ResponsePayload::ContextCreated { context } => Ok(context),
+            _ => Err(ClientError::UnexpectedResponse("expected context created")),
+        }
+    }
+
+    /// List generic runtime contexts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn list_contexts(&mut self) -> Result<Vec<ContextSummary>> {
+        match self.request(Request::ListContexts).await? {
+            ResponsePayload::ContextList { contexts } => Ok(contexts),
+            _ => Err(ClientError::UnexpectedResponse("expected context list")),
+        }
+    }
+
+    /// Select an active runtime context for this client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn select_context(&mut self, selector: ContextSelector) -> Result<ContextSummary> {
+        match self.request(Request::SelectContext { selector }).await? {
+            ResponsePayload::ContextSelected { context } => Ok(context),
+            _ => Err(ClientError::UnexpectedResponse("expected context selected")),
+        }
+    }
+
+    /// Close a runtime context and optionally force closure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn close_context(&mut self, selector: ContextSelector, force: bool) -> Result<Uuid> {
+        match self
+            .request(Request::CloseContext { selector, force })
+            .await?
+        {
+            ResponsePayload::ContextClosed { id } => Ok(id),
+            _ => Err(ClientError::UnexpectedResponse("expected context closed")),
+        }
+    }
+
+    /// Return currently active context for this client when available.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn current_context(&mut self) -> Result<Option<ContextSummary>> {
+        match self.request(Request::CurrentContext).await? {
+            ResponsePayload::CurrentContext { context } => Ok(context),
+            _ => Err(ClientError::UnexpectedResponse("expected current context")),
         }
     }
 
