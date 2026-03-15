@@ -47,6 +47,14 @@ In addition, for any code change anywhere in the repo, run:
 
 This is required. Treat failures as blocking, and do not finish with known flaky/failing tests.
 
+## Plugin Changes (REQUIRED)
+
+If a change touches `plugins/**`, rebuild bundled plugins before finishing:
+
+- `./scripts/rebuild-bundled-plugins.sh`
+
+During iteration you may run targeted rebuilds with selectors (plugin id, short name, or crate name), but final validation for plugin changes should run the command without selectors.
+
 ## Minimum Required Commands (CLI/runtime work)
 
 For changes in `packages/cli/**` (runtime, input, pane/layout, protocol, terminal handling), run:
@@ -79,6 +87,8 @@ This includes edits under:
   - Run 1-4.
 - Config-only changes
   - Run at least 1-3; include 4 if behavior affects runtime startup.
+- Any plugin changes under `plugins/**`
+  - Run `./scripts/rebuild-bundled-plugins.sh`.
 - Docs-only changes
   - No mandatory runtime commands.
 
@@ -91,5 +101,6 @@ Agents should report test execution in final response using this format:
 - `cargo nextest run --no-fail-fast` - PASS/FAIL
 - `./scripts/smoke-pty-runtime.sh` - PASS/FAIL
 - `./scripts/compat-matrix.sh` - PASS/FAIL (if required)
+- `./scripts/rebuild-bundled-plugins.sh` - PASS/FAIL (if required)
 
 If any required command is skipped, explain why.
