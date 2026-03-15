@@ -2759,7 +2759,12 @@ async fn handle_attach_runtime_action(
             view_state.can_write = attach_info.can_write;
             update_attach_viewport(client, view_state.attached_id).await?;
             hydrate_attach_state_from_snapshot(client, view_state).await?;
-            let status = attach_context_status(client, view_state.attached_id).await?;
+            let status = attach_context_status(
+                client,
+                view_state.attached_context_id,
+                view_state.attached_id,
+            )
+            .await?;
             set_attach_context_status(
                 view_state,
                 status,
@@ -2794,7 +2799,12 @@ async fn apply_plugin_command_outcome(
                 update_attach_viewport(client, view_state.attached_id).await?;
                 hydrate_attach_state_from_snapshot(client, view_state).await?;
                 view_state.ui_mode = AttachUiMode::Normal;
-                let status = attach_context_status(client, view_state.attached_id).await?;
+                let status = attach_context_status(
+                    client,
+                    view_state.attached_context_id,
+                    view_state.attached_id,
+                )
+                .await?;
                 set_attach_context_status(
                     view_state,
                     status,
@@ -2897,7 +2907,12 @@ async fn handle_attach_ui_action(
         RuntimeAction::SessionPrev => {
             view_state.exit_scrollback();
             switch_attach_session_relative(client, view_state, -1).await?;
-            let status = attach_context_status(client, view_state.attached_id).await?;
+            let status = attach_context_status(
+                client,
+                view_state.attached_context_id,
+                view_state.attached_id,
+            )
+            .await?;
             set_attach_context_status(
                 view_state,
                 status,
@@ -2908,7 +2923,12 @@ async fn handle_attach_ui_action(
         RuntimeAction::SessionNext => {
             view_state.exit_scrollback();
             switch_attach_session_relative(client, view_state, 1).await?;
-            let status = attach_context_status(client, view_state.attached_id).await?;
+            let status = attach_context_status(
+                client,
+                view_state.attached_context_id,
+                view_state.attached_id,
+            )
+            .await?;
             set_attach_context_status(
                 view_state,
                 status,
@@ -3455,6 +3475,7 @@ fn relative_context_id(
 
 async fn build_attach_status_line_for_draw(
     client: &mut BmuxClient,
+    context_id: Option<Uuid>,
     session_id: Uuid,
     can_write: bool,
     ui_mode: AttachUiMode,
@@ -3471,9 +3492,10 @@ async fn build_attach_status_line_for_draw(
         return Ok(String::new());
     }
 
-    let tabs = build_attach_tabs(client, session_id).await?;
+    let tabs = build_attach_tabs(client, context_id, session_id).await?;
     let session_label = resolve_attach_session_label(client, session_id).await?;
-    let current_context_label = resolve_attach_context_label(client, session_id).await?;
+    let current_context_label =
+        resolve_attach_context_label(client, context_id, session_id).await?;
     let mode_label = if help_overlay_open {
         "HELP"
     } else if scrollback_active {
@@ -3845,6 +3867,7 @@ async fn render_attach_frame(
         view_state.cached_status_line = Some(
             build_attach_status_line_for_draw(
                 client,
+                view_state.attached_context_id,
                 view_state.attached_id,
                 view_state.can_write,
                 view_state.ui_mode,
@@ -3893,20 +3916,72 @@ async fn render_attach_frame(
 }
 
 async fn build_attach_tabs(
-    _client: &mut BmuxClient,
-    _session_id: Uuid,
+    client: &mut BmuxClient,
+    context_id: Option<Uuid>,
+    session_id: Uuid,
 ) -> std::result::Result<Vec<AttachTab>, ClientError> {
-    Ok(vec![AttachTab {
-        label: "terminal".to_string(),
-        active: true,
-    }])
+    let contexts = client.list_contexts().await?;
+    if contexts.is_empty() {
+        return Ok(vec![AttachTab {
+            label: "terminal".to_string(),
+            active: true,
+        }]);
+    }
+
+    let current_context_id = context_id.or_else(|| {
+        contexts
+            .iter()
+            .find(|context| {
+                context
+                    .attributes
+                    .get("bmux.session_id")
+                    .is_some_and(|value| value == &session_id.to_string())
+            })
+            .map(|context| context.id)
+    });
+
+    let tabs = contexts
+        .into_iter()
+        .take(6)
+        .map(|context| AttachTab {
+            label: context_summary_label(&context),
+            active: current_context_id == Some(context.id),
+        })
+        .collect();
+    Ok(tabs)
 }
 
 async fn resolve_attach_context_label(
-    _client: &mut BmuxClient,
-    _session_id: Uuid,
+    client: &mut BmuxClient,
+    context_id: Option<Uuid>,
+    session_id: Uuid,
 ) -> std::result::Result<String, ClientError> {
+    let contexts = client.list_contexts().await?;
+    if let Some(context_id) = context_id
+        && let Some(context) = contexts.iter().find(|context| context.id == context_id)
+    {
+        return Ok(context_summary_label(context));
+    }
+
+    if let Some(context) = contexts.iter().find(|context| {
+        context
+            .attributes
+            .get("bmux.session_id")
+            .is_some_and(|value| value == &session_id.to_string())
+    }) {
+        return Ok(context_summary_label(context));
+    }
+
     Ok("terminal".to_string())
+}
+
+fn context_summary_label(context: &ContextSummary) -> String {
+    context
+        .name
+        .as_deref()
+        .filter(|name| !name.trim().is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("context-{}", short_uuid(context.id)))
 }
 
 async fn resolve_attach_session_label(
@@ -3930,10 +4005,11 @@ fn session_summary_label(session: &bmux_ipc::SessionSummary) -> String {
 
 async fn attach_context_status(
     client: &mut BmuxClient,
+    context_id: Option<Uuid>,
     session_id: Uuid,
 ) -> std::result::Result<String, ClientError> {
     let session_label = resolve_attach_session_label(client, session_id).await?;
-    let context_label = resolve_attach_context_label(client, session_id).await?;
+    let context_label = resolve_attach_context_label(client, context_id, session_id).await?;
     Ok(format!(
         "session: {session_label} | context: {context_label}"
     ))
@@ -4523,9 +4599,13 @@ async fn handle_attach_server_event(
                 .await
                 .map_err(map_attach_client_error)?;
             view_state.ui_mode = AttachUiMode::Normal;
-            let status = attach_context_status(client, view_state.attached_id)
-                .await
-                .map_err(map_attach_client_error)?;
+            let status = attach_context_status(
+                client,
+                view_state.attached_context_id,
+                view_state.attached_id,
+            )
+            .await
+            .map_err(map_attach_client_error)?;
             set_attach_context_status(
                 view_state,
                 status,
