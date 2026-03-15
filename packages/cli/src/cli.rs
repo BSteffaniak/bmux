@@ -105,6 +105,11 @@ pub enum Command {
         #[command(subcommand)]
         command: ServerCommand,
     },
+    /// Logging diagnostics and utilities
+    Logs {
+        #[command(subcommand)]
+        command: LogsCommand,
+    },
     /// Keymap tools and diagnostics
     Keymap {
         #[command(subcommand)]
@@ -226,6 +231,23 @@ pub enum KeymapCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum LogsCommand {
+    /// Print effective log file path
+    Path,
+    /// Print effective runtime log level
+    Level,
+    /// Print recent log lines and optionally follow updates
+    Tail {
+        /// Number of recent lines to show before follow
+        #[arg(long, default_value_t = 50)]
+        lines: usize,
+        /// Print recent lines only (disable follow)
+        #[arg(long)]
+        no_follow: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum TerminalCommand {
     /// Show terminal capability profile used for panes
     Doctor {
@@ -259,7 +281,8 @@ pub enum TerminalCommand {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, KeymapCommand, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
+        Cli, Command, KeymapCommand, LogsCommand, ServerCommand, SessionCommand, TerminalCommand,
+        TraceFamily,
     };
     use clap::Parser;
 
@@ -406,6 +429,40 @@ mod tests {
             panic!("expected server subcommand");
         };
         assert!(matches!(command, ServerCommand::Stop));
+    }
+
+    #[test]
+    fn parses_logs_path_subcommand() {
+        let cli = Cli::try_parse_from(["bmux", "logs", "path"]).expect("valid CLI args");
+        let Some(Command::Logs { command }) = cli.command else {
+            panic!("expected logs subcommand");
+        };
+        assert!(matches!(command, LogsCommand::Path));
+    }
+
+    #[test]
+    fn parses_logs_level_subcommand() {
+        let cli = Cli::try_parse_from(["bmux", "logs", "level"]).expect("valid CLI args");
+        let Some(Command::Logs { command }) = cli.command else {
+            panic!("expected logs subcommand");
+        };
+        assert!(matches!(command, LogsCommand::Level));
+    }
+
+    #[test]
+    fn parses_logs_tail_flags() {
+        let cli = Cli::try_parse_from(["bmux", "logs", "tail", "--lines", "10", "--no-follow"])
+            .expect("valid CLI args");
+        let Some(Command::Logs { command }) = cli.command else {
+            panic!("expected logs subcommand");
+        };
+        assert!(matches!(
+            command,
+            LogsCommand::Tail {
+                lines: 10,
+                no_follow: true
+            }
+        ));
     }
 
     #[test]

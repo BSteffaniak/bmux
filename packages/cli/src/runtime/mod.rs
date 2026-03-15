@@ -1,6 +1,6 @@
 use crate::cli::{
-    Cli, Command, KeymapCommand, LogLevel, ServerCommand, SessionCommand, TerminalCommand,
-    TraceFamily,
+    Cli, Command, KeymapCommand, LogLevel, LogsCommand, ServerCommand, SessionCommand,
+    TerminalCommand, TraceFamily,
 };
 use crate::connection::{
     ConnectionPolicyScope, ServerRuntimeMetadata, connect, connect_raw, current_cli_build_id,
@@ -34,7 +34,7 @@ use crossterm::terminal;
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::cell::RefCell;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, IsTerminal, Read, Seek, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::OnceLock;
@@ -818,6 +818,11 @@ fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
             ServerCommand::Restore { .. } => BuiltInHandlerId::ServerRestore,
             ServerCommand::Stop => BuiltInHandlerId::ServerStop,
         },
+        Command::Logs { command } => match command {
+            LogsCommand::Path => BuiltInHandlerId::LogsPath,
+            LogsCommand::Level => BuiltInHandlerId::LogsLevel,
+            LogsCommand::Tail { .. } => BuiltInHandlerId::LogsTail,
+        },
         Command::Keymap { .. } => BuiltInHandlerId::KeymapDoctor,
         Command::Terminal { command } => match command {
             TerminalCommand::Doctor { .. } => BuiltInHandlerId::TerminalDoctor,
@@ -974,6 +979,24 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 command: ServerCommand::Stop,
             },
         ) => run_server_stop().await,
+        (
+            BuiltInHandlerId::LogsPath,
+            Command::Logs {
+                command: LogsCommand::Path,
+            },
+        ) => run_logs_path(),
+        (
+            BuiltInHandlerId::LogsLevel,
+            Command::Logs {
+                command: LogsCommand::Level,
+            },
+        ) => run_logs_level(),
+        (
+            BuiltInHandlerId::LogsTail,
+            Command::Logs {
+                command: LogsCommand::Tail { lines, no_follow },
+            },
+        ) => run_logs_tail(*lines, !*no_follow),
         (
             BuiltInHandlerId::KeymapDoctor,
             Command::Keymap {
@@ -2163,6 +2186,80 @@ async fn run_server_stop() -> Result<u8> {
 
     println!("bmux server is not running");
     Ok(1)
+}
+
+fn run_logs_path() -> Result<u8> {
+    println!("{}", log_file_path().display());
+    Ok(0)
+}
+
+fn run_logs_level() -> Result<u8> {
+    let level = EFFECTIVE_LOG_LEVEL.get().copied().unwrap_or(Level::INFO);
+    let value = match level {
+        Level::ERROR => "error",
+        Level::WARN => "warn",
+        Level::INFO => "info",
+        Level::DEBUG => "debug",
+        Level::TRACE => "trace",
+    };
+    println!("{value}");
+    Ok(0)
+}
+
+fn run_logs_tail(lines: usize, follow: bool) -> Result<u8> {
+    let path = log_file_path();
+    if !path.exists() {
+        println!("no log file at {}", path.display());
+        return Ok(0);
+    }
+
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed reading log file {}", path.display()))?;
+    let all_lines = content.lines().collect::<Vec<_>>();
+    let start = all_lines.len().saturating_sub(lines.max(1));
+    for line in &all_lines[start..] {
+        println!("{line}");
+    }
+
+    if !follow {
+        return Ok(0);
+    }
+
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .with_context(|| format!("failed opening log file {}", path.display()))?;
+    let mut read_offset = file
+        .metadata()
+        .with_context(|| format!("failed reading metadata for {}", path.display()))?
+        .len();
+
+    loop {
+        let metadata = file
+            .metadata()
+            .with_context(|| format!("failed reading metadata for {}", path.display()))?;
+        let file_len = metadata.len();
+        if file_len < read_offset {
+            read_offset = 0;
+        }
+        if file_len > read_offset {
+            file.seek(std::io::SeekFrom::Start(read_offset))
+                .with_context(|| format!("failed seeking {}", path.display()))?;
+            let mut chunk = String::new();
+            file.read_to_string(&mut chunk)
+                .with_context(|| format!("failed reading appended logs from {}", path.display()))?;
+            if !chunk.is_empty() {
+                print!("{chunk}");
+                io::stdout().flush().context("failed flushing log output")?;
+            }
+            read_offset = file_len;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
+fn log_file_path() -> PathBuf {
+    ConfigPaths::default().logs_dir().join("bmux.log")
 }
 
 async fn run_session_new(name: Option<String>) -> Result<u8> {

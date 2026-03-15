@@ -47,6 +47,47 @@ Shutdown behavior:
 - `bmux server restore --yes` replaces the current in-memory server state with the persisted snapshot.
 - `--force-local` kill bypass is allowed only when your profile principal matches the server owner principal (`bmux server whoami-principal`).
 
+## Logging Commands
+
+```bash
+# show effective log file path
+bmux logs path
+
+# show effective runtime level
+bmux logs level
+
+# show recent lines and keep following
+bmux logs tail
+
+# show a fixed slice and exit
+bmux logs tail --lines 200 --no-follow
+```
+
+Logging behavior:
+
+- bmux writes logs to file by default.
+- default level is `info`.
+- `--verbose` raises level to `debug`.
+- `--log-level error|warn|info|debug|trace` overrides both defaults and `--verbose`.
+
+Log/state directory conventions:
+
+- Linux
+  - state: `$XDG_STATE_HOME/bmux` (fallback: `~/.local/state/bmux`)
+  - logs: `<state>/logs` (override with `BMUX_LOG_DIR`)
+- macOS
+  - state: `~/Library/Application Support/bmux/State`
+  - logs: `~/Library/Logs/bmux`
+- Windows
+  - state: `%LOCALAPPDATA%\\bmux\\State`
+  - logs: `%LOCALAPPDATA%\\bmux\\Logs`
+
+Environment overrides:
+
+- `BMUX_STATE_DIR`: override state root
+- `BMUX_LOG_DIR`: override log directory
+- `BMUX_LOG_LEVEL`: set runtime log level (`error|warn|info|debug|trace`)
+
 ## Session Commands
 
 Top-level and grouped forms are exact aliases.

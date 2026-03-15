@@ -28,6 +28,10 @@ pub enum BuiltInHandlerId {
     ServerSave,
     ServerRestore,
     ServerStop,
+    Logs,
+    LogsPath,
+    LogsLevel,
+    LogsTail,
     Keymap,
     KeymapDoctor,
     Terminal,
@@ -189,6 +193,26 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::ServerStop,
             &["server", "stop"],
             "Stop the server",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::Logs,
+            &["logs"],
+            "Logging diagnostics and utilities",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::LogsPath,
+            &["logs", "path"],
+            "Show effective log file path",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::LogsLevel,
+            &["logs", "level"],
+            "Show effective runtime log level",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::LogsTail,
+            &["logs", "tail"],
+            "Tail recent log lines",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Keymap,

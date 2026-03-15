@@ -59,11 +59,29 @@ bmux window list --session dev
 bmux list-clients
 bmux follow <client-uuid>
 bmux unfollow
+
+# Logging
+bmux logs path
+bmux logs level
+bmux logs tail
 ```
 
 Top-level and grouped command forms are supported in many areas of the CLI.
 
 All list commands with `--json` output a bare JSON array.
+
+Logging defaults:
+
+- file sink is enabled by default
+- default level is `info`
+- `--verbose` raises level to `debug`
+- `--log-level` supports `error|warn|info|debug|trace`
+
+Environment overrides:
+
+- `BMUX_LOG_LEVEL`: effective runtime log level
+- `BMUX_LOG_DIR`: explicit log directory
+- `BMUX_STATE_DIR`: explicit state directory
 
 Role policy: `owner` controls session and window mutations plus role changes, `writer` can send attach input, and `observer` is read-only.
 
