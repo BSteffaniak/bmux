@@ -2952,19 +2952,15 @@ async fn handle_attach_ui_action(
             view_state.exit_scrollback();
         }
         RuntimeAction::SplitFocusedVertical => {
+            let selector = attached_session_selector(client, view_state).await?;
             let _ = client
-                .split_pane(
-                    Some(SessionSelector::ById(view_state.attached_id)),
-                    PaneSplitDirection::Vertical,
-                )
+                .split_pane(Some(selector), PaneSplitDirection::Vertical)
                 .await?;
         }
         RuntimeAction::SplitFocusedHorizontal => {
+            let selector = attached_session_selector(client, view_state).await?;
             let _ = client
-                .split_pane(
-                    Some(SessionSelector::ById(view_state.attached_id)),
-                    PaneSplitDirection::Horizontal,
-                )
+                .split_pane(Some(selector), PaneSplitDirection::Horizontal)
                 .await?;
         }
         RuntimeAction::FocusNext
@@ -2977,12 +2973,8 @@ async fn handle_attach_ui_action(
             } else {
                 PaneFocusDirection::Next
             };
-            let _ = client
-                .focus_pane(
-                    Some(SessionSelector::ById(view_state.attached_id)),
-                    direction,
-                )
-                .await?;
+            let selector = attached_session_selector(client, view_state).await?;
+            let _ = client.focus_pane(Some(selector), direction).await?;
         }
         RuntimeAction::IncreaseSplit
         | RuntimeAction::DecreaseSplit
@@ -3000,14 +2992,12 @@ async fn handle_attach_ui_action(
             } else {
                 -1
             };
-            client
-                .resize_pane(Some(SessionSelector::ById(view_state.attached_id)), delta)
-                .await?;
+            let selector = attached_session_selector(client, view_state).await?;
+            client.resize_pane(Some(selector), delta).await?;
         }
         RuntimeAction::CloseFocusedPane => {
-            client
-                .close_pane(Some(SessionSelector::ById(view_state.attached_id)))
-                .await?;
+            let selector = attached_session_selector(client, view_state).await?;
+            client.close_pane(Some(selector)).await?;
         }
         RuntimeAction::NewWindow | RuntimeAction::NewSession => {
             handle_attach_runtime_action(client, action, view_state).await?;
@@ -3955,6 +3945,20 @@ async fn open_attach_for_context(
     client.open_attach_stream_info(&grant).await
 }
 
+async fn attached_session_selector(
+    client: &mut BmuxClient,
+    view_state: &mut AttachViewState,
+) -> std::result::Result<SessionSelector, ClientError> {
+    if let Some(context_id) = view_state.attached_context_id {
+        let grant = client
+            .attach_context_grant(ContextSelector::ById(context_id))
+            .await?;
+        view_state.attached_id = grant.session_id;
+        view_state.attached_context_id = grant.context_id.or(Some(context_id));
+    }
+    Ok(SessionSelector::ById(view_state.attached_id))
+}
+
 fn attach_keymap_from_config(config: &BmuxConfig) -> crate::input::Keymap {
     let (runtime_bindings, global_bindings, scroll_bindings) = filtered_attach_keybindings(config);
     let timeout_ms = config
@@ -4570,10 +4574,8 @@ async fn handle_attach_terminal_event(
     {
         match key.code {
             KeyCode::Char('y' | 'Y') => {
-                match client
-                    .kill_session(SessionSelector::ById(view_state.attached_id))
-                    .await
-                {
+                let selector = attached_session_selector(client, view_state).await?;
+                match client.kill_session(selector).await {
                     Ok(_) => return Ok(AttachLoopControl::Break(AttachExitReason::Quit)),
                     Err(error) => {
                         let status = attach_quit_failure_status(&error);
