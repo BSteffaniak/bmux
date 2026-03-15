@@ -219,6 +219,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_plugin_cli_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_plugin",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "bmux_server"
 version = "0.0.1-alpha.0"
 dependencies = [

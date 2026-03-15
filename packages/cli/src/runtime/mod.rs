@@ -1,6 +1,5 @@
 use crate::cli::{
-    Cli, Command, KeymapCommand, PluginCommand, ServerCommand, SessionCommand, TerminalCommand,
-    TraceFamily,
+    Cli, Command, KeymapCommand, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
 };
 use crate::connection::{
     ConnectionPolicyScope, ServerRuntimeMetadata, connect, connect_raw, current_cli_build_id,
@@ -753,10 +752,6 @@ fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
             TerminalCommand::Doctor { .. } => BuiltInHandlerId::TerminalDoctor,
             TerminalCommand::InstallTerminfo { .. } => BuiltInHandlerId::TerminalInstallTerminfo,
         },
-        Command::Plugin { command } => match command {
-            PluginCommand::List { .. } => BuiltInHandlerId::PluginList,
-            PluginCommand::Run { .. } => BuiltInHandlerId::PluginRun,
-        },
         Command::External(_) => unreachable!("external commands are dispatched separately"),
     }
 }
@@ -933,23 +928,6 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 command: TerminalCommand::InstallTerminfo { yes, check },
             },
         ) => run_terminal_install_terminfo(*yes, *check),
-        (
-            BuiltInHandlerId::PluginList,
-            Command::Plugin {
-                command: PluginCommand::List { json },
-            },
-        ) => run_plugin_list(*json).await,
-        (
-            BuiltInHandlerId::PluginRun,
-            Command::Plugin {
-                command:
-                    PluginCommand::Run {
-                        plugin,
-                        command,
-                        args,
-                    },
-            },
-        ) => run_plugin_command(plugin, command, args).await,
         _ => unreachable!("built-in command handler and command variant should stay in sync"),
     }
 }
@@ -1646,90 +1624,6 @@ const fn plugin_event_kind_from_server_event(event: &bmux_client::ServerEvent) -
         | bmux_client::ServerEvent::ClientDetached { .. } => PluginEventKind::Client,
         bmux_client::ServerEvent::AttachViewChanged { .. } => PluginEventKind::Pane,
     }
-}
-
-#[derive(Debug, serde::Serialize)]
-struct PluginListJsonEntry {
-    id: String,
-    display_name: String,
-    version: String,
-    enabled: bool,
-    required_capabilities: Vec<String>,
-    provided_capabilities: Vec<String>,
-    commands: Vec<String>,
-}
-
-async fn run_plugin_list(as_json: bool) -> Result<u8> {
-    let config = BmuxConfig::load()?;
-    let paths = ConfigPaths::default();
-    let registry = scan_available_plugins(&config, &paths)?;
-    let enabled = effective_enabled_plugins(&config, &registry)
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    let mut entries = registry
-        .iter()
-        .map(|plugin| PluginListJsonEntry {
-            id: plugin.declaration.id.as_str().to_string(),
-            display_name: plugin.declaration.display_name.clone(),
-            version: plugin.declaration.plugin_version.clone(),
-            enabled: enabled.contains(plugin.declaration.id.as_str()),
-            required_capabilities: plugin
-                .declaration
-                .required_capabilities
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            provided_capabilities: plugin
-                .declaration
-                .provided_capabilities
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            commands: plugin
-                .declaration
-                .commands
-                .iter()
-                .map(|command| command.name.clone())
-                .collect(),
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by(|left, right| left.id.cmp(&right.id));
-
-    if as_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&entries).context("failed encoding plugin list json")?
-        );
-    } else if entries.is_empty() {
-        println!("no plugins discovered");
-    } else {
-        for entry in entries {
-            println!(
-                "{}{} - {} ({})",
-                entry.id,
-                if entry.enabled { " [enabled]" } else { "" },
-                entry.display_name,
-                entry.version
-            );
-            if !entry.commands.is_empty() {
-                println!("  commands: {}", entry.commands.join(", "));
-            }
-            if !entry.required_capabilities.is_empty() {
-                println!(
-                    "  required capabilities: {}",
-                    entry.required_capabilities.join(", ")
-                );
-            }
-            if !entry.provided_capabilities.is_empty() {
-                println!(
-                    "  provided capabilities: {}",
-                    entry.provided_capabilities.join(", ")
-                );
-            }
-        }
-    }
-
-    Ok(0)
 }
 
 async fn run_plugin_command(plugin_id: &str, command_name: &str, args: &[String]) -> Result<u8> {
@@ -6240,6 +6134,50 @@ mod tests {
                 assert_eq!(plugin_id, "policy.plugin");
                 assert_eq!(command_name, "roles");
                 assert_eq!(arguments, vec!["--session".to_string(), "dev".to_string()]);
+            }
+            other => panic!("expected plugin runtime parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_cli_allows_plugin_owned_plugin_namespace_commands() {
+        let dir = temp_dir();
+        let plugin_dir = dir.join("plugin-cli");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir should exist");
+        fs::write(plugin_dir.join("plugin-cli.dylib"), []).expect("entry should be written");
+
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(
+                &plugin_dir.join("plugin.toml"),
+                plugin_manifest_with_commands(
+                    "bmux.plugin_cli",
+                    "plugin-cli.dylib",
+                    "[[commands]]\nname='list'\npath=['plugin','list']\nsummary='list'\nexecution='provider_exec'\nexpose_in_cli=true\n",
+                ),
+            )
+            .expect("plugin should register");
+
+        let mut config = BmuxConfig::default();
+        config.plugins.enabled.push("bmux.plugin_cli".to_string());
+        let argv = vec![
+            OsString::from("bmux"),
+            OsString::from("plugin"),
+            OsString::from("list"),
+        ];
+
+        let parsed = super::parse_runtime_cli_with_registry(&argv, &config, &registry)
+            .expect("runtime CLI should parse plugin-owned plugin namespace command");
+        match parsed {
+            super::ParsedRuntimeCli::Plugin {
+                plugin_id,
+                command_name,
+                arguments,
+                ..
+            } => {
+                assert_eq!(plugin_id, "bmux.plugin_cli");
+                assert_eq!(command_name, "list");
+                assert!(arguments.is_empty());
             }
             other => panic!("expected plugin runtime parse, got {other:?}"),
         }

@@ -33,9 +33,6 @@ pub enum BuiltInHandlerId {
     Terminal,
     TerminalDoctor,
     TerminalInstallTerminfo,
-    Plugin,
-    PluginList,
-    PluginRun,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,21 +215,6 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             &["terminal", "install-terminfo"],
             "Install terminfo entry",
         ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::Plugin,
-            &["plugin"],
-            "Plugin discovery and execution tools",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::PluginList,
-            &["plugin", "list"],
-            "List discovered plugins",
-        ),
-        BuiltInExecutionCommand::new(
-            BuiltInHandlerId::PluginRun,
-            &["plugin", "run"],
-            "Run a plugin command explicitly",
-        ),
     ]
 }
 
@@ -263,30 +245,31 @@ mod tests {
         let paths = reserved_built_in_paths();
         assert!(paths.contains(&vec!["new-session".to_string()]));
         assert!(paths.contains(&vec!["session".to_string(), "new".to_string()]));
-        assert!(paths.contains(&vec!["plugin".to_string(), "run".to_string()]));
+        assert!(paths.contains(&vec!["terminal".to_string(), "doctor".to_string()]));
     }
 
     #[test]
     fn reserved_paths_leave_session_root_extensible() {
         let paths = reserved_built_in_paths();
         assert!(!paths.contains(&vec!["session".to_string()]));
+        assert!(!paths.contains(&vec!["plugin".to_string()]));
     }
 
     #[test]
     fn built_in_table_contains_expected_handler() {
         let commands = built_in_execution_commands();
         assert!(commands.iter().any(|command| {
-            command.handler == BuiltInHandlerId::PluginRun
-                && command.canonical_path == vec!["plugin".to_string(), "run".to_string()]
+            command.handler == BuiltInHandlerId::TerminalDoctor
+                && command.canonical_path == vec!["terminal".to_string(), "doctor".to_string()]
         }));
     }
 
     #[test]
     fn command_lookup_by_handler_returns_descriptor() {
-        let command = built_in_command_by_handler(BuiltInHandlerId::PluginRun);
+        let command = built_in_command_by_handler(BuiltInHandlerId::TerminalDoctor);
         assert_eq!(
             command.canonical_path,
-            vec!["plugin".to_string(), "run".to_string()]
+            vec!["terminal".to_string(), "doctor".to_string()]
         );
     }
 

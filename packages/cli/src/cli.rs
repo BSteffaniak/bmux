@@ -102,11 +102,6 @@ pub enum Command {
         #[command(subcommand)]
         command: TerminalCommand,
     },
-    /// Plugin discovery and execution tools
-    Plugin {
-        #[command(subcommand)]
-        command: PluginCommand,
-    },
     #[command(external_subcommand)]
     External(Vec<String>),
 }
@@ -248,31 +243,10 @@ pub enum TerminalCommand {
     },
 }
 
-#[derive(Debug, Subcommand)]
-pub enum PluginCommand {
-    /// List discovered plugins
-    List {
-        /// Print plugin list as JSON
-        #[arg(long)]
-        json: bool,
-    },
-    /// Run a declared plugin command
-    Run {
-        /// Plugin id to execute
-        plugin: String,
-        /// Command declared by the plugin
-        command: String,
-        /// Positional arguments passed to the plugin command
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, KeymapCommand, PluginCommand, ServerCommand, SessionCommand, TerminalCommand,
-        TraceFamily,
+        Cli, Command, KeymapCommand, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
     };
     use clap::Parser;
 
@@ -1007,41 +981,6 @@ mod tests {
                 yes: true,
                 check: true
             }
-        ));
-    }
-
-    #[test]
-    fn parses_plugin_list_command() {
-        let cli =
-            Cli::try_parse_from(["bmux", "plugin", "list", "--json"]).expect("valid CLI args");
-        let Some(Command::Plugin { command }) = cli.command else {
-            panic!("expected plugin subcommand");
-        };
-        assert!(matches!(command, PluginCommand::List { json: true }));
-    }
-
-    #[test]
-    fn parses_plugin_run_command_with_trailing_args() {
-        let cli = Cli::try_parse_from([
-            "bmux",
-            "plugin",
-            "run",
-            "git.status",
-            "hello",
-            "--flag",
-            "value",
-        ])
-        .expect("valid CLI args");
-        let Some(Command::Plugin { command }) = cli.command else {
-            panic!("expected plugin subcommand");
-        };
-        assert!(matches!(
-            command,
-            PluginCommand::Run {
-                plugin,
-                command,
-                args,
-            } if plugin == "git.status" && command == "hello" && args == vec!["--flag", "value"]
         ));
     }
 

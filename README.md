@@ -83,15 +83,15 @@ For active development:
 ```bash
 cargo install cargo-watch
 cargo watch -x check
-./scripts/rebuild-bundled-plugins.sh
+bmux plugin rebuild
 ```
 
 Build specific plugins by bundled id, short name, or crate name:
 
 ```bash
-./scripts/rebuild-bundled-plugins.sh bmux.windows
-./scripts/rebuild-bundled-plugins.sh windows permissions
-./scripts/rebuild-bundled-plugins.sh bmux_windows_plugin --release
+bmux plugin rebuild bmux.windows
+bmux plugin rebuild windows permissions
+bmux plugin rebuild bmux_windows_plugin --release
 ```
 
 ### Nix + direnv

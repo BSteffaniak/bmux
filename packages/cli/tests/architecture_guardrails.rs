@@ -178,6 +178,10 @@ fn plugin_production_code_uses_generic_host_api_only() {
             "plugins/permissions-plugin/src/lib.rs",
             include_str!("../../../plugins/permissions-plugin/src/lib.rs"),
         ),
+        (
+            "plugins/plugin-cli-plugin/src/lib.rs",
+            include_str!("../../../plugins/plugin-cli-plugin/src/lib.rs"),
+        ),
     ];
 
     for (path, source) in plugin_sources {

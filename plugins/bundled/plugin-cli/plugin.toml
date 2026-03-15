@@ -1,0 +1,85 @@
+entry                 = "libbmux_plugin_cli_plugin.dylib"
+id                    = "bmux.plugin_cli"
+name                  = "bmux Plugin CLI"
+required_capabilities = ["bmux.commands"]
+runtime               = "native"
+version               = "0.0.1-alpha.0"
+
+[[commands]]
+execution     = "provider_exec"
+expose_in_cli = true
+name          = "list"
+path          = ["plugin", "list"]
+summary       = "List discovered plugins"
+
+[[commands.arguments]]
+kind  = "boolean"
+long  = "json"
+name  = "json"
+short = "j"
+
+[[commands]]
+execution     = "provider_exec"
+expose_in_cli = true
+name          = "run"
+path          = ["plugin", "run"]
+summary       = "Run a declared plugin command"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "plugin"
+position   = 0
+required   = true
+value_name = "PLUGIN"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "command"
+position   = 1
+required   = true
+value_name = "COMMAND"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 2
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+execution     = "provider_exec"
+expose_in_cli = true
+name          = "rebuild"
+path          = ["plugin", "rebuild"]
+summary       = "Rebuild bundled plugin crates"
+
+[[commands.arguments]]
+kind = "boolean"
+long = "release"
+name = "release"
+
+[[commands.arguments]]
+kind = "boolean"
+long = "list"
+name = "list"
+
+[[commands.arguments]]
+kind = "boolean"
+long = "all-workspace-plugins"
+name = "all-workspace-plugins"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "selectors"
+position            = 0
+value_name          = "SELECTOR"
+
+[plugin_api]
+minimum = "1.0"
+
+[native_abi]
+minimum = "1.0"

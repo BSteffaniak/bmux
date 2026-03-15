@@ -19,6 +19,7 @@ members = [
     "packages/terminal/models",
     "packages/terminal_protocol",
     "plugins/clipboard-plugin",
+    "plugins/plugin-cli-plugin",
     "plugins/permissions-plugin",
     "plugins/windows-plugin",
 ]

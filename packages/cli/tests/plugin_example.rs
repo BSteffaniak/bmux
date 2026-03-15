@@ -22,7 +22,7 @@ fn bundled_manifest(plugin_id: &str) -> PluginManifest {
 }
 
 #[test]
-fn bundled_plugin_manifests_include_windows_and_permissions() {
+fn bundled_plugin_manifests_include_core_shipped_plugins() {
     let bundled_root = workspace_root().join("plugins").join("bundled");
     let report = discover_plugin_manifests(&bundled_root).expect("manifest discovery should work");
     let manifests = report
@@ -40,6 +40,11 @@ fn bundled_plugin_manifests_include_windows_and_permissions() {
         manifests
             .iter()
             .any(|manifest| manifest.id.as_str() == "bmux.permissions")
+    );
+    assert!(
+        manifests
+            .iter()
+            .any(|manifest| manifest.id.as_str() == "bmux.plugin_cli")
     );
 }
 
