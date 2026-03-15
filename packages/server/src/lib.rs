@@ -2451,15 +2451,15 @@ impl BmuxServer {
         });
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
-        loop {
+        let shutdown_reason = loop {
             tokio::select! {
                 changed = shutdown_rx.changed() => {
                     if changed.is_ok() && *shutdown_rx.borrow() {
                         info!("bmux server shutdown requested");
-                        break;
+                        break "graceful_shutdown_requested";
                     }
                     if changed.is_err() {
-                        break;
+                        break "shutdown_channel_closed";
                     }
                 }
                 accepted = listener.accept() => {
@@ -2474,12 +2474,21 @@ impl BmuxServer {
                             });
                         }
                         Err(error) => {
+                            warn!(
+                                "bmux server listener accept failed on {:?}: {error:#}",
+                                self.endpoint
+                            );
                             return Err(error).context("accept loop failed");
                         }
                     }
                 }
             }
-        }
+        };
+
+        info!(
+            "bmux server listener closing on {:?} (reason: {shutdown_reason})",
+            self.endpoint
+        );
 
         let _ = maybe_flush_snapshot(&self.state, true);
         let _ = pane_exit_task.await;
@@ -2507,6 +2516,8 @@ impl BmuxServer {
         if let Ok(mut attach_tokens) = self.state.attach_tokens.lock() {
             attach_tokens.clear();
         }
+
+        info!("bmux server listener closed on {:?}", self.endpoint);
 
         Ok(())
     }
