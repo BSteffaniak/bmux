@@ -33,6 +33,7 @@ crossterm          = { workspace = true, features = ["events"] }
 portable-pty       = { workspace = true }
 serde              = { workspace = true, features = ["derive", "std"] }
 serde_json         = { workspace = true }
+time               = { version = "0.3.47", features = ["formatting", "parsing", "std"] }
 tokio              = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 toml               = { workspace = true }
 tracing            = { workspace = true, features = ["std"] }

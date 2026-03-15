@@ -64,6 +64,9 @@ bmux unfollow
 bmux logs path
 bmux logs level
 bmux logs tail
+bmux logs path --json
+bmux logs level --json
+bmux logs tail --since 15m --lines 200
 ```
 
 Top-level and grouped command forms are supported in many areas of the CLI.

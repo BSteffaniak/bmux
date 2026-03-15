@@ -52,15 +52,20 @@ Shutdown behavior:
 ```bash
 # show effective log file path
 bmux logs path
+bmux logs path --json
 
 # show effective runtime level
 bmux logs level
+bmux logs level --json
 
 # show recent lines and keep following
 bmux logs tail
 
 # show a fixed slice and exit
 bmux logs tail --lines 200 --no-follow
+
+# show entries newer than relative time
+bmux logs tail --since 15m
 ```
 
 Logging behavior:
@@ -69,6 +74,8 @@ Logging behavior:
 - default level is `info`.
 - `--verbose` raises level to `debug`.
 - `--log-level error|warn|info|debug|trace` overrides both defaults and `--verbose`.
+- `logs path --json` and `logs level --json` return object output.
+- `logs tail --since <duration>` filters by RFC3339 timestamps in log lines (`s`, `m`, `h`, `d` units).
 
 Log/state directory conventions:
 

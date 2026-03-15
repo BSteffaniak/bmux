@@ -233,14 +233,25 @@ pub enum KeymapCommand {
 #[derive(Debug, Subcommand)]
 pub enum LogsCommand {
     /// Print effective log file path
-    Path,
+    Path {
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Print effective runtime log level
-    Level,
+    Level {
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Print recent log lines and optionally follow updates
     Tail {
         /// Number of recent lines to show before follow
         #[arg(long, default_value_t = 50)]
         lines: usize,
+        /// Show entries newer than a relative duration (e.g. 30s, 10m, 2h, 1d)
+        #[arg(long)]
+        since: Option<String>,
         /// Print recent lines only (disable follow)
         #[arg(long)]
         no_follow: bool,
@@ -437,7 +448,7 @@ mod tests {
         let Some(Command::Logs { command }) = cli.command else {
             panic!("expected logs subcommand");
         };
-        assert!(matches!(command, LogsCommand::Path));
+        assert!(matches!(command, LogsCommand::Path { json: false }));
     }
 
     #[test]
@@ -446,7 +457,7 @@ mod tests {
         let Some(Command::Logs { command }) = cli.command else {
             panic!("expected logs subcommand");
         };
-        assert!(matches!(command, LogsCommand::Level));
+        assert!(matches!(command, LogsCommand::Level { json: false }));
     }
 
     #[test]
@@ -460,8 +471,26 @@ mod tests {
             command,
             LogsCommand::Tail {
                 lines: 10,
+                since: None,
                 no_follow: true
             }
+        ));
+    }
+
+    #[test]
+    fn parses_logs_since_filter() {
+        let cli = Cli::try_parse_from(["bmux", "logs", "tail", "--since", "15m"])
+            .expect("valid CLI args");
+        let Some(Command::Logs { command }) = cli.command else {
+            panic!("expected logs subcommand");
+        };
+        assert!(matches!(
+            command,
+            LogsCommand::Tail {
+                lines: 50,
+                since: Some(ref value),
+                no_follow: false
+            } if value == "15m"
         ));
     }
 

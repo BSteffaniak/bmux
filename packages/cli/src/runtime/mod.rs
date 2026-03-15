@@ -39,6 +39,7 @@ use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tracing::{Level, warn};
 use uuid::Uuid;
 
@@ -819,8 +820,8 @@ fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
             ServerCommand::Stop => BuiltInHandlerId::ServerStop,
         },
         Command::Logs { command } => match command {
-            LogsCommand::Path => BuiltInHandlerId::LogsPath,
-            LogsCommand::Level => BuiltInHandlerId::LogsLevel,
+            LogsCommand::Path { .. } => BuiltInHandlerId::LogsPath,
+            LogsCommand::Level { .. } => BuiltInHandlerId::LogsLevel,
             LogsCommand::Tail { .. } => BuiltInHandlerId::LogsTail,
         },
         Command::Keymap { .. } => BuiltInHandlerId::KeymapDoctor,
@@ -982,21 +983,26 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
         (
             BuiltInHandlerId::LogsPath,
             Command::Logs {
-                command: LogsCommand::Path,
+                command: LogsCommand::Path { json },
             },
-        ) => run_logs_path(),
+        ) => run_logs_path(*json),
         (
             BuiltInHandlerId::LogsLevel,
             Command::Logs {
-                command: LogsCommand::Level,
+                command: LogsCommand::Level { json },
             },
-        ) => run_logs_level(),
+        ) => run_logs_level(*json),
         (
             BuiltInHandlerId::LogsTail,
             Command::Logs {
-                command: LogsCommand::Tail { lines, no_follow },
+                command:
+                    LogsCommand::Tail {
+                        lines,
+                        since,
+                        no_follow,
+                    },
             },
-        ) => run_logs_tail(*lines, !*no_follow),
+        ) => run_logs_tail(*lines, since.as_deref(), !*no_follow),
         (
             BuiltInHandlerId::KeymapDoctor,
             Command::Keymap {
@@ -2188,12 +2194,21 @@ async fn run_server_stop() -> Result<u8> {
     Ok(1)
 }
 
-fn run_logs_path() -> Result<u8> {
-    println!("{}", log_file_path().display());
+fn run_logs_path(as_json: bool) -> Result<u8> {
+    let path = log_file_path();
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "path": path }))
+                .context("failed to encode log path json")?
+        );
+        return Ok(0);
+    }
+    println!("{}", path.display());
     Ok(0)
 }
 
-fn run_logs_level() -> Result<u8> {
+fn run_logs_level(as_json: bool) -> Result<u8> {
     let level = EFFECTIVE_LOG_LEVEL.get().copied().unwrap_or(Level::INFO);
     let value = match level {
         Level::ERROR => "error",
@@ -2202,20 +2217,36 @@ fn run_logs_level() -> Result<u8> {
         Level::DEBUG => "debug",
         Level::TRACE => "trace",
     };
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "level": value }))
+                .context("failed to encode log level json")?
+        );
+        return Ok(0);
+    }
     println!("{value}");
     Ok(0)
 }
 
-fn run_logs_tail(lines: usize, follow: bool) -> Result<u8> {
+fn run_logs_tail(lines: usize, since: Option<&str>, follow: bool) -> Result<u8> {
     let path = log_file_path();
     if !path.exists() {
         println!("no log file at {}", path.display());
         return Ok(0);
     }
 
+    let since_cutoff = match since {
+        Some(value) => Some(parse_since_cutoff(value)?),
+        None => None,
+    };
+
     let content = std::fs::read_to_string(&path)
         .with_context(|| format!("failed reading log file {}", path.display()))?;
-    let all_lines = content.lines().collect::<Vec<_>>();
+    let all_lines = content
+        .lines()
+        .filter(|line| line_matches_since(*line, since_cutoff))
+        .collect::<Vec<_>>();
     let start = all_lines.len().saturating_sub(lines.max(1));
     for line in &all_lines[start..] {
         println!("{line}");
@@ -2260,6 +2291,60 @@ fn run_logs_tail(lines: usize, follow: bool) -> Result<u8> {
 
 fn log_file_path() -> PathBuf {
     ConfigPaths::default().logs_dir().join("bmux.log")
+}
+
+fn parse_since_cutoff(raw: &str) -> Result<OffsetDateTime> {
+    let duration = parse_since_duration(raw)?;
+    let now = OffsetDateTime::now_utc();
+    Ok(now - duration)
+}
+
+fn parse_since_duration(raw: &str) -> Result<TimeDuration> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("--since must be a non-empty duration like 30s, 10m, 2h, or 1d");
+    }
+
+    let split_at = trimmed
+        .find(|char: char| !char.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (value_part, unit_part) = trimmed.split_at(split_at);
+    if value_part.is_empty() {
+        anyhow::bail!("--since must start with a number");
+    }
+
+    let amount = value_part
+        .parse::<i64>()
+        .with_context(|| format!("invalid --since value '{raw}'"))?;
+    if amount < 0 {
+        anyhow::bail!("--since must be non-negative");
+    }
+
+    let duration = match unit_part {
+        "" | "s" => TimeDuration::seconds(amount),
+        "m" => TimeDuration::minutes(amount),
+        "h" => TimeDuration::hours(amount),
+        "d" => TimeDuration::days(amount),
+        _ => {
+            anyhow::bail!(
+                "invalid --since unit '{unit_part}' (use s, m, h, d; example: 30s, 10m, 2h, 1d)"
+            )
+        }
+    };
+    Ok(duration)
+}
+
+fn line_matches_since(line: &str, cutoff: Option<OffsetDateTime>) -> bool {
+    let Some(cutoff) = cutoff else {
+        return true;
+    };
+    let Some(timestamp) = line.split_whitespace().next() else {
+        return false;
+    };
+    let Ok(parsed) = OffsetDateTime::parse(timestamp, &Rfc3339) else {
+        return false;
+    };
+    parsed >= cutoff
 }
 
 async fn run_session_new(name: Option<String>) -> Result<u8> {
@@ -7984,5 +8069,58 @@ mod tests {
 
         assert_eq!(row, 46, "cursor row should clamp to pane inner height");
         assert_eq!(col, 117, "cursor col should clamp to pane inner width");
+    }
+
+    #[test]
+    fn parse_since_duration_accepts_supported_units() {
+        assert_eq!(
+            super::parse_since_duration("45s").expect("seconds should parse"),
+            time::Duration::seconds(45)
+        );
+        assert_eq!(
+            super::parse_since_duration("10m").expect("minutes should parse"),
+            time::Duration::minutes(10)
+        );
+        assert_eq!(
+            super::parse_since_duration("2h").expect("hours should parse"),
+            time::Duration::hours(2)
+        );
+        assert_eq!(
+            super::parse_since_duration("1d").expect("days should parse"),
+            time::Duration::days(1)
+        );
+        assert_eq!(
+            super::parse_since_duration("30").expect("plain values should default to seconds"),
+            time::Duration::seconds(30)
+        );
+    }
+
+    #[test]
+    fn parse_since_duration_rejects_invalid_values() {
+        assert!(super::parse_since_duration("").is_err());
+        assert!(super::parse_since_duration("abc").is_err());
+        assert!(super::parse_since_duration("5w").is_err());
+        assert!(super::parse_since_duration("-1m").is_err());
+    }
+
+    #[test]
+    fn line_matches_since_uses_rfc3339_prefix() {
+        let cutoff = time::OffsetDateTime::parse(
+            "2026-03-15T10:00:00Z",
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("cutoff should parse");
+        assert!(super::line_matches_since(
+            "2026-03-15T10:30:00Z INFO bmux started",
+            Some(cutoff)
+        ));
+        assert!(!super::line_matches_since(
+            "2026-03-15T09:30:00Z INFO bmux started",
+            Some(cutoff)
+        ));
+        assert!(!super::line_matches_since(
+            "INFO missing timestamp",
+            Some(cutoff)
+        ));
     }
 }
