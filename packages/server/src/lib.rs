@@ -740,6 +740,14 @@ fn current_context_id_for_session(state: &Arc<ServerState>, session_id: SessionI
     context_state.context_for_session(session_id)
 }
 
+fn current_context_session_for_client(
+    state: &Arc<ServerState>,
+    client_id: ClientId,
+) -> Option<SessionId> {
+    let context_state = state.context_state.lock().ok()?;
+    context_state.current_session_for_client(client_id)
+}
+
 fn create_session_runtime(state: &Arc<ServerState>, name: Option<String>) -> Result<SessionId> {
     let mut manager = state
         .session_manager
@@ -2733,19 +2741,30 @@ fn unsubscribe_events(state: &Arc<ServerState>, client_id: ClientId) -> Result<(
     Ok(())
 }
 
-fn sync_selected_session_from_follow_state(
+fn sync_selected_target_from_follow_state(
     state: &Arc<ServerState>,
     client_id: ClientId,
     selected_session: &mut Option<SessionId>,
 ) -> Result<()> {
-    let follow_state = state
-        .follow_state
-        .lock()
-        .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
-    if let Some((_follow_selected_context, follow_selected_session)) =
+    let follow_selected = {
+        let follow_state = state
+            .follow_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
         follow_state.selected_target(client_id)
-    {
-        *selected_session = follow_selected_session;
+    };
+
+    if let Some((follow_selected_context, follow_selected_session)) = follow_selected {
+        if let Some(context_id) = follow_selected_context {
+            let mut context_state = state
+                .context_state
+                .lock()
+                .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
+            let _ = context_state.select_for_client(client_id, &ContextSelector::ById(context_id));
+        }
+
+        *selected_session = follow_selected_session
+            .or_else(|| current_context_session_for_client(state, client_id));
     }
     Ok(())
 }
@@ -3509,7 +3528,7 @@ async fn handle_request(
     };
 
     let previous_selected_session = *selected_session;
-    sync_selected_session_from_follow_state(state, client_id, selected_session)?;
+    sync_selected_target_from_follow_state(state, client_id, selected_session)?;
     reconcile_selected_session_membership(
         state,
         client_id,
