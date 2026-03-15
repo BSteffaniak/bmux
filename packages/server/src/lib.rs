@@ -3997,12 +3997,58 @@ async fn handle_request(
             }
         }
         Request::CloseContext { selector, force } => {
-            let mut context_state = state
-                .context_state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
-            match context_state.close(client_id, &selector, force) {
-                Ok((id, _session_id)) => Response::Ok(ResponsePayload::ContextClosed { id }),
+            let close_result = {
+                let mut context_state = state
+                    .context_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
+                context_state.close(client_id, &selector, force)
+            };
+            match close_result {
+                Ok((id, session_id)) => {
+                    if let Some(session_id) = session_id {
+                        let removed_runtime = {
+                            let mut manager = state
+                                .session_manager
+                                .lock()
+                                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                            let _ = manager.remove_session(&session_id);
+                            if *selected_session == Some(session_id) {
+                                *selected_session = None;
+                                persist_selected_session(state, client_id, None)?;
+                            }
+                            if *attached_stream_session == Some(session_id) {
+                                *attached_stream_session = None;
+                            }
+                            drop(manager);
+
+                            let mut runtime_manager =
+                                state.session_runtimes.lock().map_err(|_| {
+                                    anyhow::anyhow!("session runtime manager lock poisoned")
+                                })?;
+                            runtime_manager.remove_runtime(session_id).ok()
+                        };
+
+                        if let Some(removed_runtime) = removed_runtime {
+                            if removed_runtime.had_attached_clients {
+                                emit_event(state, Event::ClientDetached { id: session_id.0 })?;
+                            }
+                            shutdown_runtime_handle(removed_runtime).await;
+                        }
+
+                        let mut attach_tokens = state
+                            .attach_tokens
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
+                        attach_tokens.remove_for_session(session_id);
+                        drop(attach_tokens);
+
+                        clear_selected_session_for_all(state, session_id)?;
+                        emit_event(state, Event::SessionRemoved { id: session_id.0 })?;
+                    }
+
+                    Response::Ok(ResponsePayload::ContextClosed { id })
+                }
                 Err(message) => Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
                     message: message.to_string(),
