@@ -11,7 +11,7 @@ use crate::{
         ContextCloseRequest, ContextCloseResponse, ContextCreateRequest, ContextCreateResponse,
         ContextCurrentResponse, ContextListResponse, ContextSelectRequest, ContextSelectResponse,
         ContextSelector as HostContextSelector, ContextSummary as HostContextSummary,
-        CurrentClientResponse, PaneCloseRequest, PaneCloseResponse,
+        CurrentClientResponse, LogWriteLevel, PaneCloseRequest, PaneCloseResponse,
         PaneFocusDirection as HostPaneFocusDirection, PaneFocusRequest, PaneFocusResponse,
         PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse,
         PaneSelector as HostPaneSelector, PaneSplitDirection as HostPaneSplitDirection,
@@ -34,6 +34,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{CStr, CString, c_char};
 use std::fs;
 use std::path::{Path, PathBuf};
+use tracing::{debug, error, info, trace, warn};
 
 type NativeDescriptorFn = unsafe extern "C" fn() -> *const c_char;
 type NativeRunCommandFn = unsafe extern "C" fn(*const c_char, usize, *const *const c_char) -> i32;
@@ -725,6 +726,11 @@ fn handle_core_service_call(
             })?;
             encode_service_message(&())
         }
+        ("logging-command/v1", "write") => {
+            let request: crate::host_services::LogWriteRequest = decode_service_message(&payload)?;
+            emit_plugin_log(caller_plugin_id, &request)?;
+            encode_service_message(&())
+        }
         ("session-query/v1", "list") => {
             let response = execute_kernel_request(host_kernel_bridge, IpcRequest::ListSessions)?;
             match response {
@@ -1055,6 +1061,68 @@ fn handle_core_service_call(
             operation: "call_service",
         }),
     }
+}
+
+fn emit_plugin_log(
+    caller_plugin_id: &str,
+    request: &crate::host_services::LogWriteRequest,
+) -> Result<()> {
+    let requested_target = request
+        .target
+        .as_deref()
+        .filter(|entry| !entry.trim().is_empty())
+        .unwrap_or(caller_plugin_id);
+    let message = request.message.trim();
+    if message.is_empty() {
+        return Err(PluginError::ServiceProtocol {
+            details: "log message cannot be empty".to_string(),
+        });
+    }
+
+    match request.level {
+        LogWriteLevel::Error => {
+            error!(
+                plugin_id = caller_plugin_id,
+                plugin_target = requested_target,
+                "{}",
+                request.message
+            )
+        }
+        LogWriteLevel::Warn => {
+            warn!(
+                plugin_id = caller_plugin_id,
+                plugin_target = requested_target,
+                "{}",
+                request.message
+            )
+        }
+        LogWriteLevel::Info => {
+            info!(
+                plugin_id = caller_plugin_id,
+                plugin_target = requested_target,
+                "{}",
+                request.message
+            )
+        }
+        LogWriteLevel::Debug => {
+            debug!(
+                plugin_id = caller_plugin_id,
+                plugin_target = requested_target,
+                "{}",
+                request.message
+            )
+        }
+        LogWriteLevel::Trace => {
+            trace!(
+                plugin_id = caller_plugin_id,
+                plugin_target = requested_target,
+                "{}",
+                request.message
+            )
+        }
+    }
+
+    Ok(())
 }
 
 fn session_selector_to_ipc(selector: HostSessionSelector) -> IpcSessionSelector {
@@ -2390,6 +2458,56 @@ minimum = "1.0"
         assert_eq!(response.value, Some(b"sunset".to_vec()));
 
         let _ = std::fs::remove_dir_all(storage_root);
+    }
+
+    #[test]
+    fn command_context_calls_core_logging_service() {
+        let context = super::NativeCommandContext {
+            plugin_id: "caller.plugin".to_string(),
+            command: "log".to_string(),
+            arguments: Vec::new(),
+            required_capabilities: vec!["bmux.logs.write".to_string()],
+            provided_capabilities: Vec::new(),
+            services: vec![crate::RegisteredService {
+                capability: crate::HostScope::new("bmux.logs.write")
+                    .expect("capability should parse"),
+                kind: crate::ServiceKind::Command,
+                interface_id: "logging-command/v1".to_string(),
+                provider: crate::ProviderId::Host,
+            }],
+            available_capabilities: vec!["bmux.logs.write".to_string()],
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: crate::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: None,
+        };
+
+        let response: () = context
+            .call_service(
+                "bmux.logs.write",
+                crate::ServiceKind::Command,
+                "logging-command/v1",
+                "write",
+                &crate::host_services::LogWriteRequest {
+                    level: crate::host_services::LogWriteLevel::Info,
+                    message: "hello from plugin".to_string(),
+                    target: Some("plugin.test".to_string()),
+                },
+            )
+            .expect("core logging service should succeed");
+        assert_eq!(response, ());
     }
 
     #[test]

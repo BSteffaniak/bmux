@@ -13,6 +13,15 @@ pub enum TraceFamily {
     Dcs,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(name = "bmux")]
@@ -24,6 +33,10 @@ pub struct Cli {
     /// Enable verbose logging
     #[arg(short, long)]
     pub(crate) verbose: bool,
+
+    /// Set log level for file logging
+    #[arg(long, global = true, value_enum)]
+    pub(crate) log_level: Option<LogLevel>,
 }
 
 #[derive(Debug, Subcommand)]

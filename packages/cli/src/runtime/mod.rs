@@ -1,5 +1,6 @@
 use crate::cli::{
-    Cli, Command, KeymapCommand, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
+    Cli, Command, KeymapCommand, LogLevel, ServerCommand, SessionCommand, TerminalCommand,
+    TraceFamily,
 };
 use crate::connection::{
     ConnectionPolicyScope, ServerRuntimeMetadata, connect, connect_raw, current_cli_build_id,
@@ -36,8 +37,9 @@ use std::cell::RefCell;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-use tracing::warn;
+use tracing::{Level, warn};
 use uuid::Uuid;
 
 use bmux_server::ServiceInvokeContext;
@@ -49,6 +51,11 @@ thread_local! {
 
 struct ServiceKernelContextGuard;
 struct HostKernelConnectionGuard;
+
+static EFFECTIVE_LOG_LEVEL: OnceLock<Level> = OnceLock::new();
+
+#[cfg(feature = "logging")]
+static LOG_WRITER_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
 
 impl Drop for ServiceKernelContextGuard {
     fn drop(&mut self) {
@@ -219,6 +226,7 @@ fn core_provided_capabilities() -> Vec<HostScope> {
         "bmux.key_actions",
         "bmux.status_bar_items",
         "bmux.storage",
+        "bmux.logs.write",
         "bmux.clients.read",
         "bmux.contexts.read",
         "bmux.contexts.write",
@@ -258,6 +266,12 @@ fn core_service_descriptors() -> Vec<RegisteredService> {
             capability: HostScope::new("bmux.storage").expect("capability should parse"),
             kind: ServiceKind::Command,
             interface_id: "storage-command/v1".to_string(),
+            provider: bmux_plugin::ProviderId::Host,
+        },
+        RegisteredService {
+            capability: HostScope::new("bmux.logs.write").expect("capability should parse"),
+            kind: ServiceKind::Command,
+            interface_id: "logging-command/v1".to_string(),
             provider: bmux_plugin::ProviderId::Host,
         },
         RegisteredService {
@@ -532,8 +546,12 @@ enum TerminalProfile {
 
 pub async fn run() -> Result<u8> {
     match parse_runtime_cli()? {
-        ParsedRuntimeCli::BuiltIn(cli) => {
-            init_logging(cli.verbose);
+        ParsedRuntimeCli::BuiltIn {
+            cli,
+            log_level,
+            verbose,
+        } => {
+            init_logging(verbose, Some(log_level));
 
             if let Some(command) = &cli.command {
                 return run_command(command).await;
@@ -542,12 +560,12 @@ pub async fn run() -> Result<u8> {
             run_default_server_attach().await
         }
         ParsedRuntimeCli::Plugin {
-            verbose,
+            log_level,
             plugin_id,
             command_name,
             arguments,
         } => {
-            init_logging(verbose);
+            init_logging(false, Some(log_level));
             run_plugin_command(&plugin_id, &command_name, &arguments).await
         }
         ParsedRuntimeCli::ImmediateExit {
@@ -567,14 +585,18 @@ pub async fn run() -> Result<u8> {
 
 #[derive(Debug)]
 enum ParsedRuntimeCli {
-    BuiltIn(Cli),
+    BuiltIn {
+        cli: Cli,
+        log_level: LogLevel,
+        verbose: bool,
+    },
     ImmediateExit {
         code: u8,
         output: String,
         stderr: bool,
     },
     Plugin {
-        verbose: bool,
+        log_level: LogLevel,
         plugin_id: String,
         command_name: String,
         arguments: Vec<String>,
@@ -621,12 +643,17 @@ fn parse_runtime_cli_with_registry(
         }
     };
     let verbose = matches.get_flag("verbose");
+    let log_level = resolve_log_level(
+        verbose,
+        matches.get_one::<LogLevel>("log_level").copied(),
+        std::env::var("BMUX_LOG_LEVEL").ok().as_deref(),
+    );
     let (path, leaf_matches) = plugin_commands::selected_subcommand_path(&matches);
     if let Some(resolved) = command_registry.resolve_exact_path(&path) {
         let arguments =
             PluginCommandRegistry::normalize_arguments_from_matches(&resolved.schema, leaf_matches);
         return Ok(ParsedRuntimeCli::Plugin {
-            verbose,
+            log_level,
             plugin_id: resolved.plugin_id,
             command_name: resolved.command_name,
             arguments,
@@ -635,7 +662,51 @@ fn parse_runtime_cli_with_registry(
 
     let cli =
         Cli::from_arg_matches(&matches).map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    Ok(ParsedRuntimeCli::BuiltIn(cli))
+    Ok(ParsedRuntimeCli::BuiltIn {
+        cli,
+        log_level,
+        verbose,
+    })
+}
+
+fn resolve_log_level(
+    verbose: bool,
+    cli_level: Option<LogLevel>,
+    env_level: Option<&str>,
+) -> LogLevel {
+    if let Some(level) = cli_level {
+        return level;
+    }
+    if verbose {
+        return LogLevel::Debug;
+    }
+    if let Some(raw) = env_level
+        && let Some(level) = parse_log_level(raw)
+    {
+        return level;
+    }
+    LogLevel::Info
+}
+
+fn parse_log_level(raw: &str) -> Option<LogLevel> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "error" => Some(LogLevel::Error),
+        "warn" | "warning" => Some(LogLevel::Warn),
+        "info" => Some(LogLevel::Info),
+        "debug" => Some(LogLevel::Debug),
+        "trace" => Some(LogLevel::Trace),
+        _ => None,
+    }
+}
+
+const fn tracing_level(level: LogLevel) -> Level {
+    match level {
+        LogLevel::Error => Level::ERROR,
+        LogLevel::Warn => Level::WARN,
+        LogLevel::Info => Level::INFO,
+        LogLevel::Debug => Level::DEBUG,
+        LogLevel::Trace => Level::TRACE,
+    }
 }
 
 async fn run_default_server_attach() -> Result<u8> {
@@ -949,10 +1020,21 @@ async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8>
         let executable =
             std::env::current_exe().context("failed to resolve bmux executable path")?;
         let mut child = ProcessCommand::new(executable);
+        let log_level = EFFECTIVE_LOG_LEVEL.get().copied().unwrap_or(Level::INFO);
         child
             .arg("server")
             .arg("start")
             .arg("--foreground-internal")
+            .env(
+                "BMUX_LOG_LEVEL",
+                match log_level {
+                    Level::ERROR => "error",
+                    Level::WARN => "warn",
+                    Level::INFO => "info",
+                    Level::DEBUG => "debug",
+                    Level::TRACE => "trace",
+                },
+            )
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
@@ -5785,24 +5867,42 @@ fn run_keymap_doctor(as_json: bool) -> Result<u8> {
     Ok(0)
 }
 
-fn init_logging(verbose: bool) {
+fn init_logging(verbose: bool, cli_level: Option<LogLevel>) {
+    let level = resolve_log_level(
+        verbose,
+        cli_level,
+        std::env::var("BMUX_LOG_LEVEL").ok().as_deref(),
+    );
+    let tracing_level = tracing_level(level);
+    let _ = EFFECTIVE_LOG_LEVEL.set(tracing_level);
+
     #[cfg(feature = "logging")]
     {
-        let level = if verbose {
-            tracing::Level::DEBUG
-        } else {
-            tracing::Level::WARN
-        };
+        let paths = ConfigPaths::default();
+        let logs_dir = paths.logs_dir();
+        if let Err(error) = std::fs::create_dir_all(&logs_dir) {
+            eprintln!(
+                "bmux warning: failed to create log directory {}: {error}",
+                logs_dir.display()
+            );
+            return;
+        }
+
+        let file_appender = tracing_appender::rolling::daily(&logs_dir, "bmux.log");
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
+        let _ = LOG_WRITER_GUARD.set(guard);
 
         let _ = tracing_subscriber::fmt()
-            .with_max_level(level)
+            .with_max_level(tracing_level)
             .with_target(false)
+            .with_ansi(false)
+            .with_writer(non_blocking)
             .try_init();
     }
 
     #[cfg(not(feature = "logging"))]
     {
-        let _ = verbose;
+        let _ = level;
     }
 }
 
@@ -6229,7 +6329,7 @@ mod tests {
             .expect("runtime CLI should parse built-in attach command");
 
         match parsed {
-            super::ParsedRuntimeCli::BuiltIn(cli) => {
+            super::ParsedRuntimeCli::BuiltIn { cli, .. } => {
                 assert!(matches!(
                     cli.command,
                     Some(Command::Attach {
@@ -6310,7 +6410,7 @@ mod tests {
             context.provided_capabilities,
             vec!["example.provider.write".to_string()]
         );
-        assert_eq!(context.services.len(), 11);
+        assert_eq!(context.services.len(), 12);
         assert!(
             context
                 .services
@@ -6328,6 +6428,12 @@ mod tests {
                 .services
                 .iter()
                 .any(|service| service.interface_id == "storage-command/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "logging-command/v1")
         );
         assert!(
             context
@@ -6464,7 +6570,7 @@ mod tests {
                 "example.provider.write".to_string()
             ]
         );
-        assert_eq!(context.services.len(), 12);
+        assert_eq!(context.services.len(), 13);
         assert!(
             context
                 .services
@@ -6482,6 +6588,12 @@ mod tests {
                 .services
                 .iter()
                 .any(|service| service.interface_id == "storage-command/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "logging-command/v1")
         );
         assert!(
             context

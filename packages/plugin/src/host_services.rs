@@ -223,6 +223,23 @@ pub struct StorageSetRequest {
     pub value: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LogWriteLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogWriteRequest {
+    pub level: LogWriteLevel,
+    pub message: String,
+    pub target: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PluginCommandEffect {
@@ -401,6 +418,16 @@ pub trait HostRuntimeApi: ServiceCaller {
             ServiceKind::Command,
             "storage-command/v1",
             "set",
+            request,
+        )
+    }
+
+    fn log_write(&self, request: &LogWriteRequest) -> Result<()> {
+        self.call_service(
+            "bmux.logs.write",
+            ServiceKind::Command,
+            "logging-command/v1",
+            "write",
             request,
         )
     }

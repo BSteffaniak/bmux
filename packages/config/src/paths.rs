@@ -53,25 +53,31 @@ impl ConfigPaths {
     /// Get the logs directory path
     #[must_use]
     pub fn logs_dir(&self) -> PathBuf {
-        self.data_dir.join("logs")
+        default_log_dir()
+    }
+
+    /// Get persisted state root directory path
+    #[must_use]
+    pub fn state_dir(&self) -> PathBuf {
+        default_state_dir()
     }
 
     /// Get persisted local runtime state file path
     #[must_use]
     pub fn runtime_layout_state_file(&self) -> PathBuf {
-        self.data_dir.join("runtime").join("last-layout.json")
+        self.state_dir().join("runtime").join("last-layout.json")
     }
 
     /// Get persisted protocol trace file path
     #[must_use]
     pub fn protocol_trace_file(&self) -> PathBuf {
-        self.data_dir.join("runtime").join("protocol-trace.json")
+        self.state_dir().join("runtime").join("protocol-trace.json")
     }
 
     /// Get persisted terminfo prompt state file path
     #[must_use]
     pub fn terminfo_prompt_state_file(&self) -> PathBuf {
-        self.data_dir
+        self.state_dir()
             .join("runtime")
             .join("terminfo-prompt-state.json")
     }
@@ -117,6 +123,7 @@ impl ConfigPaths {
         std::fs::create_dir_all(&self.config_dir)?;
         std::fs::create_dir_all(&self.runtime_dir)?;
         std::fs::create_dir_all(&self.data_dir)?;
+        std::fs::create_dir_all(self.state_dir())?;
         std::fs::create_dir_all(self.plugins_dir())?;
         std::fs::create_dir_all(self.sessions_dir())?;
         std::fs::create_dir_all(self.logs_dir())?;
@@ -140,6 +147,73 @@ fn sanitize_endpoint_component(value: &str) -> String {
         "unknown".to_string()
     } else {
         trimmed.to_string()
+    }
+}
+
+fn default_state_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("BMUX_STATE_DIR") {
+        return PathBuf::from(path);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return dirs::home_dir().map_or_else(
+            || PathBuf::from(".").join("bmux").join("state"),
+            |home| {
+                home.join("Library")
+                    .join("Application Support")
+                    .join("bmux")
+                    .join("State")
+            },
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return dirs::data_local_dir().map_or_else(
+            || PathBuf::from(".").join("bmux").join("state"),
+            |base| base.join("bmux").join("State"),
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        return std::env::var_os("XDG_STATE_HOME").map_or_else(
+            || {
+                dirs::home_dir().map_or_else(
+                    || PathBuf::from(".").join("bmux").join("state"),
+                    |home| home.join(".local").join("state").join("bmux"),
+                )
+            },
+            |base| PathBuf::from(base).join("bmux"),
+        );
+    }
+}
+
+fn default_log_dir() -> PathBuf {
+    if let Some(path) = std::env::var_os("BMUX_LOG_DIR") {
+        return PathBuf::from(path);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        return dirs::home_dir().map_or_else(
+            || PathBuf::from(".").join("bmux").join("logs"),
+            |home| home.join("Library").join("Logs").join("bmux"),
+        );
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return dirs::data_local_dir().map_or_else(
+            || PathBuf::from(".").join("bmux").join("logs"),
+            |base| base.join("bmux").join("Logs"),
+        );
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        default_state_dir().join("logs")
     }
 }
 
