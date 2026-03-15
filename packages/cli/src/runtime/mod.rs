@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout, TerminfoAutoInstall};
 use bmux_ipc::{
-    AttachViewComponent, ContextSelector, InvokeServiceKind, PaneFocusDirection,
+    AttachViewComponent, ContextSelector, ContextSummary, InvokeServiceKind, PaneFocusDirection,
     PaneSplitDirection, SessionSelector, SessionSummary,
 };
 use bmux_keybind::action_to_config_name;
@@ -2635,6 +2635,7 @@ async fn run_session_attach_with_client(
         }
 
         let _ = view_state.clear_expired_transient_status(Instant::now());
+        refresh_attached_session_from_context(&mut client, &mut view_state).await?;
 
         let mut frame_needs_render = view_state.dirty.status_needs_redraw
             || view_state.dirty.full_pane_redraw
@@ -3373,6 +3374,22 @@ async fn switch_attach_session_relative(
     view_state: &mut AttachViewState,
     step: isize,
 ) -> std::result::Result<(), ClientError> {
+    if let Some(current_context_id) = view_state.attached_context_id {
+        let contexts = client.list_contexts().await?;
+        if let Some(target_context_id) = relative_context_id(&contexts, current_context_id, step) {
+            let _ = client
+                .select_context(ContextSelector::ById(target_context_id))
+                .await?;
+            let attach_info = open_attach_for_context(client, target_context_id).await?;
+            view_state.attached_id = attach_info.session_id;
+            view_state.attached_context_id = attach_info.context_id.or(Some(target_context_id));
+            view_state.can_write = attach_info.can_write;
+            update_attach_viewport(client, view_state.attached_id).await?;
+            hydrate_attach_state_from_snapshot(client, view_state).await?;
+            return Ok(());
+        }
+    }
+
     let sessions = client.list_sessions().await?;
     let Some(target_session_id) = relative_session_id(&sessions, view_state.attached_id, step)
     else {
@@ -3410,6 +3427,30 @@ fn relative_session_id(
     sessions
         .get(target_index as usize)
         .map(|session| session.id)
+}
+
+fn relative_context_id(
+    contexts: &[ContextSummary],
+    current_context_id: Uuid,
+    step: isize,
+) -> Option<Uuid> {
+    if contexts.is_empty() {
+        return None;
+    }
+
+    let current_index = contexts
+        .iter()
+        .position(|context| context.id == current_context_id)
+        .unwrap_or(0);
+    let len = contexts.len() as isize;
+    let mut target_index = current_index as isize + step;
+    while target_index < 0 {
+        target_index += len;
+    }
+    target_index %= len;
+    contexts
+        .get(target_index as usize)
+        .map(|context| context.id)
 }
 
 async fn build_attach_status_line_for_draw(
@@ -3949,6 +3990,14 @@ async fn attached_session_selector(
     client: &mut BmuxClient,
     view_state: &mut AttachViewState,
 ) -> std::result::Result<SessionSelector, ClientError> {
+    refresh_attached_session_from_context(client, view_state).await?;
+    Ok(SessionSelector::ById(view_state.attached_id))
+}
+
+async fn refresh_attached_session_from_context(
+    client: &mut BmuxClient,
+    view_state: &mut AttachViewState,
+) -> std::result::Result<(), ClientError> {
     if let Some(context_id) = view_state.attached_context_id {
         let grant = client
             .attach_context_grant(ContextSelector::ById(context_id))
@@ -3956,7 +4005,7 @@ async fn attached_session_selector(
         view_state.attached_id = grant.session_id;
         view_state.attached_context_id = grant.context_id.or(Some(context_id));
     }
-    Ok(SessionSelector::ById(view_state.attached_id))
+    Ok(())
 }
 
 fn attach_keymap_from_config(config: &BmuxConfig) -> crate::input::Keymap {
@@ -4564,6 +4613,7 @@ async fn handle_attach_terminal_event(
     view_state: &mut AttachViewState,
 ) -> Result<AttachLoopControl> {
     if matches!(terminal_event, Event::Resize(_, _)) {
+        refresh_attached_session_from_context(client, view_state).await?;
         update_attach_viewport(client, view_state.attached_id).await?;
     }
 
@@ -4624,6 +4674,7 @@ async fn handle_attach_terminal_event(
                     continue;
                 }
                 if view_state.can_write {
+                    refresh_attached_session_from_context(client, view_state).await?;
                     match client.attach_input(view_state.attached_id, bytes).await {
                         Ok(_) => {}
                         Err(error) if is_attach_stream_closed_error(&error) => {
