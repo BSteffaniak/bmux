@@ -353,12 +353,14 @@ struct FollowEntry {
 struct FollowTargetUpdate {
     follower_client_id: ClientId,
     leader_client_id: ClientId,
-    session_id: SessionId,
+    context_id: Option<Uuid>,
+    session_id: Option<SessionId>,
 }
 
 #[derive(Debug, Default)]
 struct FollowState {
     connected_clients: std::collections::BTreeSet<ClientId>,
+    selected_contexts: BTreeMap<ClientId, Option<Uuid>>,
     selected_sessions: BTreeMap<ClientId, Option<SessionId>>,
     follows: BTreeMap<ClientId, FollowEntry>,
 }
@@ -366,11 +368,13 @@ struct FollowState {
 impl FollowState {
     fn connect_client(&mut self, client_id: ClientId) {
         self.connected_clients.insert(client_id);
+        self.selected_contexts.entry(client_id).or_insert(None);
         self.selected_sessions.entry(client_id).or_insert(None);
     }
 
     fn disconnect_client(&mut self, client_id: ClientId) -> Vec<Event> {
         self.connected_clients.remove(&client_id);
+        self.selected_contexts.remove(&client_id);
         self.selected_sessions.remove(&client_id);
         self.follows.remove(&client_id);
 
@@ -395,14 +399,23 @@ impl FollowState {
             .collect()
     }
 
-    fn set_selected_session(&mut self, client_id: ClientId, session_id: Option<SessionId>) {
+    fn set_selected_target(
+        &mut self,
+        client_id: ClientId,
+        context_id: Option<Uuid>,
+        session_id: Option<SessionId>,
+    ) {
         if self.connected_clients.contains(&client_id) {
+            self.selected_contexts.insert(client_id, context_id);
             self.selected_sessions.insert(client_id, session_id);
         }
     }
 
-    fn selected_session(&self, client_id: ClientId) -> Option<Option<SessionId>> {
-        self.selected_sessions.get(&client_id).copied()
+    fn selected_target(&self, client_id: ClientId) -> Option<(Option<Uuid>, Option<SessionId>)> {
+        Some((
+            self.selected_contexts.get(&client_id).copied()?,
+            self.selected_sessions.get(&client_id).copied()?,
+        ))
     }
 
     fn start_follow(
@@ -410,7 +423,7 @@ impl FollowState {
         follower_client_id: ClientId,
         leader_client_id: ClientId,
         global: bool,
-    ) -> std::result::Result<Option<SessionId>, &'static str> {
+    ) -> std::result::Result<(Option<Uuid>, Option<SessionId>), &'static str> {
         if follower_client_id == leader_client_id {
             return Err("cannot follow self");
         }
@@ -429,15 +442,25 @@ impl FollowState {
             },
         );
 
-        if global
-            && let Some(leader_selected) = self.selected_sessions.get(&leader_client_id).copied()
-        {
+        if global {
+            let leader_context = self
+                .selected_contexts
+                .get(&leader_client_id)
+                .copied()
+                .flatten();
+            let leader_session = self
+                .selected_sessions
+                .get(&leader_client_id)
+                .copied()
+                .flatten();
+            self.selected_contexts
+                .insert(follower_client_id, leader_context);
             self.selected_sessions
-                .insert(follower_client_id, leader_selected);
-            return Ok(leader_selected);
+                .insert(follower_client_id, leader_session);
+            return Ok((leader_context, leader_session));
         }
 
-        Ok(None)
+        Ok((None, None))
     }
 
     fn stop_follow(&mut self, follower_client_id: ClientId) -> bool {
@@ -447,6 +470,7 @@ impl FollowState {
     fn sync_followers_from_leader(
         &mut self,
         leader_client_id: ClientId,
+        selected_context: Option<Uuid>,
         selected_session: Option<SessionId>,
     ) -> Vec<FollowTargetUpdate> {
         let followers = self
@@ -461,14 +485,16 @@ impl FollowState {
         for follower_id in followers {
             if self.connected_clients.contains(&follower_id) {
                 let previous = self.selected_sessions.get(&follower_id).copied().flatten();
+                let previous_context = self.selected_contexts.get(&follower_id).copied().flatten();
+                self.selected_contexts.insert(follower_id, selected_context);
                 self.selected_sessions.insert(follower_id, selected_session);
-                if let Some(session_id) = selected_session
-                    && previous != Some(session_id)
-                {
+                let changed = previous != selected_session || previous_context != selected_context;
+                if changed {
                     updates.push(FollowTargetUpdate {
                         follower_client_id: follower_id,
                         leader_client_id,
-                        session_id,
+                        context_id: selected_context,
+                        session_id: selected_session,
                     });
                 }
             }
@@ -485,6 +511,7 @@ impl FollowState {
                     .selected_sessions
                     .get(client_id)
                     .and_then(|selected| selected.map(|session_id| session_id.0));
+                let selected_context_id = self.selected_contexts.get(client_id).copied().flatten();
                 let (following_client_id, following_global) =
                     self.follows.get(client_id).map_or((None, false), |entry| {
                         (Some(entry.leader_client_id.0), entry.global)
@@ -492,7 +519,7 @@ impl FollowState {
 
                 ClientSummary {
                     id: client_id.0,
-                    selected_context_id: None,
+                    selected_context_id,
                     selected_session_id,
                     following_client_id,
                     following_global,
@@ -2715,7 +2742,9 @@ fn sync_selected_session_from_follow_state(
         .follow_state
         .lock()
         .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
-    if let Some(follow_selected_session) = follow_state.selected_session(client_id) {
+    if let Some((_follow_selected_context, follow_selected_session)) =
+        follow_state.selected_target(client_id)
+    {
         *selected_session = follow_selected_session;
     }
     Ok(())
@@ -2756,23 +2785,29 @@ fn persist_selected_session(
     client_id: ClientId,
     selected_session: Option<SessionId>,
 ) -> Result<()> {
+    let selected_context = current_context_id_for_client(state, client_id);
     let updates = {
         let mut follow_state = state
             .follow_state
             .lock()
             .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
-        follow_state.set_selected_session(client_id, selected_session);
-        follow_state.sync_followers_from_leader(client_id, selected_session)
+        follow_state.set_selected_target(client_id, selected_context, selected_session);
+        follow_state.sync_followers_from_leader(client_id, selected_context, selected_session)
     };
 
     for update in updates {
+        let Some(session_id) = update.session_id else {
+            continue;
+        };
         emit_event(
             state,
             Event::FollowTargetChanged {
                 follower_client_id: update.follower_client_id.0,
                 leader_client_id: update.leader_client_id.0,
-                context_id: current_context_id_for_client(state, update.leader_client_id),
-                session_id: update.session_id.0,
+                context_id: update
+                    .context_id
+                    .or_else(|| current_context_id_for_client(state, update.leader_client_id)),
+                session_id: session_id.0,
             },
         )?;
     }
@@ -2814,10 +2849,11 @@ fn clear_selected_session_for_all(
         .collect::<Vec<_>>();
 
     for client_id in &affected_clients {
+        follow_state.selected_contexts.insert(*client_id, None);
         follow_state.selected_sessions.insert(*client_id, None);
     }
     for client_id in affected_clients {
-        let _ = follow_state.sync_followers_from_leader(client_id, None);
+        let _ = follow_state.sync_followers_from_leader(client_id, None, None);
     }
 
     Ok(())
@@ -3191,6 +3227,7 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV3) -> Resu
             .lock()
             .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
         follow_state.follows.clear();
+        follow_state.selected_contexts.clear();
         follow_state.selected_sessions.clear();
 
         let session_manager = state
@@ -3203,6 +3240,9 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV3) -> Resu
             if selected_session
                 .is_none_or(|session_id| session_manager.get_session(&session_id).is_some())
             {
+                follow_state
+                    .selected_contexts
+                    .insert(ClientId(selected.client_id), None);
                 follow_state
                     .selected_sessions
                     .insert(ClientId(selected.client_id), selected_session);
@@ -3253,6 +3293,7 @@ async fn restore_snapshot_replace(
             .lock()
             .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
         follow_state.follows.clear();
+        follow_state.selected_contexts.clear();
         follow_state.selected_sessions.clear();
     }
     {
@@ -4046,7 +4087,9 @@ async fn handle_request(
                             if removed_runtime.had_attached_clients {
                                 emit_event(state, Event::ClientDetached { id: session_id.0 })?;
                             }
-                            shutdown_runtime_handle(removed_runtime).await;
+                            tokio::spawn(async move {
+                                shutdown_runtime_handle(removed_runtime).await;
+                            });
                         }
 
                         let mut attach_tokens = state
@@ -4175,7 +4218,7 @@ async fn handle_request(
             global,
         } => {
             let leader_client_id = ClientId(target_client_id);
-            let initial_target_session = {
+            let (initial_target_context, initial_target_session) = {
                 let mut follow_state = state
                     .follow_state
                     .lock()
@@ -4200,6 +4243,17 @@ async fn handle_request(
                     previous_selected,
                     *selected_session,
                 )?;
+
+                if let Some(initial_target_context) = initial_target_context {
+                    let mut context_state = state
+                        .context_state
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
+                    let _ = context_state.select_for_client(
+                        client_id,
+                        &ContextSelector::ById(initial_target_context),
+                    );
+                }
             }
 
             emit_event(
@@ -4217,7 +4271,8 @@ async fn handle_request(
                     Event::FollowTargetChanged {
                         follower_client_id: client_id.0,
                         leader_client_id: leader_client_id.0,
-                        context_id: current_context_id_for_client(state, leader_client_id),
+                        context_id: initial_target_context
+                            .or_else(|| current_context_id_for_client(state, leader_client_id)),
                         session_id: session_id.0,
                     },
                 )?;
@@ -5374,92 +5429,34 @@ mod tests {
 
     #[tokio::test]
     async fn close_active_context_promotes_most_recent_active_context() {
-        let server = BmuxServer::new(test_endpoint());
         let client_id = ClientId::new();
-        let principal_id = Uuid::new_v4();
-        let mut selected_session = None;
-        let mut attached_stream_session = None;
+        let mut context_state = ContextState::default();
 
-        let first = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::CreateContext {
-                name: Some("first".to_string()),
-                attributes: BTreeMap::new(),
-            },
-        )
-        .await;
-        let first_id = match first {
-            Response::Ok(ResponsePayload::ContextCreated { context }) => context.id,
-            response => panic!("expected first context created response, got {response:?}"),
-        };
+        let first = context_state.create(client_id, Some("first".to_string()), BTreeMap::new());
+        let first_id = first.id;
+        context_state
+            .bind_session(first_id, SessionId::new())
+            .expect("first context should bind to session");
 
-        let second = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::CreateContext {
-                name: Some("second".to_string()),
-                attributes: BTreeMap::new(),
-            },
-        )
-        .await;
-        let second_id = match second {
-            Response::Ok(ResponsePayload::ContextCreated { context }) => context.id,
-            response => panic!("expected second context created response, got {response:?}"),
-        };
+        let second = context_state.create(client_id, Some("second".to_string()), BTreeMap::new());
+        let second_id = second.id;
+        context_state
+            .bind_session(second_id, SessionId::new())
+            .expect("second context should bind to session");
 
-        let _selected_first = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::SelectContext {
-                selector: ContextSelector::ById(first_id),
-            },
-        )
-        .await;
+        let _ = context_state
+            .select_for_client(client_id, &ContextSelector::ById(first_id))
+            .expect("selecting first context should succeed");
 
-        let closed = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::CloseContext {
-                selector: ContextSelector::ById(first_id),
-                force: true,
-            },
-        )
-        .await;
-        match closed {
-            Response::Ok(ResponsePayload::ContextClosed { id }) => assert_eq!(id, first_id),
-            response => panic!("expected context closed response, got {response:?}"),
-        }
+        let (closed_id, _closed_session) = context_state
+            .close(client_id, &ContextSelector::ById(first_id), true)
+            .expect("closing first context should succeed");
+        assert_eq!(closed_id, first_id);
 
-        let current = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::CurrentContext,
-        )
-        .await;
-        match current {
-            Response::Ok(ResponsePayload::CurrentContext {
-                context: Some(context),
-            }) => {
-                assert_eq!(context.id, second_id);
-            }
-            response => panic!("expected current context response, got {response:?}"),
-        }
+        let current = context_state
+            .current_for_client(client_id)
+            .expect("current context should exist after close");
+        assert_eq!(current.id, second_id);
     }
 
     #[tokio::test]
