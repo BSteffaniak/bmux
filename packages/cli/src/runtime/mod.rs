@@ -2757,10 +2757,12 @@ async fn handle_attach_runtime_action(
 ) -> std::result::Result<(), ClientError> {
     match action {
         RuntimeAction::NewWindow | RuntimeAction::NewSession => {
-            let session_id = client.new_session(None).await?;
-            let attach_info = open_attach_for_session(client, session_id).await?;
+            let context = client
+                .create_context(None, std::collections::BTreeMap::new())
+                .await?;
+            let attach_info = open_attach_for_context(client, context.id).await?;
             view_state.attached_id = attach_info.session_id;
-            view_state.attached_context_id = attach_info.context_id;
+            view_state.attached_context_id = attach_info.context_id.or(Some(context.id));
             view_state.can_write = attach_info.can_write;
             update_attach_viewport(client, view_state.attached_id).await?;
             hydrate_attach_state_from_snapshot(client, view_state).await?;
@@ -4604,10 +4606,12 @@ async fn handle_attach_server_event(
                 open_attach_for_context(client, context_id)
                     .await
                     .map_err(map_attach_client_error)?
-            } else {
+            } else if view_state.attached_context_id.is_none() {
                 open_attach_for_session(client, session_id)
                     .await
                     .map_err(map_attach_client_error)?
+            } else {
+                return Ok(AttachLoopControl::Continue);
             };
             view_state.attached_id = attach_info.session_id;
             view_state.attached_context_id = attach_info.context_id;
@@ -4697,8 +4701,7 @@ fn attach_view_event_matches_target(
     event_session_id: Uuid,
 ) -> bool {
     if let Some(attached_context_id) = view_state.attached_context_id {
-        return event_context_id == Some(attached_context_id)
-            || (event_context_id.is_none() && event_session_id == view_state.attached_id);
+        return event_context_id == Some(attached_context_id);
     }
     event_session_id == view_state.attached_id
 }
