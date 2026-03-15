@@ -2541,12 +2541,17 @@ async fn run_session_attach_with_client(
     let self_client_id = client.whoami().await.map_err(map_attach_client_error)?;
 
     let attach_info = if let Some(leader_client_id) = follow_target_id {
-        let target_session = resolve_follow_target_session(&mut client, leader_client_id)
+        let target = resolve_follow_target(&mut client, leader_client_id)
             .await
             .map_err(map_attach_client_error)?;
-        open_attach_for_session(&mut client, target_session)
-            .await
-            .map_err(map_attach_client_error)?
+        match target {
+            FollowTarget::Context(context_id) => open_attach_for_context(&mut client, context_id)
+                .await
+                .map_err(map_attach_client_error)?,
+            FollowTarget::Session(session_id) => open_attach_for_session(&mut client, session_id)
+                .await
+                .map_err(map_attach_client_error)?,
+        }
     } else {
         let target = target.expect("target is present when not follow");
         let grant = client
@@ -4028,18 +4033,31 @@ fn short_uuid(id: Uuid) -> String {
     id.to_string().chars().take(8).collect()
 }
 
-async fn resolve_follow_target_session(
+enum FollowTarget {
+    Context(Uuid),
+    Session(Uuid),
+}
+
+async fn resolve_follow_target(
     client: &mut BmuxClient,
     leader_client_id: Uuid,
-) -> std::result::Result<Uuid, ClientError> {
+) -> std::result::Result<FollowTarget, ClientError> {
     let clients = client.list_clients().await?;
-    clients
+    let client = clients
         .into_iter()
         .find(|entry| entry.id == leader_client_id)
-        .and_then(|entry| entry.selected_session_id)
-        .ok_or(ClientError::UnexpectedResponse(
-            "follow target has no selected session",
-        ))
+        .ok_or(ClientError::UnexpectedResponse("follow target not found"))?;
+
+    if let Some(context_id) = client.selected_context_id {
+        return Ok(FollowTarget::Context(context_id));
+    }
+    if let Some(session_id) = client.selected_session_id {
+        return Ok(FollowTarget::Session(session_id));
+    }
+
+    Err(ClientError::UnexpectedResponse(
+        "follow target has no selected context or session",
+    ))
 }
 
 async fn open_attach_for_session(
