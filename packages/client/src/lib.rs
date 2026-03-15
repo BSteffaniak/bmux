@@ -753,6 +753,20 @@ impl BmuxClient {
         }
     }
 
+    /// Request attach grant token for a context selected by name or UUID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn attach_context_grant(&mut self, selector: ContextSelector) -> Result<AttachGrant> {
+        match self.request(Request::AttachContext { selector }).await? {
+            ResponsePayload::Attached { grant } => Ok(grant),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attached response",
+            )),
+        }
+    }
+
     /// Validate and consume attach grant token.
     ///
     /// # Errors

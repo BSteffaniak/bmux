@@ -41,6 +41,7 @@ use uuid::Uuid;
 
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
+const CONTEXT_SESSION_ID_ATTRIBUTE: &str = "bmux.session_id";
 const MAX_WINDOW_OUTPUT_BUFFER_BYTES: usize = 1_048_576;
 const SNAPSHOT_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(300);
 
@@ -511,6 +512,7 @@ struct RuntimeContext {
 #[derive(Debug, Default)]
 struct ContextState {
     contexts: BTreeMap<Uuid, RuntimeContext>,
+    session_by_context: BTreeMap<Uuid, SessionId>,
     selected_by_client: BTreeMap<ClientId, Uuid>,
     mru_contexts: VecDeque<Uuid>,
 }
@@ -558,6 +560,15 @@ impl ContextState {
         self.contexts.get(&selected).map(Self::to_summary)
     }
 
+    fn current_session_for_client(&self, client_id: ClientId) -> Option<SessionId> {
+        let selected = self
+            .selected_by_client
+            .get(&client_id)
+            .copied()
+            .or_else(|| self.mru_contexts.front().copied())?;
+        self.session_by_context.get(&selected).copied()
+    }
+
     fn select_for_client(
         &mut self,
         client_id: ClientId,
@@ -577,9 +588,10 @@ impl ContextState {
         client_id: ClientId,
         selector: &ContextSelector,
         _force: bool,
-    ) -> std::result::Result<Uuid, &'static str> {
+    ) -> std::result::Result<(Uuid, Option<SessionId>), &'static str> {
         let id = self.resolve_id(selector)?;
         let removed = self.contexts.remove(&id).ok_or("context not found")?;
+        let removed_session = self.session_by_context.remove(&id);
         self.mru_contexts.retain(|entry| *entry != id);
 
         let replacement = self
@@ -607,7 +619,34 @@ impl ContextState {
             self.selected_by_client.insert(client_id, next_id);
         }
 
-        Ok(removed.id)
+        Ok((removed.id, removed_session))
+    }
+
+    fn bind_session(
+        &mut self,
+        context_id: Uuid,
+        session_id: SessionId,
+    ) -> std::result::Result<(), &'static str> {
+        let Some(context) = self.contexts.get_mut(&context_id) else {
+            return Err("context not found");
+        };
+        context.attributes.insert(
+            CONTEXT_SESSION_ID_ATTRIBUTE.to_string(),
+            session_id.0.to_string(),
+        );
+        self.session_by_context.insert(context_id, session_id);
+        Ok(())
+    }
+
+    fn session_for_selector(
+        &self,
+        selector: &ContextSelector,
+    ) -> std::result::Result<SessionId, &'static str> {
+        let id = self.resolve_id(selector)?;
+        self.session_by_context
+            .get(&id)
+            .copied()
+            .ok_or("context has no attached runtime")
     }
 
     fn disconnect_client(&mut self, client_id: ClientId) {
@@ -659,6 +698,43 @@ fn current_context_id_for_client(state: &Arc<ServerState>, client_id: ClientId) 
     context_state
         .current_for_client(client_id)
         .map(|context| context.id)
+}
+
+fn create_session_runtime(state: &Arc<ServerState>, name: Option<String>) -> Result<SessionId> {
+    let mut manager = state
+        .session_manager
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+    if let Some(requested_name) = name.as_deref()
+        && manager
+            .list_sessions()
+            .iter()
+            .any(|session| session.name.as_deref() == Some(requested_name))
+    {
+        anyhow::bail!("session already exists with name '{requested_name}'");
+    }
+
+    let session_id = manager
+        .create_session(name.clone())
+        .map_err(|error| anyhow::anyhow!("failed creating session: {error:#}"))?;
+    drop(manager);
+
+    let mut runtime_manager = state
+        .session_runtimes
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+    if let Err(error) = runtime_manager.start_runtime(session_id) {
+        drop(runtime_manager);
+        let mut rollback_manager = state
+            .session_manager
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+        let _ = rollback_manager.remove_session(&session_id);
+        anyhow::bail!("failed creating session runtime: {error:#}");
+    }
+    drop(runtime_manager);
+
+    Ok(session_id)
 }
 
 fn resolve_server_shell(config: &BmuxConfig) -> String {
@@ -3548,56 +3624,26 @@ async fn handle_request(
                 })
             }
         }
-        Request::NewSession { name } => {
-            let mut manager = state
-                .session_manager
-                .lock()
-                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            if let Some(requested_name) = name.as_deref()
-                && manager
-                    .list_sessions()
-                    .iter()
-                    .any(|session| session.name.as_deref() == Some(requested_name))
-            {
-                return Ok(Response::Err(ErrorResponse {
-                    code: ErrorCode::AlreadyExists,
-                    message: format!("session already exists with name '{requested_name}'"),
-                }));
-            }
-
-            match manager.create_session(name.clone()) {
-                Ok(session_id) => {
-                    drop(manager);
-
-                    let mut runtime_manager = state
-                        .session_runtimes
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                    if let Err(error) = runtime_manager.start_runtime(session_id) {
-                        drop(runtime_manager);
-                        let mut rollback_manager = state
-                            .session_manager
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                        let _ = rollback_manager.remove_session(&session_id);
-                        return Ok(Response::Err(ErrorResponse {
-                            code: ErrorCode::Internal,
-                            message: format!("failed creating session runtime: {error:#}"),
-                        }));
-                    }
-                    drop(runtime_manager);
-
-                    Response::Ok(ResponsePayload::SessionCreated {
-                        id: session_id.0,
-                        name,
+        Request::NewSession { name } => match create_session_runtime(state, name.clone()) {
+            Ok(session_id) => Response::Ok(ResponsePayload::SessionCreated {
+                id: session_id.0,
+                name,
+            }),
+            Err(error) => {
+                let message = error.to_string();
+                if message.starts_with("session already exists with name") {
+                    Response::Err(ErrorResponse {
+                        code: ErrorCode::AlreadyExists,
+                        message,
+                    })
+                } else {
+                    Response::Err(ErrorResponse {
+                        code: ErrorCode::Internal,
+                        message,
                     })
                 }
-                Err(error) => Response::Err(ErrorResponse {
-                    code: ErrorCode::Internal,
-                    message: format!("failed creating session: {error:#}"),
-                }),
             }
-        }
+        },
         Request::ListPanes { session } => {
             let manager = state
                 .session_manager
@@ -3890,11 +3936,30 @@ async fn handle_request(
             Response::Ok(ResponsePayload::ClientList { clients })
         }
         Request::CreateContext { name, attributes } => {
+            let session_id = match create_session_runtime(state, name.clone()) {
+                Ok(session_id) => session_id,
+                Err(error) => {
+                    let message = error.to_string();
+                    let code = if message.starts_with("session already exists with name") {
+                        ErrorCode::AlreadyExists
+                    } else {
+                        ErrorCode::Internal
+                    };
+                    return Ok(Response::Err(ErrorResponse { code, message }));
+                }
+            };
+
             let mut context_state = state
                 .context_state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
             let context = context_state.create(client_id, name, attributes);
+            if let Err(message) = context_state.bind_session(context.id, session_id) {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::Internal,
+                    message: message.to_string(),
+                }));
+            }
             Response::Ok(ResponsePayload::ContextCreated { context })
         }
         Request::ListContexts => {
@@ -3911,7 +3976,20 @@ async fn handle_request(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
             match context_state.select_for_client(client_id, &selector) {
-                Ok(context) => Response::Ok(ResponsePayload::ContextSelected { context }),
+                Ok(context) => {
+                    if let Some(session_id) = context_state.current_session_for_client(client_id) {
+                        let previous_selected = *selected_session;
+                        *selected_session = Some(session_id);
+                        reconcile_selected_session_membership(
+                            state,
+                            client_id,
+                            previous_selected,
+                            *selected_session,
+                        )?;
+                        persist_selected_session(state, client_id, *selected_session)?;
+                    }
+                    Response::Ok(ResponsePayload::ContextSelected { context })
+                }
                 Err(message) => Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
                     message: message.to_string(),
@@ -3924,7 +4002,7 @@ async fn handle_request(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
             match context_state.close(client_id, &selector, force) {
-                Ok(id) => Response::Ok(ResponsePayload::ContextClosed { id }),
+                Ok((id, _session_id)) => Response::Ok(ResponsePayload::ContextClosed { id }),
                 Err(message) => Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
                     message: message.to_string(),
@@ -4126,6 +4204,55 @@ async fn handle_request(
                 }));
             };
 
+            if let Some(previous_session_id) = selected_session.take()
+                && previous_session_id != next_session_id
+                && let Some(previous) = manager.get_session_mut(&previous_session_id)
+            {
+                previous.remove_client(&client_id);
+            }
+
+            match manager.get_session_mut(&next_session_id) {
+                Some(session) => {
+                    session.add_client(client_id);
+                    *selected_session = Some(next_session_id);
+                    persist_selected_session(state, client_id, *selected_session)?;
+                    drop(manager);
+
+                    let mut attach_tokens = state
+                        .attach_tokens
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
+                    let mut grant = attach_tokens.issue(next_session_id);
+                    grant.context_id = current_context_id_for_client(state, client_id);
+                    Response::Ok(ResponsePayload::Attached { grant })
+                }
+                None => Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!("session not found: {}", next_session_id.0),
+                }),
+            }
+        }
+        Request::AttachContext { selector } => {
+            let next_session_id = {
+                let context_state = state
+                    .context_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
+                match context_state.session_for_selector(&selector) {
+                    Ok(session_id) => session_id,
+                    Err(message) => {
+                        return Ok(Response::Err(ErrorResponse {
+                            code: ErrorCode::NotFound,
+                            message: message.to_string(),
+                        }));
+                    }
+                }
+            };
+
+            let mut manager = state
+                .session_manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
             if let Some(previous_session_id) = selected_session.take()
                 && previous_session_id != next_session_id
                 && let Some(previous) = manager.get_session_mut(&previous_session_id)
@@ -4667,6 +4794,7 @@ const fn request_requires_exclusive(request: &Request) -> bool {
             | Request::FollowClient { .. }
             | Request::Unfollow
             | Request::Attach { .. }
+            | Request::AttachContext { .. }
             | Request::AttachOpen { .. }
             | Request::AttachInput { .. }
             | Request::AttachSetViewport { .. }

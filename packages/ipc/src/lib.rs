@@ -306,6 +306,9 @@ pub enum Request {
     Attach {
         selector: SessionSelector,
     },
+    AttachContext {
+        selector: ContextSelector,
+    },
     AttachOpen {
         session_id: Uuid,
         attach_token: Uuid,

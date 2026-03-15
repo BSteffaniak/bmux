@@ -2785,6 +2785,12 @@ async fn apply_plugin_command_outcome(
                 let _ = client
                     .select_context(ContextSelector::ById(context_id))
                     .await?;
+                let attach_info = open_attach_for_context(client, context_id).await?;
+                view_state.attached_id = attach_info.session_id;
+                view_state.can_write = attach_info.can_write;
+                update_attach_viewport(client, view_state.attached_id).await?;
+                hydrate_attach_state_from_snapshot(client, view_state).await?;
+                view_state.ui_mode = AttachUiMode::Normal;
                 let status = attach_context_status(client, view_state.attached_id).await?;
                 set_attach_context_status(
                     view_state,
@@ -3932,6 +3938,16 @@ async fn open_attach_for_session(
 ) -> std::result::Result<bmux_client::AttachOpenInfo, ClientError> {
     let grant = client
         .attach_grant(SessionSelector::ById(session_id))
+        .await?;
+    client.open_attach_stream_info(&grant).await
+}
+
+async fn open_attach_for_context(
+    client: &mut BmuxClient,
+    context_id: Uuid,
+) -> std::result::Result<bmux_client::AttachOpenInfo, ClientError> {
+    let grant = client
+        .attach_context_grant(ContextSelector::ById(context_id))
         .await?;
     client.open_attach_stream_info(&grant).await
 }
