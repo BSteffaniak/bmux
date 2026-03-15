@@ -89,6 +89,7 @@ pub struct AttachScrollbackPosition {
 
 pub struct AttachViewState {
     pub(crate) attached_id: Uuid,
+    pub(crate) attached_context_id: Option<Uuid>,
     pub(crate) can_write: bool,
     pub(crate) ui_mode: AttachUiMode,
     pub(crate) scrollback_active: bool,
@@ -111,6 +112,7 @@ impl AttachViewState {
     pub(crate) fn new(attach_info: bmux_client::AttachOpenInfo) -> Self {
         Self {
             attached_id: attach_info.session_id,
+            attached_context_id: attach_info.context_id,
             can_write: attach_info.can_write,
             ui_mode: AttachUiMode::Normal,
             scrollback_active: false,

@@ -2754,6 +2754,7 @@ async fn handle_attach_runtime_action(
             let session_id = client.new_session(None).await?;
             let attach_info = open_attach_for_session(client, session_id).await?;
             view_state.attached_id = attach_info.session_id;
+            view_state.attached_context_id = attach_info.context_id;
             view_state.can_write = attach_info.can_write;
             update_attach_viewport(client, view_state.attached_id).await?;
             hydrate_attach_state_from_snapshot(client, view_state).await?;
@@ -2787,6 +2788,7 @@ async fn apply_plugin_command_outcome(
                     .await?;
                 let attach_info = open_attach_for_context(client, context_id).await?;
                 view_state.attached_id = attach_info.session_id;
+                view_state.attached_context_id = attach_info.context_id;
                 view_state.can_write = attach_info.can_write;
                 update_attach_viewport(client, view_state.attached_id).await?;
                 hydrate_attach_state_from_snapshot(client, view_state).await?;
@@ -3389,6 +3391,7 @@ async fn switch_attach_session_relative(
 
     let attach_info = open_attach_for_session(client, target_session_id).await?;
     view_state.attached_id = attach_info.session_id;
+    view_state.attached_context_id = attach_info.context_id;
     view_state.can_write = attach_info.can_write;
     update_attach_viewport(client, view_state.attached_id).await?;
     hydrate_attach_state_from_snapshot(client, view_state).await?;
@@ -4442,18 +4445,25 @@ async fn handle_attach_server_event(
         bmux_client::ServerEvent::FollowTargetChanged {
             follower_client_id,
             leader_client_id,
+            context_id,
             session_id,
-            ..
         } => {
             if Some(leader_client_id) != follow_target_id
                 || Some(follower_client_id) != self_client_id
             {
                 return Ok(AttachLoopControl::Continue);
             }
-            let attach_info = open_attach_for_session(client, session_id)
-                .await
-                .map_err(map_attach_client_error)?;
+            let attach_info = if let Some(context_id) = context_id {
+                open_attach_for_context(client, context_id)
+                    .await
+                    .map_err(map_attach_client_error)?
+            } else {
+                open_attach_for_session(client, session_id)
+                    .await
+                    .map_err(map_attach_client_error)?
+            };
             view_state.attached_id = attach_info.session_id;
+            view_state.attached_context_id = attach_info.context_id;
             view_state.can_write = attach_info.can_write;
             update_attach_viewport(client, view_state.attached_id).await?;
             hydrate_attach_state_from_snapshot(client, view_state)
@@ -4480,10 +4490,11 @@ async fn handle_attach_server_event(
             println!("follow target disconnected; staying on current session");
         }
         bmux_client::ServerEvent::AttachViewChanged {
+            context_id,
             session_id,
             components,
             ..
-        } if session_id == view_state.attached_id => {
+        } if attach_view_event_matches_target(view_state, context_id, session_id) => {
             apply_attach_view_change_components(&components, view_state);
         }
         _ => {}
@@ -4527,6 +4538,18 @@ fn is_attach_terminal_server_exit_event(
     attached_id: Uuid,
 ) -> bool {
     matches!(event, bmux_client::ServerEvent::SessionRemoved { id } if *id == attached_id)
+}
+
+fn attach_view_event_matches_target(
+    view_state: &AttachViewState,
+    event_context_id: Option<Uuid>,
+    event_session_id: Uuid,
+) -> bool {
+    if let Some(attached_context_id) = view_state.attached_context_id {
+        return event_context_id == Some(attached_context_id)
+            || (event_context_id.is_none() && event_session_id == view_state.attached_id);
+    }
+    event_session_id == view_state.attached_id
 }
 
 async fn handle_attach_terminal_event(
