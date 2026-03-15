@@ -36,7 +36,7 @@ use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternate
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use regex::{Regex, RegexBuilder};
 use std::cell::RefCell;
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{self, IsTerminal, Read, Seek, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
@@ -1014,6 +1014,7 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                     LogsCommand::Watch {
                         lines,
                         since,
+                        profile,
                         include,
                         include_i,
                         exclude,
@@ -1023,6 +1024,7 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
         ) => run_logs_watch(
             *lines,
             since.as_deref(),
+            profile.as_deref(),
             include,
             include_i,
             exclude,
@@ -2233,13 +2235,15 @@ fn run_logs_path(as_json: bool) -> Result<u8> {
     Ok(0)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum LogFilterKind {
     Include,
     Exclude,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum LogFilterCaseMode {
     Sensitive,
     Insensitive,
@@ -2252,6 +2256,32 @@ struct LogFilterRule {
     case_mode: LogFilterCaseMode,
     enabled: bool,
     regex: std::result::Result<Regex, String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct LogsWatchStateFile {
+    version: u32,
+    active_profile: Option<String>,
+    #[serde(default)]
+    profiles: BTreeMap<String, LogsWatchProfileState>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default)]
+struct LogsWatchProfileState {
+    #[serde(default)]
+    filters: Vec<LogsWatchFilterState>,
+    quick_filter: Option<String>,
+    since: Option<String>,
+    lines: Option<usize>,
+    selected_filter_index: Option<usize>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct LogsWatchFilterState {
+    kind: LogFilterKind,
+    pattern: String,
+    case_mode: LogFilterCaseMode,
+    enabled: bool,
 }
 
 impl LogFilterRule {
@@ -2391,8 +2421,9 @@ fn run_logs_tail(lines: usize, since: Option<&str>, follow: bool) -> Result<u8> 
 }
 
 fn run_logs_watch(
-    lines: usize,
+    lines: Option<usize>,
     since: Option<&str>,
+    profile: Option<&str>,
     include: &[String],
     include_i: &[String],
     exclude: &[String],
@@ -2400,14 +2431,31 @@ fn run_logs_watch(
 ) -> Result<u8> {
     const WATCH_BUFFER_LIMIT: usize = 20_000;
 
-    let since_cutoff = match since {
+    let profile_name = normalize_logs_watch_profile(profile)?;
+    let mut persisted_profile = load_logs_watch_profile_state(&profile_name).unwrap_or_default();
+    let effective_lines = lines.or(persisted_profile.lines).unwrap_or(200);
+    let effective_since = since
+        .map(ToString::to_string)
+        .or_else(|| persisted_profile.since.clone());
+    let since_cutoff = match effective_since.as_deref() {
         Some(value) => Some(parse_since_cutoff(value)?),
         None => None,
     };
-    let mut filters = seed_watch_filters(include, include_i, exclude, exclude_i);
-    let mut selected_filter = 0_usize;
+
+    let mut filters = persisted_profile
+        .filters
+        .iter()
+        .cloned()
+        .map(logs_watch_filter_state_to_rule)
+        .collect::<Vec<_>>();
+    filters.extend(seed_watch_filters(include, include_i, exclude, exclude_i));
+
+    let mut selected_filter = persisted_profile.selected_filter_index.unwrap_or_default();
+    if selected_filter >= filters.len() {
+        selected_filter = filters.len().saturating_sub(1);
+    }
     let mut status_message = String::new();
-    let mut quick_filter: Option<String> = None;
+    let mut quick_filter: Option<String> = persisted_profile.quick_filter.take();
     let mut paused = false;
 
     let mut active_path = active_log_file_path();
@@ -2419,7 +2467,7 @@ fn run_logs_watch(
         preload_watch_entries(
             &active_path,
             &mut entries,
-            lines,
+            effective_lines,
             since_cutoff,
             WATCH_BUFFER_LIMIT,
         )?;
@@ -2509,6 +2557,16 @@ fn run_logs_watch(
                         LogFilterCaseMode::Sensitive,
                     ));
                     selected_filter = filters.len().saturating_sub(1);
+                    if let Err(error) = persist_logs_watch_profile_state(
+                        &profile_name,
+                        &filters,
+                        quick_filter.as_deref(),
+                        effective_since.as_deref(),
+                        effective_lines,
+                        selected_filter,
+                    ) {
+                        status_message = format!("failed saving watch state: {error:#}");
+                    }
                 }
             }
             KeyCode::Char('x') => {
@@ -2519,25 +2577,75 @@ fn run_logs_watch(
                         LogFilterCaseMode::Sensitive,
                     ));
                     selected_filter = filters.len().saturating_sub(1);
+                    if let Err(error) = persist_logs_watch_profile_state(
+                        &profile_name,
+                        &filters,
+                        quick_filter.as_deref(),
+                        effective_since.as_deref(),
+                        effective_lines,
+                        selected_filter,
+                    ) {
+                        status_message = format!("failed saving watch state: {error:#}");
+                    }
                 }
             }
             KeyCode::Char('/') => {
                 quick_filter = prompt_logs_watch_line("Quick substring filter (empty clears): ")?;
+                if let Err(error) = persist_logs_watch_profile_state(
+                    &profile_name,
+                    &filters,
+                    quick_filter.as_deref(),
+                    effective_since.as_deref(),
+                    effective_lines,
+                    selected_filter,
+                ) {
+                    status_message = format!("failed saving watch state: {error:#}");
+                }
             }
             KeyCode::Char('c') => {
                 filters.clear();
                 selected_filter = 0;
                 quick_filter = None;
                 status_message = "cleared filters".to_string();
+                if let Err(error) = persist_logs_watch_profile_state(
+                    &profile_name,
+                    &filters,
+                    quick_filter.as_deref(),
+                    effective_since.as_deref(),
+                    effective_lines,
+                    selected_filter,
+                ) {
+                    status_message = format!("failed saving watch state: {error:#}");
+                }
             }
             KeyCode::Char('t') => {
                 if let Some(filter) = filters.get_mut(selected_filter) {
                     filter.enabled = !filter.enabled;
+                    if let Err(error) = persist_logs_watch_profile_state(
+                        &profile_name,
+                        &filters,
+                        quick_filter.as_deref(),
+                        effective_since.as_deref(),
+                        effective_lines,
+                        selected_filter,
+                    ) {
+                        status_message = format!("failed saving watch state: {error:#}");
+                    }
                 }
             }
             KeyCode::Char('i') => {
                 if let Some(filter) = filters.get_mut(selected_filter) {
                     filter.toggle_case_mode();
+                    if let Err(error) = persist_logs_watch_profile_state(
+                        &profile_name,
+                        &filters,
+                        quick_filter.as_deref(),
+                        effective_since.as_deref(),
+                        effective_lines,
+                        selected_filter,
+                    ) {
+                        status_message = format!("failed saving watch state: {error:#}");
+                    }
                 }
             }
             KeyCode::Char('d') => {
@@ -2545,6 +2653,16 @@ fn run_logs_watch(
                     let _ = filters.remove(selected_filter);
                     if selected_filter >= filters.len() {
                         selected_filter = filters.len().saturating_sub(1);
+                    }
+                    if let Err(error) = persist_logs_watch_profile_state(
+                        &profile_name,
+                        &filters,
+                        quick_filter.as_deref(),
+                        effective_since.as_deref(),
+                        effective_lines,
+                        selected_filter,
+                    ) {
+                        status_message = format!("failed saving watch state: {error:#}");
                     }
                 }
             }
@@ -2559,6 +2677,15 @@ fn run_logs_watch(
             _ => {}
         }
     }
+
+    persist_logs_watch_profile_state(
+        &profile_name,
+        &filters,
+        quick_filter.as_deref(),
+        effective_since.as_deref(),
+        effective_lines,
+        selected_filter,
+    )?;
 
     Ok(0)
 }
@@ -2599,6 +2726,128 @@ fn seed_watch_filters(
         )
     }));
     filters
+}
+
+fn normalize_logs_watch_profile(profile: Option<&str>) -> Result<String> {
+    let value = profile.unwrap_or("default").trim();
+    if value.is_empty() {
+        anyhow::bail!("--profile cannot be empty");
+    }
+    if value.len() > 64 {
+        anyhow::bail!("--profile must be 64 characters or fewer");
+    }
+    if !value
+        .chars()
+        .all(|entry| entry.is_ascii_alphanumeric() || entry == '-' || entry == '_')
+    {
+        anyhow::bail!("--profile may contain only ASCII letters, numbers, '-', and '_'");
+    }
+    Ok(value.to_string())
+}
+
+fn logs_watch_state_file_path() -> PathBuf {
+    ConfigPaths::default()
+        .state_dir()
+        .join("runtime")
+        .join("logs-watch-state.json")
+}
+
+fn load_logs_watch_profile_state(profile_name: &str) -> Result<LogsWatchProfileState> {
+    let state = read_logs_watch_state_file()?;
+    Ok(state
+        .profiles
+        .get(profile_name)
+        .cloned()
+        .unwrap_or_default())
+}
+
+fn persist_logs_watch_profile_state(
+    profile_name: &str,
+    filters: &[LogFilterRule],
+    quick_filter: Option<&str>,
+    since: Option<&str>,
+    lines: usize,
+    selected_filter: usize,
+) -> Result<()> {
+    let mut state = read_logs_watch_state_file()?;
+    state.version = 1;
+    state.active_profile = Some(profile_name.to_string());
+    state.profiles.insert(
+        profile_name.to_string(),
+        LogsWatchProfileState {
+            filters: filters
+                .iter()
+                .map(logs_watch_filter_rule_to_state)
+                .collect(),
+            quick_filter: quick_filter
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
+            since: since
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToString::to_string),
+            lines: Some(lines.max(1)),
+            selected_filter_index: Some(selected_filter),
+        },
+    );
+    write_logs_watch_state_file(&state)
+}
+
+fn read_logs_watch_state_file() -> Result<LogsWatchStateFile> {
+    let path = logs_watch_state_file_path();
+    if !path.exists() {
+        return Ok(LogsWatchStateFile {
+            version: 1,
+            ..LogsWatchStateFile::default()
+        });
+    }
+    let content = std::fs::read_to_string(&path)
+        .with_context(|| format!("failed reading logs watch state file {}", path.display()))?;
+    let mut state: LogsWatchStateFile = serde_json::from_str(&content)
+        .with_context(|| format!("failed parsing logs watch state file {}", path.display()))?;
+    if state.version == 0 {
+        state.version = 1;
+    }
+    Ok(state)
+}
+
+fn write_logs_watch_state_file(state: &LogsWatchStateFile) -> Result<()> {
+    let path = logs_watch_state_file_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed creating logs watch state directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let bytes = serde_json::to_vec_pretty(state).context("failed encoding logs watch state")?;
+    let temp_path = path.with_extension(format!("tmp-{}", std::process::id()));
+    std::fs::write(&temp_path, bytes).with_context(|| {
+        format!(
+            "failed writing temporary logs watch state file {}",
+            temp_path.display()
+        )
+    })?;
+    std::fs::rename(&temp_path, &path)
+        .with_context(|| format!("failed finalizing logs watch state file {}", path.display()))?;
+    Ok(())
+}
+
+fn logs_watch_filter_rule_to_state(rule: &LogFilterRule) -> LogsWatchFilterState {
+    LogsWatchFilterState {
+        kind: rule.kind,
+        pattern: rule.pattern.clone(),
+        case_mode: rule.case_mode,
+        enabled: rule.enabled,
+    }
+}
+
+fn logs_watch_filter_state_to_rule(state: LogsWatchFilterState) -> LogFilterRule {
+    let mut rule = LogFilterRule::new(state.kind, state.pattern, state.case_mode);
+    rule.enabled = state.enabled;
+    rule
 }
 
 fn compile_filter_regex(
@@ -8785,5 +9034,39 @@ mod tests {
             &[],
             Some("error")
         ));
+    }
+
+    #[test]
+    fn normalize_logs_watch_profile_defaults_and_validates() {
+        assert_eq!(
+            super::normalize_logs_watch_profile(None).expect("default profile should resolve"),
+            "default"
+        );
+        assert_eq!(
+            super::normalize_logs_watch_profile(Some("incident_db"))
+                .expect("valid profile should resolve"),
+            "incident_db"
+        );
+        assert!(super::normalize_logs_watch_profile(Some("bad name")).is_err());
+        assert!(super::normalize_logs_watch_profile(Some("")).is_err());
+    }
+
+    #[test]
+    fn logs_watch_filter_state_roundtrip_preserves_case_and_enabled() {
+        let mut rule = super::LogFilterRule::new(
+            super::LogFilterKind::Exclude,
+            "server listening".to_string(),
+            super::LogFilterCaseMode::Insensitive,
+        );
+        rule.enabled = false;
+        let state = super::logs_watch_filter_rule_to_state(&rule);
+        let roundtrip = super::logs_watch_filter_state_to_rule(state);
+        assert!(matches!(roundtrip.kind, super::LogFilterKind::Exclude));
+        assert!(matches!(
+            roundtrip.case_mode,
+            super::LogFilterCaseMode::Insensitive
+        ));
+        assert!(!roundtrip.enabled);
+        assert_eq!(roundtrip.pattern, "server listening");
     }
 }

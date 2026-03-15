@@ -70,6 +70,9 @@ bmux logs tail --since 15m
 # interactive watch with seed filters
 bmux logs watch --exclude "bmux server listening"
 bmux logs watch --include-i "warn|error"
+
+# use named profile state
+bmux logs watch --profile incident-db
 ```
 
 Logging behavior:
@@ -82,6 +85,8 @@ Logging behavior:
 - `logs tail --since <duration>` filters by RFC3339 timestamps in log lines (`s`, `m`, `h`, `d` units).
 - `logs watch` provides a live interactive viewer with non-destructive include/exclude filters.
 - `logs watch` filter seed flags: `--include`, `--include-i`, `--exclude`, `--exclude-i`.
+- `logs watch` saves filter/session state across runs (default global profile `default`).
+- `logs watch --profile <name>` scopes saved state to a named profile for a specific workflow.
 - `logs watch` keys: `a` add include, `x` add exclude, `t` toggle rule, `i` toggle per-filter case mode, `d` delete rule, `c` clear rules, `/` quick substring filter, `p` pause, `q` quit.
 
 Log/state directory conventions:

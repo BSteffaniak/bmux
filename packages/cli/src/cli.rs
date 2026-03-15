@@ -258,12 +258,15 @@ pub enum LogsCommand {
     },
     /// Interactive live log viewer with dynamic filters
     Watch {
-        /// Number of recent lines to preload
-        #[arg(long, default_value_t = 200)]
-        lines: usize,
+        /// Number of recent lines to preload (defaults to saved profile value or 200)
+        #[arg(long)]
+        lines: Option<usize>,
         /// Show entries newer than a relative duration (e.g. 30s, 10m, 2h, 1d)
         #[arg(long)]
         since: Option<String>,
+        /// State profile for saved watch filters (default: global `default`)
+        #[arg(long)]
+        profile: Option<String>,
         /// Include regex filter (case-sensitive, repeatable)
         #[arg(long = "include")]
         include: Vec<String>,
@@ -541,8 +544,9 @@ mod tests {
         assert!(matches!(
             command,
             LogsCommand::Watch {
-                lines: 150,
+                lines: Some(150),
                 since: Some(ref value),
+                profile: None,
                 include,
                 include_i,
                 exclude,
@@ -552,6 +556,31 @@ mod tests {
                 && include_i == vec!["warn"]
                 && exclude == vec!["healthcheck"]
                 && exclude_i == vec!["noise"]
+        ));
+    }
+
+    #[test]
+    fn parses_logs_watch_profile_flag() {
+        let cli = Cli::try_parse_from(["bmux", "logs", "watch", "--profile", "incident-db"])
+            .expect("valid CLI args");
+        let Some(Command::Logs { command }) = cli.command else {
+            panic!("expected logs subcommand");
+        };
+        assert!(matches!(
+            command,
+            LogsCommand::Watch {
+                lines: None,
+                since: None,
+                profile: Some(ref value),
+                include,
+                include_i,
+                exclude,
+                exclude_i,
+            } if value == "incident-db"
+                && include.is_empty()
+                && include_i.is_empty()
+                && exclude.is_empty()
+                && exclude_i.is_empty()
         ));
     }
 
