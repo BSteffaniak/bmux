@@ -292,6 +292,7 @@ impl AttachTokenManager {
         );
 
         AttachGrant {
+            context_id: None,
             session_id: session_id.0,
             attach_token,
             expires_at_epoch_ms,
@@ -490,6 +491,7 @@ impl FollowState {
 
                 ClientSummary {
                     id: client_id.0,
+                    selected_context_id: None,
                     selected_session_id,
                     following_client_id,
                     following_global,
@@ -650,6 +652,13 @@ impl ContextState {
             attributes: context.attributes.clone(),
         }
     }
+}
+
+fn current_context_id_for_client(state: &Arc<ServerState>, client_id: ClientId) -> Option<Uuid> {
+    let context_state = state.context_state.lock().ok()?;
+    context_state
+        .current_for_client(client_id)
+        .map(|context| context.id)
 }
 
 fn resolve_server_shell(config: &BmuxConfig) -> String {
@@ -2554,6 +2563,7 @@ fn emit_attach_view_changed(
     emit_event(
         state,
         Event::AttachViewChanged {
+            context_id: None,
             session_id: session_id.0,
             revision,
             components,
@@ -2672,6 +2682,7 @@ fn persist_selected_session(
             Event::FollowTargetChanged {
                 follower_client_id: update.follower_client_id.0,
                 leader_client_id: update.leader_client_id.0,
+                context_id: None,
                 session_id: update.session_id.0,
             },
         )?;
@@ -3870,7 +3881,12 @@ async fn handle_request(
                 .follow_state
                 .lock()
                 .map_err(|_| anyhow::anyhow!("follow state lock poisoned"))?;
-            let clients = follow_state.list_clients();
+            let mut clients = follow_state.list_clients();
+            drop(follow_state);
+            for client in &mut clients {
+                client.selected_context_id =
+                    current_context_id_for_client(state, ClientId(client.id));
+            }
             Response::Ok(ResponsePayload::ClientList { clients })
         }
         Request::CreateContext { name, attributes } => {
@@ -4064,6 +4080,7 @@ async fn handle_request(
                     Event::FollowTargetChanged {
                         follower_client_id: client_id.0,
                         leader_client_id: leader_client_id.0,
+                        context_id: None,
                         session_id: session_id.0,
                     },
                 )?;
@@ -4127,7 +4144,8 @@ async fn handle_request(
                         .attach_tokens
                         .lock()
                         .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
-                    let grant = attach_tokens.issue(next_session_id);
+                    let mut grant = attach_tokens.issue(next_session_id);
+                    grant.context_id = current_context_id_for_client(state, client_id);
                     Response::Ok(ResponsePayload::Attached { grant })
                 }
                 None => Response::Err(ErrorResponse {
@@ -4189,7 +4207,9 @@ async fn handle_request(
                     match begin_result {
                         Ok(()) => {
                             *attached_stream_session = Some(session_id);
+                            let context_id = current_context_id_for_client(state, client_id);
                             Response::Ok(ResponsePayload::AttachReady {
+                                context_id,
                                 session_id: session_id.0,
                                 can_write,
                             })
@@ -4308,6 +4328,7 @@ async fn handle_request(
 
             match update_result {
                 Ok((cols, rows)) => Response::Ok(ResponsePayload::AttachViewportSet {
+                    context_id: current_context_id_for_client(state, client_id),
                     session_id: session_id.0,
                     cols,
                     rows,
@@ -4425,6 +4446,7 @@ async fn handle_request(
             };
             match state_snapshot {
                 Ok(snapshot) => Response::Ok(ResponsePayload::AttachLayout {
+                    context_id: current_context_id_for_client(state, client_id),
                     session_id: session_id.0,
                     focused_pane_id: snapshot.focused_pane_id,
                     panes: snapshot.panes,
@@ -4477,6 +4499,7 @@ async fn handle_request(
 
             match snapshot {
                 Ok(snapshot) => Response::Ok(ResponsePayload::AttachSnapshot {
+                    context_id: current_context_id_for_client(state, client_id),
                     session_id: snapshot.session_id.0,
                     focused_pane_id: snapshot.focused_pane_id,
                     panes: snapshot.panes,

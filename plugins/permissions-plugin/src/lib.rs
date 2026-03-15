@@ -708,6 +708,7 @@ mod tests {
                 bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ClientList {
                     clients: vec![bmux_ipc::ClientSummary {
                         id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
+                        selected_context_id: None,
                         selected_session_id: Some(service_test_session_id()),
                         following_client_id: None,
                         following_global: false,

@@ -4294,6 +4294,7 @@ async fn hydrate_attach_state_from_snapshot(
     view_state: &mut AttachViewState,
 ) -> std::result::Result<(), ClientError> {
     let AttachSnapshotState {
+        context_id: _,
         session_id,
         focused_pane_id,
         panes,
@@ -4305,6 +4306,7 @@ async fn hydrate_attach_state_from_snapshot(
         .await?;
 
     view_state.cached_layout_state = Some(AttachLayoutState {
+        context_id: None,
         session_id,
         focused_pane_id,
         panes,
@@ -4425,6 +4427,7 @@ async fn handle_attach_server_event(
             follower_client_id,
             leader_client_id,
             session_id,
+            ..
         } => {
             if Some(leader_client_id) != follow_target_id
                 || Some(follower_client_id) != self_client_id
@@ -5775,10 +5778,12 @@ mod tests {
     fn attach_view_state_with_scrollback_fixture() -> AttachViewState {
         let pane_id = Uuid::from_u128(11);
         let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
             session_id: Uuid::from_u128(12),
             can_write: true,
         });
         view_state.cached_layout_state = Some(AttachLayoutState {
+            context_id: None,
             session_id: Uuid::from_u128(12),
             focused_pane_id: pane_id,
             panes: vec![PaneSummary {
@@ -6557,6 +6562,7 @@ mod tests {
     #[test]
     fn attach_view_change_components_mark_expected_dirty_flags() {
         let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
             session_id: uuid::Uuid::new_v4(),
             can_write: true,
         });
@@ -7520,6 +7526,7 @@ mod tests {
     #[test]
     fn help_overlay_repeat_navigation_is_handled() {
         let mut view_state = super::AttachViewState::new(bmux_client::AttachOpenInfo {
+            context_id: None,
             session_id: uuid::Uuid::new_v4(),
             can_write: true,
         });
@@ -7544,6 +7551,7 @@ mod tests {
     #[test]
     fn help_overlay_release_is_ignored() {
         let mut view_state = super::AttachViewState::new(bmux_client::AttachOpenInfo {
+            context_id: None,
             session_id: uuid::Uuid::new_v4(),
             can_write: true,
         });

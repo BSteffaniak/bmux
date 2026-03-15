@@ -27,12 +27,14 @@ pub type Result<T> = std::result::Result<T, ClientError>;
 /// Details returned when opening an attach stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttachOpenInfo {
+    pub context_id: Option<Uuid>,
     pub session_id: Uuid,
     pub can_write: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachLayoutState {
+    pub context_id: Option<Uuid>,
     pub session_id: Uuid,
     pub focused_pane_id: Uuid,
     pub panes: Vec<PaneSummary>,
@@ -42,6 +44,7 @@ pub struct AttachLayoutState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachSnapshotState {
+    pub context_id: Option<Uuid>,
     pub session_id: Uuid,
     pub focused_pane_id: Uuid,
     pub panes: Vec<PaneSummary>,
@@ -774,9 +777,11 @@ impl BmuxClient {
             .await?
         {
             ResponsePayload::AttachReady {
+                context_id,
                 session_id,
                 can_write,
             } => Ok(AttachOpenInfo {
+                context_id,
                 session_id,
                 can_write,
             }),
@@ -866,12 +871,14 @@ impl BmuxClient {
     pub async fn attach_layout(&mut self, session_id: Uuid) -> Result<AttachLayoutState> {
         match self.request(Request::AttachLayout { session_id }).await? {
             ResponsePayload::AttachLayout {
+                context_id,
                 session_id,
                 focused_pane_id,
                 panes,
                 layout_root,
                 scene,
             } => Ok(AttachLayoutState {
+                context_id,
                 session_id,
                 focused_pane_id,
                 panes,
@@ -918,6 +925,7 @@ impl BmuxClient {
             .await?
         {
             ResponsePayload::AttachSnapshot {
+                context_id,
                 session_id,
                 focused_pane_id,
                 panes,
@@ -925,6 +933,7 @@ impl BmuxClient {
                 scene,
                 chunks,
             } => Ok(AttachSnapshotState {
+                context_id,
                 session_id,
                 focused_pane_id,
                 panes,

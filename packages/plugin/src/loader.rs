@@ -1888,6 +1888,7 @@ mod tests {
                 bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ClientList {
                     clients: vec![bmux_ipc::ClientSummary {
                         id: uuid::Uuid::from_u128(0x11111111_1111_1111_1111_111111111111),
+                        selected_context_id: None,
                         selected_session_id: Some(uuid::Uuid::from_u128(
                             0x22222222_2222_2222_2222_222222222222,
                         )),
@@ -1953,6 +1954,7 @@ mod tests {
                 };
                 bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::Attached {
                     grant: bmux_ipc::AttachGrant {
+                        context_id: None,
                         session_id,
                         attach_token: uuid::Uuid::new_v4(),
                         expires_at_epoch_ms: 42,

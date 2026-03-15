@@ -345,6 +345,8 @@ pub enum Request {
 /// Attach grant returned by attach control-plane request.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttachGrant {
+    #[serde(default)]
+    pub context_id: Option<Uuid>,
     pub session_id: Uuid,
     pub attach_token: Uuid,
     pub expires_at_epoch_ms: u64,
@@ -386,6 +388,8 @@ pub struct AttachPaneChunk {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientSummary {
     pub id: Uuid,
+    #[serde(default)]
+    pub selected_context_id: Option<Uuid>,
     pub selected_session_id: Option<Uuid>,
     pub following_client_id: Option<Uuid>,
     pub following_global: bool,
@@ -492,6 +496,8 @@ pub enum ResponsePayload {
         grant: AttachGrant,
     },
     AttachReady {
+        #[serde(default)]
+        context_id: Option<Uuid>,
         session_id: Uuid,
         can_write: bool,
     },
@@ -499,6 +505,8 @@ pub enum ResponsePayload {
         bytes: usize,
     },
     AttachViewportSet {
+        #[serde(default)]
+        context_id: Option<Uuid>,
         session_id: Uuid,
         cols: u16,
         rows: u16,
@@ -507,6 +515,8 @@ pub enum ResponsePayload {
         data: Vec<u8>,
     },
     AttachLayout {
+        #[serde(default)]
+        context_id: Option<Uuid>,
         session_id: Uuid,
         focused_pane_id: Uuid,
         panes: Vec<PaneSummary>,
@@ -517,6 +527,8 @@ pub enum ResponsePayload {
         chunks: Vec<AttachPaneChunk>,
     },
     AttachSnapshot {
+        #[serde(default)]
+        context_id: Option<Uuid>,
         session_id: Uuid,
         focused_pane_id: Uuid,
         panes: Vec<PaneSummary>,
@@ -596,9 +608,13 @@ pub enum Event {
     FollowTargetChanged {
         follower_client_id: Uuid,
         leader_client_id: Uuid,
+        #[serde(default)]
+        context_id: Option<Uuid>,
         session_id: Uuid,
     },
     AttachViewChanged {
+        #[serde(default)]
+        context_id: Option<Uuid>,
         session_id: Uuid,
         revision: u64,
         components: Vec<AttachViewComponent>,
@@ -670,6 +686,7 @@ mod tests {
         let pane_id = Uuid::new_v4();
         let session_id = Uuid::new_v4();
         let response = Response::Ok(ResponsePayload::AttachLayout {
+            context_id: None,
             session_id,
             focused_pane_id: pane_id,
             panes: vec![],
@@ -715,6 +732,7 @@ mod tests {
     #[test]
     fn serializes_attach_view_changed_roundtrip() {
         let event = Event::AttachViewChanged {
+            context_id: None,
             session_id: Uuid::new_v4(),
             revision: 7,
             components: vec![AttachViewComponent::Layout, AttachViewComponent::Status],
