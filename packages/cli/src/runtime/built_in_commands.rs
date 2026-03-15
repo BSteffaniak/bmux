@@ -32,6 +32,7 @@ pub enum BuiltInHandlerId {
     LogsPath,
     LogsLevel,
     LogsTail,
+    LogsWatch,
     Keymap,
     KeymapDoctor,
     Terminal,
@@ -213,6 +214,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::LogsTail,
             &["logs", "tail"],
             "Tail recent log lines",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::LogsWatch,
+            &["logs", "watch"],
+            "Interactive log viewer with live filters",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Keymap,

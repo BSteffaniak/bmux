@@ -66,6 +66,10 @@ bmux logs tail --lines 200 --no-follow
 
 # show entries newer than relative time
 bmux logs tail --since 15m
+
+# interactive watch with seed filters
+bmux logs watch --exclude "bmux server listening"
+bmux logs watch --include-i "warn|error"
 ```
 
 Logging behavior:
@@ -76,6 +80,9 @@ Logging behavior:
 - `--log-level error|warn|info|debug|trace` overrides both defaults and `--verbose`.
 - `logs path --json` and `logs level --json` return object output.
 - `logs tail --since <duration>` filters by RFC3339 timestamps in log lines (`s`, `m`, `h`, `d` units).
+- `logs watch` provides a live interactive viewer with non-destructive include/exclude filters.
+- `logs watch` filter seed flags: `--include`, `--include-i`, `--exclude`, `--exclude-i`.
+- `logs watch` keys: `a` add include, `x` add exclude, `t` toggle rule, `i` toggle per-filter case mode, `d` delete rule, `c` clear rules, `/` quick substring filter, `p` pause, `q` quit.
 
 Log/state directory conventions:
 

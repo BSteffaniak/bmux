@@ -256,6 +256,27 @@ pub enum LogsCommand {
         #[arg(long)]
         no_follow: bool,
     },
+    /// Interactive live log viewer with dynamic filters
+    Watch {
+        /// Number of recent lines to preload
+        #[arg(long, default_value_t = 200)]
+        lines: usize,
+        /// Show entries newer than a relative duration (e.g. 30s, 10m, 2h, 1d)
+        #[arg(long)]
+        since: Option<String>,
+        /// Include regex filter (case-sensitive, repeatable)
+        #[arg(long = "include")]
+        include: Vec<String>,
+        /// Include regex filter (case-insensitive, repeatable)
+        #[arg(long = "include-i")]
+        include_i: Vec<String>,
+        /// Exclude regex filter (case-sensitive, repeatable)
+        #[arg(long = "exclude")]
+        exclude: Vec<String>,
+        /// Exclude regex filter (case-insensitive, repeatable)
+        #[arg(long = "exclude-i")]
+        exclude_i: Vec<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -491,6 +512,46 @@ mod tests {
                 since: Some(ref value),
                 no_follow: false
             } if value == "15m"
+        ));
+    }
+
+    #[test]
+    fn parses_logs_watch_flags() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "logs",
+            "watch",
+            "--lines",
+            "150",
+            "--since",
+            "2h",
+            "--include",
+            "server.*listening",
+            "--include-i",
+            "warn",
+            "--exclude",
+            "healthcheck",
+            "--exclude-i",
+            "noise",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Logs { command }) = cli.command else {
+            panic!("expected logs subcommand");
+        };
+        assert!(matches!(
+            command,
+            LogsCommand::Watch {
+                lines: 150,
+                since: Some(ref value),
+                include,
+                include_i,
+                exclude,
+                exclude_i,
+            } if value == "2h"
+                && include == vec!["server.*listening"]
+                && include_i == vec!["warn"]
+                && exclude == vec!["healthcheck"]
+                && exclude_i == vec!["noise"]
         ));
     }
 

@@ -26,14 +26,17 @@ use bmux_plugin::{
 };
 use bmux_server::BmuxServer;
 use clap::{CommandFactory, FromArgMatches};
-use crossterm::cursor::{MoveTo, SavePosition, Show};
+use crossterm::cursor::{Hide, MoveTo, SavePosition, Show};
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::execute;
 use crossterm::queue;
 use crossterm::style::Print;
 use crossterm::terminal;
-use crossterm::terminal::{Clear, ClearType};
+use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use regex::{Regex, RegexBuilder};
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Read, Seek, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
@@ -823,6 +826,7 @@ fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
             LogsCommand::Path { .. } => BuiltInHandlerId::LogsPath,
             LogsCommand::Level { .. } => BuiltInHandlerId::LogsLevel,
             LogsCommand::Tail { .. } => BuiltInHandlerId::LogsTail,
+            LogsCommand::Watch { .. } => BuiltInHandlerId::LogsWatch,
         },
         Command::Keymap { .. } => BuiltInHandlerId::KeymapDoctor,
         Command::Terminal { command } => match command {
@@ -1003,6 +1007,27 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                     },
             },
         ) => run_logs_tail(*lines, since.as_deref(), !*no_follow),
+        (
+            BuiltInHandlerId::LogsWatch,
+            Command::Logs {
+                command:
+                    LogsCommand::Watch {
+                        lines,
+                        since,
+                        include,
+                        include_i,
+                        exclude,
+                        exclude_i,
+                    },
+            },
+        ) => run_logs_watch(
+            *lines,
+            since.as_deref(),
+            include,
+            include_i,
+            exclude,
+            exclude_i,
+        ),
         (
             BuiltInHandlerId::KeymapDoctor,
             Command::Keymap {
@@ -2208,6 +2233,79 @@ fn run_logs_path(as_json: bool) -> Result<u8> {
     Ok(0)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogFilterKind {
+    Include,
+    Exclude,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LogFilterCaseMode {
+    Sensitive,
+    Insensitive,
+}
+
+#[derive(Debug, Clone)]
+struct LogFilterRule {
+    kind: LogFilterKind,
+    pattern: String,
+    case_mode: LogFilterCaseMode,
+    enabled: bool,
+    regex: std::result::Result<Regex, String>,
+}
+
+impl LogFilterRule {
+    fn new(kind: LogFilterKind, pattern: String, case_mode: LogFilterCaseMode) -> Self {
+        let regex = compile_filter_regex(&pattern, case_mode);
+        Self {
+            kind,
+            pattern,
+            case_mode,
+            enabled: true,
+            regex,
+        }
+    }
+
+    fn matches(&self, line: &str) -> bool {
+        if !self.enabled {
+            return false;
+        }
+        self.regex.as_ref().is_ok_and(|regex| regex.is_match(line))
+    }
+
+    fn has_error(&self) -> bool {
+        self.regex.is_err()
+    }
+
+    fn toggle_case_mode(&mut self) {
+        self.case_mode = match self.case_mode {
+            LogFilterCaseMode::Sensitive => LogFilterCaseMode::Insensitive,
+            LogFilterCaseMode::Insensitive => LogFilterCaseMode::Sensitive,
+        };
+        self.regex = compile_filter_regex(&self.pattern, self.case_mode);
+    }
+}
+
+struct LogWatchUiGuard;
+
+impl LogWatchUiGuard {
+    fn activate() -> Result<Self> {
+        enable_raw_mode().context("failed enabling raw mode for logs watch")?;
+        let mut stdout = io::stdout();
+        execute!(stdout, EnterAlternateScreen, Hide)
+            .context("failed entering alternate screen for logs watch")?;
+        Ok(Self)
+    }
+}
+
+impl Drop for LogWatchUiGuard {
+    fn drop(&mut self) {
+        let mut stdout = io::stdout();
+        let _ = execute!(stdout, Show, LeaveAlternateScreen);
+        let _ = disable_raw_mode();
+    }
+}
+
 fn run_logs_level(as_json: bool) -> Result<u8> {
     let level = EFFECTIVE_LOG_LEVEL.get().copied().unwrap_or(Level::INFO);
     let value = match level {
@@ -2290,6 +2388,482 @@ fn run_logs_tail(lines: usize, since: Option<&str>, follow: bool) -> Result<u8> 
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+fn run_logs_watch(
+    lines: usize,
+    since: Option<&str>,
+    include: &[String],
+    include_i: &[String],
+    exclude: &[String],
+    exclude_i: &[String],
+) -> Result<u8> {
+    const WATCH_BUFFER_LIMIT: usize = 20_000;
+
+    let since_cutoff = match since {
+        Some(value) => Some(parse_since_cutoff(value)?),
+        None => None,
+    };
+    let mut filters = seed_watch_filters(include, include_i, exclude, exclude_i);
+    let mut selected_filter = 0_usize;
+    let mut status_message = String::new();
+    let mut quick_filter: Option<String> = None;
+    let mut paused = false;
+
+    let mut active_path = active_log_file_path();
+    let mut entries = VecDeque::new();
+    let mut pending_fragment = String::new();
+    let mut read_offset = 0_u64;
+
+    if active_path.exists() {
+        preload_watch_entries(
+            &active_path,
+            &mut entries,
+            lines,
+            since_cutoff,
+            WATCH_BUFFER_LIMIT,
+        )?;
+    }
+
+    let mut log_file = open_log_watch_file(&active_path)?;
+    if let Some(file) = log_file.as_mut() {
+        read_offset = file
+            .metadata()
+            .with_context(|| format!("failed reading metadata for {}", active_path.display()))?
+            .len();
+    }
+
+    let _ui_guard = LogWatchUiGuard::activate()?;
+    loop {
+        let newest_path = active_log_file_path();
+        if newest_path != active_path {
+            active_path = newest_path;
+            log_file = open_log_watch_file(&active_path)?;
+            read_offset = 0;
+            pending_fragment.clear();
+            status_message = format!("switched to {}", active_path.display());
+        }
+
+        if !paused {
+            if log_file.is_none() {
+                log_file = open_log_watch_file(&active_path)?;
+                if log_file.is_some() {
+                    status_message = format!("opened {}", active_path.display());
+                }
+            }
+
+            if let Some(file) = log_file.as_mut()
+                && let Some(new_lines) = read_watch_log_delta(
+                    file,
+                    &active_path,
+                    &mut read_offset,
+                    &mut pending_fragment,
+                )?
+            {
+                for line in new_lines {
+                    if line_matches_since(&line, since_cutoff) {
+                        entries.push_back(line);
+                    }
+                }
+                while entries.len() > WATCH_BUFFER_LIMIT {
+                    let _ = entries.pop_front();
+                }
+            }
+        }
+
+        render_logs_watch(
+            &active_path,
+            &entries,
+            &filters,
+            selected_filter,
+            quick_filter.as_deref(),
+            paused,
+            &status_message,
+        )?;
+
+        if !event::poll(Duration::from_millis(120)).context("failed polling logs watch input")? {
+            continue;
+        }
+        let Event::Key(key) = event::read().context("failed reading logs watch input")? else {
+            continue;
+        };
+        if key.kind != KeyEventKind::Press {
+            continue;
+        }
+
+        match key.code {
+            KeyCode::Char('q') => break,
+            KeyCode::Char('p') => {
+                paused = !paused;
+                status_message = if paused {
+                    "paused ingest".to_string()
+                } else {
+                    "resumed ingest".to_string()
+                };
+            }
+            KeyCode::Char('a') => {
+                if let Some(pattern) = prompt_logs_watch_line("Add include regex: ")? {
+                    filters.push(LogFilterRule::new(
+                        LogFilterKind::Include,
+                        pattern,
+                        LogFilterCaseMode::Sensitive,
+                    ));
+                    selected_filter = filters.len().saturating_sub(1);
+                }
+            }
+            KeyCode::Char('x') => {
+                if let Some(pattern) = prompt_logs_watch_line("Add exclude regex: ")? {
+                    filters.push(LogFilterRule::new(
+                        LogFilterKind::Exclude,
+                        pattern,
+                        LogFilterCaseMode::Sensitive,
+                    ));
+                    selected_filter = filters.len().saturating_sub(1);
+                }
+            }
+            KeyCode::Char('/') => {
+                quick_filter = prompt_logs_watch_line("Quick substring filter (empty clears): ")?;
+            }
+            KeyCode::Char('c') => {
+                filters.clear();
+                selected_filter = 0;
+                quick_filter = None;
+                status_message = "cleared filters".to_string();
+            }
+            KeyCode::Char('t') => {
+                if let Some(filter) = filters.get_mut(selected_filter) {
+                    filter.enabled = !filter.enabled;
+                }
+            }
+            KeyCode::Char('i') => {
+                if let Some(filter) = filters.get_mut(selected_filter) {
+                    filter.toggle_case_mode();
+                }
+            }
+            KeyCode::Char('d') => {
+                if selected_filter < filters.len() {
+                    let _ = filters.remove(selected_filter);
+                    if selected_filter >= filters.len() {
+                        selected_filter = filters.len().saturating_sub(1);
+                    }
+                }
+            }
+            KeyCode::Up => {
+                selected_filter = selected_filter.saturating_sub(1);
+            }
+            KeyCode::Down => {
+                if selected_filter + 1 < filters.len() {
+                    selected_filter += 1;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(0)
+}
+
+fn seed_watch_filters(
+    include: &[String],
+    include_i: &[String],
+    exclude: &[String],
+    exclude_i: &[String],
+) -> Vec<LogFilterRule> {
+    let mut filters = Vec::new();
+    filters.extend(include.iter().cloned().map(|pattern| {
+        LogFilterRule::new(
+            LogFilterKind::Include,
+            pattern,
+            LogFilterCaseMode::Sensitive,
+        )
+    }));
+    filters.extend(include_i.iter().cloned().map(|pattern| {
+        LogFilterRule::new(
+            LogFilterKind::Include,
+            pattern,
+            LogFilterCaseMode::Insensitive,
+        )
+    }));
+    filters.extend(exclude.iter().cloned().map(|pattern| {
+        LogFilterRule::new(
+            LogFilterKind::Exclude,
+            pattern,
+            LogFilterCaseMode::Sensitive,
+        )
+    }));
+    filters.extend(exclude_i.iter().cloned().map(|pattern| {
+        LogFilterRule::new(
+            LogFilterKind::Exclude,
+            pattern,
+            LogFilterCaseMode::Insensitive,
+        )
+    }));
+    filters
+}
+
+fn compile_filter_regex(
+    pattern: &str,
+    case_mode: LogFilterCaseMode,
+) -> std::result::Result<Regex, String> {
+    let mut builder = RegexBuilder::new(pattern);
+    builder.unicode(false);
+    if matches!(case_mode, LogFilterCaseMode::Insensitive) {
+        builder.case_insensitive(true);
+    }
+    builder.build().map_err(|error| error.to_string())
+}
+
+fn open_log_watch_file(path: &std::path::Path) -> Result<Option<std::fs::File>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(path)
+        .with_context(|| format!("failed opening log file {}", path.display()))?;
+    Ok(Some(file))
+}
+
+fn preload_watch_entries(
+    path: &std::path::Path,
+    entries: &mut VecDeque<String>,
+    lines: usize,
+    since_cutoff: Option<OffsetDateTime>,
+    max_entries: usize,
+) -> Result<()> {
+    let content = std::fs::read_to_string(path)
+        .with_context(|| format!("failed reading log file {}", path.display()))?;
+    for line in content.lines() {
+        if line_matches_since(line, since_cutoff) {
+            entries.push_back(line.to_string());
+        }
+    }
+    while entries.len() > max_entries {
+        let _ = entries.pop_front();
+    }
+    if entries.len() > lines {
+        let drop = entries.len().saturating_sub(lines);
+        for _ in 0..drop {
+            let _ = entries.pop_front();
+        }
+    }
+    Ok(())
+}
+
+fn read_watch_log_delta(
+    file: &mut std::fs::File,
+    path: &std::path::Path,
+    read_offset: &mut u64,
+    pending_fragment: &mut String,
+) -> Result<Option<Vec<String>>> {
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("failed reading metadata for {}", path.display()))?;
+    let file_len = metadata.len();
+    if file_len < *read_offset {
+        *read_offset = 0;
+    }
+    if file_len == *read_offset {
+        return Ok(None);
+    }
+
+    file.seek(std::io::SeekFrom::Start(*read_offset))
+        .with_context(|| format!("failed seeking {}", path.display()))?;
+    let mut chunk = String::new();
+    file.read_to_string(&mut chunk)
+        .with_context(|| format!("failed reading appended logs from {}", path.display()))?;
+    *read_offset = file_len;
+
+    pending_fragment.push_str(&chunk);
+    let mut complete = Vec::new();
+    let ends_with_newline = pending_fragment.ends_with('\n');
+    for segment in pending_fragment.split('\n') {
+        complete.push(segment.to_string());
+    }
+    if !ends_with_newline {
+        let last = complete.pop().unwrap_or_default();
+        *pending_fragment = last;
+    } else {
+        pending_fragment.clear();
+    }
+    if let Some(last) = complete.last()
+        && last.is_empty()
+    {
+        let _ = complete.pop();
+    }
+    Ok(Some(complete))
+}
+
+fn line_visible_in_watch(
+    line: &str,
+    filters: &[LogFilterRule],
+    quick_filter: Option<&str>,
+) -> bool {
+    if let Some(quick) = quick_filter
+        && !quick.is_empty()
+        && !line.contains(quick)
+    {
+        return false;
+    }
+
+    let include_filters = filters
+        .iter()
+        .filter(|rule| rule.enabled && matches!(rule.kind, LogFilterKind::Include))
+        .collect::<Vec<_>>();
+    if !include_filters.is_empty() && !include_filters.iter().any(|rule| rule.matches(line)) {
+        return false;
+    }
+
+    !filters.iter().any(|rule| {
+        rule.enabled && matches!(rule.kind, LogFilterKind::Exclude) && rule.matches(line)
+    })
+}
+
+fn render_logs_watch(
+    active_path: &std::path::Path,
+    entries: &VecDeque<String>,
+    filters: &[LogFilterRule],
+    selected_filter: usize,
+    quick_filter: Option<&str>,
+    paused: bool,
+    status_message: &str,
+) -> Result<()> {
+    let mut stdout = io::stdout();
+    let (cols, rows) = terminal::size().unwrap_or((120, 40));
+    let usable_rows = rows.saturating_sub(4) as usize;
+
+    let mut visible_lines = Vec::new();
+    for line in entries {
+        if line_visible_in_watch(line, filters, quick_filter) {
+            visible_lines.push(line.as_str());
+        }
+    }
+
+    let start = visible_lines.len().saturating_sub(usable_rows.max(1));
+    queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))
+        .context("failed clearing logs watch screen")?;
+
+    let mode = if paused { "PAUSED" } else { "LIVE" };
+    let status_line = format!(
+        "bmux logs watch [{mode}] file={} total={} visible={}",
+        active_path.display(),
+        entries.len(),
+        visible_lines.len()
+    );
+    queue!(
+        stdout,
+        MoveTo(0, 0),
+        Print(truncate_display(&status_line, cols as usize))
+    )
+    .context("failed rendering logs watch header")?;
+
+    let controls = "keys: q quit | p pause | a add include | x add exclude | t toggle | i case | d delete | c clear | / search";
+    queue!(
+        stdout,
+        MoveTo(0, 1),
+        Print(truncate_display(controls, cols as usize))
+    )
+    .context("failed rendering logs watch controls")?;
+
+    for (row, line) in visible_lines[start..].iter().enumerate() {
+        queue!(
+            stdout,
+            MoveTo(0, (row + 2) as u16),
+            Print(truncate_display(line, cols as usize))
+        )
+        .context("failed rendering logs watch lines")?;
+    }
+
+    let filter_summary = if filters.is_empty() {
+        "filters: (none)".to_string()
+    } else {
+        let mut parts = Vec::new();
+        for (index, filter) in filters.iter().enumerate() {
+            let marker = if index == selected_filter { '>' } else { ' ' };
+            let enabled = if filter.enabled { "on" } else { "off" };
+            let kind = match filter.kind {
+                LogFilterKind::Include => "+",
+                LogFilterKind::Exclude => "-",
+            };
+            let case = match filter.case_mode {
+                LogFilterCaseMode::Sensitive => "CS",
+                LogFilterCaseMode::Insensitive => "CI",
+            };
+            let error = if filter.has_error() { " !" } else { "" };
+            parts.push(format!(
+                "{marker}{kind}[{enabled}|{case}]/{pattern}{error}",
+                pattern = filter.pattern
+            ));
+        }
+        format!("filters: {}", parts.join("  "))
+    };
+    queue!(
+        stdout,
+        MoveTo(0, rows.saturating_sub(2)),
+        Print(truncate_display(&filter_summary, cols as usize))
+    )
+    .context("failed rendering logs watch filters")?;
+
+    let footer = if status_message.is_empty() {
+        match quick_filter {
+            Some(value) if !value.is_empty() => format!("quick filter: {value}"),
+            _ => "".to_string(),
+        }
+    } else {
+        status_message.to_string()
+    };
+    queue!(
+        stdout,
+        MoveTo(0, rows.saturating_sub(1)),
+        Print(truncate_display(&footer, cols as usize))
+    )
+    .context("failed rendering logs watch footer")?;
+
+    stdout
+        .flush()
+        .context("failed flushing logs watch render")?;
+    Ok(())
+}
+
+fn truncate_display(value: &str, max_len: usize) -> String {
+    if value.chars().count() <= max_len {
+        return value.to_string();
+    }
+    let mut output = String::new();
+    for (index, char) in value.chars().enumerate() {
+        if index + 1 >= max_len {
+            break;
+        }
+        output.push(char);
+    }
+    output.push('~');
+    output
+}
+
+fn prompt_logs_watch_line(prompt: &str) -> Result<Option<String>> {
+    disable_raw_mode().context("failed disabling raw mode for prompt")?;
+    {
+        let mut stdout = io::stdout();
+        execute!(stdout, Show).context("failed showing cursor for prompt")?;
+        print!("\r\n{prompt}");
+        stdout.flush().context("failed flushing prompt")?;
+    }
+
+    let mut input = String::new();
+    let read_result = std::io::stdin().read_line(&mut input);
+
+    {
+        let mut stdout = io::stdout();
+        execute!(stdout, Hide).context("failed hiding cursor after prompt")?;
+    }
+    enable_raw_mode().context("failed re-enabling raw mode after prompt")?;
+    read_result.context("failed reading prompt input")?;
+
+    let trimmed = input.trim().to_string();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(trimmed))
 }
 
 fn active_log_file_path() -> PathBuf {
@@ -8151,6 +8725,65 @@ mod tests {
         assert!(!super::line_matches_since(
             "INFO missing timestamp",
             Some(cutoff)
+        ));
+    }
+
+    #[test]
+    fn compile_filter_regex_supports_case_modes() {
+        let sensitive = super::compile_filter_regex("error", super::LogFilterCaseMode::Sensitive)
+            .expect("sensitive regex should compile");
+        let insensitive =
+            super::compile_filter_regex("error", super::LogFilterCaseMode::Insensitive)
+                .expect("insensitive regex should compile");
+
+        assert!(sensitive.is_match("error line"));
+        assert!(!sensitive.is_match("ERROR line"));
+        assert!(insensitive.is_match("ERROR line"));
+    }
+
+    #[test]
+    fn line_visible_in_watch_respects_include_and_exclude_rules() {
+        let filters = vec![
+            super::LogFilterRule::new(
+                super::LogFilterKind::Include,
+                "server".to_string(),
+                super::LogFilterCaseMode::Sensitive,
+            ),
+            super::LogFilterRule::new(
+                super::LogFilterKind::Exclude,
+                "listening".to_string(),
+                super::LogFilterCaseMode::Sensitive,
+            ),
+        ];
+
+        assert!(!super::line_visible_in_watch(
+            "INFO bmux server listening",
+            &filters,
+            None
+        ));
+        assert!(super::line_visible_in_watch(
+            "INFO bmux server started",
+            &filters,
+            None
+        ));
+        assert!(!super::line_visible_in_watch(
+            "INFO unrelated",
+            &filters,
+            None
+        ));
+    }
+
+    #[test]
+    fn line_visible_in_watch_supports_quick_filter() {
+        assert!(super::line_visible_in_watch(
+            "INFO subsystem ready",
+            &[],
+            Some("subsystem")
+        ));
+        assert!(!super::line_visible_in_watch(
+            "INFO subsystem ready",
+            &[],
+            Some("error")
         ));
     }
 }

@@ -67,6 +67,7 @@ bmux logs tail
 bmux logs path --json
 bmux logs level --json
 bmux logs tail --since 15m --lines 200
+bmux logs watch --exclude "bmux server listening"
 ```
 
 Top-level and grouped command forms are supported in many areas of the CLI.
