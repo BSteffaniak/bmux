@@ -2195,7 +2195,7 @@ async fn run_server_stop() -> Result<u8> {
 }
 
 fn run_logs_path(as_json: bool) -> Result<u8> {
-    let path = log_file_path();
+    let path = active_log_file_path();
     if as_json {
         println!(
             "{}",
@@ -2230,9 +2230,12 @@ fn run_logs_level(as_json: bool) -> Result<u8> {
 }
 
 fn run_logs_tail(lines: usize, since: Option<&str>, follow: bool) -> Result<u8> {
-    let path = log_file_path();
+    let path = active_log_file_path();
     if !path.exists() {
-        println!("no log file at {}", path.display());
+        println!(
+            "no log file in {} (expected prefix: bmux.log)",
+            ConfigPaths::default().logs_dir().display()
+        );
         return Ok(0);
     }
 
@@ -2289,8 +2292,35 @@ fn run_logs_tail(lines: usize, since: Option<&str>, follow: bool) -> Result<u8> 
     }
 }
 
-fn log_file_path() -> PathBuf {
-    ConfigPaths::default().logs_dir().join("bmux.log")
+fn active_log_file_path() -> PathBuf {
+    let logs_dir = ConfigPaths::default().logs_dir();
+    let mut newest: Option<(std::time::SystemTime, PathBuf)> = None;
+
+    if let Ok(entries) = std::fs::read_dir(&logs_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(file_name) = path.file_name().and_then(|value| value.to_str()) else {
+                continue;
+            };
+            if !file_name.starts_with("bmux.log") {
+                continue;
+            }
+            let Ok(metadata) = entry.metadata() else {
+                continue;
+            };
+            let Ok(modified) = metadata.modified() else {
+                continue;
+            };
+            match &newest {
+                Some((latest_modified, _)) if modified <= *latest_modified => {}
+                _ => newest = Some((modified, path)),
+            }
+        }
+    }
+
+    newest
+        .map(|(_, path)| path)
+        .unwrap_or_else(|| logs_dir.join("bmux.log"))
 }
 
 fn parse_since_cutoff(raw: &str) -> Result<OffsetDateTime> {
