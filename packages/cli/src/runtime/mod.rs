@@ -2541,17 +2541,12 @@ async fn run_session_attach_with_client(
     let self_client_id = client.whoami().await.map_err(map_attach_client_error)?;
 
     let attach_info = if let Some(leader_client_id) = follow_target_id {
-        let target = resolve_follow_target(&mut client, leader_client_id)
+        let context_id = resolve_follow_target_context(&mut client, leader_client_id)
             .await
             .map_err(map_attach_client_error)?;
-        match target {
-            FollowTarget::Context(context_id) => open_attach_for_context(&mut client, context_id)
-                .await
-                .map_err(map_attach_client_error)?,
-            FollowTarget::Session(session_id) => open_attach_for_session(&mut client, session_id)
-                .await
-                .map_err(map_attach_client_error)?,
-        }
+        open_attach_for_context(&mut client, context_id)
+            .await
+            .map_err(map_attach_client_error)?
     } else {
         let target = target.expect("target is present when not follow");
         let grant = client
@@ -4035,30 +4030,34 @@ fn short_uuid(id: Uuid) -> String {
     id.to_string().chars().take(8).collect()
 }
 
-enum FollowTarget {
-    Context(Uuid),
-    Session(Uuid),
-}
-
-async fn resolve_follow_target(
+async fn resolve_follow_target_context(
     client: &mut BmuxClient,
     leader_client_id: Uuid,
-) -> std::result::Result<FollowTarget, ClientError> {
+) -> std::result::Result<Uuid, ClientError> {
     let clients = client.list_clients().await?;
-    let client = clients
+    let leader = clients
         .into_iter()
         .find(|entry| entry.id == leader_client_id)
         .ok_or(ClientError::UnexpectedResponse("follow target not found"))?;
 
-    if let Some(context_id) = client.selected_context_id {
-        return Ok(FollowTarget::Context(context_id));
+    if let Some(context_id) = leader.selected_context_id {
+        return Ok(context_id);
     }
-    if let Some(session_id) = client.selected_session_id {
-        return Ok(FollowTarget::Session(session_id));
+
+    if let Some(session_id) = leader.selected_session_id {
+        let contexts = client.list_contexts().await?;
+        if let Some(context) = contexts.into_iter().find(|context| {
+            context
+                .attributes
+                .get("bmux.session_id")
+                .is_some_and(|value| value == &session_id.to_string())
+        }) {
+            return Ok(context.id);
+        }
     }
 
     Err(ClientError::UnexpectedResponse(
-        "follow target has no selected context or session",
+        "follow target has no selected context",
     ))
 }
 

@@ -569,6 +569,14 @@ impl ContextState {
         self.session_by_context.get(&selected).copied()
     }
 
+    fn context_for_session(&self, session_id: SessionId) -> Option<Uuid> {
+        self.session_by_context
+            .iter()
+            .find_map(|(context_id, mapped_session_id)| {
+                (*mapped_session_id == session_id).then_some(*context_id)
+            })
+    }
+
     fn select_for_client(
         &mut self,
         client_id: ClientId,
@@ -698,6 +706,11 @@ fn current_context_id_for_client(state: &Arc<ServerState>, client_id: ClientId) 
     context_state
         .current_for_client(client_id)
         .map(|context| context.id)
+}
+
+fn current_context_id_for_session(state: &Arc<ServerState>, session_id: SessionId) -> Option<Uuid> {
+    let context_state = state.context_state.lock().ok()?;
+    context_state.context_for_session(session_id)
 }
 
 fn create_session_runtime(state: &Arc<ServerState>, name: Option<String>) -> Result<SessionId> {
@@ -2639,7 +2652,7 @@ fn emit_attach_view_changed(
     emit_event(
         state,
         Event::AttachViewChanged {
-            context_id: None,
+            context_id: current_context_id_for_session(state, session_id),
             session_id: session_id.0,
             revision,
             components,
@@ -2758,7 +2771,7 @@ fn persist_selected_session(
             Event::FollowTargetChanged {
                 follower_client_id: update.follower_client_id.0,
                 leader_client_id: update.leader_client_id.0,
-                context_id: None,
+                context_id: current_context_id_for_client(state, update.leader_client_id),
                 session_id: update.session_id.0,
             },
         )?;
@@ -4204,7 +4217,7 @@ async fn handle_request(
                     Event::FollowTargetChanged {
                         follower_client_id: client_id.0,
                         leader_client_id: leader_client_id.0,
-                        context_id: None,
+                        context_id: current_context_id_for_client(state, leader_client_id),
                         session_id: session_id.0,
                     },
                 )?;
