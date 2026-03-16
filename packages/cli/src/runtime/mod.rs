@@ -40,7 +40,7 @@ use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
-use tracing::{Level, warn};
+use tracing::{Level, debug, trace, warn};
 use uuid::Uuid;
 
 use bmux_server::ServiceInvokeContext;
@@ -2869,7 +2869,18 @@ async fn run_session_attach_with_client(
         }
 
         let _ = view_state.clear_expired_transient_status(Instant::now());
-        refresh_attached_session_from_context(&mut client, &mut view_state).await?;
+        if let Err(error) =
+            refresh_attached_session_from_context(&mut client, &mut view_state).await
+        {
+            view_state.set_transient_status(
+                format!(
+                    "context refresh delayed: {}",
+                    map_attach_client_error(error)
+                ),
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+        }
 
         let mut frame_needs_render = view_state.dirty.status_needs_redraw
             || view_state.dirty.full_pane_redraw
@@ -3021,36 +3032,86 @@ async fn apply_plugin_command_outcome(
     client: &mut BmuxClient,
     view_state: &mut AttachViewState,
     outcome: PluginCommandOutcome,
-) -> std::result::Result<(), ClientError> {
+) -> std::result::Result<bool, ClientError> {
+    let mut applied = false;
+    trace!(
+        effect_count = outcome.effects.len(),
+        attached_context_id = ?view_state.attached_context_id,
+        attached_session_id = %view_state.attached_id,
+        "attach.plugin_outcome.received"
+    );
     for effect in outcome.effects {
         match effect {
             PluginCommandEffect::SelectContext { context_id } => {
-                let _ = client
-                    .select_context(ContextSelector::ById(context_id))
-                    .await?;
-                let attach_info = open_attach_for_context(client, context_id).await?;
-                view_state.attached_id = attach_info.session_id;
-                view_state.attached_context_id = attach_info.context_id;
-                view_state.can_write = attach_info.can_write;
-                update_attach_viewport(client, view_state.attached_id).await?;
-                hydrate_attach_state_from_snapshot(client, view_state).await?;
-                view_state.ui_mode = AttachUiMode::Normal;
-                let status = attach_context_status(
-                    client,
-                    view_state.attached_context_id,
-                    view_state.attached_id,
-                )
-                .await?;
-                set_attach_context_status(
-                    view_state,
-                    status,
-                    Instant::now(),
-                    ATTACH_TRANSIENT_STATUS_TTL,
+                debug!(
+                    target_context_id = %context_id,
+                    attached_context_id = ?view_state.attached_context_id,
+                    attached_session_id = %view_state.attached_id,
+                    "attach.plugin_outcome.select_context"
                 );
+                retarget_attach_to_context(client, view_state, context_id).await?;
+                applied = true;
             }
         }
     }
+    Ok(applied)
+}
+
+async fn retarget_attach_to_context(
+    client: &mut BmuxClient,
+    view_state: &mut AttachViewState,
+    context_id: Uuid,
+) -> std::result::Result<(), ClientError> {
+    let started_at = Instant::now();
+    debug!(
+        from_context_id = ?view_state.attached_context_id,
+        from_session_id = %view_state.attached_id,
+        to_context_id = %context_id,
+        "attach.retarget.start"
+    );
+    let _ = client
+        .select_context(ContextSelector::ById(context_id))
+        .await?;
+    let attach_info = open_attach_for_context(client, context_id).await?;
+    view_state.attached_id = attach_info.session_id;
+    view_state.attached_context_id = attach_info.context_id.or(Some(context_id));
+    view_state.can_write = attach_info.can_write;
+    update_attach_viewport(client, view_state.attached_id).await?;
+    hydrate_attach_state_from_snapshot(client, view_state).await?;
+    view_state.ui_mode = AttachUiMode::Normal;
+    let status = attach_context_status(
+        client,
+        view_state.attached_context_id,
+        view_state.attached_id,
+    )
+    .await?;
+    set_attach_context_status(
+        view_state,
+        status,
+        Instant::now(),
+        ATTACH_TRANSIENT_STATUS_TTL,
+    );
+    debug!(
+        to_context_id = ?view_state.attached_context_id,
+        to_session_id = %view_state.attached_id,
+        can_write = view_state.can_write,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "attach.retarget.done"
+    );
     Ok(())
+}
+
+fn plugin_fallback_retarget_context_id(
+    before_context_id: Option<Uuid>,
+    after_context_id: Option<Uuid>,
+    attached_context_id: Option<Uuid>,
+    outcome_applied: bool,
+) -> Option<Uuid> {
+    if outcome_applied {
+        return None;
+    }
+    after_context_id
+        .filter(|after| Some(*after) != before_context_id && Some(*after) != attached_context_id)
 }
 
 async fn handle_attach_ui_action(
@@ -4328,11 +4389,25 @@ async fn refresh_attached_session_from_context(
     view_state: &mut AttachViewState,
 ) -> std::result::Result<(), ClientError> {
     if let Some(context_id) = view_state.attached_context_id {
+        trace!(
+            context_id = %context_id,
+            current_session_id = %view_state.attached_id,
+            "attach.context_refresh.start"
+        );
+        let started_at = Instant::now();
         let grant = client
             .attach_context_grant(ContextSelector::ById(context_id))
             .await?;
+        let previous_session_id = view_state.attached_id;
         view_state.attached_id = grant.session_id;
         view_state.attached_context_id = grant.context_id.or(Some(context_id));
+        trace!(
+            context_id = ?view_state.attached_context_id,
+            previous_session_id = %previous_session_id,
+            refreshed_session_id = %view_state.attached_id,
+            elapsed_ms = started_at.elapsed().as_millis(),
+            "attach.context_refresh.done"
+        );
     }
     Ok(())
 }
@@ -4847,7 +4922,7 @@ async fn handle_attach_server_event(
                 return Ok(AttachLoopControl::Continue);
             };
             view_state.attached_id = attach_info.session_id;
-            view_state.attached_context_id = attach_info.context_id;
+            view_state.attached_context_id = attach_info.context_id.or(context_id);
             view_state.can_write = attach_info.can_write;
             update_attach_viewport(client, view_state.attached_id).await?;
             hydrate_attach_state_from_snapshot(client, view_state)
@@ -4947,7 +5022,16 @@ async fn handle_attach_terminal_event(
     view_state: &mut AttachViewState,
 ) -> Result<AttachLoopControl> {
     if matches!(terminal_event, Event::Resize(_, _)) {
-        refresh_attached_session_from_context(client, view_state).await?;
+        if let Err(error) = refresh_attached_session_from_context(client, view_state).await {
+            view_state.set_transient_status(
+                format!(
+                    "context refresh delayed: {}",
+                    map_attach_client_error(error)
+                ),
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+        }
         update_attach_viewport(client, view_state.attached_id).await?;
     }
 
@@ -5008,7 +5092,18 @@ async fn handle_attach_terminal_event(
                     continue;
                 }
                 if view_state.can_write {
-                    refresh_attached_session_from_context(client, view_state).await?;
+                    if let Err(error) =
+                        refresh_attached_session_from_context(client, view_state).await
+                    {
+                        view_state.set_transient_status(
+                            format!(
+                                "context refresh delayed: {}",
+                                map_attach_client_error(error)
+                            ),
+                            Instant::now(),
+                            ATTACH_TRANSIENT_STATUS_TTL,
+                        );
+                    }
                     match client.attach_input(view_state.attached_id, bytes).await {
                         Ok(_) => {}
                         Err(error) if is_attach_stream_closed_error(&error) => {
@@ -5038,8 +5133,26 @@ async fn handle_attach_terminal_event(
                 if view_state.help_overlay_open {
                     continue;
                 }
+                let before_context_id = match client.current_context().await {
+                    Ok(context) => context.map(|entry| entry.id),
+                    Err(_) => None,
+                };
+                debug!(
+                    plugin_id = %plugin_id,
+                    command_name = %command_name,
+                    before_context_id = ?before_context_id,
+                    attached_context_id = ?view_state.attached_context_id,
+                    attached_session_id = %view_state.attached_id,
+                    "attach.plugin_command.start"
+                );
                 match run_plugin_keybinding_command(&plugin_id, &command_name, &[]) {
                     Err(error) => {
+                        warn!(
+                            plugin_id = %plugin_id,
+                            command_name = %command_name,
+                            error = %error,
+                            "attach.plugin_command.run_failed"
+                        );
                         view_state.set_transient_status(
                             format!("plugin action failed: {error}"),
                             Instant::now(),
@@ -5047,20 +5160,89 @@ async fn handle_attach_terminal_event(
                         );
                     }
                     Ok(outcome) => {
-                        if let Err(error) =
-                            apply_plugin_command_outcome(client, view_state, outcome).await
-                        {
+                        let effect_count = outcome.effects.len();
+                        let outcome_applied =
+                            match apply_plugin_command_outcome(client, view_state, outcome).await {
+                                Ok(applied) => applied,
+                                Err(error) => {
+                                    view_state.set_transient_status(
+                                        format!(
+                                            "plugin outcome apply failed: {}",
+                                            map_attach_client_error(error)
+                                        ),
+                                        Instant::now(),
+                                        ATTACH_TRANSIENT_STATUS_TTL,
+                                    );
+                                    attach_input_processor
+                                        .set_scroll_mode(view_state.scrollback_active);
+                                    continue;
+                                }
+                            };
+
+                        let after_context_id = match client.current_context().await {
+                            Ok(context) => context.map(|entry| entry.id),
+                            Err(_) => None,
+                        };
+                        debug!(
+                            plugin_id = %plugin_id,
+                            command_name = %command_name,
+                            effect_count,
+                            outcome_applied,
+                            before_context_id = ?before_context_id,
+                            after_context_id = ?after_context_id,
+                            attached_context_id = ?view_state.attached_context_id,
+                            attached_session_id = %view_state.attached_id,
+                            "attach.plugin_command.outcome"
+                        );
+
+                        if let Some(fallback_context_id) = plugin_fallback_retarget_context_id(
+                            before_context_id,
+                            after_context_id,
+                            view_state.attached_context_id,
+                            outcome_applied,
+                        ) {
+                            debug!(
+                                plugin_id = %plugin_id,
+                                command_name = %command_name,
+                                fallback_context_id = %fallback_context_id,
+                                "attach.plugin_command.fallback_retarget"
+                            );
+                            if let Err(error) =
+                                retarget_attach_to_context(client, view_state, fallback_context_id)
+                                    .await
+                            {
+                                warn!(
+                                    plugin_id = %plugin_id,
+                                    command_name = %command_name,
+                                    fallback_context_id = %fallback_context_id,
+                                    error = %error,
+                                    "attach.plugin_command.fallback_retarget_failed"
+                                );
+                                view_state.set_transient_status(
+                                    format!(
+                                        "plugin fallback retarget failed: {}",
+                                        map_attach_client_error(error)
+                                    ),
+                                    Instant::now(),
+                                    ATTACH_TRANSIENT_STATUS_TTL,
+                                );
+                                attach_input_processor
+                                    .set_scroll_mode(view_state.scrollback_active);
+                                continue;
+                            }
                             view_state.set_transient_status(
                                 format!(
-                                    "plugin outcome apply failed: {}",
-                                    map_attach_client_error(error)
+                                    "plugin action: {plugin_id}:{command_name} (fallback retarget)"
                                 ),
                                 Instant::now(),
                                 ATTACH_TRANSIENT_STATUS_TTL,
                             );
+                            view_state.dirty.layout_needs_refresh = true;
+                            view_state.dirty.full_pane_redraw = true;
                             attach_input_processor.set_scroll_mode(view_state.scrollback_active);
                             continue;
                         }
+
                         view_state.set_transient_status(
                             format!("plugin action: {plugin_id}:{command_name}"),
                             Instant::now(),
@@ -7802,6 +7984,30 @@ mod tests {
         assert_eq!(
             super::relative_session_id(&sessions, session_b, 1),
             Some(session_a)
+        );
+    }
+
+    #[test]
+    fn plugin_fallback_retarget_context_id_returns_changed_context_when_no_effect_applied() {
+        let before = Some(Uuid::from_u128(1));
+        let after = Some(Uuid::from_u128(2));
+        let attached = Some(Uuid::from_u128(1));
+
+        assert_eq!(
+            super::plugin_fallback_retarget_context_id(before, after, attached, false),
+            after
+        );
+    }
+
+    #[test]
+    fn plugin_fallback_retarget_context_id_ignores_when_outcome_already_applied() {
+        let before = Some(Uuid::from_u128(1));
+        let after = Some(Uuid::from_u128(2));
+        let attached = Some(Uuid::from_u128(2));
+
+        assert_eq!(
+            super::plugin_fallback_retarget_context_id(before, after, attached, true),
+            None
         );
     }
 

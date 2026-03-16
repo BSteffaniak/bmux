@@ -18,7 +18,7 @@ use bmux_ipc::{
 use std::collections::BTreeMap;
 use std::time::Duration;
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
 /// Result type for client operations.
@@ -306,31 +306,89 @@ impl BmuxClient {
     /// Returns an error if transport/protocol validation fails.
     pub async fn request_raw(&mut self, request: Request) -> Result<Response> {
         let request_id = self.take_request_id();
+        let request_kind = request_kind_name(&request);
+        let timeout_ms = self.timeout.as_millis();
+        let started_at = std::time::Instant::now();
+        debug!(
+            request_id,
+            request = request_kind,
+            timeout_ms,
+            "ipc.request.start"
+        );
         let payload = encode(&request)?;
         let envelope = Envelope::new(request_id, EnvelopeKind::Request, payload);
 
         tokio::time::timeout(self.timeout, self.stream.send_envelope(&envelope))
             .await
-            .map_err(|_| ClientError::Timeout(self.timeout))??;
+            .map_err(|_| {
+                warn!(
+                    request_id,
+                    request = request_kind,
+                    timeout_ms,
+                    phase = "send",
+                    duration_ms = started_at.elapsed().as_millis(),
+                    "ipc.request.timeout"
+                );
+                ClientError::Timeout(self.timeout)
+            })??;
+
+        trace!(
+            request_id,
+            request = request_kind,
+            duration_ms = started_at.elapsed().as_millis(),
+            "ipc.request.sent"
+        );
 
         let response_envelope = tokio::time::timeout(self.timeout, self.stream.recv_envelope())
             .await
-            .map_err(|_| ClientError::Timeout(self.timeout))??;
+            .map_err(|_| {
+                warn!(
+                    request_id,
+                    request = request_kind,
+                    timeout_ms,
+                    phase = "recv",
+                    duration_ms = started_at.elapsed().as_millis(),
+                    "ipc.request.timeout"
+                );
+                ClientError::Timeout(self.timeout)
+            })??;
 
         if response_envelope.request_id != request_id {
+            warn!(
+                request_id,
+                request = request_kind,
+                actual_request_id = response_envelope.request_id,
+                duration_ms = started_at.elapsed().as_millis(),
+                "ipc.request.id_mismatch"
+            );
             return Err(ClientError::RequestIdMismatch {
                 expected: request_id,
                 actual: response_envelope.request_id,
             });
         }
         if response_envelope.kind != EnvelopeKind::Response {
+            warn!(
+                request_id,
+                request = request_kind,
+                actual_kind = ?response_envelope.kind,
+                duration_ms = started_at.elapsed().as_millis(),
+                "ipc.request.unexpected_envelope_kind"
+            );
             return Err(ClientError::UnexpectedEnvelopeKind {
                 expected: EnvelopeKind::Response,
                 actual: response_envelope.kind,
             });
         }
 
-        decode(&response_envelope.payload).map_err(ClientError::from)
+        let response: Response = decode(&response_envelope.payload).map_err(ClientError::from)?;
+        debug!(
+            request_id,
+            request = request_kind,
+            response = response_kind_name(&response),
+            duration_ms = started_at.elapsed().as_millis(),
+            "ipc.request.done"
+        );
+        Ok(response)
     }
 
     /// Return whether this principal can use force-local kill bypass.
@@ -1007,6 +1065,95 @@ impl BmuxClient {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
         request_id
+    }
+}
+
+fn request_kind_name(request: &Request) -> &'static str {
+    match request {
+        Request::Hello { .. } => "hello",
+        Request::Ping => "ping",
+        Request::WhoAmI => "whoami",
+        Request::WhoAmIPrincipal => "whoami_principal",
+        Request::ServerStatus => "server_status",
+        Request::ServerSave => "server_save",
+        Request::ServerRestoreDryRun => "server_restore_dry_run",
+        Request::ServerRestoreApply => "server_restore_apply",
+        Request::ServerStop => "server_stop",
+        Request::InvokeService { .. } => "invoke_service",
+        Request::NewSession { .. } => "new_session",
+        Request::ListSessions => "list_sessions",
+        Request::ListClients => "list_clients",
+        Request::CreateContext { .. } => "create_context",
+        Request::ListContexts => "list_contexts",
+        Request::SelectContext { .. } => "select_context",
+        Request::CloseContext { .. } => "close_context",
+        Request::CurrentContext => "current_context",
+        Request::KillSession { .. } => "kill_session",
+        Request::ListPanes { .. } => "list_panes",
+        Request::SplitPane { .. } => "split_pane",
+        Request::FocusPane { .. } => "focus_pane",
+        Request::ResizePane { .. } => "resize_pane",
+        Request::ClosePane { .. } => "close_pane",
+        Request::FollowClient { .. } => "follow_client",
+        Request::Unfollow => "unfollow",
+        Request::Attach { .. } => "attach",
+        Request::AttachContext { .. } => "attach_context",
+        Request::AttachOpen { .. } => "attach_open",
+        Request::AttachInput { .. } => "attach_input",
+        Request::AttachSetViewport { .. } => "attach_set_viewport",
+        Request::AttachOutput { .. } => "attach_output",
+        Request::AttachLayout { .. } => "attach_layout",
+        Request::AttachSnapshot { .. } => "attach_snapshot",
+        Request::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
+        Request::Detach => "detach",
+        Request::SubscribeEvents => "subscribe_events",
+        Request::PollEvents { .. } => "poll_events",
+    }
+}
+
+fn response_kind_name(response: &Response) -> &'static str {
+    match response {
+        Response::Ok(payload) => match payload {
+            ResponsePayload::Pong => "pong",
+            ResponsePayload::ClientIdentity { .. } => "client_identity",
+            ResponsePayload::PrincipalIdentity { .. } => "principal_identity",
+            ResponsePayload::ServerStatus { .. } => "server_status",
+            ResponsePayload::ServerSnapshotSaved { .. } => "server_snapshot_saved",
+            ResponsePayload::ServerSnapshotRestoreDryRun { .. } => {
+                "server_snapshot_restore_dry_run"
+            }
+            ResponsePayload::ServerSnapshotRestored { .. } => "server_snapshot_restored",
+            ResponsePayload::ServerStopping => "server_stopping",
+            ResponsePayload::ServiceInvoked { .. } => "service_invoked",
+            ResponsePayload::SessionCreated { .. } => "session_created",
+            ResponsePayload::SessionList { .. } => "session_list",
+            ResponsePayload::ClientList { .. } => "client_list",
+            ResponsePayload::ContextCreated { .. } => "context_created",
+            ResponsePayload::ContextList { .. } => "context_list",
+            ResponsePayload::ContextSelected { .. } => "context_selected",
+            ResponsePayload::ContextClosed { .. } => "context_closed",
+            ResponsePayload::CurrentContext { .. } => "current_context",
+            ResponsePayload::SessionKilled { .. } => "session_killed",
+            ResponsePayload::PaneList { .. } => "pane_list",
+            ResponsePayload::PaneSplit { .. } => "pane_split",
+            ResponsePayload::PaneFocused { .. } => "pane_focused",
+            ResponsePayload::PaneResized { .. } => "pane_resized",
+            ResponsePayload::PaneClosed { .. } => "pane_closed",
+            ResponsePayload::FollowStarted { .. } => "follow_started",
+            ResponsePayload::FollowStopped { .. } => "follow_stopped",
+            ResponsePayload::Attached { .. } => "attached",
+            ResponsePayload::AttachReady { .. } => "attach_ready",
+            ResponsePayload::AttachInputAccepted { .. } => "attach_input_accepted",
+            ResponsePayload::AttachViewportSet { .. } => "attach_viewport_set",
+            ResponsePayload::AttachOutput { .. } => "attach_output",
+            ResponsePayload::AttachLayout { .. } => "attach_layout",
+            ResponsePayload::AttachSnapshot { .. } => "attach_snapshot",
+            ResponsePayload::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
+            ResponsePayload::Detached => "detached",
+            ResponsePayload::EventsSubscribed => "events_subscribed",
+            ResponsePayload::EventBatch { .. } => "event_batch",
+        },
+        Response::Err(_) => "error",
     }
 }
 
