@@ -3224,9 +3224,13 @@ fn count_visible_watch_lines(
         .count()
 }
 
+const WATCH_STATUS_HEIGHT: u16 = 4;
+const WATCH_FILTER_HEIGHT: u16 = 5;
+const WATCH_INFO_HEIGHT: u16 = 3;
+
 fn watch_viewport_height() -> usize {
     let (_, rows) = terminal::size().unwrap_or((120, 40));
-    rows.saturating_sub(13) as usize
+    rows.saturating_sub(WATCH_STATUS_HEIGHT + WATCH_FILTER_HEIGHT + WATCH_INFO_HEIGHT) as usize
 }
 
 fn render_logs_watch(
@@ -3262,10 +3266,10 @@ fn render_logs_watch(
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length(2),
+                    Constraint::Length(WATCH_STATUS_HEIGHT),
                     Constraint::Min(5),
-                    Constraint::Length(5),
-                    Constraint::Length(3),
+                    Constraint::Length(WATCH_FILTER_HEIGHT),
+                    Constraint::Length(WATCH_INFO_HEIGHT),
                 ])
                 .split(frame.area());
 
