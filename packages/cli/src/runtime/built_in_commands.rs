@@ -33,6 +33,11 @@ pub enum BuiltInHandlerId {
     LogsLevel,
     LogsTail,
     LogsWatch,
+    LogsProfiles,
+    LogsProfilesList,
+    LogsProfilesShow,
+    LogsProfilesDelete,
+    LogsProfilesRename,
     Keymap,
     KeymapDoctor,
     Terminal,
@@ -219,6 +224,31 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::LogsWatch,
             &["logs", "watch"],
             "Interactive log viewer with live filters",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::LogsProfiles,
+            &["logs", "profiles"],
+            "Manage saved log watch profiles",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::LogsProfilesList,
+            &["logs", "profiles", "list"],
+            "List saved watch profiles",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::LogsProfilesShow,
+            &["logs", "profiles", "show"],
+            "Show details for one watch profile",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::LogsProfilesDelete,
+            &["logs", "profiles", "delete"],
+            "Delete a saved watch profile",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::LogsProfilesRename,
+            &["logs", "profiles", "rename"],
+            "Rename a saved watch profile",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Keymap,

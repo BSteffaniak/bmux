@@ -73,6 +73,12 @@ bmux logs watch --include-i "warn|error"
 
 # use named profile state
 bmux logs watch --profile incident-db
+
+# manage saved profiles
+bmux logs profiles list
+bmux logs profiles show incident-db
+bmux logs profiles rename incident-db incident-prod
+bmux logs profiles delete incident-prod
 ```
 
 Logging behavior:
@@ -87,6 +93,7 @@ Logging behavior:
 - `logs watch` filter seed flags: `--include`, `--include-i`, `--exclude`, `--exclude-i`.
 - `logs watch` saves filter/session state across runs (default global profile `default`).
 - `logs watch --profile <name>` scopes saved state to a named profile for a specific workflow.
+- `logs profiles list|show|delete|rename` manages saved watch profiles.
 - `logs watch` keys: `a` add include, `x` add exclude, `t` toggle rule, `i` toggle per-filter case mode, `d` delete rule, `c` clear rules, `/` quick substring filter, `p` pause, `q` quit.
 
 Log/state directory conventions:

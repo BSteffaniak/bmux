@@ -280,6 +280,41 @@ pub enum LogsCommand {
         #[arg(long = "exclude-i")]
         exclude_i: Vec<String>,
     },
+    /// Manage saved log watch profiles
+    Profiles {
+        #[command(subcommand)]
+        command: LogsProfilesCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum LogsProfilesCommand {
+    /// List saved watch profiles
+    List {
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show details for one profile
+    Show {
+        /// Profile name (default: global profile `default`)
+        profile: Option<String>,
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Delete a saved profile
+    Delete {
+        /// Profile name to delete
+        profile: String,
+    },
+    /// Rename a saved profile
+    Rename {
+        /// Existing profile name
+        from: String,
+        /// New profile name
+        to: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -316,8 +351,8 @@ pub enum TerminalCommand {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, KeymapCommand, LogsCommand, ServerCommand, SessionCommand, TerminalCommand,
-        TraceFamily,
+        Cli, Command, KeymapCommand, LogsCommand, LogsProfilesCommand, ServerCommand,
+        SessionCommand, TerminalCommand, TraceFamily,
     };
     use clap::Parser;
 
@@ -581,6 +616,73 @@ mod tests {
                 && include_i.is_empty()
                 && exclude.is_empty()
                 && exclude_i.is_empty()
+        ));
+    }
+
+    #[test]
+    fn parses_logs_profiles_list_json() {
+        let cli = Cli::try_parse_from(["bmux", "logs", "profiles", "list", "--json"])
+            .expect("valid CLI args");
+        let Some(Command::Logs { command }) = cli.command else {
+            panic!("expected logs subcommand");
+        };
+        assert!(matches!(
+            command,
+            LogsCommand::Profiles {
+                command: LogsProfilesCommand::List { json: true }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_logs_profiles_show_default() {
+        let cli =
+            Cli::try_parse_from(["bmux", "logs", "profiles", "show"]).expect("valid CLI args");
+        let Some(Command::Logs { command }) = cli.command else {
+            panic!("expected logs subcommand");
+        };
+        assert!(matches!(
+            command,
+            LogsCommand::Profiles {
+                command: LogsProfilesCommand::Show {
+                    profile: None,
+                    json: false
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_logs_profiles_delete_and_rename() {
+        let delete_cli = Cli::try_parse_from(["bmux", "logs", "profiles", "delete", "incident-db"])
+            .expect("valid CLI args");
+        assert!(matches!(
+            delete_cli.command,
+            Some(Command::Logs {
+                command:
+                    LogsCommand::Profiles {
+                        command: LogsProfilesCommand::Delete { profile }
+                    }
+            }) if profile == "incident-db"
+        ));
+
+        let rename_cli = Cli::try_parse_from([
+            "bmux",
+            "logs",
+            "profiles",
+            "rename",
+            "incident-db",
+            "incident-db-2",
+        ])
+        .expect("valid CLI args");
+        assert!(matches!(
+            rename_cli.command,
+            Some(Command::Logs {
+                command:
+                    LogsCommand::Profiles {
+                        command: LogsProfilesCommand::Rename { from, to }
+                    }
+            }) if from == "incident-db" && to == "incident-db-2"
         ));
     }
 

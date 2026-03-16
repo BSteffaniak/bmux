@@ -1,6 +1,6 @@
 use crate::cli::{
-    Cli, Command, KeymapCommand, LogLevel, LogsCommand, ServerCommand, SessionCommand,
-    TerminalCommand, TraceFamily,
+    Cli, Command, KeymapCommand, LogLevel, LogsCommand, LogsProfilesCommand, ServerCommand,
+    SessionCommand, TerminalCommand, TraceFamily,
 };
 use crate::connection::{
     ConnectionPolicyScope, ServerRuntimeMetadata, connect, connect_raw, current_cli_build_id,
@@ -827,6 +827,12 @@ fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
             LogsCommand::Level { .. } => BuiltInHandlerId::LogsLevel,
             LogsCommand::Tail { .. } => BuiltInHandlerId::LogsTail,
             LogsCommand::Watch { .. } => BuiltInHandlerId::LogsWatch,
+            LogsCommand::Profiles { command } => match command {
+                LogsProfilesCommand::List { .. } => BuiltInHandlerId::LogsProfilesList,
+                LogsProfilesCommand::Show { .. } => BuiltInHandlerId::LogsProfilesShow,
+                LogsProfilesCommand::Delete { .. } => BuiltInHandlerId::LogsProfilesDelete,
+                LogsProfilesCommand::Rename { .. } => BuiltInHandlerId::LogsProfilesRename,
+            },
         },
         Command::Keymap { .. } => BuiltInHandlerId::KeymapDoctor,
         Command::Terminal { command } => match command {
@@ -1030,6 +1036,42 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
             exclude,
             exclude_i,
         ),
+        (
+            BuiltInHandlerId::LogsProfilesList,
+            Command::Logs {
+                command:
+                    LogsCommand::Profiles {
+                        command: LogsProfilesCommand::List { json },
+                    },
+            },
+        ) => run_logs_profiles_list(*json),
+        (
+            BuiltInHandlerId::LogsProfilesShow,
+            Command::Logs {
+                command:
+                    LogsCommand::Profiles {
+                        command: LogsProfilesCommand::Show { profile, json },
+                    },
+            },
+        ) => run_logs_profiles_show(profile.as_deref(), *json),
+        (
+            BuiltInHandlerId::LogsProfilesDelete,
+            Command::Logs {
+                command:
+                    LogsCommand::Profiles {
+                        command: LogsProfilesCommand::Delete { profile },
+                    },
+            },
+        ) => run_logs_profiles_delete(profile),
+        (
+            BuiltInHandlerId::LogsProfilesRename,
+            Command::Logs {
+                command:
+                    LogsCommand::Profiles {
+                        command: LogsProfilesCommand::Rename { from, to },
+                    },
+            },
+        ) => run_logs_profiles_rename(from, to),
         (
             BuiltInHandlerId::KeymapDoctor,
             Command::Keymap {
@@ -2792,6 +2834,165 @@ fn persist_logs_watch_profile_state(
         },
     );
     write_logs_watch_state_file(&state)
+}
+
+fn run_logs_profiles_list(as_json: bool) -> Result<u8> {
+    let state = read_logs_watch_state_file()?;
+    let active_profile = state.active_profile.as_deref().unwrap_or("default");
+    let mut profile_names = state.profiles.keys().cloned().collect::<Vec<_>>();
+    if !profile_names.iter().any(|name| name == "default") {
+        profile_names.push("default".to_string());
+    }
+    profile_names.sort();
+
+    if as_json {
+        let payload = profile_names
+            .into_iter()
+            .map(|name| {
+                let filter_count = state
+                    .profiles
+                    .get(&name)
+                    .map_or(0, |profile| profile.filters.len());
+                let is_active = name == active_profile;
+                serde_json::json!({
+                    "name": name,
+                    "active": is_active,
+                    "filter_count": filter_count,
+                })
+            })
+            .collect::<Vec<_>>();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .context("failed encoding logs profiles list json")?
+        );
+        return Ok(0);
+    }
+
+    for name in profile_names {
+        let marker = if name == active_profile { "*" } else { " " };
+        let filter_count = state
+            .profiles
+            .get(&name)
+            .map_or(0, |profile| profile.filters.len());
+        println!("{marker} {name} ({filter_count} filters)");
+    }
+    Ok(0)
+}
+
+fn run_logs_profiles_show(profile: Option<&str>, as_json: bool) -> Result<u8> {
+    let profile_name = normalize_logs_watch_profile(profile)?;
+    let state = read_logs_watch_state_file()?;
+    let profile_state = state
+        .profiles
+        .get(&profile_name)
+        .cloned()
+        .unwrap_or_default();
+
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "name": profile_name,
+                "active": state.active_profile.as_deref() == Some(profile_name.as_str()),
+                "quick_filter": profile_state.quick_filter,
+                "since": profile_state.since,
+                "lines": profile_state.lines,
+                "selected_filter_index": profile_state.selected_filter_index,
+                "filters": profile_state.filters,
+            }))
+            .context("failed encoding logs profile json")?
+        );
+        return Ok(0);
+    }
+
+    println!("profile: {profile_name}");
+    println!(
+        "active: {}",
+        if state.active_profile.as_deref() == Some(profile_name.as_str()) {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!(
+        "lines: {}",
+        profile_state
+            .lines
+            .map_or_else(|| "(default)".to_string(), |value| value.to_string())
+    );
+    println!(
+        "since: {}",
+        profile_state.since.as_deref().unwrap_or("(none)")
+    );
+    println!(
+        "quick filter: {}",
+        profile_state.quick_filter.as_deref().unwrap_or("(none)")
+    );
+    println!("filters:");
+    if profile_state.filters.is_empty() {
+        println!("  (none)");
+    } else {
+        for filter in &profile_state.filters {
+            let kind = match filter.kind {
+                LogFilterKind::Include => "include",
+                LogFilterKind::Exclude => "exclude",
+            };
+            let case = match filter.case_mode {
+                LogFilterCaseMode::Sensitive => "case-sensitive",
+                LogFilterCaseMode::Insensitive => "case-insensitive",
+            };
+            let enabled = if filter.enabled {
+                "enabled"
+            } else {
+                "disabled"
+            };
+            println!("  - {kind} /{}/ ({case}, {enabled})", filter.pattern);
+        }
+    }
+    Ok(0)
+}
+
+fn run_logs_profiles_delete(profile: &str) -> Result<u8> {
+    let profile_name = normalize_logs_watch_profile(Some(profile))?;
+    if profile_name == "default" {
+        anyhow::bail!("cannot delete reserved profile 'default'");
+    }
+
+    let mut state = read_logs_watch_state_file()?;
+    if state.profiles.remove(&profile_name).is_none() {
+        anyhow::bail!("profile '{profile_name}' not found");
+    }
+    if state.active_profile.as_deref() == Some(profile_name.as_str()) {
+        state.active_profile = Some("default".to_string());
+    }
+    write_logs_watch_state_file(&state)?;
+    println!("deleted profile '{profile_name}'");
+    Ok(0)
+}
+
+fn run_logs_profiles_rename(from: &str, to: &str) -> Result<u8> {
+    let from_name = normalize_logs_watch_profile(Some(from))?;
+    let to_name = normalize_logs_watch_profile(Some(to))?;
+    if from_name == to_name {
+        anyhow::bail!("source and destination profile names are the same");
+    }
+
+    let mut state = read_logs_watch_state_file()?;
+    if state.profiles.contains_key(&to_name) {
+        anyhow::bail!("profile '{to_name}' already exists");
+    }
+    let profile = state
+        .profiles
+        .remove(&from_name)
+        .ok_or_else(|| anyhow::anyhow!("profile '{from_name}' not found"))?;
+    state.profiles.insert(to_name.clone(), profile);
+    if state.active_profile.as_deref() == Some(from_name.as_str()) {
+        state.active_profile = Some(to_name.clone());
+    }
+    write_logs_watch_state_file(&state)?;
+    println!("renamed profile '{from_name}' -> '{to_name}'");
+    Ok(0)
 }
 
 fn read_logs_watch_state_file() -> Result<LogsWatchStateFile> {
