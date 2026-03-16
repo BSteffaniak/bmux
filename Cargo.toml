@@ -82,6 +82,8 @@ bmux_session_models    = { version = "0.0.1-alpha.0", default-features = false, 
 bmux_terminal          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal" }
 bmux_terminal_models   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal/models" }
 bmux_terminal_protocol = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal_protocol" }
+moosicbox_log_runtime  = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "moosicbox_log_runtime", default-features = false }
+moosicbox_log_watch    = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "moosicbox_log_watch", default-features = false }
 
 # External dependencies
 anyhow = { version = "1.0.98", default-features = false }
@@ -103,13 +105,18 @@ serde_json = { version = "1.0.143", default-features = false, features = [
 ] }
 serial_test = { version = "3.4.0", default-features = false }
 thiserror = { version = "2.0.12", default-features = false }
+time = { version = "0.3.47", default-features = false }
 tokio = { version = "1.45.1", default-features = false }
 toml = { version = "0.8.23", default-features = false, features = ["display"] }
-tracing = { version = "0.1.41", default-features = false }
+tracing = { version = "0.1.44", default-features = false }
 tracing-appender = { version = "0.2.3", default-features = false }
-tracing-subscriber = { version = "0.3.19", default-features = false }
+tracing-subscriber = { version = "0.3.23", default-features = false }
 unicode-width = { version = "0.2.2", default-features = false }
 uuid = { version = "1.21.0", default-features = false }
 vt100 = { version = "0.16.2", default-features = false }
 
-[patch.crates-io]
+# [patch.crates-io]
+
+# [patch."https://github.com/MoosicBox/MoosicBox"]
+# moosicbox_log_runtime = { path = "../MoosicBox/packages/log_runtime" }
+# moosicbox_log_watch   = { path = "../MoosicBox/packages/log_watch" }

@@ -56,7 +56,7 @@ struct HostKernelConnectionGuard;
 static EFFECTIVE_LOG_LEVEL: OnceLock<Level> = OnceLock::new();
 
 #[cfg(feature = "logging")]
-static LOG_WRITER_GUARD: OnceLock<tracing_appender::non_blocking::WorkerGuard> = OnceLock::new();
+static LOG_WRITER_GUARD: OnceLock<moosicbox_log_runtime::init::LoggingHandle> = OnceLock::new();
 
 impl Drop for ServiceKernelContextGuard {
     fn drop(&mut self) {
@@ -5143,7 +5143,7 @@ fn attach_event_actions(
     match event {
         Event::Key(key) => attach_key_event_actions(key, attach_input_processor, ui_mode),
         Event::Resize(_, _) => Ok(vec![AttachEventAction::Redraw]),
-        Event::Mouse(_) | Event::FocusGained | Event::FocusLost => {
+        Event::Mouse(_) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {
             Ok(vec![AttachEventAction::Ignore])
         }
     }
@@ -6136,26 +6136,32 @@ fn init_logging(verbose: bool, cli_level: Option<LogLevel>) {
 
     #[cfg(feature = "logging")]
     {
-        let paths = ConfigPaths::default();
-        let logs_dir = paths.logs_dir();
-        if let Err(error) = std::fs::create_dir_all(&logs_dir) {
-            eprintln!(
-                "bmux warning: failed to create log directory {}: {error}",
-                logs_dir.display()
-            );
-            return;
+        let paths =
+            moosicbox_log_runtime::resolve_paths(&moosicbox_log_runtime::LogRuntimePathsConfig {
+                app_name: "bmux",
+                state_dir_env: "BMUX_STATE_DIR",
+                log_dir_env: "BMUX_LOG_DIR",
+            });
+        let runtime_level = match level {
+            LogLevel::Error => moosicbox_log_runtime::init::LogLevel::Error,
+            LogLevel::Warn => moosicbox_log_runtime::init::LogLevel::Warn,
+            LogLevel::Info => moosicbox_log_runtime::init::LogLevel::Info,
+            LogLevel::Debug => moosicbox_log_runtime::init::LogLevel::Debug,
+            LogLevel::Trace => moosicbox_log_runtime::init::LogLevel::Trace,
+        };
+        match moosicbox_log_runtime::init::init(moosicbox_log_runtime::init::InitConfig {
+            paths: &paths,
+            level: runtime_level,
+            with_target: false,
+            file_prefix: "bmux.log",
+        }) {
+            Ok(handle) => {
+                let _ = LOG_WRITER_GUARD.set(handle);
+            }
+            Err(error) => {
+                eprintln!("bmux warning: failed to initialize file logging: {error}");
+            }
         }
-
-        let file_appender = tracing_appender::rolling::daily(&logs_dir, "bmux.log");
-        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-        let _ = LOG_WRITER_GUARD.set(guard);
-
-        let _ = tracing_subscriber::fmt()
-            .with_max_level(tracing_level)
-            .with_target(false)
-            .with_ansi(false)
-            .with_writer(non_blocking)
-            .try_init();
     }
 
     #[cfg(not(feature = "logging"))]
