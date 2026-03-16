@@ -27,13 +27,19 @@ use bmux_plugin::{
 use bmux_server::BmuxServer;
 use clap::{CommandFactory, FromArgMatches};
 use crossterm::cursor::{Hide, MoveTo, SavePosition, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use crossterm::execute;
 use crossterm::queue;
 use crossterm::style::Print;
 use crossterm::terminal;
 use crossterm::terminal::{Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use regex::{Regex, RegexBuilder};
 use std::cell::RefCell;
 use std::collections::{BTreeMap, VecDeque};
@@ -2499,6 +2505,8 @@ fn run_logs_watch(
     let mut status_message = String::new();
     let mut quick_filter: Option<String> = persisted_profile.quick_filter.take();
     let mut paused = false;
+    let mut auto_follow = true;
+    let mut log_cursor = usize::MAX;
 
     let mut active_path = active_log_file_path();
     let mut entries = VecDeque::new();
@@ -2524,6 +2532,23 @@ fn run_logs_watch(
     }
 
     let _ui_guard = LogWatchUiGuard::activate()?;
+    let mut terminal =
+        Terminal::new(CrosstermBackend::new(io::stdout())).context("failed initializing TUI")?;
+
+    let save_state = |filters: &[LogFilterRule],
+                      quick_filter: Option<&str>,
+                      selected_filter: usize|
+     -> Result<()> {
+        persist_logs_watch_profile_state(
+            &profile_name,
+            filters,
+            quick_filter,
+            effective_since.as_deref(),
+            effective_lines,
+            selected_filter,
+        )
+    };
+
     loop {
         let newest_path = active_log_file_path();
         if newest_path != active_path {
@@ -2558,18 +2583,36 @@ fn run_logs_watch(
                 while entries.len() > WATCH_BUFFER_LIMIT {
                     let _ = entries.pop_front();
                 }
+                if auto_follow {
+                    log_cursor = usize::MAX;
+                }
             }
         }
 
         render_logs_watch(
+            &mut terminal,
             &active_path,
             &entries,
             &filters,
             selected_filter,
             quick_filter.as_deref(),
             paused,
+            &profile_name,
+            log_cursor,
+            auto_follow,
             &status_message,
-        )?;
+        )
+        .context("failed rendering logs watch ui")?;
+
+        let visible_count = count_visible_watch_lines(&entries, &filters, quick_filter.as_deref());
+        if visible_count == 0 {
+            log_cursor = 0;
+        } else {
+            if auto_follow || log_cursor == usize::MAX {
+                log_cursor = visible_count.saturating_sub(1);
+            }
+            log_cursor = log_cursor.min(visible_count.saturating_sub(1));
+        }
 
         if !event::poll(Duration::from_millis(120)).context("failed polling logs watch input")? {
             continue;
@@ -2581,6 +2624,7 @@ fn run_logs_watch(
             continue;
         }
 
+        let viewport = watch_viewport_height();
         match key.code {
             KeyCode::Char('q') => break,
             KeyCode::Char('p') => {
@@ -2599,14 +2643,9 @@ fn run_logs_watch(
                         LogFilterCaseMode::Sensitive,
                     ));
                     selected_filter = filters.len().saturating_sub(1);
-                    if let Err(error) = persist_logs_watch_profile_state(
-                        &profile_name,
-                        &filters,
-                        quick_filter.as_deref(),
-                        effective_since.as_deref(),
-                        effective_lines,
-                        selected_filter,
-                    ) {
+                    if let Err(error) =
+                        save_state(&filters, quick_filter.as_deref(), selected_filter)
+                    {
                         status_message = format!("failed saving watch state: {error:#}");
                     }
                 }
@@ -2619,28 +2658,16 @@ fn run_logs_watch(
                         LogFilterCaseMode::Sensitive,
                     ));
                     selected_filter = filters.len().saturating_sub(1);
-                    if let Err(error) = persist_logs_watch_profile_state(
-                        &profile_name,
-                        &filters,
-                        quick_filter.as_deref(),
-                        effective_since.as_deref(),
-                        effective_lines,
-                        selected_filter,
-                    ) {
+                    if let Err(error) =
+                        save_state(&filters, quick_filter.as_deref(), selected_filter)
+                    {
                         status_message = format!("failed saving watch state: {error:#}");
                     }
                 }
             }
             KeyCode::Char('/') => {
                 quick_filter = prompt_logs_watch_line("Quick substring filter (empty clears): ")?;
-                if let Err(error) = persist_logs_watch_profile_state(
-                    &profile_name,
-                    &filters,
-                    quick_filter.as_deref(),
-                    effective_since.as_deref(),
-                    effective_lines,
-                    selected_filter,
-                ) {
+                if let Err(error) = save_state(&filters, quick_filter.as_deref(), selected_filter) {
                     status_message = format!("failed saving watch state: {error:#}");
                 }
             }
@@ -2649,28 +2676,16 @@ fn run_logs_watch(
                 selected_filter = 0;
                 quick_filter = None;
                 status_message = "cleared filters".to_string();
-                if let Err(error) = persist_logs_watch_profile_state(
-                    &profile_name,
-                    &filters,
-                    quick_filter.as_deref(),
-                    effective_since.as_deref(),
-                    effective_lines,
-                    selected_filter,
-                ) {
+                if let Err(error) = save_state(&filters, quick_filter.as_deref(), selected_filter) {
                     status_message = format!("failed saving watch state: {error:#}");
                 }
             }
             KeyCode::Char('t') => {
                 if let Some(filter) = filters.get_mut(selected_filter) {
                     filter.enabled = !filter.enabled;
-                    if let Err(error) = persist_logs_watch_profile_state(
-                        &profile_name,
-                        &filters,
-                        quick_filter.as_deref(),
-                        effective_since.as_deref(),
-                        effective_lines,
-                        selected_filter,
-                    ) {
+                    if let Err(error) =
+                        save_state(&filters, quick_filter.as_deref(), selected_filter)
+                    {
                         status_message = format!("failed saving watch state: {error:#}");
                     }
                 }
@@ -2678,17 +2693,24 @@ fn run_logs_watch(
             KeyCode::Char('i') => {
                 if let Some(filter) = filters.get_mut(selected_filter) {
                     filter.toggle_case_mode();
-                    if let Err(error) = persist_logs_watch_profile_state(
-                        &profile_name,
-                        &filters,
-                        quick_filter.as_deref(),
-                        effective_since.as_deref(),
-                        effective_lines,
-                        selected_filter,
-                    ) {
+                    if let Err(error) =
+                        save_state(&filters, quick_filter.as_deref(), selected_filter)
+                    {
                         status_message = format!("failed saving watch state: {error:#}");
                     }
                 }
+            }
+            KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                if visible_count > 0 {
+                    auto_follow = false;
+                    log_cursor = log_cursor
+                        .saturating_add((viewport / 2).max(1))
+                        .min(visible_count.saturating_sub(1));
+                }
+            }
+            KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                auto_follow = false;
+                log_cursor = log_cursor.saturating_sub((viewport / 2).max(1));
             }
             KeyCode::Char('d') => {
                 if selected_filter < filters.len() {
@@ -2696,17 +2718,46 @@ fn run_logs_watch(
                     if selected_filter >= filters.len() {
                         selected_filter = filters.len().saturating_sub(1);
                     }
-                    if let Err(error) = persist_logs_watch_profile_state(
-                        &profile_name,
-                        &filters,
-                        quick_filter.as_deref(),
-                        effective_since.as_deref(),
-                        effective_lines,
-                        selected_filter,
-                    ) {
+                    if let Err(error) =
+                        save_state(&filters, quick_filter.as_deref(), selected_filter)
+                    {
                         status_message = format!("failed saving watch state: {error:#}");
                     }
                 }
+            }
+            KeyCode::Char('j') => {
+                if visible_count > 0 {
+                    auto_follow = false;
+                    log_cursor = log_cursor
+                        .saturating_add(1)
+                        .min(visible_count.saturating_sub(1));
+                }
+            }
+            KeyCode::Char('k') => {
+                auto_follow = false;
+                log_cursor = log_cursor.saturating_sub(1);
+            }
+            KeyCode::Char('g') => {
+                auto_follow = false;
+                log_cursor = 0;
+            }
+            KeyCode::Char('G') => {
+                auto_follow = true;
+                if visible_count > 0 {
+                    log_cursor = visible_count.saturating_sub(1);
+                }
+            }
+            KeyCode::PageDown => {
+                if visible_count > 0 {
+                    auto_follow = false;
+                    log_cursor = log_cursor
+                        .saturating_add(viewport.max(1))
+                        .min(visible_count.saturating_sub(1));
+                }
+            }
+            KeyCode::PageUp => {
+                auto_follow = false;
+                log_cursor = log_cursor.saturating_sub(viewport.max(1));
             }
             KeyCode::Up => {
                 selected_filter = selected_filter.saturating_sub(1);
@@ -2720,14 +2771,7 @@ fn run_logs_watch(
         }
     }
 
-    persist_logs_watch_profile_state(
-        &profile_name,
-        &filters,
-        quick_filter.as_deref(),
-        effective_since.as_deref(),
-        effective_lines,
-        selected_filter,
-    )?;
+    save_state(&filters, quick_filter.as_deref(), selected_filter)?;
 
     Ok(0)
 }
@@ -3169,125 +3213,137 @@ fn line_visible_in_watch(
     })
 }
 
+fn count_visible_watch_lines(
+    entries: &VecDeque<String>,
+    filters: &[LogFilterRule],
+    quick_filter: Option<&str>,
+) -> usize {
+    entries
+        .iter()
+        .filter(|line| line_visible_in_watch(line, filters, quick_filter))
+        .count()
+}
+
+fn watch_viewport_height() -> usize {
+    let (_, rows) = terminal::size().unwrap_or((120, 40));
+    rows.saturating_sub(13) as usize
+}
+
 fn render_logs_watch(
+    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     active_path: &std::path::Path,
     entries: &VecDeque<String>,
     filters: &[LogFilterRule],
     selected_filter: usize,
     quick_filter: Option<&str>,
     paused: bool,
+    profile_name: &str,
+    log_cursor: usize,
+    auto_follow: bool,
     status_message: &str,
 ) -> Result<()> {
-    let mut stdout = io::stdout();
-    let (cols, rows) = terminal::size().unwrap_or((120, 40));
-    let usable_rows = rows.saturating_sub(4) as usize;
-
-    let mut visible_lines = Vec::new();
-    for line in entries {
-        if line_visible_in_watch(line, filters, quick_filter) {
-            visible_lines.push(line.as_str());
-        }
+    let mut visible_lines = entries
+        .iter()
+        .filter(|line| line_visible_in_watch(line, filters, quick_filter))
+        .cloned()
+        .collect::<Vec<_>>();
+    if visible_lines.is_empty() {
+        visible_lines.push("(no visible log lines)".to_string());
     }
 
-    let start = visible_lines.len().saturating_sub(usable_rows.max(1));
-    queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))
-        .context("failed clearing logs watch screen")?;
+    let cursor = log_cursor.min(visible_lines.len().saturating_sub(1));
+    let viewport_height = watch_viewport_height().max(1);
+    let start = cursor.saturating_sub(viewport_height.saturating_sub(1));
+    let end = (start + viewport_height).min(visible_lines.len());
+    let visible_slice = &visible_lines[start..end];
 
-    let mode = if paused { "PAUSED" } else { "LIVE" };
-    let status_line = format!(
-        "bmux logs watch [{mode}] file={} total={} visible={}",
-        active_path.display(),
-        entries.len(),
-        visible_lines.len()
-    );
-    queue!(
-        stdout,
-        MoveTo(0, 0),
-        Print(truncate_display(&status_line, cols as usize))
-    )
-    .context("failed rendering logs watch header")?;
+    terminal
+        .draw(|frame| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(2),
+                    Constraint::Min(5),
+                    Constraint::Length(5),
+                    Constraint::Length(3),
+                ])
+                .split(frame.area());
 
-    let controls = "keys: q quit | p pause | a add include | x add exclude | t toggle | i case | d delete | c clear | / search";
-    queue!(
-        stdout,
-        MoveTo(0, 1),
-        Print(truncate_display(controls, cols as usize))
-    )
-    .context("failed rendering logs watch controls")?;
+            let mode = if paused { "PAUSED" } else { "LIVE" };
+            let follow = if auto_follow { "follow" } else { "manual" };
+            let header_text = vec![
+                Line::from(vec![
+                    Span::styled("bmux logs watch", Style::default().fg(Color::Cyan)),
+                    Span::raw(format!(
+                        "  [{mode}] [{follow}] profile={} total={} visible={} file={}",
+                        profile_name,
+                        entries.len(),
+                        visible_lines.len(),
+                        active_path.display()
+                    )),
+                ]),
+                Line::from(
+                    "keys: q quit | p pause | j/k move | g/G top/bottom | ctrl-u/d half-page | pgup/pgdn page | a/x add | t toggle | i case | d delete | c clear | / search",
+                ),
+            ];
+            let header = Paragraph::new(header_text)
+                .block(Block::default().borders(Borders::ALL).title("Status"));
+            frame.render_widget(header, chunks[0]);
 
-    for (row, line) in visible_lines[start..].iter().enumerate() {
-        queue!(
-            stdout,
-            MoveTo(0, (row + 2) as u16),
-            Print(truncate_display(line, cols as usize))
-        )
-        .context("failed rendering logs watch lines")?;
-    }
+            let log_items = visible_slice
+                .iter()
+                .map(|line| ListItem::new(line.clone()))
+                .collect::<Vec<_>>();
+            let logs_block = List::new(log_items)
+                .block(Block::default().borders(Borders::ALL).title("Logs"));
+            frame.render_widget(logs_block, chunks[1]);
 
-    let filter_summary = if filters.is_empty() {
-        "filters: (none)".to_string()
-    } else {
-        let mut parts = Vec::new();
-        for (index, filter) in filters.iter().enumerate() {
-            let marker = if index == selected_filter { '>' } else { ' ' };
-            let enabled = if filter.enabled { "on" } else { "off" };
-            let kind = match filter.kind {
-                LogFilterKind::Include => "+",
-                LogFilterKind::Exclude => "-",
+            let filter_lines = if filters.is_empty() {
+                vec![Line::from("(none)")]
+            } else {
+                filters
+                    .iter()
+                    .enumerate()
+                    .map(|(index, filter)| {
+                        let marker = if index == selected_filter { '>' } else { ' ' };
+                        let kind = match filter.kind {
+                            LogFilterKind::Include => "+",
+                            LogFilterKind::Exclude => "-",
+                        };
+                        let enabled = if filter.enabled { "on" } else { "off" };
+                        let case = match filter.case_mode {
+                            LogFilterCaseMode::Sensitive => "CS",
+                            LogFilterCaseMode::Insensitive => "CI",
+                        };
+                        let error = if filter.has_error() { " (regex error)" } else { "" };
+                        Line::from(format!(
+                            "{marker} {kind} [{enabled}|{case}] /{}{error}",
+                            filter.pattern
+                        ))
+                    })
+                    .collect()
             };
-            let case = match filter.case_mode {
-                LogFilterCaseMode::Sensitive => "CS",
-                LogFilterCaseMode::Insensitive => "CI",
+            let filter_panel = Paragraph::new(filter_lines)
+                .block(Block::default().borders(Borders::ALL).title("Filters"));
+            frame.render_widget(filter_panel, chunks[2]);
+
+            let footer_text = if status_message.is_empty() {
+                match quick_filter {
+                    Some(value) if !value.is_empty() => {
+                        format!("quick filter: {value} | cursor: {}/{}", cursor + 1, visible_lines.len())
+                    }
+                    _ => format!("cursor: {}/{}", cursor + 1, visible_lines.len()),
+                }
+            } else {
+                status_message.to_string()
             };
-            let error = if filter.has_error() { " !" } else { "" };
-            parts.push(format!(
-                "{marker}{kind}[{enabled}|{case}]/{pattern}{error}",
-                pattern = filter.pattern
-            ));
-        }
-        format!("filters: {}", parts.join("  "))
-    };
-    queue!(
-        stdout,
-        MoveTo(0, rows.saturating_sub(2)),
-        Print(truncate_display(&filter_summary, cols as usize))
-    )
-    .context("failed rendering logs watch filters")?;
+            let footer = Paragraph::new(footer_text)
+                .block(Block::default().borders(Borders::ALL).title("Info"));
+            frame.render_widget(footer, chunks[3]);
+        })
+        .context("failed drawing logs watch terminal")?;
 
-    let footer = if status_message.is_empty() {
-        match quick_filter {
-            Some(value) if !value.is_empty() => format!("quick filter: {value}"),
-            _ => "".to_string(),
-        }
-    } else {
-        status_message.to_string()
-    };
-    queue!(
-        stdout,
-        MoveTo(0, rows.saturating_sub(1)),
-        Print(truncate_display(&footer, cols as usize))
-    )
-    .context("failed rendering logs watch footer")?;
-
-    stdout
-        .flush()
-        .context("failed flushing logs watch render")?;
     Ok(())
-}
-
-fn truncate_display(value: &str, max_len: usize) -> String {
-    if value.chars().count() <= max_len {
-        return value.to_string();
-    }
-    let mut output = String::new();
-    for (index, char) in value.chars().enumerate() {
-        if index + 1 >= max_len {
-            break;
-        }
-        output.push(char);
-    }
-    output.push('~');
-    output
 }
 
 fn prompt_logs_watch_line(prompt: &str) -> Result<Option<String>> {

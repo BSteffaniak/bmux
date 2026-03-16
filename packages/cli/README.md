@@ -94,7 +94,9 @@ Logging behavior:
 - `logs watch` saves filter/session state across runs (default global profile `default`).
 - `logs watch --profile <name>` scopes saved state to a named profile for a specific workflow.
 - `logs profiles list|show|delete|rename` manages saved watch profiles.
+- `logs watch` uses a ratatui interface for scalable log tooling.
 - `logs watch` keys: `a` add include, `x` add exclude, `t` toggle rule, `i` toggle per-filter case mode, `d` delete rule, `c` clear rules, `/` quick substring filter, `p` pause, `q` quit.
+- Vim-style navigation: `j`/`k` move, `g`/`G` top/bottom, `Ctrl-u`/`Ctrl-d` half-page, `PageUp`/`PageDown` full-page.
 
 Log/state directory conventions:
 

@@ -72,6 +72,8 @@ bmux logs watch --profile incident-db
 bmux logs profiles list
 ```
 
+`bmux logs watch` uses a ratatui interface and supports Vim-style navigation (`j`/`k`, `g`/`G`, `Ctrl-u`/`Ctrl-d`).
+
 Top-level and grouped command forms are supported in many areas of the CLI.
 
 All list commands with `--json` output a bare JSON array.
