@@ -583,7 +583,13 @@ impl ContextState {
             .selected_by_client
             .get(&client_id)
             .copied()
-            .or_else(|| self.mru_contexts.front().copied())?;
+            .filter(|id| self.contexts.contains_key(id))
+            .or_else(|| {
+                self.mru_contexts
+                    .iter()
+                    .copied()
+                    .find(|id| self.contexts.contains_key(id))
+            })?;
         self.contexts.get(&selected).map(Self::to_summary)
     }
 
@@ -592,7 +598,13 @@ impl ContextState {
             .selected_by_client
             .get(&client_id)
             .copied()
-            .or_else(|| self.mru_contexts.front().copied())?;
+            .filter(|id| self.contexts.contains_key(id))
+            .or_else(|| {
+                self.mru_contexts
+                    .iter()
+                    .copied()
+                    .find(|id| self.contexts.contains_key(id))
+            })?;
         self.session_by_context.get(&selected).copied()
     }
 
@@ -625,36 +637,23 @@ impl ContextState {
         _force: bool,
     ) -> std::result::Result<(Uuid, Option<SessionId>), &'static str> {
         let id = self.resolve_id(selector)?;
-        let removed = self.contexts.remove(&id).ok_or("context not found")?;
-        let removed_session = self.session_by_context.remove(&id);
-        self.mru_contexts.retain(|entry| *entry != id);
+        self.remove_context_by_id(id, Some(client_id))
+            .ok_or("context not found")
+    }
 
-        let replacement = self
-            .mru_contexts
+    fn remove_contexts_for_session(&mut self, session_id: SessionId) -> Vec<Uuid> {
+        let context_ids = self
+            .session_by_context
             .iter()
-            .copied()
-            .find(|candidate| self.contexts.contains_key(candidate));
-
-        let impacted = self
-            .selected_by_client
-            .iter()
-            .filter_map(|(id_key, selected)| (*selected == removed.id).then_some(*id_key))
+            .filter_map(|(context_id, mapped)| (*mapped == session_id).then_some(*context_id))
             .collect::<Vec<_>>();
-        for impacted_client in impacted {
-            if let Some(next_id) = replacement {
-                self.selected_by_client.insert(impacted_client, next_id);
-            } else {
-                self.selected_by_client.remove(&impacted_client);
+        let mut removed = Vec::with_capacity(context_ids.len());
+        for context_id in context_ids {
+            if let Some((removed_id, _)) = self.remove_context_by_id(context_id, None) {
+                removed.push(removed_id);
             }
         }
-
-        if self.selected_by_client.get(&client_id).is_none()
-            && let Some(next_id) = replacement
-        {
-            self.selected_by_client.insert(client_id, next_id);
-        }
-
-        Ok((removed.id, removed_session))
+        removed
     }
 
     fn bind_session(
@@ -708,6 +707,44 @@ impl ContextState {
         self.mru_contexts.push_front(id);
     }
 
+    fn remove_context_by_id(
+        &mut self,
+        context_id: Uuid,
+        preferred_client: Option<ClientId>,
+    ) -> Option<(Uuid, Option<SessionId>)> {
+        let removed = self.contexts.remove(&context_id)?;
+        let removed_session = self.session_by_context.remove(&context_id);
+        self.mru_contexts.retain(|entry| *entry != context_id);
+
+        let replacement = self
+            .mru_contexts
+            .iter()
+            .copied()
+            .find(|candidate| self.contexts.contains_key(candidate));
+
+        let impacted = self
+            .selected_by_client
+            .iter()
+            .filter_map(|(id_key, selected)| (*selected == removed.id).then_some(*id_key))
+            .collect::<Vec<_>>();
+        for impacted_client in impacted {
+            if let Some(next_id) = replacement {
+                self.selected_by_client.insert(impacted_client, next_id);
+            } else {
+                self.selected_by_client.remove(&impacted_client);
+            }
+        }
+
+        if let Some(client_id) = preferred_client
+            && self.selected_by_client.get(&client_id).is_none()
+            && let Some(next_id) = replacement
+        {
+            self.selected_by_client.insert(client_id, next_id);
+        }
+
+        Some((removed.id, removed_session))
+    }
+
     fn to_summary(context: &RuntimeContext) -> ContextSummary {
         ContextSummary {
             id: context.id,
@@ -735,6 +772,17 @@ fn current_context_session_for_client(
 ) -> Option<SessionId> {
     let context_state = state.context_state.lock().ok()?;
     context_state.current_session_for_client(client_id)
+}
+
+fn prune_context_mappings_for_session(
+    state: &Arc<ServerState>,
+    session_id: SessionId,
+) -> Result<Vec<Uuid>> {
+    let mut context_state = state
+        .context_state
+        .lock()
+        .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
+    Ok(context_state.remove_contexts_for_session(session_id))
 }
 
 fn create_session_runtime(state: &Arc<ServerState>, name: Option<String>) -> Result<SessionId> {
@@ -3395,6 +3443,8 @@ async fn reap_closed_active_pane(
             .lock()
             .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
         let _ = manager.remove_session(&removed_session_id);
+        drop(manager);
+        let _ = prune_context_mappings_for_session(state, removed_session_id)?;
         if *selected_session == Some(removed_session_id) {
             *selected_session = None;
             persist_selected_session(state, client_id, None)?;
@@ -3402,7 +3452,6 @@ async fn reap_closed_active_pane(
         if *attached_stream_session == Some(removed_session_id) {
             *attached_stream_session = None;
         }
-        drop(manager);
 
         let mut attach_tokens = state
             .attach_tokens
@@ -3466,6 +3515,7 @@ async fn reap_exited_pane(
             .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
         let _ = manager.remove_session(&removed_session_id);
         drop(manager);
+        let _ = prune_context_mappings_for_session(state, removed_session_id)?;
 
         let mut attach_tokens = state
             .attach_tokens
@@ -3543,6 +3593,8 @@ async fn ensure_attach_session_exists(
     if let Some(removed_runtime) = removed_runtime {
         shutdown_runtime_handle(removed_runtime).await;
     }
+
+    let _ = prune_context_mappings_for_session(state, session_id)?;
 
     Ok(false)
 }
@@ -3980,6 +4032,8 @@ async fn handle_request(
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
                 let _ = manager.remove_session(&removed_session_id);
+                drop(manager);
+                let _ = prune_context_mappings_for_session(state, removed_session_id)?;
                 if *selected_session == Some(removed_session_id) {
                     *selected_session = None;
                     persist_selected_session(state, client_id, None)?;
@@ -3987,7 +4041,6 @@ async fn handle_request(
                 if *attached_stream_session == Some(removed_session_id) {
                     *attached_stream_session = None;
                 }
-                drop(manager);
 
                 let mut attach_tokens = state
                     .attach_tokens
@@ -4234,6 +4287,8 @@ async fn handle_request(
                         message: format!("failed removing session {}", session_id.0),
                     }));
                 }
+                drop(manager);
+                let _ = prune_context_mappings_for_session(state, session_id)?;
                 if *selected_session == Some(session_id) {
                     *selected_session = None;
                     persist_selected_session(state, client_id, None)?;
@@ -4241,7 +4296,6 @@ async fn handle_request(
                 if *attached_stream_session == Some(session_id) {
                     *attached_stream_session = None;
                 }
-                drop(manager);
 
                 let mut runtime_manager = state
                     .session_runtimes
@@ -4403,10 +4457,14 @@ async fn handle_request(
                     grant.context_id = current_context_id_for_client(state, client_id);
                     Response::Ok(ResponsePayload::Attached { grant })
                 }
-                None => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session not found: {}", next_session_id.0),
-                }),
+                None => {
+                    drop(manager);
+                    let _ = prune_context_mappings_for_session(state, next_session_id)?;
+                    Response::Err(ErrorResponse {
+                        code: ErrorCode::NotFound,
+                        message: format!("session not found: {}", next_session_id.0),
+                    })
+                }
             }
         }
         Request::AttachContext { selector } => {
@@ -4461,10 +4519,14 @@ async fn handle_request(
                     grant.context_id = Some(selected_context_id);
                     Response::Ok(ResponsePayload::Attached { grant })
                 }
-                None => Response::Err(ErrorResponse {
-                    code: ErrorCode::NotFound,
-                    message: format!("session not found: {}", next_session_id.0),
-                }),
+                None => {
+                    drop(manager);
+                    let _ = prune_context_mappings_for_session(state, next_session_id)?;
+                    Response::Err(ErrorResponse {
+                        code: ErrorCode::NotFound,
+                        message: format!("session not found: {}", next_session_id.0),
+                    })
+                }
             }
         }
         Request::AttachOpen {
@@ -5745,6 +5807,157 @@ mod tests {
             },
         )
         .await;
+    }
+
+    #[test]
+    fn remove_contexts_for_session_clears_mapping_and_reselects_client() {
+        let client_id = ClientId::new();
+        let mut context_state = ContextState::default();
+
+        let first = context_state.create(client_id, Some("first".to_string()), BTreeMap::new());
+        let first_session_id = SessionId::new();
+        context_state
+            .bind_session(first.id, first_session_id)
+            .expect("first context should bind to session");
+
+        let second = context_state.create(client_id, Some("second".to_string()), BTreeMap::new());
+        let second_session_id = SessionId::new();
+        context_state
+            .bind_session(second.id, second_session_id)
+            .expect("second context should bind to session");
+
+        let _ = context_state
+            .select_for_client(client_id, &ContextSelector::ById(first.id))
+            .expect("selecting first context should succeed");
+
+        let removed = context_state.remove_contexts_for_session(first_session_id);
+        assert_eq!(removed, vec![first.id]);
+        assert!(
+            context_state
+                .context_for_session(first_session_id)
+                .is_none()
+        );
+        assert_eq!(
+            context_state
+                .current_for_client(client_id)
+                .map(|context| context.id),
+            Some(second.id)
+        );
+        assert_eq!(
+            context_state.current_session_for_client(client_id),
+            Some(second_session_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn attach_context_prunes_stale_context_session_mapping() {
+        let server = BmuxServer::new(test_endpoint());
+        let client_id = ClientId::new();
+        let principal_id = Uuid::new_v4();
+        let mut selected_session = None;
+        let mut attached_stream_session = None;
+
+        let created = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::CreateContext {
+                name: Some("stale".to_string()),
+                attributes: BTreeMap::new(),
+            },
+        )
+        .await;
+        let context_id = match created {
+            Response::Ok(ResponsePayload::ContextCreated { context }) => context.id,
+            response => panic!("expected context created response, got {response:?}"),
+        };
+
+        let mapped_session_id = {
+            let context_state = server
+                .state
+                .context_state
+                .lock()
+                .expect("context state lock should succeed");
+            context_state
+                .session_by_context
+                .get(&context_id)
+                .copied()
+                .expect("created context should have session mapping")
+        };
+
+        {
+            let mut manager = server
+                .state
+                .session_manager
+                .lock()
+                .expect("session manager lock should succeed");
+            let _ = manager.remove_session(&mapped_session_id);
+        }
+
+        {
+            let mut runtimes = server
+                .state
+                .session_runtimes
+                .lock()
+                .expect("session runtime manager lock should succeed");
+            let _ = runtimes.remove_runtime(mapped_session_id);
+        }
+
+        let first_attach = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::AttachContext {
+                selector: ContextSelector::ById(context_id),
+            },
+        )
+        .await;
+        match first_attach {
+            Response::Err(error) => {
+                assert_eq!(error.code, ErrorCode::NotFound);
+                assert!(error.message.starts_with("session not found:"));
+            }
+            response => panic!("expected attach context not found response, got {response:?}"),
+        }
+
+        let current = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::CurrentContext,
+        )
+        .await;
+        match current {
+            Response::Ok(ResponsePayload::CurrentContext { context }) => {
+                assert!(context.is_none());
+            }
+            response => panic!("expected current context response, got {response:?}"),
+        }
+
+        let second_attach = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::AttachContext {
+                selector: ContextSelector::ById(context_id),
+            },
+        )
+        .await;
+        match second_attach {
+            Response::Err(error) => {
+                assert_eq!(error.code, ErrorCode::NotFound);
+                assert_eq!(error.message, "context not found");
+            }
+            response => panic!("expected attach context not found response, got {response:?}"),
+        }
     }
 
     #[tokio::test]

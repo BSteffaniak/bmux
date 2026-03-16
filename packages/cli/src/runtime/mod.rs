@@ -1823,9 +1823,8 @@ fn run_plugin_keybinding_command(
     plugin_id: &str,
     command_name: &str,
     args: &[String],
-) -> Result<PluginCommandOutcome> {
-    let execution = run_plugin_command_internal(plugin_id, command_name, args)?;
-    Ok(execution.outcome)
+) -> Result<PluginCommandExecution> {
+    run_plugin_command_internal(plugin_id, command_name, args)
 }
 
 struct PluginCommandExecution {
@@ -5159,25 +5158,53 @@ async fn handle_attach_terminal_event(
                             ATTACH_TRANSIENT_STATUS_TTL,
                         );
                     }
-                    Ok(outcome) => {
-                        let effect_count = outcome.effects.len();
-                        let outcome_applied =
-                            match apply_plugin_command_outcome(client, view_state, outcome).await {
-                                Ok(applied) => applied,
-                                Err(error) => {
-                                    view_state.set_transient_status(
-                                        format!(
-                                            "plugin outcome apply failed: {}",
-                                            map_attach_client_error(error)
-                                        ),
-                                        Instant::now(),
-                                        ATTACH_TRANSIENT_STATUS_TTL,
-                                    );
-                                    attach_input_processor
-                                        .set_scroll_mode(view_state.scrollback_active);
-                                    continue;
-                                }
-                            };
+                    Ok(execution) => {
+                        let status = execution.status;
+                        let effect_count = execution.outcome.effects.len();
+                        if status != 0 {
+                            warn!(
+                                plugin_id = %plugin_id,
+                                command_name = %command_name,
+                                status,
+                                effect_count,
+                                before_context_id = ?before_context_id,
+                                attached_context_id = ?view_state.attached_context_id,
+                                attached_session_id = %view_state.attached_id,
+                                "attach.plugin_command.nonzero_status"
+                            );
+                            view_state.set_transient_status(
+                                format!(
+                                    "plugin action failed ({plugin_id}:{command_name}) exit {status}"
+                                ),
+                                Instant::now(),
+                                ATTACH_TRANSIENT_STATUS_TTL,
+                            );
+                            attach_input_processor.set_scroll_mode(view_state.scrollback_active);
+                            continue;
+                        }
+
+                        let outcome_applied = match apply_plugin_command_outcome(
+                            client,
+                            view_state,
+                            execution.outcome,
+                        )
+                        .await
+                        {
+                            Ok(applied) => applied,
+                            Err(error) => {
+                                view_state.set_transient_status(
+                                    format!(
+                                        "plugin outcome apply failed: {}",
+                                        map_attach_client_error(error)
+                                    ),
+                                    Instant::now(),
+                                    ATTACH_TRANSIENT_STATUS_TTL,
+                                );
+                                attach_input_processor
+                                    .set_scroll_mode(view_state.scrollback_active);
+                                continue;
+                            }
+                        };
 
                         let after_context_id = match client.current_context().await {
                             Ok(context) => context.map(|entry| entry.id),
