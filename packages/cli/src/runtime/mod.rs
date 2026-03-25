@@ -3113,6 +3113,36 @@ fn plugin_fallback_retarget_context_id(
         .filter(|after| Some(*after) != before_context_id && Some(*after) != attached_context_id)
 }
 
+fn plugin_fallback_new_context_id(
+    before_context_ids: Option<&std::collections::BTreeSet<Uuid>>,
+    after_context_ids: Option<&std::collections::BTreeSet<Uuid>>,
+    attached_context_id: Option<Uuid>,
+    after_context_id: Option<Uuid>,
+    outcome_applied: bool,
+) -> Option<Uuid> {
+    if outcome_applied {
+        return None;
+    }
+    let (Some(before), Some(after)) = (before_context_ids, after_context_ids) else {
+        return None;
+    };
+
+    let mut new_context_ids = after
+        .difference(before)
+        .copied()
+        .filter(|context_id| Some(*context_id) != attached_context_id)
+        .collect::<Vec<_>>();
+
+    if new_context_ids.is_empty() {
+        return None;
+    }
+    if new_context_ids.len() == 1 {
+        return new_context_ids.pop();
+    }
+
+    after_context_id.filter(|context_id| new_context_ids.contains(context_id))
+}
+
 async fn handle_attach_ui_action(
     client: &mut BmuxClient,
     action: RuntimeAction,
@@ -5136,6 +5166,12 @@ async fn handle_attach_terminal_event(
                     Ok(context) => context.map(|entry| entry.id),
                     Err(_) => None,
                 };
+                let before_context_ids = client.list_contexts().await.ok().map(|contexts| {
+                    contexts
+                        .into_iter()
+                        .map(|context| context.id)
+                        .collect::<std::collections::BTreeSet<_>>()
+                });
                 debug!(
                     plugin_id = %plugin_id,
                     command_name = %command_name,
@@ -5210,6 +5246,12 @@ async fn handle_attach_terminal_event(
                             Ok(context) => context.map(|entry| entry.id),
                             Err(_) => None,
                         };
+                        let after_context_ids = client.list_contexts().await.ok().map(|contexts| {
+                            contexts
+                                .into_iter()
+                                .map(|context| context.id)
+                                .collect::<std::collections::BTreeSet<_>>()
+                        });
                         debug!(
                             plugin_id = %plugin_id,
                             command_name = %command_name,
@@ -5260,6 +5302,55 @@ async fn handle_attach_terminal_event(
                             view_state.set_transient_status(
                                 format!(
                                     "plugin action: {plugin_id}:{command_name} (fallback retarget)"
+                                ),
+                                Instant::now(),
+                                ATTACH_TRANSIENT_STATUS_TTL,
+                            );
+                            view_state.dirty.layout_needs_refresh = true;
+                            view_state.dirty.full_pane_redraw = true;
+                            attach_input_processor.set_scroll_mode(view_state.scrollback_active);
+                            continue;
+                        }
+
+                        if let Some(fallback_context_id) = plugin_fallback_new_context_id(
+                            before_context_ids.as_ref(),
+                            after_context_ids.as_ref(),
+                            view_state.attached_context_id,
+                            after_context_id,
+                            outcome_applied,
+                        ) {
+                            debug!(
+                                plugin_id = %plugin_id,
+                                command_name = %command_name,
+                                fallback_context_id = %fallback_context_id,
+                                "attach.plugin_command.new_context_fallback_retarget"
+                            );
+                            if let Err(error) =
+                                retarget_attach_to_context(client, view_state, fallback_context_id)
+                                    .await
+                            {
+                                warn!(
+                                    plugin_id = %plugin_id,
+                                    command_name = %command_name,
+                                    fallback_context_id = %fallback_context_id,
+                                    error = %error,
+                                    "attach.plugin_command.new_context_fallback_retarget_failed"
+                                );
+                                view_state.set_transient_status(
+                                    format!(
+                                        "plugin new-context fallback failed: {}",
+                                        map_attach_client_error(error)
+                                    ),
+                                    Instant::now(),
+                                    ATTACH_TRANSIENT_STATUS_TTL,
+                                );
+                                attach_input_processor
+                                    .set_scroll_mode(view_state.scrollback_active);
+                                continue;
+                            }
+                            view_state.set_transient_status(
+                                format!(
+                                    "plugin action: {plugin_id}:{command_name} (new context retarget)"
                                 ),
                                 Instant::now(),
                                 ATTACH_TRANSIENT_STATUS_TTL,
@@ -8034,6 +8125,69 @@ mod tests {
 
         assert_eq!(
             super::plugin_fallback_retarget_context_id(before, after, attached, true),
+            None
+        );
+    }
+
+    #[test]
+    fn plugin_fallback_new_context_id_returns_single_new_context() {
+        let before = [Uuid::from_u128(1)]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let after = [Uuid::from_u128(1), Uuid::from_u128(2)]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            super::plugin_fallback_new_context_id(
+                Some(&before),
+                Some(&after),
+                Some(Uuid::from_u128(1)),
+                Some(Uuid::from_u128(1)),
+                false,
+            ),
+            Some(Uuid::from_u128(2))
+        );
+    }
+
+    #[test]
+    fn plugin_fallback_new_context_id_prefers_after_context_when_multiple_new() {
+        let before = [Uuid::from_u128(1)]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let after = [Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            super::plugin_fallback_new_context_id(
+                Some(&before),
+                Some(&after),
+                Some(Uuid::from_u128(1)),
+                Some(Uuid::from_u128(3)),
+                false,
+            ),
+            Some(Uuid::from_u128(3))
+        );
+    }
+
+    #[test]
+    fn plugin_fallback_new_context_id_ignores_when_outcome_applied() {
+        let before = [Uuid::from_u128(1)]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let after = [Uuid::from_u128(1), Uuid::from_u128(2)]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            super::plugin_fallback_new_context_id(
+                Some(&before),
+                Some(&after),
+                Some(Uuid::from_u128(1)),
+                Some(Uuid::from_u128(2)),
+                true,
+            ),
             None
         );
     }

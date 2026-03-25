@@ -763,18 +763,18 @@ fn handle_core_service_call(
             let response = execute_kernel_request(host_kernel_bridge, IpcRequest::ListClients)?;
             match response {
                 IpcResponsePayload::ClientList { clients } => {
-                    let current = clients
-                        .into_iter()
-                        .find(|entry| entry.id == client_id)
-                        .ok_or(PluginError::ServiceProtocol {
-                            details: "current client missing from list-clients response"
-                                .to_string(),
-                        })?;
+                    let current = clients.into_iter().find(|entry| entry.id == client_id);
                     encode_service_message(&CurrentClientResponse {
-                        id: current.id,
-                        selected_session_id: current.selected_session_id,
-                        following_client_id: current.following_client_id,
-                        following_global: current.following_global,
+                        id: client_id,
+                        selected_session_id: current
+                            .as_ref()
+                            .and_then(|entry| entry.selected_session_id),
+                        following_client_id: current
+                            .as_ref()
+                            .and_then(|entry| entry.following_client_id),
+                        following_global: current
+                            .as_ref()
+                            .is_some_and(|entry| entry.following_global),
                     })
                 }
                 _ => Err(PluginError::ServiceProtocol {
@@ -1847,8 +1847,10 @@ mod tests {
     use std::ffi::c_char;
     use std::ptr;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     static KERNEL_REQUESTS: Mutex<Vec<bmux_ipc::Request>> = Mutex::new(Vec::new());
+    static OMIT_CURRENT_CLIENT_FROM_LIST: AtomicBool = AtomicBool::new(false);
 
     const TEST_DESCRIPTOR_TEXT: &str = concat!(
         "id = \"test.plugin\"\n",
@@ -1953,8 +1955,16 @@ mod tests {
                 })
             }
             bmux_ipc::Request::ListClients => {
-                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ClientList {
-                    clients: vec![bmux_ipc::ClientSummary {
+                let clients = if OMIT_CURRENT_CLIENT_FROM_LIST.load(Ordering::SeqCst) {
+                    vec![bmux_ipc::ClientSummary {
+                        id: uuid::Uuid::from_u128(0xaaaaaaaa_aaaa_aaaa_aaaa_aaaaaaaaaaaa),
+                        selected_context_id: None,
+                        selected_session_id: None,
+                        following_client_id: None,
+                        following_global: false,
+                    }]
+                } else {
+                    vec![bmux_ipc::ClientSummary {
                         id: uuid::Uuid::from_u128(0x11111111_1111_1111_1111_111111111111),
                         selected_context_id: None,
                         selected_session_id: Some(uuid::Uuid::from_u128(
@@ -1962,8 +1972,9 @@ mod tests {
                         )),
                         following_client_id: None,
                         following_global: false,
-                    }],
-                })
+                    }]
+                };
+                bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ClientList { clients })
             }
             bmux_ipc::Request::ListContexts => {
                 bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextList {
@@ -2763,6 +2774,66 @@ minimum = "1.0"
                 .iter()
                 .any(|request| matches!(request, bmux_ipc::Request::ListClients))
         );
+    }
+
+    #[test]
+    fn command_context_current_client_tolerates_missing_list_clients_entry() {
+        KERNEL_REQUESTS
+            .lock()
+            .expect("kernel request log lock should succeed")
+            .clear();
+        OMIT_CURRENT_CLIENT_FROM_LIST.store(true, Ordering::SeqCst);
+
+        let context = super::NativeCommandContext {
+            plugin_id: "caller.plugin".to_string(),
+            command: "current-client".to_string(),
+            arguments: Vec::new(),
+            required_capabilities: vec!["bmux.clients.read".to_string()],
+            provided_capabilities: Vec::new(),
+            services: vec![crate::RegisteredService {
+                capability: crate::HostScope::new("bmux.clients.read")
+                    .expect("capability should parse"),
+                kind: crate::ServiceKind::Query,
+                interface_id: "client-query/v1".to_string(),
+                provider: crate::ProviderId::Host,
+            }],
+            available_capabilities: vec!["bmux.clients.read".to_string()],
+            enabled_plugins: Vec::new(),
+            plugin_search_roots: Vec::new(),
+            host: HostMetadata {
+                product_name: "bmux".to_string(),
+                product_version: "0.1.0".to_string(),
+                plugin_api_version: ApiVersion::new(1, 0),
+                plugin_abi_version: ApiVersion::new(1, 0),
+            },
+            connection: crate::HostConnectionInfo {
+                config_dir: "/config".to_string(),
+                runtime_dir: "/runtime".to_string(),
+                data_dir: "/data".to_string(),
+            },
+            settings: None,
+            plugin_settings_map: BTreeMap::new(),
+            host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
+        };
+
+        let response: crate::CurrentClientResponse = context
+            .call_service(
+                "bmux.clients.read",
+                crate::ServiceKind::Query,
+                "client-query/v1",
+                "current",
+                &(),
+            )
+            .expect("core client query should succeed when list-clients omits current client");
+        assert_eq!(
+            response.id,
+            uuid::Uuid::from_u128(0x11111111_1111_1111_1111_111111111111)
+        );
+        assert_eq!(response.selected_session_id, None);
+        assert_eq!(response.following_client_id, None);
+        assert!(!response.following_global);
+
+        OMIT_CURRENT_CLIENT_FROM_LIST.store(false, Ordering::SeqCst);
     }
 
     #[test]

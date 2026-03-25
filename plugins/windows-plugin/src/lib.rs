@@ -460,8 +460,8 @@ fn switch_window(
             selector: ContextSelector::ById(context_id),
         })
         .map_err(|error| error.to_string())?;
-    let client = caller.current_client().map_err(|error| error.to_string())?;
-    if let Some(previous) = previous_context
+    if let Ok(client) = caller.current_client()
+        && let Some(previous) = previous_context
         && previous != context_id
     {
         last_selected_by_client.insert(client.id, previous);
@@ -495,13 +495,15 @@ fn cycle_window(
         .iter()
         .position(|context| context.id == current_context)
         .unwrap_or(0);
-    let client = caller.current_client().map_err(|error| error.to_string())?;
     let target_id = match direction {
         WindowCycleDirection::Next => contexts[(current_index + 1) % contexts.len()].id,
         WindowCycleDirection::Previous => {
             contexts[(current_index + contexts.len() - 1) % contexts.len()].id
         }
         WindowCycleDirection::Last => {
+            let client = caller
+                .current_client()
+                .map_err(|_| "no previously active window available".to_string())?;
             let remembered = last_selected_by_client
                 .get(&client.id)
                 .copied()
@@ -888,6 +890,7 @@ mod tests {
         sessions: Vec<SessionSummary>,
         fail_create: bool,
         fail_kill: bool,
+        fail_current_client: bool,
         current_client_id: Uuid,
         selected_session_id: Mutex<Option<Uuid>>,
         creates: Mutex<Vec<Option<String>>>,
@@ -903,6 +906,7 @@ mod tests {
                 sessions,
                 fail_create: false,
                 fail_kill: false,
+                fail_current_client: false,
                 creates: Mutex::new(Vec::new()),
                 kills: Mutex::new(Vec::new()),
                 selects: Mutex::new(Vec::new()),
@@ -921,6 +925,22 @@ mod tests {
                 sessions,
                 fail_create: false,
                 fail_kill: false,
+                fail_current_client: false,
+                creates: Mutex::new(Vec::new()),
+                kills: Mutex::new(Vec::new()),
+                selects: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn with_client_query_failure() -> Self {
+            let sessions = sample_sessions();
+            Self {
+                current_client_id: Uuid::new_v4(),
+                selected_session_id: Mutex::new(sessions.first().map(|session| session.id)),
+                sessions,
+                fail_create: false,
+                fail_kill: false,
+                fail_current_client: true,
                 creates: Mutex::new(Vec::new()),
                 kills: Mutex::new(Vec::new()),
                 selects: Mutex::new(Vec::new()),
@@ -935,6 +955,7 @@ mod tests {
                 sessions,
                 fail_create,
                 fail_kill,
+                fail_current_client: false,
                 creates: Mutex::new(Vec::new()),
                 kills: Mutex::new(Vec::new()),
                 selects: Mutex::new(Vec::new()),
@@ -1041,6 +1062,11 @@ mod tests {
                         .map_err(Into::into)
                 }
                 ("client-query/v1", "current") => {
+                    if self.fail_current_client {
+                        return Err(bmux_plugin::PluginError::ServiceProtocol {
+                            details: "mock current client failure".to_string(),
+                        });
+                    }
                     let selected_session_id = *self
                         .selected_session_id
                         .lock()
@@ -1197,6 +1223,27 @@ mod tests {
 
         let selects = host.selects.lock().expect("select log lock should succeed");
         assert_eq!(selects.as_slice(), &[target_id]);
+    }
+
+    #[test]
+    fn switch_window_succeeds_when_current_client_query_fails() {
+        let host = MockHost::with_client_query_failure();
+        let target_id = host
+            .sessions
+            .get(1)
+            .expect("sample sessions should include second item")
+            .id;
+        let mut last_selected_by_client = BTreeMap::new();
+
+        let ack = switch_window(
+            &host,
+            SessionSelector::ById(target_id),
+            &mut last_selected_by_client,
+        )
+        .expect("switch should succeed even if current client query fails");
+        assert!(ack.ok);
+        let target_text = target_id.to_string();
+        assert_eq!(ack.id.as_deref(), Some(target_text.as_str()));
     }
 
     #[test]

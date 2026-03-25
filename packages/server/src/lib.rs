@@ -21,9 +21,10 @@ use bmux_ipc::{
 use bmux_session::{ClientId, Session, SessionId, SessionManager};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
 use persistence::{
-    ClientSelectedSessionSnapshotV2, FloatingSurfaceSnapshotV3, FollowEdgeSnapshotV2,
-    PaneLayoutNodeSnapshotV2, PaneSnapshotV2, PaneSplitDirectionSnapshotV2, SessionSnapshotV3,
-    SnapshotManager, SnapshotV3,
+    ClientSelectedContextSnapshotV1, ClientSelectedSessionSnapshotV2,
+    ContextSessionBindingSnapshotV1, ContextSnapshotV1, FloatingSurfaceSnapshotV3,
+    FollowEdgeSnapshotV2, PaneLayoutNodeSnapshotV2, PaneSnapshotV2, PaneSplitDirectionSnapshotV2,
+    SessionSnapshotV3, SnapshotManager, SnapshotV4,
 };
 use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use serde::{Deserialize, Serialize};
@@ -3049,7 +3050,7 @@ fn snapshot_status(state: &Arc<ServerState>) -> Result<ServerSnapshotStatus> {
     })
 }
 
-fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV3> {
+fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV4> {
     let sessions = {
         let manager = state
             .session_manager
@@ -3178,10 +3179,58 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV3> {
         (follows, selected_sessions)
     };
 
-    Ok(SnapshotV3 {
+    let (contexts, context_session_bindings, selected_contexts, mru_contexts) = {
+        let context_state = state
+            .context_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
+
+        let contexts = context_state
+            .contexts
+            .values()
+            .map(|context| ContextSnapshotV1 {
+                id: context.id,
+                name: context.name.clone(),
+                attributes: context.attributes.clone(),
+            })
+            .collect::<Vec<_>>();
+        let context_session_bindings = context_state
+            .session_by_context
+            .iter()
+            .map(|(context_id, session_id)| ContextSessionBindingSnapshotV1 {
+                context_id: *context_id,
+                session_id: session_id.0,
+            })
+            .collect::<Vec<_>>();
+        let selected_contexts = context_state
+            .selected_by_client
+            .iter()
+            .map(|(client_id, context_id)| ClientSelectedContextSnapshotV1 {
+                client_id: client_id.0,
+                context_id: Some(*context_id),
+            })
+            .collect::<Vec<_>>();
+        let mru_contexts = context_state
+            .mru_contexts
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        (
+            contexts,
+            context_session_bindings,
+            selected_contexts,
+            mru_contexts,
+        )
+    };
+
+    Ok(SnapshotV4 {
         sessions: session_snapshots,
         follows,
         selected_sessions,
+        contexts,
+        context_session_bindings,
+        selected_contexts,
+        mru_contexts,
     })
 }
 
@@ -3234,7 +3283,7 @@ fn restore_snapshot_if_present(state: &Arc<ServerState>) -> Result<()> {
     Ok(())
 }
 
-fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV3) -> Result<RestoreSummary> {
+fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV4) -> Result<RestoreSummary> {
     let mut summary = RestoreSummary::default();
 
     {
@@ -3323,6 +3372,112 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV3) -> Resu
         }
     }
 
+    let (selected_contexts, context_for_session) = {
+        let session_catalog = {
+            let session_manager = state
+                .session_manager
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+            session_manager
+                .list_sessions()
+                .into_iter()
+                .map(|session| (session.id.0, session.name))
+                .collect::<BTreeMap<_, _>>()
+        };
+
+        let binding_by_context = snapshot
+            .context_session_bindings
+            .iter()
+            .map(|binding| (binding.context_id, binding.session_id))
+            .collect::<BTreeMap<_, _>>();
+
+        let mut context_state = state
+            .context_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
+        context_state.contexts.clear();
+        context_state.session_by_context.clear();
+        context_state.selected_by_client.clear();
+        context_state.mru_contexts.clear();
+
+        for context in &snapshot.contexts {
+            let Some(session_id) = binding_by_context.get(&context.id) else {
+                continue;
+            };
+            if !session_catalog.contains_key(session_id) {
+                continue;
+            }
+            context_state.contexts.insert(
+                context.id,
+                RuntimeContext {
+                    id: context.id,
+                    name: context.name.clone(),
+                    attributes: context.attributes.clone(),
+                },
+            );
+            context_state
+                .session_by_context
+                .insert(context.id, SessionId(*session_id));
+        }
+
+        if context_state.contexts.is_empty() {
+            for (session_id, name) in &session_catalog {
+                let context_id = *session_id;
+                context_state.contexts.insert(
+                    context_id,
+                    RuntimeContext {
+                        id: context_id,
+                        name: name.clone(),
+                        attributes: BTreeMap::from([(
+                            CONTEXT_SESSION_ID_ATTRIBUTE.to_string(),
+                            session_id.to_string(),
+                        )]),
+                    },
+                );
+                context_state
+                    .session_by_context
+                    .insert(context_id, SessionId(*session_id));
+                context_state.mru_contexts.push_back(context_id);
+            }
+        } else {
+            let mut seen = BTreeSet::new();
+            for context_id in &snapshot.mru_contexts {
+                if context_state.contexts.contains_key(context_id) && seen.insert(*context_id) {
+                    context_state.mru_contexts.push_back(*context_id);
+                }
+            }
+            let context_ids = context_state.contexts.keys().copied().collect::<Vec<_>>();
+            for context_id in context_ids {
+                if seen.insert(context_id) {
+                    context_state.mru_contexts.push_back(context_id);
+                }
+            }
+        }
+
+        for selected in &snapshot.selected_contexts {
+            if let Some(context_id) = selected.context_id
+                && context_state.contexts.contains_key(&context_id)
+            {
+                context_state
+                    .selected_by_client
+                    .insert(ClientId(selected.client_id), context_id);
+            }
+        }
+
+        (
+            context_state
+                .selected_by_client
+                .iter()
+                .map(|(client_id, context_id)| (*client_id, Some(*context_id)))
+                .collect::<BTreeMap<_, _>>(),
+            context_state
+                .session_by_context
+                .iter()
+                .map(|(context_id, session_id)| (*session_id, *context_id))
+                .collect::<BTreeMap<_, _>>(),
+        )
+    };
+
     {
         let mut follow_state = state
             .follow_state
@@ -3342,9 +3497,17 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV3) -> Resu
             if selected_session
                 .is_none_or(|session_id| session_manager.get_session(&session_id).is_some())
             {
+                let selected_context = selected_contexts
+                    .get(&ClientId(selected.client_id))
+                    .copied()
+                    .flatten()
+                    .or_else(|| {
+                        selected_session
+                            .and_then(|session_id| context_for_session.get(&session_id).copied())
+                    });
                 follow_state
                     .selected_contexts
-                    .insert(ClientId(selected.client_id), None);
+                    .insert(ClientId(selected.client_id), selected_context);
                 follow_state
                     .selected_sessions
                     .insert(ClientId(selected.client_id), selected_session);
@@ -3369,7 +3532,7 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV3) -> Resu
 
 async fn restore_snapshot_replace(
     state: &Arc<ServerState>,
-    snapshot: SnapshotV3,
+    snapshot: SnapshotV4,
 ) -> Result<RestoreSummary> {
     let removed_runtimes = {
         let mut runtime_manager = state
@@ -3784,26 +3947,64 @@ async fn handle_request(
                 })
             }
         }
-        Request::NewSession { name } => match create_session_runtime(state, name.clone()) {
-            Ok(session_id) => Response::Ok(ResponsePayload::SessionCreated {
+        Request::NewSession { name } => {
+            let session_id = match create_session_runtime(state, name.clone()) {
+                Ok(session_id) => session_id,
+                Err(error) => {
+                    let message = error.to_string();
+                    let code = if message.starts_with("session already exists with name") {
+                        ErrorCode::AlreadyExists
+                    } else {
+                        ErrorCode::Internal
+                    };
+                    return Ok(Response::Err(ErrorResponse { code, message }));
+                }
+            };
+
+            let context_bind_result = {
+                let mut context_state = state
+                    .context_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
+                let context = context_state.create(client_id, name.clone(), BTreeMap::new());
+                match context_state.bind_session(context.id, session_id) {
+                    Ok(()) => Ok(()),
+                    Err(message) => {
+                        let _ = context_state.remove_context_by_id(context.id, Some(client_id));
+                        Err(message.to_string())
+                    }
+                }
+            };
+
+            if let Err(message) = context_bind_result {
+                let removed_runtime = {
+                    let mut manager = state
+                        .session_manager
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                    let _ = manager.remove_session(&session_id);
+                    drop(manager);
+
+                    let mut runtime_manager = state
+                        .session_runtimes
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+                    runtime_manager.remove_runtime(session_id).ok()
+                };
+                if let Some(removed_runtime) = removed_runtime {
+                    shutdown_runtime_handle(removed_runtime).await;
+                }
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::Internal,
+                    message: format!("failed creating context for new session: {message}"),
+                }));
+            }
+
+            Response::Ok(ResponsePayload::SessionCreated {
                 id: session_id.0,
                 name,
-            }),
-            Err(error) => {
-                let message = error.to_string();
-                if message.starts_with("session already exists with name") {
-                    Response::Err(ErrorResponse {
-                        code: ErrorCode::AlreadyExists,
-                        message,
-                    })
-                } else {
-                    Response::Err(ErrorResponse {
-                        code: ErrorCode::Internal,
-                        message,
-                    })
-                }
-            }
-        },
+            })
+        }
         Request::ListPanes { session } => {
             let manager = state
                 .session_manager
@@ -5643,6 +5844,70 @@ mod tests {
             }
             response => panic!("expected current context response, got {response:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn new_session_creates_bound_context_for_client() {
+        let server = BmuxServer::new(test_endpoint());
+        let client_id = ClientId::new();
+        let principal_id = Uuid::new_v4();
+        let mut selected_session = None;
+        let mut attached_stream_session = None;
+
+        let session_name = "session-window".to_string();
+        let created = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::NewSession {
+                name: Some(session_name.clone()),
+            },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated {
+                id,
+                name: Some(name),
+            }) => {
+                assert_eq!(name, session_name);
+                id
+            }
+            response => panic!("expected session created response, got {response:?}"),
+        };
+
+        let current = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::CurrentContext,
+        )
+        .await;
+
+        let context = match current {
+            Response::Ok(ResponsePayload::CurrentContext {
+                context: Some(context),
+            }) => context,
+            response => panic!("expected current context response, got {response:?}"),
+        };
+        assert_eq!(context.name.as_deref(), Some(session_name.as_str()));
+
+        let mapped_session = {
+            let context_state = server
+                .state
+                .context_state
+                .lock()
+                .expect("context state lock should succeed");
+            context_state
+                .session_by_context
+                .get(&context.id)
+                .copied()
+                .expect("new session context should bind session")
+        };
+        assert_eq!(mapped_session.0, session_id);
     }
 
     #[tokio::test]
