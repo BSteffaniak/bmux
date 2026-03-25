@@ -1165,6 +1165,7 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                         target_bmux,
                         compare_recording,
                         ignore,
+                        strict_timing,
                     },
             },
         ) => {
@@ -1175,6 +1176,7 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 target_bmux.as_deref(),
                 compare_recording.as_deref(),
                 ignore.as_deref(),
+                *strict_timing,
             )
             .await
         }
@@ -2474,12 +2476,20 @@ async fn run_recording_replay(
     target_bmux: Option<&str>,
     compare_recording: Option<&str>,
     ignore: Option<&str>,
+    strict_timing: bool,
 ) -> Result<u8> {
     let events = load_recording_events(recording_id)?;
     match mode {
         RecordingReplayMode::Watch => replay_watch(&events, speed),
         RecordingReplayMode::Verify => {
-            replay_verify(&events, target_bmux, compare_recording, ignore).await
+            replay_verify(
+                &events,
+                target_bmux,
+                compare_recording,
+                ignore,
+                strict_timing,
+            )
+            .await
         }
     }
 }
@@ -2518,6 +2528,7 @@ async fn replay_verify(
     target_bmux: Option<&str>,
     compare_recording: Option<&str>,
     ignore: Option<&str>,
+    strict_timing: bool,
 ) -> Result<u8> {
     let ignore_rules = parse_ignore_rules(ignore);
     let baseline_filtered = apply_ignore_rules(baseline, &ignore_rules);
@@ -2557,7 +2568,8 @@ async fn replay_verify(
 
     let expected_output = expected_output_bytes(&baseline_filtered);
     let input_timeline = input_timeline(&baseline_filtered);
-    let actual_output = run_target_verify_capture(&target_binary, &input_timeline).await?;
+    let actual_output =
+        run_target_verify_capture(&target_binary, &input_timeline, strict_timing).await?;
 
     if let Some(index) = expected_output
         .iter()
@@ -2629,6 +2641,7 @@ fn input_timeline(events: &[RecordingEventEnvelope]) -> Vec<ReplayInputEvent> {
 async fn run_target_verify_capture(
     target_binary: &Path,
     inputs: &[ReplayInputEvent],
+    strict_timing: bool,
 ) -> Result<Vec<u8>> {
     let (paths, state_dir, root_dir) = verify_temp_paths();
     paths
@@ -2681,7 +2694,11 @@ async fn run_target_verify_capture(
         for input in inputs {
             if input.mono_ns > last_input_ns {
                 let delta = input.mono_ns.saturating_sub(last_input_ns);
-                let sleep_ns = delta.min(25_000_000);
+                let sleep_ns = if strict_timing {
+                    delta
+                } else {
+                    delta.min(25_000_000)
+                };
                 if sleep_ns > 0 {
                     tokio::time::sleep(Duration::from_nanos(sleep_ns)).await;
                 }

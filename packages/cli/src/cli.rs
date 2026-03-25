@@ -196,6 +196,9 @@ pub enum RecordingCommand {
         /// Optional comma-separated ignore rules in verify mode
         #[arg(long)]
         ignore: Option<String>,
+        /// Preserve full recorded input timing in verify mode
+        #[arg(long)]
+        strict_timing: bool,
     },
 }
 
