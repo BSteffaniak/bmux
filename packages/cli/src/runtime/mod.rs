@@ -566,12 +566,19 @@ pub async fn run() -> Result<u8> {
             verbose,
         } => {
             init_logging(verbose, Some(log_level));
+            validate_record_bootstrap_flags(&cli)?;
 
             if let Some(command) = &cli.command {
                 return run_command(command).await;
             }
 
-            run_default_server_attach().await
+            let options = DefaultAttachOptions {
+                record: cli.record,
+                capture_input: !cli.no_capture_input,
+                recording_id_file: cli.recording_id_file.clone(),
+                stop_server_on_exit: cli.stop_server_on_exit,
+            };
+            run_default_server_attach(options).await
         }
         ParsedRuntimeCli::Plugin {
             log_level,
@@ -595,6 +602,14 @@ pub async fn run() -> Result<u8> {
             Ok(code)
         }
     }
+}
+
+#[derive(Debug, Clone)]
+struct DefaultAttachOptions {
+    record: bool,
+    capture_input: bool,
+    recording_id_file: Option<String>,
+    stop_server_on_exit: bool,
 }
 
 #[derive(Debug)]
@@ -723,12 +738,116 @@ const fn tracing_level(level: LogLevel) -> Level {
     }
 }
 
-async fn run_default_server_attach() -> Result<u8> {
+fn validate_record_bootstrap_flags(cli: &Cli) -> Result<()> {
+    if cli.command.is_some() {
+        if cli.record {
+            anyhow::bail!(
+                "--record is only supported for top-level interactive start (no subcommand)"
+            )
+        }
+        if cli.no_capture_input {
+            anyhow::bail!("--no-capture-input requires --record")
+        }
+        if cli.recording_id_file.is_some() {
+            anyhow::bail!("--recording-id-file requires --record")
+        }
+        if cli.stop_server_on_exit {
+            anyhow::bail!("--stop-server-on-exit requires --record")
+        }
+    } else if !cli.record {
+        if cli.no_capture_input {
+            anyhow::bail!("--no-capture-input requires --record")
+        }
+        if cli.recording_id_file.is_some() {
+            anyhow::bail!("--recording-id-file requires --record")
+        }
+        if cli.stop_server_on_exit {
+            anyhow::bail!("--stop-server-on-exit requires --record")
+        }
+    }
+    Ok(())
+}
+
+async fn run_default_server_attach(options: DefaultAttachOptions) -> Result<u8> {
+    if options.record {
+        ensure_server_not_running_for_record_bootstrap().await?;
+    }
     ensure_server_running_for_default_attach().await?;
+
+    let mut active_recording_id = None;
+    if options.record {
+        let mut recording_client = connect(
+            ConnectionPolicyScope::Normal,
+            "bmux-cli-default-attach-recording-start",
+        )
+        .await?;
+        let started = recording_client
+            .recording_start(None, options.capture_input)
+            .await
+            .map_err(map_cli_client_error)?;
+        active_recording_id = Some(started.id);
+        println!(
+            "recording started: {} (capture_input={})",
+            started.id, started.capture_input
+        );
+        if let Some(path) = options.recording_id_file.as_deref() {
+            std::fs::write(path, format!("{}\n", started.id))
+                .with_context(|| format!("failed writing recording id file {path}"))?;
+        }
+    }
+
     let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-default-attach").await?;
     let target = resolve_default_attach_target(&mut client).await?;
     let target = target.to_string();
-    run_session_attach_with_client(client, Some(target.as_str()), None, false).await
+    let attach_result =
+        run_session_attach_with_client(client, Some(target.as_str()), None, false).await;
+
+    if let Some(recording_id) = active_recording_id {
+        let mut stop_client = connect(
+            ConnectionPolicyScope::Normal,
+            "bmux-cli-default-attach-recording-stop",
+        )
+        .await?;
+        let stopped_id = stop_client
+            .recording_stop(Some(recording_id))
+            .await
+            .map_err(map_cli_client_error)
+            .with_context(|| format!("failed stopping recording {recording_id}"))?;
+        let mut list_client = connect(
+            ConnectionPolicyScope::Normal,
+            "bmux-cli-default-attach-recording-list",
+        )
+        .await?;
+        let recording = list_client
+            .recording_list()
+            .await
+            .map_err(map_cli_client_error)?
+            .into_iter()
+            .find(|summary| summary.id == stopped_id);
+        if let Some(recording) = recording {
+            println!(
+                "recording stopped: {} events={} bytes={} path={}",
+                recording.id, recording.event_count, recording.payload_bytes, recording.path
+            );
+        } else {
+            println!("recording stopped: {stopped_id}");
+        }
+    }
+
+    if options.record && options.stop_server_on_exit {
+        let _ = run_server_stop().await;
+    }
+
+    attach_result
+}
+
+async fn ensure_server_not_running_for_record_bootstrap() -> Result<()> {
+    if server_is_running().await? {
+        anyhow::bail!(
+            "--record requires a fresh start but server is already running; stop it first or run without --record"
+        )
+    }
+    Ok(())
 }
 
 async fn ensure_server_running_for_default_attach() -> Result<()> {
@@ -7728,7 +7847,7 @@ mod tests {
         parse_pid_content, profile_for_term, protocol_profile_for_terminal_profile,
         resolve_pane_term_with_checker,
     };
-    use crate::cli::Command;
+    use crate::cli::{Cli, Command};
     use crate::input::InputProcessor;
     use crate::runtime::attach::state::AttachViewState;
     use bmux_client::{AttachLayoutState, AttachOpenInfo, ClientError};
@@ -7758,6 +7877,53 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bmux-cli-plugin-test-{nanos}"));
         fs::create_dir_all(&dir).expect("temp dir should be created");
         dir
+    }
+
+    fn empty_cli() -> Cli {
+        Cli {
+            record: false,
+            no_capture_input: false,
+            recording_id_file: None,
+            stop_server_on_exit: false,
+            command: None,
+            verbose: false,
+            log_level: None,
+        }
+    }
+
+    #[test]
+    fn validate_record_bootstrap_flags_accepts_plain_defaults() {
+        let cli = empty_cli();
+        assert!(super::validate_record_bootstrap_flags(&cli).is_ok());
+    }
+
+    #[test]
+    fn validate_record_bootstrap_flags_rejects_orphaned_record_flags() {
+        let mut cli = empty_cli();
+        cli.no_capture_input = true;
+        let error =
+            super::validate_record_bootstrap_flags(&cli).expect_err("validation should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("--no-capture-input requires --record"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validate_record_bootstrap_flags_rejects_record_with_subcommand() {
+        let mut cli = empty_cli();
+        cli.record = true;
+        cli.command = Some(Command::ListSessions { json: false });
+        let error =
+            super::validate_record_bootstrap_flags(&cli).expect_err("validation should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("--record is only supported for top-level interactive start"),
+            "unexpected error: {error}"
+        );
     }
 
     fn plugin_manifest(id: &str, entry: &str) -> PluginManifest {

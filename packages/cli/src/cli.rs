@@ -33,6 +33,22 @@ pub enum RecordingReplayMode {
 #[command(name = "bmux")]
 #[command(about = "Server-backed terminal multiplexer CLI")]
 pub struct Cli {
+    /// Start interactive bmux with full-session recording
+    #[arg(long)]
+    pub(crate) record: bool,
+
+    /// Do not capture pane input bytes when using --record
+    #[arg(long)]
+    pub(crate) no_capture_input: bool,
+
+    /// Write recording id to a file when using --record
+    #[arg(long)]
+    pub(crate) recording_id_file: Option<String>,
+
+    /// Stop the server when exiting a --record run
+    #[arg(long)]
+    pub(crate) stop_server_on_exit: bool,
+
     #[command(subcommand)]
     pub(crate) command: Option<Command>,
 
@@ -1509,5 +1525,23 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_top_level_record_flags() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "--record",
+            "--no-capture-input",
+            "--recording-id-file",
+            "/tmp/rec.id",
+            "--stop-server-on-exit",
+        ])
+        .expect("valid CLI args");
+        assert!(cli.record);
+        assert!(cli.no_capture_input);
+        assert_eq!(cli.recording_id_file.as_deref(), Some("/tmp/rec.id"));
+        assert!(cli.stop_server_on_exit);
+        assert!(cli.command.is_none());
     }
 }
