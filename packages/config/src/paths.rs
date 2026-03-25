@@ -74,6 +74,12 @@ impl ConfigPaths {
         self.state_dir().join("runtime").join("protocol-trace.json")
     }
 
+    /// Get recordings root directory path
+    #[must_use]
+    pub fn recordings_dir(&self) -> PathBuf {
+        self.state_dir().join("runtime").join("recordings")
+    }
+
     /// Get persisted terminfo prompt state file path
     #[must_use]
     pub fn terminfo_prompt_state_file(&self) -> PathBuf {
@@ -124,6 +130,7 @@ impl ConfigPaths {
         std::fs::create_dir_all(&self.runtime_dir)?;
         std::fs::create_dir_all(&self.data_dir)?;
         std::fs::create_dir_all(self.state_dir())?;
+        std::fs::create_dir_all(self.recordings_dir())?;
         std::fs::create_dir_all(self.plugins_dir())?;
         std::fs::create_dir_all(self.sessions_dir())?;
         std::fs::create_dir_all(self.logs_dir())?;

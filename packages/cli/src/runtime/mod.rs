@@ -1,6 +1,6 @@
 use crate::cli::{
-    Cli, Command, KeymapCommand, LogLevel, LogsCommand, LogsProfilesCommand, ServerCommand,
-    SessionCommand, TerminalCommand, TraceFamily,
+    Cli, Command, KeymapCommand, LogLevel, LogsCommand, LogsProfilesCommand, RecordingCommand,
+    RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
 };
 use crate::connection::{
     ConnectionPolicyScope, ServerRuntimeMetadata, connect, connect_raw, current_cli_build_id,
@@ -14,7 +14,8 @@ use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientErro
 use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout, TerminfoAutoInstall};
 use bmux_ipc::{
     AttachViewComponent, ContextSelector, ContextSummary, InvokeServiceKind, PaneFocusDirection,
-    PaneSplitDirection, SessionSelector, SessionSummary,
+    PaneSplitDirection, RecordingEventEnvelope, RecordingEventKind, RecordingPayload,
+    SessionSelector, SessionSummary,
 };
 use bmux_keybind::action_to_config_name;
 use bmux_plugin::{
@@ -847,6 +848,14 @@ fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
             TerminalCommand::Doctor { .. } => BuiltInHandlerId::TerminalDoctor,
             TerminalCommand::InstallTerminfo { .. } => BuiltInHandlerId::TerminalInstallTerminfo,
         },
+        Command::Recording { command } => match command {
+            RecordingCommand::Start { .. } => BuiltInHandlerId::RecordingStart,
+            RecordingCommand::Stop { .. } => BuiltInHandlerId::RecordingStop,
+            RecordingCommand::Status { .. } => BuiltInHandlerId::RecordingStatus,
+            RecordingCommand::List { .. } => BuiltInHandlerId::RecordingList,
+            RecordingCommand::Inspect { .. } => BuiltInHandlerId::RecordingInspect,
+            RecordingCommand::Replay { .. } => BuiltInHandlerId::RecordingReplay,
+        },
         Command::External(_) => unreachable!("external commands are dispatched separately"),
     }
 }
@@ -1105,6 +1114,67 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 command: TerminalCommand::InstallTerminfo { yes, check },
             },
         ) => run_terminal_install_terminfo(*yes, *check),
+        (
+            BuiltInHandlerId::RecordingStart,
+            Command::Recording {
+                command:
+                    RecordingCommand::Start {
+                        session_id,
+                        no_capture_input,
+                    },
+            },
+        ) => run_recording_start(session_id.as_deref(), !*no_capture_input).await,
+        (
+            BuiltInHandlerId::RecordingStop,
+            Command::Recording {
+                command: RecordingCommand::Stop { recording_id },
+            },
+        ) => run_recording_stop(recording_id.as_deref()).await,
+        (
+            BuiltInHandlerId::RecordingStatus,
+            Command::Recording {
+                command: RecordingCommand::Status { json },
+            },
+        ) => run_recording_status(*json).await,
+        (
+            BuiltInHandlerId::RecordingList,
+            Command::Recording {
+                command: RecordingCommand::List { json },
+            },
+        ) => run_recording_list(*json).await,
+        (
+            BuiltInHandlerId::RecordingInspect,
+            Command::Recording {
+                command:
+                    RecordingCommand::Inspect {
+                        recording_id,
+                        limit,
+                        kind,
+                        json,
+                    },
+            },
+        ) => run_recording_inspect(recording_id, *limit, kind.as_deref(), *json),
+        (
+            BuiltInHandlerId::RecordingReplay,
+            Command::Recording {
+                command:
+                    RecordingCommand::Replay {
+                        recording_id,
+                        mode,
+                        speed,
+                        target_bmux,
+                        compare_recording,
+                        ignore,
+                    },
+            },
+        ) => run_recording_replay(
+            recording_id,
+            *mode,
+            *speed,
+            target_bmux.as_deref(),
+            compare_recording.as_deref(),
+            ignore.as_deref(),
+        ),
         _ => unreachable!("built-in command handler and command variant should stay in sync"),
     }
 }
@@ -2268,6 +2338,289 @@ async fn run_server_stop() -> Result<u8> {
 
     println!("bmux server is not running");
     Ok(1)
+}
+
+async fn run_recording_start(session_id: Option<&str>, capture_input: bool) -> Result<u8> {
+    cleanup_stale_pid_file().await?;
+    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-recording-start").await?;
+    let session_id = match session_id {
+        Some(raw) => Some(Uuid::parse_str(raw).context("invalid --session-id UUID")?),
+        None => None,
+    };
+    let summary = client
+        .recording_start(session_id, capture_input)
+        .await
+        .map_err(map_cli_client_error)?;
+    println!(
+        "recording started: {} (capture_input={})",
+        summary.id, summary.capture_input
+    );
+    Ok(0)
+}
+
+async fn run_recording_stop(recording_id: Option<&str>) -> Result<u8> {
+    cleanup_stale_pid_file().await?;
+    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-recording-stop").await?;
+    let recording_id = match recording_id {
+        Some(raw) => Some(Uuid::parse_str(raw).context("invalid recording id")?),
+        None => None,
+    };
+    let stopped_id = client
+        .recording_stop(recording_id)
+        .await
+        .map_err(map_cli_client_error)?;
+    println!("recording stopped: {stopped_id}");
+    Ok(0)
+}
+
+async fn run_recording_status(as_json: bool) -> Result<u8> {
+    cleanup_stale_pid_file().await?;
+    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-recording-status").await?;
+    let status = client
+        .recording_status()
+        .await
+        .map_err(map_cli_client_error)?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status)
+                .context("failed encoding recording status json")?
+        );
+        return Ok(0);
+    }
+    if let Some(active) = status.active {
+        println!(
+            "active recording: {} events={} bytes={} capture_input={} path={}",
+            active.id, active.event_count, active.payload_bytes, active.capture_input, active.path
+        );
+    } else {
+        println!("active recording: none");
+    }
+    Ok(0)
+}
+
+async fn run_recording_list(as_json: bool) -> Result<u8> {
+    cleanup_stale_pid_file().await?;
+    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-recording-list").await?;
+    let recordings = client
+        .recording_list()
+        .await
+        .map_err(map_cli_client_error)?;
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&recordings)
+                .context("failed encoding recording list json")?
+        );
+        return Ok(0);
+    }
+    for recording in recordings {
+        println!(
+            "{} started={} ended={} events={} bytes={} capture_input={} path={}",
+            recording.id,
+            recording.started_epoch_ms,
+            recording
+                .ended_epoch_ms
+                .map_or_else(|| "active".to_string(), |value| value.to_string()),
+            recording.event_count,
+            recording.payload_bytes,
+            recording.capture_input,
+            recording.path
+        );
+    }
+    Ok(0)
+}
+
+fn run_recording_inspect(
+    recording_id: &str,
+    limit: usize,
+    kind: Option<&str>,
+    as_json: bool,
+) -> Result<u8> {
+    let events = load_recording_events(recording_id)?;
+    let filtered = events
+        .into_iter()
+        .filter(|event| {
+            kind.is_none_or(|kind| {
+                recording_event_kind_name(event.kind) == kind.to_ascii_lowercase()
+            })
+        })
+        .take(limit.max(1))
+        .collect::<Vec<_>>();
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&filtered)
+                .context("failed encoding recording inspect json")?
+        );
+        return Ok(0);
+    }
+    for event in filtered {
+        println!(
+            "seq={} t={} kind={:?} session={:?} pane={:?} client={:?}",
+            event.seq, event.mono_ns, event.kind, event.session_id, event.pane_id, event.client_id
+        );
+    }
+    Ok(0)
+}
+
+fn run_recording_replay(
+    recording_id: &str,
+    mode: RecordingReplayMode,
+    speed: f64,
+    target_bmux: Option<&str>,
+    compare_recording: Option<&str>,
+    ignore: Option<&str>,
+) -> Result<u8> {
+    let events = load_recording_events(recording_id)?;
+    match mode {
+        RecordingReplayMode::Watch => replay_watch(&events, speed),
+        RecordingReplayMode::Verify => {
+            if let Some(target) = target_bmux {
+                println!("verify target binary: {target}");
+            } else {
+                println!("verify target binary: current bmux");
+            }
+            replay_verify(&events, compare_recording, ignore)
+        }
+    }
+}
+
+fn replay_watch(events: &[RecordingEventEnvelope], speed: f64) -> Result<u8> {
+    let clamped_speed = if speed <= 0.0 { 1.0 } else { speed };
+    let mut last_ns = 0_u64;
+    let mut stdout = io::stdout().lock();
+    for event in events {
+        if event.mono_ns > last_ns {
+            let delta = event.mono_ns.saturating_sub(last_ns);
+            let delay = (delta as f64 / clamped_speed) as u64;
+            if delay > 0 {
+                std::thread::sleep(Duration::from_nanos(delay));
+            }
+        }
+        match &event.payload {
+            RecordingPayload::Bytes { data }
+                if matches!(
+                    event.kind,
+                    RecordingEventKind::PaneOutputRaw | RecordingEventKind::ProtocolReplyRaw
+                ) =>
+            {
+                stdout.write_all(data)?;
+            }
+            _ => {}
+        }
+        last_ns = event.mono_ns;
+    }
+    stdout.flush()?;
+    Ok(0)
+}
+
+fn replay_verify(
+    baseline: &[RecordingEventEnvelope],
+    compare_recording: Option<&str>,
+    ignore: Option<&str>,
+) -> Result<u8> {
+    let ignore_rules = parse_ignore_rules(ignore);
+    let baseline_filtered = apply_ignore_rules(baseline, &ignore_rules);
+    if let Some(other_id) = compare_recording {
+        let other = load_recording_events(other_id)?;
+        let other_filtered = apply_ignore_rules(&other, &ignore_rules);
+        let mismatch = baseline_filtered
+            .iter()
+            .zip(other_filtered.iter())
+            .position(|(left, right)| left != right);
+        if let Some(index) = mismatch {
+            let expected = &baseline_filtered[index];
+            let actual = &other_filtered[index];
+            println!(
+                "verify FAIL: mismatch at index {} expected_seq={} actual_seq={} expected_kind={:?} actual_kind={:?}",
+                index, expected.seq, actual.seq, expected.kind, actual.kind
+            );
+            return Ok(1);
+        }
+        if baseline_filtered.len() != other_filtered.len() {
+            println!(
+                "verify FAIL: length mismatch expected={} actual={}",
+                baseline_filtered.len(),
+                other_filtered.len()
+            );
+            return Ok(1);
+        }
+        println!("verify PASS: recordings are identical");
+        return Ok(0);
+    }
+
+    let monotonic = baseline_filtered
+        .windows(2)
+        .all(|pair| pair[1].seq > pair[0].seq && pair[1].mono_ns >= pair[0].mono_ns);
+    if !monotonic {
+        println!("verify FAIL: non-monotonic sequence or timestamp ordering");
+        return Ok(1);
+    }
+    println!("verify PASS: timeline integrity checks succeeded");
+    Ok(0)
+}
+
+fn parse_ignore_rules(ignore: Option<&str>) -> Vec<String> {
+    ignore
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|entry| !entry.is_empty())
+                .map(|entry| entry.to_ascii_lowercase())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn apply_ignore_rules(
+    events: &[RecordingEventEnvelope],
+    ignore_rules: &[String],
+) -> Vec<RecordingEventEnvelope> {
+    if ignore_rules.is_empty() {
+        return events.to_vec();
+    }
+    events
+        .iter()
+        .filter(|event| {
+            let name = recording_event_kind_name(event.kind);
+            !ignore_rules.contains(&name)
+        })
+        .cloned()
+        .collect()
+}
+
+fn recording_event_kind_name(kind: RecordingEventKind) -> String {
+    match kind {
+        RecordingEventKind::PaneInputRaw => "pane_input_raw",
+        RecordingEventKind::PaneOutputRaw => "pane_output_raw",
+        RecordingEventKind::ProtocolReplyRaw => "protocol_reply_raw",
+        RecordingEventKind::ServerEvent => "server_event",
+        RecordingEventKind::RequestStart => "request_start",
+        RecordingEventKind::RequestDone => "request_done",
+        RecordingEventKind::RequestError => "request_error",
+    }
+    .to_string()
+}
+
+fn load_recording_events(recording_id: &str) -> Result<Vec<RecordingEventEnvelope>> {
+    let id = Uuid::parse_str(recording_id).context("invalid recording id")?;
+    let path = ConfigPaths::default()
+        .recordings_dir()
+        .join(id.to_string())
+        .join("events.jsonl");
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("failed reading recording events file {}", path.display()))?;
+    let mut events = Vec::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let event: RecordingEventEnvelope = serde_json::from_slice(line)
+            .with_context(|| format!("failed parsing recording event in {}", path.display()))?;
+        events.push(event);
+    }
+    Ok(events)
 }
 
 fn run_logs_path(as_json: bool) -> Result<u8> {

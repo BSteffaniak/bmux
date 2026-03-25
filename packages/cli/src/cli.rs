@@ -22,6 +22,12 @@ pub enum LogLevel {
     Trace,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RecordingReplayMode {
+    Watch,
+    Verify,
+}
+
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(name = "bmux")]
@@ -120,8 +126,77 @@ pub enum Command {
         #[command(subcommand)]
         command: TerminalCommand,
     },
+    /// Recording and replay controls
+    Recording {
+        #[command(subcommand)]
+        command: RecordingCommand,
+    },
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecordingCommand {
+    /// Start explicit full-fidelity recording
+    Start {
+        /// Restrict capture to one session id
+        #[arg(long)]
+        session_id: Option<String>,
+        /// Do not capture pane input bytes
+        #[arg(long)]
+        no_capture_input: bool,
+    },
+    /// Stop active recording or one by id
+    Stop {
+        /// Recording id to stop (defaults to active)
+        recording_id: Option<String>,
+    },
+    /// Show active recording status
+    Status {
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// List available recordings
+    List {
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Inspect recording timeline events
+    Inspect {
+        /// Recording id
+        recording_id: String,
+        /// Limit number of events
+        #[arg(long, default_value_t = 200)]
+        limit: usize,
+        /// Filter events by kind
+        #[arg(long)]
+        kind: Option<String>,
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Replay a recording timeline
+    Replay {
+        /// Recording id
+        recording_id: String,
+        /// Replay mode
+        #[arg(long, value_enum, default_value_t = RecordingReplayMode::Watch)]
+        mode: RecordingReplayMode,
+        /// Playback speed multiplier in watch mode
+        #[arg(long, default_value_t = 1.0)]
+        speed: f64,
+        /// Optional target bmux binary for verify mode
+        #[arg(long)]
+        target_bmux: Option<String>,
+        /// Compare with another recording id in verify mode
+        #[arg(long)]
+        compare_recording: Option<String>,
+        /// Optional comma-separated ignore rules in verify mode
+        #[arg(long)]
+        ignore: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -351,8 +426,8 @@ pub enum TerminalCommand {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, KeymapCommand, LogsCommand, LogsProfilesCommand, ServerCommand,
-        SessionCommand, TerminalCommand, TraceFamily,
+        Cli, Command, KeymapCommand, LogsCommand, LogsProfilesCommand, RecordingCommand,
+        RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
     };
     use clap::Parser;
 
@@ -1282,5 +1357,66 @@ mod tests {
             panic!("expected external plugin command path");
         };
         assert_eq!(args, vec!["vendor", "roles", "dev"]);
+    }
+
+    #[test]
+    fn parses_recording_start_with_defaults() {
+        let cli = Cli::try_parse_from(["bmux", "recording", "start"]).expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(
+            command,
+            RecordingCommand::Start {
+                session_id: None,
+                no_capture_input: false
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_recording_start_with_no_capture_input() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "recording",
+            "start",
+            "--session-id",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--no-capture-input",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(
+            command,
+            RecordingCommand::Start {
+                session_id: Some(ref id),
+                no_capture_input: true
+            } if id == "550e8400-e29b-41d4-a716-446655440000"
+        ));
+    }
+
+    #[test]
+    fn parses_recording_replay_verify_mode() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "recording",
+            "replay",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--mode",
+            "verify",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(
+            command,
+            RecordingCommand::Replay {
+                mode: RecordingReplayMode::Verify,
+                ..
+            }
+        ));
     }
 }

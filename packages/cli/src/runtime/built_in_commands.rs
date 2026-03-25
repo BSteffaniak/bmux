@@ -43,6 +43,13 @@ pub enum BuiltInHandlerId {
     Terminal,
     TerminalDoctor,
     TerminalInstallTerminfo,
+    Recording,
+    RecordingStart,
+    RecordingStop,
+    RecordingStatus,
+    RecordingList,
+    RecordingInspect,
+    RecordingReplay,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,6 +281,41 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::TerminalInstallTerminfo,
             &["terminal", "install-terminfo"],
             "Install terminfo entry",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::Recording,
+            &["recording"],
+            "Recording and replay controls",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RecordingStart,
+            &["recording", "start"],
+            "Start explicit recording",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RecordingStop,
+            &["recording", "stop"],
+            "Stop active recording",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RecordingStatus,
+            &["recording", "status"],
+            "Show recording status",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RecordingList,
+            &["recording", "list"],
+            "List recordings",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RecordingInspect,
+            &["recording", "inspect"],
+            "Inspect recording timeline",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RecordingReplay,
+            &["recording", "replay"],
+            "Replay recording timeline",
         ),
     ]
 }

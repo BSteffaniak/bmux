@@ -60,6 +60,39 @@ pub struct BmuxConfig {
     pub plugins: PluginConfig,
     /// Status bar settings
     pub status_bar: StatusBarConfig,
+    /// Recording settings
+    pub recording: RecordingConfig,
+}
+
+/// Recording configuration options
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RecordingConfig {
+    /// Enable recording subsystem availability
+    pub enabled: bool,
+    /// Capture pane input bytes by default
+    pub capture_input: bool,
+    /// Capture pane output bytes
+    pub capture_output: bool,
+    /// Capture lifecycle and server events
+    pub capture_events: bool,
+    /// Rotate recording segments at approximately this size in MB
+    pub segment_mb: usize,
+    /// Retention period for completed recordings in days (0 disables pruning)
+    pub retention_days: u64,
+}
+
+impl Default for RecordingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            capture_input: true,
+            capture_output: true,
+            capture_events: true,
+            segment_mb: 64,
+            retention_days: 30,
+        }
+    }
 }
 
 /// General configuration options
@@ -367,6 +400,7 @@ impl BmuxConfig {
         let general_defaults = GeneralConfig::default();
         let keybind_defaults = KeyBindingConfig::default();
         let behavior_defaults = BehaviorConfig::default();
+        let recording_defaults = RecordingConfig::default();
         let mut repaired_fields = Vec::new();
 
         if self.general.scrollback_limit == 0 {
@@ -407,6 +441,14 @@ impl BmuxConfig {
             repaired_fields.push(format!(
                 "behavior.protocol_trace_capacity=0 -> {}",
                 behavior_defaults.protocol_trace_capacity
+            ));
+        }
+
+        if self.recording.segment_mb == 0 {
+            self.recording.segment_mb = recording_defaults.segment_mb;
+            repaired_fields.push(format!(
+                "recording.segment_mb=0 -> {}",
+                recording_defaults.segment_mb
             ));
         }
 

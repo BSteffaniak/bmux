@@ -342,6 +342,17 @@ pub enum Request {
     PollEvents {
         max_events: usize,
     },
+    RecordingStart {
+        #[serde(default)]
+        session_id: Option<Uuid>,
+        capture_input: bool,
+    },
+    RecordingStop {
+        #[serde(default)]
+        recording_id: Option<Uuid>,
+    },
+    RecordingStatus,
+    RecordingList,
     Detach,
 }
 
@@ -407,6 +418,87 @@ pub struct ServerSnapshotStatus {
     pub last_write_epoch_ms: Option<u64>,
     pub last_restore_epoch_ms: Option<u64>,
     pub last_restore_error: Option<String>,
+}
+
+/// Recording summary returned by recording APIs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingSummary {
+    pub id: Uuid,
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
+    pub capture_input: bool,
+    pub started_epoch_ms: u64,
+    #[serde(default)]
+    pub ended_epoch_ms: Option<u64>,
+    pub event_count: u64,
+    pub payload_bytes: u64,
+    pub path: String,
+}
+
+/// Recording runtime status details.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingStatus {
+    pub active: Option<RecordingSummary>,
+    pub queue_len: usize,
+}
+
+/// Event kind emitted into a recording timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingEventKind {
+    PaneInputRaw,
+    PaneOutputRaw,
+    ProtocolReplyRaw,
+    ServerEvent,
+    RequestStart,
+    RequestDone,
+    RequestError,
+}
+
+/// Recording event payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum RecordingPayload {
+    Bytes {
+        data: Vec<u8>,
+    },
+    ServerEvent {
+        event: Event,
+    },
+    RequestStart {
+        request_id: u64,
+        request: String,
+        exclusive: bool,
+    },
+    RequestDone {
+        request_id: u64,
+        request: String,
+        response: String,
+        elapsed_ms: u64,
+    },
+    RequestError {
+        request_id: u64,
+        request: String,
+        error_code: ErrorCode,
+        message: String,
+        elapsed_ms: u64,
+    },
+}
+
+/// Timeline event envelope persisted in recordings.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingEventEnvelope {
+    pub seq: u64,
+    pub mono_ns: u64,
+    pub wall_epoch_ms: u64,
+    #[serde(default)]
+    pub session_id: Option<Uuid>,
+    #[serde(default)]
+    pub pane_id: Option<Uuid>,
+    #[serde(default)]
+    pub client_id: Option<Uuid>,
+    pub kind: RecordingEventKind,
+    pub payload: RecordingPayload,
 }
 
 /// Successful response payload variants.
@@ -542,6 +634,18 @@ pub enum ResponsePayload {
     EventsSubscribed,
     EventBatch {
         events: Vec<Event>,
+    },
+    RecordingStarted {
+        recording: RecordingSummary,
+    },
+    RecordingStopped {
+        recording_id: Uuid,
+    },
+    RecordingStatus {
+        status: RecordingStatus,
+    },
+    RecordingList {
+        recordings: Vec<RecordingSummary>,
     },
     Detached,
     ServerStopping,

@@ -11,9 +11,9 @@ use bmux_ipc::transport::{IpcTransportError, LocalIpcStream};
 use bmux_ipc::{
     AttachGrant, AttachPaneChunk, AttachScene, ClientSummary, ContextSelector, ContextSummary,
     Envelope, EnvelopeKind, ErrorCode, InvokeServiceKind, IpcEndpoint, PaneFocusDirection,
-    PaneLayoutNode, PaneSelector, PaneSplitDirection, PaneSummary, ProtocolVersion, Request,
-    Response, ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary, decode,
-    encode,
+    PaneLayoutNode, PaneSelector, PaneSplitDirection, PaneSummary, ProtocolVersion,
+    RecordingStatus, RecordingSummary, Request, Response, ResponsePayload, ServerSnapshotStatus,
+    SessionSelector, SessionSummary, decode, encode,
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -467,6 +467,71 @@ impl BmuxClient {
         match self.request(Request::ServerStop).await? {
             ResponsePayload::ServerStopping => Ok(()),
             _ => Err(ClientError::UnexpectedResponse("expected server stopping")),
+        }
+    }
+
+    /// Start a new recording session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn recording_start(
+        &mut self,
+        session_id: Option<Uuid>,
+        capture_input: bool,
+    ) -> Result<RecordingSummary> {
+        match self
+            .request(Request::RecordingStart {
+                session_id,
+                capture_input,
+            })
+            .await?
+        {
+            ResponsePayload::RecordingStarted { recording } => Ok(recording),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording started",
+            )),
+        }
+    }
+
+    /// Stop an active recording session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn recording_stop(&mut self, recording_id: Option<Uuid>) -> Result<Uuid> {
+        match self
+            .request(Request::RecordingStop { recording_id })
+            .await?
+        {
+            ResponsePayload::RecordingStopped { recording_id } => Ok(recording_id),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording stopped",
+            )),
+        }
+    }
+
+    /// Query recording runtime status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn recording_status(&mut self) -> Result<RecordingStatus> {
+        match self.request(Request::RecordingStatus).await? {
+            ResponsePayload::RecordingStatus { status } => Ok(status),
+            _ => Err(ClientError::UnexpectedResponse("expected recording status")),
+        }
+    }
+
+    /// List known recordings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn recording_list(&mut self) -> Result<Vec<RecordingSummary>> {
+        match self.request(Request::RecordingList).await? {
+            ResponsePayload::RecordingList { recordings } => Ok(recordings),
+            _ => Err(ClientError::UnexpectedResponse("expected recording list")),
         }
     }
 
@@ -1105,6 +1170,10 @@ fn request_kind_name(request: &Request) -> &'static str {
         Request::AttachLayout { .. } => "attach_layout",
         Request::AttachSnapshot { .. } => "attach_snapshot",
         Request::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
+        Request::RecordingStart { .. } => "recording_start",
+        Request::RecordingStop { .. } => "recording_stop",
+        Request::RecordingStatus => "recording_status",
+        Request::RecordingList => "recording_list",
         Request::Detach => "detach",
         Request::SubscribeEvents => "subscribe_events",
         Request::PollEvents { .. } => "poll_events",
@@ -1149,6 +1218,10 @@ fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::AttachLayout { .. } => "attach_layout",
             ResponsePayload::AttachSnapshot { .. } => "attach_snapshot",
             ResponsePayload::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
+            ResponsePayload::RecordingStarted { .. } => "recording_started",
+            ResponsePayload::RecordingStopped { .. } => "recording_stopped",
+            ResponsePayload::RecordingStatus { .. } => "recording_status",
+            ResponsePayload::RecordingList { .. } => "recording_list",
             ResponsePayload::Detached => "detached",
             ResponsePayload::EventsSubscribed => "events_subscribed",
             ResponsePayload::EventBatch { .. } => "event_batch",

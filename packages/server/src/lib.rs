@@ -6,6 +6,7 @@
 //! Server component for bmux terminal multiplexer.
 
 mod persistence;
+mod recording;
 
 use anyhow::{Context, Result};
 use bmux_config::{BmuxConfig, ConfigPaths};
@@ -15,8 +16,9 @@ use bmux_ipc::{
     AttachSurface, AttachSurfaceKind, AttachViewComponent, CURRENT_PROTOCOL_VERSION, ClientSummary,
     ContextSelector, ContextSummary, Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event,
     IpcEndpoint, PaneFocusDirection, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector,
-    PaneSplitDirection, PaneSummary, ProtocolVersion, Request, Response, ResponsePayload,
-    ServerSnapshotStatus, SessionSelector, SessionSummary, decode, encode,
+    PaneSplitDirection, PaneSummary, ProtocolVersion, RecordingEventKind, RecordingPayload,
+    Request, Response, ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary,
+    decode, encode,
 };
 use bmux_session::{ClientId, Session, SessionId, SessionManager};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
@@ -40,6 +42,8 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use crate::recording::{RecordMeta, RecordingRuntime};
+
 const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
 const CONTEXT_SESSION_ID_ATTRIBUTE: &str = "bmux.session_id";
@@ -61,6 +65,7 @@ struct ServerState {
     follow_state: Mutex<FollowState>,
     context_state: Mutex<ContextState>,
     snapshot_runtime: Mutex<SnapshotRuntime>,
+    recording_runtime: Arc<Mutex<RecordingRuntime>>,
     operation_lock: AsyncMutex<()>,
     event_hub: Mutex<EventHub>,
     client_principals: Mutex<BTreeMap<ClientId, Uuid>>,
@@ -876,6 +881,7 @@ struct SessionRuntimeManager {
     pane_term: String,
     protocol_profile: ProtocolProfile,
     pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
+    recording_runtime: Arc<Mutex<RecordingRuntime>>,
 }
 
 struct SessionRuntimeHandle {
@@ -1493,11 +1499,12 @@ fn runtime_layout_from_snapshot(node: &PaneLayoutNodeSnapshotV2) -> PaneLayoutNo
 }
 
 impl SessionRuntimeManager {
-    const fn new(
+    fn new(
         shell: String,
         pane_term: String,
         protocol_profile: ProtocolProfile,
         pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
+        recording_runtime: Arc<Mutex<RecordingRuntime>>,
     ) -> Self {
         Self {
             runtimes: BTreeMap::new(),
@@ -1505,6 +1512,7 @@ impl SessionRuntimeManager {
             pane_term,
             protocol_profile,
             pane_exit_tx,
+            recording_runtime,
         }
     }
 
@@ -1601,6 +1609,7 @@ impl SessionRuntimeManager {
         let protocol_profile = self.protocol_profile;
         let pane_id = pane_meta.id;
         let pane_exit_tx = self.pane_exit_tx.clone();
+        let recording_runtime = Arc::clone(&self.recording_runtime);
         let output_buffer_for_reader = Arc::clone(&output_buffer);
         let exited = Arc::new(AtomicBool::new(false));
         let exited_for_task = Arc::clone(&exited);
@@ -1682,8 +1691,34 @@ impl SessionRuntimeManager {
                                 } else {
                                     break;
                                 }
+                                if let Ok(runtime) = recording_runtime.lock() {
+                                    let _ = runtime.record(
+                                        RecordingEventKind::PaneOutputRaw,
+                                        RecordingPayload::Bytes {
+                                            data: chunk.to_vec(),
+                                        },
+                                        RecordMeta {
+                                            session_id: Some(session_id.0),
+                                            pane_id: Some(pane_id),
+                                            client_id: None,
+                                        },
+                                    );
+                                }
                                 let reply = protocol_engine.process_output(chunk, (0, 0));
                                 if !reply.is_empty() {
+                                    if let Ok(runtime) = recording_runtime.lock() {
+                                        let _ = runtime.record(
+                                            RecordingEventKind::ProtocolReplyRaw,
+                                            RecordingPayload::Bytes {
+                                                data: reply.clone(),
+                                            },
+                                            RecordMeta {
+                                                session_id: Some(session_id.0),
+                                                pane_id: Some(pane_id),
+                                                client_id: None,
+                                            },
+                                        );
+                                    }
                                     if let Ok(mut writer) = writer_for_reader.lock() {
                                         if writer.write_all(&reply).is_err() {
                                             break;
@@ -2308,6 +2343,7 @@ impl BmuxServer {
         endpoint: IpcEndpoint,
         snapshot_manager: Option<SnapshotManager>,
         server_control_principal_id: Uuid,
+        recordings_dir: std::path::PathBuf,
     ) -> Self {
         let snapshot_runtime = match snapshot_manager {
             Some(manager) => SnapshotRuntime::with_manager(manager),
@@ -2320,6 +2356,7 @@ impl BmuxServer {
         let protocol_profile = protocol_profile_for_term(&pane_term);
         let (shutdown_tx, _) = watch::channel(false);
         let (pane_exit_tx, pane_exit_rx) = mpsc::unbounded_channel();
+        let recording_runtime = Arc::new(Mutex::new(RecordingRuntime::new(recordings_dir)));
         Self {
             endpoint,
             state: Arc::new(ServerState {
@@ -2329,11 +2366,13 @@ impl BmuxServer {
                     pane_term,
                     protocol_profile,
                     pane_exit_tx,
+                    Arc::clone(&recording_runtime),
                 )),
                 attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
                 follow_state: Mutex::new(FollowState::default()),
                 context_state: Mutex::new(ContextState::default()),
                 snapshot_runtime: Mutex::new(snapshot_runtime),
+                recording_runtime,
                 operation_lock: AsyncMutex::new(()),
                 event_hub: Mutex::new(EventHub::new(1024)),
                 client_principals: Mutex::new(BTreeMap::new()),
@@ -2350,7 +2389,12 @@ impl BmuxServer {
     /// Create a server with an explicit endpoint.
     #[must_use]
     pub fn new(endpoint: IpcEndpoint) -> Self {
-        Self::new_with_snapshot(endpoint, None, Uuid::new_v4())
+        Self::new_with_snapshot(
+            endpoint,
+            None,
+            Uuid::new_v4(),
+            ConfigPaths::default().recordings_dir(),
+        )
     }
 
     /// Create a server with endpoint derived from config paths.
@@ -2372,6 +2416,7 @@ impl BmuxServer {
             endpoint,
             Some(snapshot_manager),
             server_control_principal_id,
+            paths.recordings_dir(),
         )
     }
 
@@ -2678,6 +2723,21 @@ async fn handle_connection(
             exclusive,
             "server.request.start"
         );
+        if let Ok(runtime) = state.recording_runtime.lock() {
+            let _ = runtime.record(
+                RecordingEventKind::RequestStart,
+                RecordingPayload::RequestStart {
+                    request_id: envelope.request_id,
+                    request: request_kind.to_string(),
+                    exclusive,
+                },
+                RecordMeta {
+                    session_id: selected_session.map(|id| id.0),
+                    pane_id: None,
+                    client_id: Some(client_id.0),
+                },
+            );
+        }
 
         let response = handle_request(
             &state,
@@ -2700,6 +2760,22 @@ async fn handle_connection(
                     elapsed_ms,
                     "server.request.done"
                 );
+                if let Ok(runtime) = state.recording_runtime.lock() {
+                    let _ = runtime.record(
+                        RecordingEventKind::RequestDone,
+                        RecordingPayload::RequestDone {
+                            request_id: envelope.request_id,
+                            request: request_kind.to_string(),
+                            response: response_payload_kind_name(payload).to_string(),
+                            elapsed_ms: elapsed_ms.min(u128::from(u64::MAX)) as u64,
+                        },
+                        RecordMeta {
+                            session_id: selected_session.map(|id| id.0),
+                            pane_id: None,
+                            client_id: Some(client_id.0),
+                        },
+                    );
+                }
             }
             Response::Err(error) => {
                 warn!(
@@ -2711,6 +2787,23 @@ async fn handle_connection(
                     elapsed_ms,
                     "server.request.error"
                 );
+                if let Ok(runtime) = state.recording_runtime.lock() {
+                    let _ = runtime.record(
+                        RecordingEventKind::RequestError,
+                        RecordingPayload::RequestError {
+                            request_id: envelope.request_id,
+                            request: request_kind.to_string(),
+                            error_code: error.code,
+                            message: error.message.clone(),
+                            elapsed_ms: elapsed_ms.min(u128::from(u64::MAX)) as u64,
+                        },
+                        RecordMeta {
+                            session_id: selected_session.map(|id| id.0),
+                            pane_id: None,
+                            client_id: Some(client_id.0),
+                        },
+                    );
+                }
             }
         }
         send_response(&mut stream, envelope.request_id, response).await?;
@@ -2738,6 +2831,32 @@ async fn handle_connection(
 }
 
 fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
+    if let Ok(runtime) = state.recording_runtime.lock() {
+        let session_id = match &event {
+            Event::SessionCreated { id, .. }
+            | Event::SessionRemoved { id }
+            | Event::ClientAttached { id }
+            | Event::ClientDetached { id } => Some(*id),
+            Event::FollowTargetChanged { session_id, .. }
+            | Event::AttachViewChanged { session_id, .. } => Some(*session_id),
+            Event::ServerStarted
+            | Event::ServerStopping
+            | Event::FollowStarted { .. }
+            | Event::FollowStopped { .. }
+            | Event::FollowTargetGone { .. } => None,
+        };
+        let _ = runtime.record(
+            RecordingEventKind::ServerEvent,
+            RecordingPayload::ServerEvent {
+                event: event.clone(),
+            },
+            RecordMeta {
+                session_id,
+                pane_id: None,
+                client_id: None,
+            },
+        );
+    }
     let mut hub = state
         .event_hub
         .lock()
@@ -4848,6 +4967,7 @@ async fn handle_request(
             {
                 return Ok(Response::Err(response));
             }
+            let captured_input = data.clone();
             let write_result = {
                 let mut runtime_manager = state
                     .session_runtimes
@@ -4856,7 +4976,22 @@ async fn handle_request(
                 runtime_manager.write_input(session_id, client_id, data)
             };
             match write_result {
-                Ok(bytes) => Response::Ok(ResponsePayload::AttachInputAccepted { bytes }),
+                Ok(bytes) => {
+                    if let Ok(runtime) = state.recording_runtime.lock() {
+                        let _ = runtime.record(
+                            RecordingEventKind::PaneInputRaw,
+                            RecordingPayload::Bytes {
+                                data: captured_input,
+                            },
+                            RecordMeta {
+                                session_id: Some(session_id.0),
+                                pane_id: None,
+                                client_id: Some(client_id.0),
+                            },
+                        );
+                    }
+                    Response::Ok(ResponsePayload::AttachInputAccepted { bytes })
+                }
                 Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
                     message: format!("session runtime not found: {}", session_id.0),
@@ -5202,6 +5337,59 @@ async fn handle_request(
                 }),
             }
         }
+        Request::RecordingStart {
+            session_id,
+            capture_input,
+        } => {
+            let mut runtime = state
+                .recording_runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
+            match runtime.start(session_id, capture_input) {
+                Ok(recording) => Response::Ok(ResponsePayload::RecordingStarted { recording }),
+                Err(error) => Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: format!("failed starting recording: {error}"),
+                }),
+            }
+        }
+        Request::RecordingStop { recording_id } => {
+            let mut runtime = state
+                .recording_runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
+            match runtime.stop(recording_id) {
+                Ok(recording) => Response::Ok(ResponsePayload::RecordingStopped {
+                    recording_id: recording.id,
+                }),
+                Err(error) => Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: format!("failed stopping recording: {error}"),
+                }),
+            }
+        }
+        Request::RecordingStatus => {
+            let runtime = state
+                .recording_runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
+            Response::Ok(ResponsePayload::RecordingStatus {
+                status: runtime.status(),
+            })
+        }
+        Request::RecordingList => {
+            let runtime = state
+                .recording_runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
+            match runtime.list() {
+                Ok(recordings) => Response::Ok(ResponsePayload::RecordingList { recordings }),
+                Err(error) => Response::Err(ErrorResponse {
+                    code: ErrorCode::Internal,
+                    message: format!("failed listing recordings: {error}"),
+                }),
+            }
+        }
     };
 
     if let Response::Ok(ResponsePayload::SessionCreated { id, name }) = &response {
@@ -5247,6 +5435,8 @@ const fn request_requires_exclusive(request: &Request) -> bool {
             | Request::AttachOpen { .. }
             | Request::AttachInput { .. }
             | Request::AttachSetViewport { .. }
+            | Request::RecordingStart { .. }
+            | Request::RecordingStop { .. }
             | Request::Detach
     )
 }
@@ -5309,6 +5499,10 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::AttachLayout { .. } => "attach_layout",
         Request::AttachSnapshot { .. } => "attach_snapshot",
         Request::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
+        Request::RecordingStart { .. } => "recording_start",
+        Request::RecordingStop { .. } => "recording_stop",
+        Request::RecordingStatus => "recording_status",
+        Request::RecordingList => "recording_list",
         Request::Detach => "detach",
         Request::SubscribeEvents => "subscribe_events",
         Request::PollEvents { .. } => "poll_events",
@@ -5350,6 +5544,10 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::AttachLayout { .. } => "attach_layout",
         ResponsePayload::AttachSnapshot { .. } => "attach_snapshot",
         ResponsePayload::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
+        ResponsePayload::RecordingStarted { .. } => "recording_started",
+        ResponsePayload::RecordingStopped { .. } => "recording_stopped",
+        ResponsePayload::RecordingStatus { .. } => "recording_status",
+        ResponsePayload::RecordingList { .. } => "recording_list",
         ResponsePayload::Detached => "detached",
         ResponsePayload::EventsSubscribed => "events_subscribed",
         ResponsePayload::EventBatch { .. } => "event_batch",
