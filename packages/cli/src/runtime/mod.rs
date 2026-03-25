@@ -36,10 +36,10 @@ use crossterm::terminal::{Clear, ClearType};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use std::cell::RefCell;
 use std::io::{self, IsTerminal, Read, Seek, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::OnceLock;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
 use tracing::{Level, debug, trace, warn};
 use uuid::Uuid;
@@ -1167,14 +1167,17 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                         ignore,
                     },
             },
-        ) => run_recording_replay(
-            recording_id,
-            *mode,
-            *speed,
-            target_bmux.as_deref(),
-            compare_recording.as_deref(),
-            ignore.as_deref(),
-        ),
+        ) => {
+            run_recording_replay(
+                recording_id,
+                *mode,
+                *speed,
+                target_bmux.as_deref(),
+                compare_recording.as_deref(),
+                ignore.as_deref(),
+            )
+            .await
+        }
         _ => unreachable!("built-in command handler and command variant should stay in sync"),
     }
 }
@@ -2464,7 +2467,7 @@ fn run_recording_inspect(
     Ok(0)
 }
 
-fn run_recording_replay(
+async fn run_recording_replay(
     recording_id: &str,
     mode: RecordingReplayMode,
     speed: f64,
@@ -2476,12 +2479,7 @@ fn run_recording_replay(
     match mode {
         RecordingReplayMode::Watch => replay_watch(&events, speed),
         RecordingReplayMode::Verify => {
-            if let Some(target) = target_bmux {
-                println!("verify target binary: {target}");
-            } else {
-                println!("verify target binary: current bmux");
-            }
-            replay_verify(&events, compare_recording, ignore)
+            replay_verify(&events, target_bmux, compare_recording, ignore).await
         }
     }
 }
@@ -2515,8 +2513,9 @@ fn replay_watch(events: &[RecordingEventEnvelope], speed: f64) -> Result<u8> {
     Ok(0)
 }
 
-fn replay_verify(
+async fn replay_verify(
     baseline: &[RecordingEventEnvelope],
+    target_bmux: Option<&str>,
     compare_recording: Option<&str>,
     ignore: Option<&str>,
 ) -> Result<u8> {
@@ -2550,6 +2549,36 @@ fn replay_verify(
         return Ok(0);
     }
 
+    let target_binary = match target_bmux {
+        Some(path) => PathBuf::from(path),
+        None => std::env::current_exe().context("failed resolving current bmux binary")?,
+    };
+    println!("verify target binary: {}", target_binary.display());
+
+    let expected_output = expected_output_bytes(&baseline_filtered);
+    let input_timeline = input_timeline(&baseline_filtered);
+    let actual_output = run_target_verify_capture(&target_binary, &input_timeline).await?;
+
+    if let Some(index) = expected_output
+        .iter()
+        .zip(actual_output.iter())
+        .position(|(left, right)| left != right)
+    {
+        println!(
+            "verify FAIL: output mismatch at byte {} expected=0x{:02x} actual=0x{:02x}",
+            index, expected_output[index], actual_output[index]
+        );
+        return Ok(1);
+    }
+    if expected_output.len() != actual_output.len() {
+        println!(
+            "verify FAIL: output length mismatch expected={} actual={}",
+            expected_output.len(),
+            actual_output.len()
+        );
+        return Ok(1);
+    }
+
     let monotonic = baseline_filtered
         .windows(2)
         .all(|pair| pair[1].seq > pair[0].seq && pair[1].mono_ns >= pair[0].mono_ns);
@@ -2557,8 +2586,188 @@ fn replay_verify(
         println!("verify FAIL: non-monotonic sequence or timestamp ordering");
         return Ok(1);
     }
-    println!("verify PASS: timeline integrity checks succeeded");
+    println!("verify PASS: target output and timeline integrity checks succeeded");
     Ok(0)
+}
+
+#[derive(Debug, Clone)]
+struct ReplayInputEvent {
+    mono_ns: u64,
+    data: Vec<u8>,
+}
+
+fn expected_output_bytes(events: &[RecordingEventEnvelope]) -> Vec<u8> {
+    let mut output = Vec::new();
+    for event in events {
+        if matches!(event.kind, RecordingEventKind::PaneOutputRaw)
+            && let RecordingPayload::Bytes { data } = &event.payload
+        {
+            output.extend_from_slice(data);
+        }
+    }
+    output
+}
+
+fn input_timeline(events: &[RecordingEventEnvelope]) -> Vec<ReplayInputEvent> {
+    events
+        .iter()
+        .filter_map(|event| {
+            if !matches!(event.kind, RecordingEventKind::PaneInputRaw) {
+                return None;
+            }
+            match &event.payload {
+                RecordingPayload::Bytes { data } => Some(ReplayInputEvent {
+                    mono_ns: event.mono_ns,
+                    data: data.clone(),
+                }),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+async fn run_target_verify_capture(
+    target_binary: &Path,
+    inputs: &[ReplayInputEvent],
+) -> Result<Vec<u8>> {
+    let (paths, state_dir, root_dir) = verify_temp_paths();
+    paths
+        .ensure_dirs()
+        .context("failed preparing verify temp paths")?;
+    std::fs::create_dir_all(&state_dir).context("failed creating verify state dir")?;
+
+    let start_status = ProcessCommand::new(target_binary)
+        .arg("server")
+        .arg("start")
+        .arg("--daemon")
+        .env("BMUX_CONFIG_DIR", &paths.config_dir)
+        .env("BMUX_RUNTIME_DIR", &paths.runtime_dir)
+        .env("BMUX_DATA_DIR", &paths.data_dir)
+        .env("BMUX_STATE_DIR", &state_dir)
+        .status()
+        .context("failed starting target bmux server")?;
+    if !start_status.success() {
+        anyhow::bail!(
+            "target bmux server failed to start (status {})",
+            start_status
+        );
+    }
+
+    let run_result = async {
+        wait_for_verify_server_ready(&paths, Duration::from_secs(5)).await?;
+        let mut client = BmuxClient::connect_with_paths(&paths, "bmux-cli-recording-verify")
+            .await
+            .map_err(map_cli_client_error)?;
+        let session_id = client
+            .new_session(Some("verify-replay".to_string()))
+            .await
+            .map_err(map_cli_client_error)?;
+        let grant = client
+            .attach_grant(SessionSelector::ById(session_id))
+            .await
+            .map_err(map_cli_client_error)?;
+        let attach = client
+            .open_attach_stream_info(&grant)
+            .await
+            .map_err(map_cli_client_error)?;
+        let _ = client
+            .attach_set_viewport(attach.session_id, 120, 40)
+            .await
+            .map_err(map_cli_client_error);
+
+        let mut output = Vec::new();
+        let _ = drain_attach_output(&mut client, attach.session_id, &mut output).await;
+        let mut last_input_ns = 0_u64;
+        for input in inputs {
+            if input.mono_ns > last_input_ns {
+                let delta = input.mono_ns.saturating_sub(last_input_ns);
+                let sleep_ns = delta.min(25_000_000);
+                if sleep_ns > 0 {
+                    tokio::time::sleep(Duration::from_nanos(sleep_ns)).await;
+                }
+            }
+            if !input.data.is_empty() {
+                client
+                    .attach_input(attach.session_id, input.data.clone())
+                    .await
+                    .map_err(map_cli_client_error)?;
+            }
+            let _ = drain_attach_output(&mut client, attach.session_id, &mut output).await;
+            last_input_ns = input.mono_ns;
+        }
+        for _ in 0..8 {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let read = drain_attach_output(&mut client, attach.session_id, &mut output).await?;
+            if read == 0 {
+                break;
+            }
+        }
+        Ok::<Vec<u8>, anyhow::Error>(output)
+    }
+    .await;
+
+    let stop_result = stop_verify_server(&paths).await;
+    let _ = std::fs::remove_dir_all(&root_dir);
+    if let Err(error) = stop_result {
+        warn!("recording verify: failed stopping target server: {error}");
+    }
+    run_result
+}
+
+async fn drain_attach_output(
+    client: &mut BmuxClient,
+    session_id: Uuid,
+    output: &mut Vec<u8>,
+) -> Result<usize> {
+    let mut total = 0_usize;
+    loop {
+        let chunk = client
+            .attach_output(session_id, 65_536)
+            .await
+            .map_err(map_cli_client_error)?;
+        if chunk.is_empty() {
+            break;
+        }
+        total = total.saturating_add(chunk.len());
+        output.extend_from_slice(&chunk);
+    }
+    Ok(total)
+}
+
+async fn wait_for_verify_server_ready(paths: &ConfigPaths, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    loop {
+        match BmuxClient::connect_with_paths(paths, "bmux-cli-recording-verify-ready").await {
+            Ok(_) => return Ok(()),
+            Err(_) if start.elapsed() < timeout => {
+                tokio::time::sleep(Duration::from_millis(50)).await
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "verify server did not become ready: {error}"
+                ));
+            }
+        }
+    }
+}
+
+async fn stop_verify_server(paths: &ConfigPaths) -> Result<()> {
+    if let Ok(mut client) =
+        BmuxClient::connect_with_paths(paths, "bmux-cli-recording-verify-stop").await
+    {
+        let _ = client.stop_server().await.map_err(map_cli_client_error);
+    }
+    Ok(())
+}
+
+fn verify_temp_paths() -> (ConfigPaths, PathBuf, PathBuf) {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_nanos());
+    let root = std::env::temp_dir().join(format!("bmux-recording-verify-{nanos}"));
+    let paths = ConfigPaths::new(root.join("config"), root.join("runtime"), root.join("data"));
+    let state_dir = root.join("state");
+    (paths, state_dir, root)
 }
 
 fn parse_ignore_rules(ignore: Option<&str>) -> Vec<String> {
