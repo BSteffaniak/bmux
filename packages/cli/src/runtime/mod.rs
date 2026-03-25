@@ -856,6 +856,7 @@ fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
             RecordingCommand::List { .. } => BuiltInHandlerId::RecordingList,
             RecordingCommand::Inspect { .. } => BuiltInHandlerId::RecordingInspect,
             RecordingCommand::Replay { .. } => BuiltInHandlerId::RecordingReplay,
+            RecordingCommand::VerifySmoke { .. } => BuiltInHandlerId::RecordingVerifySmoke,
         },
         Command::External(_) => unreachable!("external commands are dispatched separately"),
     }
@@ -1176,6 +1177,32 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 recording_id,
                 *mode,
                 *speed,
+                target_bmux.as_deref(),
+                compare_recording.as_deref(),
+                ignore.as_deref(),
+                *strict_timing,
+                *max_verify_duration,
+                *verify_start_timeout,
+            )
+            .await
+        }
+        (
+            BuiltInHandlerId::RecordingVerifySmoke,
+            Command::Recording {
+                command:
+                    RecordingCommand::VerifySmoke {
+                        recording_id,
+                        target_bmux,
+                        compare_recording,
+                        ignore,
+                        strict_timing,
+                        max_verify_duration,
+                        verify_start_timeout,
+                    },
+            },
+        ) => {
+            run_recording_verify_smoke(
+                recording_id,
                 target_bmux.as_deref(),
                 compare_recording.as_deref(),
                 ignore.as_deref(),
@@ -2503,6 +2530,34 @@ async fn run_recording_replay(
     }
 }
 
+async fn run_recording_verify_smoke(
+    recording_id: &str,
+    target_bmux: Option<&str>,
+    compare_recording: Option<&str>,
+    ignore: Option<&str>,
+    strict_timing: bool,
+    max_verify_duration_secs: Option<u64>,
+    verify_start_timeout_secs: Option<u64>,
+) -> Result<u8> {
+    let events = load_recording_events(recording_id)?;
+    let report = verify_recording_report(
+        &events,
+        target_bmux,
+        compare_recording,
+        ignore,
+        strict_timing,
+        max_verify_duration_secs,
+        verify_start_timeout_secs,
+    )
+    .await?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .context("failed encoding verify smoke report json")?
+    );
+    Ok(if report.pass { 0 } else { 1 })
+}
+
 fn replay_watch(events: &[RecordingEventEnvelope], speed: f64) -> Result<u8> {
     let clamped_speed = if speed <= 0.0 { 1.0 } else { speed };
     let mut last_ns = 0_u64;
@@ -2532,6 +2587,37 @@ fn replay_watch(events: &[RecordingEventEnvelope], speed: f64) -> Result<u8> {
     Ok(0)
 }
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct VerifySmokeReport {
+    pass: bool,
+    reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_binary: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    compare_recording: Option<String>,
+    strict_timing: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_verify_duration_secs: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verify_start_timeout_secs: Option<u64>,
+    ignored_kinds: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mismatch_index: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expected_output_len: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    actual_output_len: Option<usize>,
+    monotonic_timeline: bool,
+}
+
 async fn replay_verify(
     baseline: &[RecordingEventEnvelope],
     target_bmux: Option<&str>,
@@ -2541,6 +2627,59 @@ async fn replay_verify(
     max_verify_duration_secs: Option<u64>,
     verify_start_timeout_secs: Option<u64>,
 ) -> Result<u8> {
+    let report = verify_recording_report(
+        baseline,
+        target_bmux,
+        compare_recording,
+        ignore,
+        strict_timing,
+        max_verify_duration_secs,
+        verify_start_timeout_secs,
+    )
+    .await?;
+
+    if let Some(target_binary) = &report.target_binary {
+        println!("verify target binary: {target_binary}");
+    }
+
+    if report.pass {
+        println!("verify PASS: {}", report.reason);
+        return Ok(0);
+    }
+
+    if let (Some(index), Some(expected), Some(actual), Some(expected_kind), Some(actual_kind)) = (
+        report.mismatch_index,
+        report.expected_seq,
+        report.actual_seq,
+        report.expected_kind.as_ref(),
+        report.actual_kind.as_ref(),
+    ) {
+        println!(
+            "verify FAIL: mismatch at index {} expected_seq={} actual_seq={} expected_kind={} actual_kind={}",
+            index, expected, actual, expected_kind, actual_kind
+        );
+        return Ok(1);
+    }
+    if let (Some(expected), Some(actual)) = (report.expected_output_len, report.actual_output_len) {
+        println!(
+            "verify FAIL: output length mismatch expected={} actual={}",
+            expected, actual
+        );
+        return Ok(1);
+    }
+    println!("verify FAIL: {}", report.reason);
+    Ok(1)
+}
+
+async fn verify_recording_report(
+    baseline: &[RecordingEventEnvelope],
+    target_bmux: Option<&str>,
+    compare_recording: Option<&str>,
+    ignore: Option<&str>,
+    strict_timing: bool,
+    max_verify_duration_secs: Option<u64>,
+    verify_start_timeout_secs: Option<u64>,
+) -> Result<VerifySmokeReport> {
     let ignore_rules = parse_ignore_rules(ignore);
     let baseline_filtered = apply_ignore_rules(baseline, &ignore_rules);
     if let Some(other_id) = compare_recording {
@@ -2553,30 +2692,69 @@ async fn replay_verify(
         if let Some(index) = mismatch {
             let expected = &baseline_filtered[index];
             let actual = &other_filtered[index];
-            println!(
-                "verify FAIL: mismatch at index {} expected_seq={} actual_seq={} expected_kind={:?} actual_kind={:?}",
-                index, expected.seq, actual.seq, expected.kind, actual.kind
-            );
-            return Ok(1);
+            return Ok(VerifySmokeReport {
+                pass: false,
+                reason: "recordings diverged".to_string(),
+                target_binary: None,
+                compare_recording: Some(other_id.to_string()),
+                strict_timing,
+                max_verify_duration_secs,
+                verify_start_timeout_secs,
+                ignored_kinds: ignore_rules,
+                mismatch_index: Some(index),
+                expected_seq: Some(expected.seq),
+                actual_seq: Some(actual.seq),
+                expected_kind: Some(recording_event_kind_name(expected.kind)),
+                actual_kind: Some(recording_event_kind_name(actual.kind)),
+                expected_output_len: Some(baseline_filtered.len()),
+                actual_output_len: Some(other_filtered.len()),
+                monotonic_timeline: true,
+            });
         }
         if baseline_filtered.len() != other_filtered.len() {
-            println!(
-                "verify FAIL: length mismatch expected={} actual={}",
-                baseline_filtered.len(),
-                other_filtered.len()
-            );
-            return Ok(1);
+            return Ok(VerifySmokeReport {
+                pass: false,
+                reason: "recordings length mismatch".to_string(),
+                target_binary: None,
+                compare_recording: Some(other_id.to_string()),
+                strict_timing,
+                max_verify_duration_secs,
+                verify_start_timeout_secs,
+                ignored_kinds: ignore_rules,
+                mismatch_index: None,
+                expected_seq: None,
+                actual_seq: None,
+                expected_kind: None,
+                actual_kind: None,
+                expected_output_len: Some(baseline_filtered.len()),
+                actual_output_len: Some(other_filtered.len()),
+                monotonic_timeline: true,
+            });
         }
-        println!("verify PASS: recordings are identical");
-        return Ok(0);
+        return Ok(VerifySmokeReport {
+            pass: true,
+            reason: "recordings are identical".to_string(),
+            target_binary: None,
+            compare_recording: Some(other_id.to_string()),
+            strict_timing,
+            max_verify_duration_secs,
+            verify_start_timeout_secs,
+            ignored_kinds: ignore_rules,
+            mismatch_index: None,
+            expected_seq: None,
+            actual_seq: None,
+            expected_kind: None,
+            actual_kind: None,
+            expected_output_len: Some(baseline_filtered.len()),
+            actual_output_len: Some(other_filtered.len()),
+            monotonic_timeline: true,
+        });
     }
 
     let target_binary = match target_bmux {
         Some(path) => PathBuf::from(path),
         None => std::env::current_exe().context("failed resolving current bmux binary")?,
     };
-    println!("verify target binary: {}", target_binary.display());
-
     let input_timeline = input_timeline(&baseline_filtered);
     let first_input_ns = input_timeline.first().map(|event| event.mono_ns);
     let expected_output = first_input_ns.map_or_else(Vec::new, |min_ns| {
@@ -2596,30 +2774,87 @@ async fn replay_verify(
         .zip(actual_output.iter())
         .position(|(left, right)| left != right)
     {
-        println!(
-            "verify FAIL: output mismatch at byte {} expected=0x{:02x} actual=0x{:02x}",
-            index, expected_output[index], actual_output[index]
-        );
-        return Ok(1);
+        return Ok(VerifySmokeReport {
+            pass: false,
+            reason: "output byte mismatch".to_string(),
+            target_binary: Some(target_binary.display().to_string()),
+            compare_recording: None,
+            strict_timing,
+            max_verify_duration_secs,
+            verify_start_timeout_secs,
+            ignored_kinds: ignore_rules,
+            mismatch_index: Some(index),
+            expected_seq: None,
+            actual_seq: None,
+            expected_kind: None,
+            actual_kind: None,
+            expected_output_len: Some(expected_output.len()),
+            actual_output_len: Some(actual_output.len()),
+            monotonic_timeline: true,
+        });
     }
     if expected_output.len() != actual_output.len() {
-        println!(
-            "verify FAIL: output length mismatch expected={} actual={}",
-            expected_output.len(),
-            actual_output.len()
-        );
-        return Ok(1);
+        return Ok(VerifySmokeReport {
+            pass: false,
+            reason: "output length mismatch".to_string(),
+            target_binary: Some(target_binary.display().to_string()),
+            compare_recording: None,
+            strict_timing,
+            max_verify_duration_secs,
+            verify_start_timeout_secs,
+            ignored_kinds: ignore_rules,
+            mismatch_index: None,
+            expected_seq: None,
+            actual_seq: None,
+            expected_kind: None,
+            actual_kind: None,
+            expected_output_len: Some(expected_output.len()),
+            actual_output_len: Some(actual_output.len()),
+            monotonic_timeline: true,
+        });
     }
 
     let monotonic = baseline_filtered
         .windows(2)
         .all(|pair| pair[1].seq > pair[0].seq && pair[1].mono_ns >= pair[0].mono_ns);
     if !monotonic {
-        println!("verify FAIL: non-monotonic sequence or timestamp ordering");
-        return Ok(1);
+        return Ok(VerifySmokeReport {
+            pass: false,
+            reason: "non-monotonic sequence or timestamp ordering".to_string(),
+            target_binary: Some(target_binary.display().to_string()),
+            compare_recording: None,
+            strict_timing,
+            max_verify_duration_secs,
+            verify_start_timeout_secs,
+            ignored_kinds: ignore_rules,
+            mismatch_index: None,
+            expected_seq: None,
+            actual_seq: None,
+            expected_kind: None,
+            actual_kind: None,
+            expected_output_len: Some(expected_output.len()),
+            actual_output_len: Some(actual_output.len()),
+            monotonic_timeline: false,
+        });
     }
-    println!("verify PASS: target output and timeline integrity checks succeeded");
-    Ok(0)
+    Ok(VerifySmokeReport {
+        pass: true,
+        reason: "target output and timeline integrity checks succeeded".to_string(),
+        target_binary: Some(target_binary.display().to_string()),
+        compare_recording: None,
+        strict_timing,
+        max_verify_duration_secs,
+        verify_start_timeout_secs,
+        ignored_kinds: ignore_rules,
+        mismatch_index: None,
+        expected_seq: None,
+        actual_seq: None,
+        expected_kind: None,
+        actual_kind: None,
+        expected_output_len: Some(expected_output.len()),
+        actual_output_len: Some(actual_output.len()),
+        monotonic_timeline: true,
+    })
 }
 
 #[derive(Debug, Clone)]

@@ -206,6 +206,29 @@ pub enum RecordingCommand {
         #[arg(long)]
         verify_start_timeout: Option<u64>,
     },
+    /// Run machine-readable verify smoke report
+    VerifySmoke {
+        /// Recording id
+        recording_id: String,
+        /// Optional target bmux binary for verify
+        #[arg(long)]
+        target_bmux: Option<String>,
+        /// Compare with another recording id
+        #[arg(long)]
+        compare_recording: Option<String>,
+        /// Optional comma-separated ignore rules
+        #[arg(long)]
+        ignore: Option<String>,
+        /// Preserve full recorded input timing
+        #[arg(long)]
+        strict_timing: bool,
+        /// Maximum verify runtime in seconds before aborting
+        #[arg(long)]
+        max_verify_duration: Option<u64>,
+        /// Timeout in seconds for target verify server readiness
+        #[arg(long)]
+        verify_start_timeout: Option<u64>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1455,6 +1478,34 @@ mod tests {
                 strict_timing: true,
                 max_verify_duration: Some(45),
                 verify_start_timeout: Some(20),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_recording_verify_smoke_flags() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "recording",
+            "verify-smoke",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--strict-timing",
+            "--max-verify-duration",
+            "50",
+            "--verify-start-timeout",
+            "30",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(
+            command,
+            RecordingCommand::VerifySmoke {
+                strict_timing: true,
+                max_verify_duration: Some(50),
+                verify_start_timeout: Some(30),
                 ..
             }
         ));

@@ -50,6 +50,7 @@ pub enum BuiltInHandlerId {
     RecordingList,
     RecordingInspect,
     RecordingReplay,
+    RecordingVerifySmoke,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -316,6 +317,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::RecordingReplay,
             &["recording", "replay"],
             "Replay recording timeline",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RecordingVerifySmoke,
+            &["recording", "verify-smoke"],
+            "Emit recording verify smoke report",
         ),
     ]
 }
