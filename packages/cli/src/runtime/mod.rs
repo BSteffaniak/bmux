@@ -221,6 +221,7 @@ const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(200);
 const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_STATUS_TIMEOUT: Duration = Duration::from_millis(1000);
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_millis(5000);
+const VERIFY_SERVER_START_TIMEOUT_DEFAULT: Duration = Duration::from_secs(30);
 const ATTACH_IO_POLL_INTERVAL: Duration = Duration::from_millis(15);
 const ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE: usize = 1_048_576;
 const ATTACH_SCROLLBACK_UNAVAILABLE_STATUS: &str = "scrollback unavailable for focused pane";
@@ -1167,6 +1168,7 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                         ignore,
                         strict_timing,
                         max_verify_duration,
+                        verify_start_timeout,
                     },
             },
         ) => {
@@ -1179,6 +1181,7 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 ignore.as_deref(),
                 *strict_timing,
                 *max_verify_duration,
+                *verify_start_timeout,
             )
             .await
         }
@@ -2480,6 +2483,7 @@ async fn run_recording_replay(
     ignore: Option<&str>,
     strict_timing: bool,
     max_verify_duration_secs: Option<u64>,
+    verify_start_timeout_secs: Option<u64>,
 ) -> Result<u8> {
     let events = load_recording_events(recording_id)?;
     match mode {
@@ -2492,6 +2496,7 @@ async fn run_recording_replay(
                 ignore,
                 strict_timing,
                 max_verify_duration_secs,
+                verify_start_timeout_secs,
             )
             .await
         }
@@ -2534,6 +2539,7 @@ async fn replay_verify(
     ignore: Option<&str>,
     strict_timing: bool,
     max_verify_duration_secs: Option<u64>,
+    verify_start_timeout_secs: Option<u64>,
 ) -> Result<u8> {
     let ignore_rules = parse_ignore_rules(ignore);
     let baseline_filtered = apply_ignore_rules(baseline, &ignore_rules);
@@ -2571,13 +2577,17 @@ async fn replay_verify(
     };
     println!("verify target binary: {}", target_binary.display());
 
-    let expected_output = expected_output_bytes(&baseline_filtered);
     let input_timeline = input_timeline(&baseline_filtered);
+    let first_input_ns = input_timeline.first().map(|event| event.mono_ns);
+    let expected_output = first_input_ns.map_or_else(Vec::new, |min_ns| {
+        expected_output_bytes(&baseline_filtered, Some(min_ns))
+    });
     let actual_output = run_target_verify_capture(
         &target_binary,
         &input_timeline,
         strict_timing,
         max_verify_duration_secs,
+        verify_start_timeout_secs,
     )
     .await?;
 
@@ -2618,9 +2628,14 @@ struct ReplayInputEvent {
     data: Vec<u8>,
 }
 
-fn expected_output_bytes(events: &[RecordingEventEnvelope]) -> Vec<u8> {
+fn expected_output_bytes(events: &[RecordingEventEnvelope], min_mono_ns: Option<u64>) -> Vec<u8> {
     let mut output = Vec::new();
     for event in events {
+        if let Some(min_mono_ns) = min_mono_ns
+            && event.mono_ns < min_mono_ns
+        {
+            continue;
+        }
         if matches!(event.kind, RecordingEventKind::PaneOutputRaw)
             && let RecordingPayload::Bytes { data } = &event.payload
         {
@@ -2653,6 +2668,7 @@ async fn run_target_verify_capture(
     inputs: &[ReplayInputEvent],
     strict_timing: bool,
     max_verify_duration_secs: Option<u64>,
+    verify_start_timeout_secs: Option<u64>,
 ) -> Result<Vec<u8>> {
     let max_verify_duration = max_verify_duration_secs.map(Duration::from_secs);
     let (paths, state_dir, root_dir) = verify_temp_paths();
@@ -2660,23 +2676,20 @@ async fn run_target_verify_capture(
         .ensure_dirs()
         .context("failed preparing verify temp paths")?;
     std::fs::create_dir_all(&state_dir).context("failed creating verify state dir")?;
+    write_verify_config(&paths)?;
 
-    let start_status = ProcessCommand::new(target_binary)
-        .arg("server")
-        .arg("start")
-        .arg("--daemon")
-        .env("BMUX_CONFIG_DIR", &paths.config_dir)
-        .env("BMUX_RUNTIME_DIR", &paths.runtime_dir)
-        .env("BMUX_DATA_DIR", &paths.data_dir)
-        .env("BMUX_STATE_DIR", &state_dir)
-        .status()
-        .context("failed starting target bmux server")?;
-    if !start_status.success() {
-        anyhow::bail!(
-            "target bmux server failed to start (status {})",
-            start_status
-        );
-    }
+    let verify_start_timeout = verify_start_timeout_secs
+        .map(Duration::from_secs)
+        .unwrap_or(VERIFY_SERVER_START_TIMEOUT_DEFAULT);
+    let mut server = start_verify_server(
+        target_binary,
+        &paths,
+        &state_dir,
+        &root_dir,
+        verify_start_timeout,
+    )
+    .await
+    .with_context(|| format!("verify startup failed; artifacts at {}", root_dir.display()))?;
 
     let run_result = async {
         wait_for_verify_server_ready(&paths, Duration::from_secs(5)).await?;
@@ -2701,7 +2714,6 @@ async fn run_target_verify_capture(
             .map_err(map_cli_client_error);
 
         let mut output = Vec::new();
-        let _ = drain_attach_output(&mut client, attach.session_id, &mut output).await;
         let mut last_input_ns = 0_u64;
         let verify_started = Instant::now();
         for input in inputs {
@@ -2730,10 +2742,16 @@ async fn run_target_verify_capture(
                     .await
                     .map_err(map_cli_client_error)?;
             }
-            let _ = drain_attach_output(&mut client, attach.session_id, &mut output).await;
+            let _ = collect_attach_output_until_idle(
+                &mut client,
+                attach.session_id,
+                &mut output,
+                Duration::from_millis(500),
+            )
+            .await;
             last_input_ns = input.mono_ns;
         }
-        for _ in 0..8 {
+        for _ in 0..6 {
             if let Some(limit) = max_verify_duration
                 && verify_started.elapsed() > limit
             {
@@ -2743,21 +2761,78 @@ async fn run_target_verify_capture(
                 );
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
-            let read = drain_attach_output(&mut client, attach.session_id, &mut output).await?;
-            if read == 0 {
-                break;
-            }
         }
+        let _ = collect_attach_output_until_idle(
+            &mut client,
+            attach.session_id,
+            &mut output,
+            Duration::from_millis(600),
+        )
+        .await;
         Ok::<Vec<u8>, anyhow::Error>(output)
     }
     .await;
 
-    let stop_result = stop_verify_server(&paths).await;
-    let _ = std::fs::remove_dir_all(&root_dir);
-    if let Err(error) = stop_result {
-        warn!("recording verify: failed stopping target server: {error}");
+    let stop_result = server.shutdown().await;
+    if run_result.is_ok() && stop_result.is_ok() {
+        let _ = std::fs::remove_dir_all(&root_dir);
+    } else {
+        warn!(
+            "recording verify artifacts retained at {}",
+            root_dir.display()
+        );
+        warn!(
+            "recording verify server stdout log: {}",
+            server.stdout_log_path().display()
+        );
+        warn!(
+            "recording verify server stderr log: {}",
+            server.stderr_log_path().display()
+        );
     }
+
+    if let Err(error) = stop_result {
+        return Err(error).with_context(|| {
+            format!(
+                "verify server shutdown failed; artifacts at {} (stdout: {}, stderr: {})",
+                root_dir.display(),
+                server.stdout_log_path().display(),
+                server.stderr_log_path().display()
+            )
+        });
+    }
+
+    if let Err(error) = run_result {
+        return Err(error).with_context(|| {
+            format!(
+                "verify run failed; artifacts at {} (stdout: {}, stderr: {})",
+                root_dir.display(),
+                server.stdout_log_path().display(),
+                server.stderr_log_path().display()
+            )
+        });
+    }
+
     run_result
+}
+
+async fn wait_for_verify_server_ready(paths: &ConfigPaths, timeout: Duration) -> Result<()> {
+    let start = Instant::now();
+    let mut poll_delay = Duration::from_millis(50);
+    loop {
+        match BmuxClient::connect_with_paths(paths, "bmux-cli-recording-verify-ready").await {
+            Ok(_) => return Ok(()),
+            Err(_) if start.elapsed() < timeout => {
+                tokio::time::sleep(poll_delay).await;
+                poll_delay = (poll_delay * 2).min(Duration::from_millis(250));
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "verify server did not become ready: {error}"
+                ));
+            }
+        }
+    }
 }
 
 async fn drain_attach_output(
@@ -2780,19 +2855,316 @@ async fn drain_attach_output(
     Ok(total)
 }
 
-async fn wait_for_verify_server_ready(paths: &ConfigPaths, timeout: Duration) -> Result<()> {
+async fn collect_attach_output_until_idle(
+    client: &mut BmuxClient,
+    session_id: Uuid,
+    output: &mut Vec<u8>,
+    max_wait: Duration,
+) -> Result<usize> {
+    let started = Instant::now();
+    let mut collected = 0_usize;
+    let mut idle_polls = 0_u8;
+    while started.elapsed() < max_wait {
+        let read = drain_attach_output(client, session_id, output).await?;
+        collected = collected.saturating_add(read);
+        if read == 0 {
+            idle_polls = idle_polls.saturating_add(1);
+            if idle_polls >= 3 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        } else {
+            idle_polls = 0;
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    }
+    Ok(collected)
+}
+
+#[derive(Debug)]
+enum VerifyServerHandle {
+    Foreground {
+        child: std::process::Child,
+        paths: ConfigPaths,
+        stdout_log: PathBuf,
+        stderr_log: PathBuf,
+    },
+    Daemon {
+        paths: ConfigPaths,
+        stdout_log: PathBuf,
+        stderr_log: PathBuf,
+    },
+}
+
+impl VerifyServerHandle {
+    async fn shutdown(&mut self) -> Result<()> {
+        stop_verify_server(self.paths()).await?;
+        match self {
+            VerifyServerHandle::Foreground { child, .. } => {
+                if wait_for_child_exit(child, Duration::from_secs(2)).await? {
+                    return Ok(());
+                }
+                if try_kill_pid(child.id())? {
+                    let _ = wait_for_child_exit(child, Duration::from_secs(2)).await;
+                }
+                Ok(())
+            }
+            VerifyServerHandle::Daemon { paths, .. } => {
+                if wait_until_verify_server_stopped(paths, Duration::from_secs(2)).await? {
+                    return Ok(());
+                }
+                if let Some(pid) = read_server_pid_file_at(paths)? {
+                    let _ = try_kill_pid(pid);
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn paths(&self) -> &ConfigPaths {
+        match self {
+            VerifyServerHandle::Foreground { paths, .. }
+            | VerifyServerHandle::Daemon { paths, .. } => paths,
+        }
+    }
+
+    fn stdout_log_path(&self) -> &Path {
+        match self {
+            VerifyServerHandle::Foreground { stdout_log, .. }
+            | VerifyServerHandle::Daemon { stdout_log, .. } => stdout_log.as_path(),
+        }
+    }
+
+    fn stderr_log_path(&self) -> &Path {
+        match self {
+            VerifyServerHandle::Foreground { stderr_log, .. }
+            | VerifyServerHandle::Daemon { stderr_log, .. } => stderr_log.as_path(),
+        }
+    }
+}
+
+async fn start_verify_server(
+    target_binary: &Path,
+    paths: &ConfigPaths,
+    state_dir: &Path,
+    root_dir: &Path,
+    timeout: Duration,
+) -> Result<VerifyServerHandle> {
+    match start_verify_server_foreground(target_binary, paths, state_dir, root_dir, timeout).await {
+        Ok(handle) => Ok(handle),
+        Err(foreground_error) => {
+            warn!(
+                "recording verify foreground server startup failed, falling back to daemon: {foreground_error}"
+            );
+            start_verify_server_daemon(target_binary, paths, state_dir, root_dir, timeout)
+                .await
+                .with_context(|| {
+                    format!(
+                        "verify startup failed in foreground and daemon fallback; foreground error: {foreground_error:#}"
+                    )
+                })
+        }
+    }
+}
+
+async fn start_verify_server_foreground(
+    target_binary: &Path,
+    paths: &ConfigPaths,
+    state_dir: &Path,
+    root_dir: &Path,
+    timeout: Duration,
+) -> Result<VerifyServerHandle> {
+    let logs_dir = root_dir.join("logs");
+    std::fs::create_dir_all(&logs_dir)
+        .with_context(|| format!("failed creating verify logs dir {}", logs_dir.display()))?;
+    let stdout_log = logs_dir.join("verify-server-foreground.stdout.log");
+    let stderr_log = logs_dir.join("verify-server-foreground.stderr.log");
+    let stdout = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stdout_log)
+        .with_context(|| format!("failed opening verify stdout log {}", stdout_log.display()))?;
+    let stderr = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_log)
+        .with_context(|| format!("failed opening verify stderr log {}", stderr_log.display()))?;
+
+    let child = ProcessCommand::new(target_binary)
+        .arg("server")
+        .arg("start")
+        .env("BMUX_CONFIG_DIR", &paths.config_dir)
+        .env("BMUX_RUNTIME_DIR", &paths.runtime_dir)
+        .env("BMUX_DATA_DIR", &paths.data_dir)
+        .env("BMUX_STATE_DIR", state_dir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(stdout))
+        .stderr(Stdio::from(stderr))
+        .spawn()
+        .with_context(|| {
+            format!(
+                "failed spawning foreground verify target binary {}",
+                target_binary.display()
+            )
+        })?;
+
+    let mut handle = VerifyServerHandle::Foreground {
+        child,
+        paths: paths.clone(),
+        stdout_log: stdout_log.clone(),
+        stderr_log: stderr_log.clone(),
+    };
+
+    match wait_for_verify_server_ready_with_child(paths, timeout, handle.child_mut()).await {
+        Ok(()) => Ok(handle),
+        Err(error) => {
+            let stderr_excerpt = read_verify_log_excerpt(&stderr_log);
+            let _ = handle.shutdown().await;
+            Err(error).with_context(|| {
+                format!(
+                    "foreground verify startup failed (stdout: {}, stderr: {}, stderr_excerpt: {})",
+                    stdout_log.display(),
+                    stderr_log.display(),
+                    stderr_excerpt
+                )
+            })
+        }
+    }
+}
+
+async fn start_verify_server_daemon(
+    target_binary: &Path,
+    paths: &ConfigPaths,
+    state_dir: &Path,
+    root_dir: &Path,
+    timeout: Duration,
+) -> Result<VerifyServerHandle> {
+    let logs_dir = root_dir.join("logs");
+    std::fs::create_dir_all(&logs_dir)
+        .with_context(|| format!("failed creating verify logs dir {}", logs_dir.display()))?;
+    let stdout_log = logs_dir.join("verify-server-daemon.stdout.log");
+    let stderr_log = logs_dir.join("verify-server-daemon.stderr.log");
+    let output = ProcessCommand::new(target_binary)
+        .arg("server")
+        .arg("start")
+        .arg("--daemon")
+        .env("BMUX_CONFIG_DIR", &paths.config_dir)
+        .env("BMUX_RUNTIME_DIR", &paths.runtime_dir)
+        .env("BMUX_DATA_DIR", &paths.data_dir)
+        .env("BMUX_STATE_DIR", state_dir)
+        .output()
+        .context("failed starting verify target daemon fallback")?;
+    std::fs::write(&stdout_log, &output.stdout)
+        .with_context(|| format!("failed writing verify stdout log {}", stdout_log.display()))?;
+    std::fs::write(&stderr_log, &output.stderr)
+        .with_context(|| format!("failed writing verify stderr log {}", stderr_log.display()))?;
+    if !output.status.success() {
+        let stderr_excerpt = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "verify daemon fallback start failed with status {} (stdout: {}, stderr: {}, stderr_excerpt: {})",
+            output.status,
+            stdout_log.display(),
+            stderr_log.display(),
+            stderr_excerpt
+        );
+    }
+    wait_for_verify_server_ready(paths, timeout).await?;
+    Ok(VerifyServerHandle::Daemon {
+        paths: paths.clone(),
+        stdout_log,
+        stderr_log,
+    })
+}
+
+async fn wait_for_verify_server_ready_with_child(
+    paths: &ConfigPaths,
+    timeout: Duration,
+    child: Option<&mut std::process::Child>,
+) -> Result<()> {
     let start = Instant::now();
+    let mut poll_delay = Duration::from_millis(50);
+    let mut child = child;
     loop {
         match BmuxClient::connect_with_paths(paths, "bmux-cli-recording-verify-ready").await {
             Ok(_) => return Ok(()),
             Err(_) if start.elapsed() < timeout => {
-                tokio::time::sleep(Duration::from_millis(50)).await
+                if let Some(child) = child.as_deref_mut()
+                    && let Some(status) = child
+                        .try_wait()
+                        .context("failed checking verify target process status")?
+                {
+                    anyhow::bail!(
+                        "verify target process exited before readiness (status: {status})"
+                    );
+                }
+                tokio::time::sleep(poll_delay).await;
+                poll_delay = (poll_delay * 2).min(Duration::from_millis(250));
             }
             Err(error) => {
                 return Err(anyhow::anyhow!(
-                    "verify server did not become ready: {error}"
+                    "verify server did not become ready within {}s: {error}",
+                    timeout.as_secs()
                 ));
             }
+        }
+    }
+}
+
+async fn wait_until_verify_server_stopped(paths: &ConfigPaths, timeout: Duration) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        match BmuxClient::connect_with_paths(paths, "bmux-cli-recording-verify-stop-check").await {
+            Ok(_) => tokio::time::sleep(Duration::from_millis(80)).await,
+            Err(_) => return Ok(true),
+        }
+    }
+    Ok(false)
+}
+
+async fn wait_for_child_exit(child: &mut std::process::Child, timeout: Duration) -> Result<bool> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if child
+            .try_wait()
+            .context("failed checking verify child process state")?
+            .is_some()
+        {
+            return Ok(true);
+        }
+        tokio::time::sleep(Duration::from_millis(80)).await;
+    }
+    Ok(child
+        .try_wait()
+        .context("failed checking verify child process state")?
+        .is_some())
+}
+
+fn read_server_pid_file_at(paths: &ConfigPaths) -> Result<Option<u32>> {
+    let pid_file = paths.server_pid_file();
+    let content = match std::fs::read_to_string(&pid_file) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("failed reading pid file {}", pid_file.display()));
+        }
+    };
+    Ok(parse_pid_content(&content))
+}
+
+fn read_verify_log_excerpt(path: &Path) -> String {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|content| content.lines().last().map(str::to_string))
+        .filter(|line| !line.trim().is_empty())
+        .unwrap_or_else(|| "<empty>".to_string())
+}
+
+impl VerifyServerHandle {
+    fn child_mut(&mut self) -> Option<&mut std::process::Child> {
+        match self {
+            VerifyServerHandle::Foreground { child, .. } => Some(child),
+            VerifyServerHandle::Daemon { .. } => None,
         }
     }
 }
@@ -2810,10 +3182,44 @@ fn verify_temp_paths() -> (ConfigPaths, PathBuf, PathBuf) {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
-    let root = std::env::temp_dir().join(format!("bmux-recording-verify-{nanos}"));
-    let paths = ConfigPaths::new(root.join("config"), root.join("runtime"), root.join("data"));
-    let state_dir = root.join("state");
+    let root = std::env::temp_dir().join(format!("brv-{nanos:x}"));
+    let paths = ConfigPaths::new(root.join("c"), root.join("r"), root.join("d"));
+    let state_dir = root.join("s");
     (paths, state_dir, root)
+}
+
+fn write_verify_config(paths: &ConfigPaths) -> Result<()> {
+    let config_path = paths.config_file();
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed creating verify config dir {}", parent.display()))?;
+    }
+    let config = BmuxConfig::default();
+    let registry = scan_available_plugins(&config, paths)?;
+    let bundled_roots = bundled_plugin_roots()
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut disabled_plugins = registry
+        .iter()
+        .filter_map(|plugin| {
+            (bundled_roots.contains(&plugin.search_root) && registered_plugin_entry_exists(plugin))
+                .then(|| plugin.declaration.id.as_str().to_string())
+        })
+        .collect::<Vec<_>>();
+    disabled_plugins.sort();
+
+    let disabled = if disabled_plugins.is_empty() {
+        String::new()
+    } else {
+        disabled_plugins
+            .iter()
+            .map(|id| format!("'{id}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let payload = format!("[plugins]\ndisabled = [{disabled}]\n");
+    std::fs::write(&config_path, payload)
+        .with_context(|| format!("failed writing verify config {}", config_path.display()))
 }
 
 fn parse_ignore_rules(ignore: Option<&str>) -> Vec<String> {

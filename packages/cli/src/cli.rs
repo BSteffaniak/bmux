@@ -202,6 +202,9 @@ pub enum RecordingCommand {
         /// Maximum verify runtime in seconds before aborting
         #[arg(long)]
         max_verify_duration: Option<u64>,
+        /// Timeout in seconds for target verify server readiness
+        #[arg(long)]
+        verify_start_timeout: Option<u64>,
     },
 }
 
@@ -1421,6 +1424,37 @@ mod tests {
             command,
             RecordingCommand::Replay {
                 mode: RecordingReplayMode::Verify,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_recording_replay_verify_tuning_flags() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "recording",
+            "replay",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--mode",
+            "verify",
+            "--strict-timing",
+            "--max-verify-duration",
+            "45",
+            "--verify-start-timeout",
+            "20",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(
+            command,
+            RecordingCommand::Replay {
+                mode: RecordingReplayMode::Verify,
+                strict_timing: true,
+                max_verify_duration: Some(45),
+                verify_start_timeout: Some(20),
                 ..
             }
         ));
