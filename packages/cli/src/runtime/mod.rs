@@ -1166,6 +1166,7 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                         compare_recording,
                         ignore,
                         strict_timing,
+                        max_verify_duration,
                     },
             },
         ) => {
@@ -1177,6 +1178,7 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 compare_recording.as_deref(),
                 ignore.as_deref(),
                 *strict_timing,
+                *max_verify_duration,
             )
             .await
         }
@@ -2477,6 +2479,7 @@ async fn run_recording_replay(
     compare_recording: Option<&str>,
     ignore: Option<&str>,
     strict_timing: bool,
+    max_verify_duration_secs: Option<u64>,
 ) -> Result<u8> {
     let events = load_recording_events(recording_id)?;
     match mode {
@@ -2488,6 +2491,7 @@ async fn run_recording_replay(
                 compare_recording,
                 ignore,
                 strict_timing,
+                max_verify_duration_secs,
             )
             .await
         }
@@ -2529,6 +2533,7 @@ async fn replay_verify(
     compare_recording: Option<&str>,
     ignore: Option<&str>,
     strict_timing: bool,
+    max_verify_duration_secs: Option<u64>,
 ) -> Result<u8> {
     let ignore_rules = parse_ignore_rules(ignore);
     let baseline_filtered = apply_ignore_rules(baseline, &ignore_rules);
@@ -2568,8 +2573,13 @@ async fn replay_verify(
 
     let expected_output = expected_output_bytes(&baseline_filtered);
     let input_timeline = input_timeline(&baseline_filtered);
-    let actual_output =
-        run_target_verify_capture(&target_binary, &input_timeline, strict_timing).await?;
+    let actual_output = run_target_verify_capture(
+        &target_binary,
+        &input_timeline,
+        strict_timing,
+        max_verify_duration_secs,
+    )
+    .await?;
 
     if let Some(index) = expected_output
         .iter()
@@ -2642,7 +2652,9 @@ async fn run_target_verify_capture(
     target_binary: &Path,
     inputs: &[ReplayInputEvent],
     strict_timing: bool,
+    max_verify_duration_secs: Option<u64>,
 ) -> Result<Vec<u8>> {
+    let max_verify_duration = max_verify_duration_secs.map(Duration::from_secs);
     let (paths, state_dir, root_dir) = verify_temp_paths();
     paths
         .ensure_dirs()
@@ -2691,7 +2703,16 @@ async fn run_target_verify_capture(
         let mut output = Vec::new();
         let _ = drain_attach_output(&mut client, attach.session_id, &mut output).await;
         let mut last_input_ns = 0_u64;
+        let verify_started = Instant::now();
         for input in inputs {
+            if let Some(limit) = max_verify_duration
+                && verify_started.elapsed() > limit
+            {
+                anyhow::bail!(
+                    "verify aborted after exceeding max duration of {}s",
+                    limit.as_secs()
+                );
+            }
             if input.mono_ns > last_input_ns {
                 let delta = input.mono_ns.saturating_sub(last_input_ns);
                 let sleep_ns = if strict_timing {
@@ -2713,6 +2734,14 @@ async fn run_target_verify_capture(
             last_input_ns = input.mono_ns;
         }
         for _ in 0..8 {
+            if let Some(limit) = max_verify_duration
+                && verify_started.elapsed() > limit
+            {
+                anyhow::bail!(
+                    "verify aborted after exceeding max duration of {}s",
+                    limit.as_secs()
+                );
+            }
             tokio::time::sleep(Duration::from_millis(25)).await;
             let read = drain_attach_output(&mut client, attach.session_id, &mut output).await?;
             if read == 0 {

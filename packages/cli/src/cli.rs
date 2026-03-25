@@ -199,6 +199,9 @@ pub enum RecordingCommand {
         /// Preserve full recorded input timing in verify mode
         #[arg(long)]
         strict_timing: bool,
+        /// Maximum verify runtime in seconds before aborting
+        #[arg(long)]
+        max_verify_duration: Option<u64>,
     },
 }
 
