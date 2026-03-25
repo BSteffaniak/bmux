@@ -49,6 +49,7 @@ use bmux_server::ServiceInvokeContext;
 thread_local! {
     static SERVICE_KERNEL_CONTEXT: RefCell<Option<ServiceInvokeContext>> = const { RefCell::new(None) };
     static HOST_KERNEL_CONNECTION: RefCell<Option<HostConnectionInfo>> = const { RefCell::new(None) };
+    static HOST_KERNEL_EFFECT_CAPTURE: RefCell<Option<Vec<PluginCommandEffect>>> = const { RefCell::new(None) };
 }
 
 struct ServiceKernelContextGuard;
@@ -89,6 +90,47 @@ fn enter_host_kernel_connection(connection: HostConnectionInfo) -> HostKernelCon
     HostKernelConnectionGuard
 }
 
+fn begin_host_kernel_effect_capture() {
+    HOST_KERNEL_EFFECT_CAPTURE.with(|slot| {
+        *slot.borrow_mut() = Some(Vec::new());
+    });
+}
+
+fn record_host_kernel_effect(effect: PluginCommandEffect) {
+    HOST_KERNEL_EFFECT_CAPTURE.with(|slot| {
+        if let Some(captured) = slot.borrow_mut().as_mut() {
+            captured.push(effect);
+        }
+    });
+}
+
+fn finish_host_kernel_effect_capture() -> Vec<PluginCommandEffect> {
+    HOST_KERNEL_EFFECT_CAPTURE
+        .with(|slot| slot.borrow_mut().take())
+        .unwrap_or_default()
+}
+
+fn maybe_record_host_kernel_effect(request: &bmux_ipc::Request, response: &bmux_ipc::Response) {
+    let effect = match (request, response) {
+        (
+            bmux_ipc::Request::CreateContext { .. },
+            bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextCreated { context }),
+        ) => Some(PluginCommandEffect::SelectContext {
+            context_id: context.id,
+        }),
+        (
+            bmux_ipc::Request::SelectContext { .. },
+            bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextSelected { context }),
+        ) => Some(PluginCommandEffect::SelectContext {
+            context_id: context.id,
+        }),
+        _ => None,
+    };
+    if let Some(effect) = effect {
+        record_host_kernel_effect(effect);
+    }
+}
+
 fn call_host_kernel_via_client(
     connection: &HostConnectionInfo,
     payload: Vec<u8>,
@@ -105,7 +147,7 @@ fn call_host_kernel_via_client(
         Ok(handle) => tokio::task::block_in_place(|| {
             handle.block_on(async {
                 let mut client = BmuxClient::connect_with_paths(&paths, &request_name).await?;
-                client.request_raw(request).await
+                client.request_raw(request.clone()).await
             })
         }),
         Err(_) => {
@@ -115,10 +157,11 @@ fn call_host_kernel_via_client(
                 .context("failed creating kernel bridge runtime")?;
             runtime.block_on(async {
                 let mut client = BmuxClient::connect_with_paths(&paths, &request_name).await?;
-                client.request_raw(request).await
+                client.request_raw(request.clone()).await
             })
         }
     }?;
+    maybe_record_host_kernel_effect(&request, &response);
     bmux_ipc::encode(&response).context("failed encoding kernel bridge response payload")
 }
 
@@ -2101,16 +2144,31 @@ fn run_plugin_command_internal(
         enabled_plugins,
         plugin_search_roots,
     );
+    begin_host_kernel_effect_capture();
     let _host_kernel_connection_guard = enter_host_kernel_connection(context.connection.clone());
-    let (status, outcome) = loaded
-        .run_command_with_context_and_outcome(command_name, args, Some(&context))
-        .map_err(|error| {
-            anyhow::anyhow!(format_plugin_command_run_error(
-                plugin_id,
-                command_name,
-                &error
-            ))
-        })?;
+    let run_result =
+        loaded.run_command_with_context_and_outcome(command_name, args, Some(&context));
+    let fallback_effects = finish_host_kernel_effect_capture();
+    let (status, mut outcome) = run_result.map_err(|error| {
+        anyhow::anyhow!(format_plugin_command_run_error(
+            plugin_id,
+            command_name,
+            &error
+        ))
+    })?;
+    if outcome.effects.is_empty() && !fallback_effects.is_empty() {
+        let mut seen = std::collections::BTreeSet::new();
+        for effect in fallback_effects {
+            match effect {
+                PluginCommandEffect::SelectContext { context_id } if seen.insert(context_id) => {
+                    outcome
+                        .effects
+                        .push(PluginCommandEffect::SelectContext { context_id });
+                }
+                PluginCommandEffect::SelectContext { .. } => {}
+            }
+        }
+    }
     Ok(PluginCommandExecution { status, outcome })
 }
 
@@ -7857,7 +7915,7 @@ mod tests {
         AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
         AttachViewComponent, ErrorCode, PaneLayoutNode, PaneSummary, SessionSummary,
     };
-    use bmux_plugin::{PluginManifest, PluginRegistry};
+    use bmux_plugin::{PluginCommandEffect, PluginManifest, PluginRegistry};
     use crossterm::event::{
         KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
         KeyEventKind as CrosstermKeyEventKind, KeyModifiers,
@@ -9605,6 +9663,42 @@ mod tests {
             ),
             None
         );
+    }
+
+    #[test]
+    fn host_kernel_effect_capture_records_select_context_from_select_response() {
+        super::begin_host_kernel_effect_capture();
+        let context_id = Uuid::from_u128(42);
+        super::maybe_record_host_kernel_effect(
+            &bmux_ipc::Request::SelectContext {
+                selector: bmux_ipc::ContextSelector::ById(context_id),
+            },
+            &bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextSelected {
+                context: bmux_ipc::ContextSummary {
+                    id: context_id,
+                    name: Some("ctx".to_string()),
+                    attributes: std::collections::BTreeMap::new(),
+                },
+            }),
+        );
+        let captured = super::finish_host_kernel_effect_capture();
+        assert_eq!(
+            captured,
+            vec![PluginCommandEffect::SelectContext { context_id }]
+        );
+    }
+
+    #[test]
+    fn host_kernel_effect_capture_ignores_non_context_responses() {
+        super::begin_host_kernel_effect_capture();
+        super::maybe_record_host_kernel_effect(
+            &bmux_ipc::Request::ListSessions,
+            &bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionList {
+                sessions: Vec::new(),
+            }),
+        );
+        let captured = super::finish_host_kernel_effect_capture();
+        assert!(captured.is_empty());
     }
 
     #[test]

@@ -6,11 +6,15 @@ use bmux_plugin::{
     CommandExecutionKind, ContextCloseRequest, ContextCreateRequest, ContextSelector,
     HostRuntimeApi, HostScope, NativeCommandContext, NativeDescriptor, NativeServiceContext,
     PluginCommand, PluginCommandArgument, PluginCommandArgumentKind, PluginService, RustPlugin,
-    ServiceKind, ServiceResponse, decode_service_message, encode_service_message,
+    ServiceKind, ServiceResponse, StorageGetRequest, StorageSetRequest, decode_service_message,
+    encode_service_message,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
+
+const ACTIVE_WINDOW_CONTEXT_KEY: &str = "windows.active_context_id";
+const PREVIOUS_WINDOW_CONTEXT_KEY: &str = "windows.previous_context_id";
 
 #[derive(Default)]
 struct WindowsPlugin {
@@ -29,6 +33,8 @@ impl RustPlugin for WindowsPlugin {
             .require_capability("bmux.contexts.write")
             .expect("capability should parse")
             .require_capability("bmux.clients.read")
+            .expect("capability should parse")
+            .require_capability("bmux.storage")
             .expect("capability should parse")
             .provide_capability("bmux.windows.read")
             .expect("capability should parse")
@@ -397,15 +403,23 @@ fn create_window(
     caller: &impl HostRuntimeApi,
     name: Option<String>,
 ) -> Result<WindowCommandAck, String> {
+    let previous_context = resolve_effective_current_context(caller).ok().flatten();
     let response = caller
         .context_create(&ContextCreateRequest {
             name,
             attributes: BTreeMap::new(),
         })
         .map_err(|error| error.to_string())?;
+    let context_id = response.context.id;
+    if let Some(previous) = previous_context
+        && previous != context_id
+    {
+        let _ = set_stored_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, Some(previous));
+    }
+    let _ = set_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id));
     Ok(WindowCommandAck {
         ok: true,
-        id: Some(response.context.id.to_string()),
+        id: Some(context_id.to_string()),
     })
 }
 
@@ -450,11 +464,12 @@ fn switch_window(
     selector: ContextSelector,
     last_selected_by_client: &mut BTreeMap<Uuid, Uuid>,
 ) -> Result<WindowCommandAck, String> {
-    let current = caller
-        .context_current()
-        .map_err(|error| error.to_string())?;
-    let previous_context = current.context.map(|context| context.id);
-    let context_id = resolve_context_id(caller, selector)?;
+    let contexts = caller
+        .context_list()
+        .map_err(|error| error.to_string())?
+        .contexts;
+    let previous_context = resolve_effective_current_context_with_contexts(caller, &contexts)?;
+    let context_id = resolve_context_id_from_contexts(&contexts, &selector)?;
     caller
         .context_select(&bmux_plugin::ContextSelectRequest {
             selector: ContextSelector::ById(context_id),
@@ -466,6 +481,12 @@ fn switch_window(
     {
         last_selected_by_client.insert(client.id, previous);
     }
+    if let Some(previous) = previous_context
+        && previous != context_id
+    {
+        let _ = set_stored_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY, Some(previous));
+    }
+    let _ = set_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY, Some(context_id));
     Ok(WindowCommandAck {
         ok: true,
         id: Some(context_id.to_string()),
@@ -484,12 +505,7 @@ fn cycle_window(
     if contexts.len() < 2 {
         return Err("no alternate window available".to_string());
     }
-    let current = caller
-        .context_current()
-        .map_err(|error| error.to_string())?;
-    let current_context = current
-        .context
-        .map(|context| context.id)
+    let current_context = resolve_effective_current_context_with_contexts(caller, &contexts)?
         .unwrap_or(contexts[0].id);
     let current_index = contexts
         .iter()
@@ -501,13 +517,20 @@ fn cycle_window(
             contexts[(current_index + contexts.len() - 1) % contexts.len()].id
         }
         WindowCycleDirection::Last => {
-            let client = caller
+            let remembered_by_client = caller
                 .current_client()
-                .map_err(|_| "no previously active window available".to_string())?;
-            let remembered = last_selected_by_client
-                .get(&client.id)
-                .copied()
+                .ok()
+                .and_then(|client| last_selected_by_client.get(&client.id).copied());
+            let remembered = remembered_by_client
+                .or_else(|| {
+                    get_stored_context_id(caller, PREVIOUS_WINDOW_CONTEXT_KEY)
+                        .ok()
+                        .flatten()
+                })
                 .ok_or_else(|| "no previously active window available".to_string())?;
+            if !contexts.iter().any(|context| context.id == remembered) {
+                return Err("no previously active window available".to_string());
+            }
             if remembered == current_context {
                 return Err("no previously active window available".to_string());
             }
@@ -521,21 +544,75 @@ fn cycle_window(
     )
 }
 
-fn resolve_context_id(
-    caller: &impl HostRuntimeApi,
-    selector: ContextSelector,
+fn resolve_context_id_from_contexts(
+    contexts: &[bmux_plugin::ContextSummary],
+    selector: &ContextSelector,
 ) -> Result<Uuid, String> {
+    contexts
+        .iter()
+        .find(|context| match selector {
+            ContextSelector::ById(id) => context.id == *id,
+            ContextSelector::ByName(name) => context.name.as_deref() == Some(name.as_str()),
+        })
+        .map(|context| context.id)
+        .ok_or_else(|| "target context not found".to_string())
+}
+
+fn resolve_effective_current_context(caller: &impl HostRuntimeApi) -> Result<Option<Uuid>, String> {
     let contexts = caller
         .context_list()
         .map_err(|error| error.to_string())?
         .contexts;
-    let context = contexts.into_iter().find(|context| match &selector {
-        ContextSelector::ById(id) => context.id == *id,
-        ContextSelector::ByName(name) => context.name.as_deref() == Some(name.as_str()),
-    });
-    context
+    resolve_effective_current_context_with_contexts(caller, &contexts)
+}
+
+fn resolve_effective_current_context_with_contexts(
+    caller: &impl HostRuntimeApi,
+    contexts: &[bmux_plugin::ContextSummary],
+) -> Result<Option<Uuid>, String> {
+    let current = caller
+        .context_current()
+        .map_err(|error| error.to_string())?
+        .context
         .map(|context| context.id)
-        .ok_or_else(|| "target context not found".to_string())
+        .filter(|id| contexts.iter().any(|context| context.id == *id));
+    if current.is_some() {
+        return Ok(current);
+    }
+    let stored_active = get_stored_context_id(caller, ACTIVE_WINDOW_CONTEXT_KEY)?
+        .filter(|id| contexts.iter().any(|context| context.id == *id));
+    Ok(stored_active)
+}
+
+fn get_stored_context_id(caller: &impl HostRuntimeApi, key: &str) -> Result<Option<Uuid>, String> {
+    let response = caller
+        .storage_get(&StorageGetRequest {
+            key: key.to_string(),
+        })
+        .map_err(|error| error.to_string())?;
+    let Some(value) = response.value else {
+        return Ok(None);
+    };
+    let text = String::from_utf8(value).map_err(|error| error.to_string())?;
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let id = Uuid::parse_str(text.trim()).map_err(|error| error.to_string())?;
+    Ok(Some(id))
+}
+
+fn set_stored_context_id(
+    caller: &impl HostRuntimeApi,
+    key: &str,
+    context_id: Option<Uuid>,
+) -> Result<(), String> {
+    let value = context_id.map_or_else(Vec::new, |id| id.to_string().into_bytes());
+    caller
+        .storage_set(&StorageSetRequest {
+            key: key.to_string(),
+            value,
+        })
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
@@ -543,7 +620,11 @@ fn resolve_session_id(
     caller: &impl HostRuntimeApi,
     selector: ContextSelector,
 ) -> Result<Uuid, String> {
-    resolve_context_id(caller, selector)
+    let contexts = caller
+        .context_list()
+        .map_err(|error| error.to_string())?
+        .contexts;
+    resolve_context_id_from_contexts(&contexts, &selector)
 }
 
 fn parse_selector(value: &str) -> Result<ContextSelector, String> {
@@ -836,6 +917,18 @@ mod tests {
                 interface_id: "client-query/v1".to_string(),
                 provider: ProviderId::Host,
             },
+            RegisteredService {
+                capability: HostScope::new("bmux.storage").expect("capability should parse"),
+                kind: ServiceKind::Query,
+                interface_id: "storage-query/v1".to_string(),
+                provider: ProviderId::Host,
+            },
+            RegisteredService {
+                capability: HostScope::new("bmux.storage").expect("capability should parse"),
+                kind: ServiceKind::Command,
+                interface_id: "storage-command/v1".to_string(),
+                provider: ProviderId::Host,
+            },
         ];
 
         NativeServiceContext {
@@ -856,6 +949,7 @@ mod tests {
                 "bmux.contexts.read".to_string(),
                 "bmux.contexts.write".to_string(),
                 "bmux.clients.read".to_string(),
+                "bmux.storage".to_string(),
             ],
             provided_capabilities: vec![
                 "bmux.windows.read".to_string(),
@@ -866,6 +960,7 @@ mod tests {
                 "bmux.contexts.read".to_string(),
                 "bmux.contexts.write".to_string(),
                 "bmux.clients.read".to_string(),
+                "bmux.storage".to_string(),
             ],
             enabled_plugins: vec!["bmux.windows".to_string()],
             plugin_search_roots: vec!["/plugins".to_string()],
@@ -896,6 +991,7 @@ mod tests {
         creates: Mutex<Vec<Option<String>>>,
         kills: Mutex<Vec<ContextCloseRequest>>,
         selects: Mutex<Vec<Uuid>>,
+        storage: Mutex<BTreeMap<String, Vec<u8>>>,
     }
 
     impl MockHost {
@@ -910,25 +1006,7 @@ mod tests {
                 creates: Mutex::new(Vec::new()),
                 kills: Mutex::new(Vec::new()),
                 selects: Mutex::new(Vec::new()),
-            }
-        }
-
-        fn with_empty_target_session(target_id: Uuid) -> Self {
-            let sessions = vec![SessionSummary {
-                id: target_id,
-                name: Some("target".to_string()),
-                attributes: BTreeMap::new(),
-            }];
-            Self {
-                current_client_id: Uuid::new_v4(),
-                selected_session_id: Mutex::new(Some(target_id)),
-                sessions,
-                fail_create: false,
-                fail_kill: false,
-                fail_current_client: false,
-                creates: Mutex::new(Vec::new()),
-                kills: Mutex::new(Vec::new()),
-                selects: Mutex::new(Vec::new()),
+                storage: Mutex::new(BTreeMap::new()),
             }
         }
 
@@ -944,6 +1022,7 @@ mod tests {
                 creates: Mutex::new(Vec::new()),
                 kills: Mutex::new(Vec::new()),
                 selects: Mutex::new(Vec::new()),
+                storage: Mutex::new(BTreeMap::new()),
             }
         }
 
@@ -959,6 +1038,7 @@ mod tests {
                 creates: Mutex::new(Vec::new()),
                 kills: Mutex::new(Vec::new()),
                 selects: Mutex::new(Vec::new()),
+                storage: Mutex::new(BTreeMap::new()),
             }
         }
     }
@@ -1078,6 +1158,25 @@ mod tests {
                         following_global: false,
                     })
                     .map_err(Into::into)
+                }
+                ("storage-query/v1", "get") => {
+                    let request: StorageGetRequest = decode_service_message(&payload)?;
+                    let value = self
+                        .storage
+                        .lock()
+                        .expect("storage lock should succeed")
+                        .get(&request.key)
+                        .cloned();
+                    encode_service_message(&bmux_plugin::StorageGetResponse { value })
+                        .map_err(Into::into)
+                }
+                ("storage-command/v1", "set") => {
+                    let request: StorageSetRequest = decode_service_message(&payload)?;
+                    self.storage
+                        .lock()
+                        .expect("storage lock should succeed")
+                        .insert(request.key, request.value);
+                    encode_service_message(&()).map_err(Into::into)
                 }
                 _ => Err(bmux_plugin::PluginError::UnsupportedHostOperation {
                     operation: "mock_service",

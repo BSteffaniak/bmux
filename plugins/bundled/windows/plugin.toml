@@ -8,6 +8,7 @@ required_capabilities = [
     "bmux.contexts.read",
     "bmux.contexts.write",
     "bmux.clients.read",
+    "bmux.storage",
 ]
 runtime = "native"
 version = "0.0.1-alpha.0"
