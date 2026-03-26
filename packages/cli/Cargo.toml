@@ -32,6 +32,7 @@ anyhow = { workspace = true, features = ["std"] }
 clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
 crossterm = { workspace = true, features = ["events"] }
 font8x8 = { workspace = true }
+fontdb = { workspace = true }
 gif = { workspace = true }
 moosicbox_log_runtime = { workspace = true, features = ["file"] }
 moosicbox_log_watch = { workspace = true, features = [

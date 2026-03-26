@@ -1,5 +1,5 @@
 use super::*;
-use ab_glyph::{Font, FontArc, PxScale, ScaleFont, point};
+use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont, point};
 use font8x8::UnicodeFonts;
 use std::collections::{HashMap, HashSet};
 
@@ -719,7 +719,7 @@ fn export_recording_gif(
         font_path,
     )?;
     let palette = xterm_256_palette();
-    let glyph_renderer = match render_options.mode {
+    let mut glyph_renderer = match render_options.mode {
         RecordingRenderMode::Font => GlyphRenderer::new(cell_w, cell_h, &render_options),
         RecordingRenderMode::Bitmap => None,
     };
@@ -798,7 +798,7 @@ fn export_recording_gif(
                     cell_w,
                     cell_h,
                     &palette,
-                    glyph_renderer.as_ref(),
+                    glyph_renderer.as_mut(),
                     &mut bitmap_cache,
                 );
                 let mut frame = GifFrame::from_rgba_speed(width, height, &mut pixels, 1);
@@ -828,7 +828,7 @@ fn render_screen_rgba(
     cell_w: u16,
     cell_h: u16,
     palette: &[(u8, u8, u8)],
-    glyph_renderer: Option<&GlyphRenderer>,
+    mut glyph_renderer: Option<&mut GlyphRenderer>,
     bitmap_cache: &mut BitmapGlyphCache,
 ) -> Vec<u8> {
     let width = usize::from(max_cols.saturating_mul(cell_w));
@@ -880,9 +880,7 @@ fn render_screen_rgba(
             }
 
             let mut drawn_with_font = false;
-            if let Some(renderer) = glyph_renderer
-                && !is_box_drawing_char(glyph_char)
-            {
+            if let Some(renderer) = glyph_renderer.as_deref_mut() {
                 drawn_with_font = renderer.draw_cell(
                     &mut pixels,
                     width,
@@ -1072,10 +1070,6 @@ fn fill_shade_mask(mask: &mut [u8], cell_w: usize, threshold: usize) {
     }
 }
 
-fn is_box_drawing_char(ch: char) -> bool {
-    matches!(ch as u32, 0x2500..=0x257f | 0x2580..=0x259f)
-}
-
 struct RenderOptions {
     mode: RecordingRenderMode,
     font_families: Vec<String>,
@@ -1126,14 +1120,15 @@ fn parse_csv_values(raw: &str) -> Vec<String> {
 }
 
 struct GlyphRenderer {
-    font: FontArc,
+    fonts: Vec<FontArc>,
     scale: PxScale,
     baseline_offset: f32,
 }
 
 impl GlyphRenderer {
     fn new(cell_w: u16, cell_h: u16, options: &RenderOptions) -> Option<Self> {
-        let font = load_monospace_font(options)?;
+        let fonts = load_monospace_fonts(options);
+        let font = fonts.first()?;
         let base_font_size = options
             .font_size_px
             .unwrap_or((f32::from(cell_h) * 0.9).max(8.0));
@@ -1150,18 +1145,18 @@ impl GlyphRenderer {
             y: base_scale.y,
         };
         let scaled = font.as_scaled(scale);
-        let glyph_height = scaled.height();
-        let line_height = glyph_height * options.line_height_mult.max(0.5);
+        let text_height = (scaled.ascent() - scaled.descent()).max(1.0);
+        let line_height = (text_height * options.line_height_mult.max(1.0)).max(text_height);
         let baseline_offset = ((f32::from(cell_h) - line_height) / 2.0).max(0.0) + scaled.ascent();
         Some(Self {
-            font,
+            fonts,
             scale,
             baseline_offset,
         })
     }
 
     fn draw_cell(
-        &self,
+        &mut self,
         rgba: &mut [u8],
         width: usize,
         height: usize,
@@ -1174,11 +1169,17 @@ impl GlyphRenderer {
         if glyph_char == ' ' {
             return false;
         }
-        let glyph = self.font.glyph_id(glyph_char).with_scale_and_position(
-            self.scale,
-            point(x0 as f32, y0 as f32 + self.baseline_offset),
-        );
-        let Some(outlined) = self.font.outline_glyph(glyph) else {
+        let Some(outlined) = self.fonts.iter().find_map(|font| {
+            let glyph_id = font.glyph_id(glyph_char);
+            if glyph_id.0 == 0 {
+                return None;
+            }
+            let glyph = glyph_id.with_scale_and_position(
+                self.scale,
+                point(x0 as f32, y0 as f32 + self.baseline_offset),
+            );
+            font.outline_glyph(glyph)
+        }) else {
             return false;
         };
         outlined.draw(|gx, gy, coverage| {
@@ -1190,13 +1191,7 @@ impl GlyphRenderer {
             if x >= width || y >= height {
                 return;
             }
-            let alpha = if coverage >= 0.75 {
-                1.0
-            } else if coverage <= 0.1 {
-                0.0
-            } else {
-                coverage
-            };
+            let alpha = coverage;
             if alpha <= 0.0 {
                 return;
             }
@@ -1214,78 +1209,83 @@ fn blend_channel(fg: u8, bg: u8, alpha: f32) -> u8 {
     ((f32::from(fg) * alpha) + (f32::from(bg) * (1.0 - alpha))).round() as u8
 }
 
-fn load_monospace_font(options: &RenderOptions) -> Option<FontArc> {
-    let mut candidates = Vec::<String>::new();
-    candidates.extend(options.font_paths.iter().cloned());
-    for family in &options.font_families {
-        candidates.extend(
-            font_family_candidates(family)
-                .into_iter()
-                .map(str::to_string),
-        );
-    }
-    candidates.extend(default_font_candidates().into_iter().map(str::to_string));
+fn load_monospace_fonts(options: &RenderOptions) -> Vec<FontArc> {
+    let mut fonts = Vec::<FontArc>::new();
 
-    let mut seen = HashSet::<String>::new();
-    for path in candidates {
-        if !seen.insert(path.clone()) {
-            continue;
-        }
-        let Ok(bytes) = std::fs::read(&path) else {
+    for path in &options.font_paths {
+        let Ok(meta) = std::fs::metadata(path) else {
             continue;
         };
-        if let Ok(font) = FontArc::try_from_vec(bytes) {
-            return Some(font);
+        if !meta.is_file() {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        if let Ok(font) = FontVec::try_from_vec_and_index(bytes, 0) {
+            fonts.push(FontArc::new(font));
         }
     }
-    None
-}
 
-#[cfg(target_os = "macos")]
-fn default_font_candidates() -> Vec<&'static str> {
-    vec![
-        "/System/Library/Fonts/Menlo.ttc",
-        "/System/Library/Fonts/Monaco.ttf",
-        "/System/Library/Fonts/SFNSMono.ttf",
-        "/System/Library/Fonts/Supplemental/Courier New.ttf",
-        "/System/Library/Fonts/Courier.ttc",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
-        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-    ]
-}
-
-#[cfg(not(target_os = "macos"))]
-fn default_font_candidates() -> Vec<&'static str> {
-    vec![
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
-        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-        "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
-    ]
-}
-
-fn font_family_candidates(family: &str) -> Vec<&'static str> {
-    let normalized = family
-        .to_ascii_lowercase()
-        .chars()
-        .filter(|ch| !ch.is_whitespace() && *ch != '-' && *ch != '_')
-        .collect::<String>();
-    match normalized.as_str() {
-        "menlo" => vec!["/System/Library/Fonts/Menlo.ttc"],
-        "monaco" => vec!["/System/Library/Fonts/Monaco.ttf"],
-        "sfmono" | "sfnsmono" => vec!["/System/Library/Fonts/SFNSMono.ttf"],
-        "couriernew" => vec!["/System/Library/Fonts/Supplemental/Courier New.ttf"],
-        "courier" => vec!["/System/Library/Fonts/Courier.ttc"],
-        "dejavusansmono" => vec![
-            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-        ],
-        "liberationmono" => {
-            vec!["/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf"]
+    let mut db = fontdb::Database::new();
+    db.load_system_fonts();
+    for path in &options.font_paths {
+        let Ok(meta) = std::fs::metadata(path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            db.load_fonts_dir(path);
         }
-        _ => Vec::new(),
     }
+
+    let mut families = Vec::<String>::new();
+    if !options.font_families.is_empty() {
+        families.extend(options.font_families.iter().cloned());
+    }
+    families.extend(default_font_families_for_rendering());
+    let mut seen = HashSet::<String>::new();
+    for family in families {
+        let normalized = family.trim().to_ascii_lowercase();
+        if normalized.is_empty() || !seen.insert(normalized) {
+            continue;
+        }
+        if let Some(font) = load_font_family_from_db(&db, &family) {
+            fonts.push(font);
+        }
+    }
+
+    fonts
+}
+
+fn load_font_family_from_db(db: &fontdb::Database, family: &str) -> Option<FontArc> {
+    let query = fontdb::Query {
+        families: &[fontdb::Family::Name(family)],
+        weight: fontdb::Weight::NORMAL,
+        stretch: fontdb::Stretch::Normal,
+        style: fontdb::Style::Normal,
+    };
+    let face_id = db.query(&query)?;
+    db.with_face_data(face_id, |font_data, face_index| {
+        let Ok(font) = FontVec::try_from_vec_and_index(font_data.to_vec(), face_index) else {
+            return None;
+        };
+        Some(FontArc::new(font))
+    })?
+}
+
+fn default_font_families_for_rendering() -> Vec<String> {
+    vec![
+        "JetBrains Mono".to_string(),
+        "JetBrainsMono Nerd Font".to_string(),
+        "Symbols Nerd Font Mono".to_string(),
+        "SF Mono".to_string(),
+        "Menlo".to_string(),
+        "Monaco".to_string(),
+        "DejaVu Sans Mono".to_string(),
+        "Liberation Mono".to_string(),
+        "Noto Emoji".to_string(),
+        "Apple Color Emoji".to_string(),
+    ]
 }
 
 fn vt100_color_to_palette_index(color: vt100::Color, foreground: bool) -> u8 {

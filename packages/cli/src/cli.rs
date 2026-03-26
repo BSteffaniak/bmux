@@ -346,7 +346,7 @@ pub enum RecordingCommand {
         #[arg(long)]
         max_frames: Option<u32>,
         /// Renderer mode for frame rasterization
-        #[arg(long, value_enum, default_value_t = RecordingRenderMode::Bitmap)]
+        #[arg(long, value_enum, default_value_t = RecordingRenderMode::Font)]
         renderer: RecordingRenderMode,
         /// Cell size in pixels as WIDTHxHEIGHT (e.g. 8x16)
         #[arg(long, value_parser = parse_cell_size)]
@@ -1768,7 +1768,7 @@ mod tests {
     }
 
     #[test]
-    fn recording_export_defaults_to_bitmap_renderer() {
+    fn recording_export_defaults_to_font_renderer() {
         let cli = Cli::try_parse_from([
             "bmux",
             "recording",
@@ -1784,7 +1784,7 @@ mod tests {
         assert!(matches!(
             command,
             RecordingCommand::Export {
-                renderer: RecordingRenderMode::Bitmap,
+                renderer: RecordingRenderMode::Font,
                 ..
             }
         ));

@@ -92,6 +92,7 @@ clap = { version = "4.5.40", default-features = false }
 crossterm = { version = "0.29.0", default-features = false }
 dirs = { version = "6.0.0", default-features = false }
 font8x8 = { version = "0.3.1", features = ["unicode"] }
+fontdb = { version = "0.23.0" }
 futures = { version = "0.3.31", default-features = false }
 gif = { version = "0.13.3" }
 libloading = { version = "0.8.9", default-features = false }
