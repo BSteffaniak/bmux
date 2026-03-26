@@ -33,6 +33,26 @@ pub enum RecordingExportFormat {
     Gif,
 }
 
+fn parse_cell_size(value: &str) -> Result<(u16, u16), String> {
+    let trimmed = value.trim();
+    let (width_raw, height_raw) = trimmed
+        .split_once('x')
+        .or_else(|| trimmed.split_once('X'))
+        .ok_or_else(|| "expected CELL_SIZE format WIDTHxHEIGHT, e.g. 8x16".to_string())?;
+    let width = width_raw
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| "cell width must be a positive integer".to_string())?;
+    let height = height_raw
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| "cell height must be a positive integer".to_string())?;
+    if width == 0 || height == 0 {
+        return Err("cell width and height must be greater than zero".to_string());
+    }
+    Ok((width, height))
+}
+
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(name = "bmux")]
@@ -286,6 +306,15 @@ pub enum RecordingCommand {
         /// Maximum exported frames
         #[arg(long)]
         max_frames: Option<u32>,
+        /// Cell size in pixels as WIDTHxHEIGHT (e.g. 8x16)
+        #[arg(long, value_parser = parse_cell_size)]
+        cell_size: Option<(u16, u16)>,
+        /// Override glyph cell width in pixels
+        #[arg(long)]
+        cell_width: Option<u16>,
+        /// Override glyph cell height in pixels
+        #[arg(long)]
+        cell_height: Option<u16>,
     },
 }
 
@@ -1616,6 +1645,12 @@ mod tests {
             "30",
             "--max-frames",
             "250",
+            "--cell-size",
+            "9x18",
+            "--cell-width",
+            "10",
+            "--cell-height",
+            "20",
         ])
         .expect("valid CLI args");
         let Some(Command::Recording { command }) = cli.command else {
@@ -1628,9 +1663,29 @@ mod tests {
                 fps: 15,
                 max_duration: Some(30),
                 max_frames: Some(250),
+                cell_size: Some((9, 18)),
+                cell_width: Some(10),
+                cell_height: Some(20),
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn rejects_invalid_recording_export_cell_size() {
+        let error = Cli::try_parse_from([
+            "bmux",
+            "recording",
+            "export",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--output",
+            "./out.gif",
+            "--cell-size",
+            "oops",
+        ])
+        .expect_err("invalid cell-size should fail");
+        let text = error.to_string();
+        assert!(text.contains("--cell-size") || text.contains("invalid value"));
     }
 
     #[test]

@@ -293,6 +293,9 @@ pub(super) async fn run_recording_export(
     fps: u32,
     max_duration: Option<u64>,
     max_frames: Option<u32>,
+    cell_size: Option<(u16, u16)>,
+    cell_width: Option<u16>,
+    cell_height: Option<u16>,
 ) -> Result<u8> {
     let recording_id = parse_uuid_value(recording_id, "recording id")?;
     let recording_dir = ConfigPaths::default()
@@ -318,9 +321,17 @@ pub(super) async fn run_recording_export(
     }
 
     match format {
-        RecordingExportFormat::Gif => {
-            export_recording_gif(&events, output, speed, fps, max_duration, max_frames)?
-        }
+        RecordingExportFormat::Gif => export_recording_gif(
+            &events,
+            output,
+            speed,
+            fps,
+            max_duration,
+            max_frames,
+            cell_size,
+            cell_width,
+            cell_height,
+        )?,
     }
 
     println!(
@@ -369,6 +380,143 @@ fn load_display_track_events(
     Ok(events)
 }
 
+#[derive(Clone, Copy, Debug)]
+struct CellMetrics {
+    width: u16,
+    height: u16,
+}
+
+fn resolve_export_cell_metrics(
+    events: &[DisplayTrackEnvelope],
+    cell_size: Option<(u16, u16)>,
+    cell_width: Option<u16>,
+    cell_height: Option<u16>,
+) -> Result<CellMetrics> {
+    if cell_size.is_some_and(|(w, h)| w == 0 || h == 0) {
+        anyhow::bail!("--cell-size values must be greater than zero")
+    }
+    if cell_width.is_some_and(|value| value == 0) {
+        anyhow::bail!("--cell-width must be greater than zero")
+    }
+    if cell_height.is_some_and(|value| value == 0) {
+        anyhow::bail!("--cell-height must be greater than zero")
+    }
+
+    let (size_width, size_height) = cell_size.unwrap_or((0, 0));
+    let cli_width = cell_width.or((size_width > 0).then_some(size_width));
+    let cli_height = cell_height.or((size_height > 0).then_some(size_height));
+
+    let recorded = recording_cell_metrics(events);
+    let current = current_terminal_cell_metrics();
+    let width = cli_width
+        .or(recorded.map(|value| value.width))
+        .or(current.map(|value| value.width))
+        .unwrap_or(8);
+    let height = cli_height
+        .or(recorded.map(|value| value.height))
+        .or(current.map(|value| value.height))
+        .unwrap_or(16);
+    Ok(CellMetrics { width, height })
+}
+
+fn recording_cell_metrics(events: &[DisplayTrackEnvelope]) -> Option<CellMetrics> {
+    let mut stream_opened = None::<(Option<u16>, Option<u16>, Option<u16>, Option<u16>)>;
+    let mut fallback_cols_rows = None::<(u16, u16)>;
+    for envelope in events {
+        match envelope.event {
+            DisplayTrackEvent::StreamOpened {
+                cell_width_px,
+                cell_height_px,
+                window_width_px,
+                window_height_px,
+                ..
+            } => {
+                stream_opened = Some((
+                    cell_width_px,
+                    cell_height_px,
+                    window_width_px,
+                    window_height_px,
+                ));
+                if let (Some(width), Some(height)) = (cell_width_px, cell_height_px)
+                    && width > 0
+                    && height > 0
+                {
+                    return Some(CellMetrics { width, height });
+                }
+            }
+            DisplayTrackEvent::Resize { cols, rows } => {
+                if fallback_cols_rows.is_none() && cols > 0 && rows > 0 {
+                    fallback_cols_rows = Some((cols, rows));
+                }
+            }
+            DisplayTrackEvent::FrameBytes { .. } | DisplayTrackEvent::StreamClosed => {}
+        }
+    }
+
+    let (cell_width_px, cell_height_px, window_width_px, window_height_px) = stream_opened?;
+    if let (Some(width), Some(height)) = (cell_width_px, cell_height_px)
+        && width > 0
+        && height > 0
+    {
+        return Some(CellMetrics { width, height });
+    }
+    let (window_width, window_height) = (window_width_px?, window_height_px?);
+    let (cols, rows) = fallback_cols_rows?;
+    infer_cell_metrics(window_width, window_height, cols, rows)
+}
+
+fn current_terminal_cell_metrics() -> Option<CellMetrics> {
+    let (cols, rows) = terminal::size().ok()?;
+    if cols == 0 || rows == 0 {
+        return None;
+    }
+    let size = terminal::window_size().ok()?;
+    infer_cell_metrics(size.width, size.height, cols, rows)
+}
+
+fn infer_cell_metrics(
+    window_width: u16,
+    window_height: u16,
+    cols: u16,
+    rows: u16,
+) -> Option<CellMetrics> {
+    if window_width == 0 || window_height == 0 || cols == 0 || rows == 0 {
+        return None;
+    }
+    let width = (window_width / cols).max(1);
+    let height = (window_height / rows).max(1);
+    Some(CellMetrics { width, height })
+}
+
+fn capture_stream_open_metrics() -> (Option<u16>, Option<u16>, Option<u16>, Option<u16>) {
+    let (window_width_px, window_height_px) = terminal::window_size()
+        .ok()
+        .map(|value| {
+            (
+                (value.width > 0).then_some(value.width),
+                (value.height > 0).then_some(value.height),
+            )
+        })
+        .unwrap_or((None, None));
+
+    let (cell_width_px, cell_height_px) = terminal::size()
+        .ok()
+        .and_then(|(cols, rows)| {
+            let window_width = window_width_px?;
+            let window_height = window_height_px?;
+            infer_cell_metrics(window_width, window_height, cols, rows)
+        })
+        .map(|value| (Some(value.width), Some(value.height)))
+        .unwrap_or((None, None));
+
+    (
+        cell_width_px,
+        cell_height_px,
+        window_width_px,
+        window_height_px,
+    )
+}
+
 fn export_recording_gif(
     events: &[DisplayTrackEnvelope],
     output: &str,
@@ -376,6 +524,9 @@ fn export_recording_gif(
     fps: u32,
     max_duration: Option<u64>,
     max_frames: Option<u32>,
+    cell_size: Option<(u16, u16)>,
+    cell_width: Option<u16>,
+    cell_height: Option<u16>,
 ) -> Result<()> {
     let speed = if speed <= 0.0 { 1.0 } else { speed };
     let fps = fps.max(1);
@@ -390,8 +541,9 @@ fn export_recording_gif(
         }
     }
 
-    let cell_w = 8_u16;
-    let cell_h = 8_u16;
+    let cell_metrics = resolve_export_cell_metrics(events, cell_size, cell_width, cell_height)?;
+    let cell_w = cell_metrics.width;
+    let cell_h = cell_metrics.height;
     let width = max_cols.saturating_mul(cell_w).max(8);
     let height = max_rows.saturating_mul(cell_h).max(8);
     let palette = xterm_256_palette_rgb();
@@ -466,6 +618,8 @@ fn export_recording_gif(
                     current_cols,
                     max_rows,
                     max_cols,
+                    cell_w,
+                    cell_h,
                 );
                 let mut frame =
                     GifFrame::from_palette_pixels(width, height, pixels, palette.clone(), None);
@@ -492,10 +646,14 @@ fn render_screen_indexed(
     cols: u16,
     max_rows: u16,
     max_cols: u16,
+    cell_w: u16,
+    cell_h: u16,
 ) -> Vec<u8> {
-    let width = usize::from(max_cols.saturating_mul(8));
-    let height = usize::from(max_rows.saturating_mul(8));
+    let width = usize::from(max_cols.saturating_mul(cell_w));
+    let height = usize::from(max_rows.saturating_mul(cell_h));
     let mut pixels = vec![0_u8; width.saturating_mul(height)];
+    let cw = usize::from(cell_w);
+    let cell_h_usize = usize::from(cell_h);
 
     for row in 0..rows {
         for col in 0..cols {
@@ -507,15 +665,15 @@ fn render_screen_indexed(
             if cell.inverse() {
                 std::mem::swap(&mut fg, &mut bg);
             }
-            let x0 = usize::from(col).saturating_mul(8);
-            let y0 = usize::from(row).saturating_mul(8);
-            for py in 0..8_usize {
+            let x0 = usize::from(col).saturating_mul(cw);
+            let y0 = usize::from(row).saturating_mul(cell_h_usize);
+            for py in 0..cell_h_usize {
                 let y = y0 + py;
                 if y >= height {
                     continue;
                 }
                 let row_start = y.saturating_mul(width);
-                for px in 0..8_usize {
+                for px in 0..cw {
                     let x = x0 + px;
                     if x >= width {
                         continue;
@@ -524,27 +682,30 @@ fn render_screen_indexed(
                 }
             }
 
-            let ch = if cell.has_contents() {
+            let glyph_char = if cell.has_contents() {
                 cell.contents().chars().next().unwrap_or(' ')
             } else {
                 ' '
             };
             let glyph = font8x8::BASIC_FONTS
-                .get(ch)
+                .get(glyph_char)
                 .or_else(|| font8x8::BASIC_FONTS.get('?'))
                 .unwrap_or([0_u8; 8]);
-            for (py, bits) in glyph.iter().copied().enumerate() {
+            for py in 0..cell_h_usize {
                 let y = y0 + py;
                 if y >= height {
                     continue;
                 }
+                let glyph_row = ((py.saturating_mul(8)) / cell_h_usize).min(7);
+                let bits = glyph[glyph_row];
                 let row_start = y.saturating_mul(width);
-                for px in 0..8_usize {
+                for px in 0..cw {
                     let x = x0 + px;
                     if x >= width {
                         continue;
                     }
-                    if ((bits >> px) & 1) == 1 {
+                    let glyph_col = ((px.saturating_mul(8)) / cw).min(7);
+                    if ((bits >> glyph_col) & 1) == 1 {
                         pixels[row_start + x] = fg;
                     }
                 }
@@ -863,9 +1024,21 @@ pub(super) const fn offline_recording_status() -> RecordingStatus {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 enum DisplayTrackEvent {
-    StreamOpened { client_id: Uuid, recording_id: Uuid },
-    Resize { cols: u16, rows: u16 },
-    FrameBytes { data: Vec<u8> },
+    StreamOpened {
+        client_id: Uuid,
+        recording_id: Uuid,
+        cell_width_px: Option<u16>,
+        cell_height_px: Option<u16>,
+        window_width_px: Option<u16>,
+        window_height_px: Option<u16>,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    FrameBytes {
+        data: Vec<u8>,
+    },
     StreamClosed,
 }
 
@@ -910,9 +1083,15 @@ impl DisplayCaptureWriter {
             started_at: Instant::now(),
             writer: BufWriter::new(file),
         };
+        let (cell_width_px, cell_height_px, window_width_px, window_height_px) =
+            capture_stream_open_metrics();
         capture.record(DisplayTrackEvent::StreamOpened {
             client_id,
             recording_id: plan.recording_id,
+            cell_width_px,
+            cell_height_px,
+            window_width_px,
+            window_height_px,
         })?;
         if let Ok((cols, rows)) = terminal::size()
             && cols > 0
@@ -969,4 +1148,77 @@ fn write_recording_owner_client(recording_path: &Path, client_id: Uuid) -> Resul
     let owner_path = recording_path.join("owner-client-id.txt");
     std::fs::write(&owner_path, format!("{client_id}\n"))
         .with_context(|| format!("failed writing owner client file {}", owner_path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stream_opened(
+        cell_width_px: Option<u16>,
+        cell_height_px: Option<u16>,
+        window_width_px: Option<u16>,
+        window_height_px: Option<u16>,
+    ) -> DisplayTrackEnvelope {
+        DisplayTrackEnvelope {
+            mono_ns: 1,
+            event: DisplayTrackEvent::StreamOpened {
+                client_id: Uuid::nil(),
+                recording_id: Uuid::nil(),
+                cell_width_px,
+                cell_height_px,
+                window_width_px,
+                window_height_px,
+            },
+        }
+    }
+
+    #[test]
+    fn parse_legacy_stream_opened_defaults_new_fields_to_none() {
+        let parsed: DisplayTrackEnvelope = serde_json::from_str(
+            r#"{"mono_ns":1,"event":{"kind":"stream_opened","client_id":"00000000-0000-0000-0000-000000000000","recording_id":"00000000-0000-0000-0000-000000000000"}}"#,
+        )
+        .expect("legacy stream_opened should deserialize");
+        let DisplayTrackEvent::StreamOpened {
+            cell_width_px,
+            cell_height_px,
+            window_width_px,
+            window_height_px,
+            ..
+        } = parsed.event
+        else {
+            panic!("expected stream_opened event");
+        };
+        assert_eq!(cell_width_px, None);
+        assert_eq!(cell_height_px, None);
+        assert_eq!(window_width_px, None);
+        assert_eq!(window_height_px, None);
+    }
+
+    #[test]
+    fn resolve_export_cell_metrics_prefers_cli_then_recording() {
+        let events = vec![stream_opened(Some(7), Some(14), Some(700), Some(350))];
+        let resolved = resolve_export_cell_metrics(&events, Some((9, 18)), Some(10), None)
+            .expect("metrics should resolve");
+        assert_eq!(resolved.width, 10);
+        assert_eq!(resolved.height, 18);
+    }
+
+    #[test]
+    fn resolve_export_cell_metrics_can_infer_from_recorded_window_and_resize() {
+        let events = vec![
+            stream_opened(None, None, Some(1200), Some(600)),
+            DisplayTrackEnvelope {
+                mono_ns: 2,
+                event: DisplayTrackEvent::Resize {
+                    cols: 120,
+                    rows: 30,
+                },
+            },
+        ];
+        let resolved =
+            resolve_export_cell_metrics(&events, None, None, None).expect("metrics should resolve");
+        assert_eq!(resolved.width, 10);
+        assert_eq!(resolved.height, 20);
+    }
 }

@@ -1420,6 +1420,9 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                         fps,
                         max_duration,
                         max_frames,
+                        cell_size,
+                        cell_width,
+                        cell_height,
                     },
             },
         ) => {
@@ -1432,6 +1435,9 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 *fps,
                 *max_duration,
                 *max_frames,
+                *cell_size,
+                *cell_width,
+                *cell_height,
             )
             .await
         }
@@ -2703,6 +2709,9 @@ async fn run_recording_export(
     fps: u32,
     max_duration: Option<u64>,
     max_frames: Option<u32>,
+    cell_size: Option<(u16, u16)>,
+    cell_width: Option<u16>,
+    cell_height: Option<u16>,
 ) -> Result<u8> {
     recording::run_recording_export(
         recording_id,
@@ -2713,6 +2722,9 @@ async fn run_recording_export(
         fps,
         max_duration,
         max_frames,
+        cell_size,
+        cell_width,
+        cell_height,
     )
     .await
 }
