@@ -1,5 +1,6 @@
 use crate::{Result, ServiceCaller, ServiceKind};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -240,6 +241,19 @@ pub struct LogWriteRequest {
     pub target: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecordingWriteEventRequest {
+    pub session_id: Option<Uuid>,
+    pub pane_id: Option<Uuid>,
+    pub name: String,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingWriteEventResponse {
+    pub accepted: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PluginCommandEffect {
@@ -428,6 +442,19 @@ pub trait HostRuntimeApi: ServiceCaller {
             ServiceKind::Command,
             "logging-command/v1",
             "write",
+            request,
+        )
+    }
+
+    fn recording_write_event(
+        &self,
+        request: &RecordingWriteEventRequest,
+    ) -> Result<RecordingWriteEventResponse> {
+        self.call_service(
+            "bmux.recording.write",
+            ServiceKind::Command,
+            "recording-command/v1",
+            "write_event",
             request,
         )
     }

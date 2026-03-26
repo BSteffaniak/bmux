@@ -15,7 +15,8 @@ use crate::{
         PaneFocusDirection as HostPaneFocusDirection, PaneFocusRequest, PaneFocusResponse,
         PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse,
         PaneSelector as HostPaneSelector, PaneSplitDirection as HostPaneSplitDirection,
-        PaneSplitRequest, PaneSplitResponse, PaneSummary as HostPaneSummary, SessionCreateRequest,
+        PaneSplitRequest, PaneSplitResponse, PaneSummary as HostPaneSummary,
+        RecordingWriteEventRequest, RecordingWriteEventResponse, SessionCreateRequest,
         SessionCreateResponse, SessionKillRequest, SessionKillResponse, SessionListResponse,
         SessionSelectRequest, SessionSelectResponse, SessionSelector as HostSessionSelector,
         SessionSummary as HostSessionSummary,
@@ -730,6 +731,28 @@ fn handle_core_service_call(
             let request: crate::host_services::LogWriteRequest = decode_service_message(&payload)?;
             emit_plugin_log(caller_plugin_id, &request)?;
             encode_service_message(&())
+        }
+        ("recording-command/v1", "write_event") => {
+            let request: RecordingWriteEventRequest = decode_service_message(&payload)?;
+            let response = execute_kernel_request(
+                host_kernel_bridge,
+                IpcRequest::RecordingWriteCustomEvent {
+                    session_id: request.session_id,
+                    pane_id: request.pane_id,
+                    source: caller_plugin_id.to_string(),
+                    name: request.name,
+                    payload: request.payload,
+                },
+            )?;
+            match response {
+                IpcResponsePayload::RecordingCustomEventWritten { accepted } => {
+                    encode_service_message(&RecordingWriteEventResponse { accepted })
+                }
+                _ => Err(PluginError::ServiceProtocol {
+                    details: "unexpected response payload for recording-command/v1:write_event"
+                        .to_string(),
+                }),
+            }
         }
         ("session-query/v1", "list") => {
             let response = execute_kernel_request(host_kernel_bridge, IpcRequest::ListSessions)?;

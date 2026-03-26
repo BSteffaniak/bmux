@@ -3,6 +3,8 @@ use super::*;
 pub(super) async fn run_recording_start(
     session_id: Option<&str>,
     capture_input: bool,
+    profile: Option<RecordingProfileArg>,
+    event_kinds: &[RecordingEventKindArg],
 ) -> Result<u8> {
     cleanup_stale_pid_file().await?;
     let mut client = connect_if_running(ConnectionPolicyScope::Normal, "bmux-cli-recording-start")
@@ -16,15 +18,121 @@ pub(super) async fn run_recording_start(
         Some(raw) => Some(Uuid::parse_str(raw).context("invalid --session-id UUID")?),
         None => None,
     };
+    let profile_overridden = profile.is_some();
+    let effective_profile = profile.unwrap_or(RecordingProfileArg::Functional);
+    let profile = recording_profile_arg_to_ipc(Some(effective_profile));
+    let event_kinds = if profile_overridden || !event_kinds.is_empty() {
+        resolve_event_kind_override(Some(effective_profile), event_kinds, capture_input)
+    } else {
+        Some(default_event_kinds_from_config(capture_input))
+    };
     let summary = client
-        .recording_start(session_id, capture_input)
+        .recording_start(session_id, capture_input, profile, event_kinds)
         .await
         .map_err(map_cli_client_error)?;
     println!(
-        "recording started: {} (capture_input={})",
-        summary.id, summary.capture_input
+        "recording started: {} (capture_input={} profile={:?} kinds={})",
+        summary.id,
+        summary.capture_input,
+        summary.profile,
+        summary
+            .event_kinds
+            .iter()
+            .map(|kind| recording_event_kind_name(*kind))
+            .collect::<Vec<_>>()
+            .join(",")
     );
     Ok(0)
+}
+
+pub(super) const fn recording_profile_arg_to_ipc(
+    profile: Option<RecordingProfileArg>,
+) -> Option<bmux_ipc::RecordingProfile> {
+    match profile {
+        Some(RecordingProfileArg::Full) => Some(bmux_ipc::RecordingProfile::Full),
+        Some(RecordingProfileArg::Functional) => Some(bmux_ipc::RecordingProfile::Functional),
+        Some(RecordingProfileArg::Visual) => Some(bmux_ipc::RecordingProfile::Visual),
+        None => None,
+    }
+}
+
+pub(super) fn resolve_event_kind_override(
+    profile: Option<RecordingProfileArg>,
+    event_kinds: &[RecordingEventKindArg],
+    capture_input: bool,
+) -> Option<Vec<RecordingEventKind>> {
+    if !event_kinds.is_empty() {
+        return Some(
+            event_kinds
+                .iter()
+                .copied()
+                .map(recording_event_kind_arg_to_ipc)
+                .collect(),
+        );
+    }
+
+    let profile = profile?;
+    let mut kinds = match profile {
+        RecordingProfileArg::Full => vec![
+            RecordingEventKind::PaneOutputRaw,
+            RecordingEventKind::ProtocolReplyRaw,
+            RecordingEventKind::ServerEvent,
+            RecordingEventKind::RequestStart,
+            RecordingEventKind::RequestDone,
+            RecordingEventKind::RequestError,
+            RecordingEventKind::Custom,
+        ],
+        RecordingProfileArg::Functional => vec![
+            RecordingEventKind::PaneOutputRaw,
+            RecordingEventKind::ServerEvent,
+            RecordingEventKind::RequestStart,
+            RecordingEventKind::RequestDone,
+            RecordingEventKind::RequestError,
+            RecordingEventKind::Custom,
+        ],
+        RecordingProfileArg::Visual => vec![RecordingEventKind::PaneOutputRaw],
+    };
+    if capture_input && profile != RecordingProfileArg::Visual {
+        kinds.push(RecordingEventKind::PaneInputRaw);
+    }
+    Some(kinds)
+}
+
+fn recording_event_kind_arg_to_ipc(kind: RecordingEventKindArg) -> RecordingEventKind {
+    match kind {
+        RecordingEventKindArg::PaneInputRaw => RecordingEventKind::PaneInputRaw,
+        RecordingEventKindArg::PaneOutputRaw => RecordingEventKind::PaneOutputRaw,
+        RecordingEventKindArg::ProtocolReplyRaw => RecordingEventKind::ProtocolReplyRaw,
+        RecordingEventKindArg::ServerEvent => RecordingEventKind::ServerEvent,
+        RecordingEventKindArg::RequestStart => RecordingEventKind::RequestStart,
+        RecordingEventKindArg::RequestDone => RecordingEventKind::RequestDone,
+        RecordingEventKindArg::RequestError => RecordingEventKind::RequestError,
+        RecordingEventKindArg::Custom => RecordingEventKind::Custom,
+    }
+}
+
+fn default_event_kinds_from_config(capture_input: bool) -> Vec<RecordingEventKind> {
+    let config = BmuxConfig::load().unwrap_or_default();
+    let mut kinds = Vec::new();
+    if capture_input && config.recording.capture_input {
+        kinds.push(RecordingEventKind::PaneInputRaw);
+    }
+    if config.recording.capture_output {
+        kinds.push(RecordingEventKind::PaneOutputRaw);
+    }
+    if config.recording.capture_events {
+        kinds.extend([
+            RecordingEventKind::ServerEvent,
+            RecordingEventKind::RequestStart,
+            RecordingEventKind::RequestDone,
+            RecordingEventKind::RequestError,
+            RecordingEventKind::Custom,
+        ]);
+    }
+    if kinds.is_empty() {
+        kinds.push(RecordingEventKind::PaneOutputRaw);
+    }
+    kinds
 }
 
 pub(super) async fn run_recording_stop(recording_id: Option<&str>) -> Result<u8> {
@@ -69,8 +177,19 @@ pub(super) async fn run_recording_status(as_json: bool) -> Result<u8> {
     }
     if let Some(active) = status.active {
         println!(
-            "active recording: {} events={} bytes={} capture_input={} path={}",
-            active.id, active.event_count, active.payload_bytes, active.capture_input, active.path
+            "active recording: {} events={} bytes={} capture_input={} profile={:?} kinds={} path={}",
+            active.id,
+            active.event_count,
+            active.payload_bytes,
+            active.capture_input,
+            active.profile,
+            active
+                .event_kinds
+                .iter()
+                .map(|kind| recording_event_kind_name(*kind))
+                .collect::<Vec<_>>()
+                .join(","),
+            active.path
         );
     } else {
         println!("active recording: none");
@@ -98,7 +217,7 @@ pub(super) async fn run_recording_list(as_json: bool) -> Result<u8> {
     }
     for recording in recordings {
         println!(
-            "{} started={} ended={} events={} bytes={} capture_input={} path={}",
+            "{} started={} ended={} events={} bytes={} capture_input={} profile={:?} kinds={} path={}",
             recording.id,
             recording.started_epoch_ms,
             recording
@@ -107,6 +226,13 @@ pub(super) async fn run_recording_list(as_json: bool) -> Result<u8> {
             recording.event_count,
             recording.payload_bytes,
             recording.capture_input,
+            recording.profile,
+            recording
+                .event_kinds
+                .iter()
+                .map(|kind| recording_event_kind_name(*kind))
+                .collect::<Vec<_>>()
+                .join(","),
             recording.path
         );
     }
@@ -829,6 +955,7 @@ pub(super) fn recording_event_kind_name(kind: RecordingEventKind) -> String {
         RecordingEventKind::RequestStart => "request_start",
         RecordingEventKind::RequestDone => "request_done",
         RecordingEventKind::RequestError => "request_error",
+        RecordingEventKind::Custom => "custom",
     }
     .to_string()
 }

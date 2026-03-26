@@ -17,8 +17,8 @@ use bmux_ipc::{
     ContextSelector, ContextSummary, Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event,
     IpcEndpoint, PaneFocusDirection, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector,
     PaneSplitDirection, PaneSummary, ProtocolVersion, RecordingEventKind, RecordingPayload,
-    Request, Response, ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary,
-    decode, encode,
+    RecordingProfile, Request, Response, ResponsePayload, ServerSnapshotStatus, SessionSelector,
+    SessionSummary, decode, encode,
 };
 use bmux_session::{ClientId, Session, SessionId, SessionManager};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
@@ -5343,12 +5343,17 @@ async fn handle_request(
         Request::RecordingStart {
             session_id,
             capture_input,
+            profile,
+            event_kinds,
         } => {
             let mut runtime = state
                 .recording_runtime
                 .lock()
                 .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
-            match runtime.start(session_id, capture_input) {
+            let profile = profile.unwrap_or(RecordingProfile::Functional);
+            let event_kinds = event_kinds
+                .unwrap_or_else(|| default_recording_event_kinds(profile, capture_input));
+            match runtime.start(session_id, capture_input, profile, event_kinds) {
                 Ok(recording) => Response::Ok(ResponsePayload::RecordingStarted { recording }),
                 Err(error) => Response::Err(ErrorResponse {
                     code: ErrorCode::InvalidRequest,
@@ -5405,6 +5410,39 @@ async fn handle_request(
                 Err(error) => Response::Err(ErrorResponse {
                     code: ErrorCode::InvalidRequest,
                     message: format!("failed deleting recording: {error}"),
+                }),
+            }
+        }
+        Request::RecordingWriteCustomEvent {
+            session_id,
+            pane_id,
+            source,
+            name,
+            payload,
+        } => {
+            let runtime = state
+                .recording_runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
+            match runtime.record(
+                RecordingEventKind::Custom,
+                RecordingPayload::Custom {
+                    source,
+                    name,
+                    payload,
+                },
+                RecordMeta {
+                    session_id,
+                    pane_id,
+                    client_id: Some(client_id.0),
+                },
+            ) {
+                Ok(accepted) => {
+                    Response::Ok(ResponsePayload::RecordingCustomEventWritten { accepted })
+                }
+                Err(error) => Response::Err(ErrorResponse {
+                    code: ErrorCode::Internal,
+                    message: format!("failed writing custom recording event: {error}"),
                 }),
             }
         }
@@ -5471,6 +5509,7 @@ const fn request_requires_exclusive(request: &Request) -> bool {
             | Request::RecordingStart { .. }
             | Request::RecordingStop { .. }
             | Request::RecordingDelete { .. }
+            | Request::RecordingWriteCustomEvent { .. }
             | Request::RecordingDeleteAll
             | Request::Detach
     )
@@ -5539,11 +5578,42 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::RecordingStatus => "recording_status",
         Request::RecordingList => "recording_list",
         Request::RecordingDelete { .. } => "recording_delete",
+        Request::RecordingWriteCustomEvent { .. } => "recording_write_custom_event",
         Request::RecordingDeleteAll => "recording_delete_all",
         Request::Detach => "detach",
         Request::SubscribeEvents => "subscribe_events",
         Request::PollEvents { .. } => "poll_events",
     }
+}
+
+fn default_recording_event_kinds(
+    profile: RecordingProfile,
+    capture_input: bool,
+) -> Vec<RecordingEventKind> {
+    let mut event_kinds = match profile {
+        RecordingProfile::Full => vec![
+            RecordingEventKind::PaneOutputRaw,
+            RecordingEventKind::ProtocolReplyRaw,
+            RecordingEventKind::ServerEvent,
+            RecordingEventKind::RequestStart,
+            RecordingEventKind::RequestDone,
+            RecordingEventKind::RequestError,
+            RecordingEventKind::Custom,
+        ],
+        RecordingProfile::Functional => vec![
+            RecordingEventKind::PaneOutputRaw,
+            RecordingEventKind::ServerEvent,
+            RecordingEventKind::RequestStart,
+            RecordingEventKind::RequestDone,
+            RecordingEventKind::RequestError,
+            RecordingEventKind::Custom,
+        ],
+        RecordingProfile::Visual => vec![RecordingEventKind::PaneOutputRaw],
+    };
+    if capture_input && profile != RecordingProfile::Visual {
+        event_kinds.push(RecordingEventKind::PaneInputRaw);
+    }
+    event_kinds
 }
 
 const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
@@ -5586,6 +5656,7 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::RecordingStatus { .. } => "recording_status",
         ResponsePayload::RecordingList { .. } => "recording_list",
         ResponsePayload::RecordingDeleted { .. } => "recording_deleted",
+        ResponsePayload::RecordingCustomEventWritten { .. } => "recording_custom_event_written",
         ResponsePayload::RecordingDeleteAll { .. } => "recording_delete_all",
         ResponsePayload::Detached => "detached",
         ResponsePayload::EventsSubscribed => "events_subscribed",

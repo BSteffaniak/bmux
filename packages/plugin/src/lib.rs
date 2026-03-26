@@ -47,10 +47,10 @@ pub use host_services::{
     LogWriteRequest, PaneCloseRequest, PaneCloseResponse, PaneFocusDirection, PaneFocusRequest,
     PaneFocusResponse, PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse,
     PaneSelector, PaneSplitDirection, PaneSplitRequest, PaneSplitResponse, PaneSummary,
-    PluginCommandEffect, PluginCommandOutcome, SessionCreateRequest, SessionCreateResponse,
-    SessionKillRequest, SessionKillResponse, SessionListResponse, SessionSelectRequest,
-    SessionSelectResponse, SessionSelector, SessionSummary, StorageGetRequest, StorageGetResponse,
-    StorageSetRequest,
+    PluginCommandEffect, PluginCommandOutcome, RecordingWriteEventRequest,
+    RecordingWriteEventResponse, SessionCreateRequest, SessionCreateResponse, SessionKillRequest,
+    SessionKillResponse, SessionListResponse, SessionSelectRequest, SessionSelectResponse,
+    SessionSelector, SessionSummary, StorageGetRequest, StorageGetResponse, StorageSetRequest,
 };
 pub use loader::{
     HostKernelBridge, HostKernelBridgeRequest, HostKernelBridgeResponse, LoadedPlugin,

@@ -5,6 +5,7 @@
 //! Cross-platform IPC protocol models for bmux.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -346,6 +347,10 @@ pub enum Request {
         #[serde(default)]
         session_id: Option<Uuid>,
         capture_input: bool,
+        #[serde(default)]
+        profile: Option<RecordingProfile>,
+        #[serde(default)]
+        event_kinds: Option<Vec<RecordingEventKind>>,
     },
     RecordingStop {
         #[serde(default)]
@@ -355,6 +360,15 @@ pub enum Request {
     RecordingList,
     RecordingDelete {
         recording_id: Uuid,
+    },
+    RecordingWriteCustomEvent {
+        #[serde(default)]
+        session_id: Option<Uuid>,
+        #[serde(default)]
+        pane_id: Option<Uuid>,
+        source: String,
+        name: String,
+        payload: Value,
     },
     RecordingDeleteAll,
     Detach,
@@ -431,12 +445,41 @@ pub struct RecordingSummary {
     #[serde(default)]
     pub session_id: Option<Uuid>,
     pub capture_input: bool,
+    #[serde(default = "recording_profile_default")]
+    pub profile: RecordingProfile,
+    #[serde(default = "recording_event_kinds_default")]
+    pub event_kinds: Vec<RecordingEventKind>,
     pub started_epoch_ms: u64,
     #[serde(default)]
     pub ended_epoch_ms: Option<u64>,
     pub event_count: u64,
     pub payload_bytes: u64,
     pub path: String,
+}
+
+fn recording_profile_default() -> RecordingProfile {
+    RecordingProfile::Full
+}
+
+fn recording_event_kinds_default() -> Vec<RecordingEventKind> {
+    vec![
+        RecordingEventKind::PaneInputRaw,
+        RecordingEventKind::PaneOutputRaw,
+        RecordingEventKind::ProtocolReplyRaw,
+        RecordingEventKind::ServerEvent,
+        RecordingEventKind::RequestStart,
+        RecordingEventKind::RequestDone,
+        RecordingEventKind::RequestError,
+    ]
+}
+
+/// Recording profile used to choose event verbosity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingProfile {
+    Full,
+    Functional,
+    Visual,
 }
 
 /// Recording runtime status details.
@@ -457,6 +500,7 @@ pub enum RecordingEventKind {
     RequestStart,
     RequestDone,
     RequestError,
+    Custom,
 }
 
 /// Recording event payload.
@@ -486,6 +530,11 @@ pub enum RecordingPayload {
         error_code: ErrorCode,
         message: String,
         elapsed_ms: u64,
+    },
+    Custom {
+        source: String,
+        name: String,
+        payload: Value,
     },
 }
 
@@ -653,6 +702,9 @@ pub enum ResponsePayload {
     },
     RecordingDeleted {
         recording_id: Uuid,
+    },
+    RecordingCustomEventWritten {
+        accepted: bool,
     },
     RecordingDeleteAll {
         deleted_count: usize,

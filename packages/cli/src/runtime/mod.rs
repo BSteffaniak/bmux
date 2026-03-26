@@ -1,7 +1,7 @@
 use crate::cli::{
     Cli, Command, KeymapCommand, LogLevel, LogsCommand, LogsProfilesCommand, RecordingCommand,
-    RecordingExportFormat, RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand,
-    TraceFamily,
+    RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg, RecordingReplayMode,
+    ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
 };
 use crate::connection::{
     ConnectionPolicyScope, ServerRuntimeMetadata, connect, connect_if_running, connect_raw,
@@ -303,6 +303,7 @@ fn core_provided_capabilities() -> Vec<HostScope> {
         "bmux.terminal.observe",
         "bmux.terminal.input_intercept",
         "bmux.terminal.output_intercept",
+        "bmux.recording.write",
     ]
     .into_iter()
     .map(|scope| HostScope::new(scope).expect("supported plugin host scope should parse"))
@@ -375,6 +376,12 @@ fn core_service_descriptors() -> Vec<RegisteredService> {
             capability: HostScope::new("bmux.panes.write").expect("capability should parse"),
             kind: ServiceKind::Command,
             interface_id: "pane-command/v1".to_string(),
+            provider: bmux_plugin::ProviderId::Host,
+        },
+        RegisteredService {
+            capability: HostScope::new("bmux.recording.write").expect("capability should parse"),
+            kind: ServiceKind::Command,
+            interface_id: "recording-command/v1".to_string(),
             provider: bmux_plugin::ProviderId::Host,
         },
     ]
@@ -622,6 +629,8 @@ pub async fn run() -> Result<u8> {
             let options = DefaultAttachOptions {
                 record: cli.record,
                 capture_input: !cli.no_capture_input,
+                profile: cli.record_profile,
+                event_kinds: cli.record_event_kind.clone(),
                 recording_id_file: cli.recording_id_file.clone(),
                 stop_server_on_exit: cli.stop_server_on_exit,
             };
@@ -655,6 +664,8 @@ pub async fn run() -> Result<u8> {
 struct DefaultAttachOptions {
     record: bool,
     capture_input: bool,
+    profile: Option<RecordingProfileArg>,
+    event_kinds: Vec<RecordingEventKindArg>,
     recording_id_file: Option<String>,
     stop_server_on_exit: bool,
 }
@@ -664,8 +675,6 @@ struct AttachDisplayCapturePlan {
     recording_id: Uuid,
     recording_path: PathBuf,
 }
-
-type DisplayCaptureWriter = recording::DisplayCaptureWriter;
 
 #[derive(Debug)]
 enum ParsedRuntimeCli {
@@ -806,6 +815,12 @@ fn validate_record_bootstrap_flags(cli: &Cli) -> Result<()> {
         if cli.recording_id_file.is_some() {
             anyhow::bail!("--recording-id-file requires --record")
         }
+        if cli.record_profile.is_some() {
+            anyhow::bail!("--record-profile requires --record")
+        }
+        if !cli.record_event_kind.is_empty() {
+            anyhow::bail!("--record-event-kind requires --record")
+        }
         if cli.stop_server_on_exit {
             anyhow::bail!("--stop-server-on-exit requires --record")
         }
@@ -815,6 +830,12 @@ fn validate_record_bootstrap_flags(cli: &Cli) -> Result<()> {
         }
         if cli.recording_id_file.is_some() {
             anyhow::bail!("--recording-id-file requires --record")
+        }
+        if cli.record_profile.is_some() {
+            anyhow::bail!("--record-profile requires --record")
+        }
+        if !cli.record_event_kind.is_empty() {
+            anyhow::bail!("--record-event-kind requires --record")
         }
         if cli.stop_server_on_exit {
             anyhow::bail!("--stop-server-on-exit requires --record")
@@ -838,7 +859,16 @@ async fn run_default_server_attach(options: DefaultAttachOptions) -> Result<u8> 
         )
         .await?;
         let started = recording_client
-            .recording_start(None, options.capture_input)
+            .recording_start(
+                None,
+                options.capture_input,
+                recording::recording_profile_arg_to_ipc(options.profile),
+                recording::resolve_event_kind_override(
+                    options.profile,
+                    &options.event_kinds,
+                    options.capture_input,
+                ),
+            )
             .await
             .map_err(map_cli_client_error)?;
         active_recording_id = Some(started.id);
@@ -1306,9 +1336,19 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                     RecordingCommand::Start {
                         session_id,
                         no_capture_input,
+                        profile,
+                        event_kind,
                     },
             },
-        ) => run_recording_start(session_id.as_deref(), !*no_capture_input).await,
+        ) => {
+            run_recording_start(
+                session_id.as_deref(),
+                !*no_capture_input,
+                *profile,
+                event_kind,
+            )
+            .await
+        }
         (
             BuiltInHandlerId::RecordingStop,
             Command::Recording {
@@ -2621,8 +2661,13 @@ async fn run_server_stop() -> Result<u8> {
     Ok(1)
 }
 
-async fn run_recording_start(session_id: Option<&str>, capture_input: bool) -> Result<u8> {
-    recording::run_recording_start(session_id, capture_input).await
+async fn run_recording_start(
+    session_id: Option<&str>,
+    capture_input: bool,
+    profile: Option<RecordingProfileArg>,
+    event_kinds: &[RecordingEventKindArg],
+) -> Result<u8> {
+    recording::run_recording_start(session_id, capture_input, profile, event_kinds).await
 }
 
 async fn run_recording_stop(recording_id: Option<&str>) -> Result<u8> {
@@ -4150,7 +4195,7 @@ async fn run_session_attach_with_client(
     }
 
     let self_client_id = client.whoami().await.map_err(map_attach_client_error)?;
-    let mut display_capture = DisplayCaptureWriter::new(capture_plan, self_client_id)?;
+    let mut display_capture = recording::DisplayCaptureWriter::new(capture_plan, self_client_id)?;
 
     let attach_info = if let Some(leader_client_id) = follow_target_id {
         let context_id = resolve_follow_target_context(&mut client, leader_client_id)
@@ -5576,7 +5621,7 @@ async fn render_attach_frame(
     keymap: &crate::input::Keymap,
     help_lines: &[String],
     help_scroll: usize,
-    display_capture: Option<&mut DisplayCaptureWriter>,
+    display_capture: Option<&mut recording::DisplayCaptureWriter>,
 ) -> Result<()> {
     if view_state.dirty.status_needs_redraw {
         let now = Instant::now();
@@ -7924,6 +7969,8 @@ mod tests {
             record: false,
             no_capture_input: false,
             recording_id_file: None,
+            record_profile: None,
+            record_event_kind: Vec::new(),
             stop_server_on_exit: false,
             command: None,
             verbose: false,
@@ -8429,7 +8476,7 @@ mod tests {
             context.provided_capabilities,
             vec!["example.provider.write".to_string()]
         );
-        assert_eq!(context.services.len(), 12);
+        assert_eq!(context.services.len(), 13);
         assert!(
             context
                 .services
@@ -8495,6 +8542,12 @@ mod tests {
                 .services
                 .iter()
                 .any(|service| service.interface_id == "pane-command/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "recording-command/v1")
         );
         assert!(
             context
@@ -8589,7 +8642,7 @@ mod tests {
                 "example.provider.write".to_string()
             ]
         );
-        assert_eq!(context.services.len(), 13);
+        assert_eq!(context.services.len(), 14);
         assert!(
             context
                 .services
@@ -8655,6 +8708,12 @@ mod tests {
                 .services
                 .iter()
                 .any(|service| service.interface_id == "pane-command/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "recording-command/v1")
         );
     }
 
@@ -8988,6 +9047,8 @@ mod tests {
                 id: other,
                 session_id: None,
                 capture_input: true,
+                profile: bmux_ipc::RecordingProfile::Functional,
+                event_kinds: vec![bmux_ipc::RecordingEventKind::PaneOutputRaw],
                 started_epoch_ms: 1,
                 ended_epoch_ms: Some(2),
                 event_count: 0,
@@ -8998,6 +9059,8 @@ mod tests {
                 id: exact,
                 session_id: None,
                 capture_input: true,
+                profile: bmux_ipc::RecordingProfile::Functional,
+                event_kinds: vec![bmux_ipc::RecordingEventKind::PaneOutputRaw],
                 started_epoch_ms: 3,
                 ended_epoch_ms: Some(4),
                 event_count: 0,
@@ -9023,6 +9086,8 @@ mod tests {
                 id: first,
                 session_id: None,
                 capture_input: true,
+                profile: bmux_ipc::RecordingProfile::Functional,
+                event_kinds: vec![bmux_ipc::RecordingEventKind::PaneOutputRaw],
                 started_epoch_ms: 1,
                 ended_epoch_ms: None,
                 event_count: 0,
@@ -9033,6 +9098,8 @@ mod tests {
                 id: second,
                 session_id: None,
                 capture_input: true,
+                profile: bmux_ipc::RecordingProfile::Functional,
+                event_kinds: vec![bmux_ipc::RecordingEventKind::PaneOutputRaw],
                 started_epoch_ms: 2,
                 ended_epoch_ms: None,
                 event_count: 0,

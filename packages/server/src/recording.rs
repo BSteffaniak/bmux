@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use bmux_ipc::{
-    RecordingEventEnvelope, RecordingEventKind, RecordingPayload, RecordingStatus, RecordingSummary,
+    RecordingEventEnvelope, RecordingEventKind, RecordingPayload, RecordingProfile,
+    RecordingStatus, RecordingSummary,
 };
 use serde::{Deserialize, Serialize};
 use std::io::{BufWriter, Write};
@@ -26,6 +27,8 @@ struct ActiveRecording {
     id: Uuid,
     session_filter: Option<Uuid>,
     capture_input: bool,
+    profile: RecordingProfile,
+    event_kinds: Vec<RecordingEventKind>,
     started_epoch_ms: u64,
     started_at: Instant,
     seq: AtomicU64,
@@ -60,6 +63,8 @@ impl RecordingRuntime {
         &mut self,
         session_filter: Option<Uuid>,
         capture_input: bool,
+        profile: RecordingProfile,
+        event_kinds: Vec<RecordingEventKind>,
     ) -> Result<RecordingSummary> {
         if self.active.is_some() {
             anyhow::bail!("recording already active")
@@ -84,6 +89,8 @@ impl RecordingRuntime {
             id,
             session_id: session_filter,
             capture_input,
+            profile,
+            event_kinds: event_kinds.clone(),
             started_epoch_ms,
             ended_epoch_ms: None,
             event_count: 0,
@@ -117,6 +124,8 @@ impl RecordingRuntime {
             id,
             session_filter,
             capture_input,
+            profile,
+            event_kinds,
             started_epoch_ms,
             started_at: Instant::now(),
             seq: AtomicU64::new(0),
@@ -156,6 +165,8 @@ impl RecordingRuntime {
             id: active.id,
             session_id: active.session_filter,
             capture_input: active.capture_input,
+            profile: active.profile,
+            event_kinds: active.event_kinds.clone(),
             started_epoch_ms: active.started_epoch_ms,
             ended_epoch_ms: None,
             event_count: active.event_count.load(Ordering::SeqCst),
@@ -258,19 +269,23 @@ impl RecordingRuntime {
         kind: RecordingEventKind,
         payload: RecordingPayload,
         meta: RecordMeta,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let Some(active) = self.active.as_ref() else {
-            return Ok(());
+            return Ok(false);
         };
 
         if let Some(filter) = active.session_filter {
             if meta.session_id != Some(filter) {
-                return Ok(());
+                return Ok(false);
             }
         }
 
+        if !active.event_kinds.contains(&kind) {
+            return Ok(false);
+        }
+
         if matches!(kind, RecordingEventKind::PaneInputRaw) && !active.capture_input {
-            return Ok(());
+            return Ok(false);
         }
 
         let seq = active.seq.fetch_add(1, Ordering::SeqCst).saturating_add(1);
@@ -291,7 +306,8 @@ impl RecordingRuntime {
         active
             .sender
             .send(envelope)
-            .map_err(|_| anyhow::anyhow!("recording writer is not accepting events"))
+            .map_err(|_| anyhow::anyhow!("recording writer is not accepting events"))?;
+        Ok(true)
     }
 }
 
@@ -366,6 +382,14 @@ fn payload_size(payload: &RecordingPayload) -> u64 {
         RecordingPayload::RequestError {
             request, message, ..
         } => (request.len() + message.len()) as u64,
+        RecordingPayload::Custom {
+            source,
+            name,
+            payload,
+        } => {
+            let payload_len = serde_json::to_vec(payload).map_or(0, |bytes| bytes.len());
+            (source.len() + name.len() + payload_len) as u64
+        }
     }
 }
 
@@ -378,7 +402,7 @@ fn epoch_millis_now() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{RecordMeta, RecordingRuntime};
-    use bmux_ipc::{RecordingEventKind, RecordingPayload};
+    use bmux_ipc::{RecordingEventKind, RecordingPayload, RecordingProfile};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -398,7 +422,14 @@ mod tests {
     fn start_record_stop_persists_manifest() {
         let root = temp_dir();
         let mut runtime = RecordingRuntime::new(root.clone());
-        let summary = runtime.start(None, true).expect("recording should start");
+        let summary = runtime
+            .start(
+                None,
+                true,
+                RecordingProfile::Functional,
+                vec![RecordingEventKind::PaneOutputRaw],
+            )
+            .expect("recording should start");
         runtime
             .record(
                 RecordingEventKind::PaneOutputRaw,
@@ -428,7 +459,14 @@ mod tests {
     fn no_capture_input_suppresses_input_events() {
         let root = temp_dir();
         let mut runtime = RecordingRuntime::new(root);
-        runtime.start(None, false).expect("recording should start");
+        runtime
+            .start(
+                None,
+                false,
+                RecordingProfile::Functional,
+                vec![RecordingEventKind::PaneInputRaw],
+            )
+            .expect("recording should start");
         runtime
             .record(
                 RecordingEventKind::PaneInputRaw,
@@ -450,7 +488,14 @@ mod tests {
     fn delete_removes_manifest_directory() {
         let root = temp_dir();
         let mut runtime = RecordingRuntime::new(root.clone());
-        let summary = runtime.start(None, true).expect("recording should start");
+        let summary = runtime
+            .start(
+                None,
+                true,
+                RecordingProfile::Functional,
+                vec![RecordingEventKind::PaneOutputRaw],
+            )
+            .expect("recording should start");
         runtime
             .stop(Some(summary.id))
             .expect("recording should stop");
@@ -465,15 +510,34 @@ mod tests {
         let root = temp_dir();
         let mut runtime = RecordingRuntime::new(root.clone());
         let active = runtime
-            .start(None, true)
+            .start(
+                None,
+                true,
+                RecordingProfile::Functional,
+                vec![RecordingEventKind::PaneOutputRaw],
+            )
             .expect("first recording should start");
-        let second = runtime.start(None, true).err();
+        let second = runtime
+            .start(
+                None,
+                true,
+                RecordingProfile::Functional,
+                vec![RecordingEventKind::PaneOutputRaw],
+            )
+            .err();
         assert!(second.is_some(), "second concurrent recording should fail");
 
         let _ = runtime
             .stop(Some(active.id))
             .expect("active recording should stop");
-        let _ = runtime.start(None, true).expect("new active should start");
+        let _ = runtime
+            .start(
+                None,
+                true,
+                RecordingProfile::Functional,
+                vec![RecordingEventKind::PaneOutputRaw],
+            )
+            .expect("new active should start");
 
         let deleted_count = runtime.delete_all().expect("delete all should succeed");
         assert_eq!(deleted_count, 2);

@@ -29,6 +29,25 @@ pub enum RecordingReplayMode {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RecordingProfileArg {
+    Full,
+    Functional,
+    Visual,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RecordingEventKindArg {
+    PaneInputRaw,
+    PaneOutputRaw,
+    ProtocolReplyRaw,
+    ServerEvent,
+    RequestStart,
+    RequestDone,
+    RequestError,
+    Custom,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum RecordingExportFormat {
     Gif,
 }
@@ -69,6 +88,14 @@ pub struct Cli {
     /// Write recording id to a file when using --record
     #[arg(long)]
     pub(crate) recording_id_file: Option<String>,
+
+    /// Recording profile when using --record
+    #[arg(long, value_enum)]
+    pub(crate) record_profile: Option<RecordingProfileArg>,
+
+    /// Explicit event kind allowlist when using --record (repeatable)
+    #[arg(long, value_enum)]
+    pub(crate) record_event_kind: Vec<RecordingEventKindArg>,
 
     /// Stop the server when exiting a --record run
     #[arg(long)]
@@ -186,6 +213,12 @@ pub enum RecordingCommand {
         /// Do not capture pane input bytes
         #[arg(long)]
         no_capture_input: bool,
+        /// Recording profile to use
+        #[arg(long, value_enum)]
+        profile: Option<RecordingProfileArg>,
+        /// Explicit event kind allowlist (repeatable)
+        #[arg(long, value_enum)]
+        event_kind: Vec<RecordingEventKindArg>,
     },
     /// Stop active recording or one by id
     Stop {
@@ -546,8 +579,8 @@ pub enum TerminalCommand {
 mod tests {
     use super::{
         Cli, Command, KeymapCommand, LogsCommand, LogsProfilesCommand, RecordingCommand,
-        RecordingExportFormat, RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand,
-        TraceFamily,
+        RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg, RecordingReplayMode,
+        ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
     };
     use clap::Parser;
 
@@ -1489,8 +1522,11 @@ mod tests {
             command,
             RecordingCommand::Start {
                 session_id: None,
-                no_capture_input: false
+                no_capture_input: false,
+                profile: None,
+                event_kind,
             }
+            if event_kind.is_empty()
         ));
     }
 
@@ -1512,8 +1548,11 @@ mod tests {
             command,
             RecordingCommand::Start {
                 session_id: Some(ref id),
-                no_capture_input: true
+                no_capture_input: true,
+                profile: None,
+                event_kind,
             } if id == "550e8400-e29b-41d4-a716-446655440000"
+                && event_kind.is_empty()
         ));
     }
 
@@ -1694,6 +1733,10 @@ mod tests {
             "bmux",
             "--record",
             "--no-capture-input",
+            "--record-profile",
+            "visual",
+            "--record-event-kind",
+            "pane-output-raw",
             "--recording-id-file",
             "/tmp/rec.id",
             "--stop-server-on-exit",
@@ -1701,8 +1744,43 @@ mod tests {
         .expect("valid CLI args");
         assert!(cli.record);
         assert!(cli.no_capture_input);
+        assert_eq!(cli.record_profile, Some(RecordingProfileArg::Visual));
+        assert_eq!(
+            cli.record_event_kind,
+            vec![RecordingEventKindArg::PaneOutputRaw]
+        );
         assert_eq!(cli.recording_id_file.as_deref(), Some("/tmp/rec.id"));
         assert!(cli.stop_server_on_exit);
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_recording_start_profile_and_event_kinds() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "recording",
+            "start",
+            "--profile",
+            "functional",
+            "--event-kind",
+            "pane-output-raw",
+            "--event-kind",
+            "request-start",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(
+            command,
+            RecordingCommand::Start {
+                profile: Some(RecordingProfileArg::Functional),
+                event_kind,
+                ..
+            } if event_kind == vec![
+                RecordingEventKindArg::PaneOutputRaw,
+                RecordingEventKindArg::RequestStart,
+            ]
+        ));
     }
 }

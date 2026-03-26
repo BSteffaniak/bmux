@@ -12,8 +12,8 @@ use bmux_ipc::{
     AttachGrant, AttachPaneChunk, AttachScene, ClientSummary, ContextSelector, ContextSummary,
     Envelope, EnvelopeKind, ErrorCode, InvokeServiceKind, IpcEndpoint, PaneFocusDirection,
     PaneLayoutNode, PaneSelector, PaneSplitDirection, PaneSummary, ProtocolVersion,
-    RecordingStatus, RecordingSummary, Request, Response, ResponsePayload, ServerSnapshotStatus,
-    SessionSelector, SessionSummary, decode, encode,
+    RecordingEventKind, RecordingProfile, RecordingStatus, RecordingSummary, Request, Response,
+    ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary, decode, encode,
 };
 use std::collections::BTreeMap;
 use std::time::Duration;
@@ -479,11 +479,15 @@ impl BmuxClient {
         &mut self,
         session_id: Option<Uuid>,
         capture_input: bool,
+        profile: Option<RecordingProfile>,
+        event_kinds: Option<Vec<RecordingEventKind>>,
     ) -> Result<RecordingSummary> {
         match self
             .request(Request::RecordingStart {
                 session_id,
                 capture_input,
+                profile,
+                event_kinds,
             })
             .await?
         {
@@ -1206,6 +1210,7 @@ fn request_kind_name(request: &Request) -> &'static str {
         Request::RecordingStatus => "recording_status",
         Request::RecordingList => "recording_list",
         Request::RecordingDelete { .. } => "recording_delete",
+        Request::RecordingWriteCustomEvent { .. } => "recording_write_custom_event",
         Request::RecordingDeleteAll => "recording_delete_all",
         Request::Detach => "detach",
         Request::SubscribeEvents => "subscribe_events",
@@ -1256,6 +1261,7 @@ fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::RecordingStatus { .. } => "recording_status",
             ResponsePayload::RecordingList { .. } => "recording_list",
             ResponsePayload::RecordingDeleted { .. } => "recording_deleted",
+            ResponsePayload::RecordingCustomEventWritten { .. } => "recording_custom_event_written",
             ResponsePayload::RecordingDeleteAll { .. } => "recording_delete_all",
             ResponsePayload::Detached => "detached",
             ResponsePayload::EventsSubscribed => "events_subscribed",
