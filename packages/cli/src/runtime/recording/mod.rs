@@ -298,9 +298,7 @@ pub(super) async fn run_recording_export(
     cell_height: Option<u16>,
 ) -> Result<u8> {
     let recording_id = parse_uuid_value(recording_id, "recording id")?;
-    let recording_dir = ConfigPaths::default()
-        .recordings_dir()
-        .join(recording_id.to_string());
+    let recording_dir = recordings_root_dir().join(recording_id.to_string());
     if !recording_dir.exists() {
         anyhow::bail!("recording not found: {recording_id}")
     }
@@ -837,8 +835,7 @@ pub(super) fn recording_event_kind_name(kind: RecordingEventKind) -> String {
 
 pub(super) fn load_recording_events(recording_id: &str) -> Result<Vec<RecordingEventEnvelope>> {
     let id = Uuid::parse_str(recording_id).context("invalid recording id")?;
-    let path = ConfigPaths::default()
-        .recordings_dir()
+    let path = recordings_root_dir()
         .join(id.to_string())
         .join("events.jsonl");
     let bytes = std::fs::read(&path)
@@ -897,7 +894,7 @@ pub(super) fn resolve_recording_id_prefix(
 }
 
 pub(super) fn delete_recording_dir(recording_id: Uuid) -> Result<()> {
-    delete_recording_dir_at(&ConfigPaths::default().recordings_dir(), recording_id)
+    delete_recording_dir_at(&recordings_root_dir(), recording_id)
 }
 
 pub(super) fn delete_recording_dir_at(recordings_root: &Path, recording_id: Uuid) -> Result<()> {
@@ -912,7 +909,7 @@ pub(super) fn delete_recording_dir_at(recordings_root: &Path, recording_id: Uuid
 }
 
 pub(super) fn delete_all_recordings_from_disk() -> Result<usize> {
-    delete_all_recordings_from_dir(&ConfigPaths::default().recordings_dir())
+    delete_all_recordings_from_dir(&recordings_root_dir())
 }
 
 pub(super) fn delete_all_recordings_from_dir(root: &Path) -> Result<usize> {
@@ -982,7 +979,14 @@ fn read_recording_manifest(manifest_path: &Path) -> Result<RecordingSummary> {
 }
 
 pub(super) fn list_recordings_from_disk() -> Result<Vec<RecordingSummary>> {
-    list_recordings_from_dir(&ConfigPaths::default().recordings_dir())
+    list_recordings_from_dir(&recordings_root_dir())
+}
+
+fn recordings_root_dir() -> PathBuf {
+    let paths = ConfigPaths::default();
+    BmuxConfig::load_from_path(&paths.config_file())
+        .map(|config| config.recordings_dir(&paths))
+        .unwrap_or_else(|_| paths.recordings_dir())
 }
 
 pub(super) fn list_recordings_from_dir(recordings_root: &Path) -> Result<Vec<RecordingSummary>> {

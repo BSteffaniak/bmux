@@ -68,6 +68,10 @@ pub struct BmuxConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RecordingConfig {
+    /// Root directory for recording data.
+    ///
+    /// Relative paths are resolved against the directory containing `bmux.toml`.
+    pub dir: Option<PathBuf>,
     /// Enable recording subsystem availability
     pub enabled: bool,
     /// Capture pane input bytes by default
@@ -85,6 +89,7 @@ pub struct RecordingConfig {
 impl Default for RecordingConfig {
     fn default() -> Self {
         Self {
+            dir: None,
             enabled: true,
             capture_input: true,
             capture_output: true,
@@ -289,6 +294,26 @@ pub enum BellAction {
 }
 
 impl BmuxConfig {
+    /// Resolve the effective recordings directory.
+    ///
+    /// If `recording.dir` is set and relative, it is resolved relative to the
+    /// directory that contains the active `bmux.toml`.
+    #[must_use]
+    pub fn recordings_dir(&self, paths: &ConfigPaths) -> PathBuf {
+        match &self.recording.dir {
+            Some(dir) if dir.is_absolute() => dir.clone(),
+            Some(dir) => {
+                let base = paths
+                    .config_file()
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| paths.config_dir.clone());
+                base.join(dir)
+            }
+            None => paths.recordings_dir(),
+        }
+    }
+
     /// Load configuration from default location
     ///
     /// # Errors
@@ -466,6 +491,7 @@ impl BmuxConfig {
 #[cfg(test)]
 mod tests {
     use super::{BmuxConfig, ResolvedTimeout, StaleBuildAction};
+    use crate::ConfigPaths;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_config_path() -> std::path::PathBuf {
@@ -696,6 +722,66 @@ timeout_profile = "missing"
 
         let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
         assert_eq!(config.behavior.stale_build_action, StaleBuildAction::Warn);
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn recordings_dir_uses_default_when_unset() {
+        let paths = ConfigPaths::new(
+            std::path::PathBuf::from("/config"),
+            std::path::PathBuf::from("/runtime"),
+            std::path::PathBuf::from("/data"),
+        );
+        let config = BmuxConfig::default();
+
+        assert_eq!(config.recordings_dir(&paths), paths.recordings_dir());
+    }
+
+    #[test]
+    fn recordings_dir_uses_absolute_override() {
+        let paths = ConfigPaths::new(
+            std::path::PathBuf::from("/config"),
+            std::path::PathBuf::from("/runtime"),
+            std::path::PathBuf::from("/data"),
+        );
+        let mut config = BmuxConfig::default();
+        config.recording.dir = Some(std::path::PathBuf::from("/custom/recordings"));
+
+        assert_eq!(
+            config.recordings_dir(&paths),
+            std::path::PathBuf::from("/custom/recordings")
+        );
+    }
+
+    #[test]
+    fn recordings_dir_resolves_relative_to_config_file_directory() {
+        let paths = ConfigPaths::new(
+            std::path::PathBuf::from("/cfg-root"),
+            std::path::PathBuf::from("/runtime"),
+            std::path::PathBuf::from("/data"),
+        );
+        let mut config = BmuxConfig::default();
+        config.recording.dir = Some(std::path::PathBuf::from("recordings/custom"));
+
+        assert_eq!(
+            config.recordings_dir(&paths),
+            std::path::PathBuf::from("/cfg-root/recordings/custom")
+        );
+    }
+
+    #[test]
+    fn load_parses_recording_dir_override() {
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        std::fs::write(&path, "[recording]\ndir = 'recordings/custom'\n")
+            .expect("failed writing config fixture");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(
+            config.recording.dir,
+            Some(std::path::PathBuf::from("recordings/custom"))
+        );
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
     }

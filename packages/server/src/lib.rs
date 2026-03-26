@@ -2389,17 +2389,20 @@ impl BmuxServer {
     /// Create a server with an explicit endpoint.
     #[must_use]
     pub fn new(endpoint: IpcEndpoint) -> Self {
+        let paths = ConfigPaths::default();
+        let config = BmuxConfig::load_from_path(&paths.config_file()).unwrap_or_default();
         Self::new_with_snapshot(
             endpoint,
             None,
             Uuid::new_v4(),
-            ConfigPaths::default().recordings_dir(),
+            config.recordings_dir(&paths),
         )
     }
 
     /// Create a server with endpoint derived from config paths.
     #[must_use]
     pub fn from_config_paths(paths: &ConfigPaths) -> Self {
+        let config = BmuxConfig::load_from_path(&paths.config_file()).unwrap_or_default();
         #[cfg(unix)]
         let endpoint = IpcEndpoint::unix_socket(paths.server_socket());
 
@@ -2416,7 +2419,7 @@ impl BmuxServer {
             endpoint,
             Some(snapshot_manager),
             server_control_principal_id,
-            paths.recordings_dir(),
+            config.recordings_dir(paths),
         )
     }
 

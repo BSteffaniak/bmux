@@ -1497,7 +1497,7 @@ async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8>
     let loaded_plugins = load_enabled_plugins(&config, &registry)?;
     activate_loaded_plugins(&loaded_plugins, &config, &paths)?;
     dispatch_loaded_plugin_event(&loaded_plugins, plugin_system_event("server_starting"))?;
-    let server = BmuxServer::from_default_paths();
+    let server = BmuxServer::from_config_paths(&paths);
     register_plugin_service_handlers(&server, &config, &paths, &registry)?;
     write_server_pid_file(std::process::id())?;
     write_server_runtime_metadata(std::process::id())?;
