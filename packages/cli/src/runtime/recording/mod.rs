@@ -1,6 +1,7 @@
 use super::*;
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont, point};
-use std::collections::HashSet;
+use font8x8::UnicodeFonts;
+use std::collections::{HashMap, HashSet};
 
 mod terminal_profile;
 
@@ -722,6 +723,7 @@ fn export_recording_gif(
         RecordingRenderMode::Font => GlyphRenderer::new(cell_w, cell_h, &render_options),
         RecordingRenderMode::Bitmap => None,
     };
+    let mut bitmap_cache = BitmapGlyphCache::new(usize::from(cell_w), usize::from(cell_h));
 
     let output_path = PathBuf::from(output);
     if let Some(parent) = output_path.parent()
@@ -797,6 +799,7 @@ fn export_recording_gif(
                     cell_h,
                     &palette,
                     glyph_renderer.as_ref(),
+                    &mut bitmap_cache,
                 );
                 let mut frame = GifFrame::from_rgba_speed(width, height, &mut pixels, 1);
                 frame.delay = delay_cs;
@@ -826,6 +829,7 @@ fn render_screen_rgba(
     cell_h: u16,
     palette: &[(u8, u8, u8)],
     glyph_renderer: Option<&GlyphRenderer>,
+    bitmap_cache: &mut BitmapGlyphCache,
 ) -> Vec<u8> {
     let width = usize::from(max_cols.saturating_mul(cell_w));
     let height = usize::from(max_rows.saturating_mul(cell_h));
@@ -901,6 +905,7 @@ fn render_screen_rgba(
                     cell_h_usize,
                     glyph_char,
                     (fg_r, fg_g, fg_b),
+                    bitmap_cache,
                 );
             }
         }
@@ -919,32 +924,150 @@ fn draw_bitmap_glyph_rgba(
     cell_h: usize,
     glyph_char: char,
     fg_rgb: (u8, u8, u8),
+    bitmap_cache: &mut BitmapGlyphCache,
 ) {
-    let glyph = font8x8::BASIC_FONTS
-        .get(glyph_char)
-        .or_else(|| font8x8::BASIC_FONTS.get('?'))
-        .unwrap_or([0_u8; 8]);
+    let Some(mask) = bitmap_cache.mask_for(glyph_char) else {
+        return;
+    };
     for py in 0..cell_h {
         let y = y0 + py;
         if y >= height {
             continue;
         }
-        let glyph_row = ((py.saturating_mul(8)) / cell_h).min(7);
-        let bits = glyph[glyph_row];
         let row_start = y.saturating_mul(width);
+        let mask_row = py.saturating_mul(cell_w);
         for px in 0..cell_w {
             let x = x0 + px;
             if x >= width {
                 continue;
             }
-            let glyph_col = ((px.saturating_mul(8)) / cell_w).min(7);
-            if ((bits >> glyph_col) & 1) == 1 {
+            if mask[mask_row + px] == 1 {
                 let idx = (row_start + x).saturating_mul(4);
                 pixels[idx] = fg_rgb.0;
                 pixels[idx + 1] = fg_rgb.1;
                 pixels[idx + 2] = fg_rgb.2;
                 pixels[idx + 3] = 255;
             }
+        }
+    }
+}
+
+struct BitmapGlyphCache {
+    cell_w: usize,
+    cell_h: usize,
+    masks: HashMap<char, Option<Vec<u8>>>,
+}
+
+impl BitmapGlyphCache {
+    fn new(cell_w: usize, cell_h: usize) -> Self {
+        Self {
+            cell_w,
+            cell_h,
+            masks: HashMap::new(),
+        }
+    }
+
+    fn mask_for(&mut self, glyph_char: char) -> Option<&[u8]> {
+        let entry = self
+            .masks
+            .entry(glyph_char)
+            .or_insert_with(|| build_bitmap_mask(glyph_char, self.cell_w, self.cell_h));
+        entry.as_deref()
+    }
+}
+
+fn build_bitmap_mask(glyph_char: char, cell_w: usize, cell_h: usize) -> Option<Vec<u8>> {
+    if cell_w == 0 || cell_h == 0 {
+        return None;
+    }
+    if let Some(mask) = block_element_mask(glyph_char, cell_w, cell_h) {
+        return Some(mask);
+    }
+    let glyph = resolve_bitmap_glyph(glyph_char)?;
+    let mut mask = vec![0_u8; cell_w.saturating_mul(cell_h)];
+    let mut any_set = false;
+    for py in 0..cell_h {
+        let glyph_row = ((py.saturating_mul(8)) / cell_h).min(7);
+        let bits = glyph[glyph_row];
+        let row_start = py.saturating_mul(cell_w);
+        for px in 0..cell_w {
+            let glyph_col = ((px.saturating_mul(8)) / cell_w).min(7);
+            if ((bits >> glyph_col) & 1) == 1 {
+                mask[row_start + px] = 1;
+                any_set = true;
+            }
+        }
+    }
+    any_set.then_some(mask)
+}
+
+fn resolve_bitmap_glyph(glyph_char: char) -> Option<[u8; 8]> {
+    font8x8::BASIC_FONTS
+        .get(glyph_char)
+        .or_else(|| font8x8::LATIN_FONTS.get(glyph_char))
+        .or_else(|| font8x8::BOX_FONTS.get(glyph_char))
+        .or_else(|| font8x8::BLOCK_FONTS.get(glyph_char))
+        .or_else(|| font8x8::GREEK_FONTS.get(glyph_char))
+        .or_else(|| font8x8::MISC_FONTS.get(glyph_char))
+        .or_else(|| font8x8::BASIC_FONTS.get('?'))
+}
+
+fn block_element_mask(glyph_char: char, cell_w: usize, cell_h: usize) -> Option<Vec<u8>> {
+    let mut mask = vec![0_u8; cell_w.saturating_mul(cell_h)];
+    match glyph_char {
+        '█' => mask.fill(1),
+        '▀' => {
+            let cutoff = cell_h.div_ceil(2);
+            for y in 0..cutoff {
+                let row = y.saturating_mul(cell_w);
+                for x in 0..cell_w {
+                    mask[row + x] = 1;
+                }
+            }
+        }
+        '▄' => {
+            let start = cell_h / 2;
+            for y in start..cell_h {
+                let row = y.saturating_mul(cell_w);
+                for x in 0..cell_w {
+                    mask[row + x] = 1;
+                }
+            }
+        }
+        '▌' => {
+            let cutoff = cell_w.div_ceil(2);
+            for y in 0..cell_h {
+                let row = y.saturating_mul(cell_w);
+                for x in 0..cutoff {
+                    mask[row + x] = 1;
+                }
+            }
+        }
+        '▐' => {
+            let start = cell_w / 2;
+            for y in 0..cell_h {
+                let row = y.saturating_mul(cell_w);
+                for x in start..cell_w {
+                    mask[row + x] = 1;
+                }
+            }
+        }
+        '░' => fill_shade_mask(&mut mask, cell_w, 1),
+        '▒' => fill_shade_mask(&mut mask, cell_w, 2),
+        '▓' => fill_shade_mask(&mut mask, cell_w, 3),
+        _ => return None,
+    }
+    Some(mask)
+}
+
+fn fill_shade_mask(mask: &mut [u8], cell_w: usize, threshold: usize) {
+    let threshold = threshold.min(4);
+    for (idx, value) in mask.iter_mut().enumerate() {
+        let y = idx / cell_w;
+        let x = idx % cell_w;
+        let matrix_value = (x & 1) + ((y & 1) << 1);
+        if matrix_value < threshold {
+            *value = 1;
         }
     }
 }
@@ -988,7 +1111,8 @@ fn build_render_options(
         mode: renderer,
         font_families,
         font_paths,
-        font_size_px: font_size,
+        font_size_px: font_size
+            .or_else(|| terminal_profile.and_then(|profile| profile.font_size_px.map(f32::from))),
         line_height_mult: line_height.unwrap_or(1.0),
     })
 }
@@ -1671,5 +1795,60 @@ mod tests {
             resolve_export_cell_metrics(&events, None, None, None).expect("metrics should resolve");
         assert_eq!(resolved.width, 10);
         assert_eq!(resolved.height, 20);
+    }
+
+    #[test]
+    fn build_render_options_uses_terminal_profile_defaults() {
+        let profile = terminal_profile::DetectedTerminalProfile {
+            terminal_id: "ghostty".to_string(),
+            font_families: vec!["JetBrains Mono".to_string()],
+            font_size_px: Some(15),
+            source: "test".to_string(),
+        };
+        let options = build_render_options(
+            Some(&profile),
+            RecordingRenderMode::Bitmap,
+            None,
+            None,
+            None,
+            &[],
+        )
+        .expect("options should resolve");
+        assert_eq!(options.font_families, vec!["JetBrains Mono".to_string()]);
+        assert_eq!(options.font_size_px, Some(15.0));
+        assert_eq!(options.line_height_mult, 1.0);
+    }
+
+    #[test]
+    fn recording_terminal_profile_reads_stream_opened_profile() {
+        let profile = terminal_profile::DetectedTerminalProfile {
+            terminal_id: "ghostty".to_string(),
+            font_families: vec!["Iosevka".to_string()],
+            font_size_px: Some(14),
+            source: "ghostty-config:/tmp/config".to_string(),
+        };
+        let events = vec![DisplayTrackEnvelope {
+            mono_ns: 1,
+            event: DisplayTrackEvent::StreamOpened {
+                client_id: Uuid::nil(),
+                recording_id: Uuid::nil(),
+                cell_width_px: Some(8),
+                cell_height_px: Some(16),
+                window_width_px: Some(800),
+                window_height_px: Some(600),
+                terminal_profile: Some(profile.clone()),
+            },
+        }];
+        let resolved = recording_terminal_profile(&events).expect("profile should be resolved");
+        assert_eq!(resolved, profile);
+    }
+
+    #[test]
+    fn bitmap_glyph_cache_reuses_computed_mask() {
+        let mut cache = BitmapGlyphCache::new(8, 16);
+        let first = cache.mask_for('A').expect("mask should exist").to_vec();
+        let second = cache.mask_for('A').expect("mask should exist").to_vec();
+        assert_eq!(first, second);
+        assert_eq!(cache.masks.len(), 1);
     }
 }

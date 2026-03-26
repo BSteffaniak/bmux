@@ -346,7 +346,7 @@ pub enum RecordingCommand {
         #[arg(long)]
         max_frames: Option<u32>,
         /// Renderer mode for frame rasterization
-        #[arg(long, value_enum, default_value_t = RecordingRenderMode::Font)]
+        #[arg(long, value_enum, default_value_t = RecordingRenderMode::Bitmap)]
         renderer: RecordingRenderMode,
         /// Cell size in pixels as WIDTHxHEIGHT (e.g. 8x16)
         #[arg(long, value_parser = parse_cell_size)]
@@ -1765,6 +1765,29 @@ mod tests {
         .expect_err("invalid cell-size should fail");
         let text = error.to_string();
         assert!(text.contains("--cell-size") || text.contains("invalid value"));
+    }
+
+    #[test]
+    fn recording_export_defaults_to_bitmap_renderer() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "recording",
+            "export",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--output",
+            "./out.gif",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(
+            command,
+            RecordingCommand::Export {
+                renderer: RecordingRenderMode::Bitmap,
+                ..
+            }
+        ));
     }
 
     #[test]

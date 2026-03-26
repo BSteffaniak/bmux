@@ -35,7 +35,6 @@ use crossterm::style::Print;
 use crossterm::terminal;
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
-use font8x8::UnicodeFonts;
 use gif::{Encoder as GifEncoder, Frame as GifFrame, Repeat};
 use std::cell::RefCell;
 use std::io::{self, BufRead, BufReader, BufWriter, IsTerminal, Read, Seek, Write};
