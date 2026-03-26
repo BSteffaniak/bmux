@@ -2,6 +2,8 @@ use super::*;
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont, point};
 use std::collections::HashSet;
 
+mod terminal_profile;
+
 pub(super) async fn run_recording_start(
     session_id: Option<&str>,
     capture_input: bool,
@@ -451,6 +453,9 @@ pub(super) async fn run_recording_export(
         )
     }
 
+    let terminal_profile =
+        recording_terminal_profile(&events).or_else(terminal_profile::detect_render_profile);
+
     match format {
         RecordingExportFormat::Gif => export_recording_gif(
             &events,
@@ -459,6 +464,7 @@ pub(super) async fn run_recording_export(
             fps,
             max_duration,
             max_frames,
+            terminal_profile.as_ref(),
             renderer,
             cell_size,
             cell_width,
@@ -514,6 +520,21 @@ fn load_display_track_events(
         events.push(event);
     }
     Ok(events)
+}
+
+fn recording_terminal_profile(
+    events: &[DisplayTrackEnvelope],
+) -> Option<terminal_profile::DetectedTerminalProfile> {
+    for envelope in events {
+        if let DisplayTrackEvent::StreamOpened {
+            terminal_profile: Some(profile),
+            ..
+        } = &envelope.event
+        {
+            return Some(profile.clone());
+        }
+    }
+    None
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -660,6 +681,7 @@ fn export_recording_gif(
     fps: u32,
     max_duration: Option<u64>,
     max_frames: Option<u32>,
+    terminal_profile: Option<&terminal_profile::DetectedTerminalProfile>,
     renderer: RecordingRenderMode,
     cell_size: Option<(u16, u16)>,
     cell_width: Option<u16>,
@@ -687,8 +709,14 @@ fn export_recording_gif(
     let cell_h = cell_metrics.height;
     let width = max_cols.saturating_mul(cell_w).max(8);
     let height = max_rows.saturating_mul(cell_h).max(8);
-    let render_options =
-        build_render_options(renderer, font_family, font_size, line_height, font_path)?;
+    let render_options = build_render_options(
+        terminal_profile,
+        renderer,
+        font_family,
+        font_size,
+        line_height,
+        font_path,
+    )?;
     let palette = xterm_256_palette();
     let glyph_renderer = match render_options.mode {
         RecordingRenderMode::Font => GlyphRenderer::new(cell_w, cell_h, &render_options),
@@ -934,6 +962,7 @@ struct RenderOptions {
 }
 
 fn build_render_options(
+    terminal_profile: Option<&terminal_profile::DetectedTerminalProfile>,
     renderer: RecordingRenderMode,
     font_family: Option<&str>,
     font_size: Option<f32>,
@@ -947,21 +976,29 @@ fn build_render_options(
         anyhow::bail!("--line-height must be greater than zero")
     }
     let font_families = font_family
-        .map(|raw| {
-            raw.split(',')
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(std::string::ToString::to_string)
-                .collect::<Vec<_>>()
-        })
+        .map(parse_csv_values)
+        .or_else(|| terminal_profile.map(|profile| profile.font_families.clone()))
         .unwrap_or_default();
+    let font_paths = if font_path.is_empty() {
+        Vec::new()
+    } else {
+        font_path.to_vec()
+    };
     Ok(RenderOptions {
         mode: renderer,
         font_families,
-        font_paths: font_path.to_vec(),
+        font_paths,
         font_size_px: font_size,
         line_height_mult: line_height.unwrap_or(1.0),
     })
+}
+
+fn parse_csv_values(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(std::string::ToString::to_string)
+        .collect::<Vec<_>>()
 }
 
 struct GlyphRenderer {
@@ -1439,6 +1476,7 @@ enum DisplayTrackEvent {
         cell_height_px: Option<u16>,
         window_width_px: Option<u16>,
         window_height_px: Option<u16>,
+        terminal_profile: Option<terminal_profile::DetectedTerminalProfile>,
     },
     Resize {
         cols: u16,
@@ -1493,6 +1531,7 @@ impl DisplayCaptureWriter {
         };
         let (cell_width_px, cell_height_px, window_width_px, window_height_px) =
             capture_stream_open_metrics();
+        let terminal_profile = terminal_profile::detect_render_profile();
         capture.record(DisplayTrackEvent::StreamOpened {
             client_id,
             recording_id: plan.recording_id,
@@ -1500,6 +1539,7 @@ impl DisplayCaptureWriter {
             cell_height_px,
             window_width_px,
             window_height_px,
+            terminal_profile,
         })?;
         if let Ok((cols, rows)) = terminal::size()
             && cols > 0
@@ -1577,6 +1617,7 @@ mod tests {
                 cell_height_px,
                 window_width_px,
                 window_height_px,
+                terminal_profile: None,
             },
         }
     }
@@ -1592,6 +1633,7 @@ mod tests {
             cell_height_px,
             window_width_px,
             window_height_px,
+            terminal_profile,
             ..
         } = parsed.event
         else {
@@ -1601,6 +1643,7 @@ mod tests {
         assert_eq!(cell_height_px, None);
         assert_eq!(window_width_px, None);
         assert_eq!(window_height_px, None);
+        assert_eq!(terminal_profile, None);
     }
 
     #[test]
