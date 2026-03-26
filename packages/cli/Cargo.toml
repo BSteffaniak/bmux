@@ -27,6 +27,7 @@ bmux_terminal          = { workspace = true }
 bmux_terminal_protocol = { workspace = true }
 
 # External dependencies
+ab_glyph = { workspace = true }
 anyhow = { workspace = true, features = ["std"] }
 clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
 crossterm = { workspace = true, features = ["events"] }

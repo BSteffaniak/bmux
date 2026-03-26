@@ -1,4 +1,6 @@
 use super::*;
+use ab_glyph::{Font, FontArc, PxScale, ScaleFont, point};
+use std::collections::HashMap;
 
 pub(super) async fn run_recording_start(
     session_id: Option<&str>,
@@ -670,7 +672,10 @@ fn export_recording_gif(
     let cell_h = cell_metrics.height;
     let width = max_cols.saturating_mul(cell_w).max(8);
     let height = max_rows.saturating_mul(cell_h).max(8);
+    let palette_tuples = xterm_256_palette();
     let palette = xterm_256_palette_rgb();
+    let glyph_renderer = GlyphRenderer::new(cell_w, cell_h);
+    let mut blend_cache = HashMap::<u32, u8>::new();
 
     let output_path = PathBuf::from(output);
     if let Some(parent) = output_path.parent()
@@ -744,6 +749,9 @@ fn export_recording_gif(
                     max_cols,
                     cell_w,
                     cell_h,
+                    glyph_renderer.as_ref(),
+                    &palette_tuples,
+                    &mut blend_cache,
                 );
                 let mut frame =
                     GifFrame::from_palette_pixels(width, height, pixels, palette.clone(), None);
@@ -772,6 +780,9 @@ fn render_screen_indexed(
     max_cols: u16,
     cell_w: u16,
     cell_h: u16,
+    glyph_renderer: Option<&GlyphRenderer>,
+    palette: &[(u8, u8, u8)],
+    blend_cache: &mut HashMap<u32, u8>,
 ) -> Vec<u8> {
     let width = usize::from(max_cols.saturating_mul(cell_w));
     let height = usize::from(max_rows.saturating_mul(cell_h));
@@ -815,22 +826,37 @@ fn render_screen_indexed(
                 .get(glyph_char)
                 .or_else(|| font8x8::BASIC_FONTS.get('?'))
                 .unwrap_or([0_u8; 8]);
-            for py in 0..cell_h_usize {
-                let y = y0 + py;
-                if y >= height {
-                    continue;
-                }
-                let glyph_row = ((py.saturating_mul(8)) / cell_h_usize).min(7);
-                let bits = glyph[glyph_row];
-                let row_start = y.saturating_mul(width);
-                for px in 0..cw {
-                    let x = x0 + px;
-                    if x >= width {
+            if let Some(renderer) = glyph_renderer {
+                renderer.draw_cell(
+                    &mut pixels,
+                    width,
+                    height,
+                    x0,
+                    y0,
+                    glyph_char,
+                    fg,
+                    bg,
+                    palette,
+                    blend_cache,
+                );
+            } else {
+                for py in 0..cell_h_usize {
+                    let y = y0 + py;
+                    if y >= height {
                         continue;
                     }
-                    let glyph_col = ((px.saturating_mul(8)) / cw).min(7);
-                    if ((bits >> glyph_col) & 1) == 1 {
-                        pixels[row_start + x] = fg;
+                    let glyph_row = ((py.saturating_mul(8)) / cell_h_usize).min(7);
+                    let bits = glyph[glyph_row];
+                    let row_start = y.saturating_mul(width);
+                    for px in 0..cw {
+                        let x = x0 + px;
+                        if x >= width {
+                            continue;
+                        }
+                        let glyph_col = ((px.saturating_mul(8)) / cw).min(7);
+                        if ((bits >> glyph_col) & 1) == 1 {
+                            pixels[row_start + x] = fg;
+                        }
                     }
                 }
             }
@@ -838,6 +864,129 @@ fn render_screen_indexed(
     }
 
     pixels
+}
+
+struct GlyphRenderer {
+    font: FontArc,
+    scale: PxScale,
+    baseline_offset: f32,
+}
+
+impl GlyphRenderer {
+    fn new(cell_w: u16, cell_h: u16) -> Option<Self> {
+        let font = load_monospace_font()?;
+        let scale = PxScale {
+            x: f32::from(cell_w).max(1.0),
+            y: (f32::from(cell_h) * 0.95).max(1.0),
+        };
+        let scaled = font.as_scaled(scale);
+        let glyph_height = scaled.height();
+        let baseline_offset = ((f32::from(cell_h) - glyph_height) / 2.0).max(0.0) + scaled.ascent();
+        Some(Self {
+            font,
+            scale,
+            baseline_offset,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn draw_cell(
+        &self,
+        pixels: &mut [u8],
+        width: usize,
+        height: usize,
+        x0: usize,
+        y0: usize,
+        glyph_char: char,
+        fg: u8,
+        bg: u8,
+        palette: &[(u8, u8, u8)],
+        blend_cache: &mut HashMap<u32, u8>,
+    ) {
+        if glyph_char == ' ' {
+            return;
+        }
+        let glyph = self.font.glyph_id(glyph_char).with_scale_and_position(
+            self.scale,
+            point(x0 as f32, y0 as f32 + self.baseline_offset),
+        );
+        let Some(outlined) = self.font.outline_glyph(glyph) else {
+            return;
+        };
+        outlined.draw(|gx, gy, coverage| {
+            if coverage <= 0.0 {
+                return;
+            }
+            let x = x0.saturating_add(gx as usize);
+            let y = y0.saturating_add(gy as usize);
+            if x >= width || y >= height {
+                return;
+            }
+            let alpha = (coverage.clamp(0.0, 1.0) * 255.0).round() as u8;
+            let color = if alpha >= 250 {
+                fg
+            } else {
+                blend_palette_index(fg, bg, alpha, palette, blend_cache)
+            };
+            pixels[y.saturating_mul(width) + x] = color;
+        });
+    }
+}
+
+fn load_monospace_font() -> Option<FontArc> {
+    const FONT_CANDIDATES: &[&str] = &[
+        "/System/Library/Fonts/SFNSMono.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    ];
+    for path in FONT_CANDIDATES {
+        let Ok(bytes) = std::fs::read(path) else {
+            continue;
+        };
+        if let Ok(font) = FontArc::try_from_vec(bytes) {
+            return Some(font);
+        }
+    }
+    None
+}
+
+fn blend_palette_index(
+    fg: u8,
+    bg: u8,
+    alpha: u8,
+    palette: &[(u8, u8, u8)],
+    cache: &mut HashMap<u32, u8>,
+) -> u8 {
+    let key = (u32::from(fg) << 16) | (u32::from(bg) << 8) | u32::from(alpha);
+    if let Some(value) = cache.get(&key) {
+        return *value;
+    }
+    let (fr, fgc, fb) = palette[usize::from(fg)];
+    let (br, bgc, bb) = palette[usize::from(bg)];
+    let a = f32::from(alpha) / 255.0;
+    let blended_r = ((f32::from(fr) * a) + (f32::from(br) * (1.0 - a))).round() as u8;
+    let blended_g = ((f32::from(fgc) * a) + (f32::from(bgc) * (1.0 - a))).round() as u8;
+    let blended_b = ((f32::from(fb) * a) + (f32::from(bb) * (1.0 - a))).round() as u8;
+    let value = nearest_xterm_index_from_palette(blended_r, blended_g, blended_b, palette);
+    cache.insert(key, value);
+    value
+}
+
+fn nearest_xterm_index_from_palette(r: u8, g: u8, b: u8, palette: &[(u8, u8, u8)]) -> u8 {
+    let mut best_index = 0_u8;
+    let mut best_distance = u32::MAX;
+    for (index, (pr, pg, pb)) in palette.iter().enumerate() {
+        let dr = i32::from(*pr) - i32::from(r);
+        let dg = i32::from(*pg) - i32::from(g);
+        let db = i32::from(*pb) - i32::from(b);
+        let distance = (dr * dr + dg * dg + db * db) as u32;
+        if distance < best_distance {
+            best_distance = distance;
+            best_index = index as u8;
+        }
+    }
+    best_index
 }
 
 fn vt100_color_to_palette_index(color: vt100::Color, foreground: bool) -> u8 {
