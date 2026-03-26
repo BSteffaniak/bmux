@@ -1,6 +1,7 @@
 use crate::cli::{
     Cli, Command, KeymapCommand, LogLevel, LogsCommand, LogsProfilesCommand, RecordingCommand,
-    RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
+    RecordingExportFormat, RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand,
+    TraceFamily,
 };
 use crate::connection::{
     ConnectionPolicyScope, ServerRuntimeMetadata, connect, connect_if_running, connect_raw,
@@ -34,8 +35,10 @@ use crossterm::style::Print;
 use crossterm::terminal;
 use crossterm::terminal::{Clear, ClearType};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use font8x8::UnicodeFonts;
+use gif::{Encoder as GifEncoder, Frame as GifFrame, Repeat};
 use std::cell::RefCell;
-use std::io::{self, IsTerminal, Read, Seek, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, IsTerminal, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::OnceLock;
@@ -655,6 +658,12 @@ struct DefaultAttachOptions {
     stop_server_on_exit: bool,
 }
 
+#[derive(Debug, Clone)]
+struct AttachDisplayCapturePlan {
+    recording_id: Uuid,
+    recording_path: PathBuf,
+}
+
 #[derive(Debug)]
 enum ParsedRuntimeCli {
     BuiltIn {
@@ -818,6 +827,7 @@ async fn run_default_server_attach(options: DefaultAttachOptions) -> Result<u8> 
     ensure_server_running_for_default_attach().await?;
 
     let mut active_recording_id = None;
+    let mut capture_plan = None;
     if options.record {
         let mut recording_client = connect(
             ConnectionPolicyScope::Normal,
@@ -829,6 +839,10 @@ async fn run_default_server_attach(options: DefaultAttachOptions) -> Result<u8> 
             .await
             .map_err(map_cli_client_error)?;
         active_recording_id = Some(started.id);
+        capture_plan = Some(AttachDisplayCapturePlan {
+            recording_id: started.id,
+            recording_path: PathBuf::from(&started.path),
+        });
         println!(
             "recording started: {} (capture_input={})",
             started.id, started.capture_input
@@ -843,7 +857,8 @@ async fn run_default_server_attach(options: DefaultAttachOptions) -> Result<u8> 
     let target = resolve_default_attach_target(&mut client).await?;
     let target = target.to_string();
     let attach_result =
-        run_session_attach_with_client(client, Some(target.as_str()), None, false).await;
+        run_session_attach_with_client(client, Some(target.as_str()), None, false, capture_plan)
+            .await;
 
     if let Some(recording_id) = active_recording_id {
         let mut stop_client = connect(
@@ -1021,6 +1036,7 @@ fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
             RecordingCommand::Inspect { .. } => BuiltInHandlerId::RecordingInspect,
             RecordingCommand::Replay { .. } => BuiltInHandlerId::RecordingReplay,
             RecordingCommand::VerifySmoke { .. } => BuiltInHandlerId::RecordingVerifySmoke,
+            RecordingCommand::Export { .. } => BuiltInHandlerId::RecordingExport,
         },
         Command::External(_) => unreachable!("external commands are dispatched separately"),
     }
@@ -1385,6 +1401,34 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 *strict_timing,
                 *max_verify_duration,
                 *verify_start_timeout,
+            )
+            .await
+        }
+        (
+            BuiltInHandlerId::RecordingExport,
+            Command::Recording {
+                command:
+                    RecordingCommand::Export {
+                        recording_id,
+                        format,
+                        output,
+                        view_client,
+                        speed,
+                        fps,
+                        max_duration,
+                        max_frames,
+                    },
+            },
+        ) => {
+            run_recording_export(
+                recording_id,
+                *format,
+                output,
+                view_client.as_deref(),
+                *speed,
+                *fps,
+                *max_duration,
+                *max_frames,
             )
             .await
         }
@@ -2847,6 +2891,354 @@ async fn run_recording_verify_smoke(
             .context("failed encoding verify smoke report json")?
     );
     Ok(if report.pass { 0 } else { 1 })
+}
+
+async fn run_recording_export(
+    recording_id: &str,
+    format: RecordingExportFormat,
+    output: &str,
+    view_client: Option<&str>,
+    speed: f64,
+    fps: u32,
+    max_duration: Option<u64>,
+    max_frames: Option<u32>,
+) -> Result<u8> {
+    let recording_id = parse_uuid_value(recording_id, "recording id")?;
+    let recording_dir = ConfigPaths::default()
+        .recordings_dir()
+        .join(recording_id.to_string());
+    if !recording_dir.exists() {
+        anyhow::bail!("recording not found: {recording_id}")
+    }
+
+    let selected_client = if let Some(raw) = view_client {
+        parse_uuid_value(raw, "view client id")?
+    } else {
+        read_recording_owner_client(&recording_dir)?.ok_or_else(|| {
+            anyhow::anyhow!("recording missing owner client id; pass --view-client")
+        })?
+    };
+
+    let events = load_display_track_events(&recording_dir, selected_client)?;
+    if events.is_empty() {
+        anyhow::bail!(
+            "display track is empty for client {selected_client}; cannot export exact-view media"
+        )
+    }
+
+    match format {
+        RecordingExportFormat::Gif => {
+            export_recording_gif(&events, output, speed, fps, max_duration, max_frames)?
+        }
+    }
+
+    println!(
+        "export complete: format={:?} view_client={} output={}",
+        format, selected_client, output
+    );
+    Ok(0)
+}
+
+fn read_recording_owner_client(recording_dir: &Path) -> Result<Option<Uuid>> {
+    let owner_path = recording_dir.join("owner-client-id.txt");
+    let content = match std::fs::read_to_string(&owner_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed reading {}", owner_path.display()));
+        }
+    };
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(parse_uuid_value(trimmed, "owner client id")?))
+}
+
+fn load_display_track_events(
+    recording_dir: &Path,
+    client_id: Uuid,
+) -> Result<Vec<DisplayTrackEnvelope>> {
+    let path = display_track_path(recording_dir, client_id);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .with_context(|| format!("failed opening display track {}", path.display()))?;
+    let reader = BufReader::new(file);
+    let mut events = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        if line.trim().is_empty() {
+            continue;
+        }
+        let event: DisplayTrackEnvelope = serde_json::from_str(&line)
+            .with_context(|| format!("failed parsing display event in {}", path.display()))?;
+        events.push(event);
+    }
+    Ok(events)
+}
+
+fn export_recording_gif(
+    events: &[DisplayTrackEnvelope],
+    output: &str,
+    speed: f64,
+    fps: u32,
+    max_duration: Option<u64>,
+    max_frames: Option<u32>,
+) -> Result<()> {
+    let speed = if speed <= 0.0 { 1.0 } else { speed };
+    let fps = fps.max(1);
+    let frame_interval_ns = (1_000_000_000_f64 / f64::from(fps)) as u64;
+
+    let mut max_cols = 80_u16;
+    let mut max_rows = 24_u16;
+    for event in events {
+        if let DisplayTrackEvent::Resize { cols, rows } = event.event {
+            max_cols = max_cols.max(cols.max(1));
+            max_rows = max_rows.max(rows.max(1));
+        }
+    }
+
+    let cell_w = 8_u16;
+    let cell_h = 8_u16;
+    let width = max_cols.saturating_mul(cell_w).max(8);
+    let height = max_rows.saturating_mul(cell_h).max(8);
+    let palette = xterm_256_palette_rgb();
+
+    let output_path = PathBuf::from(output);
+    if let Some(parent) = output_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!(
+                "failed creating export parent directory {}",
+                parent.display()
+            )
+        })?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(&output_path)
+        .with_context(|| format!("failed opening export output {}", output_path.display()))?;
+    let mut encoder =
+        GifEncoder::new(file, width, height, &palette).context("failed creating gif encoder")?;
+    encoder
+        .set_repeat(Repeat::Infinite)
+        .context("failed setting gif repeat")?;
+
+    let mut parser = vt100::Parser::new(max_rows, max_cols, 20_000);
+    let mut current_cols = max_cols;
+    let mut current_rows = max_rows;
+    let mut emitted_frames = 0_u32;
+    let mut previous_emit_ns = None::<u64>;
+    let mut first_mono_ns = None::<u64>;
+
+    for event in events {
+        if first_mono_ns.is_none() {
+            first_mono_ns = Some(event.mono_ns);
+        }
+        if let Some(limit_secs) = max_duration
+            && let Some(start_ns) = first_mono_ns
+            && event.mono_ns.saturating_sub(start_ns) / 1_000_000_000 > limit_secs
+        {
+            break;
+        }
+        if let Some(limit) = max_frames
+            && emitted_frames >= limit
+        {
+            break;
+        }
+
+        match &event.event {
+            DisplayTrackEvent::Resize { cols, rows } => {
+                current_cols = (*cols).max(1);
+                current_rows = (*rows).max(1);
+                parser.screen_mut().set_size(current_rows, current_cols);
+            }
+            DisplayTrackEvent::FrameBytes { data } => {
+                parser.process(data);
+                let scaled_ns = (event.mono_ns as f64 / speed) as u64;
+                let should_emit = previous_emit_ns
+                    .is_none_or(|previous| scaled_ns.saturating_sub(previous) >= frame_interval_ns);
+                if !should_emit {
+                    continue;
+                }
+                let delay_cs = previous_emit_ns.map_or(1_u16, |previous| {
+                    let delta_ns = scaled_ns.saturating_sub(previous);
+                    ((delta_ns / 10_000_000).max(1).min(u64::from(u16::MAX))) as u16
+                });
+                let pixels = render_screen_indexed(
+                    parser.screen(),
+                    current_rows,
+                    current_cols,
+                    max_rows,
+                    max_cols,
+                );
+                let mut frame =
+                    GifFrame::from_palette_pixels(width, height, pixels, palette.clone(), None);
+                frame.delay = delay_cs;
+                encoder
+                    .write_frame(&frame)
+                    .context("failed writing gif frame")?;
+                previous_emit_ns = Some(scaled_ns);
+                emitted_frames = emitted_frames.saturating_add(1);
+            }
+            DisplayTrackEvent::StreamOpened { .. } | DisplayTrackEvent::StreamClosed => {}
+        }
+    }
+
+    if emitted_frames == 0 {
+        anyhow::bail!("no drawable frame events found in display track")
+    }
+    Ok(())
+}
+
+fn render_screen_indexed(
+    screen: &vt100::Screen,
+    rows: u16,
+    cols: u16,
+    max_rows: u16,
+    max_cols: u16,
+) -> Vec<u8> {
+    let width = usize::from(max_cols.saturating_mul(8));
+    let height = usize::from(max_rows.saturating_mul(8));
+    let mut pixels = vec![0_u8; width.saturating_mul(height)];
+
+    for row in 0..rows {
+        for col in 0..cols {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            let mut fg = vt100_color_to_palette_index(cell.fgcolor(), true);
+            let mut bg = vt100_color_to_palette_index(cell.bgcolor(), false);
+            if cell.inverse() {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+            let x0 = usize::from(col).saturating_mul(8);
+            let y0 = usize::from(row).saturating_mul(8);
+            for py in 0..8_usize {
+                let y = y0 + py;
+                if y >= height {
+                    continue;
+                }
+                let row_start = y.saturating_mul(width);
+                for px in 0..8_usize {
+                    let x = x0 + px;
+                    if x >= width {
+                        continue;
+                    }
+                    pixels[row_start + x] = bg;
+                }
+            }
+
+            let ch = if cell.has_contents() {
+                cell.contents().chars().next().unwrap_or(' ')
+            } else {
+                ' '
+            };
+            let glyph = font8x8::BASIC_FONTS
+                .get(ch)
+                .or_else(|| font8x8::BASIC_FONTS.get('?'))
+                .unwrap_or([0_u8; 8]);
+            for (py, bits) in glyph.iter().copied().enumerate() {
+                let y = y0 + py;
+                if y >= height {
+                    continue;
+                }
+                let row_start = y.saturating_mul(width);
+                for px in 0..8_usize {
+                    let x = x0 + px;
+                    if x >= width {
+                        continue;
+                    }
+                    if ((bits >> px) & 1) == 1 {
+                        pixels[row_start + x] = fg;
+                    }
+                }
+            }
+        }
+    }
+
+    pixels
+}
+
+fn vt100_color_to_palette_index(color: vt100::Color, foreground: bool) -> u8 {
+    match color {
+        vt100::Color::Default => {
+            if foreground {
+                15
+            } else {
+                0
+            }
+        }
+        vt100::Color::Idx(idx) => idx,
+        vt100::Color::Rgb(r, g, b) => nearest_xterm_index(r, g, b),
+    }
+}
+
+fn nearest_xterm_index(r: u8, g: u8, b: u8) -> u8 {
+    let palette = xterm_256_palette();
+    let mut best_index = 0_u8;
+    let mut best_distance = u32::MAX;
+    for (index, (pr, pg, pb)) in palette.iter().enumerate() {
+        let dr = i32::from(*pr) - i32::from(r);
+        let dg = i32::from(*pg) - i32::from(g);
+        let db = i32::from(*pb) - i32::from(b);
+        let distance = (dr * dr + dg * dg + db * db) as u32;
+        if distance < best_distance {
+            best_distance = distance;
+            best_index = index as u8;
+        }
+    }
+    best_index
+}
+
+fn xterm_256_palette_rgb() -> Vec<u8> {
+    let mut palette = Vec::with_capacity(256 * 3);
+    for (r, g, b) in xterm_256_palette() {
+        palette.push(r);
+        palette.push(g);
+        palette.push(b);
+    }
+    palette
+}
+
+fn xterm_256_palette() -> Vec<(u8, u8, u8)> {
+    let mut colors = vec![
+        (0x00, 0x00, 0x00),
+        (0x80, 0x00, 0x00),
+        (0x00, 0x80, 0x00),
+        (0x80, 0x80, 0x00),
+        (0x00, 0x00, 0x80),
+        (0x80, 0x00, 0x80),
+        (0x00, 0x80, 0x80),
+        (0xc0, 0xc0, 0xc0),
+        (0x80, 0x80, 0x80),
+        (0xff, 0x00, 0x00),
+        (0x00, 0xff, 0x00),
+        (0xff, 0xff, 0x00),
+        (0x00, 0x00, 0xff),
+        (0xff, 0x00, 0xff),
+        (0x00, 0xff, 0xff),
+        (0xff, 0xff, 0xff),
+    ];
+
+    let steps = [0x00, 0x5f, 0x87, 0xaf, 0xd7, 0xff];
+    for r in steps {
+        for g in steps {
+            for b in steps {
+                colors.push((r, g, b));
+            }
+        }
+    }
+
+    for i in 0..24_u8 {
+        let value = 8 + i * 10;
+        colors.push((value, value, value));
+    }
+    colors
 }
 
 fn replay_watch(events: &[RecordingEventEnvelope], speed: f64) -> Result<u8> {
@@ -4372,6 +4764,114 @@ fn attach_quit_failure_status(error: &ClientError) -> &'static str {
     }
 }
 
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+enum DisplayTrackEvent {
+    StreamOpened { client_id: Uuid, recording_id: Uuid },
+    Resize { cols: u16, rows: u16 },
+    FrameBytes { data: Vec<u8> },
+    StreamClosed,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct DisplayTrackEnvelope {
+    mono_ns: u64,
+    event: DisplayTrackEvent,
+}
+
+struct DisplayCaptureWriter {
+    started_at: Instant,
+    writer: BufWriter<std::fs::File>,
+}
+
+impl DisplayCaptureWriter {
+    fn new(plan: Option<AttachDisplayCapturePlan>, client_id: Uuid) -> Result<Option<Self>> {
+        let Some(plan) = plan else {
+            return Ok(None);
+        };
+        std::fs::create_dir_all(&plan.recording_path).with_context(|| {
+            format!(
+                "failed creating recording path {}",
+                plan.recording_path.display()
+            )
+        })?;
+        write_recording_owner_client(&plan.recording_path, client_id)?;
+        let display_track_path = display_track_path(&plan.recording_path, client_id);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&display_track_path)
+            .with_context(|| {
+                format!(
+                    "failed opening display track {}",
+                    display_track_path.display()
+                )
+            })?;
+        let mut capture = Self {
+            started_at: Instant::now(),
+            writer: BufWriter::new(file),
+        };
+        capture.record(DisplayTrackEvent::StreamOpened {
+            client_id,
+            recording_id: plan.recording_id,
+        })?;
+        if let Ok((cols, rows)) = terminal::size()
+            && cols > 0
+            && rows > 0
+        {
+            capture.record(DisplayTrackEvent::Resize { cols, rows })?;
+        }
+        Ok(Some(capture))
+    }
+
+    fn record_resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        self.record(DisplayTrackEvent::Resize { cols, rows })
+    }
+
+    fn record_frame_bytes(&mut self, data: &[u8]) -> Result<()> {
+        if data.is_empty() {
+            return Ok(());
+        }
+        self.record(DisplayTrackEvent::FrameBytes {
+            data: data.to_vec(),
+        })
+    }
+
+    fn record_stream_closed(&mut self) -> Result<()> {
+        self.record(DisplayTrackEvent::StreamClosed)
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        self.writer
+            .flush()
+            .context("failed flushing display capture writer")
+    }
+
+    fn record(&mut self, event: DisplayTrackEvent) -> Result<()> {
+        let envelope = DisplayTrackEnvelope {
+            mono_ns: self
+                .started_at
+                .elapsed()
+                .as_nanos()
+                .min(u128::from(u64::MAX)) as u64,
+            event,
+        };
+        serde_json::to_writer(&mut self.writer, &envelope)?;
+        self.writer.write_all(b"\n")?;
+        Ok(())
+    }
+}
+
+fn display_track_path(recording_path: &Path, client_id: Uuid) -> PathBuf {
+    recording_path.join(format!("display-{client_id}.jsonl"))
+}
+
+fn write_recording_owner_client(recording_path: &Path, client_id: Uuid) -> Result<()> {
+    let owner_path = recording_path.join("owner-client-id.txt");
+    std::fs::write(&owner_path, format!("{client_id}\n"))
+        .with_context(|| format!("failed writing owner client file {}", owner_path.display()))
+}
+
 async fn run_session_kill(target: &str, force_local: bool) -> Result<u8> {
     let selector = parse_session_selector(target);
     let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-kill-session").await?;
@@ -4429,7 +4929,7 @@ async fn run_session_attach(
     global: bool,
 ) -> Result<u8> {
     let client = connect(ConnectionPolicyScope::Normal, "bmux-cli-attach").await?;
-    run_session_attach_with_client(client, target, follow, global).await
+    run_session_attach_with_client(client, target, follow, global, None).await
 }
 
 async fn run_session_attach_with_client(
@@ -4437,6 +4937,7 @@ async fn run_session_attach_with_client(
     target: Option<&str>,
     follow: Option<&str>,
     global: bool,
+    capture_plan: Option<AttachDisplayCapturePlan>,
 ) -> Result<u8> {
     if target.is_none() && follow.is_none() {
         anyhow::bail!("attach requires a session target or --follow <client-uuid>");
@@ -4475,6 +4976,7 @@ async fn run_session_attach_with_client(
     }
 
     let self_client_id = client.whoami().await.map_err(map_attach_client_error)?;
+    let mut display_capture = DisplayCaptureWriter::new(capture_plan, self_client_id)?;
 
     let attach_info = if let Some(leader_client_id) = follow_target_id {
         let context_id = resolve_follow_target_context(&mut client, leader_client_id)
@@ -4545,6 +5047,11 @@ async fn run_session_attach_with_client(
         let loop_events = collect_attach_loop_events(server_events, terminal_event);
         let mut should_break = false;
         for loop_event in loop_events {
+            if let AttachLoopEvent::Terminal(Event::Resize(cols, rows)) = loop_event {
+                if let Some(capture) = display_capture.as_mut() {
+                    let _ = capture.record_resize(cols, rows);
+                }
+            }
             match handle_attach_loop_event(
                 loop_event,
                 &mut client,
@@ -4675,6 +5182,7 @@ async fn run_session_attach_with_client(
             &attach_keymap,
             &attach_help_lines,
             help_scroll,
+            display_capture.as_mut(),
         )
         .await?;
     }
@@ -4688,6 +5196,10 @@ async fn run_session_attach_with_client(
     }
     if let Some(message) = attach_exit_message(exit_reason) {
         println!("{message}");
+    }
+    if let Some(capture) = display_capture.as_mut() {
+        let _ = capture.record_stream_closed();
+        let _ = capture.flush();
     }
     Ok(0)
 }
@@ -5630,7 +6142,7 @@ fn key_hint_or_unbound(keymap: &Keymap, action: RuntimeAction) -> String {
         .unwrap_or_else(|| "unbound".to_string())
 }
 
-fn queue_attach_status_line(stdout: &mut io::Stdout, status_line: &str) -> Result<()> {
+fn queue_attach_status_line(stdout: &mut impl Write, status_line: &str) -> Result<()> {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
     if cols == 0 || rows == 0 {
         return Ok(());
@@ -5791,7 +6303,7 @@ fn help_overlay_surface(lines: &[String]) -> Option<bmux_ipc::AttachSurface> {
 }
 
 fn queue_attach_help_overlay(
-    stdout: &mut io::Stdout,
+    stdout: &mut impl Write,
     surface_meta: &bmux_ipc::AttachSurface,
     lines: &[String],
     scroll: usize,
@@ -5890,6 +6402,7 @@ async fn render_attach_frame(
     keymap: &crate::input::Keymap,
     help_lines: &[String],
     help_scroll: usize,
+    display_capture: Option<&mut DisplayCaptureWriter>,
 ) -> Result<()> {
     if view_state.dirty.status_needs_redraw {
         let now = Instant::now();
@@ -5914,13 +6427,13 @@ async fn render_attach_frame(
         view_state.dirty.status_needs_redraw = false;
     }
 
-    let mut stdout = io::stdout();
-    queue!(stdout, SavePosition).context("failed queuing cursor save for attach frame")?;
+    let mut frame_bytes = Vec::new();
+    queue!(frame_bytes, SavePosition).context("failed queuing cursor save for attach frame")?;
     if let Some(status_line) = view_state.cached_status_line.as_deref() {
-        queue_attach_status_line(&mut stdout, status_line)?;
+        queue_attach_status_line(&mut frame_bytes, status_line)?;
     }
     let cursor_state = render_attach_scene(
-        &mut stdout,
+        &mut frame_bytes,
         &layout_state.scene,
         &mut view_state.pane_buffers,
         &view_state.dirty.pane_dirty_ids,
@@ -5932,12 +6445,25 @@ async fn render_attach_frame(
     )?;
     if view_state.help_overlay_open {
         if let Some(help_surface) = help_overlay_surface(help_lines) {
-            queue_attach_help_overlay(&mut stdout, &help_surface, help_lines, help_scroll)?;
+            queue_attach_help_overlay(&mut frame_bytes, &help_surface, help_lines, help_scroll)?;
         }
-        apply_attach_cursor_state(&mut stdout, None, &mut view_state.last_cursor_state)?;
+        apply_attach_cursor_state(&mut frame_bytes, None, &mut view_state.last_cursor_state)?;
     } else {
-        apply_attach_cursor_state(&mut stdout, cursor_state, &mut view_state.last_cursor_state)?;
+        apply_attach_cursor_state(
+            &mut frame_bytes,
+            cursor_state,
+            &mut view_state.last_cursor_state,
+        )?;
     }
+
+    if let Some(capture) = display_capture {
+        let _ = capture.record_frame_bytes(&frame_bytes);
+    }
+
+    let mut stdout = io::stdout();
+    stdout
+        .write_all(&frame_bytes)
+        .context("failed writing attach frame")?;
     stdout.flush().context("failed flushing attach frame")?;
     view_state.dirty.full_pane_redraw = false;
     view_state.dirty.pane_dirty_ids.clear();

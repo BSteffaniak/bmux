@@ -2,10 +2,10 @@ use super::state::AttachCursorState;
 use anyhow::{Context, Result};
 use crossterm::cursor::{Hide, MoveTo, RestorePosition, Show};
 use crossterm::queue;
-use std::io;
+use std::io::Write;
 
 pub fn apply_attach_cursor_state(
-    stdout: &mut io::Stdout,
+    stdout: &mut impl Write,
     cursor_state: Option<AttachCursorState>,
     last_cursor_state: &mut Option<AttachCursorState>,
 ) -> Result<()> {

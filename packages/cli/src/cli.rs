@@ -28,6 +28,11 @@ pub enum RecordingReplayMode {
     Verify,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RecordingExportFormat {
+    Gif,
+}
+
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(name = "bmux")]
@@ -255,6 +260,32 @@ pub enum RecordingCommand {
         /// Timeout in seconds for target verify server readiness
         #[arg(long)]
         verify_start_timeout: Option<u64>,
+    },
+    /// Export a recording as media
+    Export {
+        /// Recording id
+        recording_id: String,
+        /// Export format
+        #[arg(long, value_enum, default_value_t = RecordingExportFormat::Gif)]
+        format: RecordingExportFormat,
+        /// Output file path
+        #[arg(long)]
+        output: String,
+        /// Override view client id for display track selection
+        #[arg(long)]
+        view_client: Option<String>,
+        /// Playback speed multiplier
+        #[arg(long, default_value_t = 1.0)]
+        speed: f64,
+        /// Target frames per second
+        #[arg(long, default_value_t = 12)]
+        fps: u32,
+        /// Maximum export duration in seconds
+        #[arg(long)]
+        max_duration: Option<u64>,
+        /// Maximum exported frames
+        #[arg(long)]
+        max_frames: Option<u32>,
     },
 }
 
@@ -486,7 +517,8 @@ pub enum TerminalCommand {
 mod tests {
     use super::{
         Cli, Command, KeymapCommand, LogsCommand, LogsProfilesCommand, RecordingCommand,
-        RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
+        RecordingExportFormat, RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand,
+        TraceFamily,
     };
     use clap::Parser;
 
@@ -1558,6 +1590,44 @@ mod tests {
                 strict_timing: true,
                 max_verify_duration: Some(50),
                 verify_start_timeout: Some(30),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_recording_export_flags() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "recording",
+            "export",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--format",
+            "gif",
+            "--output",
+            "./out.gif",
+            "--view-client",
+            "550e8400-e29b-41d4-a716-446655440001",
+            "--fps",
+            "15",
+            "--speed",
+            "1.5",
+            "--max-duration",
+            "30",
+            "--max-frames",
+            "250",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(
+            command,
+            RecordingCommand::Export {
+                format: RecordingExportFormat::Gif,
+                fps: 15,
+                max_duration: Some(30),
+                max_frames: Some(250),
                 ..
             }
         ));
