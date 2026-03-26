@@ -31,10 +31,33 @@ pub async fn connect(
         .map_err(map_client_connect_error)
 }
 
+pub async fn connect_if_running(
+    scope: ConnectionPolicyScope,
+    client_name: &'static str,
+) -> Result<Option<BmuxClient>> {
+    apply_stale_build_policy(scope)?;
+    match BmuxClient::connect_default(client_name).await {
+        Ok(client) => Ok(Some(client)),
+        Err(error) if is_server_unavailable_client_error(&error) => Ok(None),
+        Err(error) => Err(map_client_connect_error(error)),
+    }
+}
+
 pub async fn connect_raw(client_name: &'static str) -> Result<BmuxClient> {
     BmuxClient::connect_default(client_name)
         .await
         .map_err(map_client_connect_error)
+}
+
+pub fn is_server_unavailable_client_error(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::Transport(bmux_ipc::transport::IpcTransportError::Io(io_error))
+            if matches!(
+                io_error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            )
+    )
 }
 
 pub fn map_client_connect_error(error: ClientError) -> anyhow::Error {
@@ -55,11 +78,9 @@ pub fn map_client_connect_error(error: ClientError) -> anyhow::Error {
         );
     }
 
-    if let ClientError::Transport(bmux_ipc::transport::IpcTransportError::Io(io_error)) = &error
-        && io_error.kind() == std::io::ErrorKind::NotFound
-    {
+    if is_server_unavailable_client_error(&error) {
         return anyhow::anyhow!(
-            "bmux server is not running (IPC socket not found).\nRun `bmux server start --daemon`.\nTroubleshooting: if the server is running in another shell, ensure both processes use the same runtime directory (`XDG_RUNTIME_DIR`/`TMPDIR`)."
+            "bmux server is not running (IPC endpoint unavailable).\nRun `bmux server start --daemon`.\nTroubleshooting: if the server is running in another shell, ensure both processes use the same runtime directory (`XDG_RUNTIME_DIR`/`TMPDIR`). On Unix, a stale socket file can also cause connection refused; remove stale runtime files or run `bmux server stop` and retry."
         );
     }
 
@@ -201,7 +222,7 @@ pub fn remove_server_runtime_metadata_file() -> Result<()> {
 mod tests {
     use super::{
         ConnectionPolicyScope, ServerBuildPolicyEffect, ServerRuntimeMetadata,
-        evaluate_stale_build_policy, map_client_connect_error,
+        evaluate_stale_build_policy, is_server_unavailable_client_error, map_client_connect_error,
     };
     use bmux_client::ClientError;
     use bmux_config::StaleBuildAction;
@@ -294,6 +315,38 @@ mod tests {
 
         assert!(message.contains("bmux server is not running"));
         assert!(message.contains("bmux server start --daemon"));
+        assert!(message.contains("XDG_RUNTIME_DIR"));
+        assert!(message.contains("TMPDIR"));
+    }
+
+    #[test]
+    fn map_client_connect_error_formats_transport_connection_refused() {
+        let error = map_client_connect_error(ClientError::Transport(IpcTransportError::Io(
+            std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+        )));
+        let message = error.to_string();
+
+        assert!(message.contains("bmux server is not running"));
+        assert!(message.contains("bmux server start --daemon"));
+        assert!(message.contains("stale socket"));
+    }
+
+    #[test]
+    fn server_unavailable_helper_matches_not_found_and_connection_refused() {
+        let not_found = ClientError::Transport(IpcTransportError::Io(std::io::Error::from(
+            std::io::ErrorKind::NotFound,
+        )));
+        assert!(is_server_unavailable_client_error(&not_found));
+
+        let refused = ClientError::Transport(IpcTransportError::Io(std::io::Error::from(
+            std::io::ErrorKind::ConnectionRefused,
+        )));
+        assert!(is_server_unavailable_client_error(&refused));
+
+        let denied = ClientError::Transport(IpcTransportError::Io(std::io::Error::from(
+            std::io::ErrorKind::PermissionDenied,
+        )));
+        assert!(!is_server_unavailable_client_error(&denied));
     }
 
     #[test]

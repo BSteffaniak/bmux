@@ -3,9 +3,9 @@ use crate::cli::{
     RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
 };
 use crate::connection::{
-    ConnectionPolicyScope, ServerRuntimeMetadata, connect, connect_raw, current_cli_build_id,
-    map_client_connect_error, read_server_runtime_metadata, remove_server_runtime_metadata_file,
-    write_server_runtime_metadata,
+    ConnectionPolicyScope, ServerRuntimeMetadata, connect, connect_if_running, connect_raw,
+    current_cli_build_id, map_client_connect_error, read_server_runtime_metadata,
+    remove_server_runtime_metadata_file, write_server_runtime_metadata,
 };
 use crate::input::{InputProcessor, Keymap, RuntimeAction};
 use crate::status::{AttachTab, build_attach_status_line};
@@ -15,7 +15,7 @@ use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout, TerminfoAutoInstall}
 use bmux_ipc::{
     AttachViewComponent, ContextSelector, ContextSummary, InvokeServiceKind, PaneFocusDirection,
     PaneSplitDirection, RecordingEventEnvelope, RecordingEventKind, RecordingPayload,
-    SessionSelector, SessionSummary,
+    RecordingStatus, RecordingSummary, SessionSelector, SessionSummary,
 };
 use bmux_keybind::action_to_config_name;
 use bmux_plugin::{
@@ -2556,7 +2556,13 @@ async fn run_server_stop() -> Result<u8> {
 
 async fn run_recording_start(session_id: Option<&str>, capture_input: bool) -> Result<u8> {
     cleanup_stale_pid_file().await?;
-    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-recording-start").await?;
+    let mut client = connect_if_running(ConnectionPolicyScope::Normal, "bmux-cli-recording-start")
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "recording start requires a running bmux server.\nRun `bmux server start --daemon` and retry."
+            )
+        })?;
     let session_id = match session_id {
         Some(raw) => Some(Uuid::parse_str(raw).context("invalid --session-id UUID")?),
         None => None,
@@ -2574,7 +2580,13 @@ async fn run_recording_start(session_id: Option<&str>, capture_input: bool) -> R
 
 async fn run_recording_stop(recording_id: Option<&str>) -> Result<u8> {
     cleanup_stale_pid_file().await?;
-    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-recording-stop").await?;
+    let mut client = connect_if_running(ConnectionPolicyScope::Normal, "bmux-cli-recording-stop")
+        .await?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "recording stop requires a running bmux server.\nRun `bmux server start --daemon` and retry."
+            )
+        })?;
     let recording_id = match recording_id {
         Some(raw) => Some(Uuid::parse_str(raw).context("invalid recording id")?),
         None => None,
@@ -2589,11 +2601,15 @@ async fn run_recording_stop(recording_id: Option<&str>) -> Result<u8> {
 
 async fn run_recording_status(as_json: bool) -> Result<u8> {
     cleanup_stale_pid_file().await?;
-    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-recording-status").await?;
-    let status = client
-        .recording_status()
-        .await
-        .map_err(map_cli_client_error)?;
+    let status =
+        match connect_if_running(ConnectionPolicyScope::Normal, "bmux-cli-recording-status").await?
+        {
+            Some(mut client) => client
+                .recording_status()
+                .await
+                .map_err(map_cli_client_error)?,
+            None => offline_recording_status(),
+        };
     if as_json {
         println!(
             "{}",
@@ -2615,11 +2631,14 @@ async fn run_recording_status(as_json: bool) -> Result<u8> {
 
 async fn run_recording_list(as_json: bool) -> Result<u8> {
     cleanup_stale_pid_file().await?;
-    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-recording-list").await?;
-    let recordings = client
-        .recording_list()
-        .await
-        .map_err(map_cli_client_error)?;
+    let recordings =
+        match connect_if_running(ConnectionPolicyScope::Normal, "bmux-cli-recording-list").await? {
+            Some(mut client) => client
+                .recording_list()
+                .await
+                .map_err(map_cli_client_error)?,
+            None => list_recordings_from_disk()?,
+        };
     if as_json {
         println!(
             "{}",
@@ -3694,6 +3713,67 @@ fn load_recording_events(recording_id: &str) -> Result<Vec<RecordingEventEnvelop
         events.push(event);
     }
     Ok(events)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct RecordingManifest {
+    summary: RecordingSummary,
+}
+
+fn read_recording_manifest(manifest_path: &Path) -> Result<RecordingSummary> {
+    let bytes = std::fs::read(manifest_path).with_context(|| {
+        format!(
+            "failed reading recording manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: RecordingManifest = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "failed parsing recording manifest {}",
+            manifest_path.display()
+        )
+    })?;
+    Ok(manifest.summary)
+}
+
+fn list_recordings_from_disk() -> Result<Vec<RecordingSummary>> {
+    list_recordings_from_dir(&ConfigPaths::default().recordings_dir())
+}
+
+fn list_recordings_from_dir(recordings_root: &Path) -> Result<Vec<RecordingSummary>> {
+    if !recordings_root.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut recordings = Vec::new();
+    for entry in std::fs::read_dir(recordings_root).with_context(|| {
+        format!(
+            "failed reading recordings dir {}",
+            recordings_root.display()
+        )
+    })? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let manifest_path = entry.path().join("manifest.json");
+        if !manifest_path.exists() {
+            continue;
+        }
+        if let Ok(summary) = read_recording_manifest(&manifest_path) {
+            recordings.push(summary);
+        }
+    }
+
+    recordings.sort_by(|a, b| b.started_epoch_ms.cmp(&a.started_epoch_ms));
+    Ok(recordings)
+}
+
+const fn offline_recording_status() -> RecordingStatus {
+    RecordingStatus {
+        active: None,
+        queue_len: 0,
+    }
 }
 
 fn run_logs_path(as_json: bool) -> Result<u8> {
@@ -7901,9 +7981,9 @@ mod tests {
     use super::{
         ProtocolDirection, ProtocolTraceEvent, TerminalProfile, TraceFamily,
         apply_attach_view_change_components, attach_keymap_from_config, filter_trace_events,
-        map_attach_client_error, map_cli_client_error, merged_runtime_keybindings,
-        parse_pid_content, profile_for_term, protocol_profile_for_terminal_profile,
-        resolve_pane_term_with_checker,
+        list_recordings_from_dir, map_attach_client_error, map_cli_client_error,
+        merged_runtime_keybindings, offline_recording_status, parse_pid_content, profile_for_term,
+        protocol_profile_for_terminal_profile, resolve_pane_term_with_checker,
     };
     use crate::cli::{Cli, Command};
     use crate::input::InputProcessor;
@@ -8927,6 +9007,72 @@ mod tests {
         assert_eq!(parse_pid_content(""), None);
         assert_eq!(parse_pid_content("0"), None);
         assert_eq!(parse_pid_content("abc"), None);
+    }
+
+    #[test]
+    fn list_recordings_from_dir_returns_empty_when_missing() {
+        let missing_dir = temp_dir().join("does-not-exist");
+        let recordings = list_recordings_from_dir(&missing_dir).expect("listing should succeed");
+        assert!(recordings.is_empty());
+    }
+
+    #[test]
+    fn list_recordings_from_dir_reads_and_sorts_manifests() {
+        let root = temp_dir();
+        let newer_id = Uuid::new_v4();
+        let older_id = Uuid::new_v4();
+        let newer_dir = root.join(newer_id.to_string());
+        let older_dir = root.join(older_id.to_string());
+        fs::create_dir_all(&newer_dir).expect("newer recording dir should exist");
+        fs::create_dir_all(&older_dir).expect("older recording dir should exist");
+
+        let newer_manifest = serde_json::json!({
+            "summary": {
+                "id": newer_id,
+                "session_id": serde_json::Value::Null,
+                "capture_input": true,
+                "started_epoch_ms": 200,
+                "ended_epoch_ms": serde_json::Value::Null,
+                "event_count": 12,
+                "payload_bytes": 1024,
+                "path": newer_dir.to_string_lossy().to_string()
+            }
+        });
+        let older_manifest = serde_json::json!({
+            "summary": {
+                "id": older_id,
+                "session_id": serde_json::Value::Null,
+                "capture_input": false,
+                "started_epoch_ms": 100,
+                "ended_epoch_ms": 150,
+                "event_count": 4,
+                "payload_bytes": 128,
+                "path": older_dir.to_string_lossy().to_string()
+            }
+        });
+
+        fs::write(
+            newer_dir.join("manifest.json"),
+            serde_json::to_vec(&newer_manifest).expect("newer manifest should encode"),
+        )
+        .expect("newer manifest should write");
+        fs::write(
+            older_dir.join("manifest.json"),
+            serde_json::to_vec(&older_manifest).expect("older manifest should encode"),
+        )
+        .expect("older manifest should write");
+
+        let recordings = list_recordings_from_dir(&root).expect("listing should succeed");
+        assert_eq!(recordings.len(), 2);
+        assert_eq!(recordings[0].id, newer_id);
+        assert_eq!(recordings[1].id, older_id);
+    }
+
+    #[test]
+    fn offline_recording_status_reports_no_active_recording() {
+        let status = offline_recording_status();
+        assert!(status.active.is_none());
+        assert_eq!(status.queue_len, 0);
     }
 
     #[test]
