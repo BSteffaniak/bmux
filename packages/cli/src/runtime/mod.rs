@@ -1,7 +1,7 @@
 use crate::cli::{
     Cli, Command, KeymapCommand, LogLevel, LogsCommand, LogsProfilesCommand, RecordingCommand,
-    RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg, RecordingReplayMode,
-    ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
+    RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg, RecordingRenderMode,
+    RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
 };
 use crate::connection::{
     ConnectionPolicyScope, ServerRuntimeMetadata, connect, connect_if_running, connect_raw,
@@ -1460,9 +1460,14 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                         fps,
                         max_duration,
                         max_frames,
+                        renderer,
                         cell_size,
                         cell_width,
                         cell_height,
+                        font_family,
+                        font_size,
+                        line_height,
+                        font_path,
                     },
             },
         ) => {
@@ -1475,9 +1480,14 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 *fps,
                 *max_duration,
                 *max_frames,
+                *renderer,
                 *cell_size,
                 *cell_width,
                 *cell_height,
+                font_family.as_deref(),
+                *font_size,
+                *line_height,
+                font_path,
             )
             .await
         }
@@ -2754,9 +2764,14 @@ async fn run_recording_export(
     fps: u32,
     max_duration: Option<u64>,
     max_frames: Option<u32>,
+    renderer: RecordingRenderMode,
     cell_size: Option<(u16, u16)>,
     cell_width: Option<u16>,
     cell_height: Option<u16>,
+    font_family: Option<&str>,
+    font_size: Option<f32>,
+    line_height: Option<f32>,
+    font_path: &[String],
 ) -> Result<u8> {
     recording::run_recording_export(
         recording_id,
@@ -2767,9 +2782,14 @@ async fn run_recording_export(
         fps,
         max_duration,
         max_frames,
+        renderer,
         cell_size,
         cell_width,
         cell_height,
+        font_family,
+        font_size,
+        line_height,
+        font_path,
     )
     .await
 }

@@ -52,6 +52,12 @@ pub enum RecordingExportFormat {
     Gif,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RecordingRenderMode {
+    Font,
+    Bitmap,
+}
+
 fn parse_cell_size(value: &str) -> Result<(u16, u16), String> {
     let trimmed = value.trim();
     let (width_raw, height_raw) = trimmed
@@ -339,6 +345,9 @@ pub enum RecordingCommand {
         /// Maximum exported frames
         #[arg(long)]
         max_frames: Option<u32>,
+        /// Renderer mode for frame rasterization
+        #[arg(long, value_enum, default_value_t = RecordingRenderMode::Font)]
+        renderer: RecordingRenderMode,
         /// Cell size in pixels as WIDTHxHEIGHT (e.g. 8x16)
         #[arg(long, value_parser = parse_cell_size)]
         cell_size: Option<(u16, u16)>,
@@ -348,6 +357,18 @@ pub enum RecordingCommand {
         /// Override glyph cell height in pixels
         #[arg(long)]
         cell_height: Option<u16>,
+        /// Comma-separated preferred font family names
+        #[arg(long)]
+        font_family: Option<String>,
+        /// Font size in pixels for font renderer
+        #[arg(long)]
+        font_size: Option<f32>,
+        /// Line-height multiplier for font renderer
+        #[arg(long)]
+        line_height: Option<f32>,
+        /// Additional font file path (repeatable)
+        #[arg(long)]
+        font_path: Vec<String>,
     },
 }
 
@@ -579,8 +600,8 @@ pub enum TerminalCommand {
 mod tests {
     use super::{
         Cli, Command, KeymapCommand, LogsCommand, LogsProfilesCommand, RecordingCommand,
-        RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg, RecordingReplayMode,
-        ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
+        RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg, RecordingRenderMode,
+        RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
     };
     use clap::Parser;
 
@@ -1684,12 +1705,24 @@ mod tests {
             "30",
             "--max-frames",
             "250",
+            "--renderer",
+            "font",
             "--cell-size",
             "9x18",
             "--cell-width",
             "10",
             "--cell-height",
             "20",
+            "--font-family",
+            "Menlo,Monaco",
+            "--font-size",
+            "15",
+            "--line-height",
+            "1.1",
+            "--font-path",
+            "/tmp/font.ttf",
+            "--font-path",
+            "/tmp/font2.ttf",
         ])
         .expect("valid CLI args");
         let Some(Command::Recording { command }) = cli.command else {
@@ -1702,11 +1735,18 @@ mod tests {
                 fps: 15,
                 max_duration: Some(30),
                 max_frames: Some(250),
+                renderer: RecordingRenderMode::Font,
                 cell_size: Some((9, 18)),
                 cell_width: Some(10),
                 cell_height: Some(20),
+                font_family: Some(_),
+                font_size: Some(size),
+                line_height: Some(line_height),
+                font_path,
                 ..
-            }
+            } if (size - 15.0).abs() < f32::EPSILON
+                && (line_height - 1.1).abs() < f32::EPSILON
+                && font_path.len() == 2
         ));
     }
 

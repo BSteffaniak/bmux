@@ -1,6 +1,6 @@
 use super::*;
 use ab_glyph::{Font, FontArc, PxScale, ScaleFont, point};
-use std::collections::HashMap;
+use std::collections::HashSet;
 
 pub(super) async fn run_recording_start(
     session_id: Option<&str>,
@@ -421,9 +421,14 @@ pub(super) async fn run_recording_export(
     fps: u32,
     max_duration: Option<u64>,
     max_frames: Option<u32>,
+    renderer: RecordingRenderMode,
     cell_size: Option<(u16, u16)>,
     cell_width: Option<u16>,
     cell_height: Option<u16>,
+    font_family: Option<&str>,
+    font_size: Option<f32>,
+    line_height: Option<f32>,
+    font_path: &[String],
 ) -> Result<u8> {
     let recording_id = parse_uuid_value(recording_id, "recording id")?;
     let recording_dir = recordings_root_dir().join(recording_id.to_string());
@@ -454,9 +459,14 @@ pub(super) async fn run_recording_export(
             fps,
             max_duration,
             max_frames,
+            renderer,
             cell_size,
             cell_width,
             cell_height,
+            font_family,
+            font_size,
+            line_height,
+            font_path,
         )?,
     }
 
@@ -650,9 +660,14 @@ fn export_recording_gif(
     fps: u32,
     max_duration: Option<u64>,
     max_frames: Option<u32>,
+    renderer: RecordingRenderMode,
     cell_size: Option<(u16, u16)>,
     cell_width: Option<u16>,
     cell_height: Option<u16>,
+    font_family: Option<&str>,
+    font_size: Option<f32>,
+    line_height: Option<f32>,
+    font_path: &[String],
 ) -> Result<()> {
     let speed = if speed <= 0.0 { 1.0 } else { speed };
     let fps = fps.max(1);
@@ -672,10 +687,13 @@ fn export_recording_gif(
     let cell_h = cell_metrics.height;
     let width = max_cols.saturating_mul(cell_w).max(8);
     let height = max_rows.saturating_mul(cell_h).max(8);
-    let palette_tuples = xterm_256_palette();
-    let palette = xterm_256_palette_rgb();
-    let glyph_renderer = GlyphRenderer::new(cell_w, cell_h);
-    let mut blend_cache = HashMap::<u32, u8>::new();
+    let render_options =
+        build_render_options(renderer, font_family, font_size, line_height, font_path)?;
+    let palette = xterm_256_palette();
+    let glyph_renderer = match render_options.mode {
+        RecordingRenderMode::Font => GlyphRenderer::new(cell_w, cell_h, &render_options),
+        RecordingRenderMode::Bitmap => None,
+    };
 
     let output_path = PathBuf::from(output);
     if let Some(parent) = output_path.parent()
@@ -695,7 +713,7 @@ fn export_recording_gif(
         .open(&output_path)
         .with_context(|| format!("failed opening export output {}", output_path.display()))?;
     let mut encoder =
-        GifEncoder::new(file, width, height, &palette).context("failed creating gif encoder")?;
+        GifEncoder::new(file, width, height, &[]).context("failed creating gif encoder")?;
     encoder
         .set_repeat(Repeat::Infinite)
         .context("failed setting gif repeat")?;
@@ -741,7 +759,7 @@ fn export_recording_gif(
                     let delta_ns = scaled_ns.saturating_sub(previous);
                     ((delta_ns / 10_000_000).max(1).min(u64::from(u16::MAX))) as u16
                 });
-                let pixels = render_screen_indexed(
+                let mut pixels = render_screen_rgba(
                     parser.screen(),
                     current_rows,
                     current_cols,
@@ -749,12 +767,10 @@ fn export_recording_gif(
                     max_cols,
                     cell_w,
                     cell_h,
+                    &palette,
                     glyph_renderer.as_ref(),
-                    &palette_tuples,
-                    &mut blend_cache,
                 );
-                let mut frame =
-                    GifFrame::from_palette_pixels(width, height, pixels, palette.clone(), None);
+                let mut frame = GifFrame::from_rgba_speed(width, height, &mut pixels, 1);
                 frame.delay = delay_cs;
                 encoder
                     .write_frame(&frame)
@@ -772,7 +788,7 @@ fn export_recording_gif(
     Ok(())
 }
 
-fn render_screen_indexed(
+fn render_screen_rgba(
     screen: &vt100::Screen,
     rows: u16,
     cols: u16,
@@ -780,13 +796,12 @@ fn render_screen_indexed(
     max_cols: u16,
     cell_w: u16,
     cell_h: u16,
-    glyph_renderer: Option<&GlyphRenderer>,
     palette: &[(u8, u8, u8)],
-    blend_cache: &mut HashMap<u32, u8>,
+    glyph_renderer: Option<&GlyphRenderer>,
 ) -> Vec<u8> {
     let width = usize::from(max_cols.saturating_mul(cell_w));
     let height = usize::from(max_rows.saturating_mul(cell_h));
-    let mut pixels = vec![0_u8; width.saturating_mul(height)];
+    let mut pixels = vec![0_u8; width.saturating_mul(height).saturating_mul(4)];
     let cw = usize::from(cell_w);
     let cell_h_usize = usize::from(cell_h);
 
@@ -800,6 +815,8 @@ fn render_screen_indexed(
             if cell.inverse() {
                 std::mem::swap(&mut fg, &mut bg);
             }
+            let (fg_r, fg_g, fg_b) = palette[usize::from(fg)];
+            let (bg_r, bg_g, bg_b) = palette[usize::from(bg)];
             let x0 = usize::from(col).saturating_mul(cw);
             let y0 = usize::from(row).saturating_mul(cell_h_usize);
             for py in 0..cell_h_usize {
@@ -813,7 +830,11 @@ fn render_screen_indexed(
                     if x >= width {
                         continue;
                     }
-                    pixels[row_start + x] = bg;
+                    let idx = (row_start + x).saturating_mul(4);
+                    pixels[idx] = bg_r;
+                    pixels[idx + 1] = bg_g;
+                    pixels[idx + 2] = bg_b;
+                    pixels[idx + 3] = 255;
                 }
             }
 
@@ -822,48 +843,125 @@ fn render_screen_indexed(
             } else {
                 ' '
             };
-            let glyph = font8x8::BASIC_FONTS
-                .get(glyph_char)
-                .or_else(|| font8x8::BASIC_FONTS.get('?'))
-                .unwrap_or([0_u8; 8]);
-            if let Some(renderer) = glyph_renderer {
-                renderer.draw_cell(
+            if glyph_char == ' ' {
+                continue;
+            }
+
+            let mut drawn_with_font = false;
+            if let Some(renderer) = glyph_renderer
+                && !is_box_drawing_char(glyph_char)
+            {
+                drawn_with_font = renderer.draw_cell(
                     &mut pixels,
                     width,
                     height,
                     x0,
                     y0,
                     glyph_char,
-                    fg,
-                    bg,
-                    palette,
-                    blend_cache,
+                    (fg_r, fg_g, fg_b),
+                    (bg_r, bg_g, bg_b),
                 );
-            } else {
-                for py in 0..cell_h_usize {
-                    let y = y0 + py;
-                    if y >= height {
-                        continue;
-                    }
-                    let glyph_row = ((py.saturating_mul(8)) / cell_h_usize).min(7);
-                    let bits = glyph[glyph_row];
-                    let row_start = y.saturating_mul(width);
-                    for px in 0..cw {
-                        let x = x0 + px;
-                        if x >= width {
-                            continue;
-                        }
-                        let glyph_col = ((px.saturating_mul(8)) / cw).min(7);
-                        if ((bits >> glyph_col) & 1) == 1 {
-                            pixels[row_start + x] = fg;
-                        }
-                    }
-                }
+            }
+            if !drawn_with_font {
+                draw_bitmap_glyph_rgba(
+                    &mut pixels,
+                    width,
+                    height,
+                    x0,
+                    y0,
+                    cw,
+                    cell_h_usize,
+                    glyph_char,
+                    (fg_r, fg_g, fg_b),
+                );
             }
         }
     }
 
     pixels
+}
+
+fn draw_bitmap_glyph_rgba(
+    pixels: &mut [u8],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    cell_w: usize,
+    cell_h: usize,
+    glyph_char: char,
+    fg_rgb: (u8, u8, u8),
+) {
+    let glyph = font8x8::BASIC_FONTS
+        .get(glyph_char)
+        .or_else(|| font8x8::BASIC_FONTS.get('?'))
+        .unwrap_or([0_u8; 8]);
+    for py in 0..cell_h {
+        let y = y0 + py;
+        if y >= height {
+            continue;
+        }
+        let glyph_row = ((py.saturating_mul(8)) / cell_h).min(7);
+        let bits = glyph[glyph_row];
+        let row_start = y.saturating_mul(width);
+        for px in 0..cell_w {
+            let x = x0 + px;
+            if x >= width {
+                continue;
+            }
+            let glyph_col = ((px.saturating_mul(8)) / cell_w).min(7);
+            if ((bits >> glyph_col) & 1) == 1 {
+                let idx = (row_start + x).saturating_mul(4);
+                pixels[idx] = fg_rgb.0;
+                pixels[idx + 1] = fg_rgb.1;
+                pixels[idx + 2] = fg_rgb.2;
+                pixels[idx + 3] = 255;
+            }
+        }
+    }
+}
+
+fn is_box_drawing_char(ch: char) -> bool {
+    matches!(ch as u32, 0x2500..=0x257f | 0x2580..=0x259f)
+}
+
+struct RenderOptions {
+    mode: RecordingRenderMode,
+    font_families: Vec<String>,
+    font_paths: Vec<String>,
+    font_size_px: Option<f32>,
+    line_height_mult: f32,
+}
+
+fn build_render_options(
+    renderer: RecordingRenderMode,
+    font_family: Option<&str>,
+    font_size: Option<f32>,
+    line_height: Option<f32>,
+    font_path: &[String],
+) -> Result<RenderOptions> {
+    if font_size.is_some_and(|value| value <= 0.0) {
+        anyhow::bail!("--font-size must be greater than zero")
+    }
+    if line_height.is_some_and(|value| value <= 0.0) {
+        anyhow::bail!("--line-height must be greater than zero")
+    }
+    let font_families = font_family
+        .map(|raw| {
+            raw.split(',')
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Ok(RenderOptions {
+        mode: renderer,
+        font_families,
+        font_paths: font_path.to_vec(),
+        font_size_px: font_size,
+        line_height_mult: line_height.unwrap_or(1.0),
+    })
 }
 
 struct GlyphRenderer {
@@ -873,15 +971,27 @@ struct GlyphRenderer {
 }
 
 impl GlyphRenderer {
-    fn new(cell_w: u16, cell_h: u16) -> Option<Self> {
-        let font = load_monospace_font()?;
+    fn new(cell_w: u16, cell_h: u16, options: &RenderOptions) -> Option<Self> {
+        let font = load_monospace_font(options)?;
+        let base_font_size = options
+            .font_size_px
+            .unwrap_or((f32::from(cell_h) * 0.9).max(8.0));
+        let base_scale = PxScale {
+            x: base_font_size,
+            y: base_font_size,
+        };
+        let scaled_base = font.as_scaled(base_scale);
+        let measured_advance = scaled_base.h_advance(font.glyph_id('M')).max(0.01);
+        let target_advance = (f32::from(cell_w) * 0.92).max(1.0);
+        let x_scale = base_scale.x * (target_advance / measured_advance);
         let scale = PxScale {
-            x: f32::from(cell_w).max(1.0),
-            y: (f32::from(cell_h) * 0.95).max(1.0),
+            x: x_scale,
+            y: base_scale.y,
         };
         let scaled = font.as_scaled(scale);
         let glyph_height = scaled.height();
-        let baseline_offset = ((f32::from(cell_h) - glyph_height) / 2.0).max(0.0) + scaled.ascent();
+        let line_height = glyph_height * options.line_height_mult.max(0.5);
+        let baseline_offset = ((f32::from(cell_h) - line_height) / 2.0).max(0.0) + scaled.ascent();
         Some(Self {
             font,
             scale,
@@ -889,29 +999,26 @@ impl GlyphRenderer {
         })
     }
 
-    #[allow(clippy::too_many_arguments)]
     fn draw_cell(
         &self,
-        pixels: &mut [u8],
+        rgba: &mut [u8],
         width: usize,
         height: usize,
         x0: usize,
         y0: usize,
         glyph_char: char,
-        fg: u8,
-        bg: u8,
-        palette: &[(u8, u8, u8)],
-        blend_cache: &mut HashMap<u32, u8>,
-    ) {
+        fg_rgb: (u8, u8, u8),
+        bg_rgb: (u8, u8, u8),
+    ) -> bool {
         if glyph_char == ' ' {
-            return;
+            return false;
         }
         let glyph = self.font.glyph_id(glyph_char).with_scale_and_position(
             self.scale,
             point(x0 as f32, y0 as f32 + self.baseline_offset),
         );
         let Some(outlined) = self.font.outline_glyph(glyph) else {
-            return;
+            return false;
         };
         outlined.draw(|gx, gy, coverage| {
             if coverage <= 0.0 {
@@ -922,26 +1029,48 @@ impl GlyphRenderer {
             if x >= width || y >= height {
                 return;
             }
-            let alpha = (coverage.clamp(0.0, 1.0) * 255.0).round() as u8;
-            let color = if alpha >= 250 {
-                fg
+            let alpha = if coverage >= 0.75 {
+                1.0
+            } else if coverage <= 0.1 {
+                0.0
             } else {
-                blend_palette_index(fg, bg, alpha, palette, blend_cache)
+                coverage
             };
-            pixels[y.saturating_mul(width) + x] = color;
+            if alpha <= 0.0 {
+                return;
+            }
+            let idx = (y.saturating_mul(width) + x).saturating_mul(4);
+            rgba[idx] = blend_channel(fg_rgb.0, bg_rgb.0, alpha);
+            rgba[idx + 1] = blend_channel(fg_rgb.1, bg_rgb.1, alpha);
+            rgba[idx + 2] = blend_channel(fg_rgb.2, bg_rgb.2, alpha);
+            rgba[idx + 3] = 255;
         });
+        true
     }
 }
 
-fn load_monospace_font() -> Option<FontArc> {
-    const FONT_CANDIDATES: &[&str] = &[
-        "/System/Library/Fonts/SFNSMono.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
-        "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
-        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
-    ];
-    for path in FONT_CANDIDATES {
-        let Ok(bytes) = std::fs::read(path) else {
+fn blend_channel(fg: u8, bg: u8, alpha: f32) -> u8 {
+    ((f32::from(fg) * alpha) + (f32::from(bg) * (1.0 - alpha))).round() as u8
+}
+
+fn load_monospace_font(options: &RenderOptions) -> Option<FontArc> {
+    let mut candidates = Vec::<String>::new();
+    candidates.extend(options.font_paths.iter().cloned());
+    for family in &options.font_families {
+        candidates.extend(
+            font_family_candidates(family)
+                .into_iter()
+                .map(str::to_string),
+        );
+    }
+    candidates.extend(default_font_candidates().into_iter().map(str::to_string));
+
+    let mut seen = HashSet::<String>::new();
+    for path in candidates {
+        if !seen.insert(path.clone()) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
             continue;
         };
         if let Ok(font) = FontArc::try_from_vec(bytes) {
@@ -951,42 +1080,51 @@ fn load_monospace_font() -> Option<FontArc> {
     None
 }
 
-fn blend_palette_index(
-    fg: u8,
-    bg: u8,
-    alpha: u8,
-    palette: &[(u8, u8, u8)],
-    cache: &mut HashMap<u32, u8>,
-) -> u8 {
-    let key = (u32::from(fg) << 16) | (u32::from(bg) << 8) | u32::from(alpha);
-    if let Some(value) = cache.get(&key) {
-        return *value;
-    }
-    let (fr, fgc, fb) = palette[usize::from(fg)];
-    let (br, bgc, bb) = palette[usize::from(bg)];
-    let a = f32::from(alpha) / 255.0;
-    let blended_r = ((f32::from(fr) * a) + (f32::from(br) * (1.0 - a))).round() as u8;
-    let blended_g = ((f32::from(fgc) * a) + (f32::from(bgc) * (1.0 - a))).round() as u8;
-    let blended_b = ((f32::from(fb) * a) + (f32::from(bb) * (1.0 - a))).round() as u8;
-    let value = nearest_xterm_index_from_palette(blended_r, blended_g, blended_b, palette);
-    cache.insert(key, value);
-    value
+#[cfg(target_os = "macos")]
+fn default_font_candidates() -> Vec<&'static str> {
+    vec![
+        "/System/Library/Fonts/Menlo.ttc",
+        "/System/Library/Fonts/Monaco.ttf",
+        "/System/Library/Fonts/SFNSMono.ttf",
+        "/System/Library/Fonts/Supplemental/Courier New.ttf",
+        "/System/Library/Fonts/Courier.ttc",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    ]
 }
 
-fn nearest_xterm_index_from_palette(r: u8, g: u8, b: u8, palette: &[(u8, u8, u8)]) -> u8 {
-    let mut best_index = 0_u8;
-    let mut best_distance = u32::MAX;
-    for (index, (pr, pg, pb)) in palette.iter().enumerate() {
-        let dr = i32::from(*pr) - i32::from(r);
-        let dg = i32::from(*pg) - i32::from(g);
-        let db = i32::from(*pb) - i32::from(b);
-        let distance = (dr * dr + dg * dg + db * db) as u32;
-        if distance < best_distance {
-            best_distance = distance;
-            best_index = index as u8;
+#[cfg(not(target_os = "macos"))]
+fn default_font_candidates() -> Vec<&'static str> {
+    vec![
+        "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf",
+        "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+        "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
+    ]
+}
+
+fn font_family_candidates(family: &str) -> Vec<&'static str> {
+    let normalized = family
+        .to_ascii_lowercase()
+        .chars()
+        .filter(|ch| !ch.is_whitespace() && *ch != '-' && *ch != '_')
+        .collect::<String>();
+    match normalized.as_str() {
+        "menlo" => vec!["/System/Library/Fonts/Menlo.ttc"],
+        "monaco" => vec!["/System/Library/Fonts/Monaco.ttf"],
+        "sfmono" | "sfnsmono" => vec!["/System/Library/Fonts/SFNSMono.ttf"],
+        "couriernew" => vec!["/System/Library/Fonts/Supplemental/Courier New.ttf"],
+        "courier" => vec!["/System/Library/Fonts/Courier.ttc"],
+        "dejavusansmono" => vec![
+            "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+            "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+        ],
+        "liberationmono" => {
+            vec!["/usr/share/fonts/truetype/liberation2/LiberationMono-Regular.ttf"]
         }
+        _ => Vec::new(),
     }
-    best_index
 }
 
 fn vt100_color_to_palette_index(color: vt100::Color, foreground: bool) -> u8 {
@@ -1018,16 +1156,6 @@ fn nearest_xterm_index(r: u8, g: u8, b: u8) -> u8 {
         }
     }
     best_index
-}
-
-fn xterm_256_palette_rgb() -> Vec<u8> {
-    let mut palette = Vec::with_capacity(256 * 3);
-    for (r, g, b) in xterm_256_palette() {
-        palette.push(r);
-        palette.push(g);
-        palette.push(b);
-    }
-    palette
 }
 
 fn xterm_256_palette() -> Vec<(u8, u8, u8)> {
