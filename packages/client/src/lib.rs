@@ -535,6 +535,37 @@ impl BmuxClient {
         }
     }
 
+    /// Delete one recording by id.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn recording_delete(&mut self, recording_id: Uuid) -> Result<Uuid> {
+        match self
+            .request(Request::RecordingDelete { recording_id })
+            .await?
+        {
+            ResponsePayload::RecordingDeleted { recording_id } => Ok(recording_id),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording deleted",
+            )),
+        }
+    }
+
+    /// Delete all recordings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn recording_delete_all(&mut self) -> Result<usize> {
+        match self.request(Request::RecordingDeleteAll).await? {
+            ResponsePayload::RecordingDeleteAll { deleted_count } => Ok(deleted_count),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording delete-all response",
+            )),
+        }
+    }
+
     /// Create a new session.
     ///
     /// # Errors
@@ -1174,6 +1205,8 @@ fn request_kind_name(request: &Request) -> &'static str {
         Request::RecordingStop { .. } => "recording_stop",
         Request::RecordingStatus => "recording_status",
         Request::RecordingList => "recording_list",
+        Request::RecordingDelete { .. } => "recording_delete",
+        Request::RecordingDeleteAll => "recording_delete_all",
         Request::Detach => "detach",
         Request::SubscribeEvents => "subscribe_events",
         Request::PollEvents { .. } => "poll_events",
@@ -1222,6 +1255,8 @@ fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::RecordingStopped { .. } => "recording_stopped",
             ResponsePayload::RecordingStatus { .. } => "recording_status",
             ResponsePayload::RecordingList { .. } => "recording_list",
+            ResponsePayload::RecordingDeleted { .. } => "recording_deleted",
+            ResponsePayload::RecordingDeleteAll { .. } => "recording_delete_all",
             ResponsePayload::Detached => "detached",
             ResponsePayload::EventsSubscribed => "events_subscribed",
             ResponsePayload::EventBatch { .. } => "event_batch",

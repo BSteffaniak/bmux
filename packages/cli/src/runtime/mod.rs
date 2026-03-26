@@ -1016,6 +1016,8 @@ fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
             RecordingCommand::Stop { .. } => BuiltInHandlerId::RecordingStop,
             RecordingCommand::Status { .. } => BuiltInHandlerId::RecordingStatus,
             RecordingCommand::List { .. } => BuiltInHandlerId::RecordingList,
+            RecordingCommand::Delete { .. } => BuiltInHandlerId::RecordingDelete,
+            RecordingCommand::DeleteAll { .. } => BuiltInHandlerId::RecordingDeleteAll,
             RecordingCommand::Inspect { .. } => BuiltInHandlerId::RecordingInspect,
             RecordingCommand::Replay { .. } => BuiltInHandlerId::RecordingReplay,
             RecordingCommand::VerifySmoke { .. } => BuiltInHandlerId::RecordingVerifySmoke,
@@ -1306,6 +1308,18 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 command: RecordingCommand::List { json },
             },
         ) => run_recording_list(*json).await,
+        (
+            BuiltInHandlerId::RecordingDelete,
+            Command::Recording {
+                command: RecordingCommand::Delete { recording_id },
+            },
+        ) => run_recording_delete(recording_id).await,
+        (
+            BuiltInHandlerId::RecordingDeleteAll,
+            Command::Recording {
+                command: RecordingCommand::DeleteAll { yes },
+            },
+        ) => run_recording_delete_all(*yes).await,
         (
             BuiltInHandlerId::RecordingInspect,
             Command::Recording {
@@ -2664,6 +2678,87 @@ async fn run_recording_list(as_json: bool) -> Result<u8> {
     Ok(0)
 }
 
+async fn run_recording_delete(recording_id_or_prefix: &str) -> Result<u8> {
+    cleanup_stale_pid_file().await?;
+    match connect_if_running(ConnectionPolicyScope::Normal, "bmux-cli-recording-delete").await? {
+        Some(mut client) => {
+            let status = client
+                .recording_status()
+                .await
+                .map_err(map_cli_client_error)?;
+            let recordings = client
+                .recording_list()
+                .await
+                .map_err(map_cli_client_error)?;
+            let resolved = resolve_recording_id_prefix(recording_id_or_prefix, &recordings)?;
+
+            if status
+                .active
+                .as_ref()
+                .is_some_and(|active| active.id == resolved)
+            {
+                let stopped_id = client
+                    .recording_stop(Some(resolved))
+                    .await
+                    .map_err(map_cli_client_error)?;
+                println!("stopped active recording {stopped_id} before delete");
+            }
+
+            let deleted_id = client
+                .recording_delete(resolved)
+                .await
+                .map_err(map_cli_client_error)?;
+            println!("deleted recording {deleted_id}");
+        }
+        None => {
+            let recordings = list_recordings_from_disk()?;
+            let resolved = resolve_recording_id_prefix(recording_id_or_prefix, &recordings)?;
+            delete_recording_dir(resolved)?;
+            println!("deleted recording {resolved}");
+        }
+    }
+    Ok(0)
+}
+
+async fn run_recording_delete_all(yes: bool) -> Result<u8> {
+    if !confirm_delete_all_recordings(yes)? {
+        println!("skipped recording delete-all");
+        return Ok(0);
+    }
+
+    cleanup_stale_pid_file().await?;
+    match connect_if_running(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-recording-delete-all",
+    )
+    .await?
+    {
+        Some(mut client) => {
+            let status = client
+                .recording_status()
+                .await
+                .map_err(map_cli_client_error)?;
+            if let Some(active) = status.active {
+                let stopped_id = client
+                    .recording_stop(Some(active.id))
+                    .await
+                    .map_err(map_cli_client_error)?;
+                println!("stopped active recording {stopped_id} before delete");
+            }
+            let deleted_count = client
+                .recording_delete_all()
+                .await
+                .map_err(map_cli_client_error)?;
+            println!("deleted {deleted_count} recordings");
+        }
+        None => {
+            let deleted_count = delete_all_recordings_from_disk()?;
+            println!("deleted {deleted_count} recordings");
+        }
+    }
+    Ok(0)
+}
+
 fn run_recording_inspect(
     recording_id: &str,
     limit: usize,
@@ -3713,6 +3808,108 @@ fn load_recording_events(recording_id: &str) -> Result<Vec<RecordingEventEnvelop
         events.push(event);
     }
     Ok(events)
+}
+
+fn resolve_recording_id_prefix(value: &str, recordings: &[RecordingSummary]) -> Result<Uuid> {
+    if let Ok(id) = Uuid::parse_str(value) {
+        if recordings.iter().any(|recording| recording.id == id) {
+            return Ok(id);
+        }
+        anyhow::bail!("recording not found: {id}");
+    }
+
+    let normalized = value.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        anyhow::bail!("recording id/prefix cannot be empty");
+    }
+
+    let matches = recordings
+        .iter()
+        .filter_map(|recording| {
+            let id = recording.id.to_string();
+            id.starts_with(&normalized).then_some(recording.id)
+        })
+        .collect::<Vec<_>>();
+
+    match matches.as_slice() {
+        [id] => Ok(*id),
+        [] => anyhow::bail!("no recording matches prefix '{value}'"),
+        _ => {
+            let mut options = matches
+                .iter()
+                .map(std::string::ToString::to_string)
+                .collect::<Vec<_>>();
+            options.sort();
+            anyhow::bail!(
+                "recording prefix '{value}' is ambiguous; matches: {}",
+                options.join(", ")
+            )
+        }
+    }
+}
+
+fn delete_recording_dir(recording_id: Uuid) -> Result<()> {
+    delete_recording_dir_at(&ConfigPaths::default().recordings_dir(), recording_id)
+}
+
+fn delete_recording_dir_at(recordings_root: &Path, recording_id: Uuid) -> Result<()> {
+    let dir = recordings_root.join(recording_id.to_string());
+    let manifest = dir.join("manifest.json");
+    if !manifest.exists() {
+        anyhow::bail!("recording not found: {recording_id}");
+    }
+    std::fs::remove_dir_all(&dir)
+        .with_context(|| format!("failed removing recording directory {}", dir.display()))?;
+    Ok(())
+}
+
+fn delete_all_recordings_from_disk() -> Result<usize> {
+    delete_all_recordings_from_dir(&ConfigPaths::default().recordings_dir())
+}
+
+fn delete_all_recordings_from_dir(root: &Path) -> Result<usize> {
+    if !root.exists() {
+        return Ok(0);
+    }
+
+    let mut deleted_count = 0_usize;
+    for entry in std::fs::read_dir(&root)
+        .with_context(|| format!("failed reading recordings dir {}", root.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let manifest = entry.path().join("manifest.json");
+        if !manifest.exists() {
+            continue;
+        }
+        std::fs::remove_dir_all(entry.path()).with_context(|| {
+            format!(
+                "failed removing recording directory {}",
+                entry.path().display()
+            )
+        })?;
+        deleted_count = deleted_count.saturating_add(1);
+    }
+    Ok(deleted_count)
+}
+
+fn confirm_delete_all_recordings(yes: bool) -> Result<bool> {
+    if yes {
+        return Ok(true);
+    }
+    if !io::stdin().is_terminal() {
+        anyhow::bail!("recording delete-all requires --yes in non-interactive mode");
+    }
+
+    println!("Delete all recordings? [y/N]");
+    let mut answer = String::new();
+    io::stdin()
+        .read_line(&mut answer)
+        .context("failed reading delete-all confirmation")?;
+    let trimmed = answer.trim().to_ascii_lowercase();
+    Ok(trimmed == "y" || trimmed == "yes")
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -7980,10 +8177,12 @@ fn init_logging(verbose: bool, cli_level: Option<LogLevel>) {
 mod tests {
     use super::{
         ProtocolDirection, ProtocolTraceEvent, TerminalProfile, TraceFamily,
-        apply_attach_view_change_components, attach_keymap_from_config, filter_trace_events,
-        list_recordings_from_dir, map_attach_client_error, map_cli_client_error,
-        merged_runtime_keybindings, offline_recording_status, parse_pid_content, profile_for_term,
-        protocol_profile_for_terminal_profile, resolve_pane_term_with_checker,
+        apply_attach_view_change_components, attach_keymap_from_config,
+        confirm_delete_all_recordings, delete_all_recordings_from_dir, delete_recording_dir_at,
+        filter_trace_events, list_recordings_from_dir, map_attach_client_error,
+        map_cli_client_error, merged_runtime_keybindings, offline_recording_status,
+        parse_pid_content, profile_for_term, protocol_profile_for_terminal_profile,
+        resolve_pane_term_with_checker, resolve_recording_id_prefix,
     };
     use crate::cli::{Cli, Command};
     use crate::input::InputProcessor;
@@ -7993,7 +8192,8 @@ mod tests {
     use bmux_ipc::transport::IpcTransportError;
     use bmux_ipc::{
         AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
-        AttachViewComponent, ErrorCode, PaneLayoutNode, PaneSummary, SessionSummary,
+        AttachViewComponent, ErrorCode, PaneLayoutNode, PaneSummary, RecordingSummary,
+        SessionSummary,
     };
     use bmux_plugin::{PluginCommandEffect, PluginManifest, PluginRegistry};
     use crossterm::event::{
@@ -9073,6 +9273,109 @@ mod tests {
         let status = offline_recording_status();
         assert!(status.active.is_none());
         assert_eq!(status.queue_len, 0);
+    }
+
+    #[test]
+    fn resolve_recording_id_prefix_prefers_exact_match() {
+        let exact = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
+            .expect("exact uuid should parse");
+        let other = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001")
+            .expect("other uuid should parse");
+        let recordings = vec![
+            RecordingSummary {
+                id: other,
+                session_id: None,
+                capture_input: true,
+                started_epoch_ms: 1,
+                ended_epoch_ms: Some(2),
+                event_count: 0,
+                payload_bytes: 0,
+                path: "/tmp/other".to_string(),
+            },
+            RecordingSummary {
+                id: exact,
+                session_id: None,
+                capture_input: true,
+                started_epoch_ms: 3,
+                ended_epoch_ms: Some(4),
+                event_count: 0,
+                payload_bytes: 0,
+                path: "/tmp/exact".to_string(),
+            },
+        ];
+
+        let resolved =
+            resolve_recording_id_prefix("550e8400-e29b-41d4-a716-446655440000", &recordings)
+                .expect("exact id should resolve");
+        assert_eq!(resolved, exact);
+    }
+
+    #[test]
+    fn resolve_recording_id_prefix_rejects_ambiguous_prefix() {
+        let first = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
+            .expect("first uuid should parse");
+        let second = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001")
+            .expect("second uuid should parse");
+        let recordings = vec![
+            RecordingSummary {
+                id: first,
+                session_id: None,
+                capture_input: true,
+                started_epoch_ms: 1,
+                ended_epoch_ms: None,
+                event_count: 0,
+                payload_bytes: 0,
+                path: "/tmp/first".to_string(),
+            },
+            RecordingSummary {
+                id: second,
+                session_id: None,
+                capture_input: true,
+                started_epoch_ms: 2,
+                ended_epoch_ms: None,
+                event_count: 0,
+                payload_bytes: 0,
+                path: "/tmp/second".to_string(),
+            },
+        ];
+
+        let error = resolve_recording_id_prefix("550e8400", &recordings)
+            .expect_err("ambiguous prefix should fail");
+        assert!(error.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn delete_recording_helpers_remove_manifest_directories() {
+        let root = temp_dir();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        fs::create_dir_all(root.join(first.to_string())).expect("first dir should exist");
+        fs::create_dir_all(root.join(second.to_string())).expect("second dir should exist");
+        fs::write(
+            root.join(first.to_string()).join("manifest.json"),
+            br#"{"summary":{"id":"00000000-0000-0000-0000-000000000000","session_id":null,"capture_input":true,"started_epoch_ms":1,"ended_epoch_ms":null,"event_count":0,"payload_bytes":0,"path":"x"}}"#,
+        )
+        .expect("first manifest should write");
+        fs::write(
+            root.join(second.to_string()).join("manifest.json"),
+            br#"{"summary":{"id":"00000000-0000-0000-0000-000000000000","session_id":null,"capture_input":true,"started_epoch_ms":1,"ended_epoch_ms":null,"event_count":0,"payload_bytes":0,"path":"x"}}"#,
+        )
+        .expect("second manifest should write");
+
+        delete_recording_dir_at(&root, first).expect("single delete should succeed");
+        assert!(!root.join(first.to_string()).exists());
+
+        let deleted_count =
+            delete_all_recordings_from_dir(&root).expect("delete-all helper should succeed");
+        assert_eq!(deleted_count, 1);
+        assert!(!root.join(second.to_string()).exists());
+    }
+
+    #[test]
+    fn confirm_delete_all_requires_yes_for_non_interactive_mode() {
+        assert!(confirm_delete_all_recordings(true).expect("--yes should bypass prompt"));
+        let error = confirm_delete_all_recordings(false).expect_err("non-interactive should fail");
+        assert!(error.to_string().contains("requires --yes"));
     }
 
     #[test]

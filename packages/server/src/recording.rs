@@ -196,6 +196,63 @@ impl RecordingRuntime {
         Ok(recordings)
     }
 
+    pub fn delete(&mut self, recording_id: Uuid) -> Result<RecordingSummary> {
+        if self
+            .active
+            .as_ref()
+            .is_some_and(|active| active.id == recording_id)
+        {
+            let _ = self.stop(Some(recording_id))?;
+        }
+
+        let recording_dir = self.root_dir.join(recording_id.to_string());
+        let manifest_path = recording_dir.join(MANIFEST_FILE_NAME);
+        if !manifest_path.exists() {
+            anyhow::bail!("recording not found: {recording_id}")
+        }
+        let summary = read_manifest(&manifest_path)?;
+
+        std::fs::remove_dir_all(&recording_dir).with_context(|| {
+            format!(
+                "failed removing recording directory {}",
+                recording_dir.display()
+            )
+        })?;
+
+        Ok(summary)
+    }
+
+    pub fn delete_all(&mut self) -> Result<usize> {
+        if self.active.is_some() {
+            let _ = self.stop(None)?;
+        }
+
+        if !self.root_dir.exists() {
+            return Ok(0);
+        }
+
+        let mut deleted = 0_usize;
+        for entry in std::fs::read_dir(&self.root_dir)? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let manifest_path = entry.path().join(MANIFEST_FILE_NAME);
+            if !manifest_path.exists() {
+                continue;
+            }
+            std::fs::remove_dir_all(entry.path()).with_context(|| {
+                format!(
+                    "failed removing recording directory {}",
+                    entry.path().display()
+                )
+            })?;
+            deleted = deleted.saturating_add(1);
+        }
+
+        Ok(deleted)
+    }
+
     pub fn record(
         &self,
         kind: RecordingEventKind,
@@ -387,5 +444,40 @@ mod tests {
             .expect("record should no-op without failure");
         let stopped = runtime.stop(None).expect("recording should stop");
         assert_eq!(stopped.event_count, 0);
+    }
+
+    #[test]
+    fn delete_removes_manifest_directory() {
+        let root = temp_dir();
+        let mut runtime = RecordingRuntime::new(root.clone());
+        let summary = runtime.start(None, true).expect("recording should start");
+        runtime
+            .stop(Some(summary.id))
+            .expect("recording should stop");
+
+        let deleted = runtime.delete(summary.id).expect("recording should delete");
+        assert_eq!(deleted.id, summary.id);
+        assert!(!root.join(summary.id.to_string()).exists());
+    }
+
+    #[test]
+    fn delete_all_stops_active_and_removes_recordings() {
+        let root = temp_dir();
+        let mut runtime = RecordingRuntime::new(root.clone());
+        let active = runtime
+            .start(None, true)
+            .expect("first recording should start");
+        let second = runtime.start(None, true).err();
+        assert!(second.is_some(), "second concurrent recording should fail");
+
+        let _ = runtime
+            .stop(Some(active.id))
+            .expect("active recording should stop");
+        let _ = runtime.start(None, true).expect("new active should start");
+
+        let deleted_count = runtime.delete_all().expect("delete all should succeed");
+        assert_eq!(deleted_count, 2);
+        assert!(runtime.status().active.is_none());
+        assert!(runtime.list().expect("list should succeed").is_empty());
     }
 }

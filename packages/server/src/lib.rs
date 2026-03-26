@@ -5390,6 +5390,36 @@ async fn handle_request(
                 }),
             }
         }
+        Request::RecordingDelete { recording_id } => {
+            let mut runtime = state
+                .recording_runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
+            match runtime.delete(recording_id) {
+                Ok(recording) => Response::Ok(ResponsePayload::RecordingDeleted {
+                    recording_id: recording.id,
+                }),
+                Err(error) => Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: format!("failed deleting recording: {error}"),
+                }),
+            }
+        }
+        Request::RecordingDeleteAll => {
+            let mut runtime = state
+                .recording_runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
+            match runtime.delete_all() {
+                Ok(deleted_count) => {
+                    Response::Ok(ResponsePayload::RecordingDeleteAll { deleted_count })
+                }
+                Err(error) => Response::Err(ErrorResponse {
+                    code: ErrorCode::Internal,
+                    message: format!("failed deleting all recordings: {error}"),
+                }),
+            }
+        }
     };
 
     if let Response::Ok(ResponsePayload::SessionCreated { id, name }) = &response {
@@ -5437,6 +5467,8 @@ const fn request_requires_exclusive(request: &Request) -> bool {
             | Request::AttachSetViewport { .. }
             | Request::RecordingStart { .. }
             | Request::RecordingStop { .. }
+            | Request::RecordingDelete { .. }
+            | Request::RecordingDeleteAll
             | Request::Detach
     )
 }
@@ -5503,6 +5535,8 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::RecordingStop { .. } => "recording_stop",
         Request::RecordingStatus => "recording_status",
         Request::RecordingList => "recording_list",
+        Request::RecordingDelete { .. } => "recording_delete",
+        Request::RecordingDeleteAll => "recording_delete_all",
         Request::Detach => "detach",
         Request::SubscribeEvents => "subscribe_events",
         Request::PollEvents { .. } => "poll_events",
@@ -5548,6 +5582,8 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::RecordingStopped { .. } => "recording_stopped",
         ResponsePayload::RecordingStatus { .. } => "recording_status",
         ResponsePayload::RecordingList { .. } => "recording_list",
+        ResponsePayload::RecordingDeleted { .. } => "recording_deleted",
+        ResponsePayload::RecordingDeleteAll { .. } => "recording_delete_all",
         ResponsePayload::Detached => "detached",
         ResponsePayload::EventsSubscribed => "events_subscribed",
         ResponsePayload::EventBatch { .. } => "event_batch",

@@ -353,6 +353,10 @@ pub enum Request {
     },
     RecordingStatus,
     RecordingList,
+    RecordingDelete {
+        recording_id: Uuid,
+    },
+    RecordingDeleteAll,
     Detach,
 }
 
@@ -646,6 +650,12 @@ pub enum ResponsePayload {
     },
     RecordingList {
         recordings: Vec<RecordingSummary>,
+    },
+    RecordingDeleted {
+        recording_id: Uuid,
+    },
+    RecordingDeleteAll {
+        deleted_count: usize,
     },
     Detached,
     ServerStopping,

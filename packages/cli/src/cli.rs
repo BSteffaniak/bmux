@@ -179,6 +179,17 @@ pub enum RecordingCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Delete one recording by id or unique id prefix
+    Delete {
+        /// Recording UUID or unique UUID prefix
+        recording_id: String,
+    },
+    /// Delete all recordings
+    DeleteAll {
+        /// Proceed without interactive confirmation
+        #[arg(long)]
+        yes: bool,
+    },
     /// Inspect recording timeline events
     Inspect {
         /// Recording id
@@ -1466,6 +1477,31 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_recording_delete_with_prefix() {
+        let cli = Cli::try_parse_from(["bmux", "recording", "delete", "550e8400"])
+            .expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(
+            command,
+            RecordingCommand::Delete {
+                recording_id: ref id
+            } if id == "550e8400"
+        ));
+    }
+
+    #[test]
+    fn parses_recording_delete_all_yes_flag() {
+        let cli = Cli::try_parse_from(["bmux", "recording", "delete-all", "--yes"])
+            .expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(command, RecordingCommand::DeleteAll { yes: true }));
     }
 
     #[test]
