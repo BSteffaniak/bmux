@@ -105,34 +105,19 @@ impl RustPlugin for PluginCliPlugin {
 
 fn run_list_command(context: &NativeCommandContext) -> Result<i32, String> {
     let as_json = has_flag(&context.arguments, "json");
-    let registry = scan_plugins_with_bundled_entry_fallback(context)?;
     let enabled = context.enabled_plugins.iter().collect::<BTreeSet<_>>();
 
-    let mut entries = registry
+    let mut entries = context
+        .registered_plugins
         .iter()
         .map(|plugin| PluginListEntry {
-            id: plugin.declaration.id.as_str().to_string(),
-            display_name: plugin.declaration.display_name.clone(),
-            version: plugin.declaration.plugin_version.clone(),
-            enabled: enabled.contains(&plugin.declaration.id.as_str().to_string()),
-            required_capabilities: plugin
-                .declaration
-                .required_capabilities
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            provided_capabilities: plugin
-                .declaration
-                .provided_capabilities
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
-            commands: plugin
-                .declaration
-                .commands
-                .iter()
-                .map(|command| command.name.clone())
-                .collect(),
+            id: plugin.id.clone(),
+            display_name: plugin.display_name.clone(),
+            version: plugin.version.clone(),
+            enabled: enabled.contains(&plugin.id),
+            required_capabilities: plugin.required_capabilities.clone(),
+            provided_capabilities: plugin.provided_capabilities.clone(),
+            commands: plugin.commands.clone(),
         })
         .collect::<Vec<_>>();
     entries.sort_by(|left, right| left.id.cmp(&right.id));
@@ -193,11 +178,17 @@ fn run_run_command(context: &NativeCommandContext) -> Result<i32, String> {
         );
     }
 
-    let registry = scan_plugins_with_bundled_entry_fallback(context)?;
-    let available = registry.plugin_ids();
-    let plugin = registry
-        .get(plugin_id)
-        .ok_or_else(|| format_plugin_not_found_message(plugin_id, &available))?;
+    // Check if the target plugin is known via the registry info from the host.
+    let available_ids = context
+        .registered_plugins
+        .iter()
+        .map(|p| p.id.as_str())
+        .collect::<Vec<_>>();
+    let target_info = context
+        .registered_plugins
+        .iter()
+        .find(|p| p.id == *plugin_id)
+        .ok_or_else(|| format_plugin_not_found_message(plugin_id, &available_ids))?;
 
     if !context
         .enabled_plugins
@@ -206,6 +197,20 @@ fn run_run_command(context: &NativeCommandContext) -> Result<i32, String> {
     {
         return Err(format_plugin_not_enabled_message(plugin_id));
     }
+
+    if target_info.bundled_static {
+        return Err(format!(
+            "plugin '{plugin_id}' is statically bundled into the binary and cannot be loaded dynamically via 'plugin run'.\n\
+             Run its commands directly, e.g.: bmux {}",
+            command_name,
+        ));
+    }
+
+    // Dynamic plugins: fall back to filesystem scan + dlopen loading.
+    let registry = scan_plugins_with_bundled_entry_fallback(context)?;
+    let plugin = registry
+        .get(plugin_id)
+        .ok_or_else(|| format_plugin_not_found_message(plugin_id, &available_ids))?;
 
     let available_capabilities = context
         .available_capabilities
@@ -243,6 +248,7 @@ fn run_run_command(context: &NativeCommandContext) -> Result<i32, String> {
         available_capabilities: context.available_capabilities.clone(),
         enabled_plugins: context.enabled_plugins.clone(),
         plugin_search_roots: context.plugin_search_roots.clone(),
+        registered_plugins: context.registered_plugins.clone(),
         host: context.host.clone(),
         connection: context.connection.clone(),
         settings: context.plugin_settings_map.get(plugin_id).cloned(),

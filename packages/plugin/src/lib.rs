@@ -55,8 +55,8 @@ pub use host_services::{
 pub use loader::{
     HostKernelBridge, HostKernelBridgeRequest, HostKernelBridgeResponse, LoadedPlugin,
     NativeCommandContext, NativeDescriptor, NativeLifecycleContext, NativePluginLoader,
-    NativeServiceContext, ServiceCaller, StaticPluginVtable, load_registered_plugin,
-    load_static_plugin,
+    NativeServiceContext, RegisteredPluginInfo, ServiceCaller, StaticPluginVtable,
+    load_registered_plugin, load_static_plugin,
 };
 pub use manifest::{
     PluginManifest, PluginManifestCompatibility, PluginManifestKeybindings, PluginRuntime,

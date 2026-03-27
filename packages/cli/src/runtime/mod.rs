@@ -2007,6 +2007,70 @@ fn load_enabled_plugins(
     Ok(loaded_plugins)
 }
 
+fn registered_plugin_infos_from_loaded(
+    loaded_plugins: &[bmux_plugin::LoadedPlugin],
+) -> Vec<bmux_plugin::RegisteredPluginInfo> {
+    loaded_plugins
+        .iter()
+        .map(|plugin| bmux_plugin::RegisteredPluginInfo {
+            id: plugin.declaration.id.as_str().to_string(),
+            display_name: plugin.declaration.display_name.clone(),
+            version: plugin.declaration.plugin_version.clone(),
+            bundled_static: plugin.registered.bundled_static,
+            required_capabilities: plugin
+                .declaration
+                .required_capabilities
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            provided_capabilities: plugin
+                .declaration
+                .provided_capabilities
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            commands: plugin
+                .declaration
+                .commands
+                .iter()
+                .map(|c| c.name.clone())
+                .collect(),
+        })
+        .collect()
+}
+
+fn registered_plugin_infos_from_registry(
+    registry: &PluginRegistry,
+) -> Vec<bmux_plugin::RegisteredPluginInfo> {
+    registry
+        .iter()
+        .map(|plugin| bmux_plugin::RegisteredPluginInfo {
+            id: plugin.declaration.id.as_str().to_string(),
+            display_name: plugin.declaration.display_name.clone(),
+            version: plugin.declaration.plugin_version.clone(),
+            bundled_static: plugin.bundled_static,
+            required_capabilities: plugin
+                .declaration
+                .required_capabilities
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            provided_capabilities: plugin
+                .declaration
+                .provided_capabilities
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            commands: plugin
+                .declaration
+                .commands
+                .iter()
+                .map(|c| c.name.clone())
+                .collect(),
+        })
+        .collect()
+}
+
 fn plugin_lifecycle_context(
     config: &BmuxConfig,
     paths: &ConfigPaths,
@@ -2015,6 +2079,7 @@ fn plugin_lifecycle_context(
     available_capabilities: Vec<String>,
     enabled_plugins: Vec<String>,
     plugin_search_roots: Vec<String>,
+    registered_plugins: Vec<bmux_plugin::RegisteredPluginInfo>,
 ) -> NativeLifecycleContext {
     let host = plugin_host_for_declaration(declaration, paths, config, available_services.clone());
     NativeLifecycleContext {
@@ -2033,6 +2098,7 @@ fn plugin_lifecycle_context(
         available_capabilities,
         enabled_plugins,
         plugin_search_roots,
+        registered_plugins,
         host: plugin_host_metadata(),
         connection: bmux_plugin::PluginHost::connection(&host).clone(),
         settings: config
@@ -2055,6 +2121,7 @@ fn plugin_command_context(
     available_capabilities: Vec<String>,
     enabled_plugins: Vec<String>,
     plugin_search_roots: Vec<String>,
+    registered_plugins: Vec<bmux_plugin::RegisteredPluginInfo>,
 ) -> NativeCommandContext {
     let host = plugin_host_for_declaration(declaration, paths, config, available_services.clone());
     NativeCommandContext {
@@ -2075,6 +2142,7 @@ fn plugin_command_context(
         available_capabilities,
         enabled_plugins,
         plugin_search_roots,
+        registered_plugins,
         host: plugin_host_metadata(),
         connection: bmux_plugin::PluginHost::connection(&host).clone(),
         settings: config
@@ -2129,6 +2197,7 @@ fn activate_loaded_plugins(
         .iter()
         .map(|plugin| plugin.declaration.id.as_str().to_string())
         .collect::<Vec<_>>();
+    let registered_plugins = registered_plugin_infos_from_loaded(loaded_plugins);
     for plugin in loaded_plugins {
         if !plugin.declaration.lifecycle.activate_on_startup {
             continue;
@@ -2142,6 +2211,7 @@ fn activate_loaded_plugins(
             available_capabilities.clone(),
             enabled_plugins.clone(),
             plugin_search_roots.clone(),
+            registered_plugins.clone(),
         );
         let _host_kernel_connection_guard = enter_host_kernel_connection(connection_info.clone());
         if let Err(error) = plugin.activate(&context) {
@@ -2154,6 +2224,7 @@ fn activate_loaded_plugins(
                     available_capabilities.clone(),
                     enabled_plugins.clone(),
                     plugin_search_roots.clone(),
+                    registered_plugins.clone(),
                 );
                 let _host_kernel_connection_guard =
                     enter_host_kernel_connection(connection_info.clone());
@@ -2208,6 +2279,7 @@ fn deactivate_loaded_plugins(
         .iter()
         .map(|plugin| plugin.declaration.id.as_str().to_string())
         .collect::<Vec<_>>();
+    let registered_plugins = registered_plugin_infos_from_loaded(loaded_plugins);
     for plugin in loaded_plugins.iter().rev() {
         if !plugin.declaration.lifecycle.activate_on_startup {
             continue;
@@ -2221,6 +2293,7 @@ fn deactivate_loaded_plugins(
             available_capabilities.clone(),
             enabled_plugins.clone(),
             plugin_search_roots.clone(),
+            registered_plugins.clone(),
         );
         let _host_kernel_connection_guard = enter_host_kernel_connection(connection_info.clone());
         let _ = plugin.deactivate(&context).with_context(|| {
@@ -2385,6 +2458,7 @@ fn run_plugin_command_internal(
         available_capabilities,
         enabled_plugins,
         plugin_search_roots,
+        registered_plugin_infos_from_registry(&registry),
     );
     begin_host_kernel_effect_capture();
     let _host_kernel_connection_guard = enter_host_kernel_connection(context.connection.clone());
@@ -8610,6 +8684,7 @@ mod tests {
             ],
             vec!["example.plugin".to_string()],
             vec!["/plugins".to_string()],
+            Vec::new(),
         );
         assert_eq!(context.plugin_id, "example.plugin");
         assert_eq!(context.connection.data_dir, "/data");
@@ -8772,6 +8847,7 @@ mod tests {
             ],
             vec!["provider.plugin".to_string()],
             vec!["/plugins".to_string()],
+            Vec::new(),
         );
 
         assert_eq!(context.plugin_id, "provider.plugin");
