@@ -17,7 +17,7 @@ const ACTIVE_WINDOW_CONTEXT_KEY: &str = "windows.active_context_id";
 const PREVIOUS_WINDOW_CONTEXT_KEY: &str = "windows.previous_context_id";
 
 #[derive(Default)]
-struct WindowsPlugin {
+pub struct WindowsPlugin {
     last_selected_by_client: BTreeMap<Uuid, Uuid>,
 }
 
@@ -744,6 +744,7 @@ struct WindowCommandAck {
     id: Option<String>,
 }
 
+#[cfg(not(feature = "static-bundled"))]
 bmux_plugin::export_plugin!(WindowsPlugin);
 
 #[cfg(test)]

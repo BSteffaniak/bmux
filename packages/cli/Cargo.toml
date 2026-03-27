@@ -27,6 +27,20 @@ bmux_session           = { workspace = true }
 bmux_terminal          = { workspace = true }
 bmux_terminal_protocol = { workspace = true }
 
+# Bundled plugins (optional, statically linked as rlib when enabled)
+bmux_clipboard_plugin = { workspace = true, optional = true, features = [
+    "static-bundled",
+] }
+bmux_permissions_plugin = { workspace = true, optional = true, features = [
+    "static-bundled",
+] }
+bmux_plugin_cli_plugin = { workspace = true, optional = true, features = [
+    "static-bundled",
+] }
+bmux_windows_plugin = { workspace = true, optional = true, features = [
+    "static-bundled",
+] }
+
 # External dependencies
 ab_glyph = { workspace = true }
 anyhow = { workspace = true, features = ["std"] }
@@ -59,10 +73,24 @@ vt100 = { workspace = true }
 
 [features]
 # Default features
-default = ["bundled-fonts", "logging"]
+default = ["bundled-fonts", "bundled-plugins", "logging"]
 
 # Development features
 fail-on-warnings = []
+
+# Statically link all four bundled plugins into the binary
+bundled-plugins = [
+    "bundled-plugin-clipboard",
+    "bundled-plugin-permissions",
+    "bundled-plugin-cli",
+    "bundled-plugin-windows",
+]
+
+# Individual plugin features for selective bundling
+bundled-plugin-cli         = ["dep:bmux_plugin_cli_plugin"]
+bundled-plugin-clipboard   = ["dep:bmux_clipboard_plugin"]
+bundled-plugin-permissions = ["dep:bmux_permissions_plugin"]
+bundled-plugin-windows     = ["dep:bmux_windows_plugin"]
 
 # Optional features
 bundled-fonts = ["bmux_fonts/bundled-nerd-fonts"]

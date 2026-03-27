@@ -84,8 +84,15 @@ bmux_session_models    = { version = "0.0.1-alpha.0", default-features = false, 
 bmux_terminal          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal" }
 bmux_terminal_models   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal/models" }
 bmux_terminal_protocol = { version = "0.0.1-alpha.0", default-features = false, path = "packages/terminal_protocol" }
-moosicbox_log_runtime  = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "moosicbox_log_runtime", default-features = false }
-moosicbox_log_watch    = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "moosicbox_log_watch", default-features = false }
+
+# Bundled plugin crates (used as optional rlib deps in bmux_cli)
+bmux_clipboard_plugin   = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/clipboard-plugin" }
+bmux_permissions_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/permissions-plugin" }
+bmux_plugin_cli_plugin  = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/plugin-cli-plugin" }
+bmux_windows_plugin     = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/windows-plugin" }
+
+moosicbox_log_runtime = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "moosicbox_log_runtime", default-features = false }
+moosicbox_log_watch   = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "moosicbox_log_watch", default-features = false }
 
 # External dependencies
 ab_glyph = { version = "0.2.32" }

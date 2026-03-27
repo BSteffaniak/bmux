@@ -10,7 +10,7 @@ use bmux_plugin::{
 use serde::{Deserialize, Serialize};
 
 #[derive(Default)]
-struct ClipboardPlugin;
+pub struct ClipboardPlugin;
 
 impl RustPlugin for ClipboardPlugin {
     fn descriptor(&self) -> NativeDescriptor {
@@ -53,6 +53,7 @@ impl RustPlugin for ClipboardPlugin {
     }
 }
 
+#[cfg(not(feature = "static-bundled"))]
 bmux_plugin::export_plugin!(ClipboardPlugin);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

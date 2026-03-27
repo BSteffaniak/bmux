@@ -480,14 +480,13 @@ fn register_plugin_service_handlers(
                 let connection = connection_info_for_handler.clone();
                 let enabled_plugins = enabled_plugins_for_handler.clone();
                 async move {
-                    let loaded =
-                        load_native_registered_plugin(&provider, &host, &available_capabilities)
-                            .with_context(|| {
-                                format!(
-                                    "failed loading service provider plugin '{}'",
-                                    provider.declaration.id.as_str()
-                                )
-                            })?;
+                    let loaded = load_plugin(&provider, &host, &available_capabilities)
+                        .with_context(|| {
+                            format!(
+                                "failed loading service provider plugin '{}'",
+                                provider.declaration.id.as_str()
+                            )
+                        })?;
                     let _kernel_context_guard =
                         enter_service_kernel_context(invoke_context.clone());
                     let _host_kernel_connection_guard =
@@ -1615,11 +1614,104 @@ fn validate_configured_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Resu
     validate_enabled_plugins(config, &registry)
 }
 
+/// Register statically-linked bundled plugins whose feature flags are active.
+///
+/// Each `cfg` block is only compiled when the corresponding Cargo feature is
+/// enabled, so the binary only contains the plugin code the user opted into
+/// (all four by default via the `bundled-plugins` feature).
+#[allow(unused_variables)]
+fn register_static_bundled_plugins(registry: &mut PluginRegistry) {
+    #[cfg(feature = "bundled-plugin-clipboard")]
+    if let Err(e) = registry.register_bundled_manifest(include_str!(
+        "../../../../plugins/bundled/clipboard/plugin.toml"
+    )) {
+        tracing::warn!("failed to register bundled clipboard plugin: {e}");
+    }
+
+    #[cfg(feature = "bundled-plugin-permissions")]
+    if let Err(e) = registry.register_bundled_manifest(include_str!(
+        "../../../../plugins/bundled/permissions/plugin.toml"
+    )) {
+        tracing::warn!("failed to register bundled permissions plugin: {e}");
+    }
+
+    #[cfg(feature = "bundled-plugin-cli")]
+    if let Err(e) = registry.register_bundled_manifest(include_str!(
+        "../../../../plugins/bundled/plugin-cli/plugin.toml"
+    )) {
+        tracing::warn!("failed to register bundled plugin-cli plugin: {e}");
+    }
+
+    #[cfg(feature = "bundled-plugin-windows")]
+    if let Err(e) = registry.register_bundled_manifest(include_str!(
+        "../../../../plugins/bundled/windows/plugin.toml"
+    )) {
+        tracing::warn!("failed to register bundled windows plugin: {e}");
+    }
+}
+
+/// Look up the [`StaticPluginVtable`] for a statically-linked bundled plugin.
+///
+/// Returns `None` when the plugin id does not correspond to a compiled-in
+/// plugin (either because the feature flag is off or it's a third-party
+/// plugin).
+#[allow(unused_variables)]
+fn static_bundled_vtable(plugin_id: &str) -> Option<bmux_plugin::StaticPluginVtable> {
+    #[cfg(feature = "bundled-plugin-clipboard")]
+    if plugin_id == "bmux.clipboard" {
+        return Some(bmux_plugin::bundled_plugin_vtable!(
+            bmux_clipboard_plugin::ClipboardPlugin
+        ));
+    }
+    #[cfg(feature = "bundled-plugin-permissions")]
+    if plugin_id == "bmux.permissions" {
+        return Some(bmux_plugin::bundled_plugin_vtable!(
+            bmux_permissions_plugin::PermissionsPlugin
+        ));
+    }
+    #[cfg(feature = "bundled-plugin-cli")]
+    if plugin_id == "bmux.plugin_cli" {
+        return Some(bmux_plugin::bundled_plugin_vtable!(
+            bmux_plugin_cli_plugin::PluginCliPlugin
+        ));
+    }
+    #[cfg(feature = "bundled-plugin-windows")]
+    if plugin_id == "bmux.windows" {
+        return Some(bmux_plugin::bundled_plugin_vtable!(
+            bmux_windows_plugin::WindowsPlugin
+        ));
+    }
+    None
+}
+
+/// Load a registered plugin, using the static vtable path for bundled plugins
+/// and the dynamic `dlopen` path for everything else.
+fn load_plugin(
+    plugin: &bmux_plugin::RegisteredPlugin,
+    host: &HostMetadata,
+    available_capabilities: &std::collections::BTreeMap<HostScope, bmux_plugin::CapabilityProvider>,
+) -> bmux_plugin::Result<bmux_plugin::LoadedPlugin> {
+    if plugin.bundled_static {
+        let vtable = static_bundled_vtable(plugin.declaration.id.as_str()).ok_or_else(|| {
+            bmux_plugin::PluginError::MissingStaticVtable {
+                plugin_id: plugin.declaration.id.as_str().to_string(),
+            }
+        })?;
+        bmux_plugin::load_static_plugin(plugin, vtable, host, available_capabilities)
+    } else {
+        load_native_registered_plugin(plugin, host, available_capabilities)
+    }
+}
+
 fn scan_available_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Result<PluginRegistry> {
     let workspace_bundled_root = workspace_bundled_plugin_root();
     let search_paths = resolve_plugin_search_paths(config, paths)?;
     let reports = bmux_plugin::discover_plugin_manifests_in_roots(&search_paths)?;
     let mut registry = PluginRegistry::new();
+
+    // Register statically-linked bundled plugins first (behind feature flags).
+    register_static_bundled_plugins(&mut registry);
+
     for report in reports {
         for manifest_path in report.manifest_paths {
             match PluginManifest::from_path(&manifest_path) {
@@ -1648,10 +1740,20 @@ fn scan_available_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Result<Pl
                         &manifest_path,
                         manifest,
                     ) {
-                        warn!(
-                            "skipping plugin manifest {} during enabled-plugin scan: {error}",
-                            manifest_path.display()
-                        );
+                        // DuplicatePluginId is expected when a static-bundled
+                        // plugin is also discovered on the filesystem -- skip
+                        // since the static registration already won.
+                        if matches!(error, bmux_plugin::PluginError::DuplicatePluginId { .. }) {
+                            debug!(
+                                "skipping filesystem plugin {} (duplicate of static-bundled plugin)",
+                                manifest_path.display()
+                            );
+                        } else {
+                            warn!(
+                                "skipping plugin manifest {} during enabled-plugin scan: {error}",
+                                manifest_path.display()
+                            );
+                        }
                     }
                 }
                 Err(error) => {
@@ -1751,11 +1853,35 @@ fn effective_enabled_plugins(config: &BmuxConfig, registry: &PluginRegistry) -> 
     let mut enabled = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
 
+    // Auto-enable statically-linked bundled plugins (always available, no
+    // entry file to check).
+    let mut static_bundled = registry
+        .iter()
+        .filter_map(|plugin| {
+            plugin
+                .bundled_static
+                .then(|| plugin.declaration.id.as_str().to_string())
+        })
+        .collect::<Vec<_>>();
+    static_bundled.sort();
+    for plugin_id in static_bundled {
+        if disabled.contains(plugin_id.as_str()) {
+            continue;
+        }
+        if seen.insert(plugin_id.clone()) {
+            enabled.push(plugin_id);
+        }
+    }
+
+    // Auto-enable filesystem-discovered bundled plugins (from bundled roots
+    // whose entry file exists on disk).
     let mut bundled_defaults = registry
         .iter()
         .filter_map(|plugin| {
-            (bundled_roots.contains(&plugin.search_root) && registered_plugin_entry_exists(plugin))
-                .then(|| plugin.declaration.id.as_str().to_string())
+            (!plugin.bundled_static
+                && bundled_roots.contains(&plugin.search_root)
+                && registered_plugin_entry_exists(plugin))
+            .then(|| plugin.declaration.id.as_str().to_string())
         })
         .collect::<Vec<_>>();
     bundled_defaults.sort();
@@ -1864,7 +1990,7 @@ fn load_enabled_plugins(
     let mut loaded_plugins = Vec::with_capacity(ordered_plugins.len());
     for plugin in ordered_plugins {
         let plugin_id = plugin.declaration.id.as_str();
-        let loaded = match load_native_registered_plugin(plugin, &host, &available_capabilities) {
+        let loaded = match load_plugin(plugin, &host, &available_capabilities) {
             Ok(loaded) => loaded,
             Err(error) => {
                 if explicitly_enabled.contains(plugin_id) {
@@ -2235,7 +2361,7 @@ fn run_plugin_command_internal(
         anyhow::bail!(format_plugin_not_enabled_message(plugin_id));
     }
 
-    let loaded = load_native_registered_plugin(
+    let loaded = load_plugin(
         plugin,
         &plugin_host_metadata(),
         &available_capability_providers(&config, &registry)?,
@@ -5015,7 +5141,7 @@ fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
         .into_iter()
         .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    let loaded = load_native_registered_plugin(
+    let loaded = load_plugin(
         provider,
         &plugin_host_metadata(),
         &available_capability_providers(&config, &registry)?,

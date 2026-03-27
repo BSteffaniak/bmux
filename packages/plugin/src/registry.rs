@@ -25,6 +25,9 @@ pub struct RegisteredPlugin {
     pub manifest_path: PathBuf,
     pub manifest: PluginManifest,
     pub declaration: PluginDeclaration,
+    /// `true` when the plugin is statically linked into the binary and has no
+    /// corresponding entry file on disk.
+    pub bundled_static: bool,
 }
 
 #[derive(Debug, Default)]
@@ -110,6 +113,38 @@ impl PluginRegistry {
                 manifest_path: path.to_path_buf(),
                 manifest,
                 declaration,
+                bundled_static: false,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Register a statically-linked bundled plugin from an embedded manifest
+    /// TOML string.  No filesystem paths are involved; the `search_root` and
+    /// `manifest_path` are set to sentinel values.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the manifest is invalid or uses a duplicate id.
+    pub fn register_bundled_manifest(&mut self, manifest_toml: &str) -> Result<()> {
+        let manifest = PluginManifest::from_toml_str(manifest_toml)?;
+        let declaration = manifest.to_declaration()?;
+        let plugin_id = declaration.id.as_str().to_string();
+
+        if self.plugins.contains_key(&plugin_id) {
+            return Err(PluginError::DuplicatePluginId { id: plugin_id });
+        }
+
+        let sentinel = PathBuf::from("<bundled-static>");
+        self.plugins.insert(
+            plugin_id,
+            RegisteredPlugin {
+                search_root: sentinel.clone(),
+                manifest_path: sentinel,
+                manifest,
+                declaration,
+                bundled_static: true,
             },
         );
 
@@ -316,6 +351,41 @@ impl PluginRegistry {
         host: &HostMetadata,
         available_capabilities: &BTreeMap<HostScope, CapabilityProvider>,
     ) -> Result<()> {
+        Self::validate_plugin_compat(registered_plugin, host, available_capabilities)?;
+
+        let entry_path = registered_plugin.manifest.resolve_entry_path(
+            registered_plugin
+                .manifest_path
+                .parent()
+                .unwrap_or_else(|| Path::new(".")),
+        );
+        if !entry_path.exists() {
+            return Err(PluginError::MissingEntryFile {
+                plugin_id: registered_plugin.declaration.id.as_str().to_string(),
+                path: entry_path,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Validate a statically-linked plugin against host metadata and
+    /// capabilities.  This is identical to [`Self::validate_registered_plugin`]
+    /// except it does **not** check for an entry file on disk (since the plugin
+    /// is compiled into the binary).
+    pub fn validate_static_plugin(
+        registered_plugin: &RegisteredPlugin,
+        host: &HostMetadata,
+        available_capabilities: &BTreeMap<HostScope, CapabilityProvider>,
+    ) -> Result<()> {
+        Self::validate_plugin_compat(registered_plugin, host, available_capabilities)
+    }
+
+    fn validate_plugin_compat(
+        registered_plugin: &RegisteredPlugin,
+        host: &HostMetadata,
+        available_capabilities: &BTreeMap<HostScope, CapabilityProvider>,
+    ) -> Result<()> {
         let report = Self::compatibility_report(registered_plugin, host);
         if !report.api_compatible {
             return Err(PluginError::IncompatibleApiVersion {
@@ -339,19 +409,6 @@ impl PluginRegistry {
                     capability: capability.as_str().to_string(),
                 });
             }
-        }
-
-        let entry_path = registered_plugin.manifest.resolve_entry_path(
-            registered_plugin
-                .manifest_path
-                .parent()
-                .unwrap_or_else(|| Path::new(".")),
-        );
-        if !entry_path.exists() {
-            return Err(PluginError::MissingEntryFile {
-                plugin_id: registered_plugin.declaration.id.as_str().to_string(),
-                path: entry_path,
-            });
         }
 
         Ok(())
@@ -406,7 +463,11 @@ impl PluginRegistry {
         let available_capabilities =
             self.capability_providers_for(plugin_ids, core_capabilities)?;
         for plugin in self.activation_order_for(plugin_ids)? {
-            Self::validate_registered_plugin(plugin, host, &available_capabilities)?;
+            if plugin.bundled_static {
+                Self::validate_static_plugin(plugin, host, &available_capabilities)?;
+            } else {
+                Self::validate_registered_plugin(plugin, host, &available_capabilities)?;
+            }
         }
 
         Ok(())

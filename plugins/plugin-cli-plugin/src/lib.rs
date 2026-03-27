@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 
 #[derive(Default)]
-struct PluginCliPlugin;
+pub struct PluginCliPlugin;
 
 impl RustPlugin for PluginCliPlugin {
     fn descriptor(&self) -> NativeDescriptor {
@@ -670,4 +670,5 @@ struct PluginListEntry {
     commands: Vec<String>,
 }
 
+#[cfg(not(feature = "static-bundled"))]
 bmux_plugin::export_plugin!(PluginCliPlugin);

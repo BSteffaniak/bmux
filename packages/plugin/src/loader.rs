@@ -48,6 +48,37 @@ type NativeInvokeServiceFn =
 const NATIVE_SERVICE_STATUS_OK: i32 = 0;
 const NATIVE_SERVICE_STATUS_BUFFER_TOO_SMALL: i32 = 4;
 
+/// Function table for a statically-linked bundled plugin.
+///
+/// Each field mirrors the corresponding `extern "C"` symbol that a dynamically
+/// loaded plugin exposes.  When plugins are compiled into the binary as `rlib`
+/// dependencies the vtable is populated with plain Rust function pointers
+/// instead, avoiding `dlopen` and symbol-name collisions entirely.
+#[derive(Clone, Copy)]
+pub struct StaticPluginVtable {
+    pub entry: fn() -> *const c_char,
+    pub run_command_with_context: fn(*const c_char) -> i32,
+    pub activate: fn(*const c_char) -> i32,
+    pub deactivate: fn(*const c_char) -> i32,
+    pub handle_event: fn(*const c_char) -> i32,
+    pub invoke_service: fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32,
+}
+
+impl std::fmt::Debug for StaticPluginVtable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StaticPluginVtable").finish_non_exhaustive()
+    }
+}
+
+/// Backend that a [`LoadedPlugin`] uses to dispatch calls.
+#[derive(Debug)]
+enum PluginBackend {
+    /// Dynamically loaded shared library (third-party / filesystem plugins).
+    Dynamic(Library),
+    /// Statically linked into the binary (bundled plugins behind feature flags).
+    Static(StaticPluginVtable),
+}
+
 thread_local! {
     static COMMAND_OUTCOME_CAPTURE: RefCell<Option<crate::host_services::PluginCommandOutcome>> = const { RefCell::new(None) };
 }
@@ -1363,7 +1394,7 @@ impl NativeDescriptor {
 pub struct LoadedPlugin {
     pub registered: RegisteredPlugin,
     pub declaration: PluginDeclaration,
-    _library: Library,
+    backend: PluginBackend,
 }
 
 impl LoadedPlugin {
@@ -1385,6 +1416,11 @@ impl LoadedPlugin {
     /// Returns an error when the plugin does not declare the command, the
     /// command symbol cannot be loaded, or any command input contains an
     /// interior NUL byte.
+    ///
+    /// **Note:** Static plugins always require a command context.  Calling
+    /// this method (which passes `context: None`) on a static plugin will
+    /// return [`PluginError::NativeCommandSymbol`].  Use
+    /// [`run_command_with_context`](Self::run_command_with_context) instead.
     pub fn run_command(&self, command_name: &str, arguments: &[String]) -> Result<i32> {
         self.run_command_with_context(command_name, arguments, None)
     }
@@ -1432,17 +1468,36 @@ impl LoadedPlugin {
                 field: "context",
             })?;
 
-            if let Ok(command_symbol) = unsafe {
-                self._library.get::<NativeRunCommandWithContextFn>(
-                    DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL.as_bytes(),
-                )
-            } {
-                begin_command_outcome_capture();
-                let status = unsafe { command_symbol(payload.as_ptr()) };
-                let outcome = finish_command_outcome_capture();
-                return Ok((status, outcome));
+            match &self.backend {
+                PluginBackend::Static(vtable) => {
+                    begin_command_outcome_capture();
+                    let status = (vtable.run_command_with_context)(payload.as_ptr());
+                    let outcome = finish_command_outcome_capture();
+                    return Ok((status, outcome));
+                }
+                PluginBackend::Dynamic(library) => {
+                    if let Ok(command_symbol) = unsafe {
+                        library.get::<NativeRunCommandWithContextFn>(
+                            DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL.as_bytes(),
+                        )
+                    } {
+                        begin_command_outcome_capture();
+                        let status = unsafe { command_symbol(payload.as_ptr()) };
+                        let outcome = finish_command_outcome_capture();
+                        return Ok((status, outcome));
+                    }
+                }
             }
         }
+
+        // Fallback: use the legacy run_command symbol (dynamic only)
+        let PluginBackend::Dynamic(library) = &self.backend else {
+            return Err(PluginError::NativeCommandSymbol {
+                plugin_id: self.declaration.id.as_str().to_string(),
+                symbol: DEFAULT_NATIVE_COMMAND_SYMBOL.to_string(),
+                details: "static plugins require context-based command dispatch".to_string(),
+            });
+        };
 
         let command_name =
             CString::new(command_name).map_err(|_| PluginError::InvalidNativeCommandInput {
@@ -1465,14 +1520,14 @@ impl LoadedPlugin {
             .map(|value| value.as_ptr())
             .collect::<Vec<_>>();
 
-        let command_symbol: Symbol<'_, NativeRunCommandFn> =
-            unsafe { self._library.get(DEFAULT_NATIVE_COMMAND_SYMBOL.as_bytes()) }.map_err(
-                |error| PluginError::NativeCommandSymbol {
-                    plugin_id: self.declaration.id.as_str().to_string(),
-                    symbol: DEFAULT_NATIVE_COMMAND_SYMBOL.to_string(),
-                    details: error.to_string(),
-                },
-            )?;
+        let command_symbol: Symbol<'_, NativeRunCommandFn> = unsafe {
+            library.get(DEFAULT_NATIVE_COMMAND_SYMBOL.as_bytes())
+        }
+        .map_err(|error| PluginError::NativeCommandSymbol {
+            plugin_id: self.declaration.id.as_str().to_string(),
+            symbol: DEFAULT_NATIVE_COMMAND_SYMBOL.to_string(),
+            details: error.to_string(),
+        })?;
 
         let status = unsafe {
             command_symbol(
@@ -1532,16 +1587,22 @@ impl LoadedPlugin {
             plugin_id: self.declaration.id.as_str().to_string(),
         })?;
 
-        let event_symbol: Symbol<'_, NativeEventFn> =
-            unsafe { self._library.get(DEFAULT_NATIVE_EVENT_SYMBOL.as_bytes()) }.map_err(
-                |error| PluginError::NativeEventSymbol {
-                    plugin_id: self.declaration.id.as_str().to_string(),
-                    symbol: DEFAULT_NATIVE_EVENT_SYMBOL.to_string(),
-                    details: error.to_string(),
-                },
-            )?;
+        let status = match &self.backend {
+            PluginBackend::Static(vtable) => (vtable.handle_event)(payload.as_ptr()),
+            PluginBackend::Dynamic(library) => {
+                let event_symbol: Symbol<'_, NativeEventFn> =
+                    unsafe { library.get(DEFAULT_NATIVE_EVENT_SYMBOL.as_bytes()) }.map_err(
+                        |error| PluginError::NativeEventSymbol {
+                            plugin_id: self.declaration.id.as_str().to_string(),
+                            symbol: DEFAULT_NATIVE_EVENT_SYMBOL.to_string(),
+                            details: error.to_string(),
+                        },
+                    )?;
+                unsafe { event_symbol(payload.as_ptr()) }
+            }
+        };
 
-        Ok(Some(unsafe { event_symbol(payload.as_ptr()) }))
+        Ok(Some(status))
     }
 
     /// # Errors
@@ -1550,37 +1611,56 @@ impl LoadedPlugin {
     /// payload cannot be encoded, or the plugin returns invalid transport data.
     pub fn invoke_service(&self, context: &NativeServiceContext) -> Result<ServiceResponse> {
         let payload = encode_service_envelope(0, ServiceEnvelopeKind::Request, context)?;
-        let service_symbol: Symbol<'_, NativeInvokeServiceFn> =
-            unsafe { self._library.get(DEFAULT_NATIVE_SERVICE_SYMBOL.as_bytes()) }.map_err(
-                |error| PluginError::NativeServiceSymbol {
-                    plugin_id: self.declaration.id.as_str().to_string(),
-                    symbol: DEFAULT_NATIVE_SERVICE_SYMBOL.to_string(),
-                    details: error.to_string(),
-                },
-            )?;
 
-        let mut output = vec![0_u8; 4096];
-        let mut output_len = 0_usize;
-        let mut status = unsafe {
-            service_symbol(
-                payload.as_ptr(),
-                payload.len(),
-                output.as_mut_ptr(),
-                output.len(),
-                &mut output_len,
-            )
+        // For dynamic backends, resolve the symbol once up-front so we can
+        // return a proper error instead of panicking inside the closure.
+        let resolved_symbol = match &self.backend {
+            PluginBackend::Static(_) => None,
+            PluginBackend::Dynamic(library) => {
+                let sym: Symbol<'_, NativeInvokeServiceFn> =
+                    unsafe { library.get(DEFAULT_NATIVE_SERVICE_SYMBOL.as_bytes()) }.map_err(
+                        |error| PluginError::NativeServiceSymbol {
+                            plugin_id: self.declaration.id.as_str().to_string(),
+                            symbol: DEFAULT_NATIVE_SERVICE_SYMBOL.to_string(),
+                            details: error.to_string(),
+                        },
+                    )?;
+                Some(sym)
+            }
         };
-        if status == NATIVE_SERVICE_STATUS_BUFFER_TOO_SMALL {
-            output.resize(output_len.max(output.len() * 2), 0);
-            status = unsafe {
-                service_symbol(
+
+        let call_service = |payload: &[u8], output: &mut [u8], output_len: &mut usize| -> i32 {
+            match &self.backend {
+                PluginBackend::Static(vtable) => (vtable.invoke_service)(
                     payload.as_ptr(),
                     payload.len(),
                     output.as_mut_ptr(),
                     output.len(),
-                    &mut output_len,
-                )
-            };
+                    output_len,
+                ),
+                PluginBackend::Dynamic(_) => {
+                    let service_fn = resolved_symbol
+                        .as_ref()
+                        .expect("resolved_symbol is Some for Dynamic backend");
+                    unsafe {
+                        service_fn(
+                            payload.as_ptr(),
+                            payload.len(),
+                            output.as_mut_ptr(),
+                            output.len(),
+                            output_len,
+                        )
+                    }
+                }
+            }
+        };
+
+        let mut output = vec![0_u8; 4096];
+        let mut output_len = 0_usize;
+        let mut status = call_service(&payload, &mut output, &mut output_len);
+        if status == NATIVE_SERVICE_STATUS_BUFFER_TOO_SMALL {
+            output.resize(output_len.max(output.len() * 2), 0);
+            status = call_service(&payload, &mut output, &mut output_len);
         }
 
         if status != NATIVE_SERVICE_STATUS_OK {
@@ -1614,16 +1694,35 @@ impl LoadedPlugin {
             plugin_id: self.declaration.id.as_str().to_string(),
         })?;
 
-        let lifecycle_symbol: Symbol<'_, NativeLifecycleFn> = unsafe {
-            self._library.get(symbol.as_bytes())
-        }
-        .map_err(|error| PluginError::NativeLifecycleSymbol {
-            plugin_id: self.declaration.id.as_str().to_string(),
-            symbol: symbol.to_string(),
-            details: error.to_string(),
-        })?;
+        let status = match &self.backend {
+            PluginBackend::Static(vtable) => {
+                let func = if symbol == DEFAULT_NATIVE_ACTIVATE_SYMBOL {
+                    vtable.activate
+                } else if symbol == DEFAULT_NATIVE_DEACTIVATE_SYMBOL {
+                    vtable.deactivate
+                } else {
+                    return Err(PluginError::NativeLifecycleSymbol {
+                        plugin_id: self.declaration.id.as_str().to_string(),
+                        symbol: symbol.to_string(),
+                        details: "unknown lifecycle symbol for static plugin".to_string(),
+                    });
+                };
+                func(payload.as_ptr())
+            }
+            PluginBackend::Dynamic(library) => {
+                let lifecycle_symbol: Symbol<'_, NativeLifecycleFn> = unsafe {
+                    library.get(symbol.as_bytes())
+                }
+                .map_err(|error| PluginError::NativeLifecycleSymbol {
+                    plugin_id: self.declaration.id.as_str().to_string(),
+                    symbol: symbol.to_string(),
+                    details: error.to_string(),
+                })?;
+                unsafe { lifecycle_symbol(payload.as_ptr()) }
+            }
+        };
 
-        Ok(unsafe { lifecycle_symbol(payload.as_ptr()) })
+        Ok(status)
     }
 }
 
@@ -1680,7 +1779,7 @@ impl NativePluginLoader {
         Ok(LoadedPlugin {
             registered: registered_plugin.clone(),
             declaration,
-            _library: library,
+            backend: PluginBackend::Dynamic(library),
         })
     }
 }
@@ -1698,6 +1797,60 @@ pub fn load_registered_plugin(
         host,
         available_capabilities,
     )
+}
+
+/// Load a statically-linked bundled plugin from its vtable.
+///
+/// This bypasses filesystem discovery and `dlopen` entirely.  The plugin's
+/// descriptor is obtained by calling the vtable's `entry` function pointer
+/// directly, and the resulting [`LoadedPlugin`] dispatches all subsequent calls
+/// through the same vtable.
+///
+/// # Errors
+///
+/// Returns an error when the descriptor cannot be parsed or validated.
+pub fn load_static_plugin(
+    registered_plugin: &RegisteredPlugin,
+    vtable: StaticPluginVtable,
+    host: &HostMetadata,
+    available_capabilities: &BTreeMap<HostScope, crate::CapabilityProvider>,
+) -> Result<LoadedPlugin> {
+    let descriptor_ptr = (vtable.entry)();
+    if descriptor_ptr.is_null() {
+        return Err(PluginError::NullNativeDescriptor {
+            plugin_id: registered_plugin.declaration.id.as_str().to_string(),
+            symbol: "static_vtable::entry".to_string(),
+        });
+    }
+    let descriptor_cstr = unsafe { CStr::from_ptr(descriptor_ptr) };
+    let descriptor_text =
+        descriptor_cstr
+            .to_str()
+            .map_err(|_| PluginError::InvalidNativeDescriptor {
+                plugin_id: registered_plugin.declaration.id.as_str().to_string(),
+                symbol: "static_vtable::entry".to_string(),
+                details: "descriptor is not valid UTF-8".to_string(),
+            })?;
+
+    let native_descriptor = NativeDescriptor::from_toml_str(descriptor_text)?;
+    let declaration =
+        native_descriptor.into_declaration(registered_plugin.declaration.entrypoint.clone())?;
+
+    // Validate against host capabilities (skip entry file existence check
+    // since there is no file -- the plugin is compiled into the binary).
+    let synthetic = RegisteredPlugin {
+        declaration: declaration.clone(),
+        ..registered_plugin.clone()
+    };
+    PluginRegistry::validate_static_plugin(&synthetic, host, available_capabilities)?;
+
+    compare_manifest_and_descriptor(registered_plugin, &declaration)?;
+
+    Ok(LoadedPlugin {
+        registered: registered_plugin.clone(),
+        declaration,
+        backend: PluginBackend::Static(vtable),
+    })
 }
 
 fn load_native_declaration(
@@ -1858,7 +2011,9 @@ fn ensure_match(
 
 #[cfg(test)]
 mod tests {
-    use super::{LoadedPlugin, NativeDescriptor, NativeLifecycleContext, NativeServiceContext};
+    use super::{
+        LoadedPlugin, NativeDescriptor, NativeLifecycleContext, NativeServiceContext, PluginBackend,
+    };
     use crate::{
         ApiVersion, DEFAULT_NATIVE_ENTRY_SYMBOL, HostMetadata, PluginEntrypoint, PluginEvent,
         PluginEventKind, PluginEventSubscription, PluginManifest, PluginRegistry,
@@ -2228,7 +2383,7 @@ minimum = "1.0"
                 symbol: DEFAULT_NATIVE_ENTRY_SYMBOL.to_string(),
             })
             .expect("declaration should build"),
-            _library: library,
+            backend: PluginBackend::Dynamic(library),
         };
 
         assert_eq!(loaded.commands().len(), 1);
@@ -3250,7 +3405,7 @@ minimum = "1.0"
                 dependencies: Vec::new(),
                 lifecycle: crate::PluginLifecycle::default(),
             },
-            _library: library,
+            backend: PluginBackend::Dynamic(library),
         };
 
         assert!(loaded.receives_event(&PluginEvent {

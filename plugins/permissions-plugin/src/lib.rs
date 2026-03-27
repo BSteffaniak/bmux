@@ -13,7 +13,7 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 #[derive(Default)]
-struct PermissionsPlugin;
+pub struct PermissionsPlugin;
 
 impl RustPlugin for PermissionsPlugin {
     fn descriptor(&self) -> NativeDescriptor {
@@ -570,6 +570,7 @@ struct CommandAckResponse {
     ok: bool,
 }
 
+#[cfg(not(feature = "static-bundled"))]
 bmux_plugin::export_plugin!(PermissionsPlugin);
 
 #[cfg(test)]

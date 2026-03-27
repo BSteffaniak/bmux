@@ -55,7 +55,8 @@ pub use host_services::{
 pub use loader::{
     HostKernelBridge, HostKernelBridgeRequest, HostKernelBridgeResponse, LoadedPlugin,
     NativeCommandContext, NativeDescriptor, NativeLifecycleContext, NativePluginLoader,
-    NativeServiceContext, ServiceCaller, load_registered_plugin,
+    NativeServiceContext, ServiceCaller, StaticPluginVtable, load_registered_plugin,
+    load_static_plugin,
 };
 pub use manifest::{
     PluginManifest, PluginManifestCompatibility, PluginManifestKeybindings, PluginRuntime,
@@ -170,4 +171,80 @@ macro_rules! export_plugin {
             )
         }
     };
+}
+
+/// Build a [`StaticPluginVtable`] for a [`RustPlugin`] type.
+///
+/// Unlike [`export_plugin!`], the generated functions are module-scoped
+/// (not `#[no_mangle] extern "C"`), so multiple plugins can coexist in
+/// the same binary without symbol collisions.  Each invocation gets its
+/// own `OnceLock<Mutex<P>>` static, ensuring plugin state isolation.
+///
+/// **Important:** For a given plugin type, this macro must be invoked at
+/// exactly one call site.  Multiple call sites for the same `$plugin_ty`
+/// will produce independent `OnceLock` instances with separate state,
+/// which is almost certainly not what you want.
+///
+/// # Example
+///
+/// ```ignore
+/// let vtable = bmux_plugin::bundled_plugin_vtable!(MyPlugin);
+/// ```
+#[macro_export]
+macro_rules! bundled_plugin_vtable {
+    ($plugin_ty:ty) => {{
+        fn __instance() -> &'static ::std::sync::Mutex<$plugin_ty> {
+            static INSTANCE: ::std::sync::OnceLock<::std::sync::Mutex<$plugin_ty>> =
+                ::std::sync::OnceLock::new();
+            $crate::__private::plugin_instance(&INSTANCE)
+        }
+
+        fn __entry() -> *const ::std::ffi::c_char {
+            static DESCRIPTOR: ::std::sync::OnceLock<Option<::std::ffi::CString>> =
+                ::std::sync::OnceLock::new();
+            $crate::__private::descriptor_ptr(__instance(), &DESCRIPTOR)
+        }
+
+        fn __run_command_with_context(context: *const ::std::ffi::c_char) -> i32 {
+            $crate::__private::run_command_export(__instance(), context)
+        }
+
+        fn __activate(context: *const ::std::ffi::c_char) -> i32 {
+            $crate::__private::activate_export(__instance(), context)
+        }
+
+        fn __deactivate(context: *const ::std::ffi::c_char) -> i32 {
+            $crate::__private::deactivate_export(__instance(), context)
+        }
+
+        fn __handle_event(event: *const ::std::ffi::c_char) -> i32 {
+            $crate::__private::handle_event_export(__instance(), event)
+        }
+
+        fn __invoke_service(
+            input_ptr: *const u8,
+            input_len: usize,
+            output_ptr: *mut u8,
+            output_capacity: usize,
+            output_len: *mut usize,
+        ) -> i32 {
+            $crate::__private::invoke_service_export(
+                __instance(),
+                input_ptr,
+                input_len,
+                output_ptr,
+                output_capacity,
+                output_len,
+            )
+        }
+
+        $crate::StaticPluginVtable {
+            entry: __entry,
+            run_command_with_context: __run_command_with_context,
+            activate: __activate,
+            deactivate: __deactivate,
+            handle_event: __handle_event,
+            invoke_service: __invoke_service,
+        }
+    }};
 }
