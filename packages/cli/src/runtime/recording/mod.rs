@@ -1030,6 +1030,7 @@ fn render_screen_rgba_resvg(
             match current_run.take() {
                 Some(mut run) if run.style == style => {
                     run.text.push_str(cell_text);
+                    run.cell_count = run.cell_count.saturating_add(1);
                     current_run = Some(run);
                 }
                 Some(run) => {
@@ -1037,6 +1038,7 @@ fn render_screen_rgba_resvg(
                     current_run = Some(TextRun {
                         start_col: col,
                         text: cell_text.to_string(),
+                        cell_count: 1,
                         style,
                     });
                 }
@@ -1044,6 +1046,7 @@ fn render_screen_rgba_resvg(
                     current_run = Some(TextRun {
                         start_col: col,
                         text: cell_text.to_string(),
+                        cell_count: 1,
                         style,
                     });
                 }
@@ -1053,21 +1056,20 @@ fn render_screen_rgba_resvg(
             row_runs.push(run);
         }
         for run in row_runs {
-            if run.text.trim().is_empty() {
-                continue;
-            }
             let x0 = usize::from(run.start_col).saturating_mul(cell_w_usize);
             let y0 = usize::from(row).saturating_mul(cell_h_usize);
             let text_y = y0 as f32 + y_offset;
             let style_attrs = svg_style_attrs(&run.style);
+            let text_length = usize::from(run.cell_count).saturating_mul(cell_w_usize);
             write!(
                 &mut svg,
-                "<text x=\"{}\" y=\"{:.3}\" fill=\"rgb({},{},{})\" xml:space=\"preserve\"{}>{}</text>",
+                "<text x=\"{}\" y=\"{:.3}\" fill=\"rgb({},{},{})\" xml:space=\"preserve\" textLength=\"{}\" lengthAdjust=\"spacingAndGlyphs\"{}>{}</text>",
                 x0,
                 text_y,
                 run.style.fg_rgb.0,
                 run.style.fg_rgb.1,
                 run.style.fg_rgb.2,
+                text_length,
                 style_attrs,
                 xml_escape_text(&run.text)
             )
@@ -1116,6 +1118,7 @@ struct TextStyle {
 struct TextRun {
     start_col: u16,
     text: String,
+    cell_count: u16,
     style: TextStyle,
 }
 
