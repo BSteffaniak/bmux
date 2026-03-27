@@ -64,7 +64,7 @@ default = ["bundled-fonts", "logging"]
 fail-on-warnings = []
 
 # Optional features
-bundled-fonts = ["bmux_fonts/bundled-ghostty-fonts"]
+bundled-fonts = ["bmux_fonts/bundled-nerd-fonts"]
 logging       = ["dep:tracing-appender", "dep:tracing-subscriber"]
 
 # Serialization features

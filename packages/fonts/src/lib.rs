@@ -63,38 +63,38 @@ pub fn load_preset_fonts_for_ab_glyph(preset: FontPreset) -> Vec<FontArc> {
 
 pub fn bundled_fonts_for_preset(preset: FontPreset) -> &'static [EmbeddedFont] {
     match preset {
-        FontPreset::GhosttyNerd => ghostty_nerd_fonts(),
+        FontPreset::GhosttyNerd => nerd_jetbrains_fonts(),
         FontPreset::SystemMonospace => &[],
     }
 }
 
-#[cfg(feature = "bundled-ghostty-fonts")]
-fn ghostty_nerd_fonts() -> &'static [EmbeddedFont] {
+#[cfg(feature = "bundled-nerd-fonts")]
+fn nerd_jetbrains_fonts() -> &'static [EmbeddedFont] {
     &[
         EmbeddedFont {
             family: "JetBrainsMono Nerd Font",
             style: FontStyle::Regular,
-            data: include_bytes!("../assets/ghostty/JetBrainsMonoNerdFont-Regular.ttf"),
+            data: include_bytes!("../assets/nerd-fonts/JetBrainsMonoNerdFont-Regular.ttf"),
         },
         EmbeddedFont {
             family: "JetBrainsMono Nerd Font",
             style: FontStyle::Bold,
-            data: include_bytes!("../assets/ghostty/JetBrainsMonoNerdFont-Bold.ttf"),
+            data: include_bytes!("../assets/nerd-fonts/JetBrainsMonoNerdFont-Bold.ttf"),
         },
         EmbeddedFont {
             family: "JetBrainsMono Nerd Font",
             style: FontStyle::Italic,
-            data: include_bytes!("../assets/ghostty/JetBrainsMonoNerdFont-Italic.ttf"),
+            data: include_bytes!("../assets/nerd-fonts/JetBrainsMonoNerdFont-Italic.ttf"),
         },
         EmbeddedFont {
             family: "JetBrainsMono Nerd Font",
             style: FontStyle::BoldItalic,
-            data: include_bytes!("../assets/ghostty/JetBrainsMonoNerdFont-BoldItalic.ttf"),
+            data: include_bytes!("../assets/nerd-fonts/JetBrainsMonoNerdFont-BoldItalic.ttf"),
         },
     ]
 }
 
-#[cfg(not(feature = "bundled-ghostty-fonts"))]
-fn ghostty_nerd_fonts() -> &'static [EmbeddedFont] {
+#[cfg(not(feature = "bundled-nerd-fonts"))]
+fn nerd_jetbrains_fonts() -> &'static [EmbeddedFont] {
     &[]
 }

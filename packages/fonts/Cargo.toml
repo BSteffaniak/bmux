@@ -13,5 +13,6 @@ fontdb   = { workspace = true }
 
 [features]
 bundled-fonts         = []
-bundled-ghostty-fonts = ["bundled-fonts"]
+bundled-ghostty-fonts = ["bundled-nerd-fonts"]
+bundled-nerd-fonts    = ["bundled-fonts"]
 default               = []
