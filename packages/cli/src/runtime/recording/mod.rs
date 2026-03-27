@@ -1187,22 +1187,29 @@ fn compute_font_grid_metrics(
 ) -> Option<FontGridMetrics> {
     let primary_font = primary_font_for_metrics(options)?;
     let unit_scale = PxScale { x: 1.0, y: 1.0 };
-    let unit_scaled = primary_font.as_scaled(unit_scale);
     let unit_face_width = ascii_cell_width(&primary_font, unit_scale).max(0.0001);
-    let unit_face_height =
-        (unit_scaled.ascent() - unit_scaled.descent() + unit_scaled.line_gap()).max(0.0001);
+    let (unit_ascent, unit_descent, unit_line_gap) = font_vertical_metrics_px(&primary_font, 1.0)
+        .unwrap_or_else(|| {
+            let scaled = primary_font.as_scaled(unit_scale);
+            (scaled.ascent(), scaled.descent(), scaled.line_gap())
+        });
+    let unit_face_height = (unit_ascent - unit_descent + unit_line_gap).max(0.0001);
     let target_w = f32::from(cell_w).max(1.0);
     let target_h = f32::from(cell_h).max(1.0);
     let font_size =
         solve_font_size_for_target_cells(unit_face_width, unit_face_height, target_w, target_h)?;
 
-    let scaled = primary_font.as_scaled(PxScale {
-        x: font_size,
-        y: font_size,
-    });
-    let face_height = (scaled.ascent() - scaled.descent() + scaled.line_gap()).max(0.0001);
-    let half_line_gap = scaled.line_gap() / 2.0;
-    let face_baseline = half_line_gap - scaled.descent();
+    let (ascent, descent, line_gap) = font_vertical_metrics_px(&primary_font, font_size)
+        .unwrap_or_else(|| {
+            let scaled = primary_font.as_scaled(PxScale {
+                x: font_size,
+                y: font_size,
+            });
+            (scaled.ascent(), scaled.descent(), scaled.line_gap())
+        });
+    let face_height = (ascent - descent + line_gap).max(0.0001);
+    let half_line_gap = line_gap / 2.0;
+    let face_baseline = half_line_gap - descent;
     let cell_height = target_h;
     let cell_baseline = (face_baseline - (cell_height - face_height) / 2.0).round();
     let top_to_baseline = (cell_height - cell_baseline).max(0.0);
@@ -1211,6 +1218,19 @@ fn compute_font_grid_metrics(
         font_size_px: font_size,
         top_to_baseline_px: top_to_baseline,
     })
+}
+
+fn font_vertical_metrics_px(font: &FontArc, size_px: f32) -> Option<(f32, f32, f32)> {
+    if !(size_px.is_finite() && size_px > 0.0) {
+        return None;
+    }
+    let face = ttf_parser::Face::parse(font.font_data(), 0).ok()?;
+    let units_per_em = f32::from(face.units_per_em()).max(1.0);
+    let px_per_unit = size_px / units_per_em;
+    let ascent = f32::from(face.ascender()) * px_per_unit;
+    let descent = f32::from(face.descender()) * px_per_unit;
+    let line_gap = f32::from(face.line_gap()) * px_per_unit;
+    Some((ascent, descent, line_gap))
 }
 
 fn ascii_cell_width(font: &FontArc, scale: PxScale) -> f32 {

@@ -52,6 +52,7 @@ toml = { workspace = true }
 tracing = { workspace = true, features = ["std"] }
 tracing-appender = { workspace = true, optional = true }
 tracing-subscriber = { workspace = true, features = ["fmt"], optional = true }
+ttf-parser = { workspace = true }
 unicode-width = { workspace = true }
 uuid = { workspace = true, features = ["std"] }
 vt100 = { workspace = true }

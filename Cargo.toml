@@ -118,6 +118,7 @@ toml = { version = "0.8.23", default-features = false, features = ["display"] }
 tracing = { version = "0.1.44", default-features = false }
 tracing-appender = { version = "0.2.3", default-features = false }
 tracing-subscriber = { version = "0.3.23", default-features = false }
+ttf-parser = { version = "0.25.1", default-features = true }
 unicode-width = { version = "0.2.2", default-features = false }
 uuid = { version = "1.21.0", default-features = false }
 vt100 = { version = "0.16.2", default-features = false }
