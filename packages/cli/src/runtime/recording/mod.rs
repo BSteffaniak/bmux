@@ -1,7 +1,9 @@
 use super::*;
 use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont, point};
 use font8x8::UnicodeFonts;
+use resvg::{tiny_skia, usvg};
 use std::collections::{HashMap, HashSet};
+use std::fmt::Write as _;
 
 mod terminal_profile;
 
@@ -789,18 +791,46 @@ fn export_recording_gif(
                     let delta_ns = scaled_ns.saturating_sub(previous);
                     ((delta_ns / 10_000_000).max(1).min(u64::from(u16::MAX))) as u16
                 });
-                let mut pixels = render_screen_rgba(
-                    parser.screen(),
-                    current_rows,
-                    current_cols,
-                    max_rows,
-                    max_cols,
-                    cell_w,
-                    cell_h,
-                    &palette,
-                    glyph_renderer.as_mut(),
-                    &mut bitmap_cache,
-                );
+                let mut pixels = if render_options.mode == RecordingRenderMode::Font {
+                    render_screen_rgba_resvg(
+                        parser.screen(),
+                        current_rows,
+                        current_cols,
+                        max_rows,
+                        max_cols,
+                        cell_w,
+                        cell_h,
+                        &palette,
+                        &render_options,
+                    )
+                    .unwrap_or_else(|_| {
+                        render_screen_rgba(
+                            parser.screen(),
+                            current_rows,
+                            current_cols,
+                            max_rows,
+                            max_cols,
+                            cell_w,
+                            cell_h,
+                            &palette,
+                            glyph_renderer.as_mut(),
+                            &mut bitmap_cache,
+                        )
+                    })
+                } else {
+                    render_screen_rgba(
+                        parser.screen(),
+                        current_rows,
+                        current_cols,
+                        max_rows,
+                        max_cols,
+                        cell_w,
+                        cell_h,
+                        &palette,
+                        glyph_renderer.as_mut(),
+                        &mut bitmap_cache,
+                    )
+                };
                 let mut frame = GifFrame::from_rgba_speed(width, height, &mut pixels, 1);
                 frame.delay = delay_cs;
                 encoder
@@ -910,6 +940,157 @@ fn render_screen_rgba(
     }
 
     pixels
+}
+
+fn render_screen_rgba_resvg(
+    screen: &vt100::Screen,
+    rows: u16,
+    cols: u16,
+    max_rows: u16,
+    max_cols: u16,
+    cell_w: u16,
+    cell_h: u16,
+    palette: &[(u8, u8, u8)],
+    options: &RenderOptions,
+) -> Result<Vec<u8>> {
+    let width = usize::from(max_cols.saturating_mul(cell_w));
+    let height = usize::from(max_rows.saturating_mul(cell_h));
+    let width_u32 = u32::try_from(width).context("render width exceeds u32")?;
+    let height_u32 = u32::try_from(height).context("render height exceeds u32")?;
+    let cell_w_usize = usize::from(cell_w);
+    let cell_h_usize = usize::from(cell_h);
+
+    let mut families = if options.font_families.is_empty() {
+        default_font_families_for_rendering()
+    } else {
+        options.font_families.clone()
+    };
+    if families.is_empty() {
+        families.push("monospace".to_string());
+    }
+    let font_size = options.font_size_px.unwrap_or(f32::from(cell_h).max(8.0));
+    let text_height = (font_size * options.line_height_mult.max(1.0)).max(font_size);
+    let y_offset = ((f32::from(cell_h) - text_height) / 2.0).max(0.0);
+    let font_family_attr = svg_font_family_list(&families);
+
+    let mut svg = String::with_capacity(width.saturating_mul(height / 4).max(1024));
+    write!(
+        &mut svg,
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" viewBox=\"0 0 {} {}\">",
+        width, height, width, height
+    )
+    .expect("svg write cannot fail");
+    write!(
+        &mut svg,
+        "<g font-family=\"{}\" font-size=\"{:.3}\" text-rendering=\"optimizeLegibility\" dominant-baseline=\"text-before-edge\">",
+        xml_escape_attr(&font_family_attr),
+        font_size
+    )
+    .expect("svg write cannot fail");
+
+    for row in 0..rows {
+        for col in 0..cols {
+            let Some(cell) = screen.cell(row, col) else {
+                continue;
+            };
+            let mut fg = vt100_color_to_palette_index(cell.fgcolor(), true);
+            let mut bg = vt100_color_to_palette_index(cell.bgcolor(), false);
+            if cell.inverse() {
+                std::mem::swap(&mut fg, &mut bg);
+            }
+            let (fg_r, fg_g, fg_b) = palette[usize::from(fg)];
+            let (bg_r, bg_g, bg_b) = palette[usize::from(bg)];
+            let x0 = usize::from(col).saturating_mul(cell_w_usize);
+            let y0 = usize::from(row).saturating_mul(cell_h_usize);
+            write!(
+                &mut svg,
+                "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"rgb({},{},{})\"/>",
+                x0, y0, cell_w_usize, cell_h_usize, bg_r, bg_g, bg_b
+            )
+            .expect("svg write cannot fail");
+
+            let glyph_char = if cell.has_contents() {
+                cell.contents().chars().next().unwrap_or(' ')
+            } else {
+                ' '
+            };
+            if glyph_char == ' ' {
+                continue;
+            }
+            let text_y = y0 as f32 + y_offset;
+            write!(
+                &mut svg,
+                "<text x=\"{}\" y=\"{:.3}\" fill=\"rgb({},{},{})\">{}</text>",
+                x0,
+                text_y,
+                fg_r,
+                fg_g,
+                fg_b,
+                xml_escape_text_char(glyph_char)
+            )
+            .expect("svg write cannot fail");
+        }
+    }
+
+    svg.push_str("</g></svg>");
+
+    let mut options_usvg = usvg::Options::default();
+    options_usvg.font_family = families
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "monospace".to_string());
+    options_usvg.font_size = font_size;
+    let fontdb = options_usvg.fontdb_mut();
+    fontdb.load_system_fonts();
+    for path in &options.font_paths {
+        let Ok(meta) = std::fs::metadata(path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            fontdb.load_fonts_dir(path);
+        } else if meta.is_file() {
+            let _ = fontdb.load_font_file(path);
+        }
+    }
+
+    let tree = usvg::Tree::from_str(&svg, &options_usvg).context("failed to parse SVG frame")?;
+    let mut pixmap = tiny_skia::Pixmap::new(width_u32, height_u32)
+        .ok_or_else(|| anyhow::anyhow!("failed to allocate pixmap for SVG frame"))?;
+    resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
+    Ok(pixmap.take())
+}
+
+fn svg_font_family_list(families: &[String]) -> String {
+    families
+        .iter()
+        .map(|value| format!("'{}'", value.replace('\'', "\\'")))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn xml_escape_attr(input: &str) -> String {
+    input
+        .chars()
+        .flat_map(|ch| match ch {
+            '&' => "&amp;".chars().collect::<Vec<_>>(),
+            '<' => "&lt;".chars().collect::<Vec<_>>(),
+            '>' => "&gt;".chars().collect::<Vec<_>>(),
+            '\"' => "&quot;".chars().collect::<Vec<_>>(),
+            '\'' => "&apos;".chars().collect::<Vec<_>>(),
+            _ => vec![ch],
+        })
+        .collect()
+}
+
+fn xml_escape_text_char(ch: char) -> String {
+    match ch {
+        '&' => "&amp;".to_string(),
+        '<' => "&lt;".to_string(),
+        '>' => "&gt;".to_string(),
+        '"' => "&quot;".to_string(),
+        '\'' => "&apos;".to_string(),
+        _ => ch.to_string(),
+    }
 }
 
 fn draw_bitmap_glyph_rgba(
@@ -1130,9 +1311,7 @@ impl GlyphRenderer {
     fn new(cell_w: u16, cell_h: u16, options: &RenderOptions) -> Option<Self> {
         let fonts = load_monospace_fonts(options);
         let font = fonts.first()?;
-        let base_font_size = options
-            .font_size_px
-            .unwrap_or((f32::from(cell_h) * 0.9).max(8.0));
+        let base_font_size = options.font_size_px.unwrap_or(f32::from(cell_h).max(8.0));
         let base_scale = PxScale {
             x: base_font_size,
             y: base_font_size,

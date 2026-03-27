@@ -42,6 +42,7 @@ moosicbox_log_watch = { workspace = true, features = [
 portable-pty = { workspace = true }
 ratatui = { workspace = true }
 regex = { workspace = true }
+resvg = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 time = { workspace = true, features = ["formatting", "parsing", "std"] }
