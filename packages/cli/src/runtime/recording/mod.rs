@@ -1180,17 +1180,23 @@ struct FontGridMetrics {
     top_to_baseline_px: f32,
 }
 
+struct PrimaryFontSource {
+    font: FontArc,
+    bytes: Vec<u8>,
+    face_index: u32,
+}
+
 fn compute_font_grid_metrics(
     cell_w: u16,
     cell_h: u16,
     options: &RenderOptions,
 ) -> Option<FontGridMetrics> {
-    let primary_font = primary_font_for_metrics(options)?;
+    let primary = primary_font_source_for_metrics(options)?;
     let unit_scale = PxScale { x: 1.0, y: 1.0 };
-    let unit_face_width = ascii_cell_width(&primary_font, unit_scale).max(0.0001);
-    let (unit_ascent, unit_descent, unit_line_gap) = font_vertical_metrics_px(&primary_font, 1.0)
-        .unwrap_or_else(|| {
-            let scaled = primary_font.as_scaled(unit_scale);
+    let unit_face_width = ascii_cell_width(&primary.font, unit_scale).max(0.0001);
+    let (unit_ascent, unit_descent, unit_line_gap) =
+        font_vertical_metrics_px(&primary.bytes, primary.face_index, 1.0).unwrap_or_else(|| {
+            let scaled = primary.font.as_scaled(unit_scale);
             (scaled.ascent(), scaled.descent(), scaled.line_gap())
         });
     let unit_face_height = (unit_ascent - unit_descent + unit_line_gap).max(0.0001);
@@ -1199,14 +1205,16 @@ fn compute_font_grid_metrics(
     let font_size =
         solve_font_size_for_target_cells(unit_face_width, unit_face_height, target_w, target_h)?;
 
-    let (ascent, descent, line_gap) = font_vertical_metrics_px(&primary_font, font_size)
-        .unwrap_or_else(|| {
-            let scaled = primary_font.as_scaled(PxScale {
-                x: font_size,
-                y: font_size,
-            });
-            (scaled.ascent(), scaled.descent(), scaled.line_gap())
-        });
+    let (ascent, descent, line_gap) =
+        font_vertical_metrics_px(&primary.bytes, primary.face_index, font_size).unwrap_or_else(
+            || {
+                let scaled = primary.font.as_scaled(PxScale {
+                    x: font_size,
+                    y: font_size,
+                });
+                (scaled.ascent(), scaled.descent(), scaled.line_gap())
+            },
+        );
     let face_height = (ascent - descent + line_gap).max(0.0001);
     let half_line_gap = line_gap / 2.0;
     let face_baseline = half_line_gap - descent;
@@ -1220,11 +1228,15 @@ fn compute_font_grid_metrics(
     })
 }
 
-fn font_vertical_metrics_px(font: &FontArc, size_px: f32) -> Option<(f32, f32, f32)> {
+fn font_vertical_metrics_px(
+    font_data: &[u8],
+    face_index: u32,
+    size_px: f32,
+) -> Option<(f32, f32, f32)> {
     if !(size_px.is_finite() && size_px > 0.0) {
         return None;
     }
-    let face = ttf_parser::Face::parse(font.font_data(), 0).ok()?;
+    let face = ttf_parser::Face::parse(font_data, face_index).ok()?;
     let units_per_em = f32::from(face.units_per_em()).max(1.0);
     let px_per_unit = size_px / units_per_em;
     let ascent = f32::from(face.ascender()) * px_per_unit;
@@ -1297,22 +1309,113 @@ fn solve_font_size_for_target_cells(
     best.map(|(value, _)| value)
 }
 
-fn primary_font_for_metrics(options: &RenderOptions) -> Option<FontArc> {
-    if let Some(path) = options.font_paths.iter().find(|path| {
-        std::fs::metadata(path)
-            .map(|meta| meta.is_file())
-            .unwrap_or(false)
-    }) {
-        if let Ok(bytes) = std::fs::read(path)
-            && let Ok(font) = FontVec::try_from_vec_and_index(bytes, 0)
-        {
-            return Some(FontArc::new(font));
+fn primary_font_source_for_metrics(options: &RenderOptions) -> Option<PrimaryFontSource> {
+    let preset = font_preset_for_options(options);
+
+    let mut db = fontdb::Database::new();
+    let _ = bmux_fonts::register_preset_fonts(&mut db, preset);
+    db.load_system_fonts();
+    for path in &options.font_paths {
+        let Ok(meta) = std::fs::metadata(path) else {
+            continue;
+        };
+        if meta.is_dir() {
+            db.load_fonts_dir(path);
+        } else if meta.is_file() {
+            let _ = db.load_font_file(path);
         }
     }
-    let preset = font_preset_for_options(options);
-    bmux_fonts::load_preset_fonts_for_ab_glyph(preset)
-        .into_iter()
-        .next()
+
+    let mut families = Vec::<String>::new();
+    if !options.font_families.is_empty() {
+        families.extend(options.font_families.iter().cloned());
+    }
+    families.extend(bmux_fonts::default_families_for_preset(preset));
+    let mut seen = HashSet::<String>::new();
+    for family in families {
+        let normalized = family.trim().to_ascii_lowercase();
+        if normalized.is_empty() || !seen.insert(normalized) {
+            continue;
+        }
+        if let Some(source) = load_font_family_source_from_db(&db, &family) {
+            return Some(source);
+        }
+    }
+
+    for path in &options.font_paths {
+        let Ok(meta) = std::fs::metadata(path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        if let Ok(bytes) = std::fs::read(path)
+            && let Some(source) = primary_font_source_from_bytes(bytes, None)
+        {
+            return Some(source);
+        }
+    }
+
+    for embedded in bmux_fonts::bundled_fonts_for_preset(preset) {
+        if let Some(source) = primary_font_source_from_bytes(embedded.data.to_vec(), None) {
+            return Some(source);
+        }
+    }
+
+    None
+}
+
+fn primary_font_source_from_bytes(
+    bytes: Vec<u8>,
+    preferred_face_index: Option<u32>,
+) -> Option<PrimaryFontSource> {
+    if let Some(face_index) = preferred_face_index
+        && let Ok(font) = FontVec::try_from_vec_and_index(bytes.clone(), face_index)
+    {
+        return Some(PrimaryFontSource {
+            font: FontArc::new(font),
+            bytes,
+            face_index,
+        });
+    }
+
+    let face_count = ttf_parser::fonts_in_collection(&bytes).unwrap_or(1);
+    for face_index in 0..face_count {
+        let Ok(font) = FontVec::try_from_vec_and_index(bytes.clone(), face_index) else {
+            continue;
+        };
+        return Some(PrimaryFontSource {
+            font: FontArc::new(font),
+            bytes,
+            face_index,
+        });
+    }
+
+    None
+}
+
+fn load_font_family_source_from_db(
+    db: &fontdb::Database,
+    family: &str,
+) -> Option<PrimaryFontSource> {
+    let query = fontdb::Query {
+        families: &[fontdb::Family::Name(family)],
+        weight: fontdb::Weight::NORMAL,
+        stretch: fontdb::Stretch::Normal,
+        style: fontdb::Style::Normal,
+    };
+    let face_id = db.query(&query)?;
+    db.with_face_data(face_id, |font_data, face_index| {
+        let bytes = font_data.to_vec();
+        let Ok(font) = FontVec::try_from_vec_and_index(bytes.clone(), face_index) else {
+            return None;
+        };
+        Some(PrimaryFontSource {
+            font: FontArc::new(font),
+            bytes,
+            face_index,
+        })
+    })?
 }
 
 fn svg_font_family_list(families: &[String]) -> String {
