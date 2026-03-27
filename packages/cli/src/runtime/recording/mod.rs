@@ -970,12 +970,15 @@ fn render_screen_rgba_resvg(
     if families.is_empty() {
         families.push("monospace".to_string());
     }
+    let metrics = compute_font_grid_metrics(cell_w, cell_h, options);
     let font_size = options
         .font_size_px
-        .or_else(|| calibrate_cell_font_size(cell_w, cell_h, options))
+        .or_else(|| metrics.as_ref().map(|value| value.font_size_px))
         .unwrap_or((f32::from(cell_h) * 0.9).max(8.0));
-    let line_height = (font_size * options.line_height_mult.max(1.0)).max(font_size);
-    let y_offset = ((f32::from(cell_h) - line_height) / 2.0).max(0.0).round();
+    let top_to_baseline = metrics
+        .as_ref()
+        .map(|value| value.top_to_baseline_px)
+        .unwrap_or(f32::from(cell_h) * 0.8);
     let font_family_attr = svg_font_family_list(&families);
 
     let mut svg = String::with_capacity(width.saturating_mul(height / 4).max(1024));
@@ -987,7 +990,7 @@ fn render_screen_rgba_resvg(
     .expect("svg write cannot fail");
     write!(
         &mut svg,
-        "<g font-family=\"{}\" font-size=\"{:.3}\" text-rendering=\"optimizeLegibility\" dominant-baseline=\"text-before-edge\" font-kerning=\"none\" font-variant-ligatures=\"none\">",
+        "<g font-family=\"{}\" font-size=\"{:.3}\" text-rendering=\"optimizeLegibility\" dominant-baseline=\"alphabetic\" font-kerning=\"none\" font-variant-ligatures=\"none\">",
         xml_escape_attr(&font_family_attr),
         font_size
     )
@@ -1058,7 +1061,7 @@ fn render_screen_rgba_resvg(
         for run in row_runs {
             let x0 = usize::from(run.start_col).saturating_mul(cell_w_usize);
             let y0 = usize::from(row).saturating_mul(cell_h_usize);
-            let text_y = y0 as f32 + y_offset;
+            let text_y = y0 as f32 + top_to_baseline;
             let style_attrs = svg_style_attrs(&run.style);
             let text_length = usize::from(run.cell_count).saturating_mul(cell_w_usize);
             write!(
@@ -1172,16 +1175,106 @@ fn svg_style_attrs(style: &TextStyle) -> String {
     attrs
 }
 
-fn calibrate_cell_font_size(cell_w: u16, cell_h: u16, options: &RenderOptions) -> Option<f32> {
+struct FontGridMetrics {
+    font_size_px: f32,
+    top_to_baseline_px: f32,
+}
+
+fn compute_font_grid_metrics(
+    cell_w: u16,
+    cell_h: u16,
+    options: &RenderOptions,
+) -> Option<FontGridMetrics> {
     let primary_font = primary_font_for_metrics(options)?;
-    let scale = PxScale { x: 1.0, y: 1.0 };
-    let scaled = primary_font.as_scaled(scale);
-    let unit_advance = scaled.h_advance(primary_font.glyph_id('M')).max(0.0001);
-    let unit_height = (scaled.ascent() - scaled.descent()).max(0.0001);
-    let width_target = (f32::from(cell_w) * 0.95).max(1.0);
-    let height_target = ((f32::from(cell_h) / options.line_height_mult.max(1.0)) * 0.95).max(1.0);
-    let size = (width_target / unit_advance).min(height_target / unit_height);
-    (size.is_finite() && size > 1.0).then_some(size)
+    let unit_scale = PxScale { x: 1.0, y: 1.0 };
+    let unit_scaled = primary_font.as_scaled(unit_scale);
+    let unit_face_width = ascii_cell_width(&primary_font, unit_scale).max(0.0001);
+    let unit_face_height =
+        (unit_scaled.ascent() - unit_scaled.descent() + unit_scaled.line_gap()).max(0.0001);
+    let target_w = f32::from(cell_w).max(1.0);
+    let target_h = f32::from(cell_h).max(1.0);
+    let font_size =
+        solve_font_size_for_target_cells(unit_face_width, unit_face_height, target_w, target_h)?;
+
+    let scaled = primary_font.as_scaled(PxScale {
+        x: font_size,
+        y: font_size,
+    });
+    let face_height = (scaled.ascent() - scaled.descent() + scaled.line_gap()).max(0.0001);
+    let half_line_gap = scaled.line_gap() / 2.0;
+    let face_baseline = half_line_gap - scaled.descent();
+    let cell_height = target_h;
+    let cell_baseline = (face_baseline - (cell_height - face_height) / 2.0).round();
+    let top_to_baseline = (cell_height - cell_baseline).max(0.0);
+
+    Some(FontGridMetrics {
+        font_size_px: font_size,
+        top_to_baseline_px: top_to_baseline,
+    })
+}
+
+fn ascii_cell_width(font: &FontArc, scale: PxScale) -> f32 {
+    let scaled = font.as_scaled(scale);
+    let mut max_advance = 0.0_f32;
+    for codepoint in 32_u32..127_u32 {
+        let Some(ch) = char::from_u32(codepoint) else {
+            continue;
+        };
+        let glyph_id = font.glyph_id(ch);
+        if glyph_id.0 == 0 {
+            continue;
+        }
+        max_advance = max_advance.max(scaled.h_advance(glyph_id));
+    }
+    if max_advance <= 0.0 {
+        scaled.h_advance(font.glyph_id('M')).max(0.0001)
+    } else {
+        max_advance
+    }
+}
+
+fn solve_font_size_for_target_cells(
+    unit_w: f32,
+    unit_h: f32,
+    target_w: f32,
+    target_h: f32,
+) -> Option<f32> {
+    if !(unit_w.is_finite() && unit_h.is_finite() && unit_w > 0.0 && unit_h > 0.0) {
+        return None;
+    }
+
+    let h_lo = ((target_h - 0.5) / unit_h).max(0.001);
+    let h_hi = (target_h + 0.5) / unit_h;
+    if h_lo < h_hi {
+        let preferred = target_w / unit_w;
+        let size = preferred.clamp(h_lo, h_hi - f32::EPSILON);
+        return Some(size.max(0.001));
+    }
+
+    let mut candidates = Vec::new();
+    candidates.push((target_w / unit_w).max(0.001));
+    candidates.push((target_h / unit_h).max(0.001));
+    let w_lo = ((target_w - 0.5) / unit_w).max(0.001);
+    let w_hi = (target_w + 0.5) / unit_w;
+    candidates.push(w_lo);
+    candidates.push(w_hi.max(0.001));
+    candidates.push(h_lo);
+    candidates.push(h_hi.max(0.001));
+
+    let mut best = None::<(f32, f32)>;
+    for candidate in candidates {
+        if !candidate.is_finite() || candidate <= 0.0 {
+            continue;
+        }
+        let width_err = (unit_w * candidate).round() - target_w;
+        let height_err = (unit_h * candidate).round() - target_h;
+        let score = width_err.abs() + (height_err.abs() * 2.0);
+        if best.is_none_or(|(_, best_score)| score < best_score) {
+            best = Some((candidate, score));
+        }
+    }
+
+    best.map(|(value, _)| value)
 }
 
 fn primary_font_for_metrics(options: &RenderOptions) -> Option<FontArc> {
