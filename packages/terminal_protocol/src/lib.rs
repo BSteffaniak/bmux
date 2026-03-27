@@ -95,6 +95,8 @@ pub struct TerminalProtocolEngine {
     profile: ProtocolProfile,
     pane_id: Option<u16>,
     trace: Option<SharedProtocolTraceBuffer>,
+    /// Stack of kitty keyboard enhancement flags pushed by the inner program.
+    keyboard_flag_stack: Vec<u32>,
 }
 
 impl TerminalProtocolEngine {
@@ -108,6 +110,7 @@ impl TerminalProtocolEngine {
             profile,
             pane_id: None,
             trace: None,
+            keyboard_flag_stack: Vec::new(),
         }
     }
 
@@ -160,6 +163,27 @@ impl TerminalProtocolEngine {
                     self.csi_buffer.push(*byte);
 
                     if byte.is_ascii_alphabetic() {
+                        // First try kitty keyboard protocol sequences (state-changing).
+                        if *byte == b'u' {
+                            if let Some((name, reply)) =
+                                self.handle_kitty_keyboard_csi(&self.csi_buffer.clone())
+                            {
+                                self.trace_event(
+                                    "csi",
+                                    name,
+                                    ProtocolDirection::Query,
+                                    &self.csi_buffer,
+                                );
+                                if !reply.is_empty() {
+                                    self.trace_event("csi", name, ProtocolDirection::Reply, &reply);
+                                    replies.extend_from_slice(&reply);
+                                }
+                                self.state = ParseState::Ground;
+                                self.csi_buffer.clear();
+                                continue;
+                            }
+                        }
+
                         if let Some((name, reply)) =
                             csi_query_reply(&self.csi_buffer, cursor_pos, self.profile)
                         {
@@ -285,6 +309,52 @@ impl TerminalProtocolEngine {
             guard.push(event);
         }
     }
+
+    /// Handle kitty keyboard protocol CSI sequences.
+    ///
+    /// Returns `Some((name, reply_bytes))` if the sequence was recognized.
+    /// Push/pop sequences return an empty reply (they are state changes only).
+    fn handle_kitty_keyboard_csi(&mut self, sequence: &[u8]) -> Option<(&'static str, Vec<u8>)> {
+        // Only Bmux profile responds to kitty keyboard queries.
+        if !matches!(self.profile, ProtocolProfile::Bmux) {
+            return None;
+        }
+
+        match sequence {
+            // Query: CSI ? u -> reply with current flags
+            b"?u" => {
+                let flags = self.keyboard_flag_stack.last().copied().unwrap_or(0);
+                Some((
+                    "csi_kitty_keyboard_query",
+                    format!("\x1b[?{flags}u").into_bytes(),
+                ))
+            }
+            // Pop: CSI < u -> pop one level from the stack
+            b"<u" => {
+                self.keyboard_flag_stack.pop();
+                Some(("csi_kitty_keyboard_pop", Vec::new()))
+            }
+            // Push: CSI > {flags} u -> push flags onto the stack
+            _ if sequence.starts_with(b">") && sequence.ends_with(b"u") => {
+                let flags_str = &sequence[1..sequence.len() - 1];
+                let flags = std::str::from_utf8(flags_str)
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(0);
+                self.keyboard_flag_stack.push(flags);
+                Some(("csi_kitty_keyboard_push", Vec::new()))
+            }
+            _ => None,
+        }
+    }
+
+    /// Get the current kitty keyboard enhancement flags for this pane.
+    ///
+    /// Returns 0 if no flags have been pushed.
+    #[must_use]
+    pub fn keyboard_enhancement_flags(&self) -> u32 {
+        self.keyboard_flag_stack.last().copied().unwrap_or(0)
+    }
 }
 
 impl Default for TerminalProtocolEngine {
@@ -303,6 +373,9 @@ pub fn supported_query_names() -> &'static [&'static str] {
         "csi_dec_dsr_status_report",
         "csi_dec_dsr_cursor_position",
         "csi_dec_mode_report",
+        "csi_kitty_keyboard_query",
+        "csi_kitty_keyboard_push",
+        "csi_kitty_keyboard_pop",
         "osc_color_query",
         "dcs_xtgettcap_query",
         "dcs_decrqss_query",
@@ -396,6 +469,7 @@ fn dec_mode_status(profile: ProtocolProfile, mode: u16) -> u8 {
             1004 => 2,
             2004 => 2,
             1049 => 2,
+            2048 => 1, // Kitty keyboard protocol supported
             _ => 0,
         },
         ProtocolProfile::Xterm => match mode {
@@ -544,4 +618,116 @@ fn dec_dsr_cursor_response(cursor_pos: (u16, u16)) -> Vec<u8> {
         cursor_pos.1.saturating_add(1),
     );
     format!("\x1b[?{row};{col}R").into_bytes()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kitty_keyboard_query_empty_stack() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        let reply = engine.process_output(b"\x1b[?u", (0, 0));
+        assert_eq!(reply, b"\x1b[?0u");
+    }
+
+    #[test]
+    fn kitty_keyboard_push_then_query() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        // Push flags=1 (disambiguate escape codes)
+        let reply = engine.process_output(b"\x1b[>1u", (0, 0));
+        assert!(reply.is_empty(), "push should not produce a reply");
+        // Query should return 1
+        let reply = engine.process_output(b"\x1b[?u", (0, 0));
+        assert_eq!(reply, b"\x1b[?1u");
+        assert_eq!(engine.keyboard_enhancement_flags(), 1);
+    }
+
+    #[test]
+    fn kitty_keyboard_push_push_pop_query() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        // Push flags=1
+        let _ = engine.process_output(b"\x1b[>1u", (0, 0));
+        // Push flags=3
+        let _ = engine.process_output(b"\x1b[>3u", (0, 0));
+        assert_eq!(engine.keyboard_enhancement_flags(), 3);
+        // Pop -> should return to 1
+        let _ = engine.process_output(b"\x1b[<u", (0, 0));
+        let reply = engine.process_output(b"\x1b[?u", (0, 0));
+        assert_eq!(reply, b"\x1b[?1u");
+        assert_eq!(engine.keyboard_enhancement_flags(), 1);
+    }
+
+    #[test]
+    fn kitty_keyboard_pop_empty_stack() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        // Pop from empty stack should be a no-op
+        let reply = engine.process_output(b"\x1b[<u", (0, 0));
+        assert!(reply.is_empty());
+        assert_eq!(engine.keyboard_enhancement_flags(), 0);
+    }
+
+    #[test]
+    fn kitty_keyboard_not_supported_on_xterm_profile() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
+        let reply = engine.process_output(b"\x1b[?u", (0, 0));
+        assert!(
+            reply.is_empty(),
+            "xterm profile should not respond to kitty queries"
+        );
+    }
+
+    #[test]
+    fn kitty_keyboard_not_supported_on_conservative_profile() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Conservative);
+        let reply = engine.process_output(b"\x1b[?u", (0, 0));
+        assert!(reply.is_empty());
+    }
+
+    #[test]
+    fn dec_mode_2048_supported_on_bmux_profile() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        let reply = engine.process_output(b"\x1b[?2048$p", (0, 0));
+        // Mode 2048 should be reported as "1" (set) for Bmux profile.
+        assert_eq!(reply, b"\x1b[?2048;1$y");
+    }
+
+    #[test]
+    fn dec_mode_2048_unknown_on_xterm_profile() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
+        let reply = engine.process_output(b"\x1b[?2048$p", (0, 0));
+        // Mode 2048 should be reported as "0" (not recognized) for Xterm profile.
+        assert_eq!(reply, b"\x1b[?2048;0$y");
+    }
+
+    #[test]
+    fn primary_da_replies() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        let reply = engine.process_output(b"\x1b[c", (0, 0));
+        assert_eq!(reply, b"\x1b[?1;2c");
+    }
+
+    #[test]
+    fn secondary_da_replies() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        let reply = engine.process_output(b"\x1b[>c", (0, 0));
+        assert_eq!(reply, b"\x1b[>84;0;0c");
+    }
+
+    #[test]
+    fn kitty_keyboard_interleaved_with_normal_output() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
+        // Simulate normal output with embedded kitty keyboard push
+        let reply = engine.process_output(b"Hello\x1b[>1uWorld", (0, 0));
+        assert!(reply.is_empty()); // Push produces no reply
+        assert_eq!(engine.keyboard_enhancement_flags(), 1);
+    }
+
+    #[test]
+    fn supported_query_names_includes_kitty() {
+        let names = supported_query_names();
+        assert!(names.contains(&"csi_kitty_keyboard_query"));
+        assert!(names.contains(&"csi_kitty_keyboard_push"));
+        assert!(names.contains(&"csi_kitty_keyboard_pop"));
+    }
 }

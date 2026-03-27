@@ -4391,7 +4391,6 @@ async fn run_session_attach_with_client(
     };
     let attach_keymap = attach_keymap_from_config(&attach_config);
     let attach_help_lines = build_attach_help_lines(&attach_config);
-    let mut attach_input_processor = InputProcessor::new(attach_keymap.clone());
 
     if let Some(leader_client_id) = follow_target_id {
         client
@@ -4465,6 +4464,8 @@ async fn run_session_attach_with_client(
         .map_err(map_attach_client_error)?;
 
     let raw_mode_guard = RawModeGuard::enable().context("failed to enable raw mode for attach")?;
+    let mut attach_input_processor =
+        InputProcessor::new(attach_keymap.clone(), raw_mode_guard.keyboard_enhanced);
     let mut exit_reason = AttachExitReason::Detached;
 
     loop {
@@ -6406,17 +6407,45 @@ fn describe_timeout(timeout: &ResolvedTimeout) -> String {
     }
 }
 
-struct RawModeGuard;
+struct RawModeGuard {
+    keyboard_enhanced: bool,
+}
 
 impl RawModeGuard {
     fn enable() -> Result<Self> {
         enable_raw_mode().context("failed enabling raw mode")?;
-        Ok(Self)
+
+        let keyboard_enhanced =
+            crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+
+        if keyboard_enhanced {
+            use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
+            let mut stdout = io::stdout();
+            queue!(
+                stdout,
+                PushKeyboardEnhancementFlags(
+                    KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+                        | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                )
+            )
+            .context("failed to push keyboard enhancement flags")?;
+            stdout
+                .flush()
+                .context("failed to flush after pushing keyboard flags")?;
+        }
+
+        Ok(Self { keyboard_enhanced })
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        if self.keyboard_enhanced {
+            use crossterm::event::PopKeyboardEnhancementFlags;
+            let mut stdout = io::stdout();
+            let _ = queue!(stdout, PopKeyboardEnhancementFlags);
+            let _ = stdout.flush();
+        }
         let _ = disable_raw_mode();
     }
 }
@@ -7073,6 +7102,8 @@ async fn handle_attach_terminal_event(
 
 fn restore_terminal_after_attach_ui() -> Result<()> {
     let mut stdout = io::stdout();
+    // Safety net: pop keyboard enhancement flags in case the drop guard didn't run.
+    let _ = queue!(stdout, crossterm::event::PopKeyboardEnhancementFlags);
     queue!(
         stdout,
         Show,
@@ -7106,7 +7137,9 @@ fn attach_key_event_actions(
     attach_input_processor: &mut InputProcessor,
     _ui_mode: AttachUiMode,
 ) -> Result<Vec<AttachEventAction>> {
-    if key.kind != KeyEventKind::Press {
+    // Accept Press and Repeat events. Release events are filtered out here
+    // and also inside InputProcessor's crossterm adapter as a safety net.
+    if key.kind == KeyEventKind::Release {
         return Ok(vec![AttachEventAction::Ignore]);
     }
 
@@ -9532,7 +9565,8 @@ mod tests {
 
     #[test]
     fn attach_key_event_action_detaches_on_prefix_d() {
-        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
+        let mut processor =
+            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
         let _ = super::attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('a'),
@@ -9560,7 +9594,8 @@ mod tests {
 
     #[test]
     fn attach_key_event_action_ctrl_d_forwards_to_pane() {
-        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
+        let mut processor =
+            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
         let actions = super::attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('d'),
@@ -9579,7 +9614,8 @@ mod tests {
 
     #[test]
     fn attach_key_event_action_encodes_char_input() {
-        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
+        let mut processor =
+            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
         let actions = super::attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('x'),
@@ -9596,7 +9632,8 @@ mod tests {
 
     #[test]
     fn attach_key_event_action_maps_prefixed_runtime_defaults() {
-        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
+        let mut processor =
+            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
 
         let prefix = super::attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
@@ -9788,7 +9825,8 @@ mod tests {
 
     #[test]
     fn attach_key_event_action_forwards_ctrl_t_to_pane_by_default() {
-        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
+        let mut processor =
+            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
         let actions = super::attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('t'),
@@ -9808,7 +9846,8 @@ mod tests {
 
     #[test]
     fn attach_key_event_action_routes_h_to_pane_in_normal_mode() {
-        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
+        let mut processor =
+            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
 
         let normal_actions = super::attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
@@ -9830,7 +9869,8 @@ mod tests {
 
     #[test]
     fn attach_key_event_action_routes_enter_scroll_mode_to_ui() {
-        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
+        let mut processor =
+            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
 
         let _ = super::attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
@@ -9863,7 +9903,8 @@ mod tests {
 
     #[test]
     fn attach_key_event_action_routes_shift_h_as_session_ui() {
-        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
+        let mut processor =
+            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
 
         let actions = super::attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
@@ -9885,7 +9926,8 @@ mod tests {
 
     #[test]
     fn attach_key_event_action_routes_n_to_pane_in_normal_mode() {
-        let mut processor = InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()));
+        let mut processor =
+            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
 
         let normal_actions = super::attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
@@ -9911,7 +9953,7 @@ mod tests {
             .global
             .insert("ctrl+t".to_string(), "new_session".to_string());
 
-        let mut processor = InputProcessor::new(attach_keymap_from_config(&config));
+        let mut processor = InputProcessor::new(attach_keymap_from_config(&config), false);
         let actions = super::attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('t'),
@@ -10269,7 +10311,7 @@ mod tests {
     fn attach_key_event_action_maps_show_help_to_ui() {
         let config = BmuxConfig::default();
         let keymap = super::attach_keymap_from_config(&config);
-        let mut processor = InputProcessor::new(keymap);
+        let mut processor = InputProcessor::new(keymap, false);
 
         let _ = super::attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(

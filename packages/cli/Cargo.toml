@@ -21,6 +21,7 @@ bmux_event             = { workspace = true }
 bmux_fonts             = { workspace = true, default-features = false }
 bmux_ipc               = { workspace = true }
 bmux_keybind           = { workspace = true }
+bmux_keyboard          = { workspace = true }
 bmux_plugin            = { workspace = true }
 bmux_server            = { workspace = true }
 bmux_session           = { workspace = true }

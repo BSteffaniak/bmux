@@ -1,44 +1,25 @@
-use anyhow::{Result, anyhow, bail};
+mod crossterm_adapter;
+mod decoder;
+mod parse;
+
+use anyhow::{Result, bail};
 use bmux_config::{MAX_TIMEOUT_MS, MIN_TIMEOUT_MS};
 pub use bmux_keybind::RuntimeAction;
 #[cfg(test)]
 use bmux_keybind::action_to_name;
 use bmux_keybind::{action_to_config_name, parse_action};
-use crossterm::event::{
-    Event, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent, KeyEventKind, KeyModifiers,
-};
+use bmux_keyboard::{KeyCode, KeyStroke};
+use crossterm::event::Event;
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-enum KeyCode {
-    Char(char),
-    Enter,
-    Escape,
-    Tab,
-    Backspace,
-    Space,
-    ArrowUp,
-    ArrowDown,
-    ArrowLeft,
-    ArrowRight,
-    Home,
-    End,
-    PageUp,
-    PageDown,
-    Insert,
-    Delete,
-    Function(u8),
-}
+use crossterm_adapter::crossterm_event_to_input_event;
+use decoder::ByteDecoder;
+use parse::{parse_chord, parse_stroke};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-struct KeyStroke {
-    ctrl: bool,
-    alt: bool,
-    shift: bool,
-    super_key: bool,
-    key: KeyCode,
-}
+// ============================================================================
+// Types
+// ============================================================================
 
 #[derive(Debug, Clone)]
 struct KeyBinding {
@@ -69,7 +50,7 @@ pub struct KeymapDoctorReport {
 }
 
 #[derive(Debug, Clone)]
-struct DecodedStroke {
+pub(crate) struct DecodedStroke {
     stroke: KeyStroke,
     raw: Vec<u8>,
 }
@@ -81,16 +62,12 @@ enum InputEvent {
     RawBytes(Vec<u8>),
 }
 
-#[derive(Debug, Default)]
-struct ByteDecoder {
-    pending: Vec<u8>,
-}
-
 pub struct InputProcessor {
     keymap: Keymap,
     decoder: ByteDecoder,
     pending: Option<PendingChord>,
     scroll_mode: bool,
+    enhanced: bool,
 }
 
 #[derive(Debug)]
@@ -98,6 +75,10 @@ struct PendingChord {
     started_at: Instant,
     decoded: Vec<DecodedStroke>,
 }
+
+// ============================================================================
+// Keymap
+// ============================================================================
 
 impl Keymap {
     #[cfg(test)]
@@ -395,13 +376,18 @@ fn default_scroll_bindings() -> BTreeMap<String, String> {
     .collect()
 }
 
+// ============================================================================
+// InputProcessor
+// ============================================================================
+
 impl InputProcessor {
-    pub(crate) fn new(keymap: Keymap) -> Self {
+    pub(crate) fn new(keymap: Keymap, enhanced: bool) -> Self {
         Self {
             keymap,
             decoder: ByteDecoder::default(),
             pending: None,
             scroll_mode: false,
+            enhanced,
         }
     }
 
@@ -428,7 +414,7 @@ impl InputProcessor {
             self.resolve_pending(&mut actions, true);
         }
 
-        let Some(input_event) = crossterm_event_to_input_event(event) else {
+        let Some(input_event) = crossterm_event_to_input_event(event, self.enhanced) else {
             return actions;
         };
         actions.extend(self.process_input_events(std::iter::once(input_event)));
@@ -583,174 +569,17 @@ impl InputProcessor {
     }
 }
 
-fn crossterm_event_to_input_event(event: Event) -> Option<InputEvent> {
-    match event {
-        Event::Key(key) => key_event_to_input_event(&key),
-        _ => None,
-    }
+// ============================================================================
+// Public helpers
+// ============================================================================
+
+pub fn parse_runtime_action_name(value: &str) -> Result<RuntimeAction> {
+    parse_action(value)
 }
 
-fn key_event_to_input_event(key: &CrosstermKeyEvent) -> Option<InputEvent> {
-    if key.kind == KeyEventKind::Release {
-        return None;
-    }
-
-    let stroke = key_event_to_stroke(key)?;
-    let raw = key_event_to_bytes(key)?;
-    Some(InputEvent::Key(DecodedStroke { stroke, raw }))
-}
-
-const fn key_event_to_stroke(key: &CrosstermKeyEvent) -> Option<KeyStroke> {
-    let modifiers = key.modifiers;
-    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
-    let alt = modifiers.contains(KeyModifiers::ALT);
-    let mut shift = modifiers.contains(KeyModifiers::SHIFT);
-    let super_key = modifiers.contains(KeyModifiers::SUPER);
-
-    let key_code = match key.code {
-        CrosstermKeyCode::Char(c) => {
-            let normalized = if c.is_ascii_alphabetic() {
-                if c.is_ascii_uppercase() {
-                    shift = true;
-                }
-                c.to_ascii_lowercase()
-            } else {
-                // Symbol keys often arrive from crossterm with SHIFT set (e.g. '%' and '"').
-                // Bindings for literal symbols are stored without SHIFT, so we normalize them.
-                shift = false;
-                c
-            };
-            KeyCode::Char(normalized)
-        }
-        CrosstermKeyCode::Enter => KeyCode::Enter,
-        CrosstermKeyCode::Tab => KeyCode::Tab,
-        CrosstermKeyCode::Backspace => KeyCode::Backspace,
-        CrosstermKeyCode::Esc => KeyCode::Escape,
-        CrosstermKeyCode::Up => KeyCode::ArrowUp,
-        CrosstermKeyCode::Down => KeyCode::ArrowDown,
-        CrosstermKeyCode::Left => KeyCode::ArrowLeft,
-        CrosstermKeyCode::Right => KeyCode::ArrowRight,
-        CrosstermKeyCode::Home => KeyCode::Home,
-        CrosstermKeyCode::End => KeyCode::End,
-        CrosstermKeyCode::PageUp => KeyCode::PageUp,
-        CrosstermKeyCode::PageDown => KeyCode::PageDown,
-        CrosstermKeyCode::Insert => KeyCode::Insert,
-        CrosstermKeyCode::Delete => KeyCode::Delete,
-        CrosstermKeyCode::F(number) => KeyCode::Function(number),
-        _ => return None,
-    };
-
-    Some(KeyStroke {
-        ctrl,
-        alt,
-        shift,
-        super_key,
-        key: key_code,
-    })
-}
-
-fn key_event_to_bytes(key: &CrosstermKeyEvent) -> Option<Vec<u8>> {
-    let modifiers = key.modifiers;
-    let ctrl = modifiers.contains(KeyModifiers::CONTROL);
-    let alt = modifiers.contains(KeyModifiers::ALT);
-    let shift = modifiers.contains(KeyModifiers::SHIFT);
-
-    let mut out = Vec::new();
-    let mut push_alt = || {
-        if alt {
-            out.push(0x1b);
-        }
-    };
-
-    match key.code {
-        CrosstermKeyCode::Char(c) => {
-            if ctrl {
-                let lower = c.to_ascii_lowercase();
-                if lower.is_ascii_lowercase() {
-                    push_alt();
-                    out.push((lower as u8 - b'a') + 1);
-                    return Some(out);
-                }
-            }
-
-            push_alt();
-            if c.is_ascii() {
-                out.push(c as u8);
-            } else {
-                let mut buf = [0_u8; 4];
-                out.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
-            }
-            Some(out)
-        }
-        CrosstermKeyCode::Enter => {
-            push_alt();
-            out.push(b'\r');
-            Some(out)
-        }
-        CrosstermKeyCode::Tab => {
-            push_alt();
-            out.push(b'\t');
-            Some(out)
-        }
-        CrosstermKeyCode::Backspace => {
-            push_alt();
-            out.push(0x7f);
-            Some(out)
-        }
-        CrosstermKeyCode::Esc => Some(vec![0x1b]),
-        CrosstermKeyCode::Up => Some(if shift {
-            vec![0x1b, b'[', b'1', b';', b'2', b'A']
-        } else {
-            vec![0x1b, b'[', b'A']
-        }),
-        CrosstermKeyCode::Down => Some(if shift {
-            vec![0x1b, b'[', b'1', b';', b'2', b'B']
-        } else {
-            vec![0x1b, b'[', b'B']
-        }),
-        CrosstermKeyCode::Right => Some(if shift {
-            vec![0x1b, b'[', b'1', b';', b'2', b'C']
-        } else {
-            vec![0x1b, b'[', b'C']
-        }),
-        CrosstermKeyCode::Left => Some(if shift {
-            vec![0x1b, b'[', b'1', b';', b'2', b'D']
-        } else {
-            vec![0x1b, b'[', b'D']
-        }),
-        CrosstermKeyCode::Home => Some(vec![0x1b, b'[', b'H']),
-        CrosstermKeyCode::End => Some(vec![0x1b, b'[', b'F']),
-        CrosstermKeyCode::PageUp => Some(vec![0x1b, b'[', b'5', b'~']),
-        CrosstermKeyCode::PageDown => Some(vec![0x1b, b'[', b'6', b'~']),
-        CrosstermKeyCode::Insert => Some(vec![0x1b, b'[', b'2', b'~']),
-        CrosstermKeyCode::Delete => Some(vec![0x1b, b'[', b'3', b'~']),
-        CrosstermKeyCode::F(number) => match number {
-            1 => Some(vec![0x1b, b'O', b'P']),
-            2 => Some(vec![0x1b, b'O', b'Q']),
-            3 => Some(vec![0x1b, b'O', b'R']),
-            4 => Some(vec![0x1b, b'O', b'S']),
-            _ => None,
-        },
-        _ => None,
-    }
-}
-
-impl ByteDecoder {
-    fn feed_events(&mut self, bytes: &[u8]) -> Vec<InputEvent> {
-        self.pending.extend_from_slice(bytes);
-        let mut events = Vec::new();
-
-        loop {
-            let Some((stroke, consumed)) = decode_one(&self.pending) else {
-                break;
-            };
-            self.pending.drain(0..consumed);
-            events.push(InputEvent::Key(stroke));
-        }
-
-        events
-    }
-}
+// ============================================================================
+// Internal helpers
+// ============================================================================
 
 fn validate_no_duplicate_chords(bindings: &[KeyBinding], scope: &str) -> Result<()> {
     for i in 0..bindings.len() {
@@ -856,24 +685,24 @@ fn display_chord(chord: &[KeyStroke]) -> String {
 
 fn display_stroke(stroke: &KeyStroke) -> String {
     let uppercase_shift_char = matches!(stroke.key, KeyCode::Char(c) if c.is_ascii_alphabetic())
-        && stroke.shift
-        && !stroke.ctrl
-        && !stroke.alt
-        && !stroke.super_key;
+        && stroke.modifiers.shift
+        && !stroke.modifiers.ctrl
+        && !stroke.modifiers.alt
+        && !stroke.modifiers.super_key;
     let uppercase_modified_char = matches!(stroke.key, KeyCode::Char(c) if c.is_ascii_alphabetic())
-        && (stroke.ctrl || stroke.alt || stroke.super_key);
+        && (stroke.modifiers.ctrl || stroke.modifiers.alt || stroke.modifiers.super_key);
 
     let mut parts = Vec::new();
-    if stroke.ctrl {
+    if stroke.modifiers.ctrl {
         parts.push("Ctrl".to_string());
     }
-    if stroke.alt {
+    if stroke.modifiers.alt {
         parts.push("Alt".to_string());
     }
-    if stroke.super_key {
+    if stroke.modifiers.super_key {
         parts.push("Super".to_string());
     }
-    if stroke.shift && !uppercase_shift_char {
+    if stroke.modifiers.shift && !uppercase_shift_char {
         parts.push("Shift".to_string());
     }
 
@@ -889,17 +718,17 @@ fn display_stroke(stroke: &KeyStroke) -> String {
         KeyCode::Tab => "Tab".to_string(),
         KeyCode::Backspace => "Backspace".to_string(),
         KeyCode::Space => "Space".to_string(),
-        KeyCode::ArrowUp => "Up".to_string(),
-        KeyCode::ArrowDown => "Down".to_string(),
-        KeyCode::ArrowLeft => "Left".to_string(),
-        KeyCode::ArrowRight => "Right".to_string(),
+        KeyCode::Up => "Up".to_string(),
+        KeyCode::Down => "Down".to_string(),
+        KeyCode::Left => "Left".to_string(),
+        KeyCode::Right => "Right".to_string(),
         KeyCode::Home => "Home".to_string(),
         KeyCode::End => "End".to_string(),
         KeyCode::PageUp => "PgUp".to_string(),
         KeyCode::PageDown => "PgDn".to_string(),
         KeyCode::Insert => "Insert".to_string(),
         KeyCode::Delete => "Delete".to_string(),
-        KeyCode::Function(n) => format!("F{n}"),
+        KeyCode::F(n) => format!("F{n}"),
     };
     parts.push(key);
     parts.join("-")
@@ -907,16 +736,16 @@ fn display_stroke(stroke: &KeyStroke) -> String {
 
 fn stroke_to_string(stroke: &KeyStroke) -> String {
     let mut parts = Vec::new();
-    if stroke.ctrl {
+    if stroke.modifiers.ctrl {
         parts.push("ctrl".to_string());
     }
-    if stroke.alt {
+    if stroke.modifiers.alt {
         parts.push("alt".to_string());
     }
-    if stroke.shift {
+    if stroke.modifiers.shift {
         parts.push("shift".to_string());
     }
-    if stroke.super_key {
+    if stroke.modifiers.super_key {
         parts.push("super".to_string());
     }
 
@@ -929,280 +758,25 @@ fn stroke_to_string(stroke: &KeyStroke) -> String {
         KeyCode::Tab => "tab".to_string(),
         KeyCode::Backspace => "backspace".to_string(),
         KeyCode::Space => "space".to_string(),
-        KeyCode::ArrowUp => "arrow_up".to_string(),
-        KeyCode::ArrowDown => "arrow_down".to_string(),
-        KeyCode::ArrowLeft => "arrow_left".to_string(),
-        KeyCode::ArrowRight => "arrow_right".to_string(),
+        KeyCode::Up => "arrow_up".to_string(),
+        KeyCode::Down => "arrow_down".to_string(),
+        KeyCode::Left => "arrow_left".to_string(),
+        KeyCode::Right => "arrow_right".to_string(),
         KeyCode::Home => "home".to_string(),
         KeyCode::End => "end".to_string(),
         KeyCode::PageUp => "page_up".to_string(),
         KeyCode::PageDown => "page_down".to_string(),
         KeyCode::Insert => "insert".to_string(),
         KeyCode::Delete => "delete".to_string(),
-        KeyCode::Function(n) => format!("f{n}"),
+        KeyCode::F(n) => format!("f{n}"),
     };
     parts.push(key);
     parts.join("+")
 }
 
-fn decode_one(bytes: &[u8]) -> Option<(DecodedStroke, usize)> {
-    if bytes.is_empty() {
-        return None;
-    }
-
-    let first = bytes[0];
-    if first != 0x1b {
-        return Some((decode_single(first), 1));
-    }
-
-    if bytes.len() == 1 {
-        return Some((
-            DecodedStroke {
-                stroke: KeyStroke::simple(KeyCode::Escape),
-                raw: vec![0x1b],
-            },
-            1,
-        ));
-    }
-
-    if let Some((stroke, consumed)) = decode_escape_sequence(bytes) {
-        return Some((stroke, consumed));
-    }
-
-    let second = bytes[1];
-    if second == b'[' || second == b'O' {
-        return None;
-    }
-
-    let mut decoded = decode_single(second);
-    decoded.stroke.alt = true;
-    decoded.raw = vec![0x1b, second];
-    Some((decoded, 2))
-}
-
-fn decode_single(byte: u8) -> DecodedStroke {
-    let stroke = match byte {
-        b'\r' | b'\n' => KeyStroke::simple(KeyCode::Enter),
-        b'\t' => KeyStroke::simple(KeyCode::Tab),
-        0x7f => KeyStroke::simple(KeyCode::Backspace),
-        b' ' => KeyStroke::simple(KeyCode::Space),
-        0x01..=0x1a => {
-            let character = char::from((byte - 1) + b'a');
-            KeyStroke {
-                ctrl: true,
-                alt: false,
-                shift: false,
-                super_key: false,
-                key: KeyCode::Char(character),
-            }
-        }
-        b'A'..=b'Z' => KeyStroke {
-            ctrl: false,
-            alt: false,
-            shift: true,
-            super_key: false,
-            key: KeyCode::Char(char::from(byte).to_ascii_lowercase()),
-        },
-        _ => KeyStroke::simple(KeyCode::Char(char::from(byte))),
-    };
-
-    DecodedStroke {
-        stroke,
-        raw: vec![byte],
-    }
-}
-
-fn decode_escape_sequence(bytes: &[u8]) -> Option<(DecodedStroke, usize)> {
-    let sequences: &[(&[u8], KeyStroke)] = &[
-        (b"\x1b[A", KeyStroke::simple(KeyCode::ArrowUp)),
-        (b"\x1b[B", KeyStroke::simple(KeyCode::ArrowDown)),
-        (b"\x1b[C", KeyStroke::simple(KeyCode::ArrowRight)),
-        (b"\x1b[D", KeyStroke::simple(KeyCode::ArrowLeft)),
-        (
-            b"\x1b[1;2A",
-            KeyStroke {
-                shift: true,
-                ..KeyStroke::simple(KeyCode::ArrowUp)
-            },
-        ),
-        (
-            b"\x1b[1;2B",
-            KeyStroke {
-                shift: true,
-                ..KeyStroke::simple(KeyCode::ArrowDown)
-            },
-        ),
-        (
-            b"\x1b[1;2C",
-            KeyStroke {
-                shift: true,
-                ..KeyStroke::simple(KeyCode::ArrowRight)
-            },
-        ),
-        (
-            b"\x1b[1;2D",
-            KeyStroke {
-                shift: true,
-                ..KeyStroke::simple(KeyCode::ArrowLeft)
-            },
-        ),
-        (b"\x1b[H", KeyStroke::simple(KeyCode::Home)),
-        (b"\x1b[F", KeyStroke::simple(KeyCode::End)),
-        (b"\x1b[2~", KeyStroke::simple(KeyCode::Insert)),
-        (b"\x1b[3~", KeyStroke::simple(KeyCode::Delete)),
-        (b"\x1b[5~", KeyStroke::simple(KeyCode::PageUp)),
-        (b"\x1b[6~", KeyStroke::simple(KeyCode::PageDown)),
-        (
-            b"\x1b[Z",
-            KeyStroke {
-                shift: true,
-                ..KeyStroke::simple(KeyCode::Tab)
-            },
-        ),
-        (b"\x1bOP", KeyStroke::simple(KeyCode::Function(1))),
-        (b"\x1bOQ", KeyStroke::simple(KeyCode::Function(2))),
-        (b"\x1bOR", KeyStroke::simple(KeyCode::Function(3))),
-        (b"\x1bOS", KeyStroke::simple(KeyCode::Function(4))),
-    ];
-
-    for (pattern, stroke) in sequences {
-        if bytes.starts_with(pattern) {
-            return Some((
-                DecodedStroke {
-                    stroke: *stroke,
-                    raw: pattern.to_vec(),
-                },
-                pattern.len(),
-            ));
-        }
-
-        if pattern.starts_with(bytes) {
-            return None;
-        }
-    }
-
-    Some((
-        DecodedStroke {
-            stroke: KeyStroke::simple(KeyCode::Escape),
-            raw: vec![0x1b],
-        },
-        1,
-    ))
-}
-
-fn parse_chord(value: &str) -> Result<Vec<KeyStroke>> {
-    let parts: Vec<&str> = value.split_whitespace().collect();
-    if parts.is_empty() {
-        bail!("empty key chord");
-    }
-
-    parts.into_iter().map(parse_stroke).collect()
-}
-
-fn parse_stroke(value: &str) -> Result<KeyStroke> {
-    let lowered = value.trim().to_ascii_lowercase();
-    if lowered.is_empty() {
-        bail!("empty key stroke");
-    }
-
-    if lowered == "+" || lowered == "-" {
-        return Ok(KeyStroke {
-            ctrl: false,
-            alt: false,
-            shift: false,
-            super_key: false,
-            key: parse_key_token(&lowered)?,
-        });
-    }
-
-    let tokens: Vec<&str> = lowered.split('+').collect();
-    if tokens.is_empty() {
-        bail!("invalid stroke: {value}");
-    }
-
-    let mut ctrl = false;
-    let mut alt = false;
-    let mut shift = false;
-    let mut super_key = false;
-
-    for modifier in &tokens[..tokens.len() - 1] {
-        match *modifier {
-            "ctrl" => ctrl = true,
-            "alt" => alt = true,
-            "shift" => shift = true,
-            "super" => super_key = true,
-            unknown => bail!("unknown modifier '{unknown}' in '{value}'"),
-        }
-    }
-
-    Ok(KeyStroke {
-        ctrl,
-        alt,
-        shift,
-        super_key,
-        key: parse_key_token(tokens[tokens.len() - 1])?,
-    })
-}
-
-fn parse_key_token(value: &str) -> Result<KeyCode> {
-    let normalized = match value {
-        "esc" => "escape",
-        "up" => "arrow_up",
-        "down" => "arrow_down",
-        "left" => "arrow_left",
-        "right" => "arrow_right",
-        "pgup" => "page_up",
-        "pgdn" => "page_down",
-        "+" => "plus",
-        "-" => "minus",
-        _ => value,
-    };
-
-    match normalized {
-        "enter" => Ok(KeyCode::Enter),
-        "escape" => Ok(KeyCode::Escape),
-        "tab" => Ok(KeyCode::Tab),
-        "backspace" => Ok(KeyCode::Backspace),
-        "space" => Ok(KeyCode::Space),
-        "arrow_up" => Ok(KeyCode::ArrowUp),
-        "arrow_down" => Ok(KeyCode::ArrowDown),
-        "arrow_left" => Ok(KeyCode::ArrowLeft),
-        "arrow_right" => Ok(KeyCode::ArrowRight),
-        "home" => Ok(KeyCode::Home),
-        "end" => Ok(KeyCode::End),
-        "page_up" => Ok(KeyCode::PageUp),
-        "page_down" => Ok(KeyCode::PageDown),
-        "insert" => Ok(KeyCode::Insert),
-        "delete" => Ok(KeyCode::Delete),
-        "plus" => Ok(KeyCode::Char('+')),
-        "minus" => Ok(KeyCode::Char('-')),
-        "question" => Ok(KeyCode::Char('?')),
-        token if token.starts_with('f') => {
-            let number = token[1..]
-                .parse::<u8>()
-                .map_err(|_| anyhow!("invalid function key '{token}'"))?;
-            Ok(KeyCode::Function(number))
-        }
-        token if token.len() == 1 => Ok(KeyCode::Char(token.chars().next().unwrap_or_default())),
-        _ => bail!("unknown key '{value}'"),
-    }
-}
-
-pub fn parse_runtime_action_name(value: &str) -> Result<RuntimeAction> {
-    parse_action(value)
-}
-
-impl KeyStroke {
-    const fn simple(key: KeyCode) -> Self {
-        Self {
-            ctrl: false,
-            alt: false,
-            shift: false,
-            super_key: false,
-            key,
-        }
-    }
-}
+// ============================================================================
+// Tests
+// ============================================================================
 
 #[cfg(test)]
 mod tests {
@@ -1236,9 +810,14 @@ mod tests {
             .collect()
     }
 
+    // Helper: create a processor with enhanced=false (legacy mode) for backward compat tests.
+    fn new_processor(keymap: Keymap) -> InputProcessor {
+        InputProcessor::new(keymap, false)
+    }
+
     #[test]
     fn maps_default_prefix_commands() {
-        let mut processor = InputProcessor::new(Keymap::default_runtime());
+        let mut processor = new_processor(Keymap::default_runtime());
         let actions = processor.process_chunk(&[0x01, b'r']);
         assert_eq!(actions, vec![RuntimeAction::RestartFocusedPane]);
         assert_eq!(
@@ -1291,7 +870,7 @@ mod tests {
 
     #[test]
     fn maps_default_scrollback_commands() {
-        let mut processor = InputProcessor::new(Keymap::default_runtime());
+        let mut processor = new_processor(Keymap::default_runtime());
         assert_eq!(
             processor.process_chunk(&[0x01, b'[']),
             vec![RuntimeAction::EnterScrollMode]
@@ -1336,7 +915,7 @@ mod tests {
 
     #[test]
     fn scroll_mode_accepts_unprefixed_navigation_keys() {
-        let mut processor = InputProcessor::new(Keymap::default_runtime());
+        let mut processor = new_processor(Keymap::default_runtime());
 
         assert_eq!(
             processor.process_chunk(&[0x01, b'[']),
@@ -1398,7 +977,7 @@ mod tests {
 
     #[test]
     fn maps_default_directional_focus_commands() {
-        let mut processor = InputProcessor::new(Keymap::default_runtime());
+        let mut processor = new_processor(Keymap::default_runtime());
         assert_eq!(
             processor.process_chunk(&[0x01, b'h']),
             vec![RuntimeAction::FocusLeft]
@@ -1475,7 +1054,7 @@ mod tests {
         let keymap = Keymap::from_parts("ctrl+a", Some(400), &runtime, &BTreeMap::new())
             .expect("valid keymap");
 
-        let mut processor = InputProcessor::new(keymap);
+        let mut processor = new_processor(keymap);
         assert_eq!(
             processor.process_chunk(&[0x01, b'+']),
             vec![RuntimeAction::IncreaseSplit]
@@ -1491,7 +1070,7 @@ mod tests {
         let runtime = runtime_bindings(&[("o", RuntimeAction::FocusNext)]);
         let keymap = Keymap::from_parts("ctrl+b", Some(400), &runtime, &BTreeMap::new())
             .expect("valid keymap");
-        let mut processor = InputProcessor::new(keymap);
+        let mut processor = new_processor(keymap);
 
         assert_eq!(
             processor.process_chunk(&[0x02, b'o']),
@@ -1507,7 +1086,7 @@ mod tests {
         ]);
         let keymap = Keymap::from_parts("ctrl+a", Some(80), &runtime, &BTreeMap::new())
             .expect("valid keymap");
-        let mut processor = InputProcessor::new(keymap);
+        let mut processor = new_processor(keymap);
 
         assert!(processor.process_chunk(&[0x01, b'w']).is_empty());
         assert_eq!(
@@ -1524,7 +1103,7 @@ mod tests {
         ]);
         let keymap = Keymap::from_parts("ctrl+a", Some(50), &runtime, &BTreeMap::new())
             .expect("valid keymap");
-        let mut processor = InputProcessor::new(keymap);
+        let mut processor = new_processor(keymap);
 
         assert!(processor.process_chunk(&[0x01, b'w']).is_empty());
         thread::sleep(Duration::from_millis(70));
@@ -1539,7 +1118,7 @@ mod tests {
         ]);
         let keymap =
             Keymap::from_parts("ctrl+a", None, &runtime, &BTreeMap::new()).expect("valid keymap");
-        let mut processor = InputProcessor::new(keymap);
+        let mut processor = new_processor(keymap);
 
         assert!(processor.process_chunk(&[0x01, b'w']).is_empty());
         thread::sleep(Duration::from_millis(70));
@@ -1558,7 +1137,7 @@ mod tests {
         ]);
         let keymap =
             Keymap::from_parts("ctrl+a", None, &runtime, &BTreeMap::new()).expect("valid keymap");
-        let mut processor = InputProcessor::new(keymap);
+        let mut processor = new_processor(keymap);
 
         assert!(processor.process_chunk(&[0x01, b'w']).is_empty());
         assert_eq!(
@@ -1578,7 +1157,7 @@ mod tests {
         ]);
         let keymap = Keymap::from_parts("ctrl+a", Some(50), &runtime, &BTreeMap::new())
             .expect("valid keymap");
-        let mut processor = InputProcessor::new(keymap);
+        let mut processor = new_processor(keymap);
 
         assert_eq!(
             processor.process_terminal_event(key_event(KeyCode::Char('a'), KeyModifiers::CONTROL)),
@@ -1600,7 +1179,7 @@ mod tests {
         let global = global_bindings(&[("ctrl+q", RuntimeAction::Quit)]);
         let keymap = Keymap::from_parts("ctrl+a", Some(400), &BTreeMap::new(), &global)
             .expect("valid keymap");
-        let mut processor = InputProcessor::new(keymap);
+        let mut processor = new_processor(keymap);
 
         assert_eq!(processor.process_chunk(&[0x11]), vec![RuntimeAction::Quit]);
     }
@@ -1612,7 +1191,7 @@ mod tests {
 
         let keymap =
             Keymap::from_parts("ctrl+a", Some(400), &runtime, &global).expect("valid keymap");
-        let mut processor = InputProcessor::new(keymap);
+        let mut processor = new_processor(keymap);
 
         assert_eq!(
             processor.process_chunk(&[0x01, b'o']),
@@ -1622,7 +1201,7 @@ mod tests {
 
     #[test]
     fn forwards_unmatched_bytes() {
-        let mut processor = InputProcessor::new(Keymap::default_runtime());
+        let mut processor = new_processor(Keymap::default_runtime());
         assert_eq!(
             processor.process_chunk(b"hi"),
             vec![
@@ -1634,7 +1213,7 @@ mod tests {
 
     #[test]
     fn raw_bytes_events_bypass_keymap_matching() {
-        let mut processor = InputProcessor::new(Keymap::default_runtime());
+        let mut processor = new_processor(Keymap::default_runtime());
         let actions = processor.process_input_events(vec![InputEvent::RawBytes(vec![0x01, b'o'])]);
         assert_eq!(
             actions,
@@ -1644,7 +1223,7 @@ mod tests {
 
     #[test]
     fn terminal_event_adapter_encodes_ctrl_characters() {
-        let mut processor = InputProcessor::new(Keymap::default_runtime());
+        let mut processor = new_processor(Keymap::default_runtime());
         let event = key_event(KeyCode::Char('c'), KeyModifiers::CONTROL);
 
         assert_eq!(
@@ -1655,7 +1234,7 @@ mod tests {
 
     #[test]
     fn terminal_event_adapter_encodes_arrow_sequences() {
-        let mut processor = InputProcessor::new(Keymap::default_runtime());
+        let mut processor = new_processor(Keymap::default_runtime());
         let event = key_event(KeyCode::Up, KeyModifiers::NONE);
 
         assert_eq!(
@@ -1666,7 +1245,7 @@ mod tests {
 
     #[test]
     fn terminal_event_adapter_encodes_shift_arrow_sequences() {
-        let mut processor = InputProcessor::new(Keymap::default_runtime());
+        let mut processor = new_processor(Keymap::default_runtime());
         let event = key_event(KeyCode::Left, KeyModifiers::SHIFT);
 
         assert_eq!(
@@ -1679,7 +1258,7 @@ mod tests {
 
     #[test]
     fn terminal_events_drive_scroll_mode_navigation() {
-        let mut processor = InputProcessor::new(Keymap::default_runtime());
+        let mut processor = new_processor(Keymap::default_runtime());
 
         assert_eq!(
             processor.process_terminal_event(key_event(KeyCode::Char('a'), KeyModifiers::CONTROL)),
@@ -1709,7 +1288,7 @@ mod tests {
 
     #[test]
     fn scroll_mode_keeps_prefix_pane_shortcuts() {
-        let mut processor = InputProcessor::new(Keymap::default_runtime());
+        let mut processor = new_processor(Keymap::default_runtime());
 
         let _ =
             processor.process_terminal_event(key_event(KeyCode::Char('a'), KeyModifiers::CONTROL));
@@ -1732,7 +1311,7 @@ mod tests {
 
     #[test]
     fn terminal_event_symbol_split_bindings_work() {
-        let mut processor = InputProcessor::new(Keymap::default_runtime());
+        let mut processor = new_processor(Keymap::default_runtime());
 
         assert_eq!(
             processor.process_terminal_event(key_event(KeyCode::Char('a'), KeyModifiers::CONTROL)),

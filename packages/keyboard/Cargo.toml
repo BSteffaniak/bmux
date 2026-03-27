@@ -1,18 +1,18 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Shared terminal query/reply protocol engine for bmux"
+description = "Key types and keyboard protocol encoding/decoding for bmux"
 edition     = { workspace = true }
-keywords    = ["bmux", "compatibility", "protocol", "terminal"]
+keywords    = ["bmux", "keyboard", "kitty", "protocol", "terminal"]
 license     = { workspace = true }
-name        = "bmux_terminal_protocol"
+name        = "bmux_keyboard"
 repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_keyboard = { workspace = true }
-serde         = { workspace = true, features = ["derive", "std"] }
+serde = { workspace = true, features = ["derive", "std"], optional = true }
 
 [features]
 default          = []
 fail-on-warnings = []
+serde            = ["dep:serde"]

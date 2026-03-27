@@ -19,6 +19,7 @@ members = [
     "packages/terminal",
     "packages/terminal/models",
     "packages/terminal_protocol",
+    "packages/keyboard",
     "plugins/clipboard-plugin",
     "plugins/plugin-cli-plugin",
     "plugins/permissions-plugin",
@@ -77,6 +78,7 @@ bmux_event_models      = { version = "0.0.1-alpha.0", default-features = false, 
 bmux_fonts             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/fonts" }
 bmux_ipc               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ipc" }
 bmux_keybind           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/keybind" }
+bmux_keyboard          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/keyboard" }
 bmux_plugin            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }
 bmux_server            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/server" }
 bmux_session           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/session" }

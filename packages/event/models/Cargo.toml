@@ -10,6 +10,7 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bmux_keyboard        = { workspace = true, optional = true }
 bmux_session_models  = { workspace = true }
 bmux_terminal_models = { workspace = true }
 serde                = { workspace = true, features = ["derive"], optional = true }
@@ -23,4 +24,5 @@ default = ["serde"]
 fail-on-warnings = []
 
 # Serialization features
-serde = ["bmux_session_models/serde", "bmux_terminal_models/serde", "dep:serde"]
+keyboard = ["dep:bmux_keyboard"]
+serde    = ["bmux_session_models/serde", "bmux_terminal_models/serde", "dep:serde"]
