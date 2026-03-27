@@ -1,5 +1,6 @@
 use super::*;
 use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont, point};
+use bmux_fonts::FontPreset;
 use font8x8::UnicodeFonts;
 use resvg::{tiny_skia, usvg};
 use std::collections::{HashMap, HashSet};
@@ -960,8 +961,9 @@ fn render_screen_rgba_resvg(
     let cell_w_usize = usize::from(cell_w);
     let cell_h_usize = usize::from(cell_h);
 
+    let preset = font_preset_for_options(options);
     let mut families = if options.font_families.is_empty() {
-        default_font_families_for_rendering()
+        bmux_fonts::default_families_for_preset(preset)
     } else {
         options.font_families.clone()
     };
@@ -1041,6 +1043,7 @@ fn render_screen_rgba_resvg(
         .unwrap_or_else(|| "monospace".to_string());
     options_usvg.font_size = font_size;
     let fontdb = options_usvg.fontdb_mut();
+    let _ = bmux_fonts::register_preset_fonts(fontdb, preset);
     fontdb.load_system_fonts();
     for path in &options.font_paths {
         let Ok(meta) = std::fs::metadata(path) else {
@@ -1402,6 +1405,7 @@ fn blend_channel(fg: u8, bg: u8, alpha: f32) -> u8 {
 }
 
 fn load_monospace_fonts(options: &RenderOptions) -> Vec<FontArc> {
+    let preset = font_preset_for_options(options);
     let mut fonts = Vec::<FontArc>::new();
 
     for path in &options.font_paths {
@@ -1419,7 +1423,10 @@ fn load_monospace_fonts(options: &RenderOptions) -> Vec<FontArc> {
         }
     }
 
+    fonts.extend(bmux_fonts::load_preset_fonts_for_ab_glyph(preset));
+
     let mut db = fontdb::Database::new();
+    let _ = bmux_fonts::register_preset_fonts(&mut db, preset);
     db.load_system_fonts();
     for path in &options.font_paths {
         let Ok(meta) = std::fs::metadata(path) else {
@@ -1427,6 +1434,8 @@ fn load_monospace_fonts(options: &RenderOptions) -> Vec<FontArc> {
         };
         if meta.is_dir() {
             db.load_fonts_dir(path);
+        } else if meta.is_file() {
+            let _ = db.load_font_file(path);
         }
     }
 
@@ -1434,7 +1443,7 @@ fn load_monospace_fonts(options: &RenderOptions) -> Vec<FontArc> {
     if !options.font_families.is_empty() {
         families.extend(options.font_families.iter().cloned());
     }
-    families.extend(default_font_families_for_rendering());
+    families.extend(bmux_fonts::default_families_for_preset(preset));
     let mut seen = HashSet::<String>::new();
     for family in families {
         let normalized = family.trim().to_ascii_lowercase();
@@ -1465,19 +1474,8 @@ fn load_font_family_from_db(db: &fontdb::Database, family: &str) -> Option<FontA
     })?
 }
 
-fn default_font_families_for_rendering() -> Vec<String> {
-    vec![
-        "JetBrains Mono".to_string(),
-        "JetBrainsMono Nerd Font".to_string(),
-        "Symbols Nerd Font Mono".to_string(),
-        "SF Mono".to_string(),
-        "Menlo".to_string(),
-        "Monaco".to_string(),
-        "DejaVu Sans Mono".to_string(),
-        "Liberation Mono".to_string(),
-        "Noto Emoji".to_string(),
-        "Apple Color Emoji".to_string(),
-    ]
+fn font_preset_for_options(_options: &RenderOptions) -> FontPreset {
+    FontPreset::GhosttyNerd
 }
 
 fn vt100_color_to_palette_index(color: vt100::Color, foreground: bool) -> u8 {

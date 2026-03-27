@@ -2,6 +2,7 @@
 members = [
     "examples/native-plugin",
     "packages/bmux",
+    "packages/fonts",
     "packages/cli_output",
     "packages/cli",
     "packages/client",
@@ -73,6 +74,7 @@ bmux_clipboard         = { version = "0.0.1-alpha.0", default-features = false, 
 bmux_config            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }
 bmux_event             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event" }
 bmux_event_models      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event/models" }
+bmux_fonts             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/fonts" }
 bmux_ipc               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ipc" }
 bmux_keybind           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/keybind" }
 bmux_plugin            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/plugin" }

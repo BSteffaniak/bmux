@@ -1,0 +1,17 @@
+[package]
+authors     = { workspace = true }
+description = "Bundled and preset font handling for bmux renderers"
+edition     = { workspace = true }
+license     = { workspace = true }
+name        = "bmux_fonts"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+ab_glyph = { workspace = true }
+fontdb   = { workspace = true }
+
+[features]
+bundled-fonts         = []
+bundled-ghostty-fonts = ["bundled-fonts"]
+default               = []

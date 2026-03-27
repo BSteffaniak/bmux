@@ -18,6 +18,7 @@ path = "src/main.rs"
 bmux_client            = { workspace = true }
 bmux_config            = { workspace = true }
 bmux_event             = { workspace = true }
+bmux_fonts             = { workspace = true, default-features = false }
 bmux_ipc               = { workspace = true }
 bmux_keybind           = { workspace = true }
 bmux_plugin            = { workspace = true }
@@ -57,13 +58,14 @@ vt100 = { workspace = true }
 
 [features]
 # Default features
-default = ["logging"]
+default = ["bundled-fonts", "logging"]
 
 # Development features
 fail-on-warnings = []
 
 # Optional features
-logging = ["dep:tracing-appender", "dep:tracing-subscriber"]
+bundled-fonts = ["bmux_fonts/bundled-ghostty-fonts"]
+logging       = ["dep:tracing-appender", "dep:tracing-subscriber"]
 
 # Serialization features
 serde = ["bmux_event/serde", "bmux_session/serde", "bmux_terminal/serde"]

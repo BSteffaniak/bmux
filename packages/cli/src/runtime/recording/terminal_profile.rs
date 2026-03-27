@@ -79,8 +79,8 @@ impl GhosttyProvider {
 
     fn default_font_families() -> Vec<String> {
         vec![
-            "JetBrains Mono".to_string(),
             "JetBrainsMono Nerd Font".to_string(),
+            "JetBrains Mono".to_string(),
             "Symbols Nerd Font Mono".to_string(),
         ]
     }
