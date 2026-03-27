@@ -1168,7 +1168,7 @@ impl BmuxClient {
     }
 }
 
-fn request_kind_name(request: &Request) -> &'static str {
+const fn request_kind_name(request: &Request) -> &'static str {
     match request {
         Request::Hello { .. } => "hello",
         Request::Ping => "ping",
@@ -1218,7 +1218,7 @@ fn request_kind_name(request: &Request) -> &'static str {
     }
 }
 
-fn response_kind_name(response: &Response) -> &'static str {
+const fn response_kind_name(response: &Response) -> &'static str {
     match response {
         Response::Ok(payload) => match payload {
             ResponsePayload::Pong => "pong",

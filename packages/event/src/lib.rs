@@ -50,7 +50,7 @@ impl EventDispatcher {
             Ok(_) => Ok(()),
             Err(e) => {
                 warn!("Failed to send event: {}", e);
-                Err(anyhow::anyhow!("Failed to send event: {}", e))
+                Err(anyhow::anyhow!("Failed to send event: {e}"))
             }
         }
     }

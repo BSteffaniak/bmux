@@ -56,7 +56,7 @@ impl Clipboard {
         if let Some(stdin) = child.stdin.as_mut() {
             stdin
                 .write_all(text.as_bytes())
-                .and_then(|_| stdin.flush())
+                .and_then(|()| stdin.flush())
                 .map_err(|error| ClipboardError::BackendFailed {
                     program: self.command.program.to_string(),
                     message: error.to_string(),

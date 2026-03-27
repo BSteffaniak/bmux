@@ -252,7 +252,7 @@ fn run_permissions_list(context: &NativeCommandContext) -> i32 {
         "permission-query/v1",
         "list",
         &ListPermissionsRequest {
-            session: session.to_string(),
+            session: session.clone(),
         },
     ) {
         Ok(response) => response,
@@ -309,12 +309,11 @@ fn run_permissions_grant(context: &NativeCommandContext) -> i32 {
         eprintln!("example.native permissions-grant requires --client <uuid>");
         return 64;
     };
-    let client_id = match uuid::Uuid::parse_str(&client_id) {
-        Ok(value) => value,
-        Err(_) => {
-            eprintln!("example.native permissions-grant received invalid client id");
-            return 64;
-        }
+    let client_id = if let Ok(value) = uuid::Uuid::parse_str(&client_id) {
+        value
+    } else {
+        eprintln!("example.native permissions-grant received invalid client id");
+        return 64;
     };
     let Some(role) = role else {
         eprintln!("example.native permissions-grant requires --role <role>");
@@ -331,7 +330,7 @@ fn run_permissions_grant(context: &NativeCommandContext) -> i32 {
         "permission-command/v1",
         "grant",
         &GrantPermissionRequest {
-            session: session.to_string(),
+            session: session.clone(),
             client_id,
             role,
         },
@@ -373,12 +372,11 @@ fn run_permissions_revoke(context: &NativeCommandContext) -> i32 {
         eprintln!("example.native permissions-revoke requires --client <uuid>");
         return 64;
     };
-    let client_id = match uuid::Uuid::parse_str(&client_id) {
-        Ok(value) => value,
-        Err(_) => {
-            eprintln!("example.native permissions-revoke received invalid client id");
-            return 64;
-        }
+    let client_id = if let Ok(value) = uuid::Uuid::parse_str(&client_id) {
+        value
+    } else {
+        eprintln!("example.native permissions-revoke received invalid client id");
+        return 64;
     };
 
     let response = match context.call_service::<RevokePermissionRequest, RevokePermissionResponse>(
@@ -387,7 +385,7 @@ fn run_permissions_revoke(context: &NativeCommandContext) -> i32 {
         "permission-command/v1",
         "revoke",
         &RevokePermissionRequest {
-            session: session.to_string(),
+            session: session.clone(),
             client_id,
         },
     ) {
@@ -414,7 +412,7 @@ fn run_windows_list(context: &NativeCommandContext) -> i32 {
         "window-query/v1",
         "list",
         &ListWindowsRequest {
-            session: Some(session.to_string()),
+            session: Some(session.clone()),
         },
     ) {
         Ok(response) => response,
@@ -476,7 +474,7 @@ fn run_windows_new(context: &NativeCommandContext) -> i32 {
         "window-command/v1",
         "new",
         &NewWindowRequest {
-            session: Some(session.to_string()),
+            session: Some(session.clone()),
             name,
         },
     ) {
@@ -549,7 +547,7 @@ fn run_storage_put(context: &NativeCommandContext) -> i32 {
         "storage-command/v1",
         "set",
         &StorageSetRequest {
-            key: key.to_string(),
+            key: key.clone(),
             value,
         },
     );
@@ -572,9 +570,7 @@ fn run_storage_get(context: &NativeCommandContext) -> i32 {
         ServiceKind::Query,
         "storage-query/v1",
         "get",
-        &StorageGetRequest {
-            key: key.to_string(),
-        },
+        &StorageGetRequest { key: key.clone() },
     ) {
         Ok(response) => response,
         Err(error) => {
@@ -702,7 +698,7 @@ struct StorageGetResponse {
     value: Option<Vec<u8>>,
 }
 
-fn session_role_name(role: SessionRole) -> &'static str {
+const fn session_role_name(role: SessionRole) -> &'static str {
     match role {
         SessionRole::Owner => "owner",
         SessionRole::Writer => "writer",

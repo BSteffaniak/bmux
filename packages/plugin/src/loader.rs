@@ -203,7 +203,7 @@ pub struct NativeCommandContext {
     pub host_kernel_bridge: Option<HostKernelBridge>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NativeServiceContext {
     pub plugin_id: String,
     pub request: ServiceRequest,
@@ -437,7 +437,7 @@ impl NativeServiceContext {
             request.len(),
             output.as_mut_ptr(),
             output.len(),
-            &mut output_len,
+            &raw mut output_len,
         );
 
         if status == KERNEL_STATUS_BUFFER_TOO_SMALL {
@@ -447,7 +447,7 @@ impl NativeServiceContext {
                 request.len(),
                 output.as_mut_ptr(),
                 output.len(),
-                &mut output_len,
+                &raw mut output_len,
             );
             if status != KERNEL_STATUS_OK {
                 return Err(PluginError::ServiceProtocol {
@@ -503,14 +503,7 @@ impl ServiceCaller for NativeCommandContext {
         operation: &str,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        NativeCommandContext::call_service_raw(
-            self,
-            capability,
-            kind,
-            interface_id,
-            operation,
-            payload,
-        )
+        Self::call_service_raw(self, capability, kind, interface_id, operation, payload)
     }
 }
 
@@ -523,14 +516,7 @@ impl ServiceCaller for NativeLifecycleContext {
         operation: &str,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        NativeLifecycleContext::call_service_raw(
-            self,
-            capability,
-            kind,
-            interface_id,
-            operation,
-            payload,
-        )
+        Self::call_service_raw(self, capability, kind, interface_id, operation, payload)
     }
 }
 
@@ -543,14 +529,7 @@ impl ServiceCaller for NativeServiceContext {
         operation: &str,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        NativeServiceContext::call_service_raw(
-            self,
-            capability,
-            kind,
-            interface_id,
-            operation,
-            payload,
-        )
+        Self::call_service_raw(self, capability, kind, interface_id, operation, payload)
     }
 }
 
@@ -594,7 +573,7 @@ fn call_service_raw(
                 && service.interface_id == interface_id
         })
         .cloned()
-        .ok_or_else(|| PluginError::UnsupportedHostOperation {
+        .ok_or(PluginError::UnsupportedHostOperation {
             operation: "call_service",
         })?;
 
@@ -1158,7 +1137,7 @@ fn emit_plugin_log(
                 plugin_target = requested_target,
                 "{}",
                 request.message
-            )
+            );
         }
         LogWriteLevel::Warn => {
             warn!(
@@ -1166,7 +1145,7 @@ fn emit_plugin_log(
                 plugin_target = requested_target,
                 "{}",
                 request.message
-            )
+            );
         }
         LogWriteLevel::Info => {
             info!(
@@ -1174,7 +1153,7 @@ fn emit_plugin_log(
                 plugin_target = requested_target,
                 "{}",
                 request.message
-            )
+            );
         }
         LogWriteLevel::Debug => {
             debug!(
@@ -1182,7 +1161,7 @@ fn emit_plugin_log(
                 plugin_target = requested_target,
                 "{}",
                 request.message
-            )
+            );
         }
         LogWriteLevel::Trace => {
             trace!(
@@ -1190,7 +1169,7 @@ fn emit_plugin_log(
                 plugin_target = requested_target,
                 "{}",
                 request.message
-            )
+            );
         }
     }
 
@@ -1211,7 +1190,7 @@ fn context_selector_to_ipc(selector: HostContextSelector) -> IpcContextSelector 
     }
 }
 
-fn pane_selector_to_ipc(selector: HostPaneSelector) -> IpcPaneSelector {
+const fn pane_selector_to_ipc(selector: HostPaneSelector) -> IpcPaneSelector {
     match selector {
         HostPaneSelector::ById(id) => IpcPaneSelector::ById(id),
         HostPaneSelector::ByIndex(index) => IpcPaneSelector::ByIndex(index),
@@ -1219,14 +1198,14 @@ fn pane_selector_to_ipc(selector: HostPaneSelector) -> IpcPaneSelector {
     }
 }
 
-fn pane_split_direction_to_ipc(direction: HostPaneSplitDirection) -> IpcPaneSplitDirection {
+const fn pane_split_direction_to_ipc(direction: HostPaneSplitDirection) -> IpcPaneSplitDirection {
     match direction {
         HostPaneSplitDirection::Vertical => IpcPaneSplitDirection::Vertical,
         HostPaneSplitDirection::Horizontal => IpcPaneSplitDirection::Horizontal,
     }
 }
 
-fn pane_focus_direction_to_ipc(direction: HostPaneFocusDirection) -> IpcPaneFocusDirection {
+const fn pane_focus_direction_to_ipc(direction: HostPaneFocusDirection) -> IpcPaneFocusDirection {
     match direction {
         HostPaneFocusDirection::Next => IpcPaneFocusDirection::Next,
         HostPaneFocusDirection::Prev => IpcPaneFocusDirection::Prev,
@@ -1267,7 +1246,7 @@ fn invoke_host_kernel_bridge(bridge: HostKernelBridge, payload: Vec<u8>) -> Resu
         request.len(),
         output.as_mut_ptr(),
         output.len(),
-        &mut output_len,
+        &raw mut output_len,
     );
 
     if status == KERNEL_STATUS_BUFFER_TOO_SMALL {
@@ -1277,7 +1256,7 @@ fn invoke_host_kernel_bridge(bridge: HostKernelBridge, payload: Vec<u8>) -> Resu
             request.len(),
             output.as_mut_ptr(),
             output.len(),
-            &mut output_len,
+            &raw mut output_len,
         );
         if status != KERNEL_STATUS_OK {
             return Err(PluginError::ServiceProtocol {

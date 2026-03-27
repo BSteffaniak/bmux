@@ -426,8 +426,7 @@ mod tests {
         ] {
             assert!(
                 !paths.contains(&removed),
-                "migrated plugin-owned command path {:?} should not remain in core command table",
-                removed
+                "migrated plugin-owned command path {removed:?} should not remain in core command table"
             );
         }
     }

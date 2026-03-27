@@ -20,7 +20,7 @@ impl PluginId {
     }
 
     #[must_use]
-    pub fn as_str(&self) -> &str {
+    pub const fn as_str(&self) -> &str {
         self.0.as_str()
     }
 }
@@ -128,7 +128,7 @@ impl PluginDeclaration {
             }
 
             let canonical_path = command.canonical_path();
-            if canonical_path.is_empty() || canonical_path.iter().any(|segment| segment.is_empty())
+            if canonical_path.is_empty() || canonical_path.iter().any(std::string::String::is_empty)
             {
                 return Err(PluginError::InvalidPluginCommandPath {
                     plugin_id: self.id.as_str().to_string(),
@@ -138,7 +138,7 @@ impl PluginDeclaration {
 
             let mut seen_paths = BTreeSet::from([canonical_path.clone()]);
             for alias in &command.aliases {
-                if alias.is_empty() || alias.iter().any(|segment| segment.is_empty()) {
+                if alias.is_empty() || alias.iter().any(std::string::String::is_empty) {
                     return Err(PluginError::InvalidPluginCommandPath {
                         plugin_id: self.id.as_str().to_string(),
                         command: command.name.clone(),

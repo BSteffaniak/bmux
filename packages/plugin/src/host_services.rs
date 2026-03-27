@@ -241,7 +241,7 @@ pub struct LogWriteRequest {
     pub target: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingWriteEventRequest {
     pub session_id: Option<Uuid>,
     pub pane_id: Option<Uuid>,

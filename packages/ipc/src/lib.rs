@@ -457,7 +457,7 @@ pub struct RecordingSummary {
     pub path: String,
 }
 
-fn recording_profile_default() -> RecordingProfile {
+const fn recording_profile_default() -> RecordingProfile {
     RecordingProfile::Full
 }
 

@@ -14,13 +14,13 @@ use uuid::Uuid;
 
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum AttachLayer {
+pub enum AttachLayer {
     Pane = 0,
     Overlay = 100,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct AttachLayerSurface {
+pub struct AttachLayerSurface {
     pub(crate) rect: PaneRect,
     pub(crate) layer: AttachLayer,
     pub(crate) opaque: bool,
@@ -56,7 +56,7 @@ fn draw_box_line(width: usize, left: char, mid: char, right: char) -> String {
     line
 }
 
-pub(crate) fn opaque_row_text(content: &str, width: usize) -> String {
+pub fn opaque_row_text(content: &str, width: usize) -> String {
     let mut rendered = content.to_string();
     if rendered.len() > width {
         rendered.truncate(width);
@@ -67,10 +67,7 @@ pub(crate) fn opaque_row_text(content: &str, width: usize) -> String {
     rendered
 }
 
-pub(crate) fn queue_layer_fill<W: io::Write>(
-    stdout: &mut W,
-    surface: AttachLayerSurface,
-) -> Result<()> {
+pub fn queue_layer_fill<W: io::Write>(stdout: &mut W, surface: AttachLayerSurface) -> Result<()> {
     if !surface.opaque || surface.rect.w <= 2 || surface.rect.h <= 2 {
         return Ok(());
     }
@@ -163,7 +160,7 @@ fn style_sgr(style: CellStyle) -> String {
     format!("\x1b[{}m", parts.join(";"))
 }
 
-fn selected_style(mut style: CellStyle) -> CellStyle {
+const fn selected_style(mut style: CellStyle) -> CellStyle {
     style.inverse = !style.inverse;
     style
 }
@@ -186,7 +183,7 @@ fn selection_bounds(
     })
 }
 
-fn cell_selected(
+const fn cell_selected(
     selection: Option<(AttachScrollbackPosition, AttachScrollbackPosition)>,
     row: usize,
     col: usize,

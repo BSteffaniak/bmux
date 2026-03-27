@@ -145,23 +145,22 @@ fn call_host_kernel_via_client(
         connection.data_dir.clone().into(),
     );
     let request_name = "bmux-cli-host-kernel-bridge".to_string();
-    let response: bmux_ipc::Response = match tokio::runtime::Handle::try_current() {
-        Ok(handle) => tokio::task::block_in_place(|| {
+    let response: bmux_ipc::Response = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| {
             handle.block_on(async {
                 let mut client = BmuxClient::connect_with_paths(&paths, &request_name).await?;
                 client.request_raw(request.clone()).await
             })
-        }),
-        Err(_) => {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .context("failed creating kernel bridge runtime")?;
-            runtime.block_on(async {
-                let mut client = BmuxClient::connect_with_paths(&paths, &request_name).await?;
-                client.request_raw(request.clone()).await
-            })
-        }
+        })
+    } else {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed creating kernel bridge runtime")?;
+        runtime.block_on(async {
+            let mut client = BmuxClient::connect_with_paths(&paths, &request_name).await?;
+            client.request_raw(request.clone()).await
+        })
     }?;
     maybe_record_host_kernel_effect(&request, &response);
     bmux_ipc::encode(&response).context("failed encoding kernel bridge response payload")
@@ -186,20 +185,19 @@ unsafe extern "C" fn host_kernel_bridge(
         };
 
     let payload = if let Some(context) = SERVICE_KERNEL_CONTEXT.with(|slot| slot.borrow().clone()) {
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => tokio::task::block_in_place(|| {
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            tokio::task::block_in_place(|| {
                 handle.block_on(async { context.execute_raw(request.payload).await })
-            }),
-            Err(_) => {
-                let runtime = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(runtime) => runtime,
-                    Err(_) => return 5,
-                };
-                runtime.block_on(async { context.execute_raw(request.payload).await })
-            }
+            })
+        } else {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(_) => return 5,
+            };
+            runtime.block_on(async { context.execute_raw(request.payload).await })
         }
     } else if let Some(connection) = HOST_KERNEL_CONNECTION.with(|slot| slot.borrow().clone()) {
         call_host_kernel_via_client(&connection, request.payload)
@@ -238,7 +236,7 @@ mod recording;
 mod terminal_protocol;
 
 #[cfg(test)]
-pub(crate) use self::logs_watch::{
+pub use self::logs_watch::{
     LogFilterCaseMode, LogFilterKind, LogFilterRule, compile_filter_regex, line_visible_in_watch,
     logs_watch_filter_rule_to_state, logs_watch_filter_state_to_rule, normalize_logs_watch_profile,
 };
@@ -412,7 +410,7 @@ fn available_service_descriptors(
     Ok(services)
 }
 
-fn invoke_kind_from_service_kind(kind: ServiceKind) -> Option<InvokeServiceKind> {
+const fn invoke_kind_from_service_kind(kind: ServiceKind) -> Option<InvokeServiceKind> {
     match kind {
         ServiceKind::Query => Some(InvokeServiceKind::Query),
         ServiceKind::Command => Some(InvokeServiceKind::Command),
@@ -1725,14 +1723,12 @@ fn scan_available_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Result<Pl
                         && workspace_bundled_root
                             .as_ref()
                             .is_some_and(|root| report.search_root == *root)
+                        && let Ok(executable) = std::env::current_exe()
+                        && let Some(executable_dir) = executable.parent()
                     {
-                        if let Ok(executable) = std::env::current_exe() {
-                            if let Some(executable_dir) = executable.parent() {
-                                let executable_candidate = executable_dir.join(&manifest.entry);
-                                if executable_candidate.exists() {
-                                    manifest.entry = executable_candidate;
-                                }
-                            }
+                        let executable_candidate = executable_dir.join(&manifest.entry);
+                        if executable_candidate.exists() {
+                            manifest.entry = executable_candidate;
                         }
                     }
                     if let Err(error) = registry.register_manifest_from_root(
@@ -1815,15 +1811,15 @@ fn workspace_bundled_plugin_root() -> Option<PathBuf> {
 fn bundled_plugin_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
-    if let Some(root) = bundled_plugin_root() {
-        if seen.insert(root.clone()) {
-            roots.push(root);
-        }
+    if let Some(root) = bundled_plugin_root()
+        && seen.insert(root.clone())
+    {
+        roots.push(root);
     }
-    if let Some(root) = workspace_bundled_plugin_root() {
-        if seen.insert(root.clone()) {
-            roots.push(root);
-        }
+    if let Some(root) = workspace_bundled_plugin_root()
+        && seen.insert(root.clone())
+    {
+        roots.push(root);
     }
     roots
 }
@@ -1857,11 +1853,8 @@ fn effective_enabled_plugins(config: &BmuxConfig, registry: &PluginRegistry) -> 
     // entry file to check).
     let mut static_bundled = registry
         .iter()
-        .filter_map(|plugin| {
-            plugin
-                .bundled_static
-                .then(|| plugin.declaration.id.as_str().to_string())
-        })
+        .filter(|&plugin| plugin.bundled_static)
+        .map(|plugin| plugin.declaration.id.as_str().to_string())
         .collect::<Vec<_>>();
     static_bundled.sort();
     for plugin_id in static_bundled {
@@ -1877,12 +1870,12 @@ fn effective_enabled_plugins(config: &BmuxConfig, registry: &PluginRegistry) -> 
     // whose entry file exists on disk).
     let mut bundled_defaults = registry
         .iter()
-        .filter_map(|plugin| {
-            (!plugin.bundled_static
+        .filter(|&plugin| {
+            !plugin.bundled_static
                 && bundled_roots.contains(&plugin.search_root)
-                && registered_plugin_entry_exists(plugin))
-            .then(|| plugin.declaration.id.as_str().to_string())
+                && registered_plugin_entry_exists(plugin)
         })
+        .map(|plugin| plugin.declaration.id.as_str().to_string())
         .collect::<Vec<_>>();
     bundled_defaults.sort();
     for plugin_id in bundled_defaults {
@@ -2346,7 +2339,7 @@ async fn plugin_event_bridge_loop(
                             return Ok(());
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                    () = tokio::time::sleep(Duration::from_millis(100)) => {}
                 }
             }
         }
@@ -2509,7 +2502,7 @@ fn format_plugin_not_found_message<S: AsRef<str>>(plugin_id: &str, available: &[
     } else {
         let available = available
             .iter()
-            .map(|entry| entry.as_ref())
+            .map(std::convert::AsRef::as_ref)
             .collect::<Vec<_>>();
         format!(
             "plugin '{plugin_id}' was not found (available: {})",
@@ -3090,16 +3083,12 @@ async fn replay_verify(
         report.actual_kind.as_ref(),
     ) {
         println!(
-            "verify FAIL: mismatch at index {} expected_seq={} actual_seq={} expected_kind={} actual_kind={}",
-            index, expected, actual, expected_kind, actual_kind
+            "verify FAIL: mismatch at index {index} expected_seq={expected} actual_seq={actual} expected_kind={expected_kind} actual_kind={actual_kind}"
         );
         return Ok(1);
     }
     if let (Some(expected), Some(actual)) = (report.expected_output_len, report.actual_output_len) {
-        println!(
-            "verify FAIL: output length mismatch expected={} actual={}",
-            expected, actual
-        );
+        println!("verify FAIL: output length mismatch expected={expected} actual={actual}");
         return Ok(1);
     }
     println!("verify FAIL: {}", report.reason);
@@ -3348,9 +3337,8 @@ async fn run_target_verify_capture(
     std::fs::create_dir_all(&state_dir).context("failed creating verify state dir")?;
     write_verify_config(&paths)?;
 
-    let verify_start_timeout = verify_start_timeout_secs
-        .map(Duration::from_secs)
-        .unwrap_or(VERIFY_SERVER_START_TIMEOUT_DEFAULT);
+    let verify_start_timeout =
+        verify_start_timeout_secs.map_or(VERIFY_SERVER_START_TIMEOUT_DEFAULT, Duration::from_secs);
     let mut server = start_verify_server(
         target_binary,
         &paths,
@@ -3570,7 +3558,7 @@ impl VerifyServerHandle {
     async fn shutdown(&mut self) -> Result<()> {
         stop_verify_server(self.paths()).await?;
         match self {
-            VerifyServerHandle::Foreground { child, .. } => {
+            Self::Foreground { child, .. } => {
                 if wait_for_child_exit(child, Duration::from_secs(2)).await? {
                     return Ok(());
                 }
@@ -3579,7 +3567,7 @@ impl VerifyServerHandle {
                 }
                 Ok(())
             }
-            VerifyServerHandle::Daemon { paths, .. } => {
+            Self::Daemon { paths, .. } => {
                 if wait_until_verify_server_stopped(paths, Duration::from_secs(2)).await? {
                     return Ok(());
                 }
@@ -3591,24 +3579,25 @@ impl VerifyServerHandle {
         }
     }
 
-    fn paths(&self) -> &ConfigPaths {
+    const fn paths(&self) -> &ConfigPaths {
         match self {
-            VerifyServerHandle::Foreground { paths, .. }
-            | VerifyServerHandle::Daemon { paths, .. } => paths,
+            Self::Foreground { paths, .. } | Self::Daemon { paths, .. } => paths,
         }
     }
 
     fn stdout_log_path(&self) -> &Path {
         match self {
-            VerifyServerHandle::Foreground { stdout_log, .. }
-            | VerifyServerHandle::Daemon { stdout_log, .. } => stdout_log.as_path(),
+            Self::Foreground { stdout_log, .. } | Self::Daemon { stdout_log, .. } => {
+                stdout_log.as_path()
+            }
         }
     }
 
     fn stderr_log_path(&self) -> &Path {
         match self {
-            VerifyServerHandle::Foreground { stderr_log, .. }
-            | VerifyServerHandle::Daemon { stderr_log, .. } => stderr_log.as_path(),
+            Self::Foreground { stderr_log, .. } | Self::Daemon { stderr_log, .. } => {
+                stderr_log.as_path()
+            }
         }
     }
 }
@@ -3831,10 +3820,10 @@ fn read_verify_log_excerpt(path: &Path) -> String {
 }
 
 impl VerifyServerHandle {
-    fn child_mut(&mut self) -> Option<&mut std::process::Child> {
+    const fn child_mut(&mut self) -> Option<&mut std::process::Child> {
         match self {
-            VerifyServerHandle::Foreground { child, .. } => Some(child),
-            VerifyServerHandle::Daemon { .. } => None,
+            Self::Foreground { child, .. } => Some(child),
+            Self::Daemon { .. } => None,
         }
     }
 }
@@ -3871,10 +3860,10 @@ fn write_verify_config(paths: &ConfigPaths) -> Result<()> {
         .collect::<std::collections::BTreeSet<_>>();
     let mut disabled_plugins = registry
         .iter()
-        .filter_map(|plugin| {
-            (bundled_roots.contains(&plugin.search_root) && registered_plugin_entry_exists(plugin))
-                .then(|| plugin.declaration.id.as_str().to_string())
+        .filter(|&plugin| {
+            bundled_roots.contains(&plugin.search_root) && registered_plugin_entry_exists(plugin)
         })
+        .map(|plugin| plugin.declaration.id.as_str().to_string())
         .collect::<Vec<_>>();
     disabled_plugins.sort();
 
@@ -3965,7 +3954,7 @@ fn run_logs_tail(lines: usize, since: Option<&str>, follow: bool) -> Result<u8> 
         .with_context(|| format!("failed reading log file {}", path.display()))?;
     let all_lines = content
         .lines()
-        .filter(|line| line_matches_since(*line, since_cutoff))
+        .filter(|line| line_matches_since(line, since_cutoff))
         .collect::<Vec<_>>();
     let start = all_lines.len().saturating_sub(lines.max(1));
     for line in &all_lines[start..] {
@@ -4130,8 +4119,10 @@ async fn run_client_list(as_json: bool) -> Result<u8> {
                 sessions
                     .iter()
                     .find(|session| session.id == id)
-                    .map(session_summary_label)
-                    .unwrap_or_else(|| format!("session-{}", short_uuid(id)))
+                    .map_or_else(
+                        || format!("session-{}", short_uuid(id)),
+                        session_summary_label,
+                    )
             },
         );
         let selected_context = "-".to_string();
@@ -4485,10 +4476,10 @@ async fn run_session_attach_with_client(
         let loop_events = collect_attach_loop_events(server_events, terminal_event);
         let mut should_break = false;
         for loop_event in loop_events {
-            if let AttachLoopEvent::Terminal(Event::Resize(cols, rows)) = loop_event {
-                if let Some(capture) = display_capture.as_mut() {
-                    let _ = capture.record_resize(cols, rows);
-                }
+            if let AttachLoopEvent::Terminal(Event::Resize(cols, rows)) = loop_event
+                && let Some(capture) = display_capture.as_mut()
+            {
+                let _ = capture.record_resize(cols, rows);
             }
             match handle_attach_loop_event(
                 loop_event,
@@ -5197,10 +5188,7 @@ fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
         }
     };
     let provider = registry.get(provider_plugin_id).with_context(|| {
-        format!(
-            "clipboard service provider '{}' was not found",
-            provider_plugin_id
-        )
+        format!("clipboard service provider '{provider_plugin_id}' was not found")
     })?;
 
     let payload = bmux_plugin::encode_service_message(&ClipboardWriteRequest {
@@ -5220,12 +5208,7 @@ fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
         &plugin_host_metadata(),
         &available_capability_providers(&config, &registry)?,
     )
-    .with_context(|| {
-        format!(
-            "failed loading clipboard service provider '{}'",
-            provider_plugin_id
-        )
-    })?;
+    .with_context(|| format!("failed loading clipboard service provider '{provider_plugin_id}'"))?;
 
     let connection = bmux_plugin::HostConnectionInfo {
         config_dir: paths.config_dir.to_string_lossy().into_owned(),
@@ -5234,7 +5217,7 @@ fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
     };
     let _host_kernel_connection_guard = enter_host_kernel_connection(connection.clone());
     let response = loaded.invoke_service(&bmux_plugin::NativeServiceContext {
-        plugin_id: provider_plugin_id.to_string(),
+        plugin_id: provider_plugin_id.clone(),
         request: ServiceRequest {
             caller_plugin_id: "bmux.core".to_string(),
             service,
@@ -5341,9 +5324,7 @@ fn clamp_attach_scrollback_cursor(view_state: &mut AttachViewState) {
 }
 
 fn attach_scrollback_page_size(view_state: &AttachViewState) -> usize {
-    focused_attach_pane_inner_size(view_state)
-        .map(|(_, inner_h)| inner_h)
-        .unwrap_or(10)
+    focused_attach_pane_inner_size(view_state).map_or(10, |(_, inner_h)| inner_h)
 }
 
 fn focused_attach_pane_buffer(
@@ -5543,7 +5524,7 @@ fn initial_attach_status(keymap: &Keymap, can_write: bool) -> String {
     }
 }
 
-fn attach_exit_message(reason: AttachExitReason) -> Option<&'static str> {
+const fn attach_exit_message(reason: AttachExitReason) -> Option<&'static str> {
     match reason {
         AttachExitReason::Detached | AttachExitReason::Quit => None,
         AttachExitReason::StreamClosed => Some("attach ended unexpectedly: server stream closed"),
@@ -5973,8 +5954,10 @@ fn context_summary_label(context: &ContextSummary) -> String {
         .name
         .as_deref()
         .filter(|name| !name.trim().is_empty())
-        .map(ToString::to_string)
-        .unwrap_or_else(|| format!("context-{}", short_uuid(context.id)))
+        .map_or_else(
+            || format!("context-{}", short_uuid(context.id)),
+            ToString::to_string,
+        )
 }
 
 async fn resolve_attach_session_label(
@@ -5985,8 +5968,10 @@ async fn resolve_attach_session_label(
     Ok(sessions
         .into_iter()
         .find(|session| session.id == session_id)
-        .map(|session| session_summary_label(&session))
-        .unwrap_or_else(|| format!("session-{}", short_uuid(session_id))))
+        .map_or_else(
+            || format!("session-{}", short_uuid(session_id)),
+            |session| session_summary_label(&session),
+        ))
 }
 
 fn session_summary_label(session: &bmux_ipc::SessionSummary) -> String {
@@ -9817,7 +9802,7 @@ mod tests {
 
         assert!(matches!(
             actions.first(),
-            Some(super::AttachEventAction::Send(bytes)) if bytes.as_slice() == &[0x14]
+            Some(super::AttachEventAction::Send(bytes)) if bytes.as_slice() == [0x14]
         ));
     }
 

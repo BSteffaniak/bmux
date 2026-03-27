@@ -15,7 +15,7 @@ pub enum PluginEventKind {
     Custom,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginEvent {
     pub kind: PluginEventKind,
     pub name: String,

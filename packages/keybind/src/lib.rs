@@ -66,6 +66,7 @@ pub enum RuntimeAction {
     ForwardToPane(Vec<u8>),
 }
 
+#[must_use]
 pub const fn action_to_name(action: &RuntimeAction) -> &'static str {
     match action {
         RuntimeAction::Quit => "quit",

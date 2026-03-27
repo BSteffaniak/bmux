@@ -306,8 +306,7 @@ impl BmuxConfig {
                 let base = paths
                     .config_file()
                     .parent()
-                    .map(std::path::Path::to_path_buf)
-                    .unwrap_or_else(|| paths.config_dir.clone());
+                    .map_or_else(|| paths.config_dir.clone(), std::path::Path::to_path_buf);
                 base.join(dir)
             }
             None => paths.recordings_dir(),

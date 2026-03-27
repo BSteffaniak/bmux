@@ -166,7 +166,7 @@ impl AttachViewState {
         self.transient_status.as_deref()
     }
 
-    pub(crate) fn exit_scrollback(&mut self) {
+    pub(crate) const fn exit_scrollback(&mut self) {
         self.scrollback_active = false;
         self.scrollback_offset = 0;
         self.scrollback_cursor = None;

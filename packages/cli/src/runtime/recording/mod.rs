@@ -1,4 +1,11 @@
-use super::*;
+use super::{
+    AttachDisplayCapturePlan, BmuxConfig, BufRead, BufReader, BufWriter, ConfigPaths,
+    ConnectionPolicyScope, Context, GifEncoder, GifFrame, Instant, IsTerminal, Path, PathBuf, Read,
+    RecordingEventEnvelope, RecordingEventKind, RecordingEventKindArg, RecordingExportFormat,
+    RecordingProfileArg, RecordingRenderMode, RecordingReplayMode, RecordingStatus,
+    RecordingSummary, Repeat, Result, Uuid, Write, cleanup_stale_pid_file, connect_if_running, io,
+    map_cli_client_error, parse_uuid_value, terminal,
+};
 use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont, point};
 use bmux_fonts::FontPreset;
 use font8x8::UnicodeFonts;
@@ -106,7 +113,7 @@ pub(super) fn resolve_event_kind_override(
     Some(kinds)
 }
 
-fn recording_event_kind_arg_to_ipc(kind: RecordingEventKindArg) -> RecordingEventKind {
+const fn recording_event_kind_arg_to_ipc(kind: RecordingEventKindArg) -> RecordingEventKind {
     match kind {
         RecordingEventKindArg::PaneInputRaw => RecordingEventKind::PaneInputRaw,
         RecordingEventKindArg::PaneOutputRaw => RecordingEventKind::PaneOutputRaw,
@@ -249,42 +256,41 @@ pub(super) async fn run_recording_list(as_json: bool) -> Result<u8> {
 
 pub(super) async fn run_recording_delete(recording_id_or_prefix: &str) -> Result<u8> {
     cleanup_stale_pid_file().await?;
-    match connect_if_running(ConnectionPolicyScope::Normal, "bmux-cli-recording-delete").await? {
-        Some(mut client) => {
-            let status = client
-                .recording_status()
-                .await
-                .map_err(map_cli_client_error)?;
-            let recordings = client
-                .recording_list()
-                .await
-                .map_err(map_cli_client_error)?;
-            let resolved = resolve_recording_id_prefix(recording_id_or_prefix, &recordings)?;
+    if let Some(mut client) =
+        connect_if_running(ConnectionPolicyScope::Normal, "bmux-cli-recording-delete").await?
+    {
+        let status = client
+            .recording_status()
+            .await
+            .map_err(map_cli_client_error)?;
+        let recordings = client
+            .recording_list()
+            .await
+            .map_err(map_cli_client_error)?;
+        let resolved = resolve_recording_id_prefix(recording_id_or_prefix, &recordings)?;
 
-            if status
-                .active
-                .as_ref()
-                .is_some_and(|active| active.id == resolved)
-            {
-                let stopped_id = client
-                    .recording_stop(Some(resolved))
-                    .await
-                    .map_err(map_cli_client_error)?;
-                println!("stopped active recording {stopped_id} before delete");
-            }
-
-            let deleted_id = client
-                .recording_delete(resolved)
+        if status
+            .active
+            .as_ref()
+            .is_some_and(|active| active.id == resolved)
+        {
+            let stopped_id = client
+                .recording_stop(Some(resolved))
                 .await
                 .map_err(map_cli_client_error)?;
-            println!("deleted recording {deleted_id}");
+            println!("stopped active recording {stopped_id} before delete");
         }
-        None => {
-            let recordings = list_recordings_from_disk()?;
-            let resolved = resolve_recording_id_prefix(recording_id_or_prefix, &recordings)?;
-            delete_recording_dir(resolved)?;
-            println!("deleted recording {resolved}");
-        }
+
+        let deleted_id = client
+            .recording_delete(resolved)
+            .await
+            .map_err(map_cli_client_error)?;
+        println!("deleted recording {deleted_id}");
+    } else {
+        let recordings = list_recordings_from_disk()?;
+        let resolved = resolve_recording_id_prefix(recording_id_or_prefix, &recordings)?;
+        delete_recording_dir(resolved)?;
+        println!("deleted recording {resolved}");
     }
     Ok(0)
 }
@@ -296,34 +302,31 @@ pub(super) async fn run_recording_delete_all(yes: bool) -> Result<u8> {
     }
 
     cleanup_stale_pid_file().await?;
-    match connect_if_running(
+    if let Some(mut client) = connect_if_running(
         ConnectionPolicyScope::Normal,
         "bmux-cli-recording-delete-all",
     )
     .await?
     {
-        Some(mut client) => {
-            let status = client
-                .recording_status()
+        let status = client
+            .recording_status()
+            .await
+            .map_err(map_cli_client_error)?;
+        if let Some(active) = status.active {
+            let stopped_id = client
+                .recording_stop(Some(active.id))
                 .await
                 .map_err(map_cli_client_error)?;
-            if let Some(active) = status.active {
-                let stopped_id = client
-                    .recording_stop(Some(active.id))
-                    .await
-                    .map_err(map_cli_client_error)?;
-                println!("stopped active recording {stopped_id} before delete");
-            }
-            let deleted_count = client
-                .recording_delete_all()
-                .await
-                .map_err(map_cli_client_error)?;
-            println!("deleted {deleted_count} recordings");
+            println!("stopped active recording {stopped_id} before delete");
         }
-        None => {
-            let deleted_count = delete_all_recordings_from_disk()?;
-            println!("deleted {deleted_count} recordings");
-        }
+        let deleted_count = client
+            .recording_delete_all()
+            .await
+            .map_err(map_cli_client_error)?;
+        println!("deleted {deleted_count} recordings");
+    } else {
+        let deleted_count = delete_all_recordings_from_disk()?;
+        println!("deleted {deleted_count} recordings");
     }
     Ok(0)
 }
@@ -415,7 +418,7 @@ pub(super) async fn run_recording_verify_smoke(
         serde_json::to_string_pretty(&report)
             .context("failed encoding verify smoke report json")?
     );
-    Ok(if report.pass { 0 } else { 1 })
+    Ok(u8::from(!report.pass))
 }
 
 pub(super) async fn run_recording_export(
@@ -480,10 +483,7 @@ pub(super) async fn run_recording_export(
         )?,
     }
 
-    println!(
-        "export complete: format={:?} view_client={} output={}",
-        format, selected_client, output
-    );
+    println!("export complete: format={format:?} view_client={selected_client} output={output}");
     Ok(0)
 }
 
@@ -650,15 +650,13 @@ fn infer_cell_metrics(
 }
 
 fn capture_stream_open_metrics() -> (Option<u16>, Option<u16>, Option<u16>, Option<u16>) {
-    let (window_width_px, window_height_px) = terminal::window_size()
-        .ok()
-        .map(|value| {
+    let (window_width_px, window_height_px) =
+        terminal::window_size().ok().map_or((None, None), |value| {
             (
                 (value.width > 0).then_some(value.width),
                 (value.height > 0).then_some(value.height),
             )
-        })
-        .unwrap_or((None, None));
+        });
 
     let (cell_width_px, cell_height_px) = terminal::size()
         .ok()
@@ -667,8 +665,9 @@ fn capture_stream_open_metrics() -> (Option<u16>, Option<u16>, Option<u16>, Opti
             let window_height = window_height_px?;
             infer_cell_metrics(window_width, window_height, cols, rows)
         })
-        .map(|value| (Some(value.width), Some(value.height)))
-        .unwrap_or((None, None));
+        .map_or((None, None), |value| {
+            (Some(value.width), Some(value.height))
+        });
 
     (
         cell_width_px,
@@ -977,15 +976,13 @@ fn render_screen_rgba_resvg(
         .unwrap_or((f32::from(cell_h) * 0.9).max(8.0));
     let top_to_baseline = metrics
         .as_ref()
-        .map(|value| value.top_to_baseline_px)
-        .unwrap_or(f32::from(cell_h) * 0.8);
+        .map_or(f32::from(cell_h) * 0.8, |value| value.top_to_baseline_px);
     let font_family_attr = svg_font_family_list(&families);
 
     let mut svg = String::with_capacity(width.saturating_mul(height / 4).max(1024));
     write!(
         &mut svg,
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" viewBox=\"0 0 {} {}\">",
-        width, height, width, height
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" viewBox=\"0 0 {width} {height}\">"
     )
     .expect("svg write cannot fail");
     write!(
@@ -1300,7 +1297,7 @@ fn solve_font_size_for_target_cells(
         }
         let width_err = (unit_w * candidate).round() - target_w;
         let height_err = (unit_h * candidate).round() - target_h;
-        let score = width_err.abs() + (height_err.abs() * 2.0);
+        let score = height_err.abs().mul_add(2.0, width_err.abs());
         if best.is_none_or(|(_, best_score)| score < best_score) {
             best = Some((candidate, score));
         }
@@ -1654,8 +1651,9 @@ fn build_render_options(
         line_height_mult: line_height.unwrap_or(1.0),
         background_opacity: terminal_profile
             .and_then(|profile| profile.background_opacity_permille)
-            .map(|permille| (f32::from(permille) / 1000.0).clamp(0.0, 1.0))
-            .unwrap_or(1.0),
+            .map_or(1.0, |permille| {
+                (f32::from(permille) / 1000.0).clamp(0.0, 1.0)
+            }),
         backdrop_rgb: (0, 0, 0),
     })
 }
@@ -1766,7 +1764,9 @@ impl GlyphRenderer {
 }
 
 fn blend_channel(fg: u8, bg: u8, alpha: f32) -> u8 {
-    ((f32::from(fg) * alpha) + (f32::from(bg) * (1.0 - alpha))).round() as u8
+    f32::from(fg)
+        .mul_add(alpha, f32::from(bg) * (1.0 - alpha))
+        .round() as u8
 }
 
 fn load_monospace_fonts(options: &RenderOptions) -> Vec<FontArc> {
@@ -1839,7 +1839,7 @@ fn load_font_family_from_db(db: &fontdb::Database, family: &str) -> Option<FontA
     })?
 }
 
-fn font_preset_for_options(_options: &RenderOptions) -> FontPreset {
+const fn font_preset_for_options(_options: &RenderOptions) -> FontPreset {
     FontPreset::GhosttyNerd
 }
 
@@ -1916,7 +1916,7 @@ pub(super) fn parse_ignore_rules(ignore: Option<&str>) -> Vec<String> {
             raw.split(',')
                 .map(str::trim)
                 .filter(|entry| !entry.is_empty())
-                .map(|entry| entry.to_ascii_lowercase())
+                .map(str::to_ascii_lowercase)
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default()
@@ -2038,7 +2038,7 @@ pub(super) fn delete_all_recordings_from_dir(root: &Path) -> Result<usize> {
     }
 
     let mut deleted_count = 0_usize;
-    for entry in std::fs::read_dir(&root)
+    for entry in std::fs::read_dir(root)
         .with_context(|| format!("failed reading recordings dir {}", root.display()))?
     {
         let entry = entry?;
@@ -2104,9 +2104,10 @@ pub(super) fn list_recordings_from_disk() -> Result<Vec<RecordingSummary>> {
 
 fn recordings_root_dir() -> PathBuf {
     let paths = ConfigPaths::default();
-    BmuxConfig::load_from_path(&paths.config_file())
-        .map(|config| config.recordings_dir(&paths))
-        .unwrap_or_else(|_| paths.recordings_dir())
+    BmuxConfig::load_from_path(&paths.config_file()).map_or_else(
+        |_| paths.recordings_dir(),
+        |config| config.recordings_dir(&paths),
+    )
 }
 
 pub(super) fn list_recordings_from_dir(recordings_root: &Path) -> Result<Vec<RecordingSummary>> {

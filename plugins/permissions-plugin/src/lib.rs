@@ -149,7 +149,7 @@ impl RustPlugin for PermissionsPlugin {
                 let entries = match list_entries(&context, &request.session) {
                     Ok(entries) => entries,
                     Err(error) => {
-                        return ServiceResponse::error("list_failed", error.to_string());
+                        return ServiceResponse::error("list_failed", error);
                     }
                 };
                 let payload = match encode_service_message(&ListPermissionsResponse { entries }) {
@@ -169,7 +169,7 @@ impl RustPlugin for PermissionsPlugin {
                     }
                 };
                 if let Err(error) = grant_entry(&context, request) {
-                    return ServiceResponse::error("grant_failed", error.to_string());
+                    return ServiceResponse::error("grant_failed", error);
                 }
                 let payload = match encode_service_message(&CommandAckResponse { ok: true }) {
                     Ok(payload) => payload,
@@ -188,7 +188,7 @@ impl RustPlugin for PermissionsPlugin {
                         }
                     };
                 if let Err(error) = revoke_entry(&context, request) {
-                    return ServiceResponse::error("revoke_failed", error.to_string());
+                    return ServiceResponse::error("revoke_failed", error);
                 }
                 let payload = match encode_service_message(&CommandAckResponse { ok: true }) {
                     Ok(payload) => payload,
@@ -210,7 +210,7 @@ impl RustPlugin for PermissionsPlugin {
                 let decision = match evaluate_policy(&context, &request) {
                     Ok(decision) => decision,
                     Err(error) => {
-                        return ServiceResponse::error("policy_failed", error.to_string());
+                        return ServiceResponse::error("policy_failed", error);
                     }
                 };
                 let payload = match encode_service_message(&decision) {
@@ -315,7 +315,7 @@ struct StoredPermissions {
 }
 
 impl StoredPermissions {
-    fn with_default() -> Self {
+    const fn with_default() -> Self {
         Self {
             by_session_id: BTreeMap::new(),
         }
@@ -422,17 +422,16 @@ fn evaluate_role_action(role: &str, action: &str) -> SessionPolicyCheckResponse 
         | ("observer", PolicyActionKind::Mutation) => SessionPolicyCheckResponse {
             allowed: false,
             reason: Some(format!(
-                "session policy denied for action '{}' with role '{}'",
-                action, role
+                "session policy denied for action '{action}' with role '{role}'"
             )),
         },
         (_, PolicyActionKind::Unknown) => SessionPolicyCheckResponse {
             allowed: false,
-            reason: Some(format!("invalid session policy action '{}'", action)),
+            reason: Some(format!("invalid session policy action '{action}'")),
         },
         (_, _) => SessionPolicyCheckResponse {
             allowed: false,
-            reason: Some(format!("invalid session policy role mapping '{}'", role)),
+            reason: Some(format!("invalid session policy role mapping '{role}'")),
         },
     }
 }
@@ -491,7 +490,7 @@ fn resolve_session_id(caller: &impl HostRuntimeApi, session: &str) -> Result<Uui
             SessionSelector::ByName(name) => entry.name.as_deref() == Some(name.as_str()),
         })
         .map(|entry| entry.id)
-        .ok_or_else(|| format!("session '{}' not found", session))
+        .ok_or_else(|| format!("session '{session}' not found"))
 }
 
 fn validate_role(role: &str) -> Result<(), String> {
@@ -499,8 +498,7 @@ fn validate_role(role: &str) -> Result<(), String> {
         Ok(())
     } else {
         Err(format!(
-            "invalid role '{}'; expected one of: owner, writer, observer",
-            role
+            "invalid role '{role}'; expected one of: owner, writer, observer"
         ))
     }
 }
@@ -635,8 +633,7 @@ mod tests {
             match (interface_id, operation) {
                 ("session-query/v1", "list") => encode_service_message(&SessionListResponse {
                     sessions: self.sessions.clone(),
-                })
-                .map_err(Into::into),
+                }),
                 ("client-query/v1", "current") => {
                     encode_service_message(&bmux_plugin::CurrentClientResponse {
                         id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
@@ -644,7 +641,6 @@ mod tests {
                         following_client_id: None,
                         following_global: false,
                     })
-                    .map_err(Into::into)
                 }
                 ("storage-query/v1", "get") => {
                     let request: StorageGetRequest = decode_service_message(&payload)?;
@@ -655,7 +651,6 @@ mod tests {
                         .get(&request.key)
                         .cloned();
                     encode_service_message(&bmux_plugin::StorageGetResponse { value })
-                        .map_err(Into::into)
                 }
                 ("storage-command/v1", "set") => {
                     let request: StorageSetRequest = decode_service_message(&payload)?;
@@ -663,7 +658,7 @@ mod tests {
                         .lock()
                         .expect("storage lock should succeed")
                         .insert(request.key, request.value);
-                    encode_service_message(&()).map_err(Into::into)
+                    encode_service_message(&())
                 }
                 _ => Err(bmux_plugin::PluginError::UnsupportedHostOperation {
                     operation: "mock_service",

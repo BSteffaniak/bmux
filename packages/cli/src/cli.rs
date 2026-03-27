@@ -348,7 +348,7 @@ pub enum RecordingCommand {
         /// Renderer mode for frame rasterization
         #[arg(long, value_enum, default_value_t = RecordingRenderMode::Font)]
         renderer: RecordingRenderMode,
-        /// Cell size in pixels as WIDTHxHEIGHT (e.g. 8x16)
+        /// Cell size in pixels as `WIDTHxHEIGHT` (e.g. 8x16)
         #[arg(long, value_parser = parse_cell_size)]
         cell_size: Option<(u16, u16)>,
         /// Override glyph cell width in pixels

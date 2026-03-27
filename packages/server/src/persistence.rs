@@ -436,8 +436,7 @@ fn validate_snapshot_v4(snapshot: &SnapshotV4) -> Result<(), SnapshotError> {
     for context_id in &snapshot.mru_contexts {
         if !context_ids.contains(context_id) {
             return Err(SnapshotError::Validation(format!(
-                "mru context references missing context {}",
-                context_id
+                "mru context references missing context {context_id}"
             )));
         }
     }
@@ -475,11 +474,11 @@ fn collect_layout_pane_ids(
     Ok(())
 }
 
-fn normalize_snapshot_v3_numbering(snapshot: SnapshotV3) -> SnapshotV3 {
+const fn normalize_snapshot_v3_numbering(snapshot: SnapshotV3) -> SnapshotV3 {
     snapshot
 }
 
-fn normalize_snapshot_v4_numbering(snapshot: SnapshotV4) -> SnapshotV4 {
+const fn normalize_snapshot_v4_numbering(snapshot: SnapshotV4) -> SnapshotV4 {
     snapshot
 }
 

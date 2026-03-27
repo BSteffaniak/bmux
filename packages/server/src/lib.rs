@@ -806,7 +806,7 @@ fn create_session_runtime(state: &Arc<ServerState>, name: Option<String>) -> Res
     }
 
     let session_id = manager
-        .create_session(name.clone())
+        .create_session(name)
         .map_err(|error| anyhow::anyhow!("failed creating session: {error:#}"))?;
     drop(manager);
 
@@ -1236,7 +1236,7 @@ fn collect_runtime_layout_pane_ids(node: &PaneLayoutNode, out: &mut BTreeSet<Uui
     match node {
         PaneLayoutNode::Leaf { pane_id } => {
             if !out.insert(*pane_id) {
-                anyhow::bail!("duplicate pane id {} in runtime layout", pane_id)
+                anyhow::bail!("duplicate pane id {pane_id} in runtime layout")
             }
         }
         PaneLayoutNode::Split {
@@ -1246,7 +1246,7 @@ fn collect_runtime_layout_pane_ids(node: &PaneLayoutNode, out: &mut BTreeSet<Uui
             ..
         } => {
             if !(0.1..=0.9).contains(ratio) {
-                anyhow::bail!("runtime split ratio {} out of range [0.1, 0.9]", ratio)
+                anyhow::bail!("runtime split ratio {ratio} out of range [0.1, 0.9]")
             }
             collect_runtime_layout_pane_ids(first, out)?;
             collect_runtime_layout_pane_ids(second, out)?;
@@ -1336,7 +1336,7 @@ fn collect_layout_rects(
     }
 }
 
-fn attach_rect_from_layout_rect(rect: LayoutRect) -> AttachRect {
+const fn attach_rect_from_layout_rect(rect: LayoutRect) -> AttachRect {
     AttachRect {
         x: rect.x,
         y: rect.y,
@@ -1499,7 +1499,7 @@ fn runtime_layout_from_snapshot(node: &PaneLayoutNodeSnapshotV2) -> PaneLayoutNo
 }
 
 impl SessionRuntimeManager {
-    fn new(
+    const fn new(
         shell: String,
         pane_term: String,
         protocol_profile: ProtocolProfile,
@@ -1616,27 +1616,25 @@ impl SessionRuntimeManager {
 
         let task = tokio::spawn(async move {
             let pty_system = native_pty_system();
-            let pty_pair = match pty_system.openpty(PtySize {
+            let pty_pair = if let Ok(pair) = pty_system.openpty(PtySize {
                 rows: 24,
                 cols: 80,
                 pixel_width: 0,
                 pixel_height: 0,
             }) {
-                Ok(pair) => pair,
-                Err(_) => {
-                    exited_for_task.store(true, Ordering::SeqCst);
-                    return;
-                }
+                pair
+            } else {
+                exited_for_task.store(true, Ordering::SeqCst);
+                return;
             };
 
             let mut command = CommandBuilder::new(&shell);
             command.env("TERM", &pane_term);
-            let mut child = match pty_pair.slave.spawn_command(command) {
-                Ok(child) => child,
-                Err(_) => {
-                    exited_for_task.store(true, Ordering::SeqCst);
-                    return;
-                }
+            let mut child = if let Ok(child) = pty_pair.slave.spawn_command(command) {
+                child
+            } else {
+                exited_for_task.store(true, Ordering::SeqCst);
+                return;
             };
             let mut child_killer = child.clone_killer();
             drop(pty_pair.slave);
@@ -2112,10 +2110,8 @@ impl SessionRuntimeManager {
                     .map_err(|_| SessionRuntimeError::Closed)?;
                 let data = output.read_for_client(client_id, max_bytes);
                 drop(output);
-                if pane.exited.load(Ordering::SeqCst) {
-                    if *pane_id == session.focused_pane_id {
-                        closed_active = true;
-                    }
+                if pane.exited.load(Ordering::SeqCst) && *pane_id == session.focused_pane_id {
+                    closed_active = true;
                 }
                 chunks.push(AttachPaneChunk {
                     pane_id: *pane_id,
@@ -4765,29 +4761,26 @@ async fn handle_request(
                 previous.remove_client(&client_id);
             }
 
-            match manager.get_session_mut(&next_session_id) {
-                Some(session) => {
-                    session.add_client(client_id);
-                    *selected_session = Some(next_session_id);
-                    persist_selected_session(state, client_id, *selected_session)?;
-                    drop(manager);
+            if let Some(session) = manager.get_session_mut(&next_session_id) {
+                session.add_client(client_id);
+                *selected_session = Some(next_session_id);
+                persist_selected_session(state, client_id, *selected_session)?;
+                drop(manager);
 
-                    let mut attach_tokens = state
-                        .attach_tokens
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
-                    let mut grant = attach_tokens.issue(next_session_id);
-                    grant.context_id = current_context_id_for_client(state, client_id);
-                    Response::Ok(ResponsePayload::Attached { grant })
-                }
-                None => {
-                    drop(manager);
-                    let _ = prune_context_mappings_for_session(state, next_session_id)?;
-                    Response::Err(ErrorResponse {
-                        code: ErrorCode::NotFound,
-                        message: format!("session not found: {}", next_session_id.0),
-                    })
-                }
+                let mut attach_tokens = state
+                    .attach_tokens
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
+                let mut grant = attach_tokens.issue(next_session_id);
+                grant.context_id = current_context_id_for_client(state, client_id);
+                Response::Ok(ResponsePayload::Attached { grant })
+            } else {
+                drop(manager);
+                let _ = prune_context_mappings_for_session(state, next_session_id)?;
+                Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!("session not found: {}", next_session_id.0),
+                })
             }
         }
         Request::AttachContext { selector } => {
@@ -4827,29 +4820,26 @@ async fn handle_request(
                 previous.remove_client(&client_id);
             }
 
-            match manager.get_session_mut(&next_session_id) {
-                Some(session) => {
-                    session.add_client(client_id);
-                    *selected_session = Some(next_session_id);
-                    persist_selected_session(state, client_id, *selected_session)?;
-                    drop(manager);
+            if let Some(session) = manager.get_session_mut(&next_session_id) {
+                session.add_client(client_id);
+                *selected_session = Some(next_session_id);
+                persist_selected_session(state, client_id, *selected_session)?;
+                drop(manager);
 
-                    let mut attach_tokens = state
-                        .attach_tokens
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
-                    let mut grant = attach_tokens.issue(next_session_id);
-                    grant.context_id = Some(selected_context_id);
-                    Response::Ok(ResponsePayload::Attached { grant })
-                }
-                None => {
-                    drop(manager);
-                    let _ = prune_context_mappings_for_session(state, next_session_id)?;
-                    Response::Err(ErrorResponse {
-                        code: ErrorCode::NotFound,
-                        message: format!("session not found: {}", next_session_id.0),
-                    })
-                }
+                let mut attach_tokens = state
+                    .attach_tokens
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
+                let mut grant = attach_tokens.issue(next_session_id);
+                grant.context_id = Some(selected_context_id);
+                Response::Ok(ResponsePayload::Attached { grant })
+            } else {
+                drop(manager);
+                let _ = prune_context_mappings_for_session(state, next_session_id)?;
+                Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!("session not found: {}", next_session_id.0),
+                })
             }
         }
         Request::AttachOpen {

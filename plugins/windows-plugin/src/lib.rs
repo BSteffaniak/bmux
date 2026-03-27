@@ -122,7 +122,7 @@ impl RustPlugin for WindowsPlugin {
                 let windows = match list_windows(&context, request.session.as_deref()) {
                     Ok(windows) => windows,
                     Err(error) => {
-                        return ServiceResponse::error("list_failed", error.to_string());
+                        return ServiceResponse::error("list_failed", error);
                     }
                 };
                 let payload = match encode_service_message(&ListWindowsResponse { windows }) {
@@ -164,7 +164,7 @@ impl RustPlugin for WindowsPlugin {
                 let selector = match parse_selector(&request.target) {
                     Ok(selector) => selector,
                     Err(error) => {
-                        return ServiceResponse::error("invalid_request", error.to_string());
+                        return ServiceResponse::error("invalid_request", error);
                     }
                 };
                 let ack = match kill_window(&context, selector, request.force_local) {
@@ -211,7 +211,7 @@ impl RustPlugin for WindowsPlugin {
                 let selector = match parse_selector(&request.target) {
                     Ok(selector) => selector,
                     Err(error) => {
-                        return ServiceResponse::error("invalid_request", error.to_string());
+                        return ServiceResponse::error("invalid_request", error);
                     }
                 };
                 let ack = match switch_window(&context, selector, &mut self.last_selected_by_client)
@@ -1056,8 +1056,7 @@ mod tests {
             match (interface_id, operation) {
                 ("context-query/v1", "list") => encode_service_message(&ContextListResponse {
                     contexts: self.sessions.clone(),
-                })
-                .map_err(Into::into),
+                }),
                 ("context-command/v1", "create") => {
                     if self.fail_create {
                         return Err(bmux_plugin::PluginError::ServiceProtocol {
@@ -1076,7 +1075,6 @@ mod tests {
                             attributes: request.attributes,
                         },
                     })
-                    .map_err(Into::into)
                 }
                 ("context-command/v1", "close") => {
                     if self.fail_kill {
@@ -1095,7 +1093,6 @@ mod tests {
                             SessionSelector::ByName(_) => Uuid::new_v4(),
                         },
                     })
-                    .map_err(Into::into)
                 }
                 ("context-command/v1", "select") => {
                     if self.fail_kill {
@@ -1130,7 +1127,6 @@ mod tests {
                             attributes: BTreeMap::new(),
                         },
                     })
-                    .map_err(Into::into)
                 }
                 ("context-query/v1", "current") => {
                     let current_context_id = *self
@@ -1140,7 +1136,6 @@ mod tests {
                     let context = current_context_id
                         .and_then(|id| self.sessions.iter().find(|entry| entry.id == id).cloned());
                     encode_service_message(&bmux_plugin::ContextCurrentResponse { context })
-                        .map_err(Into::into)
                 }
                 ("client-query/v1", "current") => {
                     if self.fail_current_client {
@@ -1158,7 +1153,6 @@ mod tests {
                         following_client_id: None,
                         following_global: false,
                     })
-                    .map_err(Into::into)
                 }
                 ("storage-query/v1", "get") => {
                     let request: StorageGetRequest = decode_service_message(&payload)?;
@@ -1169,7 +1163,6 @@ mod tests {
                         .get(&request.key)
                         .cloned();
                     encode_service_message(&bmux_plugin::StorageGetResponse { value })
-                        .map_err(Into::into)
                 }
                 ("storage-command/v1", "set") => {
                     let request: StorageSetRequest = decode_service_message(&payload)?;
@@ -1177,7 +1170,7 @@ mod tests {
                         .lock()
                         .expect("storage lock should succeed")
                         .insert(request.key, request.value);
-                    encode_service_message(&()).map_err(Into::into)
+                    encode_service_message(&())
                 }
                 _ => Err(bmux_plugin::PluginError::UnsupportedHostOperation {
                     operation: "mock_service",

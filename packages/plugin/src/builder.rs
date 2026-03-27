@@ -128,7 +128,7 @@ impl PluginBuilder {
     }
 
     #[must_use]
-    pub fn lifecycle(mut self, lifecycle: PluginLifecycle) -> Self {
+    pub const fn lifecycle(mut self, lifecycle: PluginLifecycle) -> Self {
         self.descriptor.lifecycle = lifecycle;
         self
     }

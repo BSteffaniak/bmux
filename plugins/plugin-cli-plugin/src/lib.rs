@@ -201,8 +201,7 @@ fn run_run_command(context: &NativeCommandContext) -> Result<i32, String> {
     if target_info.bundled_static {
         return Err(format!(
             "plugin '{plugin_id}' is statically bundled into the binary and cannot be loaded dynamically via 'plugin run'.\n\
-             Run its commands directly, e.g.: bmux {}",
-            command_name,
+             Run its commands directly, e.g.: bmux {command_name}",
         ));
     }
 
@@ -569,12 +568,10 @@ fn scan_plugins_with_bundled_entry_fallback(
             let entry_exists = manifest
                 .resolve_entry_path(manifest_path.parent().unwrap_or_else(|| Path::new(".")))
                 .exists();
-            if !entry_exists {
-                if let Some(executable_dir) = executable_dir.as_ref() {
-                    let candidate = executable_dir.join(&manifest.entry);
-                    if candidate.exists() {
-                        manifest.entry = candidate;
-                    }
+            if !entry_exists && let Some(executable_dir) = executable_dir.as_ref() {
+                let candidate = executable_dir.join(&manifest.entry);
+                if candidate.exists() {
+                    manifest.entry = candidate;
                 }
             }
 
@@ -620,7 +617,7 @@ fn format_plugin_not_found_message<S: AsRef<str>>(plugin_id: &str, available: &[
     } else {
         let available = available
             .iter()
-            .map(|entry| entry.as_ref())
+            .map(std::convert::AsRef::as_ref)
             .collect::<Vec<_>>();
         format!(
             "plugin '{plugin_id}' was not found (available: {})",

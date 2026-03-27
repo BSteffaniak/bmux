@@ -87,7 +87,7 @@ impl SessionManager {
         if self.sessions.remove(session_id).is_some() {
             Ok(())
         } else {
-            Err(anyhow::anyhow!("Session not found: {}", session_id))
+            Err(anyhow::anyhow!("Session not found: {session_id}"))
         }
     }
 

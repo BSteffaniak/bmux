@@ -52,7 +52,7 @@ struct Manifest {
 }
 
 impl RecordingRuntime {
-    pub fn new(root_dir: PathBuf) -> Self {
+    pub const fn new(root_dir: PathBuf) -> Self {
         Self {
             root_dir,
             active: None,
@@ -274,10 +274,10 @@ impl RecordingRuntime {
             return Ok(false);
         };
 
-        if let Some(filter) = active.session_filter {
-            if meta.session_id != Some(filter) {
-                return Ok(false);
-            }
+        if let Some(filter) = active.session_filter
+            && meta.session_id != Some(filter)
+        {
+            return Ok(false);
         }
 
         if !active.event_kinds.contains(&kind) {
@@ -508,7 +508,7 @@ mod tests {
     #[test]
     fn delete_all_stops_active_and_removes_recordings() {
         let root = temp_dir();
-        let mut runtime = RecordingRuntime::new(root.clone());
+        let mut runtime = RecordingRuntime::new(root);
         let active = runtime
             .start(
                 None,

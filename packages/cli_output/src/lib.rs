@@ -50,7 +50,7 @@ pub struct Table {
 
 impl Table {
     #[must_use]
-    pub fn new(columns: Vec<TableColumn>) -> Self {
+    pub const fn new(columns: Vec<TableColumn>) -> Self {
         Self {
             columns,
             rows: Vec::new(),
@@ -120,7 +120,7 @@ where
             .columns
             .iter()
             .enumerate()
-            .map(|(index, _)| row.get(index).map(String::as_str).unwrap_or(""))
+            .map(|(index, _)| row.get(index).map_or("", String::as_str))
             .collect::<Vec<_>>();
         let line = format_row(&cells, &table.columns, &widths);
         write_line(&line)?;

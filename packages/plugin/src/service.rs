@@ -38,7 +38,7 @@ pub enum ProviderId {
 
 impl ProviderId {
     #[must_use]
-    pub fn display_name(&self) -> &str {
+    pub const fn display_name(&self) -> &str {
         match self {
             Self::Plugin(plugin_id) => plugin_id.as_str(),
             Self::Host => "host",
@@ -139,7 +139,7 @@ pub struct ServiceResponse {
 
 impl ServiceResponse {
     #[must_use]
-    pub fn ok(payload: Vec<u8>) -> Self {
+    pub const fn ok(payload: Vec<u8>) -> Self {
         Self {
             payload,
             error: None,

@@ -178,11 +178,7 @@ impl Keymap {
         if let Some(timeout_ms) = timeout_ms
             && !(MIN_TIMEOUT_MS..=MAX_TIMEOUT_MS).contains(&timeout_ms)
         {
-            bail!(
-                "keymap timeout_ms must be between {} and {}",
-                MIN_TIMEOUT_MS,
-                MAX_TIMEOUT_MS
-            );
+            bail!("keymap timeout_ms must be between {MIN_TIMEOUT_MS} and {MAX_TIMEOUT_MS}");
         }
 
         let prefix_stroke = parse_stroke(prefix)?;
@@ -582,7 +578,7 @@ impl InputProcessor {
         }
     }
 
-    pub(crate) fn set_scroll_mode(&mut self, enabled: bool) {
+    pub(crate) const fn set_scroll_mode(&mut self, enabled: bool) {
         self.scroll_mode = enabled;
     }
 }

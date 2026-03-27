@@ -112,13 +112,13 @@ impl PluginCommand {
     }
 
     #[must_use]
-    pub fn execution(mut self, execution: CommandExecutionKind) -> Self {
+    pub const fn execution(mut self, execution: CommandExecutionKind) -> Self {
         self.execution = execution;
         self
     }
 
     #[must_use]
-    pub fn expose_in_cli(mut self, expose_in_cli: bool) -> Self {
+    pub const fn expose_in_cli(mut self, expose_in_cli: bool) -> Self {
         self.expose_in_cli = expose_in_cli;
         self
     }
@@ -211,31 +211,31 @@ impl PluginCommandArgument {
     }
 
     #[must_use]
-    pub fn short(mut self, short: char) -> Self {
+    pub const fn short(mut self, short: char) -> Self {
         self.short = Some(short);
         self
     }
 
     #[must_use]
-    pub fn required(mut self, required: bool) -> Self {
+    pub const fn required(mut self, required: bool) -> Self {
         self.required = required;
         self
     }
 
     #[must_use]
-    pub fn multiple(mut self, multiple: bool) -> Self {
+    pub const fn multiple(mut self, multiple: bool) -> Self {
         self.multiple = multiple;
         self
     }
 
     #[must_use]
-    pub fn trailing_var_arg(mut self, trailing_var_arg: bool) -> Self {
+    pub const fn trailing_var_arg(mut self, trailing_var_arg: bool) -> Self {
         self.trailing_var_arg = trailing_var_arg;
         self
     }
 
     #[must_use]
-    pub fn allow_hyphen_values(mut self, allow_hyphen_values: bool) -> Self {
+    pub const fn allow_hyphen_values(mut self, allow_hyphen_values: bool) -> Self {
         self.allow_hyphen_values = allow_hyphen_values;
         self
     }
@@ -259,7 +259,7 @@ impl PluginCommandArgument {
     }
 
     #[must_use]
-    pub fn position(mut self, position: usize) -> Self {
+    pub const fn position(mut self, position: usize) -> Self {
         self.position = Some(position);
         self
     }

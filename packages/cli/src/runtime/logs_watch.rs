@@ -6,7 +6,7 @@ use moosicbox_log_watch::{
 use std::path::PathBuf;
 
 #[cfg(test)]
-pub(crate) use moosicbox_log_watch::{
+pub use moosicbox_log_watch::{
     LogFilterCaseMode, LogFilterKind, LogFilterRule, compile_filter_regex, line_visible_in_watch,
     normalize_profile_name as normalize_logs_watch_profile,
     watch_filter_rule_to_state as logs_watch_filter_rule_to_state,
@@ -16,7 +16,7 @@ pub(crate) use moosicbox_log_watch::{
 const BMUX_LOG_FILE_PREFIX: &str = "bmux.log";
 const BMUX_WATCH_TITLE: &str = "bmux logs watch";
 
-pub(crate) fn run_logs_watch(
+pub fn run_logs_watch(
     lines: Option<usize>,
     since: Option<&str>,
     profile: Option<&str>,
@@ -41,7 +41,7 @@ pub(crate) fn run_logs_watch(
     Ok(0)
 }
 
-pub(crate) fn run_logs_profiles_list(as_json: bool) -> Result<u8> {
+pub fn run_logs_profiles_list(as_json: bool) -> Result<u8> {
     let summaries = moosicbox_log_watch::profiles_list(&logs_watch_state_file_path())?;
 
     if as_json {
@@ -73,7 +73,7 @@ pub(crate) fn run_logs_profiles_list(as_json: bool) -> Result<u8> {
     Ok(0)
 }
 
-pub(crate) fn run_logs_profiles_show(profile: Option<&str>, as_json: bool) -> Result<u8> {
+pub fn run_logs_profiles_show(profile: Option<&str>, as_json: bool) -> Result<u8> {
     let details = moosicbox_log_watch::profile_show(&logs_watch_state_file_path(), profile)?;
     if as_json {
         println!(
@@ -129,19 +129,19 @@ pub(crate) fn run_logs_profiles_show(profile: Option<&str>, as_json: bool) -> Re
     Ok(0)
 }
 
-pub(crate) fn run_logs_profiles_delete(profile: &str) -> Result<u8> {
+pub fn run_logs_profiles_delete(profile: &str) -> Result<u8> {
     moosicbox_log_watch::profile_delete(&logs_watch_state_file_path(), profile)?;
     println!("deleted profile '{profile}'");
     Ok(0)
 }
 
-pub(crate) fn run_logs_profiles_rename(from: &str, to: &str) -> Result<u8> {
+pub fn run_logs_profiles_rename(from: &str, to: &str) -> Result<u8> {
     moosicbox_log_watch::profile_rename(&logs_watch_state_file_path(), from, to)?;
     println!("renamed profile '{from}' -> '{to}'");
     Ok(0)
 }
 
-pub(crate) fn active_log_file_path() -> PathBuf {
+pub fn active_log_file_path() -> PathBuf {
     moosicbox_log_watch::active_log_file_path(
         &ConfigPaths::default().logs_dir(),
         BMUX_LOG_FILE_PREFIX,

@@ -179,12 +179,12 @@ impl PluginCommandRegistry {
                     if let Some(values) = matches.get_many::<String>(&argument.name) {
                         for value in values {
                             normalized.push(format!("--{long}"));
-                            normalized.push(value.to_string());
+                            normalized.push(value.clone());
                         }
                     }
                 } else if let Some(value) = matches.get_one::<String>(&argument.name) {
                     normalized.push(format!("--{long}"));
-                    normalized.push(value.to_string());
+                    normalized.push(value.clone());
                 }
                 continue;
             }
@@ -194,7 +194,7 @@ impl PluginCommandRegistry {
                     normalized.extend(values.cloned());
                 }
             } else if let Some(value) = matches.get_one::<String>(&argument.name) {
-                normalized.push(value.to_string());
+                normalized.push(value.clone());
             }
         }
 
@@ -221,12 +221,12 @@ impl PluginCommandRegistry {
                     if let Some(values) = matches.get_many::<String>(&argument.name) {
                         for value in values {
                             normalized.push(format!("--{long}"));
-                            normalized.push(value.to_string());
+                            normalized.push(value.clone());
                         }
                     }
                 } else if let Some(value) = matches.get_one::<String>(&argument.name) {
                     normalized.push(format!("--{long}"));
-                    normalized.push(value.to_string());
+                    normalized.push(value.clone());
                 }
                 continue;
             }
@@ -236,7 +236,7 @@ impl PluginCommandRegistry {
                     normalized.extend(values.cloned());
                 }
             } else if let Some(value) = matches.get_one::<String>(&argument.name) {
-                normalized.push(value.to_string());
+                normalized.push(value.clone());
             }
         }
         normalized
@@ -253,7 +253,7 @@ impl PluginCommandRegistry {
     }
 }
 
-pub fn selected_subcommand_path<'a>(matches: &'a ArgMatches) -> (Vec<String>, &'a ArgMatches) {
+pub fn selected_subcommand_path(matches: &ArgMatches) -> (Vec<String>, &ArgMatches) {
     let mut path = Vec::new();
     let mut current = matches;
     while let Some((name, next)) = current.subcommand() {
