@@ -1123,6 +1123,7 @@ struct GlyphRenderer {
     fonts: Vec<FontArc>,
     scale: PxScale,
     baseline_offset: f32,
+    glyph_font_index: HashMap<char, Option<usize>>,
 }
 
 impl GlyphRenderer {
@@ -1152,7 +1153,21 @@ impl GlyphRenderer {
             fonts,
             scale,
             baseline_offset,
+            glyph_font_index: HashMap::new(),
         })
+    }
+
+    fn resolve_font_index(&mut self, glyph_char: char) -> Option<usize> {
+        if let Some(cached) = self.glyph_font_index.get(&glyph_char) {
+            return *cached;
+        }
+        let resolved = self
+            .fonts
+            .iter()
+            .enumerate()
+            .find_map(|(index, font)| (font.glyph_id(glyph_char).0 != 0).then_some(index));
+        self.glyph_font_index.insert(glyph_char, resolved);
+        resolved
     }
 
     fn draw_cell(
@@ -1169,17 +1184,15 @@ impl GlyphRenderer {
         if glyph_char == ' ' {
             return false;
         }
-        let Some(outlined) = self.fonts.iter().find_map(|font| {
-            let glyph_id = font.glyph_id(glyph_char);
-            if glyph_id.0 == 0 {
-                return None;
-            }
-            let glyph = glyph_id.with_scale_and_position(
-                self.scale,
-                point(x0 as f32, y0 as f32 + self.baseline_offset),
-            );
-            font.outline_glyph(glyph)
-        }) else {
+        let Some(font_index) = self.resolve_font_index(glyph_char) else {
+            return false;
+        };
+        let font = &self.fonts[font_index];
+        let glyph = font.glyph_id(glyph_char).with_scale_and_position(
+            self.scale,
+            point(x0 as f32, y0 as f32 + self.baseline_offset),
+        );
+        let Some(outlined) = font.outline_glyph(glyph) else {
             return false;
         };
         outlined.draw(|gx, gy, coverage| {
