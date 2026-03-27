@@ -6,6 +6,7 @@ pub(super) struct DetectedTerminalProfile {
     pub(super) terminal_id: String,
     pub(super) font_families: Vec<String>,
     pub(super) font_size_px: Option<u16>,
+    pub(super) background_opacity_permille: Option<u16>,
     pub(super) source: String,
 }
 
@@ -58,6 +59,7 @@ struct GhosttyProvider;
 struct GhosttyConfigProfile {
     font_families: Vec<String>,
     font_size_px: Option<u16>,
+    background_opacity_permille: Option<u16>,
 }
 
 impl GhosttyProvider {
@@ -88,7 +90,10 @@ impl GhosttyProvider {
     fn resolve_from_config(path: &Path) -> Option<DetectedTerminalProfile> {
         let content = std::fs::read_to_string(path).ok()?;
         let parsed = parse_ghostty_config_profile(&content);
-        if parsed.font_families.is_empty() && parsed.font_size_px.is_none() {
+        if parsed.font_families.is_empty()
+            && parsed.font_size_px.is_none()
+            && parsed.background_opacity_permille.is_none()
+        {
             return None;
         }
         Some(DetectedTerminalProfile {
@@ -99,6 +104,7 @@ impl GhosttyProvider {
                 parsed.font_families
             },
             font_size_px: parsed.font_size_px,
+            background_opacity_permille: parsed.background_opacity_permille,
             source: format!("ghostty-config:{}", path.display()),
         })
     }
@@ -108,6 +114,7 @@ impl GhosttyProvider {
             terminal_id: "ghostty".to_string(),
             font_families: Self::default_font_families(),
             font_size_px: None,
+            background_opacity_permille: None,
             source: "ghostty-default".to_string(),
         }
     }
@@ -174,6 +181,15 @@ fn parse_ghostty_config_profile(content: &str) -> GhosttyConfigProfile {
                     profile.font_size_px = Some(font_size);
                 }
             }
+            "background-opacity" => {
+                if parsed.is_empty() {
+                    profile.background_opacity_permille = None;
+                    continue;
+                }
+                if let Some(opacity) = parse_ghostty_background_opacity_permille(&parsed) {
+                    profile.background_opacity_permille = Some(opacity);
+                }
+            }
             _ => {}
         }
     }
@@ -190,6 +206,16 @@ fn parse_ghostty_font_size_px(value: &str) -> Option<u16> {
         return None;
     }
     Some(rounded as u16)
+}
+
+fn parse_ghostty_background_opacity_permille(value: &str) -> Option<u16> {
+    let numeric = value.parse::<f32>().ok()?;
+    let clamped = numeric.clamp(0.0, 1.0);
+    let permille = (clamped * 1000.0).round();
+    if permille > f32::from(u16::MAX) {
+        return None;
+    }
+    Some(permille as u16)
 }
 
 fn strip_inline_comment(line: &str) -> String {
@@ -251,10 +277,12 @@ font-family = "Symbols Nerd Font Mono"
 font-family = ""
 font-family = "Iosevka"
 font-size = 16
+background-opacity = 0.9
 "#,
         );
         assert_eq!(parsed.font_families, vec!["Iosevka".to_string()]);
         assert_eq!(parsed.font_size_px, Some(16));
+        assert_eq!(parsed.background_opacity_permille, Some(900));
     }
 
     #[test]
@@ -265,6 +293,13 @@ font-family = "Jet#Brains Mono" # inline comment
 "#,
         );
         assert_eq!(parsed.font_families, vec!["Jet#Brains Mono".to_string()]);
+    }
+
+    #[test]
+    fn parse_ghostty_background_opacity_clamps_to_unit_interval() {
+        assert_eq!(parse_ghostty_background_opacity_permille("-1"), Some(0));
+        assert_eq!(parse_ghostty_background_opacity_permille("0.5"), Some(500));
+        assert_eq!(parse_ghostty_background_opacity_permille("1.5"), Some(1000));
     }
 
     #[test]
@@ -303,6 +338,7 @@ font-family = "Jet#Brains Mono" # inline comment
         let profile = detect_render_profile_for_env(&env).expect("profile should be detected");
         assert_eq!(profile.font_families, vec!["Iosevka Term".to_string()]);
         assert_eq!(profile.font_size_px, Some(15));
+        assert_eq!(profile.background_opacity_permille, None);
         assert!(profile.source.contains("ghostty-config:"));
         let _ = std::fs::remove_dir_all(&temp);
     }

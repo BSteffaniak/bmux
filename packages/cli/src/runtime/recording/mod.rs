@@ -970,9 +970,12 @@ fn render_screen_rgba_resvg(
     if families.is_empty() {
         families.push("monospace".to_string());
     }
-    let font_size = options.font_size_px.unwrap_or(f32::from(cell_h).max(8.0));
-    let text_height = (font_size * options.line_height_mult.max(1.0)).max(font_size);
-    let y_offset = ((f32::from(cell_h) - text_height) / 2.0).max(0.0);
+    let font_size = options
+        .font_size_px
+        .or_else(|| calibrate_cell_font_size(cell_w, cell_h, options))
+        .unwrap_or((f32::from(cell_h) * 0.9).max(8.0));
+    let line_height = (font_size * options.line_height_mult.max(1.0)).max(font_size);
+    let y_offset = ((f32::from(cell_h) - line_height) / 2.0).max(0.0).round();
     let font_family_attr = svg_font_family_list(&families);
 
     let mut svg = String::with_capacity(width.saturating_mul(height / 4).max(1024));
@@ -984,51 +987,89 @@ fn render_screen_rgba_resvg(
     .expect("svg write cannot fail");
     write!(
         &mut svg,
-        "<g font-family=\"{}\" font-size=\"{:.3}\" text-rendering=\"optimizeLegibility\" dominant-baseline=\"text-before-edge\">",
+        "<g font-family=\"{}\" font-size=\"{:.3}\" text-rendering=\"optimizeLegibility\" dominant-baseline=\"text-before-edge\" font-kerning=\"none\" font-variant-ligatures=\"none\">",
         xml_escape_attr(&font_family_attr),
         font_size
     )
     .expect("svg write cannot fail");
 
     for row in 0..rows {
+        let mut row_runs = Vec::<TextRun>::new();
+        let mut current_run = None::<TextRun>;
         for col in 0..cols {
             let Some(cell) = screen.cell(row, col) else {
                 continue;
             };
-            let mut fg = vt100_color_to_palette_index(cell.fgcolor(), true);
-            let mut bg = vt100_color_to_palette_index(cell.bgcolor(), false);
-            if cell.inverse() {
-                std::mem::swap(&mut fg, &mut bg);
+            let (mut fg_rgb, bg_rgb) = resolved_cell_colors(cell, palette);
+            if cell.dim() {
+                fg_rgb = dim_rgb(fg_rgb);
             }
-            let (fg_r, fg_g, fg_b) = palette[usize::from(fg)];
-            let (bg_r, bg_g, bg_b) = palette[usize::from(bg)];
+            let bg_rgb =
+                composite_with_backdrop(bg_rgb, options.background_opacity, options.backdrop_rgb);
             let x0 = usize::from(col).saturating_mul(cell_w_usize);
             let y0 = usize::from(row).saturating_mul(cell_h_usize);
             write!(
                 &mut svg,
                 "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"rgb({},{},{})\"/>",
-                x0, y0, cell_w_usize, cell_h_usize, bg_r, bg_g, bg_b
+                x0, y0, cell_w_usize, cell_h_usize, bg_rgb.0, bg_rgb.1, bg_rgb.2
             )
             .expect("svg write cannot fail");
 
-            let glyph_char = if cell.has_contents() {
-                cell.contents().chars().next().unwrap_or(' ')
+            let cell_text = if cell.has_contents() {
+                let text = cell.contents();
+                if text.is_empty() { " " } else { text }
             } else {
-                ' '
+                " "
             };
-            if glyph_char == ' ' {
+            let style = TextStyle {
+                fg_rgb,
+                bold: cell.bold(),
+                italic: cell.italic(),
+                underline: cell.underline(),
+            };
+            match current_run.take() {
+                Some(mut run) if run.style == style => {
+                    run.text.push_str(cell_text);
+                    current_run = Some(run);
+                }
+                Some(run) => {
+                    row_runs.push(run);
+                    current_run = Some(TextRun {
+                        start_col: col,
+                        text: cell_text.to_string(),
+                        style,
+                    });
+                }
+                None => {
+                    current_run = Some(TextRun {
+                        start_col: col,
+                        text: cell_text.to_string(),
+                        style,
+                    });
+                }
+            }
+        }
+        if let Some(run) = current_run.take() {
+            row_runs.push(run);
+        }
+        for run in row_runs {
+            if run.text.trim().is_empty() {
                 continue;
             }
+            let x0 = usize::from(run.start_col).saturating_mul(cell_w_usize);
+            let y0 = usize::from(row).saturating_mul(cell_h_usize);
             let text_y = y0 as f32 + y_offset;
+            let style_attrs = svg_style_attrs(&run.style);
             write!(
                 &mut svg,
-                "<text x=\"{}\" y=\"{:.3}\" fill=\"rgb({},{},{})\">{}</text>",
+                "<text x=\"{}\" y=\"{:.3}\" fill=\"rgb({},{},{})\" xml:space=\"preserve\"{}>{}</text>",
                 x0,
                 text_y,
-                fg_r,
-                fg_g,
-                fg_b,
-                xml_escape_text_char(glyph_char)
+                run.style.fg_rgb.0,
+                run.style.fg_rgb.1,
+                run.style.fg_rgb.2,
+                style_attrs,
+                xml_escape_text(&run.text)
             )
             .expect("svg write cannot fail");
         }
@@ -1063,6 +1104,101 @@ fn render_screen_rgba_resvg(
     Ok(pixmap.take())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TextStyle {
+    fg_rgb: (u8, u8, u8),
+    bold: bool,
+    italic: bool,
+    underline: bool,
+}
+
+#[derive(Debug, Clone)]
+struct TextRun {
+    start_col: u16,
+    text: String,
+    style: TextStyle,
+}
+
+fn resolved_cell_colors(
+    cell: &vt100::Cell,
+    palette: &[(u8, u8, u8)],
+) -> ((u8, u8, u8), (u8, u8, u8)) {
+    let mut fg = vt100_color_to_palette_index(cell.fgcolor(), true);
+    let mut bg = vt100_color_to_palette_index(cell.bgcolor(), false);
+    if cell.inverse() {
+        std::mem::swap(&mut fg, &mut bg);
+    }
+    (palette[usize::from(fg)], palette[usize::from(bg)])
+}
+
+fn dim_rgb(rgb: (u8, u8, u8)) -> (u8, u8, u8) {
+    (
+        (f32::from(rgb.0) * 0.72).round() as u8,
+        (f32::from(rgb.1) * 0.72).round() as u8,
+        (f32::from(rgb.2) * 0.72).round() as u8,
+    )
+}
+
+fn composite_with_backdrop(
+    rgb: (u8, u8, u8),
+    opacity: f32,
+    backdrop_rgb: (u8, u8, u8),
+) -> (u8, u8, u8) {
+    if opacity >= 0.999 {
+        return rgb;
+    }
+    let alpha = opacity.clamp(0.0, 1.0);
+    (
+        blend_channel(rgb.0, backdrop_rgb.0, alpha),
+        blend_channel(rgb.1, backdrop_rgb.1, alpha),
+        blend_channel(rgb.2, backdrop_rgb.2, alpha),
+    )
+}
+
+fn svg_style_attrs(style: &TextStyle) -> String {
+    let mut attrs = String::new();
+    if style.bold {
+        attrs.push_str(" font-weight=\"700\"");
+    }
+    if style.italic {
+        attrs.push_str(" font-style=\"italic\"");
+    }
+    if style.underline {
+        attrs.push_str(" text-decoration=\"underline\"");
+    }
+    attrs
+}
+
+fn calibrate_cell_font_size(cell_w: u16, cell_h: u16, options: &RenderOptions) -> Option<f32> {
+    let primary_font = primary_font_for_metrics(options)?;
+    let scale = PxScale { x: 1.0, y: 1.0 };
+    let scaled = primary_font.as_scaled(scale);
+    let unit_advance = scaled.h_advance(primary_font.glyph_id('M')).max(0.0001);
+    let unit_height = (scaled.ascent() - scaled.descent()).max(0.0001);
+    let width_target = (f32::from(cell_w) * 0.95).max(1.0);
+    let height_target = ((f32::from(cell_h) / options.line_height_mult.max(1.0)) * 0.95).max(1.0);
+    let size = (width_target / unit_advance).min(height_target / unit_height);
+    (size.is_finite() && size > 1.0).then_some(size)
+}
+
+fn primary_font_for_metrics(options: &RenderOptions) -> Option<FontArc> {
+    if let Some(path) = options.font_paths.iter().find(|path| {
+        std::fs::metadata(path)
+            .map(|meta| meta.is_file())
+            .unwrap_or(false)
+    }) {
+        if let Ok(bytes) = std::fs::read(path)
+            && let Ok(font) = FontVec::try_from_vec_and_index(bytes, 0)
+        {
+            return Some(FontArc::new(font));
+        }
+    }
+    let preset = font_preset_for_options(options);
+    bmux_fonts::load_preset_fonts_for_ab_glyph(preset)
+        .into_iter()
+        .next()
+}
+
 fn svg_font_family_list(families: &[String]) -> String {
     families
         .iter()
@@ -1085,15 +1221,18 @@ fn xml_escape_attr(input: &str) -> String {
         .collect()
 }
 
-fn xml_escape_text_char(ch: char) -> String {
-    match ch {
-        '&' => "&amp;".to_string(),
-        '<' => "&lt;".to_string(),
-        '>' => "&gt;".to_string(),
-        '"' => "&quot;".to_string(),
-        '\'' => "&apos;".to_string(),
-        _ => ch.to_string(),
-    }
+fn xml_escape_text(input: &str) -> String {
+    input
+        .chars()
+        .flat_map(|ch| match ch {
+            '&' => "&amp;".chars().collect::<Vec<_>>(),
+            '<' => "&lt;".chars().collect::<Vec<_>>(),
+            '>' => "&gt;".chars().collect::<Vec<_>>(),
+            '"' => "&quot;".chars().collect::<Vec<_>>(),
+            '\'' => "&apos;".chars().collect::<Vec<_>>(),
+            _ => vec![ch],
+        })
+        .collect()
 }
 
 fn draw_bitmap_glyph_rgba(
@@ -1260,6 +1399,8 @@ struct RenderOptions {
     font_paths: Vec<String>,
     font_size_px: Option<f32>,
     line_height_mult: f32,
+    background_opacity: f32,
+    backdrop_rgb: (u8, u8, u8),
 }
 
 fn build_render_options(
@@ -1292,6 +1433,11 @@ fn build_render_options(
         font_size_px: font_size
             .or_else(|| terminal_profile.and_then(|profile| profile.font_size_px.map(f32::from))),
         line_height_mult: line_height.unwrap_or(1.0),
+        background_opacity: terminal_profile
+            .and_then(|profile| profile.background_opacity_permille)
+            .map(|permille| (f32::from(permille) / 1000.0).clamp(0.0, 1.0))
+            .unwrap_or(1.0),
+        backdrop_rgb: (0, 0, 0),
     })
 }
 
@@ -1993,6 +2139,7 @@ mod tests {
             terminal_id: "ghostty".to_string(),
             font_families: vec!["JetBrains Mono".to_string()],
             font_size_px: Some(15),
+            background_opacity_permille: Some(900),
             source: "test".to_string(),
         };
         let options = build_render_options(
@@ -2007,6 +2154,8 @@ mod tests {
         assert_eq!(options.font_families, vec!["JetBrains Mono".to_string()]);
         assert_eq!(options.font_size_px, Some(15.0));
         assert_eq!(options.line_height_mult, 1.0);
+        assert_eq!(options.background_opacity, 0.9);
+        assert_eq!(options.backdrop_rgb, (0, 0, 0));
     }
 
     #[test]
@@ -2015,6 +2164,7 @@ mod tests {
             terminal_id: "ghostty".to_string(),
             font_families: vec!["Iosevka".to_string()],
             font_size_px: Some(14),
+            background_opacity_permille: None,
             source: "ghostty-config:/tmp/config".to_string(),
         };
         let events = vec![DisplayTrackEnvelope {
