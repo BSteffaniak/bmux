@@ -110,14 +110,14 @@ pub fn plugin(id: impl Into<String>, display_name: impl Into<String>) -> PluginB
 #[doc(hidden)]
 pub mod __private {
     pub use crate::native_exports::{
-        activate_export, deactivate_export, descriptor_ptr, handle_event_export,
-        invoke_service_export, plugin_instance, run_command_export,
+        activate_export, deactivate_export, handle_event_export, invoke_service_export,
+        manifest_toml_ptr, plugin_instance, run_command_export,
     };
 }
 
 #[macro_export]
 macro_rules! export_plugin {
-    ($plugin_ty:ty) => {
+    ($plugin_ty:ty, $manifest_toml:expr $(,)?) => {
         fn __bmux_plugin_instance() -> &'static ::std::sync::Mutex<$plugin_ty> {
             static INSTANCE: ::std::sync::OnceLock<::std::sync::Mutex<$plugin_ty>> =
                 ::std::sync::OnceLock::new();
@@ -126,9 +126,9 @@ macro_rules! export_plugin {
 
         #[unsafe(no_mangle)]
         pub extern "C" fn bmux_plugin_entry_v1() -> *const ::std::ffi::c_char {
-            static DESCRIPTOR: ::std::sync::OnceLock<Option<::std::ffi::CString>> =
+            static MANIFEST: ::std::sync::OnceLock<Option<::std::ffi::CString>> =
                 ::std::sync::OnceLock::new();
-            $crate::__private::descriptor_ptr(__bmux_plugin_instance(), &DESCRIPTOR)
+            $crate::__private::manifest_toml_ptr($manifest_toml, &MANIFEST)
         }
 
         #[unsafe(no_mangle)]
@@ -188,11 +188,14 @@ macro_rules! export_plugin {
 /// # Example
 ///
 /// ```ignore
-/// let vtable = bmux_plugin::bundled_plugin_vtable!(MyPlugin);
+/// let vtable = bmux_plugin::bundled_plugin_vtable!(
+///     MyPlugin,
+///     include_str!("../plugin.toml"),
+/// );
 /// ```
 #[macro_export]
 macro_rules! bundled_plugin_vtable {
-    ($plugin_ty:ty) => {{
+    ($plugin_ty:ty, $manifest_toml:expr $(,)?) => {{
         fn __instance() -> &'static ::std::sync::Mutex<$plugin_ty> {
             static INSTANCE: ::std::sync::OnceLock<::std::sync::Mutex<$plugin_ty>> =
                 ::std::sync::OnceLock::new();
@@ -200,9 +203,9 @@ macro_rules! bundled_plugin_vtable {
         }
 
         fn __entry() -> *const ::std::ffi::c_char {
-            static DESCRIPTOR: ::std::sync::OnceLock<Option<::std::ffi::CString>> =
+            static MANIFEST: ::std::sync::OnceLock<Option<::std::ffi::CString>> =
                 ::std::sync::OnceLock::new();
-            $crate::__private::descriptor_ptr(__instance(), &DESCRIPTOR)
+            $crate::__private::manifest_toml_ptr($manifest_toml, &MANIFEST)
         }
 
         fn __run_command_with_context(context: *const ::std::ffi::c_char) -> i32 {

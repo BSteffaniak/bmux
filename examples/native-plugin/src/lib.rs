@@ -3,203 +3,13 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_cli_output::{Table, TableColumn, write_table};
-use bmux_plugin::{
-    CommandExecutionKind, HostScope, NativeCommandContext, NativeDescriptor, PluginCommand,
-    PluginCommandArgument, PluginCommandArgumentKind, PluginEvent, PluginEventKind,
-    PluginEventSubscription, PluginFeature, RustPlugin, ServiceKind,
-};
+use bmux_plugin::{NativeCommandContext, PluginEvent, RustPlugin, ServiceKind};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
 
 #[derive(Default)]
 struct ExamplePlugin;
 
 impl RustPlugin for ExamplePlugin {
-    fn descriptor(&self) -> NativeDescriptor {
-        NativeDescriptor {
-            id: "example.native".to_string(),
-            display_name: "Example Native Plugin".to_string(),
-            plugin_version: env!("CARGO_PKG_VERSION").to_string(),
-            plugin_api: bmux_plugin::PluginManifestCompatibility {
-                minimum: "1.0".to_string(),
-                maximum: None,
-            },
-            native_abi: bmux_plugin::PluginManifestCompatibility {
-                minimum: "1.0".to_string(),
-                maximum: None,
-            },
-            description: Some("Example in-repo native plugin for bmux".to_string()),
-            homepage: None,
-            provider_priority: 0,
-            required_capabilities: BTreeSet::from([
-                HostScope::new("bmux.commands").expect("host scope should parse"),
-                HostScope::new("bmux.events.subscribe").expect("host scope should parse"),
-                HostScope::new("bmux.config.read").expect("host scope should parse"),
-                HostScope::new("bmux.storage").expect("host scope should parse"),
-                HostScope::new("bmux.permissions.read").expect("host scope should parse"),
-                HostScope::new("bmux.permissions.write").expect("host scope should parse"),
-                HostScope::new("bmux.windows.read").expect("host scope should parse"),
-                HostScope::new("bmux.windows.write").expect("host scope should parse"),
-            ]),
-            provided_capabilities: BTreeSet::new(),
-            provided_features: BTreeSet::from([
-                PluginFeature::new("example.native").expect("plugin feature should parse")
-            ]),
-            services: Vec::new(),
-            commands: vec![
-                PluginCommand::new("hello", "Print a hello message")
-                    .argument(
-                        PluginCommandArgument::positional(
-                            "message",
-                            PluginCommandArgumentKind::String,
-                        )
-                        .multiple(true)
-                        .trailing_var_arg(true)
-                        .allow_hyphen_values(true)
-                        .summary("Optional greeting target"),
-                    )
-                    .execution(CommandExecutionKind::ProviderExec)
-                    .expose_in_cli(true),
-                PluginCommand::new(
-                    "permissions-list",
-                    "List session permissions through bmux provider service",
-                )
-                .argument(
-                    PluginCommandArgument::positional("session", PluginCommandArgumentKind::String)
-                        .required(true)
-                        .summary("Session name or UUID"),
-                )
-                .execution(CommandExecutionKind::ProviderExec)
-                .expose_in_cli(true),
-                PluginCommand::new(
-                    "permissions-grant",
-                    "Grant a role through bmux provider service",
-                )
-                .argument(
-                    PluginCommandArgument::positional("session", PluginCommandArgumentKind::String)
-                        .required(true)
-                        .summary("Session name or UUID"),
-                )
-                .argument(
-                    PluginCommandArgument::option("client", PluginCommandArgumentKind::String)
-                        .required(true)
-                        .short('c')
-                        .summary("Client UUID"),
-                )
-                .argument(
-                    PluginCommandArgument::option("role", PluginCommandArgumentKind::Choice)
-                        .required(true)
-                        .short('r')
-                        .choice_values(["owner", "writer", "observer"])
-                        .summary("Role to grant"),
-                )
-                .execution(CommandExecutionKind::ProviderExec)
-                .expose_in_cli(true),
-                PluginCommand::new(
-                    "permissions-revoke",
-                    "Revoke a role through bmux provider service",
-                )
-                .argument(
-                    PluginCommandArgument::positional("session", PluginCommandArgumentKind::String)
-                        .required(true)
-                        .summary("Session name or UUID"),
-                )
-                .argument(
-                    PluginCommandArgument::option("client", PluginCommandArgumentKind::String)
-                        .required(true)
-                        .short('c')
-                        .summary("Client UUID"),
-                )
-                .execution(CommandExecutionKind::ProviderExec)
-                .expose_in_cli(true),
-                PluginCommand::new(
-                    "windows-list",
-                    "List session windows through bmux provider service",
-                )
-                .argument(
-                    PluginCommandArgument::positional("session", PluginCommandArgumentKind::String)
-                        .required(true)
-                        .summary("Session name or UUID"),
-                )
-                .execution(CommandExecutionKind::ProviderExec)
-                .expose_in_cli(true),
-                PluginCommand::new(
-                    "windows-new",
-                    "Create a session window through bmux provider service",
-                )
-                .argument(
-                    PluginCommandArgument::positional("session", PluginCommandArgumentKind::String)
-                        .required(true)
-                        .summary("Session name or UUID"),
-                )
-                .argument(
-                    PluginCommandArgument::option("name", PluginCommandArgumentKind::String)
-                        .short('n')
-                        .summary("Optional window name"),
-                )
-                .execution(CommandExecutionKind::ProviderExec)
-                .expose_in_cli(true),
-                PluginCommand::new(
-                    "settings-show",
-                    "Show plugin settings through bmux config service",
-                )
-                .execution(CommandExecutionKind::ProviderExec)
-                .expose_in_cli(true),
-                PluginCommand::new(
-                    "storage-put",
-                    "Store a key/value through bmux storage service",
-                )
-                .argument(
-                    PluginCommandArgument::positional("key", PluginCommandArgumentKind::String)
-                        .required(true)
-                        .summary("Storage key"),
-                )
-                .argument(
-                    PluginCommandArgument::positional("value", PluginCommandArgumentKind::String)
-                        .position(1)
-                        .required(true)
-                        .multiple(true)
-                        .trailing_var_arg(true)
-                        .allow_hyphen_values(true)
-                        .summary("Storage value"),
-                )
-                .execution(CommandExecutionKind::ProviderExec)
-                .expose_in_cli(true),
-                PluginCommand::new("storage-get", "Read a key through bmux storage service")
-                    .argument(
-                        PluginCommandArgument::positional("key", PluginCommandArgumentKind::String)
-                            .required(true)
-                            .summary("Storage key"),
-                    )
-                    .execution(CommandExecutionKind::ProviderExec)
-                    .expose_in_cli(true),
-            ],
-            event_subscriptions: vec![PluginEventSubscription {
-                kinds: BTreeSet::from([PluginEventKind::System, PluginEventKind::Window]),
-                names: BTreeSet::from(["server_started".to_string(), "window_created".to_string()]),
-            }],
-            dependencies: vec![
-                bmux_plugin::PluginDependency {
-                    plugin_id: bmux_plugin::PluginId::new("bmux.permissions")
-                        .expect("plugin id should parse"),
-                    version_req: format!("={}", env!("CARGO_PKG_VERSION")),
-                    required: true,
-                },
-                bmux_plugin::PluginDependency {
-                    plugin_id: bmux_plugin::PluginId::new("bmux.windows")
-                        .expect("plugin id should parse"),
-                    version_req: format!("={}", env!("CARGO_PKG_VERSION")),
-                    required: true,
-                },
-            ],
-            lifecycle: bmux_plugin::PluginLifecycle {
-                activate_on_startup: true,
-                receive_events: true,
-                allow_hot_reload: true,
-            },
-        }
-    }
-
     fn run_command(&mut self, context: NativeCommandContext) -> i32 {
         match context.command.as_str() {
             "permissions-list" => run_permissions_list(&context),
@@ -238,7 +48,7 @@ impl RustPlugin for ExamplePlugin {
     }
 }
 
-bmux_plugin::export_plugin!(ExamplePlugin);
+bmux_plugin::export_plugin!(ExamplePlugin, include_str!("../plugin.toml"));
 
 fn run_permissions_list(context: &NativeCommandContext) -> i32 {
     let Some(session) = context.arguments.first() else {
@@ -717,18 +527,13 @@ fn parse_role(value: &str) -> Option<SessionRole> {
 
 #[cfg(test)]
 mod tests {
-    use super::ExamplePlugin;
-    use bmux_plugin::RustPlugin;
-
     #[test]
-    fn descriptor_round_trips() {
-        let descriptor = ExamplePlugin.descriptor();
-        let serialized = descriptor
-            .to_toml_string()
-            .expect("descriptor should serialize");
-        let reparsed = bmux_plugin::NativeDescriptor::from_toml_str(&serialized)
-            .expect("descriptor should parse");
-        assert_eq!(reparsed.id, "example.native");
-        assert_eq!(reparsed.commands.len(), 9);
+    fn manifest_parses_and_validates() {
+        let manifest = bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml"))
+            .expect("manifest should parse");
+        assert_eq!(manifest.id, "example.native");
+        assert_eq!(manifest.commands.len(), 9);
+        let declaration = manifest.to_declaration().expect("manifest should validate");
+        assert_eq!(declaration.id.as_str(), "example.native");
     }
 }

@@ -3,9 +3,8 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_plugin::{
-    CapabilityProvider, CommandExecutionKind, HostScope, NativeCommandContext, NativeDescriptor,
-    PluginCommand, PluginCommandArgument, PluginCommandArgumentKind, PluginManifest,
-    PluginRegistry, RustPlugin, discover_plugin_manifests_in_roots, load_registered_plugin,
+    CapabilityProvider, HostScope, NativeCommandContext, PluginManifest, PluginRegistry,
+    RustPlugin, discover_plugin_manifests_in_roots, load_registered_plugin,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -16,75 +15,6 @@ use std::process::Command as ProcessCommand;
 pub struct PluginCliPlugin;
 
 impl RustPlugin for PluginCliPlugin {
-    fn descriptor(&self) -> NativeDescriptor {
-        NativeDescriptor::builder("bmux.plugin_cli", "bmux Plugin CLI")
-            .plugin_version(env!("CARGO_PKG_VERSION"))
-            .description("Shipped bmux plugin subcommands")
-            .require_capability("bmux.commands")
-            .expect("capability should parse")
-            .command(
-                PluginCommand::new("list", "List discovered plugins")
-                    .path(["plugin", "list"])
-                    .argument(PluginCommandArgument::flag("json").short('j'))
-                    .execution(CommandExecutionKind::ProviderExec)
-                    .expose_in_cli(true),
-            )
-            .command(
-                PluginCommand::new("run", "Run a declared plugin command")
-                    .path(["plugin", "run"])
-                    .argument(
-                        PluginCommandArgument::positional(
-                            "plugin",
-                            PluginCommandArgumentKind::String,
-                        )
-                        .required(true)
-                        .value_name("PLUGIN"),
-                    )
-                    .argument(
-                        PluginCommandArgument::positional(
-                            "command",
-                            PluginCommandArgumentKind::String,
-                        )
-                        .position(1)
-                        .required(true)
-                        .value_name("COMMAND"),
-                    )
-                    .argument(
-                        PluginCommandArgument::positional(
-                            "args",
-                            PluginCommandArgumentKind::String,
-                        )
-                        .position(2)
-                        .multiple(true)
-                        .trailing_var_arg(true)
-                        .allow_hyphen_values(true)
-                        .value_name("ARGS"),
-                    )
-                    .execution(CommandExecutionKind::ProviderExec)
-                    .expose_in_cli(true),
-            )
-            .command(
-                PluginCommand::new("rebuild", "Rebuild bundled plugin crates")
-                    .path(["plugin", "rebuild"])
-                    .argument(PluginCommandArgument::flag("release"))
-                    .argument(PluginCommandArgument::flag("list"))
-                    .argument(PluginCommandArgument::flag("all-workspace-plugins"))
-                    .argument(
-                        PluginCommandArgument::positional(
-                            "selectors",
-                            PluginCommandArgumentKind::String,
-                        )
-                        .multiple(true)
-                        .allow_hyphen_values(true)
-                        .value_name("SELECTOR"),
-                    )
-                    .execution(CommandExecutionKind::ProviderExec)
-                    .expose_in_cli(true),
-            )
-            .build()
-            .expect("descriptor should validate")
-    }
-
     fn run_command(&mut self, context: NativeCommandContext) -> i32 {
         let result = match context.command.as_str() {
             "list" => run_list_command(&context),
@@ -674,4 +604,4 @@ struct PluginListEntry {
 }
 
 #[cfg(not(feature = "static-bundled"))]
-bmux_plugin::export_plugin!(PluginCliPlugin);
+bmux_plugin::export_plugin!(PluginCliPlugin, include_str!("../plugin.toml"));

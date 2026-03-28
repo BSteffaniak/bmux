@@ -1,7 +1,6 @@
 use crate::{
-    NativeCommandContext, NativeDescriptor, NativeLifecycleContext, NativeServiceContext,
-    PluginEvent, ServiceEnvelopeKind, ServiceResponse, decode_service_envelope,
-    encode_service_envelope,
+    NativeCommandContext, NativeLifecycleContext, NativeServiceContext, PluginEvent,
+    ServiceEnvelopeKind, ServiceResponse, decode_service_envelope, encode_service_envelope,
 };
 use std::ffi::{CStr, CString, c_char};
 use std::ptr;
@@ -15,8 +14,6 @@ const SERVICE_STATUS_ENCODE_FAILED: i32 = 5;
 const SERVICE_STATUS_PLUGIN_UNAVAILABLE: i32 = 70;
 
 pub trait RustPlugin: Default + Send + 'static {
-    fn descriptor(&self) -> NativeDescriptor;
-
     fn run_command(&mut self, _context: NativeCommandContext) -> i32 {
         64
     }
@@ -50,16 +47,12 @@ pub fn plugin_instance<P: RustPlugin>(instance: &'static OnceLock<Mutex<P>>) -> 
 }
 
 #[doc(hidden)]
-pub fn descriptor_ptr<P: RustPlugin>(
-    instance: &'static Mutex<P>,
-    descriptor: &'static OnceLock<Option<CString>>,
+pub fn manifest_toml_ptr(
+    manifest_toml: &'static str,
+    cached: &'static OnceLock<Option<CString>>,
 ) -> *const c_char {
-    let descriptor = descriptor.get_or_init(|| {
-        let plugin = instance.lock().ok()?;
-        let text = plugin.descriptor().to_toml_string().ok()?;
-        CString::new(text).ok()
-    });
-    descriptor
+    let cached = cached.get_or_init(|| CString::new(manifest_toml).ok());
+    cached
         .as_ref()
         .map_or(std::ptr::null(), |value| value.as_ptr())
 }

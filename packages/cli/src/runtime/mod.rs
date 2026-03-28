@@ -1715,28 +1715,28 @@ fn validate_configured_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Resu
 fn register_static_bundled_plugins(registry: &mut PluginRegistry) {
     #[cfg(feature = "bundled-plugin-clipboard")]
     if let Err(e) = registry.register_bundled_manifest(include_str!(
-        "../../../../plugins/bundled/clipboard/plugin.toml"
+        "../../../../plugins/clipboard-plugin/plugin.toml"
     )) {
         tracing::warn!("failed to register bundled clipboard plugin: {e}");
     }
 
     #[cfg(feature = "bundled-plugin-permissions")]
     if let Err(e) = registry.register_bundled_manifest(include_str!(
-        "../../../../plugins/bundled/permissions/plugin.toml"
+        "../../../../plugins/permissions-plugin/plugin.toml"
     )) {
         tracing::warn!("failed to register bundled permissions plugin: {e}");
     }
 
     #[cfg(feature = "bundled-plugin-cli")]
     if let Err(e) = registry.register_bundled_manifest(include_str!(
-        "../../../../plugins/bundled/plugin-cli/plugin.toml"
+        "../../../../plugins/plugin-cli-plugin/plugin.toml"
     )) {
         tracing::warn!("failed to register bundled plugin-cli plugin: {e}");
     }
 
     #[cfg(feature = "bundled-plugin-windows")]
     if let Err(e) = registry.register_bundled_manifest(include_str!(
-        "../../../../plugins/bundled/windows/plugin.toml"
+        "../../../../plugins/windows-plugin/plugin.toml"
     )) {
         tracing::warn!("failed to register bundled windows plugin: {e}");
     }
@@ -1752,25 +1752,29 @@ fn static_bundled_vtable(plugin_id: &str) -> Option<bmux_plugin::StaticPluginVta
     #[cfg(feature = "bundled-plugin-clipboard")]
     if plugin_id == "bmux.clipboard" {
         return Some(bmux_plugin::bundled_plugin_vtable!(
-            bmux_clipboard_plugin::ClipboardPlugin
+            bmux_clipboard_plugin::ClipboardPlugin,
+            include_str!("../../../../plugins/clipboard-plugin/plugin.toml"),
         ));
     }
     #[cfg(feature = "bundled-plugin-permissions")]
     if plugin_id == "bmux.permissions" {
         return Some(bmux_plugin::bundled_plugin_vtable!(
-            bmux_permissions_plugin::PermissionsPlugin
+            bmux_permissions_plugin::PermissionsPlugin,
+            include_str!("../../../../plugins/permissions-plugin/plugin.toml"),
         ));
     }
     #[cfg(feature = "bundled-plugin-cli")]
     if plugin_id == "bmux.plugin_cli" {
         return Some(bmux_plugin::bundled_plugin_vtable!(
-            bmux_plugin_cli_plugin::PluginCliPlugin
+            bmux_plugin_cli_plugin::PluginCliPlugin,
+            include_str!("../../../../plugins/plugin-cli-plugin/plugin.toml"),
         ));
     }
     #[cfg(feature = "bundled-plugin-windows")]
     if plugin_id == "bmux.windows" {
         return Some(bmux_plugin::bundled_plugin_vtable!(
-            bmux_windows_plugin::WindowsPlugin
+            bmux_windows_plugin::WindowsPlugin,
+            include_str!("../../../../plugins/windows-plugin/plugin.toml"),
         ));
     }
     None

@@ -4,8 +4,8 @@
 
 use bmux_clipboard::ClipboardError;
 use bmux_plugin::{
-    HostScope, NativeDescriptor, NativeServiceContext, PluginService, RustPlugin, ServiceKind,
-    ServiceResponse, decode_service_message, encode_service_message,
+    NativeServiceContext, RustPlugin, ServiceResponse, decode_service_message,
+    encode_service_message,
 };
 use serde::{Deserialize, Serialize};
 
@@ -13,29 +13,6 @@ use serde::{Deserialize, Serialize};
 pub struct ClipboardPlugin;
 
 impl RustPlugin for ClipboardPlugin {
-    fn descriptor(&self) -> NativeDescriptor {
-        NativeDescriptor::builder("bmux.clipboard", "bmux Clipboard")
-            .plugin_version(env!("CARGO_PKG_VERSION"))
-            .description("Shipped bmux clipboard plugin")
-            .provide_capability("bmux.clipboard.write")
-            .expect("capability should parse")
-            .provide_feature("bmux.clipboard")
-            .expect("feature should parse")
-            .service(PluginService {
-                capability: HostScope::new("bmux.clipboard.write")
-                    .expect("host scope should parse"),
-                kind: ServiceKind::Command,
-                interface_id: "clipboard-write/v1".to_string(),
-            })
-            .lifecycle(bmux_plugin::PluginLifecycle {
-                activate_on_startup: false,
-                receive_events: false,
-                allow_hot_reload: true,
-            })
-            .build()
-            .expect("descriptor should validate")
-    }
-
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         match (
             context.request.service.interface_id.as_str(),
@@ -54,7 +31,7 @@ impl RustPlugin for ClipboardPlugin {
 }
 
 #[cfg(not(feature = "static-bundled"))]
-bmux_plugin::export_plugin!(ClipboardPlugin);
+bmux_plugin::export_plugin!(ClipboardPlugin, include_str!("../plugin.toml"));
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ClipboardCopyRequest {

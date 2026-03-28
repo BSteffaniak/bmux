@@ -1771,7 +1771,7 @@ impl NativePluginLoader {
             host,
             available_capabilities,
         )?;
-        compare_manifest_and_descriptor(registered_plugin, &declaration)?;
+        compare_manifest_and_embedded(registered_plugin, &declaration)?;
 
         Ok(LoadedPlugin {
             registered: registered_plugin.clone(),
@@ -1799,39 +1799,38 @@ pub fn load_registered_plugin(
 /// Load a statically-linked bundled plugin from its vtable.
 ///
 /// This bypasses filesystem discovery and `dlopen` entirely.  The plugin's
-/// descriptor is obtained by calling the vtable's `entry` function pointer
+/// manifest TOML is obtained by calling the vtable's `entry` function pointer
 /// directly, and the resulting [`LoadedPlugin`] dispatches all subsequent calls
 /// through the same vtable.
 ///
 /// # Errors
 ///
-/// Returns an error when the descriptor cannot be parsed or validated.
+/// Returns an error when the manifest cannot be parsed or validated.
 pub fn load_static_plugin(
     registered_plugin: &RegisteredPlugin,
     vtable: StaticPluginVtable,
     host: &HostMetadata,
     available_capabilities: &BTreeMap<HostScope, crate::CapabilityProvider>,
 ) -> Result<LoadedPlugin> {
-    let descriptor_ptr = (vtable.entry)();
-    if descriptor_ptr.is_null() {
+    let manifest_ptr = (vtable.entry)();
+    if manifest_ptr.is_null() {
         return Err(PluginError::NullNativeDescriptor {
             plugin_id: registered_plugin.declaration.id.as_str().to_string(),
             symbol: "static_vtable::entry".to_string(),
         });
     }
-    let descriptor_cstr = unsafe { CStr::from_ptr(descriptor_ptr) };
-    let descriptor_text =
-        descriptor_cstr
+    let manifest_cstr = unsafe { CStr::from_ptr(manifest_ptr) };
+    let manifest_text =
+        manifest_cstr
             .to_str()
             .map_err(|_| PluginError::InvalidNativeDescriptor {
                 plugin_id: registered_plugin.declaration.id.as_str().to_string(),
                 symbol: "static_vtable::entry".to_string(),
-                details: "descriptor is not valid UTF-8".to_string(),
+                details: "embedded manifest is not valid UTF-8".to_string(),
             })?;
 
-    let native_descriptor = NativeDescriptor::from_toml_str(descriptor_text)?;
-    let declaration =
-        native_descriptor.into_declaration(registered_plugin.declaration.entrypoint.clone())?;
+    let embedded_manifest = crate::PluginManifest::from_toml_str(manifest_text)?;
+    let declaration = embedded_manifest.to_declaration()?;
 
     // Validate against host capabilities (skip entry file existence check
     // since there is no file -- the plugin is compiled into the binary).
@@ -1841,7 +1840,7 @@ pub fn load_static_plugin(
     };
     PluginRegistry::validate_static_plugin(&synthetic, host, available_capabilities)?;
 
-    compare_manifest_and_descriptor(registered_plugin, &declaration)?;
+    compare_manifest_and_embedded(registered_plugin, &declaration)?;
 
     Ok(LoadedPlugin {
         registered: registered_plugin.clone(),
@@ -1878,25 +1877,26 @@ fn load_native_declaration(
         });
     }
 
-    let descriptor_text = unsafe { CStr::from_ptr(descriptor_ptr) }
+    let manifest_text = unsafe { CStr::from_ptr(descriptor_ptr) }
         .to_str()
         .map_err(|_| PluginError::InvalidNativeDescriptorUtf8 {
             plugin_id: registered_plugin.declaration.id.as_str().to_string(),
             symbol: symbol.clone(),
         })?;
 
-    let descriptor = NativeDescriptor::from_toml_str(descriptor_text).map_err(|error| {
-        PluginError::InvalidNativeDescriptor {
-            plugin_id: registered_plugin.declaration.id.as_str().to_string(),
-            symbol: symbol.clone(),
-            details: error.to_string(),
-        }
-    })?;
+    let embedded_manifest =
+        crate::PluginManifest::from_toml_str(manifest_text).map_err(|error| {
+            PluginError::InvalidNativeDescriptor {
+                plugin_id: registered_plugin.declaration.id.as_str().to_string(),
+                symbol: symbol.clone(),
+                details: error.to_string(),
+            }
+        })?;
 
-    descriptor.into_declaration(registered_plugin.declaration.entrypoint.clone())
+    embedded_manifest.to_declaration()
 }
 
-fn compare_manifest_and_descriptor(
+fn compare_manifest_and_embedded(
     registered_plugin: &RegisteredPlugin,
     declaration: &PluginDeclaration,
 ) -> Result<()> {
@@ -2027,10 +2027,11 @@ mod tests {
     static KERNEL_REQUESTS: Mutex<Vec<bmux_ipc::Request>> = Mutex::new(Vec::new());
     static OMIT_CURRENT_CLIENT_FROM_LIST: AtomicBool = AtomicBool::new(false);
 
-    const TEST_DESCRIPTOR_TEXT: &str = concat!(
+    const TEST_MANIFEST_TEXT: &str = concat!(
         "id = \"test.plugin\"\n",
-        "display_name = \"Test Plugin\"\n",
-        "plugin_version = \"0.1.0\"\n",
+        "name = \"Test Plugin\"\n",
+        "version = \"0.1.0\"\n",
+        "entry = \"unused.dylib\"\n",
         "required_capabilities = [\"bmux.commands\"]\n\n",
         "[[commands]]\n",
         "name = \"hello\"\n",
@@ -2045,7 +2046,7 @@ mod tests {
 
     #[unsafe(no_mangle)]
     extern "C" fn bmux_plugin_entry_v1() -> *const c_char {
-        TEST_DESCRIPTOR_TEXT.as_ptr().cast()
+        TEST_MANIFEST_TEXT.as_ptr().cast()
     }
 
     #[unsafe(no_mangle)]
@@ -2372,14 +2373,10 @@ minimum = "1.0"
                 .get("test.plugin")
                 .expect("plugin should exist")
                 .clone(),
-            declaration: NativeDescriptor::from_toml_str(
-                TEST_DESCRIPTOR_TEXT.trim_end_matches('\0'),
-            )
-            .expect("descriptor should parse")
-            .into_declaration(PluginEntrypoint::Native {
-                symbol: DEFAULT_NATIVE_ENTRY_SYMBOL.to_string(),
-            })
-            .expect("declaration should build"),
+            declaration: PluginManifest::from_toml_str(TEST_MANIFEST_TEXT.trim_end_matches('\0'))
+                .expect("manifest should parse")
+                .to_declaration()
+                .expect("declaration should build"),
             backend: PluginBackend::Dynamic(library),
         };
 

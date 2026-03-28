@@ -11,8 +11,8 @@ fn workspace_root() -> PathBuf {
 }
 
 fn bundled_manifest(plugin_id: &str) -> PluginManifest {
-    let bundled_root = workspace_root().join("plugins").join("bundled");
-    let report = discover_plugin_manifests(&bundled_root).expect("manifest discovery should work");
+    let plugins_root = workspace_root().join("plugins");
+    let report = discover_plugin_manifests(&plugins_root).expect("manifest discovery should work");
     report
         .manifest_paths
         .iter()
@@ -23,8 +23,8 @@ fn bundled_manifest(plugin_id: &str) -> PluginManifest {
 
 #[test]
 fn bundled_plugin_manifests_include_core_shipped_plugins() {
-    let bundled_root = workspace_root().join("plugins").join("bundled");
-    let report = discover_plugin_manifests(&bundled_root).expect("manifest discovery should work");
+    let plugins_root = workspace_root().join("plugins");
+    let report = discover_plugin_manifests(&plugins_root).expect("manifest discovery should work");
     let manifests = report
         .manifest_paths
         .iter()

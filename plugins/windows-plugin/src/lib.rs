@@ -3,11 +3,9 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_plugin::{
-    CommandExecutionKind, ContextCloseRequest, ContextCreateRequest, ContextSelector,
-    HostRuntimeApi, HostScope, NativeCommandContext, NativeDescriptor, NativeServiceContext,
-    PluginCommand, PluginCommandArgument, PluginCommandArgumentKind, PluginService, RustPlugin,
-    ServiceKind, ServiceResponse, StorageGetRequest, StorageSetRequest, decode_service_message,
-    encode_service_message,
+    ContextCloseRequest, ContextCreateRequest, ContextSelector, HostRuntimeApi,
+    NativeCommandContext, NativeServiceContext, RustPlugin, ServiceResponse, StorageGetRequest,
+    StorageSetRequest, decode_service_message, encode_service_message,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -22,80 +20,6 @@ pub struct WindowsPlugin {
 }
 
 impl RustPlugin for WindowsPlugin {
-    fn descriptor(&self) -> NativeDescriptor {
-        NativeDescriptor::builder("bmux.windows", "bmux Windows")
-            .plugin_version(env!("CARGO_PKG_VERSION"))
-            .description("Shipped bmux windows command plugin")
-            .require_capability("bmux.commands")
-            .expect("capability should parse")
-            .require_capability("bmux.contexts.read")
-            .expect("capability should parse")
-            .require_capability("bmux.contexts.write")
-            .expect("capability should parse")
-            .require_capability("bmux.clients.read")
-            .expect("capability should parse")
-            .require_capability("bmux.storage")
-            .expect("capability should parse")
-            .provide_capability("bmux.windows.read")
-            .expect("capability should parse")
-            .provide_capability("bmux.windows.write")
-            .expect("capability should parse")
-            .provide_feature("bmux.windows")
-            .expect("feature should parse")
-            .service(PluginService {
-                capability: HostScope::new("bmux.windows.read").expect("host scope should parse"),
-                kind: ServiceKind::Query,
-                interface_id: "window-query/v1".to_string(),
-            })
-            .service(PluginService {
-                capability: HostScope::new("bmux.windows.write").expect("host scope should parse"),
-                kind: ServiceKind::Command,
-                interface_id: "window-command/v1".to_string(),
-            })
-            .command(plugin_command(
-                "new-window",
-                "Create a workspace window",
-                vec![vec!["window", "new"]],
-            ))
-            .command(plugin_command(
-                "list-windows",
-                "List workspace windows",
-                vec![vec!["window", "list"]],
-            ))
-            .command(plugin_command(
-                "kill-window",
-                "Kill a workspace window",
-                vec![vec!["window", "kill"]],
-            ))
-            .command(plugin_command(
-                "kill-all-windows",
-                "Kill all workspace windows",
-                vec![vec!["window", "kill-all"]],
-            ))
-            .command(plugin_command(
-                "switch-window",
-                "Switch active workspace window",
-                vec![vec!["window", "switch"]],
-            ))
-            .command(plugin_command(
-                "next-window",
-                "Switch to the next workspace window",
-                vec![vec!["window", "next"]],
-            ))
-            .command(plugin_command(
-                "prev-window",
-                "Switch to the previous workspace window",
-                vec![vec!["window", "prev"]],
-            ))
-            .command(plugin_command(
-                "last-window",
-                "Switch to the previously active workspace window",
-                vec![vec!["window", "last"]],
-            ))
-            .build()
-            .expect("descriptor should validate")
-    }
-
     fn run_command(&mut self, context: NativeCommandContext) -> i32 {
         match handle_command(self, &context) {
             Ok(()) => 0,
@@ -656,49 +580,6 @@ fn positional_value(arguments: &[String]) -> Option<String> {
         .cloned()
 }
 
-fn plugin_command(name: &str, summary: &str, aliases: Vec<Vec<&str>>) -> PluginCommand {
-    let mut command = PluginCommand::new(name, summary)
-        .path([name])
-        .execution(CommandExecutionKind::ProviderExec)
-        .expose_in_cli(true);
-    for alias in aliases {
-        command = command.alias(alias);
-    }
-    for argument in command_arguments(name) {
-        command = command.argument(argument);
-    }
-    command
-}
-
-fn command_arguments(name: &str) -> Vec<PluginCommandArgument> {
-    match name {
-        "new-window" => vec![
-            PluginCommandArgument::option("session", PluginCommandArgumentKind::String).short('s'),
-            PluginCommandArgument::option("name", PluginCommandArgumentKind::String).short('n'),
-        ],
-        "list-windows" => vec![
-            PluginCommandArgument::option("session", PluginCommandArgumentKind::String).short('s'),
-            PluginCommandArgument::flag("json").short('j'),
-        ],
-        "kill-window" => vec![
-            PluginCommandArgument::positional("target", PluginCommandArgumentKind::String)
-                .required(true),
-            PluginCommandArgument::option("session", PluginCommandArgumentKind::String).short('s'),
-            PluginCommandArgument::flag("force-local"),
-        ],
-        "kill-all-windows" => vec![
-            PluginCommandArgument::option("session", PluginCommandArgumentKind::String).short('s'),
-            PluginCommandArgument::flag("force-local"),
-        ],
-        "switch-window" => vec![
-            PluginCommandArgument::positional("target", PluginCommandArgumentKind::String)
-                .required(true),
-            PluginCommandArgument::option("session", PluginCommandArgumentKind::String).short('s'),
-        ],
-        _ => Vec::new(),
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ListWindowsRequest {
     session: Option<String>,
@@ -745,7 +626,7 @@ struct WindowCommandAck {
 }
 
 #[cfg(not(feature = "static-bundled"))]
-bmux_plugin::export_plugin!(WindowsPlugin);
+bmux_plugin::export_plugin!(WindowsPlugin, include_str!("../plugin.toml"));
 
 #[cfg(test)]
 mod tests {
@@ -754,7 +635,8 @@ mod tests {
         ApiVersion, ContextCloseRequest, ContextCreateRequest, ContextListResponse,
         ContextSelectRequest, ContextSelectResponse, ContextSelector as SessionSelector,
         ContextSummary as SessionSummary, HostConnectionInfo, HostKernelBridge, HostMetadata,
-        NativeServiceContext, ProviderId, RegisteredService, ServiceCaller, ServiceRequest,
+        HostScope, NativeServiceContext, ProviderId, RegisteredService, ServiceCaller, ServiceKind,
+        ServiceRequest,
     };
     use std::sync::Mutex;
 
