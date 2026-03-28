@@ -994,6 +994,32 @@ impl BmuxClient {
         }
     }
 
+    /// Send bytes directly to a specific pane by ID, bypassing focus routing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn pane_direct_input(
+        &mut self,
+        session_id: Uuid,
+        pane_id: Uuid,
+        data: Vec<u8>,
+    ) -> Result<usize> {
+        match self
+            .request(Request::PaneDirectInput {
+                session_id,
+                pane_id,
+                data,
+            })
+            .await?
+        {
+            ResponsePayload::PaneDirectInputAccepted { bytes, .. } => Ok(bytes),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected pane direct input accepted response",
+            )),
+        }
+    }
+
     /// Update attached viewport dimensions for pane PTY sizing.
     ///
     /// # Errors
@@ -1215,6 +1241,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::Detach => "detach",
         Request::SubscribeEvents => "subscribe_events",
         Request::PollEvents { .. } => "poll_events",
+        Request::PaneDirectInput { .. } => "pane_direct_input",
     }
 }
 
@@ -1264,6 +1291,7 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::RecordingCustomEventWritten { .. } => "recording_custom_event_written",
             ResponsePayload::RecordingDeleteAll { .. } => "recording_delete_all",
             ResponsePayload::Detached => "detached",
+            ResponsePayload::PaneDirectInputAccepted { .. } => "pane_direct_input_accepted",
             ResponsePayload::EventsSubscribed => "events_subscribed",
             ResponsePayload::EventBatch { .. } => "event_batch",
         },

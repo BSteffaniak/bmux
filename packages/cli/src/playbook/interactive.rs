@@ -136,9 +136,14 @@ pub async fn run_interactive(
     let plugins = super::types::PluginConfig::default();
 
     // 1. Start sandbox server.
-    let sandbox = SandboxServer::start(shell, &plugins, SERVER_STARTUP_TIMEOUT)
-        .await
-        .context("failed starting sandbox server")?;
+    let sandbox = SandboxServer::start(
+        shell,
+        &plugins,
+        SERVER_STARTUP_TIMEOUT,
+        &std::collections::BTreeMap::new(),
+    )
+    .await
+    .context("failed starting sandbox server")?;
 
     // 2. Determine socket path.
     let socket_path = match socket_override {
@@ -317,6 +322,21 @@ async fn run_repl(
             }
             "status" => {
                 let resp = handle_status_command(client, inspector, session_id, attached).await;
+                write_response(&mut writer, &resp).await?;
+                continue;
+            }
+            "help" => {
+                let resp = InteractiveResponse {
+                    status: "ok",
+                    action: Some("help".to_string()),
+                    detail: Some(
+                        "commands: quit, screen, status, help, or any DSL action \
+                         (new-session, send-keys, wait-for, assert-screen, snapshot, \
+                         assert-layout, assert-cursor, screen, status, etc.)"
+                            .to_string(),
+                    ),
+                    ..InteractiveResponse::ok("help")
+                };
                 write_response(&mut writer, &resp).await?;
                 continue;
             }

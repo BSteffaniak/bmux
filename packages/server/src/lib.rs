@@ -2270,7 +2270,7 @@ impl SessionRuntimeManager {
         session_id: SessionId,
         client_id: ClientId,
         data: Vec<u8>,
-    ) -> Result<usize, SessionRuntimeError> {
+    ) -> Result<(usize, Uuid), SessionRuntimeError> {
         let runtime = self
             .runtimes
             .get_mut(&session_id)
@@ -2280,9 +2280,36 @@ impl SessionRuntimeManager {
             return Err(SessionRuntimeError::NotAttached);
         }
 
+        let focused_pane_id = runtime.focused_pane_id;
         let pane = runtime
             .panes
-            .get_mut(&runtime.focused_pane_id)
+            .get_mut(&focused_pane_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+
+        if pane.exited.load(Ordering::SeqCst) {
+            return Err(SessionRuntimeError::Closed);
+        }
+
+        let bytes = data.len();
+        pane.send_input(data)?;
+        Ok((bytes, focused_pane_id))
+    }
+
+    /// Write input bytes directly to a specific pane by ID, bypassing focus routing.
+    fn write_input_to_pane(
+        &mut self,
+        session_id: SessionId,
+        pane_id: Uuid,
+        data: Vec<u8>,
+    ) -> Result<usize, SessionRuntimeError> {
+        let runtime = self
+            .runtimes
+            .get_mut(&session_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+
+        let pane = runtime
+            .panes
+            .get_mut(&pane_id)
             .ok_or(SessionRuntimeError::NotFound)?;
 
         if pane.exited.load(Ordering::SeqCst) {
@@ -5015,7 +5042,7 @@ async fn handle_request(
                 runtime_manager.write_input(session_id, client_id, data)
             };
             match write_result {
-                Ok(bytes) => {
+                Ok((bytes, focused_pane_id)) => {
                     if let Ok(runtime) = state.recording_runtime.lock() {
                         let _ = runtime.record(
                             RecordingEventKind::PaneInputRaw,
@@ -5024,7 +5051,7 @@ async fn handle_request(
                             },
                             RecordMeta {
                                 session_id: Some(session_id.0),
-                                pane_id: None,
+                                pane_id: Some(focused_pane_id),
                                 client_id: Some(client_id.0),
                             },
                         );
@@ -5497,6 +5524,72 @@ async fn handle_request(
                 }),
             }
         }
+        Request::PaneDirectInput {
+            session_id,
+            pane_id,
+            data,
+        } => {
+            let session_id = SessionId(session_id);
+            if !ensure_attach_session_exists(state, session_id).await? {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!("session runtime not found: {}", session_id.0),
+                }));
+            }
+            if let Err(response) = ensure_session_mutation_allowed(
+                state,
+                shutdown_tx,
+                session_id,
+                client_id,
+                client_principal_id,
+                "pane.direct_input",
+            )
+            .await
+            {
+                return Ok(Response::Err(response));
+            }
+            let captured_input = data.clone();
+            let write_result = {
+                let mut runtime_manager = state
+                    .session_runtimes
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+                runtime_manager.write_input_to_pane(session_id, pane_id, data)
+            };
+            match write_result {
+                Ok(bytes) => {
+                    if let Ok(runtime) = state.recording_runtime.lock() {
+                        let _ = runtime.record(
+                            RecordingEventKind::PaneInputRaw,
+                            RecordingPayload::Bytes {
+                                data: captured_input,
+                            },
+                            RecordMeta {
+                                session_id: Some(session_id.0),
+                                pane_id: Some(pane_id),
+                                client_id: Some(client_id.0),
+                            },
+                        );
+                    }
+                    Response::Ok(ResponsePayload::PaneDirectInputAccepted { bytes, pane_id })
+                }
+                Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!(
+                        "session or pane not found: session={}, pane={}",
+                        session_id.0, pane_id
+                    ),
+                }),
+                Err(SessionRuntimeError::NotAttached) => Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "client is not attached to session runtime".to_string(),
+                }),
+                Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!("pane is closed: {}", pane_id),
+                }),
+            }
+        }
     };
 
     if let Response::Ok(ResponsePayload::SessionCreated { id, name }) = &response {
@@ -5542,6 +5635,7 @@ const fn request_requires_exclusive(request: &Request) -> bool {
             | Request::AttachOpen { .. }
             | Request::AttachInput { .. }
             | Request::AttachSetViewport { .. }
+            | Request::PaneDirectInput { .. }
             | Request::RecordingStart { .. }
             | Request::RecordingStop { .. }
             | Request::RecordingDelete { .. }
@@ -5619,6 +5713,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::Detach => "detach",
         Request::SubscribeEvents => "subscribe_events",
         Request::PollEvents { .. } => "poll_events",
+        Request::PaneDirectInput { .. } => "pane_direct_input",
     }
 }
 
@@ -5695,6 +5790,7 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::RecordingCustomEventWritten { .. } => "recording_custom_event_written",
         ResponsePayload::RecordingDeleteAll { .. } => "recording_delete_all",
         ResponsePayload::Detached => "detached",
+        ResponsePayload::PaneDirectInputAccepted { .. } => "pane_direct_input_accepted",
         ResponsePayload::EventsSubscribed => "events_subscribed",
         ResponsePayload::EventBatch { .. } => "event_batch",
     }

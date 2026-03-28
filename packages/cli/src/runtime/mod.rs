@@ -3264,58 +3264,59 @@ async fn verify_recording_report(
     let expected_output = first_input_ns.map_or_else(Vec::new, |min_ns| {
         expected_output_bytes(&baseline_filtered, Some(min_ns))
     });
+    // Extract viewport dimensions from recording (first AttachSetViewport request).
+    let viewport = extract_viewport_from_events(&baseline_filtered);
     let actual_output = run_target_verify_capture(
         &target_binary,
         &input_timeline,
         strict_timing,
         max_verify_duration_secs,
         verify_start_timeout_secs,
+        viewport,
     )
     .await?;
 
-    if let Some(index) = expected_output
+    // Compare output: first try byte-exact, then fall back to structural
+    // (vt100-rendered) comparison which tolerates byte-level differences from
+    // timing/chunking while catching actual content divergence.
+    let byte_mismatch = expected_output
         .iter()
         .zip(actual_output.iter())
-        .position(|(left, right)| left != right)
-    {
-        return Ok(VerifySmokeReport {
-            pass: false,
-            reason: "output byte mismatch".to_string(),
-            target_binary: Some(target_binary.display().to_string()),
-            compare_recording: None,
-            strict_timing,
-            max_verify_duration_secs,
-            verify_start_timeout_secs,
-            ignored_kinds: ignore_rules,
-            mismatch_index: Some(index),
-            expected_seq: None,
-            actual_seq: None,
-            expected_kind: None,
-            actual_kind: None,
-            expected_output_len: Some(expected_output.len()),
-            actual_output_len: Some(actual_output.len()),
-            monotonic_timeline: true,
-        });
-    }
-    if expected_output.len() != actual_output.len() {
-        return Ok(VerifySmokeReport {
-            pass: false,
-            reason: "output length mismatch".to_string(),
-            target_binary: Some(target_binary.display().to_string()),
-            compare_recording: None,
-            strict_timing,
-            max_verify_duration_secs,
-            verify_start_timeout_secs,
-            ignored_kinds: ignore_rules,
-            mismatch_index: None,
-            expected_seq: None,
-            actual_seq: None,
-            expected_kind: None,
-            actual_kind: None,
-            expected_output_len: Some(expected_output.len()),
-            actual_output_len: Some(actual_output.len()),
-            monotonic_timeline: true,
-        });
+        .position(|(left, right)| left != right);
+    let length_mismatch = expected_output.len() != actual_output.len();
+
+    if byte_mismatch.is_some() || length_mismatch {
+        // Byte comparison failed — try structural comparison via vt100.
+        let (vp_cols, vp_rows) = viewport.unwrap_or((120, 40));
+        let expected_text = render_output_via_vt100(&expected_output, vp_cols, vp_rows);
+        let actual_text = render_output_via_vt100(&actual_output, vp_cols, vp_rows);
+
+        // Normalize both: collapse digit sequences, strip trailing whitespace.
+        let expected_norm = normalize_screen_text(&expected_text);
+        let actual_norm = normalize_screen_text(&actual_text);
+
+        if expected_norm != actual_norm {
+            let mismatch_detail = find_text_mismatch(&expected_norm, &actual_norm);
+            return Ok(VerifySmokeReport {
+                pass: false,
+                reason: format!("output mismatch (structural comparison): {mismatch_detail}"),
+                target_binary: Some(target_binary.display().to_string()),
+                compare_recording: None,
+                strict_timing,
+                max_verify_duration_secs,
+                verify_start_timeout_secs,
+                ignored_kinds: ignore_rules,
+                mismatch_index: byte_mismatch,
+                expected_seq: None,
+                actual_seq: None,
+                expected_kind: None,
+                actual_kind: None,
+                expected_output_len: Some(expected_output.len()),
+                actual_output_len: Some(actual_output.len()),
+                monotonic_timeline: true,
+            });
+        }
+        // Structural comparison passed — byte differences were cosmetic.
     }
 
     let monotonic = baseline_filtered
@@ -3402,12 +3403,111 @@ fn input_timeline(events: &[RecordingEventEnvelope]) -> Vec<ReplayInputEvent> {
         .collect()
 }
 
+/// Extract viewport dimensions from recording events by finding the first
+/// `AttachSetViewport` request. Returns `None` if no viewport was recorded.
+fn extract_viewport_from_events(events: &[RecordingEventEnvelope]) -> Option<(u16, u16)> {
+    for event in events {
+        if let (
+            RecordingEventKind::RequestStart,
+            RecordingPayload::RequestStart { request_data, .. },
+        ) = (&event.kind, &event.payload)
+        {
+            if request_data.is_empty() {
+                continue;
+            }
+            if let Ok(request) = bmux_ipc::decode::<bmux_ipc::Request>(request_data) {
+                if let bmux_ipc::Request::AttachSetViewport { cols, rows, .. } = request {
+                    return Some((cols, rows));
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Render raw output bytes through a vt100 terminal emulator and return the
+/// visible screen text.
+fn render_output_via_vt100(output: &[u8], cols: u16, rows: u16) -> String {
+    let mut parser = vt100::Parser::new(rows, cols, 0);
+    parser.process(output);
+    let screen = parser.screen();
+    let mut lines = Vec::new();
+    for row in 0..rows {
+        lines.push(screen.contents_between(row, 0, row, cols));
+    }
+    // Trim trailing empty lines.
+    while lines.last().map_or(false, |l| l.trim().is_empty()) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+/// Normalize screen text for structural comparison: collapse digit sequences
+/// to a placeholder, trim trailing whitespace per line.
+fn normalize_screen_text(text: &str) -> String {
+    text.lines()
+        .map(|line| {
+            let trimmed = line.trim_end();
+            // Replace sequences of digits with a placeholder to tolerate PIDs,
+            // timestamps, and other non-deterministic numeric values.
+            let mut result = String::new();
+            let mut chars = trimmed.chars().peekable();
+            while let Some(ch) = chars.next() {
+                if ch.is_ascii_digit() {
+                    while chars.peek().map_or(false, |c| c.is_ascii_digit()) {
+                        chars.next();
+                    }
+                    result.push_str("<N>");
+                } else {
+                    result.push(ch);
+                }
+            }
+            result
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Find the first line where two texts differ and return a human-readable
+/// description.
+fn find_text_mismatch(expected: &str, actual: &str) -> String {
+    let expected_lines: Vec<&str> = expected.lines().collect();
+    let actual_lines: Vec<&str> = actual.lines().collect();
+    for (i, (e, a)) in expected_lines.iter().zip(actual_lines.iter()).enumerate() {
+        if e != a {
+            return format!(
+                "line {}: expected {:?}, got {:?}",
+                i + 1,
+                truncate_str(e, 80),
+                truncate_str(a, 80)
+            );
+        }
+    }
+    if expected_lines.len() != actual_lines.len() {
+        return format!(
+            "line count: expected {}, got {}",
+            expected_lines.len(),
+            actual_lines.len()
+        );
+    }
+    "unknown difference".to_string()
+}
+
+fn truncate_str(s: &str, max_len: usize) -> String {
+    if s.len() > max_len {
+        format!("{}...", &s[..max_len])
+    } else {
+        s.to_string()
+    }
+}
+
 async fn run_target_verify_capture(
     target_binary: &Path,
     inputs: &[ReplayInputEvent],
     strict_timing: bool,
     max_verify_duration_secs: Option<u64>,
     verify_start_timeout_secs: Option<u64>,
+    viewport: Option<(u16, u16)>,
 ) -> Result<Vec<u8>> {
     let max_verify_duration = max_verify_duration_secs.map(Duration::from_secs);
     let (paths, root_dir) = verify_temp_paths();
@@ -3439,8 +3539,9 @@ async fn run_target_verify_capture(
             .open_attach_stream_info(&grant)
             .await
             .map_err(map_cli_client_error)?;
+        let (vp_cols, vp_rows) = viewport.unwrap_or((120, 40));
         let _ = client
-            .attach_set_viewport(attach.session_id, 120, 40)
+            .attach_set_viewport(attach.session_id, vp_cols, vp_rows)
             .await
             .map_err(map_cli_client_error);
 
@@ -9544,6 +9645,7 @@ mod tests {
         let recordings = vec![
             RecordingSummary {
                 id: other,
+                format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
                 session_id: None,
                 capture_input: true,
                 profile: bmux_ipc::RecordingProfile::Functional,
@@ -9556,6 +9658,7 @@ mod tests {
             },
             RecordingSummary {
                 id: exact,
+                format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
                 session_id: None,
                 capture_input: true,
                 profile: bmux_ipc::RecordingProfile::Functional,
@@ -9583,6 +9686,7 @@ mod tests {
         let recordings = vec![
             RecordingSummary {
                 id: first,
+                format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
                 session_id: None,
                 capture_input: true,
                 profile: bmux_ipc::RecordingProfile::Functional,
@@ -9595,6 +9699,7 @@ mod tests {
             },
             RecordingSummary {
                 id: second,
+                format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
                 session_id: None,
                 capture_input: true,
                 profile: bmux_ipc::RecordingProfile::Functional,

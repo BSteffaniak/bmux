@@ -73,6 +73,7 @@ fn parse_config(raw: Option<RawPlaybookConfig>) -> Result<PlaybookConfig> {
         record: raw.record.unwrap_or(false),
         plugins,
         vars: raw.vars.unwrap_or_default(),
+        env: raw.env.unwrap_or_default(),
     })
 }
 
@@ -203,6 +204,8 @@ fn parse_step_action(step: RawStep) -> Result<Action> {
                 payload,
             })
         }
+        "screen" => Ok(Action::Screen),
+        "status" => Ok(Action::Status),
         other => bail!("unknown action: {other}"),
     }
 }
@@ -239,6 +242,7 @@ struct RawPlaybookConfig {
     record: Option<bool>,
     plugins: Option<RawPluginConfig>,
     vars: Option<BTreeMap<String, String>>,
+    env: Option<BTreeMap<String, String>>,
     include: Option<Vec<String>>,
 }
 

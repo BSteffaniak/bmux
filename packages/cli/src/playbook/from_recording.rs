@@ -1,38 +1,225 @@
-//! Convert a recording into a playbook stub.
+//! Convert a recording into a playbook with assertions.
 //!
-//! Reads the recording's `events.bin`, extracts structural requests and input
-//! events, and outputs a line-oriented DSL playbook.
+//! Reads the recording's `events.bin`, extracts structural requests, input
+//! events, and output events, then produces a line-oriented DSL playbook with
+//! `wait-for` barriers and `assert-screen` checks generated from the recorded
+//! terminal output.
+//!
+//! ## Approach
+//!
+//! 1. **State tracking** — a `RecordingStateTracker` processes the event stream
+//!    to track pane creation/destruction, focus changes, and viewport dimensions.
+//!    This lets us attribute input events to specific panes and use correct
+//!    terminal dimensions for vt100 parsing.
+//!
+//! 2. **Input/output correlation** — input events are grouped with subsequent
+//!    output events from the same pane (the "response window") until the next
+//!    input or a quiescent gap.
+//!
+//! 3. **Assertion generation** — output in each response window is parsed through
+//!    a vt100 terminal emulator to extract the rendered screen. The last non-empty
+//!    line (typically a shell prompt after command completion) becomes a `wait-for`
+//!    barrier. Distinctive content lines become `assert-screen contains=` checks.
+
+use std::collections::BTreeMap;
 
 use anyhow::Result;
 use bmux_ipc::{
     PaneSplitDirection, RecordingEventEnvelope, RecordingEventKind, RecordingPayload, Request,
+    ResponsePayload,
 };
+use uuid::Uuid;
 
-/// Minimum timing gap (in nanoseconds) before inserting a `sleep` step.
-const SLEEP_THRESHOLD_NS: u64 = 500_000_000; // 500ms
+// ---------------------------------------------------------------------------
+// Timing thresholds
+// ---------------------------------------------------------------------------
 
-/// Maximum timing gap (in nanoseconds) between consecutive `AttachInput` events
-/// to coalesce them into a single `send-keys` line.
+/// Minimum gap (ns) before inserting a `sleep` step.
+const SLEEP_THRESHOLD_NS: u64 = 200_000_000; // 200ms (lowered from 500ms for fidelity)
+
+/// Maximum gap (ns) between consecutive inputs before flushing an input batch.
 const INPUT_COALESCE_NS: u64 = 100_000_000; // 100ms
 
-/// Convert a list of recording events into a DSL playbook string.
+/// Quiescent gap (ns) after the last output event before considering the
+/// response window closed and generating assertions.
+const OUTPUT_QUIESCENT_NS: u64 = 300_000_000; // 300ms
+
+// ---------------------------------------------------------------------------
+// Pane state tracker
+// ---------------------------------------------------------------------------
+
+/// Tracks pane lifecycle and focus state from the recording event stream.
+struct RecordingStateTracker {
+    /// Map from pane UUID to its stable index in the layout order.
+    pane_uuid_to_index: BTreeMap<Uuid, u32>,
+    /// The UUID of the currently focused pane (if known).
+    focused_pane_id: Option<Uuid>,
+    /// Terminal viewport dimensions (cols, rows).
+    viewport: (u16, u16),
+    /// Number of panes created so far (used for index assignment).
+    next_pane_index: u32,
+}
+
+impl RecordingStateTracker {
+    fn new() -> Self {
+        Self {
+            pane_uuid_to_index: BTreeMap::new(),
+            focused_pane_id: None,
+            viewport: (80, 24),
+            next_pane_index: 0,
+        }
+    }
+
+    /// Register a new pane with a UUID, assigning the next sequential index.
+    fn add_pane(&mut self, pane_id: Uuid) {
+        if !self.pane_uuid_to_index.contains_key(&pane_id) {
+            self.pane_uuid_to_index
+                .insert(pane_id, self.next_pane_index);
+            self.next_pane_index += 1;
+        }
+    }
+
+    /// Remove a pane (on close).
+    fn remove_pane(&mut self, pane_id: &Uuid) {
+        self.pane_uuid_to_index.remove(pane_id);
+    }
+
+    /// Set the focused pane.
+    fn set_focus(&mut self, pane_id: Uuid) {
+        self.focused_pane_id = Some(pane_id);
+    }
+
+    /// Get the index for a pane UUID, if known.
+    fn pane_index(&self, pane_id: &Uuid) -> Option<u32> {
+        self.pane_uuid_to_index.get(pane_id).copied()
+    }
+
+    /// Get the index of the focused pane.
+    fn focused_pane_index(&self) -> Option<u32> {
+        self.focused_pane_id
+            .as_ref()
+            .and_then(|id| self.pane_index(id))
+    }
+
+    /// Update state from a decoded Request.
+    fn process_request(&mut self, request: &Request) {
+        match request {
+            Request::AttachSetViewport { cols, rows, .. } => {
+                self.viewport = (*cols, *rows);
+            }
+            _ => {}
+        }
+    }
+
+    /// Update state from a decoded ResponsePayload.
+    fn process_response(&mut self, response: &ResponsePayload) {
+        match response {
+            ResponsePayload::SessionCreated { .. } => {
+                // Session just created — the first pane is auto-created by the
+                // engine, but its UUID comes from the first snapshot or server
+                // event. We handle it via PaneSplit/snapshot.
+            }
+            ResponsePayload::PaneSplit { id, .. } => {
+                self.add_pane(*id);
+            }
+            ResponsePayload::PaneFocused { id, .. } => {
+                self.set_focus(*id);
+            }
+            ResponsePayload::PaneClosed { id, .. } => {
+                self.remove_pane(id);
+            }
+            ResponsePayload::AttachSnapshot {
+                focused_pane_id,
+                panes,
+                ..
+            } => {
+                // Snapshot responses give us authoritative pane state.
+                for pane in panes {
+                    self.add_pane(pane.id);
+                }
+                self.set_focus(*focused_pane_id);
+            }
+            ResponsePayload::AttachLayout {
+                focused_pane_id,
+                panes,
+                ..
+            } => {
+                for pane in panes {
+                    self.add_pane(pane.id);
+                }
+                self.set_focus(*focused_pane_id);
+            }
+            _ => {}
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Output accumulator
+// ---------------------------------------------------------------------------
+
+/// Accumulated output bytes for a specific pane during a response window.
+struct PaneOutputAccumulator {
+    pane_id: Uuid,
+    bytes: Vec<u8>,
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Convert a list of recording events into a DSL playbook string with assertions.
 pub fn events_to_playbook(events: &[RecordingEventEnvelope]) -> Result<String> {
     let mut lines: Vec<String> = Vec::new();
     lines.push("# Auto-generated from recording".to_string());
     lines.push(String::new());
 
+    let mut state = RecordingStateTracker::new();
     let mut last_mono_ns: u64 = 0;
     let mut has_session = false;
+
     // Accumulator for coalescing consecutive AttachInput events.
     let mut pending_input: Vec<u8> = Vec::new();
+    let mut pending_input_pane: Option<Uuid> = None;
     let mut last_input_mono_ns: u64 = 0;
+    // Tracks whether the pending input ends with \r (command execution).
+    let mut pending_input_is_command = false;
+
+    // Output accumulator: collects PaneOutputRaw bytes between input events.
+    let mut output_accum: Vec<PaneOutputAccumulator> = Vec::new();
+    let mut last_output_mono_ns: u64 = 0;
+    let mut viewport_set = false;
 
     for event in events {
-        // Check if we need to flush pending input before a timing gap or non-input event.
-        let is_attach_input = matches!(
+        // ---- Update state from RequestDone events ----
+        if let (
+            RecordingEventKind::RequestDone,
+            RecordingPayload::RequestDone {
+                request_data,
+                response_data,
+                ..
+            },
+        ) = (&event.kind, &event.payload)
+        {
+            if !request_data.is_empty() {
+                if let Ok(request) = bmux_ipc::decode::<Request>(request_data) {
+                    state.process_request(&request);
+                }
+            }
+            if !response_data.is_empty() {
+                if let Ok(response) = bmux_ipc::decode::<ResponsePayload>(response_data) {
+                    state.process_response(&response);
+                }
+            }
+        }
+
+        // ---- Detect input events ----
+        let is_input_event = matches!(
             (&event.kind, &event.payload),
-            (RecordingEventKind::RequestStart, RecordingPayload::RequestStart { request_kind, .. })
-            if request_kind == "attach_input"
+            (
+                RecordingEventKind::RequestStart,
+                RecordingPayload::RequestStart { request_kind, .. }
+            ) if request_kind == "attach_input" || request_kind == "pane_direct_input"
         );
 
         let time_gap = if last_input_mono_ns > 0 && event.mono_ns > last_input_mono_ns {
@@ -41,15 +228,37 @@ pub fn events_to_playbook(events: &[RecordingEventEnvelope]) -> Result<String> {
             0
         };
 
-        // Flush pending input if: this isn't an input event, or the timing gap exceeds the
-        // coalescing threshold.
-        if !pending_input.is_empty() && (!is_attach_input || time_gap > INPUT_COALESCE_NS) {
-            let escaped = bytes_to_c_escaped(&pending_input);
-            lines.push(format!("send-keys keys='{escaped}'"));
-            pending_input.clear();
+        // Check if output has been quiescent (indicating a response window is complete).
+        let output_quiescent = !output_accum.is_empty()
+            && last_output_mono_ns > 0
+            && event.mono_ns.saturating_sub(last_output_mono_ns) > OUTPUT_QUIESCENT_NS;
+
+        // ---- Flush pending input + generate assertions from output ----
+        let should_flush_input =
+            !pending_input.is_empty() && (!is_input_event || time_gap > INPUT_COALESCE_NS);
+
+        if should_flush_input || (output_quiescent && pending_input.is_empty()) {
+            if !pending_input.is_empty() {
+                flush_input(&mut lines, &pending_input, pending_input_pane, &state);
+                let was_command = pending_input_is_command;
+                pending_input.clear();
+                pending_input_pane = None;
+                pending_input_is_command = false;
+
+                // Generate assertions from output accumulated since the last input.
+                if was_command && !output_accum.is_empty() {
+                    generate_assertions_from_output(&mut lines, &output_accum, &state);
+                }
+                output_accum.clear();
+            } else if output_quiescent {
+                // Output quiescent with no pending input — generate assertions
+                // for startup output or other non-input-driven output.
+                generate_assertions_from_output(&mut lines, &output_accum, &state);
+                output_accum.clear();
+            }
         }
 
-        // Insert sleep for timing gaps.
+        // ---- Insert sleep for timing gaps ----
         if last_mono_ns > 0 && event.mono_ns > last_mono_ns {
             let gap_ns = event.mono_ns - last_mono_ns;
             if gap_ns >= SLEEP_THRESHOLD_NS {
@@ -59,52 +268,246 @@ pub fn events_to_playbook(events: &[RecordingEventEnvelope]) -> Result<String> {
         }
         last_mono_ns = event.mono_ns;
 
-        match (&event.kind, &event.payload) {
-            // Structural requests — decode the full Request from postcard bytes.
-            (
-                RecordingEventKind::RequestStart,
-                RecordingPayload::RequestStart {
-                    request_data,
-                    request_kind,
-                    ..
-                },
-            ) => {
-                if request_data.is_empty() {
-                    continue;
-                }
-                if let Ok(request) = bmux_ipc::decode::<Request>(request_data) {
-                    match request_to_dsl(&request, &mut has_session, request_kind) {
-                        RequestDslResult::Line(line) => lines.push(line),
-                        RequestDslResult::CoalesceInput(data) => {
-                            pending_input.extend_from_slice(&data);
-                            last_input_mono_ns = event.mono_ns;
-                        }
-                        RequestDslResult::Skip => {}
+        // ---- Accumulate output ----
+        if let (RecordingEventKind::PaneOutputRaw, RecordingPayload::Bytes { data }) =
+            (&event.kind, &event.payload)
+        {
+            let pane_id = event.pane_id.unwrap_or_default();
+            if let Some(existing) = output_accum.iter_mut().find(|a| a.pane_id == pane_id) {
+                existing.bytes.extend_from_slice(data);
+            } else {
+                output_accum.push(PaneOutputAccumulator {
+                    pane_id,
+                    bytes: data.clone(),
+                });
+            }
+            last_output_mono_ns = event.mono_ns;
+        }
+
+        // ---- Process structural requests ----
+        if let (
+            RecordingEventKind::RequestStart,
+            RecordingPayload::RequestStart {
+                request_data,
+                request_kind,
+                ..
+            },
+        ) = (&event.kind, &event.payload)
+        {
+            if request_data.is_empty() {
+                continue;
+            }
+            if let Ok(request) = bmux_ipc::decode::<Request>(request_data) {
+                // Emit viewport directive on first AttachSetViewport.
+                if let Request::AttachSetViewport { cols, rows, .. } = &request {
+                    if !viewport_set {
+                        // Insert viewport as the first directive after the header.
+                        let insert_pos = lines.iter().position(|l| l.is_empty()).unwrap_or(1) + 1;
+                        lines.insert(insert_pos, format!("@viewport cols={cols} rows={rows}"));
+                        viewport_set = true;
                     }
                 }
+
+                match request_to_dsl(&request, &mut has_session, request_kind, &state, event) {
+                    RequestDslResult::Line(line) => lines.push(line),
+                    RequestDslResult::CoalesceInput(data, pane_id) => {
+                        // Track if input contains \r (command execution).
+                        if data.contains(&b'\r') {
+                            pending_input_is_command = true;
+                        }
+                        if pending_input_pane.is_none() {
+                            pending_input_pane = pane_id;
+                        }
+                        pending_input.extend_from_slice(&data);
+                        last_input_mono_ns = event.mono_ns;
+                    }
+                    RequestDslResult::Skip => {}
+                }
             }
-            _ => {}
         }
     }
 
     // Flush any remaining pending input.
     if !pending_input.is_empty() {
-        let escaped = bytes_to_c_escaped(&pending_input);
-        lines.push(format!("send-keys keys='{escaped}'"));
+        flush_input(&mut lines, &pending_input, pending_input_pane, &state);
+        if pending_input_is_command && !output_accum.is_empty() {
+            generate_assertions_from_output(&mut lines, &output_accum, &state);
+        }
+    } else if !output_accum.is_empty() {
+        generate_assertions_from_output(&mut lines, &output_accum, &state);
     }
 
     lines.push(String::new());
-    lines.push("# TODO: add assertions".to_string());
 
     Ok(lines.join("\n"))
 }
+
+// ---------------------------------------------------------------------------
+// Input flushing
+// ---------------------------------------------------------------------------
+
+/// Emit a `send-keys` line, optionally with pane targeting.
+fn flush_input(
+    lines: &mut Vec<String>,
+    data: &[u8],
+    pane_id: Option<Uuid>,
+    state: &RecordingStateTracker,
+) {
+    let escaped = bytes_to_c_escaped(data);
+
+    // Determine if we need explicit pane targeting.
+    let pane_arg = pane_id.and_then(|id| {
+        let target_idx = state.pane_index(&id)?;
+        let focused_idx = state.focused_pane_index();
+        // Only add pane arg if target differs from the currently focused pane
+        // and there are multiple panes.
+        if state.pane_uuid_to_index.len() > 1 && focused_idx.map_or(true, |fi| fi != target_idx) {
+            Some(target_idx)
+        } else {
+            None
+        }
+    });
+
+    match pane_arg {
+        Some(idx) => lines.push(format!("send-keys keys='{escaped}' pane={idx}")),
+        None => lines.push(format!("send-keys keys='{escaped}'")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Assertion generation from output
+// ---------------------------------------------------------------------------
+
+/// Generate `wait-for` barriers and `assert-screen` checks from accumulated
+/// output bytes, using vt100 parsing to extract the rendered screen content.
+fn generate_assertions_from_output(
+    lines: &mut Vec<String>,
+    output_accum: &[PaneOutputAccumulator],
+    state: &RecordingStateTracker,
+) {
+    let (cols, rows) = state.viewport;
+
+    for accum in output_accum {
+        if accum.bytes.is_empty() {
+            continue;
+        }
+
+        let pane_index = state.pane_index(&accum.pane_id);
+
+        // Parse the output through a vt100 terminal emulator.
+        let mut parser = vt100::Parser::new(rows, cols, 0);
+        parser.process(&accum.bytes);
+        let screen = parser.screen();
+
+        // Extract visible text lines.
+        let mut text_lines: Vec<String> = Vec::new();
+        for row in 0..rows {
+            let line = screen.contents_between(row, 0, row, cols);
+            text_lines.push(line);
+        }
+
+        // Find the last non-empty line (often a shell prompt).
+        let last_nonempty = text_lines.iter().rposition(|l| !l.trim().is_empty());
+
+        let Some(last_idx) = last_nonempty else {
+            continue; // All empty — nothing to assert.
+        };
+
+        let prompt_line = text_lines[last_idx].trim();
+
+        // Generate a `wait-for` using the last non-empty line as a regex anchor.
+        // We escape regex meta-characters and replace digit sequences with \d+
+        // to tolerate non-deterministic numeric content (PIDs, counters, etc.).
+        let pattern = make_robust_pattern(prompt_line);
+
+        if !pattern.is_empty() {
+            let pane_suffix = pane_index
+                .filter(|_| state.pane_uuid_to_index.len() > 1)
+                .map_or(String::new(), |idx| format!(" pane={idx}"));
+            lines.push(format!("wait-for pattern='{pattern}'{pane_suffix}"));
+        }
+
+        // Look for distinctive content lines above the prompt to generate
+        // `assert-screen contains=` checks. We pick lines that look like
+        // meaningful output (not just whitespace or very short).
+        let content_lines = &text_lines[..last_idx];
+        let mut assertions_added = 0;
+        for content_line in content_lines.iter().rev() {
+            let trimmed = content_line.trim();
+            if trimmed.is_empty() || trimmed.len() < 3 {
+                continue;
+            }
+            // Skip lines that are purely numeric or look like timing/noise.
+            if trimmed
+                .chars()
+                .all(|c| c.is_ascii_digit() || c == '.' || c == ':' || c == ' ')
+            {
+                continue;
+            }
+            // Use the literal content for assert-screen (no regex needed).
+            let escaped_content = escape_single_quote(trimmed);
+            let pane_suffix = pane_index
+                .filter(|_| state.pane_uuid_to_index.len() > 1)
+                .map_or(String::new(), |idx| format!(" pane={idx}"));
+            lines.push(format!(
+                "assert-screen contains='{escaped_content}'{pane_suffix}"
+            ));
+            assertions_added += 1;
+            if assertions_added >= 3 {
+                break; // Limit assertions per response window.
+            }
+        }
+    }
+}
+
+/// Build a regex pattern from a screen line, making it robust to non-deterministic
+/// content while preserving structural anchors.
+fn make_robust_pattern(line: &str) -> String {
+    let mut result = String::new();
+    let mut chars = line.chars().peekable();
+
+    while let Some(ch) = chars.next() {
+        if ch.is_ascii_digit() {
+            // Collapse consecutive digits into \d+
+            while chars.peek().map_or(false, |c| c.is_ascii_digit()) {
+                chars.next();
+            }
+            result.push_str("\\d+");
+        } else if is_regex_meta(ch) {
+            result.push('\\');
+            result.push(ch);
+        } else {
+            result.push(ch);
+        }
+    }
+
+    result
+}
+
+/// Check if a character is a regex metacharacter that needs escaping.
+fn is_regex_meta(ch: char) -> bool {
+    matches!(
+        ch,
+        '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\'
+    )
+}
+
+/// Escape single quotes for DSL string values.
+fn escape_single_quote(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('\'', "\\'")
+}
+
+// ---------------------------------------------------------------------------
+// Request → DSL conversion
+// ---------------------------------------------------------------------------
 
 /// Result of converting a Request to a DSL line.
 enum RequestDslResult {
     /// A complete DSL line to emit.
     Line(String),
     /// Input bytes to coalesce with subsequent AttachInput events.
-    CoalesceInput(Vec<u8>),
+    /// Second element is the pane UUID the input was sent to (if known).
+    CoalesceInput(Vec<u8>, Option<Uuid>),
     /// Skip this request (non-structural).
     Skip,
 }
@@ -114,6 +517,8 @@ fn request_to_dsl(
     request: &Request,
     has_session: &mut bool,
     request_kind: &str,
+    state: &RecordingStateTracker,
+    event: &RecordingEventEnvelope,
 ) -> RequestDslResult {
     match request {
         Request::NewSession { name } => {
@@ -155,7 +560,16 @@ fn request_to_dsl(
             if data.is_empty() || !*has_session {
                 return RequestDslResult::Skip;
             }
-            RequestDslResult::CoalesceInput(data.clone())
+            // Use pane_id from the recording envelope if available (Phase 1.1),
+            // otherwise fall back to the tracker's focused pane.
+            let pane_id = event.pane_id.or(state.focused_pane_id);
+            RequestDslResult::CoalesceInput(data.clone(), pane_id)
+        }
+        Request::PaneDirectInput { data, pane_id, .. } => {
+            if data.is_empty() || !*has_session {
+                return RequestDslResult::Skip;
+            }
+            RequestDslResult::CoalesceInput(data.clone(), Some(*pane_id))
         }
         // Skip high-frequency / non-structural requests.
         Request::AttachOutput { .. }
@@ -189,6 +603,10 @@ fn request_to_dsl(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Byte escaping
+// ---------------------------------------------------------------------------
+
 /// Escape bytes to C-style escape string for use in `send-keys keys='...'`.
 fn bytes_to_c_escaped(data: &[u8]) -> String {
     let mut result = String::new();
@@ -212,6 +630,10 @@ fn bytes_to_c_escaped(data: &[u8]) -> String {
     result
 }
 
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -230,5 +652,81 @@ mod tests {
     #[test]
     fn bytes_to_c_escaped_mixed() {
         assert_eq!(bytes_to_c_escaped(b"echo hello\r"), "echo hello\\r");
+    }
+
+    #[test]
+    fn make_robust_pattern_digits() {
+        assert_eq!(make_robust_pattern("pid: 12345"), "pid: \\d+");
+        assert_eq!(make_robust_pattern("line 42: error"), "line \\d+: error");
+    }
+
+    #[test]
+    fn make_robust_pattern_escapes_meta() {
+        assert_eq!(make_robust_pattern("file.txt"), "file\\.txt");
+        assert_eq!(make_robust_pattern("a+b"), "a\\+b");
+        assert_eq!(make_robust_pattern("user@host:~$"), "user@host:~\\$");
+    }
+
+    #[test]
+    fn make_robust_pattern_preserves_text() {
+        assert_eq!(make_robust_pattern("hello world"), "hello world");
+    }
+
+    #[test]
+    fn escape_single_quote_basic() {
+        assert_eq!(escape_single_quote("it's"), "it\\'s");
+        assert_eq!(escape_single_quote("a\\b"), "a\\\\b");
+    }
+
+    #[test]
+    fn tracker_pane_lifecycle() {
+        let mut tracker = RecordingStateTracker::new();
+        let pane1 = Uuid::nil();
+        let pane2 = Uuid::from_u128(1);
+
+        tracker.add_pane(pane1);
+        tracker.set_focus(pane1);
+        assert_eq!(tracker.pane_index(&pane1), Some(0));
+        assert_eq!(tracker.focused_pane_index(), Some(0));
+
+        tracker.add_pane(pane2);
+        tracker.set_focus(pane2);
+        assert_eq!(tracker.pane_index(&pane2), Some(1));
+        assert_eq!(tracker.focused_pane_index(), Some(1));
+
+        tracker.remove_pane(&pane1);
+        assert_eq!(tracker.pane_index(&pane1), None);
+        assert_eq!(tracker.pane_index(&pane2), Some(1)); // index preserved
+    }
+
+    #[test]
+    fn generate_assertions_basic() {
+        let mut state = RecordingStateTracker::new();
+        let pane_id = Uuid::nil();
+        state.add_pane(pane_id);
+        state.set_focus(pane_id);
+        state.viewport = (40, 10);
+
+        // Simulate output: "hello world\r\nuser@host:~$ "
+        let output = b"hello world\r\nuser@host:~$ ";
+        let accum = vec![PaneOutputAccumulator {
+            pane_id,
+            bytes: output.to_vec(),
+        }];
+
+        let mut lines = Vec::new();
+        generate_assertions_from_output(&mut lines, &accum, &state);
+
+        // Should have a wait-for on the prompt line
+        assert!(
+            lines.iter().any(|l| l.starts_with("wait-for")),
+            "expected wait-for, got: {lines:?}"
+        );
+        // The prompt pattern should contain "user@host"
+        let waitfor = lines.iter().find(|l| l.starts_with("wait-for")).unwrap();
+        assert!(
+            waitfor.contains("user@host"),
+            "wait-for should match prompt: {waitfor}"
+        );
     }
 }

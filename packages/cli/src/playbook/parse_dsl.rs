@@ -104,6 +104,22 @@ fn parse_config_directive(
                 }
             }
         }
+        "env" => {
+            // @env NAME=VALUE — set environment variable in the sandbox process.
+            let args = parse_kv_args(rest)?;
+            for (key, value) in &args {
+                config.env.insert(key.clone(), value.clone());
+            }
+            if args.is_empty() {
+                if let Some(eq) = rest.find('=') {
+                    let key = rest[..eq].trim().to_string();
+                    let value = rest[eq + 1..].trim().to_string();
+                    config.env.insert(key, value);
+                } else {
+                    bail!("@env requires NAME=VALUE format");
+                }
+            }
+        }
         "include" => {
             let path = rest.trim().to_string();
             if path.is_empty() {
@@ -293,6 +309,8 @@ pub(crate) fn parse_action_line(line: &str) -> Result<Action> {
                 payload,
             })
         }
+        "screen" => Ok(Action::Screen),
+        "status" => Ok(Action::Status),
         _ => bail!("unknown action: {action_name}"),
     }
 }

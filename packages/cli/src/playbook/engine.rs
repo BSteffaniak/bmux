@@ -65,6 +65,7 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
             playbook.config.shell.as_deref(),
             &playbook.config.plugins,
             SERVER_STARTUP_TIMEOUT,
+            &playbook.config.env,
         )
         .await
         .context("failed starting sandbox server")?;
@@ -399,35 +400,23 @@ pub(super) async fn execute_step(
             let resolved_keys = runtime_vars.resolve_bytes(keys);
 
             if let Some(target_index) = pane {
-                // Pane-targeted send: focus the target pane, send input, then
-                // restore focus to the original pane.
+                // Pane-targeted send: resolve the pane index to a UUID and use
+                // PaneDirectInput to write bytes directly without focus changes.
                 let snapshot = client
                     .attach_snapshot(sid, 0)
                     .await
-                    .map_err(|e| anyhow::anyhow!("snapshot for focus check failed: {e}"))?;
-                let current_focused = snapshot.panes.iter().find(|p| p.focused).map(|p| p.index);
+                    .map_err(|e| anyhow::anyhow!("snapshot for pane lookup failed: {e}"))?;
+                let pane_id = snapshot
+                    .panes
+                    .iter()
+                    .find(|p| p.index == *target_index)
+                    .map(|p| p.id)
+                    .ok_or_else(|| anyhow::anyhow!("pane index {target_index} not found"))?;
 
-                let target_selector = bmux_ipc::PaneSelector::ByIndex(*target_index);
                 client
-                    .focus_pane_target(Some(SessionSelector::ById(sid)), target_selector)
+                    .pane_direct_input(sid, pane_id, resolved_keys.clone())
                     .await
-                    .map_err(|e| anyhow::anyhow!("send-keys focus target pane failed: {e}"))?;
-
-                client
-                    .attach_input(sid, resolved_keys.clone())
-                    .await
-                    .map_err(|e| anyhow::anyhow!("send-keys failed: {e}"))?;
-
-                // Restore focus to the original pane if it was different.
-                if let Some(orig_index) = current_focused {
-                    if orig_index != *target_index {
-                        let restore_selector = bmux_ipc::PaneSelector::ByIndex(orig_index);
-                        client
-                            .focus_pane_target(Some(SessionSelector::ById(sid)), restore_selector)
-                            .await
-                            .map_err(|e| anyhow::anyhow!("send-keys restore focus failed: {e}"))?;
-                    }
-                }
+                    .map_err(|e| anyhow::anyhow!("send-keys to pane {target_index} failed: {e}"))?;
             } else {
                 client
                     .attach_input(sid, resolved_keys)
@@ -473,9 +462,15 @@ pub(super) async fn execute_step(
             let mut poll_delay = Duration::from_millis(10);
 
             loop {
-                // Drain any pending output
-                drain_output_until_idle(client, sid, Duration::from_millis(100), display_track)
-                    .await?;
+                // Drain any pending output (lower threshold for WaitFor's retry loop)
+                drain_output_with_threshold(
+                    client,
+                    sid,
+                    Duration::from_millis(100),
+                    display_track,
+                    3,
+                )
+                .await?;
 
                 // Refresh screen state
                 let snapshot = inspector.refresh(client, sid).await?;
@@ -708,6 +703,27 @@ pub(super) async fn execute_step(
             };
             Ok(detail)
         }
+
+        Action::Screen => {
+            let sid = require_session(*session_id)?;
+            require_attached(*attached)?;
+            drain_output_until_idle(client, sid, Duration::from_millis(200), display_track).await?;
+            let snapshot = inspector.refresh(client, sid).await?;
+            let _ = snapshot; // satisfy the borrow checker
+            let captures = inspector.capture_all();
+            // Serialize the pane captures as JSON for inclusion in step detail.
+            let json = serde_json::to_string(&captures).unwrap_or_else(|_| "[]".to_string());
+            Ok(Some(json))
+        }
+
+        Action::Status => {
+            let sid_detail = session_id.map_or("none".to_string(), |id| id.to_string());
+            let detail = format!(
+                "session_id={}, pane_count={}, focused_pane={}",
+                sid_detail, runtime_vars.pane_count, runtime_vars.focused_pane,
+            );
+            Ok(Some(detail))
+        }
     }
 }
 
@@ -722,13 +738,30 @@ pub(super) fn require_attached(attached: bool) -> Result<()> {
     Ok(())
 }
 
-/// Drain output from the attached session until idle (3 consecutive empty reads).
+/// Drain output from the attached session until idle.
+///
+/// "Idle" is defined as `idle_threshold` consecutive empty reads separated by
+/// 25ms gaps. The default threshold is 5 consecutive empty reads (125ms of
+/// silence). For the `wait-for` polling loop, a lower threshold of 3 is
+/// acceptable since the outer loop will re-drain on the next iteration.
+///
 /// Optionally captures output bytes to a display track writer for GIF export.
 pub(super) async fn drain_output_until_idle(
     client: &mut BmuxClient,
     session_id: Uuid,
     max_wait: Duration,
     display_track: &mut Option<super::display_track::PlaybookDisplayTrackWriter>,
+) -> Result<()> {
+    drain_output_with_threshold(client, session_id, max_wait, display_track, 5).await
+}
+
+/// Same as `drain_output_until_idle` but with a configurable idle threshold.
+pub(super) async fn drain_output_with_threshold(
+    client: &mut BmuxClient,
+    session_id: Uuid,
+    max_wait: Duration,
+    display_track: &mut Option<super::display_track::PlaybookDisplayTrackWriter>,
+    idle_threshold: u8,
 ) -> Result<()> {
     let started = Instant::now();
     let mut idle_polls = 0u8;
@@ -741,7 +774,7 @@ pub(super) async fn drain_output_until_idle(
 
         if data.is_empty() {
             idle_polls += 1;
-            if idle_polls >= 3 {
+            if idle_polls >= idle_threshold {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;

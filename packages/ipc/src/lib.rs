@@ -372,6 +372,12 @@ pub enum Request {
     },
     RecordingDeleteAll,
     Detach,
+    /// Write input bytes directly to a specific pane by ID, bypassing focus routing.
+    PaneDirectInput {
+        session_id: Uuid,
+        pane_id: Uuid,
+        data: Vec<u8>,
+    },
 }
 
 /// Attach grant returned by attach control-plane request.
@@ -442,6 +448,9 @@ pub struct ServerSnapshotStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingSummary {
     pub id: Uuid,
+    /// Recording format version. Absent in recordings created before versioning was added.
+    #[serde(default = "recording_format_version_default")]
+    pub format_version: u32,
     #[serde(default)]
     pub session_id: Option<Uuid>,
     pub capture_input: bool,
@@ -455,6 +464,13 @@ pub struct RecordingSummary {
     pub event_count: u64,
     pub payload_bytes: u64,
     pub path: String,
+}
+
+/// Current recording format version.
+pub const RECORDING_FORMAT_VERSION: u32 = 2;
+
+const fn recording_format_version_default() -> u32 {
+    1 // pre-versioning recordings are treated as version 1
 }
 
 const fn recording_profile_default() -> RecordingProfile {
@@ -714,6 +730,10 @@ pub enum ResponsePayload {
         deleted_count: usize,
     },
     Detached,
+    PaneDirectInputAccepted {
+        bytes: usize,
+        pane_id: Uuid,
+    },
     ServerStopping,
     ServiceInvoked {
         payload: Vec<u8>,

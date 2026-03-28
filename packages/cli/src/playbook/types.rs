@@ -22,6 +22,10 @@ pub struct PlaybookConfig {
     pub plugins: PluginConfig,
     /// User-defined variables for substitution.
     pub vars: BTreeMap<String, String>,
+    /// Environment variables to set in the sandbox server process.
+    /// If non-empty, the sandbox uses a clean environment with only these vars
+    /// plus the `BMUX_*` path overrides.
+    pub env: BTreeMap<String, String>,
 }
 
 impl Default for PlaybookConfig {
@@ -35,6 +39,7 @@ impl Default for PlaybookConfig {
             record: false,
             plugins: PluginConfig::default(),
             vars: BTreeMap::new(),
+            env: BTreeMap::new(),
         }
     }
 }
@@ -126,6 +131,13 @@ pub enum Action {
         operation: String,
         payload: String,
     },
+    /// Capture the current screen state of all panes. In batch mode, the result
+    /// is included in the `PlaybookResult`'s step details as serialized JSON.
+    /// This is useful for LLM debugging: inspect screen state without asserting.
+    Screen,
+    /// Query the current session status (session ID, pane count, focused pane).
+    /// In batch mode, the result is included in the step details.
+    Status,
 }
 
 /// Plugin service invocation kind.
@@ -216,6 +228,8 @@ impl Action {
             Self::PrefixKey { .. } => "prefix-key",
             Self::WaitForEvent { .. } => "wait-for-event",
             Self::InvokeService { .. } => "invoke-service",
+            Self::Screen => "screen",
+            Self::Status => "status",
         }
     }
 }

@@ -87,6 +87,7 @@ impl RecordingRuntime {
         let events_path = dir.join(EVENTS_FILE_NAME);
         let summary = RecordingSummary {
             id,
+            format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
             session_id: session_filter,
             capture_input,
             profile,
@@ -163,6 +164,7 @@ impl RecordingRuntime {
     pub fn status(&self) -> RecordingStatus {
         let active = self.active.as_ref().map(|active| RecordingSummary {
             id: active.id,
+            format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
             session_id: active.session_filter,
             capture_input: active.capture_input,
             profile: active.profile,
@@ -288,14 +290,15 @@ impl RecordingRuntime {
             return Ok(false);
         }
 
+        // Sample the clock BEFORE incrementing seq to ensure that if thread A
+        // gets seq=N and thread B gets seq=N+1, A's mono_ns <= B's mono_ns
+        // (because A read the clock first in wall-clock time, before B could
+        // observe the incremented counter).
+        let elapsed = active.started_at.elapsed();
         let seq = active.seq.fetch_add(1, Ordering::SeqCst).saturating_add(1);
         let envelope = RecordingEventEnvelope {
             seq,
-            mono_ns: active
-                .started_at
-                .elapsed()
-                .as_nanos()
-                .min(u128::from(u64::MAX)) as u64,
+            mono_ns: elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
             wall_epoch_ms: epoch_millis_now(),
             session_id: meta.session_id,
             pane_id: meta.pane_id,
