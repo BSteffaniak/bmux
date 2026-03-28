@@ -389,6 +389,9 @@ pub enum PlaybookCommand {
         /// Run against the live server instead of an ephemeral sandbox
         #[arg(long)]
         target_server: bool,
+        /// Record the playbook execution (overrides playbook config)
+        #[arg(long)]
+        record: bool,
     },
     /// Validate a playbook without executing it
     Validate {

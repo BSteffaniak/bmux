@@ -1500,9 +1500,10 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                         source,
                         json,
                         target_server,
+                        record,
                     },
             },
-        ) => run_playbook_run(source, *json, *target_server).await,
+        ) => run_playbook_run(source, *json, *target_server, *record).await,
         (
             BuiltInHandlerId::PlaybookValidate,
             Command::Playbook {
@@ -8186,13 +8187,23 @@ fn init_logging(verbose: bool, cli_level: Option<LogLevel>) {
 
 // ── Playbook commands ────────────────────────────────────────────────────────
 
-async fn run_playbook_run(source: &str, json: bool, target_server: bool) -> Result<u8> {
-    let playbook = if source == "-" {
+async fn run_playbook_run(
+    source: &str,
+    json: bool,
+    target_server: bool,
+    record: bool,
+) -> Result<u8> {
+    let mut playbook = if source == "-" {
         crate::playbook::parse_stdin().context("failed parsing playbook from stdin")?
     } else {
         crate::playbook::parse_file(std::path::Path::new(source))
             .with_context(|| format!("failed parsing playbook from {source}"))?
     };
+
+    // CLI --record flag overrides the playbook config.
+    if record {
+        playbook.config.record = true;
+    }
 
     let result = crate::playbook::run(playbook, target_server).await?;
 

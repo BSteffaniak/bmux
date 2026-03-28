@@ -121,6 +121,10 @@ pub fn format_result(result: &PlaybookResult) -> String {
         }
     }
 
+    if let Some(rid) = &result.recording_id {
+        out.push_str(&format!("\nrecording: {rid}\n"));
+    }
+
     if let Some(err) = &result.error {
         out.push_str(&format!("\nerror: {err}\n"));
     }

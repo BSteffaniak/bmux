@@ -26,10 +26,12 @@ const ATTACH_OUTPUT_MAX_BYTES: usize = 256 * 1024;
 pub async fn run_playbook(playbook: Playbook, target_server: bool) -> Result<PlaybookResult> {
     let started = Instant::now();
     let playbook_name = playbook.config.name.clone();
+    let should_record = playbook.config.record;
 
     let mut step_results = Vec::new();
     let mut snapshots = Vec::new();
     let mut error_msg: Option<String> = None;
+    let mut recording_id: Option<Uuid> = None;
 
     // Either connect to an existing server or spin up a sandbox.
     let sandbox: Option<SandboxServer>;
@@ -58,6 +60,7 @@ pub async fn run_playbook(playbook: Playbook, target_server: bool) -> Result<Pla
     // Session tracking
     let mut session_id: Option<Uuid> = None;
     let mut attached = false;
+    let mut recording_started = false;
 
     // Execute each step
     let deadline = Instant::now() + playbook.config.timeout;
@@ -106,6 +109,24 @@ pub async fn run_playbook(playbook: Playbook, target_server: bool) -> Result<Pla
                     elapsed_ms,
                     detail,
                 });
+
+                // Start recording after the first successful new-session step.
+                if should_record
+                    && !recording_started
+                    && matches!(step.action, Action::NewSession { .. })
+                {
+                    match start_recording(&mut client, session_id).await {
+                        Ok(rid) => {
+                            info!("recording started: {rid}");
+                            recording_id = Some(rid);
+                            recording_started = true;
+                        }
+                        Err(e) => {
+                            warn!("failed to start recording: {e:#}");
+                            // Non-fatal — continue without recording.
+                        }
+                    }
+                }
             }
             Err(err) => {
                 warn!(
@@ -128,6 +149,21 @@ pub async fn run_playbook(playbook: Playbook, target_server: bool) -> Result<Pla
         }
     }
 
+    // Stop recording if one was started.
+    if recording_started {
+        if let Some(rid) = recording_id {
+            match client.recording_stop(Some(rid)).await {
+                Ok(stopped_id) => {
+                    info!("recording stopped: {stopped_id}");
+                }
+                Err(e) => {
+                    warn!("failed to stop recording: {e}");
+                    // Non-fatal — don't change pass/fail status.
+                }
+            }
+        }
+    }
+
     let total_elapsed_ms = started.elapsed().as_millis() as u64;
     let pass = error_msg.is_none();
 
@@ -143,10 +179,23 @@ pub async fn run_playbook(playbook: Playbook, target_server: bool) -> Result<Pla
         pass,
         steps: step_results,
         snapshots,
-        recording_id: None,
+        recording_id,
         total_elapsed_ms,
         error: error_msg,
     })
+}
+
+/// Start a recording on the server, optionally filtered to a specific session.
+async fn start_recording(client: &mut BmuxClient, session_id: Option<Uuid>) -> Result<Uuid> {
+    let summary = client
+        .recording_start(
+            session_id, true, // capture_input
+            None, // profile: server default (Functional)
+            None, // event_kinds: server default
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("recording start failed: {e}"))?;
+    Ok(summary.id)
 }
 
 /// Execute a single step.
