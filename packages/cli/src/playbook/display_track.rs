@@ -1,11 +1,9 @@
 //! Display track writer for playbook recordings.
 //!
-//! Produces the same JSONL format as the attach runtime's `DisplayCaptureWriter`,
+//! Produces the same binary format as the attach runtime's `DisplayCaptureWriter`,
 //! enabling GIF export from playbook recordings.
 //!
-//! Format: one JSON object per line (NDJSON), each containing:
-//! - `mono_ns`: monotonic nanosecond timestamp from session start
-//! - `event`: one of `stream_opened`, `resize`, `frame_bytes`, `stream_closed`
+//! Format: length-prefixed postcard frames.
 
 use std::io::Write;
 use std::path::Path;
@@ -17,7 +15,7 @@ use uuid::Uuid;
 
 /// Display track event — matches the format used by `recording/mod.rs`.
 #[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+#[serde(rename_all = "snake_case")]
 enum DisplayTrackEvent {
     StreamOpened {
         client_id: Uuid,
@@ -45,7 +43,7 @@ struct DisplayTrackEnvelope {
     event: DisplayTrackEvent,
 }
 
-/// Writer that produces the display track JSONL file alongside a recording.
+/// Writer that produces the display track binary file alongside a recording.
 pub struct PlaybookDisplayTrackWriter {
     started_at: Instant,
     writer: std::io::BufWriter<std::fs::File>,
@@ -72,7 +70,7 @@ impl PlaybookDisplayTrackWriter {
             .with_context(|| format!("failed writing {}", owner_path.display()))?;
 
         // Open display track file
-        let track_path = recording_dir.join(format!("display-{client_id}.jsonl"));
+        let track_path = recording_dir.join(format!("display-{client_id}.bin"));
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -133,8 +131,8 @@ impl PlaybookDisplayTrackWriter {
                 .min(u128::from(u64::MAX)) as u64,
             event,
         };
-        serde_json::to_writer(&mut self.writer, &envelope)?;
-        self.writer.write_all(b"\n")?;
+        bmux_ipc::write_frame(&mut self.writer, &envelope)
+            .map_err(|e| anyhow::anyhow!("display track write_frame failed: {e}"))?;
         Ok(())
     }
 }

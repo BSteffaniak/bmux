@@ -38,7 +38,7 @@ use crossterm::terminal::{Clear, ClearType};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use gif::{Encoder as GifEncoder, Frame as GifFrame, Repeat};
 use std::cell::RefCell;
-use std::io::{self, BufRead, BufReader, BufWriter, IsTerminal, Read, Seek, Write};
+use std::io::{self, BufWriter, IsTerminal, Read, Seek, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::OnceLock;
@@ -1074,6 +1074,7 @@ fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
             PlaybookCommand::Run { .. } => BuiltInHandlerId::PlaybookRun,
             PlaybookCommand::Validate { .. } => BuiltInHandlerId::PlaybookValidate,
             PlaybookCommand::Interactive { .. } => BuiltInHandlerId::PlaybookInteractive,
+            PlaybookCommand::FromRecording { .. } => BuiltInHandlerId::PlaybookFromRecording,
         },
         Command::External(_) => unreachable!("external commands are dispatched separately"),
     }
@@ -1551,6 +1552,16 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
             )
             .await
         }
+        (
+            BuiltInHandlerId::PlaybookFromRecording,
+            Command::Playbook {
+                command:
+                    PlaybookCommand::FromRecording {
+                        recording_id,
+                        output,
+                    },
+            },
+        ) => run_playbook_from_recording(recording_id, output.as_deref()),
         _ => unreachable!("built-in command handler and command variant should stay in sync"),
     }
 }
@@ -8378,6 +8389,23 @@ fn parse_viewport_string(viewport: &str) -> Result<(u16, u16)> {
         anyhow::bail!("viewport too small (minimum 10x5): {cols}x{rows}");
     }
     Ok((cols, rows))
+}
+
+fn run_playbook_from_recording(recording_id: &str, output: Option<&str>) -> Result<u8> {
+    let recordings = recording::list_recordings_from_dir(&recording::recordings_root_dir())?;
+    let resolved_id = recording::resolve_recording_id_prefix(recording_id, &recordings)?;
+    let events = recording::load_recording_events(&resolved_id.to_string())?;
+    let playbook_dsl = crate::playbook::from_recording::events_to_playbook(&events)?;
+
+    if let Some(path) = output {
+        std::fs::write(path, &playbook_dsl)
+            .with_context(|| format!("failed writing playbook to {path}"))?;
+        println!("wrote playbook to {path}");
+    } else {
+        print!("{playbook_dsl}");
+    }
+
+    Ok(0)
 }
 
 #[cfg(test)]

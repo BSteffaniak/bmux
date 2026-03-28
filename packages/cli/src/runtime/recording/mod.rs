@@ -1,10 +1,10 @@
 use super::{
-    AttachDisplayCapturePlan, BmuxConfig, BufRead, BufReader, BufWriter, ConfigPaths,
-    ConnectionPolicyScope, Context, GifEncoder, GifFrame, Instant, IsTerminal, Path, PathBuf, Read,
-    RecordingEventEnvelope, RecordingEventKind, RecordingEventKindArg, RecordingExportFormat,
-    RecordingProfileArg, RecordingRenderMode, RecordingReplayMode, RecordingStatus,
-    RecordingSummary, Repeat, Result, Uuid, Write, cleanup_stale_pid_file, connect_if_running, io,
-    map_cli_client_error, parse_uuid_value, terminal,
+    AttachDisplayCapturePlan, BmuxConfig, BufWriter, ConfigPaths, ConnectionPolicyScope, Context,
+    GifEncoder, GifFrame, Instant, IsTerminal, Path, PathBuf, RecordingEventEnvelope,
+    RecordingEventKind, RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg,
+    RecordingRenderMode, RecordingReplayMode, RecordingStatus, RecordingSummary, Repeat, Result,
+    Uuid, Write, cleanup_stale_pid_file, connect_if_running, io, map_cli_client_error,
+    parse_uuid_value, terminal,
 };
 use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont, point};
 use bmux_fonts::FontPreset;
@@ -508,21 +508,10 @@ fn load_display_track_events(
     client_id: Uuid,
 ) -> Result<Vec<DisplayTrackEnvelope>> {
     let path = display_track_path(recording_dir, client_id);
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .open(&path)
-        .with_context(|| format!("failed opening display track {}", path.display()))?;
-    let reader = BufReader::new(file);
-    let mut events = Vec::new();
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let event: DisplayTrackEnvelope = serde_json::from_str(&line)
-            .with_context(|| format!("failed parsing display event in {}", path.display()))?;
-        events.push(event);
-    }
+    let bytes = std::fs::read(&path)
+        .with_context(|| format!("failed reading display track {}", path.display()))?;
+    let events: Vec<DisplayTrackEnvelope> = bmux_ipc::read_frames(&bytes)
+        .map_err(|e| anyhow::anyhow!("failed parsing display track {}: {e}", path.display()))?;
     Ok(events)
 }
 
@@ -1957,18 +1946,11 @@ pub(super) fn load_recording_events(recording_id: &str) -> Result<Vec<RecordingE
     let id = Uuid::parse_str(recording_id).context("invalid recording id")?;
     let path = recordings_root_dir()
         .join(id.to_string())
-        .join("events.jsonl");
+        .join("events.bin");
     let bytes = std::fs::read(&path)
         .with_context(|| format!("failed reading recording events file {}", path.display()))?;
-    let mut events = Vec::new();
-    for line in bytes.split(|byte| *byte == b'\n') {
-        if line.is_empty() {
-            continue;
-        }
-        let event: RecordingEventEnvelope = serde_json::from_slice(line)
-            .with_context(|| format!("failed parsing recording event in {}", path.display()))?;
-        events.push(event);
-    }
+    let events: Vec<RecordingEventEnvelope> = bmux_ipc::read_frames(&bytes)
+        .map_err(|e| anyhow::anyhow!("failed parsing recording events {}: {e}", path.display()))?;
     Ok(events)
 }
 
@@ -2102,7 +2084,7 @@ pub(super) fn list_recordings_from_disk() -> Result<Vec<RecordingSummary>> {
     list_recordings_from_dir(&recordings_root_dir())
 }
 
-fn recordings_root_dir() -> PathBuf {
+pub(super) fn recordings_root_dir() -> PathBuf {
     let paths = ConfigPaths::default();
     BmuxConfig::load_from_path(&paths.config_file()).map_or_else(
         |_| paths.recordings_dir(),
@@ -2147,7 +2129,7 @@ pub(super) const fn offline_recording_status() -> RecordingStatus {
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+#[serde(rename_all = "snake_case")]
 enum DisplayTrackEvent {
     StreamOpened {
         client_id: Uuid,
@@ -2262,14 +2244,14 @@ impl DisplayCaptureWriter {
                 .min(u128::from(u64::MAX)) as u64,
             event,
         };
-        serde_json::to_writer(&mut self.writer, &envelope)?;
-        self.writer.write_all(b"\n")?;
+        bmux_ipc::write_frame(&mut self.writer, &envelope)
+            .map_err(|e| anyhow::anyhow!("display track write_frame failed: {e}"))?;
         Ok(())
     }
 }
 
 fn display_track_path(recording_path: &Path, client_id: Uuid) -> PathBuf {
-    recording_path.join(format!("display-{client_id}.jsonl"))
+    recording_path.join(format!("display-{client_id}.bin"))
 }
 
 fn write_recording_owner_client(recording_path: &Path, client_id: Uuid) -> Result<()> {
@@ -2303,27 +2285,36 @@ mod tests {
     }
 
     #[test]
-    fn parse_legacy_stream_opened_defaults_new_fields_to_none() {
-        let parsed: DisplayTrackEnvelope = serde_json::from_str(
-            r#"{"mono_ns":1,"event":{"kind":"stream_opened","client_id":"00000000-0000-0000-0000-000000000000","recording_id":"00000000-0000-0000-0000-000000000000"}}"#,
-        )
-        .expect("legacy stream_opened should deserialize");
-        let DisplayTrackEvent::StreamOpened {
-            cell_width_px,
-            cell_height_px,
-            window_width_px,
-            window_height_px,
-            terminal_profile,
-            ..
-        } = parsed.event
-        else {
-            panic!("expected stream_opened event");
+    fn display_track_envelope_round_trips_through_postcard() {
+        let envelope = DisplayTrackEnvelope {
+            mono_ns: 1,
+            event: DisplayTrackEvent::StreamOpened {
+                client_id: Uuid::nil(),
+                recording_id: Uuid::nil(),
+                cell_width_px: Some(8),
+                cell_height_px: Some(16),
+                window_width_px: Some(640),
+                window_height_px: Some(480),
+                terminal_profile: None,
+            },
         };
-        assert_eq!(cell_width_px, None);
-        assert_eq!(cell_height_px, None);
-        assert_eq!(window_width_px, None);
-        assert_eq!(window_height_px, None);
-        assert_eq!(terminal_profile, None);
+        let mut buf = Vec::new();
+        bmux_ipc::write_frame(&mut buf, &envelope).expect("write should succeed");
+        let frames: Vec<DisplayTrackEnvelope> =
+            bmux_ipc::read_frames(&buf).expect("read should succeed");
+        assert_eq!(frames.len(), 1);
+        assert_eq!(frames[0].mono_ns, 1);
+        match &frames[0].event {
+            DisplayTrackEvent::StreamOpened {
+                cell_width_px,
+                cell_height_px,
+                ..
+            } => {
+                assert_eq!(*cell_width_px, Some(8));
+                assert_eq!(*cell_height_px, Some(16));
+            }
+            _ => panic!("expected stream_opened event"),
+        }
     }
 
     #[test]

@@ -5,7 +5,6 @@
 //! Cross-platform IPC protocol models for bmux.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -368,7 +367,8 @@ pub enum Request {
         pane_id: Option<Uuid>,
         source: String,
         name: String,
-        payload: Value,
+        /// Pre-serialized JSON payload bytes.
+        payload: Vec<u8>,
     },
     RecordingDeleteAll,
     Detach,
@@ -505,7 +505,7 @@ pub enum RecordingEventKind {
 
 /// Recording event payload.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "kind")]
+#[serde(rename_all = "snake_case")]
 pub enum RecordingPayload {
     Bytes {
         data: Vec<u8>,
@@ -515,18 +515,24 @@ pub enum RecordingPayload {
     },
     RequestStart {
         request_id: u64,
-        request: String,
+        request_kind: String,
         exclusive: bool,
+        /// Full request, postcard-encoded.
+        request_data: Vec<u8>,
     },
     RequestDone {
         request_id: u64,
-        request: String,
-        response: String,
+        request_kind: String,
+        response_kind: String,
         elapsed_ms: u64,
+        /// Full request, postcard-encoded.
+        request_data: Vec<u8>,
+        /// Full response payload, postcard-encoded.
+        response_data: Vec<u8>,
     },
     RequestError {
         request_id: u64,
-        request: String,
+        request_kind: String,
         error_code: ErrorCode,
         message: String,
         elapsed_ms: u64,
@@ -534,7 +540,8 @@ pub enum RecordingPayload {
     Custom {
         source: String,
         name: String,
-        payload: Value,
+        /// Pre-serialized JSON payload bytes.
+        payload: Vec<u8>,
     },
 }
 
@@ -812,6 +819,42 @@ where
     T: DeserializeOwned,
 {
     postcard::from_bytes(bytes)
+}
+
+// ── Binary frame utilities for recording files ───────────────────────────────
+
+/// Write a length-prefixed postcard frame to a writer.
+///
+/// Format: `[u32 little-endian length][postcard bytes]`
+pub fn write_frame<W: std::io::Write, T: Serialize>(
+    writer: &mut W,
+    value: &T,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let bytes =
+        postcard::to_allocvec(value).map_err(|e| format!("postcard serialize failed: {e}"))?;
+    writer.write_all(&(bytes.len() as u32).to_le_bytes())?;
+    writer.write_all(&bytes)?;
+    Ok(())
+}
+
+/// Read all length-prefixed postcard frames from a byte buffer.
+///
+/// Returns a vector of deserialized values. Stops at EOF.
+pub fn read_frames<T: DeserializeOwned>(data: &[u8]) -> Result<Vec<T>, Box<dyn std::error::Error>> {
+    let mut results = Vec::new();
+    let mut offset = 0;
+    while offset + 4 <= data.len() {
+        let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
+        offset += 4;
+        if offset + len > data.len() {
+            break;
+        }
+        let value: T = postcard::from_bytes(&data[offset..offset + len])
+            .map_err(|e| format!("postcard deserialize failed at offset {}: {e}", offset))?;
+        results.push(value);
+        offset += len;
+    }
+    Ok(results)
 }
 
 #[cfg(test)]

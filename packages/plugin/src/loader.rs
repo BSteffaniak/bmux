@@ -769,7 +769,7 @@ fn handle_core_service_call(
                     pane_id: request.pane_id,
                     source: caller_plugin_id.to_string(),
                     name: request.name,
-                    payload: request.payload,
+                    payload: serde_json::to_vec(&request.payload).unwrap_or_default(),
                 },
             )?;
             match response {

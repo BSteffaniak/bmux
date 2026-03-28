@@ -21,6 +21,7 @@ bmux_terminal_protocol = { workspace = true }
 # External dependencies
 anyhow       = { workspace = true, features = ["std"] }
 portable-pty = { workspace = true }
+postcard     = { workspace = true }
 serde        = { workspace = true, features = ["derive"] }
 serde_json   = { workspace = true, features = ["std"] }
 thiserror    = { workspace = true }

@@ -2749,6 +2749,7 @@ async fn handle_connection(
 
         let request_kind = request_kind_name(&request);
         let exclusive = request_requires_exclusive(&request);
+        let request_data = postcard::to_allocvec(&request).unwrap_or_default();
         let started_at = Instant::now();
         debug!(
             client_id = %client_id.0,
@@ -2762,8 +2763,9 @@ async fn handle_connection(
                 RecordingEventKind::RequestStart,
                 RecordingPayload::RequestStart {
                     request_id: envelope.request_id,
-                    request: request_kind.to_string(),
+                    request_kind: request_kind.to_string(),
                     exclusive,
+                    request_data: request_data.clone(),
                 },
                 RecordMeta {
                     session_id: selected_session.map(|id| id.0),
@@ -2786,6 +2788,7 @@ async fn handle_connection(
         let elapsed_ms = started_at.elapsed().as_millis();
         match &response {
             Response::Ok(payload) => {
+                let response_data = postcard::to_allocvec(payload).unwrap_or_default();
                 debug!(
                     client_id = %client_id.0,
                     request_id = envelope.request_id,
@@ -2799,9 +2802,11 @@ async fn handle_connection(
                         RecordingEventKind::RequestDone,
                         RecordingPayload::RequestDone {
                             request_id: envelope.request_id,
-                            request: request_kind.to_string(),
-                            response: response_payload_kind_name(payload).to_string(),
+                            request_kind: request_kind.to_string(),
+                            response_kind: response_payload_kind_name(payload).to_string(),
                             elapsed_ms: elapsed_ms.min(u128::from(u64::MAX)) as u64,
+                            request_data,
+                            response_data,
                         },
                         RecordMeta {
                             session_id: selected_session.map(|id| id.0),
@@ -2826,7 +2831,7 @@ async fn handle_connection(
                         RecordingEventKind::RequestError,
                         RecordingPayload::RequestError {
                             request_id: envelope.request_id,
-                            request: request_kind.to_string(),
+                            request_kind: request_kind.to_string(),
                             error_code: error.code,
                             message: error.message.clone(),
                             elapsed_ms: elapsed_ms.min(u128::from(u64::MAX)) as u64,

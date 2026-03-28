@@ -14,7 +14,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const MANIFEST_FILE_NAME: &str = "manifest.json";
-const EVENTS_FILE_NAME: &str = "events.jsonl";
+const EVENTS_FILE_NAME: &str = "events.bin";
 
 #[derive(Debug)]
 pub struct RecordingRuntime {
@@ -332,8 +332,8 @@ fn writer_loop(
     let mut writer = BufWriter::new(file);
 
     while let Ok(event) = rx.recv() {
-        serde_json::to_writer(&mut writer, &event)?;
-        writer.write_all(b"\n")?;
+        bmux_ipc::write_frame(&mut writer, &event)
+            .map_err(|e| anyhow::anyhow!("recording write_frame failed: {e}"))?;
         let payload_size = payload_size(&event.payload);
         event_count.fetch_add(1, Ordering::SeqCst);
         payload_bytes.fetch_add(payload_size, Ordering::SeqCst);
@@ -373,23 +373,24 @@ fn payload_size(payload: &RecordingPayload) -> u64 {
     match payload {
         RecordingPayload::Bytes { data } => data.len() as u64,
         RecordingPayload::ServerEvent { event } => {
-            serde_json::to_vec(event).map_or(0, |bytes| bytes.len() as u64)
+            postcard::to_allocvec(event).map_or(0, |bytes: Vec<u8>| bytes.len() as u64)
         }
-        RecordingPayload::RequestStart { request, .. } => request.len() as u64,
+        RecordingPayload::RequestStart { request_data, .. } => request_data.len() as u64,
         RecordingPayload::RequestDone {
-            request, response, ..
-        } => (request.len() + response.len()) as u64,
+            request_data,
+            response_data,
+            ..
+        } => (request_data.len() + response_data.len()) as u64,
         RecordingPayload::RequestError {
-            request, message, ..
-        } => (request.len() + message.len()) as u64,
+            request_kind,
+            message,
+            ..
+        } => (request_kind.len() + message.len()) as u64,
         RecordingPayload::Custom {
             source,
             name,
             payload,
-        } => {
-            let payload_len = serde_json::to_vec(payload).map_or(0, |bytes| bytes.len());
-            (source.len() + name.len() + payload_len) as u64
-        }
+        } => (source.len() + name.len() + payload.len()) as u64,
     }
 }
 

@@ -58,6 +58,7 @@ pub enum BuiltInHandlerId {
     PlaybookRun,
     PlaybookValidate,
     PlaybookInteractive,
+    PlaybookFromRecording,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -364,6 +365,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::PlaybookInteractive,
             &["playbook", "interactive"],
             "Start an interactive playbook session",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::PlaybookFromRecording,
+            &["playbook", "from-recording"],
+            "Generate a playbook from a recording",
         ),
     ]
 }

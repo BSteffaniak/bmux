@@ -363,6 +363,7 @@ dependencies = [
  "bmux_terminal",
  "bmux_terminal_protocol",
  "portable-pty",
+ "postcard",
  "serde",
  "serde_json",
  "thiserror 2.0.18",

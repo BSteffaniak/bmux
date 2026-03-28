@@ -431,6 +431,14 @@ pub enum PlaybookCommand {
         #[arg(long)]
         timeout: Option<u64>,
     },
+    /// Generate a playbook stub from an existing recording
+    FromRecording {
+        /// Recording ID (or prefix)
+        recording_id: String,
+        /// Output file path (default: stdout)
+        #[arg(long, short)]
+        output: Option<String>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
