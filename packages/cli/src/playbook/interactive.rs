@@ -122,6 +122,9 @@ struct ReadyMessage {
 }
 
 /// Entry point for `bmux playbook interactive`.
+///
+/// Handles Ctrl+C gracefully: on signal, the sandbox server is cleaned up
+/// via `SandboxServer`'s `Drop` impl.
 pub async fn run_interactive(
     socket_override: Option<&str>,
     record: bool,
@@ -143,18 +146,18 @@ pub async fn run_interactive(
         None => sandbox.root_dir().join("playbook.sock"),
     };
 
-    // 3. Run the session, ensuring cleanup happens regardless of outcome.
-    let result = run_interactive_inner(
-        &sandbox,
-        &socket_path,
-        record,
-        viewport_cols,
-        viewport_rows,
-        session_timeout,
-    )
-    .await;
+    // 3. Run the session with signal handling.
+    //    On Ctrl+C, the sandbox is cleaned up via Drop when the select! drops
+    //    the inner future (which owns references to the sandbox).
+    let result = tokio::select! {
+        result = run_interactive_session_managed(&sandbox, &socket_path, record, viewport_cols, viewport_rows, session_timeout) => result,
+        _ = tokio::signal::ctrl_c() => {
+            info!("interactive session interrupted by signal");
+            Ok(130)
+        }
+    };
 
-    // 4. Cleanup.
+    // 4. Cleanup (no-op in Drop if shutdown succeeds).
     if let Err(e) = sandbox.shutdown(false).await {
         warn!("sandbox shutdown error: {e:#}");
     }
@@ -165,7 +168,7 @@ pub async fn run_interactive(
     result
 }
 
-async fn run_interactive_inner(
+async fn run_interactive_session_managed(
     sandbox: &SandboxServer,
     socket_path: &Path,
     record: bool,

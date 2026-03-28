@@ -23,7 +23,23 @@ const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 const ATTACH_OUTPUT_MAX_BYTES: usize = 256 * 1024;
 
 /// Run a playbook to completion, returning the result.
+///
+/// Handles Ctrl+C gracefully: on signal, the sandbox server is cleaned up
+/// via `SandboxServer`'s `Drop` impl.
 pub async fn run_playbook(playbook: Playbook, target_server: bool) -> Result<PlaybookResult> {
+    tokio::select! {
+        result = run_playbook_inner(playbook, target_server) => result,
+        _ = tokio::signal::ctrl_c() => {
+            // The sandbox (if any) will be cleaned up by Drop when the
+            // run_playbook_inner future is dropped by select!.
+            info!("playbook interrupted by signal");
+            Err(anyhow::anyhow!("interrupted by signal"))
+        }
+    }
+}
+
+/// Core playbook execution logic.
+async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<PlaybookResult> {
     let started = Instant::now();
     let playbook_name = playbook.config.name.clone();
     let should_record = playbook.config.record;

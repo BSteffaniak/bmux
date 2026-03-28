@@ -1758,7 +1758,10 @@ fn load_plugin(
     }
 }
 
-fn scan_available_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Result<PluginRegistry> {
+pub(crate) fn scan_available_plugins(
+    config: &BmuxConfig,
+    paths: &ConfigPaths,
+) -> Result<PluginRegistry> {
     let workspace_bundled_root = workspace_bundled_plugin_root();
     let search_paths = resolve_plugin_search_paths(config, paths)?;
     let reports = bmux_plugin::discover_plugin_manifests_in_roots(&search_paths)?;
@@ -1865,7 +1868,7 @@ fn workspace_bundled_plugin_root() -> Option<PathBuf> {
     bundled.exists().then_some(bundled)
 }
 
-fn bundled_plugin_roots() -> Vec<PathBuf> {
+pub(crate) fn bundled_plugin_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     if let Some(root) = bundled_plugin_root()
@@ -1881,7 +1884,7 @@ fn bundled_plugin_roots() -> Vec<PathBuf> {
     roots
 }
 
-fn registered_plugin_entry_exists(plugin: &bmux_plugin::RegisteredPlugin) -> bool {
+pub(crate) fn registered_plugin_entry_exists(plugin: &bmux_plugin::RegisteredPlugin) -> bool {
     plugin
         .manifest
         .resolve_entry_path(

@@ -16,10 +16,15 @@ use tracing::warn;
 use super::types::PluginConfig;
 
 /// Handle to a running sandbox server.
+///
+/// Implements `Drop` as a defense-in-depth cleanup mechanism: if the struct is
+/// dropped without calling `shutdown()` (e.g. due to panic, early return, or
+/// signal), it will kill the server process and remove temp dirs.
 #[derive(Debug)]
 pub struct SandboxServer {
     handle: ServerHandle,
     root_dir: PathBuf,
+    cleaned_up: bool,
 }
 
 #[derive(Debug)]
@@ -56,7 +61,11 @@ impl SandboxServer {
             .await
             .context("failed starting sandbox server")?;
 
-        Ok(Self { handle, root_dir })
+        Ok(Self {
+            handle,
+            root_dir,
+            cleaned_up: false,
+        })
     }
 
     /// Connect a new `BmuxClient` to this sandbox server.
@@ -80,6 +89,7 @@ impl SandboxServer {
 
     /// Gracefully shut down the sandbox server and optionally clean up temp dirs.
     pub async fn shutdown(mut self, retain_on_failure: bool) -> Result<()> {
+        self.cleaned_up = true;
         let result = self.stop_server().await;
         if !retain_on_failure || result.is_ok() {
             let _ = std::fs::remove_dir_all(&self.root_dir);
@@ -116,6 +126,28 @@ impl SandboxServer {
                 Ok(())
             }
         }
+    }
+}
+
+impl Drop for SandboxServer {
+    fn drop(&mut self) {
+        if self.cleaned_up {
+            return;
+        }
+        // Best-effort synchronous cleanup for abnormal termination (panic, signal, early return).
+        warn!("SandboxServer dropped without shutdown — performing emergency cleanup");
+        match &mut self.handle {
+            ServerHandle::Foreground { child, .. } => {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            ServerHandle::Daemon { paths, .. } => {
+                if let Ok(Some(pid)) = read_pid_file(paths) {
+                    let _ = try_kill_pid(pid);
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&self.root_dir);
     }
 }
 
@@ -156,7 +188,8 @@ fn write_sandbox_config(
     }
 
     // Plugin configuration — build disabled list
-    let disabled = build_plugin_disabled_list(plugin_config);
+    let bundled_ids = discover_bundled_plugin_ids();
+    let disabled = build_plugin_disabled_list(plugin_config, &bundled_ids);
     let enabled = build_plugin_enabled_list(plugin_config);
 
     if !disabled.is_empty() || !enabled.is_empty() {
@@ -175,21 +208,37 @@ fn write_sandbox_config(
         .with_context(|| format!("failed writing sandbox config {}", config_path.display()))
 }
 
-fn build_plugin_disabled_list(plugin_config: &PluginConfig) -> Vec<String> {
+/// Discover bundled plugin IDs using the same dynamic discovery as the runtime.
+fn discover_bundled_plugin_ids() -> Vec<String> {
+    let config = bmux_config::BmuxConfig::default();
+    let paths = bmux_config::ConfigPaths::default();
+    let bundled_roots = crate::runtime::bundled_plugin_roots();
+
+    match crate::runtime::scan_available_plugins(&config, &paths) {
+        Ok(registry) => registry
+            .iter()
+            .filter(|plugin| {
+                bundled_roots.contains(&plugin.search_root)
+                    && crate::runtime::registered_plugin_entry_exists(plugin)
+            })
+            .map(|plugin| plugin.declaration.id.as_str().to_string())
+            .collect(),
+        Err(e) => {
+            warn!("failed to discover bundled plugins, using empty list: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
+fn build_plugin_disabled_list(plugin_config: &PluginConfig, bundled_ids: &[String]) -> Vec<String> {
     // If the user explicitly enabled specific plugins, disable everything else
-    // by using a blanket disable approach: disable all known bundled plugin IDs
+    // by using a blanket disable approach: disable all discovered bundled plugin IDs
     // except those in the enable list.
     if !plugin_config.enable.is_empty() {
-        let known_bundled = [
-            "bmux.windows",
-            "bmux.permissions",
-            "bmux.clipboard",
-            "bmux.plugin_cli",
-        ];
-        let mut disabled: Vec<String> = known_bundled
+        let mut disabled: Vec<String> = bundled_ids
             .iter()
-            .filter(|id| !plugin_config.enable.contains(&(**id).to_string()))
-            .map(|id| (*id).to_string())
+            .filter(|id| !plugin_config.enable.contains(id))
+            .cloned()
             .collect();
         // Also include explicitly disabled plugins
         for id in &plugin_config.disable {
@@ -201,12 +250,7 @@ fn build_plugin_disabled_list(plugin_config: &PluginConfig) -> Vec<String> {
         disabled
     } else if plugin_config.disable.is_empty() {
         // Default: disable all bundled plugins for clean deterministic baseline
-        let mut all = vec![
-            "bmux.windows".to_string(),
-            "bmux.permissions".to_string(),
-            "bmux.clipboard".to_string(),
-            "bmux.plugin_cli".to_string(),
-        ];
+        let mut all = bundled_ids.to_vec();
         all.sort();
         all
     } else {
