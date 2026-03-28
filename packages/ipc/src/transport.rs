@@ -1,8 +1,11 @@
 use crate::frame::{FrameDecodeError, FrameEncodeError, decode_frame_exact, encode_frame};
 use crate::{Envelope, IpcEndpoint};
+use std::io;
 use std::path::Path;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 use thiserror::Error;
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 
 #[cfg(windows)]
 use tokio::net::windows::named_pipe::{
@@ -173,6 +176,71 @@ impl LocalIpcStream {
             StreamInner::WindowsServer(stream) => read_frame(stream).await,
             #[cfg(windows)]
             StreamInner::WindowsClient(stream) => read_frame(stream).await,
+        }
+    }
+}
+
+// ── AsyncRead + AsyncWrite delegation for raw I/O ────────────────────────────
+//
+// These impls allow `LocalIpcStream` to be used with `BufReader`, `BufWriter`,
+// `tokio::io::split()`, etc. — enabling line-based protocols (like the playbook
+// interactive NDJSON protocol) on top of the cross-platform transport.
+//
+// Safety: all inner stream types (`UnixStream`, `NamedPipeServer`,
+// `NamedPipeClient`) implement `Unpin`, so `Pin::new(s)` is sound.
+
+impl AsyncRead for LocalIpcStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        match &mut self.get_mut().inner {
+            #[cfg(unix)]
+            StreamInner::Unix(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(windows)]
+            StreamInner::WindowsServer(s) => Pin::new(s).poll_read(cx, buf),
+            #[cfg(windows)]
+            StreamInner::WindowsClient(s) => Pin::new(s).poll_read(cx, buf),
+        }
+    }
+}
+
+impl AsyncWrite for LocalIpcStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        match &mut self.get_mut().inner {
+            #[cfg(unix)]
+            StreamInner::Unix(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(windows)]
+            StreamInner::WindowsServer(s) => Pin::new(s).poll_write(cx, buf),
+            #[cfg(windows)]
+            StreamInner::WindowsClient(s) => Pin::new(s).poll_write(cx, buf),
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &mut self.get_mut().inner {
+            #[cfg(unix)]
+            StreamInner::Unix(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(windows)]
+            StreamInner::WindowsServer(s) => Pin::new(s).poll_flush(cx),
+            #[cfg(windows)]
+            StreamInner::WindowsClient(s) => Pin::new(s).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        match &mut self.get_mut().inner {
+            #[cfg(unix)]
+            StreamInner::Unix(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(windows)]
+            StreamInner::WindowsServer(s) => Pin::new(s).poll_shutdown(cx),
+            #[cfg(windows)]
+            StreamInner::WindowsClient(s) => Pin::new(s).poll_shutdown(cx),
         }
     }
 }

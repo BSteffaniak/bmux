@@ -554,6 +554,12 @@ fn try_kill_pid(pid: u32) -> Result<bool> {
             .context("failed to execute taskkill command")?;
         Ok(status.success())
     }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        Ok(false)
+    }
 }
 
 fn read_log_excerpt(path: &Path) -> String {

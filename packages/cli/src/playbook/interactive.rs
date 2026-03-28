@@ -9,7 +9,6 @@
 //! - bmux → Agent: one JSON object per `\n`
 //! - Special commands: `quit`, `screen`, `status`
 
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -146,17 +145,14 @@ pub async fn run_interactive(
     .await
     .context("failed starting sandbox server")?;
 
-    // 2. Determine socket path.
-    let socket_path = match socket_override {
-        Some(p) => PathBuf::from(p),
-        None => sandbox.root_dir().join("playbook.sock"),
-    };
+    // 2. Determine the IPC endpoint.
+    let endpoint = interactive_endpoint(socket_override, &sandbox);
 
     // 3. Run the session with signal handling.
     //    On Ctrl+C, the sandbox is cleaned up via Drop when the select! drops
     //    the inner future (which owns references to the sandbox).
     let result = tokio::select! {
-        result = run_interactive_session_managed(&sandbox, &socket_path, record, viewport_cols, viewport_rows, session_timeout) => result,
+        result = run_interactive_session_managed(&sandbox, &endpoint, record, viewport_cols, viewport_rows, session_timeout) => result,
         _ = tokio::signal::ctrl_c() => {
             info!("interactive session interrupted by signal");
             Ok(130)
@@ -168,33 +164,53 @@ pub async fn run_interactive(
         warn!("sandbox shutdown error: {e:#}");
     }
 
-    // Clean up socket file if it still exists.
-    let _ = std::fs::remove_file(&socket_path);
+    // Clean up socket file if it still exists (Unix only — named pipes don't leave files).
+    #[cfg(unix)]
+    if let bmux_ipc::IpcEndpoint::UnixSocket(ref path) = endpoint {
+        let _ = std::fs::remove_file(path);
+    }
 
     result
 }
 
 async fn run_interactive_session_managed(
     sandbox: &SandboxServer,
-    socket_path: &Path,
+    endpoint: &bmux_ipc::IpcEndpoint,
     record: bool,
     viewport_cols: u16,
     viewport_rows: u16,
     session_timeout: Option<Duration>,
 ) -> Result<u8> {
-    // Bind the listener.
-    let listener = bind_listener(socket_path)?;
+    // Bind the listener using the cross-platform IPC transport.
+    let listener = bmux_ipc::transport::LocalIpcListener::bind(endpoint)
+        .await
+        .with_context(|| format!("failed binding interactive listener on {endpoint:?}"))?;
 
     // Print ready message to stdout.
+    let endpoint_display = match endpoint {
+        bmux_ipc::IpcEndpoint::UnixSocket(path) => path.to_string_lossy().to_string(),
+        bmux_ipc::IpcEndpoint::WindowsNamedPipe(name) => name.clone(),
+    };
     let ready = ReadyMessage {
         status: "ready",
-        socket: socket_path.to_string_lossy().to_string(),
+        socket: endpoint_display,
         sandbox_root: sandbox.root_dir().to_string_lossy().to_string(),
     };
     println!("{}", serde_json::to_string(&ready)?);
 
-    // Accept a single client connection.
-    let stream = accept_one(&listener, session_timeout).await?;
+    // Accept a single client connection with optional timeout.
+    let accept_fut = listener.accept();
+    let stream = if let Some(timeout_dur) = session_timeout {
+        tokio::time::timeout(timeout_dur, accept_fut)
+            .await
+            .context("timed out waiting for agent connection")?
+            .map_err(|e| anyhow::anyhow!("accept failed: {e}"))?
+    } else {
+        accept_fut
+            .await
+            .map_err(|e| anyhow::anyhow!("accept failed: {e}"))?
+    };
+    info!("interactive client connected");
 
     // Connect to the sandbox server.
     let mut client = sandbox.connect("bmux-playbook-interactive").await?;
@@ -497,48 +513,57 @@ async fn write_response<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
-// ── Platform-specific socket binding ─────────────────────────────────────────
+// ── Endpoint selection ────────────────────────────────────────────────────────
 
-#[cfg(unix)]
-fn bind_listener(path: &Path) -> Result<tokio::net::UnixListener> {
-    // Ensure parent dir exists and remove stale socket.
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("failed creating socket dir {}", parent.display()))?;
+/// Create a cross-platform IPC endpoint for the interactive session.
+///
+/// On Unix, this is a Unix socket in the sandbox temp directory.
+/// On Windows, this is a named pipe derived from the sandbox root path.
+fn interactive_endpoint(
+    socket_override: Option<&str>,
+    sandbox: &SandboxServer,
+) -> bmux_ipc::IpcEndpoint {
+    if let Some(user_path) = socket_override {
+        // User-specified path — treat as Unix socket on Unix, named pipe on Windows.
+        #[cfg(unix)]
+        {
+            return bmux_ipc::IpcEndpoint::unix_socket(user_path);
+        }
+        #[cfg(windows)]
+        {
+            return bmux_ipc::IpcEndpoint::windows_named_pipe(user_path.to_string());
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            return bmux_ipc::IpcEndpoint::unix_socket(user_path);
+        }
     }
-    if path.exists() {
-        std::fs::remove_file(path)
-            .with_context(|| format!("failed removing stale socket {}", path.display()))?;
+
+    // Auto-generated endpoint from sandbox root.
+    #[cfg(unix)]
+    {
+        bmux_ipc::IpcEndpoint::unix_socket(sandbox.root_dir().join("playbook.sock"))
     }
-    tokio::net::UnixListener::bind(path)
-        .with_context(|| format!("failed binding socket {}", path.display()))
+    #[cfg(windows)]
+    {
+        // Generate a unique named pipe from the sandbox root path.
+        let root_str = sandbox.root_dir().to_string_lossy();
+        let hash = simple_hash(root_str.as_bytes());
+        bmux_ipc::IpcEndpoint::windows_named_pipe(format!(r"\\.\pipe\bmux-playbook-{hash:016x}"))
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        bmux_ipc::IpcEndpoint::unix_socket(sandbox.root_dir().join("playbook.sock"))
+    }
 }
 
-#[cfg(unix)]
-async fn accept_one(
-    listener: &tokio::net::UnixListener,
-    timeout: Option<Duration>,
-) -> Result<tokio::net::UnixStream> {
-    let accept_fut = listener.accept();
-    let (stream, _addr) = if let Some(timeout_dur) = timeout {
-        tokio::time::timeout(timeout_dur, accept_fut)
-            .await
-            .context("timed out waiting for agent connection")?
-            .context("accept failed")?
-    } else {
-        accept_fut.await.context("accept failed")?
-    };
-    info!("interactive client connected");
-    Ok(stream)
-}
-
-// Windows stub — to be implemented with named pipes when needed.
-#[cfg(not(unix))]
-fn bind_listener(_path: &Path) -> Result<()> {
-    anyhow::bail!("interactive playbook mode is not yet supported on this platform")
-}
-
-#[cfg(not(unix))]
-async fn accept_one(_listener: &(), _timeout: Option<Duration>) -> Result<()> {
-    anyhow::bail!("interactive playbook mode is not yet supported on this platform")
+/// Simple FNV-1a hash for generating stable, unique pipe names.
+#[cfg(windows)]
+fn simple_hash(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
 }
