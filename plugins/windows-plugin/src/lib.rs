@@ -3,9 +3,9 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_plugin::{
-    ContextCloseRequest, ContextCreateRequest, ContextSelector, HostRuntimeApi,
-    NativeCommandContext, NativeServiceContext, RustPlugin, ServiceResponse, StorageGetRequest,
-    StorageSetRequest, decode_service_message, encode_service_message,
+    ContextCloseRequest, ContextCreateRequest, ContextSelector, EXIT_ERROR, EXIT_OK,
+    HostRuntimeApi, NativeCommandContext, NativeServiceContext, RustPlugin, ServiceResponse,
+    StorageGetRequest, StorageSetRequest, decode_service_message, encode_service_message,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -22,10 +22,10 @@ pub struct WindowsPlugin {
 impl RustPlugin for WindowsPlugin {
     fn run_command(&mut self, context: NativeCommandContext) -> i32 {
         match handle_command(self, &context) {
-            Ok(()) => 0,
+            Ok(()) => EXIT_OK,
             Err(error) => {
                 eprintln!("{error}");
-                1
+                EXIT_ERROR
             }
         }
     }

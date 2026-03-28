@@ -126,9 +126,3 @@ value_name = "CLIENT"
 
 [keybindings.runtime]
 "shift+p" = "plugin:bmux.permissions:permissions-current"
-
-[plugin_api]
-minimum = "1.0"
-
-[native_abi]
-minimum = "1.0"

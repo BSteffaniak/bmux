@@ -3,10 +3,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_clipboard::ClipboardError;
-use bmux_plugin::{
-    NativeServiceContext, RustPlugin, ServiceResponse, decode_service_message,
-    encode_service_message,
-};
+use bmux_plugin::{NativeServiceContext, RustPlugin, ServiceResponse, handle_service};
 use serde::{Deserialize, Serialize};
 
 #[derive(Default)]
@@ -18,7 +15,21 @@ impl RustPlugin for ClipboardPlugin {
             context.request.service.interface_id.as_str(),
             context.request.operation.as_str(),
         ) {
-            ("clipboard-write/v1", "copy_text") => run_copy_text_service(&context),
+            ("clipboard-write/v1", "copy_text") => {
+                handle_service(&context, |req: ClipboardCopyRequest, _ctx| {
+                    bmux_clipboard::copy_text(&req.text).map_err(|error| match error {
+                        ClipboardError::BackendUnavailable { .. } => ServiceResponse::error(
+                            "backend_unavailable",
+                            "clipboard backend unavailable",
+                        ),
+                        ClipboardError::BackendFailed { message, .. } => ServiceResponse::error(
+                            "backend_failed",
+                            format!("clipboard copy failed: {message}"),
+                        ),
+                    })?;
+                    Ok(())
+                })
+            }
             _ => ServiceResponse::error(
                 "unsupported_service_operation",
                 format!(
@@ -36,30 +47,4 @@ bmux_plugin::export_plugin!(ClipboardPlugin, include_str!("../plugin.toml"));
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ClipboardCopyRequest {
     text: String,
-}
-
-fn run_copy_text_service(context: &NativeServiceContext) -> ServiceResponse {
-    let request = match decode_service_message::<ClipboardCopyRequest>(&context.request.payload) {
-        Ok(request) => request,
-        Err(error) => {
-            return ServiceResponse::error("invalid_request", error.to_string());
-        }
-    };
-
-    if let Err(error) = bmux_clipboard::copy_text(&request.text) {
-        return match error {
-            ClipboardError::BackendUnavailable { .. } => {
-                ServiceResponse::error("backend_unavailable", "clipboard backend unavailable")
-            }
-            ClipboardError::BackendFailed { message, .. } => ServiceResponse::error(
-                "backend_failed",
-                format!("clipboard copy failed: {message}"),
-            ),
-        };
-    }
-
-    match encode_service_message(&()) {
-        Ok(payload) => ServiceResponse::ok(payload),
-        Err(error) => ServiceResponse::error("response_encode_failed", error.to_string()),
-    }
 }

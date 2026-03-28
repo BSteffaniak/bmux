@@ -193,9 +193,3 @@ version_req = "=0.0.1-alpha.0"
 [[dependencies]]
 plugin_id   = "bmux.windows"
 version_req = "=0.0.1-alpha.0"
-
-[plugin_api]
-minimum = "1.0"
-
-[native_abi]
-minimum = "1.0"

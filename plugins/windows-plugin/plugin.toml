@@ -159,12 +159,6 @@ name          = "last-window"
 path          = ["last-window"]
 summary       = "Switch to the previously active workspace window"
 
-[plugin_api]
-minimum = "1.0"
-
-[native_abi]
-minimum = "1.0"
-
 [keybindings.runtime]
 c = "plugin:bmux.windows:new-window"
 n = "plugin:bmux.windows:next-window"

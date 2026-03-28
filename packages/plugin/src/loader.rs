@@ -2,11 +2,10 @@ use crate::{
     CapabilityProvider, DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_COMMAND_SYMBOL,
     DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
     DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL, HostConnectionInfo, HostMetadata,
-    HostScope, PluginDeclaration, PluginEntrypoint, PluginError, PluginEvent, PluginFeature,
-    PluginLifecycle, PluginManifestCompatibility, PluginRegistry, PluginService, RegisteredPlugin,
-    RegisteredService, Result, ServiceEnvelopeKind, ServiceKind, ServiceRequest, ServiceResponse,
-    decode_service_envelope, decode_service_message, discover_registered_plugins_in_roots,
-    encode_service_envelope, encode_service_message,
+    HostScope, PluginDeclaration, PluginEntrypoint, PluginError, PluginEvent, PluginRegistry,
+    RegisteredPlugin, RegisteredService, Result, ServiceEnvelopeKind, ServiceKind, ServiceRequest,
+    ServiceResponse, decode_service_envelope, decode_service_message,
+    discover_registered_plugins_in_roots, encode_service_envelope, encode_service_message,
     host_services::{
         ContextCloseRequest, ContextCloseResponse, ContextCreateRequest, ContextCreateResponse,
         ContextCurrentResponse, ContextListResponse, ContextSelectRequest, ContextSelectResponse,
@@ -31,13 +30,13 @@ use bmux_ipc::{
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char};
 use std::fs;
 use std::path::{Path, PathBuf};
 use tracing::{debug, error, info, trace, warn};
 
-type NativeDescriptorFn = unsafe extern "C" fn() -> *const c_char;
+type PluginEntryFn = unsafe extern "C" fn() -> *const c_char;
 type NativeRunCommandFn = unsafe extern "C" fn(*const c_char, usize, *const *const c_char) -> i32;
 type NativeRunCommandWithContextFn = unsafe extern "C" fn(*const c_char) -> i32;
 type NativeLifecycleFn = unsafe extern "C" fn(*const c_char) -> i32;
@@ -1294,100 +1293,6 @@ fn validate_storage_key(key: &str) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeDescriptor {
-    pub id: String,
-    pub display_name: String,
-    pub plugin_version: String,
-    pub plugin_api: PluginManifestCompatibility,
-    pub native_abi: PluginManifestCompatibility,
-    #[serde(default)]
-    pub description: Option<String>,
-    #[serde(default)]
-    pub homepage: Option<String>,
-    #[serde(default)]
-    pub provider_priority: i32,
-    #[serde(default)]
-    #[serde(alias = "required_host_scopes")]
-    pub required_capabilities: BTreeSet<HostScope>,
-    #[serde(default)]
-    pub provided_capabilities: BTreeSet<HostScope>,
-    #[serde(default)]
-    pub provided_features: BTreeSet<PluginFeature>,
-    #[serde(default)]
-    pub services: Vec<PluginService>,
-    #[serde(default)]
-    pub commands: Vec<crate::PluginCommand>,
-    #[serde(default)]
-    pub event_subscriptions: Vec<crate::PluginEventSubscription>,
-    #[serde(default)]
-    pub dependencies: Vec<crate::PluginDependency>,
-    #[serde(default)]
-    pub lifecycle: PluginLifecycle,
-}
-
-impl NativeDescriptor {
-    #[must_use]
-    pub fn builder(id: impl Into<String>, display_name: impl Into<String>) -> crate::PluginBuilder {
-        crate::PluginBuilder::new(id, display_name)
-    }
-
-    /// # Errors
-    ///
-    /// Returns an error when the descriptor cannot be converted into a checked
-    /// plugin declaration.
-    pub fn into_declaration(self, entrypoint: PluginEntrypoint) -> Result<PluginDeclaration> {
-        let plugin_id = self.id.clone();
-        let declaration = PluginDeclaration {
-            id: crate::PluginId::new(self.id)?,
-            display_name: self.display_name,
-            plugin_version: self.plugin_version,
-            plugin_api: self.plugin_api.to_version_range().map_err(|details| {
-                PluginError::InvalidVersionRange {
-                    plugin_id: plugin_id.clone(),
-                    field: "plugin_api",
-                    details,
-                }
-            })?,
-            native_abi: self.native_abi.to_version_range().map_err(|details| {
-                PluginError::InvalidVersionRange {
-                    plugin_id: plugin_id.clone(),
-                    field: "native_abi",
-                    details,
-                }
-            })?,
-            entrypoint,
-            description: self.description,
-            homepage: self.homepage,
-            provider_priority: self.provider_priority,
-            required_capabilities: self.required_capabilities,
-            provided_capabilities: self.provided_capabilities,
-            provided_features: self.provided_features,
-            services: self.services,
-            commands: self.commands,
-            event_subscriptions: self.event_subscriptions,
-            dependencies: self.dependencies,
-            lifecycle: self.lifecycle,
-        };
-        declaration.validate()?;
-        Ok(declaration)
-    }
-
-    /// # Errors
-    ///
-    /// Returns an error when the descriptor text cannot be parsed.
-    pub fn from_toml_str(value: &str) -> std::result::Result<Self, toml::de::Error> {
-        toml::from_str(value)
-    }
-
-    /// # Errors
-    ///
-    /// Returns an error when the descriptor cannot be encoded as TOML.
-    pub fn to_toml_string(&self) -> std::result::Result<String, toml::ser::Error> {
-        toml::to_string(self)
-    }
-}
-
 pub struct LoadedPlugin {
     pub registered: RegisteredPlugin,
     pub declaration: PluginDeclaration,
@@ -1814,20 +1719,19 @@ pub fn load_static_plugin(
 ) -> Result<LoadedPlugin> {
     let manifest_ptr = (vtable.entry)();
     if manifest_ptr.is_null() {
-        return Err(PluginError::NullNativeDescriptor {
+        return Err(PluginError::NullPluginEntry {
             plugin_id: registered_plugin.declaration.id.as_str().to_string(),
             symbol: "static_vtable::entry".to_string(),
         });
     }
     let manifest_cstr = unsafe { CStr::from_ptr(manifest_ptr) };
-    let manifest_text =
-        manifest_cstr
-            .to_str()
-            .map_err(|_| PluginError::InvalidNativeDescriptor {
-                plugin_id: registered_plugin.declaration.id.as_str().to_string(),
-                symbol: "static_vtable::entry".to_string(),
-                details: "embedded manifest is not valid UTF-8".to_string(),
-            })?;
+    let manifest_text = manifest_cstr
+        .to_str()
+        .map_err(|_| PluginError::InvalidPluginEntry {
+            plugin_id: registered_plugin.declaration.id.as_str().to_string(),
+            symbol: "static_vtable::entry".to_string(),
+            details: "embedded manifest is not valid UTF-8".to_string(),
+        })?;
 
     let embedded_manifest = crate::PluginManifest::from_toml_str(manifest_text)?;
     let declaration = embedded_manifest.to_declaration()?;
@@ -1857,7 +1761,7 @@ fn load_native_declaration(
         PluginEntrypoint::Native { symbol } => symbol.as_bytes(),
     };
 
-    let descriptor_symbol: Symbol<'_, NativeDescriptorFn> = unsafe { library.get(symbol_name) }
+    let descriptor_symbol: Symbol<'_, PluginEntryFn> = unsafe { library.get(symbol_name) }
         .map_err(|error| PluginError::NativeEntrySymbol {
             plugin_id: registered_plugin.declaration.id.as_str().to_string(),
             symbol: match &registered_plugin.declaration.entrypoint {
@@ -1871,7 +1775,7 @@ fn load_native_declaration(
         PluginEntrypoint::Native { symbol } => symbol.clone(),
     };
     if descriptor_ptr.is_null() {
-        return Err(PluginError::NullNativeDescriptor {
+        return Err(PluginError::NullPluginEntry {
             plugin_id: registered_plugin.declaration.id.as_str().to_string(),
             symbol,
         });
@@ -1879,14 +1783,14 @@ fn load_native_declaration(
 
     let manifest_text = unsafe { CStr::from_ptr(descriptor_ptr) }
         .to_str()
-        .map_err(|_| PluginError::InvalidNativeDescriptorUtf8 {
+        .map_err(|_| PluginError::InvalidPluginEntryUtf8 {
             plugin_id: registered_plugin.declaration.id.as_str().to_string(),
             symbol: symbol.clone(),
         })?;
 
     let embedded_manifest =
         crate::PluginManifest::from_toml_str(manifest_text).map_err(|error| {
-            PluginError::InvalidNativeDescriptor {
+            PluginError::InvalidPluginEntry {
                 plugin_id: registered_plugin.declaration.id.as_str().to_string(),
                 symbol: symbol.clone(),
                 details: error.to_string(),
@@ -1992,25 +1896,23 @@ fn ensure_match(
     plugin_id: &str,
     field: &'static str,
     manifest_value: &str,
-    descriptor_value: &str,
+    embedded_value: &str,
 ) -> Result<()> {
-    if manifest_value == descriptor_value {
+    if manifest_value == embedded_value {
         Ok(())
     } else {
-        Err(PluginError::NativeDescriptorMismatch {
+        Err(PluginError::ManifestMismatch {
             plugin_id: plugin_id.to_string(),
             field,
             manifest_value: manifest_value.to_string(),
-            descriptor_value: descriptor_value.to_string(),
+            embedded_value: embedded_value.to_string(),
         })
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        LoadedPlugin, NativeDescriptor, NativeLifecycleContext, NativeServiceContext, PluginBackend,
-    };
+    use super::{LoadedPlugin, NativeLifecycleContext, NativeServiceContext, PluginBackend};
     use crate::{
         ApiVersion, DEFAULT_NATIVE_ENTRY_SYMBOL, HostMetadata, PluginEntrypoint, PluginEvent,
         PluginEventKind, PluginEventSubscription, PluginManifest, PluginRegistry,
@@ -2036,11 +1938,7 @@ mod tests {
         "[[commands]]\n",
         "name = \"hello\"\n",
         "summary = \"hello\"\n",
-        "execution = \"provider_exec\"\n\n",
-        "[plugin_api]\n",
-        "minimum = \"1.0\"\n\n",
-        "[native_abi]\n",
-        "minimum = \"1.0\"\n",
+        "execution = \"provider_exec\"\n",
         "\0"
     );
 
@@ -2279,58 +2177,6 @@ mod tests {
             *output_len = required_len;
         }
         0
-    }
-
-    #[test]
-    fn parses_native_descriptor_document() {
-        let descriptor = NativeDescriptor::from_toml_str(
-            r#"
-id = "git.status"
-display_name = "Git Status"
-plugin_version = "0.1.0"
-required_capabilities = ["bmux.commands"]
-
-[plugin_api]
-minimum = "1.0"
-
-[native_abi]
-minimum = "1.0"
-"#,
-        )
-        .expect("descriptor should parse");
-
-        let declaration = descriptor
-            .into_declaration(PluginEntrypoint::Native {
-                symbol: DEFAULT_NATIVE_ENTRY_SYMBOL.to_string(),
-            })
-            .expect("declaration should convert");
-        assert_eq!(declaration.id.as_str(), "git.status");
-    }
-
-    #[test]
-    fn descriptor_conversion_rejects_invalid_plugin_id() {
-        let descriptor = NativeDescriptor::from_toml_str(
-            r#"
-id = "GitStatus"
-display_name = "Git Status"
-plugin_version = "0.1.0"
-
-[plugin_api]
-minimum = "1.0"
-
-[native_abi]
-minimum = "1.0"
-"#,
-        )
-        .expect("descriptor should parse");
-
-        assert!(
-            descriptor
-                .into_declaration(PluginEntrypoint::Native {
-                    symbol: DEFAULT_NATIVE_ENTRY_SYMBOL.to_string(),
-                })
-                .is_err()
-        );
     }
 
     #[test]

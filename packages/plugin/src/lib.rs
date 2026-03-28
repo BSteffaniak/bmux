@@ -8,7 +8,6 @@
 //! the bmux host and plugins without exposing the internal server, CLI, or
 //! terminal runtime implementation details directly.
 
-mod builder;
 mod capability;
 mod command;
 mod declaration;
@@ -24,7 +23,6 @@ mod registry;
 mod service;
 mod version;
 
-pub use builder::PluginBuilder;
 pub use capability::{HostScope, PluginFeature};
 pub use command::{
     CommandExecutionKind, PluginCommand, PluginCommandArgument, PluginCommandArgumentKind,
@@ -54,14 +52,14 @@ pub use host_services::{
 };
 pub use loader::{
     HostKernelBridge, HostKernelBridgeRequest, HostKernelBridgeResponse, LoadedPlugin,
-    NativeCommandContext, NativeDescriptor, NativeLifecycleContext, NativePluginLoader,
-    NativeServiceContext, RegisteredPluginInfo, ServiceCaller, StaticPluginVtable,
-    load_registered_plugin, load_static_plugin,
+    NativeCommandContext, NativeLifecycleContext, NativePluginLoader, NativeServiceContext,
+    RegisteredPluginInfo, ServiceCaller, StaticPluginVtable, load_registered_plugin,
+    load_static_plugin,
 };
 pub use manifest::{
     PluginManifest, PluginManifestCompatibility, PluginManifestKeybindings, PluginRuntime,
 };
-pub use native_exports::RustPlugin;
+pub use native_exports::{EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, EXIT_USAGE, RustPlugin};
 pub use registry::{
     CapabilityProvider, PluginCompatibilityReport, PluginRegistry, RegisteredPlugin,
     ServiceProvider,
@@ -102,9 +100,75 @@ pub const DEFAULT_NATIVE_EVENT_SYMBOL: &str = "bmux_plugin_handle_event_v1";
 /// Default exported symbol used to invoke a plugin-provided service.
 pub const DEFAULT_NATIVE_SERVICE_SYMBOL: &str = "bmux_plugin_invoke_service_v1";
 
-#[must_use]
-pub fn plugin(id: impl Into<String>, display_name: impl Into<String>) -> PluginBuilder {
-    PluginBuilder::new(id, display_name)
+/// Convenience helper for implementing a service operation.
+///
+/// Handles the common decode-request → run-handler → encode-response pattern
+/// that every service provider repeats.  The handler receives the decoded
+/// request plus the full [`NativeServiceContext`] and returns either a typed
+/// response or a pre-built [`ServiceResponse`] error.
+///
+/// # Example
+///
+/// ```ignore
+/// ("clipboard-write/v1", "copy_text") => {
+///     handle_service(&context, |req: CopyRequest, _ctx| {
+///         do_copy(&req.text).map_err(|e| ServiceResponse::error("failed", e.to_string()))?;
+///         Ok(())
+///     })
+/// }
+/// ```
+pub fn handle_service<Req, Resp, F>(context: &NativeServiceContext, handler: F) -> ServiceResponse
+where
+    Req: serde::de::DeserializeOwned,
+    Resp: serde::Serialize,
+    F: FnOnce(Req, &NativeServiceContext) -> std::result::Result<Resp, ServiceResponse>,
+{
+    let request = match decode_service_message::<Req>(&context.request.payload) {
+        Ok(req) => req,
+        Err(error) => {
+            return ServiceResponse::error("invalid_request", error.to_string());
+        }
+    };
+    match handler(request, context) {
+        Ok(response) => match encode_service_message(&response) {
+            Ok(payload) => ServiceResponse::ok(payload),
+            Err(error) => ServiceResponse::error("response_encode_failed", error.to_string()),
+        },
+        Err(error_response) => error_response,
+    }
+}
+
+/// Common imports for plugin authors.
+///
+/// A typical plugin can replace its individual `use bmux_plugin::{...}` imports
+/// with a single `use bmux_plugin::prelude::*;` to get everything needed for
+/// commands, services, lifecycle hooks, and host-runtime calls.
+pub mod prelude {
+    pub use crate::{
+        // Exit codes
+        EXIT_ERROR,
+        EXIT_OK,
+        EXIT_UNAVAILABLE,
+        EXIT_USAGE,
+        // Host runtime API
+        HostRuntimeApi,
+        // Context types
+        NativeCommandContext,
+        NativeLifecycleContext,
+        NativeServiceContext,
+        // Events
+        PluginEvent,
+        // Core trait
+        RustPlugin,
+        // Service types
+        ServiceKind,
+        ServiceResponse,
+        // Codec helpers
+        decode_service_message,
+        encode_service_message,
+        // Service helper
+        handle_service,
+    };
 }
 
 #[doc(hidden)]

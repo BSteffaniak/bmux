@@ -77,9 +77,3 @@ multiple            = true
 name                = "selectors"
 position            = 0
 value_name          = "SELECTOR"
-
-[plugin_api]
-minimum = "1.0"
-
-[native_abi]
-minimum = "1.0"

@@ -3,7 +3,9 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_cli_output::{Table, TableColumn, write_table};
-use bmux_plugin::{NativeCommandContext, PluginEvent, RustPlugin, ServiceKind};
+use bmux_plugin::{
+    EXIT_ERROR, EXIT_OK, EXIT_USAGE, NativeCommandContext, PluginEvent, RustPlugin, ServiceKind,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Default)]
@@ -26,25 +28,25 @@ impl RustPlugin for ExamplePlugin {
                 } else {
                     println!("example.native: hello {}", context.arguments.join(" "));
                 }
-                0
+                EXIT_OK
             }
-            _ => 64,
+            _ => EXIT_USAGE,
         }
     }
 
     fn activate(&mut self, context: bmux_plugin::NativeLifecycleContext) -> i32 {
         println!("example.native: activated {}", context.plugin_id);
-        0
+        EXIT_OK
     }
 
     fn deactivate(&mut self, context: bmux_plugin::NativeLifecycleContext) -> i32 {
         println!("example.native: deactivated {}", context.plugin_id);
-        0
+        EXIT_OK
     }
 
     fn handle_event(&mut self, event: PluginEvent) -> i32 {
         println!("example.native: observed event {}", event.name);
-        0
+        EXIT_OK
     }
 }
 
@@ -53,7 +55,7 @@ bmux_plugin::export_plugin!(ExamplePlugin, include_str!("../plugin.toml"));
 fn run_permissions_list(context: &NativeCommandContext) -> i32 {
     let Some(session) = context.arguments.first() else {
         eprintln!("example.native permissions-list requires a session name or UUID");
-        return 64;
+        return EXIT_USAGE;
     };
 
     let response = match context.call_service::<ListPermissionsRequest, ListPermissionsResponse>(
@@ -68,7 +70,7 @@ fn run_permissions_list(context: &NativeCommandContext) -> i32 {
         Ok(response) => response,
         Err(error) => {
             eprintln!("example.native: failed listing permissions through service: {error}");
-            return 1;
+            return EXIT_ERROR;
         }
     };
 
@@ -88,17 +90,17 @@ fn run_permissions_list(context: &NativeCommandContext) -> i32 {
         }
         if let Err(error) = write_stdout_table(&table) {
             eprintln!("example.native: failed rendering permissions table: {error}");
-            return 1;
+            return EXIT_ERROR;
         }
     }
 
-    0
+    EXIT_OK
 }
 
 fn run_permissions_grant(context: &NativeCommandContext) -> i32 {
     let Some(session) = context.arguments.first() else {
         eprintln!("example.native permissions-grant requires a session name or UUID");
-        return 64;
+        return EXIT_USAGE;
     };
 
     let mut client_id = None;
@@ -110,28 +112,28 @@ fn run_permissions_grant(context: &NativeCommandContext) -> i32 {
             "--role" | "-r" => role = args.next().cloned(),
             other => {
                 eprintln!("example.native permissions-grant does not accept argument '{other}'");
-                return 64;
+                return EXIT_USAGE;
             }
         }
     }
 
     let Some(client_id) = client_id else {
         eprintln!("example.native permissions-grant requires --client <uuid>");
-        return 64;
+        return EXIT_USAGE;
     };
     let client_id = if let Ok(value) = uuid::Uuid::parse_str(&client_id) {
         value
     } else {
         eprintln!("example.native permissions-grant received invalid client id");
-        return 64;
+        return EXIT_USAGE;
     };
     let Some(role) = role else {
         eprintln!("example.native permissions-grant requires --role <role>");
-        return 64;
+        return EXIT_USAGE;
     };
     let Some(role) = parse_role(&role) else {
         eprintln!("example.native permissions-grant received invalid role '{role}'");
-        return 64;
+        return EXIT_USAGE;
     };
 
     let response = match context.call_service::<GrantPermissionRequest, GrantPermissionResponse>(
@@ -148,7 +150,7 @@ fn run_permissions_grant(context: &NativeCommandContext) -> i32 {
         Ok(response) => response,
         Err(error) => {
             eprintln!("example.native: failed granting role through service: {error}");
-            return 1;
+            return EXIT_ERROR;
         }
     };
 
@@ -157,13 +159,13 @@ fn run_permissions_grant(context: &NativeCommandContext) -> i32 {
         session_role_name(response.role),
         response.client_id
     );
-    0
+    EXIT_OK
 }
 
 fn run_permissions_revoke(context: &NativeCommandContext) -> i32 {
     let Some(session) = context.arguments.first() else {
         eprintln!("example.native permissions-revoke requires a session name or UUID");
-        return 64;
+        return EXIT_USAGE;
     };
 
     let mut client_id = None;
@@ -173,20 +175,20 @@ fn run_permissions_revoke(context: &NativeCommandContext) -> i32 {
             "--client" | "-c" => client_id = args.next().cloned(),
             other => {
                 eprintln!("example.native permissions-revoke does not accept argument '{other}'");
-                return 64;
+                return EXIT_USAGE;
             }
         }
     }
 
     let Some(client_id) = client_id else {
         eprintln!("example.native permissions-revoke requires --client <uuid>");
-        return 64;
+        return EXIT_USAGE;
     };
     let client_id = if let Ok(value) = uuid::Uuid::parse_str(&client_id) {
         value
     } else {
         eprintln!("example.native permissions-revoke received invalid client id");
-        return 64;
+        return EXIT_USAGE;
     };
 
     let response = match context.call_service::<RevokePermissionRequest, RevokePermissionResponse>(
@@ -202,18 +204,18 @@ fn run_permissions_revoke(context: &NativeCommandContext) -> i32 {
         Ok(response) => response,
         Err(error) => {
             eprintln!("example.native: failed revoking role through service: {error}");
-            return 1;
+            return EXIT_ERROR;
         }
     };
 
     println!("revoked explicit role for client {}", response.client_id);
-    0
+    EXIT_OK
 }
 
 fn run_windows_list(context: &NativeCommandContext) -> i32 {
     let Some(session) = context.arguments.first() else {
         eprintln!("example.native windows-list requires a session name or UUID");
-        return 64;
+        return EXIT_USAGE;
     };
 
     let response = match context.call_service::<ListWindowsRequest, ListWindowsResponse>(
@@ -228,7 +230,7 @@ fn run_windows_list(context: &NativeCommandContext) -> i32 {
         Ok(response) => response,
         Err(error) => {
             eprintln!("example.native: failed listing windows through service: {error}");
-            return 1;
+            return EXIT_ERROR;
         }
     };
 
@@ -254,18 +256,18 @@ fn run_windows_list(context: &NativeCommandContext) -> i32 {
         }
         if let Err(error) = write_stdout_table(&table) {
             eprintln!("example.native: failed rendering windows table: {error}");
-            return 1;
+            return EXIT_ERROR;
         }
     }
 
-    0
+    EXIT_OK
 }
 
 fn run_windows_new(context: &NativeCommandContext) -> i32 {
     let mut args = context.arguments.iter();
     let Some(session) = args.next() else {
         eprintln!("example.native windows-new requires a session name or UUID");
-        return 64;
+        return EXIT_USAGE;
     };
     let mut name = None;
     while let Some(arg) = args.next() {
@@ -273,7 +275,7 @@ fn run_windows_new(context: &NativeCommandContext) -> i32 {
             "--name" | "-n" => name = args.next().cloned(),
             other => {
                 eprintln!("example.native windows-new does not accept argument '{other}'");
-                return 64;
+                return EXIT_USAGE;
             }
         }
     }
@@ -291,7 +293,7 @@ fn run_windows_new(context: &NativeCommandContext) -> i32 {
         Ok(response) => response,
         Err(error) => {
             eprintln!("example.native: failed creating window through service: {error}");
-            return 1;
+            return EXIT_ERROR;
         }
     };
 
@@ -303,7 +305,7 @@ fn run_windows_new(context: &NativeCommandContext) -> i32 {
             .name
             .unwrap_or_else(|| format!("#{}", response.window.number))
     );
-    0
+    EXIT_OK
 }
 
 fn run_settings_show(context: &NativeCommandContext) -> i32 {
@@ -319,7 +321,7 @@ fn run_settings_show(context: &NativeCommandContext) -> i32 {
         Ok(response) => response,
         Err(error) => {
             eprintln!("example.native: failed reading settings through service: {error}");
-            return 1;
+            return EXIT_ERROR;
         }
     };
 
@@ -335,19 +337,19 @@ fn run_settings_show(context: &NativeCommandContext) -> i32 {
     }
     if let Err(error) = write_stdout_table(&table) {
         eprintln!("example.native: failed rendering settings table: {error}");
-        return 1;
+        return EXIT_ERROR;
     }
-    0
+    EXIT_OK
 }
 
 fn run_storage_put(context: &NativeCommandContext) -> i32 {
     let Some(key) = context.arguments.first() else {
         eprintln!("example.native storage-put requires a key");
-        return 64;
+        return EXIT_USAGE;
     };
     if context.arguments.len() < 2 {
         eprintln!("example.native storage-put requires a value");
-        return 64;
+        return EXIT_USAGE;
     }
     let value = context.arguments[1..].join(" ").into_bytes();
 
@@ -363,17 +365,17 @@ fn run_storage_put(context: &NativeCommandContext) -> i32 {
     );
     if let Err(error) = result {
         eprintln!("example.native: failed writing storage through service: {error}");
-        return 1;
+        return EXIT_ERROR;
     }
 
     println!("stored key: {key}");
-    0
+    EXIT_OK
 }
 
 fn run_storage_get(context: &NativeCommandContext) -> i32 {
     let Some(key) = context.arguments.first() else {
         eprintln!("example.native storage-get requires a key");
-        return 64;
+        return EXIT_USAGE;
     };
     let response = match context.call_service::<StorageGetRequest, StorageGetResponse>(
         "bmux.storage",
@@ -385,7 +387,7 @@ fn run_storage_get(context: &NativeCommandContext) -> i32 {
         Ok(response) => response,
         Err(error) => {
             eprintln!("example.native: failed reading storage through service: {error}");
-            return 1;
+            return EXIT_ERROR;
         }
     };
 
@@ -396,7 +398,7 @@ fn run_storage_get(context: &NativeCommandContext) -> i32 {
         }
         None => println!("{key} is not set"),
     }
-    0
+    EXIT_OK
 }
 
 fn write_stdout_table(table: &Table) -> std::io::Result<()> {

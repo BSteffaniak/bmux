@@ -11,12 +11,6 @@ capability   = "bmux.clipboard.write"
 interface_id = "clipboard-write/v1"
 kind         = "command"
 
-[plugin_api]
-minimum = "1.0"
-
-[native_abi]
-minimum = "1.0"
-
 [keybindings.runtime]
 y = "copy_scrollback"
 

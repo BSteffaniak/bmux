@@ -165,27 +165,27 @@ pub enum PluginError {
         details: String,
     },
 
-    #[error("plugin '{plugin_id}' returned a null native descriptor from symbol '{symbol}'")]
-    NullNativeDescriptor { plugin_id: String, symbol: String },
+    #[error("plugin '{plugin_id}' returned a null entry from symbol '{symbol}'")]
+    NullPluginEntry { plugin_id: String, symbol: String },
 
-    #[error("plugin '{plugin_id}' returned invalid UTF-8 descriptor text from '{symbol}'")]
-    InvalidNativeDescriptorUtf8 { plugin_id: String, symbol: String },
+    #[error("plugin '{plugin_id}' returned invalid UTF-8 entry text from '{symbol}'")]
+    InvalidPluginEntryUtf8 { plugin_id: String, symbol: String },
 
-    #[error("plugin '{plugin_id}' returned invalid native descriptor from '{symbol}': {details}")]
-    InvalidNativeDescriptor {
+    #[error("plugin '{plugin_id}' returned invalid entry from '{symbol}': {details}")]
+    InvalidPluginEntry {
         plugin_id: String,
         symbol: String,
         details: String,
     },
 
     #[error(
-        "plugin '{plugin_id}' descriptor field '{field}' does not match manifest (manifest: {manifest_value}, descriptor: {descriptor_value})"
+        "plugin '{plugin_id}' embedded manifest field '{field}' does not match registered manifest (registered: {manifest_value}, embedded: {embedded_value})"
     )]
-    NativeDescriptorMismatch {
+    ManifestMismatch {
         plugin_id: String,
         field: &'static str,
         manifest_value: String,
-        descriptor_value: String,
+        embedded_value: String,
     },
 
     #[error("plugin '{plugin_id}' does not declare command '{command}'")]

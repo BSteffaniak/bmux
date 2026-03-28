@@ -3,8 +3,8 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_plugin::{
-    CapabilityProvider, HostScope, NativeCommandContext, PluginManifest, PluginRegistry,
-    RustPlugin, discover_plugin_manifests_in_roots, load_registered_plugin,
+    CapabilityProvider, EXIT_ERROR, HostScope, NativeCommandContext, PluginManifest,
+    PluginRegistry, RustPlugin, discover_plugin_manifests_in_roots, load_registered_plugin,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -27,7 +27,7 @@ impl RustPlugin for PluginCliPlugin {
             Ok(status) => status,
             Err(error) => {
                 eprintln!("{error}");
-                1
+                EXIT_ERROR
             }
         }
     }

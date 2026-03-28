@@ -3,8 +3,8 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_plugin::{
-    HostRuntimeApi, NativeCommandContext, NativeServiceContext, RustPlugin, ServiceResponse,
-    SessionSelector, StorageGetRequest, StorageSetRequest, decode_service_message,
+    EXIT_ERROR, EXIT_OK, HostRuntimeApi, NativeCommandContext, NativeServiceContext, RustPlugin,
+    ServiceResponse, SessionSelector, StorageGetRequest, StorageSetRequest, decode_service_message,
     encode_service_message,
 };
 use serde::{Deserialize, Serialize};
@@ -17,10 +17,10 @@ pub struct PermissionsPlugin;
 impl RustPlugin for PermissionsPlugin {
     fn run_command(&mut self, context: NativeCommandContext) -> i32 {
         match handle_command(&context) {
-            Ok(()) => 0,
+            Ok(()) => EXIT_OK,
             Err(error) => {
                 eprintln!("{error}");
-                1
+                EXIT_ERROR
             }
         }
     }

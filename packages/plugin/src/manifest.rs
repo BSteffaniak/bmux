@@ -23,6 +23,15 @@ pub struct PluginManifestCompatibility {
     pub maximum: Option<String>,
 }
 
+impl Default for PluginManifestCompatibility {
+    fn default() -> Self {
+        Self {
+            minimum: "1.0".to_string(),
+            maximum: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginManifestDependency {
     pub plugin_id: String,
@@ -63,7 +72,9 @@ pub struct PluginManifest {
     pub entry: PathBuf,
     #[serde(default = "default_entry_symbol")]
     pub entry_symbol: String,
+    #[serde(default)]
     pub plugin_api: PluginManifestCompatibility,
+    #[serde(default)]
     pub native_abi: PluginManifestCompatibility,
     #[serde(default)]
     #[serde(alias = "required_host_scopes")]
@@ -208,12 +219,6 @@ execution = "provider_exec"
 [[event_subscriptions]]
 kinds = ["system"]
 names = ["server_started"]
-
-[plugin_api]
-minimum = "1.0"
-
-[native_abi]
-minimum = "1.0"
 "#,
         )
         .expect("manifest should parse");
@@ -241,12 +246,6 @@ version = "0.1.0"
 runtime = "native"
 entry = "libwindows.dylib"
 
-[plugin_api]
-minimum = "1.0"
-
-[native_abi]
-minimum = "1.0"
-
 [keybindings.runtime]
 c = "plugin:bmux.windows:new-window"
 "alt+w" = "plugin:bmux.windows:switch-window"
@@ -258,5 +257,27 @@ c = "plugin:bmux.windows:new-window"
             manifest.keybindings.runtime.get("c").map(String::as_str),
             Some("plugin:bmux.windows:new-window")
         );
+    }
+
+    #[test]
+    fn plugin_api_and_native_abi_default_to_1_0() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "test.minimal"
+name = "Minimal"
+version = "0.1.0"
+entry = "unused.dylib"
+"#,
+        )
+        .expect("manifest should parse without plugin_api/native_abi");
+
+        assert_eq!(manifest.plugin_api.minimum, "1.0");
+        assert!(manifest.plugin_api.maximum.is_none());
+        assert_eq!(manifest.native_abi.minimum, "1.0");
+        assert!(manifest.native_abi.maximum.is_none());
+
+        // Verify conversion to declaration also works
+        let declaration = manifest.to_declaration().expect("declaration should build");
+        assert_eq!(declaration.id.as_str(), "test.minimal");
     }
 }

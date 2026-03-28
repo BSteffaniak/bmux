@@ -6,6 +6,22 @@ use std::ffi::{CStr, CString, c_char};
 use std::ptr;
 use std::sync::{Mutex, OnceLock};
 
+// ── Plugin exit codes ────────────────────────────────────────────────────────
+
+/// Command completed successfully.
+pub const EXIT_OK: i32 = 0;
+
+/// Command failed with a generic error.
+pub const EXIT_ERROR: i32 = 1;
+
+/// Command received invalid arguments or was unknown.
+pub const EXIT_USAGE: i32 = 64;
+
+/// Plugin is unavailable (e.g. mutex poisoned, feature disabled).
+pub const EXIT_UNAVAILABLE: i32 = 70;
+
+// ── Internal FFI status codes (not exposed to plugin authors) ────────────────
+
 const SERVICE_STATUS_OK: i32 = 0;
 const SERVICE_STATUS_INVALID_ARGUMENT: i32 = 2;
 const SERVICE_STATUS_DECODE_FAILED: i32 = 3;
@@ -15,19 +31,19 @@ const SERVICE_STATUS_PLUGIN_UNAVAILABLE: i32 = 70;
 
 pub trait RustPlugin: Default + Send + 'static {
     fn run_command(&mut self, _context: NativeCommandContext) -> i32 {
-        64
+        EXIT_USAGE
     }
 
     fn activate(&mut self, _context: NativeLifecycleContext) -> i32 {
-        0
+        EXIT_OK
     }
 
     fn deactivate(&mut self, _context: NativeLifecycleContext) -> i32 {
-        0
+        EXIT_OK
     }
 
     fn handle_event(&mut self, _event: PluginEvent) -> i32 {
-        0
+        EXIT_OK
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
