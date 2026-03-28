@@ -850,11 +850,46 @@ fn resolve_server_shell(config: &BmuxConfig) -> String {
 
 fn resolve_server_pane_term(config: &BmuxConfig) -> String {
     let configured = config.behavior.pane_term.trim();
-    if configured.is_empty() {
-        "xterm-256color".to_string()
+    let candidate = if configured.is_empty() {
+        "bmux-256color"
     } else {
-        configured.to_string()
+        configured
+    };
+
+    if check_terminfo_available(candidate) {
+        return candidate.to_string();
     }
+
+    // Configured TERM not found in terminfo; try fallback chain.
+    const FALLBACKS: &[&str] = &["xterm-256color", "screen-256color"];
+    for fallback in FALLBACKS {
+        if *fallback != candidate && check_terminfo_available(fallback) {
+            warn!(
+                "pane TERM '{}' terminfo not installed; falling back to '{}'",
+                candidate, fallback
+            );
+            return (*fallback).to_string();
+        }
+    }
+
+    // Nothing in the fallback chain was available either; use the configured
+    // value and hope the pane environment can cope.
+    warn!(
+        "pane TERM '{}' terminfo not installed and no fallback found; using as-is",
+        candidate
+    );
+    candidate.to_string()
+}
+
+/// Check whether a terminfo entry is installed by running `infocmp`.
+fn check_terminfo_available(term: &str) -> bool {
+    std::process::Command::new("infocmp")
+        .arg(term)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 async fn shutdown_runtime_handle(removed: RemovedRuntime) {
