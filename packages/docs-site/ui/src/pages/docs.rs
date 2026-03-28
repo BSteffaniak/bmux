@@ -63,7 +63,7 @@ pub fn config() -> Containers {
     layout::docs_layout(
         "/docs/config",
         "Configuration",
-        &md(include_str!("../../../../../packages/config/README.md")),
+        &md(include_str!("../../../../../docs/config.md")),
     )
 }
 
