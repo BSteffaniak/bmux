@@ -228,6 +228,16 @@ pub struct StepResult {
     pub elapsed_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    /// The expected value/pattern for assertion failures (assert-screen, wait-for, etc.).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expected: Option<String>,
+    /// The actual value/screen text found at the time of failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub actual: Option<String>,
+    /// Screen capture of all panes at the time of failure.
+    /// Only populated when `status == Fail` and the session was attached.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_captures: Option<Vec<PaneCapture>>,
 }
 
 /// Step execution status.
@@ -238,6 +248,52 @@ pub enum StepStatus {
     Fail,
     Skip,
 }
+
+/// Structured step failure with optional expected/actual values.
+///
+/// Used internally by `execute_step` to return rich failure context that gets
+/// propagated into `StepResult` fields.
+#[derive(Debug)]
+pub struct StepFailure {
+    /// Human-readable error message.
+    pub message: String,
+    /// The expected value/pattern (for assertion failures).
+    pub expected: Option<String>,
+    /// The actual value/screen text found.
+    pub actual: Option<String>,
+}
+
+impl StepFailure {
+    /// Create a failure with only a message (no expected/actual).
+    pub fn msg(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            expected: None,
+            actual: None,
+        }
+    }
+
+    /// Create an assertion failure with expected and actual values.
+    pub fn assertion(
+        message: impl Into<String>,
+        expected: impl Into<String>,
+        actual: impl Into<String>,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            expected: Some(expected.into()),
+            actual: Some(actual.into()),
+        }
+    }
+}
+
+impl std::fmt::Display for StepFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for StepFailure {}
 
 /// A named snapshot of screen state captured mid-playbook.
 #[derive(Debug, Clone, Serialize)]

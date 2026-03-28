@@ -156,6 +156,16 @@ impl ScreenInspector {
             .collect()
     }
 
+    /// Capture all panes, returning `None` if no panes are available.
+    /// Safe to call even when the inspector has not been refreshed.
+    pub fn capture_all_safe(&self) -> Option<Vec<PaneCapture>> {
+        if self.panes.is_empty() {
+            None
+        } else {
+            Some(self.capture_all())
+        }
+    }
+
     /// Check if a pane's screen text contains a substring.
     pub fn pane_contains(&self, pane_index: u32, needle: &str) -> bool {
         self.pane_text(pane_index)

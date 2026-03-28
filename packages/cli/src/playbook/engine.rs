@@ -15,7 +15,7 @@ use super::screen::ScreenInspector;
 use super::subst::RuntimeVars;
 use super::types::{
     Action, Playbook, PlaybookResult, ServiceKind, SnapshotCapture, SplitDirection, Step,
-    StepResult, StepStatus,
+    StepFailure, StepResult, StepStatus,
 };
 
 /// Default timeout for waiting for the sandbox server to start.
@@ -139,6 +139,9 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
                 status: StepStatus::Skip,
                 elapsed_ms: 0,
                 detail: Some("skipped: playbook timeout".to_string()),
+                expected: None,
+                actual: None,
+                failure_captures: None,
             });
             continue;
         }
@@ -176,6 +179,9 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
                     status: StepStatus::Pass,
                     elapsed_ms,
                     detail,
+                    expected: None,
+                    actual: None,
+                    failure_captures: None,
                 });
             }
             Err(err) => {
@@ -185,13 +191,30 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
                     step.action.name(),
                     elapsed_ms
                 );
-                let msg = format!("{err:#}");
+
+                // Try to extract structured failure info if the error is a StepFailure.
+                let (msg, expected, actual) = if let Some(sf) = err.downcast_ref::<StepFailure>() {
+                    (sf.message.clone(), sf.expected.clone(), sf.actual.clone())
+                } else {
+                    (format!("{err:#}"), None, None)
+                };
+
+                // Auto-capture all pane states at the time of failure.
+                let failure_captures = if attached {
+                    inspector.capture_all_safe()
+                } else {
+                    None
+                };
+
                 step_results.push(StepResult {
                     index: step.index,
                     action: step.action.name().to_string(),
                     status: StepStatus::Fail,
                     elapsed_ms,
                     detail: Some(msg.clone()),
+                    expected,
+                    actual,
+                    failure_captures,
                 });
                 error_msg = Some(msg);
                 break; // Stop on first failure
@@ -487,18 +510,16 @@ pub(super) async fn execute_step(
                     let screen_text = inspector
                         .pane_text(pane_idx)
                         .unwrap_or_else(|| "<no text>".to_string());
-                    // Truncate for readability
-                    let truncated = if screen_text.len() > 200 {
-                        format!("{}...", &screen_text[..200])
-                    } else {
-                        screen_text
-                    };
-                    bail!(
-                        "wait-for timed out after {}ms on pane {} waiting for pattern '{}'; screen: {truncated}",
-                        timeout.as_millis(),
-                        pane_idx,
-                        pattern
-                    );
+                    return Err(StepFailure::assertion(
+                        format!(
+                            "wait-for timed out after {}ms on pane {} waiting for pattern '{resolved_pattern}'",
+                            timeout.as_millis(),
+                            pane_idx,
+                        ),
+                        resolved_pattern.clone(),
+                        screen_text,
+                    )
+                    .into());
                 }
 
                 tokio::time::sleep(poll_delay).await;
@@ -541,16 +562,29 @@ pub(super) async fn execute_step(
                     let text = inspector
                         .pane_text(pane_idx)
                         .unwrap_or_else(|| "<no text>".to_string());
-                    bail!(
-                        "assert-screen: pane {pane_idx} does not contain '{resolved}'; screen: {text}"
-                    );
+                    return Err(StepFailure::assertion(
+                        format!("assert-screen: pane {pane_idx} does not contain '{resolved}'"),
+                        resolved,
+                        text,
+                    )
+                    .into());
                 }
             }
 
             if let Some(needle) = not_contains {
                 let resolved = runtime_vars.resolve_opt(needle);
                 if inspector.pane_contains(pane_idx, &resolved) {
-                    bail!("assert-screen: pane {pane_idx} unexpectedly contains '{resolved}'");
+                    let text = inspector
+                        .pane_text(pane_idx)
+                        .unwrap_or_else(|| "<no text>".to_string());
+                    return Err(StepFailure::assertion(
+                        format!(
+                            "assert-screen: pane {pane_idx} unexpectedly contains '{resolved}'"
+                        ),
+                        format!("not '{resolved}'"),
+                        text,
+                    )
+                    .into());
                 }
             }
 
@@ -560,9 +594,12 @@ pub(super) async fn execute_step(
                     let text = inspector
                         .pane_text(pane_idx)
                         .unwrap_or_else(|| "<no text>".to_string());
-                    bail!(
-                        "assert-screen: pane {pane_idx} does not match '{resolved}'; screen: {text}"
-                    );
+                    return Err(StepFailure::assertion(
+                        format!("assert-screen: pane {pane_idx} does not match '{resolved}'"),
+                        resolved,
+                        text,
+                    )
+                    .into());
                 }
             }
 
@@ -578,7 +615,12 @@ pub(super) async fn execute_step(
 
             if let Some(expected) = pane_count {
                 if actual_count != *expected {
-                    bail!("assert-layout: expected {expected} panes, got {actual_count}");
+                    return Err(StepFailure::assertion(
+                        format!("assert-layout: expected {expected} panes, got {actual_count}"),
+                        expected.to_string(),
+                        actual_count.to_string(),
+                    )
+                    .into());
                 }
             }
 
@@ -597,7 +639,14 @@ pub(super) async fn execute_step(
                 .context("pane cursor not available")?;
 
             if actual_row != *row || actual_col != *col {
-                bail!("assert-cursor: expected ({row},{col}), got ({actual_row},{actual_col})");
+                return Err(StepFailure::assertion(
+                    format!(
+                        "assert-cursor: expected ({row},{col}), got ({actual_row},{actual_col})"
+                    ),
+                    format!("({row},{col})"),
+                    format!("({actual_row},{actual_col})"),
+                )
+                .into());
             }
 
             Ok(None)

@@ -850,13 +850,44 @@ When using `--json`, `bmux playbook run` outputs a `PlaybookResult`:
 }
 ```
 
-| Field        | Type           | Description                                                 |
-| ------------ | -------------- | ----------------------------------------------------------- |
-| `index`      | u64            | Step index (0-based)                                        |
-| `action`     | string         | Action name                                                 |
-| `status`     | string         | `"pass"`, `"fail"`, or `"skip"`                             |
-| `elapsed_ms` | u64            | Step execution time                                         |
-| `detail`     | string \| null | Action-specific detail. For failures, includes screen text. |
+On failure, additional structured fields are included:
+
+```json
+{
+  "index": 3,
+  "action": "assert-screen",
+  "status": "fail",
+  "elapsed_ms": 12,
+  "detail": "assert-screen: pane 1 does not contain 'expected_output'",
+  "expected": "expected_output",
+  "actual": "$ echo something_else\nsomething_else\n$ ",
+  "failure_captures": [
+    {
+      "index": 1,
+      "focused": true,
+      "screen_text": "$ echo something_else\nsomething_else\n$ ",
+      "cursor_row": 2,
+      "cursor_col": 2
+    }
+  ]
+}
+```
+
+| Field              | Type                  | Description                                                                |
+| ------------------ | --------------------- | -------------------------------------------------------------------------- |
+| `index`            | u64                   | Step index (0-based)                                                       |
+| `action`           | string                | Action name                                                                |
+| `status`           | string                | `"pass"`, `"fail"`, or `"skip"`                                            |
+| `elapsed_ms`       | u64                   | Step execution time                                                        |
+| `detail`           | string \| null        | Action-specific detail. For failures, a human-readable error message.      |
+| `expected`         | string \| null        | The expected value/pattern for assertion failures. Only present on `fail`. |
+| `actual`           | string \| null        | The actual value/screen text found. Only present on `fail`.                |
+| `failure_captures` | PaneCapture[] \| null | Screen capture of all panes at time of failure. Only present on `fail`.    |
+
+The `expected` and `actual` fields allow machine consumers (LLMs) to compare
+expected vs actual values without parsing the `detail` string. The
+`failure_captures` array provides the full screen state of every pane at the
+moment of failure, regardless of which pane was being asserted on.
 
 ### `SnapshotCapture`
 

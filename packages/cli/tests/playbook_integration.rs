@@ -197,6 +197,42 @@ fn playbook_failing_assert() {
         failed_step.is_some(),
         "should have a failed assert-screen step: {json:#}"
     );
+    let failed = failed_step.unwrap();
+
+    // Verify structured failure fields are present.
+    assert!(
+        failed.get("expected").is_some() && !failed["expected"].is_null(),
+        "failed step should have 'expected' field: {failed:#}"
+    );
+    assert_eq!(
+        failed["expected"].as_str().unwrap(),
+        "nonexistent_string_xyz",
+        "expected should be the contains pattern"
+    );
+    assert!(
+        failed.get("actual").is_some() && !failed["actual"].is_null(),
+        "failed step should have 'actual' field: {failed:#}"
+    );
+    // The actual screen text should contain the real output from the playbook.
+    assert!(
+        failed["actual"].as_str().unwrap().contains("real_output"),
+        "actual should contain the real screen text: {failed:#}"
+    );
+
+    // Verify failure_captures is present with at least one pane.
+    let captures = failed["failure_captures"].as_array();
+    assert!(
+        captures.is_some() && !captures.unwrap().is_empty(),
+        "failed step should have failure_captures: {failed:#}"
+    );
+    let pane = &captures.unwrap()[0];
+    assert!(
+        pane["screen_text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("real_output"),
+        "failure_captures pane should contain real_output: {pane:#}"
+    );
 }
 
 // ---------------------------------------------------------------------------
