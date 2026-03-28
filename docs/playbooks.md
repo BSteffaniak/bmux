@@ -72,14 +72,15 @@ Parse, validate, and print the execution plan without running.
 bmux playbook dry-run <source> [--json]
 ```
 
-| Argument/Flag | Type | Default | Description |
-|---------------|------|---------|-------------|
-| `<source>` | string | required | Path to playbook file, or `-` for stdin |
-| `--json` | bool | false | Output as structured JSON |
+| Argument/Flag | Type   | Default  | Description                             |
+| ------------- | ------ | -------- | --------------------------------------- |
+| `<source>`    | string | required | Path to playbook file, or `-` for stdin |
+| `--json`      | bool   | false    | Output as structured JSON               |
 
 **Exit codes:** `0` = playbook is valid, `1` = validation errors found.
 
 **JSON output:**
+
 ```json
 {
   "valid": true,
@@ -783,12 +784,39 @@ All fields except `status` are optional and omitted when not applicable.
 
 ### Special Commands
 
-| Command  | Description                                                                           |
-| -------- | ------------------------------------------------------------------------------------- |
-| `quit`   | End the session. Returns `{"status":"ok","action":"quit"}` and closes the connection. |
-| `screen` | Drain output and capture all pane text. Returns `panes` array.                        |
-| `status` | Return session metadata. Returns `session_id`, `pane_count`, `focused_pane`.          |
-| `help`   | List available commands.                                                              |
+| Command       | Description                                                                                                  |
+| ------------- | ------------------------------------------------------------------------------------------------------------ |
+| `quit`        | End the session. Returns `{"status":"ok","action":"quit"}` and closes the connection.                        |
+| `screen`      | Drain output and capture all pane text. Returns `panes` array.                                               |
+| `status`      | Return session metadata. Returns `session_id`, `pane_count`, `focused_pane`.                                 |
+| `help`        | List available commands.                                                                                     |
+| `subscribe`   | Start push-based output streaming. After subscribing, output events are pushed to the agent without polling. |
+| `unsubscribe` | Stop push-based output streaming.                                                                            |
+
+### Push Output Events
+
+After sending `subscribe`, the server pushes output events as they arrive:
+
+```json
+{
+  "status": "ok",
+  "event_type": "output",
+  "pane_index": 1,
+  "output_data": "hello world\n"
+}
+```
+
+Push events have `event_type` set (e.g. `"output"`), which distinguishes them
+from command responses. They may arrive between commands or interleaved with
+command responses.
+
+| Field         | Type   | Description                                               |
+| ------------- | ------ | --------------------------------------------------------- |
+| `event_type`  | string | Always `"output"` for output push events                  |
+| `pane_index`  | u32    | The pane that produced the output                         |
+| `output_data` | string | The new output text (UTF-8, may contain escape sequences) |
+
+Use `unsubscribe` to stop receiving push events.
 
 ### Example Session
 

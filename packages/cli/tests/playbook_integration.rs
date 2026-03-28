@@ -694,3 +694,260 @@ fn playbook_from_recording_cli() {
         parse_result.err()
     );
 }
+
+// ---------------------------------------------------------------------------
+// C: assert-screen matches= failure tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn playbook_assert_matches_fail() {
+    let (json, pass) = run_playbook_fixture("assert_matches_fail.dsl");
+    assert!(
+        !pass,
+        "matches= on non-matching regex should fail: {json:#}"
+    );
+
+    let steps = json["steps"].as_array().expect("steps should be array");
+    let failed = steps
+        .iter()
+        .find(|s| s["action"] == "assert-screen" && s["status"] == "fail");
+    assert!(
+        failed.is_some(),
+        "should have a failed assert-screen step: {json:#}"
+    );
+
+    let f = failed.unwrap();
+    assert!(
+        f.get("expected").is_some() && !f["expected"].is_null(),
+        "should have expected field: {f:#}"
+    );
+    assert!(
+        f.get("actual").is_some() && !f["actual"].is_null(),
+        "should have actual field (screen text): {f:#}"
+    );
+    assert!(
+        f.get("failure_captures").is_some() && !f["failure_captures"].is_null(),
+        "should have failure_captures: {f:#}"
+    );
+    // The actual screen text should contain the real output.
+    assert!(
+        f["actual"].as_str().unwrap_or("").contains("real_output"),
+        "actual should contain 'real_output': {f:#}"
+    );
+}
+
+#[test]
+fn playbook_assert_matches_invalid_regex() {
+    let (json, pass) = run_playbook_fixture("assert_matches_invalid_regex.dsl");
+    assert!(!pass, "invalid regex should fail: {json:#}");
+
+    let steps = json["steps"].as_array().expect("steps should be array");
+    let failed = steps
+        .iter()
+        .find(|s| s["action"] == "assert-screen" && s["status"] == "fail");
+    assert!(
+        failed.is_some(),
+        "should have a failed assert-screen step: {json:#}"
+    );
+    let detail = failed.unwrap()["detail"].as_str().unwrap_or("");
+    assert!(
+        detail.to_lowercase().contains("regex"),
+        "detail should mention regex error: {detail}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// A: Interactive mode integration test
+// ---------------------------------------------------------------------------
+
+/// Guard that kills a child process on drop (for test cleanup).
+struct ProcessGuard(std::process::Child);
+
+impl Drop for ProcessGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[tokio::test]
+async fn interactive_mode_basic() {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+
+    // Step 1: Spawn the interactive session.
+    let mut child = std::process::Command::new(bmux_binary())
+        .args([
+            "playbook",
+            "interactive",
+            "--viewport",
+            "80x24",
+            "--shell",
+            "sh",
+            "--timeout",
+            "30",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn bmux playbook interactive");
+
+    let _guard = ProcessGuard(std::process::Command::new("true").spawn().unwrap());
+
+    // Step 2: Read the ready message from stdout.
+    let stdout = child.stdout.take().expect("stdout should be piped");
+    let mut stdout_reader = std::io::BufReader::new(stdout);
+    let mut ready_line = String::new();
+    std::io::BufRead::read_line(&mut stdout_reader, &mut ready_line)
+        .expect("failed to read ready message");
+
+    let ready: serde_json::Value = serde_json::from_str(ready_line.trim())
+        .unwrap_or_else(|e| panic!("failed to parse ready message: {e}\nline: {ready_line}"));
+
+    assert_eq!(ready["status"], "ready", "ready message: {ready:#}");
+    let socket_path = ready["socket"]
+        .as_str()
+        .expect("ready message should have socket path");
+
+    // Step 3: Connect to the socket.
+    // Retry a few times in case the socket isn't ready yet.
+    let mut stream = None;
+    for _ in 0..10 {
+        match tokio::net::UnixStream::connect(socket_path).await {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    }
+    let stream = stream.unwrap_or_else(|| panic!("failed to connect to socket: {socket_path}"));
+
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = TokioBufReader::new(reader);
+
+    // Helper: send command and read response.
+    async fn send_cmd(
+        writer: &mut tokio::io::WriteHalf<tokio::net::UnixStream>,
+        reader: &mut TokioBufReader<tokio::io::ReadHalf<tokio::net::UnixStream>>,
+        cmd: &str,
+    ) -> serde_json::Value {
+        writer
+            .write_all(format!("{cmd}\n").as_bytes())
+            .await
+            .expect("failed to write command");
+        writer.flush().await.expect("failed to flush");
+
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .expect("failed to read response");
+        serde_json::from_str(line.trim())
+            .unwrap_or_else(|e| panic!("failed to parse response: {e}\nline: {line}"))
+    }
+
+    // Step 4: Send commands and verify responses.
+
+    // new-session
+    let resp = send_cmd(&mut writer, &mut reader, "new-session").await;
+    assert_eq!(resp["status"], "ok", "new-session response: {resp:#}");
+    assert_eq!(resp["action"], "new-session");
+
+    // send-keys
+    let resp = send_cmd(
+        &mut writer,
+        &mut reader,
+        "send-keys keys='echo interactive_test\\r'",
+    )
+    .await;
+    assert_eq!(resp["status"], "ok", "send-keys response: {resp:#}");
+
+    // sleep briefly for output to arrive
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // screen
+    let resp = send_cmd(&mut writer, &mut reader, "screen").await;
+    assert_eq!(resp["status"], "ok", "screen response: {resp:#}");
+    let panes = resp["panes"].as_array().expect("screen should have panes");
+    assert!(!panes.is_empty(), "should have at least one pane");
+    let screen_text = panes[0]["screen_text"].as_str().unwrap_or("");
+    assert!(
+        screen_text.contains("interactive_test"),
+        "screen should contain 'interactive_test': {screen_text}"
+    );
+
+    // assert-screen
+    let resp = send_cmd(
+        &mut writer,
+        &mut reader,
+        "assert-screen contains='interactive_test'",
+    )
+    .await;
+    assert_eq!(resp["status"], "ok", "assert-screen response: {resp:#}");
+
+    // status
+    let resp = send_cmd(&mut writer, &mut reader, "status").await;
+    assert_eq!(resp["status"], "ok", "status response: {resp:#}");
+    assert!(
+        resp.get("session_id").is_some() && !resp["session_id"].is_null(),
+        "status should have session_id: {resp:#}"
+    );
+    assert!(
+        resp.get("pane_count").is_some(),
+        "status should have pane_count: {resp:#}"
+    );
+    assert!(
+        resp.get("focused_pane").is_some(),
+        "status should have focused_pane: {resp:#}"
+    );
+
+    // subscribe for push output events
+    let resp = send_cmd(&mut writer, &mut reader, "subscribe").await;
+    assert_eq!(resp["status"], "ok", "subscribe response: {resp:#}");
+    assert_eq!(resp["action"], "subscribe");
+
+    // send-keys to trigger output while subscribed
+    let resp = send_cmd(
+        &mut writer,
+        &mut reader,
+        "send-keys keys='echo push_test_marker\\r'",
+    )
+    .await;
+    assert_eq!(resp["status"], "ok", "send-keys response: {resp:#}");
+
+    // Read responses/push events until we find an output push event or the
+    // screen command response. Push events may arrive before or after the
+    // screen response.
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    // Drain any push events that arrived.
+    let resp = send_cmd(&mut writer, &mut reader, "screen").await;
+    assert_eq!(resp["status"], "ok", "screen after subscribe: {resp:#}");
+    // The screen text should contain our marker.
+    let empty_vec = vec![];
+    let panes = resp["panes"].as_array().unwrap_or(&empty_vec);
+    let screen_has_marker = panes.iter().any(|p| {
+        p["screen_text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("push_test_marker")
+    });
+    assert!(
+        screen_has_marker,
+        "screen should contain push_test_marker after subscribe"
+    );
+
+    // unsubscribe
+    let resp = send_cmd(&mut writer, &mut reader, "unsubscribe").await;
+    assert_eq!(resp["status"], "ok", "unsubscribe response: {resp:#}");
+    assert_eq!(resp["action"], "unsubscribe");
+
+    // quit
+    let resp = send_cmd(&mut writer, &mut reader, "quit").await;
+    assert_eq!(resp["status"], "ok", "quit response: {resp:#}");
+    assert_eq!(resp["action"], "quit");
+
+    // Wait for the child to exit.
+    let _ = child.wait();
+}

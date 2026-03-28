@@ -48,6 +48,15 @@ struct InteractiveResponse {
     pane_count: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     focused_pane: Option<u32>,
+    /// For push events: the event type (e.g. `"output"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_type: Option<String>,
+    /// For output push events: the pane index that produced the output.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pane_index: Option<u32>,
+    /// For output push events: the new output text.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_data: Option<String>,
 }
 
 impl InteractiveResponse {
@@ -63,6 +72,9 @@ impl InteractiveResponse {
             session_id: None,
             pane_count: None,
             focused_pane: None,
+            event_type: None,
+            pane_index: None,
+            output_data: None,
         }
     }
 
@@ -78,6 +90,9 @@ impl InteractiveResponse {
             session_id: None,
             pane_count: None,
             focused_pane: None,
+            event_type: None,
+            pane_index: None,
+            output_data: None,
         }
     }
 
@@ -93,6 +108,9 @@ impl InteractiveResponse {
             session_id: None,
             pane_count: None,
             focused_pane: None,
+            event_type: None,
+            pane_index: None,
+            output_data: None,
         }
     }
 
@@ -108,6 +126,28 @@ impl InteractiveResponse {
             session_id: None,
             pane_count: None,
             focused_pane: None,
+            event_type: None,
+            pane_index: None,
+            output_data: None,
+        }
+    }
+
+    /// Create a push output event.
+    fn push_output(pane_index: u32, data: String) -> Self {
+        Self {
+            status: "ok",
+            action: None,
+            elapsed_ms: None,
+            detail: None,
+            error: None,
+            snapshot: None,
+            panes: None,
+            session_id: None,
+            pane_count: None,
+            focused_pane: None,
+            event_type: Some("output".to_string()),
+            pane_index: Some(pane_index),
+            output_data: Some(data),
         }
     }
 }
@@ -252,6 +292,7 @@ async fn run_interactive_session_managed(
         record,
         deadline,
         &mut runtime_vars,
+        sandbox,
     )
     .await;
 
@@ -289,10 +330,16 @@ async fn run_repl(
     record: bool,
     deadline: Option<Instant>,
     runtime_vars: &mut super::subst::RuntimeVars,
+    sandbox: &super::sandbox::SandboxServer,
 ) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
     let mut line = String::new();
+
+    // Channel for push output events (populated when subscribed).
+    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<(u32, String)>(64);
+    let mut output_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut subscribed = false;
 
     loop {
         // Check session timeout.
@@ -304,8 +351,17 @@ async fn run_repl(
             }
         }
 
-        // Read next command line.
+        // Read next command, optionally interleaved with push events.
         line.clear();
+
+        // Drain any pending push events before blocking on the next command.
+        if subscribed {
+            while let Ok((pane_idx, data)) = output_rx.try_recv() {
+                let push = InteractiveResponse::push_output(pane_idx, data);
+                write_response(&mut writer, &push).await?;
+            }
+        }
+
         let read_result = if let Some(dl) = deadline {
             let remaining = dl.saturating_duration_since(Instant::now());
             match tokio::time::timeout(remaining, reader.read_line(&mut line)).await {
@@ -329,13 +385,21 @@ async fn run_repl(
             }
         }
 
-        let trimmed = line.trim();
+        let trimmed = line.trim().to_string();
         if trimmed.is_empty() {
             continue;
         }
 
+        // Drain push events that arrived during the command read.
+        if subscribed {
+            while let Ok((pane_idx, data)) = output_rx.try_recv() {
+                let push = InteractiveResponse::push_output(pane_idx, data);
+                write_response(&mut writer, &push).await?;
+            }
+        }
+
         // Handle special commands.
-        match trimmed {
+        match trimmed.as_str() {
             "quit" => {
                 let resp = InteractiveResponse::ok("quit");
                 write_response(&mut writer, &resp).await?;
@@ -356,9 +420,9 @@ async fn run_repl(
                     status: "ok",
                     action: Some("help".to_string()),
                     detail: Some(
-                        "commands: quit, screen, status, help, or any DSL action \
-                         (new-session, send-keys, wait-for, assert-screen, snapshot, \
-                         assert-layout, assert-cursor, screen, status, etc.)"
+                        "commands: quit, screen, status, help, subscribe, unsubscribe, \
+                         or any DSL action (new-session, send-keys, wait-for, \
+                         assert-screen, snapshot, etc.)"
                             .to_string(),
                     ),
                     ..InteractiveResponse::ok("help")
@@ -366,11 +430,56 @@ async fn run_repl(
                 write_response(&mut writer, &resp).await?;
                 continue;
             }
+            "subscribe" => {
+                if subscribed {
+                    let resp = InteractiveResponse::ok("subscribe");
+                    write_response(&mut writer, &resp).await?;
+                    continue;
+                }
+                let Some(sid) = *session_id else {
+                    let resp = InteractiveResponse::error(
+                        "no session — use new-session first".to_string(),
+                    );
+                    write_response(&mut writer, &resp).await?;
+                    continue;
+                };
+                if !*attached {
+                    let resp = InteractiveResponse::error("not attached to a session".to_string());
+                    write_response(&mut writer, &resp).await?;
+                    continue;
+                }
+                // Create a second client connection for output polling.
+                match sandbox.connect("bmux-playbook-output-stream").await {
+                    Ok(mut event_client) => {
+                        let tx = output_tx.clone();
+                        output_task = Some(tokio::spawn(async move {
+                            output_poll_loop(&mut event_client, sid, tx).await;
+                        }));
+                        subscribed = true;
+                        let resp = InteractiveResponse::ok("subscribe");
+                        write_response(&mut writer, &resp).await?;
+                    }
+                    Err(e) => {
+                        let resp = InteractiveResponse::error(format!("subscribe failed: {e:#}"));
+                        write_response(&mut writer, &resp).await?;
+                    }
+                }
+                continue;
+            }
+            "unsubscribe" => {
+                if let Some(task) = output_task.take() {
+                    task.abort();
+                }
+                subscribed = false;
+                let resp = InteractiveResponse::ok("unsubscribe");
+                write_response(&mut writer, &resp).await?;
+                continue;
+            }
             _ => {}
         }
 
         // Parse as DSL action line.
-        let action = match parse_action_line(trimmed) {
+        let action = match parse_action_line(&trimmed) {
             Ok(action) => action,
             Err(e) => {
                 let resp = InteractiveResponse::error(format!("{e:#}"));
@@ -442,6 +551,11 @@ async fn run_repl(
                 // Don't break on failure — let the agent decide what to do.
             }
         }
+    }
+
+    // Clean up the output polling task if still running.
+    if let Some(task) = output_task.take() {
+        task.abort();
     }
 
     Ok(())
@@ -575,4 +689,38 @@ fn simple_hash(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     hash
+}
+
+/// Background task that polls for output from the sandbox and sends push
+/// events through the channel. Runs until the channel is closed (receiver dropped)
+/// or the task is aborted.
+async fn output_poll_loop(
+    client: &mut bmux_client::BmuxClient,
+    session_id: Uuid,
+    tx: tokio::sync::mpsc::Sender<(u32, String)>,
+) {
+    const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+    loop {
+        match client.attach_output(session_id, MAX_OUTPUT_BYTES).await {
+            Ok(data) if !data.is_empty() => {
+                // Convert to lossy UTF-8 for text display.
+                let text = String::from_utf8_lossy(&data).to_string();
+                // Use pane index 0 as a placeholder (the attach_output API
+                // returns output from the focused pane only).
+                if tx.send((0, text)).await.is_err() {
+                    break; // Receiver dropped — unsubscribed or session ended
+                }
+            }
+            Ok(_) => {
+                // No output — sleep before polling again.
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+            Err(e) => {
+                warn!("output poll error: {e}");
+                break;
+            }
+        }
+    }
 }
