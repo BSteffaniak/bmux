@@ -1,0 +1,10 @@
+[package]
+authors     = { workspace = true }
+description = "Types and trait for bmux configuration documentation schema"
+edition     = { workspace = true }
+license     = { workspace = true }
+name        = "bmux_config_doc"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]

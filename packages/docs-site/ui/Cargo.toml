@@ -8,6 +8,9 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
+bmux_config     = { workspace = true }
+bmux_config_doc = { workspace = true }
+
 hyperchad = { workspace = true, features = [
     "actions",
     "actions-logic",

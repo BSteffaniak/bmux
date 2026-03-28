@@ -3,6 +3,7 @@
 //! This module provides key binding configuration management with support
 //! for modal keybindings (Normal, Insert, Visual, Command modes).
 
+use bmux_config_doc_derive::ConfigDoc;
 use bmux_event::{KeyCode, KeyEvent, Mode};
 use bmux_keybind::{RuntimeAction, action_to_name};
 use serde::{Deserialize, Serialize};
@@ -16,7 +17,8 @@ const PROFILE_TRADITIONAL: &str = "traditional";
 const PROFILE_SLOW: &str = "slow";
 
 /// Key binding configuration for all modes
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "keybindings")]
 #[serde(default)]
 pub struct KeyBindingConfig {
     /// Prefix key used for runtime key chords (e.g. "ctrl+a")

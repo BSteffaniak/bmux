@@ -9,6 +9,8 @@ members = [
     "packages/client",
     "packages/clipboard",
     "packages/config",
+    "packages/config-doc",
+    "packages/config-doc-derive",
     "packages/event",
     "packages/event/models",
     "packages/ipc",
@@ -77,6 +79,8 @@ bmux_client            = { version = "0.0.1-alpha.0", default-features = false, 
 bmux_clipboard         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/clipboard" }
 bmux_codec             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/codec" }
 bmux_config            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }
+bmux_config_doc        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config-doc" }
+bmux_config_doc_derive = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config-doc-derive" }
 bmux_event             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event" }
 bmux_event_models      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event/models" }
 bmux_fonts             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/fonts" }

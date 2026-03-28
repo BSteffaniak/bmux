@@ -3,6 +3,11 @@
 use hyperchad::markdown::markdown_to_container;
 use hyperchad::template::Containers;
 
+use bmux_config::{
+    AppearanceConfig, BehaviorConfig, ConfigDocSchema, GeneralConfig, KeyBindingConfig,
+    MultiClientConfig, PluginConfig, RecordingConfig, StatusBarConfig,
+};
+
 use crate::layout;
 use crate::theme;
 
@@ -63,7 +68,7 @@ pub fn config() -> Containers {
     layout::docs_layout(
         "/docs/config",
         "Configuration",
-        &md(include_str!("../../../../../docs/config.md")),
+        &md(&generate_config_reference()),
     )
 }
 
@@ -149,4 +154,73 @@ fn extract_section(markdown: &str, start_heading: &str, end_prefix: Option<&str>
         Some(start) => lines[start..end_idx].join("\n"),
         None => markdown.to_string(),
     }
+}
+
+// ── Config reference generation from schema ─────────────────────────────────
+
+/// Generate the full configuration reference markdown from the `ConfigDocSchema`
+/// trait implementations on each config struct. This is always in sync with the
+/// actual code because descriptions come from doc comments and defaults come
+/// from `Default::default()` serialized at compile time.
+fn generate_config_reference() -> String {
+    let mut doc = String::from(
+        "bmux is configured via a `bmux.toml` file. If no config file exists, \
+         bmux uses sensible defaults for all options.\n\n\
+         ## Config File Location\n\n\
+         bmux looks for `bmux.toml` in the standard XDG config directory:\n\n\
+         ```\n~/.config/bmux/bmux.toml\n```\n\n\
+         ---\n\n",
+    );
+
+    doc.push_str(&render_section::<GeneralConfig>());
+    doc.push_str(&render_section::<AppearanceConfig>());
+    doc.push_str(&render_section::<BehaviorConfig>());
+    doc.push_str(&render_section::<MultiClientConfig>());
+    doc.push_str(&render_section::<KeyBindingConfig>());
+    doc.push_str(&render_section::<PluginConfig>());
+    doc.push_str(&render_section::<StatusBarConfig>());
+    doc.push_str(&render_section::<RecordingConfig>());
+
+    doc
+}
+
+fn render_section<T: ConfigDocSchema>() -> String {
+    let defaults = T::default_values();
+    let mut s = format!(
+        "## `[{}]`\n\n{}\n\n",
+        T::section_name(),
+        T::section_description()
+    );
+
+    s.push_str("| Option | Type | Default | Description |\n");
+    s.push_str("|--------|------|---------|-------------|\n");
+
+    for field in T::field_docs() {
+        let default_val = defaults
+            .get(field.toml_key)
+            .map(|v| {
+                if v.is_empty() {
+                    "*(empty)*".to_string()
+                } else {
+                    format!("`{v}`")
+                }
+            })
+            .unwrap_or_else(|| "—".to_string());
+
+        let type_info = match field.enum_values {
+            Some(vals) => {
+                let joined = vals.join("`, `");
+                format!("{} (`{joined}`)", field.type_display)
+            }
+            None => field.type_display.to_string(),
+        };
+
+        s.push_str(&format!(
+            "| `{}` | {} | {} | {} |\n",
+            field.toml_key, type_info, default_val, field.description
+        ));
+    }
+
+    s.push_str("\n---\n\n");
+    s
 }

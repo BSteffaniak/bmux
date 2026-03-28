@@ -1,0 +1,16 @@
+[package]
+authors     = { workspace = true }
+description = "Proc macros for generating config documentation schema from bmux config types"
+edition     = { workspace = true }
+license     = { workspace = true }
+name        = "bmux_config_doc_derive"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1"
+quote       = "1"
+syn         = { version = "2", features = ["full", "extra-traits"] }

@@ -7,6 +7,7 @@
 //! This crate provides configuration loading, validation, and management
 //! for the bmux terminal multiplexer system.
 
+use bmux_config_doc_derive::{ConfigDoc, ConfigDocEnum};
 use bmux_event::Mode;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -17,6 +18,7 @@ pub mod keybind;
 pub mod paths;
 pub mod theme;
 
+pub use bmux_config_doc::{ConfigDocSchema, FieldDoc};
 pub use keybind::{KeyBindingConfig, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS, ResolvedTimeout};
 pub use paths::ConfigPaths;
 pub use theme::ThemeConfig;
@@ -65,7 +67,8 @@ pub struct BmuxConfig {
 }
 
 /// Recording configuration options
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "recording")]
 #[serde(default)]
 pub struct RecordingConfig {
     /// Root directory for recording data.
@@ -101,10 +104,12 @@ impl Default for RecordingConfig {
 }
 
 /// General configuration options
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "general")]
 #[serde(default)]
 pub struct GeneralConfig {
     /// Default mode when starting bmux
+    #[config_doc(values("normal", "insert", "visual", "command"))]
     pub default_mode: Mode,
     /// Enable mouse support
     pub mouse_support: bool,
@@ -129,7 +134,8 @@ impl Default for GeneralConfig {
 }
 
 /// Appearance configuration options
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
+#[config_doc(section = "appearance")]
 #[serde(default)]
 pub struct AppearanceConfig {
     /// Theme name
@@ -145,7 +151,8 @@ pub struct AppearanceConfig {
 }
 
 /// Behavior configuration options
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "behavior")]
 #[serde(default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct BehaviorConfig {
@@ -203,7 +210,7 @@ impl Default for BehaviorConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum StaleBuildAction {
     #[default]
@@ -211,7 +218,7 @@ pub enum StaleBuildAction {
     Warn,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminfoAutoInstall {
     #[default]
@@ -221,7 +228,8 @@ pub enum TerminfoAutoInstall {
 }
 
 /// Multi-client specific configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
+#[config_doc(section = "multi_client")]
 #[serde(default)]
 pub struct MultiClientConfig {
     /// Allow clients to have independent views of the same session
@@ -235,7 +243,8 @@ pub struct MultiClientConfig {
 }
 
 /// Plugin configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
+#[config_doc(section = "plugins")]
 #[serde(default)]
 pub struct PluginConfig {
     /// Enabled plugins
@@ -249,7 +258,8 @@ pub struct PluginConfig {
 }
 
 /// Status bar configuration
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
+#[config_doc(section = "status_bar")]
 #[serde(default)]
 pub struct StatusBarConfig {
     /// Left side format
@@ -267,7 +277,7 @@ pub struct StatusBarConfig {
 }
 
 /// Status bar position
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, ConfigDocEnum)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum StatusPosition {
     Top,
@@ -277,7 +287,7 @@ pub enum StatusPosition {
 }
 
 /// Border style for panes
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, ConfigDocEnum)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BorderStyle {
     #[default]
@@ -289,7 +299,7 @@ pub enum BorderStyle {
 }
 
 /// Bell action behavior
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, ConfigDocEnum)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BellAction {
     None,
