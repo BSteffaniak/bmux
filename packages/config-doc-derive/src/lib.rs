@@ -403,8 +403,15 @@ pub fn derive_config_doc(input: TokenStream) -> TokenStream {
                 #field_name.to_string(),
                 toml::Value::try_from(&d.#field_ident)
                     .map(|v| {
-                        let s = v.to_string();
-                        s.trim_matches('"').to_string()
+                        if v.is_table() || v.is_array() {
+                            toml::to_string_pretty(&v)
+                                .unwrap_or_default()
+                                .trim()
+                                .to_string()
+                        } else {
+                            let s = v.to_string();
+                            s.trim_matches('"').to_string()
+                        }
                     })
                     .unwrap_or_else(|_| "—".to_string()),
             );

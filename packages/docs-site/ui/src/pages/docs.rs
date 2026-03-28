@@ -185,27 +185,44 @@ fn generate_config_reference() -> String {
 }
 
 fn render_section<T: ConfigDocSchema>() -> String {
+    let section_name = T::section_name();
     let defaults = T::default_values();
     let mut s = format!(
         "## `[{}]`\n\n{}\n\n",
-        T::section_name(),
+        section_name,
         T::section_description()
     );
 
     s.push_str("| Option | Type | Default | Description |\n");
     s.push_str("|--------|------|---------|-------------|\n");
 
+    // Collect table-typed fields with non-empty defaults for rendering after
+    // the table as collapsible code blocks.
+    let mut deferred_tables: Vec<(&str, &str)> = Vec::new();
+
     for field in T::field_docs() {
-        let default_val = defaults
-            .get(field.toml_key)
-            .map(|v| {
-                if v.is_empty() {
-                    "*(empty)*".to_string()
-                } else {
-                    format!("`{v}`")
+        let raw_default = defaults.get(field.toml_key).map(String::as_str);
+        let is_table = field.type_display == "table";
+
+        let default_val = if is_table {
+            match raw_default {
+                Some(v) if v.is_empty() || v == "{}" => "*(empty)*".to_string(),
+                Some(v) => {
+                    deferred_tables.push((field.toml_key, v));
+                    format!(
+                        "[*(see defaults below)*](#default-{section_name}-{})",
+                        field.toml_key
+                    )
                 }
-            })
-            .unwrap_or_else(|| "—".to_string());
+                None => "*(empty)*".to_string(),
+            }
+        } else {
+            match raw_default {
+                Some(v) if v.is_empty() => "*(empty)*".to_string(),
+                Some(v) => format!("`{v}`"),
+                None => "—".to_string(),
+            }
+        };
 
         let type_info = match field.enum_values {
             Some(vals) => {
@@ -221,6 +238,17 @@ fn render_section<T: ConfigDocSchema>() -> String {
         ));
     }
 
-    s.push_str("\n---\n\n");
+    s.push('\n');
+
+    // Render deferred table defaults as code blocks with anchor IDs
+    for (toml_key, default_val) in &deferred_tables {
+        s.push_str(&format!(
+            "<div id=\"default-{section_name}-{toml_key}\"></div>\n\n\
+             ### Default `{toml_key}` bindings\n\n\
+             ```toml\n[{section_name}.{toml_key}]\n{default_val}\n```\n\n"
+        ));
+    }
+
+    s.push_str("---\n\n");
     s
 }
