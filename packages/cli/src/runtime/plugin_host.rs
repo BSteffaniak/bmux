@@ -28,6 +28,7 @@ impl CliPluginHost {
                 config_dir: paths.config_dir.to_string_lossy().into_owned(),
                 runtime_dir: paths.runtime_dir.to_string_lossy().into_owned(),
                 data_dir: paths.data_dir.to_string_lossy().into_owned(),
+                state_dir: paths.state_dir.to_string_lossy().into_owned(),
             },
             required_capabilities,
             provided_capabilities,

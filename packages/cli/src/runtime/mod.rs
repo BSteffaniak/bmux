@@ -144,7 +144,7 @@ fn call_host_kernel_via_client(
         connection.config_dir.clone().into(),
         connection.runtime_dir.clone().into(),
         connection.data_dir.clone().into(),
-        ConfigPaths::default().state_dir,
+        connection.state_dir.clone().into(),
     );
     let request_name = "bmux-cli-host-kernel-bridge".to_string();
     let response: bmux_ipc::Response = if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -437,6 +437,7 @@ fn register_plugin_service_handlers(
         config_dir: paths.config_dir.to_string_lossy().into_owned(),
         runtime_dir: paths.runtime_dir.to_string_lossy().into_owned(),
         data_dir: paths.data_dir.to_string_lossy().into_owned(),
+        state_dir: paths.state_dir.to_string_lossy().into_owned(),
     };
     let available_capability_names = available_capabilities
         .keys()
@@ -2235,6 +2236,7 @@ fn activate_loaded_plugins(
         config_dir: paths.config_dir.to_string_lossy().into_owned(),
         runtime_dir: paths.runtime_dir.to_string_lossy().into_owned(),
         data_dir: paths.data_dir.to_string_lossy().into_owned(),
+        state_dir: paths.state_dir.to_string_lossy().into_owned(),
     };
     let plugin_search_roots = resolve_plugin_search_paths(config, paths)?
         .into_iter()
@@ -2317,6 +2319,7 @@ fn deactivate_loaded_plugins(
         config_dir: paths.config_dir.to_string_lossy().into_owned(),
         runtime_dir: paths.runtime_dir.to_string_lossy().into_owned(),
         data_dir: paths.data_dir.to_string_lossy().into_owned(),
+        state_dir: paths.state_dir.to_string_lossy().into_owned(),
     };
     let plugin_search_roots = resolve_plugin_search_paths(config, paths)?
         .into_iter()
@@ -5276,6 +5279,7 @@ fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
         config_dir: paths.config_dir.to_string_lossy().into_owned(),
         runtime_dir: paths.runtime_dir.to_string_lossy().into_owned(),
         data_dir: paths.data_dir.to_string_lossy().into_owned(),
+        state_dir: paths.state_dir.to_string_lossy().into_owned(),
     };
     let _host_kernel_connection_guard = enter_host_kernel_connection(connection.clone());
     let response = loaded.invoke_service(&bmux_plugin::NativeServiceContext {

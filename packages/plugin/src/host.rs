@@ -15,6 +15,7 @@ pub struct HostConnectionInfo {
     pub config_dir: String,
     pub runtime_dir: String,
     pub data_dir: String,
+    pub state_dir: String,
 }
 
 pub trait PluginHost: Send + Sync {
@@ -94,6 +95,7 @@ mod tests {
                     config_dir: "/tmp/config".to_string(),
                     runtime_dir: "/tmp/runtime".to_string(),
                     data_dir: "/tmp/data".to_string(),
+                    state_dir: "/tmp/state".to_string(),
                 },
                 required_capabilities: required
                     .iter()

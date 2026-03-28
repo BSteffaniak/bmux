@@ -830,6 +830,7 @@ mod tests {
                 config_dir: "/config".to_string(),
                 runtime_dir: "/runtime".to_string(),
                 data_dir: data_dir.to_string_lossy().into_owned(),
+                state_dir: "/state".to_string(),
             },
             settings: std::collections::BTreeMap::new(),
             plugin_settings_map: std::collections::BTreeMap::new(),

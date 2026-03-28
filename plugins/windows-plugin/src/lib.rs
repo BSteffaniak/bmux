@@ -975,6 +975,7 @@ mod tests {
                 config_dir: "/config".to_string(),
                 runtime_dir: "/runtime".to_string(),
                 data_dir: "/data".to_string(),
+                state_dir: "/state".to_string(),
             },
             settings: std::collections::BTreeMap::new(),
             plugin_settings_map: std::collections::BTreeMap::new(),
