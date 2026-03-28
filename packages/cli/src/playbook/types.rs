@@ -28,21 +28,38 @@ pub struct PlaybookConfig {
     /// deterministic defaults.
     pub env: BTreeMap<String, String>,
     /// Controls how the sandbox inherits the parent process environment.
-    pub env_mode: SandboxEnvMode,
+    /// `None` means the playbook did not explicitly specify a mode.
+    pub env_mode: Option<SandboxEnvMode>,
 }
 
 /// Controls how the sandbox server inherits environment variables.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SandboxEnvMode {
     /// Inherit the full parent environment, then overlay deterministic defaults
     /// (`TERM`, `LANG`, `LC_ALL`, `HOME`) and any explicit `@env` overrides.
     /// This is backward-compatible and the default.
-    #[default]
     Inherit,
     /// Start from an empty environment. Only `PATH`, `USER`, and `SHELL` are
     /// inherited from the parent; everything else uses deterministic defaults
     /// or explicit `@env` overrides. Maximally deterministic.
     Clean,
+}
+
+impl PlaybookConfig {
+    /// Resolve the effective sandbox environment mode.
+    ///
+    /// Priority: playbook config (if explicitly set) → `BMUX_PLAYBOOK_ENV_MODE`
+    /// env var (if set) → `Inherit`.
+    pub fn effective_env_mode(&self) -> SandboxEnvMode {
+        if let Some(mode) = self.env_mode {
+            return mode;
+        }
+        match std::env::var("BMUX_PLAYBOOK_ENV_MODE").ok().as_deref() {
+            Some("clean") => SandboxEnvMode::Clean,
+            Some("inherit") => SandboxEnvMode::Inherit,
+            _ => SandboxEnvMode::Inherit,
+        }
+    }
 }
 
 impl Default for PlaybookConfig {
@@ -57,7 +74,7 @@ impl Default for PlaybookConfig {
             plugins: PluginConfig::default(),
             vars: BTreeMap::new(),
             env: BTreeMap::new(),
-            env_mode: SandboxEnvMode::default(),
+            env_mode: None,
         }
     }
 }

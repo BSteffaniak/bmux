@@ -135,12 +135,19 @@ pub async fn run_interactive(
     let plugins = super::types::PluginConfig::default();
 
     // 1. Start sandbox server.
+    // Interactive mode has no playbook config, so resolve env mode from
+    // BMUX_PLAYBOOK_ENV_MODE env var, falling back to Inherit.
+    let env_mode = match std::env::var("BMUX_PLAYBOOK_ENV_MODE").ok().as_deref() {
+        Some("clean") => super::types::SandboxEnvMode::Clean,
+        _ => super::types::SandboxEnvMode::Inherit,
+    };
+
     let sandbox = SandboxServer::start(
         shell,
         &plugins,
         SERVER_STARTUP_TIMEOUT,
         &std::collections::BTreeMap::new(),
-        super::types::SandboxEnvMode::Inherit,
+        env_mode,
     )
     .await
     .context("failed starting sandbox server")?;

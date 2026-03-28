@@ -65,8 +65,9 @@ fn parse_config(raw: Option<RawPlaybookConfig>) -> Result<PlaybookConfig> {
     };
 
     let env_mode = match raw.env_mode.as_deref() {
-        Some("clean") => super::types::SandboxEnvMode::Clean,
-        Some("inherit") | None => super::types::SandboxEnvMode::Inherit,
+        Some("clean") => Some(super::types::SandboxEnvMode::Clean),
+        Some("inherit") => Some(super::types::SandboxEnvMode::Inherit),
+        None => None,
         Some(other) => bail!("env_mode must be 'inherit' or 'clean', got '{other}'"),
     };
 

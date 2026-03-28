@@ -123,11 +123,11 @@ fn parse_config_directive(
         "env-mode" => {
             // @env-mode inherit|clean
             let mode = rest.trim();
-            config.env_mode = match mode {
+            config.env_mode = Some(match mode {
                 "inherit" => super::types::SandboxEnvMode::Inherit,
                 "clean" => super::types::SandboxEnvMode::Clean,
                 other => bail!("@env-mode must be 'inherit' or 'clean', got '{other}'"),
-            };
+            });
         }
         "include" => {
             let path = rest.trim().to_string();
