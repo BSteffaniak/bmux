@@ -18,14 +18,14 @@ bmux_session  = { workspace = true }
 bmux_terminal = { workspace = true }
 
 # External dependencies
-anyhow    = { workspace = true }
-crossterm = { workspace = true }
-postcard  = { workspace = true }
-serde     = { workspace = true, features = ["derive"], optional = true }
-thiserror = { workspace = true }
-tokio     = { workspace = true, features = ["time"] }
-tracing   = { workspace = true }
-uuid      = { workspace = true, features = ["std"] }
+anyhow     = { workspace = true }
+bmux_codec = { workspace = true }
+crossterm  = { workspace = true }
+serde      = { workspace = true, features = ["derive"], optional = true }
+thiserror  = { workspace = true }
+tokio      = { workspace = true, features = ["time"] }
+tracing    = { workspace = true }
+uuid       = { workspace = true, features = ["std"] }
 
 [dev-dependencies]
 bmux_server = { workspace = true }

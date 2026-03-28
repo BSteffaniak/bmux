@@ -1,19 +1,20 @@
 [package]
 authors     = { workspace = true }
-categories  = ["development-tools"]
-description = "Cross-platform IPC protocol models for bmux"
+categories  = ["encoding"]
+description = "Custom binary serialization codec for bmux IPC protocol"
 edition     = { workspace = true }
-keywords    = ["bmux", "ipc", "multiplexer", "protocol", "terminal"]
+keywords    = ["bmux", "codec", "serialization", "binary"]
 license     = { workspace = true }
-name        = "bmux_ipc"
+name        = "bmux_codec"
 repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_codec = { workspace = true }
+serde = { workspace = true, features = ["std"] }
+
+[dev-dependencies]
 serde      = { workspace = true, features = ["derive", "std"] }
-thiserror  = { workspace = true }
-tokio      = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
+serde_json = { workspace = true }
 uuid       = { workspace = true, features = ["serde", "std", "v4"] }
 
 [features]

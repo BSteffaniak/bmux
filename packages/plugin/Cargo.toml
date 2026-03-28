@@ -12,9 +12,9 @@ version     = { workspace = true }
 
 [dependencies]
 # External dependencies
+bmux_codec = { workspace = true }
 bmux_ipc   = { workspace = true }
 libloading = { workspace = true }
-postcard   = { workspace = true, features = ["alloc"] }
 semver     = { workspace = true }
 serde      = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }

@@ -2280,7 +2280,7 @@ mod tests {
     }
 
     #[test]
-    fn display_track_envelope_round_trips_through_postcard() {
+    fn display_track_envelope_round_trips_through_codec() {
         let envelope = DisplayTrackEnvelope {
             mono_ns: 1,
             event: DisplayTrackEvent::StreamOpened {

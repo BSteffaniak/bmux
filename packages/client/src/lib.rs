@@ -84,7 +84,7 @@ pub enum ClientError {
     #[error("transport error: {0}")]
     Transport(#[from] IpcTransportError),
     #[error("serialization error: {0}")]
-    Serialization(#[from] postcard::Error),
+    Serialization(#[from] bmux_codec::Error),
     #[error("request timed out after {0:?}")]
     Timeout(Duration),
     #[error("request id mismatch (expected {expected}, got {actual})")]

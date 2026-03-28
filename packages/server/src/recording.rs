@@ -376,7 +376,7 @@ fn read_manifest(path: &Path) -> Result<RecordingSummary> {
 ///
 /// This measures the size of the primary data fields in each payload variant,
 /// not the actual serialized frame size (which includes the 4-byte length prefix
-/// and postcard envelope overhead). Treat `payload_bytes` in the manifest as
+/// and codec envelope overhead). Treat `payload_bytes` in the manifest as
 /// an approximate content-size metric, not an exact file-size measurement.
 fn payload_size(payload: &RecordingPayload) -> u64 {
     match payload {

@@ -533,7 +533,7 @@ pub enum RecordingPayload {
         request_id: u64,
         request_kind: String,
         exclusive: bool,
-        /// Full request, postcard-encoded.
+        /// Full request, binary-encoded.
         request_data: Vec<u8>,
     },
     RequestDone {
@@ -541,9 +541,9 @@ pub enum RecordingPayload {
         request_kind: String,
         response_kind: String,
         elapsed_ms: u64,
-        /// Full request, postcard-encoded.
+        /// Full request, binary-encoded.
         request_data: Vec<u8>,
-        /// Full response payload, postcard-encoded.
+        /// Full response payload, binary-encoded.
         response_data: Vec<u8>,
     },
     RequestError {
@@ -814,28 +814,28 @@ pub enum Event {
     },
 }
 
-/// Serialize any protocol message using postcard.
+/// Serialize any protocol message using the bmux binary codec.
 ///
 /// # Errors
 ///
 /// Returns an error when serialization fails.
-pub fn encode<T>(message: &T) -> Result<Vec<u8>, postcard::Error>
+pub fn encode<T>(message: &T) -> Result<Vec<u8>, bmux_codec::Error>
 where
     T: Serialize,
 {
-    postcard::to_allocvec(message)
+    bmux_codec::to_vec(message)
 }
 
-/// Deserialize any protocol message using postcard.
+/// Deserialize any protocol message using the bmux binary codec.
 ///
 /// # Errors
 ///
 /// Returns an error when deserialization fails.
-pub fn decode<T>(bytes: &[u8]) -> Result<T, postcard::Error>
+pub fn decode<T>(bytes: &[u8]) -> Result<T, bmux_codec::Error>
 where
     T: DeserializeOwned,
 {
-    postcard::from_bytes(bytes)
+    bmux_codec::from_bytes(bytes)
 }
 
 // ── Shared display track types for recording files ───────────────────────────
@@ -843,7 +843,7 @@ where
 /// Display track event — shared type used by both the attach runtime's
 /// `DisplayCaptureWriter` and the playbook engine's `PlaybookDisplayTrackWriter`.
 ///
-/// The `terminal_profile` field stores pre-serialized bytes (postcard-encoded
+/// The `terminal_profile` field stores pre-serialized bytes (codec-encoded
 /// `DetectedTerminalProfile`) to avoid cross-crate type dependencies. Use `None`
 /// when no terminal profile is available (e.g., headless playbook execution).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -856,7 +856,7 @@ pub enum DisplayTrackEvent {
         cell_height_px: Option<u16>,
         window_width_px: Option<u16>,
         window_height_px: Option<u16>,
-        /// Pre-serialized terminal profile bytes (postcard-encoded), or `None`.
+        /// Pre-serialized terminal profile bytes (binary-encoded), or `None`.
         terminal_profile: Option<Vec<u8>>,
     },
     Resize {
@@ -878,17 +878,16 @@ pub struct DisplayTrackEnvelope {
 
 // ── Binary frame utilities for recording files ───────────────────────────────
 
-/// Write a length-prefixed postcard frame to a writer.
+/// Write a length-prefixed binary frame to a writer.
 ///
-/// Format: `[u32 little-endian length][postcard bytes]`
+/// Format: `[u32 little-endian length][codec bytes]`
 ///
 /// Returns an error if the serialized payload exceeds `u32::MAX` bytes.
 pub fn write_frame<W: std::io::Write, T: Serialize>(
     writer: &mut W,
     value: &T,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let bytes =
-        postcard::to_allocvec(value).map_err(|e| format!("postcard serialize failed: {e}"))?;
+    let bytes = bmux_codec::to_vec(value).map_err(|e| format!("codec serialize failed: {e}"))?;
     let len = u32::try_from(bytes.len())
         .map_err(|_| format!("frame too large: {} bytes exceeds u32::MAX", bytes.len()))?;
     writer.write_all(&len.to_le_bytes())?;
@@ -905,7 +904,7 @@ pub struct ReadFramesResult<T> {
     pub bytes_remaining: usize,
 }
 
-/// Read all length-prefixed postcard frames from a byte buffer.
+/// Read all length-prefixed binary frames from a byte buffer.
 ///
 /// Returns all successfully-parsed frames plus the count of any trailing bytes
 /// that could not form a complete frame (indicating a truncated recording).
@@ -922,8 +921,8 @@ pub fn read_frames<T: DeserializeOwned>(
             offset -= 4;
             break;
         }
-        let value: T = postcard::from_bytes(&data[offset..offset + len])
-            .map_err(|e| format!("postcard deserialize failed at offset {}: {e}", offset))?;
+        let value: T = bmux_codec::from_bytes(&data[offset..offset + len])
+            .map_err(|e| format!("codec deserialize failed at offset {}: {e}", offset))?;
         results.push(value);
         offset += len;
     }

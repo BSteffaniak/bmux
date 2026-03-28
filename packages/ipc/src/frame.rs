@@ -16,7 +16,7 @@ pub enum FrameEncodeError {
     )]
     PayloadTooLarge { actual: usize, max: usize },
     #[error("failed to serialize frame payload: {0}")]
-    Serialize(#[from] postcard::Error),
+    Serialize(#[from] bmux_codec::Error),
 }
 
 /// Errors returned by frame decoding.
@@ -35,14 +35,14 @@ pub enum FrameDecodeError {
     #[error("unsupported protocol version {actual}; expected {expected}")]
     UnsupportedVersion { actual: u16, expected: u16 },
     #[error("failed to deserialize frame payload: {0}")]
-    Deserialize(postcard::Error),
+    Deserialize(bmux_codec::Error),
 }
 
 /// Encode an envelope into a length-prefixed frame.
 ///
 /// Framing format:
 /// - 4-byte little-endian payload length
-/// - postcard-encoded envelope payload
+/// - binary-encoded envelope payload
 ///
 /// # Errors
 ///

@@ -3,7 +3,7 @@
 //! Uses the shared `DisplayTrackEvent` and `DisplayTrackEnvelope` types from
 //! `bmux_ipc` for binary compatibility with the attach runtime's display tracks.
 //!
-//! Format: length-prefixed postcard frames.
+//! Format: length-prefixed binary codec frames.
 
 use std::io::Write;
 use std::path::Path;

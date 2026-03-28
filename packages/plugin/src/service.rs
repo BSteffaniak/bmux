@@ -162,7 +162,7 @@ pub fn encode_service_message<T>(message: &T) -> Result<Vec<u8>>
 where
     T: Serialize,
 {
-    postcard::to_allocvec(message).map_err(|error| PluginError::ServiceProtocol {
+    bmux_codec::to_vec(message).map_err(|error| PluginError::ServiceProtocol {
         details: error.to_string(),
     })
 }
@@ -171,7 +171,7 @@ pub fn decode_service_message<T>(payload: &[u8]) -> Result<T>
 where
     T: DeserializeOwned,
 {
-    postcard::from_bytes(payload).map_err(|error| PluginError::ServiceProtocol {
+    bmux_codec::from_bytes(payload).map_err(|error| PluginError::ServiceProtocol {
         details: error.to_string(),
     })
 }

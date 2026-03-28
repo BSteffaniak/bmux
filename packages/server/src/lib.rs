@@ -2776,7 +2776,7 @@ async fn handle_connection(
 
         let request_kind = request_kind_name(&request);
         let exclusive = request_requires_exclusive(&request);
-        let request_data = postcard::to_allocvec(&request).unwrap_or_else(|e| {
+        let request_data = bmux_codec::to_vec(&request).unwrap_or_else(|e| {
             tracing::warn!("failed to serialize request for recording: {e}");
             vec![]
         });
@@ -2818,7 +2818,7 @@ async fn handle_connection(
         let elapsed_ms = started_at.elapsed().as_millis();
         match &response {
             Response::Ok(payload) => {
-                let response_data = postcard::to_allocvec(payload).unwrap_or_else(|e| {
+                let response_data = bmux_codec::to_vec(payload).unwrap_or_else(|e| {
                     tracing::warn!("failed to serialize response for recording: {e}");
                     vec![]
                 });

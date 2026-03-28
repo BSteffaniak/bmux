@@ -2,6 +2,7 @@
 members = [
     "examples/native-plugin",
     "packages/bmux",
+    "packages/codec",
     "packages/fonts",
     "packages/cli_output",
     "packages/cli",
@@ -72,6 +73,7 @@ bmux_cli               = { version = "0.0.1-alpha.0", default-features = false, 
 bmux_cli_output        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli_output" }
 bmux_client            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/client" }
 bmux_clipboard         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/clipboard" }
+bmux_codec             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/codec" }
 bmux_config            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/config" }
 bmux_event             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event" }
 bmux_event_models      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event/models" }
@@ -108,7 +110,6 @@ futures = { version = "0.3.31", default-features = false }
 gif = { version = "0.13.3" }
 libloading = { version = "0.8.9", default-features = false }
 portable-pty = { version = "0.9.0" }
-postcard = { version = "1.1.3", default-features = false }
 regex = { version = "1.12.2", default-features = false, features = ["std"] }
 resvg = { version = "0.45.1", default-features = true }
 semver = { version = "1.0.26", default-features = false, features = ["std"] }
