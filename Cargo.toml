@@ -21,6 +21,8 @@ members = [
     "packages/terminal/models",
     "packages/terminal_protocol",
     "packages/keyboard",
+    "packages/docs-site",
+    "packages/docs-site/ui",
     "plugins/clipboard-plugin",
     "plugins/plugin-cli-plugin",
     "plugins/permissions-plugin",
@@ -94,6 +96,18 @@ bmux_clipboard_plugin   = { version = "0.0.1-alpha.0", default-features = false,
 bmux_permissions_plugin = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/permissions-plugin" }
 bmux_plugin_cli_plugin  = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/plugin-cli-plugin" }
 bmux_windows_plugin     = { version = "0.0.1-alpha.0", default-features = false, path = "plugins/windows-plugin" }
+
+# Docs site crates
+bmux_docs_site_ui = { version = "0.0.1-alpha.0", default-features = false, path = "packages/docs-site/ui" }
+
+hyperchad                    = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "hyperchad", default-features = false }
+hyperchad_color              = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "hyperchad_color", default-features = false }
+hyperchad_renderer           = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "hyperchad_renderer", default-features = false }
+hyperchad_template           = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "hyperchad_template", default-features = false }
+hyperchad_transformer        = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "hyperchad_transformer", default-features = false }
+hyperchad_transformer_models = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "hyperchad_transformer_models", default-features = false }
+
+switchy = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "switchy", default-features = false }
 
 moosicbox_log_runtime = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "moosicbox_log_runtime", default-features = false }
 moosicbox_log_watch   = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "moosicbox_log_watch", default-features = false }

@@ -1,0 +1,32 @@
+[package]
+authors     = { workspace = true }
+description = "bmux documentation website UI components"
+edition     = { workspace = true }
+license     = { workspace = true }
+name        = "bmux_docs_site_ui"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+hyperchad = { workspace = true, features = [
+    "actions",
+    "actions-logic",
+    "actions-serde",
+    "color",
+    "markdown",
+    "markdown-syntax-highlighting",
+    "markdown-xss-protection",
+    "renderer",
+    "router",
+    "template",
+    "transformer",
+    "transformer-models",
+] }
+
+# These are needed as direct dependencies because the `container!` proc macro
+# generates code with absolute paths like `::hyperchad_template::Container`.
+hyperchad_color              = { workspace = true }
+hyperchad_renderer           = { workspace = true }
+hyperchad_template           = { workspace = true }
+hyperchad_transformer        = { workspace = true }
+hyperchad_transformer_models = { workspace = true }

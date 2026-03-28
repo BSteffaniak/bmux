@@ -8338,18 +8338,18 @@ fn init_logging(verbose: bool, cli_level: Option<LogLevel>) {
                 log_dir_env: "BMUX_LOG_DIR",
             });
         let runtime_level = match level {
-            LogLevel::Error => moosicbox_log_runtime::init::LogLevel::Error,
-            LogLevel::Warn => moosicbox_log_runtime::init::LogLevel::Warn,
-            LogLevel::Info => moosicbox_log_runtime::init::LogLevel::Info,
-            LogLevel::Debug => moosicbox_log_runtime::init::LogLevel::Debug,
-            LogLevel::Trace => moosicbox_log_runtime::init::LogLevel::Trace,
+            LogLevel::Error => "error",
+            LogLevel::Warn => "warn",
+            LogLevel::Info => "info",
+            LogLevel::Debug => "debug",
+            LogLevel::Trace => "trace",
         };
-        match moosicbox_log_runtime::init::init(moosicbox_log_runtime::init::InitConfig {
-            paths: &paths,
-            level: runtime_level,
-            with_target: false,
-            file_prefix: "bmux.log",
-        }) {
+        let mut log_config = moosicbox_log_runtime::init::InitConfig::new(&paths);
+        log_config.default_env_filter = Some(format!("bmux={runtime_level}"));
+        log_config.sinks.file = Some(moosicbox_log_runtime::init::FileSinkConfig {
+            mode: moosicbox_log_runtime::init::FileMode::Exact("bmux.log"),
+        });
+        match moosicbox_log_runtime::init::init(log_config) {
             Ok(handle) => {
                 let _ = LOG_WRITER_GUARD.set(handle);
             }

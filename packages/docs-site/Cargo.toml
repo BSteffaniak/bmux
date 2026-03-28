@@ -1,0 +1,47 @@
+[package]
+authors     = { workspace = true }
+build       = "build.rs"
+description = "bmux documentation website"
+edition     = { workspace = true }
+license     = { workspace = true }
+name        = "bmux-docs-site"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[[bin]]
+name = "bmux-docs-site"
+path = "src/main.rs"
+
+[dependencies]
+bmux_docs_site_ui = { workspace = true }
+hyperchad = { workspace = true, features = [
+    "actions",
+    "actions-logic",
+    "app",
+    "color",
+    "json",
+    "markdown",
+    "markdown-syntax-highlighting",
+    "markdown-xss-protection",
+    "renderer",
+    "router",
+] }
+
+env_logger = { version = "0.11" }
+log        = { version = "0.4" }
+serde_json = { workspace = true }
+switchy    = { workspace = true, features = ["async", "async-tokio"] }
+
+[features]
+default = ["actix", "html", "vanilla-js", "assets", "static-routes"]
+
+actix = ["hyperchad/renderer-html-actix"]
+assets = ["hyperchad/renderer-assets"]
+html = ["hyperchad/renderer-html"]
+static-routes = ["hyperchad/router-static-routes"]
+vanilla-js = [
+    "html",
+    "hyperchad/renderer-vanilla-js",
+    "hyperchad/renderer-vanilla-js-plugin-nav",
+    "hyperchad/renderer-vanilla-js-plugin-routing",
+]
