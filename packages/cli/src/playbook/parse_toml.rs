@@ -64,6 +64,12 @@ fn parse_config(raw: Option<RawPlaybookConfig>) -> Result<PlaybookConfig> {
         None => PluginConfig::default(),
     };
 
+    let env_mode = match raw.env_mode.as_deref() {
+        Some("clean") => super::types::SandboxEnvMode::Clean,
+        Some("inherit") | None => super::types::SandboxEnvMode::Inherit,
+        Some(other) => bail!("env_mode must be 'inherit' or 'clean', got '{other}'"),
+    };
+
     Ok(PlaybookConfig {
         name: raw.name,
         description: raw.description,
@@ -74,6 +80,7 @@ fn parse_config(raw: Option<RawPlaybookConfig>) -> Result<PlaybookConfig> {
         plugins,
         vars: raw.vars.unwrap_or_default(),
         env: raw.env.unwrap_or_default(),
+        env_mode,
     })
 }
 
@@ -243,6 +250,7 @@ struct RawPlaybookConfig {
     plugins: Option<RawPluginConfig>,
     vars: Option<BTreeMap<String, String>>,
     env: Option<BTreeMap<String, String>>,
+    env_mode: Option<String>,
     include: Option<Vec<String>>,
 }
 

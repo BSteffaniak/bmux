@@ -23,9 +23,26 @@ pub struct PlaybookConfig {
     /// User-defined variables for substitution.
     pub vars: BTreeMap<String, String>,
     /// Environment variables to set in the sandbox server process.
-    /// If non-empty, the sandbox uses a clean environment with only these vars
-    /// plus the `BMUX_*` path overrides.
+    /// In `Inherit` mode these are overlaid on the parent environment.
+    /// In `Clean` mode the sandbox starts empty and only has these plus
+    /// deterministic defaults.
     pub env: BTreeMap<String, String>,
+    /// Controls how the sandbox inherits the parent process environment.
+    pub env_mode: SandboxEnvMode,
+}
+
+/// Controls how the sandbox server inherits environment variables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SandboxEnvMode {
+    /// Inherit the full parent environment, then overlay deterministic defaults
+    /// (`TERM`, `LANG`, `LC_ALL`, `HOME`) and any explicit `@env` overrides.
+    /// This is backward-compatible and the default.
+    #[default]
+    Inherit,
+    /// Start from an empty environment. Only `PATH`, `USER`, and `SHELL` are
+    /// inherited from the parent; everything else uses deterministic defaults
+    /// or explicit `@env` overrides. Maximally deterministic.
+    Clean,
 }
 
 impl Default for PlaybookConfig {
@@ -40,6 +57,7 @@ impl Default for PlaybookConfig {
             plugins: PluginConfig::default(),
             vars: BTreeMap::new(),
             env: BTreeMap::new(),
+            env_mode: SandboxEnvMode::default(),
         }
     }
 }

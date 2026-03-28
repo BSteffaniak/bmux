@@ -141,6 +141,7 @@ pub async fn run_interactive(
         &plugins,
         SERVER_STARTUP_TIMEOUT,
         &std::collections::BTreeMap::new(),
+        super::types::SandboxEnvMode::Inherit,
     )
     .await
     .context("failed starting sandbox server")?;

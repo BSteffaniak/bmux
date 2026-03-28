@@ -51,6 +51,7 @@ impl SandboxServer {
         plugin_config: &PluginConfig,
         startup_timeout: Duration,
         env: &std::collections::BTreeMap<String, String>,
+        env_mode: super::types::SandboxEnvMode,
     ) -> Result<Self> {
         let (paths, root_dir) = create_temp_paths();
         write_sandbox_config(&paths, shell, plugin_config)
@@ -58,9 +59,16 @@ impl SandboxServer {
 
         let bmux_binary = std::env::current_exe().context("failed resolving bmux binary path")?;
 
-        let handle = start_sandbox_server(&bmux_binary, &paths, &root_dir, startup_timeout, env)
-            .await
-            .context("failed starting sandbox server")?;
+        let handle = start_sandbox_server(
+            &bmux_binary,
+            &paths,
+            &root_dir,
+            startup_timeout,
+            env,
+            env_mode,
+        )
+        .await
+        .context("failed starting sandbox server")?;
 
         Ok(Self {
             handle,
@@ -170,65 +178,71 @@ fn create_temp_paths() -> (ConfigPaths, PathBuf) {
 
 // ── Sandbox environment ─────────────────────────────────────────────────────
 
-/// Apply a deterministic environment to a sandbox server command.
+/// Apply the sandbox environment to a server command.
 ///
-/// Starts from an empty env (caller must call `env_clear()` first), then sets:
-/// 1. BMUX path overrides (required for sandbox isolation)
-/// 2. Deterministic defaults for TERM, LANG, HOME, PATH, USER
-/// 3. User-specified overrides from the `env` map
+/// - **Inherit mode** (default): keeps the parent environment, then overlays
+///   the `BMUX_*` path overrides and deterministic defaults for `TERM`, `LANG`,
+///   `LC_ALL`, and `HOME`. Any explicit `@env` entries are applied last.
+///
+/// - **Clean mode**: calls `env_clear()` first, then sets only `BMUX_*` paths,
+///   deterministic defaults, `PATH`/`USER`/`SHELL` from the parent, and
+///   explicit `@env` entries. Maximally deterministic.
 fn apply_sandbox_env(
     cmd: &mut ProcessCommand,
     paths: &ConfigPaths,
     root_dir: &Path,
     env: &std::collections::BTreeMap<String, String>,
+    env_mode: super::types::SandboxEnvMode,
 ) {
+    if env_mode == super::types::SandboxEnvMode::Clean {
+        cmd.env_clear();
+    }
+
     // BMUX isolation paths (always set).
     cmd.env("BMUX_CONFIG_DIR", &paths.config_dir);
     cmd.env("BMUX_RUNTIME_DIR", &paths.runtime_dir);
     cmd.env("BMUX_DATA_DIR", &paths.data_dir);
     cmd.env("BMUX_STATE_DIR", &paths.state_dir);
 
-    // Deterministic defaults — these provide a sane baseline that can be
-    // overridden by the user's `env` map.
-    let defaults: &[(&str, fn(&Path) -> String)] = &[];
-    let _ = defaults; // avoid warning
-
-    // HOME defaults to the sandbox temp dir.
+    // Deterministic defaults — override the parent value (Inherit) or provide
+    // the only value (Clean) for variables that affect terminal/locale behavior.
+    //
+    // HOME defaults to the sandbox temp dir so shells don't read the user's
+    // dotfiles (which could produce non-deterministic prompts/output).
     if !env.contains_key("HOME") {
         cmd.env("HOME", root_dir);
     }
-    // TERM defaults to xterm-256color (widely compatible).
     if !env.contains_key("TERM") {
         cmd.env("TERM", "xterm-256color");
     }
-    // LANG defaults to C.UTF-8 for deterministic locale behavior.
     if !env.contains_key("LANG") {
         cmd.env("LANG", "C.UTF-8");
     }
-    // LC_ALL to C.UTF-8 to override any locale subcategories.
     if !env.contains_key("LC_ALL") {
         cmd.env("LC_ALL", "C.UTF-8");
     }
-    // PATH — inherit from parent if not overridden (programs must be findable).
-    if !env.contains_key("PATH") {
-        if let Ok(path) = std::env::var("PATH") {
-            cmd.env("PATH", path);
+
+    // In Clean mode, PATH/USER/SHELL must be explicitly inherited because
+    // env_clear() removed them. In Inherit mode they're already present.
+    if env_mode == super::types::SandboxEnvMode::Clean {
+        if !env.contains_key("PATH") {
+            if let Ok(path) = std::env::var("PATH") {
+                cmd.env("PATH", path);
+            }
         }
-    }
-    // USER — inherit from parent if not overridden.
-    if !env.contains_key("USER") {
-        if let Ok(user) = std::env::var("USER") {
-            cmd.env("USER", user);
+        if !env.contains_key("USER") {
+            if let Ok(user) = std::env::var("USER") {
+                cmd.env("USER", user);
+            }
         }
-    }
-    // SHELL — inherit from parent if not overridden (shells may read this).
-    if !env.contains_key("SHELL") {
-        if let Ok(shell) = std::env::var("SHELL") {
-            cmd.env("SHELL", shell);
+        if !env.contains_key("SHELL") {
+            if let Ok(shell) = std::env::var("SHELL") {
+                cmd.env("SHELL", shell);
+            }
         }
     }
 
-    // User-specified overrides.
+    // User-specified overrides (from @env directives or [playbook.env]).
     for (key, value) in env {
         cmd.env(key, value);
     }
@@ -345,12 +359,13 @@ async fn start_sandbox_server(
     root_dir: &Path,
     timeout: Duration,
     env: &std::collections::BTreeMap<String, String>,
+    env_mode: super::types::SandboxEnvMode,
 ) -> Result<ServerHandle> {
-    match start_foreground(binary, paths, root_dir, timeout, env).await {
+    match start_foreground(binary, paths, root_dir, timeout, env, env_mode).await {
         Ok(handle) => Ok(handle),
         Err(fg_error) => {
             warn!("playbook sandbox foreground startup failed, falling back to daemon: {fg_error}");
-            start_daemon(binary, paths, root_dir, timeout, env)
+            start_daemon(binary, paths, root_dir, timeout, env, env_mode)
                 .await
                 .with_context(|| {
                     format!(
@@ -367,6 +382,7 @@ async fn start_foreground(
     root_dir: &Path,
     timeout: Duration,
     env: &std::collections::BTreeMap<String, String>,
+    env_mode: super::types::SandboxEnvMode,
 ) -> Result<ServerHandle> {
     let logs_dir = root_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
@@ -385,10 +401,7 @@ async fn start_foreground(
     let mut cmd = ProcessCommand::new(binary);
     cmd.arg("server").arg("start");
 
-    // Apply clean environment: start from an empty env and set deterministic
-    // defaults, then layer any user-specified overrides.
-    cmd.env_clear();
-    apply_sandbox_env(&mut cmd, paths, root_dir, env);
+    apply_sandbox_env(&mut cmd, paths, root_dir, env, env_mode);
 
     let child = cmd
         .stdin(Stdio::null())
@@ -422,6 +435,7 @@ async fn start_daemon(
     root_dir: &Path,
     timeout: Duration,
     env: &std::collections::BTreeMap<String, String>,
+    env_mode: super::types::SandboxEnvMode,
 ) -> Result<ServerHandle> {
     let logs_dir = root_dir.join("logs");
     std::fs::create_dir_all(&logs_dir)?;
@@ -430,8 +444,7 @@ async fn start_daemon(
 
     let mut cmd = ProcessCommand::new(binary);
     cmd.arg("server").arg("start").arg("--daemon");
-    cmd.env_clear();
-    apply_sandbox_env(&mut cmd, paths, root_dir, env);
+    apply_sandbox_env(&mut cmd, paths, root_dir, env, env_mode);
 
     let output = cmd.output().context("failed starting sandbox daemon")?;
 
