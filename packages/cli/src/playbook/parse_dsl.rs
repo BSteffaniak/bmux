@@ -84,7 +84,7 @@ fn parse_config_directive(directive: &str, config: &mut PlaybookConfig) -> Resul
     Ok(())
 }
 
-fn parse_action_line(line: &str) -> Result<Action> {
+pub(crate) fn parse_action_line(line: &str) -> Result<Action> {
     let (action_name, rest) = split_first_token(line);
     let args = parse_kv_args(rest)?;
 

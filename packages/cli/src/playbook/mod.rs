@@ -8,6 +8,7 @@
 //! by the same engine against an ephemeral sandbox server (or a live server).
 
 pub mod engine;
+pub mod interactive;
 pub mod parse_dsl;
 pub mod parse_toml;
 pub mod sandbox;

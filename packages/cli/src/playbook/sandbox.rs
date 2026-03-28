@@ -19,7 +19,6 @@ use super::types::PluginConfig;
 #[derive(Debug)]
 pub struct SandboxServer {
     handle: ServerHandle,
-    #[allow(dead_code)]
     root_dir: PathBuf,
 }
 
@@ -76,7 +75,6 @@ impl SandboxServer {
     }
 
     /// Return the root temp directory for this sandbox.
-    #[allow(dead_code)]
     pub fn root_dir(&self) -> &Path {
         &self.root_dir
     }

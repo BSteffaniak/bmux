@@ -62,7 +62,13 @@ resvg = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 time = { workspace = true, features = ["formatting", "parsing", "std"] }
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "io-util",
+    "time",
+] }
 toml = { workspace = true }
 tracing = { workspace = true, features = ["std"] }
 tracing-appender = { workspace = true, optional = true }

@@ -401,6 +401,24 @@ pub enum PlaybookCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Start an interactive playbook session with a socket for agent control
+    Interactive {
+        /// Socket path override (default: auto-generated in sandbox temp dir)
+        #[arg(long)]
+        socket: Option<String>,
+        /// Record the session
+        #[arg(long)]
+        record: bool,
+        /// Viewport dimensions as COLSxROWS (default: 80x24)
+        #[arg(long, default_value = "80x24")]
+        viewport: String,
+        /// Shell override
+        #[arg(long)]
+        shell: Option<String>,
+        /// Max session lifetime in seconds (default: no limit)
+        #[arg(long)]
+        timeout: Option<u64>,
+    },
 }
 
 #[derive(Debug, Subcommand)]

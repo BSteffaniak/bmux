@@ -1071,6 +1071,7 @@ fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
         Command::Playbook { command } => match command {
             PlaybookCommand::Run { .. } => BuiltInHandlerId::PlaybookRun,
             PlaybookCommand::Validate { .. } => BuiltInHandlerId::PlaybookValidate,
+            PlaybookCommand::Interactive { .. } => BuiltInHandlerId::PlaybookInteractive,
         },
         Command::External(_) => unreachable!("external commands are dispatched separately"),
     }
@@ -1510,6 +1511,28 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 command: PlaybookCommand::Validate { source, json },
             },
         ) => run_playbook_validate(source, *json),
+        (
+            BuiltInHandlerId::PlaybookInteractive,
+            Command::Playbook {
+                command:
+                    PlaybookCommand::Interactive {
+                        socket,
+                        record,
+                        viewport,
+                        shell,
+                        timeout,
+                    },
+            },
+        ) => {
+            run_playbook_interactive(
+                socket.as_deref(),
+                *record,
+                viewport,
+                shell.as_deref(),
+                *timeout,
+            )
+            .await
+        }
         _ => unreachable!("built-in command handler and command variant should stay in sync"),
     }
 }
@@ -8244,6 +8267,46 @@ fn run_playbook_validate(source: &str, json: bool) -> Result<u8> {
     }
 
     Ok(if errors.is_empty() { 0 } else { 1 })
+}
+
+async fn run_playbook_interactive(
+    socket: Option<&str>,
+    record: bool,
+    viewport: &str,
+    shell: Option<&str>,
+    timeout: Option<u64>,
+) -> Result<u8> {
+    // Parse viewport string "COLSxROWS"
+    let (cols, rows) = parse_viewport_string(viewport)?;
+
+    let timeout_duration = timeout.map(Duration::from_secs);
+
+    crate::playbook::interactive::run_interactive(
+        socket,
+        record,
+        cols,
+        rows,
+        shell,
+        timeout_duration,
+    )
+    .await
+}
+
+fn parse_viewport_string(viewport: &str) -> Result<(u16, u16)> {
+    let parts: Vec<&str> = viewport.split('x').collect();
+    if parts.len() != 2 {
+        anyhow::bail!("invalid viewport format: expected COLSxROWS (e.g. 80x24), got '{viewport}'");
+    }
+    let cols: u16 = parts[0]
+        .parse()
+        .with_context(|| format!("invalid viewport cols: '{}'", parts[0]))?;
+    let rows: u16 = parts[1]
+        .parse()
+        .with_context(|| format!("invalid viewport rows: '{}'", parts[1]))?;
+    if cols < 10 || rows < 5 {
+        anyhow::bail!("viewport too small (minimum 10x5): {cols}x{rows}");
+    }
+    Ok((cols, rows))
 }
 
 #[cfg(test)]

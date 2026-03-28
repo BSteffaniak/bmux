@@ -186,7 +186,10 @@ pub async fn run_playbook(playbook: Playbook, target_server: bool) -> Result<Pla
 }
 
 /// Start a recording on the server, optionally filtered to a specific session.
-async fn start_recording(client: &mut BmuxClient, session_id: Option<Uuid>) -> Result<Uuid> {
+pub(super) async fn start_recording(
+    client: &mut BmuxClient,
+    session_id: Option<Uuid>,
+) -> Result<Uuid> {
     let summary = client
         .recording_start(
             session_id, true, // capture_input
@@ -200,7 +203,7 @@ async fn start_recording(client: &mut BmuxClient, session_id: Option<Uuid>) -> R
 
 /// Execute a single step.
 #[allow(clippy::too_many_arguments)]
-async fn execute_step(
+pub(super) async fn execute_step(
     step: &Step,
     client: &mut BmuxClient,
     inspector: &mut ScreenInspector,
@@ -537,11 +540,11 @@ async fn execute_step(
     }
 }
 
-fn require_session(session_id: Option<Uuid>) -> Result<Uuid> {
+pub(super) fn require_session(session_id: Option<Uuid>) -> Result<Uuid> {
     session_id.context("no session — use new-session first")
 }
 
-fn require_attached(attached: bool) -> Result<()> {
+pub(super) fn require_attached(attached: bool) -> Result<()> {
     if !attached {
         bail!("not attached to a session");
     }
@@ -549,7 +552,7 @@ fn require_attached(attached: bool) -> Result<()> {
 }
 
 /// Drain output from the attached session until idle (3 consecutive empty reads).
-async fn drain_output_until_idle(
+pub(super) async fn drain_output_until_idle(
     client: &mut BmuxClient,
     session_id: Uuid,
     max_wait: Duration,
