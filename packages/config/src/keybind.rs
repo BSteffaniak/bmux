@@ -16,32 +16,48 @@ const PROFILE_FAST: &str = "fast";
 const PROFILE_TRADITIONAL: &str = "traditional";
 const PROFILE_SLOW: &str = "slow";
 
-/// Key binding configuration for all modes
+/// Keyboard shortcuts organized by scope. Prefix-chord bindings (runtime)
+/// require pressing the prefix key first. Modal bindings (normal, insert,
+/// visual, command) are active only in their respective interaction modes.
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "keybindings")]
 #[serde(default)]
 pub struct KeyBindingConfig {
-    /// Prefix key used for runtime key chords (e.g. "ctrl+a")
+    /// Prefix key for runtime key chords (e.g. "ctrl+a"). All runtime
+    /// bindings require pressing this key first.
     pub prefix: String,
-    /// Exact timeout override for multi-stroke chord resolution
+    /// Exact timeout in milliseconds for multi-stroke chord resolution.
+    /// Takes precedence over timeout_profile. Valid range: 50-5000.
     pub timeout_ms: Option<u64>,
-    /// Named timeout profile for multi-stroke chord resolution
+    /// Named timeout profile for multi-stroke chord resolution. Built-in
+    /// profiles: fast (200ms), traditional (400ms), slow (800ms). Ignored
+    /// when timeout_ms is set.
     pub timeout_profile: Option<String>,
-    /// User overrides for built-in timeout profiles
+    /// Override values for built-in timeout profiles or define custom ones.
+    /// Keys are profile names, values are timeout in milliseconds.
     pub timeout_profiles: BTreeMap<String, u64>,
-    /// Runtime action bindings after prefix
+    /// Key bindings triggered after pressing the prefix key. Maps key
+    /// chords to runtime action names.
     pub runtime: BTreeMap<String, String>,
-    /// Global runtime action bindings (no prefix required)
+    /// Key bindings that trigger without the prefix key. Use sparingly to
+    /// avoid conflicts with pane input.
     pub global: BTreeMap<String, String>,
-    /// Scrollback mode bindings (no prefix required unless chord includes it)
+    /// Key bindings active in scrollback/copy mode. No prefix required
+    /// unless the chord explicitly includes it.
     pub scroll: BTreeMap<String, String>,
-    /// Normal mode key bindings
+    /// Key bindings for Normal mode, the default mode for navigation and
+    /// pane management. Keystrokes are intercepted by bmux, not forwarded
+    /// to the pane.
     pub normal: BTreeMap<String, String>,
-    /// Insert mode key bindings (usually just Escape)
+    /// Key bindings for Insert mode, where keystrokes are forwarded directly
+    /// to the focused pane process. Typically only Escape is bound to return
+    /// to Normal mode.
     pub insert: BTreeMap<String, String>,
-    /// Visual mode key bindings
+    /// Key bindings for Visual mode, used for text selection and copy
+    /// operations in scrollback
     pub visual: BTreeMap<String, String>,
-    /// Command mode key bindings
+    /// Key bindings for Command mode, the : command-line for executing
+    /// runtime commands by name
     pub command: BTreeMap<String, String>,
 }
 

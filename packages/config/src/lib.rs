@@ -44,48 +44,50 @@ pub enum ConfigError {
 
 pub type Result<T> = std::result::Result<T, ConfigError>;
 
-/// Main configuration structure for bmux
+/// Root configuration structure for bmux, deserialized from `bmux.toml`
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct BmuxConfig {
-    /// General settings
+    /// Core session defaults: shell, scrollback depth, and server connection settings
     pub general: GeneralConfig,
-    /// Appearance settings
+    /// Visual styling: color theme, pane borders, status bar placement, and window titles
     pub appearance: AppearanceConfig,
-    /// Behavior settings
+    /// Runtime behavior toggles for terminal protocol handling, layout persistence, and build compatibility
     pub behavior: BehaviorConfig,
-    /// Multi-client settings
+    /// Settings for multiple clients attached to the same session
     pub multi_client: MultiClientConfig,
-    /// Key bindings
+    /// Keyboard shortcuts organized by scope and interaction mode
     pub keybindings: KeyBindingConfig,
-    /// Plugin settings
+    /// Plugin discovery, enablement, and per-plugin settings
     pub plugins: PluginConfig,
-    /// Status bar settings
+    /// Content and layout of the status bar displayed at the top or bottom of the terminal
     pub status_bar: StatusBarConfig,
-    /// Recording settings
+    /// Session recording for terminal replay, debugging, and playbook generation
     pub recording: RecordingConfig,
 }
 
-/// Recording configuration options
+/// Session recording for terminal replay, debugging, and playbook generation.
+/// Records pane I/O and lifecycle events to disk.
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "recording")]
 #[serde(default)]
 pub struct RecordingConfig {
     /// Root directory for recording data.
-    ///
     /// Relative paths are resolved against the directory containing `bmux.toml`.
     pub dir: Option<PathBuf>,
-    /// Enable recording subsystem availability
+    /// Enable the recording subsystem. When false, no recording data is captured
+    /// or written to disk regardless of other recording settings.
     pub enabled: bool,
-    /// Capture pane input bytes by default
+    /// Capture pane input bytes (keystrokes sent to pane processes)
     pub capture_input: bool,
-    /// Capture pane output bytes
+    /// Capture pane output bytes (terminal output from pane processes)
     pub capture_output: bool,
-    /// Capture lifecycle and server events
+    /// Capture lifecycle and server events (pane creation, resize, close, etc.)
     pub capture_events: bool,
     /// Rotate recording segments at approximately this size in MB
     pub segment_mb: usize,
-    /// Retention period for completed recordings in days (0 disables pruning)
+    /// Retention period for completed recordings in days. Set to 0 to disable
+    /// automatic pruning and keep recordings indefinitely.
     pub retention_days: u64,
 }
 
@@ -103,21 +105,23 @@ impl Default for RecordingConfig {
     }
 }
 
-/// General configuration options
+/// Core session defaults: shell, scrollback depth, and server connection settings
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "general")]
 #[serde(default)]
 pub struct GeneralConfig {
-    /// Default mode when starting bmux
+    /// Default interaction mode when starting bmux
     #[config_doc(values("normal", "insert", "visual", "command"))]
     pub default_mode: Mode,
-    /// Enable mouse support
+    /// Enable mouse support for clicking to focus panes, scrolling through
+    /// output, and dragging to resize pane borders
     pub mouse_support: bool,
-    /// Default shell to use in new panes
+    /// Default shell to launch in new panes. When unset, uses the SHELL
+    /// environment variable or falls back to /bin/sh.
     pub default_shell: Option<String>,
-    /// Maximum number of scrollback lines
+    /// Maximum number of scrollback lines retained per pane. Must be at least 1.
     pub scrollback_limit: usize,
-    /// Server socket timeout in milliseconds
+    /// Server socket timeout in milliseconds. Must be at least 1.
     pub server_timeout: u64,
 }
 
@@ -133,54 +137,74 @@ impl Default for GeneralConfig {
     }
 }
 
-/// Appearance configuration options
+/// Visual styling: color theme, pane borders, status bar placement, and window titles
 #[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
 #[config_doc(section = "appearance")]
 #[serde(default)]
 pub struct AppearanceConfig {
-    /// Theme name
+    /// Name of the color theme to apply. Empty string uses the default theme.
     pub theme: String,
-    /// Status bar position
+    /// Where to render the status bar. TOP places it above panes, BOTTOM below
+    /// panes, and OFF hides it entirely.
     pub status_position: StatusPosition,
-    /// Pane border style
+    /// Drawing style for pane borders. NONE hides borders entirely, giving
+    /// panes the full terminal width.
     pub pane_border_style: BorderStyle,
-    /// Show pane titles
+    /// Display a title label in each pane's border showing the running
+    /// process name
     pub show_pane_titles: bool,
-    /// Window title format
+    /// Format string for the outer terminal's title bar. Empty string leaves
+    /// the title unset.
     pub window_title_format: String,
 }
 
-/// Behavior configuration options
+/// Runtime behavior toggles for terminal protocol handling, layout persistence,
+/// and build compatibility
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "behavior")]
 #[serde(default)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct BehaviorConfig {
-    /// Aggressively resize windows when clients disconnect
+    /// Immediately resize panes to the largest remaining client when a client
+    /// disconnects, rather than keeping the previous dimensions
     pub aggressive_resize: bool,
-    /// Show visual activity indicators
+    /// Highlight panes in the status bar when they produce output while
+    /// unfocused, so you can tell which panes have new activity
     pub visual_activity: bool,
-    /// Bell action behavior
+    /// How to handle terminal bell signals from panes. NONE ignores bells
+    /// entirely. ANY notifies on bells from any pane. CURRENT only notifies
+    /// from the focused pane. OTHER only notifies from unfocused panes.
     pub bell_action: BellAction,
-    /// Automatically rename windows based on running command
+    /// Automatically rename windows based on the currently running command
+    /// in the focused pane
     pub automatic_rename: bool,
     /// Exit bmux when no sessions remain
     pub exit_empty: bool,
-    /// Restore and persist last local CLI runtime layout
+    /// Restore and persist the last local CLI runtime layout across sessions,
+    /// so reattaching resumes where you left off
     pub restore_last_layout: bool,
-    /// Confirm before destructive quit that clears persisted local runtime state
+    /// Prompt for confirmation before a destructive quit that clears
+    /// persisted local runtime state
     pub confirm_quit_destroy: bool,
-    /// Terminal type to expose to pane processes as TERM
+    /// Terminal type exposed to pane processes via the TERM environment
+    /// variable. Common values: bmux-256color, xterm-256color, screen-256color.
     pub pane_term: String,
-    /// Enable protocol query/reply tracing in runtime
+    /// Enable protocol query/reply tracing in the runtime. Useful for
+    /// debugging terminal protocol behavior with CSI/OSC/DCS sequences.
     pub protocol_trace_enabled: bool,
-    /// Maximum in-memory protocol trace events to retain
+    /// Maximum number of in-memory protocol trace events to retain.
+    /// Must be at least 1.
     pub protocol_trace_capacity: usize,
-    /// Auto-install policy for bmux terminfo when missing
+    /// What to do when the bmux terminfo entry is missing from the system.
+    /// ask prompts before installing. always installs silently. never skips
+    /// installation, which may degrade terminal rendering.
     pub terminfo_auto_install: TerminfoAutoInstall,
-    /// Cooldown before prompting again after declining install
+    /// Number of days to wait before prompting again after the user declines
+    /// terminfo installation
     pub terminfo_prompt_cooldown_days: u64,
-    /// Behavior when the running server build differs from the current CLI build
+    /// What to do when the running server was built from a different version
+    /// than the current CLI binary. error refuses to connect until the server
+    /// is restarted. warn connects with a warning message.
     pub stale_build_action: StaleBuildAction,
     /// Enable the Kitty keyboard protocol for enhanced key reporting.
     /// When true, bmux negotiates enhanced keyboard mode with the outer
@@ -227,52 +251,67 @@ pub enum TerminfoAutoInstall {
     Never,
 }
 
-/// Multi-client specific configuration
+/// Settings for multiple clients attached to the same session, controlling
+/// independent views and mode synchronization
 #[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
 #[config_doc(section = "multi_client")]
 #[serde(default)]
 pub struct MultiClientConfig {
-    /// Allow clients to have independent views of the same session
+    /// Allow clients to have independent views of the same session, with
+    /// separate focused panes and scroll positions
     pub allow_independent_views: bool,
-    /// Default follow mode for new clients
+    /// When true, new clients automatically track the leader client's focused
+    /// pane and scroll position. When false, clients start with an independent view.
     pub default_follow_mode: bool,
-    /// Maximum clients per session (0 = unlimited)
+    /// Maximum number of clients that can attach to a single session.
+    /// Set to 0 for unlimited.
     pub max_clients_per_session: usize,
-    /// Sync client modes by default
+    /// When true, switching interaction modes (e.g. Normal to Insert) on one
+    /// client applies to all attached clients in the same session
     pub sync_client_modes: bool,
 }
 
-/// Plugin configuration
+/// Plugin discovery, enablement, and per-plugin settings. Bundled plugins
+/// (like bmux.windows and bmux.permissions) are enabled by default.
 #[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
 #[config_doc(section = "plugins")]
 #[serde(default)]
 pub struct PluginConfig {
-    /// Enabled plugins
+    /// Plugin IDs to enable in addition to the bundled defaults. Bundled
+    /// plugins like bmux.windows and bmux.permissions are enabled automatically
+    /// without being listed here.
     pub enabled: Vec<String>,
-    /// Bundled or explicitly enabled plugins to disable
+    /// Plugin IDs to explicitly disable, including bundled ones. Overrides
+    /// both bundled defaults and the enabled list.
     pub disabled: Vec<String>,
-    /// Additional plugin search roots
+    /// Additional directories to scan for plugin binaries beyond the default
+    /// plugin search path
     pub search_paths: Vec<PathBuf>,
-    /// Plugin-specific settings
+    /// Per-plugin settings keyed by plugin ID. Each plugin defines its own
+    /// accepted keys and values.
     pub settings: BTreeMap<String, toml::Value>,
 }
 
-/// Status bar configuration
+/// Content and layout of the status bar displayed at the top or bottom
+/// of the terminal
 #[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
 #[config_doc(section = "status_bar")]
 #[serde(default)]
 pub struct StatusBarConfig {
-    /// Left side format
+    /// Format string for the left side of the status bar. Empty string
+    /// disables the left section.
     pub left: String,
-    /// Right side format
+    /// Format string for the right side of the status bar. Empty string
+    /// disables the right section.
     pub right: String,
-    /// Update interval in seconds
+    /// How often to refresh the status bar content, in seconds
     pub update_interval: u64,
-    /// Show session name
+    /// Display the active session name in the status bar
     pub show_session_name: bool,
-    /// Show window list
+    /// Display the list of open panes in the status bar
     pub show_window_list: bool,
-    /// Show current mode
+    /// Display the current interaction mode (Normal, Insert, etc.) in
+    /// the status bar
     pub show_mode: bool,
 }
 
