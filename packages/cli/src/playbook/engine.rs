@@ -6,14 +6,16 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bmux_client::BmuxClient;
-use bmux_ipc::{PaneSplitDirection, SessionSelector};
+use bmux_ipc::{InvokeServiceKind, PaneSplitDirection, SessionSelector};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
 use super::sandbox::SandboxServer;
 use super::screen::ScreenInspector;
+use super::subst::RuntimeVars;
 use super::types::{
-    Action, Playbook, PlaybookResult, SnapshotCapture, SplitDirection, Step, StepResult, StepStatus,
+    Action, Playbook, PlaybookResult, ServiceKind, SnapshotCapture, SplitDirection, Step,
+    StepResult, StepStatus,
 };
 
 /// Default timeout for waiting for the sandbox server to start.
@@ -73,9 +75,13 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
     let mut inspector =
         ScreenInspector::new(playbook.config.viewport.cols, playbook.config.viewport.rows);
 
+    // Runtime variable context for substitution
+    let mut runtime_vars = RuntimeVars::new(playbook.config.vars.clone());
+
     // Session tracking
     let mut session_id: Option<Uuid> = None;
     let mut attached = false;
+    let mut events_subscribed = false;
     let mut recording_started = false;
     let mut display_track: Option<super::display_track::PlaybookDisplayTrackWriter> = None;
 
@@ -102,11 +108,13 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
             &mut inspector,
             &mut session_id,
             &mut attached,
+            &mut events_subscribed,
             &playbook.config.viewport.cols,
             &playbook.config.viewport.rows,
             &mut snapshots,
             deadline,
             &mut display_track,
+            &mut runtime_vars,
         )
         .await;
 
@@ -273,19 +281,28 @@ pub(super) async fn execute_step(
     inspector: &mut ScreenInspector,
     session_id: &mut Option<Uuid>,
     attached: &mut bool,
+    events_subscribed: &mut bool,
     viewport_cols: &u16,
     viewport_rows: &u16,
     snapshots: &mut Vec<SnapshotCapture>,
     deadline: Instant,
     display_track: &mut Option<super::display_track::PlaybookDisplayTrackWriter>,
+    runtime_vars: &mut RuntimeVars,
 ) -> Result<Option<String>> {
     match &step.action {
         Action::NewSession { name } => {
+            let resolved_name = name.as_ref().map(|n| runtime_vars.resolve_opt(n));
             let sid = client
-                .new_session(name.clone())
+                .new_session(resolved_name.clone())
                 .await
                 .map_err(|e| anyhow::anyhow!("new-session failed: {e}"))?;
             debug!("created session {sid}");
+
+            // Update runtime vars
+            runtime_vars.session_id = Some(sid);
+            runtime_vars.session_name = resolved_name;
+            runtime_vars.pane_count = 1;
+            runtime_vars.focused_pane = 1;
 
             // Attach to the session
             let grant = client
@@ -342,6 +359,8 @@ pub(super) async fn execute_step(
             // Let the new pane shell start
             drain_output_until_idle(client, sid, Duration::from_millis(300), display_track).await?;
 
+            runtime_vars.pane_count += 1;
+
             Ok(Some(format!("pane_id={pane_id}")))
         }
 
@@ -353,6 +372,7 @@ pub(super) async fn execute_step(
                 .focus_pane_target(Some(SessionSelector::ById(sid)), selector)
                 .await
                 .map_err(|e| anyhow::anyhow!("focus-pane failed: {e}"))?;
+            runtime_vars.focused_pane = *target;
             Ok(None)
         }
 
@@ -374,12 +394,14 @@ pub(super) async fn execute_step(
                         .map_err(|e| anyhow::anyhow!("close-pane failed: {e}"))?;
                 }
             }
+            runtime_vars.pane_count = runtime_vars.pane_count.saturating_sub(1);
             Ok(None)
         }
 
         Action::SendKeys { keys, pane } => {
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
+            let resolved_keys = runtime_vars.resolve_bytes(keys);
 
             if let Some(target_index) = pane {
                 // Pane-targeted send: focus the target pane, send input, then
@@ -397,7 +419,7 @@ pub(super) async fn execute_step(
                     .map_err(|e| anyhow::anyhow!("send-keys focus target pane failed: {e}"))?;
 
                 client
-                    .attach_input(sid, keys.clone())
+                    .attach_input(sid, resolved_keys.clone())
                     .await
                     .map_err(|e| anyhow::anyhow!("send-keys failed: {e}"))?;
 
@@ -413,7 +435,7 @@ pub(super) async fn execute_step(
                 }
             } else {
                 client
-                    .attach_input(sid, keys.clone())
+                    .attach_input(sid, resolved_keys)
                     .await
                     .map_err(|e| anyhow::anyhow!("send-keys failed: {e}"))?;
             }
@@ -445,9 +467,12 @@ pub(super) async fn execute_step(
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
 
+            // Resolve variables in the pattern before compiling the regex.
+            let resolved_pattern = runtime_vars.resolve_opt(pattern);
+
             // Compile regex once, not on every poll iteration.
-            let re =
-                regex::Regex::new(pattern).with_context(|| format!("invalid regex: {pattern}"))?;
+            let re = regex::Regex::new(&resolved_pattern)
+                .with_context(|| format!("invalid regex: {resolved_pattern}"))?;
 
             let wait_deadline = Instant::now() + (*timeout).min(deadline - Instant::now());
             let mut poll_delay = Duration::from_millis(10);
@@ -462,7 +487,7 @@ pub(super) async fn execute_step(
                 let pane_idx = inspector.resolve_pane_index(*pane, &snapshot)?;
 
                 if inspector.pane_matches_compiled(pane_idx, &re) {
-                    return Ok(Some(format!("matched pattern '{pattern}'")));
+                    return Ok(Some(format!("matched pattern '{resolved_pattern}'")));
                 }
 
                 if Instant::now() >= wait_deadline {
@@ -518,29 +543,32 @@ pub(super) async fn execute_step(
             let pane_idx = inspector.resolve_pane_index(*pane, &snapshot)?;
 
             if let Some(needle) = contains {
-                if !inspector.pane_contains(pane_idx, needle) {
+                let resolved = runtime_vars.resolve_opt(needle);
+                if !inspector.pane_contains(pane_idx, &resolved) {
                     let text = inspector
                         .pane_text(pane_idx)
                         .unwrap_or_else(|| "<no text>".to_string());
                     bail!(
-                        "assert-screen: pane {pane_idx} does not contain '{needle}'; screen: {text}"
+                        "assert-screen: pane {pane_idx} does not contain '{resolved}'; screen: {text}"
                     );
                 }
             }
 
             if let Some(needle) = not_contains {
-                if inspector.pane_contains(pane_idx, needle) {
-                    bail!("assert-screen: pane {pane_idx} unexpectedly contains '{needle}'");
+                let resolved = runtime_vars.resolve_opt(needle);
+                if inspector.pane_contains(pane_idx, &resolved) {
+                    bail!("assert-screen: pane {pane_idx} unexpectedly contains '{resolved}'");
                 }
             }
 
             if let Some(pattern) = matches {
-                if !inspector.pane_matches(pane_idx, pattern)? {
+                let resolved = runtime_vars.resolve_opt(pattern);
+                if !inspector.pane_matches(pane_idx, &resolved)? {
                     let text = inspector
                         .pane_text(pane_idx)
                         .unwrap_or_else(|| "<no text>".to_string());
                     bail!(
-                        "assert-screen: pane {pane_idx} does not match '{pattern}'; screen: {text}"
+                        "assert-screen: pane {pane_idx} does not match '{resolved}'; screen: {text}"
                     );
                 }
             }
@@ -610,6 +638,80 @@ pub(super) async fn execute_step(
                 .await
                 .map_err(|e| anyhow::anyhow!("prefix-key failed: {e}"))?;
             Ok(None)
+        }
+
+        Action::WaitForEvent { event, timeout } => {
+            let _sid = require_session(*session_id)?;
+
+            // Subscribe to events on first use.
+            if !*events_subscribed {
+                client
+                    .subscribe_events()
+                    .await
+                    .map_err(|e| anyhow::anyhow!("event subscription failed: {e}"))?;
+                *events_subscribed = true;
+            }
+
+            let resolved_event = runtime_vars.resolve_opt(event);
+            let wait_deadline = Instant::now() + (*timeout).min(deadline - Instant::now());
+            let mut poll_delay = Duration::from_millis(25);
+
+            loop {
+                let events = client
+                    .poll_events(32)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("poll events failed: {e}"))?;
+
+                for evt in &events {
+                    if event_matches(evt, &resolved_event) {
+                        return Ok(Some(format!("matched event '{resolved_event}'")));
+                    }
+                }
+
+                if Instant::now() >= wait_deadline {
+                    bail!(
+                        "wait-for-event timed out after {}ms waiting for '{resolved_event}'",
+                        timeout.as_millis()
+                    );
+                }
+
+                tokio::time::sleep(poll_delay).await;
+                poll_delay = (poll_delay * 2).min(Duration::from_millis(250));
+            }
+        }
+
+        Action::InvokeService {
+            capability,
+            kind,
+            interface_id,
+            operation,
+            payload,
+        } => {
+            let resolved_payload = runtime_vars.resolve_opt(payload);
+            let ipc_kind = match kind {
+                ServiceKind::Query => InvokeServiceKind::Query,
+                ServiceKind::Command => InvokeServiceKind::Command,
+            };
+            let response_bytes = client
+                .invoke_service_raw(
+                    capability.clone(),
+                    ipc_kind,
+                    interface_id.clone(),
+                    operation.clone(),
+                    resolved_payload.into_bytes(),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("invoke-service failed: {e}"))?;
+
+            let detail = if response_bytes.is_empty() {
+                None
+            } else {
+                Some(
+                    String::from_utf8(response_bytes)
+                        .unwrap_or_else(|e| format!("<{} bytes binary>", e.into_bytes().len())),
+                )
+            };
+            Ok(detail)
         }
     }
 }
@@ -682,4 +784,18 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
         }
     }
     Ok(())
+}
+
+/// Match a server event against a user-specified event name string.
+fn event_matches(event: &bmux_ipc::Event, name: &str) -> bool {
+    match (event, name) {
+        (bmux_ipc::Event::ServerStarted, "server_started") => true,
+        (bmux_ipc::Event::ServerStopping, "server_stopping") => true,
+        (bmux_ipc::Event::SessionCreated { .. }, "session_created") => true,
+        (bmux_ipc::Event::SessionRemoved { .. }, "session_removed") => true,
+        (bmux_ipc::Event::ClientAttached { .. }, "client_attached") => true,
+        (bmux_ipc::Event::ClientDetached { .. }, "client_detached") => true,
+        (bmux_ipc::Event::AttachViewChanged { .. }, "attach_view_changed") => true,
+        _ => false,
+    }
 }

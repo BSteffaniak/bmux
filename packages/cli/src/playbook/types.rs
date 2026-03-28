@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -19,6 +20,8 @@ pub struct PlaybookConfig {
     pub timeout: Duration,
     pub record: bool,
     pub plugins: PluginConfig,
+    /// User-defined variables for substitution.
+    pub vars: BTreeMap<String, String>,
 }
 
 impl Default for PlaybookConfig {
@@ -31,6 +34,7 @@ impl Default for PlaybookConfig {
             timeout: Duration::from_secs(30),
             record: false,
             plugins: PluginConfig::default(),
+            vars: BTreeMap::new(),
         }
     }
 }
@@ -112,6 +116,23 @@ pub enum Action {
     ResizeViewport { cols: u16, rows: u16 },
     /// Send the prefix key combo + a key character.
     PrefixKey { key: char },
+    /// Wait for a server event.
+    WaitForEvent { event: String, timeout: Duration },
+    /// Invoke a plugin service.
+    InvokeService {
+        capability: String,
+        kind: ServiceKind,
+        interface_id: String,
+        operation: String,
+        payload: String,
+    },
+}
+
+/// Plugin service invocation kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServiceKind {
+    Query,
+    Command,
 }
 
 /// Pane split direction.
@@ -193,6 +214,8 @@ impl Action {
             Self::AssertCursor { .. } => "assert-cursor",
             Self::ResizeViewport { .. } => "resize-viewport",
             Self::PrefixKey { .. } => "prefix-key",
+            Self::WaitForEvent { .. } => "wait-for-event",
+            Self::InvokeService { .. } => "invoke-service",
         }
     }
 }

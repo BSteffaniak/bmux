@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
@@ -5,12 +6,20 @@ use serde::Deserialize;
 
 use super::parse_dsl::decode_c_escapes;
 use super::types::{
-    Action, Playbook, PlaybookConfig, PluginConfig, SplitDirection, Step, Viewport,
+    Action, Playbook, PlaybookConfig, PluginConfig, ServiceKind, SplitDirection, Step, Viewport,
 };
 
 /// Parse a playbook from a TOML string.
-pub fn parse_toml(input: &str) -> Result<Playbook> {
+///
+/// Returns the playbook and a list of include paths that the caller
+/// is responsible for resolving and merging.
+pub fn parse_toml(input: &str) -> Result<(Playbook, Vec<String>)> {
     let raw: RawPlaybook = toml::from_str(input).context("invalid playbook TOML")?;
+    let includes = raw
+        .playbook
+        .as_ref()
+        .and_then(|p| p.include.clone())
+        .unwrap_or_default();
     let config = parse_config(raw.playbook)?;
     let steps = raw
         .step
@@ -24,7 +33,7 @@ pub fn parse_toml(input: &str) -> Result<Playbook> {
         })
         .collect::<Result<Vec<_>>>()?;
 
-    Ok(Playbook { config, steps })
+    Ok((Playbook { config, steps }, includes))
 }
 
 fn parse_config(raw: Option<RawPlaybookConfig>) -> Result<PlaybookConfig> {
@@ -63,6 +72,7 @@ fn parse_config(raw: Option<RawPlaybookConfig>) -> Result<PlaybookConfig> {
         timeout,
         record: raw.record.unwrap_or(false),
         plugins,
+        vars: raw.vars.unwrap_or_default(),
     })
 }
 
@@ -161,6 +171,38 @@ fn parse_step_action(step: RawStep) -> Result<Action> {
             let key = key_str.chars().next().context("empty key")?;
             Ok(Action::PrefixKey { key })
         }
+        "wait-for-event" => {
+            let event = step.event.context("wait-for-event requires 'event'")?;
+            let timeout_ms = step.timeout_ms.unwrap_or(5000);
+            Ok(Action::WaitForEvent {
+                event,
+                timeout: Duration::from_millis(timeout_ms),
+            })
+        }
+        "invoke-service" => {
+            let capability = step
+                .capability
+                .context("invoke-service requires 'capability'")?;
+            let kind = match step.kind.as_deref() {
+                Some("query") | Some("q") => ServiceKind::Query,
+                Some("command") | Some("cmd") | None => ServiceKind::Command,
+                Some(other) => bail!("invalid service kind: {other}"),
+            };
+            let interface_id = step
+                .interface
+                .context("invoke-service requires 'interface'")?;
+            let operation = step
+                .operation
+                .context("invoke-service requires 'operation'")?;
+            let payload = step.payload.unwrap_or_default();
+            Ok(Action::InvokeService {
+                capability,
+                kind,
+                interface_id,
+                operation,
+                payload,
+            })
+        }
         other => bail!("unknown action: {other}"),
     }
 }
@@ -196,6 +238,8 @@ struct RawPlaybookConfig {
     timeout_ms: Option<u64>,
     record: Option<bool>,
     plugins: Option<RawPluginConfig>,
+    vars: Option<BTreeMap<String, String>>,
+    include: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -239,6 +283,14 @@ struct RawStep {
     // Resize
     cols: Option<u16>,
     rows: Option<u16>,
+    // Events
+    event: Option<String>,
+    // Service invocation
+    capability: Option<String>,
+    kind: Option<String>,
+    interface: Option<String>,
+    operation: Option<String>,
+    payload: Option<String>,
 }
 
 #[cfg(test)]
@@ -256,7 +308,7 @@ name = "main"
 action = "send-keys"
 keys = "echo hello\r"
 "#;
-        let playbook = parse_toml(input).unwrap();
+        let (playbook, _includes) = parse_toml(input).unwrap();
         assert_eq!(playbook.steps.len(), 2);
         assert_eq!(playbook.steps[0].action.name(), "new-session");
         assert_eq!(playbook.steps[1].action.name(), "send-keys");
@@ -299,7 +351,7 @@ action = "assert-screen"
 pane = 0
 contains = "hello"
 "#;
-        let playbook = parse_toml(input).unwrap();
+        let (playbook, _includes) = parse_toml(input).unwrap();
         assert_eq!(playbook.config.name.as_deref(), Some("test"));
         assert_eq!(playbook.config.viewport.cols, 120);
         assert_eq!(playbook.config.viewport.rows, 50);
@@ -317,7 +369,7 @@ contains = "hello"
 action = "sleep"
 ms = 100
 "#;
-        let playbook = parse_toml(input).unwrap();
+        let (playbook, _includes) = parse_toml(input).unwrap();
         assert!(playbook.config.name.is_none());
         assert_eq!(playbook.config.viewport.cols, 80);
         assert_eq!(playbook.config.viewport.rows, 24);
@@ -340,7 +392,7 @@ action = "nonexistent"
 [[step]]
 action = "split-pane"
 "#;
-        let playbook = parse_toml(input).unwrap();
+        let (playbook, _includes) = parse_toml(input).unwrap();
         match &playbook.steps[0].action {
             Action::SplitPane { direction, ratio } => {
                 assert_eq!(*direction, SplitDirection::Vertical);
@@ -353,7 +405,7 @@ action = "split-pane"
     #[test]
     fn toml_empty_playbook() {
         let input = "";
-        let playbook = parse_toml(input).unwrap();
+        let (playbook, _includes) = parse_toml(input).unwrap();
         assert!(playbook.steps.is_empty());
     }
 }

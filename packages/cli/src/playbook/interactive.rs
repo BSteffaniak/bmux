@@ -197,9 +197,11 @@ async fn run_interactive_session_managed(
     // Session state.
     let mut session_id: Option<Uuid> = None;
     let mut attached = false;
+    let mut events_subscribed = false;
     let mut recording_id: Option<Uuid> = None;
     let mut step_counter: usize = 0;
     let mut snapshots: Vec<SnapshotCapture> = Vec::new();
+    let mut runtime_vars = super::subst::RuntimeVars::new(std::collections::BTreeMap::new());
 
     let deadline = session_timeout.map(|d| Instant::now() + d);
 
@@ -210,6 +212,7 @@ async fn run_interactive_session_managed(
         &mut inspector,
         &mut session_id,
         &mut attached,
+        &mut events_subscribed,
         &mut recording_id,
         &mut step_counter,
         &mut snapshots,
@@ -217,6 +220,7 @@ async fn run_interactive_session_managed(
         viewport_rows,
         record,
         deadline,
+        &mut runtime_vars,
     )
     .await;
 
@@ -245,6 +249,7 @@ async fn run_repl(
     inspector: &mut ScreenInspector,
     session_id: &mut Option<Uuid>,
     attached: &mut bool,
+    events_subscribed: &mut bool,
     recording_id: &mut Option<Uuid>,
     step_counter: &mut usize,
     snapshots: &mut Vec<SnapshotCapture>,
@@ -252,6 +257,7 @@ async fn run_repl(
     viewport_rows: u16,
     record: bool,
     deadline: Option<Instant>,
+    runtime_vars: &mut super::subst::RuntimeVars,
 ) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = BufReader::new(reader);
@@ -347,11 +353,13 @@ async fn run_repl(
             inspector,
             session_id,
             attached,
+            events_subscribed,
             &viewport_cols,
             &viewport_rows,
             snapshots,
             step_deadline,
             &mut no_display_track,
+            runtime_vars,
         )
         .await;
 

@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use super::types::{Action, Playbook, PlaybookConfig, SplitDirection, Step};
+use super::types::{Action, Playbook, PlaybookConfig, ServiceKind, SplitDirection, Step};
 
 /// Parse a playbook from the line-oriented DSL format.
 ///
@@ -12,10 +12,14 @@ use super::types::{Action, Playbook, PlaybookConfig, SplitDirection, Step};
 /// - Starting with `#`: comment, ignored
 /// - Starting with `@`: config directive
 /// - Otherwise: an action line with `key=value` arguments
-pub fn parse_dsl(input: &str) -> Result<Playbook> {
+///
+/// Returns the playbook and a list of include paths (from `@include` directives)
+/// that the caller is responsible for resolving and merging.
+pub fn parse_dsl(input: &str) -> Result<(Playbook, Vec<String>)> {
     let mut config = PlaybookConfig::default();
     let mut steps = Vec::new();
     let mut step_index = 0_usize;
+    let mut includes = Vec::new();
 
     for (line_num, raw_line) in input.lines().enumerate() {
         let line = raw_line.trim();
@@ -26,7 +30,7 @@ pub fn parse_dsl(input: &str) -> Result<Playbook> {
         let line_ctx = line_num + 1;
 
         if let Some(directive) = line.strip_prefix('@') {
-            parse_config_directive(directive.trim(), &mut config)
+            parse_config_directive(directive.trim(), &mut config, &mut includes)
                 .with_context(|| format!("line {line_ctx}: invalid config directive"))?;
         } else {
             let action = parse_action_line(line)
@@ -39,10 +43,14 @@ pub fn parse_dsl(input: &str) -> Result<Playbook> {
         }
     }
 
-    Ok(Playbook { config, steps })
+    Ok((Playbook { config, steps }, includes))
 }
 
-fn parse_config_directive(directive: &str, config: &mut PlaybookConfig) -> Result<()> {
+fn parse_config_directive(
+    directive: &str,
+    config: &mut PlaybookConfig,
+    includes: &mut Vec<String>,
+) -> Result<()> {
     let (name, rest) = split_first_token(directive);
     match name {
         "viewport" => {
@@ -78,6 +86,30 @@ fn parse_config_directive(directive: &str, config: &mut PlaybookConfig) -> Resul
             if let Some(disable) = args.get("disable") {
                 config.plugins.disable.push(disable.clone());
             }
+        }
+        "var" => {
+            // @var NAME=VALUE
+            let args = parse_kv_args(rest)?;
+            for (key, value) in &args {
+                config.vars.insert(key.clone(), value.clone());
+            }
+            if args.is_empty() {
+                // Bare form: @var NAME=VALUE parsed as a single token
+                if let Some(eq) = rest.find('=') {
+                    let key = rest[..eq].trim().to_string();
+                    let value = rest[eq + 1..].trim().to_string();
+                    config.vars.insert(key, value);
+                } else {
+                    bail!("@var requires NAME=VALUE format");
+                }
+            }
+        }
+        "include" => {
+            let path = rest.trim().to_string();
+            if path.is_empty() {
+                bail!("@include requires a file path");
+            }
+            includes.push(path);
         }
         _ => bail!("unknown config directive: @{name}"),
     }
@@ -227,6 +259,39 @@ pub(crate) fn parse_action_line(line: &str) -> Result<Action> {
             let key_str = require_arg(&args, "key", "prefix-key")?;
             let key = key_str.chars().next().context("empty key")?;
             Ok(Action::PrefixKey { key })
+        }
+        "wait-for-event" => {
+            let event = require_arg(&args, "event", "wait-for-event")?;
+            let timeout_ms: u64 = args
+                .get("timeout")
+                .map(|s| s.parse())
+                .transpose()
+                .context("invalid timeout")?
+                .unwrap_or(5000);
+            Ok(Action::WaitForEvent {
+                event,
+                timeout: Duration::from_millis(timeout_ms),
+            })
+        }
+        "invoke-service" => {
+            let capability = require_arg(&args, "capability", "invoke-service")?;
+            let kind = match args.get("kind").map(String::as_str) {
+                Some("query") | Some("q") => ServiceKind::Query,
+                Some("command") | Some("cmd") | None => ServiceKind::Command,
+                Some(other) => {
+                    bail!("invalid service kind: {other} (expected 'query' or 'command')")
+                }
+            };
+            let interface_id = require_arg(&args, "interface", "invoke-service")?;
+            let operation = require_arg(&args, "operation", "invoke-service")?;
+            let payload = args.get("payload").cloned().unwrap_or_default();
+            Ok(Action::InvokeService {
+                capability,
+                kind,
+                interface_id,
+                operation,
+                payload,
+            })
         }
         _ => bail!("unknown action: {action_name}"),
     }
@@ -404,7 +469,7 @@ wait-for pattern='hello' timeout=3000
 sleep ms=100
 snapshot id=final
 "#;
-        let playbook = parse_dsl(input).unwrap();
+        let (playbook, _includes) = parse_dsl(input).unwrap();
         assert_eq!(playbook.config.name.as_deref(), Some("test-playbook"));
         assert_eq!(playbook.config.viewport.cols, 120);
         assert_eq!(playbook.config.viewport.rows, 50);
@@ -420,7 +485,7 @@ snapshot id=final
     #[test]
     fn parse_send_keys_escapes() {
         let input = "send-keys keys='hello\\r\\n'";
-        let playbook = parse_dsl(input).unwrap();
+        let (playbook, _includes) = parse_dsl(input).unwrap();
         match &playbook.steps[0].action {
             Action::SendKeys { keys, .. } => {
                 assert_eq!(keys, b"hello\r\n");
@@ -432,7 +497,7 @@ snapshot id=final
     #[test]
     fn parse_send_keys_hex_escape() {
         let input = "send-keys keys='\\x1b[A'";
-        let playbook = parse_dsl(input).unwrap();
+        let (playbook, _includes) = parse_dsl(input).unwrap();
         match &playbook.steps[0].action {
             Action::SendKeys { keys, .. } => {
                 assert_eq!(keys, b"\x1b[A");
@@ -444,7 +509,7 @@ snapshot id=final
     #[test]
     fn parse_send_bytes_hex() {
         let input = "send-bytes hex=1b5b41";
-        let playbook = parse_dsl(input).unwrap();
+        let (playbook, _includes) = parse_dsl(input).unwrap();
         match &playbook.steps[0].action {
             Action::SendBytes { hex } => {
                 assert_eq!(hex, &[0x1b, 0x5b, 0x41]);
@@ -456,7 +521,7 @@ snapshot id=final
     #[test]
     fn parse_split_pane_defaults() {
         let input = "split-pane";
-        let playbook = parse_dsl(input).unwrap();
+        let (playbook, _includes) = parse_dsl(input).unwrap();
         match &playbook.steps[0].action {
             Action::SplitPane { direction, ratio } => {
                 assert_eq!(*direction, SplitDirection::Vertical);
@@ -469,7 +534,7 @@ snapshot id=final
     #[test]
     fn parse_plugin_config() {
         let input = "@plugin enable=bmux.windows\n@plugin disable=bmux.permissions";
-        let playbook = parse_dsl(input).unwrap();
+        let (playbook, _includes) = parse_dsl(input).unwrap();
         assert_eq!(playbook.config.plugins.enable, vec!["bmux.windows"]);
         assert_eq!(playbook.config.plugins.disable, vec!["bmux.permissions"]);
     }
@@ -477,7 +542,7 @@ snapshot id=final
     #[test]
     fn parse_assert_screen() {
         let input = "assert-screen pane=0 contains='hello world'";
-        let playbook = parse_dsl(input).unwrap();
+        let (playbook, _includes) = parse_dsl(input).unwrap();
         match &playbook.steps[0].action {
             Action::AssertScreen {
                 pane,
@@ -508,14 +573,14 @@ snapshot id=final
 
     #[test]
     fn empty_input_produces_empty_playbook() {
-        let playbook = parse_dsl("").unwrap();
+        let (playbook, _) = parse_dsl("").unwrap();
         assert!(playbook.steps.is_empty());
     }
 
     #[test]
     fn comments_and_blanks_ignored() {
         let input = "\n# comment\n   \n# another comment\n";
-        let playbook = parse_dsl(input).unwrap();
+        let (playbook, _includes) = parse_dsl(input).unwrap();
         assert!(playbook.steps.is_empty());
     }
 
@@ -534,7 +599,7 @@ snapshot id=final
     #[test]
     fn parse_resize_viewport() {
         let input = "resize-viewport cols=132 rows=50";
-        let playbook = parse_dsl(input).unwrap();
+        let (playbook, _includes) = parse_dsl(input).unwrap();
         match &playbook.steps[0].action {
             Action::ResizeViewport { cols, rows } => {
                 assert_eq!(*cols, 132);
@@ -547,7 +612,7 @@ snapshot id=final
     #[test]
     fn parse_prefix_key() {
         let input = "prefix-key key=c";
-        let playbook = parse_dsl(input).unwrap();
+        let (playbook, _includes) = parse_dsl(input).unwrap();
         match &playbook.steps[0].action {
             Action::PrefixKey { key } => {
                 assert_eq!(*key, 'c');
@@ -559,7 +624,7 @@ snapshot id=final
     #[test]
     fn double_quoted_value() {
         let input = r#"send-keys keys="echo hello\r""#;
-        let playbook = parse_dsl(input).unwrap();
+        let (playbook, _includes) = parse_dsl(input).unwrap();
         match &playbook.steps[0].action {
             Action::SendKeys { keys, .. } => {
                 assert_eq!(keys, b"echo hello\r");
