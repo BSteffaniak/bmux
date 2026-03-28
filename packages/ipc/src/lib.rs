@@ -934,14 +934,8 @@ pub fn read_frames<T: DeserializeOwned>(
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
-        AttachViewComponent, Envelope, EnvelopeKind, ErrorCode, Event, IpcEndpoint,
-        ProtocolVersion, Request, Response, ResponsePayload, SessionSelector, SessionSummary,
-        decode, encode,
-    };
+    use super::*;
     use std::path::Path;
-    use uuid::Uuid;
 
     #[test]
     fn serializes_request_roundtrip() {
@@ -1096,5 +1090,986 @@ mod tests {
             endpoint.as_windows_named_pipe(),
             Some(r"\\.\pipe\bmux-test")
         );
+    }
+
+    // ── Helper: assert encode/decode roundtrip ───────────────────────────────
+
+    fn assert_roundtrip<T>(value: &T)
+    where
+        T: std::fmt::Debug + PartialEq + serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let bytes = encode(value).unwrap_or_else(|e| panic!("encode failed: {e}"));
+        let decoded: T = decode(&bytes).unwrap_or_else(|e| panic!("decode failed: {e}"));
+        assert_eq!(&decoded, value);
+    }
+
+    // ── Level 1A: Exhaustive Request variant round-trips ─────────────────────
+
+    #[test]
+    fn request_all_variants_roundtrip() {
+        let id = Uuid::from_u128(1);
+        let id2 = Uuid::from_u128(2);
+
+        let variants: Vec<Request> = vec![
+            Request::Hello {
+                protocol_version: ProtocolVersion::current(),
+                client_name: "test-client".into(),
+                principal_id: id,
+            },
+            Request::Ping,
+            Request::WhoAmI,
+            Request::WhoAmIPrincipal,
+            Request::ServerStatus,
+            Request::ServerSave,
+            Request::ServerRestoreDryRun,
+            Request::ServerRestoreApply,
+            Request::ServerStop,
+            Request::InvokeService {
+                capability: "bmux.sessions.read".into(),
+                kind: InvokeServiceKind::Query,
+                interface_id: "session-query/v1".into(),
+                operation: "list".into(),
+                payload: vec![1, 2, 3],
+            },
+            Request::NewSession {
+                name: Some("dev".into()),
+            },
+            Request::NewSession { name: None },
+            Request::ListSessions,
+            Request::ListClients,
+            Request::CreateContext {
+                name: Some("ctx".into()),
+                attributes: {
+                    let mut m = BTreeMap::new();
+                    m.insert("key".into(), "val".into());
+                    m
+                },
+            },
+            Request::CreateContext {
+                name: None,
+                attributes: BTreeMap::new(),
+            },
+            Request::ListContexts,
+            Request::SelectContext {
+                selector: ContextSelector::ById(id),
+            },
+            Request::SelectContext {
+                selector: ContextSelector::ByName("ctx-name".into()),
+            },
+            Request::CloseContext {
+                selector: ContextSelector::ById(id),
+                force: true,
+            },
+            Request::CurrentContext,
+            Request::KillSession {
+                selector: SessionSelector::ById(id),
+                force_local: true,
+            },
+            Request::KillSession {
+                selector: SessionSelector::ByName("session".into()),
+                force_local: false,
+            },
+            Request::SplitPane {
+                session: Some(SessionSelector::ById(id)),
+                target: Some(PaneSelector::ById(id2)),
+                direction: PaneSplitDirection::Vertical,
+            },
+            Request::SplitPane {
+                session: None,
+                target: Some(PaneSelector::ByIndex(0)),
+                direction: PaneSplitDirection::Horizontal,
+            },
+            Request::SplitPane {
+                session: None,
+                target: Some(PaneSelector::Active),
+                direction: PaneSplitDirection::Vertical,
+            },
+            Request::FocusPane {
+                session: None,
+                target: None,
+                direction: Some(PaneFocusDirection::Next),
+            },
+            Request::FocusPane {
+                session: None,
+                target: None,
+                direction: Some(PaneFocusDirection::Prev),
+            },
+            Request::FocusPane {
+                session: None,
+                target: None,
+                direction: None,
+            },
+            Request::ResizePane {
+                session: None,
+                target: None,
+                delta: -5,
+            },
+            Request::ResizePane {
+                session: Some(SessionSelector::ByName("s".into())),
+                target: Some(PaneSelector::ByIndex(3)),
+                delta: 10,
+            },
+            Request::ClosePane {
+                session: None,
+                target: None,
+            },
+            Request::ListPanes {
+                session: Some(SessionSelector::ById(id)),
+            },
+            Request::ListPanes { session: None },
+            Request::FollowClient {
+                target_client_id: id,
+                global: true,
+            },
+            Request::Unfollow,
+            Request::Attach {
+                selector: SessionSelector::ByName("main".into()),
+            },
+            Request::AttachContext {
+                selector: ContextSelector::ByName("default".into()),
+            },
+            Request::AttachOpen {
+                session_id: id,
+                attach_token: id2,
+            },
+            Request::AttachInput {
+                session_id: id,
+                data: vec![27, 91, 65], // ESC [ A
+            },
+            Request::AttachSetViewport {
+                session_id: id,
+                cols: 120,
+                rows: 40,
+            },
+            Request::AttachOutput {
+                session_id: id,
+                max_bytes: 65536,
+            },
+            Request::AttachLayout { session_id: id },
+            Request::AttachPaneOutputBatch {
+                session_id: id,
+                pane_ids: vec![id, id2],
+                max_bytes: 4096,
+            },
+            Request::AttachSnapshot {
+                session_id: id,
+                max_bytes_per_pane: 8192,
+            },
+            Request::SubscribeEvents,
+            Request::PollEvents { max_events: 100 },
+            Request::RecordingStart {
+                session_id: Some(id),
+                capture_input: true,
+                profile: Some(RecordingProfile::Visual),
+                event_kinds: Some(vec![
+                    RecordingEventKind::PaneOutputRaw,
+                    RecordingEventKind::Custom,
+                ]),
+            },
+            Request::RecordingStart {
+                session_id: None,
+                capture_input: false,
+                profile: None,
+                event_kinds: None,
+            },
+            Request::RecordingStop {
+                recording_id: Some(id),
+            },
+            Request::RecordingStop { recording_id: None },
+            Request::RecordingStatus,
+            Request::RecordingList,
+            Request::RecordingDelete { recording_id: id },
+            Request::RecordingWriteCustomEvent {
+                session_id: Some(id),
+                pane_id: Some(id2),
+                source: "test-plugin".into(),
+                name: "my-event".into(),
+                payload: b"{\"key\":\"value\"}".to_vec(),
+            },
+            Request::RecordingWriteCustomEvent {
+                session_id: None,
+                pane_id: None,
+                source: "s".into(),
+                name: "n".into(),
+                payload: vec![],
+            },
+            Request::RecordingDeleteAll,
+            Request::Detach,
+            Request::PaneDirectInput {
+                session_id: id,
+                pane_id: id2,
+                data: vec![104, 101, 108, 108, 111],
+            },
+        ];
+
+        for (i, variant) in variants.iter().enumerate() {
+            let bytes = encode(variant)
+                .unwrap_or_else(|e| panic!("Request variant {i} encode failed: {e}"));
+            let decoded: Request =
+                decode(&bytes).unwrap_or_else(|e| panic!("Request variant {i} decode failed: {e}"));
+            assert_eq!(&decoded, variant, "Request variant {i} roundtrip mismatch");
+        }
+    }
+
+    // ── Level 1B: Exhaustive ResponsePayload variant round-trips ─────────────
+
+    fn sample_recording_summary() -> RecordingSummary {
+        RecordingSummary {
+            id: Uuid::from_u128(100),
+            format_version: RECORDING_FORMAT_VERSION,
+            session_id: Some(Uuid::from_u128(1)),
+            capture_input: true,
+            profile: RecordingProfile::Full,
+            event_kinds: vec![
+                RecordingEventKind::PaneInputRaw,
+                RecordingEventKind::PaneOutputRaw,
+                RecordingEventKind::ServerEvent,
+            ],
+            started_epoch_ms: 1_700_000_000_000,
+            ended_epoch_ms: Some(1_700_000_060_000),
+            event_count: 42,
+            payload_bytes: 123_456,
+            path: "/tmp/recordings/test.bmux".into(),
+        }
+    }
+
+    fn sample_attach_scene() -> (AttachScene, Uuid) {
+        let pane_id = Uuid::from_u128(10);
+        let session_id = Uuid::from_u128(1);
+        let scene = AttachScene {
+            session_id,
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![
+                AttachSurface {
+                    id: pane_id,
+                    kind: AttachSurfaceKind::Pane,
+                    layer: AttachLayer::Pane,
+                    z: 0,
+                    rect: AttachRect {
+                        x: 0,
+                        y: 1,
+                        w: 80,
+                        h: 24,
+                    },
+                    opaque: true,
+                    visible: true,
+                    accepts_input: true,
+                    cursor_owner: true,
+                    pane_id: Some(pane_id),
+                },
+                AttachSurface {
+                    id: Uuid::from_u128(20),
+                    kind: AttachSurfaceKind::FloatingPane,
+                    layer: AttachLayer::FloatingPane,
+                    z: 10,
+                    rect: AttachRect {
+                        x: 5,
+                        y: 5,
+                        w: 40,
+                        h: 10,
+                    },
+                    opaque: false,
+                    visible: true,
+                    accepts_input: true,
+                    cursor_owner: false,
+                    pane_id: None,
+                },
+            ],
+        };
+        (scene, pane_id)
+    }
+
+    fn sample_layout_tree() -> PaneLayoutNode {
+        PaneLayoutNode::Split {
+            direction: PaneSplitDirection::Horizontal,
+            ratio_percent: 50,
+            first: Box::new(PaneLayoutNode::Leaf {
+                pane_id: Uuid::from_u128(10),
+            }),
+            second: Box::new(PaneLayoutNode::Split {
+                direction: PaneSplitDirection::Vertical,
+                ratio_percent: 60,
+                first: Box::new(PaneLayoutNode::Leaf {
+                    pane_id: Uuid::from_u128(11),
+                }),
+                second: Box::new(PaneLayoutNode::Leaf {
+                    pane_id: Uuid::from_u128(12),
+                }),
+            }),
+        }
+    }
+
+    #[test]
+    fn response_payload_all_variants_roundtrip() {
+        let id = Uuid::from_u128(1);
+        let id2 = Uuid::from_u128(2);
+        let (scene, pane_id) = sample_attach_scene();
+        let layout = sample_layout_tree();
+
+        let variants: Vec<ResponsePayload> = vec![
+            ResponsePayload::Pong,
+            ResponsePayload::ClientIdentity { id },
+            ResponsePayload::PrincipalIdentity {
+                principal_id: id,
+                server_control_principal_id: id2,
+                force_local_permitted: true,
+            },
+            ResponsePayload::ServerStatus {
+                running: true,
+                snapshot: ServerSnapshotStatus {
+                    enabled: true,
+                    path: Some("/tmp/snap".into()),
+                    snapshot_exists: true,
+                    last_write_epoch_ms: Some(1_700_000_000_000),
+                    last_restore_epoch_ms: None,
+                    last_restore_error: None,
+                },
+                principal_id: id,
+                server_control_principal_id: id2,
+            },
+            ResponsePayload::ServerSnapshotSaved {
+                path: Some("/tmp/snap".into()),
+            },
+            ResponsePayload::ServerSnapshotSaved { path: None },
+            ResponsePayload::ServerSnapshotRestoreDryRun {
+                ok: true,
+                message: "all good".into(),
+            },
+            ResponsePayload::ServerSnapshotRestored {
+                sessions: 3,
+                follows: 1,
+                selected_sessions: 2,
+            },
+            ResponsePayload::SessionCreated {
+                id,
+                name: Some("dev".into()),
+            },
+            ResponsePayload::SessionList {
+                sessions: vec![
+                    SessionSummary {
+                        id,
+                        name: Some("s1".into()),
+                        client_count: 2,
+                    },
+                    SessionSummary {
+                        id: id2,
+                        name: None,
+                        client_count: 0,
+                    },
+                ],
+            },
+            ResponsePayload::ClientList {
+                clients: vec![ClientSummary {
+                    id,
+                    selected_context_id: Some(id2),
+                    selected_session_id: Some(id),
+                    following_client_id: None,
+                    following_global: false,
+                }],
+            },
+            ResponsePayload::ContextCreated {
+                context: ContextSummary {
+                    id,
+                    name: Some("default".into()),
+                    attributes: {
+                        let mut m = BTreeMap::new();
+                        m.insert("key".into(), "val".into());
+                        m
+                    },
+                },
+            },
+            ResponsePayload::ContextList {
+                contexts: vec![ContextSummary {
+                    id,
+                    name: None,
+                    attributes: BTreeMap::new(),
+                }],
+            },
+            ResponsePayload::ContextSelected {
+                context: ContextSummary {
+                    id,
+                    name: None,
+                    attributes: BTreeMap::new(),
+                },
+            },
+            ResponsePayload::ContextClosed { id },
+            ResponsePayload::CurrentContext {
+                context: Some(ContextSummary {
+                    id,
+                    name: None,
+                    attributes: BTreeMap::new(),
+                }),
+            },
+            ResponsePayload::CurrentContext { context: None },
+            ResponsePayload::SessionKilled { id },
+            ResponsePayload::PaneSplit {
+                id: pane_id,
+                session_id: id,
+            },
+            ResponsePayload::PaneFocused {
+                id: pane_id,
+                session_id: id,
+            },
+            ResponsePayload::PaneResized { session_id: id },
+            ResponsePayload::PaneClosed {
+                id: pane_id,
+                session_id: id,
+                session_closed: false,
+            },
+            ResponsePayload::PaneList {
+                panes: vec![
+                    PaneSummary {
+                        id: pane_id,
+                        index: 0,
+                        name: Some("shell".into()),
+                        focused: true,
+                    },
+                    PaneSummary {
+                        id: id2,
+                        index: 1,
+                        name: None,
+                        focused: false,
+                    },
+                ],
+            },
+            ResponsePayload::FollowStarted {
+                follower_client_id: id,
+                leader_client_id: id2,
+                global: true,
+            },
+            ResponsePayload::FollowStopped {
+                follower_client_id: id,
+            },
+            ResponsePayload::Attached {
+                grant: AttachGrant {
+                    context_id: Some(id2),
+                    session_id: id,
+                    attach_token: Uuid::from_u128(99),
+                    expires_at_epoch_ms: 1_700_000_060_000,
+                },
+            },
+            ResponsePayload::AttachReady {
+                context_id: Some(id2),
+                session_id: id,
+                can_write: true,
+            },
+            ResponsePayload::AttachReady {
+                context_id: None,
+                session_id: id,
+                can_write: false,
+            },
+            ResponsePayload::AttachInputAccepted { bytes: 256 },
+            ResponsePayload::AttachViewportSet {
+                context_id: None,
+                session_id: id,
+                cols: 120,
+                rows: 40,
+            },
+            ResponsePayload::AttachOutput {
+                data: vec![27, 91, 72, 27, 91, 50, 74], // ESC[H ESC[2J
+            },
+            ResponsePayload::AttachLayout {
+                context_id: Some(id2),
+                session_id: id,
+                focused_pane_id: pane_id,
+                panes: vec![PaneSummary {
+                    id: pane_id,
+                    index: 0,
+                    name: None,
+                    focused: true,
+                }],
+                layout_root: layout.clone(),
+                scene: scene.clone(),
+            },
+            ResponsePayload::AttachPaneOutputBatch {
+                chunks: vec![
+                    AttachPaneChunk {
+                        pane_id,
+                        data: vec![65, 66, 67],
+                    },
+                    AttachPaneChunk {
+                        pane_id: id2,
+                        data: vec![],
+                    },
+                ],
+            },
+            ResponsePayload::AttachSnapshot {
+                context_id: None,
+                session_id: id,
+                focused_pane_id: pane_id,
+                panes: vec![PaneSummary {
+                    id: pane_id,
+                    index: 0,
+                    name: None,
+                    focused: true,
+                }],
+                layout_root: layout,
+                scene,
+                chunks: vec![AttachPaneChunk {
+                    pane_id,
+                    data: vec![0; 100],
+                }],
+            },
+            ResponsePayload::EventsSubscribed,
+            ResponsePayload::EventBatch {
+                events: vec![
+                    Event::ServerStarted,
+                    Event::SessionCreated {
+                        id,
+                        name: Some("test".into()),
+                    },
+                ],
+            },
+            ResponsePayload::RecordingStarted {
+                recording: sample_recording_summary(),
+            },
+            ResponsePayload::RecordingStopped { recording_id: id },
+            ResponsePayload::RecordingStatus {
+                status: RecordingStatus {
+                    active: Some(sample_recording_summary()),
+                    queue_len: 5,
+                },
+            },
+            ResponsePayload::RecordingStatus {
+                status: RecordingStatus {
+                    active: None,
+                    queue_len: 0,
+                },
+            },
+            ResponsePayload::RecordingList {
+                recordings: vec![sample_recording_summary()],
+            },
+            ResponsePayload::RecordingDeleted { recording_id: id },
+            ResponsePayload::RecordingCustomEventWritten { accepted: true },
+            ResponsePayload::RecordingDeleteAll { deleted_count: 7 },
+            ResponsePayload::Detached,
+            ResponsePayload::PaneDirectInputAccepted { bytes: 5, pane_id },
+            ResponsePayload::ServerStopping,
+            ResponsePayload::ServiceInvoked {
+                payload: vec![9, 8, 7],
+            },
+        ];
+
+        for (i, variant) in variants.iter().enumerate() {
+            let response = Response::Ok(variant.clone());
+            let bytes = encode(&response)
+                .unwrap_or_else(|e| panic!("ResponsePayload variant {i} encode failed: {e}"));
+            let decoded: Response = decode(&bytes)
+                .unwrap_or_else(|e| panic!("ResponsePayload variant {i} decode failed: {e}"));
+            assert_eq!(
+                decoded, response,
+                "ResponsePayload variant {i} roundtrip mismatch"
+            );
+        }
+    }
+
+    // ── Level 1C: Response::Err, all Event variants, all ErrorCode variants ──
+
+    #[test]
+    fn response_err_roundtrip() {
+        let response = Response::Err(ErrorResponse {
+            code: ErrorCode::NotFound,
+            message: "session not found".into(),
+        });
+        assert_roundtrip(&response);
+    }
+
+    #[test]
+    fn error_code_all_variants_roundtrip() {
+        let codes = [
+            ErrorCode::NotFound,
+            ErrorCode::AlreadyExists,
+            ErrorCode::InvalidRequest,
+            ErrorCode::VersionMismatch,
+            ErrorCode::Timeout,
+            ErrorCode::Internal,
+        ];
+        for code in &codes {
+            assert_roundtrip(code);
+        }
+    }
+
+    #[test]
+    fn event_all_variants_roundtrip() {
+        let id = Uuid::from_u128(1);
+        let id2 = Uuid::from_u128(2);
+
+        let variants: Vec<Event> = vec![
+            Event::ServerStarted,
+            Event::ServerStopping,
+            Event::SessionCreated {
+                id,
+                name: Some("test".into()),
+            },
+            Event::SessionCreated { id, name: None },
+            Event::SessionRemoved { id },
+            Event::ClientAttached { id },
+            Event::ClientDetached { id },
+            Event::FollowStarted {
+                follower_client_id: id,
+                leader_client_id: id2,
+                global: false,
+            },
+            Event::FollowStopped {
+                follower_client_id: id,
+            },
+            Event::FollowTargetGone {
+                follower_client_id: id,
+                former_leader_client_id: id2,
+            },
+            Event::FollowTargetChanged {
+                follower_client_id: id,
+                leader_client_id: id2,
+                context_id: Some(Uuid::from_u128(3)),
+                session_id: Uuid::from_u128(4),
+            },
+            Event::FollowTargetChanged {
+                follower_client_id: id,
+                leader_client_id: id2,
+                context_id: None,
+                session_id: Uuid::from_u128(4),
+            },
+            Event::AttachViewChanged {
+                context_id: Some(id),
+                session_id: id2,
+                revision: 42,
+                components: vec![
+                    AttachViewComponent::Scene,
+                    AttachViewComponent::SurfaceContent,
+                    AttachViewComponent::Layout,
+                    AttachViewComponent::Status,
+                ],
+            },
+        ];
+
+        for (i, variant) in variants.iter().enumerate() {
+            let bytes =
+                encode(variant).unwrap_or_else(|e| panic!("Event variant {i} encode failed: {e}"));
+            let decoded: Event =
+                decode(&bytes).unwrap_or_else(|e| panic!("Event variant {i} decode failed: {e}"));
+            assert_eq!(&decoded, variant, "Event variant {i} roundtrip mismatch");
+        }
+    }
+
+    // ── Level 1D: Recording types round-trips ────────────────────────────────
+
+    #[test]
+    fn recording_profile_all_variants_roundtrip() {
+        for profile in &[
+            RecordingProfile::Full,
+            RecordingProfile::Functional,
+            RecordingProfile::Visual,
+        ] {
+            assert_roundtrip(profile);
+        }
+    }
+
+    #[test]
+    fn recording_event_kind_all_variants_roundtrip() {
+        let kinds = [
+            RecordingEventKind::PaneInputRaw,
+            RecordingEventKind::PaneOutputRaw,
+            RecordingEventKind::ProtocolReplyRaw,
+            RecordingEventKind::ServerEvent,
+            RecordingEventKind::RequestStart,
+            RecordingEventKind::RequestDone,
+            RecordingEventKind::RequestError,
+            RecordingEventKind::Custom,
+        ];
+        for kind in &kinds {
+            assert_roundtrip(kind);
+        }
+    }
+
+    #[test]
+    fn recording_summary_roundtrip() {
+        assert_roundtrip(&sample_recording_summary());
+    }
+
+    #[test]
+    fn recording_payload_all_variants_roundtrip() {
+        let id = Uuid::from_u128(1);
+        let payloads: Vec<RecordingPayload> = vec![
+            RecordingPayload::Bytes {
+                data: vec![1, 2, 3, 4, 5],
+            },
+            RecordingPayload::Bytes { data: vec![] },
+            RecordingPayload::ServerEvent {
+                event: Event::SessionCreated {
+                    id,
+                    name: Some("test".into()),
+                },
+            },
+            RecordingPayload::RequestStart {
+                request_id: 42,
+                request_kind: "ping".into(),
+                exclusive: false,
+                request_data: vec![0, 1],
+            },
+            RecordingPayload::RequestDone {
+                request_id: 42,
+                request_kind: "ping".into(),
+                response_kind: "pong".into(),
+                elapsed_ms: 5,
+                request_data: vec![0, 1],
+                response_data: vec![2, 3],
+            },
+            RecordingPayload::RequestError {
+                request_id: 43,
+                request_kind: "kill_session".into(),
+                error_code: ErrorCode::NotFound,
+                message: "session not found".into(),
+                elapsed_ms: 2,
+            },
+            RecordingPayload::Custom {
+                source: "test-plugin".into(),
+                name: "custom-event".into(),
+                payload: b"{\"ok\":true}".to_vec(),
+            },
+        ];
+
+        for (i, payload) in payloads.iter().enumerate() {
+            let bytes = encode(payload)
+                .unwrap_or_else(|e| panic!("RecordingPayload variant {i} encode failed: {e}"));
+            let decoded: RecordingPayload = decode(&bytes)
+                .unwrap_or_else(|e| panic!("RecordingPayload variant {i} decode failed: {e}"));
+            assert_eq!(&decoded, payload, "RecordingPayload variant {i} mismatch");
+        }
+    }
+
+    #[test]
+    fn recording_event_envelope_roundtrip() {
+        let envelope = RecordingEventEnvelope {
+            seq: 1,
+            mono_ns: 1_000_000,
+            wall_epoch_ms: 1_700_000_000_000,
+            session_id: Some(Uuid::from_u128(1)),
+            pane_id: Some(Uuid::from_u128(2)),
+            client_id: Some(Uuid::from_u128(3)),
+            kind: RecordingEventKind::RequestDone,
+            payload: RecordingPayload::RequestDone {
+                request_id: 7,
+                request_kind: "attach".into(),
+                response_kind: "attached".into(),
+                elapsed_ms: 12,
+                request_data: vec![1, 2, 3],
+                response_data: vec![4, 5, 6],
+            },
+        };
+        assert_roundtrip(&envelope);
+    }
+
+    #[test]
+    fn recording_event_envelope_with_none_ids_roundtrip() {
+        let envelope = RecordingEventEnvelope {
+            seq: 0,
+            mono_ns: 0,
+            wall_epoch_ms: 0,
+            session_id: None,
+            pane_id: None,
+            client_id: None,
+            kind: RecordingEventKind::Custom,
+            payload: RecordingPayload::Bytes { data: vec![255] },
+        };
+        assert_roundtrip(&envelope);
+    }
+
+    #[test]
+    fn recording_event_envelope_write_frame_read_frames_roundtrip() {
+        let envelopes = vec![
+            RecordingEventEnvelope {
+                seq: 0,
+                mono_ns: 1000,
+                wall_epoch_ms: 1_700_000_000_000,
+                session_id: Some(Uuid::from_u128(1)),
+                pane_id: None,
+                client_id: None,
+                kind: RecordingEventKind::PaneOutputRaw,
+                payload: RecordingPayload::Bytes {
+                    data: vec![65, 66, 67],
+                },
+            },
+            RecordingEventEnvelope {
+                seq: 1,
+                mono_ns: 2000,
+                wall_epoch_ms: 1_700_000_000_001,
+                session_id: Some(Uuid::from_u128(1)),
+                pane_id: Some(Uuid::from_u128(2)),
+                client_id: None,
+                kind: RecordingEventKind::ServerEvent,
+                payload: RecordingPayload::ServerEvent {
+                    event: Event::ServerStarted,
+                },
+            },
+        ];
+
+        let mut buf = Vec::new();
+        for env in &envelopes {
+            write_frame(&mut buf, env).expect("write_frame should succeed");
+        }
+
+        let result =
+            read_frames::<RecordingEventEnvelope>(&buf).expect("read_frames should succeed");
+        assert_eq!(result.frames, envelopes);
+        assert_eq!(result.bytes_remaining, 0);
+    }
+
+    // ── Level 1E: DisplayTrack types round-trips ─────────────────────────────
+
+    #[test]
+    fn display_track_event_all_variants_roundtrip() {
+        let variants: Vec<DisplayTrackEvent> = vec![
+            DisplayTrackEvent::StreamOpened {
+                client_id: Uuid::from_u128(1),
+                recording_id: Uuid::from_u128(2),
+                cell_width_px: Some(8),
+                cell_height_px: Some(16),
+                window_width_px: Some(1920),
+                window_height_px: Some(1080),
+                terminal_profile: Some(vec![10, 20, 30]),
+            },
+            DisplayTrackEvent::StreamOpened {
+                client_id: Uuid::from_u128(1),
+                recording_id: Uuid::from_u128(2),
+                cell_width_px: None,
+                cell_height_px: None,
+                window_width_px: None,
+                window_height_px: None,
+                terminal_profile: None,
+            },
+            DisplayTrackEvent::Resize {
+                cols: 120,
+                rows: 40,
+            },
+            DisplayTrackEvent::FrameBytes {
+                data: vec![27, 91, 72],
+            },
+            DisplayTrackEvent::FrameBytes { data: vec![] },
+            DisplayTrackEvent::StreamClosed,
+        ];
+
+        for (i, variant) in variants.iter().enumerate() {
+            let envelope = DisplayTrackEnvelope {
+                mono_ns: (i as u64) * 1000,
+                event: variant.clone(),
+            };
+            assert_roundtrip(&envelope);
+        }
+    }
+
+    #[test]
+    fn display_track_write_frame_read_frames_roundtrip() {
+        let envelopes = vec![
+            DisplayTrackEnvelope {
+                mono_ns: 0,
+                event: DisplayTrackEvent::StreamOpened {
+                    client_id: Uuid::from_u128(1),
+                    recording_id: Uuid::from_u128(2),
+                    cell_width_px: Some(8),
+                    cell_height_px: Some(16),
+                    window_width_px: None,
+                    window_height_px: None,
+                    terminal_profile: None,
+                },
+            },
+            DisplayTrackEnvelope {
+                mono_ns: 1000,
+                event: DisplayTrackEvent::Resize { cols: 80, rows: 24 },
+            },
+            DisplayTrackEnvelope {
+                mono_ns: 2000,
+                event: DisplayTrackEvent::FrameBytes {
+                    data: vec![65; 100],
+                },
+            },
+            DisplayTrackEnvelope {
+                mono_ns: 3000,
+                event: DisplayTrackEvent::StreamClosed,
+            },
+        ];
+
+        let mut buf = Vec::new();
+        for env in &envelopes {
+            write_frame(&mut buf, env).expect("write_frame should succeed");
+        }
+
+        let result = read_frames::<DisplayTrackEnvelope>(&buf).expect("read_frames should succeed");
+        assert_eq!(result.frames, envelopes);
+        assert_eq!(result.bytes_remaining, 0);
+    }
+
+    // ── Supporting type round-trips ──────────────────────────────────────────
+
+    #[test]
+    fn attach_focus_target_all_variants_roundtrip() {
+        let targets = [
+            AttachFocusTarget::None,
+            AttachFocusTarget::Pane {
+                pane_id: Uuid::from_u128(1),
+            },
+            AttachFocusTarget::Surface {
+                surface_id: Uuid::from_u128(2),
+            },
+        ];
+        for target in &targets {
+            assert_roundtrip(target);
+        }
+    }
+
+    #[test]
+    fn attach_surface_kind_all_variants_roundtrip() {
+        let kinds = [
+            AttachSurfaceKind::Pane,
+            AttachSurfaceKind::FloatingPane,
+            AttachSurfaceKind::Modal,
+            AttachSurfaceKind::Overlay,
+            AttachSurfaceKind::Tooltip,
+        ];
+        for kind in &kinds {
+            assert_roundtrip(kind);
+        }
+    }
+
+    #[test]
+    fn attach_layer_all_variants_roundtrip() {
+        let layers = [
+            AttachLayer::Status,
+            AttachLayer::Pane,
+            AttachLayer::Overlay,
+            AttachLayer::FloatingPane,
+            AttachLayer::Tooltip,
+            AttachLayer::Cursor,
+        ];
+        for layer in &layers {
+            assert_roundtrip(layer);
+        }
+    }
+
+    #[test]
+    fn pane_layout_node_split_roundtrip() {
+        assert_roundtrip(&sample_layout_tree());
+    }
+
+    #[test]
+    fn context_selector_all_variants_roundtrip() {
+        let selectors = [
+            ContextSelector::ById(Uuid::from_u128(1)),
+            ContextSelector::ByName("ctx-name".into()),
+        ];
+        for sel in &selectors {
+            assert_roundtrip(sel);
+        }
+    }
+
+    #[test]
+    fn pane_selector_all_variants_roundtrip() {
+        let selectors = [
+            PaneSelector::ById(Uuid::from_u128(1)),
+            PaneSelector::ByIndex(42),
+            PaneSelector::Active,
+        ];
+        for sel in &selectors {
+            assert_roundtrip(sel);
+        }
     }
 }

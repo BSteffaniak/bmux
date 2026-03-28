@@ -225,9 +225,9 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        ProviderId, RegisteredService, ServiceEnvelopeKind, ServiceKind, ServiceRequest,
-        ServiceResponse, decode_service_envelope, decode_service_message, encode_service_envelope,
-        encode_service_message,
+        ProviderId, RegisteredService, ServiceEnvelopeKind, ServiceError, ServiceKind,
+        ServiceRequest, ServiceResponse, decode_service_envelope, decode_service_message,
+        encode_service_envelope, encode_service_message,
     };
     use crate::HostScope;
 
@@ -262,5 +262,100 @@ mod tests {
                 .expect("service envelope should decode");
         assert_eq!(request_id, 41);
         assert_eq!(decoded, request);
+    }
+
+    // ── Level 1F: Extended plugin service protocol round-trips ───────────────
+
+    #[test]
+    fn service_response_error_roundtrip() {
+        let response = ServiceResponse::error("NOT_FOUND", "resource not found");
+        let bytes = encode_service_message(&response).expect("error response should encode");
+        let decoded: ServiceResponse =
+            decode_service_message(&bytes).expect("error response should decode");
+        assert_eq!(decoded, response);
+        assert!(decoded.error.is_some());
+        let err = decoded.error.unwrap();
+        assert_eq!(err.code, "NOT_FOUND");
+        assert_eq!(err.message, "resource not found");
+    }
+
+    #[test]
+    fn service_error_standalone_roundtrip() {
+        let error = ServiceError {
+            code: "INTERNAL".to_string(),
+            message: "something went wrong".to_string(),
+        };
+        let bytes = encode_service_message(&error).expect("service error should encode");
+        let decoded: ServiceError =
+            decode_service_message(&bytes).expect("service error should decode");
+        assert_eq!(decoded, error);
+    }
+
+    #[test]
+    fn provider_id_host_roundtrip() {
+        let provider = ProviderId::Host;
+        let bytes = encode_service_message(&provider).expect("host provider should encode");
+        let decoded: ProviderId =
+            decode_service_message(&bytes).expect("host provider should decode");
+        assert_eq!(decoded, provider);
+    }
+
+    #[test]
+    fn provider_id_plugin_roundtrip() {
+        let provider = ProviderId::Plugin("my-plugin".to_string());
+        let bytes = encode_service_message(&provider).expect("plugin provider should encode");
+        let decoded: ProviderId =
+            decode_service_message(&bytes).expect("plugin provider should decode");
+        assert_eq!(decoded, provider);
+    }
+
+    #[test]
+    fn service_kind_all_variants_roundtrip() {
+        for kind in &[ServiceKind::Query, ServiceKind::Command, ServiceKind::Event] {
+            let bytes = encode_service_message(kind).expect("service kind should encode");
+            let decoded: ServiceKind =
+                decode_service_message(&bytes).expect("service kind should decode");
+            assert_eq!(&decoded, kind);
+        }
+    }
+
+    #[test]
+    fn service_envelope_kind_all_variants_roundtrip() {
+        for kind in &[
+            ServiceEnvelopeKind::Request,
+            ServiceEnvelopeKind::Response,
+            ServiceEnvelopeKind::Event,
+        ] {
+            let bytes = encode_service_message(kind).expect("envelope kind should encode");
+            let decoded: ServiceEnvelopeKind =
+                decode_service_message(&bytes).expect("envelope kind should decode");
+            assert_eq!(&decoded, kind);
+        }
+    }
+
+    #[test]
+    fn service_envelope_response_kind_roundtrip() {
+        let response = ServiceResponse::ok(vec![7, 8, 9]);
+        let bytes = encode_service_envelope(99, ServiceEnvelopeKind::Response, &response)
+            .expect("response envelope should encode");
+        let (request_id, decoded): (u64, ServiceResponse) =
+            decode_service_envelope(&bytes, ServiceEnvelopeKind::Response)
+                .expect("response envelope should decode");
+        assert_eq!(request_id, 99);
+        assert_eq!(decoded, response);
+    }
+
+    #[test]
+    fn registered_service_with_host_provider_roundtrip() {
+        let service = RegisteredService {
+            capability: HostScope::new("bmux.sessions.read").expect("capability should parse"),
+            kind: ServiceKind::Command,
+            interface_id: "session-command/v1".to_string(),
+            provider: ProviderId::Host,
+        };
+        let bytes = encode_service_message(&service).expect("registered service should encode");
+        let decoded: RegisteredService =
+            decode_service_message(&bytes).expect("registered service should decode");
+        assert_eq!(decoded, service);
     }
 }

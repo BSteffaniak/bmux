@@ -487,4 +487,308 @@ mod tests {
             assert!(result.is_err());
         }
     }
+
+    // ── Level 2A: Error path tests ───────────────────────────────────────────
+
+    #[test]
+    fn invalid_bool_byte_returns_error() {
+        // A bool should be 0 or 1. Byte value 2 should fail.
+        let result = from_bytes::<bool>(&[2]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn invalid_bool_byte_returns_error_high_value() {
+        let result = from_bytes::<bool>(&[255]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn invalid_variant_index_returns_error() {
+        #[derive(Debug, PartialEq, Deserialize)]
+        enum SmallEnum {
+            A,
+            B,
+        }
+        // Variant index 99 is out of range for a 2-variant enum
+        let mut bytes = Vec::new();
+        varint::encode_u32(&mut bytes, 99);
+        let result = from_bytes::<SmallEnum>(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn invalid_utf8_in_string_returns_error() {
+        // Construct a "string" with invalid UTF-8: length=3 then 3 bytes of 0xFF
+        let mut bytes = Vec::new();
+        varint::encode_usize(&mut bytes, 3);
+        bytes.extend_from_slice(&[0xFF, 0xFE, 0xFD]);
+        let result = from_bytes::<String>(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn truncated_struct_returns_error() {
+        let v = SimpleStruct {
+            a: 42,
+            b: "test".into(),
+            c: true,
+        };
+        let bytes = to_vec(&v).unwrap();
+        // Truncate to half the bytes
+        let truncated = &bytes[..bytes.len() / 2];
+        let result = from_bytes::<SimpleStruct>(truncated);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn truncated_varint_returns_error() {
+        // 0x80 sets continuation bit but no terminator follows
+        let result = from_bytes::<u64>(&[0x80]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn truncated_varint_multi_byte_returns_error() {
+        let result = from_bytes::<u64>(&[0x80, 0x80]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn empty_input_returns_error_for_non_unit() {
+        let result = from_bytes::<u32>(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn empty_input_returns_error_for_string() {
+        let result = from_bytes::<String>(&[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn invalid_char_surrogate_returns_error() {
+        // U+D800 is a surrogate codepoint, not a valid char
+        let mut bytes = Vec::new();
+        varint::encode_u32(&mut bytes, 0xD800);
+        let result = from_bytes::<char>(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn invalid_char_too_large_returns_error() {
+        // 0x110000 is beyond the Unicode range
+        let mut bytes = Vec::new();
+        varint::encode_u32(&mut bytes, 0x11_0000);
+        let result = from_bytes::<char>(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn deserialize_any_returns_unsupported_error() {
+        // serde_json::Value calls deserialize_any
+        let bytes = to_vec(&42u32).unwrap();
+        let result = from_bytes::<serde_json::Value>(&bytes);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn option_invalid_tag_returns_error() {
+        // Option tag should be 0 (None) or 1 (Some). Value 2 is invalid.
+        let result = from_bytes::<Option<u32>>(&[2]);
+        assert!(result.is_err());
+    }
+
+    // ── Level 2B: Edge case round-trips ──────────────────────────────────────
+
+    #[test]
+    fn roundtrip_btreeset() {
+        use std::collections::BTreeSet;
+        let mut s = BTreeSet::new();
+        s.insert("alpha".to_string());
+        s.insert("beta".to_string());
+        s.insert("gamma".to_string());
+        let bytes = to_vec(&s).unwrap();
+        assert_eq!(from_bytes::<BTreeSet<String>>(&bytes).unwrap(), s);
+    }
+
+    #[test]
+    fn roundtrip_btreeset_empty() {
+        use std::collections::BTreeSet;
+        let s: BTreeSet<u32> = BTreeSet::new();
+        let bytes = to_vec(&s).unwrap();
+        assert_eq!(from_bytes::<BTreeSet<u32>>(&bytes).unwrap(), s);
+    }
+
+    #[test]
+    fn roundtrip_pathbuf() {
+        use std::path::PathBuf;
+        let p = PathBuf::from("/tmp/bmux/server.sock");
+        let bytes = to_vec(&p).unwrap();
+        assert_eq!(from_bytes::<PathBuf>(&bytes).unwrap(), p);
+    }
+
+    #[test]
+    fn roundtrip_pathbuf_empty() {
+        use std::path::PathBuf;
+        let p = PathBuf::from("");
+        let bytes = to_vec(&p).unwrap();
+        assert_eq!(from_bytes::<PathBuf>(&bytes).unwrap(), p);
+    }
+
+    #[test]
+    fn roundtrip_i8_edge_values() {
+        for v in [0i8, 1, -1, i8::MIN, i8::MAX] {
+            let bytes = to_vec(&v).unwrap();
+            assert_eq!(
+                from_bytes::<i8>(&bytes).unwrap(),
+                v,
+                "i8 roundtrip failed for {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn roundtrip_usize_edge_values() {
+        for v in [0usize, 1, 127, 128, 65535, usize::MAX] {
+            let bytes = to_vec(&v).unwrap();
+            assert_eq!(
+                from_bytes::<usize>(&bytes).unwrap(),
+                v,
+                "usize roundtrip failed for {v}"
+            );
+        }
+    }
+
+    #[test]
+    fn roundtrip_empty_btreemap() {
+        let m: BTreeMap<String, String> = BTreeMap::new();
+        let bytes = to_vec(&m).unwrap();
+        assert_eq!(from_bytes::<BTreeMap<String, String>>(&bytes).unwrap(), m);
+    }
+
+    #[test]
+    fn roundtrip_large_vec_u8() {
+        let v: Vec<u8> = vec![0xAB; 65536];
+        let bytes = to_vec(&v).unwrap();
+        assert_eq!(from_bytes::<Vec<u8>>(&bytes).unwrap(), v);
+    }
+
+    #[test]
+    fn roundtrip_deeply_nested_recursive_type() {
+        // Build a tree 15 levels deep
+        let mut node = TreeNode::Leaf { value: 42 };
+        for _ in 0..15 {
+            node = TreeNode::Branch {
+                left: Box::new(node),
+                right: Box::new(TreeNode::Leaf { value: 0 }),
+            };
+        }
+        let bytes = to_vec(&node).unwrap();
+        assert_eq!(from_bytes::<TreeNode>(&bytes).unwrap(), node);
+    }
+
+    #[test]
+    fn roundtrip_integer_boundary_values() {
+        // Test boundary values for all integer types
+        for v in [u16::MIN, u16::MAX] {
+            let bytes = to_vec(&v).unwrap();
+            assert_eq!(from_bytes::<u16>(&bytes).unwrap(), v);
+        }
+        for v in [u32::MIN, u32::MAX] {
+            let bytes = to_vec(&v).unwrap();
+            assert_eq!(from_bytes::<u32>(&bytes).unwrap(), v);
+        }
+        for v in [u64::MIN, u64::MAX] {
+            let bytes = to_vec(&v).unwrap();
+            assert_eq!(from_bytes::<u64>(&bytes).unwrap(), v);
+        }
+        for v in [i16::MIN, i16::MAX] {
+            let bytes = to_vec(&v).unwrap();
+            assert_eq!(from_bytes::<i16>(&bytes).unwrap(), v);
+        }
+        for v in [i32::MIN, i32::MAX] {
+            let bytes = to_vec(&v).unwrap();
+            assert_eq!(from_bytes::<i32>(&bytes).unwrap(), v);
+        }
+        for v in [i64::MIN, i64::MAX] {
+            let bytes = to_vec(&v).unwrap();
+            assert_eq!(from_bytes::<i64>(&bytes).unwrap(), v);
+        }
+    }
+
+    #[test]
+    fn roundtrip_f32_special_values() {
+        for v in [
+            f32::MIN,
+            f32::MAX,
+            f32::EPSILON,
+            0.0f32,
+            -0.0f32,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+        ] {
+            let bytes = to_vec(&v).unwrap();
+            assert_eq!(from_bytes::<f32>(&bytes).unwrap(), v);
+        }
+        // NaN: can't use == for NaN, check is_nan instead
+        let bytes = to_vec(&f32::NAN).unwrap();
+        assert!(from_bytes::<f32>(&bytes).unwrap().is_nan());
+    }
+
+    #[test]
+    fn roundtrip_nested_option() {
+        let v: Option<Option<u32>> = Some(Some(42));
+        let bytes = to_vec(&v).unwrap();
+        assert_eq!(from_bytes::<Option<Option<u32>>>(&bytes).unwrap(), v);
+
+        let v: Option<Option<u32>> = Some(None);
+        let bytes = to_vec(&v).unwrap();
+        assert_eq!(from_bytes::<Option<Option<u32>>>(&bytes).unwrap(), v);
+
+        let v: Option<Option<u32>> = None;
+        let bytes = to_vec(&v).unwrap();
+        assert_eq!(from_bytes::<Option<Option<u32>>>(&bytes).unwrap(), v);
+    }
+
+    #[test]
+    fn roundtrip_vec_of_enums() {
+        let v: Vec<TestEnum> = vec![
+            TestEnum::Unit,
+            TestEnum::Newtype(1),
+            TestEnum::Tuple(2, "x".into()),
+            TestEnum::Struct {
+                x: -1,
+                y: "y".into(),
+            },
+        ];
+        let bytes = to_vec(&v).unwrap();
+        assert_eq!(from_bytes::<Vec<TestEnum>>(&bytes).unwrap(), v);
+    }
+
+    #[test]
+    fn roundtrip_map_with_complex_values() {
+        let mut m = BTreeMap::new();
+        m.insert(
+            "simple".to_string(),
+            SimpleStruct {
+                a: 1,
+                b: "x".into(),
+                c: true,
+            },
+        );
+        m.insert(
+            "other".to_string(),
+            SimpleStruct {
+                a: 2,
+                b: "y".into(),
+                c: false,
+            },
+        );
+        let bytes = to_vec(&m).unwrap();
+        assert_eq!(
+            from_bytes::<BTreeMap<String, SimpleStruct>>(&bytes).unwrap(),
+            m
+        );
+    }
 }
