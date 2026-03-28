@@ -80,11 +80,7 @@ pub enum Action {
     /// Close a pane (focused if no target given).
     ClosePane { target: Option<u32> },
     /// Send keystrokes to the focused pane (C-style escapes supported).
-    SendKeys {
-        keys: Vec<u8>,
-        #[allow(dead_code)]
-        pane: Option<u32>,
-    },
+    SendKeys { keys: Vec<u8>, pane: Option<u32> },
     /// Send raw bytes (hex-encoded) to the focused pane.
     SendBytes { hex: Vec<u8> },
     /// Wait until pane screen content matches a regex pattern.

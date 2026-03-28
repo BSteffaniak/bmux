@@ -260,15 +260,46 @@ async fn execute_step(
             Ok(None)
         }
 
-        Action::SendKeys { keys, pane: _ } => {
+        Action::SendKeys { keys, pane } => {
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
-            // TODO: pane-targeted send when the IPC supports it;
-            // for now all input goes to the focused pane.
-            client
-                .attach_input(sid, keys.clone())
-                .await
-                .map_err(|e| anyhow::anyhow!("send-keys failed: {e}"))?;
+
+            if let Some(target_index) = pane {
+                // Pane-targeted send: focus the target pane, send input, then
+                // restore focus to the original pane.
+                let snapshot = client
+                    .attach_snapshot(sid, 0)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("snapshot for focus check failed: {e}"))?;
+                let current_focused = snapshot.panes.iter().find(|p| p.focused).map(|p| p.index);
+
+                let target_selector = bmux_ipc::PaneSelector::ByIndex(*target_index);
+                client
+                    .focus_pane_target(Some(SessionSelector::ById(sid)), target_selector)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("send-keys focus target pane failed: {e}"))?;
+
+                client
+                    .attach_input(sid, keys.clone())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("send-keys failed: {e}"))?;
+
+                // Restore focus to the original pane if it was different.
+                if let Some(orig_index) = current_focused {
+                    if orig_index != *target_index {
+                        let restore_selector = bmux_ipc::PaneSelector::ByIndex(orig_index);
+                        client
+                            .focus_pane_target(Some(SessionSelector::ById(sid)), restore_selector)
+                            .await
+                            .map_err(|e| anyhow::anyhow!("send-keys restore focus failed: {e}"))?;
+                    }
+                }
+            } else {
+                client
+                    .attach_input(sid, keys.clone())
+                    .await
+                    .map_err(|e| anyhow::anyhow!("send-keys failed: {e}"))?;
+            }
             Ok(None)
         }
 
@@ -339,8 +370,8 @@ async fn execute_step(
             require_attached(*attached)?;
 
             drain_output_until_idle(client, sid, Duration::from_millis(200)).await?;
-            let snapshot = inspector.refresh(client, sid).await?;
-            let panes = inspector.capture_all(&snapshot);
+            let _snapshot = inspector.refresh(client, sid).await?;
+            let panes = inspector.capture_all();
 
             snapshots.push(SnapshotCapture {
                 id: id.clone(),

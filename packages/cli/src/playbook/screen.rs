@@ -1,4 +1,12 @@
 //! Screen inspector: parse terminal output and extract text content for assertions.
+//!
+//! On each `refresh()`, a fresh `vt100::Parser` is created per pane and fed the
+//! snapshot chunk data. This avoids the re-feed problem: `attach_snapshot` returns
+//! the most recent bytes from a ring buffer (not cursor-based), so appending to an
+//! existing parser would double-process overlapping data and corrupt state.
+//!
+//! Pane dimensions are extracted from the `AttachScene` surface rects, which give
+//! exact pixel-accurate (cell-accurate) sizes for each pane including after splits.
 
 use anyhow::{Context, Result, bail};
 use bmux_client::{AttachSnapshotState, BmuxClient};
@@ -10,10 +18,24 @@ use super::types::PaneCapture;
 /// Maximum bytes to request per pane in a snapshot.
 const SNAPSHOT_MAX_BYTES_PER_PANE: usize = 256 * 1024;
 
-/// Inspector that maintains per-pane vt100 parsers and provides text extraction.
+/// Parsed screen state for a single pane after one `refresh()` cycle.
+struct ParsedPane {
+    #[allow(dead_code)]
+    pane_id: Uuid,
+    pane_index: u32,
+    focused: bool,
+    screen_text: String,
+    cursor_row: u16,
+    cursor_col: u16,
+}
+
+/// Inspector that parses terminal output into text for assertions.
+///
+/// Stateless between `refresh()` calls — each refresh produces a complete,
+/// self-contained view of every pane's screen content.
 pub struct ScreenInspector {
-    /// Per-pane parser state, keyed by pane UUID.
-    parsers: Vec<(Uuid, u32, vt100::Parser)>,
+    /// Parsed pane state from the most recent `refresh()` call.
+    panes: Vec<ParsedPane>,
     viewport_rows: u16,
     viewport_cols: u16,
 }
@@ -21,7 +43,7 @@ pub struct ScreenInspector {
 impl ScreenInspector {
     pub fn new(viewport_cols: u16, viewport_rows: u16) -> Self {
         Self {
-            parsers: Vec::new(),
+            panes: Vec::new(),
             viewport_rows,
             viewport_cols,
         }
@@ -30,11 +52,14 @@ impl ScreenInspector {
     pub fn update_viewport(&mut self, cols: u16, rows: u16) {
         self.viewport_cols = cols;
         self.viewport_rows = rows;
-        // Reset parsers on resize since dimensions changed
-        self.parsers.clear();
+        self.panes.clear();
     }
 
-    /// Fetch a fresh snapshot from the server and update internal parser state.
+    /// Fetch a fresh snapshot from the server and parse all pane screens.
+    ///
+    /// This creates a **fresh** vt100 parser for each pane on every call,
+    /// avoiding the re-feed problem with `read_recent` (sliding window) data.
+    /// Pane dimensions come from the scene's surface rects when available.
     pub async fn refresh(
         &mut self,
         client: &mut BmuxClient,
@@ -45,69 +70,88 @@ impl ScreenInspector {
             .await
             .map_err(|e| anyhow::anyhow!("snapshot failed: {e}"))?;
 
-        // Update parsers for each pane
-        for chunk in &snapshot.chunks {
-            if let Some(pane_summary) = snapshot.panes.iter().find(|p| p.id == chunk.pane_id) {
-                let parser = self.get_or_create_parser(chunk.pane_id, pane_summary.index);
+        // Build pane dimension map from the scene surfaces.
+        let pane_dims = build_pane_dimensions(&snapshot);
+
+        // Parse each pane's chunk data with a fresh parser.
+        let mut parsed = Vec::new();
+        for pane_summary in &snapshot.panes {
+            let chunk = snapshot
+                .chunks
+                .iter()
+                .find(|c| c.pane_id == pane_summary.id);
+
+            // Get pane dimensions: prefer scene rect, fall back to viewport estimate.
+            let (cols, rows) = pane_dims
+                .iter()
+                .find(|(id, _, _)| *id == pane_summary.id)
+                .map(|(_, w, h)| (*w, *h))
+                .unwrap_or_else(|| {
+                    (
+                        self.viewport_cols.saturating_sub(2).max(1),
+                        self.viewport_rows.saturating_sub(2).max(1),
+                    )
+                });
+
+            let mut parser = vt100::Parser::new(rows, cols, 4096);
+
+            if let Some(chunk) = chunk {
                 parser.process(&chunk.data);
             }
+
+            let screen = parser.screen();
+            let text = screen_to_text(screen);
+            let (cursor_row, cursor_col) = screen.cursor_position();
+
+            parsed.push(ParsedPane {
+                pane_id: pane_summary.id,
+                pane_index: pane_summary.index,
+                focused: pane_summary.focused,
+                screen_text: text,
+                cursor_row,
+                cursor_col,
+            });
         }
 
+        self.panes = parsed;
         Ok(snapshot)
     }
 
     /// Get the full screen text of a specific pane (by index).
-    /// Returns the text with trailing whitespace trimmed per line.
     pub fn pane_text(&self, pane_index: u32) -> Option<String> {
-        self.parsers
+        self.panes
             .iter()
-            .find(|(_, idx, _)| *idx == pane_index)
-            .map(|(_, _, parser)| screen_to_text(parser.screen()))
+            .find(|p| p.pane_index == pane_index)
+            .map(|p| p.screen_text.clone())
     }
 
     /// Get the full screen text of the focused pane.
     #[allow(dead_code)]
-    pub fn focused_pane_text(&self, snapshot: &AttachSnapshotState) -> Option<String> {
-        let focused = snapshot.panes.iter().find(|p| p.focused)?;
-        self.pane_text(focused.index)
+    pub fn focused_pane_text(&self) -> Option<String> {
+        self.panes
+            .iter()
+            .find(|p| p.focused)
+            .map(|p| p.screen_text.clone())
     }
 
     /// Get cursor position for a pane (by index). Returns (row, col).
     pub fn pane_cursor(&self, pane_index: u32) -> Option<(u16, u16)> {
-        self.parsers
+        self.panes
             .iter()
-            .find(|(_, idx, _)| *idx == pane_index)
-            .map(|(_, _, parser)| {
-                let screen = parser.screen();
-                (screen.cursor_position().0, screen.cursor_position().1)
-            })
+            .find(|p| p.pane_index == pane_index)
+            .map(|p| (p.cursor_row, p.cursor_col))
     }
 
     /// Capture the state of all panes for a snapshot.
-    pub fn capture_all(&self, snapshot: &AttachSnapshotState) -> Vec<PaneCapture> {
-        snapshot
-            .panes
+    pub fn capture_all(&self) -> Vec<PaneCapture> {
+        self.panes
             .iter()
-            .map(|pane| {
-                let (screen_text, cursor_row, cursor_col) = self
-                    .parsers
-                    .iter()
-                    .find(|(_, idx, _)| *idx == pane.index)
-                    .map(|(_, _, parser)| {
-                        let screen = parser.screen();
-                        let text = screen_to_text(screen);
-                        let (row, col) = screen.cursor_position();
-                        (text, row, col)
-                    })
-                    .unwrap_or_default();
-
-                PaneCapture {
-                    index: pane.index,
-                    focused: pane.focused,
-                    screen_text,
-                    cursor_row,
-                    cursor_col,
-                }
+            .map(|p| PaneCapture {
+                index: p.pane_index,
+                focused: p.focused,
+                screen_text: p.screen_text.clone(),
+                cursor_row: p.cursor_row,
+                cursor_col: p.cursor_col,
             })
             .collect()
     }
@@ -148,32 +192,36 @@ impl ScreenInspector {
                 .context("no focused pane"),
         }
     }
+}
 
-    fn get_or_create_parser(&mut self, pane_id: Uuid, pane_index: u32) -> &mut vt100::Parser {
-        let pos = self.parsers.iter().position(|(id, _, _)| *id == pane_id);
-        match pos {
-            Some(i) => &mut self.parsers[i].2,
-            None => {
-                // Estimate pane size from viewport — for a single pane it gets
-                // the full viewport minus borders; for splits it's smaller.
-                // Using full viewport as an approximation since we don't have
-                // exact per-pane dimensions here.
-                let rows = self.viewport_rows.saturating_sub(2).max(1);
-                let cols = self.viewport_cols.saturating_sub(2).max(1);
-                self.parsers
-                    .push((pane_id, pane_index, vt100::Parser::new(rows, cols, 4096)));
-                &mut self.parsers.last_mut().unwrap().2
+/// Extract per-pane (cols, rows) from the scene's surface rects.
+///
+/// Each pane has an `AttachSurface` in the scene with `pane_id` set and a `rect`
+/// giving the exact cell dimensions.
+fn build_pane_dimensions(snapshot: &AttachSnapshotState) -> Vec<(Uuid, u16, u16)> {
+    snapshot
+        .scene
+        .surfaces
+        .iter()
+        .filter_map(|surface| {
+            let pane_id = surface.pane_id?;
+            // Only consider visible pane surfaces
+            if !surface.visible {
+                return None;
             }
-        }
-    }
+            let w = surface.rect.w.max(1);
+            let h = surface.rect.h.max(1);
+            Some((pane_id, w, h))
+        })
+        .collect()
 }
 
 /// Extract visible text from a vt100 screen, with trailing whitespace trimmed per line.
 fn screen_to_text(screen: &vt100::Screen) -> String {
     let mut lines = Vec::new();
-    let (rows, _cols) = screen.size();
+    let (rows, cols) = screen.size();
     for row in 0..rows {
-        let row_text = screen.contents_between(row, 0, row, screen.size().1);
+        let row_text = screen.contents_between(row, 0, row, cols);
         lines.push(row_text.trim_end().to_string());
     }
 
@@ -206,5 +254,28 @@ mod tests {
         assert!(!text.ends_with('\n'));
         let line_count = text.lines().count();
         assert_eq!(line_count, 2);
+    }
+
+    #[test]
+    fn fresh_parser_avoids_double_processing() {
+        // Simulates what would happen if we re-fed the same data twice
+        // to an accumulated parser vs. using a fresh one each time.
+        let data = b"hello\r\nworld\r\n";
+
+        // Accumulated parser (old buggy approach): process same data twice
+        let mut accumulated = vt100::Parser::new(24, 80, 100);
+        accumulated.process(data);
+        accumulated.process(data); // re-feed!
+        let accumulated_text = screen_to_text(accumulated.screen());
+
+        // Fresh parser (correct approach): process once
+        let mut fresh = vt100::Parser::new(24, 80, 100);
+        fresh.process(data);
+        let fresh_text = screen_to_text(fresh.screen());
+
+        // The fresh parser should show "hello\nworld"
+        assert_eq!(fresh_text, "hello\nworld");
+        // The accumulated parser shows doubled output — this is the bug we fixed
+        assert_ne!(accumulated_text, fresh_text);
     }
 }
