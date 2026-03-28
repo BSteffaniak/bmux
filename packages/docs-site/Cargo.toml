@@ -27,10 +27,14 @@ hyperchad = { workspace = true, features = [
     "router",
 ] }
 
-env_logger = { version = "0.11" }
-log        = { version = "0.4" }
+env_logger = { workspace = true, features = [
+    "auto-color",
+    "humantime",
+    "regex",
+] }
+log = { workspace = true }
 serde_json = { workspace = true }
-switchy    = { workspace = true, features = ["async", "async-tokio"] }
+switchy = { workspace = true, features = ["async", "async-tokio"] }
 
 [features]
 default = ["actix", "html", "vanilla-js", "assets", "static-routes"]

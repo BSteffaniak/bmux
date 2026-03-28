@@ -11,6 +11,14 @@ version     = { workspace = true }
 proc-macro = true
 
 [dependencies]
-proc-macro2 = "1"
-quote       = "1"
-syn         = { version = "2", features = ["full", "extra-traits"] }
+proc-macro2 = { workspace = true, features = ["proc-macro"] }
+quote = { workspace = true, features = ["proc-macro"] }
+syn = { workspace = true, features = [
+    "clone-impls",
+    "derive",
+    "extra-traits",
+    "full",
+    "parsing",
+    "printing",
+    "proc-macro",
+] }
