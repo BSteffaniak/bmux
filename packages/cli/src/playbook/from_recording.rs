@@ -20,27 +20,6 @@ pub fn events_to_playbook(events: &[RecordingEventEnvelope]) -> Result<String> {
     let mut last_mono_ns: u64 = 0;
     let mut has_session = false;
 
-    // The recording often starts after the session was already created (since
-    // the playbook engine starts recording after new-session succeeds). If no
-    // NewSession event is found, synthesize one at the beginning.
-    let has_new_session_event = events.iter().any(|e| {
-        if let (
-            RecordingEventKind::RequestStart,
-            RecordingPayload::RequestStart { request_data, .. },
-        ) = (&e.kind, &e.payload)
-        {
-            if let Ok(Request::NewSession { .. }) = bmux_ipc::decode::<Request>(request_data) {
-                return true;
-            }
-        }
-        false
-    });
-    if !has_new_session_event {
-        lines.push("new-session".to_string());
-        lines.push("sleep ms=500".to_string());
-        has_session = true;
-    }
-
     for event in events {
         // Insert sleep for timing gaps.
         if last_mono_ns > 0 && event.mono_ns > last_mono_ns {

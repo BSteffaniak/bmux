@@ -82,8 +82,46 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
     let mut session_id: Option<Uuid> = None;
     let mut attached = false;
     let mut events_subscribed = false;
-    let mut recording_started = false;
     let mut display_track: Option<super::display_track::PlaybookDisplayTrackWriter> = None;
+
+    // Start recording before any steps execute so that all events (including
+    // NewSession) are captured. Uses session_id: None since no session exists
+    // yet — the sandbox is ephemeral so there's no noise from other sessions.
+    if should_record {
+        match start_recording(&mut client, None).await {
+            Ok(rid) => {
+                info!("recording started: {rid}");
+                recording_id = Some(rid);
+
+                // Create display track writer for GIF export.
+                if let Some(ref sb) = sandbox {
+                    let rec_dir = sb.paths().recordings_dir().join(rid.to_string());
+                    let client_id = match client.whoami().await {
+                        Ok(id) => id,
+                        Err(_) => Uuid::new_v4(),
+                    };
+                    match super::display_track::PlaybookDisplayTrackWriter::new(
+                        &rec_dir,
+                        client_id,
+                        rid,
+                        playbook.config.viewport.cols,
+                        playbook.config.viewport.rows,
+                    ) {
+                        Ok(dt) => {
+                            display_track = Some(dt);
+                        }
+                        Err(e) => {
+                            warn!("failed to create display track: {e:#}");
+                        }
+                    }
+                }
+            }
+            Err(e) => {
+                warn!("failed to start recording: {e:#}");
+                // Non-fatal — continue without recording.
+            }
+        }
+    }
 
     // Execute each step
     let deadline = Instant::now() + playbook.config.timeout;
@@ -135,47 +173,6 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
                     elapsed_ms,
                     detail,
                 });
-
-                // Start recording after the first successful new-session step.
-                if should_record
-                    && !recording_started
-                    && matches!(step.action, Action::NewSession { .. })
-                {
-                    match start_recording(&mut client, session_id).await {
-                        Ok(rid) => {
-                            info!("recording started: {rid}");
-                            recording_id = Some(rid);
-                            recording_started = true;
-
-                            // Create display track writer for GIF export.
-                            if let Some(ref sb) = sandbox {
-                                let rec_dir = sb.paths().recordings_dir().join(rid.to_string());
-                                let client_id = match client.whoami().await {
-                                    Ok(id) => id,
-                                    Err(_) => Uuid::new_v4(),
-                                };
-                                match super::display_track::PlaybookDisplayTrackWriter::new(
-                                    &rec_dir,
-                                    client_id,
-                                    rid,
-                                    playbook.config.viewport.cols,
-                                    playbook.config.viewport.rows,
-                                ) {
-                                    Ok(dt) => {
-                                        display_track = Some(dt);
-                                    }
-                                    Err(e) => {
-                                        warn!("failed to create display track: {e:#}");
-                                    }
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            warn!("failed to start recording: {e:#}");
-                            // Non-fatal — continue without recording.
-                        }
-                    }
-                }
             }
             Err(err) => {
                 warn!(
@@ -207,30 +204,28 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
 
     // Copy recording dir to user recordings dir before sandbox shutdown.
     let mut recording_path: Option<std::path::PathBuf> = None;
-    if recording_started {
-        if let (Some(rid), Some(sb)) = (recording_id, &sandbox) {
-            // Stop recording first so the server finalizes the JSONL files.
-            match client.recording_stop(Some(rid)).await {
-                Ok(stopped_id) => {
-                    info!("recording stopped: {stopped_id}");
-                }
-                Err(e) => {
-                    warn!("failed to stop recording: {e}");
-                }
+    if let (Some(rid), Some(sb)) = (recording_id, &sandbox) {
+        // Stop recording first so the server finalizes the binary files.
+        match client.recording_stop(Some(rid)).await {
+            Ok(stopped_id) => {
+                info!("recording stopped: {stopped_id}");
             }
+            Err(e) => {
+                warn!("failed to stop recording: {e}");
+            }
+        }
 
-            // Copy recording dir from sandbox to user recordings dir.
-            let src_dir = sb.paths().recordings_dir().join(rid.to_string());
-            let user_recordings = bmux_config::ConfigPaths::default().recordings_dir();
-            let dest_dir = user_recordings.join(rid.to_string());
+        // Copy recording dir from sandbox to user recordings dir.
+        let src_dir = sb.paths().recordings_dir().join(rid.to_string());
+        let user_recordings = bmux_config::ConfigPaths::default().recordings_dir();
+        let dest_dir = user_recordings.join(rid.to_string());
 
-            if src_dir.exists() {
-                if let Err(e) = copy_dir_recursive(&src_dir, &dest_dir) {
-                    warn!("failed to copy recording to user dir: {e:#}");
-                } else {
-                    info!("recording copied to {}", dest_dir.display());
-                    recording_path = Some(dest_dir);
-                }
+        if src_dir.exists() {
+            if let Err(e) = copy_dir_recursive(&src_dir, &dest_dir) {
+                warn!("failed to copy recording to user dir: {e:#}");
+            } else {
+                info!("recording copied to {}", dest_dir.display());
+                recording_path = Some(dest_dir);
             }
         }
     }
