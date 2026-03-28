@@ -46,18 +46,28 @@ enum ServerHandle {
 
 impl SandboxServer {
     /// Create and start a new ephemeral sandbox server.
+    ///
+    /// - `binary`: path to the bmux binary. Falls back to `std::env::current_exe()`
+    ///   when `None`.
+    /// - `bundled_plugin_ids`: pre-computed list of bundled plugin IDs for the
+    ///   disable list. Pass an empty vec if plugin discovery is unavailable.
     pub async fn start(
         shell: Option<&str>,
         plugin_config: &PluginConfig,
         startup_timeout: Duration,
         env: &std::collections::BTreeMap<String, String>,
         env_mode: super::types::SandboxEnvMode,
+        binary: Option<&Path>,
+        bundled_plugin_ids: &[String],
     ) -> Result<Self> {
         let (paths, root_dir) = create_temp_paths();
-        write_sandbox_config(&paths, shell, plugin_config)
+        write_sandbox_config(&paths, shell, plugin_config, bundled_plugin_ids)
             .context("failed writing sandbox config")?;
 
-        let bmux_binary = std::env::current_exe().context("failed resolving bmux binary path")?;
+        let bmux_binary = match binary {
+            Some(p) => p.to_path_buf(),
+            None => std::env::current_exe().context("failed resolving bmux binary path")?,
+        };
 
         let handle = start_sandbox_server(
             &bmux_binary,
@@ -254,6 +264,7 @@ fn write_sandbox_config(
     paths: &ConfigPaths,
     shell: Option<&str>,
     plugin_config: &PluginConfig,
+    bundled_plugin_ids: &[String],
 ) -> Result<()> {
     let config_path = paths.config_file();
     if let Some(parent) = config_path.parent() {
@@ -269,8 +280,7 @@ fn write_sandbox_config(
     }
 
     // Plugin configuration — build disabled list
-    let bundled_ids = discover_bundled_plugin_ids();
-    let disabled = build_plugin_disabled_list(plugin_config, &bundled_ids);
+    let disabled = build_plugin_disabled_list(plugin_config, bundled_plugin_ids);
     let enabled = build_plugin_enabled_list(plugin_config);
 
     if !disabled.is_empty() || !enabled.is_empty() {
@@ -287,28 +297,6 @@ fn write_sandbox_config(
 
     std::fs::write(&config_path, toml)
         .with_context(|| format!("failed writing sandbox config {}", config_path.display()))
-}
-
-/// Discover bundled plugin IDs using the same dynamic discovery as the runtime.
-fn discover_bundled_plugin_ids() -> Vec<String> {
-    let config = bmux_config::BmuxConfig::default();
-    let paths = bmux_config::ConfigPaths::default();
-    let bundled_roots = crate::runtime::bundled_plugin_roots();
-
-    match crate::runtime::scan_available_plugins(&config, &paths) {
-        Ok(registry) => registry
-            .iter()
-            .filter(|plugin| {
-                bundled_roots.contains(&plugin.search_root)
-                    && crate::runtime::registered_plugin_entry_exists(plugin)
-            })
-            .map(|plugin| plugin.declaration.id.as_str().to_string())
-            .collect(),
-        Err(e) => {
-            warn!("failed to discover bundled plugins, using empty list: {e:#}");
-            Vec::new()
-        }
-    }
 }
 
 fn build_plugin_disabled_list(plugin_config: &PluginConfig, bundled_ids: &[String]) -> Vec<String> {

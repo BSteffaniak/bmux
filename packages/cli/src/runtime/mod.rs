@@ -1913,6 +1913,28 @@ pub(crate) fn registered_plugin_entry_exists(plugin: &bmux_plugin::RegisteredPlu
         .exists()
 }
 
+/// Discover bundled plugin IDs using the same dynamic discovery as the runtime.
+/// Returns an empty vec on failure (non-fatal).
+pub(crate) fn discover_bundled_plugin_ids() -> Vec<String> {
+    let config = BmuxConfig::default();
+    let paths = bmux_config::ConfigPaths::default();
+    let roots = bundled_plugin_roots();
+
+    match scan_available_plugins(&config, &paths) {
+        Ok(registry) => registry
+            .iter()
+            .filter(|plugin| {
+                roots.contains(&plugin.search_root) && registered_plugin_entry_exists(plugin)
+            })
+            .map(|plugin| plugin.declaration.id.as_str().to_string())
+            .collect(),
+        Err(e) => {
+            tracing::warn!("failed to discover bundled plugins, using empty list: {e:#}");
+            Vec::new()
+        }
+    }
+}
+
 fn effective_enabled_plugins(config: &BmuxConfig, registry: &PluginRegistry) -> Vec<String> {
     let disabled = config
         .plugins
@@ -8365,6 +8387,9 @@ async fn run_playbook_run(
     if let Some(sh) = shell {
         playbook.config.shell = Some(sh.to_string());
     }
+
+    // Populate bundled plugin IDs so the sandbox can configure plugins.
+    playbook.config.bundled_plugin_ids = discover_bundled_plugin_ids();
 
     let result = crate::playbook::run(playbook, target_server).await?;
 

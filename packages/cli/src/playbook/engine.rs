@@ -67,6 +67,8 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
             SERVER_STARTUP_TIMEOUT,
             &playbook.config.env,
             playbook.config.effective_env_mode(),
+            playbook.config.binary.as_deref(),
+            &playbook.config.bundled_plugin_ids,
         )
         .await
         .context("failed starting sandbox server")?;

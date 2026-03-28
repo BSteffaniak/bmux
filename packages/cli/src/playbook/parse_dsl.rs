@@ -659,4 +659,52 @@ snapshot id=final
             _ => panic!("expected send-keys"),
         }
     }
+
+    #[test]
+    fn parse_env_mode_clean() {
+        let input = "@env-mode clean\nnew-session\n";
+        let (playbook, _) = parse_dsl(input).unwrap();
+        assert_eq!(
+            playbook.config.env_mode,
+            Some(super::super::types::SandboxEnvMode::Clean)
+        );
+    }
+
+    #[test]
+    fn parse_env_mode_inherit() {
+        let input = "@env-mode inherit\nnew-session\n";
+        let (playbook, _) = parse_dsl(input).unwrap();
+        assert_eq!(
+            playbook.config.env_mode,
+            Some(super::super::types::SandboxEnvMode::Inherit)
+        );
+    }
+
+    #[test]
+    fn parse_env_mode_invalid_fails() {
+        let input = "@env-mode foobar\nnew-session\n";
+        assert!(parse_dsl(input).is_err());
+    }
+
+    #[test]
+    fn parse_env_directive() {
+        let input = "@env FOO=bar\n@env BAZ=qux\nnew-session\n";
+        let (playbook, _) = parse_dsl(input).unwrap();
+        assert_eq!(playbook.config.env.get("FOO").unwrap(), "bar");
+        assert_eq!(playbook.config.env.get("BAZ").unwrap(), "qux");
+    }
+
+    #[test]
+    fn parse_screen_action() {
+        let input = "new-session\nscreen\n";
+        let (playbook, _) = parse_dsl(input).unwrap();
+        assert!(matches!(playbook.steps[1].action, Action::Screen));
+    }
+
+    #[test]
+    fn parse_status_action() {
+        let input = "new-session\nstatus\n";
+        let (playbook, _) = parse_dsl(input).unwrap();
+        assert!(matches!(playbook.steps[1].action, Action::Status));
+    }
 }

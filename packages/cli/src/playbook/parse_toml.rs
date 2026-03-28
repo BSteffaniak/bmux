@@ -82,6 +82,8 @@ fn parse_config(raw: Option<RawPlaybookConfig>) -> Result<PlaybookConfig> {
         vars: raw.vars.unwrap_or_default(),
         env: raw.env.unwrap_or_default(),
         env_mode,
+        binary: None,
+        bundled_plugin_ids: Vec::new(),
     })
 }
 
@@ -420,5 +422,43 @@ action = "split-pane"
         let input = "";
         let (playbook, _includes) = parse_toml(input).unwrap();
         assert!(playbook.steps.is_empty());
+    }
+
+    #[test]
+    fn parse_toml_env_mode_clean() {
+        let input = r#"
+[playbook]
+env_mode = "clean"
+
+[[step]]
+action = "new-session"
+"#;
+        let (playbook, _) = parse_toml(input).unwrap();
+        assert_eq!(
+            playbook.config.env_mode,
+            Some(super::super::types::SandboxEnvMode::Clean)
+        );
+    }
+
+    #[test]
+    fn parse_toml_env_mode_absent() {
+        let input = r#"
+[[step]]
+action = "new-session"
+"#;
+        let (playbook, _) = parse_toml(input).unwrap();
+        assert!(playbook.config.env_mode.is_none());
+    }
+
+    #[test]
+    fn parse_toml_env_mode_invalid_fails() {
+        let input = r#"
+[playbook]
+env_mode = "garbage"
+
+[[step]]
+action = "new-session"
+"#;
+        assert!(parse_toml(input).is_err());
     }
 }

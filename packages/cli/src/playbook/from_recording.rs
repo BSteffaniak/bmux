@@ -729,4 +729,271 @@ mod tests {
             "wait-for should match prompt: {waitfor}"
         );
     }
+
+    /// Helper to build a synthetic recording event.
+    fn make_event(
+        seq: u64,
+        mono_ns: u64,
+        kind: RecordingEventKind,
+        payload: RecordingPayload,
+        pane_id: Option<Uuid>,
+        session_id: Option<Uuid>,
+    ) -> RecordingEventEnvelope {
+        RecordingEventEnvelope {
+            seq,
+            mono_ns,
+            wall_epoch_ms: 0,
+            session_id,
+            pane_id,
+            client_id: None,
+            kind,
+            payload,
+        }
+    }
+
+    /// Helper: encode a Request as postcard bytes.
+    fn encode_request(req: &bmux_ipc::Request) -> Vec<u8> {
+        bmux_ipc::encode(req).unwrap_or_default()
+    }
+
+    /// Helper: encode a ResponsePayload as postcard bytes.
+    fn encode_response(resp: &bmux_ipc::ResponsePayload) -> Vec<u8> {
+        bmux_ipc::encode(resp).unwrap_or_default()
+    }
+
+    #[test]
+    fn events_to_playbook_generates_wait_for() {
+        let session_id = Uuid::from_u128(1);
+        let pane_id = Uuid::from_u128(2);
+
+        // Event sequence: NewSession request → RequestDone with session created →
+        // AttachInput (send "echo hi\r") → PaneOutputRaw with response.
+        let new_session_req = bmux_ipc::Request::NewSession { name: None };
+        let new_session_resp = bmux_ipc::ResponsePayload::SessionCreated {
+            id: session_id,
+            name: None,
+        };
+        let attach_input_req = bmux_ipc::Request::AttachInput {
+            session_id,
+            data: b"echo hi\r".to_vec(),
+        };
+
+        let events = vec![
+            // NewSession RequestStart
+            make_event(
+                1,
+                100_000_000,
+                RecordingEventKind::RequestStart,
+                RecordingPayload::RequestStart {
+                    request_id: 1,
+                    request_kind: "new_session".to_string(),
+                    exclusive: false,
+                    request_data: encode_request(&new_session_req),
+                },
+                None,
+                Some(session_id),
+            ),
+            // NewSession RequestDone
+            make_event(
+                2,
+                200_000_000,
+                RecordingEventKind::RequestDone,
+                RecordingPayload::RequestDone {
+                    request_id: 1,
+                    request_kind: "new_session".to_string(),
+                    response_kind: "session_created".to_string(),
+                    elapsed_ms: 100,
+                    request_data: encode_request(&new_session_req),
+                    response_data: encode_response(&new_session_resp),
+                },
+                None,
+                Some(session_id),
+            ),
+            // AttachInput RequestStart
+            make_event(
+                3,
+                1_000_000_000,
+                RecordingEventKind::RequestStart,
+                RecordingPayload::RequestStart {
+                    request_id: 2,
+                    request_kind: "attach_input".to_string(),
+                    exclusive: false,
+                    request_data: encode_request(&attach_input_req),
+                },
+                Some(pane_id),
+                Some(session_id),
+            ),
+            // PaneOutputRaw — simulated shell output
+            make_event(
+                4,
+                1_500_000_000,
+                RecordingEventKind::PaneOutputRaw,
+                RecordingPayload::Bytes {
+                    data: b"echo hi\r\nhi\r\nuser@host:~$ ".to_vec(),
+                },
+                Some(pane_id),
+                Some(session_id),
+            ),
+        ];
+
+        let dsl = events_to_playbook(&events).unwrap();
+
+        assert!(
+            dsl.contains("new-session"),
+            "should contain new-session: {dsl}"
+        );
+        assert!(dsl.contains("send-keys"), "should contain send-keys: {dsl}");
+        assert!(dsl.contains("wait-for"), "should contain wait-for: {dsl}");
+    }
+
+    #[test]
+    fn events_to_playbook_pane_targeting() {
+        let session_id = Uuid::from_u128(1);
+        let pane0 = Uuid::from_u128(10);
+        let pane1 = Uuid::from_u128(11);
+
+        let new_session_req = bmux_ipc::Request::NewSession { name: None };
+        let new_session_resp = bmux_ipc::ResponsePayload::SessionCreated {
+            id: session_id,
+            name: None,
+        };
+
+        // Use PaneSplit response to register pane1.
+        let split_resp = bmux_ipc::ResponsePayload::PaneSplit {
+            id: pane1,
+            session_id,
+        };
+
+        let input_to_pane1 = bmux_ipc::Request::PaneDirectInput {
+            session_id,
+            pane_id: pane1,
+            data: b"echo pane1\r".to_vec(),
+        };
+
+        let events = vec![
+            // NewSession
+            make_event(
+                1,
+                100_000_000,
+                RecordingEventKind::RequestStart,
+                RecordingPayload::RequestStart {
+                    request_id: 1,
+                    request_kind: "new_session".to_string(),
+                    exclusive: false,
+                    request_data: encode_request(&new_session_req),
+                },
+                None,
+                Some(session_id),
+            ),
+            make_event(
+                2,
+                200_000_000,
+                RecordingEventKind::RequestDone,
+                RecordingPayload::RequestDone {
+                    request_id: 1,
+                    request_kind: "new_session".to_string(),
+                    response_kind: "session_created".to_string(),
+                    elapsed_ms: 100,
+                    request_data: encode_request(&new_session_req),
+                    response_data: encode_response(&new_session_resp),
+                },
+                None,
+                Some(session_id),
+            ),
+            // PaneSplit response — registers pane0 (auto) and pane1
+            make_event(
+                3,
+                300_000_000,
+                RecordingEventKind::RequestDone,
+                RecordingPayload::RequestDone {
+                    request_id: 2,
+                    request_kind: "split_pane".to_string(),
+                    response_kind: "pane_split".to_string(),
+                    elapsed_ms: 10,
+                    request_data: vec![],
+                    response_data: encode_response(&split_resp),
+                },
+                None,
+                Some(session_id),
+            ),
+            // Input to pane0 (via envelope pane_id) — registers pane0
+            make_event(
+                4,
+                1_000_000_000,
+                RecordingEventKind::PaneOutputRaw,
+                RecordingPayload::Bytes {
+                    data: b"$ ".to_vec(),
+                },
+                Some(pane0),
+                Some(session_id),
+            ),
+            // PaneDirectInput to pane1 (not focused)
+            make_event(
+                5,
+                2_000_000_000,
+                RecordingEventKind::RequestStart,
+                RecordingPayload::RequestStart {
+                    request_id: 4,
+                    request_kind: "pane_direct_input".to_string(),
+                    exclusive: false,
+                    request_data: encode_request(&input_to_pane1),
+                },
+                Some(pane1),
+                Some(session_id),
+            ),
+        ];
+
+        let dsl = events_to_playbook(&events).unwrap();
+
+        // The input to pane1 should have pane targeting
+        assert!(dsl.contains("send-keys"), "should have send-keys: {dsl}");
+    }
+
+    #[test]
+    fn events_to_playbook_viewport_directive() {
+        let session_id = Uuid::from_u128(1);
+
+        let new_session_req = bmux_ipc::Request::NewSession { name: None };
+        let viewport_req = bmux_ipc::Request::AttachSetViewport {
+            session_id,
+            cols: 120,
+            rows: 40,
+        };
+
+        let events = vec![
+            make_event(
+                1,
+                100_000_000,
+                RecordingEventKind::RequestStart,
+                RecordingPayload::RequestStart {
+                    request_id: 1,
+                    request_kind: "new_session".to_string(),
+                    exclusive: false,
+                    request_data: encode_request(&new_session_req),
+                },
+                None,
+                Some(session_id),
+            ),
+            make_event(
+                2,
+                200_000_000,
+                RecordingEventKind::RequestStart,
+                RecordingPayload::RequestStart {
+                    request_id: 2,
+                    request_kind: "attach_set_viewport".to_string(),
+                    exclusive: false,
+                    request_data: encode_request(&viewport_req),
+                },
+                None,
+                Some(session_id),
+            ),
+        ];
+
+        let dsl = events_to_playbook(&events).unwrap();
+
+        assert!(
+            dsl.contains("@viewport cols=120 rows=40"),
+            "should contain viewport directive: {dsl}"
+        );
+    }
 }

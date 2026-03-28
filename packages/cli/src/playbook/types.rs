@@ -30,6 +30,12 @@ pub struct PlaybookConfig {
     /// Controls how the sandbox inherits the parent process environment.
     /// `None` means the playbook did not explicitly specify a mode.
     pub env_mode: Option<SandboxEnvMode>,
+    /// Path to the bmux binary for spawning sandbox servers.
+    /// `None` falls back to `std::env::current_exe()`.
+    pub binary: Option<std::path::PathBuf>,
+    /// Pre-computed bundled plugin IDs for sandbox plugin configuration.
+    /// Populated by the CLI runtime; empty when not available.
+    pub bundled_plugin_ids: Vec<String>,
 }
 
 /// Controls how the sandbox server inherits environment variables.
@@ -75,6 +81,8 @@ impl Default for PlaybookConfig {
             vars: BTreeMap::new(),
             env: BTreeMap::new(),
             env_mode: None,
+            binary: None,
+            bundled_plugin_ids: Vec::new(),
         }
     }
 }
@@ -266,5 +274,82 @@ impl Action {
             Self::Screen => "screen",
             Self::Status => "status",
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    fn config_with_env_mode(mode: Option<SandboxEnvMode>) -> PlaybookConfig {
+        PlaybookConfig {
+            env_mode: mode,
+            ..Default::default()
+        }
+    }
+
+    fn set_env(key: &str, val: &str) {
+        // SAFETY: Tests using this helper are marked #[serial] to prevent
+        // concurrent env var mutation.
+        unsafe { std::env::set_var(key, val) };
+    }
+
+    fn remove_env(key: &str) {
+        // SAFETY: Tests using this helper are marked #[serial].
+        unsafe { std::env::remove_var(key) };
+    }
+
+    #[test]
+    #[serial]
+    fn explicit_clean_wins_over_env_var() {
+        set_env("BMUX_PLAYBOOK_ENV_MODE", "inherit");
+        let config = config_with_env_mode(Some(SandboxEnvMode::Clean));
+        assert_eq!(config.effective_env_mode(), SandboxEnvMode::Clean);
+        remove_env("BMUX_PLAYBOOK_ENV_MODE");
+    }
+
+    #[test]
+    #[serial]
+    fn explicit_inherit_wins_over_env_var() {
+        set_env("BMUX_PLAYBOOK_ENV_MODE", "clean");
+        let config = config_with_env_mode(Some(SandboxEnvMode::Inherit));
+        assert_eq!(config.effective_env_mode(), SandboxEnvMode::Inherit);
+        remove_env("BMUX_PLAYBOOK_ENV_MODE");
+    }
+
+    #[test]
+    #[serial]
+    fn none_falls_through_to_env_var_clean() {
+        set_env("BMUX_PLAYBOOK_ENV_MODE", "clean");
+        let config = config_with_env_mode(None);
+        assert_eq!(config.effective_env_mode(), SandboxEnvMode::Clean);
+        remove_env("BMUX_PLAYBOOK_ENV_MODE");
+    }
+
+    #[test]
+    #[serial]
+    fn none_falls_through_to_env_var_inherit() {
+        set_env("BMUX_PLAYBOOK_ENV_MODE", "inherit");
+        let config = config_with_env_mode(None);
+        assert_eq!(config.effective_env_mode(), SandboxEnvMode::Inherit);
+        remove_env("BMUX_PLAYBOOK_ENV_MODE");
+    }
+
+    #[test]
+    #[serial]
+    fn none_no_env_var_defaults_to_inherit() {
+        remove_env("BMUX_PLAYBOOK_ENV_MODE");
+        let config = config_with_env_mode(None);
+        assert_eq!(config.effective_env_mode(), SandboxEnvMode::Inherit);
+    }
+
+    #[test]
+    #[serial]
+    fn none_invalid_env_var_defaults_to_inherit() {
+        set_env("BMUX_PLAYBOOK_ENV_MODE", "garbage");
+        let config = config_with_env_mode(None);
+        assert_eq!(config.effective_env_mode(), SandboxEnvMode::Inherit);
+        remove_env("BMUX_PLAYBOOK_ENV_MODE");
     }
 }

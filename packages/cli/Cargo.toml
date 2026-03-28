@@ -108,3 +108,7 @@ bundled-fonts = ["bmux_fonts/bundled-nerd-fonts"]
 
 # Serialization features
 serde = ["bmux_event/serde", "bmux_session/serde", "bmux_terminal/serde"]
+
+[dev-dependencies]
+serde_json  = { workspace = true }
+serial_test = { workspace = true }

@@ -12,5 +12,5 @@ pub use bmux_event::{Event, EventDispatcher, ModalSystem, Mode};
 pub use bmux_session::{SessionId, SessionInfo, SessionManager};
 pub use bmux_terminal::{TerminalInstance, TerminalManager};
 
-// CLI-specific functionality can be added here
-// For now, this mainly serves as a re-export for CLI operations
+/// Playbook system for headless scripted bmux execution.
+pub mod playbook;
