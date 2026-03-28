@@ -46,16 +46,15 @@ impl SandboxServer {
         plugin_config: &PluginConfig,
         startup_timeout: Duration,
     ) -> Result<Self> {
-        let (paths, state_dir, root_dir) = create_temp_paths();
+        let (paths, root_dir) = create_temp_paths();
         write_sandbox_config(&paths, shell, plugin_config)
             .context("failed writing sandbox config")?;
 
         let bmux_binary = std::env::current_exe().context("failed resolving bmux binary path")?;
 
-        let handle =
-            start_sandbox_server(&bmux_binary, &paths, &state_dir, &root_dir, startup_timeout)
-                .await
-                .context("failed starting sandbox server")?;
+        let handle = start_sandbox_server(&bmux_binary, &paths, &root_dir, startup_timeout)
+            .await
+            .context("failed starting sandbox server")?;
 
         Ok(Self { handle, root_dir })
     }
@@ -122,14 +121,18 @@ impl SandboxServer {
 
 // ── Temp directory creation ──────────────────────────────────────────────────
 
-fn create_temp_paths() -> (ConfigPaths, PathBuf, PathBuf) {
+fn create_temp_paths() -> (ConfigPaths, PathBuf) {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
     let root = std::env::temp_dir().join(format!("bpb-{nanos:x}"));
-    let paths = ConfigPaths::new(root.join("c"), root.join("r"), root.join("d"));
-    let state_dir = root.join("s");
-    (paths, state_dir, root)
+    let paths = ConfigPaths::new(
+        root.join("c"),
+        root.join("r"),
+        root.join("d"),
+        root.join("s"),
+    );
+    (paths, root)
 }
 
 // ── Config writing ───────────────────────────────────────────────────────────
@@ -228,15 +231,14 @@ fn build_plugin_enabled_list(plugin_config: &PluginConfig) -> Vec<String> {
 async fn start_sandbox_server(
     binary: &Path,
     paths: &ConfigPaths,
-    state_dir: &Path,
     root_dir: &Path,
     timeout: Duration,
 ) -> Result<ServerHandle> {
-    match start_foreground(binary, paths, state_dir, root_dir, timeout).await {
+    match start_foreground(binary, paths, root_dir, timeout).await {
         Ok(handle) => Ok(handle),
         Err(fg_error) => {
             warn!("playbook sandbox foreground startup failed, falling back to daemon: {fg_error}");
-            start_daemon(binary, paths, state_dir, root_dir, timeout)
+            start_daemon(binary, paths, root_dir, timeout)
                 .await
                 .with_context(|| {
                     format!(
@@ -250,7 +252,6 @@ async fn start_sandbox_server(
 async fn start_foreground(
     binary: &Path,
     paths: &ConfigPaths,
-    state_dir: &Path,
     root_dir: &Path,
     timeout: Duration,
 ) -> Result<ServerHandle> {
@@ -274,7 +275,7 @@ async fn start_foreground(
         .env("BMUX_CONFIG_DIR", &paths.config_dir)
         .env("BMUX_RUNTIME_DIR", &paths.runtime_dir)
         .env("BMUX_DATA_DIR", &paths.data_dir)
-        .env("BMUX_STATE_DIR", state_dir)
+        .env("BMUX_STATE_DIR", &paths.state_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
@@ -303,7 +304,6 @@ async fn start_foreground(
 async fn start_daemon(
     binary: &Path,
     paths: &ConfigPaths,
-    state_dir: &Path,
     root_dir: &Path,
     timeout: Duration,
 ) -> Result<ServerHandle> {
@@ -319,7 +319,7 @@ async fn start_daemon(
         .env("BMUX_CONFIG_DIR", &paths.config_dir)
         .env("BMUX_RUNTIME_DIR", &paths.runtime_dir)
         .env("BMUX_DATA_DIR", &paths.data_dir)
-        .env("BMUX_STATE_DIR", state_dir)
+        .env("BMUX_STATE_DIR", &paths.state_dir)
         .output()
         .context("failed starting sandbox daemon")?;
 

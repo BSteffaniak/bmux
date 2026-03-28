@@ -124,14 +124,8 @@ pub async fn run_playbook(playbook: Playbook, target_server: bool) -> Result<Pla
                             recording_started = true;
 
                             // Create display track writer for GIF export.
-                            // The sandbox server stores recordings in <root>/s/runtime/recordings/
                             if let Some(ref sb) = sandbox {
-                                let rec_dir = sb
-                                    .root_dir()
-                                    .join("s")
-                                    .join("runtime")
-                                    .join("recordings")
-                                    .join(rid.to_string());
+                                let rec_dir = sb.paths().recordings_dir().join(rid.to_string());
                                 let client_id = match client.whoami().await {
                                     Ok(id) => id,
                                     Err(_) => Uuid::new_v4(),
@@ -202,12 +196,7 @@ pub async fn run_playbook(playbook: Playbook, target_server: bool) -> Result<Pla
             }
 
             // Copy recording dir from sandbox to user recordings dir.
-            let src_dir = sb
-                .root_dir()
-                .join("s")
-                .join("runtime")
-                .join("recordings")
-                .join(rid.to_string());
+            let src_dir = sb.paths().recordings_dir().join(rid.to_string());
             let user_recordings = bmux_config::ConfigPaths::default().recordings_dir();
             let dest_dir = user_recordings.join(rid.to_string());
 

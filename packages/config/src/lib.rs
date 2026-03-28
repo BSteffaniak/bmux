@@ -737,6 +737,7 @@ timeout_profile = "missing"
             std::path::PathBuf::from("/config"),
             std::path::PathBuf::from("/runtime"),
             std::path::PathBuf::from("/data"),
+            std::path::PathBuf::from("/state"),
         );
         let config = BmuxConfig::default();
 
@@ -749,6 +750,7 @@ timeout_profile = "missing"
             std::path::PathBuf::from("/config"),
             std::path::PathBuf::from("/runtime"),
             std::path::PathBuf::from("/data"),
+            std::path::PathBuf::from("/state"),
         );
         let mut config = BmuxConfig::default();
         config.recording.dir = Some(std::path::PathBuf::from("/custom/recordings"));
@@ -765,6 +767,7 @@ timeout_profile = "missing"
             std::path::PathBuf::from("/cfg-root"),
             std::path::PathBuf::from("/runtime"),
             std::path::PathBuf::from("/data"),
+            std::path::PathBuf::from("/state"),
         );
         let mut config = BmuxConfig::default();
         config.recording.dir = Some(std::path::PathBuf::from("recordings/custom"));

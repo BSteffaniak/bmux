@@ -99,6 +99,7 @@ mod tests {
                 PathBuf::from("/tmp/config"),
                 PathBuf::from("/tmp/runtime"),
                 PathBuf::from("/tmp/data"),
+                PathBuf::from("/tmp/state"),
             ),
             BmuxConfig::default(),
             required

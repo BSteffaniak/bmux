@@ -13,16 +13,24 @@ pub struct ConfigPaths {
     pub runtime_dir: PathBuf,
     /// Data directory for persistent data
     pub data_dir: PathBuf,
+    /// State directory for persisted local state (recordings, layout, traces)
+    pub state_dir: PathBuf,
 }
 
 impl ConfigPaths {
     /// Create a new `ConfigPaths` with explicit directories
     #[must_use]
-    pub const fn new(config_dir: PathBuf, runtime_dir: PathBuf, data_dir: PathBuf) -> Self {
+    pub const fn new(
+        config_dir: PathBuf,
+        runtime_dir: PathBuf,
+        data_dir: PathBuf,
+        state_dir: PathBuf,
+    ) -> Self {
         Self {
             config_dir,
             runtime_dir,
             data_dir,
+            state_dir,
         }
     }
 
@@ -59,7 +67,7 @@ impl ConfigPaths {
     /// Get persisted state root directory path
     #[must_use]
     pub fn state_dir(&self) -> PathBuf {
-        default_state_dir()
+        self.state_dir.clone()
     }
 
     /// Get persisted local runtime state file path
@@ -275,7 +283,7 @@ impl Default for ConfigPaths {
             std::env::temp_dir().join("bmux")
         };
 
-        Self::new(config_dir, runtime_dir, data_dir)
+        Self::new(config_dir, runtime_dir, data_dir, default_state_dir())
     }
 }
 
@@ -290,6 +298,7 @@ mod tests {
             PathBuf::from("/config"),
             PathBuf::from("/runtime"),
             PathBuf::from("/data"),
+            PathBuf::from("/state"),
         );
         assert_eq!(paths.server_socket(), PathBuf::from("/runtime/server.sock"));
     }
@@ -300,6 +309,7 @@ mod tests {
             PathBuf::from("/config"),
             PathBuf::from("/runtime"),
             PathBuf::from("/data"),
+            PathBuf::from("/state"),
         );
         assert_eq!(
             paths.server_pid_file(),
@@ -313,6 +323,7 @@ mod tests {
             PathBuf::from("/config"),
             PathBuf::from("/runtime/path"),
             PathBuf::from("/data"),
+            PathBuf::from("/state"),
         );
         assert_eq!(paths.server_named_pipe(), paths.server_named_pipe());
     }
@@ -323,11 +334,13 @@ mod tests {
             PathBuf::from("/config"),
             PathBuf::from("/runtime/a"),
             PathBuf::from("/data"),
+            PathBuf::from("/state"),
         );
         let b = ConfigPaths::new(
             PathBuf::from("/config"),
             PathBuf::from("/runtime/b"),
             PathBuf::from("/data"),
+            PathBuf::from("/state"),
         );
         assert_ne!(a.server_named_pipe(), b.server_named_pipe());
     }
@@ -339,6 +352,7 @@ mod tests {
             PathBuf::from("C:/config"),
             PathBuf::from("C:/runtime"),
             PathBuf::from("C:/data"),
+            PathBuf::from("C:/state"),
         );
         assert!(paths.server_named_pipe().starts_with(r"\\.\pipe\"));
     }
@@ -350,6 +364,7 @@ mod tests {
             PathBuf::from("/config"),
             PathBuf::from("/runtime"),
             PathBuf::from("/data"),
+            PathBuf::from("/state"),
         );
         assert!(paths.server_socket().ends_with("server.sock"));
     }

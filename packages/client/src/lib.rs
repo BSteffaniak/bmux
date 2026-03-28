@@ -1337,7 +1337,12 @@ mod tests {
     #[test]
     fn load_or_create_principal_id_creates_and_persists_value() {
         let root = temp_dir();
-        let paths = ConfigPaths::new(root.join("config"), root.join("runtime"), root.join("data"));
+        let paths = ConfigPaths::new(
+            root.join("config"),
+            root.join("runtime"),
+            root.join("data"),
+            root.join("state"),
+        );
         let first = load_or_create_principal_id(&paths).expect("principal id should be created");
         let second = load_or_create_principal_id(&paths).expect("principal id should be reused");
         assert_eq!(first, second);
@@ -1346,7 +1351,12 @@ mod tests {
     #[test]
     fn load_or_create_principal_id_rejects_invalid_file_contents() {
         let root = temp_dir();
-        let paths = ConfigPaths::new(root.join("config"), root.join("runtime"), root.join("data"));
+        let paths = ConfigPaths::new(
+            root.join("config"),
+            root.join("runtime"),
+            root.join("data"),
+            root.join("state"),
+        );
         let path = paths.principal_id_file();
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent).expect("principal parent should exist");

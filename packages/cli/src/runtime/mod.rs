@@ -144,6 +144,7 @@ fn call_host_kernel_via_client(
         connection.config_dir.clone().into(),
         connection.runtime_dir.clone().into(),
         connection.data_dir.clone().into(),
+        ConfigPaths::default().state_dir,
     );
     let request_name = "bmux-cli-host-kernel-bridge".to_string();
     let response: bmux_ipc::Response = if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -3386,24 +3387,17 @@ async fn run_target_verify_capture(
     verify_start_timeout_secs: Option<u64>,
 ) -> Result<Vec<u8>> {
     let max_verify_duration = max_verify_duration_secs.map(Duration::from_secs);
-    let (paths, state_dir, root_dir) = verify_temp_paths();
+    let (paths, root_dir) = verify_temp_paths();
     paths
         .ensure_dirs()
         .context("failed preparing verify temp paths")?;
-    std::fs::create_dir_all(&state_dir).context("failed creating verify state dir")?;
     write_verify_config(&paths)?;
 
     let verify_start_timeout =
         verify_start_timeout_secs.map_or(VERIFY_SERVER_START_TIMEOUT_DEFAULT, Duration::from_secs);
-    let mut server = start_verify_server(
-        target_binary,
-        &paths,
-        &state_dir,
-        &root_dir,
-        verify_start_timeout,
-    )
-    .await
-    .with_context(|| format!("verify startup failed; artifacts at {}", root_dir.display()))?;
+    let mut server = start_verify_server(target_binary, &paths, &root_dir, verify_start_timeout)
+        .await
+        .with_context(|| format!("verify startup failed; artifacts at {}", root_dir.display()))?;
 
     let run_result = async {
         wait_for_verify_server_ready(&paths, Duration::from_secs(5)).await?;
@@ -3661,17 +3655,16 @@ impl VerifyServerHandle {
 async fn start_verify_server(
     target_binary: &Path,
     paths: &ConfigPaths,
-    state_dir: &Path,
     root_dir: &Path,
     timeout: Duration,
 ) -> Result<VerifyServerHandle> {
-    match start_verify_server_foreground(target_binary, paths, state_dir, root_dir, timeout).await {
+    match start_verify_server_foreground(target_binary, paths, root_dir, timeout).await {
         Ok(handle) => Ok(handle),
         Err(foreground_error) => {
             warn!(
                 "recording verify foreground server startup failed, falling back to daemon: {foreground_error}"
             );
-            start_verify_server_daemon(target_binary, paths, state_dir, root_dir, timeout)
+            start_verify_server_daemon(target_binary, paths, root_dir, timeout)
                 .await
                 .with_context(|| {
                     format!(
@@ -3685,7 +3678,6 @@ async fn start_verify_server(
 async fn start_verify_server_foreground(
     target_binary: &Path,
     paths: &ConfigPaths,
-    state_dir: &Path,
     root_dir: &Path,
     timeout: Duration,
 ) -> Result<VerifyServerHandle> {
@@ -3711,7 +3703,7 @@ async fn start_verify_server_foreground(
         .env("BMUX_CONFIG_DIR", &paths.config_dir)
         .env("BMUX_RUNTIME_DIR", &paths.runtime_dir)
         .env("BMUX_DATA_DIR", &paths.data_dir)
-        .env("BMUX_STATE_DIR", state_dir)
+        .env("BMUX_STATE_DIR", &paths.state_dir)
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout))
         .stderr(Stdio::from(stderr))
@@ -3750,7 +3742,6 @@ async fn start_verify_server_foreground(
 async fn start_verify_server_daemon(
     target_binary: &Path,
     paths: &ConfigPaths,
-    state_dir: &Path,
     root_dir: &Path,
     timeout: Duration,
 ) -> Result<VerifyServerHandle> {
@@ -3766,7 +3757,7 @@ async fn start_verify_server_daemon(
         .env("BMUX_CONFIG_DIR", &paths.config_dir)
         .env("BMUX_RUNTIME_DIR", &paths.runtime_dir)
         .env("BMUX_DATA_DIR", &paths.data_dir)
-        .env("BMUX_STATE_DIR", state_dir)
+        .env("BMUX_STATE_DIR", &paths.state_dir)
         .output()
         .context("failed starting verify target daemon fallback")?;
     std::fs::write(&stdout_log, &output.stdout)
@@ -3893,14 +3884,18 @@ async fn stop_verify_server(paths: &ConfigPaths) -> Result<()> {
     Ok(())
 }
 
-fn verify_temp_paths() -> (ConfigPaths, PathBuf, PathBuf) {
+fn verify_temp_paths() -> (ConfigPaths, PathBuf) {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_nanos());
     let root = std::env::temp_dir().join(format!("brv-{nanos:x}"));
-    let paths = ConfigPaths::new(root.join("c"), root.join("r"), root.join("d"));
-    let state_dir = root.join("s");
-    (paths, state_dir, root)
+    let paths = ConfigPaths::new(
+        root.join("c"),
+        root.join("r"),
+        root.join("d"),
+        root.join("s"),
+    );
+    (paths, root)
 }
 
 fn write_verify_config(paths: &ConfigPaths) -> Result<()> {
@@ -8694,7 +8689,12 @@ mod tests {
 
         let mut config = BmuxConfig::default();
         config.plugins.enabled.push("example.plugin".to_string());
-        let paths = ConfigPaths::new(dir.join("config"), dir.join("runtime"), dir.join("data"));
+        let paths = ConfigPaths::new(
+            dir.join("config"),
+            dir.join("runtime"),
+            dir.join("data"),
+            dir.join("state"),
+        );
 
         assert!(super::validate_configured_plugins(&config, &paths).is_ok());
     }
@@ -8861,6 +8861,7 @@ mod tests {
             std::path::PathBuf::from("/config"),
             std::path::PathBuf::from("/runtime"),
             std::path::PathBuf::from("/data"),
+            std::path::PathBuf::from("/state"),
         );
         let declaration = bmux_plugin::PluginDeclaration {
             id: bmux_plugin::PluginId::new("example.plugin").expect("id should parse"),
@@ -9009,6 +9010,7 @@ mod tests {
             std::path::PathBuf::from("/config"),
             std::path::PathBuf::from("/runtime"),
             std::path::PathBuf::from("/data"),
+            std::path::PathBuf::from("/state"),
         );
         let declaration = bmux_plugin::PluginDeclaration {
             id: bmux_plugin::PluginId::new("provider.plugin").expect("id should parse"),
