@@ -245,9 +245,9 @@ pub enum StaleBuildAction {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum TerminfoAutoInstall {
-    #[default]
     Ask,
     Always,
+    #[default]
     Never,
 }
 
