@@ -33,10 +33,13 @@ fn parse_config(raw: Option<RawPlaybookConfig>) -> Result<PlaybookConfig> {
     };
 
     let viewport = match raw.viewport {
-        Some(v) => Viewport {
-            cols: v.cols.unwrap_or(80),
-            rows: v.rows.unwrap_or(40),
-        },
+        Some(v) => {
+            let defaults = Viewport::default();
+            Viewport {
+                cols: v.cols.unwrap_or(defaults.cols),
+                rows: v.rows.unwrap_or(defaults.rows),
+            }
+        }
         None => Viewport::default(),
     };
 
@@ -317,7 +320,7 @@ ms = 100
         let playbook = parse_toml(input).unwrap();
         assert!(playbook.config.name.is_none());
         assert_eq!(playbook.config.viewport.cols, 80);
-        assert_eq!(playbook.config.viewport.rows, 40);
+        assert_eq!(playbook.config.viewport.rows, 24);
         assert_eq!(playbook.config.timeout, Duration::from_secs(30));
         assert!(!playbook.config.record);
     }

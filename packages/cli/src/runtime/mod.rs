@@ -1504,6 +1504,9 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                         target_server,
                         record,
                         export_gif,
+                        viewport,
+                        timeout,
+                        shell,
                     },
             },
         ) => {
@@ -1513,6 +1516,9 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 *target_server,
                 *record,
                 export_gif.as_deref(),
+                viewport.as_deref(),
+                *timeout,
+                shell.as_deref(),
             )
             .await
         }
@@ -8224,6 +8230,9 @@ async fn run_playbook_run(
     target_server: bool,
     record: bool,
     export_gif: Option<&str>,
+    viewport: Option<&str>,
+    timeout: Option<u64>,
+    shell: Option<&str>,
 ) -> Result<u8> {
     let mut playbook = if source == "-" {
         crate::playbook::parse_stdin().context("failed parsing playbook from stdin")?
@@ -8232,9 +8241,20 @@ async fn run_playbook_run(
             .with_context(|| format!("failed parsing playbook from {source}"))?
     };
 
-    // --export-gif implies --record.
+    // CLI flags override playbook config.
     if record || export_gif.is_some() {
         playbook.config.record = true;
+    }
+    if let Some(vp) = viewport {
+        let (cols, rows) = parse_viewport_string(vp)?;
+        playbook.config.viewport.cols = cols;
+        playbook.config.viewport.rows = rows;
+    }
+    if let Some(secs) = timeout {
+        playbook.config.timeout = Duration::from_secs(secs);
+    }
+    if let Some(sh) = shell {
+        playbook.config.shell = Some(sh.to_string());
     }
 
     let result = crate::playbook::run(playbook, target_server).await?;
@@ -8296,7 +8316,7 @@ fn run_playbook_validate(source: &str, json: bool) -> Result<u8> {
             .with_context(|| format!("failed parsing playbook from {source}"))?
     };
 
-    let errors = crate::playbook::validate(&playbook);
+    let errors = crate::playbook::validate(&playbook, false);
 
     if json {
         let report = serde_json::json!({

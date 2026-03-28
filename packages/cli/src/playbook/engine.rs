@@ -445,6 +445,10 @@ pub(super) async fn execute_step(
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
 
+            // Compile regex once, not on every poll iteration.
+            let re =
+                regex::Regex::new(pattern).with_context(|| format!("invalid regex: {pattern}"))?;
+
             let wait_deadline = Instant::now() + (*timeout).min(deadline - Instant::now());
             let mut poll_delay = Duration::from_millis(10);
 
@@ -457,7 +461,7 @@ pub(super) async fn execute_step(
                 let snapshot = inspector.refresh(client, sid).await?;
                 let pane_idx = inspector.resolve_pane_index(*pane, &snapshot)?;
 
-                if inspector.pane_matches(pane_idx, pattern)? {
+                if inspector.pane_matches_compiled(pane_idx, &re) {
                     return Ok(Some(format!("matched pattern '{pattern}'")));
                 }
 
@@ -472,8 +476,9 @@ pub(super) async fn execute_step(
                         screen_text
                     };
                     bail!(
-                        "wait-for timed out after {}ms waiting for pattern '{}'; screen: {truncated}",
+                        "wait-for timed out after {}ms on pane {} waiting for pattern '{}'; screen: {truncated}",
                         timeout.as_millis(),
+                        pane_idx,
                         pattern
                     );
                 }

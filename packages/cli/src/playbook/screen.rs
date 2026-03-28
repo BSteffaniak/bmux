@@ -165,9 +165,14 @@ impl ScreenInspector {
     /// Check if a pane's screen text matches a regex.
     pub fn pane_matches(&self, pane_index: u32, pattern: &str) -> Result<bool> {
         let re = Regex::new(pattern).with_context(|| format!("invalid regex: {pattern}"))?;
-        Ok(self
-            .pane_text(pane_index)
-            .map_or(false, |text| re.is_match(&text)))
+        Ok(self.pane_matches_compiled(pane_index, &re))
+    }
+
+    /// Check if a pane's screen text matches a pre-compiled regex.
+    /// Use this in hot loops (e.g. `wait-for` polling) to avoid recompiling.
+    pub fn pane_matches_compiled(&self, pane_index: u32, re: &Regex) -> bool {
+        self.pane_text(pane_index)
+            .map_or(false, |text| re.is_match(&text))
     }
 
     /// Resolve which pane index to inspect. If `pane` is `None`, uses the focused pane.

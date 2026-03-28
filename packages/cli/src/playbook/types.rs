@@ -44,7 +44,7 @@ pub struct Viewport {
 
 impl Default for Viewport {
     fn default() -> Self {
-        Self { cols: 80, rows: 40 }
+        Self { cols: 80, rows: 24 }
     }
 }
 

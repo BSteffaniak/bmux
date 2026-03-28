@@ -54,7 +54,10 @@ pub async fn run(playbook: Playbook, target_server: bool) -> Result<PlaybookResu
 }
 
 /// Validate a playbook without executing it.
-pub fn validate(playbook: &Playbook) -> Vec<String> {
+///
+/// If `target_server` is true, the first-step `new-session` check is skipped
+/// since the user may be targeting an existing session on a live server.
+pub fn validate(playbook: &Playbook, target_server: bool) -> Vec<String> {
     let mut errors = Vec::new();
 
     if playbook.steps.is_empty() {
@@ -62,12 +65,14 @@ pub fn validate(playbook: &Playbook) -> Vec<String> {
     }
 
     // Check that the first meaningful action is new-session (unless targeting live server)
-    let first_action = playbook.steps.first().map(|s| &s.action);
-    if let Some(action) = first_action {
-        if !matches!(action, types::Action::NewSession { .. }) {
-            errors.push(
-                "first step should be 'new-session' (no session exists at start)".to_string(),
-            );
+    if !target_server {
+        let first_action = playbook.steps.first().map(|s| &s.action);
+        if let Some(action) = first_action {
+            if !matches!(action, types::Action::NewSession { .. }) {
+                errors.push(
+                    "first step should be 'new-session' (no session exists at start)".to_string(),
+                );
+            }
         }
     }
 
@@ -76,12 +81,60 @@ pub fn validate(playbook: &Playbook) -> Vec<String> {
         errors.push("viewport too small (minimum 10x5)".to_string());
     }
 
-    // Check for wait-for with zero timeout
+    // Track expected pane count for index validation
+    let mut expected_pane_count: u32 = 0;
+
     for step in &playbook.steps {
-        if let types::Action::WaitFor { timeout, .. } = &step.action {
-            if timeout.is_zero() {
-                errors.push(format!("step {}: wait-for has zero timeout", step.index));
+        match &step.action {
+            types::Action::NewSession { .. } => {
+                expected_pane_count = 1;
             }
+            types::Action::SplitPane { .. } => {
+                expected_pane_count += 1;
+            }
+            types::Action::ClosePane { .. } => {
+                expected_pane_count = expected_pane_count.saturating_sub(1);
+            }
+
+            // Validate regex patterns at parse time
+            types::Action::WaitFor {
+                pattern, timeout, ..
+            } => {
+                if timeout.is_zero() {
+                    errors.push(format!("step {}: wait-for has zero timeout", step.index));
+                }
+                if let Err(e) = regex::Regex::new(pattern) {
+                    errors.push(format!(
+                        "step {}: invalid regex pattern '{}': {}",
+                        step.index, pattern, e
+                    ));
+                }
+            }
+            types::Action::AssertScreen { matches, .. } => {
+                if let Some(pattern) = matches {
+                    if let Err(e) = regex::Regex::new(pattern) {
+                        errors.push(format!(
+                            "step {}: invalid regex pattern '{}': {}",
+                            step.index, pattern, e
+                        ));
+                    }
+                }
+            }
+
+            // Warn if targeting a pane before any split
+            types::Action::SendKeys {
+                pane: Some(idx), ..
+            }
+            | types::Action::FocusPane { target: idx } => {
+                if expected_pane_count < 2 && *idx > 1 {
+                    errors.push(format!(
+                        "step {}: targets pane {} but only {} pane(s) expected at this point",
+                        step.index, idx, expected_pane_count
+                    ));
+                }
+            }
+
+            _ => {}
         }
     }
 

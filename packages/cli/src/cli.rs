@@ -395,6 +395,15 @@ pub enum PlaybookCommand {
         /// Export the recording as a GIF to the given path (implies --record)
         #[arg(long)]
         export_gif: Option<String>,
+        /// Override viewport dimensions as COLSxROWS (e.g. 120x40)
+        #[arg(long)]
+        viewport: Option<String>,
+        /// Override max playbook timeout in seconds
+        #[arg(long)]
+        timeout: Option<u64>,
+        /// Override shell
+        #[arg(long)]
+        shell: Option<String>,
     },
     /// Validate a playbook without executing it
     Validate {
