@@ -392,6 +392,9 @@ pub enum PlaybookCommand {
         /// Record the playbook execution (overrides playbook config)
         #[arg(long)]
         record: bool,
+        /// Export the recording as a GIF to the given path (implies --record)
+        #[arg(long)]
+        export_gif: Option<String>,
     },
     /// Validate a playbook without executing it
     Validate {

@@ -337,6 +337,7 @@ async fn run_repl(
         let step_deadline = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
 
         let step_start = Instant::now();
+        let mut no_display_track: Option<super::display_track::PlaybookDisplayTrackWriter> = None;
         let result = execute_step(
             &step,
             client,
@@ -347,6 +348,7 @@ async fn run_repl(
             &viewport_rows,
             snapshots,
             step_deadline,
+            &mut no_display_track,
         )
         .await;
 
@@ -446,7 +448,7 @@ async fn drain_and_capture(
     inspector: &mut ScreenInspector,
     session_id: Uuid,
 ) -> Result<Vec<PaneCapture>> {
-    drain_output_until_idle(client, session_id, Duration::from_millis(200)).await?;
+    drain_output_until_idle(client, session_id, Duration::from_millis(200), &mut None).await?;
     let _snapshot = inspector.refresh(client, session_id).await?;
     Ok(inspector.capture_all())
 }

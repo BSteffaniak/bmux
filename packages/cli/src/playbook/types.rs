@@ -130,6 +130,8 @@ pub struct PlaybookResult {
     pub snapshots: Vec<SnapshotCapture>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub recording_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub recording_path: Option<String>,
     pub total_elapsed_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,

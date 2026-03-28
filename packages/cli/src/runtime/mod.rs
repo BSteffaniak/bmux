@@ -1502,9 +1502,19 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                         json,
                         target_server,
                         record,
+                        export_gif,
                     },
             },
-        ) => run_playbook_run(source, *json, *target_server, *record).await,
+        ) => {
+            run_playbook_run(
+                source,
+                *json,
+                *target_server,
+                *record,
+                export_gif.as_deref(),
+            )
+            .await
+        }
         (
             BuiltInHandlerId::PlaybookValidate,
             Command::Playbook {
@@ -8215,6 +8225,7 @@ async fn run_playbook_run(
     json: bool,
     target_server: bool,
     record: bool,
+    export_gif: Option<&str>,
 ) -> Result<u8> {
     let mut playbook = if source == "-" {
         crate::playbook::parse_stdin().context("failed parsing playbook from stdin")?
@@ -8223,12 +8234,50 @@ async fn run_playbook_run(
             .with_context(|| format!("failed parsing playbook from {source}"))?
     };
 
-    // CLI --record flag overrides the playbook config.
-    if record {
+    // --export-gif implies --record.
+    if record || export_gif.is_some() {
         playbook.config.record = true;
     }
 
     let result = crate::playbook::run(playbook, target_server).await?;
+
+    // Export GIF if requested and a recording was produced.
+    if let Some(gif_path) = export_gif {
+        if let Some(ref rec_id) = result.recording_id {
+            let recording_id_str = rec_id.to_string();
+            match recording::run_recording_export(
+                &recording_id_str,
+                RecordingExportFormat::Gif,
+                gif_path,
+                None,                        // view_client: auto-detect
+                1.0,                         // speed
+                12,                          // fps
+                None,                        // max_duration
+                None,                        // max_frames
+                RecordingRenderMode::Bitmap, // Use bitmap for headless (no real terminal fonts)
+                None,                        // cell_size
+                None,                        // cell_width
+                None,                        // cell_height
+                None,                        // font_family
+                None,                        // font_size
+                None,                        // line_height
+                &[],                         // font_path
+            )
+            .await
+            {
+                Ok(_) => {
+                    if !json {
+                        println!("exported GIF: {gif_path}");
+                    }
+                }
+                Err(e) => {
+                    eprintln!("GIF export failed: {e:#}");
+                }
+            }
+        } else if !json {
+            eprintln!("GIF export skipped: no recording was produced");
+        }
+    }
 
     if json {
         let json_str =

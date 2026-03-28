@@ -61,6 +61,7 @@ pub async fn run_playbook(playbook: Playbook, target_server: bool) -> Result<Pla
     let mut session_id: Option<Uuid> = None;
     let mut attached = false;
     let mut recording_started = false;
+    let mut display_track: Option<super::display_track::PlaybookDisplayTrackWriter> = None;
 
     // Execute each step
     let deadline = Instant::now() + playbook.config.timeout;
@@ -89,6 +90,7 @@ pub async fn run_playbook(playbook: Playbook, target_server: bool) -> Result<Pla
             &playbook.config.viewport.rows,
             &mut snapshots,
             deadline,
+            &mut display_track,
         )
         .await;
 
@@ -120,6 +122,35 @@ pub async fn run_playbook(playbook: Playbook, target_server: bool) -> Result<Pla
                             info!("recording started: {rid}");
                             recording_id = Some(rid);
                             recording_started = true;
+
+                            // Create display track writer for GIF export.
+                            // The sandbox server stores recordings in <root>/s/runtime/recordings/
+                            if let Some(ref sb) = sandbox {
+                                let rec_dir = sb
+                                    .root_dir()
+                                    .join("s")
+                                    .join("runtime")
+                                    .join("recordings")
+                                    .join(rid.to_string());
+                                let client_id = match client.whoami().await {
+                                    Ok(id) => id,
+                                    Err(_) => Uuid::new_v4(),
+                                };
+                                match super::display_track::PlaybookDisplayTrackWriter::new(
+                                    &rec_dir,
+                                    client_id,
+                                    rid,
+                                    playbook.config.viewport.cols,
+                                    playbook.config.viewport.rows,
+                                ) {
+                                    Ok(dt) => {
+                                        display_track = Some(dt);
+                                    }
+                                    Err(e) => {
+                                        warn!("failed to create display track: {e:#}");
+                                    }
+                                }
+                            }
                         }
                         Err(e) => {
                             warn!("failed to start recording: {e:#}");
@@ -149,16 +180,43 @@ pub async fn run_playbook(playbook: Playbook, target_server: bool) -> Result<Pla
         }
     }
 
-    // Stop recording if one was started.
+    // Finish display track before stopping the recording.
+    if let Some(ref mut dt) = display_track {
+        if let Err(e) = dt.finish() {
+            warn!("failed to finish display track: {e:#}");
+        }
+    }
+
+    // Copy recording dir to user recordings dir before sandbox shutdown.
+    let mut recording_path: Option<std::path::PathBuf> = None;
     if recording_started {
-        if let Some(rid) = recording_id {
+        if let (Some(rid), Some(sb)) = (recording_id, &sandbox) {
+            // Stop recording first so the server finalizes the JSONL files.
             match client.recording_stop(Some(rid)).await {
                 Ok(stopped_id) => {
                     info!("recording stopped: {stopped_id}");
                 }
                 Err(e) => {
                     warn!("failed to stop recording: {e}");
-                    // Non-fatal — don't change pass/fail status.
+                }
+            }
+
+            // Copy recording dir from sandbox to user recordings dir.
+            let src_dir = sb
+                .root_dir()
+                .join("s")
+                .join("runtime")
+                .join("recordings")
+                .join(rid.to_string());
+            let user_recordings = bmux_config::ConfigPaths::default().recordings_dir();
+            let dest_dir = user_recordings.join(rid.to_string());
+
+            if src_dir.exists() {
+                if let Err(e) = copy_dir_recursive(&src_dir, &dest_dir) {
+                    warn!("failed to copy recording to user dir: {e:#}");
+                } else {
+                    info!("recording copied to {}", dest_dir.display());
+                    recording_path = Some(dest_dir);
                 }
             }
         }
@@ -180,6 +238,7 @@ pub async fn run_playbook(playbook: Playbook, target_server: bool) -> Result<Pla
         steps: step_results,
         snapshots,
         recording_id,
+        recording_path: recording_path.map(|p| p.to_string_lossy().to_string()),
         total_elapsed_ms,
         error: error_msg,
     })
@@ -213,6 +272,7 @@ pub(super) async fn execute_step(
     viewport_rows: &u16,
     snapshots: &mut Vec<SnapshotCapture>,
     deadline: Instant,
+    display_track: &mut Option<super::display_track::PlaybookDisplayTrackWriter>,
 ) -> Result<Option<String>> {
     match &step.action {
         Action::NewSession { name } => {
@@ -240,7 +300,7 @@ pub(super) async fn execute_step(
             *attached = true;
 
             // Drain initial output to let the shell start up
-            drain_output_until_idle(client, sid, Duration::from_millis(500)).await?;
+            drain_output_until_idle(client, sid, Duration::from_millis(500), display_track).await?;
 
             Ok(Some(format!("session_id={sid}")))
         }
@@ -275,7 +335,7 @@ pub(super) async fn execute_step(
                 .map_err(|e| anyhow::anyhow!("split-pane failed: {e}"))?;
 
             // Let the new pane shell start
-            drain_output_until_idle(client, sid, Duration::from_millis(300)).await?;
+            drain_output_until_idle(client, sid, Duration::from_millis(300), display_track).await?;
 
             Ok(Some(format!("pane_id={pane_id}")))
         }
@@ -385,7 +445,8 @@ pub(super) async fn execute_step(
 
             loop {
                 // Drain any pending output
-                drain_output_until_idle(client, sid, Duration::from_millis(100)).await?;
+                drain_output_until_idle(client, sid, Duration::from_millis(100), display_track)
+                    .await?;
 
                 // Refresh screen state
                 let snapshot = inspector.refresh(client, sid).await?;
@@ -421,7 +482,7 @@ pub(super) async fn execute_step(
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
 
-            drain_output_until_idle(client, sid, Duration::from_millis(200)).await?;
+            drain_output_until_idle(client, sid, Duration::from_millis(200), display_track).await?;
             let _snapshot = inspector.refresh(client, sid).await?;
             let panes = inspector.capture_all();
 
@@ -442,7 +503,7 @@ pub(super) async fn execute_step(
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
 
-            drain_output_until_idle(client, sid, Duration::from_millis(200)).await?;
+            drain_output_until_idle(client, sid, Duration::from_millis(200), display_track).await?;
             let snapshot = inspector.refresh(client, sid).await?;
             let pane_idx = inspector.resolve_pane_index(*pane, &snapshot)?;
 
@@ -520,6 +581,9 @@ pub(super) async fn execute_step(
                     .map_err(|e| anyhow::anyhow!("resize-viewport failed: {e}"))?;
             }
             inspector.update_viewport(*cols, *rows);
+            if let Some(ref mut dt) = *display_track {
+                let _ = dt.record_resize(*cols, *rows);
+            }
             Ok(None)
         }
 
@@ -552,10 +616,12 @@ pub(super) fn require_attached(attached: bool) -> Result<()> {
 }
 
 /// Drain output from the attached session until idle (3 consecutive empty reads).
+/// Optionally captures output bytes to a display track writer for GIF export.
 pub(super) async fn drain_output_until_idle(
     client: &mut BmuxClient,
     session_id: Uuid,
     max_wait: Duration,
+    display_track: &mut Option<super::display_track::PlaybookDisplayTrackWriter>,
 ) -> Result<()> {
     let started = Instant::now();
     let mut idle_polls = 0u8;
@@ -573,10 +639,37 @@ pub(super) async fn drain_output_until_idle(
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         } else {
+            if let Some(ref mut dt) = *display_track {
+                let _ = dt.record_frame_bytes(&data);
+            }
             idle_polls = 0;
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
+    Ok(())
+}
+
+/// Recursively copy a directory and its contents.
+fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(dst).with_context(|| format!("failed creating {}", dst.display()))?;
+    for entry in
+        std::fs::read_dir(src).with_context(|| format!("failed reading {}", src.display()))?
+    {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if src_path.is_dir() {
+            copy_dir_recursive(&src_path, &dst_path)?;
+        } else {
+            std::fs::copy(&src_path, &dst_path).with_context(|| {
+                format!(
+                    "failed copying {} -> {}",
+                    src_path.display(),
+                    dst_path.display()
+                )
+            })?;
+        }
+    }
     Ok(())
 }
