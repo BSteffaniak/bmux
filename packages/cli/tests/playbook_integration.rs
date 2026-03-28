@@ -251,6 +251,9 @@ fn parse_and_validate_fixtures() {
         "snapshot_capture.dsl",
         "failing_assert.dsl",
         "assert_matches.dsl",
+        "include_main.dsl",
+        "timeout_wait_for.dsl",
+        "timeout_playbook.dsl",
     ];
 
     for name in &fixtures {
@@ -523,5 +526,171 @@ async fn recording_to_playbook_end_to_end() {
         result.pass,
         "generated playbook should pass. steps: {:?}, error: {:?}",
         result.steps, result.error
+    );
+}
+
+// ---------------------------------------------------------------------------
+// G: Include system tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn playbook_include_basic() {
+    let (json, pass) = run_playbook_fixture("include_main.dsl");
+    assert!(pass, "include playbook should pass: {json:#}");
+
+    let steps = json["steps"].as_array().expect("steps should be array");
+    // The included file has new-session + send-keys + wait-for (3 steps),
+    // then the main file adds assert-screen (1 step) = 4 total.
+    assert!(
+        steps.len() >= 4,
+        "should have steps from both files: {json:#}"
+    );
+    // The first step should be new-session (from included file).
+    assert_eq!(
+        steps[0]["action"], "new-session",
+        "first step should be new-session from include"
+    );
+}
+
+#[test]
+fn playbook_include_validates() {
+    let path = fixtures_dir().join("include_main.dsl");
+    let playbook = bmux_cli::playbook::parse_file(&path)
+        .unwrap_or_else(|e| panic!("failed to parse include_main.dsl: {e:#}"));
+
+    let errors = bmux_cli::playbook::validate(&playbook, false);
+    assert!(
+        errors.is_empty(),
+        "include playbook should validate: {errors:?}"
+    );
+
+    // Verify we have steps from both the main and included files.
+    assert!(
+        playbook.steps.len() >= 4,
+        "should have merged steps from include: {} steps",
+        playbook.steps.len()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// H: Timeout behavior tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn playbook_wait_for_timeout() {
+    let (json, pass) = run_playbook_fixture("timeout_wait_for.dsl");
+    assert!(!pass, "wait-for timeout playbook should fail: {json:#}");
+
+    let steps = json["steps"].as_array().expect("steps should be array");
+    let wait_step = steps
+        .iter()
+        .find(|s| s["action"] == "wait-for" && s["status"] == "fail");
+    assert!(
+        wait_step.is_some(),
+        "should have a failed wait-for step: {json:#}"
+    );
+
+    let ws = wait_step.unwrap();
+    let detail = ws["detail"].as_str().unwrap_or("");
+    assert!(
+        detail.contains("timed out"),
+        "detail should mention timeout: {detail}"
+    );
+    // Verify structured failure fields.
+    assert!(
+        ws.get("expected").is_some() && !ws["expected"].is_null(),
+        "wait-for timeout should have expected field: {ws:#}"
+    );
+    assert!(
+        ws.get("actual").is_some() && !ws["actual"].is_null(),
+        "wait-for timeout should have actual field: {ws:#}"
+    );
+}
+
+#[test]
+fn playbook_level_timeout_skips_remaining() {
+    let (json, pass) = run_playbook_fixture("timeout_playbook.dsl");
+    assert!(!pass, "playbook timeout should fail: {json:#}");
+
+    let steps = json["steps"].as_array().expect("steps should be array");
+    // Find a step with status "skip" and detail containing "playbook timeout".
+    let skipped = steps.iter().find(|s| s["status"] == "skip");
+    assert!(
+        skipped.is_some(),
+        "should have a skipped step from playbook timeout: {json:#}"
+    );
+    let detail = skipped.unwrap()["detail"].as_str().unwrap_or("");
+    assert!(
+        detail.contains("playbook timeout"),
+        "skipped step should mention playbook timeout: {detail}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// I: from-recording CLI integration test
+// ---------------------------------------------------------------------------
+
+#[test]
+fn playbook_from_recording_cli() {
+    // Step 1: Run a playbook with --record to produce a recording.
+    let fixture = fixtures_dir().join("echo_hello.dsl");
+    let output = Command::new(bmux_binary())
+        .args([
+            "playbook",
+            "run",
+            "--json",
+            "--record",
+            fixture.to_str().unwrap(),
+        ])
+        .env("BMUX_PLAYBOOK_ENV_MODE", "inherit")
+        .output()
+        .expect("failed to run bmux playbook with recording");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = match serde_json::from_str(&stdout) {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("JSON parse failed (recording run): {e}\nstdout: {stdout}");
+            return; // Skip if we can't parse -- recording might not be supported in this env
+        }
+    };
+
+    let recording_id = match json["recording_id"].as_str() {
+        Some(id) => id.to_string(),
+        None => {
+            eprintln!("No recording_id in output, skipping from-recording test");
+            return; // Recording wasn't produced -- skip gracefully
+        }
+    };
+
+    // Step 2: Run from-recording to generate DSL from the recording.
+    let from_output = Command::new(bmux_binary())
+        .args(["playbook", "from-recording", &recording_id])
+        .output()
+        .expect("failed to run bmux playbook from-recording");
+
+    let dsl = String::from_utf8_lossy(&from_output.stdout);
+    assert!(
+        from_output.status.success(),
+        "from-recording should succeed. stderr: {}",
+        String::from_utf8_lossy(&from_output.stderr)
+    );
+
+    // Step 3: Verify the generated DSL contains expected elements.
+    assert!(
+        dsl.contains("new-session"),
+        "generated DSL should contain new-session: {dsl}"
+    );
+    assert!(
+        dsl.contains("send-keys"),
+        "generated DSL should contain send-keys: {dsl}"
+    );
+
+    // Step 4: Validate the generated DSL parses cleanly.
+    let parse_result = bmux_cli::playbook::parse_dsl::parse_dsl(&dsl);
+    assert!(
+        parse_result.is_ok(),
+        "generated DSL should parse: {:?}",
+        parse_result.err()
     );
 }

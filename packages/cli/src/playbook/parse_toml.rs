@@ -156,12 +156,10 @@ fn parse_step_action(step: RawStep) -> Result<Action> {
             })
         }
         "assert-layout" => {
-            if step.pane_count.is_none() {
-                bail!("assert-layout requires pane_count");
-            }
-            Ok(Action::AssertLayout {
-                pane_count: step.pane_count,
-            })
+            let pane_count = step
+                .pane_count
+                .context("assert-layout requires pane_count")?;
+            Ok(Action::AssertLayout { pane_count })
         }
         "assert-cursor" => {
             let row = step.row.context("assert-cursor requires 'row'")?;

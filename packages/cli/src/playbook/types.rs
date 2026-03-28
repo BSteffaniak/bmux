@@ -159,7 +159,7 @@ pub enum Action {
         matches: Option<String>,
     },
     /// Assert layout structure.
-    AssertLayout { pane_count: Option<u32> },
+    AssertLayout { pane_count: u32 },
     /// Assert cursor position in a pane.
     AssertCursor {
         pane: Option<u32>,
@@ -417,10 +417,9 @@ impl Action {
                 }
                 line
             }
-            Self::AssertLayout { pane_count } => match pane_count {
-                Some(n) => format!("assert-layout pane_count={n}"),
-                None => "assert-layout".to_string(),
-            },
+            Self::AssertLayout { pane_count } => {
+                format!("assert-layout pane_count={pane_count}")
+            }
             Self::AssertCursor { pane, row, col } => {
                 let mut line = format!("assert-cursor row={row} col={col}");
                 if let Some(p) = pane {
@@ -453,7 +452,10 @@ impl Action {
                     ServiceKind::Command => "command",
                 };
                 let mut line = format!(
-                    "invoke-service capability='{capability}' interface='{interface_id}' operation='{operation}' kind={kind_str}"
+                    "invoke-service capability='{}' interface='{}' operation='{}' kind={kind_str}",
+                    escape_single_quote(capability),
+                    escape_single_quote(interface_id),
+                    escape_single_quote(operation),
                 );
                 if !payload.is_empty() {
                     line.push_str(&format!(" payload='{}'", escape_single_quote(payload)));
@@ -540,5 +542,346 @@ mod tests {
         let config = config_with_env_mode(None);
         assert_eq!(config.effective_env_mode(), SandboxEnvMode::Inherit);
         remove_env("BMUX_PLAYBOOK_ENV_MODE");
+    }
+
+    // ── to_dsl() round-trip tests ──────────────────────────────────────
+
+    /// Parse a single DSL action line (prepended with `new-session` so the
+    /// playbook is valid) and return the parsed action at the given step index.
+    fn parse_action_dsl(dsl_line: &str, step_index: usize) -> Action {
+        let input = format!("new-session\n{dsl_line}\n");
+        let (playbook, _) =
+            crate::playbook::parse_dsl::parse_dsl(&input).expect("DSL should parse");
+        playbook.steps[step_index].action.clone()
+    }
+
+    /// Round-trip helper: serialize an action to DSL, parse it back, return both.
+    fn round_trip(action: &Action) -> (String, Action) {
+        let dsl = action.to_dsl();
+        let parsed = parse_action_dsl(&dsl, 1); // index 1 because new-session is index 0
+        (dsl, parsed)
+    }
+
+    #[test]
+    fn to_dsl_round_trip_new_session_no_name() {
+        let action = Action::NewSession { name: None };
+        // new-session is the first step, so parse at index 0
+        let dsl = action.to_dsl();
+        let (playbook, _) = crate::playbook::parse_dsl::parse_dsl(&format!("{dsl}\n")).unwrap();
+        assert!(matches!(
+            playbook.steps[0].action,
+            Action::NewSession { name: None }
+        ));
+    }
+
+    #[test]
+    fn to_dsl_round_trip_new_session_with_name() {
+        let action = Action::NewSession {
+            name: Some("my-session".to_string()),
+        };
+        let dsl = action.to_dsl();
+        let (playbook, _) = crate::playbook::parse_dsl::parse_dsl(&format!("{dsl}\n")).unwrap();
+        match &playbook.steps[0].action {
+            Action::NewSession { name } => assert_eq!(name.as_deref(), Some("my-session")),
+            other => panic!("expected NewSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_kill_session() {
+        let (_, parsed) = round_trip(&Action::KillSession {
+            name: "test".to_string(),
+        });
+        match parsed {
+            Action::KillSession { name } => assert_eq!(name, "test"),
+            other => panic!("expected KillSession, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_split_pane() {
+        let (_, parsed) = round_trip(&Action::SplitPane {
+            direction: SplitDirection::Horizontal,
+            ratio: None,
+        });
+        match parsed {
+            Action::SplitPane { direction, .. } => {
+                assert_eq!(direction, SplitDirection::Horizontal)
+            }
+            other => panic!("expected SplitPane, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_focus_pane() {
+        let (_, parsed) = round_trip(&Action::FocusPane { target: 3 });
+        match parsed {
+            Action::FocusPane { target } => assert_eq!(target, 3),
+            other => panic!("expected FocusPane, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_close_pane() {
+        let (_, parsed) = round_trip(&Action::ClosePane { target: Some(2) });
+        match parsed {
+            Action::ClosePane { target } => assert_eq!(target, Some(2)),
+            other => panic!("expected ClosePane, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_close_pane_no_target() {
+        let (_, parsed) = round_trip(&Action::ClosePane { target: None });
+        match parsed {
+            Action::ClosePane { target } => assert_eq!(target, None),
+            other => panic!("expected ClosePane, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_send_keys() {
+        let action = Action::SendKeys {
+            keys: b"echo hello\r".to_vec(),
+            pane: None,
+        };
+        let (_, parsed) = round_trip(&action);
+        match parsed {
+            Action::SendKeys { keys, pane } => {
+                assert_eq!(keys, b"echo hello\r");
+                assert_eq!(pane, None);
+            }
+            other => panic!("expected SendKeys, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_send_keys_with_pane() {
+        let action = Action::SendKeys {
+            keys: b"\x1b[A".to_vec(), // ESC [ A (up arrow)
+            pane: Some(2),
+        };
+        let (_, parsed) = round_trip(&action);
+        match parsed {
+            Action::SendKeys { keys, pane } => {
+                assert_eq!(keys, b"\x1b[A");
+                assert_eq!(pane, Some(2));
+            }
+            other => panic!("expected SendKeys, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_send_bytes() {
+        let action = Action::SendBytes {
+            hex: vec![0x1b, 0x5b, 0x41],
+        };
+        let (_, parsed) = round_trip(&action);
+        match parsed {
+            Action::SendBytes { hex } => assert_eq!(hex, vec![0x1b, 0x5b, 0x41]),
+            other => panic!("expected SendBytes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_wait_for_default_timeout() {
+        let action = Action::WaitFor {
+            pattern: "hello".to_string(),
+            pane: None,
+            timeout: Duration::from_millis(5000),
+        };
+        let (dsl, parsed) = round_trip(&action);
+        // Default timeout should be omitted from DSL
+        assert!(
+            !dsl.contains("timeout="),
+            "default timeout should be omitted: {dsl}"
+        );
+        match parsed {
+            Action::WaitFor {
+                pattern, timeout, ..
+            } => {
+                assert_eq!(pattern, "hello");
+                assert_eq!(timeout, Duration::from_millis(5000));
+            }
+            other => panic!("expected WaitFor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_wait_for_custom_timeout() {
+        let action = Action::WaitFor {
+            pattern: "prompt\\$".to_string(),
+            pane: Some(1),
+            timeout: Duration::from_millis(10000),
+        };
+        let (dsl, parsed) = round_trip(&action);
+        assert!(
+            dsl.contains("timeout=10000"),
+            "custom timeout in DSL: {dsl}"
+        );
+        match parsed {
+            Action::WaitFor {
+                pattern,
+                pane,
+                timeout,
+            } => {
+                assert_eq!(pattern, "prompt\\$");
+                assert_eq!(pane, Some(1));
+                assert_eq!(timeout, Duration::from_millis(10000));
+            }
+            other => panic!("expected WaitFor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_sleep() {
+        let (_, parsed) = round_trip(&Action::Sleep {
+            duration: Duration::from_millis(500),
+        });
+        match parsed {
+            Action::Sleep { duration } => assert_eq!(duration, Duration::from_millis(500)),
+            other => panic!("expected Sleep, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_snapshot() {
+        let (_, parsed) = round_trip(&Action::Snapshot {
+            id: "after_echo".to_string(),
+        });
+        match parsed {
+            Action::Snapshot { id } => assert_eq!(id, "after_echo"),
+            other => panic!("expected Snapshot, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_assert_screen() {
+        let action = Action::AssertScreen {
+            pane: Some(1),
+            contains: Some("hello".to_string()),
+            not_contains: Some("error".to_string()),
+            matches: Some("\\d+".to_string()),
+        };
+        let (_, parsed) = round_trip(&action);
+        match parsed {
+            Action::AssertScreen {
+                pane,
+                contains,
+                not_contains,
+                matches,
+            } => {
+                assert_eq!(pane, Some(1));
+                assert_eq!(contains.as_deref(), Some("hello"));
+                assert_eq!(not_contains.as_deref(), Some("error"));
+                assert_eq!(matches.as_deref(), Some("\\d+"));
+            }
+            other => panic!("expected AssertScreen, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_assert_layout() {
+        let (_, parsed) = round_trip(&Action::AssertLayout { pane_count: 3 });
+        match parsed {
+            Action::AssertLayout { pane_count } => assert_eq!(pane_count, 3),
+            other => panic!("expected AssertLayout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_assert_cursor() {
+        let action = Action::AssertCursor {
+            pane: Some(1),
+            row: 5,
+            col: 10,
+        };
+        let (_, parsed) = round_trip(&action);
+        match parsed {
+            Action::AssertCursor { pane, row, col } => {
+                assert_eq!(pane, Some(1));
+                assert_eq!(row, 5);
+                assert_eq!(col, 10);
+            }
+            other => panic!("expected AssertCursor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_resize_viewport() {
+        let (_, parsed) = round_trip(&Action::ResizeViewport {
+            cols: 132,
+            rows: 50,
+        });
+        match parsed {
+            Action::ResizeViewport { cols, rows } => {
+                assert_eq!(cols, 132);
+                assert_eq!(rows, 50);
+            }
+            other => panic!("expected ResizeViewport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_prefix_key() {
+        let (_, parsed) = round_trip(&Action::PrefixKey { key: 'c' });
+        match parsed {
+            Action::PrefixKey { key } => assert_eq!(key, 'c'),
+            other => panic!("expected PrefixKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_wait_for_event() {
+        let action = Action::WaitForEvent {
+            event: "session_created".to_string(),
+            timeout: Duration::from_millis(5000),
+        };
+        let (dsl, parsed) = round_trip(&action);
+        assert!(!dsl.contains("timeout="), "default timeout omitted: {dsl}");
+        match parsed {
+            Action::WaitForEvent { event, timeout } => {
+                assert_eq!(event, "session_created");
+                assert_eq!(timeout, Duration::from_millis(5000));
+            }
+            other => panic!("expected WaitForEvent, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_invoke_service() {
+        let action = Action::InvokeService {
+            capability: "my.cap".to_string(),
+            kind: ServiceKind::Query,
+            interface_id: "iface.1".to_string(),
+            operation: "do_thing".to_string(),
+            payload: r#"{"key":"val"}"#.to_string(),
+        };
+        let (_, parsed) = round_trip(&action);
+        match parsed {
+            Action::InvokeService {
+                capability,
+                kind,
+                interface_id,
+                operation,
+                payload,
+            } => {
+                assert_eq!(capability, "my.cap");
+                assert_eq!(kind, ServiceKind::Query);
+                assert_eq!(interface_id, "iface.1");
+                assert_eq!(operation, "do_thing");
+                assert_eq!(payload, r#"{"key":"val"}"#);
+            }
+            other => panic!("expected InvokeService, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_screen_status() {
+        let (_, parsed_screen) = round_trip(&Action::Screen);
+        assert!(matches!(parsed_screen, Action::Screen));
+
+        let (_, parsed_status) = round_trip(&Action::Status);
+        assert!(matches!(parsed_status, Action::Status));
     }
 }

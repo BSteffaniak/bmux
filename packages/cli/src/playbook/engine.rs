@@ -613,15 +613,13 @@ pub(super) async fn execute_step(
             let snapshot = inspector.refresh(client, sid).await?;
             let actual_count = snapshot.panes.len() as u32;
 
-            if let Some(expected) = pane_count {
-                if actual_count != *expected {
-                    return Err(StepFailure::assertion(
-                        format!("assert-layout: expected {expected} panes, got {actual_count}"),
-                        expected.to_string(),
-                        actual_count.to_string(),
-                    )
-                    .into());
-                }
+            if actual_count != *pane_count {
+                return Err(StepFailure::assertion(
+                    format!("assert-layout: expected {pane_count} panes, got {actual_count}"),
+                    pane_count.to_string(),
+                    actual_count.to_string(),
+                )
+                .into());
             }
 
             Ok(None)

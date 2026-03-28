@@ -254,12 +254,9 @@ pub(crate) fn parse_action_line(line: &str) -> Result<Action> {
         "assert-layout" => {
             let pane_count = args
                 .get("pane_count")
-                .map(|s| s.parse::<u32>())
-                .transpose()
+                .context("assert-layout requires pane_count")?
+                .parse::<u32>()
                 .context("invalid pane_count")?;
-            if pane_count.is_none() {
-                bail!("assert-layout requires pane_count");
-            }
             Ok(Action::AssertLayout { pane_count })
         }
         "assert-cursor" => {
