@@ -1,3 +1,8 @@
+//! Line-oriented DSL parser for playbooks.
+//!
+//! Parses the text DSL format into the shared `Playbook` representation.
+//! See `docs/playbooks.md` for the full DSL syntax reference.
+
 use std::collections::BTreeMap;
 use std::time::Duration;
 

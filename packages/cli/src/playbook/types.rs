@@ -1,3 +1,9 @@
+//! Playbook data types: actions, configuration, and result structures.
+//!
+//! These types are the internal representation shared between the DSL parser,
+//! TOML parser, and execution engine. See `docs/playbooks.md` for the full
+//! user-facing reference.
+
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::time::Duration;
