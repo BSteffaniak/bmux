@@ -175,6 +175,11 @@ pub struct BehaviorConfig {
     pub terminfo_prompt_cooldown_days: u64,
     /// Behavior when the running server build differs from the current CLI build
     pub stale_build_action: StaleBuildAction,
+    /// Enable the Kitty keyboard protocol for enhanced key reporting.
+    /// When true, bmux negotiates enhanced keyboard mode with the outer
+    /// terminal, allowing modified special keys like Ctrl+Enter to be
+    /// correctly forwarded to pane programs.
+    pub kitty_keyboard: bool,
 }
 
 impl Default for BehaviorConfig {
@@ -193,6 +198,7 @@ impl Default for BehaviorConfig {
             terminfo_auto_install: TerminfoAutoInstall::Never,
             terminfo_prompt_cooldown_days: 7,
             stale_build_action: StaleBuildAction::Error,
+            kitty_keyboard: true,
         }
     }
 }

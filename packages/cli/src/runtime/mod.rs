@@ -4463,7 +4463,8 @@ async fn run_session_attach_with_client(
         .await
         .map_err(map_attach_client_error)?;
 
-    let raw_mode_guard = RawModeGuard::enable().context("failed to enable raw mode for attach")?;
+    let raw_mode_guard = RawModeGuard::enable(attach_config.behavior.kitty_keyboard)
+        .context("failed to enable raw mode for attach")?;
     let mut attach_input_processor =
         InputProcessor::new(attach_keymap.clone(), raw_mode_guard.keyboard_enhanced);
     let mut exit_reason = AttachExitReason::Detached;
@@ -6412,11 +6413,11 @@ struct RawModeGuard {
 }
 
 impl RawModeGuard {
-    fn enable() -> Result<Self> {
+    fn enable(kitty_keyboard_enabled: bool) -> Result<Self> {
         enable_raw_mode().context("failed enabling raw mode")?;
 
-        let keyboard_enhanced =
-            crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+        let keyboard_enhanced = kitty_keyboard_enabled
+            && crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
 
         if keyboard_enhanced {
             use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
