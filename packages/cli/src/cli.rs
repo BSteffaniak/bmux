@@ -205,6 +205,11 @@ pub enum Command {
         #[command(subcommand)]
         command: RecordingCommand,
     },
+    /// Headless playbook execution and testing
+    Playbook {
+        #[command(subcommand)]
+        command: PlaybookCommand,
+    },
     #[command(external_subcommand)]
     External(Vec<String>),
 }
@@ -369,6 +374,29 @@ pub enum RecordingCommand {
         /// Additional font file path (repeatable)
         #[arg(long)]
         font_path: Vec<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PlaybookCommand {
+    /// Run a playbook from a file or stdin
+    Run {
+        /// Path to playbook file, or `-` for stdin
+        source: String,
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
+        /// Run against the live server instead of an ephemeral sandbox
+        #[arg(long)]
+        target_server: bool,
+    },
+    /// Validate a playbook without executing it
+    Validate {
+        /// Path to playbook file, or `-` for stdin
+        source: String,
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 

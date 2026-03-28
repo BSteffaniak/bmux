@@ -54,6 +54,9 @@ pub enum BuiltInHandlerId {
     RecordingReplay,
     RecordingVerifySmoke,
     RecordingExport,
+    Playbook,
+    PlaybookRun,
+    PlaybookValidate,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -340,6 +343,21 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::RecordingExport,
             &["recording", "export"],
             "Export recording media",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::Playbook,
+            &["playbook"],
+            "Headless playbook execution and testing",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::PlaybookRun,
+            &["playbook", "run"],
+            "Run a playbook",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::PlaybookValidate,
+            &["playbook", "validate"],
+            "Validate a playbook without executing",
         ),
     ]
 }

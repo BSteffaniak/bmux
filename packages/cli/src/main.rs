@@ -6,6 +6,7 @@
 mod cli;
 mod connection;
 mod input;
+mod playbook;
 mod runtime;
 mod status;
 

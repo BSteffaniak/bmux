@@ -1,7 +1,8 @@
 use crate::cli::{
-    Cli, Command, KeymapCommand, LogLevel, LogsCommand, LogsProfilesCommand, RecordingCommand,
-    RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg, RecordingRenderMode,
-    RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
+    Cli, Command, KeymapCommand, LogLevel, LogsCommand, LogsProfilesCommand, PlaybookCommand,
+    RecordingCommand, RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg,
+    RecordingRenderMode, RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand,
+    TraceFamily,
 };
 use crate::connection::{
     ConnectionPolicyScope, ServerRuntimeMetadata, connect, connect_if_running, connect_raw,
@@ -1067,6 +1068,10 @@ fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
             RecordingCommand::VerifySmoke { .. } => BuiltInHandlerId::RecordingVerifySmoke,
             RecordingCommand::Export { .. } => BuiltInHandlerId::RecordingExport,
         },
+        Command::Playbook { command } => match command {
+            PlaybookCommand::Run { .. } => BuiltInHandlerId::PlaybookRun,
+            PlaybookCommand::Validate { .. } => BuiltInHandlerId::PlaybookValidate,
+        },
         Command::External(_) => unreachable!("external commands are dispatched separately"),
     }
 }
@@ -1487,6 +1492,23 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
             )
             .await
         }
+        (
+            BuiltInHandlerId::PlaybookRun,
+            Command::Playbook {
+                command:
+                    PlaybookCommand::Run {
+                        source,
+                        json,
+                        target_server,
+                    },
+            },
+        ) => run_playbook_run(source, *json, *target_server).await,
+        (
+            BuiltInHandlerId::PlaybookValidate,
+            Command::Playbook {
+                command: PlaybookCommand::Validate { source, json },
+            },
+        ) => run_playbook_validate(source, *json),
         _ => unreachable!("built-in command handler and command variant should stay in sync"),
     }
 }
@@ -8160,6 +8182,57 @@ fn init_logging(verbose: bool, cli_level: Option<LogLevel>) {
     {
         let _ = level;
     }
+}
+
+// ── Playbook commands ────────────────────────────────────────────────────────
+
+async fn run_playbook_run(source: &str, json: bool, target_server: bool) -> Result<u8> {
+    let playbook = if source == "-" {
+        crate::playbook::parse_stdin().context("failed parsing playbook from stdin")?
+    } else {
+        crate::playbook::parse_file(std::path::Path::new(source))
+            .with_context(|| format!("failed parsing playbook from {source}"))?
+    };
+
+    let result = crate::playbook::run(playbook, target_server).await?;
+
+    if json {
+        let json_str =
+            serde_json::to_string_pretty(&result).context("failed serializing playbook result")?;
+        println!("{json_str}");
+    } else {
+        print!("{}", crate::playbook::format_result(&result));
+    }
+
+    Ok(if result.pass { 0 } else { 1 })
+}
+
+fn run_playbook_validate(source: &str, json: bool) -> Result<u8> {
+    let playbook = if source == "-" {
+        crate::playbook::parse_stdin().context("failed parsing playbook from stdin")?
+    } else {
+        crate::playbook::parse_file(std::path::Path::new(source))
+            .with_context(|| format!("failed parsing playbook from {source}"))?
+    };
+
+    let errors = crate::playbook::validate(&playbook);
+
+    if json {
+        let report = serde_json::json!({
+            "valid": errors.is_empty(),
+            "errors": errors,
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if errors.is_empty() {
+        println!("playbook is valid");
+    } else {
+        println!("playbook validation errors:");
+        for error in &errors {
+            println!("  - {error}");
+        }
+    }
+
+    Ok(if errors.is_empty() { 0 } else { 1 })
 }
 
 #[cfg(test)]
