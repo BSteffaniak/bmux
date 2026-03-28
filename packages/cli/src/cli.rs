@@ -439,6 +439,14 @@ pub enum PlaybookCommand {
         #[arg(long, short)]
         output: Option<String>,
     },
+    /// Dry-run: parse, validate, and print the execution plan without running
+    DryRun {
+        /// Path to playbook file, or `-` for stdin
+        source: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

@@ -337,6 +337,133 @@ impl Action {
             Self::Status => "status",
         }
     }
+
+    /// Serialize the action back to a DSL line for round-trip display.
+    pub fn to_dsl(&self) -> String {
+        use super::from_recording::{bytes_to_c_escaped, escape_single_quote};
+
+        match self {
+            Self::NewSession { name } => match name {
+                Some(n) => format!("new-session name='{}'", escape_single_quote(n)),
+                None => "new-session".to_string(),
+            },
+            Self::KillSession { name } => {
+                format!("kill-session name='{}'", escape_single_quote(name))
+            }
+            Self::SplitPane { direction, ratio } => {
+                let dir = match direction {
+                    SplitDirection::Vertical => "vertical",
+                    SplitDirection::Horizontal => "horizontal",
+                };
+                match ratio {
+                    Some(r) => format!("split-pane direction={dir} ratio={r}"),
+                    None => format!("split-pane direction={dir}"),
+                }
+            }
+            Self::FocusPane { target } => format!("focus-pane target={target}"),
+            Self::ClosePane { target } => match target {
+                Some(t) => format!("close-pane target={t}"),
+                None => "close-pane".to_string(),
+            },
+            Self::SendKeys { keys, pane } => {
+                let escaped = bytes_to_c_escaped(keys);
+                match pane {
+                    Some(p) => format!("send-keys keys='{escaped}' pane={p}"),
+                    None => format!("send-keys keys='{escaped}'"),
+                }
+            }
+            Self::SendBytes { hex } => {
+                let hex_str: String = hex.iter().map(|b| format!("{b:02x}")).collect();
+                format!("send-bytes hex={hex_str}")
+            }
+            Self::WaitFor {
+                pattern,
+                pane,
+                timeout,
+            } => {
+                let escaped = escape_single_quote(pattern);
+                let mut line = format!("wait-for pattern='{escaped}'");
+                if let Some(p) = pane {
+                    line.push_str(&format!(" pane={p}"));
+                }
+                let ms = timeout.as_millis();
+                if ms != 5000 {
+                    line.push_str(&format!(" timeout={ms}"));
+                }
+                line
+            }
+            Self::Sleep { duration } => format!("sleep ms={}", duration.as_millis()),
+            Self::Snapshot { id } => {
+                format!("snapshot id='{}'", escape_single_quote(id))
+            }
+            Self::AssertScreen {
+                pane,
+                contains,
+                not_contains,
+                matches,
+            } => {
+                let mut line = "assert-screen".to_string();
+                if let Some(p) = pane {
+                    line.push_str(&format!(" pane={p}"));
+                }
+                if let Some(c) = contains {
+                    line.push_str(&format!(" contains='{}'", escape_single_quote(c)));
+                }
+                if let Some(nc) = not_contains {
+                    line.push_str(&format!(" not_contains='{}'", escape_single_quote(nc)));
+                }
+                if let Some(m) = matches {
+                    line.push_str(&format!(" matches='{}'", escape_single_quote(m)));
+                }
+                line
+            }
+            Self::AssertLayout { pane_count } => match pane_count {
+                Some(n) => format!("assert-layout pane_count={n}"),
+                None => "assert-layout".to_string(),
+            },
+            Self::AssertCursor { pane, row, col } => {
+                let mut line = format!("assert-cursor row={row} col={col}");
+                if let Some(p) = pane {
+                    line.push_str(&format!(" pane={p}"));
+                }
+                line
+            }
+            Self::ResizeViewport { cols, rows } => {
+                format!("resize-viewport cols={cols} rows={rows}")
+            }
+            Self::PrefixKey { key } => format!("prefix-key key={key}"),
+            Self::WaitForEvent { event, timeout } => {
+                let escaped = escape_single_quote(event);
+                let ms = timeout.as_millis();
+                if ms != 5000 {
+                    format!("wait-for-event event='{escaped}' timeout={ms}")
+                } else {
+                    format!("wait-for-event event='{escaped}'")
+                }
+            }
+            Self::InvokeService {
+                capability,
+                kind,
+                interface_id,
+                operation,
+                payload,
+            } => {
+                let kind_str = match kind {
+                    ServiceKind::Query => "query",
+                    ServiceKind::Command => "command",
+                };
+                let mut line = format!(
+                    "invoke-service capability='{capability}' interface='{interface_id}' operation='{operation}' kind={kind_str}"
+                );
+                if !payload.is_empty() {
+                    line.push_str(&format!(" payload='{}'", escape_single_quote(payload)));
+                }
+                line
+            }
+            Self::Screen => "screen".to_string(),
+            Self::Status => "status".to_string(),
+        }
+    }
 }
 
 #[cfg(test)]

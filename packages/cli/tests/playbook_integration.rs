@@ -250,6 +250,7 @@ fn parse_and_validate_fixtures() {
         "screen_status.dsl",
         "snapshot_capture.dsl",
         "failing_assert.dsl",
+        "assert_matches.dsl",
     ];
 
     for name in &fixtures {
@@ -263,4 +264,264 @@ fn parse_and_validate_fixtures() {
             "validation errors for {name}: {errors:?}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Subprocess: assert-screen matches= (regex)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn playbook_assert_matches() {
+    let (json, pass) = run_playbook_fixture("assert_matches.dsl");
+    assert!(pass, "assert-screen matches= should pass: {json:#}");
+    let steps = json["steps"].as_array().unwrap();
+    let assert_step = steps
+        .iter()
+        .find(|s| s["action"] == "assert-screen")
+        .expect("should have an assert-screen step");
+    assert_eq!(
+        assert_step["status"], "pass",
+        "assert-screen matches= should pass"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Subprocess: dry-run
+// ---------------------------------------------------------------------------
+
+#[test]
+fn playbook_dry_run() {
+    let fixture = fixtures_dir().join("echo_hello.dsl");
+
+    let output = Command::new(bmux_binary())
+        .args(["playbook", "dry-run", "--json", fixture.to_str().unwrap()])
+        .output()
+        .expect("failed to run bmux playbook dry-run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("JSON parse failed: {e}\nstdout: {stdout}\nstderr: {stderr}"));
+
+    assert_eq!(json["valid"], true, "dry-run should be valid: {json:#}");
+
+    let steps = json["steps"].as_array().expect("should have steps array");
+    assert!(!steps.is_empty(), "dry-run should list steps: {json:#}");
+
+    // Verify each step has index, action, and dsl fields.
+    for step in steps {
+        assert!(
+            step.get("index").is_some(),
+            "step should have index: {step:#}"
+        );
+        assert!(
+            step.get("action").is_some(),
+            "step should have action: {step:#}"
+        );
+        assert!(step.get("dsl").is_some(), "step should have dsl: {step:#}");
+    }
+
+    // Verify the dsl field contains recognizable DSL.
+    let first_dsl = steps[0]["dsl"].as_str().unwrap_or("");
+    assert!(
+        first_dsl.starts_with("new-session"),
+        "first step dsl should be new-session: {first_dsl}"
+    );
+
+    // Verify config section.
+    assert!(
+        json.get("config").is_some(),
+        "dry-run should have config: {json:#}"
+    );
+
+    // Check errors is empty.
+    let errors = json["errors"].as_array().expect("should have errors array");
+    assert!(errors.is_empty(), "should have no errors: {json:#}");
+
+    // Exit code should be 0.
+    assert!(output.status.success(), "dry-run exit code should be 0");
+}
+
+// ---------------------------------------------------------------------------
+// Direct API: run_playbook (async)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn run_playbook_echo_pass() {
+    let dsl = "\
+@viewport cols=80 rows=24
+@shell sh
+new-session
+send-keys keys='echo api_test_marker\\r'
+wait-for pattern='api_test_marker'
+assert-screen contains='api_test_marker'
+";
+    let (mut playbook, _) = bmux_cli::playbook::parse_dsl::parse_dsl(dsl).unwrap();
+    playbook.config.binary = Some(PathBuf::from(env!("CARGO_BIN_EXE_bmux")));
+
+    let result = bmux_cli::playbook::run(playbook, false).await.unwrap();
+    assert!(result.pass, "playbook should pass: {:?}", result.error);
+    assert!(
+        result
+            .steps
+            .iter()
+            .all(|s| s.status == bmux_cli::playbook::types::StepStatus::Pass),
+        "all steps should pass: {:?}",
+        result.steps
+    );
+}
+
+#[tokio::test]
+async fn run_playbook_failing_returns_fail() {
+    let dsl = "\
+@viewport cols=80 rows=24
+@shell sh
+new-session
+send-keys keys='echo real_output\\r'
+wait-for pattern='real_output'
+assert-screen contains='nonexistent_xyz_api'
+";
+    let (mut playbook, _) = bmux_cli::playbook::parse_dsl::parse_dsl(dsl).unwrap();
+    playbook.config.binary = Some(PathBuf::from(env!("CARGO_BIN_EXE_bmux")));
+
+    let result = bmux_cli::playbook::run(playbook, false).await.unwrap();
+    assert!(!result.pass, "playbook should fail");
+
+    let failed = result
+        .steps
+        .iter()
+        .find(|s| s.status == bmux_cli::playbook::types::StepStatus::Fail);
+    assert!(failed.is_some(), "should have a failed step");
+
+    let f = failed.unwrap();
+    assert!(f.expected.is_some(), "failed step should have expected");
+    assert!(f.actual.is_some(), "failed step should have actual");
+    assert!(
+        f.failure_captures.is_some(),
+        "failed step should have failure_captures"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Direct API: end-to-end recording → playbook → execution
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn recording_to_playbook_end_to_end() {
+    use bmux_ipc::{RecordingEventEnvelope, RecordingEventKind, RecordingPayload};
+    use uuid::Uuid;
+
+    let session_id = Uuid::from_u128(1);
+    let pane_id = Uuid::from_u128(2);
+
+    // Build a minimal synthetic recording: NewSession → send "echo e2e_marker\r" → output.
+    let new_session_req = bmux_ipc::Request::NewSession { name: None };
+    let new_session_resp = bmux_ipc::ResponsePayload::SessionCreated {
+        id: session_id,
+        name: None,
+    };
+    let input_req = bmux_ipc::Request::AttachInput {
+        session_id,
+        data: b"echo e2e_marker\r".to_vec(),
+    };
+
+    let events = vec![
+        RecordingEventEnvelope {
+            seq: 1,
+            mono_ns: 100_000_000,
+            wall_epoch_ms: 0,
+            session_id: Some(session_id),
+            pane_id: None,
+            client_id: None,
+            kind: RecordingEventKind::RequestStart,
+            payload: RecordingPayload::RequestStart {
+                request_id: 1,
+                request_kind: "new_session".to_string(),
+                exclusive: false,
+                request_data: bmux_ipc::encode(&new_session_req).unwrap(),
+            },
+        },
+        RecordingEventEnvelope {
+            seq: 2,
+            mono_ns: 200_000_000,
+            wall_epoch_ms: 0,
+            session_id: Some(session_id),
+            pane_id: None,
+            client_id: None,
+            kind: RecordingEventKind::RequestDone,
+            payload: RecordingPayload::RequestDone {
+                request_id: 1,
+                request_kind: "new_session".to_string(),
+                response_kind: "session_created".to_string(),
+                elapsed_ms: 100,
+                request_data: bmux_ipc::encode(&new_session_req).unwrap(),
+                response_data: bmux_ipc::encode(&new_session_resp).unwrap(),
+            },
+        },
+        RecordingEventEnvelope {
+            seq: 3,
+            mono_ns: 1_000_000_000,
+            wall_epoch_ms: 0,
+            session_id: Some(session_id),
+            pane_id: Some(pane_id),
+            client_id: None,
+            kind: RecordingEventKind::RequestStart,
+            payload: RecordingPayload::RequestStart {
+                request_id: 2,
+                request_kind: "attach_input".to_string(),
+                exclusive: false,
+                request_data: bmux_ipc::encode(&input_req).unwrap(),
+            },
+        },
+        RecordingEventEnvelope {
+            seq: 4,
+            mono_ns: 1_500_000_000,
+            wall_epoch_ms: 0,
+            session_id: Some(session_id),
+            pane_id: Some(pane_id),
+            client_id: None,
+            kind: RecordingEventKind::PaneOutputRaw,
+            payload: RecordingPayload::Bytes {
+                data: b"echo e2e_marker\r\ne2e_marker\r\n$ ".to_vec(),
+            },
+        },
+    ];
+
+    // Step 1: Convert recording events → DSL string.
+    let dsl = bmux_cli::playbook::from_recording::events_to_playbook(&events)
+        .expect("events_to_playbook should succeed");
+
+    // Sanity check: the DSL should contain key elements.
+    assert!(
+        dsl.contains("new-session"),
+        "DSL should have new-session: {dsl}"
+    );
+    assert!(
+        dsl.contains("send-keys"),
+        "DSL should have send-keys: {dsl}"
+    );
+    assert!(
+        dsl.contains("wait-for"),
+        "DSL should have wait-for barriers: {dsl}"
+    );
+
+    // Step 2: Parse the generated DSL into a Playbook.
+    let (mut playbook, _) =
+        bmux_cli::playbook::parse_dsl::parse_dsl(&dsl).expect("generated DSL should parse");
+
+    // Step 3: Configure for sandbox execution.
+    playbook.config.binary = Some(PathBuf::from(env!("CARGO_BIN_EXE_bmux")));
+    playbook.config.shell = Some("sh".to_string());
+
+    // Step 4: Run the playbook.
+    let result = bmux_cli::playbook::run(playbook, false)
+        .await
+        .expect("run_playbook should not error");
+
+    // Step 5: Assert it passes.
+    assert!(
+        result.pass,
+        "generated playbook should pass. steps: {:?}, error: {:?}",
+        result.steps, result.error
+    );
 }

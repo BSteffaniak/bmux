@@ -1074,6 +1074,7 @@ fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
             PlaybookCommand::Validate { .. } => BuiltInHandlerId::PlaybookValidate,
             PlaybookCommand::Interactive { .. } => BuiltInHandlerId::PlaybookInteractive,
             PlaybookCommand::FromRecording { .. } => BuiltInHandlerId::PlaybookFromRecording,
+            PlaybookCommand::DryRun { .. } => BuiltInHandlerId::PlaybookDryRun,
         },
         Command::External(_) => unreachable!("external commands are dispatched separately"),
     }
@@ -1561,6 +1562,12 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                     },
             },
         ) => run_playbook_from_recording(recording_id, output.as_deref()),
+        (
+            BuiltInHandlerId::PlaybookDryRun,
+            Command::Playbook {
+                command: PlaybookCommand::DryRun { source, json },
+            },
+        ) => run_playbook_dry_run(source, *json),
         _ => unreachable!("built-in command handler and command variant should stay in sync"),
     }
 }
@@ -8468,6 +8475,83 @@ fn run_playbook_validate(source: &str, json: bool) -> Result<u8> {
     }
 
     Ok(if errors.is_empty() { 0 } else { 1 })
+}
+
+fn run_playbook_dry_run(source: &str, json: bool) -> Result<u8> {
+    let playbook = if source == "-" {
+        crate::playbook::parse_stdin().context("failed parsing playbook from stdin")?
+    } else {
+        crate::playbook::parse_file(std::path::Path::new(source))
+            .with_context(|| format!("failed parsing playbook from {source}"))?
+    };
+
+    let errors = crate::playbook::validate(&playbook, false);
+    let valid = errors.is_empty();
+
+    if json {
+        let config = &playbook.config;
+        let env_mode_str = match config.env_mode {
+            Some(crate::playbook::types::SandboxEnvMode::Clean) => "clean",
+            Some(crate::playbook::types::SandboxEnvMode::Inherit) => "inherit",
+            None => "default",
+        };
+        let steps: Vec<serde_json::Value> = playbook
+            .steps
+            .iter()
+            .map(|s| {
+                serde_json::json!({
+                    "index": s.index,
+                    "action": s.action.name(),
+                    "dsl": s.action.to_dsl(),
+                })
+            })
+            .collect();
+
+        let report = serde_json::json!({
+            "valid": valid,
+            "config": {
+                "name": config.name,
+                "viewport": format!("{}x{}", config.viewport.cols, config.viewport.rows),
+                "shell": config.shell,
+                "timeout_ms": config.timeout.as_millis() as u64,
+                "env_mode": env_mode_str,
+                "record": config.record,
+            },
+            "steps": steps,
+            "step_count": playbook.steps.len(),
+            "errors": errors,
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        let name = playbook.config.name.as_deref().unwrap_or("<unnamed>");
+        println!("playbook: {name} (dry run)");
+        println!(
+            "  config: viewport={}x{} shell={} timeout={}ms env_mode={}",
+            playbook.config.viewport.cols,
+            playbook.config.viewport.rows,
+            playbook.config.shell.as_deref().unwrap_or("default"),
+            playbook.config.timeout.as_millis(),
+            match playbook.config.env_mode {
+                Some(crate::playbook::types::SandboxEnvMode::Clean) => "clean",
+                Some(crate::playbook::types::SandboxEnvMode::Inherit) => "inherit",
+                None => "default",
+            },
+        );
+        println!("  steps:");
+        for step in &playbook.steps {
+            println!("    {}. {}", step.index, step.action.to_dsl());
+        }
+        if valid {
+            println!("  validation: ok");
+        } else {
+            println!("  validation: ERRORS");
+            for error in &errors {
+                println!("    - {error}");
+            }
+        }
+    }
+
+    Ok(if valid { 0 } else { 1 })
 }
 
 async fn run_playbook_interactive(

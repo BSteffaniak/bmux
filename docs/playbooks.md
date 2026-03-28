@@ -64,6 +64,46 @@ bmux playbook validate <source> [--json]
 
 Returns validation errors (missing `new-session` as first step, unknown actions, etc.).
 
+### `bmux playbook dry-run`
+
+Parse, validate, and print the execution plan without running.
+
+```
+bmux playbook dry-run <source> [--json]
+```
+
+| Argument/Flag | Type | Default | Description |
+|---------------|------|---------|-------------|
+| `<source>` | string | required | Path to playbook file, or `-` for stdin |
+| `--json` | bool | false | Output as structured JSON |
+
+**Exit codes:** `0` = playbook is valid, `1` = validation errors found.
+
+**JSON output:**
+```json
+{
+  "valid": true,
+  "config": {
+    "name": "my-test",
+    "viewport": "80x24",
+    "shell": "sh",
+    "timeout_ms": 30000,
+    "env_mode": "default",
+    "record": false
+  },
+  "steps": [
+    { "index": 0, "action": "new-session", "dsl": "new-session" },
+    { "index": 1, "action": "send-keys", "dsl": "send-keys keys='echo hi\\r'" },
+    { "index": 2, "action": "wait-for", "dsl": "wait-for pattern='hi'" }
+  ],
+  "step_count": 3,
+  "errors": []
+}
+```
+
+Each step's `dsl` field contains the round-trip DSL serialization of the action,
+which is valid DSL syntax that can be copy-pasted.
+
 ### `bmux playbook interactive`
 
 Start an interactive playbook session with a socket for agent control.
