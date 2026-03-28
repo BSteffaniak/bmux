@@ -13,7 +13,8 @@ use crate::types::{KeyCode, KeyStroke, Modifiers};
 /// Legacy encoding has limited modifier support:
 /// - Ctrl+alpha maps to control codes (0x01-0x1a)
 /// - Alt prepends ESC (0x1b) for chars, Enter, Tab, Backspace
-/// - Shift only encodes for arrow keys (modifier param 2)
+/// - Shift on alphabetic chars maps to uppercase (A-Z)
+/// - Shift encodes for arrow keys (modifier param 2)
 /// - Other modifier combinations for special keys are silently lost
 #[must_use]
 pub fn encode(stroke: &KeyStroke) -> Option<Vec<u8>> {
@@ -43,6 +44,11 @@ pub fn encode(stroke: &KeyStroke) -> Option<Vec<u8>> {
             }
 
             push_alt(&mut out);
+            let c = if shift && c.is_ascii_lowercase() {
+                c.to_ascii_uppercase()
+            } else {
+                c
+            };
             if c.is_ascii() {
                 out.push(c as u8);
             } else {
@@ -282,6 +288,62 @@ mod tests {
     }
 
     #[test]
+    fn encode_shift_alpha_produces_uppercase() {
+        let stroke = KeyStroke::with_modifiers(
+            KeyCode::Char('a'),
+            Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            },
+        );
+        assert_eq!(encode(&stroke).unwrap(), b"A");
+    }
+
+    #[test]
+    fn encode_shift_various_letters() {
+        for (lower, upper) in [('a', b'A'), ('z', b'Z'), ('m', b'M')] {
+            let stroke = KeyStroke::with_modifiers(
+                KeyCode::Char(lower),
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::NONE
+                },
+            );
+            assert_eq!(
+                encode(&stroke).unwrap(),
+                vec![upper],
+                "shift+{lower} should encode as uppercase"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_shift_nonalpha_unchanged() {
+        // Shift on non-alphabetic chars should not alter the character.
+        let stroke = KeyStroke::with_modifiers(
+            KeyCode::Char('1'),
+            Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            },
+        );
+        assert_eq!(encode(&stroke).unwrap(), b"1");
+    }
+
+    #[test]
+    fn encode_alt_shift_char() {
+        let stroke = KeyStroke::with_modifiers(
+            KeyCode::Char('a'),
+            Modifiers {
+                alt: true,
+                shift: true,
+                ..Modifiers::NONE
+            },
+        );
+        assert_eq!(encode(&stroke).unwrap(), b"\x1bA");
+    }
+
+    #[test]
     fn encode_alt_char() {
         let stroke = KeyStroke::with_modifiers(
             KeyCode::Char('x'),
@@ -392,5 +454,19 @@ mod tests {
         let result = decode_escape(b"\x1b[Z").unwrap();
         assert_eq!(result.stroke.key, KeyCode::Tab);
         assert!(result.stroke.modifiers.shift);
+    }
+
+    #[test]
+    fn roundtrip_uppercase_decode_encode() {
+        // Decoding uppercase byte then re-encoding should produce the same byte.
+        for byte in b'A'..=b'Z' {
+            let (stroke, raw) = decode_single(byte);
+            let encoded = encode(&stroke).unwrap();
+            assert_eq!(
+                encoded, raw,
+                "roundtrip failed for byte 0x{byte:02x} ('{}')",
+                byte as char,
+            );
+        }
     }
 }

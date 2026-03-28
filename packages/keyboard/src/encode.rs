@@ -42,7 +42,8 @@ fn needs_enhanced_encoding(stroke: &KeyStroke) -> bool {
     }
 
     match stroke.key {
-        // Chars: legacy handles Ctrl+alpha and Alt+char, but not Super+char.
+        // Chars: legacy handles Ctrl+alpha, Alt+char, and Shift+alpha (uppercase).
+        // Need CSI u only for Super+char.
         KeyCode::Char(_) => mods.super_key,
 
         // Enter, Tab, Backspace, Escape: legacy only handles Alt prefix.
@@ -130,6 +131,41 @@ mod tests {
             },
         );
         assert_eq!(encode_key(&stroke, true).unwrap(), vec![0x03]);
+    }
+
+    #[test]
+    fn shift_alpha_produces_uppercase() {
+        // Shift+a should produce uppercase 'A' (0x41) via legacy encoding.
+        let stroke = KeyStroke::with_modifiers(
+            KeyCode::Char('a'),
+            Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            },
+        );
+        assert_eq!(encode_key(&stroke, true).unwrap(), vec![b'A']);
+        assert_eq!(encode_key(&stroke, false).unwrap(), vec![b'A']);
+    }
+
+    #[test]
+    fn shift_alpha_all_letters() {
+        for c in b'a'..=b'z' {
+            let stroke = KeyStroke::with_modifiers(
+                KeyCode::Char(c as char),
+                Modifiers {
+                    shift: true,
+                    ..Modifiers::NONE
+                },
+            );
+            let expected = vec![c - b'a' + b'A'];
+            assert_eq!(
+                encode_key(&stroke, true).unwrap(),
+                expected,
+                "shift+{} should produce {}",
+                c as char,
+                (c - b'a' + b'A') as char,
+            );
+        }
     }
 
     #[cfg(feature = "csi-u")]
