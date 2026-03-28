@@ -1,0 +1,1 @@
+assert-screen contains='hello'

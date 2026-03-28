@@ -951,3 +951,109 @@ async fn interactive_mode_basic() {
     // Wait for the child to exit.
     let _ = child.wait();
 }
+
+// ---------------------------------------------------------------------------
+// A: Concurrent playbook runs
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn concurrent_playbook_runs() {
+    let dsl = "\
+@viewport cols=80 rows=24
+@shell sh
+new-session
+send-keys keys='echo concurrent_test\\r'
+wait-for pattern='concurrent_test'
+assert-screen contains='concurrent_test'
+";
+
+    let run1 = async {
+        let (mut pb, _) = bmux_cli::playbook::parse_dsl::parse_dsl(dsl).unwrap();
+        pb.config.binary = Some(PathBuf::from(env!("CARGO_BIN_EXE_bmux")));
+        bmux_cli::playbook::run(pb, false).await.unwrap()
+    };
+    let run2 = async {
+        let (mut pb, _) = bmux_cli::playbook::parse_dsl::parse_dsl(dsl).unwrap();
+        pb.config.binary = Some(PathBuf::from(env!("CARGO_BIN_EXE_bmux")));
+        bmux_cli::playbook::run(pb, false).await.unwrap()
+    };
+
+    let (r1, r2) = tokio::join!(run1, run2);
+    assert!(r1.pass, "concurrent run 1 should pass: {:?}", r1.error);
+    assert!(r2.pass, "concurrent run 2 should pass: {:?}", r2.error);
+}
+
+// ---------------------------------------------------------------------------
+// B: Shell exit mid-playbook
+// ---------------------------------------------------------------------------
+
+#[test]
+fn playbook_shell_exit_mid_playbook() {
+    let (json, pass) = run_playbook_fixture("shell_exit.dsl");
+    assert!(!pass, "should fail after shell exit: {json:#}");
+
+    // Verify we got a failure, not a hang or panic.
+    let steps = json["steps"].as_array().expect("should have steps");
+    let failed = steps.iter().find(|s| s["status"] == "fail");
+    assert!(
+        failed.is_some(),
+        "should have a failed step after shell exit: {json:#}"
+    );
+    // The failed step should have a detail with an error message.
+    let detail = failed.unwrap()["detail"].as_str().unwrap_or("");
+    assert!(
+        !detail.is_empty(),
+        "failed step should have a detail: {json:#}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// C: Validate --json integration tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn playbook_validate_valid_json() {
+    let fixture = fixtures_dir().join("echo_hello.dsl");
+
+    let output = Command::new(bmux_binary())
+        .args(["playbook", "validate", "--json", fixture.to_str().unwrap()])
+        .output()
+        .expect("failed to run bmux playbook validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("JSON parse failed: {e}\nstdout: {stdout}"));
+
+    assert_eq!(json["valid"], true, "echo_hello should be valid: {json:#}");
+    let errors = json["errors"].as_array().expect("should have errors array");
+    assert!(errors.is_empty(), "should have no errors: {json:#}");
+    assert!(output.status.success(), "exit code should be 0");
+}
+
+#[test]
+fn playbook_validate_invalid_json() {
+    let fixture = fixtures_dir().join("invalid_no_session.dsl");
+
+    let output = Command::new(bmux_binary())
+        .args(["playbook", "validate", "--json", fixture.to_str().unwrap()])
+        .output()
+        .expect("failed to run bmux playbook validate");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("JSON parse failed: {e}\nstdout: {stdout}"));
+
+    assert_eq!(
+        json["valid"], false,
+        "invalid playbook should not be valid: {json:#}"
+    );
+    let errors = json["errors"].as_array().expect("should have errors array");
+    assert!(
+        !errors.is_empty(),
+        "should have validation errors: {json:#}"
+    );
+    assert!(
+        !output.status.success(),
+        "exit code should be non-zero for invalid playbook"
+    );
+}

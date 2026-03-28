@@ -176,7 +176,7 @@ fn create_temp_paths() -> (ConfigPaths, PathBuf) {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_nanos());
-    let root = std::env::temp_dir().join(format!("bpb-{nanos:x}"));
+    let root = std::env::temp_dir().join(format!("bpb-{nanos:x}-{}", std::process::id()));
     let paths = ConfigPaths::new(
         root.join("c"),
         root.join("r"),

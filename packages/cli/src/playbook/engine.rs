@@ -709,10 +709,11 @@ pub(super) async fn execute_step(
                 }
 
                 if Instant::now() >= wait_deadline {
-                    bail!(
+                    return Err(StepFailure::msg(format!(
                         "wait-for-event timed out after {}ms waiting for '{resolved_event}'",
                         timeout.as_millis()
-                    );
+                    ))
+                    .into());
                 }
 
                 tokio::time::sleep(poll_delay).await;
