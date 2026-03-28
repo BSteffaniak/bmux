@@ -10,9 +10,9 @@ repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-bmux_keyboard = { workspace = true }
-serde         = { workspace = true, features = ["derive", "std"] }
+serde = { workspace = true, features = ["derive", "std"] }
 
 [features]
-default          = []
+default          = ["kitty-keyboard"]
 fail-on-warnings = []
+kitty-keyboard   = []

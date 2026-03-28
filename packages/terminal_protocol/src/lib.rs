@@ -96,6 +96,7 @@ pub struct TerminalProtocolEngine {
     pane_id: Option<u16>,
     trace: Option<SharedProtocolTraceBuffer>,
     /// Stack of kitty keyboard enhancement flags pushed by the inner program.
+    #[cfg(feature = "kitty-keyboard")]
     keyboard_flag_stack: Vec<u32>,
 }
 
@@ -110,6 +111,7 @@ impl TerminalProtocolEngine {
             profile,
             pane_id: None,
             trace: None,
+            #[cfg(feature = "kitty-keyboard")]
             keyboard_flag_stack: Vec::new(),
         }
     }
@@ -164,6 +166,7 @@ impl TerminalProtocolEngine {
 
                     if byte.is_ascii_alphabetic() {
                         // First try kitty keyboard protocol sequences (state-changing).
+                        #[cfg(feature = "kitty-keyboard")]
                         if *byte == b'u' {
                             if let Some((name, reply)) =
                                 self.handle_kitty_keyboard_csi(&self.csi_buffer.clone())
@@ -314,6 +317,7 @@ impl TerminalProtocolEngine {
     ///
     /// Returns `Some((name, reply_bytes))` if the sequence was recognized.
     /// Push/pop sequences return an empty reply (they are state changes only).
+    #[cfg(feature = "kitty-keyboard")]
     fn handle_kitty_keyboard_csi(&mut self, sequence: &[u8]) -> Option<(&'static str, Vec<u8>)> {
         // Only Bmux profile responds to kitty keyboard queries.
         if !matches!(self.profile, ProtocolProfile::Bmux) {
@@ -351,6 +355,7 @@ impl TerminalProtocolEngine {
     /// Get the current kitty keyboard enhancement flags for this pane.
     ///
     /// Returns 0 if no flags have been pushed.
+    #[cfg(feature = "kitty-keyboard")]
     #[must_use]
     pub fn keyboard_enhancement_flags(&self) -> u32 {
         self.keyboard_flag_stack.last().copied().unwrap_or(0)
@@ -373,8 +378,11 @@ pub fn supported_query_names() -> &'static [&'static str] {
         "csi_dec_dsr_status_report",
         "csi_dec_dsr_cursor_position",
         "csi_dec_mode_report",
+        #[cfg(feature = "kitty-keyboard")]
         "csi_kitty_keyboard_query",
+        #[cfg(feature = "kitty-keyboard")]
         "csi_kitty_keyboard_push",
+        #[cfg(feature = "kitty-keyboard")]
         "csi_kitty_keyboard_pop",
         "osc_color_query",
         "dcs_xtgettcap_query",
@@ -469,6 +477,7 @@ fn dec_mode_status(profile: ProtocolProfile, mode: u16) -> u8 {
             1004 => 2,
             2004 => 2,
             1049 => 2,
+            #[cfg(feature = "kitty-keyboard")]
             2048 => 1, // Kitty keyboard protocol supported
             _ => 0,
         },
@@ -624,6 +633,7 @@ fn dec_dsr_cursor_response(cursor_pos: (u16, u16)) -> Vec<u8> {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "kitty-keyboard")]
     #[test]
     fn kitty_keyboard_query_empty_stack() {
         let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
@@ -631,6 +641,7 @@ mod tests {
         assert_eq!(reply, b"\x1b[?0u");
     }
 
+    #[cfg(feature = "kitty-keyboard")]
     #[test]
     fn kitty_keyboard_push_then_query() {
         let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
@@ -643,6 +654,7 @@ mod tests {
         assert_eq!(engine.keyboard_enhancement_flags(), 1);
     }
 
+    #[cfg(feature = "kitty-keyboard")]
     #[test]
     fn kitty_keyboard_push_push_pop_query() {
         let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
@@ -658,6 +670,7 @@ mod tests {
         assert_eq!(engine.keyboard_enhancement_flags(), 1);
     }
 
+    #[cfg(feature = "kitty-keyboard")]
     #[test]
     fn kitty_keyboard_pop_empty_stack() {
         let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
@@ -667,6 +680,7 @@ mod tests {
         assert_eq!(engine.keyboard_enhancement_flags(), 0);
     }
 
+    #[cfg(feature = "kitty-keyboard")]
     #[test]
     fn kitty_keyboard_not_supported_on_xterm_profile() {
         let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
@@ -677,6 +691,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "kitty-keyboard")]
     #[test]
     fn kitty_keyboard_not_supported_on_conservative_profile() {
         let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Conservative);
@@ -684,6 +699,7 @@ mod tests {
         assert!(reply.is_empty());
     }
 
+    #[cfg(feature = "kitty-keyboard")]
     #[test]
     fn dec_mode_2048_supported_on_bmux_profile() {
         let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
@@ -714,6 +730,7 @@ mod tests {
         assert_eq!(reply, b"\x1b[>84;0;0c");
     }
 
+    #[cfg(feature = "kitty-keyboard")]
     #[test]
     fn kitty_keyboard_interleaved_with_normal_output() {
         let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Bmux);
@@ -723,6 +740,7 @@ mod tests {
         assert_eq!(engine.keyboard_enhancement_flags(), 1);
     }
 
+    #[cfg(feature = "kitty-keyboard")]
     #[test]
     fn supported_query_names_includes_kitty() {
         let names = supported_query_names();

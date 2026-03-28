@@ -74,10 +74,16 @@ vt100 = { workspace = true }
 
 [features]
 # Default features
-default = ["bundled-fonts", "bundled-plugins", "logging"]
+default = ["bundled-fonts", "bundled-plugins", "kitty-keyboard", "logging"]
 
 # Development features
 fail-on-warnings = []
+
+# Kitty keyboard protocol support (CSI u encoding/decoding + inner program negotiation)
+kitty-keyboard = [
+    "bmux_keyboard/csi-u",
+    "bmux_terminal_protocol/kitty-keyboard",
+]
 
 # Statically link all four bundled plugins into the binary
 bundled-plugins = [

@@ -12,6 +12,45 @@
 
 use crate::types::{KeyCode, KeyStroke, Modifiers};
 
+/// Compute the CSI u modifier parameter value from modifier flags.
+///
+/// Per the kitty keyboard protocol specification:
+/// `modifier_param = 1 + (shift ? 1 : 0) + (alt ? 2 : 0) + (ctrl ? 4 : 0) + (super ? 8 : 0)`
+#[must_use]
+pub const fn modifier_param(mods: Modifiers) -> u8 {
+    let mut param: u8 = 1;
+    if mods.shift {
+        param += 1;
+    }
+    if mods.alt {
+        param += 2;
+    }
+    if mods.ctrl {
+        param += 4;
+    }
+    if mods.super_key {
+        param += 8;
+    }
+    param
+}
+
+/// Decode a CSI u modifier parameter value back into modifier flags.
+///
+/// Returns `None` if `param` is 0 (invalid per spec).
+#[must_use]
+pub const fn modifiers_from_param(param: u8) -> Option<Modifiers> {
+    if param == 0 {
+        return None;
+    }
+    let val = param - 1;
+    Some(Modifiers {
+        shift: val & 1 != 0,
+        alt: val & 2 != 0,
+        ctrl: val & 4 != 0,
+        super_key: val & 8 != 0,
+    })
+}
+
 /// Map a [`KeyCode`] to its CSI u Unicode codepoint value.
 ///
 /// Returns `None` for keys that should use legacy CSI encoding with modifier
@@ -84,7 +123,7 @@ pub const fn codepoint_to_keycode(cp: u32) -> Option<KeyCode> {
 pub fn encode(stroke: &KeyStroke) -> Option<Vec<u8>> {
     // First try CSI u codepoint encoding.
     if let Some(cp) = keycode_to_codepoint(stroke.key) {
-        let modifier = stroke.modifiers.csi_u_param();
+        let modifier = modifier_param(stroke.modifiers);
         return if modifier == 1 {
             Some(format!("\x1b[{cp}u").into_bytes())
         } else {
@@ -98,7 +137,7 @@ pub fn encode(stroke: &KeyStroke) -> Option<Vec<u8>> {
 
 /// Encode navigation/arrow keys with xterm-style modifier parameters.
 fn encode_modified_legacy(stroke: &KeyStroke) -> Option<Vec<u8>> {
-    let modifier = stroke.modifiers.csi_u_param();
+    let modifier = modifier_param(stroke.modifiers);
 
     match stroke.key {
         // Arrows: ESC [ 1 ; <mod> <letter>
@@ -205,7 +244,7 @@ pub fn decode(bytes: &[u8]) -> Option<DecodeResult> {
         // CSI u format: codepoint [; modifier] u
         let codepoint = *params.first()?;
         let modifier_param = params.get(1).copied().unwrap_or(1);
-        let modifiers = Modifiers::from_csi_u_param(u8::try_from(modifier_param).ok()?)?;
+        let modifiers = modifiers_from_param(u8::try_from(modifier_param).ok()?)?;
         let key = codepoint_to_keycode(codepoint)?;
         return Some(DecodeResult {
             stroke: KeyStroke::with_modifiers(key, modifiers),
@@ -217,7 +256,7 @@ pub fn decode(bytes: &[u8]) -> Option<DecodeResult> {
         // Modified tilde key: <number> [; modifier] ~
         let number = *params.first()?;
         let modifier_param = params.get(1).copied().unwrap_or(1);
-        let modifiers = Modifiers::from_csi_u_param(u8::try_from(modifier_param).ok()?)?;
+        let modifiers = modifiers_from_param(u8::try_from(modifier_param).ok()?)?;
         let key = tilde_number_to_keycode(number)?;
         return Some(DecodeResult {
             stroke: KeyStroke::with_modifiers(key, modifiers),
@@ -229,7 +268,7 @@ pub fn decode(bytes: &[u8]) -> Option<DecodeResult> {
         // Modified arrow/Home/End or F1-F4: [1] ; <modifier> <final>
         // Format: ESC [ <params> <final>
         let modifier_param = params.get(1).copied().unwrap_or(1);
-        let modifiers = Modifiers::from_csi_u_param(u8::try_from(modifier_param).ok()?)?;
+        let modifiers = modifiers_from_param(u8::try_from(modifier_param).ok()?)?;
 
         // Only decode if there's a modifier parameter (otherwise it's a plain
         // legacy sequence that the legacy decoder should handle).
@@ -301,6 +340,61 @@ fn parse_params(bytes: &[u8]) -> Vec<u32> {
 mod tests {
     use super::*;
     use crate::types::{KeyCode, KeyStroke, Modifiers};
+
+    #[test]
+    fn modifier_param_none() {
+        assert_eq!(modifier_param(Modifiers::NONE), 1);
+    }
+
+    #[test]
+    fn modifier_param_ctrl() {
+        assert_eq!(
+            modifier_param(Modifiers {
+                ctrl: true,
+                ..Modifiers::NONE
+            }),
+            5
+        );
+    }
+
+    #[test]
+    fn modifier_param_roundtrip() {
+        let cases = [
+            Modifiers::NONE,
+            Modifiers {
+                shift: true,
+                ..Modifiers::NONE
+            },
+            Modifiers {
+                alt: true,
+                ..Modifiers::NONE
+            },
+            Modifiers {
+                ctrl: true,
+                ..Modifiers::NONE
+            },
+            Modifiers {
+                super_key: true,
+                ..Modifiers::NONE
+            },
+            Modifiers {
+                ctrl: true,
+                shift: true,
+                alt: true,
+                super_key: true,
+            },
+        ];
+        for m in &cases {
+            let param = modifier_param(*m);
+            let decoded = modifiers_from_param(param).expect("valid param");
+            assert_eq!(*m, decoded, "roundtrip failed for param {param}");
+        }
+    }
+
+    #[test]
+    fn modifiers_from_param_zero_is_none() {
+        assert!(modifiers_from_param(0).is_none());
+    }
 
     #[test]
     fn encode_ctrl_enter() {

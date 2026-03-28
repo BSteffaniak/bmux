@@ -6416,8 +6416,13 @@ impl RawModeGuard {
     fn enable(kitty_keyboard_enabled: bool) -> Result<Self> {
         enable_raw_mode().context("failed enabling raw mode")?;
 
+        #[cfg(feature = "kitty-keyboard")]
         let keyboard_enhanced = kitty_keyboard_enabled
             && crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+        #[cfg(not(feature = "kitty-keyboard"))]
+        let keyboard_enhanced = false;
+
+        let _ = kitty_keyboard_enabled; // suppress unused warning when feature is disabled
 
         if keyboard_enhanced {
             use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
@@ -7104,6 +7109,7 @@ async fn handle_attach_terminal_event(
 fn restore_terminal_after_attach_ui() -> Result<()> {
     let mut stdout = io::stdout();
     // Safety net: pop keyboard enhancement flags in case the drop guard didn't run.
+    #[cfg(feature = "kitty-keyboard")]
     let _ = queue!(stdout, crossterm::event::PopKeyboardEnhancementFlags);
     queue!(
         stdout,

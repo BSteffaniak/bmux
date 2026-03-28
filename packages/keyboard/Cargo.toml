@@ -13,6 +13,7 @@ version     = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"], optional = true }
 
 [features]
-default          = []
+csi-u            = []
+default          = ["csi-u"]
 fail-on-warnings = []
 serde            = ["dep:serde"]

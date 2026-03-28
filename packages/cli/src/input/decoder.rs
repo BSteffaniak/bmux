@@ -1,9 +1,10 @@
 //! Raw byte stream decoder.
 //!
 //! Decodes raw terminal byte streams into key events, supporting both
-//! legacy VT/xterm escape sequences and CSI u (kitty keyboard protocol)
-//! sequences.
+//! legacy VT/xterm escape sequences and optionally CSI u (kitty keyboard
+//! protocol) sequences when the `csi-u` feature is enabled on `bmux_keyboard`.
 
+#[cfg(feature = "kitty-keyboard")]
 use bmux_keyboard::csi_u;
 use bmux_keyboard::legacy;
 use bmux_keyboard::{KeyCode, KeyStroke};
@@ -59,6 +60,7 @@ fn decode_one(bytes: &[u8]) -> Option<(DecodedStroke, usize)> {
     }
 
     // Try CSI u decoding first (for kitty keyboard protocol sequences).
+    #[cfg(feature = "kitty-keyboard")]
     if let Some(result) = csi_u::decode(bytes) {
         return Some((
             DecodedStroke {

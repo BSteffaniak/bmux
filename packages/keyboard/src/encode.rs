@@ -3,9 +3,12 @@
 //! Dispatches to CSI u or legacy encoding based on whether the terminal
 //! supports keyboard enhancement and whether the key event requires it.
 
+#[cfg(feature = "csi-u")]
 use crate::csi_u;
 use crate::legacy;
-use crate::types::{KeyCode, KeyStroke};
+#[cfg(feature = "csi-u")]
+use crate::types::KeyCode;
+use crate::types::KeyStroke;
 
 /// Encode a key stroke to raw bytes for writing to a PTY.
 ///
@@ -16,26 +19,22 @@ use crate::types::{KeyCode, KeyStroke};
 /// Returns `None` if the key cannot be encoded.
 #[must_use]
 pub fn encode_key(stroke: &KeyStroke, enhanced: bool) -> Option<Vec<u8>> {
+    #[cfg(feature = "csi-u")]
     if enhanced && needs_enhanced_encoding(stroke) {
         if let Some(encoded) = csi_u::encode(stroke) {
             return Some(encoded);
         }
     }
 
+    let _ = enhanced; // suppress unused warning when csi-u is disabled
     legacy::encode(stroke)
 }
 
 /// Determine whether a key stroke requires enhanced (CSI u) encoding.
 ///
 /// Returns true when the key has modifiers that legacy encoding would silently
-/// lose. Specifically:
-///
-/// - Special keys (Enter, Tab, Backspace, Escape) with Ctrl, Shift, or Super
-///   (legacy only supports Alt as ESC prefix for these)
-/// - Arrow keys with Ctrl, Alt, or Super (legacy only supports Shift)
-/// - Navigation keys (Home, End, PageUp, PageDown, Insert, Delete) with any
-///   modifier (legacy has no modifier encoding for these)
-/// - F-keys with any modifier
+/// lose.
+#[cfg(feature = "csi-u")]
 fn needs_enhanced_encoding(stroke: &KeyStroke) -> bool {
     let mods = stroke.modifiers;
     if mods.is_empty() {
@@ -43,14 +42,13 @@ fn needs_enhanced_encoding(stroke: &KeyStroke) -> bool {
     }
 
     match stroke.key {
-        // Chars: legacy handles Ctrl+alpha and Alt+char, but not Shift+char
-        // combos that differ from just the shifted character, or Super+char.
-        // For safety, use CSI u when super is involved.
+        // Chars: legacy handles Ctrl+alpha and Alt+char, but not Super+char.
         KeyCode::Char(_) => mods.super_key,
 
         // Enter, Tab, Backspace, Escape: legacy only handles Alt prefix.
+        // Need CSI u when Ctrl, Shift, or Super is set.
         KeyCode::Enter | KeyCode::Tab | KeyCode::Backspace | KeyCode::Escape | KeyCode::Space => {
-            mods.needs_csi_u()
+            mods.ctrl || mods.shift || mods.super_key
         }
 
         // Arrows: legacy only handles Shift (param 2).
@@ -82,6 +80,7 @@ mod tests {
         assert_eq!(encode_key(&stroke, true).unwrap(), b"\r");
     }
 
+    #[cfg(feature = "csi-u")]
     #[test]
     fn ctrl_enter_enhanced_uses_csi_u() {
         let stroke = KeyStroke::with_modifiers(
@@ -133,6 +132,7 @@ mod tests {
         assert_eq!(encode_key(&stroke, true).unwrap(), vec![0x03]);
     }
 
+    #[cfg(feature = "csi-u")]
     #[test]
     fn shift_up_uses_legacy() {
         // Shift+Up has legacy encoding (modifier param 2).
@@ -146,6 +146,7 @@ mod tests {
         assert_eq!(encode_key(&stroke, true).unwrap(), b"\x1b[1;2A");
     }
 
+    #[cfg(feature = "csi-u")]
     #[test]
     fn ctrl_up_enhanced_uses_csi_u() {
         let stroke = KeyStroke::with_modifiers(
@@ -171,6 +172,7 @@ mod tests {
         assert_eq!(encode_key(&stroke, false).unwrap(), b"\x1b[A");
     }
 
+    #[cfg(feature = "csi-u")]
     #[test]
     fn ctrl_page_up_enhanced() {
         let stroke = KeyStroke::with_modifiers(
