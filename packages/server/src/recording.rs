@@ -20,6 +20,8 @@ const EVENTS_FILE_NAME: &str = "events.bin";
 pub struct RecordingRuntime {
     root_dir: PathBuf,
     active: Option<ActiveRecording>,
+    segment_mb: usize,
+    retention_days: u64,
 }
 
 #[derive(Debug)]
@@ -52,10 +54,12 @@ struct Manifest {
 }
 
 impl RecordingRuntime {
-    pub const fn new(root_dir: PathBuf) -> Self {
+    pub const fn new(root_dir: PathBuf, segment_mb: usize, retention_days: u64) -> Self {
         Self {
             root_dir,
             active: None,
+            segment_mb,
+            retention_days,
         }
     }
 
@@ -84,7 +88,6 @@ impl RecordingRuntime {
             .with_context(|| format!("failed creating recording dir {}", dir.display()))?;
 
         let manifest_path = dir.join(MANIFEST_FILE_NAME);
-        let events_path = dir.join(EVENTS_FILE_NAME);
         let summary = RecordingSummary {
             id,
             format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
@@ -97,6 +100,8 @@ impl RecordingRuntime {
             event_count: 0,
             payload_bytes: 0,
             path: dir.to_string_lossy().to_string(),
+            segments: vec![format!("events_0.bin")],
+            total_segment_bytes: 0,
         };
         write_manifest(&manifest_path, &summary)?;
 
@@ -106,17 +111,20 @@ impl RecordingRuntime {
         let event_count_thread = Arc::clone(&event_count);
         let payload_bytes_thread = Arc::clone(&payload_bytes);
         let summary_for_thread = summary.clone();
+        let segment_mb = self.segment_mb;
+        let recording_dir = dir.clone();
 
         let writer = thread::Builder::new()
             .name(format!("bmux-recording-{id}"))
             .spawn(move || {
                 writer_loop(
                     rx,
-                    &events_path,
+                    &recording_dir,
                     &manifest_path,
                     summary_for_thread,
                     event_count_thread,
                     payload_bytes_thread,
+                    segment_mb,
                 )
             })
             .context("failed to spawn recording writer thread")?;
@@ -174,6 +182,8 @@ impl RecordingRuntime {
             event_count: active.event_count.load(Ordering::SeqCst),
             payload_bytes: active.payload_bytes.load(Ordering::SeqCst),
             path: active.path.to_string_lossy().to_string(),
+            segments: vec!["events_0.bin".to_string()],
+            total_segment_bytes: active.payload_bytes.load(Ordering::SeqCst),
         });
         RecordingStatus {
             active,
@@ -312,48 +322,114 @@ impl RecordingRuntime {
             .map_err(|_| anyhow::anyhow!("recording writer is not accepting events"))?;
         Ok(true)
     }
+
+    /// Prune completed recordings older than the specified retention period.
+    /// Returns the number of recordings deleted.
+    pub fn prune(&self, older_than_days: Option<u64>) -> Result<usize> {
+        let retention = older_than_days.unwrap_or(self.retention_days);
+        prune_old_recordings(&self.root_dir, retention)
+    }
+
+    /// Get the root recordings directory.
+    pub fn root_dir(&self) -> &Path {
+        &self.root_dir
+    }
+
+    /// Get the configured retention days.
+    pub fn retention_days(&self) -> u64 {
+        self.retention_days
+    }
 }
 
 fn writer_loop(
     rx: mpsc::Receiver<RecordingEventEnvelope>,
-    events_path: &Path,
+    recording_dir: &Path,
     manifest_path: &Path,
     mut summary: RecordingSummary,
     event_count: Arc<AtomicU64>,
     payload_bytes: Arc<AtomicU64>,
+    segment_mb: usize,
 ) -> Result<RecordingSummary> {
+    let segment_limit_bytes = (segment_mb as u64) * 1024 * 1024;
+    let mut segment_index: usize = 0;
+    let mut segment_bytes: u64 = 0;
+
+    let segment_name = format!("events_{segment_index}.bin");
+    let segment_path = recording_dir.join(&segment_name);
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(events_path)
-        .with_context(|| {
-            format!(
-                "failed opening recording event file {}",
-                events_path.display()
-            )
-        })?;
+        .open(&segment_path)
+        .with_context(|| format!("failed opening segment file {}", segment_path.display()))?;
     let mut writer = BufWriter::new(file);
+    summary.segments = vec![segment_name];
 
     while let Ok(event) = rx.recv() {
         bmux_ipc::write_frame(&mut writer, &event)
             .map_err(|e| anyhow::anyhow!("recording write_frame failed: {e}"))?;
-        let payload_size = payload_size(&event.payload);
+        let payload_sz = payload_size(&event.payload);
         event_count.fetch_add(1, Ordering::SeqCst);
-        payload_bytes.fetch_add(payload_size, Ordering::SeqCst);
+        payload_bytes.fetch_add(payload_sz, Ordering::SeqCst);
+        segment_bytes += payload_sz;
+
+        // Periodic flush + manifest update.
         if event.seq % 128 == 0 {
             writer.flush()?;
+            summary.event_count = event_count.load(Ordering::SeqCst);
+            summary.payload_bytes = payload_bytes.load(Ordering::SeqCst);
+            summary.total_segment_bytes += 0; // updated at rotation + finalization
+            write_manifest(manifest_path, &summary)?;
+        }
+
+        // Segment rotation: if current segment exceeds the limit, start a new one.
+        if segment_limit_bytes > 0 && segment_bytes >= segment_limit_bytes {
+            writer.flush()?;
+            drop(writer);
+
+            segment_index += 1;
+            segment_bytes = 0;
+            let new_segment_name = format!("events_{segment_index}.bin");
+            let new_segment_path = recording_dir.join(&new_segment_name);
+            let new_file = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&new_segment_path)
+                .with_context(|| {
+                    format!(
+                        "failed opening new segment file {}",
+                        new_segment_path.display()
+                    )
+                })?;
+            writer = BufWriter::new(new_file);
+            summary.segments.push(new_segment_name);
+
+            // Update manifest with new segment list.
             summary.event_count = event_count.load(Ordering::SeqCst);
             summary.payload_bytes = payload_bytes.load(Ordering::SeqCst);
             write_manifest(manifest_path, &summary)?;
         }
     }
 
+    // Final flush and manifest update.
     writer.flush()?;
     summary.event_count = event_count.load(Ordering::SeqCst);
     summary.payload_bytes = payload_bytes.load(Ordering::SeqCst);
+    summary.total_segment_bytes = compute_total_segment_bytes(recording_dir, &summary.segments);
     summary.ended_epoch_ms = Some(epoch_millis_now());
     write_manifest(manifest_path, &summary)?;
     Ok(summary)
+}
+
+/// Compute the total size of all segment files on disk.
+fn compute_total_segment_bytes(recording_dir: &Path, segments: &[String]) -> u64 {
+    segments
+        .iter()
+        .map(|name| {
+            std::fs::metadata(recording_dir.join(name))
+                .map(|m| m.len())
+                .unwrap_or(0)
+        })
+        .sum()
 }
 
 fn write_manifest(path: &Path, summary: &RecordingSummary) -> Result<()> {
@@ -411,10 +487,58 @@ fn epoch_millis_now() -> u64 {
         .map_or(0, |duration| duration.as_millis() as u64)
 }
 
+/// Prune completed recordings older than `retention_days`.
+/// Returns the number of recordings deleted. If `retention_days` is 0, returns 0
+/// (0 means keep forever).
+pub fn prune_old_recordings(root_dir: &Path, retention_days: u64) -> Result<usize> {
+    if retention_days == 0 {
+        return Ok(0);
+    }
+    if !root_dir.exists() {
+        return Ok(0);
+    }
+
+    let cutoff_ms = epoch_millis_now().saturating_sub(retention_days * 24 * 60 * 60 * 1000);
+    let mut deleted = 0;
+
+    let entries = std::fs::read_dir(root_dir)
+        .with_context(|| format!("failed reading recordings dir {}", root_dir.display()))?;
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        if !entry.path().is_dir() {
+            continue;
+        }
+        let manifest_path = entry.path().join(MANIFEST_FILE_NAME);
+        if !manifest_path.exists() {
+            continue;
+        }
+        let summary = match read_manifest(&manifest_path) {
+            Ok(s) => s,
+            Err(_) => continue, // skip unreadable manifests
+        };
+        // Only prune completed recordings (has ended_epoch_ms).
+        if let Some(ended_ms) = summary.ended_epoch_ms {
+            if ended_ms < cutoff_ms {
+                if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                    tracing::warn!("failed to prune recording {}: {e}", entry.path().display());
+                } else {
+                    deleted += 1;
+                }
+            }
+        }
+    }
+
+    Ok(deleted)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{RecordMeta, RecordingRuntime};
-    use bmux_ipc::{RecordingEventKind, RecordingPayload, RecordingProfile};
+    use super::{Manifest, RecordMeta, RecordingRuntime};
+    use bmux_ipc::{RecordingEventKind, RecordingPayload, RecordingProfile, RecordingSummary};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -433,7 +557,7 @@ mod tests {
     #[test]
     fn start_record_stop_persists_manifest() {
         let root = temp_dir();
-        let mut runtime = RecordingRuntime::new(root.clone());
+        let mut runtime = RecordingRuntime::new(root.clone(), 64, 30);
         let summary = runtime
             .start(
                 None,
@@ -470,7 +594,7 @@ mod tests {
     #[test]
     fn no_capture_input_suppresses_input_events() {
         let root = temp_dir();
-        let mut runtime = RecordingRuntime::new(root);
+        let mut runtime = RecordingRuntime::new(root, 64, 30);
         runtime
             .start(
                 None,
@@ -499,7 +623,7 @@ mod tests {
     #[test]
     fn delete_removes_manifest_directory() {
         let root = temp_dir();
-        let mut runtime = RecordingRuntime::new(root.clone());
+        let mut runtime = RecordingRuntime::new(root.clone(), 64, 30);
         let summary = runtime
             .start(
                 None,
@@ -520,7 +644,7 @@ mod tests {
     #[test]
     fn delete_all_stops_active_and_removes_recordings() {
         let root = temp_dir();
-        let mut runtime = RecordingRuntime::new(root);
+        let mut runtime = RecordingRuntime::new(root, 64, 30);
         let active = runtime
             .start(
                 None,
@@ -555,5 +679,149 @@ mod tests {
         assert_eq!(deleted_count, 2);
         assert!(runtime.status().active.is_none());
         assert!(runtime.list().expect("list should succeed").is_empty());
+    }
+
+    #[test]
+    fn segment_rotation_creates_files() {
+        let root = temp_dir();
+        let mut runtime = RecordingRuntime::new(root.clone(), 64, 30);
+
+        let summary = runtime
+            .start(
+                None,
+                true,
+                RecordingProfile::Full,
+                vec![RecordingEventKind::PaneOutputRaw],
+            )
+            .expect("start recording");
+        assert_eq!(summary.segments, vec!["events_0.bin"]);
+
+        // Write some events.
+        runtime
+            .record(
+                RecordingEventKind::PaneOutputRaw,
+                RecordingPayload::Bytes {
+                    data: b"hello".to_vec(),
+                },
+                RecordMeta {
+                    session_id: None,
+                    pane_id: None,
+                    client_id: None,
+                },
+            )
+            .unwrap();
+
+        let stopped = runtime.stop(None).expect("stop recording");
+        assert!(stopped.event_count >= 1);
+        assert!(!stopped.segments.is_empty());
+        // Verify the first segment file exists on disk.
+        let seg_path = root.join(stopped.id.to_string()).join(&stopped.segments[0]);
+        assert!(
+            seg_path.exists(),
+            "segment file should exist: {}",
+            seg_path.display()
+        );
+    }
+
+    #[test]
+    fn prune_old_recordings_deletes_expired() {
+        let root = temp_dir();
+
+        let rec_id = Uuid::new_v4();
+        let rec_dir = root.join(rec_id.to_string());
+        std::fs::create_dir_all(&rec_dir).unwrap();
+        let summary = RecordingSummary {
+            id: rec_id,
+            format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+            session_id: None,
+            capture_input: true,
+            profile: RecordingProfile::Full,
+            event_kinds: vec![],
+            started_epoch_ms: 1,
+            ended_epoch_ms: Some(1_000_000),
+            event_count: 0,
+            payload_bytes: 0,
+            path: rec_dir.to_string_lossy().to_string(),
+            segments: vec!["events_0.bin".to_string()],
+            total_segment_bytes: 0,
+        };
+        let manifest = Manifest { summary };
+        std::fs::write(
+            rec_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let deleted = super::prune_old_recordings(&root, 1).unwrap();
+        assert_eq!(deleted, 1);
+        assert!(!rec_dir.exists());
+    }
+
+    #[test]
+    fn prune_skips_active_recordings() {
+        let root = temp_dir();
+
+        let rec_id = Uuid::new_v4();
+        let rec_dir = root.join(rec_id.to_string());
+        std::fs::create_dir_all(&rec_dir).unwrap();
+        let summary = RecordingSummary {
+            id: rec_id,
+            format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+            session_id: None,
+            capture_input: true,
+            profile: RecordingProfile::Full,
+            event_kinds: vec![],
+            started_epoch_ms: 1,
+            ended_epoch_ms: None,
+            event_count: 0,
+            payload_bytes: 0,
+            path: rec_dir.to_string_lossy().to_string(),
+            segments: vec!["events_0.bin".to_string()],
+            total_segment_bytes: 0,
+        };
+        let manifest = Manifest { summary };
+        std::fs::write(
+            rec_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let deleted = super::prune_old_recordings(&root, 1).unwrap();
+        assert_eq!(deleted, 0);
+        assert!(rec_dir.exists());
+    }
+
+    #[test]
+    fn prune_zero_retention_keeps_all() {
+        let root = temp_dir();
+
+        let rec_id = Uuid::new_v4();
+        let rec_dir = root.join(rec_id.to_string());
+        std::fs::create_dir_all(&rec_dir).unwrap();
+        let summary = RecordingSummary {
+            id: rec_id,
+            format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+            session_id: None,
+            capture_input: true,
+            profile: RecordingProfile::Full,
+            event_kinds: vec![],
+            started_epoch_ms: 1,
+            ended_epoch_ms: Some(1_000_000),
+            event_count: 0,
+            payload_bytes: 0,
+            path: rec_dir.to_string_lossy().to_string(),
+            segments: vec!["events_0.bin".to_string()],
+            total_segment_bytes: 0,
+        };
+        let manifest = Manifest { summary };
+        std::fs::write(
+            rec_dir.join("manifest.json"),
+            serde_json::to_vec_pretty(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let deleted = super::prune_old_recordings(&root, 0).unwrap();
+        assert_eq!(deleted, 0);
+        assert!(rec_dir.exists());
     }
 }

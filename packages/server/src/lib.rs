@@ -6,7 +6,7 @@
 //! Server component for bmux terminal multiplexer.
 
 mod persistence;
-mod recording;
+pub mod recording;
 
 use anyhow::{Context, Result};
 use bmux_config::{BmuxConfig, ConfigPaths};
@@ -2402,6 +2402,8 @@ impl BmuxServer {
         snapshot_manager: Option<SnapshotManager>,
         server_control_principal_id: Uuid,
         recordings_dir: std::path::PathBuf,
+        segment_mb: usize,
+        retention_days: u64,
     ) -> Self {
         let snapshot_runtime = match snapshot_manager {
             Some(manager) => SnapshotRuntime::with_manager(manager),
@@ -2414,7 +2416,11 @@ impl BmuxServer {
         let protocol_profile = protocol_profile_for_term(&pane_term);
         let (shutdown_tx, _) = watch::channel(false);
         let (pane_exit_tx, pane_exit_rx) = mpsc::unbounded_channel();
-        let recording_runtime = Arc::new(Mutex::new(RecordingRuntime::new(recordings_dir)));
+        let recording_runtime = Arc::new(Mutex::new(RecordingRuntime::new(
+            recordings_dir,
+            segment_mb,
+            retention_days,
+        )));
         Self {
             endpoint,
             state: Arc::new(ServerState {
@@ -2454,6 +2460,8 @@ impl BmuxServer {
             None,
             Uuid::new_v4(),
             config.recordings_dir(&paths),
+            config.recording.segment_mb,
+            config.recording.retention_days,
         )
     }
 
@@ -2478,6 +2486,8 @@ impl BmuxServer {
             Some(snapshot_manager),
             server_control_principal_id,
             config.recordings_dir(paths),
+            config.recording.segment_mb,
+            config.recording.retention_days,
         )
     }
 
@@ -2592,6 +2602,44 @@ impl BmuxServer {
         let pane_exit_shutdown_rx = self.shutdown_tx.subscribe();
         let pane_exit_task = tokio::spawn(async move {
             process_pane_exit_events(pane_exit_state, pane_exit_shutdown_rx).await;
+        });
+
+        // Periodic recording retention enforcement.
+        let recording_prune_runtime = Arc::clone(&self.state.recording_runtime);
+        let mut prune_shutdown_rx = self.shutdown_tx.subscribe();
+        let _prune_task = tokio::spawn(async move {
+            // Initial prune on startup.
+            if let Ok(runtime) = recording_prune_runtime.lock() {
+                match runtime.prune(None) {
+                    Ok(0) => {}
+                    Ok(n) => info!("startup recording prune: deleted {n} recording(s)"),
+                    Err(e) => warn!("startup recording prune failed: {e:#}"),
+                }
+            }
+            // Periodic prune every hour.
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(3600));
+            interval.tick().await; // skip the immediate first tick
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Ok(runtime) = recording_prune_runtime.lock() {
+                            match runtime.prune(None) {
+                                Ok(0) => {}
+                                Ok(n) => info!("periodic recording prune: deleted {n} recording(s)"),
+                                Err(e) => warn!("periodic recording prune failed: {e:#}"),
+                            }
+                        }
+                    }
+                    changed = prune_shutdown_rx.changed() => {
+                        if changed.is_ok() && *prune_shutdown_rx.borrow() {
+                            break;
+                        }
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
         });
 
         let mut shutdown_rx = self.shutdown_tx.subscribe();
@@ -5524,6 +5572,24 @@ async fn handle_request(
                 }),
             }
         }
+        Request::RecordingPrune { older_than_days } => {
+            let result = {
+                let runtime = state
+                    .recording_runtime
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
+                runtime.prune(older_than_days)
+            };
+            match result {
+                Ok(deleted_count) => {
+                    Response::Ok(ResponsePayload::RecordingPruned { deleted_count })
+                }
+                Err(error) => Response::Err(ErrorResponse {
+                    code: ErrorCode::Internal,
+                    message: format!("failed pruning recordings: {error}"),
+                }),
+            }
+        }
         Request::PaneDirectInput {
             session_id,
             pane_id,
@@ -5641,6 +5707,7 @@ const fn request_requires_exclusive(request: &Request) -> bool {
             | Request::RecordingDelete { .. }
             | Request::RecordingWriteCustomEvent { .. }
             | Request::RecordingDeleteAll
+            | Request::RecordingPrune { .. }
             | Request::Detach
     )
 }
@@ -5710,6 +5777,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::RecordingDelete { .. } => "recording_delete",
         Request::RecordingWriteCustomEvent { .. } => "recording_write_custom_event",
         Request::RecordingDeleteAll => "recording_delete_all",
+        Request::RecordingPrune { .. } => "recording_prune",
         Request::Detach => "detach",
         Request::SubscribeEvents => "subscribe_events",
         Request::PollEvents { .. } => "poll_events",
@@ -5789,6 +5857,7 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::RecordingDeleted { .. } => "recording_deleted",
         ResponsePayload::RecordingCustomEventWritten { .. } => "recording_custom_event_written",
         ResponsePayload::RecordingDeleteAll { .. } => "recording_delete_all",
+        ResponsePayload::RecordingPruned { .. } => "recording_pruned",
         ResponsePayload::Detached => "detached",
         ResponsePayload::PaneDirectInputAccepted { .. } => "pane_direct_input_accepted",
         ResponsePayload::EventsSubscribed => "events_subscribed",

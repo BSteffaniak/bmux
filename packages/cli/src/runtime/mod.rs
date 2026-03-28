@@ -1068,6 +1068,7 @@ fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
             RecordingCommand::Replay { .. } => BuiltInHandlerId::RecordingReplay,
             RecordingCommand::VerifySmoke { .. } => BuiltInHandlerId::RecordingVerifySmoke,
             RecordingCommand::Export { .. } => BuiltInHandlerId::RecordingExport,
+            RecordingCommand::Prune { .. } => BuiltInHandlerId::RecordingPrune,
         },
         Command::Playbook { command } => match command {
             PlaybookCommand::Run { .. } => BuiltInHandlerId::PlaybookRun,
@@ -1497,6 +1498,12 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
             )
             .await
         }
+        (
+            BuiltInHandlerId::RecordingPrune,
+            Command::Recording {
+                command: RecordingCommand::Prune { older_than, json },
+            },
+        ) => recording::run_recording_prune(*older_than, *json).await,
         (
             BuiltInHandlerId::PlaybookRun,
             Command::Playbook {
@@ -9805,6 +9812,8 @@ mod tests {
                 event_count: 0,
                 payload_bytes: 0,
                 path: "/tmp/other".to_string(),
+                segments: vec!["events_0.bin".to_string()],
+                total_segment_bytes: 0,
             },
             RecordingSummary {
                 id: exact,
@@ -9818,6 +9827,8 @@ mod tests {
                 event_count: 0,
                 payload_bytes: 0,
                 path: "/tmp/exact".to_string(),
+                segments: vec!["events_0.bin".to_string()],
+                total_segment_bytes: 0,
             },
         ];
 
@@ -9846,6 +9857,8 @@ mod tests {
                 event_count: 0,
                 payload_bytes: 0,
                 path: "/tmp/first".to_string(),
+                segments: vec!["events_0.bin".to_string()],
+                total_segment_bytes: 0,
             },
             RecordingSummary {
                 id: second,
@@ -9859,6 +9872,8 @@ mod tests {
                 event_count: 0,
                 payload_bytes: 0,
                 path: "/tmp/second".to_string(),
+                segments: vec!["events_0.bin".to_string()],
+                total_segment_bytes: 0,
             },
         ];
 

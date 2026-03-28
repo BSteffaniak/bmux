@@ -570,6 +570,23 @@ impl BmuxClient {
         }
     }
 
+    /// Prune completed recordings older than the specified retention period.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn recording_prune(&mut self, older_than_days: Option<u64>) -> Result<usize> {
+        match self
+            .request(Request::RecordingPrune { older_than_days })
+            .await?
+        {
+            ResponsePayload::RecordingPruned { deleted_count } => Ok(deleted_count),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording pruned response",
+            )),
+        }
+    }
+
     /// Create a new session.
     ///
     /// # Errors
@@ -1238,6 +1255,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::RecordingDelete { .. } => "recording_delete",
         Request::RecordingWriteCustomEvent { .. } => "recording_write_custom_event",
         Request::RecordingDeleteAll => "recording_delete_all",
+        Request::RecordingPrune { .. } => "recording_prune",
         Request::Detach => "detach",
         Request::SubscribeEvents => "subscribe_events",
         Request::PollEvents { .. } => "poll_events",
@@ -1290,6 +1308,7 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::RecordingDeleted { .. } => "recording_deleted",
             ResponsePayload::RecordingCustomEventWritten { .. } => "recording_custom_event_written",
             ResponsePayload::RecordingDeleteAll { .. } => "recording_delete_all",
+            ResponsePayload::RecordingPruned { .. } => "recording_pruned",
             ResponsePayload::Detached => "detached",
             ResponsePayload::PaneDirectInputAccepted { .. } => "pane_direct_input_accepted",
             ResponsePayload::EventsSubscribed => "events_subscribed",

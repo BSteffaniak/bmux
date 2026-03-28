@@ -331,6 +331,37 @@ pub(super) async fn run_recording_delete_all(yes: bool) -> Result<u8> {
     Ok(0)
 }
 
+pub(super) async fn run_recording_prune(older_than: Option<u64>, json: bool) -> Result<u8> {
+    cleanup_stale_pid_file().await?;
+    let deleted_count = if let Some(mut client) =
+        connect_if_running(ConnectionPolicyScope::Normal, "bmux-cli-recording-prune").await?
+    {
+        client
+            .recording_prune(older_than)
+            .await
+            .map_err(map_cli_client_error)?
+    } else {
+        let root = recordings_root_dir();
+        let config = bmux_config::BmuxConfig::load().unwrap_or_default();
+        let retention = older_than.unwrap_or(config.recording.retention_days);
+        bmux_server::recording::prune_old_recordings(&root, retention)?
+    };
+
+    if json {
+        let report = serde_json::json!({
+            "deleted_count": deleted_count,
+            "older_than_days": older_than,
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if deleted_count > 0 {
+        println!("pruned {deleted_count} recording(s)");
+    } else {
+        println!("no recordings to prune");
+    }
+
+    Ok(0)
+}
+
 pub(super) fn run_recording_inspect(
     recording_id: &str,
     limit: usize,
@@ -1955,20 +1986,60 @@ pub(super) fn recording_event_kind_name(kind: RecordingEventKind) -> String {
 
 pub(super) fn load_recording_events(recording_id: &str) -> Result<Vec<RecordingEventEnvelope>> {
     let id = Uuid::parse_str(recording_id).context("invalid recording id")?;
-    let path = recordings_root_dir()
-        .join(id.to_string())
-        .join("events.bin");
-    let bytes = std::fs::read(&path)
-        .with_context(|| format!("failed reading recording events file {}", path.display()))?;
-    let result = bmux_ipc::read_frames(&bytes)
-        .map_err(|e| anyhow::anyhow!("failed parsing recording events {}: {e}", path.display()))?;
-    if result.bytes_remaining > 0 {
-        tracing::warn!(
-            "recording {id}: {} trailing bytes could not be parsed (truncated recording?)",
-            result.bytes_remaining
-        );
+    let recording_dir = recordings_root_dir().join(id.to_string());
+    let manifest_path = recording_dir.join("manifest.json");
+
+    // Read manifest to discover segment files.
+    let segments = if manifest_path.exists() {
+        let manifest_bytes = std::fs::read(&manifest_path)
+            .with_context(|| format!("failed reading manifest {}", manifest_path.display()))?;
+        let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
+        manifest["summary"]["segments"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| vec!["events_0.bin".to_string()])
+    } else {
+        // Fallback: try legacy single-file format.
+        vec!["events.bin".to_string()]
+    };
+
+    let mut all_frames = Vec::new();
+    for segment_name in &segments {
+        let segment_path = recording_dir.join(segment_name);
+        if !segment_path.exists() {
+            tracing::warn!(
+                "recording {id}: segment file {} not found, skipping",
+                segment_path.display()
+            );
+            continue;
+        }
+        let bytes = std::fs::read(&segment_path).with_context(|| {
+            format!(
+                "failed reading recording segment {}",
+                segment_path.display()
+            )
+        })?;
+        let result = bmux_ipc::read_frames(&bytes).map_err(|e| {
+            anyhow::anyhow!(
+                "failed parsing recording segment {}: {e}",
+                segment_path.display()
+            )
+        })?;
+        if result.bytes_remaining > 0 {
+            tracing::warn!(
+                "recording {id}: segment {} has {} trailing bytes (truncated?)",
+                segment_name,
+                result.bytes_remaining
+            );
+        }
+        all_frames.extend(result.frames);
     }
-    Ok(result.frames)
+
+    Ok(all_frames)
 }
 
 pub(super) fn resolve_recording_id_prefix(

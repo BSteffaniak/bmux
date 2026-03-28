@@ -54,6 +54,7 @@ pub enum BuiltInHandlerId {
     RecordingReplay,
     RecordingVerifySmoke,
     RecordingExport,
+    RecordingPrune,
     Playbook,
     PlaybookRun,
     PlaybookValidate,
@@ -347,6 +348,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::RecordingExport,
             &["recording", "export"],
             "Export recording media",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RecordingPrune,
+            &["recording", "prune"],
+            "Delete completed recordings older than the retention period",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Playbook,

@@ -375,6 +375,15 @@ pub enum RecordingCommand {
         #[arg(long)]
         font_path: Vec<String>,
     },
+    /// Delete completed recordings older than the retention period
+    Prune {
+        /// Override retention period in days (default: use config value)
+        #[arg(long)]
+        older_than: Option<u64>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

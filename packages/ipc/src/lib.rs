@@ -371,6 +371,11 @@ pub enum Request {
         payload: Vec<u8>,
     },
     RecordingDeleteAll,
+    /// Prune completed recordings older than the specified retention period.
+    RecordingPrune {
+        /// Override retention period in days. If `None`, uses the server config.
+        older_than_days: Option<u64>,
+    },
     Detach,
     /// Write input bytes directly to a specific pane by ID, bypassing focus routing.
     PaneDirectInput {
@@ -464,13 +469,23 @@ pub struct RecordingSummary {
     pub event_count: u64,
     pub payload_bytes: u64,
     pub path: String,
+    /// Ordered list of segment file names within the recording directory.
+    #[serde(default = "default_segments")]
+    pub segments: Vec<String>,
+    /// Total bytes written across all segment files (approximate).
+    #[serde(default)]
+    pub total_segment_bytes: u64,
 }
 
 /// Current recording format version.
-pub const RECORDING_FORMAT_VERSION: u32 = 2;
+pub const RECORDING_FORMAT_VERSION: u32 = 3;
 
 const fn recording_format_version_default() -> u32 {
     1 // pre-versioning recordings are treated as version 1
+}
+
+fn default_segments() -> Vec<String> {
+    vec!["events_0.bin".to_string()]
 }
 
 const fn recording_profile_default() -> RecordingProfile {
@@ -727,6 +742,9 @@ pub enum ResponsePayload {
         accepted: bool,
     },
     RecordingDeleteAll {
+        deleted_count: usize,
+    },
+    RecordingPruned {
         deleted_count: usize,
     },
     Detached,
@@ -1330,6 +1348,8 @@ mod tests {
             event_count: 42,
             payload_bytes: 123_456,
             path: "/tmp/recordings/test.bmux".into(),
+            segments: vec!["events_0.bin".to_string()],
+            total_segment_bytes: 123_456,
         }
     }
 
