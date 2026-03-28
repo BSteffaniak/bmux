@@ -6317,8 +6317,8 @@ fn normalize_attach_keybindings(
 
 fn inject_attach_global_defaults(global: &mut std::collections::BTreeMap<String, String>) {
     let defaults = [
-        ("shift+h", RuntimeAction::SessionPrev),
-        ("shift+l", RuntimeAction::SessionNext),
+        ("alt+h", RuntimeAction::SessionPrev),
+        ("alt+l", RuntimeAction::SessionNext),
     ];
 
     for (key, action) in defaults {
@@ -9909,14 +9909,14 @@ mod tests {
     }
 
     #[test]
-    fn attach_key_event_action_routes_shift_h_as_session_ui() {
+    fn attach_key_event_action_routes_alt_h_as_session_ui() {
         let mut processor =
             InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
 
         let actions = super::attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
-                CrosstermKeyCode::Char('H'),
-                KeyModifiers::SHIFT,
+                CrosstermKeyCode::Char('h'),
+                KeyModifiers::ALT,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
@@ -10004,11 +10004,11 @@ mod tests {
         config
             .keybindings
             .global
-            .insert("shift+h".to_string(), "new_session".to_string());
+            .insert("alt+h".to_string(), "new_session".to_string());
         config
             .keybindings
             .global
-            .insert("shift+l".to_string(), "detach".to_string());
+            .insert("alt+l".to_string(), "detach".to_string());
         config
             .keybindings
             .global
@@ -10383,7 +10383,7 @@ mod tests {
         }));
         assert!(entries.iter().any(|entry| {
             entry.scope == super::AttachKeybindingScope::Global
-                && entry.chord == "shift+h"
+                && entry.chord == "alt+h"
                 && entry.action_name == "session_prev"
                 && entry.action == crate::input::RuntimeAction::SessionPrev
         }));
