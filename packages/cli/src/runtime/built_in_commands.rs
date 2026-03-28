@@ -60,6 +60,7 @@ pub enum BuiltInHandlerId {
     PlaybookInteractive,
     PlaybookFromRecording,
     PlaybookDryRun,
+    PlaybookDiff,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -376,6 +377,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::PlaybookDryRun,
             &["playbook", "dry-run"],
             "Dry-run a playbook: parse, validate, and print the execution plan",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::PlaybookDiff,
+            &["playbook", "diff"],
+            "Compare results from two playbook runs",
         ),
     ]
 }

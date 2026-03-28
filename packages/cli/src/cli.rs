@@ -447,6 +447,19 @@ pub enum PlaybookCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Compare results from two playbook runs
+    Diff {
+        /// Path to first (baseline/left) playbook result JSON
+        left: String,
+        /// Path to second (new/right) playbook result JSON
+        right: String,
+        /// Output diff as JSON
+        #[arg(long)]
+        json: bool,
+        /// Timing regression threshold in percent (default: 50)
+        #[arg(long, default_value = "50")]
+        timing_threshold: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]

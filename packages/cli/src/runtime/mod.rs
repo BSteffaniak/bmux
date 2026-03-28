@@ -1075,6 +1075,7 @@ fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
             PlaybookCommand::Interactive { .. } => BuiltInHandlerId::PlaybookInteractive,
             PlaybookCommand::FromRecording { .. } => BuiltInHandlerId::PlaybookFromRecording,
             PlaybookCommand::DryRun { .. } => BuiltInHandlerId::PlaybookDryRun,
+            PlaybookCommand::Diff { .. } => BuiltInHandlerId::PlaybookDiff,
         },
         Command::External(_) => unreachable!("external commands are dispatched separately"),
     }
@@ -1568,6 +1569,18 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 command: PlaybookCommand::DryRun { source, json },
             },
         ) => run_playbook_dry_run(source, *json),
+        (
+            BuiltInHandlerId::PlaybookDiff,
+            Command::Playbook {
+                command:
+                    PlaybookCommand::Diff {
+                        left,
+                        right,
+                        json,
+                        timing_threshold,
+                    },
+            },
+        ) => run_playbook_diff(left, right, *json, *timing_threshold),
         _ => unreachable!("built-in command handler and command variant should stay in sync"),
     }
 }
@@ -8552,6 +8565,47 @@ fn run_playbook_dry_run(source: &str, json: bool) -> Result<u8> {
     }
 
     Ok(if valid { 0 } else { 1 })
+}
+
+fn run_playbook_diff(
+    left_path: &str,
+    right_path: &str,
+    json: bool,
+    timing_threshold: u64,
+) -> Result<u8> {
+    let left_data = std::fs::read_to_string(left_path)
+        .with_context(|| format!("failed reading {left_path}"))?;
+    let right_data = std::fs::read_to_string(right_path)
+        .with_context(|| format!("failed reading {right_path}"))?;
+
+    let left: crate::playbook::types::PlaybookResult = serde_json::from_str(&left_data)
+        .with_context(|| format!("failed parsing {left_path} as PlaybookResult JSON"))?;
+    let right: crate::playbook::types::PlaybookResult = serde_json::from_str(&right_data)
+        .with_context(|| format!("failed parsing {right_path} as PlaybookResult JSON"))?;
+
+    let report = crate::playbook::diff::diff_results(&left, &right, timing_threshold as f64);
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        let left_name = std::path::Path::new(left_path)
+            .file_name()
+            .map_or(left_path, |n| n.to_str().unwrap_or(left_path));
+        let right_name = std::path::Path::new(right_path)
+            .file_name()
+            .map_or(right_path, |n| n.to_str().unwrap_or(right_path));
+        print!(
+            "{}",
+            crate::playbook::diff::format_diff_report(&report, left_name, right_name)
+        );
+    }
+
+    // Exit code: 0 if no changes, 1 if anything changed.
+    let has_changes = report.summary.outcome_changed
+        || report.summary.steps_changed > 0
+        || report.summary.snapshots_changed > 0
+        || !report.timing_regressions.is_empty();
+    Ok(if has_changes { 1 } else { 0 })
 }
 
 async fn run_playbook_interactive(

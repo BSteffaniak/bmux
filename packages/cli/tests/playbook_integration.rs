@@ -1057,3 +1057,116 @@ fn playbook_validate_invalid_json() {
         "exit code should be non-zero for invalid playbook"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Playbook diff tests
+// ---------------------------------------------------------------------------
+
+/// Helper: run a playbook fixture and return the raw JSON string.
+fn run_playbook_fixture_raw(name: &str) -> String {
+    let fixture = fixtures_dir().join(name);
+    let output = Command::new(bmux_binary())
+        .args(["playbook", "run", "--json", fixture.to_str().unwrap()])
+        .env("BMUX_PLAYBOOK_ENV_MODE", "inherit")
+        .output()
+        .expect("failed to run bmux playbook");
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+#[test]
+fn playbook_diff_detects_changes() {
+    // Run two different playbooks to get two result JSONs.
+    let left_json = run_playbook_fixture_raw("echo_hello.dsl");
+    let right_json = run_playbook_fixture_raw("failing_assert.dsl");
+
+    // Write to temp files.
+    let dir = std::env::temp_dir().join(format!("bmux-diff-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let left_path = dir.join("left.json");
+    let right_path = dir.join("right.json");
+    std::fs::write(&left_path, &left_json).unwrap();
+    std::fs::write(&right_path, &right_json).unwrap();
+
+    // Run diff.
+    let output = Command::new(bmux_binary())
+        .args([
+            "playbook",
+            "diff",
+            "--json",
+            left_path.to_str().unwrap(),
+            right_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run bmux playbook diff");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("JSON parse failed: {e}\nstdout: {stdout}"));
+
+    // Verify outcome changed (echo_hello passes, failing_assert fails).
+    assert_eq!(
+        json["summary"]["outcome_changed"], true,
+        "outcome should have changed: {json:#}"
+    );
+    assert_eq!(json["summary"]["left_pass"], true);
+    assert_eq!(json["summary"]["right_pass"], false);
+
+    // Verify at least one step changed.
+    assert!(
+        json["summary"]["steps_changed"].as_u64().unwrap_or(0) > 0,
+        "should have at least one changed step: {json:#}"
+    );
+
+    // Verify step_diffs is populated.
+    let step_diffs = json["step_diffs"]
+        .as_array()
+        .expect("should have step_diffs");
+    assert!(!step_diffs.is_empty(), "step_diffs should not be empty");
+
+    // Clean up.
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn playbook_diff_identical() {
+    let result_json = run_playbook_fixture_raw("echo_hello.dsl");
+
+    let dir = std::env::temp_dir().join(format!("bmux-diff-identical-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("result.json");
+    std::fs::write(&path, &result_json).unwrap();
+
+    let output = Command::new(bmux_binary())
+        .args([
+            "playbook",
+            "diff",
+            "--json",
+            path.to_str().unwrap(),
+            path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("failed to run bmux playbook diff");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim())
+        .unwrap_or_else(|e| panic!("JSON parse failed: {e}\nstdout: {stdout}"));
+
+    // Identical results should have no changes.
+    assert_eq!(
+        json["summary"]["outcome_changed"], false,
+        "outcome should not change for identical results: {json:#}"
+    );
+    assert_eq!(
+        json["summary"]["steps_changed"].as_u64().unwrap_or(99),
+        0,
+        "no steps should change for identical results: {json:#}"
+    );
+
+    // Exit code should be 0 (no changes).
+    assert!(
+        output.status.success(),
+        "exit code should be 0 for identical results"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

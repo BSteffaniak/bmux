@@ -105,6 +105,43 @@ bmux playbook dry-run <source> [--json]
 Each step's `dsl` field contains the round-trip DSL serialization of the action,
 which is valid DSL syntax that can be copy-pasted.
 
+### `bmux playbook diff`
+
+Compare results from two playbook runs. Produces a structured diff covering
+step status changes, screen text differences, timing comparison, and failure
+capture comparison.
+
+```
+bmux playbook diff <left.json> <right.json> [flags]
+```
+
+| Argument/Flag | Type | Default | Description |
+|---------------|------|---------|-------------|
+| `<left.json>` | string | required | Path to baseline/left playbook result JSON |
+| `<right.json>` | string | required | Path to new/right playbook result JSON |
+| `--json` | bool | false | Output diff as structured JSON |
+| `--timing-threshold <pct>` | u64 | 50 | Flag steps that slowed by more than this percent |
+
+**Exit codes:** `0` = no changes detected, `1` = changes or regressions found.
+
+**JSON output includes:**
+
+- `summary` -- outcome change, step/snapshot counts, total timing delta
+- `step_diffs` -- per-step status changes, timing deltas, detail/expected/actual on failures
+- `snapshot_diffs` -- per-snapshot pane text diffs (unified diff format via Myers algorithm)
+- `failure_capture_diffs` -- screen state diffs from auto-snapshots on failure
+- `timing_regressions` -- steps that exceeded the timing threshold
+
+**Usage pattern for before/after verification:**
+```sh
+# Run before fix
+bmux playbook run --json test.dsl > before.json
+# Apply fix...
+bmux playbook run --json test.dsl > after.json
+# Compare
+bmux playbook diff --json before.json after.json
+```
+
 ### `bmux playbook interactive`
 
 Start an interactive playbook session with a socket for agent control.

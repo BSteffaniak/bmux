@@ -7,6 +7,7 @@
 //! Both formats parse into the same internal representation and are executed
 //! by the same engine against an ephemeral sandbox server (or a live server).
 
+pub mod diff;
 pub mod display_track;
 pub mod engine;
 pub mod from_recording;

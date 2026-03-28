@@ -204,7 +204,7 @@ pub enum SplitDirection {
 }
 
 /// Result of a full playbook run.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PlaybookResult {
     pub playbook_name: Option<String>,
     pub pass: bool,
@@ -220,7 +220,7 @@ pub struct PlaybookResult {
 }
 
 /// Result of a single step execution.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StepResult {
     pub index: usize,
     pub action: String,
@@ -296,14 +296,14 @@ impl std::fmt::Display for StepFailure {
 impl std::error::Error for StepFailure {}
 
 /// A named snapshot of screen state captured mid-playbook.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotCapture {
     pub id: String,
     pub panes: Vec<PaneCapture>,
 }
 
 /// Captured state of a single pane.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaneCapture {
     pub index: u32,
     pub focused: bool,
