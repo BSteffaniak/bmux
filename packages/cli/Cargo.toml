@@ -56,7 +56,6 @@ moosicbox_log_watch = { workspace = true, features = [
     "persistence-json",
 ] }
 portable-pty = { workspace = true }
-ratatui = { workspace = true }
 regex = { workspace = true }
 resvg = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
@@ -72,8 +71,6 @@ tokio = { workspace = true, features = [
 ] }
 toml = { workspace = true }
 tracing = { workspace = true, features = ["std"] }
-tracing-appender = { workspace = true, optional = true }
-tracing-subscriber = { workspace = true, features = ["fmt"], optional = true }
 ttf-parser = { workspace = true }
 unicode-width = { workspace = true }
 uuid = { workspace = true, features = ["std"] }
@@ -81,7 +78,7 @@ vt100 = { workspace = true }
 
 [features]
 # Default features
-default = ["bundled-fonts", "bundled-plugins", "kitty-keyboard", "logging"]
+default = ["bundled-fonts", "bundled-plugins", "kitty-keyboard"]
 
 # Development features
 fail-on-warnings = []
@@ -108,10 +105,6 @@ bundled-plugin-windows     = ["dep:bmux_windows_plugin"]
 
 # Optional features
 bundled-fonts = ["bmux_fonts/bundled-nerd-fonts"]
-logging       = ["dep:tracing-appender", "dep:tracing-subscriber"]
 
 # Serialization features
 serde = ["bmux_event/serde", "bmux_session/serde", "bmux_terminal/serde"]
-
-[dev-dependencies]
-serial_test = { workspace = true }

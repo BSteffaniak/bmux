@@ -60,7 +60,6 @@ struct HostKernelConnectionGuard;
 
 static EFFECTIVE_LOG_LEVEL: OnceLock<Level> = OnceLock::new();
 
-#[cfg(feature = "logging")]
 static LOG_WRITER_GUARD: OnceLock<moosicbox_log_runtime::init::LoggingHandle> = OnceLock::new();
 
 impl Drop for ServiceKernelContextGuard {
@@ -8302,7 +8301,6 @@ fn init_logging(verbose: bool, cli_level: Option<LogLevel>) {
     let tracing_level = tracing_level(level);
     let _ = EFFECTIVE_LOG_LEVEL.set(tracing_level);
 
-    #[cfg(feature = "logging")]
     {
         let paths =
             moosicbox_log_runtime::resolve_paths(&moosicbox_log_runtime::LogRuntimePathsConfig {
@@ -8330,11 +8328,6 @@ fn init_logging(verbose: bool, cli_level: Option<LogLevel>) {
                 eprintln!("bmux warning: failed to initialize file logging: {error}");
             }
         }
-    }
-
-    #[cfg(not(feature = "logging"))]
-    {
-        let _ = level;
     }
 }
 
