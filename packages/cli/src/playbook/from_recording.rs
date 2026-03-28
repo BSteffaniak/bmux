@@ -11,6 +11,10 @@ use bmux_ipc::{
 /// Minimum timing gap (in nanoseconds) before inserting a `sleep` step.
 const SLEEP_THRESHOLD_NS: u64 = 500_000_000; // 500ms
 
+/// Maximum timing gap (in nanoseconds) between consecutive `AttachInput` events
+/// to coalesce them into a single `send-keys` line.
+const INPUT_COALESCE_NS: u64 = 100_000_000; // 100ms
+
 /// Convert a list of recording events into a DSL playbook string.
 pub fn events_to_playbook(events: &[RecordingEventEnvelope]) -> Result<String> {
     let mut lines: Vec<String> = Vec::new();
@@ -19,8 +23,32 @@ pub fn events_to_playbook(events: &[RecordingEventEnvelope]) -> Result<String> {
 
     let mut last_mono_ns: u64 = 0;
     let mut has_session = false;
+    // Accumulator for coalescing consecutive AttachInput events.
+    let mut pending_input: Vec<u8> = Vec::new();
+    let mut last_input_mono_ns: u64 = 0;
 
     for event in events {
+        // Check if we need to flush pending input before a timing gap or non-input event.
+        let is_attach_input = matches!(
+            (&event.kind, &event.payload),
+            (RecordingEventKind::RequestStart, RecordingPayload::RequestStart { request_kind, .. })
+            if request_kind == "attach_input"
+        );
+
+        let time_gap = if last_input_mono_ns > 0 && event.mono_ns > last_input_mono_ns {
+            event.mono_ns - last_input_mono_ns
+        } else {
+            0
+        };
+
+        // Flush pending input if: this isn't an input event, or the timing gap exceeds the
+        // coalescing threshold.
+        if !pending_input.is_empty() && (!is_attach_input || time_gap > INPUT_COALESCE_NS) {
+            let escaped = bytes_to_c_escaped(&pending_input);
+            lines.push(format!("send-keys keys='{escaped}'"));
+            pending_input.clear();
+        }
+
         // Insert sleep for timing gaps.
         if last_mono_ns > 0 && event.mono_ns > last_mono_ns {
             let gap_ns = event.mono_ns - last_mono_ns;
@@ -35,19 +63,34 @@ pub fn events_to_playbook(events: &[RecordingEventEnvelope]) -> Result<String> {
             // Structural requests — decode the full Request from postcard bytes.
             (
                 RecordingEventKind::RequestStart,
-                RecordingPayload::RequestStart { request_data, .. },
+                RecordingPayload::RequestStart {
+                    request_data,
+                    request_kind,
+                    ..
+                },
             ) => {
                 if request_data.is_empty() {
                     continue;
                 }
                 if let Ok(request) = bmux_ipc::decode::<Request>(request_data) {
-                    if let Some(line) = request_to_dsl(&request, &mut has_session) {
-                        lines.push(line);
+                    match request_to_dsl(&request, &mut has_session, request_kind) {
+                        RequestDslResult::Line(line) => lines.push(line),
+                        RequestDslResult::CoalesceInput(data) => {
+                            pending_input.extend_from_slice(&data);
+                            last_input_mono_ns = event.mono_ns;
+                        }
+                        RequestDslResult::Skip => {}
                     }
                 }
             }
             _ => {}
         }
+    }
+
+    // Flush any remaining pending input.
+    if !pending_input.is_empty() {
+        let escaped = bytes_to_c_escaped(&pending_input);
+        lines.push(format!("send-keys keys='{escaped}'"));
     }
 
     lines.push(String::new());
@@ -56,46 +99,63 @@ pub fn events_to_playbook(events: &[RecordingEventEnvelope]) -> Result<String> {
     Ok(lines.join("\n"))
 }
 
+/// Result of converting a Request to a DSL line.
+enum RequestDslResult {
+    /// A complete DSL line to emit.
+    Line(String),
+    /// Input bytes to coalesce with subsequent AttachInput events.
+    CoalesceInput(Vec<u8>),
+    /// Skip this request (non-structural).
+    Skip,
+}
+
 /// Convert a `Request` variant to a DSL action line, if applicable.
-fn request_to_dsl(request: &Request, has_session: &mut bool) -> Option<String> {
+fn request_to_dsl(
+    request: &Request,
+    has_session: &mut bool,
+    request_kind: &str,
+) -> RequestDslResult {
     match request {
         Request::NewSession { name } => {
             *has_session = true;
-            match name {
-                Some(n) => Some(format!("new-session name='{n}'")),
-                None => Some("new-session".to_string()),
-            }
+            RequestDslResult::Line(match name {
+                Some(n) => format!("new-session name='{n}'"),
+                None => "new-session".to_string(),
+            })
         }
         Request::SplitPane { direction, .. } => {
             let dir = match direction {
                 PaneSplitDirection::Vertical => "vertical",
                 PaneSplitDirection::Horizontal => "horizontal",
             };
-            Some(format!("split-pane direction={dir}"))
+            RequestDslResult::Line(format!("split-pane direction={dir}"))
         }
-        Request::FocusPane { target, .. } => {
-            // target is Option<PaneSelector>, extract index if available
-            match target {
-                Some(bmux_ipc::PaneSelector::ByIndex(idx)) => {
-                    Some(format!("focus-pane target={idx}"))
-                }
-                _ => Some("# focus-pane (direction-based, manual edit needed)".to_string()),
+        Request::FocusPane { target, .. } => match target {
+            Some(bmux_ipc::PaneSelector::ByIndex(idx)) => {
+                RequestDslResult::Line(format!("focus-pane target={idx}"))
             }
-        }
-        Request::ClosePane { .. } => Some("close-pane".to_string()),
+            _ => RequestDslResult::Line(
+                "# focus-pane (direction-based, manual edit needed)".to_string(),
+            ),
+        },
+        Request::ClosePane { .. } => RequestDslResult::Line("close-pane".to_string()),
         Request::KillSession { selector, .. } => match selector {
-            bmux_ipc::SessionSelector::ByName(name) => Some(format!("kill-session name='{name}'")),
-            _ => Some("# kill-session (by id, manual edit needed)".to_string()),
+            bmux_ipc::SessionSelector::ByName(name) => {
+                RequestDslResult::Line(format!("kill-session name='{name}'"))
+            }
+            _ => RequestDslResult::Line("# kill-session (by id, manual edit needed)".to_string()),
         },
         Request::AttachSetViewport { cols, rows, .. } => {
-            Some(format!("resize-viewport cols={cols} rows={rows}"))
+            RequestDslResult::Line(format!("resize-viewport cols={cols} rows={rows}"))
+        }
+        Request::ResizePane { delta, .. } => {
+            RequestDslResult::Line(format!("# resize-pane delta={delta}"))
         }
         Request::AttachInput { data, .. } => {
             if data.is_empty() || !*has_session {
-                return None;
+                return RequestDslResult::Skip;
             }
-            let escaped = bytes_to_c_escaped(data);
-            Some(format!("send-keys keys='{escaped}'"))
+            RequestDslResult::CoalesceInput(data.clone())
         }
         // Skip high-frequency / non-structural requests.
         Request::AttachOutput { .. }
@@ -110,7 +170,7 @@ fn request_to_dsl(request: &Request, has_session: &mut bool) -> Option<String> {
         | Request::ListPanes { .. }
         | Request::ListClients
         | Request::SubscribeEvents
-        | Request::PollEvents { .. } => None,
+        | Request::PollEvents { .. } => RequestDslResult::Skip,
         // Recording-related requests aren't playbook actions.
         Request::RecordingStart { .. }
         | Request::RecordingStop { .. }
@@ -118,17 +178,14 @@ fn request_to_dsl(request: &Request, has_session: &mut bool) -> Option<String> {
         | Request::RecordingList
         | Request::RecordingDelete { .. }
         | Request::RecordingDeleteAll
-        | Request::RecordingWriteCustomEvent { .. } => None,
+        | Request::RecordingWriteCustomEvent { .. } => RequestDslResult::Skip,
         // Attach lifecycle is handled implicitly by the playbook engine.
         Request::Attach { .. }
         | Request::AttachContext { .. }
         | Request::AttachOpen { .. }
-        | Request::Detach => None,
+        | Request::Detach => RequestDslResult::Skip,
         // Everything else gets a comment for manual review.
-        _ => Some(format!(
-            "# unhandled request: {:?}",
-            std::mem::discriminant(request)
-        )),
+        _ => RequestDslResult::Line(format!("# unhandled request: {request_kind}")),
     }
 }
 

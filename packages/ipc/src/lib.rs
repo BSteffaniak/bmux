@@ -551,11 +551,8 @@ pub struct RecordingEventEnvelope {
     pub seq: u64,
     pub mono_ns: u64,
     pub wall_epoch_ms: u64,
-    #[serde(default)]
     pub session_id: Option<Uuid>,
-    #[serde(default)]
     pub pane_id: Option<Uuid>,
-    #[serde(default)]
     pub client_id: Option<Uuid>,
     pub kind: RecordingEventKind,
     pub payload: RecordingPayload,
@@ -821,32 +818,88 @@ where
     postcard::from_bytes(bytes)
 }
 
+// ── Shared display track types for recording files ───────────────────────────
+
+/// Display track event — shared type used by both the attach runtime's
+/// `DisplayCaptureWriter` and the playbook engine's `PlaybookDisplayTrackWriter`.
+///
+/// The `terminal_profile` field stores pre-serialized bytes (postcard-encoded
+/// `DetectedTerminalProfile`) to avoid cross-crate type dependencies. Use `None`
+/// when no terminal profile is available (e.g., headless playbook execution).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayTrackEvent {
+    StreamOpened {
+        client_id: Uuid,
+        recording_id: Uuid,
+        cell_width_px: Option<u16>,
+        cell_height_px: Option<u16>,
+        window_width_px: Option<u16>,
+        window_height_px: Option<u16>,
+        /// Pre-serialized terminal profile bytes (postcard-encoded), or `None`.
+        terminal_profile: Option<Vec<u8>>,
+    },
+    Resize {
+        cols: u16,
+        rows: u16,
+    },
+    FrameBytes {
+        data: Vec<u8>,
+    },
+    StreamClosed,
+}
+
+/// Display track envelope — wraps an event with a monotonic timestamp.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DisplayTrackEnvelope {
+    pub mono_ns: u64,
+    pub event: DisplayTrackEvent,
+}
+
 // ── Binary frame utilities for recording files ───────────────────────────────
 
 /// Write a length-prefixed postcard frame to a writer.
 ///
 /// Format: `[u32 little-endian length][postcard bytes]`
+///
+/// Returns an error if the serialized payload exceeds `u32::MAX` bytes.
 pub fn write_frame<W: std::io::Write, T: Serialize>(
     writer: &mut W,
     value: &T,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let bytes =
         postcard::to_allocvec(value).map_err(|e| format!("postcard serialize failed: {e}"))?;
-    writer.write_all(&(bytes.len() as u32).to_le_bytes())?;
+    let len = u32::try_from(bytes.len())
+        .map_err(|_| format!("frame too large: {} bytes exceeds u32::MAX", bytes.len()))?;
+    writer.write_all(&len.to_le_bytes())?;
     writer.write_all(&bytes)?;
     Ok(())
 }
 
+/// Result of reading binary frames from a buffer.
+pub struct ReadFramesResult<T> {
+    /// Successfully deserialized frames.
+    pub frames: Vec<T>,
+    /// Number of trailing bytes that could not be parsed as a complete frame.
+    /// Zero means a clean EOF with no leftover data.
+    pub bytes_remaining: usize,
+}
+
 /// Read all length-prefixed postcard frames from a byte buffer.
 ///
-/// Returns a vector of deserialized values. Stops at EOF.
-pub fn read_frames<T: DeserializeOwned>(data: &[u8]) -> Result<Vec<T>, Box<dyn std::error::Error>> {
+/// Returns all successfully-parsed frames plus the count of any trailing bytes
+/// that could not form a complete frame (indicating a truncated recording).
+pub fn read_frames<T: DeserializeOwned>(
+    data: &[u8],
+) -> Result<ReadFramesResult<T>, Box<dyn std::error::Error>> {
     let mut results = Vec::new();
     let mut offset = 0;
     while offset + 4 <= data.len() {
         let len = u32::from_le_bytes(data[offset..offset + 4].try_into().unwrap()) as usize;
         offset += 4;
         if offset + len > data.len() {
+            // Truncated frame — rewind to include the length prefix in remaining bytes.
+            offset -= 4;
             break;
         }
         let value: T = postcard::from_bytes(&data[offset..offset + len])
@@ -854,7 +907,10 @@ pub fn read_frames<T: DeserializeOwned>(data: &[u8]) -> Result<Vec<T>, Box<dyn s
         results.push(value);
         offset += len;
     }
-    Ok(results)
+    Ok(ReadFramesResult {
+        frames: results,
+        bytes_remaining: data.len() - offset,
+    })
 }
 
 #[cfg(test)]

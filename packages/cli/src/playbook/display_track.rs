@@ -1,7 +1,7 @@
 //! Display track writer for playbook recordings.
 //!
-//! Produces the same binary format as the attach runtime's `DisplayCaptureWriter`,
-//! enabling GIF export from playbook recordings.
+//! Uses the shared `DisplayTrackEvent` and `DisplayTrackEnvelope` types from
+//! `bmux_ipc` for binary compatibility with the attach runtime's display tracks.
 //!
 //! Format: length-prefixed postcard frames.
 
@@ -10,38 +10,8 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use bmux_ipc::{DisplayTrackEnvelope, DisplayTrackEvent};
 use uuid::Uuid;
-
-/// Display track event — matches the format used by `recording/mod.rs`.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "snake_case")]
-enum DisplayTrackEvent {
-    StreamOpened {
-        client_id: Uuid,
-        recording_id: Uuid,
-        cell_width_px: Option<u16>,
-        cell_height_px: Option<u16>,
-        window_width_px: Option<u16>,
-        window_height_px: Option<u16>,
-        terminal_profile: Option<()>,
-    },
-    Resize {
-        cols: u16,
-        rows: u16,
-    },
-    FrameBytes {
-        data: Vec<u8>,
-    },
-    StreamClosed,
-}
-
-/// Display track envelope — wraps an event with a monotonic timestamp.
-#[derive(Debug, Clone, Serialize)]
-struct DisplayTrackEnvelope {
-    mono_ns: u64,
-    event: DisplayTrackEvent,
-}
 
 /// Writer that produces the display track binary file alongside a recording.
 pub struct PlaybookDisplayTrackWriter {

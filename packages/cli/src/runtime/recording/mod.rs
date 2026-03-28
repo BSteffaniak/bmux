@@ -510,9 +510,16 @@ fn load_display_track_events(
     let path = display_track_path(recording_dir, client_id);
     let bytes = std::fs::read(&path)
         .with_context(|| format!("failed reading display track {}", path.display()))?;
-    let events: Vec<DisplayTrackEnvelope> = bmux_ipc::read_frames(&bytes)
+    let result = bmux_ipc::read_frames(&bytes)
         .map_err(|e| anyhow::anyhow!("failed parsing display track {}: {e}", path.display()))?;
-    Ok(events)
+    if result.bytes_remaining > 0 {
+        tracing::warn!(
+            "display track {}: {} trailing bytes could not be parsed (truncated?)",
+            path.display(),
+            result.bytes_remaining
+        );
+    }
+    Ok(result.frames)
 }
 
 fn recording_terminal_profile(
@@ -520,11 +527,15 @@ fn recording_terminal_profile(
 ) -> Option<terminal_profile::DetectedTerminalProfile> {
     for envelope in events {
         if let DisplayTrackEvent::StreamOpened {
-            terminal_profile: Some(profile),
+            terminal_profile: Some(profile_bytes),
             ..
         } = &envelope.event
         {
-            return Some(profile.clone());
+            if let Ok(profile) =
+                bmux_ipc::decode::<terminal_profile::DetectedTerminalProfile>(profile_bytes)
+            {
+                return Some(profile);
+            }
         }
     }
     None
@@ -1949,9 +1960,15 @@ pub(super) fn load_recording_events(recording_id: &str) -> Result<Vec<RecordingE
         .join("events.bin");
     let bytes = std::fs::read(&path)
         .with_context(|| format!("failed reading recording events file {}", path.display()))?;
-    let events: Vec<RecordingEventEnvelope> = bmux_ipc::read_frames(&bytes)
+    let result = bmux_ipc::read_frames(&bytes)
         .map_err(|e| anyhow::anyhow!("failed parsing recording events {}: {e}", path.display()))?;
-    Ok(events)
+    if result.bytes_remaining > 0 {
+        tracing::warn!(
+            "recording {id}: {} trailing bytes could not be parsed (truncated recording?)",
+            result.bytes_remaining
+        );
+    }
+    Ok(result.frames)
 }
 
 pub(super) fn resolve_recording_id_prefix(
@@ -2128,33 +2145,8 @@ pub(super) const fn offline_recording_status() -> RecordingStatus {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum DisplayTrackEvent {
-    StreamOpened {
-        client_id: Uuid,
-        recording_id: Uuid,
-        cell_width_px: Option<u16>,
-        cell_height_px: Option<u16>,
-        window_width_px: Option<u16>,
-        window_height_px: Option<u16>,
-        terminal_profile: Option<terminal_profile::DetectedTerminalProfile>,
-    },
-    Resize {
-        cols: u16,
-        rows: u16,
-    },
-    FrameBytes {
-        data: Vec<u8>,
-    },
-    StreamClosed,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct DisplayTrackEnvelope {
-    mono_ns: u64,
-    event: DisplayTrackEvent,
-}
+// Display track types are defined in bmux_ipc for cross-module sharing.
+use bmux_ipc::{DisplayTrackEnvelope, DisplayTrackEvent};
 
 pub(super) struct DisplayCaptureWriter {
     started_at: Instant,
@@ -2194,6 +2186,9 @@ impl DisplayCaptureWriter {
         let (cell_width_px, cell_height_px, window_width_px, window_height_px) =
             capture_stream_open_metrics();
         let terminal_profile = terminal_profile::detect_render_profile();
+        let terminal_profile_bytes = terminal_profile
+            .as_ref()
+            .and_then(|p| bmux_ipc::encode(p).ok());
         capture.record(DisplayTrackEvent::StreamOpened {
             client_id,
             recording_id: plan.recording_id,
@@ -2201,7 +2196,7 @@ impl DisplayCaptureWriter {
             cell_height_px,
             window_width_px,
             window_height_px,
-            terminal_profile,
+            terminal_profile: terminal_profile_bytes,
         })?;
         if let Ok((cols, rows)) = terminal::size()
             && cols > 0
@@ -2300,11 +2295,12 @@ mod tests {
         };
         let mut buf = Vec::new();
         bmux_ipc::write_frame(&mut buf, &envelope).expect("write should succeed");
-        let frames: Vec<DisplayTrackEnvelope> =
-            bmux_ipc::read_frames(&buf).expect("read should succeed");
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].mono_ns, 1);
-        match &frames[0].event {
+        let result =
+            bmux_ipc::read_frames::<DisplayTrackEnvelope>(&buf).expect("read should succeed");
+        assert_eq!(result.bytes_remaining, 0);
+        assert_eq!(result.frames.len(), 1);
+        assert_eq!(result.frames[0].mono_ns, 1);
+        match &result.frames[0].event {
             DisplayTrackEvent::StreamOpened {
                 cell_width_px,
                 cell_height_px,
@@ -2387,7 +2383,7 @@ mod tests {
                 cell_height_px: Some(16),
                 window_width_px: Some(800),
                 window_height_px: Some(600),
-                terminal_profile: Some(profile.clone()),
+                terminal_profile: Some(bmux_ipc::encode(&profile).unwrap()),
             },
         }];
         let resolved = recording_terminal_profile(&events).expect("profile should be resolved");

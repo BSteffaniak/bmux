@@ -369,11 +369,19 @@ fn read_manifest(path: &Path) -> Result<RecordingSummary> {
     Ok(manifest.summary)
 }
 
+/// Approximate content size of a recording payload, used for manifest statistics.
+///
+/// This measures the size of the primary data fields in each payload variant,
+/// not the actual serialized frame size (which includes the 4-byte length prefix
+/// and postcard envelope overhead). Treat `payload_bytes` in the manifest as
+/// an approximate content-size metric, not an exact file-size measurement.
 fn payload_size(payload: &RecordingPayload) -> u64 {
     match payload {
         RecordingPayload::Bytes { data } => data.len() as u64,
-        RecordingPayload::ServerEvent { event } => {
-            postcard::to_allocvec(event).map_or(0, |bytes: Vec<u8>| bytes.len() as u64)
+        RecordingPayload::ServerEvent { .. } => {
+            // Estimate: server events are typically small (< 256 bytes).
+            // Avoid re-serializing just to measure size.
+            128
         }
         RecordingPayload::RequestStart { request_data, .. } => request_data.len() as u64,
         RecordingPayload::RequestDone {
