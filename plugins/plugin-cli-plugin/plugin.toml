@@ -1,4 +1,3 @@
-entry                 = "libbmux_plugin_cli_plugin.dylib"
 id                    = "bmux.plugin_cli"
 name                  = "bmux Plugin CLI"
 required_capabilities = ["bmux.commands"]

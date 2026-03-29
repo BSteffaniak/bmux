@@ -1,4 +1,3 @@
-entry = "libbmux_permissions_plugin.dylib"
 id = "bmux.permissions"
 name = "bmux Permissions"
 provided_capabilities = [

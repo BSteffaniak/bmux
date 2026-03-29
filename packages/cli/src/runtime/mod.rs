@@ -1823,21 +1823,24 @@ pub(crate) fn scan_available_plugins(
         for manifest_path in report.manifest_paths {
             match PluginManifest::from_path(&manifest_path) {
                 Ok(mut manifest) => {
-                    let entry_path = manifest.resolve_entry_path(
+                    if let Some(entry_path) = manifest.resolve_entry_path(
                         manifest_path
                             .parent()
                             .unwrap_or_else(|| std::path::Path::new(".")),
-                    );
-                    if !entry_path.exists()
-                        && workspace_bundled_root
-                            .as_ref()
-                            .is_some_and(|root| report.search_root == *root)
-                        && let Ok(executable) = std::env::current_exe()
-                        && let Some(executable_dir) = executable.parent()
-                    {
-                        let executable_candidate = executable_dir.join(&manifest.entry);
-                        if executable_candidate.exists() {
-                            manifest.entry = executable_candidate;
+                    ) {
+                        if !entry_path.exists()
+                            && workspace_bundled_root
+                                .as_ref()
+                                .is_some_and(|root| report.search_root == *root)
+                            && let Ok(executable) = std::env::current_exe()
+                            && let Some(executable_dir) = executable.parent()
+                        {
+                            if let Some(entry) = manifest.entry.as_ref() {
+                                let executable_candidate = executable_dir.join(entry);
+                                if executable_candidate.exists() {
+                                    manifest.entry = Some(executable_candidate);
+                                }
+                            }
                         }
                     }
                     if let Err(error) = registry.register_manifest_from_root(
@@ -1913,8 +1916,8 @@ fn bundled_plugin_root() -> Option<PathBuf> {
 fn workspace_bundled_plugin_root() -> Option<PathBuf> {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let root = manifest_dir.parent()?.parent()?;
-    let bundled = root.join("plugins").join("bundled");
-    bundled.exists().then_some(bundled)
+    let plugins = root.join("plugins");
+    plugins.exists().then_some(plugins)
 }
 
 pub(crate) fn bundled_plugin_roots() -> Vec<PathBuf> {
@@ -1942,7 +1945,7 @@ pub(crate) fn registered_plugin_entry_exists(plugin: &bmux_plugin::RegisteredPlu
                 .parent()
                 .unwrap_or_else(|| std::path::Path::new(".")),
         )
-        .exists()
+        .is_some_and(|path| path.exists())
 }
 
 /// Discover bundled plugin IDs using the same dynamic discovery as the runtime.

@@ -1653,12 +1653,17 @@ impl NativePluginLoader {
             available_capabilities,
         )?;
 
-        let entry_path = registered_plugin.manifest.resolve_entry_path(
-            registered_plugin
-                .manifest_path
-                .parent()
-                .unwrap_or_else(|| Path::new(".")),
-        );
+        let entry_path = registered_plugin
+            .manifest
+            .resolve_entry_path(
+                registered_plugin
+                    .manifest_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new(".")),
+            )
+            .ok_or_else(|| PluginError::MissingEntryPath {
+                plugin_id: registered_plugin.declaration.id.as_str().to_string(),
+            })?;
         let library = unsafe { Library::new(&entry_path) }.map_err(|error| {
             PluginError::NativeLibraryLoad {
                 plugin_id: registered_plugin.declaration.id.as_str().to_string(),

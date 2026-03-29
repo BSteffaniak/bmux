@@ -69,7 +69,8 @@ pub struct PluginManifest {
     pub provider_priority: i32,
     #[serde(default)]
     pub runtime: PluginRuntime,
-    pub entry: PathBuf,
+    #[serde(default)]
+    pub entry: Option<PathBuf>,
     #[serde(default = "default_entry_symbol")]
     pub entry_symbol: String,
     #[serde(default)]
@@ -174,11 +175,12 @@ impl PluginManifest {
     }
 
     #[must_use]
-    pub fn resolve_entry_path(&self, base_dir: &Path) -> PathBuf {
-        if self.entry.is_absolute() {
-            self.entry.clone()
+    pub fn resolve_entry_path(&self, base_dir: &Path) -> Option<PathBuf> {
+        let entry = self.entry.as_ref()?;
+        if entry.is_absolute() {
+            Some(entry.clone())
         } else {
-            base_dir.join(&self.entry)
+            Some(base_dir.join(entry))
         }
     }
 }
@@ -266,18 +268,56 @@ c = "plugin:bmux.windows:new-window"
 id = "test.minimal"
 name = "Minimal"
 version = "0.1.0"
-entry = "unused.dylib"
 "#,
         )
-        .expect("manifest should parse without plugin_api/native_abi");
+        .expect("manifest should parse without plugin_api/native_abi/entry");
 
         assert_eq!(manifest.plugin_api.minimum, "1.0");
         assert!(manifest.plugin_api.maximum.is_none());
         assert_eq!(manifest.native_abi.minimum, "1.0");
         assert!(manifest.native_abi.maximum.is_none());
+        assert!(manifest.entry.is_none());
 
         // Verify conversion to declaration also works
         let declaration = manifest.to_declaration().expect("declaration should build");
         assert_eq!(declaration.id.as_str(), "test.minimal");
+    }
+
+    #[test]
+    fn entry_is_optional_and_resolves_when_present() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "test.with_entry"
+name = "With Entry"
+version = "0.1.0"
+entry = "libfoo.dylib"
+"#,
+        )
+        .expect("manifest should parse");
+
+        assert_eq!(
+            manifest.entry.as_deref(),
+            Some(std::path::Path::new("libfoo.dylib"))
+        );
+        assert_eq!(
+            manifest.resolve_entry_path(std::path::Path::new("/base")),
+            Some(std::path::PathBuf::from("/base/libfoo.dylib"))
+        );
+
+        let no_entry = PluginManifest::from_toml_str(
+            r#"
+id = "test.no_entry"
+name = "No Entry"
+version = "0.1.0"
+"#,
+        )
+        .expect("manifest should parse without entry");
+
+        assert!(no_entry.entry.is_none());
+        assert!(
+            no_entry
+                .resolve_entry_path(std::path::Path::new("/base"))
+                .is_none()
+        );
     }
 }

@@ -353,17 +353,18 @@ impl PluginRegistry {
     ) -> Result<()> {
         Self::validate_plugin_compat(registered_plugin, host, available_capabilities)?;
 
-        let entry_path = registered_plugin.manifest.resolve_entry_path(
+        if let Some(entry_path) = registered_plugin.manifest.resolve_entry_path(
             registered_plugin
                 .manifest_path
                 .parent()
                 .unwrap_or_else(|| Path::new(".")),
-        );
-        if !entry_path.exists() {
-            return Err(PluginError::MissingEntryFile {
-                plugin_id: registered_plugin.declaration.id.as_str().to_string(),
-                path: entry_path,
-            });
+        ) {
+            if !entry_path.exists() {
+                return Err(PluginError::MissingEntryFile {
+                    plugin_id: registered_plugin.declaration.id.as_str().to_string(),
+                    path: entry_path,
+                });
+            }
         }
 
         Ok(())

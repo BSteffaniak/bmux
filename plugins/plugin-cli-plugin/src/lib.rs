@@ -275,15 +275,6 @@ fn discover_bundled_plugins(context: &NativeCommandContext) -> Result<Vec<Bundle
             continue;
         };
         for manifest_path in report.manifest_paths {
-            let is_bundled = manifest_path
-                .parent()
-                .and_then(Path::parent)
-                .and_then(Path::file_name)
-                .is_some_and(|segment| segment == "bundled");
-            if !is_bundled {
-                continue;
-            }
-
             let manifest = bmux_plugin::PluginManifest::from_path(&manifest_path)
                 .map_err(|error| format!("failed parsing {}: {error}", manifest_path.display()))?;
             if !seen_ids.insert(manifest.id.as_str().to_string()) {
@@ -296,18 +287,16 @@ fn discover_bundled_plugins(context: &NativeCommandContext) -> Result<Vec<Bundle
                 .and_then(|value| value.to_str())
                 .ok_or_else(|| {
                     format!(
-                        "invalid bundled plugin path for manifest {}",
+                        "invalid plugin path for manifest {}",
                         manifest_path.display()
                     )
                 })?
                 .to_string();
-            let crate_name = entry_to_crate_name(&manifest.entry).ok_or_else(|| {
-                format!(
-                    "invalid bundled plugin entry '{}' in {}",
-                    manifest.entry.display(),
-                    manifest_path.display()
-                )
-            })?;
+            let crate_name = manifest
+                .entry
+                .as_ref()
+                .and_then(|e| entry_to_crate_name(e))
+                .unwrap_or_else(|| dir_name_to_crate_name(&short_name));
 
             discovered.push(BundledPlugin {
                 plugin_id: manifest.id.as_str().to_string(),
@@ -488,13 +477,18 @@ fn scan_plugins_with_bundled_entry_fallback(
             let mut manifest = PluginManifest::from_path(&manifest_path)
                 .map_err(|error| format!("failed parsing {}: {error}", manifest_path.display()))?;
 
-            let entry_exists = manifest
+            if let Some(entry_path) = manifest
                 .resolve_entry_path(manifest_path.parent().unwrap_or_else(|| Path::new(".")))
-                .exists();
-            if !entry_exists && let Some(executable_dir) = executable_dir.as_ref() {
-                let candidate = executable_dir.join(&manifest.entry);
-                if candidate.exists() {
-                    manifest.entry = candidate;
+            {
+                if !entry_path.exists() {
+                    if let (Some(entry), Some(executable_dir)) =
+                        (manifest.entry.as_ref(), executable_dir.as_ref())
+                    {
+                        let candidate = executable_dir.join(entry);
+                        if candidate.exists() {
+                            manifest.entry = Some(candidate);
+                        }
+                    }
                 }
             }
 
@@ -527,6 +521,13 @@ fn entry_to_crate_name(entry: &Path) -> Option<String> {
     }
     let dot = file_name.find('.')?;
     Some(file_name[..dot].to_string())
+}
+
+/// Derive a crate name from a plugin directory name by prefixing `bmux_` and
+/// replacing hyphens with underscores.  For example, `clipboard-plugin` becomes
+/// `bmux_clipboard_plugin`.
+fn dir_name_to_crate_name(dir_name: &str) -> String {
+    format!("bmux_{}", dir_name.replace('-', "_"))
 }
 
 fn has_flag(arguments: &[String], long_name: &str) -> bool {
