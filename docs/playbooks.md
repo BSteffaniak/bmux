@@ -45,6 +45,8 @@ bmux playbook run <source> [flags]
 | `--viewport <COLSxROWS>` | string | none     | Override viewport dimensions (e.g. `120x40`)     |
 | `--timeout <secs>`       | u64    | none     | Override max playbook timeout in seconds         |
 | `--shell <path>`         | string | none     | Override shell binary                            |
+| `--var KEY=VALUE`        | string | none     | Define a variable (repeatable, overrides `@var`) |
+| `--verbose` / `-v`       | bool   | false    | Print step-by-step progress to stderr            |
 
 **Exit codes:** `0` = all steps passed, `1` = one or more steps failed or error.
 
@@ -141,6 +143,23 @@ bmux playbook run --json test.dsl > after.json
 # Compare
 bmux playbook diff --json before.json after.json
 ```
+
+### `bmux playbook cleanup`
+
+Remove orphaned sandbox temp directories from previous playbook runs. Useful
+after SIGKILL or crashes that prevent normal cleanup.
+
+```
+bmux playbook cleanup [--dry-run] [--json]
+```
+
+| Flag | Type | Default | Description |
+|------|------|---------|-------------|
+| `--dry-run` | bool | false | List orphaned dirs without deleting |
+| `--json` | bool | false | Output as JSON |
+
+Detection heuristic: directories matching `bpb-*` in the system temp dir that
+are older than 5 minutes and whose server process is no longer running.
 
 ### `bmux playbook interactive`
 
@@ -383,7 +402,7 @@ synchronization mechanism -- use it after `send-keys` to wait for output before
 proceeding.
 
 ```
-wait-for pattern=<regex> [pane=<u32>] [timeout=<ms>]
+wait-for pattern=<regex> [pane=<u32>] [timeout=<ms>] [retry=<u32>]
 ```
 
 | Arg       | Type  | Required | Default      | Description                                |
@@ -391,6 +410,7 @@ wait-for pattern=<regex> [pane=<u32>] [timeout=<ms>]
 | `pattern` | regex | yes      | -            | Regex pattern to match against screen text |
 | `pane`    | u32   | no       | focused pane | Pane index (1-based)                       |
 | `timeout` | u64   | no       | `5000`       | Max wait time in milliseconds              |
+| `retry`   | u32   | no       | `1`          | Number of attempts (1 = no retry)          |
 
 **Polling behavior:** Exponential backoff starting at 10ms, doubling up to
 200ms max (10, 20, 40, 80, 160, 200, 200...). Each poll drains output and
@@ -577,6 +597,31 @@ invoke-service capability=<cap> interface=<id> operation=<op> [kind=query|comman
 
 ---
 
+## Step Modifiers
+
+### `!continue` — Continue on Error
+
+Append `!continue` to any action line to prevent the playbook from stopping
+if that step fails. The step is still recorded as `fail` in the results, and
+`pass` will be `false`, but execution continues to the next step.
+
+```
+assert-screen contains='optional_check' !continue
+assert-screen contains='required_check'
+```
+
+In TOML format, use `continue_on_error = true` on the step:
+
+```toml
+[[step]]
+action = "assert-screen"
+contains = "optional_check"
+continue_on_error = true
+```
+
+This is useful for diagnostic playbooks that want to check multiple conditions
+and report all failures, not just the first one.
+
 ## Variable Substitution
 
 Playbook values support `${NAME}` variable references. Variables are resolved at
@@ -589,7 +634,18 @@ Variables are resolved in this order (first match wins):
 1. **Runtime variables** -- dynamic values set during execution
 2. **Static variables** -- defined via `@var` directives
 3. **Environment variables** -- from the process environment
-4. **Unresolved** -- if no match, `${NAME}` is left as-is in the output
+4. **Unresolved** -- if no match, `${NAME}` is left as-is (with a warning logged)
+
+### Literal `${` Escaping
+
+Use `$${...}` to produce a literal `${...}` without variable expansion:
+
+```
+send-keys keys='echo $${HOME}\r'   # sends literal ${HOME} to the terminal
+```
+
+The first `$` acts as an escape character. After resolution, `$${HOME}` becomes
+the literal string `${HOME}`.
 
 ### Runtime Variables
 
@@ -942,6 +998,7 @@ When using `--json`, `bmux playbook run` outputs a `PlaybookResult`:
 | `recording_path`   | string \| null    | no             | Path to recording directory             |
 | `total_elapsed_ms` | u64               | yes            | Wall-clock execution time               |
 | `error`            | string \| null    | no             | Top-level error (sandbox failure, etc.) |
+| `sandbox_root`     | string \| null    | no             | Sandbox temp dir path (only on failure, for inspection) |
 
 ### `StepResult`
 

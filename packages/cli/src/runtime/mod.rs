@@ -1077,6 +1077,7 @@ fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
             PlaybookCommand::FromRecording { .. } => BuiltInHandlerId::PlaybookFromRecording,
             PlaybookCommand::DryRun { .. } => BuiltInHandlerId::PlaybookDryRun,
             PlaybookCommand::Diff { .. } => BuiltInHandlerId::PlaybookDiff,
+            PlaybookCommand::Cleanup { .. } => BuiltInHandlerId::PlaybookCleanup,
         },
         Command::External(_) => unreachable!("external commands are dispatched separately"),
     }
@@ -1592,6 +1593,12 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                     },
             },
         ) => run_playbook_diff(left, right, *json, *timing_threshold),
+        (
+            BuiltInHandlerId::PlaybookCleanup,
+            Command::Playbook {
+                command: PlaybookCommand::Cleanup { dry_run, json },
+            },
+        ) => run_playbook_cleanup(*dry_run, *json),
         _ => unreachable!("built-in command handler and command variant should stay in sync"),
     }
 }
@@ -8625,6 +8632,36 @@ fn run_playbook_diff(
         || report.summary.snapshots_changed > 0
         || !report.timing_regressions.is_empty();
     Ok(if has_changes { 1 } else { 0 })
+}
+
+fn run_playbook_cleanup(dry_run: bool, json: bool) -> Result<u8> {
+    let (scanned, entries) = crate::playbook::sandbox::cleanup_orphaned_sandboxes(dry_run)?;
+    let orphaned = entries.len();
+
+    if json {
+        let report = serde_json::json!({
+            "scanned": scanned,
+            "orphaned": orphaned,
+            "dry_run": dry_run,
+            "entries": entries,
+        });
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else if orphaned > 0 {
+        for entry in &entries {
+            let status = if entry.removed { "removed" } else { "found" };
+            println!("  {status}: {} (age: {}s)", entry.path, entry.age_secs);
+        }
+        if dry_run {
+            println!("{orphaned} orphaned sandbox(es) found (dry run, not removed)");
+        } else {
+            let removed = entries.iter().filter(|e| e.removed).count();
+            println!("{removed} orphaned sandbox(es) removed");
+        }
+    } else {
+        println!("no orphaned sandboxes found ({scanned} scanned)");
+    }
+
+    Ok(0)
 }
 
 async fn run_playbook_interactive(

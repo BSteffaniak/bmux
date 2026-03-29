@@ -724,4 +724,28 @@ snapshot id=final
         let (playbook, _) = parse_dsl(input).unwrap();
         assert!(matches!(playbook.steps[1].action, Action::Status));
     }
+
+    #[test]
+    fn parse_wait_for_retry() {
+        let input = "new-session\nwait-for pattern='hello' retry=3\n";
+        let (playbook, _) = parse_dsl(input).unwrap();
+        match &playbook.steps[1].action {
+            Action::WaitFor { retry, .. } => assert_eq!(*retry, 3),
+            other => panic!("expected WaitFor, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_continue_on_error_suffix() {
+        let input = "new-session\nassert-screen contains='hello' !continue\n";
+        let (playbook, _) = parse_dsl(input).unwrap();
+        assert!(playbook.steps[1].continue_on_error);
+    }
+
+    #[test]
+    fn parse_no_continue_on_error_by_default() {
+        let input = "new-session\nassert-screen contains='hello'\n";
+        let (playbook, _) = parse_dsl(input).unwrap();
+        assert!(!playbook.steps[1].continue_on_error);
+    }
 }

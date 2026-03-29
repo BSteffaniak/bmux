@@ -902,4 +902,20 @@ mod tests {
         let (_, parsed_status) = round_trip(&Action::Status);
         assert!(matches!(parsed_status, Action::Status));
     }
+
+    #[test]
+    fn to_dsl_round_trip_wait_for_with_retry() {
+        let action = Action::WaitFor {
+            pattern: "hello".to_string(),
+            pane: None,
+            timeout: Duration::from_millis(5000),
+            retry: 3,
+        };
+        let (dsl, parsed) = round_trip(&action);
+        assert!(dsl.contains("retry=3"), "DSL should contain retry=3: {dsl}");
+        match parsed {
+            Action::WaitFor { retry, .. } => assert_eq!(retry, 3),
+            other => panic!("expected WaitFor, got {other:?}"),
+        }
+    }
 }

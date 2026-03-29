@@ -242,6 +242,17 @@ fn playbook_failing_assert() {
             .contains("real_output"),
         "failure_captures pane should contain real_output: {pane:#}"
     );
+
+    // Verify sandbox_root is included for failed playbooks.
+    assert!(
+        json.get("sandbox_root").is_some() && !json["sandbox_root"].is_null(),
+        "failed playbook should have sandbox_root: {json:#}"
+    );
+    let root = json["sandbox_root"].as_str().unwrap();
+    assert!(
+        root.contains("bpb-"),
+        "sandbox_root should be a bpb temp dir: {root}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -559,6 +570,12 @@ fn playbook_include_basic() {
         steps[0]["action"], "new-session",
         "first step should be new-session from include"
     );
+    // The last step should be assert-screen (from main file).
+    let last = steps.last().unwrap();
+    assert_eq!(
+        last["action"], "assert-screen",
+        "last step should be assert-screen from main file: {json:#}"
+    );
 }
 
 #[test]
@@ -632,6 +649,13 @@ fn playbook_level_timeout_skips_remaining() {
     assert!(
         detail.contains("playbook timeout"),
         "skipped step should mention playbook timeout: {detail}"
+    );
+
+    // Verify the top-level error includes elapsed time and step info.
+    let error = json["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("exceeded after") && error.contains("ms"),
+        "error should include elapsed time: {error}"
     );
 }
 
@@ -912,6 +936,21 @@ async fn interactive_mode_basic() {
         "status should have focused_pane: {resp:#}"
     );
 
+    // Test interactive failure response includes pane captures.
+    let resp = send_cmd(
+        &mut writer,
+        &mut reader,
+        "assert-screen contains='nonexistent_interactive_xyz'",
+    )
+    .await;
+    assert_eq!(resp["status"], "fail", "assert should fail: {resp:#}");
+    // Verify pane captures are included on failure.
+    let fail_panes = resp["panes"].as_array();
+    assert!(
+        fail_panes.is_some() && !fail_panes.unwrap().is_empty(),
+        "interactive failure should include pane captures: {resp:#}"
+    );
+
     // subscribe for push output events
     let resp = send_cmd(&mut writer, &mut reader, "subscribe").await;
     assert_eq!(resp["status"], "ok", "subscribe response: {resp:#}");
@@ -1179,4 +1218,95 @@ fn playbook_diff_identical() {
     );
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// A2: --var CLI flag test
+// ---------------------------------------------------------------------------
+
+#[test]
+fn playbook_var_cli_override() {
+    let fixture = fixtures_dir().join("var_override.dsl");
+    let output = Command::new(bmux_binary())
+        .args([
+            "playbook",
+            "run",
+            "--json",
+            "--var",
+            "MARKER=cli_override",
+            fixture.to_str().unwrap(),
+        ])
+        .env("BMUX_PLAYBOOK_ENV_MODE", "inherit")
+        .output()
+        .expect("failed to run bmux playbook");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("JSON parse failed: {e}\nstdout: {stdout}\nstderr: {stderr}")
+    });
+
+    let pass = json["pass"].as_bool().unwrap_or(false);
+    assert!(pass, "--var should override @var: {json:#}");
+}
+
+// ---------------------------------------------------------------------------
+// A4: continue-on-error test
+// ---------------------------------------------------------------------------
+
+#[test]
+fn playbook_continue_on_error() {
+    let (json, pass) = run_playbook_fixture("continue_on_error.dsl");
+    assert!(
+        !pass,
+        "playbook with failed !continue step should fail: {json:#}"
+    );
+
+    let steps = json["steps"].as_array().expect("steps should be array");
+    let assert_steps: Vec<_> = steps
+        .iter()
+        .filter(|s| s["action"] == "assert-screen")
+        .collect();
+
+    assert_eq!(
+        assert_steps.len(),
+        2,
+        "both asserts should execute: {json:#}"
+    );
+    assert_eq!(
+        assert_steps[0]["status"], "fail",
+        "first assert should fail"
+    );
+    assert_eq!(
+        assert_steps[1]["status"], "pass",
+        "second assert should pass"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// C: Sandbox cleanup command test
+// ---------------------------------------------------------------------------
+
+#[test]
+fn playbook_cleanup_dry_run() {
+    let output = Command::new(bmux_binary())
+        .args(["playbook", "cleanup", "--json", "--dry-run"])
+        .output()
+        .expect("failed to run bmux playbook cleanup");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap_or_else(|e| {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("JSON parse failed: {e}\nstdout: {stdout}\nstderr: {stderr}")
+    });
+
+    assert!(
+        json.get("scanned").is_some(),
+        "should have scanned: {json:#}"
+    );
+    assert!(
+        json.get("orphaned").is_some(),
+        "should have orphaned: {json:#}"
+    );
+    assert!(output.status.success(), "cleanup should succeed");
 }

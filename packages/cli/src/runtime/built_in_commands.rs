@@ -62,6 +62,7 @@ pub enum BuiltInHandlerId {
     PlaybookFromRecording,
     PlaybookDryRun,
     PlaybookDiff,
+    PlaybookCleanup,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -388,6 +389,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::PlaybookDiff,
             &["playbook", "diff"],
             "Compare results from two playbook runs",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::PlaybookCleanup,
+            &["playbook", "cleanup"],
+            "Remove orphaned sandbox temp directories",
         ),
     ]
 }

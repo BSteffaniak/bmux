@@ -475,6 +475,15 @@ pub enum PlaybookCommand {
         #[arg(long, default_value = "50")]
         timing_threshold: u64,
     },
+    /// Remove orphaned sandbox temp directories from previous playbook runs
+    Cleanup {
+        /// Only list orphaned dirs without deleting
+        #[arg(long)]
+        dry_run: bool,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

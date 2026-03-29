@@ -566,3 +566,113 @@ impl ServerHandle {
         }
     }
 }
+
+// ── Orphaned sandbox cleanup ────────────────────────────────────────────────
+
+/// An orphaned sandbox entry found during cleanup.
+#[derive(Debug, serde::Serialize)]
+pub struct CleanupEntry {
+    pub path: String,
+    pub age_secs: u64,
+    pub removed: bool,
+}
+
+/// Scan for orphaned sandbox temp directories and optionally remove them.
+///
+/// Orphaned sandboxes are detected by:
+/// 1. Directory name starts with `bpb-`
+/// 2. Directory is older than 5 minutes (to avoid touching active sandboxes)
+/// 3. The `server.pid` file inside contains a PID of a dead process
+pub fn cleanup_orphaned_sandboxes(dry_run: bool) -> anyhow::Result<(usize, Vec<CleanupEntry>)> {
+    let temp_dir = std::env::temp_dir();
+    let mut scanned = 0;
+    let mut entries = Vec::new();
+    let now = SystemTime::now();
+    let min_age = std::time::Duration::from_secs(300); // 5 minutes
+
+    let dir_entries = match std::fs::read_dir(&temp_dir) {
+        Ok(entries) => entries,
+        Err(_) => return Ok((0, entries)),
+    };
+
+    for entry in dir_entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+
+        let name = entry.file_name();
+        let name_str = name.to_string_lossy();
+        if !name_str.starts_with("bpb-") {
+            continue;
+        }
+        if !entry.path().is_dir() {
+            continue;
+        }
+
+        scanned += 1;
+
+        // Check age.
+        let age = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|mtime| now.duration_since(mtime).ok())
+            .unwrap_or_default();
+
+        if age < min_age {
+            continue; // Too recent -- might still be starting up.
+        }
+
+        // Check if the server process is still alive.
+        // Try reading the PID file and checking if the process exists.
+        let pid_file = entry.path().join("r").join("server.pid");
+        let sock_file = entry.path().join("r").join("server.sock");
+        let is_alive = if sock_file.exists() {
+            // If the socket file exists, try a non-blocking connect to check
+            // if the server is actually listening. If connect fails, it's dead.
+            std::os::unix::net::UnixStream::connect(&sock_file).is_ok()
+        } else if pid_file.exists() {
+            // No socket but PID file exists -- check if process is running.
+            // Use `kill -0` via std::process::Command as a portable check.
+            match std::fs::read_to_string(&pid_file) {
+                Ok(contents) => {
+                    if let Ok(pid) = contents.trim().parse::<u32>() {
+                        // `kill -0 <pid>` exits 0 if process exists, non-zero otherwise.
+                        std::process::Command::new("kill")
+                            .args(["-0", &pid.to_string()])
+                            .stdout(std::process::Stdio::null())
+                            .stderr(std::process::Stdio::null())
+                            .status()
+                            .map(|s| s.success())
+                            .unwrap_or(false)
+                    } else {
+                        false
+                    }
+                }
+                Err(_) => false,
+            }
+        } else {
+            false // No PID file, no socket -- server is gone.
+        };
+
+        if is_alive {
+            continue; // Server is still running.
+        }
+
+        // This sandbox is orphaned.
+        let removed = if dry_run {
+            false
+        } else {
+            std::fs::remove_dir_all(entry.path()).is_ok()
+        };
+
+        entries.push(CleanupEntry {
+            path: entry.path().to_string_lossy().to_string(),
+            age_secs: age.as_secs(),
+            removed,
+        });
+    }
+
+    Ok((scanned, entries))
+}

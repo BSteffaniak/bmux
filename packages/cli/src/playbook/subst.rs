@@ -220,4 +220,23 @@ mod tests {
         let output = rv.resolve_bytes(input);
         assert_eq!(output, b"echo ls\r");
     }
+
+    #[test]
+    fn double_dollar_escapes_to_literal() {
+        let rv = RuntimeVars::new(BTreeMap::new());
+        // $${HOME} should produce literal ${HOME}, not the env var value.
+        assert_eq!(rv.resolve("$${HOME}"), "${HOME}");
+    }
+
+    #[test]
+    fn double_dollar_mid_string() {
+        let mut vars = BTreeMap::new();
+        vars.insert("X".to_string(), "resolved".to_string());
+        let rv = RuntimeVars::new(vars);
+        // Mix escaped and real variable references.
+        assert_eq!(
+            rv.resolve("before $${LITERAL} ${X} after"),
+            "before ${LITERAL} resolved after"
+        );
+    }
 }
