@@ -39,13 +39,27 @@ impl RuntimeVars {
     /// 1. Runtime variables (SESSION_ID, SESSION_NAME, PANE_COUNT, FOCUSED_PANE)
     /// 2. Static variables (`@var` directives)
     /// 3. Environment variables
-    /// 4. Unresolved references are left as-is
+    /// 4. Unresolved references are left as-is (with a warning)
+    ///
+    /// Use `$${...}` to produce a literal `${...}` without variable expansion.
     pub fn resolve(&self, template: &str) -> String {
         let mut result = String::with_capacity(template.len());
         let bytes = template.as_bytes();
         let mut i = 0;
 
         while i < bytes.len() {
+            // Check for escaped variable reference: $${...} → literal ${...}
+            if i + 2 < bytes.len()
+                && bytes[i] == b'$'
+                && bytes[i + 1] == b'$'
+                && bytes[i + 2] == b'{'
+            {
+                // Skip the first '$', emit the rest literally.
+                result.push('$');
+                result.push('{');
+                i += 3;
+                continue;
+            }
             if i + 1 < bytes.len() && bytes[i] == b'$' && bytes[i + 1] == b'{' {
                 // Find closing brace
                 if let Some(close) = template[i + 2..].find('}') {
@@ -53,6 +67,7 @@ impl RuntimeVars {
                     if let Some(value) = self.lookup(var_name) {
                         result.push_str(&value);
                     } else {
+                        tracing::warn!("unresolved variable reference: ${{{var_name}}}");
                         // Leave unresolved
                         result.push_str(&template[i..i + 2 + close + 1]);
                     }

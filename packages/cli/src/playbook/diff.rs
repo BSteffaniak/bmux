@@ -620,6 +620,7 @@ mod tests {
             recording_path: None,
             total_elapsed_ms: 1000,
             error: None,
+            sandbox_root: None,
         }
     }
 

@@ -251,7 +251,7 @@ fn parse_file_recursive(
 
 fn resolve_includes(
     playbook: &mut Playbook,
-    includes: &[String],
+    includes: &[(usize, String)],
     base_dir: &Path,
     seen: &mut BTreeSet<PathBuf>,
     depth: usize,
@@ -260,9 +260,10 @@ fn resolve_includes(
         return Ok(());
     }
 
-    let mut included_steps: Vec<Step> = Vec::new();
+    // Resolve all includes and collect their steps with insertion positions.
+    let mut insertions: Vec<(usize, Vec<Step>)> = Vec::new();
 
-    for include_path in includes {
+    for (insert_at, include_path) in includes {
         let resolved = base_dir.join(include_path);
         let canonical = resolved
             .canonicalize()
@@ -279,22 +280,29 @@ fn resolve_includes(
             .with_context(|| format!("failed parsing included file {}", canonical.display()))?;
 
         // Only merge steps from included files; config is ignored.
-        included_steps.extend(included.steps);
+        insertions.push((*insert_at, included.steps));
     }
 
-    // Prepend included steps before the current file's steps.
+    // Insert included steps at their declared positions (in reverse order
+    // to preserve indices as we insert).
+    insertions.sort_by(|a, b| b.0.cmp(&a.0)); // reverse sort by position
+    for (insert_at, steps) in insertions {
+        let pos = insert_at.min(playbook.steps.len());
+        for (i, step) in steps.into_iter().enumerate() {
+            playbook.steps.insert(pos + i, step);
+        }
+    }
+
     // Re-index all steps sequentially.
-    included_steps.extend(std::mem::take(&mut playbook.steps));
-    for (i, step) in included_steps.iter_mut().enumerate() {
+    for (i, step) in playbook.steps.iter_mut().enumerate() {
         step.index = i;
     }
-    playbook.steps = included_steps;
 
     Ok(())
 }
 
 /// Parse raw content, trying TOML first then DSL.
-fn parse_content(content: &str) -> Result<(Playbook, Vec<String>)> {
+fn parse_content(content: &str) -> Result<(Playbook, Vec<(usize, String)>)> {
     // Try TOML first
     if let Ok(result) = parse_toml::parse_toml(content) {
         return Ok(result);

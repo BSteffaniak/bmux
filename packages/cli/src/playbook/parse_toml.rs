@@ -13,13 +13,16 @@ use super::types::{
 ///
 /// Returns the playbook and a list of include paths that the caller
 /// is responsible for resolving and merging.
-pub fn parse_toml(input: &str) -> Result<(Playbook, Vec<String>)> {
+pub fn parse_toml(input: &str) -> Result<(Playbook, Vec<(usize, String)>)> {
     let raw: RawPlaybook = toml::from_str(input).context("invalid playbook TOML")?;
-    let includes = raw
+    let includes: Vec<(usize, String)> = raw
         .playbook
         .as_ref()
         .and_then(|p| p.include.clone())
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .map(|path| (0, path)) // TOML includes are always at position 0 (before all steps)
+        .collect();
     let config = parse_config(raw.playbook)?;
     let steps = raw
         .step
@@ -27,9 +30,14 @@ pub fn parse_toml(input: &str) -> Result<(Playbook, Vec<String>)> {
         .into_iter()
         .enumerate()
         .map(|(i, raw_step)| {
+            let coe = raw_step.continue_on_error.unwrap_or(false);
             let action =
                 parse_step_action(raw_step).with_context(|| format!("step {}: invalid", i + 1))?;
-            Ok(Step { index: i, action })
+            Ok(Step {
+                index: i,
+                action,
+                continue_on_error: coe,
+            })
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -84,6 +92,7 @@ fn parse_config(raw: Option<RawPlaybookConfig>) -> Result<PlaybookConfig> {
         env_mode,
         binary: None,
         bundled_plugin_ids: Vec::new(),
+        verbose: false,
     })
 }
 
@@ -132,6 +141,7 @@ fn parse_step_action(step: RawStep) -> Result<Action> {
                 pattern,
                 pane: step.pane,
                 timeout: Duration::from_millis(timeout_ms),
+                retry: step.retry.unwrap_or(1),
             })
         }
         "sleep" => {
@@ -270,6 +280,7 @@ struct RawPluginConfig {
 #[derive(Deserialize)]
 struct RawStep {
     action: String,
+    continue_on_error: Option<bool>,
     // Session/pane management
     name: Option<String>,
     direction: Option<String>,
@@ -283,6 +294,7 @@ struct RawStep {
     // Waiting
     pattern: Option<String>,
     timeout_ms: Option<u64>,
+    retry: Option<u32>,
     ms: Option<u64>,
     // Snapshot
     id: Option<String>,

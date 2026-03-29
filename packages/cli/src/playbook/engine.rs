@@ -128,11 +128,17 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
     }
 
     // Execute each step
-    let deadline = Instant::now() + playbook.config.timeout;
+    let playbook_start = Instant::now();
+    let deadline = playbook_start + playbook.config.timeout;
 
     for step in &playbook.steps {
         if Instant::now() > deadline {
-            error_msg = Some("playbook timeout exceeded".to_string());
+            let elapsed = playbook_start.elapsed().as_millis();
+            error_msg = Some(format!(
+                "playbook timeout exceeded after {elapsed}ms (at step {}: {})",
+                step.index,
+                step.action.name()
+            ));
             step_results.push(StepResult {
                 index: step.index,
                 action: step.action.name().to_string(),
@@ -147,6 +153,15 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
         }
 
         let step_start = Instant::now();
+        let total_steps = playbook.steps.len();
+        if playbook.config.verbose {
+            eprint!(
+                "[{}/{}] {}...",
+                step.index + 1,
+                total_steps,
+                step.action.name()
+            );
+        }
         let result = execute_step(
             step,
             &mut client,
@@ -185,6 +200,9 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
                 });
             }
             Err(err) => {
+                if playbook.config.verbose {
+                    eprintln!(" FAIL ({elapsed_ms}ms)");
+                }
                 warn!(
                     "step {}: {} — fail: {err:#} ({}ms)",
                     step.index,
@@ -216,8 +234,16 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
                     actual,
                     failure_captures,
                 });
-                error_msg = Some(msg);
-                break; // Stop on first failure
+                if step.continue_on_error {
+                    // Record the failure but keep going.
+                    warn!(
+                        "step {} failed but continue_on_error is set, continuing",
+                        step.index
+                    );
+                } else {
+                    error_msg = Some(msg);
+                    break; // Stop on first failure
+                }
             }
         }
     }
@@ -258,7 +284,12 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
     }
 
     let total_elapsed_ms = started.elapsed().as_millis() as u64;
-    let pass = error_msg.is_none();
+    let pass = error_msg.is_none() && !step_results.iter().any(|s| s.status == StepStatus::Fail);
+
+    // Capture sandbox root before shutdown (for inclusion in failed results).
+    let sandbox_root = sandbox
+        .as_ref()
+        .map(|sb| sb.root_dir().to_string_lossy().to_string());
 
     // Shutdown sandbox if we created one.
     if let Some(sb) = sandbox {
@@ -276,6 +307,7 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
         recording_path: recording_path.map(|p| p.to_string_lossy().to_string()),
         total_elapsed_ms,
         error: error_msg,
+        sandbox_root: if pass { None } else { sandbox_root },
     })
 }
 
@@ -351,12 +383,12 @@ pub(super) async fn execute_step(
 
         Action::KillSession { name } => {
             let selector = SessionSelector::ByName(name.clone());
-            client
+            let killed_id = client
                 .kill_session(selector)
                 .await
                 .map_err(|e| anyhow::anyhow!("kill-session failed: {e}"))?;
-            if session_id.map(|_| true).unwrap_or(false) {
-                // If we killed the session we were attached to, clear state
+            // Only clear state if we killed the session we were attached to.
+            if *session_id == Some(killed_id) {
                 *session_id = None;
                 *attached = false;
             }
@@ -473,6 +505,7 @@ pub(super) async fn execute_step(
             pattern,
             pane,
             timeout,
+            retry,
         } => {
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
@@ -484,47 +517,76 @@ pub(super) async fn execute_step(
             let re = regex::Regex::new(&resolved_pattern)
                 .with_context(|| format!("invalid regex: {resolved_pattern}"))?;
 
-            let wait_deadline = Instant::now() + (*timeout).min(deadline - Instant::now());
-            let mut poll_delay = Duration::from_millis(10);
+            let max_attempts = (*retry).max(1);
+            let mut last_err = None;
 
-            loop {
-                // Drain any pending output (lower threshold for WaitFor's retry loop)
-                drain_output_with_threshold(
-                    client,
-                    sid,
-                    Duration::from_millis(100),
-                    display_track,
-                    3,
-                )
-                .await?;
-
-                // Refresh screen state
-                let snapshot = inspector.refresh(client, sid).await?;
-                let pane_idx = inspector.resolve_pane_index(*pane, &snapshot)?;
-
-                if inspector.pane_matches_compiled(pane_idx, &re) {
-                    return Ok(Some(format!("matched pattern '{resolved_pattern}'")));
+            for attempt in 0..max_attempts {
+                if attempt > 0 {
+                    // Brief drain between retry attempts.
+                    drain_output_until_idle(client, sid, Duration::from_millis(200), display_track)
+                        .await?;
                 }
 
-                if Instant::now() >= wait_deadline {
-                    let screen_text = inspector
-                        .pane_text(pane_idx)
-                        .unwrap_or_else(|| "<no text>".to_string());
-                    return Err(StepFailure::assertion(
-                        format!(
-                            "wait-for timed out after {}ms on pane {} waiting for pattern '{resolved_pattern}'",
-                            timeout.as_millis(),
-                            pane_idx,
-                        ),
-                        resolved_pattern.clone(),
-                        screen_text,
+                let wait_deadline = Instant::now() + (*timeout).min(deadline - Instant::now());
+                let mut poll_delay = Duration::from_millis(10);
+
+                let result = loop {
+                    // Drain any pending output (lower threshold for WaitFor's retry loop)
+                    drain_output_with_threshold(
+                        client,
+                        sid,
+                        Duration::from_millis(100),
+                        display_track,
+                        3,
                     )
-                    .into());
-                }
+                    .await?;
 
-                tokio::time::sleep(poll_delay).await;
-                poll_delay = (poll_delay * 2).min(Duration::from_millis(200));
+                    // Refresh screen state
+                    let snapshot = inspector.refresh(client, sid).await?;
+                    let pane_idx = inspector.resolve_pane_index(*pane, &snapshot)?;
+
+                    if inspector.pane_matches_compiled(pane_idx, &re) {
+                        break Ok(Some(format!("matched pattern '{resolved_pattern}'")));
+                    }
+
+                    if Instant::now() >= wait_deadline {
+                        let screen_text = inspector
+                            .pane_text(pane_idx)
+                            .unwrap_or_else(|| "<no text>".to_string());
+                        break Err(StepFailure::assertion(
+                            format!(
+                                "wait-for timed out after {}ms on pane {} waiting for pattern '{resolved_pattern}' (attempt {}/{})",
+                                timeout.as_millis(),
+                                pane_idx,
+                                attempt + 1,
+                                max_attempts,
+                            ),
+                            resolved_pattern.clone(),
+                            screen_text,
+                        ));
+                    }
+
+                    tokio::time::sleep(poll_delay).await;
+                    poll_delay = (poll_delay * 2).min(Duration::from_millis(200));
+                };
+
+                match result {
+                    Ok(detail) => return Ok(detail),
+                    Err(err) => {
+                        if attempt + 1 < max_attempts {
+                            info!(
+                                "wait-for attempt {}/{} failed, retrying",
+                                attempt + 1,
+                                max_attempts
+                            );
+                        }
+                        last_err = Some(err);
+                    }
+                }
             }
+
+            // All attempts exhausted.
+            Err(last_err.unwrap().into())
         }
 
         Action::Snapshot { id } => {

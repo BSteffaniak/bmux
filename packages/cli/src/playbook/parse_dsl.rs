@@ -18,13 +18,13 @@ use super::types::{Action, Playbook, PlaybookConfig, ServiceKind, SplitDirection
 /// - Starting with `@`: config directive
 /// - Otherwise: an action line with `key=value` arguments
 ///
-/// Returns the playbook and a list of include paths (from `@include` directives)
-/// that the caller is responsible for resolving and merging.
-pub fn parse_dsl(input: &str) -> Result<(Playbook, Vec<String>)> {
+/// Returns the playbook and a list of (step_index, include_path) pairs from
+/// `@include` directives that the caller is responsible for resolving.
+pub fn parse_dsl(input: &str) -> Result<(Playbook, Vec<(usize, String)>)> {
     let mut config = PlaybookConfig::default();
     let mut steps = Vec::new();
     let mut step_index = 0_usize;
-    let mut includes = Vec::new();
+    let mut includes: Vec<(usize, String)> = Vec::new();
 
     for (line_num, raw_line) in input.lines().enumerate() {
         let line = raw_line.trim();
@@ -35,14 +35,21 @@ pub fn parse_dsl(input: &str) -> Result<(Playbook, Vec<String>)> {
         let line_ctx = line_num + 1;
 
         if let Some(directive) = line.strip_prefix('@') {
-            parse_config_directive(directive.trim(), &mut config, &mut includes)
+            parse_config_directive(directive.trim(), &mut config, &mut includes, step_index)
                 .with_context(|| format!("line {line_ctx}: invalid config directive"))?;
         } else {
-            let action = parse_action_line(line)
+            // Check for !continue suffix.
+            let (action_line, continue_on_error) = if line.ends_with("!continue") {
+                (line[..line.len() - "!continue".len()].trim(), true)
+            } else {
+                (line, false)
+            };
+            let action = parse_action_line(action_line)
                 .with_context(|| format!("line {line_ctx}: invalid action"))?;
             steps.push(Step {
                 index: step_index,
                 action,
+                continue_on_error,
             });
             step_index += 1;
         }
@@ -54,7 +61,8 @@ pub fn parse_dsl(input: &str) -> Result<(Playbook, Vec<String>)> {
 fn parse_config_directive(
     directive: &str,
     config: &mut PlaybookConfig,
-    includes: &mut Vec<String>,
+    includes: &mut Vec<(usize, String)>,
+    current_step_index: usize,
 ) -> Result<()> {
     let (name, rest) = split_first_token(directive);
     match name {
@@ -139,7 +147,7 @@ fn parse_config_directive(
             if path.is_empty() {
                 bail!("@include requires a file path");
             }
-            includes.push(path);
+            includes.push((current_step_index, path));
         }
         _ => bail!("unknown config directive: @{name}"),
     }
@@ -214,10 +222,17 @@ pub(crate) fn parse_action_line(line: &str) -> Result<Action> {
                 .transpose()
                 .context("invalid timeout")?
                 .unwrap_or(5000);
+            let retry: u32 = args
+                .get("retry")
+                .map(|s| s.parse())
+                .transpose()
+                .context("invalid retry count")?
+                .unwrap_or(1);
             Ok(Action::WaitFor {
                 pattern,
                 pane,
                 timeout: Duration::from_millis(timeout_ms),
+                retry,
             })
         }
         "sleep" => {

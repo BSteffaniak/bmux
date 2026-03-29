@@ -413,6 +413,12 @@ pub enum PlaybookCommand {
         /// Override shell
         #[arg(long)]
         shell: Option<String>,
+        /// Define a variable (repeatable). Format: KEY=VALUE
+        #[arg(long = "var")]
+        vars: Vec<String>,
+        /// Print step-by-step progress to stderr
+        #[arg(long, short)]
+        verbose: bool,
     },
     /// Validate a playbook without executing it
     Validate {

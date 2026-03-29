@@ -42,6 +42,8 @@ pub struct PlaybookConfig {
     /// Pre-computed bundled plugin IDs for sandbox plugin configuration.
     /// Populated by the CLI runtime; empty when not available.
     pub bundled_plugin_ids: Vec<String>,
+    /// Print step-by-step progress to stderr during execution.
+    pub verbose: bool,
 }
 
 /// Controls how the sandbox server inherits environment variables.
@@ -89,6 +91,7 @@ impl Default for PlaybookConfig {
             env_mode: None,
             binary: None,
             bundled_plugin_ids: Vec::new(),
+            verbose: false,
         }
     }
 }
@@ -118,6 +121,8 @@ pub struct PluginConfig {
 pub struct Step {
     pub index: usize,
     pub action: Action,
+    /// If true, the playbook continues executing even if this step fails.
+    pub continue_on_error: bool,
 }
 
 /// All supported playbook actions.
@@ -146,6 +151,9 @@ pub enum Action {
         pattern: String,
         pane: Option<u32>,
         timeout: Duration,
+        /// Number of retry attempts (default 1 = no retry). Each attempt
+        /// re-drains output and re-polls from scratch.
+        retry: u32,
     },
     /// Hard pause.
     Sleep { duration: Duration },
@@ -217,6 +225,9 @@ pub struct PlaybookResult {
     pub total_elapsed_ms: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Sandbox temp directory path. Retained on failure for inspection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sandbox_root: Option<String>,
 }
 
 /// Result of a single step execution.
@@ -380,6 +391,7 @@ impl Action {
                 pattern,
                 pane,
                 timeout,
+                retry,
             } => {
                 let escaped = escape_single_quote(pattern);
                 let mut line = format!("wait-for pattern='{escaped}'");
@@ -389,6 +401,9 @@ impl Action {
                 let ms = timeout.as_millis();
                 if ms != 5000 {
                     line.push_str(&format!(" timeout={ms}"));
+                }
+                if *retry > 1 {
+                    line.push_str(&format!(" retry={retry}"));
                 }
                 line
             }
@@ -689,6 +704,7 @@ mod tests {
             pattern: "hello".to_string(),
             pane: None,
             timeout: Duration::from_millis(5000),
+            retry: 1,
         };
         let (dsl, parsed) = round_trip(&action);
         // Default timeout should be omitted from DSL
@@ -713,6 +729,7 @@ mod tests {
             pattern: "prompt\\$".to_string(),
             pane: Some(1),
             timeout: Duration::from_millis(10000),
+            retry: 1,
         };
         let (dsl, parsed) = round_trip(&action);
         assert!(
@@ -724,6 +741,7 @@ mod tests {
                 pattern,
                 pane,
                 timeout,
+                ..
             } => {
                 assert_eq!(pattern, "prompt\\$");
                 assert_eq!(pane, Some(1));

@@ -1517,6 +1517,8 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                         viewport,
                         timeout,
                         shell,
+                        vars,
+                        verbose,
                     },
             },
         ) => {
@@ -1529,6 +1531,8 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 viewport.as_deref(),
                 *timeout,
                 shell.as_deref(),
+                vars,
+                *verbose,
             )
             .await
         }
@@ -8385,6 +8389,8 @@ async fn run_playbook_run(
     viewport: Option<&str>,
     timeout: Option<u64>,
     shell: Option<&str>,
+    cli_vars: &[String],
+    verbose: bool,
 ) -> Result<u8> {
     let mut playbook = if source == "-" {
         crate::playbook::parse_stdin().context("failed parsing playbook from stdin")?
@@ -8409,8 +8415,20 @@ async fn run_playbook_run(
         playbook.config.shell = Some(sh.to_string());
     }
 
+    // CLI --var overrides @var directives.
+    for var_str in cli_vars {
+        if let Some(eq_pos) = var_str.find('=') {
+            let key = var_str[..eq_pos].to_string();
+            let value = var_str[eq_pos + 1..].to_string();
+            playbook.config.vars.insert(key, value);
+        } else {
+            anyhow::bail!("invalid --var format: expected KEY=VALUE, got '{var_str}'");
+        }
+    }
+
     // Populate bundled plugin IDs so the sandbox can configure plugins.
     playbook.config.bundled_plugin_ids = discover_bundled_plugin_ids();
+    playbook.config.verbose = verbose;
 
     let result = crate::playbook::run(playbook, target_server).await?;
 

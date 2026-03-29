@@ -494,6 +494,7 @@ async fn run_repl(
         let step = Step {
             index: *step_counter,
             action,
+            continue_on_error: false,
         };
         *step_counter += 1;
 
@@ -546,7 +547,27 @@ async fn run_repl(
                 write_response(&mut writer, &resp).await?;
             }
             Err(err) => {
-                let resp = InteractiveResponse::fail(&action_name, elapsed_ms, format!("{err:#}"));
+                let mut resp =
+                    InteractiveResponse::fail(&action_name, elapsed_ms, format!("{err:#}"));
+
+                // Extract structured failure data if available (same pattern as batch mode).
+                if let Some(sf) = err.downcast_ref::<super::types::StepFailure>() {
+                    if let Some(ref expected) = sf.expected {
+                        resp.detail = Some(sf.message.clone());
+                        // Use the error field for the structured expected value.
+                        resp.error = Some(format!("expected: {expected}"));
+                    }
+                }
+
+                // Auto-capture pane states on failure.
+                if *attached {
+                    if let Some(sid) = *session_id {
+                        // Refresh screen to get latest state.
+                        let _ = inspector.refresh(client, sid).await;
+                    }
+                    resp.panes = inspector.capture_all_safe();
+                }
+
                 write_response(&mut writer, &resp).await?;
                 // Don't break on failure — let the agent decide what to do.
             }
