@@ -148,8 +148,8 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
                 expected: None,
                 actual: None,
                 failure_captures: None,
+                continue_on_error: step.continue_on_error,
             });
-            continue;
         }
 
         let step_start = Instant::now();
@@ -197,6 +197,7 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
                     expected: None,
                     actual: None,
                     failure_captures: None,
+                    continue_on_error: step.continue_on_error,
                 });
             }
             Err(err) => {
@@ -233,6 +234,7 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
                     expected,
                     actual,
                     failure_captures,
+                    continue_on_error: step.continue_on_error,
                 });
                 if step.continue_on_error {
                     // Record the failure but keep going.

@@ -190,10 +190,11 @@ pub fn format_result(result: &PlaybookResult) -> String {
     out.push('\n');
 
     for step in &result.steps {
-        let icon = match step.status {
-            types::StepStatus::Pass => "+",
-            types::StepStatus::Fail => "x",
-            types::StepStatus::Skip => "-",
+        let icon = match (step.status, step.continue_on_error) {
+            (types::StepStatus::Pass, _) => "+",
+            (types::StepStatus::Fail, true) => "~", // failed but continued
+            (types::StepStatus::Fail, false) => "x",
+            (types::StepStatus::Skip, _) => "-",
         };
         out.push_str(&format!(
             "  [{icon}] step {}: {} ({} ms)",

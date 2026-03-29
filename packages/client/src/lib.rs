@@ -734,6 +734,7 @@ impl BmuxClient {
                 session,
                 target: None,
                 direction,
+                ratio_pct: None,
             })
             .await?
         {
@@ -753,6 +754,7 @@ impl BmuxClient {
                 session,
                 target: Some(target),
                 direction,
+                ratio_pct: None,
             })
             .await?
         {

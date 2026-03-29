@@ -4275,6 +4275,7 @@ async fn handle_request(
             session,
             target,
             direction,
+            ratio_pct: _, // TODO: pass to layout system when supported
         } => {
             let session_id = {
                 let manager = state
@@ -6293,6 +6294,7 @@ mod tests {
                 session: Some(SessionSelector::ById(session_id)),
                 target: None,
                 direction: PaneSplitDirection::Vertical,
+                ratio_pct: None,
             },
         )
         .await;
@@ -6935,6 +6937,7 @@ mod tests {
                 session: Some(SessionSelector::ById(session_id)),
                 target: None,
                 direction: PaneSplitDirection::Vertical,
+                ratio_pct: None,
             },
         )
         .await;

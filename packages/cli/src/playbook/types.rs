@@ -261,6 +261,10 @@ pub struct StepResult {
     /// Only populated when `status == Fail` and the session was attached.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure_captures: Option<Vec<PaneCapture>>,
+    /// Whether this step had `continue_on_error` set. If true and the step
+    /// failed, execution continued past this step.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub continue_on_error: bool,
 }
 
 /// Step execution status.

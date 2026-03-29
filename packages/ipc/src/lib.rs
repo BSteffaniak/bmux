@@ -280,6 +280,10 @@ pub enum Request {
         session: Option<SessionSelector>,
         target: Option<PaneSelector>,
         direction: PaneSplitDirection,
+        /// Split ratio as a percentage (0-100). Currently passed through the
+        /// protocol but not yet used by the server runtime (layout-level feature).
+        #[serde(default)]
+        ratio_pct: Option<u32>,
     },
     FocusPane {
         session: Option<SessionSelector>,
@@ -1191,16 +1195,19 @@ mod tests {
                 session: Some(SessionSelector::ById(id)),
                 target: Some(PaneSelector::ById(id2)),
                 direction: PaneSplitDirection::Vertical,
+                ratio_pct: None,
             },
             Request::SplitPane {
                 session: None,
                 target: Some(PaneSelector::ByIndex(0)),
                 direction: PaneSplitDirection::Horizontal,
+                ratio_pct: None,
             },
             Request::SplitPane {
                 session: None,
                 target: Some(PaneSelector::Active),
                 direction: PaneSplitDirection::Vertical,
+                ratio_pct: None,
             },
             Request::FocusPane {
                 session: None,

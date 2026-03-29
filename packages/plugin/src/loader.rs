@@ -746,6 +746,7 @@ fn handle_core_service_call(
                     session: request.session.map(session_selector_to_ipc),
                     target: request.target.map(pane_selector_to_ipc),
                     direction: pane_split_direction_to_ipc(request.direction),
+                    ratio_pct: None,
                 },
             )?;
             match response {

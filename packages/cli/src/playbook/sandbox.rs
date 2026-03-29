@@ -33,14 +33,12 @@ enum ServerHandle {
         child: std::process::Child,
         paths: ConfigPaths,
         _stdout_log: PathBuf,
-        #[allow(dead_code)]
-        stderr_log: PathBuf,
+        _stderr_log: PathBuf,
     },
     Daemon {
         paths: ConfigPaths,
         _stdout_log: PathBuf,
-        #[allow(dead_code)]
-        stderr_log: PathBuf,
+        _stderr_log: PathBuf,
     },
 }
 
@@ -402,7 +400,7 @@ async fn start_foreground(
         child,
         paths: paths.clone(),
         _stdout_log: stdout_log,
-        stderr_log: stderr_log.clone(),
+        _stderr_log: stderr_log.clone(),
     };
 
     match wait_for_server_ready(paths, timeout, handle.child_mut()).await {
@@ -449,7 +447,7 @@ async fn start_daemon(
     Ok(ServerHandle::Daemon {
         paths: paths.clone(),
         _stdout_log: stdout_log,
-        stderr_log,
+        _stderr_log: stderr_log,
     })
 }
 
@@ -603,7 +601,7 @@ pub fn cleanup_orphaned_sandboxes(dry_run: bool) -> anyhow::Result<(usize, Vec<C
 
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
-        if !name_str.starts_with("bpb-") {
+        if !name_str.starts_with("bpb-") && !name_str.starts_with("brv-") {
             continue;
         }
         if !entry.path().is_dir() {

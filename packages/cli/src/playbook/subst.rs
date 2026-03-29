@@ -137,15 +137,6 @@ impl RuntimeVars {
     }
 }
 
-/// Resolve static variables (parse-time substitution).
-/// Used for the first pass before execution starts.
-#[allow(dead_code)]
-pub fn resolve_static(template: &str, vars: &BTreeMap<String, String>) -> String {
-    let runtime = RuntimeVars::new(vars.clone());
-    // Only resolve static vars and env vars (runtime vars won't match anything yet)
-    runtime.resolve(template)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

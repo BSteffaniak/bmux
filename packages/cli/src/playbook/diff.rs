@@ -637,6 +637,7 @@ mod tests {
             expected: None,
             actual: None,
             failure_captures: None,
+            continue_on_error: false,
         }
     }
 

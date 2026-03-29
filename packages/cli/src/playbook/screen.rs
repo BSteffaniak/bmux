@@ -20,8 +20,7 @@ const SNAPSHOT_MAX_BYTES_PER_PANE: usize = 256 * 1024;
 
 /// Parsed screen state for a single pane after one `refresh()` cycle.
 struct ParsedPane {
-    #[allow(dead_code)]
-    pane_id: Uuid,
+    _pane_id: Uuid,
     pane_index: u32,
     focused: bool,
     screen_text: String,
@@ -104,7 +103,7 @@ impl ScreenInspector {
             let (cursor_row, cursor_col) = screen.cursor_position();
 
             parsed.push(ParsedPane {
-                pane_id: pane_summary.id,
+                _pane_id: pane_summary.id,
                 pane_index: pane_summary.index,
                 focused: pane_summary.focused,
                 screen_text: text,
@@ -122,15 +121,6 @@ impl ScreenInspector {
         self.panes
             .iter()
             .find(|p| p.pane_index == pane_index)
-            .map(|p| p.screen_text.clone())
-    }
-
-    /// Get the full screen text of the focused pane.
-    #[allow(dead_code)]
-    pub fn focused_pane_text(&self) -> Option<String> {
-        self.panes
-            .iter()
-            .find(|p| p.focused)
             .map(|p| p.screen_text.clone())
     }
 
