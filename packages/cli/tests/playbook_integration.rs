@@ -21,6 +21,15 @@ fn fixtures_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/playbooks")
 }
 
+/// Construct a platform-appropriate IPC endpoint from a socket path string.
+fn endpoint_from_socket_path(path: &str) -> bmux_ipc::IpcEndpoint {
+    if cfg!(windows) {
+        bmux_ipc::IpcEndpoint::windows_named_pipe(path.to_string())
+    } else {
+        bmux_ipc::IpcEndpoint::unix_socket(path)
+    }
+}
+
 /// Run a playbook fixture via the bmux binary and return parsed JSON output.
 fn run_playbook_fixture(name: &str) -> (serde_json::Value, bool) {
     let fixture = fixtures_dir().join(name);
@@ -809,11 +818,12 @@ async fn interactive_mode_basic() {
         .as_str()
         .expect("ready message should have socket path");
 
-    // Step 3: Connect to the socket.
+    // Step 3: Connect to the socket using the cross-platform IPC abstraction.
     // Retry a few times in case the socket isn't ready yet.
+    let endpoint = endpoint_from_socket_path(socket_path);
     let mut stream = None;
     for _ in 0..10 {
-        match tokio::net::UnixStream::connect(socket_path).await {
+        match bmux_ipc::transport::LocalIpcStream::connect(&endpoint).await {
             Ok(s) => {
                 stream = Some(s);
                 break;
@@ -826,10 +836,10 @@ async fn interactive_mode_basic() {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = TokioBufReader::new(reader);
 
-    // Helper: send command and read response.
+    // Helper: send command and read response (generic over stream type).
     async fn send_cmd(
-        writer: &mut tokio::io::WriteHalf<tokio::net::UnixStream>,
-        reader: &mut TokioBufReader<tokio::io::ReadHalf<tokio::net::UnixStream>>,
+        writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+        reader: &mut (impl AsyncBufReadExt + Unpin),
         cmd: &str,
     ) -> serde_json::Value {
         writer
