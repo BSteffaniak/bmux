@@ -85,7 +85,7 @@ pub fn plugin_sdk() -> Containers {
     layout::docs_layout(
         "/docs/plugin-sdk",
         "Plugin SDK",
-        &md(include_str!("../../../../../packages/plugin/README.md")),
+        &md(include_str!("../../../../../packages/plugin-sdk/README.md")),
     )
 }
 
