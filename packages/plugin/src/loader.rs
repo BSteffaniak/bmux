@@ -205,51 +205,6 @@ impl ServiceCaller for NativeServiceContext {
     }
 }
 
-/// Dispatch a host kernel bridge call for raw service bytes.
-#[allow(dead_code)]
-pub fn call_host_kernel_raw(context: &NativeServiceContext, payload: Vec<u8>) -> Result<Vec<u8>> {
-    let Some(bridge) = context.host_kernel_bridge else {
-        return Err(PluginError::UnsupportedHostOperation {
-            operation: "call_host_kernel",
-        });
-    };
-    let request = encode_service_message(&HostKernelBridgeRequest { payload })?;
-    let mut output = vec![0u8; request.len().saturating_mul(4).max(1024)];
-    let mut output_len = 0usize;
-
-    let status = bridge.invoke(
-        request.as_ptr(),
-        request.len(),
-        output.as_mut_ptr(),
-        output.len(),
-        &raw mut output_len,
-    );
-
-    if status == KERNEL_STATUS_BUFFER_TOO_SMALL {
-        output.resize(output_len, 0);
-        let status = bridge.invoke(
-            request.as_ptr(),
-            request.len(),
-            output.as_mut_ptr(),
-            output.len(),
-            &raw mut output_len,
-        );
-        if status != KERNEL_STATUS_OK {
-            return Err(PluginError::ServiceProtocol {
-                details: format!("kernel bridge invocation failed with status {status}"),
-            });
-        }
-    } else if status != KERNEL_STATUS_OK {
-        return Err(PluginError::ServiceProtocol {
-            details: format!("kernel bridge invocation failed with status {status}"),
-        });
-    }
-
-    output.truncate(output_len);
-    let response: HostKernelBridgeResponse = decode_service_message(&output)?;
-    Ok(response.payload)
-}
-
 fn call_service_raw(
     caller_plugin_id: &str,
     required_capabilities: &[String],

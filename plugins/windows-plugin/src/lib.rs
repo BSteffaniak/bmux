@@ -27,53 +27,33 @@ impl RustPlugin for WindowsPlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
-        match (
-            context.request.service.interface_id.as_str(),
-            context.request.operation.as_str(),
-        ) {
-            ("window-query/v1", "list") => {
-                handle_service(&context, |req: ListWindowsRequest, ctx| {
-                    let windows = list_windows(ctx, req.session.as_deref())
-                        .map_err(|e| ServiceResponse::error("list_failed", e))?;
-                    Ok(ListWindowsResponse { windows })
-                })
-            }
-            ("window-command/v1", "new") => {
-                handle_service(&context, |req: NewWindowRequest, ctx| {
-                    create_window(ctx, req.name)
-                        .map_err(|e| ServiceResponse::error("new_failed", e))
-                })
-            }
-            ("window-command/v1", "kill") => {
-                handle_service(&context, |req: KillWindowRequest, ctx| {
-                    let selector = parse_selector(&req.target)
-                        .map_err(|e| ServiceResponse::error("invalid_request", e))?;
-                    kill_window(ctx, selector, req.force_local)
-                        .map_err(|e| ServiceResponse::error("kill_failed", e))
-                })
-            }
-            ("window-command/v1", "kill_all") => {
-                handle_service(&context, |req: KillAllWindowsRequest, ctx| {
-                    kill_all_windows(ctx, req.force_local)
-                        .map_err(|e| ServiceResponse::error("kill_failed", e))
-                })
-            }
-            ("window-command/v1", "switch") => {
-                handle_service(&context, |req: SwitchWindowRequest, ctx| {
-                    let selector = parse_selector(&req.target)
-                        .map_err(|e| ServiceResponse::error("invalid_request", e))?;
-                    switch_window(ctx, selector, &mut self.last_selected_by_client)
-                        .map_err(|e| ServiceResponse::error("switch_failed", e))
-                })
-            }
-            _ => ServiceResponse::error(
-                "unsupported_service_operation",
-                format!(
-                    "unsupported windows service invocation '{}:{}'",
-                    context.request.service.interface_id, context.request.operation,
-                ),
-            ),
-        }
+        bmux_plugin_sdk::route_service!(context, {
+            "window-query/v1", "list" => |req: ListWindowsRequest, ctx| {
+                let windows = list_windows(ctx, req.session.as_deref())
+                    .map_err(|e| ServiceResponse::error("list_failed", e))?;
+                Ok(ListWindowsResponse { windows })
+            },
+            "window-command/v1", "new" => |req: NewWindowRequest, ctx| {
+                create_window(ctx, req.name)
+                    .map_err(|e| ServiceResponse::error("new_failed", e))
+            },
+            "window-command/v1", "kill" => |req: KillWindowRequest, ctx| {
+                let selector = parse_selector(&req.target)
+                    .map_err(|e| ServiceResponse::error("invalid_request", e))?;
+                kill_window(ctx, selector, req.force_local)
+                    .map_err(|e| ServiceResponse::error("kill_failed", e))
+            },
+            "window-command/v1", "kill_all" => |req: KillAllWindowsRequest, ctx| {
+                kill_all_windows(ctx, req.force_local)
+                    .map_err(|e| ServiceResponse::error("kill_failed", e))
+            },
+            "window-command/v1", "switch" => |req: SwitchWindowRequest, ctx| {
+                let selector = parse_selector(&req.target)
+                    .map_err(|e| ServiceResponse::error("invalid_request", e))?;
+                switch_window(ctx, selector, &mut self.last_selected_by_client)
+                    .map_err(|e| ServiceResponse::error("switch_failed", e))
+            },
+        })
     }
 }
 

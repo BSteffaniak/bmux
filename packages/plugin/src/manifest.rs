@@ -320,4 +320,32 @@ version = "0.1.0"
                 .is_none()
         );
     }
+
+    #[test]
+    fn explicit_plugin_api_and_native_abi_override_defaults() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "test.custom_compat"
+name = "Custom Compat"
+version = "0.1.0"
+entry = "unused.dylib"
+
+[plugin_api]
+minimum = "2.0"
+maximum = "3.0"
+
+[native_abi]
+minimum = "1.5"
+"#,
+        )
+        .expect("manifest with explicit compat should parse");
+
+        assert_eq!(manifest.plugin_api.minimum, "2.0");
+        assert_eq!(manifest.plugin_api.maximum.as_deref(), Some("3.0"));
+        assert_eq!(manifest.native_abi.minimum, "1.5");
+        assert!(manifest.native_abi.maximum.is_none());
+
+        let declaration = manifest.to_declaration().expect("declaration should build");
+        assert_eq!(declaration.id.as_str(), "test.custom_compat");
+    }
 }

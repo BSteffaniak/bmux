@@ -19,44 +19,26 @@ impl RustPlugin for PermissionsPlugin {
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
-        match (
-            context.request.service.interface_id.as_str(),
-            context.request.operation.as_str(),
-        ) {
-            ("permission-query/v1", "list") => {
-                handle_service(&context, |req: ListPermissionsRequest, ctx| {
-                    let entries = list_entries(ctx, &req.session)
-                        .map_err(|e| ServiceResponse::error("list_failed", e))?;
-                    Ok(ListPermissionsResponse { entries })
-                })
-            }
-            ("permission-command/v1", "grant") => {
-                handle_service(&context, |req: GrantRequest, ctx| {
-                    grant_entry(ctx, req).map_err(|e| ServiceResponse::error("grant_failed", e))?;
-                    Ok(CommandAckResponse { ok: true })
-                })
-            }
-            ("permission-command/v1", "revoke") => {
-                handle_service(&context, |req: RevokeRequest, ctx| {
-                    revoke_entry(ctx, req)
-                        .map_err(|e| ServiceResponse::error("revoke_failed", e))?;
-                    Ok(CommandAckResponse { ok: true })
-                })
-            }
-            ("session-policy-query/v1", "check") => {
-                handle_service(&context, |req: SessionPolicyCheckRequest, ctx| {
-                    evaluate_policy(ctx, &req)
-                        .map_err(|e| ServiceResponse::error("policy_failed", e))
-                })
-            }
-            _ => ServiceResponse::error(
-                "unsupported_service_operation",
-                format!(
-                    "unsupported permissions service invocation '{}:{}'",
-                    context.request.service.interface_id, context.request.operation,
-                ),
-            ),
-        }
+        bmux_plugin_sdk::route_service!(context, {
+            "permission-query/v1", "list" => |req: ListPermissionsRequest, ctx| {
+                let entries = list_entries(ctx, &req.session)
+                    .map_err(|e| ServiceResponse::error("list_failed", e))?;
+                Ok(ListPermissionsResponse { entries })
+            },
+            "permission-command/v1", "grant" => |req: GrantRequest, ctx| {
+                grant_entry(ctx, req).map_err(|e| ServiceResponse::error("grant_failed", e))?;
+                Ok(CommandAckResponse { ok: true })
+            },
+            "permission-command/v1", "revoke" => |req: RevokeRequest, ctx| {
+                revoke_entry(ctx, req)
+                    .map_err(|e| ServiceResponse::error("revoke_failed", e))?;
+                Ok(CommandAckResponse { ok: true })
+            },
+            "session-policy-query/v1", "check" => |req: SessionPolicyCheckRequest, ctx| {
+                evaluate_policy(ctx, &req)
+                    .map_err(|e| ServiceResponse::error("policy_failed", e))
+            },
+        })
     }
 }
 
