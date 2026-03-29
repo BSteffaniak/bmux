@@ -1,4 +1,5 @@
-use crate::{PluginManifest, PluginRegistry, Result};
+use crate::{PluginManifest, PluginRegistry};
+use bmux_plugin_sdk::Result;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};

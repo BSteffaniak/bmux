@@ -1,7 +1,7 @@
-use crate::{
-    ApiVersion, HostScope, PluginCommand, PluginDeclaration, PluginDependency, PluginEntrypoint,
-    PluginError, PluginEventSubscription, PluginFeature, PluginId, PluginService, Result,
-    VersionRange,
+use crate::{PluginDeclaration, PluginDependency, PluginEntrypoint, PluginId};
+use bmux_plugin_sdk::{
+    ApiVersion, HostScope, PluginCommand, PluginError, PluginEventSubscription, PluginFeature,
+    PluginService, Result, VersionRange,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -186,7 +186,7 @@ impl PluginManifest {
 }
 
 fn default_entry_symbol() -> String {
-    crate::DEFAULT_NATIVE_ENTRY_SYMBOL.to_string()
+    bmux_plugin_sdk::DEFAULT_NATIVE_ENTRY_SYMBOL.to_string()
 }
 
 const fn default_true() -> bool {
@@ -200,7 +200,7 @@ fn default_dependency_version_req() -> String {
 #[cfg(test)]
 mod tests {
     use super::PluginManifest;
-    use crate::HostScope;
+    use bmux_plugin_sdk::HostScope;
 
     #[test]
     fn parses_native_plugin_manifest() {

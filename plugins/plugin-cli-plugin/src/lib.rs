@@ -3,10 +3,10 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_plugin::{
-    CapabilityProvider, EXIT_OK, HostScope, NativeCommandContext, PluginCommandError,
-    PluginManifest, PluginRegistry, RustPlugin, discover_plugin_manifests_in_roots,
+    CapabilityProvider, PluginManifest, PluginRegistry, discover_plugin_manifests_in_roots,
     load_registered_plugin,
 };
+use bmux_plugin_sdk::{EXIT_OK, HostScope, NativeCommandContext, PluginCommandError, RustPlugin};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -141,7 +141,7 @@ fn run_run_command(context: &NativeCommandContext) -> Result<i32, String> {
         .map(|capability| {
             let provider = CapabilityProvider {
                 capability: capability.clone(),
-                provider: bmux_plugin::ProviderId::Host,
+                provider: bmux_plugin_sdk::ProviderId::Host,
             };
             (capability, provider)
         })
@@ -597,4 +597,4 @@ struct PluginListEntry {
     commands: Vec<String>,
 }
 
-bmux_plugin::export_plugin!(PluginCliPlugin, include_str!("../plugin.toml"));
+bmux_plugin_sdk::export_plugin!(PluginCliPlugin, include_str!("../plugin.toml"));

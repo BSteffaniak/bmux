@@ -2,30 +2,15 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-//! Plugin system for bmux.
+//! Host-side plugin infrastructure for bmux.
 //!
-//! This crate combines the plugin SDK (re-exported from [`bmux_plugin_sdk`])
-//! with the host-side loading, registry, and discovery infrastructure.
+//! This crate provides the registry, loader, discovery, and validation
+//! machinery that the bmux runtime uses to manage plugins.
 //!
-//! **Plugin authors** should depend on `bmux_plugin_sdk` directly for a slim
-//! dependency footprint.  This crate is for the host runtime and tools that
-//! need the full plugin lifecycle (loading, validation, discovery).
-
-// ── Re-export everything from the SDK ────────────────────────────────────────
-//
-// This ensures backward compatibility: code that uses `bmux_plugin::RustPlugin`
-// continues to work without changes.
-
-pub use bmux_plugin_sdk::*;
-
-// Also re-export the SDK's prelude and __private modules by name so that
-// `bmux_plugin::prelude::*` and macro-generated `$crate::__private::*`
-// paths resolve correctly.
-#[doc(hidden)]
-pub use bmux_plugin_sdk::__private;
-pub use bmux_plugin_sdk::prelude;
-
-// ── Host-only modules ────────────────────────────────────────────────────────
+//! **Plugin authors** should depend on [`bmux_plugin_sdk`] instead — it
+//! provides the [`RustPlugin`](bmux_plugin_sdk::RustPlugin) trait, context
+//! types, macros, and everything needed to write a plugin without pulling
+//! in the host-side dependencies.
 
 mod declaration;
 mod discovery;

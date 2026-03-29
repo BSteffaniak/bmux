@@ -22,13 +22,14 @@ pub const EXIT_UNAVAILABLE: i32 = 70;
 
 // ── Plugin command error ─────────────────────────────────────────────────────
 
-/// Error type returned by [`RustPlugin`] command and lifecycle methods.
+/// Error type for plugin command and lifecycle methods.
 ///
-/// Carries an exit code and a human-readable message.  The SDK prints the
-/// message to stderr and returns the code across the FFI boundary.
+/// Carries an exit code and a human-readable message.  When a plugin method
+/// returns `Err(PluginCommandError)`, the SDK prints the message to stderr
+/// and passes the exit code back to the host.
 ///
-/// Implements `From<String>` and `From<&str>` so you can use `?` with
-/// string errors -- they map to [`EXIT_ERROR`].
+/// Implements `From<String>` and `From<&str>` for easy use with the `?`
+/// operator — string errors map to [`EXIT_ERROR`].
 #[derive(Debug, Clone)]
 pub struct PluginCommandError {
     pub code: i32,
@@ -36,6 +37,7 @@ pub struct PluginCommandError {
 }
 
 impl PluginCommandError {
+    /// Create an error with a specific exit code and message.
     #[must_use]
     pub fn new(code: i32, message: impl Into<String>) -> Self {
         Self {
@@ -44,25 +46,25 @@ impl PluginCommandError {
         }
     }
 
-    /// Generic failure (`EXIT_ERROR`).
+    /// Generic failure ([`EXIT_ERROR`]).
     #[must_use]
     pub fn failed(message: impl Into<String>) -> Self {
         Self::new(EXIT_ERROR, message)
     }
 
-    /// Unknown or unsupported command (`EXIT_USAGE`).
+    /// Unknown or unsupported command ([`EXIT_USAGE`]).
     #[must_use]
     pub fn unknown_command(name: &str) -> Self {
         Self::new(EXIT_USAGE, format!("unknown command '{name}'"))
     }
 
-    /// Invalid arguments (`EXIT_USAGE`).
+    /// Invalid arguments ([`EXIT_USAGE`]).
     #[must_use]
     pub fn invalid_arguments(message: impl Into<String>) -> Self {
         Self::new(EXIT_USAGE, message)
     }
 
-    /// Plugin unavailable (`EXIT_UNAVAILABLE`).
+    /// Plugin unavailable ([`EXIT_UNAVAILABLE`]).
     #[must_use]
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self::new(EXIT_UNAVAILABLE, message)
@@ -114,23 +116,58 @@ const SERVICE_STATUS_PLUGIN_UNAVAILABLE: i32 = 70;
 
 // ── Plugin trait ─────────────────────────────────────────────────────────────
 
+/// The core trait that every bmux plugin implements.
+///
+/// All five methods have default implementations, so a plugin only needs to
+/// override the methods relevant to its functionality:
+///
+/// - [`run_command`](Self::run_command) — handle CLI commands declared in `plugin.toml`
+/// - [`invoke_service`](Self::invoke_service) — handle inbound service calls from other plugins
+/// - [`activate`](Self::activate) / [`deactivate`](Self::deactivate) — lifecycle hooks
+/// - [`handle_event`](Self::handle_event) — react to system or plugin events
+///
+/// ## Error patterns
+///
+/// Commands and lifecycle hooks return `Result<i32, PluginCommandError>` where
+/// the `i32` is an exit code (use [`EXIT_OK`], [`EXIT_ERROR`], etc.).  On
+/// `Err`, the SDK prints the error message to stderr and returns the error's
+/// exit code to the host.
+///
+/// Service handlers return [`ServiceResponse`] directly — a structured RPC
+/// response with an optional error payload.  Use [`handle_service`](crate::handle_service)
+/// or [`route_service!`](crate::route_service) to reduce boilerplate.
 pub trait RustPlugin: Default + Send + 'static {
+    /// Handle a CLI command declared in the plugin manifest.
+    ///
+    /// The default returns `Err(PluginCommandError::unknown_command(""))`.
     fn run_command(&mut self, _context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         Err(PluginCommandError::unknown_command(""))
     }
 
+    /// Called when the plugin is activated by the host.
+    ///
+    /// The default returns `Ok(EXIT_OK)`.
     fn activate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
         Ok(EXIT_OK)
     }
 
+    /// Called when the plugin is deactivated by the host.
+    ///
+    /// The default returns `Ok(EXIT_OK)`.
     fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
         Ok(EXIT_OK)
     }
 
+    /// Called when a subscribed event fires.
+    ///
+    /// The default returns `Ok(EXIT_OK)`.
     fn handle_event(&mut self, _event: PluginEvent) -> Result<i32, PluginCommandError> {
         Ok(EXIT_OK)
     }
 
+    /// Handle an inbound service call from another plugin or the host.
+    ///
+    /// The default returns an "unsupported_service" error response.
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         ServiceResponse::error(
             "unsupported_service",

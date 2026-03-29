@@ -700,6 +700,7 @@ dependencies = [
  "bmux_event",
  "bmux_keybind",
  "bmux_plugin",
+ "bmux_plugin_sdk",
  "bmux_server",
  "bmux_session",
  "bmux_terminal",
@@ -735,6 +736,7 @@ dependencies = [
  "bmux_permissions_plugin",
  "bmux_plugin",
  "bmux_plugin_cli_plugin",
+ "bmux_plugin_sdk",
  "bmux_server",
  "bmux_session",
  "bmux_terminal",
@@ -915,6 +917,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_hello_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_plugin_sdk",
+]
+
+[[package]]
 name = "bmux_ipc"
 version = "0.0.1-alpha.0"
 dependencies = [
@@ -977,6 +986,7 @@ name = "bmux_plugin_cli_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_plugin",
+ "bmux_plugin_sdk",
  "serde",
  "serde_json",
 ]

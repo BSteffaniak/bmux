@@ -1,4 +1,4 @@
-use crate::{
+use bmux_plugin_sdk::{
     CommandExecutionKind, HostScope, PluginCommand, PluginContext, PluginError,
     PluginEventSubscription, PluginFeature, PluginService, Result, VersionRange,
 };
@@ -245,7 +245,9 @@ fn default_dependency_version_req() -> String {
 #[cfg(test)]
 mod tests {
     use super::{PluginDeclaration, PluginDependency, PluginEntrypoint, PluginId};
-    use crate::{ApiVersion, CommandExecutionKind, HostScope, PluginCommand, VersionRange};
+    use bmux_plugin_sdk::{
+        ApiVersion, CommandExecutionKind, HostScope, PluginCommand, VersionRange,
+    };
     use std::collections::BTreeSet;
 
     #[test]

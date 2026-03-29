@@ -1,9 +1,9 @@
 [package]
 authors     = { workspace = true }
-description = "Shipped plugin CLI plugin for bmux"
+description = "Minimal hello-world bmux plugin example"
 edition     = { workspace = true }
 license     = { workspace = true }
-name        = "bmux_plugin_cli_plugin"
+name        = "bmux_hello_plugin"
 publish     = false
 repository  = { workspace = true }
 version     = { workspace = true }
@@ -12,10 +12,7 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bmux_plugin     = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
-serde           = { workspace = true, features = ["derive", "std"] }
-serde_json      = { workspace = true }
 
 [features]
 fail-on-warnings = []

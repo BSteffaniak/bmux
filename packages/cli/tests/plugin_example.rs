@@ -86,7 +86,7 @@ fn bundled_permissions_manifest_exposes_policy_service_interface() {
 
     assert!(permissions.services.iter().any(|service| {
         service.interface_id == "session-policy-query/v1"
-            && service.kind == bmux_plugin::ServiceKind::Query
+            && service.kind == bmux_plugin_sdk::ServiceKind::Query
     }));
 }
 
@@ -96,7 +96,7 @@ fn bundled_windows_manifest_exposes_window_command_service_interface() {
 
     assert!(windows.services.iter().any(|service| {
         service.interface_id == "window-command/v1"
-            && service.kind == bmux_plugin::ServiceKind::Command
+            && service.kind == bmux_plugin_sdk::ServiceKind::Command
     }));
 }
 

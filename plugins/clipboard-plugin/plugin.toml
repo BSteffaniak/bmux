@@ -2,7 +2,6 @@ id                    = "bmux.clipboard"
 name                  = "bmux Clipboard"
 provided_capabilities = ["bmux.clipboard.write"]
 provided_features     = ["bmux.clipboard"]
-runtime               = "native"
 version               = "0.0.1-alpha.0"
 
 [[services]]

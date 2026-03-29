@@ -1,0 +1,8 @@
+id      = "example.hello"
+name    = "Hello Plugin"
+version = "0.0.1"
+
+[[commands]]
+execution = "provider_exec"
+name      = "hello"
+summary   = "Print a greeting"

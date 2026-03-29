@@ -21,11 +21,13 @@ use bmux_ipc::{
 };
 use bmux_keybind::action_to_config_name;
 use bmux_plugin::{
+    PluginManifest, PluginRegistry, load_registered_plugin as load_native_registered_plugin,
+};
+use bmux_plugin_sdk::{
     CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
     HostScope, NativeCommandContext, NativeLifecycleContext, PluginCommandEffect,
-    PluginCommandOutcome, PluginEvent, PluginEventKind, PluginManifest, PluginRegistry,
-    RegisteredService, ServiceKind, ServiceRequest,
-    load_registered_plugin as load_native_registered_plugin,
+    PluginCommandOutcome, PluginEvent, PluginEventKind, RegisteredService, ServiceKind,
+    ServiceRequest,
 };
 use bmux_server::BmuxServer;
 use clap::{CommandFactory, FromArgMatches};
@@ -179,8 +181,8 @@ unsafe extern "C" fn host_kernel_bridge(
     }
 
     let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-    let request: bmux_plugin::HostKernelBridgeRequest =
-        match bmux_plugin::decode_service_message(input) {
+    let request: bmux_plugin_sdk::HostKernelBridgeRequest =
+        match bmux_plugin_sdk::decode_service_message(input) {
             Ok(value) => value,
             Err(_) => return 3,
         };
@@ -207,11 +209,11 @@ unsafe extern "C" fn host_kernel_bridge(
     };
 
     let response = match payload {
-        Ok(payload) => bmux_plugin::HostKernelBridgeResponse { payload },
+        Ok(payload) => bmux_plugin_sdk::HostKernelBridgeResponse { payload },
         Err(_) => return 5,
     };
 
-    let encoded = match bmux_plugin::encode_service_message(&response) {
+    let encoded = match bmux_plugin_sdk::encode_service_message(&response) {
         Ok(value) => value,
         Err(_) => return 5,
     };
@@ -314,73 +316,73 @@ fn core_service_descriptors() -> Vec<RegisteredService> {
             capability: HostScope::new("bmux.config.read").expect("capability should parse"),
             kind: ServiceKind::Query,
             interface_id: "config-query/v1".to_string(),
-            provider: bmux_plugin::ProviderId::Host,
+            provider: bmux_plugin_sdk::ProviderId::Host,
         },
         RegisteredService {
             capability: HostScope::new("bmux.storage").expect("capability should parse"),
             kind: ServiceKind::Query,
             interface_id: "storage-query/v1".to_string(),
-            provider: bmux_plugin::ProviderId::Host,
+            provider: bmux_plugin_sdk::ProviderId::Host,
         },
         RegisteredService {
             capability: HostScope::new("bmux.storage").expect("capability should parse"),
             kind: ServiceKind::Command,
             interface_id: "storage-command/v1".to_string(),
-            provider: bmux_plugin::ProviderId::Host,
+            provider: bmux_plugin_sdk::ProviderId::Host,
         },
         RegisteredService {
             capability: HostScope::new("bmux.logs.write").expect("capability should parse"),
             kind: ServiceKind::Command,
             interface_id: "logging-command/v1".to_string(),
-            provider: bmux_plugin::ProviderId::Host,
+            provider: bmux_plugin_sdk::ProviderId::Host,
         },
         RegisteredService {
             capability: HostScope::new("bmux.clients.read").expect("capability should parse"),
             kind: ServiceKind::Query,
             interface_id: "client-query/v1".to_string(),
-            provider: bmux_plugin::ProviderId::Host,
+            provider: bmux_plugin_sdk::ProviderId::Host,
         },
         RegisteredService {
             capability: HostScope::new("bmux.contexts.read").expect("capability should parse"),
             kind: ServiceKind::Query,
             interface_id: "context-query/v1".to_string(),
-            provider: bmux_plugin::ProviderId::Host,
+            provider: bmux_plugin_sdk::ProviderId::Host,
         },
         RegisteredService {
             capability: HostScope::new("bmux.contexts.write").expect("capability should parse"),
             kind: ServiceKind::Command,
             interface_id: "context-command/v1".to_string(),
-            provider: bmux_plugin::ProviderId::Host,
+            provider: bmux_plugin_sdk::ProviderId::Host,
         },
         RegisteredService {
             capability: HostScope::new("bmux.sessions.read").expect("capability should parse"),
             kind: ServiceKind::Query,
             interface_id: "session-query/v1".to_string(),
-            provider: bmux_plugin::ProviderId::Host,
+            provider: bmux_plugin_sdk::ProviderId::Host,
         },
         RegisteredService {
             capability: HostScope::new("bmux.sessions.write").expect("capability should parse"),
             kind: ServiceKind::Command,
             interface_id: "session-command/v1".to_string(),
-            provider: bmux_plugin::ProviderId::Host,
+            provider: bmux_plugin_sdk::ProviderId::Host,
         },
         RegisteredService {
             capability: HostScope::new("bmux.panes.read").expect("capability should parse"),
             kind: ServiceKind::Query,
             interface_id: "pane-query/v1".to_string(),
-            provider: bmux_plugin::ProviderId::Host,
+            provider: bmux_plugin_sdk::ProviderId::Host,
         },
         RegisteredService {
             capability: HostScope::new("bmux.panes.write").expect("capability should parse"),
             kind: ServiceKind::Command,
             interface_id: "pane-command/v1".to_string(),
-            provider: bmux_plugin::ProviderId::Host,
+            provider: bmux_plugin_sdk::ProviderId::Host,
         },
         RegisteredService {
             capability: HostScope::new("bmux.recording.write").expect("capability should parse"),
             kind: ServiceKind::Command,
             interface_id: "recording-command/v1".to_string(),
-            provider: bmux_plugin::ProviderId::Host,
+            provider: bmux_plugin_sdk::ProviderId::Host,
         },
     ]
 }
@@ -432,7 +434,7 @@ fn register_plugin_service_handlers(
         .into_iter()
         .map(|path| path.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    let connection_info = bmux_plugin::HostConnectionInfo {
+    let connection_info = bmux_plugin_sdk::HostConnectionInfo {
         config_dir: paths.config_dir.to_string_lossy().into_owned(),
         runtime_dir: paths.runtime_dir.to_string_lossy().into_owned(),
         data_dir: paths.data_dir.to_string_lossy().into_owned(),
@@ -447,7 +449,8 @@ fn register_plugin_service_handlers(
         let Some(invoke_kind) = invoke_kind_from_service_kind(service.kind) else {
             continue;
         };
-        let bmux_plugin::ProviderId::Plugin(provider_plugin_id) = service.provider.clone() else {
+        let bmux_plugin_sdk::ProviderId::Plugin(provider_plugin_id) = service.provider.clone()
+        else {
             continue;
         };
         let Some(provider) = registry.get(&provider_plugin_id) else {
@@ -491,61 +494,62 @@ fn register_plugin_service_handlers(
                         enter_service_kernel_context(invoke_context.clone());
                     let _host_kernel_connection_guard =
                         enter_host_kernel_connection(connection.clone());
-                    let response = loaded.invoke_service(&bmux_plugin::NativeServiceContext {
-                        plugin_id: provider.declaration.id.as_str().to_string(),
-                        request: ServiceRequest {
-                            caller_plugin_id: "bmux.core".to_string(),
-                            service: RegisteredService {
-                                capability: HostScope::new(route.capability.as_str())?,
-                                kind: match route.kind {
-                                    InvokeServiceKind::Query => ServiceKind::Query,
-                                    InvokeServiceKind::Command => ServiceKind::Command,
+                    let response =
+                        loaded.invoke_service(&bmux_plugin_sdk::NativeServiceContext {
+                            plugin_id: provider.declaration.id.as_str().to_string(),
+                            request: ServiceRequest {
+                                caller_plugin_id: "bmux.core".to_string(),
+                                service: RegisteredService {
+                                    capability: HostScope::new(route.capability.as_str())?,
+                                    kind: match route.kind {
+                                        InvokeServiceKind::Query => ServiceKind::Query,
+                                        InvokeServiceKind::Command => ServiceKind::Command,
+                                    },
+                                    interface_id: route.interface_id,
+                                    provider: bmux_plugin_sdk::ProviderId::Plugin(
+                                        provider.declaration.id.as_str().to_string(),
+                                    ),
                                 },
-                                interface_id: route.interface_id,
-                                provider: bmux_plugin::ProviderId::Plugin(
-                                    provider.declaration.id.as_str().to_string(),
-                                ),
+                                operation: route.operation,
+                                payload,
                             },
-                            operation: route.operation,
-                            payload,
-                        },
-                        required_capabilities: provider
-                            .declaration
-                            .required_capabilities
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect(),
-                        provided_capabilities: provider
-                            .declaration
-                            .provided_capabilities
-                            .iter()
-                            .map(ToString::to_string)
-                            .collect(),
-                        services,
-                        available_capabilities: capability_names,
-                        enabled_plugins,
-                        plugin_search_roots,
-                        host,
-                        connection,
-                        settings: config
-                            .plugins
-                            .settings
-                            .get(provider.declaration.id.as_str())
-                            .and_then(parse_plugin_settings_value)
-                            .unwrap_or_default(),
-                        plugin_settings_map: config
-                            .plugins
-                            .settings
-                            .iter()
-                            .filter_map(|(plugin_id, value)| {
-                                parse_plugin_settings_value(value)
-                                    .map(|settings| (plugin_id.clone(), settings))
-                            })
-                            .collect(),
-                        host_kernel_bridge: Some(bmux_plugin::HostKernelBridge::from_fn(
-                            host_kernel_bridge,
-                        )),
-                    })?;
+                            required_capabilities: provider
+                                .declaration
+                                .required_capabilities
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect(),
+                            provided_capabilities: provider
+                                .declaration
+                                .provided_capabilities
+                                .iter()
+                                .map(ToString::to_string)
+                                .collect(),
+                            services,
+                            available_capabilities: capability_names,
+                            enabled_plugins,
+                            plugin_search_roots,
+                            host,
+                            connection,
+                            settings: config
+                                .plugins
+                                .settings
+                                .get(provider.declaration.id.as_str())
+                                .and_then(parse_plugin_settings_value)
+                                .unwrap_or_default(),
+                            plugin_settings_map: config
+                                .plugins
+                                .settings
+                                .iter()
+                                .filter_map(|(plugin_id, value)| {
+                                    parse_plugin_settings_value(value)
+                                        .map(|settings| (plugin_id.clone(), settings))
+                                })
+                                .collect(),
+                            host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(
+                                host_kernel_bridge,
+                            )),
+                        })?;
                     if let Some(error) = response.error {
                         anyhow::bail!(error.message);
                     }
@@ -596,7 +600,7 @@ fn service_descriptors_from_declarations<'a>(
                 capability: service.capability.clone(),
                 kind: service.kind,
                 interface_id: service.interface_id.clone(),
-                provider: bmux_plugin::ProviderId::Plugin(declaration.id.as_str().to_string()),
+                provider: bmux_plugin_sdk::ProviderId::Plugin(declaration.id.as_str().to_string()),
             })
     }));
     services
@@ -1754,11 +1758,11 @@ macro_rules! declare_bundled_plugins {
         }
 
         #[allow(unused_variables)]
-        fn static_bundled_vtable(plugin_id: &str) -> Option<bmux_plugin::StaticPluginVtable> {
+        fn static_bundled_vtable(plugin_id: &str) -> Option<bmux_plugin_sdk::StaticPluginVtable> {
             $(
                 #[cfg(feature = $feature)]
                 if plugin_id == $id {
-                    return Some(bmux_plugin::bundled_plugin_vtable!($ty, $manifest));
+                    return Some(bmux_plugin_sdk::bundled_plugin_vtable!($ty, $manifest));
                 }
             )*
             None
@@ -1794,10 +1798,10 @@ fn load_plugin(
     plugin: &bmux_plugin::RegisteredPlugin,
     host: &HostMetadata,
     available_capabilities: &std::collections::BTreeMap<HostScope, bmux_plugin::CapabilityProvider>,
-) -> bmux_plugin::Result<bmux_plugin::LoadedPlugin> {
+) -> bmux_plugin_sdk::Result<bmux_plugin::LoadedPlugin> {
     if plugin.bundled_static {
         let vtable = static_bundled_vtable(plugin.declaration.id.as_str()).ok_or_else(|| {
-            bmux_plugin::PluginError::MissingStaticVtable {
+            bmux_plugin_sdk::PluginError::MissingStaticVtable {
                 plugin_id: plugin.declaration.id.as_str().to_string(),
             }
         })?;
@@ -1851,7 +1855,10 @@ pub(crate) fn scan_available_plugins(
                         // DuplicatePluginId is expected when a static-bundled
                         // plugin is also discovered on the filesystem -- skip
                         // since the static registration already won.
-                        if matches!(error, bmux_plugin::PluginError::DuplicatePluginId { .. }) {
+                        if matches!(
+                            error,
+                            bmux_plugin_sdk::PluginError::DuplicatePluginId { .. }
+                        ) {
                             debug!(
                                 "skipping filesystem plugin {} (duplicate of static-bundled plugin)",
                                 manifest_path.display()
@@ -2136,10 +2143,10 @@ fn load_enabled_plugins(
 
 fn registered_plugin_infos_from_loaded(
     loaded_plugins: &[bmux_plugin::LoadedPlugin],
-) -> Vec<bmux_plugin::RegisteredPluginInfo> {
+) -> Vec<bmux_plugin_sdk::RegisteredPluginInfo> {
     loaded_plugins
         .iter()
-        .map(|plugin| bmux_plugin::RegisteredPluginInfo {
+        .map(|plugin| bmux_plugin_sdk::RegisteredPluginInfo {
             id: plugin.declaration.id.as_str().to_string(),
             display_name: plugin.declaration.display_name.clone(),
             version: plugin.declaration.plugin_version.clone(),
@@ -2168,10 +2175,10 @@ fn registered_plugin_infos_from_loaded(
 
 fn registered_plugin_infos_from_registry(
     registry: &PluginRegistry,
-) -> Vec<bmux_plugin::RegisteredPluginInfo> {
+) -> Vec<bmux_plugin_sdk::RegisteredPluginInfo> {
     registry
         .iter()
-        .map(|plugin| bmux_plugin::RegisteredPluginInfo {
+        .map(|plugin| bmux_plugin_sdk::RegisteredPluginInfo {
             id: plugin.declaration.id.as_str().to_string(),
             display_name: plugin.declaration.display_name.clone(),
             version: plugin.declaration.plugin_version.clone(),
@@ -2206,7 +2213,7 @@ fn plugin_lifecycle_context(
     available_capabilities: Vec<String>,
     enabled_plugins: Vec<String>,
     plugin_search_roots: Vec<String>,
-    registered_plugins: Vec<bmux_plugin::RegisteredPluginInfo>,
+    registered_plugins: Vec<bmux_plugin_sdk::RegisteredPluginInfo>,
 ) -> NativeLifecycleContext {
     let host = plugin_host_for_declaration(declaration, paths, config, available_services.clone());
     NativeLifecycleContext {
@@ -2227,14 +2234,16 @@ fn plugin_lifecycle_context(
         plugin_search_roots,
         registered_plugins,
         host: plugin_host_metadata(),
-        connection: bmux_plugin::PluginHost::connection(&host).clone(),
+        connection: bmux_plugin_sdk::PluginHost::connection(&host).clone(),
         settings: config
             .plugins
             .settings
             .get(declaration.id.as_str())
             .cloned(),
         plugin_settings_map: config.plugins.settings.clone(),
-        host_kernel_bridge: Some(bmux_plugin::HostKernelBridge::from_fn(host_kernel_bridge)),
+        host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(
+            host_kernel_bridge,
+        )),
     }
 }
 
@@ -2248,7 +2257,7 @@ fn plugin_command_context(
     available_capabilities: Vec<String>,
     enabled_plugins: Vec<String>,
     plugin_search_roots: Vec<String>,
-    registered_plugins: Vec<bmux_plugin::RegisteredPluginInfo>,
+    registered_plugins: Vec<bmux_plugin_sdk::RegisteredPluginInfo>,
 ) -> NativeCommandContext {
     let host = plugin_host_for_declaration(declaration, paths, config, available_services.clone());
     NativeCommandContext {
@@ -2271,14 +2280,16 @@ fn plugin_command_context(
         plugin_search_roots,
         registered_plugins,
         host: plugin_host_metadata(),
-        connection: bmux_plugin::PluginHost::connection(&host).clone(),
+        connection: bmux_plugin_sdk::PluginHost::connection(&host).clone(),
         settings: config
             .plugins
             .settings
             .get(declaration.id.as_str())
             .cloned(),
         plugin_settings_map: config.plugins.settings.clone(),
-        host_kernel_bridge: Some(bmux_plugin::HostKernelBridge::from_fn(host_kernel_bridge)),
+        host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(
+            host_kernel_bridge,
+        )),
     }
 }
 
@@ -5415,8 +5426,8 @@ fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
         .context("clipboard service unavailable; ensure a provider is enabled and discoverable")?;
 
     let provider_plugin_id = match &service.provider {
-        bmux_plugin::ProviderId::Plugin(plugin_id) => plugin_id,
-        bmux_plugin::ProviderId::Host => {
+        bmux_plugin_sdk::ProviderId::Plugin(plugin_id) => plugin_id,
+        bmux_plugin_sdk::ProviderId::Host => {
             anyhow::bail!("clipboard service provider must be plugin-owned")
         }
     };
@@ -5424,7 +5435,7 @@ fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
         format!("clipboard service provider '{provider_plugin_id}' was not found")
     })?;
 
-    let payload = bmux_plugin::encode_service_message(&ClipboardWriteRequest {
+    let payload = bmux_plugin_sdk::encode_service_message(&ClipboardWriteRequest {
         text: text.to_string(),
     })?;
     let enabled_plugins = effective_enabled_plugins(&config, &registry);
@@ -5443,14 +5454,14 @@ fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
     )
     .with_context(|| format!("failed loading clipboard service provider '{provider_plugin_id}'"))?;
 
-    let connection = bmux_plugin::HostConnectionInfo {
+    let connection = bmux_plugin_sdk::HostConnectionInfo {
         config_dir: paths.config_dir.to_string_lossy().into_owned(),
         runtime_dir: paths.runtime_dir.to_string_lossy().into_owned(),
         data_dir: paths.data_dir.to_string_lossy().into_owned(),
         state_dir: paths.state_dir.to_string_lossy().into_owned(),
     };
     let _host_kernel_connection_guard = enter_host_kernel_connection(connection.clone());
-    let response = loaded.invoke_service(&bmux_plugin::NativeServiceContext {
+    let response = loaded.invoke_service(&bmux_plugin_sdk::NativeServiceContext {
         plugin_id: provider_plugin_id.clone(),
         request: ServiceRequest {
             caller_plugin_id: "bmux.core".to_string(),
@@ -5478,13 +5489,15 @@ fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
         connection,
         settings: std::collections::BTreeMap::new(),
         plugin_settings_map: std::collections::BTreeMap::new(),
-        host_kernel_bridge: Some(bmux_plugin::HostKernelBridge::from_fn(host_kernel_bridge)),
+        host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(
+            host_kernel_bridge,
+        )),
     })?;
     if let Some(error) = response.error {
         anyhow::bail!(error.message);
     }
 
-    let _: () = bmux_plugin::decode_service_message(&response.payload)
+    let _: () = bmux_plugin_sdk::decode_service_message(&response.payload)
         .context("failed decoding clipboard service response payload")?;
     Ok(())
 }
@@ -8748,7 +8761,8 @@ mod tests {
         AttachViewComponent, ErrorCode, PaneLayoutNode, PaneSummary, RecordingSummary,
         SessionSummary,
     };
-    use bmux_plugin::{PluginCommandEffect, PluginManifest, PluginRegistry};
+    use bmux_plugin::{PluginManifest, PluginRegistry};
+    use bmux_plugin_sdk::PluginCommandEffect;
     use crossterm::event::{
         KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
         KeyEventKind as CrosstermKeyEventKind, KeyModifiers,
@@ -9238,27 +9252,30 @@ mod tests {
             id: bmux_plugin::PluginId::new("example.plugin").expect("id should parse"),
             display_name: "Example".to_string(),
             plugin_version: "0.1.0".to_string(),
-            plugin_api: bmux_plugin::VersionRange::at_least(bmux_plugin::ApiVersion::new(1, 0)),
-            native_abi: bmux_plugin::VersionRange::at_least(bmux_plugin::ApiVersion::new(1, 0)),
+            plugin_api: bmux_plugin_sdk::VersionRange::at_least(bmux_plugin_sdk::ApiVersion::new(
+                1, 0,
+            )),
+            native_abi: bmux_plugin_sdk::VersionRange::at_least(bmux_plugin_sdk::ApiVersion::new(
+                1, 0,
+            )),
             entrypoint: bmux_plugin::PluginEntrypoint::Native {
-                symbol: bmux_plugin::DEFAULT_NATIVE_ENTRY_SYMBOL.to_string(),
+                symbol: bmux_plugin_sdk::DEFAULT_NATIVE_ENTRY_SYMBOL.to_string(),
             },
             description: None,
             homepage: None,
             provider_priority: 0,
-            required_capabilities: std::collections::BTreeSet::from([bmux_plugin::HostScope::new(
-                "bmux.commands",
-            )
-            .expect("capability should parse")]),
-            provided_capabilities: std::collections::BTreeSet::from([bmux_plugin::HostScope::new(
-                "example.provider.write",
-            )
-            .expect("capability should parse")]),
-            provided_features: std::collections::BTreeSet::new(),
-            services: vec![bmux_plugin::PluginService {
-                capability: bmux_plugin::HostScope::new("example.provider.write")
+            required_capabilities: std::collections::BTreeSet::from([
+                bmux_plugin_sdk::HostScope::new("bmux.commands").expect("capability should parse"),
+            ]),
+            provided_capabilities: std::collections::BTreeSet::from([
+                bmux_plugin_sdk::HostScope::new("example.provider.write")
                     .expect("capability should parse"),
-                kind: bmux_plugin::ServiceKind::Command,
+            ]),
+            provided_features: std::collections::BTreeSet::new(),
+            services: vec![bmux_plugin_sdk::PluginService {
+                capability: bmux_plugin_sdk::HostScope::new("example.provider.write")
+                    .expect("capability should parse"),
+                kind: bmux_plugin_sdk::ServiceKind::Command,
                 interface_id: "provider-command/v1".to_string(),
             }],
             commands: Vec::new(),
@@ -9387,36 +9404,41 @@ mod tests {
             id: bmux_plugin::PluginId::new("provider.plugin").expect("id should parse"),
             display_name: "Provider".to_string(),
             plugin_version: "0.1.0".to_string(),
-            plugin_api: bmux_plugin::VersionRange::at_least(bmux_plugin::ApiVersion::new(1, 0)),
-            native_abi: bmux_plugin::VersionRange::at_least(bmux_plugin::ApiVersion::new(1, 0)),
+            plugin_api: bmux_plugin_sdk::VersionRange::at_least(bmux_plugin_sdk::ApiVersion::new(
+                1, 0,
+            )),
+            native_abi: bmux_plugin_sdk::VersionRange::at_least(bmux_plugin_sdk::ApiVersion::new(
+                1, 0,
+            )),
             entrypoint: bmux_plugin::PluginEntrypoint::Native {
-                symbol: bmux_plugin::DEFAULT_NATIVE_ENTRY_SYMBOL.to_string(),
+                symbol: bmux_plugin_sdk::DEFAULT_NATIVE_ENTRY_SYMBOL.to_string(),
             },
             description: None,
             homepage: None,
             provider_priority: 0,
             required_capabilities: std::collections::BTreeSet::from([
-                bmux_plugin::HostScope::new("bmux.commands").expect("capability should parse"),
-                bmux_plugin::HostScope::new("example.base.read").expect("capability should parse"),
+                bmux_plugin_sdk::HostScope::new("bmux.commands").expect("capability should parse"),
+                bmux_plugin_sdk::HostScope::new("example.base.read")
+                    .expect("capability should parse"),
             ]),
             provided_capabilities: std::collections::BTreeSet::from([
-                bmux_plugin::HostScope::new("example.provider.read")
+                bmux_plugin_sdk::HostScope::new("example.provider.read")
                     .expect("capability should parse"),
-                bmux_plugin::HostScope::new("example.provider.write")
+                bmux_plugin_sdk::HostScope::new("example.provider.write")
                     .expect("capability should parse"),
             ]),
             provided_features: std::collections::BTreeSet::new(),
             services: vec![
-                bmux_plugin::PluginService {
-                    capability: bmux_plugin::HostScope::new("example.provider.read")
+                bmux_plugin_sdk::PluginService {
+                    capability: bmux_plugin_sdk::HostScope::new("example.provider.read")
                         .expect("capability should parse"),
-                    kind: bmux_plugin::ServiceKind::Query,
+                    kind: bmux_plugin_sdk::ServiceKind::Query,
                     interface_id: "provider-query/v1".to_string(),
                 },
-                bmux_plugin::PluginService {
-                    capability: bmux_plugin::HostScope::new("example.provider.write")
+                bmux_plugin_sdk::PluginService {
+                    capability: bmux_plugin_sdk::HostScope::new("example.provider.write")
                         .expect("capability should parse"),
-                    kind: bmux_plugin::ServiceKind::Command,
+                    kind: bmux_plugin_sdk::ServiceKind::Command,
                     interface_id: "provider-command/v1".to_string(),
                 },
             ],
@@ -9535,7 +9557,7 @@ mod tests {
     #[test]
     fn plugin_system_event_uses_system_kind_and_name() {
         let event = super::plugin_system_event("server_started");
-        assert_eq!(event.kind, bmux_plugin::PluginEventKind::System);
+        assert_eq!(event.kind, bmux_plugin_sdk::PluginEventKind::System);
         assert_eq!(event.name, "server_started");
         assert_eq!(
             event
@@ -9556,7 +9578,7 @@ mod tests {
             })
             .expect("plugin event should build");
         let session_id_text = session_id.to_string();
-        assert_eq!(event.kind, bmux_plugin::PluginEventKind::Session);
+        assert_eq!(event.kind, bmux_plugin_sdk::PluginEventKind::Session);
         assert_eq!(event.name, "session_created");
         assert!(event.payload.to_string().contains(&session_id_text));
     }

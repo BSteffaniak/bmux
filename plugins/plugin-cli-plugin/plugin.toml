@@ -1,7 +1,6 @@
 id                    = "bmux.plugin_cli"
 name                  = "bmux Plugin CLI"
 required_capabilities = ["bmux.commands"]
-runtime               = "native"
 version               = "0.0.1-alpha.0"
 
 [[commands]]

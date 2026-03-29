@@ -39,26 +39,38 @@ pub struct RegisteredPluginInfo {
 pub struct NativeLifecycleContext {
     /// The plugin's own ID (e.g. `"bmux.clipboard"`).
     pub plugin_id: String,
+    /// Capabilities this plugin declared as required in its manifest.
     #[serde(default)]
     pub required_capabilities: Vec<String>,
+    /// Capabilities this plugin provides to other plugins.
     #[serde(default)]
     pub provided_capabilities: Vec<String>,
+    /// Registered services visible to this plugin for cross-plugin calls.
     #[serde(default)]
     pub services: Vec<RegisteredService>,
+    /// All capabilities available in the current host environment.
     #[serde(default)]
     pub available_capabilities: Vec<String>,
+    /// IDs of all currently enabled plugins.
     #[serde(default)]
     pub enabled_plugins: Vec<String>,
+    /// Filesystem roots where plugin manifests are discovered.
     #[serde(default)]
     pub plugin_search_roots: Vec<String>,
+    /// Summary of all registered plugins (for introspection).
     #[serde(default)]
     pub registered_plugins: Vec<RegisteredPluginInfo>,
+    /// Host runtime metadata (product name, version, API version).
     pub host: HostMetadata,
+    /// Host connection paths (config dir, runtime dir, data dir, state dir).
     pub connection: HostConnectionInfo,
+    /// Plugin-specific settings from the host configuration.
     #[serde(default)]
     pub settings: Option<toml::Value>,
+    /// Settings map for all plugins (keyed by plugin ID).
     #[serde(default)]
     pub plugin_settings_map: BTreeMap<String, toml::Value>,
+    /// Opaque handle for dispatching calls to the host kernel (internal use).
     #[serde(default)]
     pub host_kernel_bridge: Option<HostKernelBridge>,
 }
@@ -72,26 +84,38 @@ pub struct NativeCommandContext {
     pub command: String,
     /// Positional and flag arguments passed to the command.
     pub arguments: Vec<String>,
+    /// Capabilities this plugin declared as required in its manifest.
     #[serde(default)]
     pub required_capabilities: Vec<String>,
+    /// Capabilities this plugin provides to other plugins.
     #[serde(default)]
     pub provided_capabilities: Vec<String>,
+    /// Registered services visible to this plugin for cross-plugin calls.
     #[serde(default)]
     pub services: Vec<RegisteredService>,
+    /// All capabilities available in the current host environment.
     #[serde(default)]
     pub available_capabilities: Vec<String>,
+    /// IDs of all currently enabled plugins.
     #[serde(default)]
     pub enabled_plugins: Vec<String>,
+    /// Filesystem roots where plugin manifests are discovered.
     #[serde(default)]
     pub plugin_search_roots: Vec<String>,
+    /// Summary of all registered plugins (for introspection).
     #[serde(default)]
     pub registered_plugins: Vec<RegisteredPluginInfo>,
+    /// Host runtime metadata (product name, version, API version).
     pub host: HostMetadata,
+    /// Host connection paths (config dir, runtime dir, data dir, state dir).
     pub connection: HostConnectionInfo,
+    /// Plugin-specific settings from the host configuration.
     #[serde(default)]
     pub settings: Option<toml::Value>,
+    /// Settings map for all plugins (keyed by plugin ID).
     #[serde(default)]
     pub plugin_settings_map: BTreeMap<String, toml::Value>,
+    /// Opaque handle for dispatching calls to the host kernel (internal use).
     #[serde(default)]
     pub host_kernel_bridge: Option<HostKernelBridge>,
 }
@@ -103,24 +127,35 @@ pub struct NativeServiceContext {
     pub plugin_id: String,
     /// The inbound service request (interface ID, operation, payload).
     pub request: ServiceRequest,
+    /// Capabilities this plugin declared as required in its manifest.
     #[serde(default)]
     pub required_capabilities: Vec<String>,
+    /// Capabilities this plugin provides to other plugins.
     #[serde(default)]
     pub provided_capabilities: Vec<String>,
+    /// Registered services visible to this plugin for cross-plugin calls.
     #[serde(default)]
     pub services: Vec<RegisteredService>,
+    /// All capabilities available in the current host environment.
     #[serde(default)]
     pub available_capabilities: Vec<String>,
+    /// IDs of all currently enabled plugins.
     #[serde(default)]
     pub enabled_plugins: Vec<String>,
+    /// Filesystem roots where plugin manifests are discovered.
     #[serde(default)]
     pub plugin_search_roots: Vec<String>,
+    /// Host runtime metadata (product name, version, API version).
     pub host: HostMetadata,
+    /// Host connection paths (config dir, runtime dir, data dir, state dir).
     pub connection: HostConnectionInfo,
+    /// Plugin-specific settings from the host configuration.
     #[serde(default)]
     pub settings: BTreeMap<String, String>,
+    /// Settings map for all plugins (keyed by plugin ID).
     #[serde(default)]
     pub plugin_settings_map: BTreeMap<String, BTreeMap<String, String>>,
+    /// Opaque handle for dispatching calls to the host kernel (internal use).
     #[serde(default)]
     pub host_kernel_bridge: Option<HostKernelBridge>,
 }
@@ -135,6 +170,10 @@ type HostKernelBridgeFn = unsafe extern "C" fn(
     output_len: *mut usize,
 ) -> i32;
 
+/// Opaque handle to a host kernel bridge function pointer.
+///
+/// Used internally by the service dispatch machinery. Plugin authors
+/// do not interact with this type directly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct HostKernelBridge(u64);

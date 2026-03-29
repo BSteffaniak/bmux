@@ -1,7 +1,5 @@
-use crate::{
-    HostMetadata, HostScope, PluginDeclaration, PluginError, PluginManifest, RegisteredService,
-    Result,
-};
+use crate::{PluginDeclaration, PluginManifest};
+use bmux_plugin_sdk::{HostMetadata, HostScope, PluginError, RegisteredService, Result};
 use semver::Version;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -38,7 +36,7 @@ pub struct PluginRegistry {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityProvider {
     pub capability: HostScope,
-    pub provider: crate::ProviderId,
+    pub provider: bmux_plugin_sdk::ProviderId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -315,7 +313,7 @@ impl PluginRegistry {
                 capability.clone(),
                 CapabilityProvider {
                     capability: capability.clone(),
-                    provider: crate::ProviderId::Host,
+                    provider: bmux_plugin_sdk::ProviderId::Host,
                 },
             );
         }
@@ -325,8 +323,8 @@ impl PluginRegistry {
             for capability in &plugin.declaration.provided_capabilities {
                 if let Some(existing) = providers.get(capability)
                     && match &existing.provider {
-                        crate::ProviderId::Host => true,
-                        crate::ProviderId::Plugin(existing_id) => {
+                        bmux_plugin_sdk::ProviderId::Host => true,
+                        bmux_plugin_sdk::ProviderId::Plugin(existing_id) => {
                             !self.plugin_preferred_over(&plugin_id, existing_id)
                         }
                     }
@@ -337,7 +335,7 @@ impl PluginRegistry {
                     capability.clone(),
                     CapabilityProvider {
                         capability: capability.clone(),
-                        provider: crate::ProviderId::Plugin(plugin_id.clone()),
+                        provider: bmux_plugin_sdk::ProviderId::Plugin(plugin_id.clone()),
                     },
                 );
             }
@@ -418,9 +416,11 @@ impl PluginRegistry {
     pub fn service_providers_for(
         &self,
         plugin_ids: &[String],
-    ) -> Result<BTreeMap<(HostScope, crate::ServiceKind, String), ServiceProvider>> {
-        let mut providers: BTreeMap<(HostScope, crate::ServiceKind, String), ServiceProvider> =
-            BTreeMap::new();
+    ) -> Result<BTreeMap<(HostScope, bmux_plugin_sdk::ServiceKind, String), ServiceProvider>> {
+        let mut providers: BTreeMap<
+            (HostScope, bmux_plugin_sdk::ServiceKind, String),
+            ServiceProvider,
+        > = BTreeMap::new();
         for plugin in self.activation_order_for(plugin_ids)? {
             let plugin_id = plugin.declaration.id.as_str().to_string();
             for service in &plugin.declaration.services {
@@ -428,12 +428,12 @@ impl PluginRegistry {
                     capability: service.capability.clone(),
                     kind: service.kind,
                     interface_id: service.interface_id.clone(),
-                    provider: crate::ProviderId::Plugin(plugin_id.clone()),
+                    provider: bmux_plugin_sdk::ProviderId::Plugin(plugin_id.clone()),
                 };
                 if let Some(existing) = providers.get(&registered.key())
                     && match &existing.service.provider {
-                        crate::ProviderId::Host => true,
-                        crate::ProviderId::Plugin(existing_id) => {
+                        bmux_plugin_sdk::ProviderId::Host => true,
+                        bmux_plugin_sdk::ProviderId::Plugin(existing_id) => {
                             !self.plugin_preferred_over(&plugin_id, existing_id)
                         }
                     }
@@ -478,7 +478,8 @@ impl PluginRegistry {
 #[cfg(test)]
 mod tests {
     use super::PluginRegistry;
-    use crate::{ApiVersion, HostMetadata, HostScope, PluginManifest};
+    use crate::PluginManifest;
+    use bmux_plugin_sdk::{ApiVersion, HostMetadata, HostScope};
     use std::fs;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -740,7 +741,7 @@ minimum = "1.0"
             .expect("service provider selection should succeed");
         let key = (
             HostScope::new("bmux.windows.read").expect("scope should parse"),
-            crate::ServiceKind::Query,
+            bmux_plugin_sdk::ServiceKind::Query,
             "window-query/v1".to_string(),
         );
         let selected = providers

@@ -1,5 +1,5 @@
 use bmux_config::{BmuxConfig, ConfigPaths};
-use bmux_plugin::{HostConnectionInfo, HostMetadata, HostScope, PluginHost, RegisteredService};
+use bmux_plugin_sdk::{HostConnectionInfo, HostMetadata, HostScope, PluginHost, RegisteredService};
 use std::collections::BTreeSet;
 
 pub struct CliPluginHost {
@@ -67,7 +67,7 @@ impl PluginHost for CliPluginHost {
 mod tests {
     use super::CliPluginHost;
     use bmux_config::{BmuxConfig, ConfigPaths};
-    use bmux_plugin::{
+    use bmux_plugin_sdk::{
         CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostMetadata, HostScope,
         PluginHost, RegisteredService, ServiceKind,
     };
@@ -79,7 +79,7 @@ mod tests {
             capability: HostScope::new(capability).expect("capability should parse"),
             kind,
             interface_id: interface_id.to_string(),
-            provider: bmux_plugin::ProviderId::Plugin("provider.plugin".to_string()),
+            provider: bmux_plugin_sdk::ProviderId::Plugin("provider.plugin".to_string()),
         }
     }
 

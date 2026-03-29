@@ -3,7 +3,7 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_cli_output::{Table, TableColumn, write_table};
-use bmux_plugin::{HostRuntimeApi, ServiceCaller};
+use bmux_plugin::ServiceCaller;
 use bmux_plugin_sdk::EXIT_USAGE;
 use bmux_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};

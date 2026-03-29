@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "examples/hello-plugin",
     "examples/native-plugin",
     "packages/bmux",
     "packages/codec",

@@ -1,9 +1,8 @@
 use super::built_in_commands::reserved_built_in_paths;
 use anyhow::{Context, Result, bail};
 use bmux_config::BmuxConfig;
-use bmux_plugin::{
-    PluginCommand, PluginCommandArgument, PluginCommandArgumentKind, PluginRegistry,
-};
+use bmux_plugin::PluginRegistry;
+use bmux_plugin_sdk::{PluginCommand, PluginCommandArgument, PluginCommandArgumentKind};
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use std::collections::{BTreeMap, BTreeSet};
 

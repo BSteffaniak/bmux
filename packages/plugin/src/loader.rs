@@ -1,31 +1,33 @@
 use crate::{
-    CapabilityProvider, ContextCloseRequest, ContextCloseResponse, ContextCreateRequest,
-    ContextCreateResponse, ContextCurrentResponse, ContextListResponse, ContextSelectRequest,
-    ContextSelectResponse, ContextSelector as HostContextSelector,
-    ContextSummary as HostContextSummary, CurrentClientResponse, DEFAULT_NATIVE_ACTIVATE_SYMBOL,
-    DEFAULT_NATIVE_COMMAND_SYMBOL, DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL,
-    DEFAULT_NATIVE_DEACTIVATE_SYMBOL, DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL,
-    HostConnectionInfo, HostKernelBridge, HostKernelBridgeRequest, HostKernelBridgeResponse,
-    HostMetadata, HostScope, LogWriteLevel, NativeCommandContext, NativeLifecycleContext,
-    NativeServiceContext, PaneCloseRequest, PaneCloseResponse,
-    PaneFocusDirection as HostPaneFocusDirection, PaneFocusRequest, PaneFocusResponse,
-    PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse,
-    PaneSelector as HostPaneSelector, PaneSplitDirection as HostPaneSplitDirection,
-    PaneSplitRequest, PaneSplitResponse, PaneSummary as HostPaneSummary, PluginDeclaration,
-    PluginEntrypoint, PluginError, PluginEvent, PluginRegistry, RecordingWriteEventRequest,
-    RecordingWriteEventResponse, RegisteredPlugin, RegisteredService, Result, ServiceCaller,
-    ServiceEnvelopeKind, ServiceKind, ServiceRequest, ServiceResponse, SessionCreateRequest,
-    SessionCreateResponse, SessionKillRequest, SessionKillResponse, SessionListResponse,
-    SessionSelectRequest, SessionSelectResponse, SessionSelector as HostSessionSelector,
-    SessionSummary as HostSessionSummary, StaticPluginVtable, decode_service_envelope,
-    decode_service_message, discover_registered_plugins_in_roots, encode_service_envelope,
-    encode_service_message,
+    CapabilityProvider, DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_COMMAND_SYMBOL,
+    DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
+    DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL, PluginDeclaration,
+    PluginEntrypoint, PluginRegistry, RegisteredPlugin, ServiceCaller,
+    discover_registered_plugins_in_roots,
 };
 use bmux_ipc::{
     ContextSelector as IpcContextSelector, PaneFocusDirection as IpcPaneFocusDirection,
     PaneSelector as IpcPaneSelector, PaneSplitDirection as IpcPaneSplitDirection,
     Request as IpcRequest, Response as IpcResponse, ResponsePayload as IpcResponsePayload,
     SessionSelector as IpcSessionSelector,
+};
+use bmux_plugin_sdk::{
+    ContextCloseRequest, ContextCloseResponse, ContextCreateRequest, ContextCreateResponse,
+    ContextCurrentResponse, ContextListResponse, ContextSelectRequest, ContextSelectResponse,
+    ContextSelector as HostContextSelector, ContextSummary as HostContextSummary,
+    CurrentClientResponse, HostConnectionInfo, HostKernelBridge, HostKernelBridgeRequest,
+    HostKernelBridgeResponse, HostMetadata, HostScope, LogWriteLevel, NativeCommandContext,
+    NativeLifecycleContext, NativeServiceContext, PaneCloseRequest, PaneCloseResponse,
+    PaneFocusDirection as HostPaneFocusDirection, PaneFocusRequest, PaneFocusResponse,
+    PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse,
+    PaneSelector as HostPaneSelector, PaneSplitDirection as HostPaneSplitDirection,
+    PaneSplitRequest, PaneSplitResponse, PaneSummary as HostPaneSummary, PluginError, PluginEvent,
+    RecordingWriteEventRequest, RecordingWriteEventResponse, RegisteredService, Result,
+    ServiceEnvelopeKind, ServiceKind, ServiceRequest, ServiceResponse, SessionCreateRequest,
+    SessionCreateResponse, SessionKillRequest, SessionKillResponse, SessionListResponse,
+    SessionSelectRequest, SessionSelectResponse, SessionSelector as HostSessionSelector,
+    SessionSummary as HostSessionSummary, StaticPluginVtable, decode_service_envelope,
+    decode_service_message, encode_service_envelope, encode_service_message,
 };
 use libloading::{Library, Symbol};
 use serde::{Deserialize, Serialize};
@@ -59,18 +61,18 @@ enum PluginBackend {
 }
 
 thread_local! {
-    static COMMAND_OUTCOME_CAPTURE: RefCell<Option<crate::PluginCommandOutcome>> = const { RefCell::new(None) };
+    static COMMAND_OUTCOME_CAPTURE: RefCell<Option<bmux_plugin_sdk::PluginCommandOutcome>> = const { RefCell::new(None) };
 }
 
 fn begin_command_outcome_capture() {
     COMMAND_OUTCOME_CAPTURE.with(|slot| {
-        *slot.borrow_mut() = Some(crate::PluginCommandOutcome {
+        *slot.borrow_mut() = Some(bmux_plugin_sdk::PluginCommandOutcome {
             effects: Vec::new(),
         });
     });
 }
 
-fn record_command_effect(effect: crate::PluginCommandEffect) {
+fn record_command_effect(effect: bmux_plugin_sdk::PluginCommandEffect) {
     COMMAND_OUTCOME_CAPTURE.with(|slot| {
         if let Some(outcome) = slot.borrow_mut().as_mut() {
             outcome.effects.push(effect);
@@ -78,10 +80,10 @@ fn record_command_effect(effect: crate::PluginCommandEffect) {
     });
 }
 
-fn finish_command_outcome_capture() -> crate::PluginCommandOutcome {
+fn finish_command_outcome_capture() -> bmux_plugin_sdk::PluginCommandOutcome {
     COMMAND_OUTCOME_CAPTURE
         .with(|slot| slot.borrow_mut().take())
-        .unwrap_or(crate::PluginCommandOutcome {
+        .unwrap_or(bmux_plugin_sdk::PluginCommandOutcome {
             effects: Vec::new(),
         })
 }
@@ -292,7 +294,7 @@ fn call_service_raw(
             operation: "call_service",
         })?;
 
-    if matches!(service.provider, crate::ProviderId::Host) {
+    if matches!(service.provider, bmux_plugin_sdk::ProviderId::Host) {
         return handle_core_service_call(
             caller_plugin_id,
             connection,
@@ -310,8 +312,10 @@ fn call_service_raw(
         .collect::<Vec<_>>();
     let registry = discover_registered_plugins_in_roots(&search_roots)?;
     let provider_plugin_id = match &service.provider {
-        crate::ProviderId::Plugin(plugin_id) => plugin_id.clone(),
-        crate::ProviderId::Host => unreachable!("host services should be handled earlier"),
+        bmux_plugin_sdk::ProviderId::Plugin(plugin_id) => plugin_id.clone(),
+        bmux_plugin_sdk::ProviderId::Host => {
+            unreachable!("host services should be handled earlier")
+        }
     };
     let registered =
         registry
@@ -328,7 +332,7 @@ fn call_service_raw(
         .map(|capability| {
             let provider = CapabilityProvider {
                 capability: capability.clone(),
-                provider: crate::ProviderId::Host,
+                provider: bmux_plugin_sdk::ProviderId::Host,
             };
             (capability, provider)
         })
@@ -471,7 +475,7 @@ fn handle_core_service_call(
             encode_service_message(&())
         }
         ("logging-command/v1", "write") => {
-            let request: crate::LogWriteRequest = decode_service_message(&payload)?;
+            let request: bmux_plugin_sdk::LogWriteRequest = decode_service_message(&payload)?;
             emit_plugin_log(caller_plugin_id, &request)?;
             encode_service_message(&())
         }
@@ -595,7 +599,7 @@ fn handle_core_service_call(
             )?;
             match response {
                 IpcResponsePayload::ContextCreated { context } => {
-                    record_command_effect(crate::PluginCommandEffect::SelectContext {
+                    record_command_effect(bmux_plugin_sdk::PluginCommandEffect::SelectContext {
                         context_id: context.id,
                     });
                     encode_service_message(&ContextCreateResponse {
@@ -622,7 +626,7 @@ fn handle_core_service_call(
             )?;
             match response {
                 IpcResponsePayload::ContextSelected { context } => {
-                    record_command_effect(crate::PluginCommandEffect::SelectContext {
+                    record_command_effect(bmux_plugin_sdk::PluginCommandEffect::SelectContext {
                         context_id: context.id,
                     });
                     encode_service_message(&ContextSelectResponse {
@@ -826,7 +830,10 @@ fn handle_core_service_call(
     }
 }
 
-fn emit_plugin_log(caller_plugin_id: &str, request: &crate::LogWriteRequest) -> Result<()> {
+fn emit_plugin_log(
+    caller_plugin_id: &str,
+    request: &bmux_plugin_sdk::LogWriteRequest,
+) -> Result<()> {
     let requested_target = request
         .target
         .as_deref()
@@ -1011,7 +1018,7 @@ pub struct LoadedPlugin {
 
 impl LoadedPlugin {
     #[must_use]
-    pub fn commands(&self) -> &[crate::PluginCommand] {
+    pub fn commands(&self) -> &[bmux_plugin_sdk::PluginCommand] {
         &self.declaration.commands
     }
 
@@ -1063,7 +1070,7 @@ impl LoadedPlugin {
         command_name: &str,
         arguments: &[String],
         context: Option<&NativeCommandContext>,
-    ) -> Result<(i32, crate::PluginCommandOutcome)> {
+    ) -> Result<(i32, bmux_plugin_sdk::PluginCommandOutcome)> {
         if !self.supports_command(command_name) {
             return Err(PluginError::UnknownPluginCommand {
                 plugin_id: self.declaration.id.as_str().to_string(),
@@ -1151,7 +1158,7 @@ impl LoadedPlugin {
 
         Ok((
             status,
-            crate::PluginCommandOutcome {
+            bmux_plugin_sdk::PluginCommandOutcome {
                 effects: Vec::new(),
             },
         ))
@@ -1628,10 +1635,10 @@ fn ensure_match(
 #[cfg(test)]
 mod tests {
     use super::{LoadedPlugin, PluginBackend};
-    use crate::{
+    use crate::{PluginEntrypoint, PluginManifest, PluginRegistry, ServiceCaller};
+    use bmux_plugin_sdk::{
         ApiVersion, DEFAULT_NATIVE_ENTRY_SYMBOL, HostMetadata, NativeLifecycleContext,
-        NativeServiceContext, PluginEntrypoint, PluginEvent, PluginEventKind,
-        PluginEventSubscription, PluginManifest, PluginRegistry, ServiceCaller,
+        NativeServiceContext, PluginEvent, PluginEventKind, PluginEventSubscription,
         ServiceEnvelopeKind, ServiceResponse, decode_service_envelope, decode_service_message,
         encode_service_envelope, encode_service_message,
     };
@@ -1964,7 +1971,7 @@ minimum = "1.0"
                 plugin_api_version: ApiVersion::new(1, 0),
                 plugin_abi_version: ApiVersion::new(1, 0),
             },
-            connection: crate::HostConnectionInfo {
+            connection: bmux_plugin_sdk::HostConnectionInfo {
                 config_dir: "/config".to_string(),
                 runtime_dir: "/runtime".to_string(),
                 data_dir: "/data".to_string(),
@@ -1989,12 +1996,12 @@ minimum = "1.0"
             arguments: Vec::new(),
             required_capabilities: Vec::new(),
             provided_capabilities: Vec::new(),
-            services: vec![crate::RegisteredService {
-                capability: crate::HostScope::new("bmux.permissions.read")
+            services: vec![bmux_plugin_sdk::RegisteredService {
+                capability: bmux_plugin_sdk::HostScope::new("bmux.permissions.read")
                     .expect("capability should parse"),
-                kind: crate::ServiceKind::Query,
+                kind: bmux_plugin_sdk::ServiceKind::Query,
                 interface_id: "permission-query/v1".to_string(),
-                provider: crate::ProviderId::Plugin("bmux.permissions".to_string()),
+                provider: bmux_plugin_sdk::ProviderId::Plugin("bmux.permissions".to_string()),
             }],
             available_capabilities: vec!["bmux.permissions.read".to_string()],
             enabled_plugins: vec!["bmux.permissions".to_string()],
@@ -2006,7 +2013,7 @@ minimum = "1.0"
                 plugin_api_version: ApiVersion::new(1, 0),
                 plugin_abi_version: ApiVersion::new(1, 0),
             },
-            connection: crate::HostConnectionInfo {
+            connection: bmux_plugin_sdk::HostConnectionInfo {
                 config_dir: "/config".to_string(),
                 runtime_dir: "/runtime".to_string(),
                 data_dir: "/data".to_string(),
@@ -2020,7 +2027,7 @@ minimum = "1.0"
         let error = context
             .call_service_raw(
                 "bmux.permissions.read",
-                crate::ServiceKind::Query,
+                bmux_plugin_sdk::ServiceKind::Query,
                 "permission-query/v1",
                 "list",
                 Vec::new(),
@@ -2048,7 +2055,7 @@ minimum = "1.0"
                 plugin_api_version: ApiVersion::new(1, 0),
                 plugin_abi_version: ApiVersion::new(1, 0),
             },
-            connection: crate::HostConnectionInfo {
+            connection: bmux_plugin_sdk::HostConnectionInfo {
                 config_dir: "/config".to_string(),
                 runtime_dir: "/runtime".to_string(),
                 data_dir: "/data".to_string(),
@@ -2062,7 +2069,7 @@ minimum = "1.0"
         let error = context
             .call_service_raw(
                 "bmux.permissions.read",
-                crate::ServiceKind::Query,
+                bmux_plugin_sdk::ServiceKind::Query,
                 "permission-query/v1",
                 "list",
                 Vec::new(),
@@ -2087,12 +2094,12 @@ minimum = "1.0"
             arguments: Vec::new(),
             required_capabilities: vec!["bmux.config.read".to_string()],
             provided_capabilities: Vec::new(),
-            services: vec![crate::RegisteredService {
-                capability: crate::HostScope::new("bmux.config.read")
+            services: vec![bmux_plugin_sdk::RegisteredService {
+                capability: bmux_plugin_sdk::HostScope::new("bmux.config.read")
                     .expect("capability should parse"),
-                kind: crate::ServiceKind::Query,
+                kind: bmux_plugin_sdk::ServiceKind::Query,
                 interface_id: "config-query/v1".to_string(),
-                provider: crate::ProviderId::Host,
+                provider: bmux_plugin_sdk::ProviderId::Host,
             }],
             available_capabilities: vec!["bmux.config.read".to_string()],
             enabled_plugins: Vec::new(),
@@ -2104,7 +2111,7 @@ minimum = "1.0"
                 plugin_api_version: ApiVersion::new(1, 0),
                 plugin_abi_version: ApiVersion::new(1, 0),
             },
-            connection: crate::HostConnectionInfo {
+            connection: bmux_plugin_sdk::HostConnectionInfo {
                 config_dir: "/config".to_string(),
                 runtime_dir: "/runtime".to_string(),
                 data_dir: "/data".to_string(),
@@ -2118,7 +2125,7 @@ minimum = "1.0"
         let response = context
             .call_service_raw(
                 "bmux.config.read",
-                crate::ServiceKind::Query,
+                bmux_plugin_sdk::ServiceKind::Query,
                 "config-query/v1",
                 "plugin_settings",
                 encode_service_message(&super::CorePluginSettingsRequest {
@@ -2146,19 +2153,19 @@ minimum = "1.0"
             required_capabilities: vec!["bmux.storage".to_string()],
             provided_capabilities: Vec::new(),
             services: vec![
-                crate::RegisteredService {
-                    capability: crate::HostScope::new("bmux.storage")
+                bmux_plugin_sdk::RegisteredService {
+                    capability: bmux_plugin_sdk::HostScope::new("bmux.storage")
                         .expect("capability should parse"),
-                    kind: crate::ServiceKind::Command,
+                    kind: bmux_plugin_sdk::ServiceKind::Command,
                     interface_id: "storage-command/v1".to_string(),
-                    provider: crate::ProviderId::Host,
+                    provider: bmux_plugin_sdk::ProviderId::Host,
                 },
-                crate::RegisteredService {
-                    capability: crate::HostScope::new("bmux.storage")
+                bmux_plugin_sdk::RegisteredService {
+                    capability: bmux_plugin_sdk::HostScope::new("bmux.storage")
                         .expect("capability should parse"),
-                    kind: crate::ServiceKind::Query,
+                    kind: bmux_plugin_sdk::ServiceKind::Query,
                     interface_id: "storage-query/v1".to_string(),
-                    provider: crate::ProviderId::Host,
+                    provider: bmux_plugin_sdk::ProviderId::Host,
                 },
             ],
             available_capabilities: vec!["bmux.storage".to_string()],
@@ -2171,7 +2178,7 @@ minimum = "1.0"
                 plugin_api_version: ApiVersion::new(1, 0),
                 plugin_abi_version: ApiVersion::new(1, 0),
             },
-            connection: crate::HostConnectionInfo {
+            connection: bmux_plugin_sdk::HostConnectionInfo {
                 config_dir: "/config".to_string(),
                 runtime_dir: "/runtime".to_string(),
                 data_dir: storage_root.to_string_lossy().to_string(),
@@ -2185,7 +2192,7 @@ minimum = "1.0"
         context
             .call_service_raw(
                 "bmux.storage",
-                crate::ServiceKind::Command,
+                bmux_plugin_sdk::ServiceKind::Command,
                 "storage-command/v1",
                 "set",
                 encode_service_message(&super::CoreStorageSetRequest {
@@ -2199,7 +2206,7 @@ minimum = "1.0"
         let bytes = context
             .call_service_raw(
                 "bmux.storage",
-                crate::ServiceKind::Query,
+                bmux_plugin_sdk::ServiceKind::Query,
                 "storage-query/v1",
                 "get",
                 encode_service_message(&super::CoreStorageGetRequest {
@@ -2223,12 +2230,12 @@ minimum = "1.0"
             arguments: Vec::new(),
             required_capabilities: vec!["bmux.logs.write".to_string()],
             provided_capabilities: Vec::new(),
-            services: vec![crate::RegisteredService {
-                capability: crate::HostScope::new("bmux.logs.write")
+            services: vec![bmux_plugin_sdk::RegisteredService {
+                capability: bmux_plugin_sdk::HostScope::new("bmux.logs.write")
                     .expect("capability should parse"),
-                kind: crate::ServiceKind::Command,
+                kind: bmux_plugin_sdk::ServiceKind::Command,
                 interface_id: "logging-command/v1".to_string(),
-                provider: crate::ProviderId::Host,
+                provider: bmux_plugin_sdk::ProviderId::Host,
             }],
             available_capabilities: vec!["bmux.logs.write".to_string()],
             enabled_plugins: Vec::new(),
@@ -2240,7 +2247,7 @@ minimum = "1.0"
                 plugin_api_version: ApiVersion::new(1, 0),
                 plugin_abi_version: ApiVersion::new(1, 0),
             },
-            connection: crate::HostConnectionInfo {
+            connection: bmux_plugin_sdk::HostConnectionInfo {
                 config_dir: "/config".to_string(),
                 runtime_dir: "/runtime".to_string(),
                 data_dir: "/data".to_string(),
@@ -2254,11 +2261,11 @@ minimum = "1.0"
         let response: () = context
             .call_service(
                 "bmux.logs.write",
-                crate::ServiceKind::Command,
+                bmux_plugin_sdk::ServiceKind::Command,
                 "logging-command/v1",
                 "write",
-                &crate::LogWriteRequest {
-                    level: crate::LogWriteLevel::Info,
+                &bmux_plugin_sdk::LogWriteRequest {
+                    level: bmux_plugin_sdk::LogWriteLevel::Info,
                     message: "hello from plugin".to_string(),
                     target: Some("plugin.test".to_string()),
                 },
@@ -2280,12 +2287,12 @@ minimum = "1.0"
             arguments: Vec::new(),
             required_capabilities: vec!["bmux.sessions.read".to_string()],
             provided_capabilities: Vec::new(),
-            services: vec![crate::RegisteredService {
-                capability: crate::HostScope::new("bmux.sessions.read")
+            services: vec![bmux_plugin_sdk::RegisteredService {
+                capability: bmux_plugin_sdk::HostScope::new("bmux.sessions.read")
                     .expect("capability should parse"),
-                kind: crate::ServiceKind::Query,
+                kind: bmux_plugin_sdk::ServiceKind::Query,
                 interface_id: "session-query/v1".to_string(),
-                provider: crate::ProviderId::Host,
+                provider: bmux_plugin_sdk::ProviderId::Host,
             }],
             available_capabilities: vec!["bmux.sessions.read".to_string()],
             enabled_plugins: Vec::new(),
@@ -2297,7 +2304,7 @@ minimum = "1.0"
                 plugin_api_version: ApiVersion::new(1, 0),
                 plugin_abi_version: ApiVersion::new(1, 0),
             },
-            connection: crate::HostConnectionInfo {
+            connection: bmux_plugin_sdk::HostConnectionInfo {
                 config_dir: "/config".to_string(),
                 runtime_dir: "/runtime".to_string(),
                 data_dir: "/data".to_string(),
@@ -2308,10 +2315,10 @@ minimum = "1.0"
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
-        let response: crate::SessionListResponse = context
+        let response: bmux_plugin_sdk::SessionListResponse = context
             .call_service(
                 "bmux.sessions.read",
-                crate::ServiceKind::Query,
+                bmux_plugin_sdk::ServiceKind::Query,
                 "session-query/v1",
                 "list",
                 &(),
@@ -2341,12 +2348,12 @@ minimum = "1.0"
             arguments: Vec::new(),
             required_capabilities: vec!["bmux.panes.write".to_string()],
             provided_capabilities: Vec::new(),
-            services: vec![crate::RegisteredService {
-                capability: crate::HostScope::new("bmux.panes.write")
+            services: vec![bmux_plugin_sdk::RegisteredService {
+                capability: bmux_plugin_sdk::HostScope::new("bmux.panes.write")
                     .expect("capability should parse"),
-                kind: crate::ServiceKind::Command,
+                kind: bmux_plugin_sdk::ServiceKind::Command,
                 interface_id: "pane-command/v1".to_string(),
-                provider: crate::ProviderId::Host,
+                provider: bmux_plugin_sdk::ProviderId::Host,
             }],
             available_capabilities: vec!["bmux.panes.write".to_string()],
             enabled_plugins: Vec::new(),
@@ -2358,7 +2365,7 @@ minimum = "1.0"
                 plugin_api_version: ApiVersion::new(1, 0),
                 plugin_abi_version: ApiVersion::new(1, 0),
             },
-            connection: crate::HostConnectionInfo {
+            connection: bmux_plugin_sdk::HostConnectionInfo {
                 config_dir: "/config".to_string(),
                 runtime_dir: "/runtime".to_string(),
                 data_dir: "/data".to_string(),
@@ -2369,16 +2376,16 @@ minimum = "1.0"
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
-        let _response: crate::PaneSplitResponse = context
+        let _response: bmux_plugin_sdk::PaneSplitResponse = context
             .call_service(
                 "bmux.panes.write",
-                crate::ServiceKind::Command,
+                bmux_plugin_sdk::ServiceKind::Command,
                 "pane-command/v1",
                 "split",
-                &crate::PaneSplitRequest {
+                &bmux_plugin_sdk::PaneSplitRequest {
                     session: None,
                     target: None,
-                    direction: crate::PaneSplitDirection::Vertical,
+                    direction: bmux_plugin_sdk::PaneSplitDirection::Vertical,
                 },
             )
             .expect("core pane command should succeed");
@@ -2405,12 +2412,12 @@ minimum = "1.0"
             arguments: Vec::new(),
             required_capabilities: vec!["bmux.sessions.write".to_string()],
             provided_capabilities: Vec::new(),
-            services: vec![crate::RegisteredService {
-                capability: crate::HostScope::new("bmux.sessions.write")
+            services: vec![bmux_plugin_sdk::RegisteredService {
+                capability: bmux_plugin_sdk::HostScope::new("bmux.sessions.write")
                     .expect("capability should parse"),
-                kind: crate::ServiceKind::Command,
+                kind: bmux_plugin_sdk::ServiceKind::Command,
                 interface_id: "session-command/v1".to_string(),
-                provider: crate::ProviderId::Host,
+                provider: bmux_plugin_sdk::ProviderId::Host,
             }],
             available_capabilities: vec!["bmux.sessions.write".to_string()],
             enabled_plugins: Vec::new(),
@@ -2422,7 +2429,7 @@ minimum = "1.0"
                 plugin_api_version: ApiVersion::new(1, 0),
                 plugin_abi_version: ApiVersion::new(1, 0),
             },
-            connection: crate::HostConnectionInfo {
+            connection: bmux_plugin_sdk::HostConnectionInfo {
                 config_dir: "/config".to_string(),
                 runtime_dir: "/runtime".to_string(),
                 data_dir: "/data".to_string(),
@@ -2433,13 +2440,13 @@ minimum = "1.0"
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
-        let _response: crate::SessionCreateResponse = context
+        let _response: bmux_plugin_sdk::SessionCreateResponse = context
             .call_service(
                 "bmux.sessions.write",
-                crate::ServiceKind::Command,
+                bmux_plugin_sdk::ServiceKind::Command,
                 "session-command/v1",
                 "new",
-                &crate::SessionCreateRequest {
+                &bmux_plugin_sdk::SessionCreateRequest {
                     name: Some("created".to_string()),
                 },
             )
@@ -2467,12 +2474,12 @@ minimum = "1.0"
             arguments: Vec::new(),
             required_capabilities: vec!["bmux.clients.read".to_string()],
             provided_capabilities: Vec::new(),
-            services: vec![crate::RegisteredService {
-                capability: crate::HostScope::new("bmux.clients.read")
+            services: vec![bmux_plugin_sdk::RegisteredService {
+                capability: bmux_plugin_sdk::HostScope::new("bmux.clients.read")
                     .expect("capability should parse"),
-                kind: crate::ServiceKind::Query,
+                kind: bmux_plugin_sdk::ServiceKind::Query,
                 interface_id: "client-query/v1".to_string(),
-                provider: crate::ProviderId::Host,
+                provider: bmux_plugin_sdk::ProviderId::Host,
             }],
             available_capabilities: vec!["bmux.clients.read".to_string()],
             enabled_plugins: Vec::new(),
@@ -2484,7 +2491,7 @@ minimum = "1.0"
                 plugin_api_version: ApiVersion::new(1, 0),
                 plugin_abi_version: ApiVersion::new(1, 0),
             },
-            connection: crate::HostConnectionInfo {
+            connection: bmux_plugin_sdk::HostConnectionInfo {
                 config_dir: "/config".to_string(),
                 runtime_dir: "/runtime".to_string(),
                 data_dir: "/data".to_string(),
@@ -2495,10 +2502,10 @@ minimum = "1.0"
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
-        let response: crate::CurrentClientResponse = context
+        let response: bmux_plugin_sdk::CurrentClientResponse = context
             .call_service(
                 "bmux.clients.read",
-                crate::ServiceKind::Query,
+                bmux_plugin_sdk::ServiceKind::Query,
                 "client-query/v1",
                 "current",
                 &(),
@@ -2544,12 +2551,12 @@ minimum = "1.0"
             arguments: Vec::new(),
             required_capabilities: vec!["bmux.clients.read".to_string()],
             provided_capabilities: Vec::new(),
-            services: vec![crate::RegisteredService {
-                capability: crate::HostScope::new("bmux.clients.read")
+            services: vec![bmux_plugin_sdk::RegisteredService {
+                capability: bmux_plugin_sdk::HostScope::new("bmux.clients.read")
                     .expect("capability should parse"),
-                kind: crate::ServiceKind::Query,
+                kind: bmux_plugin_sdk::ServiceKind::Query,
                 interface_id: "client-query/v1".to_string(),
-                provider: crate::ProviderId::Host,
+                provider: bmux_plugin_sdk::ProviderId::Host,
             }],
             available_capabilities: vec!["bmux.clients.read".to_string()],
             enabled_plugins: Vec::new(),
@@ -2561,7 +2568,7 @@ minimum = "1.0"
                 plugin_api_version: ApiVersion::new(1, 0),
                 plugin_abi_version: ApiVersion::new(1, 0),
             },
-            connection: crate::HostConnectionInfo {
+            connection: bmux_plugin_sdk::HostConnectionInfo {
                 config_dir: "/config".to_string(),
                 runtime_dir: "/runtime".to_string(),
                 data_dir: "/data".to_string(),
@@ -2572,10 +2579,10 @@ minimum = "1.0"
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
-        let response: crate::CurrentClientResponse = context
+        let response: bmux_plugin_sdk::CurrentClientResponse = context
             .call_service(
                 "bmux.clients.read",
-                crate::ServiceKind::Query,
+                bmux_plugin_sdk::ServiceKind::Query,
                 "client-query/v1",
                 "current",
                 &(),
@@ -2606,12 +2613,12 @@ minimum = "1.0"
             arguments: Vec::new(),
             required_capabilities: vec!["bmux.sessions.write".to_string()],
             provided_capabilities: Vec::new(),
-            services: vec![crate::RegisteredService {
-                capability: crate::HostScope::new("bmux.sessions.write")
+            services: vec![bmux_plugin_sdk::RegisteredService {
+                capability: bmux_plugin_sdk::HostScope::new("bmux.sessions.write")
                     .expect("capability should parse"),
-                kind: crate::ServiceKind::Command,
+                kind: bmux_plugin_sdk::ServiceKind::Command,
                 interface_id: "session-command/v1".to_string(),
-                provider: crate::ProviderId::Host,
+                provider: bmux_plugin_sdk::ProviderId::Host,
             }],
             available_capabilities: vec!["bmux.sessions.write".to_string()],
             enabled_plugins: Vec::new(),
@@ -2623,7 +2630,7 @@ minimum = "1.0"
                 plugin_api_version: ApiVersion::new(1, 0),
                 plugin_abi_version: ApiVersion::new(1, 0),
             },
-            connection: crate::HostConnectionInfo {
+            connection: bmux_plugin_sdk::HostConnectionInfo {
                 config_dir: "/config".to_string(),
                 runtime_dir: "/runtime".to_string(),
                 data_dir: "/data".to_string(),
@@ -2634,14 +2641,14 @@ minimum = "1.0"
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
-        let response: crate::SessionSelectResponse = context
+        let response: bmux_plugin_sdk::SessionSelectResponse = context
             .call_service(
                 "bmux.sessions.write",
-                crate::ServiceKind::Command,
+                bmux_plugin_sdk::ServiceKind::Command,
                 "session-command/v1",
                 "select",
-                &crate::SessionSelectRequest {
-                    selector: crate::SessionSelector::ById(target_session_id),
+                &bmux_plugin_sdk::SessionSelectRequest {
+                    selector: bmux_plugin_sdk::SessionSelector::ById(target_session_id),
                 },
             )
             .expect("core session select should succeed");
@@ -2669,12 +2676,12 @@ minimum = "1.0"
             arguments: Vec::new(),
             required_capabilities: vec!["bmux.sessions.write".to_string()],
             provided_capabilities: Vec::new(),
-            services: vec![crate::RegisteredService {
-                capability: crate::HostScope::new("bmux.sessions.write")
+            services: vec![bmux_plugin_sdk::RegisteredService {
+                capability: bmux_plugin_sdk::HostScope::new("bmux.sessions.write")
                     .expect("capability should parse"),
-                kind: crate::ServiceKind::Command,
+                kind: bmux_plugin_sdk::ServiceKind::Command,
                 interface_id: "session-command/v1".to_string(),
-                provider: crate::ProviderId::Host,
+                provider: bmux_plugin_sdk::ProviderId::Host,
             }],
             available_capabilities: vec!["bmux.sessions.write".to_string()],
             enabled_plugins: Vec::new(),
@@ -2686,7 +2693,7 @@ minimum = "1.0"
                 plugin_api_version: ApiVersion::new(1, 0),
                 plugin_abi_version: ApiVersion::new(1, 0),
             },
-            connection: crate::HostConnectionInfo {
+            connection: bmux_plugin_sdk::HostConnectionInfo {
                 config_dir: "/config".to_string(),
                 runtime_dir: "/runtime".to_string(),
                 data_dir: "/data".to_string(),
@@ -2698,12 +2705,12 @@ minimum = "1.0"
         };
 
         let error = context
-            .call_service::<crate::SessionCreateRequest, crate::SessionCreateResponse>(
+            .call_service::<bmux_plugin_sdk::SessionCreateRequest, bmux_plugin_sdk::SessionCreateResponse>(
                 "bmux.sessions.write",
-                crate::ServiceKind::Command,
+                bmux_plugin_sdk::ServiceKind::Command,
                 "session-command/v1",
                 "new",
-                &crate::SessionCreateRequest {
+                &bmux_plugin_sdk::SessionCreateRequest {
                     name: Some("deny".to_string()),
                 },
             )
@@ -2729,12 +2736,12 @@ minimum = "1.0"
             arguments: Vec::new(),
             required_capabilities: vec!["bmux.panes.read".to_string()],
             provided_capabilities: Vec::new(),
-            services: vec![crate::RegisteredService {
-                capability: crate::HostScope::new("bmux.panes.read")
+            services: vec![bmux_plugin_sdk::RegisteredService {
+                capability: bmux_plugin_sdk::HostScope::new("bmux.panes.read")
                     .expect("capability should parse"),
-                kind: crate::ServiceKind::Query,
+                kind: bmux_plugin_sdk::ServiceKind::Query,
                 interface_id: "pane-query/v1".to_string(),
-                provider: crate::ProviderId::Host,
+                provider: bmux_plugin_sdk::ProviderId::Host,
             }],
             available_capabilities: vec!["bmux.panes.read".to_string()],
             enabled_plugins: Vec::new(),
@@ -2746,7 +2753,7 @@ minimum = "1.0"
                 plugin_api_version: ApiVersion::new(1, 0),
                 plugin_abi_version: ApiVersion::new(1, 0),
             },
-            connection: crate::HostConnectionInfo {
+            connection: bmux_plugin_sdk::HostConnectionInfo {
                 config_dir: "/config".to_string(),
                 runtime_dir: "/runtime".to_string(),
                 data_dir: "/data".to_string(),
@@ -2757,13 +2764,13 @@ minimum = "1.0"
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
-        let response: crate::PaneListResponse = context
+        let response: bmux_plugin_sdk::PaneListResponse = context
             .call_service(
                 "bmux.panes.read",
-                crate::ServiceKind::Query,
+                bmux_plugin_sdk::ServiceKind::Query,
                 "pane-query/v1",
                 "list",
-                &crate::PaneListRequest { session: None },
+                &bmux_plugin_sdk::PaneListRequest { session: None },
             )
             .expect("core pane query should succeed");
         assert_eq!(response.panes.len(), 1);
@@ -2790,12 +2797,12 @@ minimum = "1.0"
             arguments: Vec::new(),
             required_capabilities: vec!["bmux.panes.write".to_string()],
             provided_capabilities: Vec::new(),
-            services: vec![crate::RegisteredService {
-                capability: crate::HostScope::new("bmux.panes.write")
+            services: vec![bmux_plugin_sdk::RegisteredService {
+                capability: bmux_plugin_sdk::HostScope::new("bmux.panes.write")
                     .expect("capability should parse"),
-                kind: crate::ServiceKind::Command,
+                kind: bmux_plugin_sdk::ServiceKind::Command,
                 interface_id: "pane-command/v1".to_string(),
-                provider: crate::ProviderId::Host,
+                provider: bmux_plugin_sdk::ProviderId::Host,
             }],
             available_capabilities: vec!["bmux.panes.write".to_string()],
             enabled_plugins: Vec::new(),
@@ -2807,7 +2814,7 @@ minimum = "1.0"
                 plugin_api_version: ApiVersion::new(1, 0),
                 plugin_abi_version: ApiVersion::new(1, 0),
             },
-            connection: crate::HostConnectionInfo {
+            connection: bmux_plugin_sdk::HostConnectionInfo {
                 config_dir: "/config".to_string(),
                 runtime_dir: "/runtime".to_string(),
                 data_dir: "/data".to_string(),
@@ -2818,43 +2825,43 @@ minimum = "1.0"
             host_kernel_bridge: Some(super::HostKernelBridge::from_fn(test_host_kernel_bridge)),
         };
 
-        let _focused: crate::PaneFocusResponse = context
+        let _focused: bmux_plugin_sdk::PaneFocusResponse = context
             .call_service(
                 "bmux.panes.write",
-                crate::ServiceKind::Command,
+                bmux_plugin_sdk::ServiceKind::Command,
                 "pane-command/v1",
                 "focus",
-                &crate::PaneFocusRequest {
+                &bmux_plugin_sdk::PaneFocusRequest {
                     session: None,
-                    target: Some(crate::PaneSelector::Active),
-                    direction: Some(crate::PaneFocusDirection::Next),
+                    target: Some(bmux_plugin_sdk::PaneSelector::Active),
+                    direction: Some(bmux_plugin_sdk::PaneFocusDirection::Next),
                 },
             )
             .expect("focus command should succeed");
 
-        let _resized: crate::PaneResizeResponse = context
+        let _resized: bmux_plugin_sdk::PaneResizeResponse = context
             .call_service(
                 "bmux.panes.write",
-                crate::ServiceKind::Command,
+                bmux_plugin_sdk::ServiceKind::Command,
                 "pane-command/v1",
                 "resize",
-                &crate::PaneResizeRequest {
+                &bmux_plugin_sdk::PaneResizeRequest {
                     session: None,
-                    target: Some(crate::PaneSelector::Active),
+                    target: Some(bmux_plugin_sdk::PaneSelector::Active),
                     delta: 1,
                 },
             )
             .expect("resize command should succeed");
 
-        let _closed: crate::PaneCloseResponse = context
+        let _closed: bmux_plugin_sdk::PaneCloseResponse = context
             .call_service(
                 "bmux.panes.write",
-                crate::ServiceKind::Command,
+                bmux_plugin_sdk::ServiceKind::Command,
                 "pane-command/v1",
                 "close",
-                &crate::PaneCloseRequest {
+                &bmux_plugin_sdk::PaneCloseRequest {
                     session: None,
-                    target: Some(crate::PaneSelector::Active),
+                    target: Some(bmux_plugin_sdk::PaneSelector::Active),
                 },
             )
             .expect("close command should succeed");
@@ -2883,14 +2890,14 @@ minimum = "1.0"
     fn native_service_context_roundtrips_through_service_envelope() {
         let context = NativeServiceContext {
             plugin_id: "bmux.permissions".to_string(),
-            request: crate::ServiceRequest {
+            request: bmux_plugin_sdk::ServiceRequest {
                 caller_plugin_id: "example.native".to_string(),
-                service: crate::RegisteredService {
-                    capability: crate::HostScope::new("bmux.permissions.read")
+                service: bmux_plugin_sdk::RegisteredService {
+                    capability: bmux_plugin_sdk::HostScope::new("bmux.permissions.read")
                         .expect("capability should parse"),
-                    kind: crate::ServiceKind::Query,
+                    kind: bmux_plugin_sdk::ServiceKind::Query,
                     interface_id: "permission-query/v1".to_string(),
-                    provider: crate::ProviderId::Plugin("bmux.permissions".to_string()),
+                    provider: bmux_plugin_sdk::ProviderId::Plugin("bmux.permissions".to_string()),
                 },
                 operation: "list".to_string(),
                 payload: vec![1, 2, 3],
@@ -2907,7 +2914,7 @@ minimum = "1.0"
                 plugin_api_version: ApiVersion::new(1, 0),
                 plugin_abi_version: ApiVersion::new(1, 0),
             },
-            connection: crate::HostConnectionInfo {
+            connection: bmux_plugin_sdk::HostConnectionInfo {
                 config_dir: "/config".to_string(),
                 runtime_dir: "/runtime".to_string(),
                 data_dir: "/data".to_string(),
@@ -2972,8 +2979,8 @@ minimum = "1.0"
                 id: crate::PluginId::new("test.plugin").expect("plugin id should parse"),
                 display_name: "Test Plugin".to_string(),
                 plugin_version: "0.1.0".to_string(),
-                plugin_api: crate::VersionRange::at_least(ApiVersion::new(1, 0)),
-                native_abi: crate::VersionRange::at_least(ApiVersion::new(1, 0)),
+                plugin_api: bmux_plugin_sdk::VersionRange::at_least(ApiVersion::new(1, 0)),
+                native_abi: bmux_plugin_sdk::VersionRange::at_least(ApiVersion::new(1, 0)),
                 entrypoint: PluginEntrypoint::Native {
                     symbol: DEFAULT_NATIVE_ENTRY_SYMBOL.to_string(),
                 },

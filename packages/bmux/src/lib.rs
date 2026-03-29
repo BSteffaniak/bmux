@@ -73,6 +73,9 @@ pub use bmux_keybind as keybind;
 #[cfg(feature = "plugin")]
 pub use bmux_plugin as plugin;
 
+#[cfg(feature = "plugin_sdk")]
+pub use bmux_plugin_sdk as plugin_sdk;
+
 /// Prelude module for commonly used types across all enabled features
 pub mod prelude {
     #[cfg(feature = "session")]
