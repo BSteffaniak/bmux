@@ -47,7 +47,7 @@ bmux_plugin_sdk::export_plugin!(HelloPlugin, include_str!("../plugin.toml"));
 ```toml
 [package]
 name    = "my_plugin"
-edition = "2021"
+edition = "2024"
 version = "0.1.0"
 
 [lib]
