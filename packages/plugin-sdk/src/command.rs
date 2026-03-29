@@ -68,7 +68,7 @@ const fn default_execution_kind() -> CommandExecutionKind {
 }
 
 const fn default_expose_in_cli() -> bool {
-    true
+    false
 }
 
 impl PluginCommand {

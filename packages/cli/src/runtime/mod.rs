@@ -535,17 +535,8 @@ fn register_plugin_service_handlers(
                                 .plugins
                                 .settings
                                 .get(provider.declaration.id.as_str())
-                                .and_then(parse_plugin_settings_value)
-                                .unwrap_or_default(),
-                            plugin_settings_map: config
-                                .plugins
-                                .settings
-                                .iter()
-                                .filter_map(|(plugin_id, value)| {
-                                    parse_plugin_settings_value(value)
-                                        .map(|settings| (plugin_id.clone(), settings))
-                                })
-                                .collect(),
+                                .cloned(),
+                            plugin_settings_map: config.plugins.settings.clone(),
                             host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(
                                 host_kernel_bridge,
                             )),
@@ -561,31 +552,6 @@ fn register_plugin_service_handlers(
     }
 
     Ok(())
-}
-
-fn parse_plugin_settings_value(
-    value: &toml::Value,
-) -> Option<std::collections::BTreeMap<String, String>> {
-    let table = value.as_table()?;
-    let mut parsed = std::collections::BTreeMap::new();
-    for (key, entry) in table {
-        match entry {
-            toml::Value::String(v) => {
-                parsed.insert(key.clone(), v.clone());
-            }
-            toml::Value::Integer(v) => {
-                parsed.insert(key.clone(), v.to_string());
-            }
-            toml::Value::Float(v) => {
-                parsed.insert(key.clone(), v.to_string());
-            }
-            toml::Value::Boolean(v) => {
-                parsed.insert(key.clone(), v.to_string());
-            }
-            _ => {}
-        }
-    }
-    Some(parsed)
 }
 
 fn service_descriptors_from_declarations<'a>(
@@ -5487,7 +5453,7 @@ fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
         plugin_search_roots,
         host: plugin_host_metadata(),
         connection,
-        settings: std::collections::BTreeMap::new(),
+        settings: None,
         plugin_settings_map: std::collections::BTreeMap::new(),
         host_kernel_bridge: Some(bmux_plugin_sdk::HostKernelBridge::from_fn(
             host_kernel_bridge,

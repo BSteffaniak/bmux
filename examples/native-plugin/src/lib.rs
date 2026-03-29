@@ -13,7 +13,7 @@ struct ExamplePlugin;
 
 impl RustPlugin for ExamplePlugin {
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
-        match context.command.as_str() {
+        bmux_plugin_sdk::route_command!(context, {
             "permissions-list" => Ok(run_permissions_list(&context)),
             "permissions-grant" => Ok(run_permissions_grant(&context)),
             "permissions-revoke" => Ok(run_permissions_revoke(&context)),
@@ -29,9 +29,8 @@ impl RustPlugin for ExamplePlugin {
                     println!("example.native: hello {}", context.arguments.join(" "));
                 }
                 Ok(EXIT_OK)
-            }
-            _ => Err(PluginCommandError::unknown_command(&context.command)),
-        }
+            },
+        })
     }
 
     fn activate(

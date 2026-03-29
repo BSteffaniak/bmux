@@ -754,7 +754,7 @@ mod tests {
                 data_dir: "/data".to_string(),
                 state_dir: "/state".to_string(),
             },
-            settings: std::collections::BTreeMap::new(),
+            settings: None,
             plugin_settings_map: std::collections::BTreeMap::new(),
             host_kernel_bridge: Some(HostKernelBridge::from_fn(service_test_kernel_bridge)),
         }

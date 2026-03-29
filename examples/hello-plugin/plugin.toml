@@ -3,6 +3,6 @@ name    = "Hello Plugin"
 version = "0.0.1"
 
 [[commands]]
-execution = "provider_exec"
-name      = "hello"
-summary   = "Print a greeting"
+expose_in_cli = true
+name          = "hello"
+summary       = "Print a greeting"

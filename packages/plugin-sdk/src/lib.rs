@@ -164,6 +164,34 @@ macro_rules! route_service {
     };
 }
 
+/// Route inbound commands to handler expressions.
+///
+/// Generates the `match` on `ctx.command.as_str()` and produces a standard
+/// "unknown command" error for unrecognised names.  Symmetric with
+/// [`route_service!`].
+///
+/// # Example
+///
+/// ```ignore
+/// fn run_command(&mut self, ctx: NativeCommandContext) -> Result<i32, PluginCommandError> {
+///     bmux_plugin_sdk::route_command!(ctx, {
+///         "hello" => {
+///             println!("Hello!");
+///             Ok(EXIT_OK)
+///         },
+///     })
+/// }
+/// ```
+#[macro_export]
+macro_rules! route_command {
+    ($ctx:ident, { $( $name:literal => $handler:expr ),* $(,)? }) => {
+        match $ctx.command.as_str() {
+            $( $name => $handler, )*
+            __unknown => Err($crate::PluginCommandError::unknown_command(__unknown)),
+        }
+    };
+}
+
 /// Common imports for plugin authors.
 ///
 /// A typical plugin can replace individual `use bmux_plugin_sdk::{...}` imports

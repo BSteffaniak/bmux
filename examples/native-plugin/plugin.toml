@@ -16,7 +16,6 @@ runtime = "native"
 version = "0.0.1-alpha.0"
 
 [[commands]]
-execution     = "provider_exec"
 expose_in_cli = true
 name          = "hello"
 summary       = "Print a hello message"
@@ -32,7 +31,6 @@ trailing_var_arg    = true
 value_name          = "MESSAGE"
 
 [[commands]]
-execution     = "provider_exec"
 expose_in_cli = true
 name          = "permissions-list"
 summary       = "List session permissions through bmux provider service"
@@ -46,7 +44,6 @@ summary    = "Session name or UUID"
 value_name = "SESSION"
 
 [[commands]]
-execution     = "provider_exec"
 expose_in_cli = true
 name          = "permissions-grant"
 summary       = "Grant a role through bmux provider service"
@@ -79,7 +76,6 @@ value_name = "ROLE"
 values     = ["owner", "writer", "observer"]
 
 [[commands]]
-execution     = "provider_exec"
 expose_in_cli = true
 name          = "permissions-revoke"
 summary       = "Revoke a role through bmux provider service"
@@ -102,7 +98,6 @@ summary    = "Client UUID"
 value_name = "CLIENT"
 
 [[commands]]
-execution     = "provider_exec"
 expose_in_cli = true
 name          = "windows-list"
 summary       = "List session windows through bmux provider service"
@@ -116,7 +111,6 @@ summary    = "Session name or UUID"
 value_name = "SESSION"
 
 [[commands]]
-execution     = "provider_exec"
 expose_in_cli = true
 name          = "windows-new"
 summary       = "Create a session window through bmux provider service"
@@ -138,13 +132,11 @@ summary    = "Optional window name"
 value_name = "NAME"
 
 [[commands]]
-execution     = "provider_exec"
 expose_in_cli = true
 name          = "settings-show"
 summary       = "Show plugin settings through bmux config service"
 
 [[commands]]
-execution     = "provider_exec"
 expose_in_cli = true
 name          = "storage-put"
 summary       = "Store a key/value through bmux storage service"
@@ -169,7 +161,6 @@ trailing_var_arg    = true
 value_name          = "VALUE"
 
 [[commands]]
-execution     = "provider_exec"
 expose_in_cli = true
 name          = "storage-get"
 summary       = "Read a key through bmux storage service"

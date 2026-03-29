@@ -4,7 +4,6 @@ required_capabilities = ["bmux.commands"]
 version               = "0.0.1-alpha.0"
 
 [[commands]]
-execution     = "provider_exec"
 expose_in_cli = true
 name          = "list"
 path          = ["plugin", "list"]
@@ -17,7 +16,6 @@ name  = "json"
 short = "j"
 
 [[commands]]
-execution     = "provider_exec"
 expose_in_cli = true
 name          = "run"
 path          = ["plugin", "run"]
@@ -47,7 +45,6 @@ trailing_var_arg    = true
 value_name          = "ARGS"
 
 [[commands]]
-execution     = "provider_exec"
 expose_in_cli = true
 name          = "rebuild"
 path          = ["plugin", "rebuild"]

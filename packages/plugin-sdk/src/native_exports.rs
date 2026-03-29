@@ -91,6 +91,36 @@ impl From<&str> for PluginCommandError {
     }
 }
 
+impl From<std::io::Error> for PluginCommandError {
+    fn from(error: std::io::Error) -> Self {
+        Self::failed(error.to_string())
+    }
+}
+
+impl From<serde_json::Error> for PluginCommandError {
+    fn from(error: serde_json::Error) -> Self {
+        Self::failed(error.to_string())
+    }
+}
+
+impl From<toml::de::Error> for PluginCommandError {
+    fn from(error: toml::de::Error) -> Self {
+        Self::failed(error.to_string())
+    }
+}
+
+impl From<Box<dyn std::error::Error>> for PluginCommandError {
+    fn from(error: Box<dyn std::error::Error>) -> Self {
+        Self::failed(error.to_string())
+    }
+}
+
+impl From<Box<dyn std::error::Error + Send + Sync>> for PluginCommandError {
+    fn from(error: Box<dyn std::error::Error + Send + Sync>) -> Self {
+        Self::failed(error.to_string())
+    }
+}
+
 /// Convert a plugin Result into an FFI exit code.
 ///
 /// - `Ok(code)` → returns `code`

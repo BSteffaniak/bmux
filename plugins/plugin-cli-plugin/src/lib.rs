@@ -17,12 +17,11 @@ pub struct PluginCliPlugin;
 
 impl RustPlugin for PluginCliPlugin {
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
-        match context.command.as_str() {
+        bmux_plugin_sdk::route_command!(context, {
             "list" => run_list_command(&context).map_err(PluginCommandError::from),
             "run" => run_run_command(&context).map_err(PluginCommandError::from),
             "rebuild" => run_rebuild_command(&context).map_err(PluginCommandError::from),
-            _ => Err(PluginCommandError::unknown_command(&context.command)),
-        }
+        })
     }
 }
 

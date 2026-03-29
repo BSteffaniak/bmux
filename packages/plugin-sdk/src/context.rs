@@ -20,6 +20,68 @@ use crate::{HostConnectionInfo, HostMetadata, RegisteredService, ServiceRequest}
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
+// ── Serde helpers for toml::Value over binary codecs ─────────────────────────
+//
+// `toml::Value` requires `deserialize_any` which is unsupported by
+// non-self-describing formats like bincode/bmux_codec.  These modules
+// serialize values as JSON text strings so they survive the binary round-trip.
+
+mod toml_value_option {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub fn serialize<S: Serializer>(
+        value: &Option<toml::Value>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let text: Option<String> = value
+            .as_ref()
+            .map(|v| serde_json::to_string(v))
+            .transpose()
+            .map_err(serde::ser::Error::custom)?;
+        text.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Option<toml::Value>, D::Error> {
+        let text: Option<String> = Option::deserialize(deserializer)?;
+        text.map(|s| serde_json::from_str(&s))
+            .transpose()
+            .map_err(serde::de::Error::custom)
+    }
+}
+
+mod toml_value_map {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S: Serializer>(
+        map: &BTreeMap<String, toml::Value>,
+        serializer: S,
+    ) -> Result<S::Ok, S::Error> {
+        let text_map: BTreeMap<String, String> = map
+            .iter()
+            .map(|(k, v)| serde_json::to_string(v).map(|s| (k.clone(), s)))
+            .collect::<Result<_, _>>()
+            .map_err(serde::ser::Error::custom)?;
+        text_map.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<BTreeMap<String, toml::Value>, D::Error> {
+        let text_map: BTreeMap<String, String> = BTreeMap::deserialize(deserializer)?;
+        text_map
+            .into_iter()
+            .map(|(k, s)| {
+                serde_json::from_str(&s)
+                    .map(|v| (k, v))
+                    .map_err(serde::de::Error::custom)
+            })
+            .collect()
+    }
+}
+
 /// Serializable summary of a registered plugin, carried through command and
 /// lifecycle contexts so plugins can introspect the full plugin registry
 /// without re-scanning the filesystem.
@@ -65,10 +127,10 @@ pub struct NativeLifecycleContext {
     /// Host connection paths (config dir, runtime dir, data dir, state dir).
     pub connection: HostConnectionInfo,
     /// Plugin-specific settings from the host configuration.
-    #[serde(default)]
+    #[serde(default, with = "toml_value_option")]
     pub settings: Option<toml::Value>,
     /// Settings map for all plugins (keyed by plugin ID).
-    #[serde(default)]
+    #[serde(default, with = "toml_value_map")]
     pub plugin_settings_map: BTreeMap<String, toml::Value>,
     /// Opaque handle for dispatching calls to the host kernel (internal use).
     #[serde(default)]
@@ -110,10 +172,10 @@ pub struct NativeCommandContext {
     /// Host connection paths (config dir, runtime dir, data dir, state dir).
     pub connection: HostConnectionInfo,
     /// Plugin-specific settings from the host configuration.
-    #[serde(default)]
+    #[serde(default, with = "toml_value_option")]
     pub settings: Option<toml::Value>,
     /// Settings map for all plugins (keyed by plugin ID).
-    #[serde(default)]
+    #[serde(default, with = "toml_value_map")]
     pub plugin_settings_map: BTreeMap<String, toml::Value>,
     /// Opaque handle for dispatching calls to the host kernel (internal use).
     #[serde(default)]
@@ -121,7 +183,7 @@ pub struct NativeCommandContext {
 }
 
 /// Context passed to [`RustPlugin::invoke_service`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NativeServiceContext {
     /// The plugin's own ID (e.g. `"bmux.clipboard"`).
     pub plugin_id: String,
@@ -150,11 +212,11 @@ pub struct NativeServiceContext {
     /// Host connection paths (config dir, runtime dir, data dir, state dir).
     pub connection: HostConnectionInfo,
     /// Plugin-specific settings from the host configuration.
-    #[serde(default)]
-    pub settings: BTreeMap<String, String>,
+    #[serde(default, with = "toml_value_option")]
+    pub settings: Option<toml::Value>,
     /// Settings map for all plugins (keyed by plugin ID).
-    #[serde(default)]
-    pub plugin_settings_map: BTreeMap<String, BTreeMap<String, String>>,
+    #[serde(default, with = "toml_value_map")]
+    pub plugin_settings_map: BTreeMap<String, toml::Value>,
     /// Opaque handle for dispatching calls to the host kernel (internal use).
     #[serde(default)]
     pub host_kernel_bridge: Option<HostKernelBridge>,

@@ -95,7 +95,32 @@ struct CorePluginSettingsRequest {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct CorePluginSettingsResponse {
-    settings: BTreeMap<String, String>,
+    #[serde(
+        serialize_with = "serialize_toml_option",
+        deserialize_with = "deserialize_toml_option"
+    )]
+    settings: Option<toml::Value>,
+}
+
+fn serialize_toml_option<S: serde::Serializer>(
+    value: &Option<toml::Value>,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    let text: Option<String> = value
+        .as_ref()
+        .map(|v| serde_json::to_string(v))
+        .transpose()
+        .map_err(serde::ser::Error::custom)?;
+    text.serialize(serializer)
+}
+
+fn deserialize_toml_option<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<Option<toml::Value>, D::Error> {
+    let text: Option<String> = Option::deserialize(deserializer)?;
+    text.map(|s| serde_json::from_str(&s))
+        .transpose()
+        .map_err(serde::de::Error::custom)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -183,7 +208,6 @@ impl ServiceCaller for NativeServiceContext {
         operation: &str,
         payload: Vec<u8>,
     ) -> Result<Vec<u8>> {
-        let plugin_settings_map = deserialize_plugin_settings_map(&self.plugin_settings_map)?;
         call_service_raw(
             &self.plugin_id,
             &self.required_capabilities,
@@ -195,7 +219,7 @@ impl ServiceCaller for NativeServiceContext {
             &self.host,
             &self.connection,
             self.host_kernel_bridge,
-            &plugin_settings_map,
+            &self.plugin_settings_map,
             capability,
             kind,
             interface_id,
@@ -320,10 +344,10 @@ fn call_service_raw(
         plugin_search_roots: plugin_search_roots.to_vec(),
         host: host.clone(),
         connection: connection.clone(),
-        settings: serialize_plugin_settings(
-            plugin_settings_map.get(registered.declaration.id.as_str()),
-        ),
-        plugin_settings_map: serialize_plugin_settings_map(plugin_settings_map),
+        settings: plugin_settings_map
+            .get(registered.declaration.id.as_str())
+            .cloned(),
+        plugin_settings_map: plugin_settings_map.clone(),
         host_kernel_bridge,
     })?;
 
@@ -341,50 +365,6 @@ fn call_service_raw(
     Ok(response.payload)
 }
 
-fn serialize_plugin_settings(value: Option<&toml::Value>) -> BTreeMap<String, String> {
-    value
-        .and_then(toml::Value::as_table)
-        .map(|table| {
-            table
-                .iter()
-                .map(|(key, value)| (key.clone(), value.to_string()))
-                .collect::<BTreeMap<_, _>>()
-        })
-        .unwrap_or_default()
-}
-
-fn serialize_plugin_settings_map(
-    plugin_settings_map: &BTreeMap<String, toml::Value>,
-) -> BTreeMap<String, BTreeMap<String, String>> {
-    plugin_settings_map
-        .iter()
-        .map(|(plugin_id, value)| (plugin_id.clone(), serialize_plugin_settings(Some(value))))
-        .collect()
-}
-
-fn deserialize_plugin_settings_map(
-    plugin_settings_map: &BTreeMap<String, BTreeMap<String, String>>,
-) -> Result<BTreeMap<String, toml::Value>> {
-    plugin_settings_map
-        .iter()
-        .map(|(plugin_id, settings)| {
-            let table = settings
-                .iter()
-                .map(|(key, value)| {
-                    toml::from_str::<toml::Value>(value)
-                        .map(|parsed| (key.clone(), parsed))
-                        .map_err(|error| PluginError::ServiceProtocol {
-                            details: format!(
-                                "failed parsing serialized setting '{key}' for plugin '{plugin_id}': {error}",
-                            ),
-                        })
-                })
-                .collect::<Result<toml::map::Map<_, _>>>()?;
-            Ok((plugin_id.clone(), toml::Value::Table(table)))
-        })
-        .collect()
-}
-
 fn handle_core_service_call(
     caller_plugin_id: &str,
     connection: &HostConnectionInfo,
@@ -397,7 +377,7 @@ fn handle_core_service_call(
     match (service.interface_id.as_str(), operation) {
         ("config-query/v1", "plugin_settings") => {
             let request: CorePluginSettingsRequest = decode_service_message(&payload)?;
-            let settings = serialize_plugin_settings(plugin_settings_map.get(&request.plugin_id));
+            let settings = plugin_settings_map.get(&request.plugin_id).cloned();
             encode_service_message(&CorePluginSettingsResponse { settings })
         }
         ("storage-query/v1", "get") => {
@@ -2092,8 +2072,11 @@ minimum = "1.0"
         let response: super::CorePluginSettingsResponse =
             decode_service_message(&response).expect("response should decode");
         assert_eq!(
-            response.settings.get("greeting"),
-            Some(&"\"hello\"".to_string())
+            response.settings,
+            Some(toml::Value::Table(toml::map::Map::from_iter([(
+                "greeting".to_string(),
+                toml::Value::String("hello".to_string()),
+            )])))
         );
     }
 
@@ -2875,10 +2858,10 @@ minimum = "1.0"
                 data_dir: "/data".to_string(),
                 state_dir: "/state".to_string(),
             },
-            settings: BTreeMap::from([("mode".to_string(), "\"service\"".to_string())]),
+            settings: Some(toml::toml! { mode = "service" }.into()),
             plugin_settings_map: BTreeMap::from([(
                 "example.native".to_string(),
-                BTreeMap::from([("mode".to_string(), "\"service\"".to_string())]),
+                toml::toml! { mode = "service" }.into(),
             )]),
             host_kernel_bridge: None,
         };

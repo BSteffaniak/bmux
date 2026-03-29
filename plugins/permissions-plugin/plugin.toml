@@ -31,7 +31,6 @@ kind         = "query"
 
 [[commands]]
 aliases       = [["session", "permissions"]]
-execution     = "provider_exec"
 expose_in_cli = true
 name          = "permissions"
 path          = ["permissions"]
@@ -53,7 +52,6 @@ short = "j"
 
 [[commands]]
 aliases       = [["session", "permissions-current"]]
-execution     = "provider_exec"
 expose_in_cli = true
 name          = "permissions-current"
 path          = ["permissions-current"]
@@ -67,7 +65,6 @@ short = "j"
 
 [[commands]]
 aliases       = [["session", "grant"]]
-execution     = "provider_exec"
 expose_in_cli = true
 name          = "grant"
 path          = ["grant"]
@@ -100,7 +97,6 @@ values     = ["owner", "writer", "observer"]
 
 [[commands]]
 aliases       = [["session", "revoke"]]
-execution     = "provider_exec"
 expose_in_cli = true
 name          = "revoke"
 path          = ["revoke"]

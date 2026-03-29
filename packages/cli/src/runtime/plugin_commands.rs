@@ -452,7 +452,7 @@ name = "roles"
 path = ["acl", "list"]
 aliases = [["acl", "roles"]]
 summary = "list"
-execution = "provider_exec"
+expose_in_cli = true
 
 [plugin_api]
 minimum = "1.0"
