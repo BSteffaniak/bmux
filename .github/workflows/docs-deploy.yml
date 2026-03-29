@@ -6,6 +6,7 @@ on:
         paths:
             - ".github/workflows/docs-deploy.yml"
             - "packages/docs-site/**"
+            - "packages/cli-schema/**"
             - "packages/config/**"
             - "packages/config-doc/**"
             - "packages/config-doc-derive/**"
