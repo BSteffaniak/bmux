@@ -4,7 +4,8 @@
 
 use bmux_cli_output::{Table, TableColumn, write_table};
 use bmux_plugin::{
-    EXIT_ERROR, EXIT_OK, EXIT_USAGE, NativeCommandContext, PluginEvent, RustPlugin, ServiceKind,
+    EXIT_ERROR, EXIT_OK, EXIT_USAGE, NativeCommandContext, PluginCommandError, PluginEvent,
+    RustPlugin, ServiceKind,
 };
 use serde::{Deserialize, Serialize};
 
@@ -12,41 +13,47 @@ use serde::{Deserialize, Serialize};
 struct ExamplePlugin;
 
 impl RustPlugin for ExamplePlugin {
-    fn run_command(&mut self, context: NativeCommandContext) -> i32 {
+    fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         match context.command.as_str() {
-            "permissions-list" => run_permissions_list(&context),
-            "permissions-grant" => run_permissions_grant(&context),
-            "permissions-revoke" => run_permissions_revoke(&context),
-            "windows-list" => run_windows_list(&context),
-            "windows-new" => run_windows_new(&context),
-            "settings-show" => run_settings_show(&context),
-            "storage-put" => run_storage_put(&context),
-            "storage-get" => run_storage_get(&context),
+            "permissions-list" => Ok(run_permissions_list(&context)),
+            "permissions-grant" => Ok(run_permissions_grant(&context)),
+            "permissions-revoke" => Ok(run_permissions_revoke(&context)),
+            "windows-list" => Ok(run_windows_list(&context)),
+            "windows-new" => Ok(run_windows_new(&context)),
+            "settings-show" => Ok(run_settings_show(&context)),
+            "storage-put" => Ok(run_storage_put(&context)),
+            "storage-get" => Ok(run_storage_get(&context)),
             "hello" => {
                 if context.arguments.is_empty() {
                     println!("example.native: hello from bmux plugin");
                 } else {
                     println!("example.native: hello {}", context.arguments.join(" "));
                 }
-                EXIT_OK
+                Ok(EXIT_OK)
             }
-            _ => EXIT_USAGE,
+            _ => Err(PluginCommandError::unknown_command(&context.command)),
         }
     }
 
-    fn activate(&mut self, context: bmux_plugin::NativeLifecycleContext) -> i32 {
+    fn activate(
+        &mut self,
+        context: bmux_plugin::NativeLifecycleContext,
+    ) -> Result<i32, PluginCommandError> {
         println!("example.native: activated {}", context.plugin_id);
-        EXIT_OK
+        Ok(EXIT_OK)
     }
 
-    fn deactivate(&mut self, context: bmux_plugin::NativeLifecycleContext) -> i32 {
+    fn deactivate(
+        &mut self,
+        context: bmux_plugin::NativeLifecycleContext,
+    ) -> Result<i32, PluginCommandError> {
         println!("example.native: deactivated {}", context.plugin_id);
-        EXIT_OK
+        Ok(EXIT_OK)
     }
 
-    fn handle_event(&mut self, event: PluginEvent) -> i32 {
+    fn handle_event(&mut self, event: PluginEvent) -> Result<i32, PluginCommandError> {
         println!("example.native: observed event {}", event.name);
-        EXIT_OK
+        Ok(EXIT_OK)
     }
 }
 

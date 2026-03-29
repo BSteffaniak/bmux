@@ -59,7 +59,9 @@ pub use loader::{
 pub use manifest::{
     PluginManifest, PluginManifestCompatibility, PluginManifestKeybindings, PluginRuntime,
 };
-pub use native_exports::{EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, EXIT_USAGE, RustPlugin};
+pub use native_exports::{
+    EXIT_ERROR, EXIT_OK, EXIT_UNAVAILABLE, EXIT_USAGE, PluginCommandError, RustPlugin,
+};
 pub use registry::{
     CapabilityProvider, PluginCompatibilityReport, PluginRegistry, RegisteredPlugin,
     ServiceProvider,
@@ -156,6 +158,8 @@ pub mod prelude {
         NativeCommandContext,
         NativeLifecycleContext,
         NativeServiceContext,
+        // Error type
+        PluginCommandError,
         // Events
         PluginEvent,
         // Core trait
@@ -182,58 +186,65 @@ pub mod __private {
 #[macro_export]
 macro_rules! export_plugin {
     ($plugin_ty:ty, $manifest_toml:expr $(,)?) => {
-        fn __bmux_plugin_instance() -> &'static ::std::sync::Mutex<$plugin_ty> {
-            static INSTANCE: ::std::sync::OnceLock<::std::sync::Mutex<$plugin_ty>> =
-                ::std::sync::OnceLock::new();
-            $crate::__private::plugin_instance(&INSTANCE)
-        }
+        /// When the `static-bundled` feature is active the plugin is compiled
+        /// into the host binary and the [`bundled_plugin_vtable!`] macro
+        /// provides the symbols instead.  The `export_plugin!` body is
+        /// suppressed to avoid duplicate `#[no_mangle]` symbol collisions.
+        #[cfg(not(feature = "static-bundled"))]
+        const _: () = {
+            fn __bmux_plugin_instance() -> &'static ::std::sync::Mutex<$plugin_ty> {
+                static INSTANCE: ::std::sync::OnceLock<::std::sync::Mutex<$plugin_ty>> =
+                    ::std::sync::OnceLock::new();
+                $crate::__private::plugin_instance(&INSTANCE)
+            }
 
-        #[unsafe(no_mangle)]
-        pub extern "C" fn bmux_plugin_entry_v1() -> *const ::std::ffi::c_char {
-            static MANIFEST: ::std::sync::OnceLock<Option<::std::ffi::CString>> =
-                ::std::sync::OnceLock::new();
-            $crate::__private::manifest_toml_ptr($manifest_toml, &MANIFEST)
-        }
+            #[unsafe(no_mangle)]
+            pub extern "C" fn bmux_plugin_entry_v1() -> *const ::std::ffi::c_char {
+                static MANIFEST: ::std::sync::OnceLock<Option<::std::ffi::CString>> =
+                    ::std::sync::OnceLock::new();
+                $crate::__private::manifest_toml_ptr($manifest_toml, &MANIFEST)
+            }
 
-        #[unsafe(no_mangle)]
-        pub extern "C" fn bmux_plugin_run_command_with_context_v1(
-            context: *const ::std::ffi::c_char,
-        ) -> i32 {
-            $crate::__private::run_command_export(__bmux_plugin_instance(), context)
-        }
+            #[unsafe(no_mangle)]
+            pub extern "C" fn bmux_plugin_run_command_with_context_v1(
+                context: *const ::std::ffi::c_char,
+            ) -> i32 {
+                $crate::__private::run_command_export(__bmux_plugin_instance(), context)
+            }
 
-        #[unsafe(no_mangle)]
-        pub extern "C" fn bmux_plugin_activate_v1(context: *const ::std::ffi::c_char) -> i32 {
-            $crate::__private::activate_export(__bmux_plugin_instance(), context)
-        }
+            #[unsafe(no_mangle)]
+            pub extern "C" fn bmux_plugin_activate_v1(context: *const ::std::ffi::c_char) -> i32 {
+                $crate::__private::activate_export(__bmux_plugin_instance(), context)
+            }
 
-        #[unsafe(no_mangle)]
-        pub extern "C" fn bmux_plugin_deactivate_v1(context: *const ::std::ffi::c_char) -> i32 {
-            $crate::__private::deactivate_export(__bmux_plugin_instance(), context)
-        }
+            #[unsafe(no_mangle)]
+            pub extern "C" fn bmux_plugin_deactivate_v1(context: *const ::std::ffi::c_char) -> i32 {
+                $crate::__private::deactivate_export(__bmux_plugin_instance(), context)
+            }
 
-        #[unsafe(no_mangle)]
-        pub extern "C" fn bmux_plugin_handle_event_v1(event: *const ::std::ffi::c_char) -> i32 {
-            $crate::__private::handle_event_export(__bmux_plugin_instance(), event)
-        }
+            #[unsafe(no_mangle)]
+            pub extern "C" fn bmux_plugin_handle_event_v1(event: *const ::std::ffi::c_char) -> i32 {
+                $crate::__private::handle_event_export(__bmux_plugin_instance(), event)
+            }
 
-        #[unsafe(no_mangle)]
-        pub extern "C" fn bmux_plugin_invoke_service_v1(
-            input_ptr: *const u8,
-            input_len: usize,
-            output_ptr: *mut u8,
-            output_capacity: usize,
-            output_len: *mut usize,
-        ) -> i32 {
-            $crate::__private::invoke_service_export(
-                __bmux_plugin_instance(),
-                input_ptr,
-                input_len,
-                output_ptr,
-                output_capacity,
-                output_len,
-            )
-        }
+            #[unsafe(no_mangle)]
+            pub extern "C" fn bmux_plugin_invoke_service_v1(
+                input_ptr: *const u8,
+                input_len: usize,
+                output_ptr: *mut u8,
+                output_capacity: usize,
+                output_len: *mut usize,
+            ) -> i32 {
+                $crate::__private::invoke_service_export(
+                    __bmux_plugin_instance(),
+                    input_ptr,
+                    input_len,
+                    output_ptr,
+                    output_capacity,
+                    output_len,
+                )
+            }
+        };
     };
 }
 

@@ -3,9 +3,9 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_plugin::{
-    ContextCloseRequest, ContextCreateRequest, ContextSelector, EXIT_ERROR, EXIT_OK,
-    HostRuntimeApi, NativeCommandContext, NativeServiceContext, RustPlugin, ServiceResponse,
-    StorageGetRequest, StorageSetRequest, decode_service_message, encode_service_message,
+    ContextCloseRequest, ContextCreateRequest, ContextSelector, EXIT_OK, HostRuntimeApi,
+    NativeCommandContext, NativeServiceContext, PluginCommandError, RustPlugin, ServiceResponse,
+    StorageGetRequest, StorageSetRequest, handle_service,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -20,14 +20,9 @@ pub struct WindowsPlugin {
 }
 
 impl RustPlugin for WindowsPlugin {
-    fn run_command(&mut self, context: NativeCommandContext) -> i32 {
-        match handle_command(self, &context) {
-            Ok(()) => EXIT_OK,
-            Err(error) => {
-                eprintln!("{error}");
-                EXIT_ERROR
-            }
-        }
+    fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+        handle_command(self, &context)?;
+        Ok(EXIT_OK)
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
@@ -36,120 +31,39 @@ impl RustPlugin for WindowsPlugin {
             context.request.operation.as_str(),
         ) {
             ("window-query/v1", "list") => {
-                let request =
-                    match decode_service_message::<ListWindowsRequest>(&context.request.payload) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            return ServiceResponse::error("invalid_request", error.to_string());
-                        }
-                    };
-                let windows = match list_windows(&context, request.session.as_deref()) {
-                    Ok(windows) => windows,
-                    Err(error) => {
-                        return ServiceResponse::error("list_failed", error);
-                    }
-                };
-                let payload = match encode_service_message(&ListWindowsResponse { windows }) {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        return ServiceResponse::error("encode_failed", error.to_string());
-                    }
-                };
-                ServiceResponse::ok(payload)
+                handle_service(&context, |req: ListWindowsRequest, ctx| {
+                    let windows = list_windows(ctx, req.session.as_deref())
+                        .map_err(|e| ServiceResponse::error("list_failed", e))?;
+                    Ok(ListWindowsResponse { windows })
+                })
             }
             ("window-command/v1", "new") => {
-                let request =
-                    match decode_service_message::<NewWindowRequest>(&context.request.payload) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            return ServiceResponse::error("invalid_request", error.to_string());
-                        }
-                    };
-                let ack = match create_window(&context, request.name) {
-                    Ok(ack) => ack,
-                    Err(error) => return ServiceResponse::error("new_failed", error),
-                };
-                let payload = match encode_service_message(&ack) {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        return ServiceResponse::error("encode_failed", error.to_string());
-                    }
-                };
-                ServiceResponse::ok(payload)
+                handle_service(&context, |req: NewWindowRequest, ctx| {
+                    create_window(ctx, req.name)
+                        .map_err(|e| ServiceResponse::error("new_failed", e))
+                })
             }
             ("window-command/v1", "kill") => {
-                let request =
-                    match decode_service_message::<KillWindowRequest>(&context.request.payload) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            return ServiceResponse::error("invalid_request", error.to_string());
-                        }
-                    };
-                let selector = match parse_selector(&request.target) {
-                    Ok(selector) => selector,
-                    Err(error) => {
-                        return ServiceResponse::error("invalid_request", error);
-                    }
-                };
-                let ack = match kill_window(&context, selector, request.force_local) {
-                    Ok(ack) => ack,
-                    Err(error) => return ServiceResponse::error("kill_failed", error),
-                };
-                let payload = match encode_service_message(&ack) {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        return ServiceResponse::error("encode_failed", error.to_string());
-                    }
-                };
-                ServiceResponse::ok(payload)
+                handle_service(&context, |req: KillWindowRequest, ctx| {
+                    let selector = parse_selector(&req.target)
+                        .map_err(|e| ServiceResponse::error("invalid_request", e))?;
+                    kill_window(ctx, selector, req.force_local)
+                        .map_err(|e| ServiceResponse::error("kill_failed", e))
+                })
             }
             ("window-command/v1", "kill_all") => {
-                let request =
-                    match decode_service_message::<KillAllWindowsRequest>(&context.request.payload)
-                    {
-                        Ok(request) => request,
-                        Err(error) => {
-                            return ServiceResponse::error("invalid_request", error.to_string());
-                        }
-                    };
-                let ack = match kill_all_windows(&context, request.force_local) {
-                    Ok(ack) => ack,
-                    Err(error) => return ServiceResponse::error("kill_failed", error),
-                };
-                let payload = match encode_service_message(&ack) {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        return ServiceResponse::error("encode_failed", error.to_string());
-                    }
-                };
-                ServiceResponse::ok(payload)
+                handle_service(&context, |req: KillAllWindowsRequest, ctx| {
+                    kill_all_windows(ctx, req.force_local)
+                        .map_err(|e| ServiceResponse::error("kill_failed", e))
+                })
             }
             ("window-command/v1", "switch") => {
-                let request =
-                    match decode_service_message::<SwitchWindowRequest>(&context.request.payload) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            return ServiceResponse::error("invalid_request", error.to_string());
-                        }
-                    };
-                let selector = match parse_selector(&request.target) {
-                    Ok(selector) => selector,
-                    Err(error) => {
-                        return ServiceResponse::error("invalid_request", error);
-                    }
-                };
-                let ack = match switch_window(&context, selector, &mut self.last_selected_by_client)
-                {
-                    Ok(ack) => ack,
-                    Err(error) => return ServiceResponse::error("switch_failed", error),
-                };
-                let payload = match encode_service_message(&ack) {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        return ServiceResponse::error("encode_failed", error.to_string());
-                    }
-                };
-                ServiceResponse::ok(payload)
+                handle_service(&context, |req: SwitchWindowRequest, ctx| {
+                    let selector = parse_selector(&req.target)
+                        .map_err(|e| ServiceResponse::error("invalid_request", e))?;
+                    switch_window(ctx, selector, &mut self.last_selected_by_client)
+                        .map_err(|e| ServiceResponse::error("switch_failed", e))
+                })
             }
             _ => ServiceResponse::error(
                 "unsupported_service_operation",
@@ -625,7 +539,6 @@ struct WindowCommandAck {
     id: Option<String>,
 }
 
-#[cfg(not(feature = "static-bundled"))]
 bmux_plugin::export_plugin!(WindowsPlugin, include_str!("../plugin.toml"));
 
 #[cfg(test)]
@@ -636,7 +549,7 @@ mod tests {
         ContextSelectRequest, ContextSelectResponse, ContextSelector as SessionSelector,
         ContextSummary as SessionSummary, HostConnectionInfo, HostKernelBridge, HostMetadata,
         HostScope, NativeServiceContext, ProviderId, RegisteredService, ServiceCaller, ServiceKind,
-        ServiceRequest,
+        ServiceRequest, decode_service_message, encode_service_message,
     };
     use std::sync::Mutex;
 

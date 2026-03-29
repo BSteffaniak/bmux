@@ -3,9 +3,9 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_plugin::{
-    EXIT_ERROR, EXIT_OK, HostRuntimeApi, NativeCommandContext, NativeServiceContext, RustPlugin,
-    ServiceResponse, SessionSelector, StorageGetRequest, StorageSetRequest, decode_service_message,
-    encode_service_message,
+    EXIT_OK, HostRuntimeApi, NativeCommandContext, NativeServiceContext, PluginCommandError,
+    RustPlugin, ServiceResponse, SessionSelector, StorageGetRequest, StorageSetRequest,
+    decode_service_message, encode_service_message, handle_service,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -15,14 +15,9 @@ use uuid::Uuid;
 pub struct PermissionsPlugin;
 
 impl RustPlugin for PermissionsPlugin {
-    fn run_command(&mut self, context: NativeCommandContext) -> i32 {
-        match handle_command(&context) {
-            Ok(()) => EXIT_OK,
-            Err(error) => {
-                eprintln!("{error}");
-                EXIT_ERROR
-            }
-        }
+    fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+        handle_command(&context)?;
+        Ok(EXIT_OK)
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
@@ -31,88 +26,30 @@ impl RustPlugin for PermissionsPlugin {
             context.request.operation.as_str(),
         ) {
             ("permission-query/v1", "list") => {
-                let request = match decode_service_message::<ListPermissionsRequest>(
-                    &context.request.payload,
-                ) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        return ServiceResponse::error("invalid_request", error.to_string());
-                    }
-                };
-                let entries = match list_entries(&context, &request.session) {
-                    Ok(entries) => entries,
-                    Err(error) => {
-                        return ServiceResponse::error("list_failed", error);
-                    }
-                };
-                let payload = match encode_service_message(&ListPermissionsResponse { entries }) {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        return ServiceResponse::error("encode_failed", error.to_string());
-                    }
-                };
-                ServiceResponse::ok(payload)
+                handle_service(&context, |req: ListPermissionsRequest, ctx| {
+                    let entries = list_entries(ctx, &req.session)
+                        .map_err(|e| ServiceResponse::error("list_failed", e))?;
+                    Ok(ListPermissionsResponse { entries })
+                })
             }
             ("permission-command/v1", "grant") => {
-                let request = match decode_service_message::<GrantRequest>(&context.request.payload)
-                {
-                    Ok(request) => request,
-                    Err(error) => {
-                        return ServiceResponse::error("invalid_request", error.to_string());
-                    }
-                };
-                if let Err(error) = grant_entry(&context, request) {
-                    return ServiceResponse::error("grant_failed", error);
-                }
-                let payload = match encode_service_message(&CommandAckResponse { ok: true }) {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        return ServiceResponse::error("encode_failed", error.to_string());
-                    }
-                };
-                ServiceResponse::ok(payload)
+                handle_service(&context, |req: GrantRequest, ctx| {
+                    grant_entry(ctx, req).map_err(|e| ServiceResponse::error("grant_failed", e))?;
+                    Ok(CommandAckResponse { ok: true })
+                })
             }
             ("permission-command/v1", "revoke") => {
-                let request =
-                    match decode_service_message::<RevokeRequest>(&context.request.payload) {
-                        Ok(request) => request,
-                        Err(error) => {
-                            return ServiceResponse::error("invalid_request", error.to_string());
-                        }
-                    };
-                if let Err(error) = revoke_entry(&context, request) {
-                    return ServiceResponse::error("revoke_failed", error);
-                }
-                let payload = match encode_service_message(&CommandAckResponse { ok: true }) {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        return ServiceResponse::error("encode_failed", error.to_string());
-                    }
-                };
-                ServiceResponse::ok(payload)
+                handle_service(&context, |req: RevokeRequest, ctx| {
+                    revoke_entry(ctx, req)
+                        .map_err(|e| ServiceResponse::error("revoke_failed", e))?;
+                    Ok(CommandAckResponse { ok: true })
+                })
             }
             ("session-policy-query/v1", "check") => {
-                let request = match decode_service_message::<SessionPolicyCheckRequest>(
-                    &context.request.payload,
-                ) {
-                    Ok(request) => request,
-                    Err(error) => {
-                        return ServiceResponse::error("invalid_request", error.to_string());
-                    }
-                };
-                let decision = match evaluate_policy(&context, &request) {
-                    Ok(decision) => decision,
-                    Err(error) => {
-                        return ServiceResponse::error("policy_failed", error);
-                    }
-                };
-                let payload = match encode_service_message(&decision) {
-                    Ok(payload) => payload,
-                    Err(error) => {
-                        return ServiceResponse::error("encode_failed", error.to_string());
-                    }
-                };
-                ServiceResponse::ok(payload)
+                handle_service(&context, |req: SessionPolicyCheckRequest, ctx| {
+                    evaluate_policy(ctx, &req)
+                        .map_err(|e| ServiceResponse::error("policy_failed", e))
+                })
             }
             _ => ServiceResponse::error(
                 "unsupported_service_operation",
@@ -461,7 +398,6 @@ struct CommandAckResponse {
     ok: bool,
 }
 
-#[cfg(not(feature = "static-bundled"))]
 bmux_plugin::export_plugin!(PermissionsPlugin, include_str!("../plugin.toml"));
 
 #[cfg(test)]

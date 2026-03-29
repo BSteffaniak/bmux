@@ -25,3 +25,4 @@ uuid            = { workspace = true, features = ["std"] }
 
 [features]
 fail-on-warnings = []
+static-bundled   = []

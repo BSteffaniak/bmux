@@ -41,7 +41,6 @@ impl RustPlugin for ClipboardPlugin {
     }
 }
 
-#[cfg(not(feature = "static-bundled"))]
 bmux_plugin::export_plugin!(ClipboardPlugin, include_str!("../plugin.toml"));
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

@@ -3,8 +3,9 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_plugin::{
-    CapabilityProvider, EXIT_ERROR, HostScope, NativeCommandContext, PluginManifest,
-    PluginRegistry, RustPlugin, discover_plugin_manifests_in_roots, load_registered_plugin,
+    CapabilityProvider, EXIT_OK, HostScope, NativeCommandContext, PluginCommandError,
+    PluginManifest, PluginRegistry, RustPlugin, discover_plugin_manifests_in_roots,
+    load_registered_plugin,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -15,20 +16,12 @@ use std::process::Command as ProcessCommand;
 pub struct PluginCliPlugin;
 
 impl RustPlugin for PluginCliPlugin {
-    fn run_command(&mut self, context: NativeCommandContext) -> i32 {
-        let result = match context.command.as_str() {
-            "list" => run_list_command(&context),
-            "run" => run_run_command(&context),
-            "rebuild" => run_rebuild_command(&context),
-            _ => Err(format!("unsupported command '{}'", context.command)),
-        };
-
-        match result {
-            Ok(status) => status,
-            Err(error) => {
-                eprintln!("{error}");
-                EXIT_ERROR
-            }
+    fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+        match context.command.as_str() {
+            "list" => run_list_command(&context).map_err(PluginCommandError::from),
+            "run" => run_run_command(&context).map_err(PluginCommandError::from),
+            "rebuild" => run_rebuild_command(&context).map_err(PluginCommandError::from),
+            _ => Err(PluginCommandError::unknown_command(&context.command)),
         }
     }
 }
@@ -56,12 +49,12 @@ fn run_list_command(context: &NativeCommandContext) -> Result<i32, String> {
         let output = serde_json::to_string_pretty(&entries)
             .map_err(|error| format!("failed encoding plugin list json: {error}"))?;
         println!("{output}");
-        return Ok(0);
+        return Ok(EXIT_OK);
     }
 
     if entries.is_empty() {
         println!("no plugins discovered");
-        return Ok(0);
+        return Ok(EXIT_OK);
     }
 
     for entry in entries {
@@ -89,7 +82,7 @@ fn run_list_command(context: &NativeCommandContext) -> Result<i32, String> {
         }
     }
 
-    Ok(0)
+    Ok(EXIT_OK)
 }
 
 fn run_run_command(context: &NativeCommandContext) -> Result<i32, String> {
@@ -200,7 +193,7 @@ fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String> {
 
     if options.list_only {
         print_discovered_plugins(&bundled_plugins, &workspace_plugin_crates);
-        return Ok(0);
+        return Ok(EXIT_OK);
     }
 
     let mut targets = Vec::new();
@@ -270,7 +263,7 @@ fn run_rebuild_command(context: &NativeCommandContext) -> Result<i32, String> {
         return Err("cargo build failed for selected plugin crates".to_string());
     }
 
-    Ok(0)
+    Ok(EXIT_OK)
 }
 
 fn discover_bundled_plugins(context: &NativeCommandContext) -> Result<Vec<BundledPlugin>, String> {
@@ -603,5 +596,4 @@ struct PluginListEntry {
     commands: Vec<String>,
 }
 
-#[cfg(not(feature = "static-bundled"))]
 bmux_plugin::export_plugin!(PluginCliPlugin, include_str!("../plugin.toml"));

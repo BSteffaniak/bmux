@@ -20,6 +20,89 @@ pub const EXIT_USAGE: i32 = 64;
 /// Plugin is unavailable (e.g. mutex poisoned, feature disabled).
 pub const EXIT_UNAVAILABLE: i32 = 70;
 
+// ── Plugin command error ─────────────────────────────────────────────────────
+
+/// Error type returned by [`RustPlugin`] command and lifecycle methods.
+///
+/// Carries an exit code and a human-readable message.  The SDK prints the
+/// message to stderr and returns the code across the FFI boundary.
+///
+/// Implements `From<String>` and `From<&str>` so you can use `?` with
+/// string errors -- they map to [`EXIT_ERROR`].
+#[derive(Debug, Clone)]
+pub struct PluginCommandError {
+    pub code: i32,
+    pub message: String,
+}
+
+impl PluginCommandError {
+    #[must_use]
+    pub fn new(code: i32, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+        }
+    }
+
+    /// Generic failure (`EXIT_ERROR`).
+    #[must_use]
+    pub fn failed(message: impl Into<String>) -> Self {
+        Self::new(EXIT_ERROR, message)
+    }
+
+    /// Unknown or unsupported command (`EXIT_USAGE`).
+    #[must_use]
+    pub fn unknown_command(name: &str) -> Self {
+        Self::new(EXIT_USAGE, format!("unknown command '{name}'"))
+    }
+
+    /// Invalid arguments (`EXIT_USAGE`).
+    #[must_use]
+    pub fn invalid_arguments(message: impl Into<String>) -> Self {
+        Self::new(EXIT_USAGE, message)
+    }
+
+    /// Plugin unavailable (`EXIT_UNAVAILABLE`).
+    #[must_use]
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self::new(EXIT_UNAVAILABLE, message)
+    }
+}
+
+impl std::fmt::Display for PluginCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for PluginCommandError {}
+
+impl From<String> for PluginCommandError {
+    fn from(message: String) -> Self {
+        Self::failed(message)
+    }
+}
+
+impl From<&str> for PluginCommandError {
+    fn from(message: &str) -> Self {
+        Self::failed(message)
+    }
+}
+
+/// Convert a plugin Result into an FFI exit code.
+///
+/// - `Ok(code)` → returns `code`
+/// - `Err(e)` → prints `e.message` to stderr, returns `e.code`
+fn result_to_exit_code(result: Result<i32, PluginCommandError>) -> i32 {
+    match result {
+        Ok(code) => code,
+        Err(error) => {
+            eprintln!("{}", error.message);
+            error.code
+        }
+    }
+}
+
 // ── Internal FFI status codes (not exposed to plugin authors) ────────────────
 
 const SERVICE_STATUS_OK: i32 = 0;
@@ -29,21 +112,23 @@ const SERVICE_STATUS_BUFFER_TOO_SMALL: i32 = 4;
 const SERVICE_STATUS_ENCODE_FAILED: i32 = 5;
 const SERVICE_STATUS_PLUGIN_UNAVAILABLE: i32 = 70;
 
+// ── Plugin trait ─────────────────────────────────────────────────────────────
+
 pub trait RustPlugin: Default + Send + 'static {
-    fn run_command(&mut self, _context: NativeCommandContext) -> i32 {
-        EXIT_USAGE
+    fn run_command(&mut self, _context: NativeCommandContext) -> Result<i32, PluginCommandError> {
+        Err(PluginCommandError::unknown_command(""))
     }
 
-    fn activate(&mut self, _context: NativeLifecycleContext) -> i32 {
-        EXIT_OK
+    fn activate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        Ok(EXIT_OK)
     }
 
-    fn deactivate(&mut self, _context: NativeLifecycleContext) -> i32 {
-        EXIT_OK
+    fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
+        Ok(EXIT_OK)
     }
 
-    fn handle_event(&mut self, _event: PluginEvent) -> i32 {
-        EXIT_OK
+    fn handle_event(&mut self, _event: PluginEvent) -> Result<i32, PluginCommandError> {
+        Ok(EXIT_OK)
     }
 
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
@@ -56,6 +141,8 @@ pub trait RustPlugin: Default + Send + 'static {
         )
     }
 }
+
+// ── FFI helpers ──────────────────────────────────────────────────────────────
 
 #[doc(hidden)]
 pub fn plugin_instance<P: RustPlugin>(instance: &'static OnceLock<Mutex<P>>) -> &'static Mutex<P> {
@@ -81,9 +168,9 @@ pub fn run_command_export<P: RustPlugin>(
     parse_json_input::<NativeCommandContext>(context, 2, 3).map_or_else(
         |code| code,
         |payload| {
-            instance
-                .lock()
-                .map_or(70, |mut plugin| plugin.run_command(payload))
+            instance.lock().map_or(EXIT_UNAVAILABLE, |mut plugin| {
+                result_to_exit_code(plugin.run_command(payload))
+            })
         },
     )
 }
@@ -93,9 +180,9 @@ pub fn activate_export<P: RustPlugin>(instance: &'static Mutex<P>, context: *con
     parse_json_input::<NativeLifecycleContext>(context, 2, 3).map_or_else(
         |code| code,
         |payload| {
-            instance
-                .lock()
-                .map_or(70, |mut plugin| plugin.activate(payload))
+            instance.lock().map_or(EXIT_UNAVAILABLE, |mut plugin| {
+                result_to_exit_code(plugin.activate(payload))
+            })
         },
     )
 }
@@ -108,9 +195,9 @@ pub fn deactivate_export<P: RustPlugin>(
     parse_json_input::<NativeLifecycleContext>(context, 2, 3).map_or_else(
         |code| code,
         |payload| {
-            instance
-                .lock()
-                .map_or(70, |mut plugin| plugin.deactivate(payload))
+            instance.lock().map_or(EXIT_UNAVAILABLE, |mut plugin| {
+                result_to_exit_code(plugin.deactivate(payload))
+            })
         },
     )
 }
@@ -123,9 +210,9 @@ pub fn handle_event_export<P: RustPlugin>(
     parse_json_input::<PluginEvent>(event, 2, 3).map_or_else(
         |code| code,
         |payload| {
-            instance
-                .lock()
-                .map_or(70, |mut plugin| plugin.handle_event(payload))
+            instance.lock().map_or(EXIT_UNAVAILABLE, |mut plugin| {
+                result_to_exit_code(plugin.handle_event(payload))
+            })
         },
     )
 }
