@@ -65,7 +65,7 @@ Expose generic host service interfaces for context operations:
 - `context-query/v1`
 - `context-command/v1`
 
-Use typed `bmux_plugin` host runtime APIs for all plugin access to core mechanics.
+Use typed `bmux_plugin_sdk` host runtime APIs for all plugin access to core mechanics.
 
 ## Command Outcome Contract
 

@@ -1,93 +1,194 @@
 # bmux_plugin
 
-Native-first plugin SDK for bmux.
+Host-side plugin infrastructure for bmux.
 
-## Goals
+## Crate Architecture
 
-- Keep the default plugin authoring path simple
-- Support deep native integrations without exposing unstable internals directly
-- Separate bmux plugin API and native ABI versioning from the bmux product version
-- Make it possible to move more built-in functionality onto plugin-style contracts over time
+The plugin system is split into two crates:
 
-## What This Crate Provides Today
+| Crate | Audience | What it provides |
+|-------|----------|-----------------|
+| **`bmux_plugin_sdk`** | Plugin authors | `RustPlugin` trait, context types, macros, service helpers, prelude |
+| **`bmux_plugin`** | Host runtime | Registry, loader, discovery, manifest parsing, `ServiceCaller`, `HostRuntimeApi` |
 
-- Plugin manifest parsing
-- Stable plugin declaration types
-- Host scope and plugin feature declaration types
-- Host service traits for plugin-facing integrations
-- Plugin registry and host compatibility validation
-- Native plugin entrypoint metadata constants
+**Plugin authors** should depend on `bmux_plugin_sdk` for a slim dependency footprint. Add `bmux_plugin` only if you need host service calls (`HostRuntimeApi`, `ServiceCaller`).
 
-## Current Scope
+## Quick Start
 
-This crate now supports native plugin discovery, validation, loading, lifecycle hooks, command execution, and event delivery. Host services are still intentionally narrow and deeper runtime hooks are still being built out.
-
-## Manifest Example
+### 1. Create `plugin.toml`
 
 ```toml
-id = "git.status"
-name = "Git Status"
+id      = "example.hello"
+name    = "Hello Plugin"
 version = "0.1.0"
-runtime = "native"
-entry = "libgit_status.dylib"
-required_host_scopes = ["bmux.commands", "bmux.events.subscribe"]
-provided_features = ["git.status"]
 
-[plugin_api]
-minimum = "1.0"
-
-[native_abi]
-minimum = "1.0"
+[[commands]]
+name          = "hello"
+summary       = "Print a greeting"
+expose_in_cli = true
 ```
 
-The manifest `entry` should point at the installed plugin bundle artifact, typically a library placed next to the manifest, rather than a hardcoded Cargo `target/` path.
-
-## Rust Example (Builder-First)
+### 2. Create `src/lib.rs`
 
 ```rust
-use bmux_plugin::{
-    CommandExecutionKind, HostScope, NativeCommandContext, NativeDescriptor, PluginCommand,
-    RustPlugin,
-};
+use bmux_plugin_sdk::prelude::*;
 
 #[derive(Default)]
-struct HelloPlugin;
+pub struct HelloPlugin;
 
 impl RustPlugin for HelloPlugin {
-    fn descriptor(&self) -> NativeDescriptor {
-        NativeDescriptor::builder("hello.example", "Hello Example")
-            .plugin_version("0.1.0")
-            .description("Small example plugin")
-            .require_capability("bmux.commands")
-            .unwrap()
-            .provide_feature("hello.example")
-            .unwrap()
-            .command(
-                PluginCommand::new("hello", "Print a greeting")
-                    .execution(CommandExecutionKind::ProviderExec),
-            )
-            .build()
-            .unwrap()
-    }
-
-    fn run_command(&mut self, context: NativeCommandContext) -> i32 {
-        match context.command.as_str() {
+    fn run_command(&mut self, ctx: NativeCommandContext) -> Result<i32, PluginCommandError> {
+        bmux_plugin_sdk::route_command!(ctx, {
             "hello" => {
-                println!("hello from bmux");
-                0
-            }
-            _ => 64,
-        }
+                let name = ctx.arguments.first().map_or("world", String::as_str);
+                println!("Hello, {name}!");
+                Ok(EXIT_OK)
+            },
+        })
     }
 }
 
-bmux_plugin::export_plugin!(HelloPlugin);
+bmux_plugin_sdk::export_plugin!(HelloPlugin, include_str!("../plugin.toml"));
 ```
+
+### 3. Create `Cargo.toml`
+
+```toml
+[package]
+name    = "my_plugin"
+edition = "2021"
+version = "0.1.0"
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+bmux_plugin_sdk = { version = "..." }
+
+[features]
+static-bundled = []
+```
+
+The `crate-type` must include `cdylib` (for dynamic loading) and `rlib` (for static bundling). The `static-bundled` feature is used when the plugin is compiled into the host binary.
+
+## Manifest Reference (`plugin.toml`)
+
+### Top-Level Fields
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `id` | string | **Yes** | — | Unique plugin identifier (e.g. `"bmux.clipboard"`, `"example.hello"`) |
+| `name` | string | **Yes** | — | Human-readable display name |
+| `version` | string | **Yes** | — | Plugin version (semver) |
+| `description` | string | No | — | Optional description |
+| `homepage` | string | No | — | Optional URL |
+| `runtime` | string | No | `"native"` | Runtime type (only `"native"` is supported) |
+| `entry` | path | No | — | Path to `.dylib`/`.so` file (only needed for external/dynamic plugins) |
+| `entry_symbol` | string | No | `"bmux_plugin_entry_v1"` | FFI entry point symbol name |
+| `provider_priority` | integer | No | `0` | Ordering priority when multiple plugins provide the same capability |
+| `required_capabilities` | list | No | `[]` | Host capabilities this plugin needs (e.g. `["bmux.commands"]`) |
+| `provided_capabilities` | list | No | `[]` | Capabilities this plugin provides to others |
+| `provided_features` | list | No | `[]` | Feature flags this plugin provides |
+
+### Compatibility (optional sections)
+
+```toml
+[plugin_api]
+minimum = "1.0"    # default
+maximum = "2.0"    # optional upper bound
+
+[native_abi]
+minimum = "1.0"    # default
+```
+
+Both sections default to `minimum = "1.0"` with no maximum and can be omitted entirely.
+
+### Commands (`[[commands]]`)
+
+```toml
+[[commands]]
+name          = "hello"          # required: dispatch name (matches context.command)
+summary       = "Print a greeting" # required: short description
+expose_in_cli = true             # default: false -- set true to show in CLI
+path          = ["greet"]        # optional: CLI subcommand path
+aliases       = [["say", "hi"]]  # optional: alternative CLI paths
+execution     = "provider_exec"  # default: "provider_exec"
+description   = "Longer help text" # optional
+```
+
+#### Command Arguments (`[[commands.arguments]]`)
+
+```toml
+[[commands.arguments]]
+name     = "target"       # required
+kind     = "string"       # required: string | integer | boolean | path | choice
+required = true           # default: false
+position = 0              # optional: positional index
+long     = "target"       # optional: --target
+short    = "t"            # optional: -t
+multiple = true           # default: false
+value_name = "TARGET"     # optional: displayed in help
+choice_values = ["a","b"] # optional: valid values for kind = "choice"
+```
+
+### Services (`[[services]]`)
+
+```toml
+[[services]]
+capability   = "bmux.clipboard.write"  # required: host capability scope
+interface_id = "clipboard-write/v1"    # required: service interface identifier
+kind         = "command"               # required: "command" or "query"
+```
+
+### Event Subscriptions (`[[event_subscriptions]]`)
+
+```toml
+[[event_subscriptions]]
+kinds = ["system", "window"]          # event categories
+names = ["server_started", "window_created"]  # specific event names
+```
+
+### Dependencies (`[[dependencies]]`)
+
+```toml
+[[dependencies]]
+plugin_id   = "bmux.permissions"
+version_req = "=0.0.1-alpha.0"
+required    = true                    # default: true
+```
+
+### Keybindings (`[keybindings]`)
+
+```toml
+[keybindings.runtime]
+c = "plugin:bmux.windows:new-window"
+"alt+w" = "plugin:bmux.windows:switch-window"
+
+[keybindings.global]
+# global keybindings (active outside runtime mode)
+
+[keybindings.scroll]
+y = "copy_scrollback"
+```
+
+## The `RustPlugin` Trait
+
+All five methods have default implementations. Override only what your plugin needs:
+
+| Method | When to override |
+|--------|-----------------|
+| `run_command` | Plugin provides CLI commands |
+| `invoke_service` | Plugin provides services to other plugins |
+| `activate` / `deactivate` | Plugin needs lifecycle setup/teardown |
+| `handle_event` | Plugin subscribes to system events |
+
+Commands and lifecycle methods return `Result<i32, PluginCommandError>`. Use the `?` operator with string errors, `io::Error`, `serde_json::Error`, etc. -- they all convert automatically via `From` impls.
+
+Service handlers return `ServiceResponse`. Use `route_service!` to reduce boilerplate.
 
 ## Design Notes
 
 - Prefer plugin-facing DTOs, handles, and service traits over direct access to server internals
 - Treat hot-path runtime hooks as explicit high-risk host scopes
-- Keep ordinary plugins compatible across bmux releases by stabilizing `bmux_plugin` first
+- Keep ordinary plugins compatible across bmux releases by stabilizing `bmux_plugin_sdk` first
 - Leave room for future non-Rust runtimes by defining manifests, host scopes, and plugin features as host concepts
-- Keep plugin domain ownership, capability policy, and migration intent in code and tests rather than external markdown planning docs
