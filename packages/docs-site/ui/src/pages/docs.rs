@@ -324,8 +324,8 @@ fn render_command(doc: &mut String, cmd: &clap::Command, path: &[&str], depth: u
 
     // Render flags/options table
     if !flags.is_empty() {
-        doc.push_str("| Flag | Description | Default |\n");
-        doc.push_str("|------|-------------|--------|\n");
+        doc.push_str("| Flag | Description | Values | Default |\n");
+        doc.push_str("|------|-------------|--------|--------|\n");
 
         for flag in &flags {
             let mut flag_str = String::new();
@@ -352,19 +352,63 @@ fn render_command(doc: &mut String, cmd: &clap::Command, path: &[&str], depth: u
 
             let desc = flag.get_help().map(|h| h.to_string()).unwrap_or_default();
 
+            // Determine the Values column content:
+            // - ValueEnum args: show the valid choices
+            // - Boolean flags: show "boolean"
+            // - Otherwise: infer type from value name heuristic
+            let possible: Vec<String> = flag
+                .get_possible_values()
+                .iter()
+                .filter(|v| !v.is_hide_set())
+                .map(|v| v.get_name().to_string())
+                .collect();
+
+            let is_bool_values = possible.is_empty()
+                || possible == ["true", "false"]
+                || possible == ["false", "true"];
+
+            let values_display = if !is_bool_values {
+                // Real ValueEnum — show the choices
+                possible
+                    .iter()
+                    .map(|v| format!("`{v}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            } else if matches!(
+                flag.get_action(),
+                clap::ArgAction::SetTrue | clap::ArgAction::SetFalse | clap::ArgAction::Count
+            ) {
+                // Boolean flag (SetTrue/SetFalse) or count flag (-vvv)
+                "boolean".to_string()
+            } else {
+                // Takes a value — infer type from value name
+                let val_name = flag
+                    .get_value_names()
+                    .and_then(|n| n.first())
+                    .map(|n| n.as_str().to_lowercase())
+                    .unwrap_or_default();
+                infer_value_type(&val_name)
+            };
+
             let default = flag
                 .get_default_values()
                 .iter()
                 .map(|v| v.to_string_lossy().to_string())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let default_display = if default.is_empty() {
-                String::new()
-            } else {
+            let default_display = if !default.is_empty() {
                 format!("`{default}`")
+            } else if matches!(flag.get_action(), clap::ArgAction::SetTrue) {
+                "`false`".to_string()
+            } else if matches!(flag.get_action(), clap::ArgAction::SetFalse) {
+                "`true`".to_string()
+            } else {
+                String::new()
             };
 
-            doc.push_str(&format!("| `{flag_str}` | {desc} | {default_display} |\n"));
+            doc.push_str(&format!(
+                "| `{flag_str}` | {desc} | {values_display} | {default_display} |\n"
+            ));
         }
         doc.push('\n');
     }
@@ -390,4 +434,50 @@ fn render_command(doc: &mut String, cmd: &clap::Command, path: &[&str], depth: u
         sub_path.push(sub.get_name());
         render_command(doc, sub, &sub_path, depth + 1);
     }
+}
+
+/// Infer a human-readable type name from a clap value name.
+fn infer_value_type(val_name: &str) -> String {
+    // Integer-like value names
+    if matches!(
+        val_name,
+        "lines"
+            | "limit"
+            | "fps"
+            | "n"
+            | "days"
+            | "secs"
+            | "ms"
+            | "timeout"
+            | "threshold"
+            | "px"
+            | "cell_size"
+            | "max_frames"
+            | "max_duration"
+            | "max_verify_duration"
+            | "verify_start_timeout"
+            | "older_than"
+            | "timing_threshold"
+            | "trace_limit"
+            | "trace_pane"
+    ) {
+        return "integer".to_string();
+    }
+
+    // Float-like value names
+    if matches!(val_name, "speed" | "line_height" | "font_size") {
+        return "number".to_string();
+    }
+
+    // Path-like value names
+    if val_name.contains("path")
+        || val_name.contains("file")
+        || val_name.contains("dir")
+        || val_name == "output"
+        || val_name == "source"
+    {
+        return "path".to_string();
+    }
+
+    "string".to_string()
 }
