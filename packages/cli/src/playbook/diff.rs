@@ -23,6 +23,8 @@ pub struct DiffReport {
     pub snapshot_diffs: Vec<SnapshotDiff>,
     pub failure_capture_diffs: Vec<FailureCaptureDiff>,
     pub timing_regressions: Vec<TimingRegression>,
+    /// The timing regression threshold percentage used for detection.
+    pub timing_threshold_pct: f64,
 }
 
 /// High-level summary of the diff.
@@ -253,6 +255,7 @@ pub fn diff_results(
     };
 
     DiffReport {
+        timing_threshold_pct,
         summary: DiffSummary {
             left_pass: left.pass,
             right_pass: right.pass,
@@ -579,8 +582,8 @@ pub fn format_diff_report(report: &DiffReport, left_name: &str, right_name: &str
     // Timing regressions
     if !report.timing_regressions.is_empty() {
         out.push_str(&format!(
-            "\n  timing regressions (>{}%):\n",
-            report.summary.timing_delta_pct.abs() as u64
+            "\n  timing regressions (>{:.0}%):\n",
+            report.timing_threshold_pct
         ));
         for tr in &report.timing_regressions {
             out.push_str(&format!(

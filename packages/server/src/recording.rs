@@ -14,7 +14,6 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const MANIFEST_FILE_NAME: &str = "manifest.json";
-const EVENTS_FILE_NAME: &str = "events.bin";
 
 #[derive(Debug)]
 pub struct RecordingRuntime {

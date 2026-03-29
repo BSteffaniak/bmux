@@ -38,9 +38,9 @@ pub fn parse_dsl(input: &str) -> Result<(Playbook, Vec<(usize, String)>)> {
             parse_config_directive(directive.trim(), &mut config, &mut includes, step_index)
                 .with_context(|| format!("line {line_ctx}: invalid config directive"))?;
         } else {
-            // Check for !continue suffix.
-            let (action_line, continue_on_error) = if line.ends_with("!continue") {
-                (line[..line.len() - "!continue".len()].trim(), true)
+            // Check for !continue suffix (must be preceded by whitespace).
+            let (action_line, continue_on_error) = if line.ends_with(" !continue") {
+                (line[..line.len() - " !continue".len()].trim(), true)
             } else {
                 (line, false)
             };

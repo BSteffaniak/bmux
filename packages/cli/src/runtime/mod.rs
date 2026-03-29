@@ -8544,7 +8544,7 @@ fn run_playbook_dry_run(source: &str, json: bool) -> Result<u8> {
                 serde_json::json!({
                     "index": s.index,
                     "action": s.action.name(),
-                    "dsl": s.action.to_dsl(),
+                    "dsl": s.to_dsl(),
                 })
             })
             .collect();
@@ -8581,7 +8581,7 @@ fn run_playbook_dry_run(source: &str, json: bool) -> Result<u8> {
         );
         println!("  steps:");
         for step in &playbook.steps {
-            println!("    {}. {}", step.index, step.action.to_dsl());
+            println!("    {}. {}", step.index, step.to_dsl());
         }
         if valid {
             println!("  validation: ok");

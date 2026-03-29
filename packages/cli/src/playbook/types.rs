@@ -125,6 +125,18 @@ pub struct Step {
     pub continue_on_error: bool,
 }
 
+impl Step {
+    /// Serialize the step to a DSL line, including the `!continue` suffix if set.
+    pub fn to_dsl(&self) -> String {
+        let line = self.action.to_dsl();
+        if self.continue_on_error {
+            format!("{line} !continue")
+        } else {
+            line
+        }
+    }
+}
+
 /// All supported playbook actions.
 #[derive(Debug, Clone)]
 pub enum Action {

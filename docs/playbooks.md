@@ -714,8 +714,18 @@ pattern = "hello"
 timeout = 5000
 
 [[step]]
+action = "wait-for"
+pattern = "flaky_output"
+retry = 3
+
+[[step]]
 action = "assert-screen"
 contains = "hello"
+
+[[step]]
+action = "assert-screen"
+contains = "optional"
+continue_on_error = true
 ```
 
 ### TOML Example
@@ -1228,7 +1238,53 @@ screen content.
    bmux playbook run repro.dsl --json
    ```
 
-### Example 10: LLM-generated playbook pattern
+### Example 10: CLI variable overrides
+
+Pass variables from the command line to override `@var` defaults:
+
+```sh
+# The playbook uses ${MARKER} which defaults to "test"
+bmux playbook run test.dsl --var MARKER=production_check --json
+```
+
+### Example 11: Retry flaky operations
+
+Use `retry=` on `wait-for` for operations that may not succeed immediately:
+
+```
+@shell sh
+new-session
+send-keys keys='./flaky_server.sh &\r'
+wait-for pattern='server ready' timeout=3000 retry=3
+```
+
+### Example 12: Continue on error for diagnostics
+
+Use `!continue` to check multiple conditions and report all failures:
+
+```
+@shell sh
+new-session
+send-keys keys='run_diagnostics\r'
+wait-for pattern='\$'
+assert-screen contains='check_1_ok' !continue
+assert-screen contains='check_2_ok' !continue
+assert-screen contains='check_3_ok' !continue
+snapshot id=diagnostic_results
+```
+
+### Example 13: Literal variable references
+
+Use `$${...}` to send literal `${...}` to the terminal:
+
+```
+@shell sh
+new-session
+send-keys keys='echo $${HOME}\r'
+wait-for pattern='\$\{HOME\}'
+```
+
+### Example 14: LLM-generated playbook pattern
 
 An LLM generating a playbook from a bug description should follow this pattern:
 

@@ -64,6 +64,12 @@ impl RuntimeVars {
                 // Find closing brace
                 if let Some(close) = template[i + 2..].find('}') {
                     let var_name = &template[i + 2..i + 2 + close];
+                    if var_name.is_empty() {
+                        tracing::warn!("empty variable reference: ${{}}");
+                        result.push_str("${}");
+                        i += 3; // skip past ${}
+                        continue;
+                    }
                     if let Some(value) = self.lookup(var_name) {
                         result.push_str(&value);
                     } else {

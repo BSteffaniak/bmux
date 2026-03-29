@@ -452,8 +452,9 @@ async fn run_repl(
                 match sandbox.connect("bmux-playbook-output-stream").await {
                     Ok(mut event_client) => {
                         let tx = output_tx.clone();
+                        let focused = runtime_vars.focused_pane;
                         output_task = Some(tokio::spawn(async move {
-                            output_poll_loop(&mut event_client, sid, tx).await;
+                            output_poll_loop(&mut event_client, sid, focused, tx).await;
                         }));
                         subscribed = true;
                         let resp = InteractiveResponse::ok("subscribe");
@@ -552,10 +553,12 @@ async fn run_repl(
 
                 // Extract structured failure data if available (same pattern as batch mode).
                 if let Some(sf) = err.downcast_ref::<super::types::StepFailure>() {
+                    resp.detail = Some(sf.message.clone());
                     if let Some(ref expected) = sf.expected {
-                        resp.detail = Some(sf.message.clone());
-                        // Use the error field for the structured expected value.
                         resp.error = Some(format!("expected: {expected}"));
+                    }
+                    if let Some(ref actual) = sf.actual {
+                        resp.detail = Some(format!("{}\nactual: {actual}", sf.message));
                     }
                 }
 
@@ -718,6 +721,7 @@ fn simple_hash(bytes: &[u8]) -> u64 {
 async fn output_poll_loop(
     client: &mut bmux_client::BmuxClient,
     session_id: Uuid,
+    focused_pane_index: u32,
     tx: tokio::sync::mpsc::Sender<(u32, String)>,
 ) {
     const MAX_OUTPUT_BYTES: usize = 64 * 1024;
@@ -726,11 +730,9 @@ async fn output_poll_loop(
     loop {
         match client.attach_output(session_id, MAX_OUTPUT_BYTES).await {
             Ok(data) if !data.is_empty() => {
-                // Convert to lossy UTF-8 for text display.
                 let text = String::from_utf8_lossy(&data).to_string();
-                // Use pane index 0 as a placeholder (the attach_output API
-                // returns output from the focused pane only).
-                if tx.send((0, text)).await.is_err() {
+                // attach_output returns output from the focused pane.
+                if tx.send((focused_pane_index, text)).await.is_err() {
                     break; // Receiver dropped — unsubscribed or session ended
                 }
             }

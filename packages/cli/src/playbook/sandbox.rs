@@ -630,8 +630,15 @@ pub fn cleanup_orphaned_sandboxes(dry_run: bool) -> anyhow::Result<(usize, Vec<C
         let sock_file = entry.path().join("r").join("server.sock");
         let is_alive = if sock_file.exists() {
             // If the socket file exists, try a non-blocking connect to check
-            // if the server is actually listening. If connect fails, it's dead.
-            std::os::unix::net::UnixStream::connect(&sock_file).is_ok()
+            // if the server is actually listening.
+            #[cfg(unix)]
+            {
+                std::os::unix::net::UnixStream::connect(&sock_file).is_ok()
+            }
+            #[cfg(not(unix))]
+            {
+                false // Socket files don't exist on non-Unix; assume dead.
+            }
         } else if pid_file.exists() {
             // No socket but PID file exists -- check if process is running.
             // Use `kill -0` via std::process::Command as a portable check.

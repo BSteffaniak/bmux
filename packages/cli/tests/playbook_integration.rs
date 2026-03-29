@@ -274,6 +274,8 @@ fn parse_and_validate_fixtures() {
         "include_main.dsl",
         "timeout_wait_for.dsl",
         "timeout_playbook.dsl",
+        "var_override.dsl",
+        "continue_on_error.dsl",
     ];
 
     for name in &fixtures {
@@ -794,12 +796,24 @@ fn playbook_assert_matches_invalid_regex() {
 // ---------------------------------------------------------------------------
 
 /// Guard that kills a child process on drop (for test cleanup).
-struct ProcessGuard(std::process::Child);
+struct ProcessGuard {
+    pid: u32,
+}
+
+impl ProcessGuard {
+    fn new(child: &std::process::Child) -> Self {
+        Self { pid: child.id() }
+    }
+}
 
 impl Drop for ProcessGuard {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        // Best-effort kill on test failure/panic.
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &self.pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
     }
 }
 
@@ -825,7 +839,7 @@ async fn interactive_mode_basic() {
         .spawn()
         .expect("failed to spawn bmux playbook interactive");
 
-    let _guard = ProcessGuard(std::process::Command::new("true").spawn().unwrap());
+    let _guard = ProcessGuard::new(&child);
 
     // Step 2: Read the ready message from stdout.
     let stdout = child.stdout.take().expect("stdout should be piped");
