@@ -2,11 +2,9 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use bmux_plugin::{
-    EXIT_OK, HostRuntimeApi, NativeCommandContext, NativeServiceContext, PluginCommandError,
-    RustPlugin, ServiceResponse, SessionSelector, StorageGetRequest, StorageSetRequest,
-    decode_service_message, encode_service_message, handle_service,
-};
+use bmux_plugin::HostRuntimeApi;
+use bmux_plugin_sdk::prelude::*;
+use bmux_plugin_sdk::{SessionSelector, StorageGetRequest, StorageSetRequest};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use uuid::Uuid;
@@ -398,15 +396,16 @@ struct CommandAckResponse {
     ok: bool,
 }
 
-bmux_plugin::export_plugin!(PermissionsPlugin, include_str!("../plugin.toml"));
+bmux_plugin_sdk::export_plugin!(PermissionsPlugin, include_str!("../plugin.toml"));
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bmux_plugin::{
+    use bmux_plugin::ServiceCaller;
+    use bmux_plugin_sdk::{
         ApiVersion, HostConnectionInfo, HostKernelBridge, HostMetadata, HostScope,
-        NativeServiceContext, ProviderId, RegisteredService, ServiceCaller, ServiceKind,
-        ServiceRequest, SessionListResponse, SessionSummary,
+        NativeServiceContext, ProviderId, RegisteredService, ServiceKind, ServiceRequest,
+        SessionListResponse, SessionSummary,
     };
     use std::path::PathBuf;
     use std::sync::Mutex;
@@ -458,13 +457,13 @@ mod tests {
             interface_id: &str,
             operation: &str,
             payload: Vec<u8>,
-        ) -> bmux_plugin::Result<Vec<u8>> {
+        ) -> bmux_plugin_sdk::Result<Vec<u8>> {
             match (interface_id, operation) {
                 ("session-query/v1", "list") => encode_service_message(&SessionListResponse {
                     sessions: self.sessions.clone(),
                 }),
                 ("client-query/v1", "current") => {
-                    encode_service_message(&bmux_plugin::CurrentClientResponse {
+                    encode_service_message(&bmux_plugin_sdk::CurrentClientResponse {
                         id: Uuid::from_u128(0x1111_1111_1111_1111_1111_1111_1111_1111),
                         selected_session_id: self.selected_session_id,
                         following_client_id: None,
@@ -479,7 +478,7 @@ mod tests {
                         .expect("storage lock should succeed")
                         .get(&request.key)
                         .cloned();
-                    encode_service_message(&bmux_plugin::StorageGetResponse { value })
+                    encode_service_message(&bmux_plugin_sdk::StorageGetResponse { value })
                 }
                 ("storage-command/v1", "set") => {
                     let request: StorageSetRequest = decode_service_message(&payload)?;
@@ -489,7 +488,7 @@ mod tests {
                         .insert(request.key, request.value);
                     encode_service_message(&())
                 }
-                _ => Err(bmux_plugin::PluginError::UnsupportedHostOperation {
+                _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
                     operation: "mock_service",
                 }),
             }

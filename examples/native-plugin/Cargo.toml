@@ -17,6 +17,7 @@ bmux_client     = { workspace = true }
 bmux_config     = { workspace = true }
 bmux_ipc        = { workspace = true }
 bmux_plugin     = { workspace = true }
+bmux_plugin_sdk = { workspace = true }
 serde           = { workspace = true, features = ["derive", "std"] }
 serde_json      = { workspace = true }
 tokio           = { workspace = true, features = ["rt-multi-thread"] }
@@ -26,3 +27,6 @@ uuid            = { workspace = true, features = ["std"] }
 [features]
 fail-on-warnings = []
 static-bundled   = []
+
+[dev-dependencies]
+bmux_plugin = { workspace = true }

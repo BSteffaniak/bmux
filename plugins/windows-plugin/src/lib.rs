@@ -2,10 +2,11 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 
-use bmux_plugin::{
-    ContextCloseRequest, ContextCreateRequest, ContextSelector, EXIT_OK, HostRuntimeApi,
-    NativeCommandContext, NativeServiceContext, PluginCommandError, RustPlugin, ServiceResponse,
-    StorageGetRequest, StorageSetRequest, handle_service,
+use bmux_plugin::HostRuntimeApi;
+use bmux_plugin_sdk::prelude::*;
+use bmux_plugin_sdk::{
+    ContextCloseRequest, ContextCreateRequest, ContextSelector, StorageGetRequest,
+    StorageSetRequest,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -309,7 +310,7 @@ fn switch_window(
     let previous_context = resolve_effective_current_context_with_contexts(caller, &contexts)?;
     let context_id = resolve_context_id_from_contexts(&contexts, &selector)?;
     caller
-        .context_select(&bmux_plugin::ContextSelectRequest {
+        .context_select(&bmux_plugin_sdk::ContextSelectRequest {
             selector: ContextSelector::ById(context_id),
         })
         .map_err(|error| error.to_string())?;
@@ -383,7 +384,7 @@ fn cycle_window(
 }
 
 fn resolve_context_id_from_contexts(
-    contexts: &[bmux_plugin::ContextSummary],
+    contexts: &[bmux_plugin_sdk::ContextSummary],
     selector: &ContextSelector,
 ) -> Result<Uuid, String> {
     contexts
@@ -406,7 +407,7 @@ fn resolve_effective_current_context(caller: &impl HostRuntimeApi) -> Result<Opt
 
 fn resolve_effective_current_context_with_contexts(
     caller: &impl HostRuntimeApi,
-    contexts: &[bmux_plugin::ContextSummary],
+    contexts: &[bmux_plugin_sdk::ContextSummary],
 ) -> Result<Option<Uuid>, String> {
     let current = caller
         .context_current()
@@ -539,16 +540,17 @@ struct WindowCommandAck {
     id: Option<String>,
 }
 
-bmux_plugin::export_plugin!(WindowsPlugin, include_str!("../plugin.toml"));
+bmux_plugin_sdk::export_plugin!(WindowsPlugin, include_str!("../plugin.toml"));
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use bmux_plugin::{
+    use bmux_plugin::ServiceCaller;
+    use bmux_plugin_sdk::{
         ApiVersion, ContextCloseRequest, ContextCreateRequest, ContextListResponse,
         ContextSelectRequest, ContextSelectResponse, ContextSelector as SessionSelector,
         ContextSummary as SessionSummary, HostConnectionInfo, HostKernelBridge, HostMetadata,
-        HostScope, NativeServiceContext, ProviderId, RegisteredService, ServiceCaller, ServiceKind,
+        HostScope, NativeServiceContext, ProviderId, RegisteredService, ServiceKind,
         ServiceRequest, decode_service_message, encode_service_message,
     };
     use std::sync::Mutex;
@@ -848,14 +850,14 @@ mod tests {
             interface_id: &str,
             operation: &str,
             payload: Vec<u8>,
-        ) -> bmux_plugin::Result<Vec<u8>> {
+        ) -> bmux_plugin_sdk::Result<Vec<u8>> {
             match (interface_id, operation) {
                 ("context-query/v1", "list") => encode_service_message(&ContextListResponse {
                     contexts: self.sessions.clone(),
                 }),
                 ("context-command/v1", "create") => {
                     if self.fail_create {
-                        return Err(bmux_plugin::PluginError::ServiceProtocol {
+                        return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
                             details: "mock create failure".to_string(),
                         });
                     }
@@ -864,7 +866,7 @@ mod tests {
                         .lock()
                         .expect("create log lock should succeed")
                         .push(request.name.clone());
-                    encode_service_message(&bmux_plugin::ContextCreateResponse {
+                    encode_service_message(&bmux_plugin_sdk::ContextCreateResponse {
                         context: SessionSummary {
                             id: Uuid::new_v4(),
                             name: request.name,
@@ -874,7 +876,7 @@ mod tests {
                 }
                 ("context-command/v1", "close") => {
                     if self.fail_kill {
-                        return Err(bmux_plugin::PluginError::ServiceProtocol {
+                        return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
                             details: "mock kill failure".to_string(),
                         });
                     }
@@ -883,7 +885,7 @@ mod tests {
                         .lock()
                         .expect("kill log lock should succeed")
                         .push(request.clone());
-                    encode_service_message(&bmux_plugin::ContextCloseResponse {
+                    encode_service_message(&bmux_plugin_sdk::ContextCloseResponse {
                         id: match request.selector {
                             SessionSelector::ById(id) => id,
                             SessionSelector::ByName(_) => Uuid::new_v4(),
@@ -892,7 +894,7 @@ mod tests {
                 }
                 ("context-command/v1", "select") => {
                     if self.fail_kill {
-                        return Err(bmux_plugin::PluginError::ServiceProtocol {
+                        return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
                             details: "mock select failure".to_string(),
                         });
                     }
@@ -904,7 +906,7 @@ mod tests {
                             .iter()
                             .find(|session| session.name.as_deref() == Some(name.as_str()))
                             .map(|session| session.id)
-                            .ok_or_else(|| bmux_plugin::PluginError::ServiceProtocol {
+                            .ok_or_else(|| bmux_plugin_sdk::PluginError::ServiceProtocol {
                                 details: "mock select target not found".to_string(),
                             })?,
                     };
@@ -931,11 +933,11 @@ mod tests {
                         .expect("selected context lock should succeed");
                     let context = current_context_id
                         .and_then(|id| self.sessions.iter().find(|entry| entry.id == id).cloned());
-                    encode_service_message(&bmux_plugin::ContextCurrentResponse { context })
+                    encode_service_message(&bmux_plugin_sdk::ContextCurrentResponse { context })
                 }
                 ("client-query/v1", "current") => {
                     if self.fail_current_client {
-                        return Err(bmux_plugin::PluginError::ServiceProtocol {
+                        return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
                             details: "mock current client failure".to_string(),
                         });
                     }
@@ -943,7 +945,7 @@ mod tests {
                         .selected_session_id
                         .lock()
                         .expect("selected session lock should succeed");
-                    encode_service_message(&bmux_plugin::CurrentClientResponse {
+                    encode_service_message(&bmux_plugin_sdk::CurrentClientResponse {
                         id: self.current_client_id,
                         selected_session_id,
                         following_client_id: None,
@@ -958,7 +960,7 @@ mod tests {
                         .expect("storage lock should succeed")
                         .get(&request.key)
                         .cloned();
-                    encode_service_message(&bmux_plugin::StorageGetResponse { value })
+                    encode_service_message(&bmux_plugin_sdk::StorageGetResponse { value })
                 }
                 ("storage-command/v1", "set") => {
                     let request: StorageSetRequest = decode_service_message(&payload)?;
@@ -968,7 +970,7 @@ mod tests {
                         .insert(request.key, request.value);
                     encode_service_message(&())
                 }
-                _ => Err(bmux_plugin::PluginError::UnsupportedHostOperation {
+                _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
                     operation: "mock_service",
                 }),
             }

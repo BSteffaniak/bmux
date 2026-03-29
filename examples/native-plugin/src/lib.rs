@@ -3,10 +3,9 @@
 #![allow(clippy::multiple_crate_versions)]
 
 use bmux_cli_output::{Table, TableColumn, write_table};
-use bmux_plugin::{
-    EXIT_ERROR, EXIT_OK, EXIT_USAGE, NativeCommandContext, PluginCommandError, PluginEvent,
-    RustPlugin, ServiceKind,
-};
+use bmux_plugin::{HostRuntimeApi, ServiceCaller};
+use bmux_plugin_sdk::EXIT_USAGE;
+use bmux_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
 
 #[derive(Default)]
@@ -37,7 +36,7 @@ impl RustPlugin for ExamplePlugin {
 
     fn activate(
         &mut self,
-        context: bmux_plugin::NativeLifecycleContext,
+        context: bmux_plugin_sdk::NativeLifecycleContext,
     ) -> Result<i32, PluginCommandError> {
         println!("example.native: activated {}", context.plugin_id);
         Ok(EXIT_OK)
@@ -45,7 +44,7 @@ impl RustPlugin for ExamplePlugin {
 
     fn deactivate(
         &mut self,
-        context: bmux_plugin::NativeLifecycleContext,
+        context: bmux_plugin_sdk::NativeLifecycleContext,
     ) -> Result<i32, PluginCommandError> {
         println!("example.native: deactivated {}", context.plugin_id);
         Ok(EXIT_OK)
@@ -57,7 +56,7 @@ impl RustPlugin for ExamplePlugin {
     }
 }
 
-bmux_plugin::export_plugin!(ExamplePlugin, include_str!("../plugin.toml"));
+bmux_plugin_sdk::export_plugin!(ExamplePlugin, include_str!("../plugin.toml"));
 
 fn run_permissions_list(context: &NativeCommandContext) -> i32 {
     let Some(session) = context.arguments.first() else {

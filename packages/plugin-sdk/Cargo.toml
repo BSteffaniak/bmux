@@ -1,35 +1,24 @@
 [package]
 authors     = { workspace = true }
 categories  = ["development-tools"]
-description = "Plugin system for bmux terminal multiplexer"
+description = "Plugin SDK for bmux — the types and traits plugin authors need"
 edition     = { workspace = true }
-keywords    = ["bmux", "extensibility", "plugin", "terminal"]
+keywords    = ["bmux", "extensibility", "plugin", "sdk"]
 license     = { workspace = true }
-name        = "bmux_plugin"
+name        = "bmux_plugin_sdk"
 readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 
 [dependencies]
-# SDK crate (re-exported for backward compatibility)
-bmux_plugin_sdk = { workspace = true }
-
-# External dependencies (host-side only)
 bmux_codec = { workspace = true }
-bmux_ipc   = { workspace = true }
-libloading = { workspace = true }
 semver     = { workspace = true }
 serde      = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 thiserror  = { workspace = true }
 toml       = { workspace = true, features = ["parse"] }
-tracing    = { workspace = true, features = ["std"] }
 uuid       = { workspace = true, features = ["serde", "std"] }
 
-
 [features]
-# Default features
-default = []
-
-# Development features
+default          = []
 fail-on-warnings = []

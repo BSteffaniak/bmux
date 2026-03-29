@@ -1,25 +1,25 @@
 use crate::{
-    CapabilityProvider, DEFAULT_NATIVE_ACTIVATE_SYMBOL, DEFAULT_NATIVE_COMMAND_SYMBOL,
-    DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL, DEFAULT_NATIVE_DEACTIVATE_SYMBOL,
-    DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL, HostConnectionInfo, HostMetadata,
-    HostScope, PluginDeclaration, PluginEntrypoint, PluginError, PluginEvent, PluginRegistry,
-    RegisteredPlugin, RegisteredService, Result, ServiceEnvelopeKind, ServiceKind, ServiceRequest,
-    ServiceResponse, decode_service_envelope, decode_service_message,
-    discover_registered_plugins_in_roots, encode_service_envelope, encode_service_message,
-    host_services::{
-        ContextCloseRequest, ContextCloseResponse, ContextCreateRequest, ContextCreateResponse,
-        ContextCurrentResponse, ContextListResponse, ContextSelectRequest, ContextSelectResponse,
-        ContextSelector as HostContextSelector, ContextSummary as HostContextSummary,
-        CurrentClientResponse, LogWriteLevel, PaneCloseRequest, PaneCloseResponse,
-        PaneFocusDirection as HostPaneFocusDirection, PaneFocusRequest, PaneFocusResponse,
-        PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse,
-        PaneSelector as HostPaneSelector, PaneSplitDirection as HostPaneSplitDirection,
-        PaneSplitRequest, PaneSplitResponse, PaneSummary as HostPaneSummary,
-        RecordingWriteEventRequest, RecordingWriteEventResponse, SessionCreateRequest,
-        SessionCreateResponse, SessionKillRequest, SessionKillResponse, SessionListResponse,
-        SessionSelectRequest, SessionSelectResponse, SessionSelector as HostSessionSelector,
-        SessionSummary as HostSessionSummary,
-    },
+    CapabilityProvider, ContextCloseRequest, ContextCloseResponse, ContextCreateRequest,
+    ContextCreateResponse, ContextCurrentResponse, ContextListResponse, ContextSelectRequest,
+    ContextSelectResponse, ContextSelector as HostContextSelector,
+    ContextSummary as HostContextSummary, CurrentClientResponse, DEFAULT_NATIVE_ACTIVATE_SYMBOL,
+    DEFAULT_NATIVE_COMMAND_SYMBOL, DEFAULT_NATIVE_COMMAND_WITH_CONTEXT_SYMBOL,
+    DEFAULT_NATIVE_DEACTIVATE_SYMBOL, DEFAULT_NATIVE_EVENT_SYMBOL, DEFAULT_NATIVE_SERVICE_SYMBOL,
+    HostConnectionInfo, HostKernelBridge, HostKernelBridgeRequest, HostKernelBridgeResponse,
+    HostMetadata, HostScope, LogWriteLevel, NativeCommandContext, NativeLifecycleContext,
+    NativeServiceContext, PaneCloseRequest, PaneCloseResponse,
+    PaneFocusDirection as HostPaneFocusDirection, PaneFocusRequest, PaneFocusResponse,
+    PaneListRequest, PaneListResponse, PaneResizeRequest, PaneResizeResponse,
+    PaneSelector as HostPaneSelector, PaneSplitDirection as HostPaneSplitDirection,
+    PaneSplitRequest, PaneSplitResponse, PaneSummary as HostPaneSummary, PluginDeclaration,
+    PluginEntrypoint, PluginError, PluginEvent, PluginRegistry, RecordingWriteEventRequest,
+    RecordingWriteEventResponse, RegisteredPlugin, RegisteredService, Result, ServiceCaller,
+    ServiceEnvelopeKind, ServiceKind, ServiceRequest, ServiceResponse, SessionCreateRequest,
+    SessionCreateResponse, SessionKillRequest, SessionKillResponse, SessionListResponse,
+    SessionSelectRequest, SessionSelectResponse, SessionSelector as HostSessionSelector,
+    SessionSummary as HostSessionSummary, StaticPluginVtable, decode_service_envelope,
+    decode_service_message, discover_registered_plugins_in_roots, encode_service_envelope,
+    encode_service_message,
 };
 use bmux_ipc::{
     ContextSelector as IpcContextSelector, PaneFocusDirection as IpcPaneFocusDirection,
@@ -28,7 +28,7 @@ use bmux_ipc::{
     SessionSelector as IpcSessionSelector,
 };
 use libloading::{Library, Symbol};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::BTreeMap;
 use std::ffi::{CStr, CString, c_char};
@@ -46,28 +46,8 @@ type NativeInvokeServiceFn =
 
 const NATIVE_SERVICE_STATUS_OK: i32 = 0;
 const NATIVE_SERVICE_STATUS_BUFFER_TOO_SMALL: i32 = 4;
-
-/// Function table for a statically-linked bundled plugin.
-///
-/// Each field mirrors the corresponding `extern "C"` symbol that a dynamically
-/// loaded plugin exposes.  When plugins are compiled into the binary as `rlib`
-/// dependencies the vtable is populated with plain Rust function pointers
-/// instead, avoiding `dlopen` and symbol-name collisions entirely.
-#[derive(Clone, Copy)]
-pub struct StaticPluginVtable {
-    pub entry: fn() -> *const c_char,
-    pub run_command_with_context: fn(*const c_char) -> i32,
-    pub activate: fn(*const c_char) -> i32,
-    pub deactivate: fn(*const c_char) -> i32,
-    pub handle_event: fn(*const c_char) -> i32,
-    pub invoke_service: fn(*const u8, usize, *mut u8, usize, *mut usize) -> i32,
-}
-
-impl std::fmt::Debug for StaticPluginVtable {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StaticPluginVtable").finish_non_exhaustive()
-    }
-}
+const KERNEL_STATUS_OK: i32 = 0;
+const KERNEL_STATUS_BUFFER_TOO_SMALL: i32 = 4;
 
 /// Backend that a [`LoadedPlugin`] uses to dispatch calls.
 #[derive(Debug)]
@@ -79,18 +59,18 @@ enum PluginBackend {
 }
 
 thread_local! {
-    static COMMAND_OUTCOME_CAPTURE: RefCell<Option<crate::host_services::PluginCommandOutcome>> = const { RefCell::new(None) };
+    static COMMAND_OUTCOME_CAPTURE: RefCell<Option<crate::PluginCommandOutcome>> = const { RefCell::new(None) };
 }
 
 fn begin_command_outcome_capture() {
     COMMAND_OUTCOME_CAPTURE.with(|slot| {
-        *slot.borrow_mut() = Some(crate::host_services::PluginCommandOutcome {
+        *slot.borrow_mut() = Some(crate::PluginCommandOutcome {
             effects: Vec::new(),
         });
     });
 }
 
-fn record_command_effect(effect: crate::host_services::PluginCommandEffect) {
+fn record_command_effect(effect: crate::PluginCommandEffect) {
     COMMAND_OUTCOME_CAPTURE.with(|slot| {
         if let Some(outcome) = slot.borrow_mut().as_mut() {
             outcome.effects.push(effect);
@@ -98,10 +78,10 @@ fn record_command_effect(effect: crate::host_services::PluginCommandEffect) {
     });
 }
 
-fn finish_command_outcome_capture() -> crate::host_services::PluginCommandOutcome {
+fn finish_command_outcome_capture() -> crate::PluginCommandOutcome {
     COMMAND_OUTCOME_CAPTURE
         .with(|slot| slot.borrow_mut().take())
-        .unwrap_or(crate::host_services::PluginCommandOutcome {
+        .unwrap_or(crate::PluginCommandOutcome {
             effects: Vec::new(),
         })
 }
@@ -132,156 +112,8 @@ struct CoreStorageSetRequest {
     value: Vec<u8>,
 }
 
-/// Serializable summary of a registered plugin, carried through command and
-/// lifecycle contexts so plugins can introspect the full plugin registry
-/// without re-scanning the filesystem.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RegisteredPluginInfo {
-    pub id: String,
-    pub display_name: String,
-    pub version: String,
-    pub bundled_static: bool,
-    pub required_capabilities: Vec<String>,
-    pub provided_capabilities: Vec<String>,
-    pub commands: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NativeLifecycleContext {
-    pub plugin_id: String,
-    #[serde(default)]
-    pub required_capabilities: Vec<String>,
-    #[serde(default)]
-    pub provided_capabilities: Vec<String>,
-    #[serde(default)]
-    pub services: Vec<crate::RegisteredService>,
-    #[serde(default)]
-    pub available_capabilities: Vec<String>,
-    #[serde(default)]
-    pub enabled_plugins: Vec<String>,
-    #[serde(default)]
-    pub plugin_search_roots: Vec<String>,
-    #[serde(default)]
-    pub registered_plugins: Vec<RegisteredPluginInfo>,
-    pub host: HostMetadata,
-    pub connection: HostConnectionInfo,
-    #[serde(default)]
-    pub settings: Option<toml::Value>,
-    #[serde(default)]
-    pub plugin_settings_map: BTreeMap<String, toml::Value>,
-    #[serde(default)]
-    pub host_kernel_bridge: Option<HostKernelBridge>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct NativeCommandContext {
-    pub plugin_id: String,
-    pub command: String,
-    pub arguments: Vec<String>,
-    #[serde(default)]
-    pub required_capabilities: Vec<String>,
-    #[serde(default)]
-    pub provided_capabilities: Vec<String>,
-    #[serde(default)]
-    pub services: Vec<crate::RegisteredService>,
-    #[serde(default)]
-    pub available_capabilities: Vec<String>,
-    #[serde(default)]
-    pub enabled_plugins: Vec<String>,
-    #[serde(default)]
-    pub plugin_search_roots: Vec<String>,
-    #[serde(default)]
-    pub registered_plugins: Vec<RegisteredPluginInfo>,
-    pub host: HostMetadata,
-    pub connection: HostConnectionInfo,
-    #[serde(default)]
-    pub settings: Option<toml::Value>,
-    #[serde(default)]
-    pub plugin_settings_map: BTreeMap<String, toml::Value>,
-    #[serde(default)]
-    pub host_kernel_bridge: Option<HostKernelBridge>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct NativeServiceContext {
-    pub plugin_id: String,
-    pub request: ServiceRequest,
-    #[serde(default)]
-    pub required_capabilities: Vec<String>,
-    #[serde(default)]
-    pub provided_capabilities: Vec<String>,
-    #[serde(default)]
-    pub services: Vec<RegisteredService>,
-    #[serde(default)]
-    pub available_capabilities: Vec<String>,
-    #[serde(default)]
-    pub enabled_plugins: Vec<String>,
-    #[serde(default)]
-    pub plugin_search_roots: Vec<String>,
-    pub host: HostMetadata,
-    pub connection: HostConnectionInfo,
-    #[serde(default)]
-    pub settings: BTreeMap<String, String>,
-    #[serde(default)]
-    pub plugin_settings_map: BTreeMap<String, BTreeMap<String, String>>,
-    #[serde(default)]
-    pub host_kernel_bridge: Option<HostKernelBridge>,
-}
-
-type HostKernelBridgeFn = unsafe extern "C" fn(
-    input_ptr: *const u8,
-    input_len: usize,
-    output_ptr: *mut u8,
-    output_capacity: usize,
-    output_len: *mut usize,
-) -> i32;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct HostKernelBridge(u64);
-
-impl HostKernelBridge {
-    #[must_use]
-    pub fn from_fn(pointer: HostKernelBridgeFn) -> Self {
-        Self(pointer as usize as u64)
-    }
-
-    fn invoke(
-        self,
-        input_ptr: *const u8,
-        input_len: usize,
-        output_ptr: *mut u8,
-        output_capacity: usize,
-        output_len: *mut usize,
-    ) -> i32 {
-        let bridge: HostKernelBridgeFn = unsafe { std::mem::transmute(self.0 as usize) };
-        unsafe {
-            bridge(
-                input_ptr,
-                input_len,
-                output_ptr,
-                output_capacity,
-                output_len,
-            )
-        }
-    }
-}
-
-const KERNEL_STATUS_OK: i32 = 0;
-const KERNEL_STATUS_BUFFER_TOO_SMALL: i32 = 4;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HostKernelBridgeRequest {
-    pub payload: Vec<u8>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct HostKernelBridgeResponse {
-    pub payload: Vec<u8>,
-}
-
-impl NativeCommandContext {
-    pub fn call_service_raw(
+impl ServiceCaller for NativeCommandContext {
+    fn call_service_raw(
         &self,
         capability: &str,
         kind: ServiceKind,
@@ -308,27 +140,10 @@ impl NativeCommandContext {
             payload,
         )
     }
-
-    pub fn call_service<Request, Response>(
-        &self,
-        capability: &str,
-        kind: ServiceKind,
-        interface_id: &str,
-        operation: &str,
-        request: &Request,
-    ) -> Result<Response>
-    where
-        Request: Serialize,
-        Response: DeserializeOwned,
-    {
-        let payload = encode_service_message(request)?;
-        let response = self.call_service_raw(capability, kind, interface_id, operation, payload)?;
-        decode_service_message(&response)
-    }
 }
 
-impl NativeLifecycleContext {
-    pub fn call_service_raw(
+impl ServiceCaller for NativeLifecycleContext {
+    fn call_service_raw(
         &self,
         capability: &str,
         kind: ServiceKind,
@@ -355,27 +170,10 @@ impl NativeLifecycleContext {
             payload,
         )
     }
-
-    pub fn call_service<Request, Response>(
-        &self,
-        capability: &str,
-        kind: ServiceKind,
-        interface_id: &str,
-        operation: &str,
-        request: &Request,
-    ) -> Result<Response>
-    where
-        Request: Serialize,
-        Response: DeserializeOwned,
-    {
-        let payload = encode_service_message(request)?;
-        let response = self.call_service_raw(capability, kind, interface_id, operation, payload)?;
-        decode_service_message(&response)
-    }
 }
 
-impl NativeServiceContext {
-    pub fn call_service_raw(
+impl ServiceCaller for NativeServiceContext {
+    fn call_service_raw(
         &self,
         capability: &str,
         kind: ServiceKind,
@@ -403,34 +201,30 @@ impl NativeServiceContext {
             payload,
         )
     }
+}
 
-    pub fn call_service<Request, Response>(
-        &self,
-        capability: &str,
-        kind: ServiceKind,
-        interface_id: &str,
-        operation: &str,
-        request: &Request,
-    ) -> Result<Response>
-    where
-        Request: Serialize,
-        Response: DeserializeOwned,
-    {
-        let payload = encode_service_message(request)?;
-        let response = self.call_service_raw(capability, kind, interface_id, operation, payload)?;
-        decode_service_message(&response)
-    }
+/// Dispatch a host kernel bridge call for raw service bytes.
+#[allow(dead_code)]
+pub fn call_host_kernel_raw(context: &NativeServiceContext, payload: Vec<u8>) -> Result<Vec<u8>> {
+    let Some(bridge) = context.host_kernel_bridge else {
+        return Err(PluginError::UnsupportedHostOperation {
+            operation: "call_host_kernel",
+        });
+    };
+    let request = encode_service_message(&HostKernelBridgeRequest { payload })?;
+    let mut output = vec![0u8; request.len().saturating_mul(4).max(1024)];
+    let mut output_len = 0usize;
 
-    pub fn call_host_kernel_raw(&self, payload: Vec<u8>) -> Result<Vec<u8>> {
-        let Some(bridge) = self.host_kernel_bridge else {
-            return Err(PluginError::UnsupportedHostOperation {
-                operation: "call_host_kernel",
-            });
-        };
-        let request = encode_service_message(&HostKernelBridgeRequest { payload })?;
-        let mut output = vec![0u8; request.len().saturating_mul(4).max(1024)];
-        let mut output_len = 0usize;
+    let status = bridge.invoke(
+        request.as_ptr(),
+        request.len(),
+        output.as_mut_ptr(),
+        output.len(),
+        &raw mut output_len,
+    );
 
+    if status == KERNEL_STATUS_BUFFER_TOO_SMALL {
+        output.resize(output_len, 0);
         let status = bridge.invoke(
             request.as_ptr(),
             request.len(),
@@ -438,98 +232,20 @@ impl NativeServiceContext {
             output.len(),
             &raw mut output_len,
         );
-
-        if status == KERNEL_STATUS_BUFFER_TOO_SMALL {
-            output.resize(output_len, 0);
-            let status = bridge.invoke(
-                request.as_ptr(),
-                request.len(),
-                output.as_mut_ptr(),
-                output.len(),
-                &raw mut output_len,
-            );
-            if status != KERNEL_STATUS_OK {
-                return Err(PluginError::ServiceProtocol {
-                    details: format!("kernel bridge invocation failed with status {status}"),
-                });
-            }
-        } else if status != KERNEL_STATUS_OK {
+        if status != KERNEL_STATUS_OK {
             return Err(PluginError::ServiceProtocol {
                 details: format!("kernel bridge invocation failed with status {status}"),
             });
         }
-
-        output.truncate(output_len);
-        let response: HostKernelBridgeResponse = decode_service_message(&output)?;
-        Ok(response.payload)
+    } else if status != KERNEL_STATUS_OK {
+        return Err(PluginError::ServiceProtocol {
+            details: format!("kernel bridge invocation failed with status {status}"),
+        });
     }
-}
 
-pub trait ServiceCaller {
-    fn call_service_raw(
-        &self,
-        capability: &str,
-        kind: ServiceKind,
-        interface_id: &str,
-        operation: &str,
-        payload: Vec<u8>,
-    ) -> Result<Vec<u8>>;
-
-    fn call_service<Request, Response>(
-        &self,
-        capability: &str,
-        kind: ServiceKind,
-        interface_id: &str,
-        operation: &str,
-        request: &Request,
-    ) -> Result<Response>
-    where
-        Request: Serialize,
-        Response: DeserializeOwned,
-    {
-        let payload = encode_service_message(request)?;
-        let response = self.call_service_raw(capability, kind, interface_id, operation, payload)?;
-        decode_service_message(&response)
-    }
-}
-
-impl ServiceCaller for NativeCommandContext {
-    fn call_service_raw(
-        &self,
-        capability: &str,
-        kind: ServiceKind,
-        interface_id: &str,
-        operation: &str,
-        payload: Vec<u8>,
-    ) -> Result<Vec<u8>> {
-        Self::call_service_raw(self, capability, kind, interface_id, operation, payload)
-    }
-}
-
-impl ServiceCaller for NativeLifecycleContext {
-    fn call_service_raw(
-        &self,
-        capability: &str,
-        kind: ServiceKind,
-        interface_id: &str,
-        operation: &str,
-        payload: Vec<u8>,
-    ) -> Result<Vec<u8>> {
-        Self::call_service_raw(self, capability, kind, interface_id, operation, payload)
-    }
-}
-
-impl ServiceCaller for NativeServiceContext {
-    fn call_service_raw(
-        &self,
-        capability: &str,
-        kind: ServiceKind,
-        interface_id: &str,
-        operation: &str,
-        payload: Vec<u8>,
-    ) -> Result<Vec<u8>> {
-        Self::call_service_raw(self, capability, kind, interface_id, operation, payload)
-    }
+    output.truncate(output_len);
+    let response: HostKernelBridgeResponse = decode_service_message(&output)?;
+    Ok(response.payload)
 }
 
 fn call_service_raw(
@@ -755,7 +471,7 @@ fn handle_core_service_call(
             encode_service_message(&())
         }
         ("logging-command/v1", "write") => {
-            let request: crate::host_services::LogWriteRequest = decode_service_message(&payload)?;
+            let request: crate::LogWriteRequest = decode_service_message(&payload)?;
             emit_plugin_log(caller_plugin_id, &request)?;
             encode_service_message(&())
         }
@@ -879,11 +595,9 @@ fn handle_core_service_call(
             )?;
             match response {
                 IpcResponsePayload::ContextCreated { context } => {
-                    record_command_effect(
-                        crate::host_services::PluginCommandEffect::SelectContext {
-                            context_id: context.id,
-                        },
-                    );
+                    record_command_effect(crate::PluginCommandEffect::SelectContext {
+                        context_id: context.id,
+                    });
                     encode_service_message(&ContextCreateResponse {
                         context: HostContextSummary {
                             id: context.id,
@@ -908,11 +622,9 @@ fn handle_core_service_call(
             )?;
             match response {
                 IpcResponsePayload::ContextSelected { context } => {
-                    record_command_effect(
-                        crate::host_services::PluginCommandEffect::SelectContext {
-                            context_id: context.id,
-                        },
-                    );
+                    record_command_effect(crate::PluginCommandEffect::SelectContext {
+                        context_id: context.id,
+                    });
                     encode_service_message(&ContextSelectResponse {
                         context: HostContextSummary {
                             id: context.id,
@@ -1113,10 +825,7 @@ fn handle_core_service_call(
     }
 }
 
-fn emit_plugin_log(
-    caller_plugin_id: &str,
-    request: &crate::host_services::LogWriteRequest,
-) -> Result<()> {
+fn emit_plugin_log(caller_plugin_id: &str, request: &crate::LogWriteRequest) -> Result<()> {
     let requested_target = request
         .target
         .as_deref()
@@ -1353,7 +1062,7 @@ impl LoadedPlugin {
         command_name: &str,
         arguments: &[String],
         context: Option<&NativeCommandContext>,
-    ) -> Result<(i32, crate::host_services::PluginCommandOutcome)> {
+    ) -> Result<(i32, crate::PluginCommandOutcome)> {
         if !self.supports_command(command_name) {
             return Err(PluginError::UnknownPluginCommand {
                 plugin_id: self.declaration.id.as_str().to_string(),
@@ -1441,7 +1150,7 @@ impl LoadedPlugin {
 
         Ok((
             status,
-            crate::host_services::PluginCommandOutcome {
+            crate::PluginCommandOutcome {
                 effects: Vec::new(),
             },
         ))
@@ -1917,10 +1626,11 @@ fn ensure_match(
 
 #[cfg(test)]
 mod tests {
-    use super::{LoadedPlugin, NativeLifecycleContext, NativeServiceContext, PluginBackend};
+    use super::{LoadedPlugin, PluginBackend};
     use crate::{
-        ApiVersion, DEFAULT_NATIVE_ENTRY_SYMBOL, HostMetadata, PluginEntrypoint, PluginEvent,
-        PluginEventKind, PluginEventSubscription, PluginManifest, PluginRegistry,
+        ApiVersion, DEFAULT_NATIVE_ENTRY_SYMBOL, HostMetadata, NativeLifecycleContext,
+        NativeServiceContext, PluginEntrypoint, PluginEvent, PluginEventKind,
+        PluginEventSubscription, PluginManifest, PluginRegistry, ServiceCaller,
         ServiceEnvelopeKind, ServiceResponse, decode_service_envelope, decode_service_message,
         encode_service_envelope, encode_service_message,
     };
@@ -2546,8 +2256,8 @@ minimum = "1.0"
                 crate::ServiceKind::Command,
                 "logging-command/v1",
                 "write",
-                &crate::host_services::LogWriteRequest {
-                    level: crate::host_services::LogWriteLevel::Info,
+                &crate::LogWriteRequest {
+                    level: crate::LogWriteLevel::Info,
                     message: "hello from plugin".to_string(),
                     target: Some("plugin.test".to_string()),
                 },

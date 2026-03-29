@@ -12,9 +12,9 @@ version     = { workspace = true }
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-bmux_clipboard = { workspace = true }
-bmux_plugin    = { workspace = true }
-serde          = { workspace = true, features = ["derive", "std"] }
+bmux_clipboard  = { workspace = true }
+bmux_plugin_sdk = { workspace = true }
+serde           = { workspace = true, features = ["derive", "std"] }
 
 [features]
 fail-on-warnings = []
