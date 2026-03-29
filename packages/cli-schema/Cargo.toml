@@ -1,0 +1,11 @@
+[package]
+authors     = { workspace = true }
+description = "CLI argument definitions for bmux (clap derive structs, no runtime dependencies)"
+edition     = { workspace = true }
+license     = { workspace = true }
+name        = "bmux_cli_schema"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+clap = { workspace = true, features = ["derive", "help", "std", "usage"] }

@@ -1,9 +1,3 @@
-use crate::cli::{
-    Cli, Command, KeymapCommand, LogLevel, LogsCommand, LogsProfilesCommand, PlaybookCommand,
-    RecordingCommand, RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg,
-    RecordingRenderMode, RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand,
-    TraceFamily,
-};
 use crate::connection::{
     ConnectionPolicyScope, ServerRuntimeMetadata, connect, connect_if_running, connect_raw,
     current_cli_build_id, map_client_connect_error, read_server_runtime_metadata,
@@ -12,6 +6,12 @@ use crate::connection::{
 use crate::input::{InputProcessor, Keymap, RuntimeAction};
 use crate::status::{AttachTab, build_attach_status_line};
 use anyhow::{Context, Result};
+use bmux_cli_schema::{
+    Cli, Command, KeymapCommand, LogLevel, LogsCommand, LogsProfilesCommand, PlaybookCommand,
+    RecordingCommand, RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg,
+    RecordingRenderMode, RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand,
+    TraceFamily,
+};
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout, TerminfoAutoInstall};
 use bmux_ipc::{
@@ -8737,9 +8737,9 @@ mod tests {
         parse_pid_content, profile_for_term, protocol_profile_for_terminal_profile,
         resolve_pane_term_with_checker,
     };
-    use crate::cli::{Cli, Command};
     use crate::input::InputProcessor;
     use crate::runtime::attach::state::AttachViewState;
+    use bmux_cli_schema::{Cli, Command};
     use bmux_client::{AttachLayoutState, AttachOpenInfo, ClientError};
     use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout};
     use bmux_ipc::transport::IpcTransportError;

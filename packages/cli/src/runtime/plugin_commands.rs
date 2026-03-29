@@ -427,7 +427,7 @@ fn is_prefix_collision(left: &[String], right: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::PluginCommandRegistry;
-    use crate::cli::Cli;
+    use bmux_cli_schema::Cli;
     use bmux_config::BmuxConfig;
     use bmux_plugin::{PluginManifest, PluginRegistry};
     use clap::{Command, CommandFactory};

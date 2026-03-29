@@ -1,5 +1,6 @@
 //! Doc page functions — one per route, embedding markdown via `include_str!`.
 
+use clap::CommandFactory;
 use hyperchad::markdown::markdown_to_container;
 use hyperchad::template::Containers;
 
@@ -47,11 +48,7 @@ pub fn quickstart() -> Containers {
 
 #[must_use]
 pub fn cli() -> Containers {
-    layout::docs_layout(
-        "/docs/cli",
-        "CLI Reference",
-        &md(include_str!("../../../../../packages/cli/README.md")),
-    )
+    layout::docs_layout("/docs/cli", "CLI Reference", &md(&generate_cli_reference()))
 }
 
 #[must_use]
@@ -251,4 +248,146 @@ fn render_section<T: ConfigDocSchema>() -> String {
 
     s.push_str("---\n\n");
     s
+}
+
+// ── CLI reference generation from clap Command tree ─────────────────────────
+
+/// Generate the full CLI reference markdown by walking the clap `Command` tree
+/// from `bmux_cli_schema::Cli`. Descriptions come from `///` doc comments on
+/// the derive structs and are always in sync with the actual binary.
+fn generate_cli_reference() -> String {
+    let cmd = bmux_cli_schema::Cli::command();
+    let mut doc = String::new();
+    render_command(&mut doc, &cmd, &["bmux"], 0);
+    doc
+}
+
+fn render_command(doc: &mut String, cmd: &clap::Command, path: &[&str], depth: usize) {
+    let full_path = path.join(" ");
+
+    // Heading level: depth 0 = ##, depth 1 = ###, depth 2+ = ####
+    let heading = match depth {
+        0 => "##",
+        1 => "###",
+        _ => "####",
+    };
+    doc.push_str(&format!("{heading} `{full_path}`\n\n"));
+
+    // Description
+    if let Some(about) = cmd.get_about() {
+        doc.push_str(&format!("{about}\n\n"));
+    }
+
+    // Collect visible arguments (skip hidden ones and positionals handled separately)
+    let options: Vec<_> = cmd
+        .get_arguments()
+        .filter(|a| !a.is_hide_set() && a.get_id() != "help" && a.get_id() != "version")
+        .collect();
+
+    // Split into positional args and flags/options
+    let positionals: Vec<_> = options.iter().filter(|a| a.is_positional()).collect();
+    let flags: Vec<_> = options.iter().filter(|a| !a.is_positional()).collect();
+
+    // Render usage line
+    if !positionals.is_empty() || !flags.is_empty() {
+        let mut usage = format!("`{full_path}");
+        for pos in &positionals {
+            let name = pos.get_id().as_str().to_uppercase();
+            if pos.is_required_set() {
+                usage.push_str(&format!(" <{name}>"));
+            } else {
+                usage.push_str(&format!(" [{name}]"));
+            }
+        }
+        if !flags.is_empty() {
+            usage.push_str(" [OPTIONS]");
+        }
+        usage.push('`');
+        doc.push_str(&format!("**Usage:** {usage}\n\n"));
+    }
+
+    // Render positional arguments
+    if !positionals.is_empty() {
+        doc.push_str("**Arguments:**\n\n");
+        for pos in &positionals {
+            let name = pos.get_id().as_str().to_uppercase();
+            let desc = pos.get_help().map(|h| h.to_string()).unwrap_or_default();
+            let required = if pos.is_required_set() {
+                " *(required)*"
+            } else {
+                ""
+            };
+            doc.push_str(&format!("- `<{name}>`{required} — {desc}\n"));
+        }
+        doc.push('\n');
+    }
+
+    // Render flags/options table
+    if !flags.is_empty() {
+        doc.push_str("| Flag | Description | Default |\n");
+        doc.push_str("|------|-------------|--------|\n");
+
+        for flag in &flags {
+            let mut flag_str = String::new();
+            if let Some(short) = flag.get_short() {
+                flag_str.push_str(&format!("-{short}, "));
+            }
+            if let Some(long) = flag.get_long() {
+                flag_str.push_str(&format!("--{long}"));
+            }
+
+            // Show value name for non-bool flags
+            let num_vals = flag.get_num_args();
+            if num_vals.map_or(false, |r| r.min_values() > 0 || r.max_values() > 0) {
+                let val_names = flag.get_value_names().unwrap_or_default();
+                if !val_names.is_empty() {
+                    let names = val_names
+                        .iter()
+                        .map(|n| n.as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    flag_str.push_str(&format!(" <{names}>"));
+                }
+            }
+
+            let desc = flag.get_help().map(|h| h.to_string()).unwrap_or_default();
+
+            let default = flag
+                .get_default_values()
+                .iter()
+                .map(|v| v.to_string_lossy().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let default_display = if default.is_empty() {
+                String::new()
+            } else {
+                format!("`{default}`")
+            };
+
+            doc.push_str(&format!("| `{flag_str}` | {desc} | {default_display} |\n"));
+        }
+        doc.push('\n');
+    }
+
+    // Collect visible subcommands
+    let subcommands: Vec<_> = cmd.get_subcommands().filter(|s| !s.is_hide_set()).collect();
+
+    // List subcommands with descriptions
+    if !subcommands.is_empty() && depth < 2 {
+        doc.push_str("**Subcommands:**\n\n");
+        for sub in &subcommands {
+            let desc = sub.get_about().map(|a| a.to_string()).unwrap_or_default();
+            doc.push_str(&format!("- `{}` — {desc}\n", sub.get_name()));
+        }
+        doc.push('\n');
+    }
+
+    doc.push_str("---\n\n");
+
+    // Recurse into subcommands
+    for sub in subcommands {
+        let mut sub_path = path.to_vec();
+        sub_path.push(sub.get_name());
+        render_command(doc, sub, &sub_path, depth + 1);
+    }
 }

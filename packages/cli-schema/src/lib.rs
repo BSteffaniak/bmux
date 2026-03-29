@@ -1,3 +1,9 @@
+//! CLI argument definitions for bmux.
+//!
+//! This crate contains the clap derive structs and enums that define bmux's
+//! command-line interface. It has no runtime dependencies — only `clap`.
+//! The docs site uses this to auto-generate the CLI reference page.
+
 use clap::{Parser, Subcommand, ValueEnum};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
@@ -85,38 +91,38 @@ fn parse_cell_size(value: &str) -> Result<(u16, u16), String> {
 pub struct Cli {
     /// Start interactive bmux with full-session recording
     #[arg(long)]
-    pub(crate) record: bool,
+    pub record: bool,
 
     /// Do not capture pane input bytes when using --record
     #[arg(long)]
-    pub(crate) no_capture_input: bool,
+    pub no_capture_input: bool,
 
     /// Write recording id to a file when using --record
     #[arg(long)]
-    pub(crate) recording_id_file: Option<String>,
+    pub recording_id_file: Option<String>,
 
     /// Recording profile when using --record
     #[arg(long, value_enum)]
-    pub(crate) record_profile: Option<RecordingProfileArg>,
+    pub record_profile: Option<RecordingProfileArg>,
 
     /// Explicit event kind allowlist when using --record (repeatable)
     #[arg(long, value_enum)]
-    pub(crate) record_event_kind: Vec<RecordingEventKindArg>,
+    pub record_event_kind: Vec<RecordingEventKindArg>,
 
     /// Stop the server when exiting a --record run
     #[arg(long)]
-    pub(crate) stop_server_on_exit: bool,
+    pub stop_server_on_exit: bool,
 
     #[command(subcommand)]
-    pub(crate) command: Option<Command>,
+    pub command: Option<Command>,
 
     /// Enable verbose logging
     #[arg(short, long)]
-    pub(crate) verbose: bool,
+    pub verbose: bool,
 
     /// Set log level for file logging
     #[arg(long, global = true, value_enum)]
-    pub(crate) log_level: Option<LogLevel>,
+    pub log_level: Option<LogLevel>,
 }
 
 #[derive(Debug, Subcommand)]

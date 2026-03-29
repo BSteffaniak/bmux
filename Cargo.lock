@@ -723,6 +723,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
+ "bmux_cli_schema",
  "bmux_client",
  "bmux_clipboard_plugin",
  "bmux_config",
@@ -766,6 +767,13 @@ dependencies = [
 [[package]]
 name = "bmux_cli_output"
 version = "0.0.1-alpha.0"
+
+[[package]]
+name = "bmux_cli_schema"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "clap",
+]
 
 [[package]]
 name = "bmux_client"
@@ -846,8 +854,10 @@ dependencies = [
 name = "bmux_docs_site_ui"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_cli_schema",
  "bmux_config",
  "bmux_config_doc",
+ "clap",
  "hyperchad",
  "hyperchad_color",
  "hyperchad_renderer",

@@ -6,6 +6,7 @@ members = [
     "packages/fonts",
     "packages/cli_output",
     "packages/cli",
+    "packages/cli-schema",
     "packages/client",
     "packages/clipboard",
     "packages/config",
@@ -75,6 +76,7 @@ version    = "0.0.1-alpha.0"
 bmux                   = { version = "0.0.1-alpha.0", default-features = false, path = "packages/bmux" }
 bmux_cli               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli" }
 bmux_cli_output        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli_output" }
+bmux_cli_schema        = { version = "0.0.1-alpha.0", default-features = false, path = "packages/cli-schema" }
 bmux_client            = { version = "0.0.1-alpha.0", default-features = false, path = "packages/client" }
 bmux_clipboard         = { version = "0.0.1-alpha.0", default-features = false, path = "packages/clipboard" }
 bmux_codec             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/codec" }
