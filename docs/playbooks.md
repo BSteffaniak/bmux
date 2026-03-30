@@ -1035,6 +1035,13 @@ Watchpoint hit event:
 - `pane_index`: optional pane scope (defaults to any pane).
 - `window_ms`: burst window in milliseconds (default `500`).
 - `min_hits`: required hit count inside `window_ms` (default `3`).
+- `contains_regex`: optional regex predicate (v1: supported for `event_type: "pane_output"` only).
+
+Example (only trigger on pane output that matches):
+
+```json
+{"op":"set_watchpoint","id":"errors-only","kind":"event_burst","event_type":"pane_output","contains_regex":"(?i)error|panic","min_hits":1,"window_ms":1000}
+```
 
 `watchpoint_hit` cannot be watched in v1 (recursive watchpoint loops are blocked).
 

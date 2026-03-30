@@ -12,6 +12,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{info, warn};
@@ -308,6 +309,8 @@ struct InteractiveJsonRequest {
     min_hits: Option<u16>,
     #[serde(default)]
     event_type: Option<String>,
+    #[serde(default)]
+    contains_regex: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -401,6 +404,8 @@ struct EventBurstWatchpoint {
     pane_index: Option<u32>,
     min_hits: u16,
     window_ms: u64,
+    contains_regex_raw: Option<String>,
+    contains_regex: Option<Regex>,
 }
 
 #[derive(Debug, Clone)]
@@ -662,6 +667,7 @@ async fn run_repl(
                         Some(pane_idx),
                         output_seq,
                         None,
+                        Some(&data),
                     ) {
                         let response = InteractiveResponse::event_watchpoint_hit(hit);
                         send_response(&mut writer, &mut sequencer, response, "event", None).await?;
@@ -732,6 +738,7 @@ async fn run_repl(
                         Some(pane_idx),
                         output_seq,
                         None,
+                        Some(&data),
                     ) {
                         let response = InteractiveResponse::event_watchpoint_hit(hit);
                         send_response(&mut writer, &mut sequencer, response, "event", None).await?;
@@ -1270,6 +1277,7 @@ async fn emit_screen_events<W: tokio::io::AsyncWrite + Unpin>(
                     Some(delta.pane.index),
                     cursor_event_seq,
                     Some(cursor.distance),
+                    None,
                 ) {
                     let response = InteractiveResponse::event_watchpoint_hit(hit);
                     send_response(writer, sequencer, response, "event", None).await?;
@@ -1289,6 +1297,7 @@ async fn emit_screen_events<W: tokio::io::AsyncWrite + Unpin>(
                     "screen_delta",
                     Some(delta.pane.index),
                     screen_delta_seq,
+                    None,
                     None,
                 ) {
                     let response = InteractiveResponse::event_watchpoint_hit(hit);
@@ -1501,23 +1510,52 @@ async fn handle_json_command<W: tokio::io::AsyncWrite + Unpin>(
                 return Ok(true);
             }
 
+            let contains_regex = if let Some(raw_regex) = json.contains_regex.as_deref() {
+                if event_type != "pane_output" {
+                    let mut resp = InteractiveResponse::error(
+                        "contains_regex is currently only supported for pane_output watchpoints"
+                            .to_string(),
+                    );
+                    resp.code = Some("invalid_op".to_string());
+                    send_response(writer, sequencer, resp, "error", json.request_id.as_deref())
+                        .await?;
+                    return Ok(true);
+                }
+                match Regex::new(raw_regex) {
+                    Ok(compiled) => Some((raw_regex.to_string(), compiled)),
+                    Err(error) => {
+                        let mut resp =
+                            InteractiveResponse::error(format!("invalid contains_regex: {error}"));
+                        resp.code = Some("invalid_op".to_string());
+                        send_response(writer, sequencer, resp, "error", json.request_id.as_deref())
+                            .await?;
+                        return Ok(true);
+                    }
+                }
+            } else {
+                None
+            };
+
             let watchpoint = EventBurstWatchpoint {
                 id: id.clone(),
                 event_type: event_type.clone(),
                 pane_index: json.pane_index,
                 min_hits: json.min_hits.unwrap_or(3).max(1),
                 window_ms: json.window_ms.unwrap_or(500).max(1),
+                contains_regex_raw: contains_regex.as_ref().map(|(raw, _)| raw.clone()),
+                contains_regex: contains_regex.map(|(_, compiled)| compiled),
             };
             watchpoints.upsert_event_burst(watchpoint.clone());
             let detail = format!(
-                "id={} kind=event_burst event_type={} pane_index={} min_hits={} window_ms={}",
+                "id={} kind=event_burst event_type={} pane_index={} min_hits={} window_ms={} contains_regex={}",
                 watchpoint.id,
                 watchpoint.event_type,
                 watchpoint
                     .pane_index
                     .map_or_else(|| "any".to_string(), |pane| pane.to_string()),
                 watchpoint.min_hits,
-                watchpoint.window_ms
+                watchpoint.window_ms,
+                watchpoint.contains_regex_raw.as_deref().unwrap_or("none")
             );
 
             let mut resp = InteractiveResponse::ok("set_watchpoint");
@@ -1664,6 +1702,7 @@ fn evaluate_watchpoints(
     pane_index: Option<u32>,
     event_seq: Option<u64>,
     peak_distance: Option<u16>,
+    event_text: Option<&str>,
 ) -> Vec<WatchpointHitEvent> {
     let mut hits = Vec::new();
     let now = Instant::now();
@@ -1677,6 +1716,14 @@ fn evaluate_watchpoints(
         }
         if watchpoint.pane_index.is_some() && pane_index != watchpoint.pane_index {
             continue;
+        }
+        if let Some(regex) = &watchpoint.contains_regex {
+            let Some(text) = event_text else {
+                continue;
+            };
+            if !regex.is_match(text) {
+                continue;
+            }
         }
 
         let pane_scope_key = pane_index.unwrap_or(0);
@@ -1728,6 +1775,47 @@ fn evaluate_watchpoints(
     }
 
     hits
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_burst_regex_predicate_filters_pane_output() {
+        let mut watchpoints = WatchpointRegistry::default();
+        watchpoints.upsert_event_burst(EventBurstWatchpoint {
+            id: "pane-output-regex".to_string(),
+            event_type: "pane_output".to_string(),
+            pane_index: Some(1),
+            min_hits: 1,
+            window_ms: 500,
+            contains_regex_raw: Some("match_me_[0-9]+".to_string()),
+            contains_regex: Some(Regex::new("match_me_[0-9]+$").expect("valid regex")),
+        });
+
+        let no_match_hits = evaluate_watchpoints(
+            &mut watchpoints,
+            "pane_output",
+            Some(1),
+            Some(1),
+            None,
+            Some("no_match_here"),
+        );
+        assert!(no_match_hits.is_empty());
+
+        let match_hits = evaluate_watchpoints(
+            &mut watchpoints,
+            "pane_output",
+            Some(1),
+            Some(2),
+            None,
+            Some("match_me_123"),
+        );
+        assert_eq!(match_hits.len(), 1);
+        assert_eq!(match_hits[0].kind, "event_burst");
+        assert_eq!(match_hits[0].watch_event_type, "pane_output");
+    }
 }
 
 // ── Endpoint selection ────────────────────────────────────────────────────────
