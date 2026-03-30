@@ -1018,6 +1018,158 @@ async fn interactive_mode_basic() {
     let _ = child.wait();
 }
 
+#[tokio::test]
+async fn interactive_mode_json_screen_delta_formats() {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+
+    let mut child = std::process::Command::new(bmux_binary())
+        .args([
+            "playbook",
+            "interactive",
+            "--viewport",
+            "80x24",
+            "--shell",
+            "sh",
+            "--timeout",
+            "30",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn bmux playbook interactive");
+
+    let _guard = ProcessGuard::new(&child);
+
+    let stdout = child.stdout.take().expect("stdout should be piped");
+    let mut stdout_reader = std::io::BufReader::new(stdout);
+    let mut ready_line = String::new();
+    std::io::BufRead::read_line(&mut stdout_reader, &mut ready_line)
+        .expect("failed to read ready message");
+    let ready: serde_json::Value = serde_json::from_str(ready_line.trim())
+        .unwrap_or_else(|e| panic!("failed to parse ready message: {e}\nline: {ready_line}"));
+    let socket_path = ready["socket"]
+        .as_str()
+        .expect("ready message should have socket path");
+
+    let endpoint = endpoint_from_socket_path(socket_path);
+    let mut stream = None;
+    for _ in 0..10 {
+        match bmux_ipc::transport::LocalIpcStream::connect(&endpoint).await {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    }
+    let stream = stream.unwrap_or_else(|| panic!("failed to connect to socket: {socket_path}"));
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = TokioBufReader::new(reader);
+
+    async fn send_json(
+        writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+        payload: &serde_json::Value,
+    ) {
+        writer
+            .write_all(format!("{}\n", payload).as_bytes())
+            .await
+            .expect("failed to write json command");
+        writer.flush().await.expect("failed to flush");
+    }
+
+    async fn read_json(reader: &mut (impl AsyncBufReadExt + Unpin)) -> serde_json::Value {
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .expect("failed to read response line");
+        serde_json::from_str(line.trim())
+            .unwrap_or_else(|e| panic!("failed to parse json line: {e}\nline: {line}"))
+    }
+
+    send_json(
+        &mut writer,
+        &serde_json::json!({"op":"command","request_id":"r-new","dsl":"new-session"}),
+    )
+    .await;
+    let new_session = read_json(&mut reader).await;
+    assert_eq!(new_session["action"], "new-session", "new-session response");
+    assert_eq!(new_session["request_id"], "r-new");
+
+    send_json(
+        &mut writer,
+        &serde_json::json!({
+            "op":"subscribe",
+            "request_id":"r-sub-1",
+            "client":"llm-agent",
+            "event_types":["screen_delta"],
+            "screen_delta_format":"line_ops"
+        }),
+    )
+    .await;
+    let subscribe_1 = read_json(&mut reader).await;
+    assert_eq!(subscribe_1["action"], "subscribe");
+
+    send_json(
+        &mut writer,
+        &serde_json::json!({"op":"command","request_id":"r-keys-1","dsl":"send-keys keys='echo line_ops_marker\\r'"}),
+    )
+    .await;
+
+    let mut saw_line_ops = false;
+    for _ in 0..20 {
+        let msg = read_json(&mut reader).await;
+        if msg["event_type"] == "screen_delta" {
+            assert_eq!(msg["screen_delta"]["format"], "line_ops");
+            saw_line_ops = true;
+            break;
+        }
+    }
+    assert!(saw_line_ops, "expected line_ops screen_delta event");
+
+    send_json(
+        &mut writer,
+        &serde_json::json!({
+            "op":"subscribe",
+            "request_id":"r-sub-2",
+            "event_types":["screen_delta"],
+            "screen_delta_format":"unified_diff"
+        }),
+    )
+    .await;
+    let subscribe_2 = read_json(&mut reader).await;
+    assert_eq!(subscribe_2["action"], "subscribe");
+
+    send_json(
+        &mut writer,
+        &serde_json::json!({"op":"command","request_id":"r-keys-2","dsl":"send-keys keys='echo unified_diff_marker\\r'"}),
+    )
+    .await;
+
+    let mut saw_unified_diff = false;
+    for _ in 0..20 {
+        let msg = read_json(&mut reader).await;
+        if msg["event_type"] == "screen_delta" {
+            assert_eq!(msg["screen_delta"]["format"], "unified_diff");
+            let diff = msg["screen_delta"]["diff"].as_str().unwrap_or("");
+            assert!(
+                diff.contains("@@"),
+                "unified diff payload should include hunks"
+            );
+            saw_unified_diff = true;
+            break;
+        }
+    }
+    assert!(saw_unified_diff, "expected unified_diff screen_delta event");
+
+    send_json(&mut writer, &serde_json::json!({"op":"quit"})).await;
+    let quit = read_json(&mut reader).await;
+    assert_eq!(quit["action"], "quit");
+
+    let _ = child.wait();
+}
+
 // ---------------------------------------------------------------------------
 // A: Concurrent playbook runs
 // ---------------------------------------------------------------------------

@@ -11,6 +11,7 @@
 use anyhow::{Context, Result, bail};
 use bmux_client::{AttachSnapshotState, BmuxClient};
 use regex::Regex;
+use serde::Serialize;
 use uuid::Uuid;
 
 use super::types::PaneCapture;
@@ -37,6 +38,54 @@ pub struct ScreenInspector {
     panes: Vec<ParsedPane>,
     viewport_rows: u16,
     viewport_cols: u16,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ScreenDeltaFormat {
+    LineOps,
+    UnifiedDiff,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CursorPosition {
+    pub row: u16,
+    pub col: u16,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CursorDeltaEvent {
+    pub pane_index: u32,
+    pub from: CursorPosition,
+    pub to: CursorPosition,
+    pub distance: u16,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum ScreenLineOp {
+    SetLine { row: u16, text: String },
+    ClearLine { row: u16 },
+    Cursor { row: u16, col: u16 },
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ScreenDeltaEvent {
+    pub pane_index: u32,
+    pub format: ScreenDeltaFormat,
+    pub base_hash: String,
+    pub new_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ops: Option<Vec<ScreenLineOp>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diff: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct PaneDeltaResult {
+    pub pane: PaneCapture,
+    pub cursor_delta: Option<CursorDeltaEvent>,
+    pub screen_delta: Option<ScreenDeltaEvent>,
 }
 
 impl ScreenInspector {
@@ -156,6 +205,27 @@ impl ScreenInspector {
         }
     }
 
+    /// Build cursor and screen deltas against a previous pane cache.
+    pub fn build_deltas(
+        &self,
+        previous: &std::collections::HashMap<u32, PaneCapture>,
+        format: ScreenDeltaFormat,
+    ) -> Vec<PaneDeltaResult> {
+        self.capture_all()
+            .into_iter()
+            .map(|pane| {
+                let prior = previous.get(&pane.index);
+                let cursor_delta = build_cursor_delta(prior, &pane);
+                let screen_delta = build_screen_delta(prior, &pane, format);
+                PaneDeltaResult {
+                    pane,
+                    cursor_delta,
+                    screen_delta,
+                }
+            })
+            .collect()
+    }
+
     /// Check if a pane's screen text contains a substring.
     pub fn pane_contains(&self, pane_index: u32, needle: &str) -> bool {
         self.pane_text(pane_index)
@@ -197,6 +267,125 @@ impl ScreenInspector {
                 .context("no focused pane"),
         }
     }
+}
+
+fn build_cursor_delta(
+    previous: Option<&PaneCapture>,
+    current: &PaneCapture,
+) -> Option<CursorDeltaEvent> {
+    let prior = previous?;
+    if prior.cursor_row == current.cursor_row && prior.cursor_col == current.cursor_col {
+        return None;
+    }
+    let row_delta = current.cursor_row.abs_diff(prior.cursor_row);
+    let col_delta = current.cursor_col.abs_diff(prior.cursor_col);
+    Some(CursorDeltaEvent {
+        pane_index: current.index,
+        from: CursorPosition {
+            row: prior.cursor_row,
+            col: prior.cursor_col,
+        },
+        to: CursorPosition {
+            row: current.cursor_row,
+            col: current.cursor_col,
+        },
+        distance: row_delta.saturating_add(col_delta),
+    })
+}
+
+fn build_screen_delta(
+    previous: Option<&PaneCapture>,
+    current: &PaneCapture,
+    format: ScreenDeltaFormat,
+) -> Option<ScreenDeltaEvent> {
+    let previous_text = previous.map_or("", |p| p.screen_text.as_str());
+    if previous.is_some_and(|p| p.screen_text == current.screen_text) {
+        return None;
+    }
+
+    let base_hash = text_hash(previous_text);
+    let new_hash = text_hash(&current.screen_text);
+    match format {
+        ScreenDeltaFormat::LineOps => {
+            let mut ops = line_ops_delta(previous_text, &current.screen_text);
+            ops.push(ScreenLineOp::Cursor {
+                row: current.cursor_row,
+                col: current.cursor_col,
+            });
+            Some(ScreenDeltaEvent {
+                pane_index: current.index,
+                format,
+                base_hash,
+                new_hash,
+                ops: Some(ops),
+                diff: None,
+            })
+        }
+        ScreenDeltaFormat::UnifiedDiff => {
+            let diff = unified_diff(previous_text, &current.screen_text)?;
+            Some(ScreenDeltaEvent {
+                pane_index: current.index,
+                format,
+                base_hash,
+                new_hash,
+                ops: None,
+                diff: Some(diff),
+            })
+        }
+    }
+}
+
+fn line_ops_delta(previous_text: &str, current_text: &str) -> Vec<ScreenLineOp> {
+    let previous_lines = previous_text.lines().collect::<Vec<_>>();
+    let current_lines = current_text.lines().collect::<Vec<_>>();
+    let max_len = previous_lines.len().max(current_lines.len());
+    let mut ops = Vec::new();
+    for row in 0..max_len {
+        match (previous_lines.get(row), current_lines.get(row)) {
+            (Some(prev), Some(curr)) if prev != curr => ops.push(ScreenLineOp::SetLine {
+                row: row as u16,
+                text: (*curr).to_string(),
+            }),
+            (None, Some(curr)) => ops.push(ScreenLineOp::SetLine {
+                row: row as u16,
+                text: (*curr).to_string(),
+            }),
+            (Some(_), None) => ops.push(ScreenLineOp::ClearLine { row: row as u16 }),
+            _ => {}
+        }
+    }
+    ops
+}
+
+fn unified_diff(previous_text: &str, current_text: &str) -> Option<String> {
+    let previous_lines = previous_text.lines().collect::<Vec<_>>();
+    let current_lines = current_text.lines().collect::<Vec<_>>();
+    let max_len = previous_lines.len().max(current_lines.len());
+    let mut output = String::new();
+    for row in 0..max_len {
+        let prev = previous_lines.get(row).copied().unwrap_or("");
+        let curr = current_lines.get(row).copied().unwrap_or("");
+        if prev == curr {
+            continue;
+        }
+        output.push_str(&format!("@@ -{},1 +{},1 @@\n", row + 1, row + 1));
+        output.push_str(&format!("-{prev}\n"));
+        output.push_str(&format!("+{curr}\n"));
+    }
+    if output.is_empty() {
+        None
+    } else {
+        Some(output)
+    }
+}
+
+fn text_hash(text: &str) -> String {
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for byte in text.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    format!("{hash:016x}")
 }
 
 /// Extract per-pane (cols, rows) from the scene's surface rects.
@@ -282,5 +471,22 @@ mod tests {
         assert_eq!(fresh_text, "hello\nworld");
         // The accumulated parser shows doubled output — this is the bug we fixed
         assert_ne!(accumulated_text, fresh_text);
+    }
+
+    #[test]
+    fn line_ops_delta_reports_changed_rows() {
+        let ops = line_ops_delta("a\nb", "a\nc");
+        assert!(matches!(
+            ops.as_slice(),
+            [ScreenLineOp::SetLine { row: 1, text }] if text == "c"
+        ));
+    }
+
+    #[test]
+    fn unified_diff_reports_changed_rows() {
+        let diff = unified_diff("hello", "hullo").expect("diff should exist");
+        assert!(diff.contains("@@ -1,1 +1,1 @@"));
+        assert!(diff.contains("-hello"));
+        assert!(diff.contains("+hullo"));
     }
 }

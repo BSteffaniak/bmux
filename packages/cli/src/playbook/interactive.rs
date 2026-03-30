@@ -12,7 +12,7 @@
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -20,7 +20,7 @@ use uuid::Uuid;
 use super::engine::{drain_output_until_idle, execute_step, start_recording};
 use super::parse_dsl::parse_action_line;
 use super::sandbox::SandboxServer;
-use super::screen::ScreenInspector;
+use super::screen::{ScreenDeltaEvent, ScreenDeltaFormat, ScreenInspector};
 use super::types::{PaneCapture, SnapshotCapture, Step};
 
 /// Default timeout for sandbox server startup.
@@ -29,6 +29,14 @@ const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 /// JSON response sent back to the agent for each command.
 #[derive(Serialize)]
 struct InteractiveResponse {
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    message_type: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seq: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mono_ns: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_id: Option<String>,
     status: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     action: Option<String>,
@@ -57,11 +65,39 @@ struct InteractiveResponse {
     /// For output push events: the new output text.
     #[serde(skip_serializing_if = "Option::is_none")]
     output_data: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    retryable: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subscription_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    screen_delta: Option<ScreenDeltaEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cursor_delta: Option<CursorDeltaEvent>,
+}
+
+#[derive(Serialize)]
+struct CursorDeltaEvent {
+    pane_index: u32,
+    from: CursorPosition,
+    to: CursorPosition,
+    distance: u16,
+}
+
+#[derive(Serialize)]
+struct CursorPosition {
+    row: u16,
+    col: u16,
 }
 
 impl InteractiveResponse {
     fn ok(action: &str) -> Self {
         Self {
+            message_type: None,
+            seq: None,
+            mono_ns: None,
+            request_id: None,
             status: "ok",
             action: Some(action.to_string()),
             elapsed_ms: None,
@@ -75,11 +111,20 @@ impl InteractiveResponse {
             event_type: None,
             pane_index: None,
             output_data: None,
+            code: None,
+            retryable: None,
+            subscription_id: None,
+            screen_delta: None,
+            cursor_delta: None,
         }
     }
 
     fn ok_with_detail(action: &str, elapsed_ms: u64, detail: Option<String>) -> Self {
         Self {
+            message_type: None,
+            seq: None,
+            mono_ns: None,
+            request_id: None,
             status: "ok",
             action: Some(action.to_string()),
             elapsed_ms: Some(elapsed_ms),
@@ -93,11 +138,20 @@ impl InteractiveResponse {
             event_type: None,
             pane_index: None,
             output_data: None,
+            code: None,
+            retryable: None,
+            subscription_id: None,
+            screen_delta: None,
+            cursor_delta: None,
         }
     }
 
     fn fail(action: &str, elapsed_ms: u64, error: String) -> Self {
         Self {
+            message_type: None,
+            seq: None,
+            mono_ns: None,
+            request_id: None,
             status: "fail",
             action: Some(action.to_string()),
             elapsed_ms: Some(elapsed_ms),
@@ -111,11 +165,20 @@ impl InteractiveResponse {
             event_type: None,
             pane_index: None,
             output_data: None,
+            code: None,
+            retryable: None,
+            subscription_id: None,
+            screen_delta: None,
+            cursor_delta: None,
         }
     }
 
     fn error(message: String) -> Self {
         Self {
+            message_type: None,
+            seq: None,
+            mono_ns: None,
+            request_id: None,
             status: "error",
             action: None,
             elapsed_ms: None,
@@ -129,12 +192,21 @@ impl InteractiveResponse {
             event_type: None,
             pane_index: None,
             output_data: None,
+            code: Some("internal".to_string()),
+            retryable: Some(false),
+            subscription_id: None,
+            screen_delta: None,
+            cursor_delta: None,
         }
     }
 
     /// Create a push output event.
     fn push_output(pane_index: u32, data: String) -> Self {
         Self {
+            message_type: None,
+            seq: None,
+            mono_ns: None,
+            request_id: None,
             status: "ok",
             action: None,
             elapsed_ms: None,
@@ -148,7 +220,134 @@ impl InteractiveResponse {
             event_type: Some("output".to_string()),
             pane_index: Some(pane_index),
             output_data: Some(data),
+            code: None,
+            retryable: None,
+            subscription_id: None,
+            screen_delta: None,
+            cursor_delta: None,
         }
+    }
+
+    fn event_screen_delta(delta: ScreenDeltaEvent) -> Self {
+        Self {
+            event_type: Some("screen_delta".to_string()),
+            screen_delta: Some(delta),
+            ..Self::ok("screen-delta")
+        }
+    }
+
+    fn event_cursor_delta(delta: CursorDeltaEvent) -> Self {
+        Self {
+            event_type: Some("cursor_delta".to_string()),
+            cursor_delta: Some(delta),
+            ..Self::ok("cursor-delta")
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct InteractiveJsonRequest {
+    op: String,
+    #[serde(default)]
+    request_id: Option<String>,
+    #[serde(default)]
+    client: Option<String>,
+    #[serde(default)]
+    prefer_machine_readable: Option<bool>,
+    #[serde(default)]
+    dsl: Option<String>,
+    #[serde(default)]
+    event_types: Vec<String>,
+    #[serde(default)]
+    pane_indexes: Vec<u32>,
+    #[serde(default)]
+    screen_delta_format: Option<String>,
+    #[serde(default)]
+    kind: Option<String>,
+    #[serde(default)]
+    pane_index: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeltaFormatPreference {
+    Auto,
+    LineOps,
+    UnifiedDiff,
+}
+
+#[derive(Debug, Clone)]
+struct LiveSubscription {
+    active: bool,
+    event_types: std::collections::BTreeSet<String>,
+    pane_indexes: Option<std::collections::BTreeSet<u32>>,
+    format_preference: DeltaFormatPreference,
+    prefer_machine_readable: bool,
+    subscription_id: String,
+}
+
+impl Default for LiveSubscription {
+    fn default() -> Self {
+        Self {
+            active: false,
+            event_types: ["pane_output".to_string()].into_iter().collect(),
+            pane_indexes: None,
+            format_preference: DeltaFormatPreference::Auto,
+            prefer_machine_readable: false,
+            subscription_id: "sub_1".to_string(),
+        }
+    }
+}
+
+impl LiveSubscription {
+    fn wants(&self, event_type: &str) -> bool {
+        self.event_types.contains(event_type)
+    }
+
+    fn allows_pane(&self, pane_index: u32) -> bool {
+        self.pane_indexes
+            .as_ref()
+            .is_none_or(|panes| panes.contains(&pane_index))
+    }
+
+    fn resolved_delta_format(&self) -> ScreenDeltaFormat {
+        match self.format_preference {
+            DeltaFormatPreference::LineOps => ScreenDeltaFormat::LineOps,
+            DeltaFormatPreference::UnifiedDiff => ScreenDeltaFormat::UnifiedDiff,
+            DeltaFormatPreference::Auto => {
+                if self.prefer_machine_readable {
+                    ScreenDeltaFormat::LineOps
+                } else {
+                    ScreenDeltaFormat::UnifiedDiff
+                }
+            }
+        }
+    }
+}
+
+struct MessageSequencer {
+    started: Instant,
+    seq: u64,
+}
+
+impl MessageSequencer {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            seq: 0,
+        }
+    }
+
+    fn stamp(
+        &mut self,
+        response: &mut InteractiveResponse,
+        message_type: &str,
+        request_id: Option<&str>,
+    ) {
+        self.seq = self.seq.saturating_add(1);
+        response.message_type = Some(message_type.to_string());
+        response.seq = Some(self.seq);
+        response.mono_ns = Some(self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        response.request_id = request_id.map(std::string::ToString::to_string);
     }
 }
 
@@ -339,14 +538,16 @@ async fn run_repl(
     // Channel for push output events (populated when subscribed).
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<(u32, String)>(64);
     let mut output_task: Option<tokio::task::JoinHandle<()>> = None;
-    let mut subscribed = false;
+    let mut subscription = LiveSubscription::default();
+    let mut pane_cache = std::collections::HashMap::<u32, PaneCapture>::new();
+    let mut sequencer = MessageSequencer::new();
 
     loop {
         // Check session timeout.
         if let Some(dl) = deadline {
             if Instant::now() >= dl {
                 let resp = InteractiveResponse::error("session timeout exceeded".to_string());
-                write_response(&mut writer, &resp).await?;
+                send_response(&mut writer, &mut sequencer, resp, "error", None).await?;
                 break;
             }
         }
@@ -355,10 +556,24 @@ async fn run_repl(
         line.clear();
 
         // Drain any pending push events before blocking on the next command.
-        if subscribed {
+        if subscription.active {
             while let Ok((pane_idx, data)) = output_rx.try_recv() {
-                let push = InteractiveResponse::push_output(pane_idx, data);
-                write_response(&mut writer, &push).await?;
+                if subscription.wants("pane_output") && subscription.allows_pane(pane_idx) {
+                    let mut push = InteractiveResponse::push_output(pane_idx, data.clone());
+                    push.event_type = Some("pane_output".to_string());
+                    send_response(&mut writer, &mut sequencer, push, "event", None).await?;
+                }
+                emit_screen_events(
+                    &mut writer,
+                    &mut sequencer,
+                    client,
+                    inspector,
+                    session_id,
+                    attached,
+                    &subscription,
+                    &mut pane_cache,
+                )
+                .await?;
             }
         }
 
@@ -368,7 +583,7 @@ async fn run_repl(
                 Ok(result) => result,
                 Err(_) => {
                     let resp = InteractiveResponse::error("session timeout exceeded".to_string());
-                    write_response(&mut writer, &resp).await?;
+                    send_response(&mut writer, &mut sequencer, resp, "error", None).await?;
                     break;
                 }
             }
@@ -385,16 +600,85 @@ async fn run_repl(
             }
         }
 
-        let trimmed = line.trim().to_string();
+        let mut trimmed = line.trim().to_string();
         if trimmed.is_empty() {
             continue;
         }
+        let mut active_request_id: Option<String> = None;
 
         // Drain push events that arrived during the command read.
-        if subscribed {
+        if subscription.active {
             while let Ok((pane_idx, data)) = output_rx.try_recv() {
-                let push = InteractiveResponse::push_output(pane_idx, data);
-                write_response(&mut writer, &push).await?;
+                if subscription.wants("pane_output") && subscription.allows_pane(pane_idx) {
+                    let mut push = InteractiveResponse::push_output(pane_idx, data.clone());
+                    push.event_type = Some("pane_output".to_string());
+                    send_response(&mut writer, &mut sequencer, push, "event", None).await?;
+                }
+                emit_screen_events(
+                    &mut writer,
+                    &mut sequencer,
+                    client,
+                    inspector,
+                    session_id,
+                    attached,
+                    &subscription,
+                    &mut pane_cache,
+                )
+                .await?;
+            }
+        }
+
+        if let Ok(json) = serde_json::from_str::<InteractiveJsonRequest>(&trimmed) {
+            if json.op == "command" {
+                let Some(dsl) = json.dsl.as_deref() else {
+                    let mut resp = InteractiveResponse::error("command requires dsl".to_string());
+                    resp.code = Some("invalid_op".to_string());
+                    send_response(
+                        &mut writer,
+                        &mut sequencer,
+                        resp,
+                        "error",
+                        json.request_id.as_deref(),
+                    )
+                    .await?;
+                    continue;
+                };
+                trimmed = dsl.trim().to_string();
+                if trimmed.is_empty() {
+                    let mut resp =
+                        InteractiveResponse::error("command dsl cannot be empty".to_string());
+                    resp.code = Some("invalid_op".to_string());
+                    send_response(
+                        &mut writer,
+                        &mut sequencer,
+                        resp,
+                        "error",
+                        json.request_id.as_deref(),
+                    )
+                    .await?;
+                    continue;
+                }
+                active_request_id = json.request_id;
+            } else {
+                let should_continue = handle_json_command(
+                    json,
+                    &mut writer,
+                    &mut sequencer,
+                    client,
+                    inspector,
+                    session_id,
+                    attached,
+                    &mut subscription,
+                    &mut output_task,
+                    &output_tx,
+                    &mut pane_cache,
+                    sandbox,
+                )
+                .await?;
+                if !should_continue {
+                    break;
+                }
+                continue;
             }
         }
 
@@ -402,17 +686,40 @@ async fn run_repl(
         match trimmed.as_str() {
             "quit" => {
                 let resp = InteractiveResponse::ok("quit");
-                write_response(&mut writer, &resp).await?;
+                send_response(
+                    &mut writer,
+                    &mut sequencer,
+                    resp,
+                    "response",
+                    active_request_id.as_deref(),
+                )
+                .await?;
                 break;
             }
             "screen" => {
                 let resp = handle_screen_command(client, inspector, session_id, attached).await;
-                write_response(&mut writer, &resp).await?;
+                update_pane_cache_from_inspector(inspector, &mut pane_cache);
+                send_response(
+                    &mut writer,
+                    &mut sequencer,
+                    resp,
+                    "response",
+                    active_request_id.as_deref(),
+                )
+                .await?;
                 continue;
             }
             "status" => {
                 let resp = handle_status_command(client, inspector, session_id, attached).await;
-                write_response(&mut writer, &resp).await?;
+                update_pane_cache_from_inspector(inspector, &mut pane_cache);
+                send_response(
+                    &mut writer,
+                    &mut sequencer,
+                    resp,
+                    "response",
+                    active_request_id.as_deref(),
+                )
+                .await?;
                 continue;
             }
             "help" => {
@@ -427,25 +734,53 @@ async fn run_repl(
                     ),
                     ..InteractiveResponse::ok("help")
                 };
-                write_response(&mut writer, &resp).await?;
+                send_response(
+                    &mut writer,
+                    &mut sequencer,
+                    resp,
+                    "response",
+                    active_request_id.as_deref(),
+                )
+                .await?;
                 continue;
             }
             "subscribe" => {
-                if subscribed {
+                if subscription.active {
                     let resp = InteractiveResponse::ok("subscribe");
-                    write_response(&mut writer, &resp).await?;
+                    send_response(
+                        &mut writer,
+                        &mut sequencer,
+                        resp,
+                        "response",
+                        active_request_id.as_deref(),
+                    )
+                    .await?;
                     continue;
                 }
                 let Some(sid) = *session_id else {
                     let resp = InteractiveResponse::error(
                         "no session — use new-session first".to_string(),
                     );
-                    write_response(&mut writer, &resp).await?;
+                    send_response(
+                        &mut writer,
+                        &mut sequencer,
+                        resp,
+                        "error",
+                        active_request_id.as_deref(),
+                    )
+                    .await?;
                     continue;
                 };
                 if !*attached {
                     let resp = InteractiveResponse::error("not attached to a session".to_string());
-                    write_response(&mut writer, &resp).await?;
+                    send_response(
+                        &mut writer,
+                        &mut sequencer,
+                        resp,
+                        "error",
+                        active_request_id.as_deref(),
+                    )
+                    .await?;
                     continue;
                 }
                 // Create a second client connection for output polling.
@@ -456,13 +791,29 @@ async fn run_repl(
                         output_task = Some(tokio::spawn(async move {
                             output_poll_loop(&mut event_client, sid, focused, tx).await;
                         }));
-                        subscribed = true;
+                        subscription.active = true;
+                        subscription.event_types =
+                            ["pane_output".to_string()].into_iter().collect();
                         let resp = InteractiveResponse::ok("subscribe");
-                        write_response(&mut writer, &resp).await?;
+                        send_response(
+                            &mut writer,
+                            &mut sequencer,
+                            resp,
+                            "response",
+                            active_request_id.as_deref(),
+                        )
+                        .await?;
                     }
                     Err(e) => {
                         let resp = InteractiveResponse::error(format!("subscribe failed: {e:#}"));
-                        write_response(&mut writer, &resp).await?;
+                        send_response(
+                            &mut writer,
+                            &mut sequencer,
+                            resp,
+                            "error",
+                            active_request_id.as_deref(),
+                        )
+                        .await?;
                     }
                 }
                 continue;
@@ -471,9 +822,16 @@ async fn run_repl(
                 if let Some(task) = output_task.take() {
                     task.abort();
                 }
-                subscribed = false;
+                subscription.active = false;
                 let resp = InteractiveResponse::ok("unsubscribe");
-                write_response(&mut writer, &resp).await?;
+                send_response(
+                    &mut writer,
+                    &mut sequencer,
+                    resp,
+                    "response",
+                    active_request_id.as_deref(),
+                )
+                .await?;
                 continue;
             }
             _ => {}
@@ -484,7 +842,14 @@ async fn run_repl(
             Ok(action) => action,
             Err(e) => {
                 let resp = InteractiveResponse::error(format!("{e:#}"));
-                write_response(&mut writer, &resp).await?;
+                send_response(
+                    &mut writer,
+                    &mut sequencer,
+                    resp,
+                    "error",
+                    active_request_id.as_deref(),
+                )
+                .await?;
                 continue;
             }
         };
@@ -545,7 +910,26 @@ async fn run_repl(
                     }
                 }
 
-                write_response(&mut writer, &resp).await?;
+                update_pane_cache_from_inspector(inspector, &mut pane_cache);
+                send_response(
+                    &mut writer,
+                    &mut sequencer,
+                    resp,
+                    "response",
+                    active_request_id.as_deref(),
+                )
+                .await?;
+                emit_screen_events(
+                    &mut writer,
+                    &mut sequencer,
+                    client,
+                    inspector,
+                    session_id,
+                    attached,
+                    &subscription,
+                    &mut pane_cache,
+                )
+                .await?;
             }
             Err(err) => {
                 let mut resp =
@@ -571,7 +955,25 @@ async fn run_repl(
                     resp.panes = inspector.capture_all_safe();
                 }
 
-                write_response(&mut writer, &resp).await?;
+                send_response(
+                    &mut writer,
+                    &mut sequencer,
+                    resp,
+                    "response",
+                    active_request_id.as_deref(),
+                )
+                .await?;
+                emit_screen_events(
+                    &mut writer,
+                    &mut sequencer,
+                    client,
+                    inspector,
+                    session_id,
+                    attached,
+                    &subscription,
+                    &mut pane_cache,
+                )
+                .await?;
                 // Don't break on failure — let the agent decide what to do.
             }
         }
@@ -658,6 +1060,350 @@ async fn write_response<W: tokio::io::AsyncWrite + Unpin>(
     writer.write_all(b"\n").await?;
     writer.flush().await?;
     Ok(())
+}
+
+async fn send_response<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    sequencer: &mut MessageSequencer,
+    mut response: InteractiveResponse,
+    message_type: &str,
+    request_id: Option<&str>,
+) -> Result<()> {
+    sequencer.stamp(&mut response, message_type, request_id);
+    write_response(writer, &response).await
+}
+
+fn update_pane_cache_from_inspector(
+    inspector: &ScreenInspector,
+    pane_cache: &mut std::collections::HashMap<u32, PaneCapture>,
+) {
+    pane_cache.clear();
+    for pane in inspector.capture_all() {
+        pane_cache.insert(pane.index, pane);
+    }
+}
+
+async fn emit_screen_events<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    sequencer: &mut MessageSequencer,
+    client: &mut bmux_client::BmuxClient,
+    inspector: &mut ScreenInspector,
+    session_id: &Option<Uuid>,
+    attached: &bool,
+    subscription: &LiveSubscription,
+    pane_cache: &mut std::collections::HashMap<u32, PaneCapture>,
+) -> Result<()> {
+    if !subscription.active
+        || (!subscription.wants("cursor_delta") && !subscription.wants("screen_delta"))
+    {
+        return Ok(());
+    }
+    let Some(sid) = *session_id else {
+        return Ok(());
+    };
+    if !*attached {
+        return Ok(());
+    }
+
+    if inspector.refresh(client, sid).await.is_err() {
+        return Ok(());
+    }
+    let deltas = inspector.build_deltas(pane_cache, subscription.resolved_delta_format());
+    for delta in &deltas {
+        if !subscription.allows_pane(delta.pane.index) {
+            continue;
+        }
+        if subscription.wants("cursor_delta")
+            && let Some(cursor) = &delta.cursor_delta
+        {
+            let event = CursorDeltaEvent {
+                pane_index: cursor.pane_index,
+                from: CursorPosition {
+                    row: cursor.from.row,
+                    col: cursor.from.col,
+                },
+                to: CursorPosition {
+                    row: cursor.to.row,
+                    col: cursor.to.col,
+                },
+                distance: cursor.distance,
+            };
+            let response = InteractiveResponse::event_cursor_delta(event);
+            send_response(writer, sequencer, response, "event", None).await?;
+        }
+        if subscription.wants("screen_delta")
+            && let Some(screen_delta) = &delta.screen_delta
+        {
+            let response = InteractiveResponse::event_screen_delta(screen_delta.clone());
+            send_response(writer, sequencer, response, "event", None).await?;
+        }
+    }
+    pane_cache.clear();
+    for pane in deltas {
+        pane_cache.insert(pane.pane.index, pane.pane);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn handle_json_command<W: tokio::io::AsyncWrite + Unpin>(
+    json: InteractiveJsonRequest,
+    writer: &mut W,
+    sequencer: &mut MessageSequencer,
+    client: &mut bmux_client::BmuxClient,
+    inspector: &mut ScreenInspector,
+    session_id: &mut Option<Uuid>,
+    attached: &mut bool,
+    subscription: &mut LiveSubscription,
+    output_task: &mut Option<tokio::task::JoinHandle<()>>,
+    output_tx: &tokio::sync::mpsc::Sender<(u32, String)>,
+    pane_cache: &mut std::collections::HashMap<u32, PaneCapture>,
+    sandbox: &super::sandbox::SandboxServer,
+) -> Result<bool> {
+    match json.op.as_str() {
+        "hello" => {
+            if json.prefer_machine_readable.unwrap_or(false)
+                || json
+                    .client
+                    .as_deref()
+                    .is_some_and(|client| client.to_ascii_lowercase().contains("llm"))
+            {
+                subscription.prefer_machine_readable = true;
+            }
+            let mut resp = InteractiveResponse::ok("hello");
+            resp.detail = Some("protocol_version=1".to_string());
+            send_response(
+                writer,
+                sequencer,
+                resp,
+                "response",
+                json.request_id.as_deref(),
+            )
+            .await?;
+            Ok(true)
+        }
+        "subscribe" => {
+            let Some(sid) = *session_id else {
+                let mut resp =
+                    InteractiveResponse::error("no session — use new-session first".to_string());
+                resp.code = Some("invalid_state".to_string());
+                send_response(writer, sequencer, resp, "error", json.request_id.as_deref()).await?;
+                return Ok(true);
+            };
+            if !*attached {
+                let mut resp = InteractiveResponse::error("not attached to a session".to_string());
+                resp.code = Some("invalid_state".to_string());
+                send_response(writer, sequencer, resp, "error", json.request_id.as_deref()).await?;
+                return Ok(true);
+            }
+            if output_task.is_none() {
+                match sandbox.connect("bmux-playbook-output-stream").await {
+                    Ok(mut event_client) => {
+                        let tx = output_tx.clone();
+                        let focused = inspector
+                            .refresh(client, sid)
+                            .await
+                            .ok()
+                            .and_then(|snapshot| {
+                                snapshot
+                                    .panes
+                                    .iter()
+                                    .find(|pane| pane.focused)
+                                    .map(|pane| pane.index)
+                            })
+                            .unwrap_or(1);
+                        *output_task = Some(tokio::spawn(async move {
+                            output_poll_loop(&mut event_client, sid, focused, tx).await;
+                        }));
+                    }
+                    Err(e) => {
+                        let mut resp =
+                            InteractiveResponse::error(format!("subscribe failed: {e:#}"));
+                        resp.code = Some("internal".to_string());
+                        send_response(writer, sequencer, resp, "error", json.request_id.as_deref())
+                            .await?;
+                        return Ok(true);
+                    }
+                }
+            }
+
+            subscription.active = true;
+            subscription.event_types = if json.event_types.is_empty() {
+                [
+                    "pane_output".to_string(),
+                    "cursor_delta".to_string(),
+                    "screen_delta".to_string(),
+                ]
+                .into_iter()
+                .collect()
+            } else {
+                json.event_types
+                    .into_iter()
+                    .map(|entry| entry.to_ascii_lowercase())
+                    .collect()
+            };
+            subscription.pane_indexes = if json.pane_indexes.is_empty() {
+                None
+            } else {
+                Some(json.pane_indexes.into_iter().collect())
+            };
+            subscription.format_preference =
+                match parse_delta_preference(json.screen_delta_format.as_deref()) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        let mut resp = InteractiveResponse::error(error.to_string());
+                        resp.code = Some("invalid_op".to_string());
+                        send_response(writer, sequencer, resp, "error", json.request_id.as_deref())
+                            .await?;
+                        return Ok(true);
+                    }
+                };
+            if json.prefer_machine_readable.unwrap_or(false)
+                || json
+                    .client
+                    .as_deref()
+                    .is_some_and(|client| client.to_ascii_lowercase().contains("llm"))
+            {
+                subscription.prefer_machine_readable = true;
+            }
+
+            let mut resp = InteractiveResponse::ok("subscribe");
+            resp.subscription_id = Some(subscription.subscription_id.clone());
+            resp.detail = Some(format!(
+                "events={} screen_delta_format={:?}",
+                subscription
+                    .event_types
+                    .iter()
+                    .map(std::string::ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(","),
+                subscription.resolved_delta_format()
+            ));
+            send_response(
+                writer,
+                sequencer,
+                resp,
+                "response",
+                json.request_id.as_deref(),
+            )
+            .await?;
+            Ok(true)
+        }
+        "unsubscribe" => {
+            if let Some(task) = output_task.take() {
+                task.abort();
+            }
+            subscription.active = false;
+            let resp = InteractiveResponse::ok("unsubscribe");
+            send_response(
+                writer,
+                sequencer,
+                resp,
+                "response",
+                json.request_id.as_deref(),
+            )
+            .await?;
+            Ok(true)
+        }
+        "hydrate" => {
+            if json.kind.as_deref() != Some("screen_full") {
+                let mut resp = InteractiveResponse::error("unsupported hydrate kind".to_string());
+                resp.code = Some("invalid_op".to_string());
+                send_response(writer, sequencer, resp, "error", json.request_id.as_deref()).await?;
+                return Ok(true);
+            }
+            let resp = handle_screen_command(client, inspector, session_id, attached).await;
+            update_pane_cache_from_inspector(inspector, pane_cache);
+            let response = if let Some(target_pane) = json.pane_index {
+                let mut single = resp;
+                single.panes = single.panes.map(|panes| {
+                    panes
+                        .into_iter()
+                        .filter(|pane| pane.index == target_pane)
+                        .collect()
+                });
+                single
+            } else {
+                resp
+            };
+            send_response(
+                writer,
+                sequencer,
+                response,
+                "response",
+                json.request_id.as_deref(),
+            )
+            .await?;
+            Ok(true)
+        }
+        "status" => {
+            let resp = handle_status_command(client, inspector, session_id, attached).await;
+            update_pane_cache_from_inspector(inspector, pane_cache);
+            send_response(
+                writer,
+                sequencer,
+                resp,
+                "response",
+                json.request_id.as_deref(),
+            )
+            .await?;
+            Ok(true)
+        }
+        "quit" => {
+            let resp = InteractiveResponse::ok("quit");
+            send_response(
+                writer,
+                sequencer,
+                resp,
+                "response",
+                json.request_id.as_deref(),
+            )
+            .await?;
+            Ok(false)
+        }
+        "command" => {
+            let Some(dsl) = json.dsl.as_deref() else {
+                let mut resp = InteractiveResponse::error("command requires dsl".to_string());
+                resp.code = Some("invalid_op".to_string());
+                send_response(writer, sequencer, resp, "error", json.request_id.as_deref()).await?;
+                return Ok(true);
+            };
+            let line = dsl.trim().to_string();
+            if line.is_empty() {
+                let mut resp =
+                    InteractiveResponse::error("command dsl cannot be empty".to_string());
+                resp.code = Some("invalid_op".to_string());
+                send_response(writer, sequencer, resp, "error", json.request_id.as_deref()).await?;
+                return Ok(true);
+            }
+            let mut resp = InteractiveResponse::ok("command");
+            resp.detail = Some(format!("dsl={line}"));
+            send_response(
+                writer,
+                sequencer,
+                resp,
+                "response",
+                json.request_id.as_deref(),
+            )
+            .await?;
+            Ok(true)
+        }
+        _ => {
+            let mut resp = InteractiveResponse::error(format!("unsupported op: {}", json.op));
+            resp.code = Some("invalid_op".to_string());
+            send_response(writer, sequencer, resp, "error", json.request_id.as_deref()).await?;
+            Ok(true)
+        }
+    }
+}
+
+fn parse_delta_preference(value: Option<&str>) -> Result<DeltaFormatPreference> {
+    match value.map(str::to_ascii_lowercase).as_deref() {
+        None | Some("auto") => Ok(DeltaFormatPreference::Auto),
+        Some("line_ops") => Ok(DeltaFormatPreference::LineOps),
+        Some("unified_diff") => Ok(DeltaFormatPreference::UnifiedDiff),
+        Some(other) => anyhow::bail!("invalid screen_delta_format '{other}'"),
+    }
 }
 
 // ── Endpoint selection ────────────────────────────────────────────────────────

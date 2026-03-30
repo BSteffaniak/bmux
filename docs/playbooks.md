@@ -842,8 +842,12 @@ JSON.
 
 ### Wire Protocol
 
-**Request:** One DSL action line terminated by `\n`. Same syntax as the batch
-DSL format.
+Interactive mode accepts both of these request forms:
+
+1. **DSL line mode (backward compatible):** one DSL action line terminated by `\n`.
+2. **JSON op mode (recommended for agents):** one JSON object terminated by `\n`.
+
+DSL examples:
 
 ```
 new-session\n
@@ -851,12 +855,24 @@ send-keys keys='echo hello\r'\n
 screen\n
 ```
 
-**Response:** One JSON object per `\n`.
+JSON op examples:
+
+```json
+{"op":"hello","protocol_version":1,"client":"llm-agent"}
+{"op":"command","request_id":"r1","dsl":"new-session"}
+{"op":"subscribe","event_types":["pane_output","cursor_delta","screen_delta"],"screen_delta_format":"line_ops"}
+```
+
+**Response:** one JSON object per `\n`.
 
 ### Response Schema
 
 ```json
 {
+  "type": "response" | "event" | "error",
+  "seq": 1,
+  "mono_ns": 1000000,
+  "request_id": "optional-correlation-id",
   "status": "ok" | "fail" | "error",
   "action": "send-keys",
   "elapsed_ms": 12,
@@ -884,6 +900,10 @@ All fields except `status` are optional and omitted when not applicable.
 | `session_id`   | `status` command executed       | UUID string                    |
 | `pane_count`   | `status` command executed       | u32                            |
 | `focused_pane` | `status` command executed       | u32                            |
+| `type`         | always                          | message class (`response`, `event`, `error`) |
+| `seq`          | always                          | monotonic message sequence number |
+| `mono_ns`      | always                          | monotonic nanoseconds since interactive session start |
+| `request_id`   | JSON `command`/op requests      | correlation id echoed in response |
 
 ### Special Commands
 
@@ -898,14 +918,70 @@ All fields except `status` are optional and omitted when not applicable.
 
 ### Push Output Events
 
-After sending `subscribe`, the server pushes output events as they arrive:
+After sending `subscribe`, the server pushes events as they arrive.
+
+Pane output event:
 
 ```json
 {
+  "type": "event",
   "status": "ok",
-  "event_type": "output",
+  "event_type": "pane_output",
   "pane_index": 1,
   "output_data": "hello world\n"
+}
+```
+
+Cursor delta event:
+
+```json
+{
+  "type": "event",
+  "status": "ok",
+  "event_type": "cursor_delta",
+  "cursor_delta": {
+    "pane_index": 1,
+    "from": { "row": 10, "col": 1 },
+    "to": { "row": 10, "col": 12 },
+    "distance": 11
+  }
+}
+```
+
+Screen delta event (LLM-friendly line ops):
+
+```json
+{
+  "type": "event",
+  "status": "ok",
+  "event_type": "screen_delta",
+  "screen_delta": {
+    "pane_index": 1,
+    "format": "line_ops",
+    "base_hash": "9f1b2c3d4e5f6a70",
+    "new_hash": "4f8e1d3ab2c04910",
+    "ops": [
+      { "op": "set_line", "row": 12, "text": "fn main() {" },
+      { "op": "cursor", "row": 12, "col": 11 }
+    ]
+  }
+}
+```
+
+Screen delta event (human-readable unified diff):
+
+```json
+{
+  "type": "event",
+  "status": "ok",
+  "event_type": "screen_delta",
+  "screen_delta": {
+    "pane_index": 1,
+    "format": "unified_diff",
+    "base_hash": "9f1b2c3d4e5f6a70",
+    "new_hash": "4f8e1d3ab2c04910",
+    "diff": "@@ -13,1 +13,1 @@\n-fn mian() {\n+fn main() {\n"
+  }
 }
 ```
 
@@ -915,9 +991,16 @@ command responses.
 
 | Field         | Type   | Description                                               |
 | ------------- | ------ | --------------------------------------------------------- |
-| `event_type`  | string | Always `"output"` for output push events                  |
+| `event_type`  | string | Push event type (`pane_output`, `cursor_delta`, `screen_delta`) |
 | `pane_index`  | u32    | The pane that produced the output                         |
 | `output_data` | string | The new output text (UTF-8, may contain escape sequences) |
+
+`subscribe` JSON options:
+
+- `event_types`: array of event names (`pane_output`, `cursor_delta`, `screen_delta`).
+- `pane_indexes`: optional pane-index filter.
+- `screen_delta_format`: `line_ops`, `unified_diff`, or `auto`.
+  - `auto` resolves to `line_ops` for machine-readable clients (e.g. `client: "llm-agent"`) and `unified_diff` otherwise.
 
 Use `unsubscribe` to stop receiving push events.
 
