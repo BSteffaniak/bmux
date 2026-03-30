@@ -7305,6 +7305,7 @@ async fn handle_attach_terminal_event(
                         ATTACH_TRANSIENT_STATUS_TTL,
                     );
                 }
+                attach_input_processor.set_scroll_mode(view_state.scrollback_active);
             }
             AttachEventAction::Ui(action) => {
                 if matches!(action, RuntimeAction::ShowHelp) {
@@ -7372,6 +7373,10 @@ async fn handle_attach_mouse_event(
         return Ok(());
     }
 
+    if handle_attach_mouse_scrollback(view_state, mouse_event.kind) {
+        return Ok(());
+    }
+
     match mouse_event.kind {
         MouseEventKind::Down(MouseButton::Left) if view_state.mouse.config.focus_on_click => {
             let target = attach_scene_pane_at(view_state, mouse_event.column, mouse_event.row);
@@ -7415,6 +7420,41 @@ async fn handle_attach_mouse_event(
     }
 
     Ok(())
+}
+
+fn handle_attach_mouse_scrollback(view_state: &mut AttachViewState, kind: MouseEventKind) -> bool {
+    if !view_state.mouse.config.scroll_scrollback {
+        return false;
+    }
+
+    let lines = view_state.mouse.config.scroll_lines_per_tick.max(1) as isize;
+    match kind {
+        MouseEventKind::ScrollUp => {
+            if !view_state.scrollback_active && !enter_attach_scrollback(view_state) {
+                return false;
+            }
+            step_attach_scrollback(view_state, -lines);
+            view_state.dirty.full_pane_redraw = true;
+            view_state.dirty.status_needs_redraw = true;
+            true
+        }
+        MouseEventKind::ScrollDown => {
+            if !view_state.scrollback_active {
+                return false;
+            }
+            step_attach_scrollback(view_state, lines);
+            if view_state.mouse.config.exit_scrollback_on_bottom
+                && view_state.scrollback_offset == 0
+                && !view_state.selection_active()
+            {
+                view_state.exit_scrollback();
+            }
+            view_state.dirty.full_pane_redraw = true;
+            view_state.dirty.status_needs_redraw = true;
+            true
+        }
+        _ => false,
+    }
 }
 
 async fn focus_attach_pane(
@@ -11144,6 +11184,37 @@ mod tests {
 
         super::confirm_attach_scrollback(&mut view_state);
         assert!(!view_state.scrollback_active);
+    }
+
+    #[test]
+    fn mouse_scroll_up_enters_scrollback_and_steps_by_configured_lines() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        view_state.mouse.config.scroll_lines_per_tick = 1;
+        view_state.mouse.config.scroll_scrollback = true;
+
+        assert!(super::handle_attach_mouse_scrollback(
+            &mut view_state,
+            MouseEventKind::ScrollUp,
+        ));
+        assert!(view_state.scrollback_active);
+        assert_eq!(view_state.scrollback_offset, 1);
+    }
+
+    #[test]
+    fn mouse_scroll_down_exits_scrollback_at_bottom_when_enabled() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        view_state.mouse.config.scroll_lines_per_tick = 1;
+        view_state.mouse.config.scroll_scrollback = true;
+        view_state.mouse.config.exit_scrollback_on_bottom = true;
+        assert!(super::enter_attach_scrollback(&mut view_state));
+        view_state.scrollback_offset = 1;
+
+        assert!(super::handle_attach_mouse_scrollback(
+            &mut view_state,
+            MouseEventKind::ScrollDown,
+        ));
+        assert!(!view_state.scrollback_active);
+        assert_eq!(view_state.scrollback_offset, 0);
     }
 
     #[test]
