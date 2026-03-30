@@ -915,7 +915,7 @@ All fields except `status` are optional and omitted when not applicable.
 | `help`        | List available commands.                                                                                     |
 | `subscribe`   | Start push-based output streaming. After subscribing, output events are pushed to the agent without polling. |
 | `unsubscribe` | Stop push-based output streaming.                                                                            |
-| `set_watchpoint` | Register anomaly detection watchpoints (for v1, `kind: "cursor_jump"`).                                |
+| `set_watchpoint` | Register anomaly detection watchpoints (`kind: "event_burst"`).                                         |
 | `clear_watchpoint` | Remove a watchpoint by id.                                                                              |
 
 ### Push Output Events
@@ -1005,13 +1005,15 @@ Watchpoint hit event:
   "status": "ok",
   "event_type": "watchpoint_hit",
   "watchpoint_hit": {
-    "id": "cursor-jump-1",
-    "kind": "cursor_jump",
+    "id": "cursor-delta-burst-1",
+    "kind": "event_burst",
+    "watch_event_type": "cursor_delta",
     "pane_index": 1,
-    "summary": "cursor jump detected: distance=12 threshold=8 pane=1",
-    "distance": 12,
-    "threshold": 8,
-    "window_ms": 120,
+    "summary": "event burst detected: event_type=cursor_delta hits=3 min_hits=3 pane=1",
+    "window_ms": 500,
+    "min_hits": 3,
+    "observed_hits": 3,
+    "peak_distance": 12,
     "evidence_seq_start": 42,
     "evidence_seq_end": 42
   }
@@ -1028,10 +1030,13 @@ Watchpoint hit event:
 `set_watchpoint` JSON options:
 
 - `id`: required watchpoint id.
-- `kind`: currently `cursor_jump`.
+- `kind`: `event_burst`.
+- `event_type`: required watched stream event (`pane_output`, `cursor_delta`, `screen_delta`).
 - `pane_index`: optional pane scope (defaults to any pane).
-- `min_distance`: cursor Manhattan distance threshold (default `8`).
-- `window_ms`: advisory detection window metadata (default `120`).
+- `window_ms`: burst window in milliseconds (default `500`).
+- `min_hits`: required hit count inside `window_ms` (default `3`).
+
+`watchpoint_hit` cannot be watched in v1 (recursive watchpoint loops are blocked).
 
 Use `unsubscribe` to stop receiving push events.
 
