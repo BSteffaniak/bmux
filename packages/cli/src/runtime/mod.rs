@@ -15,9 +15,10 @@ use bmux_cli_schema::{
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout, TerminfoAutoInstall};
 use bmux_ipc::{
-    AttachViewComponent, ContextSelector, ContextSummary, InvokeServiceKind, PaneFocusDirection,
-    PaneSplitDirection, RecordingEventEnvelope, RecordingEventKind, RecordingPayload,
-    RecordingStatus, RecordingSummary, SessionSelector, SessionSummary,
+    AttachRect, AttachViewComponent, ContextSelector, ContextSummary, InvokeServiceKind,
+    PaneFocusDirection, PaneSelector, PaneSplitDirection, RecordingEventEnvelope,
+    RecordingEventKind, RecordingPayload, RecordingStatus, RecordingSummary, SessionSelector,
+    SessionSummary,
 };
 use bmux_keybind::action_to_config_name;
 use bmux_plugin::{
@@ -34,7 +35,7 @@ use clap::{CommandFactory, FromArgMatches};
 use crossterm::cursor::{MoveTo, SavePosition, Show};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    MouseEvent,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::queue;
 use crossterm::style::Print;
@@ -4648,6 +4649,7 @@ async fn run_session_attach_with_client(
     }
 
     let mut view_state = AttachViewState::new(attach_info);
+    view_state.mouse.config = attach_config.attach_mouse_config();
 
     update_attach_viewport(&mut client, view_state.attached_id).await?;
     hydrate_attach_state_from_snapshot(&mut client, &mut view_state).await?;
@@ -4775,6 +4777,7 @@ async fn run_session_attach_with_client(
                         }
                     }
                 }
+                view_state.mouse.last_focused_pane_id = Some(layout_state.focused_pane_id);
                 view_state.cached_layout_state = Some(layout_state);
             }
             view_state.dirty.layout_needs_refresh = false;
@@ -6738,6 +6741,7 @@ async fn hydrate_attach_state_from_snapshot(
         layout_root,
         scene,
     });
+    view_state.mouse.last_focused_pane_id = Some(focused_pane_id);
     view_state.pane_buffers.clear();
     if let Some(layout_state) = view_state.cached_layout_state.as_ref() {
         resize_attach_parsers_for_scene(&mut view_state.pane_buffers, &layout_state.scene);
@@ -7293,7 +7297,14 @@ async fn handle_attach_terminal_event(
                 attach_input_processor.set_scroll_mode(view_state.scrollback_active);
             }
             AttachEventAction::Mouse(mouse_event) => {
-                record_attach_mouse_event(mouse_event, view_state);
+                if let Err(error) = handle_attach_mouse_event(client, mouse_event, view_state).await
+                {
+                    view_state.set_transient_status(
+                        format!("mouse action failed: {}", map_attach_client_error(error)),
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                }
             }
             AttachEventAction::Ui(action) => {
                 if matches!(action, RuntimeAction::ShowHelp) {
@@ -7345,6 +7356,130 @@ async fn handle_attach_terminal_event(
 fn record_attach_mouse_event(mouse_event: MouseEvent, view_state: &mut AttachViewState) {
     view_state.mouse.last_position = Some((mouse_event.column, mouse_event.row));
     view_state.mouse.last_event_at = Some(Instant::now());
+}
+
+async fn handle_attach_mouse_event(
+    client: &mut BmuxClient,
+    mouse_event: MouseEvent,
+    view_state: &mut AttachViewState,
+) -> std::result::Result<(), ClientError> {
+    record_attach_mouse_event(mouse_event, view_state);
+
+    if !view_state.mouse.config.enabled || !view_state.can_write {
+        return Ok(());
+    }
+    if view_state.help_overlay_open || view_state.quit_confirmation_pending {
+        return Ok(());
+    }
+
+    match mouse_event.kind {
+        MouseEventKind::Down(MouseButton::Left) if view_state.mouse.config.focus_on_click => {
+            let target = attach_scene_pane_at(view_state, mouse_event.column, mouse_event.row);
+            view_state.mouse.hovered_pane_id = target;
+            view_state.mouse.hover_started_at = Some(Instant::now());
+            if let Some(pane_id) = target {
+                focus_attach_pane(client, view_state, pane_id).await?;
+            }
+        }
+        MouseEventKind::Moved if view_state.mouse.config.focus_on_hover => {
+            let now = Instant::now();
+            let target = attach_scene_pane_at(view_state, mouse_event.column, mouse_event.row);
+            if target != view_state.mouse.hovered_pane_id {
+                view_state.mouse.hovered_pane_id = target;
+                view_state.mouse.hover_started_at = Some(now);
+                return Ok(());
+            }
+
+            let Some(pane_id) = target else {
+                view_state.mouse.hover_started_at = None;
+                return Ok(());
+            };
+
+            if view_state.mouse.last_focused_pane_id == Some(pane_id) {
+                return Ok(());
+            }
+
+            let Some(hover_started_at) = view_state.mouse.hover_started_at else {
+                view_state.mouse.hover_started_at = Some(now);
+                return Ok(());
+            };
+
+            if now.duration_since(hover_started_at)
+                >= Duration::from_millis(view_state.mouse.config.hover_delay_ms)
+            {
+                focus_attach_pane(client, view_state, pane_id).await?;
+                view_state.mouse.hover_started_at = Some(now);
+            }
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+async fn focus_attach_pane(
+    client: &mut BmuxClient,
+    view_state: &mut AttachViewState,
+    pane_id: Uuid,
+) -> std::result::Result<(), ClientError> {
+    if view_state.mouse.last_focused_pane_id == Some(pane_id) {
+        return Ok(());
+    }
+
+    if let Err(error) = refresh_attached_session_from_context(client, view_state).await {
+        view_state.set_transient_status(
+            format!(
+                "context refresh delayed: {}",
+                map_attach_client_error(error)
+            ),
+            Instant::now(),
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
+    }
+
+    client
+        .focus_pane_target(
+            Some(SessionSelector::ById(view_state.attached_id)),
+            PaneSelector::ById(pane_id),
+        )
+        .await?;
+
+    view_state.mouse.last_focused_pane_id = Some(pane_id);
+    view_state.dirty.layout_needs_refresh = true;
+    view_state.dirty.full_pane_redraw = true;
+    view_state.dirty.status_needs_redraw = true;
+
+    Ok(())
+}
+
+fn attach_scene_pane_at(view_state: &AttachViewState, column: u16, row: u16) -> Option<Uuid> {
+    let layout_state = view_state.cached_layout_state.as_ref()?;
+    let mut best: Option<(bmux_ipc::AttachLayer, i32, usize, Uuid)> = None;
+    for (index, surface) in layout_state.scene.surfaces.iter().enumerate() {
+        let Some(pane_id) = surface.pane_id else {
+            continue;
+        };
+        if !surface.visible || !surface.accepts_input {
+            continue;
+        }
+        if !attach_rect_contains_point(surface.rect, column, row) {
+            continue;
+        }
+        let candidate = (surface.layer, surface.z, index, pane_id);
+        if best.as_ref().is_none_or(|current| candidate > *current) {
+            best = Some(candidate);
+        }
+    }
+    best.map(|(_, _, _, pane_id)| pane_id)
+}
+
+fn attach_rect_contains_point(rect: AttachRect, column: u16, row: u16) -> bool {
+    if rect.w == 0 || rect.h == 0 {
+        return false;
+    }
+    let max_x = rect.x.saturating_add(rect.w.saturating_sub(1));
+    let max_y = rect.y.saturating_add(rect.h.saturating_sub(1));
+    column >= rect.x && column <= max_x && row >= rect.y && row <= max_y
 }
 
 fn restore_terminal_after_attach_ui() -> Result<()> {
@@ -10278,6 +10413,79 @@ mod tests {
 
         assert_eq!(view_state.mouse.last_position, Some((3, 4)));
         assert!(view_state.mouse.last_event_at.is_some());
+    }
+
+    #[test]
+    fn attach_scene_pane_at_prefers_topmost_surface() {
+        let session_id = Uuid::new_v4();
+        let background_pane = Uuid::new_v4();
+        let floating_pane = Uuid::new_v4();
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id,
+            can_write: true,
+        });
+        view_state.cached_layout_state = Some(AttachLayoutState {
+            context_id: None,
+            session_id,
+            focused_pane_id: background_pane,
+            panes: Vec::new(),
+            layout_root: PaneLayoutNode::Leaf {
+                pane_id: background_pane,
+            },
+            scene: AttachScene {
+                session_id,
+                focus: AttachFocusTarget::Pane {
+                    pane_id: background_pane,
+                },
+                surfaces: vec![
+                    AttachSurface {
+                        id: Uuid::new_v4(),
+                        kind: AttachSurfaceKind::Pane,
+                        layer: AttachLayer::Pane,
+                        z: 1,
+                        rect: AttachRect {
+                            x: 0,
+                            y: 0,
+                            w: 20,
+                            h: 10,
+                        },
+                        opaque: true,
+                        visible: true,
+                        accepts_input: true,
+                        cursor_owner: true,
+                        pane_id: Some(background_pane),
+                    },
+                    AttachSurface {
+                        id: Uuid::new_v4(),
+                        kind: AttachSurfaceKind::FloatingPane,
+                        layer: AttachLayer::FloatingPane,
+                        z: 10,
+                        rect: AttachRect {
+                            x: 2,
+                            y: 2,
+                            w: 8,
+                            h: 5,
+                        },
+                        opaque: true,
+                        visible: true,
+                        accepts_input: true,
+                        cursor_owner: false,
+                        pane_id: Some(floating_pane),
+                    },
+                ],
+            },
+        });
+
+        assert_eq!(
+            super::attach_scene_pane_at(&view_state, 4, 4),
+            Some(floating_pane)
+        );
+        assert_eq!(
+            super::attach_scene_pane_at(&view_state, 1, 1),
+            Some(background_pane)
+        );
+        assert_eq!(super::attach_scene_pane_at(&view_state, 30, 30), None);
     }
 
     #[test]

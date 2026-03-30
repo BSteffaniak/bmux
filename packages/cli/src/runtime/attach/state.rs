@@ -1,5 +1,6 @@
 use crate::input::RuntimeAction;
 use bmux_client::AttachLayoutState;
+use bmux_config::MouseBehaviorConfig;
 use crossterm::event::MouseEvent;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -114,6 +115,7 @@ pub struct AttachViewState {
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub struct AttachMouseState {
+    pub(crate) config: MouseBehaviorConfig,
     pub(crate) last_position: Option<(u16, u16)>,
     pub(crate) last_event_at: Option<Instant>,
     pub(crate) hover_started_at: Option<Instant>,
@@ -141,7 +143,10 @@ impl AttachViewState {
             cached_status_line: None,
             cached_layout_state: None,
             last_cursor_state: None,
-            mouse: AttachMouseState::default(),
+            mouse: AttachMouseState {
+                config: MouseBehaviorConfig::default(),
+                ..AttachMouseState::default()
+            },
             dirty: AttachDirtyFlags::default(),
         }
     }
