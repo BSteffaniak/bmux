@@ -73,6 +73,34 @@ Plugin command execution should support a generic outcome contract (for keybindi
 
 This enables behavior like `ctrl-a c` to create and immediately switch to a newly created context without embedding windows-domain logic in core runtime.
 
+## Mouse Gesture Mapping (Config Snippet)
+
+Mouse gestures can trigger built-in runtime actions or plugin commands through
+`behavior.mouse.gesture_actions`.
+
+```toml
+[behavior.mouse]
+enabled = true
+focus_on_click = true
+focus_on_hover = false
+scroll_scrollback = true
+scroll_lines_per_tick = 3
+exit_scrollback_on_bottom = true
+
+[behavior.mouse.gesture_actions]
+click_left = "plugin:bmux.windows:new-window"
+hover_focus = "focus_next_pane"
+scroll_up = "scroll_up_line"
+scroll_down = "scroll_down_line"
+```
+
+Supported gesture keys in current core runtime:
+
+- `click_left`
+- `hover_focus`
+- `scroll_up`
+- `scroll_down`
+
 ## Permissions and Policy
 
 - Enforcement is config/policy-file driven and non-interactive for now.
