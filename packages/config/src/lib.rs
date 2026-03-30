@@ -256,6 +256,12 @@ pub struct MouseBehaviorConfig {
     pub scroll_lines_per_tick: u16,
     /// Exit scrollback mode automatically when wheel scrolling reaches bottom.
     pub exit_scrollback_on_bottom: bool,
+    /// Optional mouse gesture overrides mapped to action names.
+    ///
+    /// Keys are gesture identifiers such as `click_left`, `hover_focus`,
+    /// `scroll_up`, and `scroll_down`. Values use the same action naming
+    /// format as keybindings, including `plugin:<id>:<command>`.
+    pub gesture_actions: BTreeMap<String, String>,
 }
 
 impl Default for MouseBehaviorConfig {
@@ -268,6 +274,7 @@ impl Default for MouseBehaviorConfig {
             scroll_scrollback: true,
             scroll_lines_per_tick: 3,
             exit_scrollback_on_bottom: true,
+            gesture_actions: BTreeMap::new(),
         }
     }
 }

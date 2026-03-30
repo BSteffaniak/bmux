@@ -5006,6 +5006,202 @@ fn plugin_fallback_new_context_id(
     after_context_id.filter(|context_id| new_context_ids.contains(context_id))
 }
 
+async fn handle_attach_plugin_command_action(
+    client: &mut BmuxClient,
+    plugin_id: &str,
+    command_name: &str,
+    view_state: &mut AttachViewState,
+) -> std::result::Result<(), ClientError> {
+    let before_context_id = match client.current_context().await {
+        Ok(context) => context.map(|entry| entry.id),
+        Err(_) => None,
+    };
+    let before_context_ids = client.list_contexts().await.ok().map(|contexts| {
+        contexts
+            .into_iter()
+            .map(|context| context.id)
+            .collect::<std::collections::BTreeSet<_>>()
+    });
+    debug!(
+        plugin_id = %plugin_id,
+        command_name = %command_name,
+        before_context_id = ?before_context_id,
+        attached_context_id = ?view_state.attached_context_id,
+        attached_session_id = %view_state.attached_id,
+        "attach.plugin_command.start"
+    );
+    match run_plugin_keybinding_command(plugin_id, command_name, &[]) {
+        Err(error) => {
+            warn!(
+                plugin_id = %plugin_id,
+                command_name = %command_name,
+                error = %error,
+                "attach.plugin_command.run_failed"
+            );
+            view_state.set_transient_status(
+                format!("plugin action failed: {error}"),
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+        }
+        Ok(execution) => {
+            let status = execution.status;
+            let effect_count = execution.outcome.effects.len();
+            if status != 0 {
+                warn!(
+                    plugin_id = %plugin_id,
+                    command_name = %command_name,
+                    status,
+                    effect_count,
+                    before_context_id = ?before_context_id,
+                    attached_context_id = ?view_state.attached_context_id,
+                    attached_session_id = %view_state.attached_id,
+                    "attach.plugin_command.nonzero_status"
+                );
+                view_state.set_transient_status(
+                    format!("plugin action failed ({plugin_id}:{command_name}) exit {status}"),
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+                return Ok(());
+            }
+
+            let outcome_applied =
+                match apply_plugin_command_outcome(client, view_state, execution.outcome).await {
+                    Ok(applied) => applied,
+                    Err(error) => {
+                        view_state.set_transient_status(
+                            format!(
+                                "plugin outcome apply failed: {}",
+                                map_attach_client_error(error)
+                            ),
+                            Instant::now(),
+                            ATTACH_TRANSIENT_STATUS_TTL,
+                        );
+                        return Ok(());
+                    }
+                };
+
+            let after_context_id = match client.current_context().await {
+                Ok(context) => context.map(|entry| entry.id),
+                Err(_) => None,
+            };
+            let after_context_ids = client.list_contexts().await.ok().map(|contexts| {
+                contexts
+                    .into_iter()
+                    .map(|context| context.id)
+                    .collect::<std::collections::BTreeSet<_>>()
+            });
+            debug!(
+                plugin_id = %plugin_id,
+                command_name = %command_name,
+                effect_count,
+                outcome_applied,
+                before_context_id = ?before_context_id,
+                after_context_id = ?after_context_id,
+                attached_context_id = ?view_state.attached_context_id,
+                attached_session_id = %view_state.attached_id,
+                "attach.plugin_command.outcome"
+            );
+
+            if let Some(fallback_context_id) = plugin_fallback_retarget_context_id(
+                before_context_id,
+                after_context_id,
+                view_state.attached_context_id,
+                outcome_applied,
+            ) {
+                debug!(
+                    plugin_id = %plugin_id,
+                    command_name = %command_name,
+                    fallback_context_id = %fallback_context_id,
+                    "attach.plugin_command.fallback_retarget"
+                );
+                if let Err(error) =
+                    retarget_attach_to_context(client, view_state, fallback_context_id).await
+                {
+                    warn!(
+                        plugin_id = %plugin_id,
+                        command_name = %command_name,
+                        fallback_context_id = %fallback_context_id,
+                        error = %error,
+                        "attach.plugin_command.fallback_retarget_failed"
+                    );
+                    view_state.set_transient_status(
+                        format!(
+                            "plugin fallback retarget failed: {}",
+                            map_attach_client_error(error)
+                        ),
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                    return Ok(());
+                }
+                view_state.set_transient_status(
+                    format!("plugin action: {plugin_id}:{command_name} (fallback retarget)"),
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+                view_state.dirty.layout_needs_refresh = true;
+                view_state.dirty.full_pane_redraw = true;
+                return Ok(());
+            }
+
+            if let Some(fallback_context_id) = plugin_fallback_new_context_id(
+                before_context_ids.as_ref(),
+                after_context_ids.as_ref(),
+                view_state.attached_context_id,
+                after_context_id,
+                outcome_applied,
+            ) {
+                debug!(
+                    plugin_id = %plugin_id,
+                    command_name = %command_name,
+                    fallback_context_id = %fallback_context_id,
+                    "attach.plugin_command.new_context_fallback_retarget"
+                );
+                if let Err(error) =
+                    retarget_attach_to_context(client, view_state, fallback_context_id).await
+                {
+                    warn!(
+                        plugin_id = %plugin_id,
+                        command_name = %command_name,
+                        fallback_context_id = %fallback_context_id,
+                        error = %error,
+                        "attach.plugin_command.new_context_fallback_retarget_failed"
+                    );
+                    view_state.set_transient_status(
+                        format!(
+                            "plugin new-context fallback failed: {}",
+                            map_attach_client_error(error)
+                        ),
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                    return Ok(());
+                }
+                view_state.set_transient_status(
+                    format!("plugin action: {plugin_id}:{command_name} (new context retarget)"),
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+                view_state.dirty.layout_needs_refresh = true;
+                view_state.dirty.full_pane_redraw = true;
+                return Ok(());
+            }
+
+            view_state.set_transient_status(
+                format!("plugin action: {plugin_id}:{command_name}"),
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+            view_state.dirty.layout_needs_refresh = true;
+            view_state.dirty.full_pane_redraw = true;
+        }
+    }
+
+    Ok(())
+}
+
 async fn handle_attach_ui_action(
     client: &mut BmuxClient,
     action: RuntimeAction,
@@ -7086,213 +7282,19 @@ async fn handle_attach_terminal_event(
                 if view_state.help_overlay_open {
                     continue;
                 }
-                let before_context_id = match client.current_context().await {
-                    Ok(context) => context.map(|entry| entry.id),
-                    Err(_) => None,
-                };
-                let before_context_ids = client.list_contexts().await.ok().map(|contexts| {
-                    contexts
-                        .into_iter()
-                        .map(|context| context.id)
-                        .collect::<std::collections::BTreeSet<_>>()
-                });
-                debug!(
-                    plugin_id = %plugin_id,
-                    command_name = %command_name,
-                    before_context_id = ?before_context_id,
-                    attached_context_id = ?view_state.attached_context_id,
-                    attached_session_id = %view_state.attached_id,
-                    "attach.plugin_command.start"
-                );
-                match run_plugin_keybinding_command(&plugin_id, &command_name, &[]) {
-                    Err(error) => {
-                        warn!(
-                            plugin_id = %plugin_id,
-                            command_name = %command_name,
-                            error = %error,
-                            "attach.plugin_command.run_failed"
-                        );
-                        view_state.set_transient_status(
-                            format!("plugin action failed: {error}"),
-                            Instant::now(),
-                            ATTACH_TRANSIENT_STATUS_TTL,
-                        );
-                    }
-                    Ok(execution) => {
-                        let status = execution.status;
-                        let effect_count = execution.outcome.effects.len();
-                        if status != 0 {
-                            warn!(
-                                plugin_id = %plugin_id,
-                                command_name = %command_name,
-                                status,
-                                effect_count,
-                                before_context_id = ?before_context_id,
-                                attached_context_id = ?view_state.attached_context_id,
-                                attached_session_id = %view_state.attached_id,
-                                "attach.plugin_command.nonzero_status"
-                            );
-                            view_state.set_transient_status(
-                                format!(
-                                    "plugin action failed ({plugin_id}:{command_name}) exit {status}"
-                                ),
-                                Instant::now(),
-                                ATTACH_TRANSIENT_STATUS_TTL,
-                            );
-                            attach_input_processor.set_scroll_mode(view_state.scrollback_active);
-                            continue;
-                        }
-
-                        let outcome_applied = match apply_plugin_command_outcome(
-                            client,
-                            view_state,
-                            execution.outcome,
-                        )
-                        .await
-                        {
-                            Ok(applied) => applied,
-                            Err(error) => {
-                                view_state.set_transient_status(
-                                    format!(
-                                        "plugin outcome apply failed: {}",
-                                        map_attach_client_error(error)
-                                    ),
-                                    Instant::now(),
-                                    ATTACH_TRANSIENT_STATUS_TTL,
-                                );
-                                attach_input_processor
-                                    .set_scroll_mode(view_state.scrollback_active);
-                                continue;
-                            }
-                        };
-
-                        let after_context_id = match client.current_context().await {
-                            Ok(context) => context.map(|entry| entry.id),
-                            Err(_) => None,
-                        };
-                        let after_context_ids = client.list_contexts().await.ok().map(|contexts| {
-                            contexts
-                                .into_iter()
-                                .map(|context| context.id)
-                                .collect::<std::collections::BTreeSet<_>>()
-                        });
-                        debug!(
-                            plugin_id = %plugin_id,
-                            command_name = %command_name,
-                            effect_count,
-                            outcome_applied,
-                            before_context_id = ?before_context_id,
-                            after_context_id = ?after_context_id,
-                            attached_context_id = ?view_state.attached_context_id,
-                            attached_session_id = %view_state.attached_id,
-                            "attach.plugin_command.outcome"
-                        );
-
-                        if let Some(fallback_context_id) = plugin_fallback_retarget_context_id(
-                            before_context_id,
-                            after_context_id,
-                            view_state.attached_context_id,
-                            outcome_applied,
-                        ) {
-                            debug!(
-                                plugin_id = %plugin_id,
-                                command_name = %command_name,
-                                fallback_context_id = %fallback_context_id,
-                                "attach.plugin_command.fallback_retarget"
-                            );
-                            if let Err(error) =
-                                retarget_attach_to_context(client, view_state, fallback_context_id)
-                                    .await
-                            {
-                                warn!(
-                                    plugin_id = %plugin_id,
-                                    command_name = %command_name,
-                                    fallback_context_id = %fallback_context_id,
-                                    error = %error,
-                                    "attach.plugin_command.fallback_retarget_failed"
-                                );
-                                view_state.set_transient_status(
-                                    format!(
-                                        "plugin fallback retarget failed: {}",
-                                        map_attach_client_error(error)
-                                    ),
-                                    Instant::now(),
-                                    ATTACH_TRANSIENT_STATUS_TTL,
-                                );
-                                attach_input_processor
-                                    .set_scroll_mode(view_state.scrollback_active);
-                                continue;
-                            }
-                            view_state.set_transient_status(
-                                format!(
-                                    "plugin action: {plugin_id}:{command_name} (fallback retarget)"
-                                ),
-                                Instant::now(),
-                                ATTACH_TRANSIENT_STATUS_TTL,
-                            );
-                            view_state.dirty.layout_needs_refresh = true;
-                            view_state.dirty.full_pane_redraw = true;
-                            attach_input_processor.set_scroll_mode(view_state.scrollback_active);
-                            continue;
-                        }
-
-                        if let Some(fallback_context_id) = plugin_fallback_new_context_id(
-                            before_context_ids.as_ref(),
-                            after_context_ids.as_ref(),
-                            view_state.attached_context_id,
-                            after_context_id,
-                            outcome_applied,
-                        ) {
-                            debug!(
-                                plugin_id = %plugin_id,
-                                command_name = %command_name,
-                                fallback_context_id = %fallback_context_id,
-                                "attach.plugin_command.new_context_fallback_retarget"
-                            );
-                            if let Err(error) =
-                                retarget_attach_to_context(client, view_state, fallback_context_id)
-                                    .await
-                            {
-                                warn!(
-                                    plugin_id = %plugin_id,
-                                    command_name = %command_name,
-                                    fallback_context_id = %fallback_context_id,
-                                    error = %error,
-                                    "attach.plugin_command.new_context_fallback_retarget_failed"
-                                );
-                                view_state.set_transient_status(
-                                    format!(
-                                        "plugin new-context fallback failed: {}",
-                                        map_attach_client_error(error)
-                                    ),
-                                    Instant::now(),
-                                    ATTACH_TRANSIENT_STATUS_TTL,
-                                );
-                                attach_input_processor
-                                    .set_scroll_mode(view_state.scrollback_active);
-                                continue;
-                            }
-                            view_state.set_transient_status(
-                                format!(
-                                    "plugin action: {plugin_id}:{command_name} (new context retarget)"
-                                ),
-                                Instant::now(),
-                                ATTACH_TRANSIENT_STATUS_TTL,
-                            );
-                            view_state.dirty.layout_needs_refresh = true;
-                            view_state.dirty.full_pane_redraw = true;
-                            attach_input_processor.set_scroll_mode(view_state.scrollback_active);
-                            continue;
-                        }
-
-                        view_state.set_transient_status(
-                            format!("plugin action: {plugin_id}:{command_name}"),
-                            Instant::now(),
-                            ATTACH_TRANSIENT_STATUS_TTL,
-                        );
-                        view_state.dirty.layout_needs_refresh = true;
-                        view_state.dirty.full_pane_redraw = true;
-                    }
+                if let Err(error) = handle_attach_plugin_command_action(
+                    client,
+                    &plugin_id,
+                    &command_name,
+                    view_state,
+                )
+                .await
+                {
+                    view_state.set_transient_status(
+                        format!("plugin action failed: {}", map_attach_client_error(error)),
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
                 }
                 attach_input_processor.set_scroll_mode(view_state.scrollback_active);
             }
@@ -7373,6 +7375,17 @@ async fn handle_attach_mouse_event(
         return Ok(());
     }
 
+    if matches!(mouse_event.kind, MouseEventKind::ScrollUp)
+        && handle_attach_mouse_gesture_action(client, view_state, "scroll_up").await?
+    {
+        return Ok(());
+    }
+    if matches!(mouse_event.kind, MouseEventKind::ScrollDown)
+        && handle_attach_mouse_gesture_action(client, view_state, "scroll_down").await?
+    {
+        return Ok(());
+    }
+
     if handle_attach_mouse_scrollback(view_state, mouse_event.kind) {
         return Ok(());
     }
@@ -7383,7 +7396,9 @@ async fn handle_attach_mouse_event(
             view_state.mouse.hovered_pane_id = target;
             view_state.mouse.hover_started_at = Some(Instant::now());
             if let Some(pane_id) = target {
-                focus_attach_pane(client, view_state, pane_id).await?;
+                if !handle_attach_mouse_gesture_action(client, view_state, "click_left").await? {
+                    focus_attach_pane(client, view_state, pane_id).await?;
+                }
             }
         }
         MouseEventKind::Moved if view_state.mouse.config.focus_on_hover => {
@@ -7412,7 +7427,9 @@ async fn handle_attach_mouse_event(
             if now.duration_since(hover_started_at)
                 >= Duration::from_millis(view_state.mouse.config.hover_delay_ms)
             {
-                focus_attach_pane(client, view_state, pane_id).await?;
+                if !handle_attach_mouse_gesture_action(client, view_state, "hover_focus").await? {
+                    focus_attach_pane(client, view_state, pane_id).await?;
+                }
                 view_state.mouse.hover_started_at = Some(now);
             }
         }
@@ -7420,6 +7437,79 @@ async fn handle_attach_mouse_event(
     }
 
     Ok(())
+}
+
+async fn handle_attach_mouse_gesture_action(
+    client: &mut BmuxClient,
+    view_state: &mut AttachViewState,
+    gesture: &str,
+) -> std::result::Result<bool, ClientError> {
+    let Some(attach_action) = resolve_mouse_gesture_action(view_state, gesture) else {
+        return Ok(false);
+    };
+
+    match attach_action {
+        AttachEventAction::PluginCommand {
+            plugin_id,
+            command_name,
+        } => {
+            handle_attach_plugin_command_action(client, &plugin_id, &command_name, view_state)
+                .await?;
+            Ok(true)
+        }
+        AttachEventAction::Runtime(action) => {
+            if let Err(error) = handle_attach_runtime_action(client, action, view_state).await {
+                view_state.set_transient_status(
+                    format!("mouse action failed: {}", map_attach_client_error(error)),
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            } else {
+                view_state.dirty.status_needs_redraw = true;
+                view_state.dirty.layout_needs_refresh = true;
+                view_state.dirty.full_pane_redraw = true;
+            }
+            Ok(true)
+        }
+        AttachEventAction::Ui(action) => {
+            if let Err(error) = handle_attach_ui_action(client, action, view_state).await {
+                view_state.set_transient_status(
+                    format!("mouse action failed: {}", map_attach_client_error(error)),
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            } else {
+                view_state.dirty.status_needs_redraw = true;
+                view_state.dirty.layout_needs_refresh = true;
+                view_state.dirty.full_pane_redraw = true;
+            }
+            Ok(true)
+        }
+        AttachEventAction::Ignore => Ok(true),
+        AttachEventAction::Detach
+        | AttachEventAction::Send(_)
+        | AttachEventAction::Mouse(_)
+        | AttachEventAction::Redraw => Ok(false),
+    }
+}
+
+fn resolve_mouse_gesture_action(
+    view_state: &AttachViewState,
+    gesture: &str,
+) -> Option<AttachEventAction> {
+    let action_name = view_state.mouse.config.gesture_actions.get(gesture)?;
+    match crate::input::parse_runtime_action_name(action_name) {
+        Ok(action) => Some(runtime_action_to_attach_event_action(action)),
+        Err(error) => {
+            warn!(
+                gesture = %gesture,
+                action_name = %action_name,
+                error = %error,
+                "attach.mouse_gesture.invalid_action"
+            );
+            None
+        }
+    }
 }
 
 fn handle_attach_mouse_scrollback(view_state: &mut AttachViewState, kind: MouseEventKind) -> bool {
@@ -7571,71 +7661,72 @@ fn attach_key_event_actions(
     let actions = attach_input_processor.process_terminal_event(Event::Key(*key));
     Ok(actions
         .into_iter()
-        .map(|action| match action {
-            RuntimeAction::Detach => AttachEventAction::Detach,
-            RuntimeAction::ForwardToPane(bytes) => AttachEventAction::Send(bytes),
-            RuntimeAction::NewWindow | RuntimeAction::NewSession => {
-                AttachEventAction::Runtime(action)
-            }
-            RuntimeAction::PluginCommand {
-                plugin_id,
-                command_name,
-            } => AttachEventAction::PluginCommand {
-                plugin_id,
-                command_name,
-            },
-            RuntimeAction::SessionPrev | RuntimeAction::SessionNext => {
-                AttachEventAction::Ui(action)
-            }
-            RuntimeAction::EnterWindowMode
-            | RuntimeAction::SplitFocusedVertical
-            | RuntimeAction::SplitFocusedHorizontal
-            | RuntimeAction::FocusNext
-            | RuntimeAction::FocusLeft
-            | RuntimeAction::FocusRight
-            | RuntimeAction::FocusUp
-            | RuntimeAction::FocusDown
-            | RuntimeAction::IncreaseSplit
-            | RuntimeAction::DecreaseSplit
-            | RuntimeAction::ResizeLeft
-            | RuntimeAction::ResizeRight
-            | RuntimeAction::ResizeUp
-            | RuntimeAction::ResizeDown
-            | RuntimeAction::CloseFocusedPane => AttachEventAction::Ui(action),
-            RuntimeAction::ExitMode
-            | RuntimeAction::WindowPrev
-            | RuntimeAction::WindowNext
-            | RuntimeAction::WindowGoto1
-            | RuntimeAction::WindowGoto2
-            | RuntimeAction::WindowGoto3
-            | RuntimeAction::WindowGoto4
-            | RuntimeAction::WindowGoto5
-            | RuntimeAction::WindowGoto6
-            | RuntimeAction::WindowGoto7
-            | RuntimeAction::WindowGoto8
-            | RuntimeAction::WindowGoto9
-            | RuntimeAction::WindowClose => AttachEventAction::Ui(action),
-            RuntimeAction::Quit => AttachEventAction::Ui(action),
-            RuntimeAction::ShowHelp => AttachEventAction::Ui(action),
-            RuntimeAction::ToggleSplitDirection
-            | RuntimeAction::RestartFocusedPane
-            | RuntimeAction::EnterScrollMode
-            | RuntimeAction::ExitScrollMode
-            | RuntimeAction::ScrollUpLine
-            | RuntimeAction::ScrollDownLine
-            | RuntimeAction::ScrollUpPage
-            | RuntimeAction::ScrollDownPage
-            | RuntimeAction::ScrollTop
-            | RuntimeAction::ScrollBottom
-            | RuntimeAction::BeginSelection
-            | RuntimeAction::MoveCursorLeft
-            | RuntimeAction::MoveCursorRight
-            | RuntimeAction::MoveCursorUp
-            | RuntimeAction::MoveCursorDown
-            | RuntimeAction::CopyScrollback
-            | RuntimeAction::ConfirmScrollback => AttachEventAction::Ui(action),
-        })
+        .map(runtime_action_to_attach_event_action)
         .collect())
+}
+
+fn runtime_action_to_attach_event_action(action: RuntimeAction) -> AttachEventAction {
+    match action {
+        RuntimeAction::Detach => AttachEventAction::Detach,
+        RuntimeAction::ForwardToPane(bytes) => AttachEventAction::Send(bytes),
+        RuntimeAction::NewWindow | RuntimeAction::NewSession => AttachEventAction::Runtime(action),
+        RuntimeAction::PluginCommand {
+            plugin_id,
+            command_name,
+        } => AttachEventAction::PluginCommand {
+            plugin_id,
+            command_name,
+        },
+        RuntimeAction::SessionPrev
+        | RuntimeAction::SessionNext
+        | RuntimeAction::EnterWindowMode
+        | RuntimeAction::SplitFocusedVertical
+        | RuntimeAction::SplitFocusedHorizontal
+        | RuntimeAction::FocusNext
+        | RuntimeAction::FocusLeft
+        | RuntimeAction::FocusRight
+        | RuntimeAction::FocusUp
+        | RuntimeAction::FocusDown
+        | RuntimeAction::IncreaseSplit
+        | RuntimeAction::DecreaseSplit
+        | RuntimeAction::ResizeLeft
+        | RuntimeAction::ResizeRight
+        | RuntimeAction::ResizeUp
+        | RuntimeAction::ResizeDown
+        | RuntimeAction::CloseFocusedPane
+        | RuntimeAction::ExitMode
+        | RuntimeAction::WindowPrev
+        | RuntimeAction::WindowNext
+        | RuntimeAction::WindowGoto1
+        | RuntimeAction::WindowGoto2
+        | RuntimeAction::WindowGoto3
+        | RuntimeAction::WindowGoto4
+        | RuntimeAction::WindowGoto5
+        | RuntimeAction::WindowGoto6
+        | RuntimeAction::WindowGoto7
+        | RuntimeAction::WindowGoto8
+        | RuntimeAction::WindowGoto9
+        | RuntimeAction::WindowClose
+        | RuntimeAction::Quit
+        | RuntimeAction::ShowHelp
+        | RuntimeAction::ToggleSplitDirection
+        | RuntimeAction::RestartFocusedPane
+        | RuntimeAction::EnterScrollMode
+        | RuntimeAction::ExitScrollMode
+        | RuntimeAction::ScrollUpLine
+        | RuntimeAction::ScrollDownLine
+        | RuntimeAction::ScrollUpPage
+        | RuntimeAction::ScrollDownPage
+        | RuntimeAction::ScrollTop
+        | RuntimeAction::ScrollBottom
+        | RuntimeAction::BeginSelection
+        | RuntimeAction::MoveCursorLeft
+        | RuntimeAction::MoveCursorRight
+        | RuntimeAction::MoveCursorUp
+        | RuntimeAction::MoveCursorDown
+        | RuntimeAction::CopyScrollback
+        | RuntimeAction::ConfirmScrollback => AttachEventAction::Ui(action),
+    }
 }
 
 const fn is_attach_stream_closed_error(error: &ClientError) -> bool {
@@ -10453,6 +10544,28 @@ mod tests {
 
         assert_eq!(view_state.mouse.last_position, Some((3, 4)));
         assert!(view_state.mouse.last_event_at.is_some());
+    }
+
+    #[test]
+    fn resolve_mouse_gesture_action_parses_plugin_command() {
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id: Uuid::new_v4(),
+            can_write: true,
+        });
+        view_state.mouse.config.gesture_actions.insert(
+            "click_left".to_string(),
+            "plugin:bmux.windows:new-window".to_string(),
+        );
+
+        let resolved = super::resolve_mouse_gesture_action(&view_state, "click_left");
+        assert!(matches!(
+            resolved,
+            Some(super::AttachEventAction::PluginCommand {
+                plugin_id,
+                command_name
+            }) if plugin_id == "bmux.windows" && command_name == "new-window"
+        ));
     }
 
     #[test]
