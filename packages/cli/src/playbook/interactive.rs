@@ -75,6 +75,8 @@ struct InteractiveResponse {
     screen_delta: Option<ScreenDeltaEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     cursor_delta: Option<CursorDeltaEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    watchpoint_hit: Option<WatchpointHitEvent>,
 }
 
 #[derive(Serialize)]
@@ -89,6 +91,21 @@ struct CursorDeltaEvent {
 struct CursorPosition {
     row: u16,
     col: u16,
+}
+
+#[derive(Serialize)]
+struct WatchpointHitEvent {
+    id: String,
+    kind: &'static str,
+    pane_index: u32,
+    summary: String,
+    distance: u16,
+    threshold: u16,
+    window_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence_seq_start: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence_seq_end: Option<u64>,
 }
 
 impl InteractiveResponse {
@@ -116,6 +133,7 @@ impl InteractiveResponse {
             subscription_id: None,
             screen_delta: None,
             cursor_delta: None,
+            watchpoint_hit: None,
         }
     }
 
@@ -143,6 +161,7 @@ impl InteractiveResponse {
             subscription_id: None,
             screen_delta: None,
             cursor_delta: None,
+            watchpoint_hit: None,
         }
     }
 
@@ -170,6 +189,7 @@ impl InteractiveResponse {
             subscription_id: None,
             screen_delta: None,
             cursor_delta: None,
+            watchpoint_hit: None,
         }
     }
 
@@ -197,6 +217,7 @@ impl InteractiveResponse {
             subscription_id: None,
             screen_delta: None,
             cursor_delta: None,
+            watchpoint_hit: None,
         }
     }
 
@@ -225,6 +246,7 @@ impl InteractiveResponse {
             subscription_id: None,
             screen_delta: None,
             cursor_delta: None,
+            watchpoint_hit: None,
         }
     }
 
@@ -241,6 +263,14 @@ impl InteractiveResponse {
             event_type: Some("cursor_delta".to_string()),
             cursor_delta: Some(delta),
             ..Self::ok("cursor-delta")
+        }
+    }
+
+    fn event_watchpoint_hit(hit: WatchpointHitEvent) -> Self {
+        Self {
+            event_type: Some("watchpoint_hit".to_string()),
+            watchpoint_hit: Some(hit),
+            ..Self::ok("watchpoint-hit")
         }
     }
 }
@@ -266,6 +296,12 @@ struct InteractiveJsonRequest {
     kind: Option<String>,
     #[serde(default)]
     pane_index: Option<u32>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    min_distance: Option<u16>,
+    #[serde(default)]
+    window_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -342,12 +378,43 @@ impl MessageSequencer {
         response: &mut InteractiveResponse,
         message_type: &str,
         request_id: Option<&str>,
-    ) {
+    ) -> u64 {
         self.seq = self.seq.saturating_add(1);
         response.message_type = Some(message_type.to_string());
         response.seq = Some(self.seq);
         response.mono_ns = Some(self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
         response.request_id = request_id.map(std::string::ToString::to_string);
+        self.seq
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CursorJumpWatchpoint {
+    id: String,
+    pane_index: Option<u32>,
+    min_distance: u16,
+    window_ms: u64,
+}
+
+#[derive(Debug, Default)]
+struct WatchpointRegistry {
+    cursor_jump: Vec<CursorJumpWatchpoint>,
+}
+
+impl WatchpointRegistry {
+    fn upsert_cursor_jump(&mut self, watchpoint: CursorJumpWatchpoint) {
+        self.cursor_jump.retain(|entry| entry.id != watchpoint.id);
+        self.cursor_jump.push(watchpoint);
+    }
+
+    fn clear(&mut self, id: &str) -> bool {
+        let before = self.cursor_jump.len();
+        self.cursor_jump.retain(|entry| entry.id != id);
+        before != self.cursor_jump.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.cursor_jump.is_empty()
     }
 }
 
@@ -541,6 +608,7 @@ async fn run_repl(
     let mut subscription = LiveSubscription::default();
     let mut pane_cache = std::collections::HashMap::<u32, PaneCapture>::new();
     let mut sequencer = MessageSequencer::new();
+    let mut watchpoints = WatchpointRegistry::default();
 
     loop {
         // Check session timeout.
@@ -572,6 +640,7 @@ async fn run_repl(
                     attached,
                     &subscription,
                     &mut pane_cache,
+                    &watchpoints,
                 )
                 .await?;
             }
@@ -623,6 +692,7 @@ async fn run_repl(
                     attached,
                     &subscription,
                     &mut pane_cache,
+                    &watchpoints,
                 )
                 .await?;
             }
@@ -673,6 +743,7 @@ async fn run_repl(
                     &output_tx,
                     &mut pane_cache,
                     sandbox,
+                    &mut watchpoints,
                 )
                 .await?;
                 if !should_continue {
@@ -928,6 +999,7 @@ async fn run_repl(
                     attached,
                     &subscription,
                     &mut pane_cache,
+                    &watchpoints,
                 )
                 .await?;
             }
@@ -972,6 +1044,7 @@ async fn run_repl(
                     attached,
                     &subscription,
                     &mut pane_cache,
+                    &watchpoints,
                 )
                 .await?;
                 // Don't break on failure — let the agent decide what to do.
@@ -1068,9 +1141,10 @@ async fn send_response<W: tokio::io::AsyncWrite + Unpin>(
     mut response: InteractiveResponse,
     message_type: &str,
     request_id: Option<&str>,
-) -> Result<()> {
-    sequencer.stamp(&mut response, message_type, request_id);
-    write_response(writer, &response).await
+) -> Result<u64> {
+    let seq = sequencer.stamp(&mut response, message_type, request_id);
+    write_response(writer, &response).await?;
+    Ok(seq)
 }
 
 fn update_pane_cache_from_inspector(
@@ -1092,9 +1166,12 @@ async fn emit_screen_events<W: tokio::io::AsyncWrite + Unpin>(
     attached: &bool,
     subscription: &LiveSubscription,
     pane_cache: &mut std::collections::HashMap<u32, PaneCapture>,
+    watchpoints: &WatchpointRegistry,
 ) -> Result<()> {
     if !subscription.active
-        || (!subscription.wants("cursor_delta") && !subscription.wants("screen_delta"))
+        || (!subscription.wants("cursor_delta")
+            && !subscription.wants("screen_delta")
+            && !subscription.wants("watchpoint_hit"))
     {
         return Ok(());
     }
@@ -1113,6 +1190,7 @@ async fn emit_screen_events<W: tokio::io::AsyncWrite + Unpin>(
         if !subscription.allows_pane(delta.pane.index) {
             continue;
         }
+        let mut cursor_event_seq = None;
         if subscription.wants("cursor_delta")
             && let Some(cursor) = &delta.cursor_delta
         {
@@ -1129,13 +1207,24 @@ async fn emit_screen_events<W: tokio::io::AsyncWrite + Unpin>(
                 distance: cursor.distance,
             };
             let response = InteractiveResponse::event_cursor_delta(event);
-            send_response(writer, sequencer, response, "event", None).await?;
+            cursor_event_seq =
+                Some(send_response(writer, sequencer, response, "event", None).await?);
         }
         if subscription.wants("screen_delta")
             && let Some(screen_delta) = &delta.screen_delta
         {
             let response = InteractiveResponse::event_screen_delta(screen_delta.clone());
             send_response(writer, sequencer, response, "event", None).await?;
+        }
+        if subscription.wants("watchpoint_hit")
+            && !watchpoints.is_empty()
+            && let Some(cursor) = &delta.cursor_delta
+        {
+            for hit in evaluate_watchpoints(watchpoints, cursor, delta.pane.index, cursor_event_seq)
+            {
+                let response = InteractiveResponse::event_watchpoint_hit(hit);
+                send_response(writer, sequencer, response, "event", None).await?;
+            }
         }
     }
     pane_cache.clear();
@@ -1159,6 +1248,7 @@ async fn handle_json_command<W: tokio::io::AsyncWrite + Unpin>(
     output_tx: &tokio::sync::mpsc::Sender<(u32, String)>,
     pane_cache: &mut std::collections::HashMap<u32, PaneCapture>,
     sandbox: &super::sandbox::SandboxServer,
+    watchpoints: &mut WatchpointRegistry,
 ) -> Result<bool> {
     match json.op.as_str() {
         "hello" => {
@@ -1233,6 +1323,7 @@ async fn handle_json_command<W: tokio::io::AsyncWrite + Unpin>(
                     "pane_output".to_string(),
                     "cursor_delta".to_string(),
                     "screen_delta".to_string(),
+                    "watchpoint_hit".to_string(),
                 ]
                 .into_iter()
                 .collect()
@@ -1295,6 +1386,74 @@ async fn handle_json_command<W: tokio::io::AsyncWrite + Unpin>(
             }
             subscription.active = false;
             let resp = InteractiveResponse::ok("unsubscribe");
+            send_response(
+                writer,
+                sequencer,
+                resp,
+                "response",
+                json.request_id.as_deref(),
+            )
+            .await?;
+            Ok(true)
+        }
+        "set_watchpoint" => {
+            let Some(id) = json.id.clone() else {
+                let mut resp = InteractiveResponse::error("set_watchpoint requires id".to_string());
+                resp.code = Some("invalid_op".to_string());
+                send_response(writer, sequencer, resp, "error", json.request_id.as_deref()).await?;
+                return Ok(true);
+            };
+            let kind = json.kind.as_deref().unwrap_or("cursor_jump");
+            if kind != "cursor_jump" {
+                let mut resp =
+                    InteractiveResponse::error(format!("unsupported watchpoint kind: {kind}"));
+                resp.code = Some("invalid_op".to_string());
+                send_response(writer, sequencer, resp, "error", json.request_id.as_deref()).await?;
+                return Ok(true);
+            }
+
+            let watchpoint = CursorJumpWatchpoint {
+                id: id.clone(),
+                pane_index: json.pane_index,
+                min_distance: json.min_distance.unwrap_or(8).max(1),
+                window_ms: json.window_ms.unwrap_or(120).max(1),
+            };
+            watchpoints.upsert_cursor_jump(watchpoint.clone());
+            let mut resp = InteractiveResponse::ok("set_watchpoint");
+            resp.detail = Some(format!(
+                "id={} kind=cursor_jump pane_index={} min_distance={} window_ms={}",
+                watchpoint.id,
+                watchpoint
+                    .pane_index
+                    .map_or_else(|| "any".to_string(), |pane| pane.to_string()),
+                watchpoint.min_distance,
+                watchpoint.window_ms
+            ));
+            send_response(
+                writer,
+                sequencer,
+                resp,
+                "response",
+                json.request_id.as_deref(),
+            )
+            .await?;
+            Ok(true)
+        }
+        "clear_watchpoint" => {
+            let Some(id) = json.id.as_deref() else {
+                let mut resp =
+                    InteractiveResponse::error("clear_watchpoint requires id".to_string());
+                resp.code = Some("invalid_op".to_string());
+                send_response(writer, sequencer, resp, "error", json.request_id.as_deref()).await?;
+                return Ok(true);
+            };
+            let removed = watchpoints.clear(id);
+            let mut resp = InteractiveResponse::ok("clear_watchpoint");
+            resp.detail = Some(if removed {
+                format!("removed watchpoint id={id}")
+            } else {
+                format!("watchpoint id={id} not found")
+            });
             send_response(
                 writer,
                 sequencer,
@@ -1404,6 +1563,38 @@ fn parse_delta_preference(value: Option<&str>) -> Result<DeltaFormatPreference> 
         Some("unified_diff") => Ok(DeltaFormatPreference::UnifiedDiff),
         Some(other) => anyhow::bail!("invalid screen_delta_format '{other}'"),
     }
+}
+
+fn evaluate_watchpoints(
+    watchpoints: &WatchpointRegistry,
+    cursor: &super::screen::CursorDeltaEvent,
+    pane_index: u32,
+    cursor_event_seq: Option<u64>,
+) -> Vec<WatchpointHitEvent> {
+    let mut hits = Vec::new();
+    for watchpoint in &watchpoints.cursor_jump {
+        if watchpoint.pane_index.is_some_and(|pane| pane != pane_index) {
+            continue;
+        }
+        if cursor.distance < watchpoint.min_distance {
+            continue;
+        }
+        hits.push(WatchpointHitEvent {
+            id: watchpoint.id.clone(),
+            kind: "cursor_jump",
+            pane_index,
+            summary: format!(
+                "cursor jump detected: distance={} threshold={} pane={}",
+                cursor.distance, watchpoint.min_distance, pane_index
+            ),
+            distance: cursor.distance,
+            threshold: watchpoint.min_distance,
+            window_ms: watchpoint.window_ms,
+            evidence_seq_start: cursor_event_seq,
+            evidence_seq_end: cursor_event_seq,
+        });
+    }
+    hits
 }
 
 // ── Endpoint selection ────────────────────────────────────────────────────────

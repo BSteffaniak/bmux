@@ -915,6 +915,8 @@ All fields except `status` are optional and omitted when not applicable.
 | `help`        | List available commands.                                                                                     |
 | `subscribe`   | Start push-based output streaming. After subscribing, output events are pushed to the agent without polling. |
 | `unsubscribe` | Stop push-based output streaming.                                                                            |
+| `set_watchpoint` | Register anomaly detection watchpoints (for v1, `kind: "cursor_jump"`).                                |
+| `clear_watchpoint` | Remove a watchpoint by id.                                                                              |
 
 ### Push Output Events
 
@@ -995,12 +997,41 @@ command responses.
 | `pane_index`  | u32    | The pane that produced the output                         |
 | `output_data` | string | The new output text (UTF-8, may contain escape sequences) |
 
+Watchpoint hit event:
+
+```json
+{
+  "type": "event",
+  "status": "ok",
+  "event_type": "watchpoint_hit",
+  "watchpoint_hit": {
+    "id": "cursor-jump-1",
+    "kind": "cursor_jump",
+    "pane_index": 1,
+    "summary": "cursor jump detected: distance=12 threshold=8 pane=1",
+    "distance": 12,
+    "threshold": 8,
+    "window_ms": 120,
+    "evidence_seq_start": 42,
+    "evidence_seq_end": 42
+  }
+}
+```
+
 `subscribe` JSON options:
 
-- `event_types`: array of event names (`pane_output`, `cursor_delta`, `screen_delta`).
+- `event_types`: array of event names (`pane_output`, `cursor_delta`, `screen_delta`, `watchpoint_hit`).
 - `pane_indexes`: optional pane-index filter.
 - `screen_delta_format`: `line_ops`, `unified_diff`, or `auto`.
   - `auto` resolves to `line_ops` for machine-readable clients (e.g. `client: "llm-agent"`) and `unified_diff` otherwise.
+
+`set_watchpoint` JSON options:
+
+- `id`: required watchpoint id.
+- `kind`: currently `cursor_jump`.
+- `pane_index`: optional pane scope (defaults to any pane).
+- `min_distance`: cursor Manhattan distance threshold (default `8`).
+- `window_ms`: advisory detection window metadata (default `120`).
 
 Use `unsubscribe` to stop receiving push events.
 

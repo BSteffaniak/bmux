@@ -1170,6 +1170,146 @@ async fn interactive_mode_json_screen_delta_formats() {
     let _ = child.wait();
 }
 
+#[tokio::test]
+async fn interactive_mode_watchpoint_cursor_jump_hit() {
+    use std::process::Stdio;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+
+    let mut child = std::process::Command::new(bmux_binary())
+        .args([
+            "playbook",
+            "interactive",
+            "--viewport",
+            "80x24",
+            "--shell",
+            "sh",
+            "--timeout",
+            "30",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn bmux playbook interactive");
+
+    let _guard = ProcessGuard::new(&child);
+
+    let stdout = child.stdout.take().expect("stdout should be piped");
+    let mut stdout_reader = std::io::BufReader::new(stdout);
+    let mut ready_line = String::new();
+    std::io::BufRead::read_line(&mut stdout_reader, &mut ready_line)
+        .expect("failed to read ready message");
+    let ready: serde_json::Value = serde_json::from_str(ready_line.trim())
+        .unwrap_or_else(|e| panic!("failed to parse ready message: {e}\nline: {ready_line}"));
+    let socket_path = ready["socket"]
+        .as_str()
+        .expect("ready message should have socket path");
+
+    let endpoint = endpoint_from_socket_path(socket_path);
+    let mut stream = None;
+    for _ in 0..10 {
+        match bmux_ipc::transport::LocalIpcStream::connect(&endpoint).await {
+            Ok(s) => {
+                stream = Some(s);
+                break;
+            }
+            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(100)).await,
+        }
+    }
+    let stream = stream.unwrap_or_else(|| panic!("failed to connect to socket: {socket_path}"));
+    let (reader, mut writer) = tokio::io::split(stream);
+    let mut reader = TokioBufReader::new(reader);
+
+    async fn send_json(
+        writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+        payload: &serde_json::Value,
+    ) {
+        writer
+            .write_all(format!("{}\n", payload).as_bytes())
+            .await
+            .expect("failed to write json command");
+        writer.flush().await.expect("failed to flush");
+    }
+
+    async fn read_json(reader: &mut (impl AsyncBufReadExt + Unpin)) -> serde_json::Value {
+        let mut line = String::new();
+        reader
+            .read_line(&mut line)
+            .await
+            .expect("failed to read response line");
+        serde_json::from_str(line.trim())
+            .unwrap_or_else(|e| panic!("failed to parse json line: {e}\nline: {line}"))
+    }
+
+    send_json(
+        &mut writer,
+        &serde_json::json!({"op":"command","request_id":"wp-new","dsl":"new-session"}),
+    )
+    .await;
+    let new_session = read_json(&mut reader).await;
+    assert_eq!(new_session["action"], "new-session");
+
+    send_json(
+        &mut writer,
+        &serde_json::json!({
+            "op":"subscribe",
+            "request_id":"wp-sub",
+            "event_types":["watchpoint_hit"],
+            "pane_indexes":[1]
+        }),
+    )
+    .await;
+    let subscribed = read_json(&mut reader).await;
+    assert_eq!(subscribed["action"], "subscribe");
+
+    send_json(
+        &mut writer,
+        &serde_json::json!({
+            "op":"set_watchpoint",
+            "request_id":"wp-set",
+            "id":"cursor-jump-1",
+            "kind":"cursor_jump",
+            "pane_index":1,
+            "min_distance":1,
+            "window_ms":500
+        }),
+    )
+    .await;
+    let set_resp = read_json(&mut reader).await;
+    assert_eq!(set_resp["action"], "set_watchpoint");
+
+    send_json(
+        &mut writer,
+        &serde_json::json!({"op":"command","request_id":"wp-keys","dsl":"send-keys keys='echo watchpoint_cursor_marker\\r'"}),
+    )
+    .await;
+
+    let mut saw_hit = false;
+    for _ in 0..30 {
+        let msg = read_json(&mut reader).await;
+        if msg["event_type"] == "watchpoint_hit" {
+            assert_eq!(msg["watchpoint_hit"]["id"], "cursor-jump-1");
+            assert_eq!(msg["watchpoint_hit"]["kind"], "cursor_jump");
+            saw_hit = true;
+            break;
+        }
+    }
+    assert!(saw_hit, "expected watchpoint_hit event for cursor-jump-1");
+
+    send_json(
+        &mut writer,
+        &serde_json::json!({"op":"clear_watchpoint","request_id":"wp-clear","id":"cursor-jump-1"}),
+    )
+    .await;
+    let clear_resp = read_json(&mut reader).await;
+    assert_eq!(clear_resp["action"], "clear_watchpoint");
+
+    send_json(&mut writer, &serde_json::json!({"op":"quit"})).await;
+    let quit = read_json(&mut reader).await;
+    assert_eq!(quit["action"], "quit");
+
+    let _ = child.wait();
+}
+
 // ---------------------------------------------------------------------------
 // A: Concurrent playbook runs
 // ---------------------------------------------------------------------------
