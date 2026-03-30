@@ -211,6 +211,8 @@ pub struct BehaviorConfig {
     /// terminal, allowing modified special keys like Ctrl+Enter to be
     /// correctly forwarded to pane programs.
     pub kitty_keyboard: bool,
+    /// Mouse interaction settings for attach mode (focus/scroll gestures).
+    pub mouse: MouseBehaviorConfig,
 }
 
 impl Default for BehaviorConfig {
@@ -230,7 +232,50 @@ impl Default for BehaviorConfig {
             terminfo_prompt_cooldown_days: 7,
             stale_build_action: StaleBuildAction::Error,
             kitty_keyboard: true,
+            mouse: MouseBehaviorConfig::default(),
         }
+    }
+}
+
+/// Mouse interaction behavior for attach mode.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ConfigDoc)]
+#[config_doc(section = "behavior.mouse")]
+#[serde(default)]
+pub struct MouseBehaviorConfig {
+    /// Master toggle for mouse handling in attach mode.
+    pub enabled: bool,
+    /// Focus pane when clicking inside it.
+    pub focus_on_click: bool,
+    /// Focus pane when hovering over it.
+    pub focus_on_hover: bool,
+    /// Hover dwell time before focus is applied.
+    pub hover_delay_ms: u64,
+    /// Route wheel scrolling to focused pane scrollback.
+    pub scroll_scrollback: bool,
+    /// Number of scrollback lines per mouse wheel tick.
+    pub scroll_lines_per_tick: u16,
+    /// Exit scrollback mode automatically when wheel scrolling reaches bottom.
+    pub exit_scrollback_on_bottom: bool,
+}
+
+impl Default for MouseBehaviorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            focus_on_click: true,
+            focus_on_hover: false,
+            hover_delay_ms: 175,
+            scroll_scrollback: true,
+            scroll_lines_per_tick: 3,
+            exit_scrollback_on_bottom: true,
+        }
+    }
+}
+
+impl MouseBehaviorConfig {
+    #[must_use]
+    pub const fn config_doc_values() -> &'static [&'static str] {
+        &[]
     }
 }
 
@@ -349,6 +394,19 @@ pub enum BellAction {
 }
 
 impl BmuxConfig {
+    #[must_use]
+    pub fn attach_mouse_config(&self) -> MouseBehaviorConfig {
+        let defaults = MouseBehaviorConfig::default();
+        if self.behavior.mouse == defaults
+            && self.general.mouse_support != GeneralConfig::default().mouse_support
+        {
+            let mut mapped = self.behavior.mouse.clone();
+            mapped.enabled = self.general.mouse_support;
+            return mapped;
+        }
+        self.behavior.mouse.clone()
+    }
+
     /// Resolve the effective recordings directory.
     ///
     /// If `recording.dir` is set and relative, it is resolved relative to the
@@ -472,6 +530,20 @@ impl BmuxConfig {
             });
         }
 
+        if self.behavior.mouse.hover_delay_ms == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "behavior.mouse.hover_delay_ms".to_string(),
+                value: "0".to_string(),
+            });
+        }
+
+        if self.behavior.mouse.scroll_lines_per_tick == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "behavior.mouse.scroll_lines_per_tick".to_string(),
+                value: "0".to_string(),
+            });
+        }
+
         Ok(())
     }
 
@@ -520,6 +592,33 @@ impl BmuxConfig {
             repaired_fields.push(format!(
                 "behavior.protocol_trace_capacity=0 -> {}",
                 behavior_defaults.protocol_trace_capacity
+            ));
+        }
+
+        if self.behavior.mouse == MouseBehaviorConfig::default()
+            && self.general.mouse_support != general_defaults.mouse_support
+        {
+            self.behavior.mouse.enabled = self.general.mouse_support;
+            repaired_fields.push(format!(
+                "general.mouse_support={} -> behavior.mouse.enabled={}",
+                self.general.mouse_support, self.general.mouse_support
+            ));
+        }
+
+        if self.behavior.mouse.hover_delay_ms == 0 {
+            self.behavior.mouse.hover_delay_ms = MouseBehaviorConfig::default().hover_delay_ms;
+            repaired_fields.push(format!(
+                "behavior.mouse.hover_delay_ms=0 -> {}",
+                self.behavior.mouse.hover_delay_ms
+            ));
+        }
+
+        if self.behavior.mouse.scroll_lines_per_tick == 0 {
+            self.behavior.mouse.scroll_lines_per_tick =
+                MouseBehaviorConfig::default().scroll_lines_per_tick;
+            repaired_fields.push(format!(
+                "behavior.mouse.scroll_lines_per_tick=0 -> {}",
+                self.behavior.mouse.scroll_lines_per_tick
             ));
         }
 
@@ -776,6 +875,36 @@ timeout_profile = "missing"
 
         let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
         assert_eq!(config.behavior.stale_build_action, StaleBuildAction::Warn);
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn attach_mouse_config_maps_legacy_general_mouse_support_when_mouse_block_uses_defaults() {
+        let mut config = BmuxConfig::default();
+        config.general.mouse_support = false;
+
+        let mouse = config.attach_mouse_config();
+        assert!(!mouse.enabled);
+    }
+
+    #[test]
+    fn load_repairs_invalid_mouse_values_without_persisting() {
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        std::fs::write(
+            &path,
+            "[behavior.mouse]\nhover_delay_ms = 0\nscroll_lines_per_tick = 0\n",
+        )
+        .expect("failed writing invalid config fixture");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(config.behavior.mouse.hover_delay_ms, 175);
+        assert_eq!(config.behavior.mouse.scroll_lines_per_tick, 3);
+
+        let persisted = std::fs::read_to_string(&path).expect("failed reading config file");
+        assert!(persisted.contains("hover_delay_ms = 0"));
+        assert!(persisted.contains("scroll_lines_per_tick = 0"));
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
     }

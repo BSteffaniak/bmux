@@ -32,7 +32,10 @@ use bmux_plugin_sdk::{
 use bmux_server::BmuxServer;
 use clap::{CommandFactory, FromArgMatches};
 use crossterm::cursor::{MoveTo, SavePosition, Show};
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
+    MouseEvent,
+};
 use crossterm::queue;
 use crossterm::style::Print;
 use crossterm::terminal;
@@ -4671,8 +4674,11 @@ async fn run_session_attach_with_client(
         .await
         .map_err(map_attach_client_error)?;
 
-    let raw_mode_guard = RawModeGuard::enable(attach_config.behavior.kitty_keyboard)
-        .context("failed to enable raw mode for attach")?;
+    let raw_mode_guard = RawModeGuard::enable(
+        attach_config.behavior.kitty_keyboard,
+        attach_config.attach_mouse_config().enabled,
+    )
+    .context("failed to enable raw mode for attach")?;
     let mut attach_input_processor =
         InputProcessor::new(attach_keymap.clone(), raw_mode_guard.keyboard_enhanced);
     let mut exit_reason = AttachExitReason::Detached;
@@ -6621,10 +6627,11 @@ fn describe_timeout(timeout: &ResolvedTimeout) -> String {
 
 struct RawModeGuard {
     keyboard_enhanced: bool,
+    mouse_capture_enabled: bool,
 }
 
 impl RawModeGuard {
-    fn enable(kitty_keyboard_enabled: bool) -> Result<Self> {
+    fn enable(kitty_keyboard_enabled: bool, mouse_capture_enabled: bool) -> Result<Self> {
         enable_raw_mode().context("failed enabling raw mode")?;
 
         #[cfg(feature = "kitty-keyboard")]
@@ -6635,9 +6642,9 @@ impl RawModeGuard {
 
         let _ = kitty_keyboard_enabled; // suppress unused warning when feature is disabled
 
+        let mut stdout = io::stdout();
         if keyboard_enhanced {
             use crossterm::event::{KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
-            let mut stdout = io::stdout();
             queue!(
                 stdout,
                 PushKeyboardEnhancementFlags(
@@ -6651,12 +6658,27 @@ impl RawModeGuard {
                 .context("failed to flush after pushing keyboard flags")?;
         }
 
-        Ok(Self { keyboard_enhanced })
+        if mouse_capture_enabled {
+            queue!(stdout, EnableMouseCapture).context("failed to enable mouse capture")?;
+            stdout
+                .flush()
+                .context("failed to flush after enabling mouse capture")?;
+        }
+
+        Ok(Self {
+            keyboard_enhanced,
+            mouse_capture_enabled,
+        })
     }
 }
 
 impl Drop for RawModeGuard {
     fn drop(&mut self) {
+        if self.mouse_capture_enabled {
+            let mut stdout = io::stdout();
+            let _ = queue!(stdout, DisableMouseCapture);
+            let _ = stdout.flush();
+        }
         if self.keyboard_enhanced {
             use crossterm::event::PopKeyboardEnhancementFlags;
             let mut stdout = io::stdout();
@@ -7270,6 +7292,9 @@ async fn handle_attach_terminal_event(
                 }
                 attach_input_processor.set_scroll_mode(view_state.scrollback_active);
             }
+            AttachEventAction::Mouse(mouse_event) => {
+                record_attach_mouse_event(mouse_event, view_state);
+            }
             AttachEventAction::Ui(action) => {
                 if matches!(action, RuntimeAction::ShowHelp) {
                     view_state.help_overlay_open = !view_state.help_overlay_open;
@@ -7317,11 +7342,17 @@ async fn handle_attach_terminal_event(
     Ok(AttachLoopControl::Continue)
 }
 
+fn record_attach_mouse_event(mouse_event: MouseEvent, view_state: &mut AttachViewState) {
+    view_state.mouse.last_position = Some((mouse_event.column, mouse_event.row));
+    view_state.mouse.last_event_at = Some(Instant::now());
+}
+
 fn restore_terminal_after_attach_ui() -> Result<()> {
     let mut stdout = io::stdout();
-    // Safety net: pop keyboard enhancement flags in case the drop guard didn't run.
+    // Safety net: restore terminal input flags in case the drop guard didn't run.
     #[cfg(feature = "kitty-keyboard")]
     let _ = queue!(stdout, crossterm::event::PopKeyboardEnhancementFlags);
+    let _ = queue!(stdout, DisableMouseCapture);
     queue!(
         stdout,
         Show,
@@ -7343,8 +7374,9 @@ fn attach_event_actions(
 ) -> Result<Vec<AttachEventAction>> {
     match event {
         Event::Key(key) => attach_key_event_actions(key, attach_input_processor, ui_mode),
+        Event::Mouse(mouse) => Ok(vec![AttachEventAction::Mouse(*mouse)]),
         Event::Resize(_, _) => Ok(vec![AttachEventAction::Redraw]),
-        Event::Mouse(_) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {
+        Event::FocusGained | Event::FocusLost | Event::Paste(_) => {
             Ok(vec![AttachEventAction::Ignore])
         }
     }
@@ -8730,8 +8762,9 @@ mod tests {
     use bmux_plugin::{PluginManifest, PluginRegistry};
     use bmux_plugin_sdk::PluginCommandEffect;
     use crossterm::event::{
-        KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
-        KeyEventKind as CrosstermKeyEventKind, KeyModifiers,
+        Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
+        KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
     };
     use std::collections::BTreeMap;
     use std::ffi::OsString;
@@ -10204,6 +10237,47 @@ mod tests {
         .expect("attach key action should parse");
         assert_eq!(actions.len(), 1);
         assert!(matches!(actions[0], super::AttachEventAction::Send(ref bytes) if bytes == b"x"));
+    }
+
+    #[test]
+    fn attach_event_actions_maps_mouse_events() {
+        let mut processor =
+            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
+        let event = CrosstermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 12,
+            row: 8,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        let actions =
+            super::attach_event_actions(&event, &mut processor, super::AttachUiMode::Normal)
+                .expect("mouse event should map");
+
+        assert!(matches!(
+            actions.first(),
+            Some(super::AttachEventAction::Mouse(mouse)) if mouse.column == 12 && mouse.row == 8
+        ));
+    }
+
+    #[test]
+    fn record_attach_mouse_event_tracks_position_and_timestamp() {
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id: Uuid::new_v4(),
+            can_write: true,
+        });
+        let event = MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 3,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        super::record_attach_mouse_event(event, &mut view_state);
+
+        assert_eq!(view_state.mouse.last_position, Some((3, 4)));
+        assert!(view_state.mouse.last_event_at.is_some());
     }
 
     #[test]

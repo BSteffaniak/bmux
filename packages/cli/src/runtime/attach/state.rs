@@ -1,5 +1,6 @@
 use crate::input::RuntimeAction;
 use bmux_client::AttachLayoutState;
+use crossterm::event::MouseEvent;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
@@ -11,6 +12,7 @@ pub enum AttachEventAction {
         plugin_id: String,
         command_name: String,
     },
+    Mouse(MouseEvent),
     Ui(RuntimeAction),
     Redraw,
     Detach,
@@ -105,7 +107,18 @@ pub struct AttachViewState {
     pub(crate) cached_status_line: Option<String>,
     pub(crate) cached_layout_state: Option<AttachLayoutState>,
     pub(crate) last_cursor_state: Option<AttachCursorState>,
+    pub(crate) mouse: AttachMouseState,
     pub(crate) dirty: AttachDirtyFlags,
+}
+
+#[derive(Debug, Clone, Default)]
+#[allow(dead_code)]
+pub struct AttachMouseState {
+    pub(crate) last_position: Option<(u16, u16)>,
+    pub(crate) last_event_at: Option<Instant>,
+    pub(crate) hover_started_at: Option<Instant>,
+    pub(crate) hovered_pane_id: Option<Uuid>,
+    pub(crate) last_focused_pane_id: Option<Uuid>,
 }
 
 impl AttachViewState {
@@ -128,6 +141,7 @@ impl AttachViewState {
             cached_status_line: None,
             cached_layout_state: None,
             last_cursor_state: None,
+            mouse: AttachMouseState::default(),
             dirty: AttachDirtyFlags::default(),
         }
     }
