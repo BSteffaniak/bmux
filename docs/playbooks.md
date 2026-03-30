@@ -844,18 +844,7 @@ JSON.
 
 ### Wire Protocol
 
-Interactive mode accepts both of these request forms:
-
-1. **DSL line mode (backward compatible):** one DSL action line terminated by `\n`.
-2. **JSON op mode (recommended for agents):** one JSON object terminated by `\n`.
-
-DSL examples:
-
-```
-new-session\n
-send-keys keys='echo hello\r'\n
-screen\n
-```
+Interactive mode is JSON-op only in v2: one JSON object per line (`\n`-delimited).
 
 JSON op examples:
 
@@ -909,16 +898,17 @@ All fields except `status` are optional and omitted when not applicable.
 
 ### Special Commands
 
-| Command       | Description                                                                                                  |
-| ------------- | ------------------------------------------------------------------------------------------------------------ |
-| `quit`        | End the session. Returns `{"status":"ok","action":"quit"}` and closes the connection.                        |
-| `screen`      | Drain output and capture all pane text. Returns `panes` array.                                               |
-| `status`      | Return session metadata. Returns `session_id`, `pane_count`, `focused_pane`.                                 |
-| `help`        | List available commands.                                                                                     |
-| `subscribe`   | Start push-based output streaming. After subscribing, output events are pushed to the agent without polling. |
-| `unsubscribe` | Stop push-based output streaming.                                                                            |
-| `set_watchpoint` | Register anomaly detection watchpoints (`kind: "event_burst"`).                                         |
-| `clear_watchpoint` | Remove a watchpoint by id.                                                                              |
+| Op                | Description |
+| ----------------- | ----------- |
+| `hello`           | Optional capability handshake. |
+| `command`         | Execute one DSL action line via `dsl` field (for example `new-session`, `send-keys`, `assert-screen`). |
+| `status`          | Return session metadata (`session_id`, `pane_count`, `focused_pane`). |
+| `hydrate`         | Hydrate detailed data (`screen_full`, `event_window`, `incident`). |
+| `subscribe`       | Start live event streaming with filters and budgets. |
+| `unsubscribe`     | Stop live event streaming. |
+| `set_watchpoint`  | Register anomaly watchpoint (`kind: "event_burst"`). |
+| `clear_watchpoint`| Remove a watchpoint by id. |
+| `quit`            | End the interactive session. |
 
 ### Push Output Events
 
@@ -995,7 +985,7 @@ command responses.
 
 | Field         | Type   | Description                                               |
 | ------------- | ------ | --------------------------------------------------------- |
-| `event_type`  | string | Push event type (`pane_output`, `cursor_delta`, `screen_delta`) |
+| `event_type`  | string | Push event type (`pane_output`, `pane_input`, `cursor_delta`, `screen_delta`, `server_event`, `request_lifecycle`, `watchpoint_hit`) |
 | `pane_index`  | u32    | The pane that produced the output                         |
 | `output_data` | string | The new output text (UTF-8, may contain escape sequences) |
 
@@ -1028,12 +1018,15 @@ Watchpoint hit event:
 - `pane_indexes`: optional pane-index filter.
 - `screen_delta_format`: `line_ops`, `unified_diff`, or `auto`.
   - `auto` resolves to `line_ops` for machine-readable clients (e.g. `client: "llm-agent"`) and `unified_diff` otherwise.
+- `max_events_per_sec`: optional streaming event budget.
+- `max_bytes_per_sec`: optional streaming byte budget.
+- `coalesce_ms`: optional per-event-type coalescing interval.
 
 `set_watchpoint` JSON options:
 
 - `id`: required watchpoint id.
 - `kind`: `event_burst`.
-- `event_type`: required watched stream event (`pane_output`, `cursor_delta`, `screen_delta`).
+- `event_type`: required watched stream event (`pane_output`, `pane_input`, `cursor_delta`, `screen_delta`, `server_event`, `request_lifecycle`).
 - `pane_index`: optional pane scope (defaults to any pane).
 - `window_ms`: burst window in milliseconds (default `500`).
 - `min_hits`: required hit count inside `window_ms` (default `3`).
@@ -1046,6 +1039,12 @@ Example (only trigger on pane output that matches):
 ```
 
 `watchpoint_hit` cannot be watched in v1 (recursive watchpoint loops are blocked).
+
+`hydrate` JSON options:
+
+- `kind: "screen_full"` for full pane snapshot.
+- `kind: "event_window"` with `start_seq` and `end_seq`.
+- `kind: "incident"` with `id` (watchpoint id) or `around_seq`, plus optional `window_radius`.
 
 Use `unsubscribe` to stop receiving push events.
 

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use regex::Regex;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tracing::{info, warn};
 use uuid::Uuid;
@@ -78,6 +79,14 @@ struct InteractiveResponse {
     cursor_delta: Option<CursorDeltaEvent>,
     #[serde(skip_serializing_if = "Option::is_none")]
     watchpoint_hit: Option<WatchpointHitEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pane_input: Option<PaneInputEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    server_event: Option<ServerEventPayload>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    request_lifecycle: Option<RequestLifecycleEvent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    event_window: Option<Vec<Value>>,
 }
 
 #[derive(Serialize)]
@@ -113,6 +122,88 @@ struct WatchpointHitEvent {
     evidence_seq_end: Option<u64>,
 }
 
+#[derive(Clone, Serialize)]
+struct PaneInputEvent {
+    pane_index: Option<u32>,
+    byte_len: usize,
+    printable_preview: String,
+}
+
+#[derive(Serialize)]
+struct ServerEventPayload {
+    name: String,
+    payload: Value,
+}
+
+#[derive(Serialize)]
+struct RequestLifecycleEvent {
+    phase: &'static str,
+    request_kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    elapsed_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct StoredMessage {
+    seq: u64,
+    event_type: Option<String>,
+    payload: Value,
+}
+
+#[derive(Debug, Default)]
+struct EventBuffer {
+    messages: std::collections::VecDeque<StoredMessage>,
+    max_messages: usize,
+    last_watchpoint_hit_seq: std::collections::HashMap<String, u64>,
+}
+
+impl EventBuffer {
+    fn with_capacity(max_messages: usize) -> Self {
+        Self {
+            messages: std::collections::VecDeque::new(),
+            max_messages,
+            last_watchpoint_hit_seq: std::collections::HashMap::new(),
+        }
+    }
+
+    fn push(&mut self, message: StoredMessage) {
+        if message.event_type.as_deref() == Some("watchpoint_hit")
+            && let Some(id) = message
+                .payload
+                .get("watchpoint_hit")
+                .and_then(|v| v.get("id"))
+                .and_then(Value::as_str)
+        {
+            self.last_watchpoint_hit_seq
+                .insert(id.to_string(), message.seq);
+        }
+        self.messages.push_back(message);
+        while self.messages.len() > self.max_messages {
+            self.messages.pop_front();
+        }
+    }
+
+    fn window(&self, start_seq: u64, end_seq: u64) -> Vec<Value> {
+        self.messages
+            .iter()
+            .filter(|entry| entry.seq >= start_seq && entry.seq <= end_seq)
+            .map(|entry| entry.payload.clone())
+            .collect()
+    }
+
+    fn around(&self, center_seq: u64, radius: u64) -> Vec<Value> {
+        let start = center_seq.saturating_sub(radius);
+        let end = center_seq.saturating_add(radius);
+        self.window(start, end)
+    }
+
+    fn latest_seq(&self) -> u64 {
+        self.messages.back().map_or(0, |entry| entry.seq)
+    }
+}
+
 impl InteractiveResponse {
     fn ok(action: &str) -> Self {
         Self {
@@ -139,6 +230,10 @@ impl InteractiveResponse {
             screen_delta: None,
             cursor_delta: None,
             watchpoint_hit: None,
+            pane_input: None,
+            server_event: None,
+            request_lifecycle: None,
+            event_window: None,
         }
     }
 
@@ -167,6 +262,10 @@ impl InteractiveResponse {
             screen_delta: None,
             cursor_delta: None,
             watchpoint_hit: None,
+            pane_input: None,
+            server_event: None,
+            request_lifecycle: None,
+            event_window: None,
         }
     }
 
@@ -195,6 +294,10 @@ impl InteractiveResponse {
             screen_delta: None,
             cursor_delta: None,
             watchpoint_hit: None,
+            pane_input: None,
+            server_event: None,
+            request_lifecycle: None,
+            event_window: None,
         }
     }
 
@@ -223,6 +326,10 @@ impl InteractiveResponse {
             screen_delta: None,
             cursor_delta: None,
             watchpoint_hit: None,
+            pane_input: None,
+            server_event: None,
+            request_lifecycle: None,
+            event_window: None,
         }
     }
 
@@ -252,6 +359,10 @@ impl InteractiveResponse {
             screen_delta: None,
             cursor_delta: None,
             watchpoint_hit: None,
+            pane_input: None,
+            server_event: None,
+            request_lifecycle: None,
+            event_window: None,
         }
     }
 
@@ -276,6 +387,30 @@ impl InteractiveResponse {
             event_type: Some("watchpoint_hit".to_string()),
             watchpoint_hit: Some(hit),
             ..Self::ok("watchpoint-hit")
+        }
+    }
+
+    fn event_pane_input(event: PaneInputEvent) -> Self {
+        Self {
+            event_type: Some("pane_input".to_string()),
+            pane_input: Some(event),
+            ..Self::ok("pane-input")
+        }
+    }
+
+    fn event_server_event(event: ServerEventPayload) -> Self {
+        Self {
+            event_type: Some("server_event".to_string()),
+            server_event: Some(event),
+            ..Self::ok("server-event")
+        }
+    }
+
+    fn event_request_lifecycle(event: RequestLifecycleEvent) -> Self {
+        Self {
+            event_type: Some("request_lifecycle".to_string()),
+            request_lifecycle: Some(event),
+            ..Self::ok("request-lifecycle")
         }
     }
 }
@@ -311,6 +446,20 @@ struct InteractiveJsonRequest {
     event_type: Option<String>,
     #[serde(default)]
     contains_regex: Option<String>,
+    #[serde(default)]
+    max_events_per_sec: Option<u32>,
+    #[serde(default)]
+    max_bytes_per_sec: Option<usize>,
+    #[serde(default)]
+    coalesce_ms: Option<u64>,
+    #[serde(default)]
+    start_seq: Option<u64>,
+    #[serde(default)]
+    end_seq: Option<u64>,
+    #[serde(default)]
+    around_seq: Option<u64>,
+    #[serde(default)]
+    window_radius: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,6 +477,9 @@ struct LiveSubscription {
     format_preference: DeltaFormatPreference,
     prefer_machine_readable: bool,
     subscription_id: String,
+    max_events_per_sec: Option<u32>,
+    max_bytes_per_sec: Option<usize>,
+    coalesce_ms: u64,
 }
 
 impl Default for LiveSubscription {
@@ -339,6 +491,9 @@ impl Default for LiveSubscription {
             format_preference: DeltaFormatPreference::Auto,
             prefer_machine_readable: false,
             subscription_id: "sub_1".to_string(),
+            max_events_per_sec: Some(500),
+            max_bytes_per_sec: Some(256 * 1024),
+            coalesce_ms: 0,
         }
     }
 }
@@ -366,6 +521,64 @@ impl LiveSubscription {
                 }
             }
         }
+    }
+}
+
+#[derive(Debug)]
+struct EventBudgetState {
+    window_started: Instant,
+    sent_events: u32,
+    sent_bytes: usize,
+    last_sent_at: std::collections::HashMap<(String, Option<u32>), Instant>,
+}
+
+impl EventBudgetState {
+    fn new() -> Self {
+        Self {
+            window_started: Instant::now(),
+            sent_events: 0,
+            sent_bytes: 0,
+            last_sent_at: std::collections::HashMap::new(),
+        }
+    }
+
+    fn allows(
+        &mut self,
+        subscription: &LiveSubscription,
+        event_type: &str,
+        pane_index: Option<u32>,
+        approx_bytes: usize,
+    ) -> bool {
+        if self.window_started.elapsed() >= Duration::from_secs(1) {
+            self.window_started = Instant::now();
+            self.sent_events = 0;
+            self.sent_bytes = 0;
+        }
+
+        if subscription.coalesce_ms > 0 {
+            let key = (event_type.to_string(), pane_index);
+            if let Some(last) = self.last_sent_at.get(&key)
+                && last.elapsed() < Duration::from_millis(subscription.coalesce_ms)
+            {
+                return false;
+            }
+            self.last_sent_at.insert(key, Instant::now());
+        }
+
+        if let Some(max_events) = subscription.max_events_per_sec
+            && self.sent_events >= max_events
+        {
+            return false;
+        }
+        if let Some(max_bytes) = subscription.max_bytes_per_sec
+            && self.sent_bytes.saturating_add(approx_bytes) > max_bytes
+        {
+            return false;
+        }
+
+        self.sent_events = self.sent_events.saturating_add(1);
+        self.sent_bytes = self.sent_bytes.saturating_add(approx_bytes);
+        true
     }
 }
 
@@ -627,10 +840,15 @@ async fn run_repl(
 
     // Channel for push output events (populated when subscribed).
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<(u32, String)>(64);
+    let (server_event_tx, mut server_event_rx) =
+        tokio::sync::mpsc::channel::<bmux_client::ServerEvent>(64);
     let mut output_task: Option<tokio::task::JoinHandle<()>> = None;
+    let mut server_event_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut subscription = LiveSubscription::default();
     let mut pane_cache = std::collections::HashMap::<u32, PaneCapture>::new();
     let mut sequencer = MessageSequencer::new();
+    let mut event_buffer = EventBuffer::with_capacity(10_000);
+    let mut budget_state = EventBudgetState::new();
     let mut watchpoints = WatchpointRegistry::default();
 
     loop {
@@ -653,9 +871,17 @@ async fn run_repl(
                 if subscription.wants("pane_output") && subscription.allows_pane(pane_idx) {
                     let mut push = InteractiveResponse::push_output(pane_idx, data.clone());
                     push.event_type = Some("pane_output".to_string());
-                    output_seq = Some(
-                        send_response(&mut writer, &mut sequencer, push, "event", None).await?,
-                    );
+                    output_seq = send_event_if_allowed(
+                        &mut writer,
+                        &mut sequencer,
+                        &mut event_buffer,
+                        &subscription,
+                        &mut budget_state,
+                        push,
+                        "pane_output",
+                        Some(pane_idx),
+                    )
+                    .await?;
                 }
                 if subscription.wants("watchpoint_hit")
                     && !watchpoints.is_empty()
@@ -676,6 +902,8 @@ async fn run_repl(
                 emit_screen_events(
                     &mut writer,
                     &mut sequencer,
+                    &mut event_buffer,
+                    &mut budget_state,
                     client,
                     inspector,
                     session_id,
@@ -685,6 +913,50 @@ async fn run_repl(
                     &mut watchpoints,
                 )
                 .await?;
+            }
+            while let Ok(event) = server_event_rx.try_recv() {
+                let mut event_seq = None;
+                if subscription.wants("server_event") {
+                    let payload = ServerEventPayload {
+                        name: server_event_name(&event).to_string(),
+                        payload: serde_json::to_value(&event)?,
+                    };
+                    let response = InteractiveResponse::event_server_event(payload);
+                    event_seq = send_event_if_allowed(
+                        &mut writer,
+                        &mut sequencer,
+                        &mut event_buffer,
+                        &subscription,
+                        &mut budget_state,
+                        response,
+                        "server_event",
+                        None,
+                    )
+                    .await?;
+                }
+                if subscription.wants("watchpoint_hit") && !watchpoints.is_empty() {
+                    for hit in evaluate_watchpoints(
+                        &mut watchpoints,
+                        "server_event",
+                        None,
+                        event_seq,
+                        None,
+                        Some(server_event_name(&event)),
+                    ) {
+                        let response = InteractiveResponse::event_watchpoint_hit(hit);
+                        let _ = send_event_if_allowed(
+                            &mut writer,
+                            &mut sequencer,
+                            &mut event_buffer,
+                            &subscription,
+                            &mut budget_state,
+                            response,
+                            "watchpoint_hit",
+                            None,
+                        )
+                        .await?;
+                    }
+                }
             }
         }
 
@@ -715,7 +987,7 @@ async fn run_repl(
         if trimmed.is_empty() {
             continue;
         }
-        let mut active_request_id: Option<String> = None;
+        let active_request_id: Option<String>;
 
         // Drain push events that arrived during the command read.
         if subscription.active {
@@ -724,9 +996,17 @@ async fn run_repl(
                 if subscription.wants("pane_output") && subscription.allows_pane(pane_idx) {
                     let mut push = InteractiveResponse::push_output(pane_idx, data.clone());
                     push.event_type = Some("pane_output".to_string());
-                    output_seq = Some(
-                        send_response(&mut writer, &mut sequencer, push, "event", None).await?,
-                    );
+                    output_seq = send_event_if_allowed(
+                        &mut writer,
+                        &mut sequencer,
+                        &mut event_buffer,
+                        &subscription,
+                        &mut budget_state,
+                        push,
+                        "pane_output",
+                        Some(pane_idx),
+                    )
+                    .await?;
                 }
                 if subscription.wants("watchpoint_hit")
                     && !watchpoints.is_empty()
@@ -747,6 +1027,8 @@ async fn run_repl(
                 emit_screen_events(
                     &mut writer,
                     &mut sequencer,
+                    &mut event_buffer,
+                    &mut budget_state,
                     client,
                     inspector,
                     session_id,
@@ -756,6 +1038,50 @@ async fn run_repl(
                     &mut watchpoints,
                 )
                 .await?;
+            }
+            while let Ok(event) = server_event_rx.try_recv() {
+                let mut event_seq = None;
+                if subscription.wants("server_event") {
+                    let payload = ServerEventPayload {
+                        name: server_event_name(&event).to_string(),
+                        payload: serde_json::to_value(&event)?,
+                    };
+                    let response = InteractiveResponse::event_server_event(payload);
+                    event_seq = send_event_if_allowed(
+                        &mut writer,
+                        &mut sequencer,
+                        &mut event_buffer,
+                        &subscription,
+                        &mut budget_state,
+                        response,
+                        "server_event",
+                        None,
+                    )
+                    .await?;
+                }
+                if subscription.wants("watchpoint_hit") && !watchpoints.is_empty() {
+                    for hit in evaluate_watchpoints(
+                        &mut watchpoints,
+                        "server_event",
+                        None,
+                        event_seq,
+                        None,
+                        Some(server_event_name(&event)),
+                    ) {
+                        let response = InteractiveResponse::event_watchpoint_hit(hit);
+                        let _ = send_event_if_allowed(
+                            &mut writer,
+                            &mut sequencer,
+                            &mut event_buffer,
+                            &subscription,
+                            &mut budget_state,
+                            response,
+                            "watchpoint_hit",
+                            None,
+                        )
+                        .await?;
+                    }
+                }
             }
         }
 
@@ -795,13 +1121,16 @@ async fn run_repl(
                     json,
                     &mut writer,
                     &mut sequencer,
+                    &mut event_buffer,
                     client,
                     inspector,
                     session_id,
                     attached,
                     &mut subscription,
                     &mut output_task,
+                    &mut server_event_task,
                     &output_tx,
+                    &server_event_tx,
                     &mut pane_cache,
                     sandbox,
                     &mut watchpoints,
@@ -812,6 +1141,22 @@ async fn run_repl(
                 }
                 continue;
             }
+        } else {
+            let mut resp = InteractiveResponse::error(
+                "interactive v2 requires JSON operations; plain DSL lines are unsupported"
+                    .to_string(),
+            );
+            resp.code = Some("invalid_op".to_string());
+            send_response_buffered(
+                &mut writer,
+                &mut sequencer,
+                &mut event_buffer,
+                resp,
+                "error",
+                None,
+            )
+            .await?;
+            continue;
         }
 
         // Handle special commands.
@@ -996,6 +1341,94 @@ async fn run_repl(
         };
         *step_counter += 1;
 
+        if subscription.active && subscription.wants("request_lifecycle") {
+            let lifecycle = RequestLifecycleEvent {
+                phase: "start",
+                request_kind: action_name.clone(),
+                elapsed_ms: None,
+                error: None,
+            };
+            let response = InteractiveResponse::event_request_lifecycle(lifecycle);
+            let lifecycle_seq = send_event_if_allowed(
+                &mut writer,
+                &mut sequencer,
+                &mut event_buffer,
+                &subscription,
+                &mut budget_state,
+                response,
+                "request_lifecycle",
+                None,
+            )
+            .await?;
+            if subscription.wants("watchpoint_hit") && !watchpoints.is_empty() {
+                for hit in evaluate_watchpoints(
+                    &mut watchpoints,
+                    "request_lifecycle",
+                    None,
+                    lifecycle_seq,
+                    None,
+                    Some("start"),
+                ) {
+                    let response = InteractiveResponse::event_watchpoint_hit(hit);
+                    let _ = send_event_if_allowed(
+                        &mut writer,
+                        &mut sequencer,
+                        &mut event_buffer,
+                        &subscription,
+                        &mut budget_state,
+                        response,
+                        "watchpoint_hit",
+                        None,
+                    )
+                    .await?;
+                }
+            }
+        }
+
+        if let Some(input_event) = pane_input_from_action(&step.action) {
+            let mut event_seq = None;
+            if subscription.active && subscription.wants("pane_input") {
+                let response = InteractiveResponse::event_pane_input(input_event.clone());
+                event_seq = send_event_if_allowed(
+                    &mut writer,
+                    &mut sequencer,
+                    &mut event_buffer,
+                    &subscription,
+                    &mut budget_state,
+                    response,
+                    "pane_input",
+                    input_event.pane_index,
+                )
+                .await?;
+            }
+            if subscription.active
+                && subscription.wants("watchpoint_hit")
+                && !watchpoints.is_empty()
+            {
+                for hit in evaluate_watchpoints(
+                    &mut watchpoints,
+                    "pane_input",
+                    input_event.pane_index,
+                    event_seq,
+                    None,
+                    Some(&input_event.printable_preview),
+                ) {
+                    let response = InteractiveResponse::event_watchpoint_hit(hit);
+                    let _ = send_event_if_allowed(
+                        &mut writer,
+                        &mut sequencer,
+                        &mut event_buffer,
+                        &subscription,
+                        &mut budget_state,
+                        response,
+                        "watchpoint_hit",
+                        input_event.pane_index,
+                    )
+                    .await?;
+                }
+            }
+        }
+
         // Use a far-future deadline for individual steps if no session timeout.
         let step_deadline = deadline.unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
 
@@ -1051,9 +1484,54 @@ async fn run_repl(
                     active_request_id.as_deref(),
                 )
                 .await?;
+                if subscription.active && subscription.wants("request_lifecycle") {
+                    let lifecycle = RequestLifecycleEvent {
+                        phase: "done",
+                        request_kind: action_name.clone(),
+                        elapsed_ms: Some(elapsed_ms),
+                        error: None,
+                    };
+                    let response = InteractiveResponse::event_request_lifecycle(lifecycle);
+                    let lifecycle_seq = send_event_if_allowed(
+                        &mut writer,
+                        &mut sequencer,
+                        &mut event_buffer,
+                        &subscription,
+                        &mut budget_state,
+                        response,
+                        "request_lifecycle",
+                        None,
+                    )
+                    .await?;
+                    if subscription.wants("watchpoint_hit") && !watchpoints.is_empty() {
+                        for hit in evaluate_watchpoints(
+                            &mut watchpoints,
+                            "request_lifecycle",
+                            None,
+                            lifecycle_seq,
+                            None,
+                            Some("done"),
+                        ) {
+                            let response = InteractiveResponse::event_watchpoint_hit(hit);
+                            let _ = send_event_if_allowed(
+                                &mut writer,
+                                &mut sequencer,
+                                &mut event_buffer,
+                                &subscription,
+                                &mut budget_state,
+                                response,
+                                "watchpoint_hit",
+                                None,
+                            )
+                            .await?;
+                        }
+                    }
+                }
                 emit_screen_events(
                     &mut writer,
                     &mut sequencer,
+                    &mut event_buffer,
+                    &mut budget_state,
                     client,
                     inspector,
                     session_id,
@@ -1096,9 +1574,54 @@ async fn run_repl(
                     active_request_id.as_deref(),
                 )
                 .await?;
+                if subscription.active && subscription.wants("request_lifecycle") {
+                    let lifecycle = RequestLifecycleEvent {
+                        phase: "error",
+                        request_kind: action_name.clone(),
+                        elapsed_ms: Some(elapsed_ms),
+                        error: Some(err.to_string()),
+                    };
+                    let response = InteractiveResponse::event_request_lifecycle(lifecycle);
+                    let lifecycle_seq = send_event_if_allowed(
+                        &mut writer,
+                        &mut sequencer,
+                        &mut event_buffer,
+                        &subscription,
+                        &mut budget_state,
+                        response,
+                        "request_lifecycle",
+                        None,
+                    )
+                    .await?;
+                    if subscription.wants("watchpoint_hit") && !watchpoints.is_empty() {
+                        for hit in evaluate_watchpoints(
+                            &mut watchpoints,
+                            "request_lifecycle",
+                            None,
+                            lifecycle_seq,
+                            None,
+                            Some("error"),
+                        ) {
+                            let response = InteractiveResponse::event_watchpoint_hit(hit);
+                            let _ = send_event_if_allowed(
+                                &mut writer,
+                                &mut sequencer,
+                                &mut event_buffer,
+                                &subscription,
+                                &mut budget_state,
+                                response,
+                                "watchpoint_hit",
+                                None,
+                            )
+                            .await?;
+                        }
+                    }
+                }
                 emit_screen_events(
                     &mut writer,
                     &mut sequencer,
+                    &mut event_buffer,
+                    &mut budget_state,
                     client,
                     inspector,
                     session_id,
@@ -1115,6 +1638,9 @@ async fn run_repl(
 
     // Clean up the output polling task if still running.
     if let Some(task) = output_task.take() {
+        task.abort();
+    }
+    if let Some(task) = server_event_task.take() {
         task.abort();
     }
 
@@ -1202,10 +1728,48 @@ async fn send_response<W: tokio::io::AsyncWrite + Unpin>(
     mut response: InteractiveResponse,
     message_type: &str,
     request_id: Option<&str>,
-) -> Result<u64> {
+) -> Result<StoredMessage> {
     let seq = sequencer.stamp(&mut response, message_type, request_id);
+    let payload = serde_json::to_value(&response)?;
     write_response(writer, &response).await?;
+    Ok(StoredMessage {
+        seq,
+        event_type: response.event_type.clone(),
+        payload,
+    })
+}
+
+async fn send_response_buffered<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    sequencer: &mut MessageSequencer,
+    event_buffer: &mut EventBuffer,
+    response: InteractiveResponse,
+    message_type: &str,
+    request_id: Option<&str>,
+) -> Result<u64> {
+    let stored = send_response(writer, sequencer, response, message_type, request_id).await?;
+    let seq = stored.seq;
+    event_buffer.push(stored);
     Ok(seq)
+}
+
+async fn send_event_if_allowed<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    sequencer: &mut MessageSequencer,
+    event_buffer: &mut EventBuffer,
+    subscription: &LiveSubscription,
+    budget_state: &mut EventBudgetState,
+    response: InteractiveResponse,
+    event_type: &str,
+    pane_index: Option<u32>,
+) -> Result<Option<u64>> {
+    let approx_bytes = serde_json::to_vec(&response)?.len();
+    if !budget_state.allows(subscription, event_type, pane_index, approx_bytes) {
+        return Ok(None);
+    }
+    let seq =
+        send_response_buffered(writer, sequencer, event_buffer, response, "event", None).await?;
+    Ok(Some(seq))
 }
 
 fn update_pane_cache_from_inspector(
@@ -1221,6 +1785,8 @@ fn update_pane_cache_from_inspector(
 async fn emit_screen_events<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     sequencer: &mut MessageSequencer,
+    event_buffer: &mut EventBuffer,
+    budget_state: &mut EventBudgetState,
     client: &mut bmux_client::BmuxClient,
     inspector: &mut ScreenInspector,
     session_id: &Option<Uuid>,
@@ -1267,8 +1833,17 @@ async fn emit_screen_events<W: tokio::io::AsyncWrite + Unpin>(
                     distance: cursor.distance,
                 };
                 let response = InteractiveResponse::event_cursor_delta(event);
-                cursor_event_seq =
-                    Some(send_response(writer, sequencer, response, "event", None).await?);
+                cursor_event_seq = send_event_if_allowed(
+                    writer,
+                    sequencer,
+                    event_buffer,
+                    subscription,
+                    budget_state,
+                    response,
+                    "cursor_delta",
+                    Some(delta.pane.index),
+                )
+                .await?;
             }
             if subscription.wants("watchpoint_hit") && !watchpoints.is_empty() {
                 for hit in evaluate_watchpoints(
@@ -1280,7 +1855,17 @@ async fn emit_screen_events<W: tokio::io::AsyncWrite + Unpin>(
                     None,
                 ) {
                     let response = InteractiveResponse::event_watchpoint_hit(hit);
-                    send_response(writer, sequencer, response, "event", None).await?;
+                    let _ = send_event_if_allowed(
+                        writer,
+                        sequencer,
+                        event_buffer,
+                        subscription,
+                        budget_state,
+                        response,
+                        "watchpoint_hit",
+                        Some(delta.pane.index),
+                    )
+                    .await?;
                 }
             }
         }
@@ -1288,8 +1873,17 @@ async fn emit_screen_events<W: tokio::io::AsyncWrite + Unpin>(
             let mut screen_delta_seq = None;
             if subscription.wants("screen_delta") {
                 let response = InteractiveResponse::event_screen_delta(screen_delta.clone());
-                screen_delta_seq =
-                    Some(send_response(writer, sequencer, response, "event", None).await?);
+                screen_delta_seq = send_event_if_allowed(
+                    writer,
+                    sequencer,
+                    event_buffer,
+                    subscription,
+                    budget_state,
+                    response,
+                    "screen_delta",
+                    Some(delta.pane.index),
+                )
+                .await?;
             }
             if subscription.wants("watchpoint_hit") && !watchpoints.is_empty() {
                 for hit in evaluate_watchpoints(
@@ -1301,7 +1895,17 @@ async fn emit_screen_events<W: tokio::io::AsyncWrite + Unpin>(
                     None,
                 ) {
                     let response = InteractiveResponse::event_watchpoint_hit(hit);
-                    send_response(writer, sequencer, response, "event", None).await?;
+                    let _ = send_event_if_allowed(
+                        writer,
+                        sequencer,
+                        event_buffer,
+                        subscription,
+                        budget_state,
+                        response,
+                        "watchpoint_hit",
+                        Some(delta.pane.index),
+                    )
+                    .await?;
                 }
             }
         }
@@ -1318,13 +1922,16 @@ async fn handle_json_command<W: tokio::io::AsyncWrite + Unpin>(
     json: InteractiveJsonRequest,
     writer: &mut W,
     sequencer: &mut MessageSequencer,
+    event_buffer: &mut EventBuffer,
     client: &mut bmux_client::BmuxClient,
     inspector: &mut ScreenInspector,
     session_id: &mut Option<Uuid>,
     attached: &mut bool,
     subscription: &mut LiveSubscription,
     output_task: &mut Option<tokio::task::JoinHandle<()>>,
+    server_event_task: &mut Option<tokio::task::JoinHandle<()>>,
     output_tx: &tokio::sync::mpsc::Sender<(u32, String)>,
+    server_event_tx: &tokio::sync::mpsc::Sender<bmux_client::ServerEvent>,
     pane_cache: &mut std::collections::HashMap<u32, PaneCapture>,
     sandbox: &super::sandbox::SandboxServer,
     watchpoints: &mut WatchpointRegistry,
@@ -1395,13 +2002,58 @@ async fn handle_json_command<W: tokio::io::AsyncWrite + Unpin>(
                     }
                 }
             }
+            if server_event_task.is_none() {
+                match sandbox.connect("bmux-playbook-event-stream").await {
+                    Ok(mut event_client) => {
+                        if let Err(error) = event_client.subscribe_events().await {
+                            let mut resp = InteractiveResponse::error(format!(
+                                "server event subscribe failed: {error:#}"
+                            ));
+                            resp.code = Some("internal".to_string());
+                            send_response_buffered(
+                                writer,
+                                sequencer,
+                                event_buffer,
+                                resp,
+                                "error",
+                                json.request_id.as_deref(),
+                            )
+                            .await?;
+                            return Ok(true);
+                        }
+                        let tx = server_event_tx.clone();
+                        *server_event_task = Some(tokio::spawn(async move {
+                            server_event_poll_loop(&mut event_client, tx).await;
+                        }));
+                    }
+                    Err(error) => {
+                        let mut resp = InteractiveResponse::error(format!(
+                            "server event stream connection failed: {error:#}"
+                        ));
+                        resp.code = Some("internal".to_string());
+                        send_response_buffered(
+                            writer,
+                            sequencer,
+                            event_buffer,
+                            resp,
+                            "error",
+                            json.request_id.as_deref(),
+                        )
+                        .await?;
+                        return Ok(true);
+                    }
+                }
+            }
 
             subscription.active = true;
             subscription.event_types = if json.event_types.is_empty() {
                 [
                     "pane_output".to_string(),
+                    "pane_input".to_string(),
                     "cursor_delta".to_string(),
                     "screen_delta".to_string(),
+                    "server_event".to_string(),
+                    "request_lifecycle".to_string(),
                     "watchpoint_hit".to_string(),
                 ]
                 .into_iter()
@@ -1417,6 +2069,9 @@ async fn handle_json_command<W: tokio::io::AsyncWrite + Unpin>(
             } else {
                 Some(json.pane_indexes.into_iter().collect())
             };
+            subscription.max_events_per_sec = json.max_events_per_sec.or(Some(500));
+            subscription.max_bytes_per_sec = json.max_bytes_per_sec.or(Some(256 * 1024));
+            subscription.coalesce_ms = json.coalesce_ms.unwrap_or(0);
             subscription.format_preference =
                 match parse_delta_preference(json.screen_delta_format.as_deref()) {
                     Ok(value) => value,
@@ -1449,9 +2104,10 @@ async fn handle_json_command<W: tokio::io::AsyncWrite + Unpin>(
                     .join(","),
                 subscription.resolved_delta_format()
             ));
-            send_response(
+            send_response_buffered(
                 writer,
                 sequencer,
+                event_buffer,
                 resp,
                 "response",
                 json.request_id.as_deref(),
@@ -1463,11 +2119,15 @@ async fn handle_json_command<W: tokio::io::AsyncWrite + Unpin>(
             if let Some(task) = output_task.take() {
                 task.abort();
             }
+            if let Some(task) = server_event_task.take() {
+                task.abort();
+            }
             subscription.active = false;
             let resp = InteractiveResponse::ok("unsubscribe");
-            send_response(
+            send_response_buffered(
                 writer,
                 sequencer,
+                event_buffer,
                 resp,
                 "response",
                 json.request_id.as_deref(),
@@ -1500,10 +2160,15 @@ async fn handle_json_command<W: tokio::io::AsyncWrite + Unpin>(
             };
             if !matches!(
                 event_type.as_str(),
-                "pane_output" | "cursor_delta" | "screen_delta"
+                "pane_output"
+                    | "pane_input"
+                    | "cursor_delta"
+                    | "screen_delta"
+                    | "server_event"
+                    | "request_lifecycle"
             ) {
                 let mut resp = InteractiveResponse::error(format!(
-                    "unsupported event_type '{event_type}'; supported: pane_output,cursor_delta,screen_delta"
+                    "unsupported event_type '{event_type}'; supported: pane_output,pane_input,cursor_delta,screen_delta,server_event,request_lifecycle"
                 ));
                 resp.code = Some("invalid_op".to_string());
                 send_response(writer, sequencer, resp, "error", json.request_id.as_deref()).await?;
@@ -1596,10 +2261,62 @@ async fn handle_json_command<W: tokio::io::AsyncWrite + Unpin>(
             Ok(true)
         }
         "hydrate" => {
+            if json.kind.as_deref() == Some("event_window") {
+                let start = json.start_seq.unwrap_or(1);
+                let end = json.end_seq.unwrap_or_else(|| event_buffer.latest_seq());
+                let mut resp = InteractiveResponse::ok("hydrate");
+                resp.detail = Some(format!("kind=event_window start_seq={start} end_seq={end}"));
+                resp.event_window = Some(event_buffer.window(start, end));
+                send_response_buffered(
+                    writer,
+                    sequencer,
+                    event_buffer,
+                    resp,
+                    "response",
+                    json.request_id.as_deref(),
+                )
+                .await?;
+                return Ok(true);
+            }
+            if json.kind.as_deref() == Some("incident") {
+                let center_seq = json
+                    .around_seq
+                    .or_else(|| {
+                        json.id
+                            .as_ref()
+                            .and_then(|id| event_buffer.last_watchpoint_hit_seq.get(id).copied())
+                    })
+                    .unwrap_or_else(|| event_buffer.latest_seq());
+                let radius = json.window_radius.unwrap_or(50);
+                let mut resp = InteractiveResponse::ok("hydrate");
+                resp.detail = Some(format!(
+                    "kind=incident center_seq={center_seq} radius={radius}"
+                ));
+                resp.event_window = Some(event_buffer.around(center_seq, radius));
+                send_response_buffered(
+                    writer,
+                    sequencer,
+                    event_buffer,
+                    resp,
+                    "response",
+                    json.request_id.as_deref(),
+                )
+                .await?;
+                return Ok(true);
+            }
+
             if json.kind.as_deref() != Some("screen_full") {
                 let mut resp = InteractiveResponse::error("unsupported hydrate kind".to_string());
                 resp.code = Some("invalid_op".to_string());
-                send_response(writer, sequencer, resp, "error", json.request_id.as_deref()).await?;
+                send_response_buffered(
+                    writer,
+                    sequencer,
+                    event_buffer,
+                    resp,
+                    "error",
+                    json.request_id.as_deref(),
+                )
+                .await?;
                 return Ok(true);
             }
             let resp = handle_screen_command(client, inspector, session_id, attached).await;
@@ -1616,9 +2333,10 @@ async fn handle_json_command<W: tokio::io::AsyncWrite + Unpin>(
             } else {
                 resp
             };
-            send_response(
+            send_response_buffered(
                 writer,
                 sequencer,
+                event_buffer,
                 response,
                 "response",
                 json.request_id.as_deref(),
@@ -1777,6 +2495,43 @@ fn evaluate_watchpoints(
     hits
 }
 
+fn pane_input_from_action(action: &super::types::Action) -> Option<PaneInputEvent> {
+    match action {
+        super::types::Action::SendKeys { keys, pane } => Some(PaneInputEvent {
+            pane_index: *pane,
+            byte_len: keys.len(),
+            printable_preview: String::from_utf8_lossy(keys).to_string(),
+        }),
+        super::types::Action::SendBytes { hex } => Some(PaneInputEvent {
+            pane_index: None,
+            byte_len: hex.len(),
+            printable_preview: String::from_utf8_lossy(hex).to_string(),
+        }),
+        super::types::Action::PrefixKey { key } => Some(PaneInputEvent {
+            pane_index: None,
+            byte_len: 2,
+            printable_preview: format!("<prefix>{key}"),
+        }),
+        _ => None,
+    }
+}
+
+fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
+    match event {
+        bmux_client::ServerEvent::ServerStarted => "server_started",
+        bmux_client::ServerEvent::ServerStopping => "server_stopping",
+        bmux_client::ServerEvent::SessionCreated { .. } => "session_created",
+        bmux_client::ServerEvent::SessionRemoved { .. } => "session_removed",
+        bmux_client::ServerEvent::ClientAttached { .. } => "client_attached",
+        bmux_client::ServerEvent::ClientDetached { .. } => "client_detached",
+        bmux_client::ServerEvent::FollowStarted { .. } => "follow_started",
+        bmux_client::ServerEvent::FollowStopped { .. } => "follow_stopped",
+        bmux_client::ServerEvent::FollowTargetGone { .. } => "follow_target_gone",
+        bmux_client::ServerEvent::FollowTargetChanged { .. } => "follow_target_changed",
+        bmux_client::ServerEvent::AttachViewChanged { .. } => "attach_view_changed",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1901,6 +2656,31 @@ async fn output_poll_loop(
             Err(e) => {
                 warn!("output poll error: {e}");
                 break;
+            }
+        }
+    }
+}
+
+async fn server_event_poll_loop(
+    client: &mut bmux_client::BmuxClient,
+    tx: tokio::sync::mpsc::Sender<bmux_client::ServerEvent>,
+) {
+    const POLL_INTERVAL: Duration = Duration::from_millis(50);
+    loop {
+        match client.poll_events(64).await {
+            Ok(events) if !events.is_empty() => {
+                for event in events {
+                    if tx.send(event).await.is_err() {
+                        return;
+                    }
+                }
+            }
+            Ok(_) => {
+                tokio::time::sleep(POLL_INTERVAL).await;
+            }
+            Err(error) => {
+                warn!("server event poll error: {error}");
+                return;
             }
         }
     }
