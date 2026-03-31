@@ -190,3 +190,76 @@ pub(super) fn parse_pid_content(content: &str) -> Option<u32> {
     }
     trimmed.parse::<u32>().ok().filter(|pid| *pid > 0)
 }
+#[cfg(test)]
+mod tests {
+    use crate::input::InputProcessor;
+    use crate::runtime::attach::state::AttachViewState;
+    use crate::runtime::*;
+    use bmux_cli_schema::{Cli, Command};
+    use bmux_client::{AttachLayoutState, AttachOpenInfo, ClientError};
+    use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout};
+    use bmux_ipc::transport::IpcTransportError;
+    use bmux_ipc::{
+        AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
+        AttachViewComponent, ErrorCode, PaneLayoutNode, PaneSummary, RecordingSummary,
+        SessionSummary,
+    };
+    use bmux_plugin::{PluginManifest, PluginRegistry};
+    use bmux_plugin_sdk::PluginCommandEffect;
+    use crossterm::event::{
+        Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
+        KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    };
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use uuid::Uuid;
+
+    #[test]
+    fn describe_timeout_formats_resolved_timeout_states() {
+        assert_eq!(
+            crate::runtime::describe_timeout(&ResolvedTimeout::Indefinite),
+            "indefinite"
+        );
+        assert_eq!(
+            crate::runtime::describe_timeout(&ResolvedTimeout::Exact(275)),
+            "exact (275ms)"
+        );
+        assert_eq!(
+            crate::runtime::describe_timeout(&ResolvedTimeout::Profile {
+                name: "traditional".to_string(),
+                ms: 450,
+            }),
+            "profile:traditional (450ms)"
+        );
+    }
+
+    #[test]
+    fn parse_pid_content_accepts_positive_pid() {
+        assert_eq!(parse_pid_content("123\n"), Some(123));
+    }
+
+    #[test]
+    fn parse_pid_content_rejects_invalid_values() {
+        assert_eq!(parse_pid_content(""), None);
+        assert_eq!(parse_pid_content("0"), None);
+        assert_eq!(parse_pid_content("abc"), None);
+    }
+
+    #[test]
+    fn server_event_name_maps_known_variants() {
+        assert_eq!(
+            crate::runtime::server_event_name(&bmux_client::ServerEvent::ServerStarted),
+            "server_started"
+        );
+        assert_eq!(
+            crate::runtime::server_event_name(&bmux_client::ServerEvent::ClientDetached {
+                id: uuid::Uuid::new_v4()
+            }),
+            "client_detached"
+        );
+    }
+}

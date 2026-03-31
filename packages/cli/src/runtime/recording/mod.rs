@@ -3350,4 +3350,233 @@ mod tests {
         assert!(matches!(state.shape, CursorVisualShape::Underline));
         assert!(state.blink_enabled);
     }
+
+    fn temp_dir() -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should be monotonic for test")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("bmux-cli-plugin-test-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        dir
+    }
+
+    use crate::input::InputProcessor;
+    use crate::runtime::attach::state::AttachViewState;
+    use crate::runtime::recording::{
+        confirm_delete_all_recordings, delete_all_recordings_from_dir, delete_recording_dir_at,
+        list_recordings_from_dir, offline_recording_status, resolve_recording_id_prefix,
+    };
+    use crate::runtime::*;
+    use bmux_cli_schema::{Cli, Command};
+    use bmux_client::{AttachLayoutState, AttachOpenInfo, ClientError};
+    use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout};
+    use bmux_ipc::transport::IpcTransportError;
+    use bmux_ipc::{
+        AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
+        AttachViewComponent, ErrorCode, PaneLayoutNode, PaneSummary, RecordingSummary,
+        SessionSummary,
+    };
+    use bmux_plugin::{PluginManifest, PluginRegistry};
+    use bmux_plugin_sdk::PluginCommandEffect;
+    use crossterm::event::{
+        Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
+        KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    };
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use uuid::Uuid;
+
+    #[test]
+    fn list_recordings_from_dir_returns_empty_when_missing() {
+        let missing_dir = temp_dir().join("does-not-exist");
+        let recordings = list_recordings_from_dir(&missing_dir).expect("listing should succeed");
+        assert!(recordings.is_empty());
+    }
+
+    #[test]
+    fn list_recordings_from_dir_reads_and_sorts_manifests() {
+        let root = temp_dir();
+        let newer_id = Uuid::new_v4();
+        let older_id = Uuid::new_v4();
+        let newer_dir = root.join(newer_id.to_string());
+        let older_dir = root.join(older_id.to_string());
+        fs::create_dir_all(&newer_dir).expect("newer recording dir should exist");
+        fs::create_dir_all(&older_dir).expect("older recording dir should exist");
+
+        let newer_manifest = serde_json::json!({
+            "summary": {
+                "id": newer_id,
+                "session_id": serde_json::Value::Null,
+                "capture_input": true,
+                "started_epoch_ms": 200,
+                "ended_epoch_ms": serde_json::Value::Null,
+                "event_count": 12,
+                "payload_bytes": 1024,
+                "path": newer_dir.to_string_lossy().to_string()
+            }
+        });
+        let older_manifest = serde_json::json!({
+            "summary": {
+                "id": older_id,
+                "session_id": serde_json::Value::Null,
+                "capture_input": false,
+                "started_epoch_ms": 100,
+                "ended_epoch_ms": 150,
+                "event_count": 4,
+                "payload_bytes": 128,
+                "path": older_dir.to_string_lossy().to_string()
+            }
+        });
+
+        fs::write(
+            newer_dir.join("manifest.json"),
+            serde_json::to_vec(&newer_manifest).expect("newer manifest should encode"),
+        )
+        .expect("newer manifest should write");
+        fs::write(
+            older_dir.join("manifest.json"),
+            serde_json::to_vec(&older_manifest).expect("older manifest should encode"),
+        )
+        .expect("older manifest should write");
+
+        let recordings = list_recordings_from_dir(&root).expect("listing should succeed");
+        assert_eq!(recordings.len(), 2);
+        assert_eq!(recordings[0].id, newer_id);
+        assert_eq!(recordings[1].id, older_id);
+    }
+
+    #[test]
+    fn offline_recording_status_reports_no_active_recording() {
+        let status = offline_recording_status();
+        assert!(status.active.is_none());
+        assert_eq!(status.queue_len, 0);
+    }
+
+    #[test]
+    fn resolve_recording_id_prefix_prefers_exact_match() {
+        let exact = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
+            .expect("exact uuid should parse");
+        let other = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001")
+            .expect("other uuid should parse");
+        let recordings = vec![
+            RecordingSummary {
+                id: other,
+                format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+                session_id: None,
+                capture_input: true,
+                profile: bmux_ipc::RecordingProfile::Functional,
+                event_kinds: vec![bmux_ipc::RecordingEventKind::PaneOutputRaw],
+                started_epoch_ms: 1,
+                ended_epoch_ms: Some(2),
+                event_count: 0,
+                payload_bytes: 0,
+                path: "/tmp/other".to_string(),
+                segments: vec!["events_0.bin".to_string()],
+                total_segment_bytes: 0,
+            },
+            RecordingSummary {
+                id: exact,
+                format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+                session_id: None,
+                capture_input: true,
+                profile: bmux_ipc::RecordingProfile::Functional,
+                event_kinds: vec![bmux_ipc::RecordingEventKind::PaneOutputRaw],
+                started_epoch_ms: 3,
+                ended_epoch_ms: Some(4),
+                event_count: 0,
+                payload_bytes: 0,
+                path: "/tmp/exact".to_string(),
+                segments: vec!["events_0.bin".to_string()],
+                total_segment_bytes: 0,
+            },
+        ];
+
+        let resolved =
+            resolve_recording_id_prefix("550e8400-e29b-41d4-a716-446655440000", &recordings)
+                .expect("exact id should resolve");
+        assert_eq!(resolved, exact);
+    }
+
+    #[test]
+    fn resolve_recording_id_prefix_rejects_ambiguous_prefix() {
+        let first = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
+            .expect("first uuid should parse");
+        let second = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001")
+            .expect("second uuid should parse");
+        let recordings = vec![
+            RecordingSummary {
+                id: first,
+                format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+                session_id: None,
+                capture_input: true,
+                profile: bmux_ipc::RecordingProfile::Functional,
+                event_kinds: vec![bmux_ipc::RecordingEventKind::PaneOutputRaw],
+                started_epoch_ms: 1,
+                ended_epoch_ms: None,
+                event_count: 0,
+                payload_bytes: 0,
+                path: "/tmp/first".to_string(),
+                segments: vec!["events_0.bin".to_string()],
+                total_segment_bytes: 0,
+            },
+            RecordingSummary {
+                id: second,
+                format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+                session_id: None,
+                capture_input: true,
+                profile: bmux_ipc::RecordingProfile::Functional,
+                event_kinds: vec![bmux_ipc::RecordingEventKind::PaneOutputRaw],
+                started_epoch_ms: 2,
+                ended_epoch_ms: None,
+                event_count: 0,
+                payload_bytes: 0,
+                path: "/tmp/second".to_string(),
+                segments: vec!["events_0.bin".to_string()],
+                total_segment_bytes: 0,
+            },
+        ];
+
+        let error = resolve_recording_id_prefix("550e8400", &recordings)
+            .expect_err("ambiguous prefix should fail");
+        assert!(error.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn delete_recording_helpers_remove_manifest_directories() {
+        let root = temp_dir();
+        let first = Uuid::new_v4();
+        let second = Uuid::new_v4();
+        fs::create_dir_all(root.join(first.to_string())).expect("first dir should exist");
+        fs::create_dir_all(root.join(second.to_string())).expect("second dir should exist");
+        fs::write(
+                root.join(first.to_string()).join("manifest.json"),
+                br#"{"summary":{"id":"00000000-0000-0000-0000-000000000000","session_id":null,"capture_input":true,"started_epoch_ms":1,"ended_epoch_ms":null,"event_count":0,"payload_bytes":0,"path":"x"}}"#,
+            )
+            .expect("first manifest should write");
+        fs::write(
+                root.join(second.to_string()).join("manifest.json"),
+                br#"{"summary":{"id":"00000000-0000-0000-0000-000000000000","session_id":null,"capture_input":true,"started_epoch_ms":1,"ended_epoch_ms":null,"event_count":0,"payload_bytes":0,"path":"x"}}"#,
+            )
+            .expect("second manifest should write");
+
+        delete_recording_dir_at(&root, first).expect("single delete should succeed");
+        assert!(!root.join(first.to_string()).exists());
+
+        let deleted_count =
+            delete_all_recordings_from_dir(&root).expect("delete-all helper should succeed");
+        assert_eq!(deleted_count, 1);
+        assert!(!root.join(second.to_string()).exists());
+    }
+
+    #[test]
+    fn confirm_delete_all_requires_yes_for_non_interactive_mode() {
+        assert!(confirm_delete_all_recordings(true).expect("--yes should bypass prompt"));
+        let error = confirm_delete_all_recordings(false).expect_err("non-interactive should fail");
+        assert!(error.to_string().contains("requires --yes"));
+    }
 }

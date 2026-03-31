@@ -643,3 +643,114 @@ pub(super) fn run_keymap_doctor(as_json: bool) -> Result<u8> {
 
     Ok(0)
 }
+#[cfg(test)]
+mod tests {
+    use crate::input::InputProcessor;
+    use crate::runtime::attach::state::AttachViewState;
+    use crate::runtime::*;
+    use bmux_cli_schema::{Cli, Command};
+    use bmux_client::{AttachLayoutState, AttachOpenInfo, ClientError};
+    use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout};
+    use bmux_ipc::transport::IpcTransportError;
+    use bmux_ipc::{
+        AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
+        AttachViewComponent, ErrorCode, PaneLayoutNode, PaneSummary, RecordingSummary,
+        SessionSummary,
+    };
+    use bmux_plugin::{PluginManifest, PluginRegistry};
+    use bmux_plugin_sdk::PluginCommandEffect;
+    use crossterm::event::{
+        Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
+        KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    };
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use uuid::Uuid;
+
+    #[test]
+    fn pane_term_profile_mapping_is_stable() {
+        assert_eq!(
+            profile_for_term("bmux-256color"),
+            TerminalProfile::Bmux256Color
+        );
+        assert_eq!(
+            profile_for_term("screen-256color"),
+            TerminalProfile::Screen256Color
+        );
+        assert_eq!(
+            profile_for_term("tmux-256color"),
+            TerminalProfile::Screen256Color
+        );
+        assert_eq!(
+            profile_for_term("xterm-256color"),
+            TerminalProfile::Xterm256Color
+        );
+        assert_eq!(
+            profile_for_term("weird-term"),
+            TerminalProfile::Conservative
+        );
+    }
+
+    #[test]
+    fn pane_term_falls_back_to_xterm_then_screen() {
+        let resolved = resolve_pane_term_with_checker("bmux-256color", |term| match term {
+            "bmux-256color" => Some(false),
+            "xterm-256color" => Some(true),
+            "screen-256color" => Some(true),
+            _ => Some(false),
+        });
+
+        assert_eq!(resolved.pane_term, "xterm-256color");
+        assert_eq!(resolved.profile, TerminalProfile::Xterm256Color);
+    }
+
+    #[test]
+    fn pane_term_uses_screen_when_xterm_unavailable() {
+        let resolved = resolve_pane_term_with_checker("bmux-256color", |term| match term {
+            "bmux-256color" => Some(false),
+            "xterm-256color" => Some(false),
+            "screen-256color" => Some(true),
+            _ => Some(false),
+        });
+
+        assert_eq!(resolved.pane_term, "screen-256color");
+        assert_eq!(resolved.profile, TerminalProfile::Screen256Color);
+    }
+
+    #[test]
+    fn pane_term_keeps_configured_when_no_fallback_available() {
+        let resolved = resolve_pane_term_with_checker("bmux-256color", |_term| Some(false));
+
+        assert_eq!(resolved.pane_term, "bmux-256color");
+        assert!(
+            resolved
+                .warnings
+                .iter()
+                .any(|w| w.contains("no fallback available"))
+        );
+    }
+
+    #[test]
+    fn protocol_profile_mapping_is_stable() {
+        assert_eq!(
+            protocol_profile_for_terminal_profile(TerminalProfile::Bmux256Color),
+            crate::runtime::ProtocolProfile::Bmux
+        );
+        assert_eq!(
+            protocol_profile_for_terminal_profile(TerminalProfile::Xterm256Color),
+            crate::runtime::ProtocolProfile::Xterm
+        );
+        assert_eq!(
+            protocol_profile_for_terminal_profile(TerminalProfile::Screen256Color),
+            crate::runtime::ProtocolProfile::Screen
+        );
+        assert_eq!(
+            protocol_profile_for_terminal_profile(TerminalProfile::Conservative),
+            crate::runtime::ProtocolProfile::Conservative
+        );
+    }
+}

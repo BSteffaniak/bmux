@@ -330,3 +330,135 @@ pub(super) fn init_logging(verbose: bool, cli_level: Option<LogLevel>) {
         }
     }
 }
+#[cfg(test)]
+mod tests {
+    fn empty_cli() -> bmux_cli_schema::Cli {
+        bmux_cli_schema::Cli {
+            record: false,
+            no_capture_input: false,
+            recording_id_file: None,
+            record_profile: None,
+            record_event_kind: Vec::new(),
+            stop_server_on_exit: false,
+            command: None,
+            verbose: false,
+            log_level: None,
+        }
+    }
+
+    use crate::input::InputProcessor;
+    use crate::runtime::attach::state::AttachViewState;
+    use crate::runtime::*;
+    use bmux_cli_schema::{Cli, Command};
+    use bmux_client::{AttachLayoutState, AttachOpenInfo, ClientError};
+    use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout};
+    use bmux_ipc::transport::IpcTransportError;
+    use bmux_ipc::{
+        AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
+        AttachViewComponent, ErrorCode, PaneLayoutNode, PaneSummary, RecordingSummary,
+        SessionSummary,
+    };
+    use bmux_plugin::{PluginManifest, PluginRegistry};
+    use bmux_plugin_sdk::PluginCommandEffect;
+    use crossterm::event::{
+        Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
+        KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    };
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use uuid::Uuid;
+
+    #[test]
+    fn validate_record_bootstrap_flags_accepts_plain_defaults() {
+        let cli = empty_cli();
+        assert!(crate::runtime::validate_record_bootstrap_flags(&cli).is_ok());
+    }
+
+    #[test]
+    fn validate_record_bootstrap_flags_rejects_orphaned_record_flags() {
+        let mut cli = empty_cli();
+        cli.no_capture_input = true;
+        let error = crate::runtime::validate_record_bootstrap_flags(&cli)
+            .expect_err("validation should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("--no-capture-input requires --record"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn validate_record_bootstrap_flags_rejects_record_with_subcommand() {
+        let mut cli = empty_cli();
+        cli.record = true;
+        cli.command = Some(Command::ListSessions { json: false });
+        let error = crate::runtime::validate_record_bootstrap_flags(&cli)
+            .expect_err("validation should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("--record is only supported for top-level interactive start"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn map_attach_client_error_formats_busy_session() {
+        let error = map_attach_client_error(ClientError::ServerError {
+            code: ErrorCode::AlreadyExists,
+            message: "session busy".to_string(),
+        });
+        assert!(
+            error
+                .to_string()
+                .contains("session already has an active attached client")
+        );
+    }
+
+    #[test]
+    fn map_cli_client_error_formats_transport_not_found() {
+        let error = map_cli_client_error(ClientError::Transport(IpcTransportError::Io(
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+        )));
+        let message = error.to_string();
+
+        assert!(message.contains("bmux server is not running"));
+        assert!(message.contains("bmux server start --daemon"));
+        assert!(message.contains("XDG_RUNTIME_DIR"));
+        assert!(message.contains("TMPDIR"));
+    }
+
+    #[test]
+    fn map_cli_client_error_keeps_non_not_found_errors() {
+        let error = map_cli_client_error(ClientError::Transport(IpcTransportError::Io(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        )));
+        let message = error.to_string();
+
+        assert!(message.contains("transport error"));
+        assert!(!message.contains("bmux server is not running"));
+    }
+
+    #[test]
+    fn attach_quit_failure_status_is_actionable_for_policy_errors() {
+        let status = crate::runtime::attach_quit_failure_status(&ClientError::ServerError {
+            code: ErrorCode::InvalidRequest,
+            message: "session policy denied for this operation".to_string(),
+        });
+
+        assert_eq!(status, "quit blocked by session policy");
+    }
+
+    #[test]
+    fn initial_attach_status_mentions_help_and_typing() {
+        let keymap = attach_keymap_from_config(&BmuxConfig::default());
+        let status = crate::runtime::initial_attach_status(&keymap, true);
+        assert!(status.contains("help"));
+        assert!(status.contains("typing goes to pane"));
+    }
+}

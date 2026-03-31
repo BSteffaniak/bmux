@@ -1032,3 +1032,1049 @@ pub(super) async fn run_external_plugin_command(args: &[String]) -> Result<u8> {
     )
     .await
 }
+#[cfg(test)]
+mod tests {
+    fn temp_dir() -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("time should be monotonic for test")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("bmux-cli-plugin-test-{nanos}"));
+        std::fs::create_dir_all(&dir).expect("temp dir should be created");
+        dir
+    }
+
+    use crate::input::InputProcessor;
+    use crate::runtime::attach::state::AttachViewState;
+    use crate::runtime::*;
+    use bmux_cli_schema::{Cli, Command};
+    use bmux_client::{AttachLayoutState, AttachOpenInfo, ClientError};
+    use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout};
+    use bmux_ipc::transport::IpcTransportError;
+    use bmux_ipc::{
+        AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
+        AttachViewComponent, ErrorCode, PaneLayoutNode, PaneSummary, RecordingSummary,
+        SessionSummary,
+    };
+    use bmux_plugin::{PluginManifest, PluginRegistry};
+    use bmux_plugin_sdk::PluginCommandEffect;
+    use crossterm::event::{
+        Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
+        KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+        MouseEventKind,
+    };
+    use std::collections::BTreeMap;
+    use std::ffi::OsString;
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    use uuid::Uuid;
+
+    fn plugin_manifest(id: &str, entry: &str) -> PluginManifest {
+        plugin_manifest_with_commands(id, entry, "")
+    }
+
+    fn plugin_manifest_with_commands(id: &str, entry: &str, commands: &str) -> PluginManifest {
+        let manifest = format!(
+            "id = \"{id}\"\nname = \"{id}\"\nversion = \"0.1.0\"\nentry = \"{entry}\"\n{commands}\n"
+        );
+        PluginManifest::from_toml_str(&manifest).expect("manifest should parse")
+    }
+
+    #[test]
+    fn validate_enabled_plugins_accepts_registered_plugin() {
+        let dir = temp_dir();
+        let plugin_dir = dir.join("example");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir should exist");
+        fs::write(plugin_dir.join("example.dylib"), []).expect("entry should be written");
+
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(
+                &plugin_dir.join("plugin.toml"),
+                plugin_manifest("example.plugin", "example.dylib"),
+            )
+            .expect("plugin should register");
+
+        let mut config = BmuxConfig::default();
+        config.plugins.enabled.push("example.plugin".to_string());
+
+        assert!(crate::runtime::validate_enabled_plugins(&config, &registry).is_ok());
+    }
+
+    #[test]
+    fn effective_enabled_plugins_includes_bundled_plugins_by_default() {
+        let Some(bundled_root) = crate::runtime::bundled_plugin_root() else {
+            return;
+        };
+        let dir = temp_dir();
+        fs::write(dir.join("windows.dylib"), []).expect("entry should be written");
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest_from_root(
+                &bundled_root,
+                &dir.join("plugin.toml"),
+                plugin_manifest("bmux.windows", "windows.dylib"),
+            )
+            .expect("bundled plugin should register");
+
+        let config = BmuxConfig::default();
+        let enabled = crate::runtime::effective_enabled_plugins(&config, &registry);
+        assert!(enabled.iter().any(|plugin_id| plugin_id == "bmux.windows"));
+    }
+
+    #[test]
+    fn effective_enabled_plugins_include_windows_and_permissions_by_default() {
+        let Some(bundled_root) = crate::runtime::bundled_plugin_root() else {
+            return;
+        };
+        let dir = temp_dir();
+        fs::write(dir.join("windows.dylib"), []).expect("windows entry should be written");
+        fs::write(dir.join("permissions.dylib"), []).expect("permissions entry should be written");
+
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest_from_root(
+                &bundled_root,
+                &dir.join("windows.toml"),
+                plugin_manifest("bmux.windows", "windows.dylib"),
+            )
+            .expect("windows plugin should register");
+        registry
+            .register_manifest_from_root(
+                &bundled_root,
+                &dir.join("permissions.toml"),
+                plugin_manifest("bmux.permissions", "permissions.dylib"),
+            )
+            .expect("permissions plugin should register");
+
+        let config = BmuxConfig::default();
+        let enabled = crate::runtime::effective_enabled_plugins(&config, &registry);
+        assert!(enabled.iter().any(|plugin_id| plugin_id == "bmux.windows"));
+        assert!(
+            enabled
+                .iter()
+                .any(|plugin_id| plugin_id == "bmux.permissions")
+        );
+    }
+
+    #[test]
+    fn effective_enabled_plugins_honors_disabled_overrides() {
+        let Some(bundled_root) = crate::runtime::bundled_plugin_root() else {
+            return;
+        };
+        let dir = temp_dir();
+        fs::write(dir.join("windows.dylib"), []).expect("entry should be written");
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest_from_root(
+                &bundled_root,
+                &dir.join("plugin.toml"),
+                plugin_manifest("bmux.windows", "windows.dylib"),
+            )
+            .expect("bundled plugin should register");
+
+        let mut config = BmuxConfig::default();
+        config.plugins.disabled.push("bmux.windows".to_string());
+        let enabled = crate::runtime::effective_enabled_plugins(&config, &registry);
+        assert!(!enabled.iter().any(|plugin_id| plugin_id == "bmux.windows"));
+    }
+
+    #[test]
+    fn effective_enabled_plugins_skips_bundled_plugins_with_missing_entry() {
+        let Some(bundled_root) = crate::runtime::bundled_plugin_root() else {
+            return;
+        };
+        let dir = temp_dir();
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest_from_root(
+                &bundled_root,
+                &dir.join("plugin.toml"),
+                plugin_manifest("bmux.windows", "windows.dylib"),
+            )
+            .expect("bundled plugin should register");
+
+        let config = BmuxConfig::default();
+        let enabled = crate::runtime::effective_enabled_plugins(&config, &registry);
+        assert!(!enabled.iter().any(|plugin_id| plugin_id == "bmux.windows"));
+    }
+
+    #[test]
+    fn validate_enabled_plugins_accepts_plugin_provided_capabilities() {
+        let dir = temp_dir();
+        let provider_dir = dir.join("provider");
+        let dependent_dir = dir.join("consumer");
+        fs::create_dir_all(&provider_dir).expect("provider dir should exist");
+        fs::create_dir_all(&dependent_dir).expect("dependent dir should exist");
+        fs::write(provider_dir.join("provider.dylib"), []).expect("provider entry should exist");
+        fs::write(dependent_dir.join("consumer.dylib"), []).expect("dependent entry should exist");
+
+        let mut registry = PluginRegistry::new();
+        registry
+                .register_manifest(
+                    &provider_dir.join("plugin.toml"),
+                    PluginManifest::from_toml_str(
+                        "id='provider.plugin'\nname='Provider'\nversion='0.1.0'\nentry='provider.dylib'\nrequired_capabilities=['bmux.commands']\nprovided_capabilities=['example.cap.read','example.cap.write']\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n",
+                    )
+                    .expect("provider manifest should parse"),
+                )
+                .expect("provider should register");
+        registry
+                .register_manifest(
+                    &dependent_dir.join("plugin.toml"),
+                    PluginManifest::from_toml_str(
+                        "id='consumer.plugin'\nname='Consumer'\nversion='0.1.0'\nentry='consumer.dylib'\nrequired_capabilities=['example.cap.read']\n[[dependencies]]\nplugin_id='provider.plugin'\nversion_req='^0.1'\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n",
+                    )
+                    .expect("dependent manifest should parse"),
+                )
+                .expect("dependent should register");
+
+        let mut config = BmuxConfig::default();
+        config.plugins.enabled.push("provider.plugin".to_string());
+        config.plugins.enabled.push("consumer.plugin".to_string());
+
+        assert!(crate::runtime::validate_enabled_plugins(&config, &registry).is_ok());
+    }
+
+    #[test]
+    fn validate_enabled_plugins_rejects_missing_plugin() {
+        let mut config = BmuxConfig::default();
+        config.plugins.enabled.push("missing.plugin".to_string());
+
+        let error = crate::runtime::validate_enabled_plugins(&config, &PluginRegistry::new())
+            .expect_err("validation should fail");
+        assert!(error.to_string().contains("missing.plugin"));
+    }
+
+    #[test]
+    fn validate_configured_plugins_discovers_plugins_from_default_layout() {
+        let dir = temp_dir();
+        let plugin_dir = dir.join("data").join("plugins").join("example");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir should exist");
+        fs::write(plugin_dir.join("example.dylib"), []).expect("entry should be written");
+        fs::write(
+                plugin_dir.join("plugin.toml"),
+                "id = 'example.plugin'\nname = 'Example'\nversion='0.1.0'\nentry='example.dylib'\nrequired_capabilities=['bmux.commands']\n[plugin_api]\nminimum='1.0'\n[native_abi]\nminimum='1.0'\n",
+            )
+            .expect("manifest should be written");
+
+        let mut config = BmuxConfig::default();
+        config.plugins.enabled.push("example.plugin".to_string());
+        let paths = ConfigPaths::new(
+            dir.join("config"),
+            dir.join("runtime"),
+            dir.join("data"),
+            dir.join("state"),
+        );
+
+        assert!(crate::runtime::validate_configured_plugins(&config, &paths).is_ok());
+    }
+
+    #[test]
+    fn runtime_cli_prefers_dynamic_session_plugin_aliases_over_static_cli_rejection() {
+        let dir = temp_dir();
+        let plugin_dir = dir.join("policy");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir should exist");
+        fs::write(plugin_dir.join("policy.dylib"), []).expect("entry should be written");
+
+        let mut registry = PluginRegistry::new();
+        registry
+                .register_manifest(
+                    &plugin_dir.join("plugin.toml"),
+                    plugin_manifest_with_commands(
+                        "policy.plugin",
+                        "policy.dylib",
+                        "[[commands]]\nname='roles'\npath=['roles']\naliases=[[\"session\",\"roles\"]]\nsummary='list'\nexecution='provider_exec'\nexpose_in_cli=true\n[[commands.arguments]]\nname='session'\nkind='string'\nlong='session'\nrequired=true\n",
+                    ),
+                )
+                .expect("plugin should register");
+
+        let mut config = BmuxConfig::default();
+        config.plugins.enabled.push("policy.plugin".to_string());
+        let argv = vec![
+            OsString::from("bmux"),
+            OsString::from("session"),
+            OsString::from("roles"),
+            OsString::from("--session"),
+            OsString::from("dev"),
+        ];
+
+        let parsed = crate::runtime::parse_runtime_cli_with_registry(&argv, &config, &registry)
+            .expect("runtime CLI should parse plugin alias under session namespace");
+        match parsed {
+            crate::runtime::ParsedRuntimeCli::Plugin {
+                plugin_id,
+                command_name,
+                arguments,
+                ..
+            } => {
+                assert_eq!(plugin_id, "policy.plugin");
+                assert_eq!(command_name, "roles");
+                assert_eq!(arguments, vec!["--session".to_string(), "dev".to_string()]);
+            }
+            other => panic!("expected plugin runtime parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_cli_allows_plugin_owned_plugin_namespace_commands() {
+        let dir = temp_dir();
+        let plugin_dir = dir.join("plugin-cli");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir should exist");
+        fs::write(plugin_dir.join("plugin-cli.dylib"), []).expect("entry should be written");
+
+        let mut registry = PluginRegistry::new();
+        registry
+                .register_manifest(
+                    &plugin_dir.join("plugin.toml"),
+                    plugin_manifest_with_commands(
+                        "bmux.plugin_cli",
+                        "plugin-cli.dylib",
+                        "[[commands]]\nname='list'\npath=['plugin','list']\nsummary='list'\nexecution='provider_exec'\nexpose_in_cli=true\n",
+                    ),
+                )
+                .expect("plugin should register");
+
+        let mut config = BmuxConfig::default();
+        config.plugins.enabled.push("bmux.plugin_cli".to_string());
+        let argv = vec![
+            OsString::from("bmux"),
+            OsString::from("plugin"),
+            OsString::from("list"),
+        ];
+
+        let parsed = crate::runtime::parse_runtime_cli_with_registry(&argv, &config, &registry)
+            .expect("runtime CLI should parse plugin-owned plugin namespace command");
+        match parsed {
+            crate::runtime::ParsedRuntimeCli::Plugin {
+                plugin_id,
+                command_name,
+                arguments,
+                ..
+            } => {
+                assert_eq!(plugin_id, "bmux.plugin_cli");
+                assert_eq!(command_name, "list");
+                assert!(arguments.is_empty());
+            }
+            other => panic!("expected plugin runtime parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_cli_parses_bundled_plugin_command_without_explicit_enable() {
+        let Some(bundled_root) = crate::runtime::bundled_plugin_root() else {
+            return;
+        };
+        let dir = temp_dir();
+        fs::write(dir.join("windows.dylib"), []).expect("entry should be written");
+        let mut registry = PluginRegistry::new();
+        registry
+                .register_manifest_from_root(
+                    &bundled_root,
+                    &dir.join("plugin.toml"),
+                    plugin_manifest_with_commands(
+                        "bmux.windows",
+                        "windows.dylib",
+                        "[[commands]]\nname='new-window'\npath=['new-window']\nsummary='new'\nexecution='provider_exec'\nexpose_in_cli=true\n",
+                    ),
+                )
+                .expect("plugin should register");
+
+        let config = BmuxConfig::default();
+        let argv = vec![OsString::from("bmux"), OsString::from("new-window")];
+        let parsed = crate::runtime::parse_runtime_cli_with_registry(&argv, &config, &registry)
+            .expect("runtime CLI should parse bundled plugin command");
+        match parsed {
+            crate::runtime::ParsedRuntimeCli::Plugin { plugin_id, .. } => {
+                assert_eq!(plugin_id, "bmux.windows");
+            }
+            other => panic!("expected plugin runtime parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn runtime_cli_attach_remains_builtin_without_windows_plugin() {
+        let config = BmuxConfig::default();
+        let registry = PluginRegistry::new();
+        let argv = vec![
+            OsString::from("bmux"),
+            OsString::from("attach"),
+            OsString::from("dev"),
+        ];
+
+        let parsed = crate::runtime::parse_runtime_cli_with_registry(&argv, &config, &registry)
+            .expect("runtime CLI should parse built-in attach command");
+
+        match parsed {
+            crate::runtime::ParsedRuntimeCli::BuiltIn { cli, .. } => {
+                assert!(matches!(
+                    cli.command,
+                    Some(Command::Attach {
+                        target: Some(ref target),
+                        follow: None,
+                        global: false,
+                    }) if target == "dev"
+                ));
+            }
+            other => panic!("expected built-in CLI parse, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plugin_lifecycle_context_uses_plugin_specific_settings() {
+        let mut config = BmuxConfig::default();
+        config
+            .plugins
+            .settings
+            .insert("example.plugin".to_string(), "configured".into());
+
+        let paths = ConfigPaths::new(
+            std::path::PathBuf::from("/config"),
+            std::path::PathBuf::from("/runtime"),
+            std::path::PathBuf::from("/data"),
+            std::path::PathBuf::from("/state"),
+        );
+        let declaration = bmux_plugin::PluginDeclaration {
+            id: bmux_plugin::PluginId::new("example.plugin").expect("id should parse"),
+            display_name: "Example".to_string(),
+            plugin_version: "0.1.0".to_string(),
+            plugin_api: bmux_plugin_sdk::VersionRange::at_least(bmux_plugin_sdk::ApiVersion::new(
+                1, 0,
+            )),
+            native_abi: bmux_plugin_sdk::VersionRange::at_least(bmux_plugin_sdk::ApiVersion::new(
+                1, 0,
+            )),
+            entrypoint: bmux_plugin::PluginEntrypoint::Native {
+                symbol: bmux_plugin_sdk::DEFAULT_NATIVE_ENTRY_SYMBOL.to_string(),
+            },
+            description: None,
+            homepage: None,
+            provider_priority: 0,
+            required_capabilities: std::collections::BTreeSet::from([
+                bmux_plugin_sdk::HostScope::new("bmux.commands").expect("capability should parse"),
+            ]),
+            provided_capabilities: std::collections::BTreeSet::from([
+                bmux_plugin_sdk::HostScope::new("example.provider.write")
+                    .expect("capability should parse"),
+            ]),
+            provided_features: std::collections::BTreeSet::new(),
+            services: vec![bmux_plugin_sdk::PluginService {
+                capability: bmux_plugin_sdk::HostScope::new("example.provider.write")
+                    .expect("capability should parse"),
+                kind: bmux_plugin_sdk::ServiceKind::Command,
+                interface_id: "provider-command/v1".to_string(),
+            }],
+            commands: Vec::new(),
+            event_subscriptions: Vec::new(),
+            dependencies: Vec::new(),
+            lifecycle: bmux_plugin::PluginLifecycle::default(),
+        };
+        let context = crate::runtime::plugin_lifecycle_context(
+            &config,
+            &paths,
+            &declaration,
+            crate::runtime::service_descriptors_from_declarations([&declaration]),
+            vec![
+                "bmux.commands".to_string(),
+                "example.provider.write".to_string(),
+            ],
+            vec!["example.plugin".to_string()],
+            vec!["/plugins".to_string()],
+            Vec::new(),
+        );
+        assert_eq!(context.plugin_id, "example.plugin");
+        assert_eq!(context.connection.data_dir, "/data");
+        assert_eq!(
+            context.required_capabilities,
+            vec!["bmux.commands".to_string()]
+        );
+        assert_eq!(
+            context.provided_capabilities,
+            vec!["example.provider.write".to_string()]
+        );
+        assert_eq!(context.services.len(), 13);
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "config-query/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "storage-query/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "storage-command/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "logging-command/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "client-query/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "context-query/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "context-command/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "session-query/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "session-command/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "pane-query/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "pane-command/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "recording-command/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "provider-command/v1")
+        );
+        assert_eq!(
+            context.settings.as_ref().and_then(|value| value.as_str()),
+            Some("configured")
+        );
+    }
+
+    #[test]
+    fn plugin_command_context_includes_capability_sets() {
+        let config = BmuxConfig::default();
+        let paths = ConfigPaths::new(
+            std::path::PathBuf::from("/config"),
+            std::path::PathBuf::from("/runtime"),
+            std::path::PathBuf::from("/data"),
+            std::path::PathBuf::from("/state"),
+        );
+        let declaration = bmux_plugin::PluginDeclaration {
+            id: bmux_plugin::PluginId::new("provider.plugin").expect("id should parse"),
+            display_name: "Provider".to_string(),
+            plugin_version: "0.1.0".to_string(),
+            plugin_api: bmux_plugin_sdk::VersionRange::at_least(bmux_plugin_sdk::ApiVersion::new(
+                1, 0,
+            )),
+            native_abi: bmux_plugin_sdk::VersionRange::at_least(bmux_plugin_sdk::ApiVersion::new(
+                1, 0,
+            )),
+            entrypoint: bmux_plugin::PluginEntrypoint::Native {
+                symbol: bmux_plugin_sdk::DEFAULT_NATIVE_ENTRY_SYMBOL.to_string(),
+            },
+            description: None,
+            homepage: None,
+            provider_priority: 0,
+            required_capabilities: std::collections::BTreeSet::from([
+                bmux_plugin_sdk::HostScope::new("bmux.commands").expect("capability should parse"),
+                bmux_plugin_sdk::HostScope::new("example.base.read")
+                    .expect("capability should parse"),
+            ]),
+            provided_capabilities: std::collections::BTreeSet::from([
+                bmux_plugin_sdk::HostScope::new("example.provider.read")
+                    .expect("capability should parse"),
+                bmux_plugin_sdk::HostScope::new("example.provider.write")
+                    .expect("capability should parse"),
+            ]),
+            provided_features: std::collections::BTreeSet::new(),
+            services: vec![
+                bmux_plugin_sdk::PluginService {
+                    capability: bmux_plugin_sdk::HostScope::new("example.provider.read")
+                        .expect("capability should parse"),
+                    kind: bmux_plugin_sdk::ServiceKind::Query,
+                    interface_id: "provider-query/v1".to_string(),
+                },
+                bmux_plugin_sdk::PluginService {
+                    capability: bmux_plugin_sdk::HostScope::new("example.provider.write")
+                        .expect("capability should parse"),
+                    kind: bmux_plugin_sdk::ServiceKind::Command,
+                    interface_id: "provider-command/v1".to_string(),
+                },
+            ],
+            commands: Vec::new(),
+            event_subscriptions: Vec::new(),
+            dependencies: Vec::new(),
+            lifecycle: bmux_plugin::PluginLifecycle::default(),
+        };
+
+        let context = crate::runtime::plugin_command_context(
+            &config,
+            &paths,
+            &declaration,
+            "run-action",
+            &["--name".to_string(), "editor".to_string()],
+            crate::runtime::service_descriptors_from_declarations([&declaration]),
+            vec![
+                "bmux.commands".to_string(),
+                "example.base.read".to_string(),
+                "example.provider.read".to_string(),
+                "example.provider.write".to_string(),
+            ],
+            vec!["provider.plugin".to_string()],
+            vec!["/plugins".to_string()],
+            Vec::new(),
+        );
+
+        assert_eq!(context.plugin_id, "provider.plugin");
+        assert_eq!(context.command, "run-action");
+        assert_eq!(
+            context.required_capabilities,
+            vec!["bmux.commands".to_string(), "example.base.read".to_string()]
+        );
+        assert_eq!(
+            context.provided_capabilities,
+            vec![
+                "example.provider.read".to_string(),
+                "example.provider.write".to_string()
+            ]
+        );
+        assert_eq!(context.services.len(), 14);
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "config-query/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "storage-query/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "storage-command/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "logging-command/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "client-query/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "context-query/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "context-command/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "session-query/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "session-command/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "pane-query/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "pane-command/v1")
+        );
+        assert!(
+            context
+                .services
+                .iter()
+                .any(|service| service.interface_id == "recording-command/v1")
+        );
+    }
+
+    #[test]
+    fn plugin_system_event_uses_system_kind_and_name() {
+        let event = crate::runtime::plugin_system_event("server_started");
+        assert_eq!(event.kind, bmux_plugin_sdk::PluginEventKind::System);
+        assert_eq!(event.name, "server_started");
+        assert_eq!(
+            event
+                .payload
+                .get("product")
+                .and_then(serde_json::Value::as_str),
+            Some("bmux")
+        );
+    }
+
+    #[test]
+    fn plugin_event_from_server_event_maps_kind_and_payload() {
+        let session_id = Uuid::from_u128(1);
+        let event = crate::runtime::plugin_event_from_server_event(
+            &bmux_client::ServerEvent::SessionCreated {
+                id: session_id,
+                name: Some("editor".to_string()),
+            },
+        )
+        .expect("plugin event should build");
+        let session_id_text = session_id.to_string();
+        assert_eq!(event.kind, bmux_plugin_sdk::PluginEventKind::Session);
+        assert_eq!(event.name, "session_created");
+        assert!(event.payload.to_string().contains(&session_id_text));
+    }
+
+    #[test]
+    fn built_in_handler_mapping_stays_in_sync_for_core_native_commands() {
+        let command = Command::KillSession {
+            target: "dev".to_string(),
+            force_local: false,
+        };
+        assert_eq!(
+            crate::runtime::built_in_handler_for_command(&command),
+            crate::runtime::BuiltInHandlerId::KillSession
+        );
+    }
+
+    #[test]
+    fn runtime_keybindings_deep_merge_defaults_and_overrides() {
+        let mut config = BmuxConfig::default();
+        config.keybindings.runtime.clear();
+        config
+            .keybindings
+            .runtime
+            .insert("o".to_string(), "quit".to_string());
+
+        let (runtime, _global, _scroll) = merged_runtime_keybindings(&config);
+
+        assert_eq!(runtime.get("o"), Some(&"quit".to_string()));
+        assert_eq!(
+            runtime.get("%"),
+            Some(&"split_focused_vertical".to_string())
+        );
+        assert_eq!(runtime.get("["), Some(&"enter_scroll_mode".to_string()));
+    }
+
+    #[test]
+    fn trace_filtering_applies_family_and_pane_constraints() {
+        let events = vec![
+            ProtocolTraceEvent {
+                timestamp_ms: 1,
+                pane_id: Some(1),
+                profile: "xterm".to_string(),
+                family: "csi".to_string(),
+                name: "csi_primary_da".to_string(),
+                direction: ProtocolDirection::Query,
+                raw_hex: "1b5b63".to_string(),
+                decoded: "\u{1b}[c".to_string(),
+            },
+            ProtocolTraceEvent {
+                timestamp_ms: 2,
+                pane_id: Some(2),
+                profile: "xterm".to_string(),
+                family: "osc".to_string(),
+                name: "osc_color_query".to_string(),
+                direction: ProtocolDirection::Reply,
+                raw_hex: "1b5d31303b3f".to_string(),
+                decoded: "...".to_string(),
+            },
+            ProtocolTraceEvent {
+                timestamp_ms: 3,
+                pane_id: Some(2),
+                profile: "xterm".to_string(),
+                family: "csi".to_string(),
+                name: "csi_primary_da".to_string(),
+                direction: ProtocolDirection::Reply,
+                raw_hex: "1b5b3f313b3263".to_string(),
+                decoded: "...".to_string(),
+            },
+        ];
+
+        let by_family = filter_trace_events(&events, Some(TraceFamily::Csi), None, 50);
+        assert_eq!(by_family.len(), 2);
+
+        let by_pane = filter_trace_events(&events, None, Some(2), 50);
+        assert_eq!(by_pane.len(), 2);
+
+        let both = filter_trace_events(&events, Some(TraceFamily::Csi), Some(2), 50);
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].timestamp_ms, 3);
+    }
+
+    #[test]
+    fn destructive_op_error_formats_session_policy_guidance() {
+        let message = crate::runtime::format_destructive_op_error(
+            "session",
+            ClientError::ServerError {
+                code: ErrorCode::InvalidRequest,
+                message: "session policy denied for this operation".to_string(),
+            },
+            false,
+        );
+
+        assert!(message.contains("not permitted by current session policy"));
+    }
+
+    #[test]
+    fn destructive_op_error_formats_force_local_guidance() {
+        let message = crate::runtime::format_destructive_op_error(
+            "window",
+            ClientError::ServerError {
+                code: ErrorCode::InvalidRequest,
+                message: "force-local is only allowed for the server control principal".to_string(),
+            },
+            true,
+        );
+
+        assert!(message.contains("--force-local"));
+        assert!(message.contains("bmux server whoami-principal"));
+    }
+
+    #[test]
+    fn format_plugin_command_run_error_adds_policy_hint_when_denied() {
+        let error = anyhow::anyhow!("session policy denied for this operation");
+        let message =
+            crate::runtime::format_plugin_command_run_error("bmux.windows", "kill", &error);
+        assert!(message.contains("failed running plugin command 'bmux.windows:kill'"));
+        assert!(message.contains("operation denied by an active policy provider"));
+        assert!(message.contains("authorized principal"));
+    }
+
+    #[test]
+    fn format_plugin_command_run_error_keeps_generic_failures_without_hint() {
+        let error = anyhow::anyhow!("unsupported service operation");
+        let message =
+            crate::runtime::format_plugin_command_run_error("bmux.permissions", "grant", &error);
+        assert!(message.contains("failed running plugin command 'bmux.permissions:grant'"));
+        assert!(!message.contains("operation denied by session policy"));
+    }
+
+    #[test]
+    fn unknown_external_command_message_points_to_plugin_list_help() {
+        let message = crate::runtime::unknown_external_command_message(&[
+            "session".to_string(),
+            "roles".to_string(),
+        ]);
+        assert!(message.contains("unknown command 'session roles'"));
+        assert!(message.contains("bmux plugin list"));
+    }
+
+    #[test]
+    fn format_plugin_not_found_message_lists_available_plugins() {
+        let message = crate::runtime::format_plugin_not_found_message(
+            "missing.plugin",
+            &["bmux.windows".to_string(), "bmux.permissions".to_string()],
+        );
+        assert!(message.contains("plugin 'missing.plugin' was not found"));
+        assert!(message.contains("bmux.windows, bmux.permissions"));
+    }
+
+    #[test]
+    fn format_plugin_not_found_message_handles_empty_registry() {
+        let empty: [&str; 0] = [];
+        let message = crate::runtime::format_plugin_not_found_message("missing.plugin", &empty);
+        assert_eq!(message, "plugin 'missing.plugin' was not found");
+    }
+
+    #[test]
+    fn format_plugin_not_enabled_message_points_to_plugins_enabled() {
+        let message = crate::runtime::format_plugin_not_enabled_message("bmux.windows");
+        assert!(message.contains("plugin 'bmux.windows' is not enabled"));
+        assert!(message.contains("plugins.disabled"));
+        assert!(message.contains("plugins.enabled"));
+    }
+
+    #[test]
+    fn format_plugin_argument_validation_error_adds_help_hint_for_missing_required() {
+        let error = anyhow::anyhow!("missing required option '--session'");
+        let message = crate::runtime::format_plugin_argument_validation_error(
+            &["session".to_string(), "roles".to_string()],
+            &error,
+        );
+        assert!(message.contains("failed validating plugin command arguments for 'session roles'"));
+        assert!(message.contains("missing required option '--session'"));
+        assert!(message.contains("--help"));
+    }
+
+    #[test]
+    fn format_plugin_argument_validation_error_keeps_non_required_errors_without_hint() {
+        let error = anyhow::anyhow!("unknown option '--wat'");
+        let message = crate::runtime::format_plugin_argument_validation_error(
+            &["session".to_string(), "roles".to_string()],
+            &error,
+        );
+        assert!(message.contains("failed validating plugin command arguments for 'session roles'"));
+        assert!(message.contains("unknown option '--wat'"));
+        assert!(!message.contains("--help"));
+    }
+
+    #[test]
+    fn plugin_fallback_retarget_context_id_returns_changed_context_when_no_effect_applied() {
+        let before = Some(Uuid::from_u128(1));
+        let after = Some(Uuid::from_u128(2));
+        let attached = Some(Uuid::from_u128(1));
+
+        assert_eq!(
+            crate::runtime::plugin_fallback_retarget_context_id(before, after, attached, false),
+            after
+        );
+    }
+
+    #[test]
+    fn plugin_fallback_retarget_context_id_ignores_when_outcome_already_applied() {
+        let before = Some(Uuid::from_u128(1));
+        let after = Some(Uuid::from_u128(2));
+        let attached = Some(Uuid::from_u128(2));
+
+        assert_eq!(
+            crate::runtime::plugin_fallback_retarget_context_id(before, after, attached, true),
+            None
+        );
+    }
+
+    #[test]
+    fn plugin_fallback_new_context_id_returns_single_new_context() {
+        let before = [Uuid::from_u128(1)]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let after = [Uuid::from_u128(1), Uuid::from_u128(2)]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            crate::runtime::plugin_fallback_new_context_id(
+                Some(&before),
+                Some(&after),
+                Some(Uuid::from_u128(1)),
+                Some(Uuid::from_u128(1)),
+                false,
+            ),
+            Some(Uuid::from_u128(2))
+        );
+    }
+
+    #[test]
+    fn plugin_fallback_new_context_id_prefers_after_context_when_multiple_new() {
+        let before = [Uuid::from_u128(1)]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let after = [Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3)]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            crate::runtime::plugin_fallback_new_context_id(
+                Some(&before),
+                Some(&after),
+                Some(Uuid::from_u128(1)),
+                Some(Uuid::from_u128(3)),
+                false,
+            ),
+            Some(Uuid::from_u128(3))
+        );
+    }
+
+    #[test]
+    fn plugin_fallback_new_context_id_ignores_when_outcome_applied() {
+        let before = [Uuid::from_u128(1)]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+        let after = [Uuid::from_u128(1), Uuid::from_u128(2)]
+            .into_iter()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(
+            crate::runtime::plugin_fallback_new_context_id(
+                Some(&before),
+                Some(&after),
+                Some(Uuid::from_u128(1)),
+                Some(Uuid::from_u128(2)),
+                true,
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn host_kernel_effect_capture_records_select_context_from_select_response() {
+        crate::runtime::begin_host_kernel_effect_capture();
+        let context_id = Uuid::from_u128(42);
+        crate::runtime::maybe_record_host_kernel_effect(
+            &bmux_ipc::Request::SelectContext {
+                selector: bmux_ipc::ContextSelector::ById(context_id),
+            },
+            &bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::ContextSelected {
+                context: bmux_ipc::ContextSummary {
+                    id: context_id,
+                    name: Some("ctx".to_string()),
+                    attributes: std::collections::BTreeMap::new(),
+                },
+            }),
+        );
+        let captured = crate::runtime::finish_host_kernel_effect_capture();
+        assert_eq!(
+            captured,
+            vec![PluginCommandEffect::SelectContext { context_id }]
+        );
+    }
+
+    #[test]
+    fn host_kernel_effect_capture_ignores_non_context_responses() {
+        crate::runtime::begin_host_kernel_effect_capture();
+        crate::runtime::maybe_record_host_kernel_effect(
+            &bmux_ipc::Request::ListSessions,
+            &bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionList {
+                sessions: Vec::new(),
+            }),
+        );
+        let captured = crate::runtime::finish_host_kernel_effect_capture();
+        assert!(captured.is_empty());
+    }
+}
