@@ -3361,34 +3361,11 @@ mod tests {
         dir
     }
 
-    use crate::input::InputProcessor;
-    use crate::runtime::attach::state::AttachViewState;
     use crate::runtime::recording::{
         confirm_delete_all_recordings, delete_all_recordings_from_dir, delete_recording_dir_at,
         list_recordings_from_dir, offline_recording_status, resolve_recording_id_prefix,
     };
-    use crate::runtime::*;
-    use bmux_cli_schema::{Cli, Command};
-    use bmux_client::{AttachLayoutState, AttachOpenInfo, ClientError};
-    use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout};
-    use bmux_ipc::transport::IpcTransportError;
-    use bmux_ipc::{
-        AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
-        AttachViewComponent, ErrorCode, PaneLayoutNode, PaneSummary, RecordingSummary,
-        SessionSummary,
-    };
-    use bmux_plugin::{PluginManifest, PluginRegistry};
-    use bmux_plugin_sdk::PluginCommandEffect;
-    use crossterm::event::{
-        Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
-        KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseButton, MouseEvent,
-        MouseEventKind,
-    };
-    use std::collections::BTreeMap;
-    use std::ffi::OsString;
     use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use uuid::Uuid;
 
     #[test]

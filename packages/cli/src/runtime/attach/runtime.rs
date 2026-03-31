@@ -3195,27 +3195,18 @@ mod tests {
     use crate::input::InputProcessor;
     use crate::runtime::attach::state::AttachViewState;
     use crate::runtime::*;
-    use bmux_cli_schema::{Cli, Command};
-    use bmux_client::{AttachLayoutState, AttachOpenInfo, ClientError};
-    use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout};
-    use bmux_ipc::transport::IpcTransportError;
+    use bmux_client::{AttachLayoutState, AttachOpenInfo};
+    use bmux_config::BmuxConfig;
     use bmux_ipc::{
-        AttachFocusTarget, AttachLayer, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
-        AttachViewComponent, ErrorCode, PaneLayoutNode, PaneSummary, RecordingSummary,
-        SessionSummary,
+        AttachFocusTarget, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
+        AttachViewComponent, PaneLayoutNode, SessionSummary,
     };
-    use bmux_plugin::{PluginManifest, PluginRegistry};
-    use bmux_plugin_sdk::PluginCommandEffect;
     use crossterm::event::{
         Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
         KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseButton, MouseEvent,
         MouseEventKind,
     };
     use std::collections::BTreeMap;
-    use std::ffi::OsString;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
     use uuid::Uuid;
 
     fn attach_view_state_with_scrollback_fixture() -> AttachViewState {
