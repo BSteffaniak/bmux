@@ -3115,41 +3115,40 @@ async fn run_recording_export(
 ) -> Result<u8> {
     let paths = ConfigPaths::default();
     let config = BmuxConfig::load_from_path(&paths.config_file()).unwrap_or_default();
-    let export_defaults = &config.recording;
+    let export_defaults = &config.recording.export;
 
-    let resolved_cursor = cursor.unwrap_or(match export_defaults.export_cursor {
+    let resolved_cursor = cursor.unwrap_or(match export_defaults.cursor {
         RecordingExportCursorMode::Auto => RecordingCursorMode::Auto,
         RecordingExportCursorMode::On => RecordingCursorMode::On,
         RecordingExportCursorMode::Off => RecordingCursorMode::Off,
     });
-    let resolved_cursor_shape = cursor_shape.unwrap_or(match export_defaults.export_cursor_shape {
+    let resolved_cursor_shape = cursor_shape.unwrap_or(match export_defaults.cursor_shape {
         RecordingExportCursorShape::Auto => RecordingCursorShape::Auto,
         RecordingExportCursorShape::Block => RecordingCursorShape::Block,
         RecordingExportCursorShape::Bar => RecordingCursorShape::Bar,
         RecordingExportCursorShape::Underline => RecordingCursorShape::Underline,
     });
-    let resolved_cursor_blink = cursor_blink.unwrap_or(match export_defaults.export_cursor_blink {
+    let resolved_cursor_blink = cursor_blink.unwrap_or(match export_defaults.cursor_blink {
         RecordingExportCursorBlinkMode::Auto => RecordingCursorBlinkMode::Auto,
         RecordingExportCursorBlinkMode::On => RecordingCursorBlinkMode::On,
         RecordingExportCursorBlinkMode::Off => RecordingCursorBlinkMode::Off,
     });
     let resolved_cursor_blink_period_ms =
-        cursor_blink_period_ms.unwrap_or(export_defaults.export_cursor_blink_period_ms.max(1));
+        cursor_blink_period_ms.unwrap_or(export_defaults.cursor_blink_period_ms.max(1));
     let resolved_cursor_color = cursor_color
         .map(str::to_string)
         .or_else(|| {
-            let value = export_defaults.export_cursor_color.trim();
+            let value = export_defaults.cursor_color.trim();
             (!value.is_empty()).then(|| value.to_string())
         })
         .unwrap_or_else(|| "auto".to_string());
-    let resolved_cursor_profile =
-        cursor_profile.unwrap_or(match export_defaults.export_cursor_profile {
-            RecordingExportCursorProfile::Auto => RecordingCursorProfile::Auto,
-            RecordingExportCursorProfile::Ghostty => RecordingCursorProfile::Ghostty,
-            RecordingExportCursorProfile::Generic => RecordingCursorProfile::Generic,
-        });
+    let resolved_cursor_profile = cursor_profile.unwrap_or(match export_defaults.cursor_profile {
+        RecordingExportCursorProfile::Auto => RecordingCursorProfile::Auto,
+        RecordingExportCursorProfile::Ghostty => RecordingCursorProfile::Ghostty,
+        RecordingExportCursorProfile::Generic => RecordingCursorProfile::Generic,
+    });
     let resolved_cursor_solid_after_activity_ms =
-        cursor_solid_after_activity_ms.or(export_defaults.export_cursor_solid_after_activity_ms);
+        cursor_solid_after_activity_ms.or(export_defaults.cursor_solid_after_activity_ms);
 
     recording::run_recording_export(
         recording_id,

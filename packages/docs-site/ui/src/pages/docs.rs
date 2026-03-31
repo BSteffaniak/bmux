@@ -6,7 +6,8 @@ use hyperchad::template::Containers;
 
 use bmux_config::{
     AppearanceConfig, BehaviorConfig, ConfigDocSchema, GeneralConfig, KeyBindingConfig,
-    MouseBehaviorConfig, MultiClientConfig, PluginConfig, RecordingConfig, StatusBarConfig,
+    MouseBehaviorConfig, MultiClientConfig, PluginConfig, RecordingConfig, RecordingExportConfig,
+    StatusBarConfig,
 };
 use std::collections::BTreeMap;
 
@@ -177,7 +178,7 @@ fn generate_config_reference() -> String {
     doc.push_str(&render_section::<KeyBindingConfig>());
     doc.push_str(&render_section::<PluginConfig>());
     doc.push_str(&render_section::<StatusBarConfig>());
-    doc.push_str(&render_section::<RecordingConfig>());
+    doc.push_str(&render_recording_section());
 
     doc
 }
@@ -223,6 +224,39 @@ fn render_behavior_section() -> String {
     render_section_with_fields(
         BehaviorConfig::section_name(),
         BehaviorConfig::section_description(),
+        fields,
+        defaults,
+    )
+}
+
+fn render_recording_section() -> String {
+    let mut defaults = RecordingConfig::default_values();
+    let export_defaults = RecordingExportConfig::default_values();
+
+    let mut fields = RecordingConfig::field_docs()
+        .into_iter()
+        .filter(|field| field.toml_key != "export")
+        .map(RenderField::from)
+        .collect::<Vec<_>>();
+
+    for field in RecordingExportConfig::field_docs() {
+        let dotted_key = format!("export.{}", field.toml_key);
+        if let Some(default) = export_defaults.get(field.toml_key) {
+            defaults.insert(dotted_key.clone(), default.clone());
+        }
+        fields.push(RenderField {
+            toml_key: dotted_key,
+            type_display: field.type_display.to_string(),
+            description: field.description.to_string(),
+            enum_values: field
+                .enum_values
+                .map(|values| values.iter().map(|value| (*value).to_string()).collect()),
+        });
+    }
+
+    render_section_with_fields(
+        RecordingConfig::section_name(),
+        RecordingConfig::section_description(),
         fields,
         defaults,
     )
