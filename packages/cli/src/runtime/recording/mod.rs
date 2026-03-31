@@ -869,6 +869,7 @@ fn compute_cursor_visibility(
     replay_state: CursorReplayState,
     parser_visible: bool,
     mono_ns: u64,
+    blink_anchor_ns: &mut Option<u64>,
 ) -> (bool, bool) {
     let base_visible = match options.mode {
         RecordingCursorMode::Auto => parser_visible,
@@ -887,7 +888,9 @@ fn compute_cursor_visibility(
         return (true, true);
     }
     let period = options.blink_period_ns.max(1);
-    let blink_on = ((mono_ns / period) % 2) == 0;
+    let anchor = *blink_anchor_ns.get_or_insert(mono_ns);
+    let phase_ns = mono_ns.saturating_sub(anchor);
+    let blink_on = ((phase_ns / period) % 2) == 0;
     (blink_on, blink_on)
 }
 
@@ -1079,6 +1082,7 @@ fn export_recording_gif(
     let mut previous_emit_ns = None::<u64>;
     let mut cursor_state = CursorReplayState::default();
     let mut cursor_frames = export_metadata.map(|_| Vec::<ExportCursorFrame>::new());
+    let mut blink_anchor_ns = None::<u64>;
     let start_mono_ns = events.iter().map(|event| event.mono_ns).min().unwrap_or(0);
     let frame_cutoff_ns = max_frames.map(|limit| {
         if limit == 0 {
@@ -1200,6 +1204,7 @@ fn export_recording_gif(
             cursor_state,
             parser_cursor_visible,
             frame_time_ns,
+            &mut blink_anchor_ns,
         );
         if cursor_visible && cursor_row < current_rows && cursor_col < current_cols {
             let cursor_color_rgb = cursor_options.color_override.unwrap_or_else(|| {
@@ -3115,12 +3120,37 @@ mod tests {
             color_override: None,
         };
         let state = CursorReplayState::default();
-        let (on_a, blink_a) = compute_cursor_visibility(&options, state, true, 0);
-        let (on_b, blink_b) = compute_cursor_visibility(&options, state, true, 510_000_000);
-        let (on_c, blink_c) = compute_cursor_visibility(&options, state, true, 1_020_000_000);
+        let mut blink_anchor_ns = None;
+        let (on_a, blink_a) =
+            compute_cursor_visibility(&options, state, true, 0, &mut blink_anchor_ns);
+        let (on_b, blink_b) =
+            compute_cursor_visibility(&options, state, true, 510_000_000, &mut blink_anchor_ns);
+        let (on_c, blink_c) =
+            compute_cursor_visibility(&options, state, true, 1_020_000_000, &mut blink_anchor_ns);
         assert!(on_a && blink_a);
         assert!(!on_b && !blink_b);
         assert!(on_c && blink_c);
+    }
+
+    #[test]
+    fn compute_cursor_visibility_aligns_phase_to_first_visible_frame() {
+        let options = CursorExportOptions {
+            mode: RecordingCursorMode::Auto,
+            shape: RecordingCursorShape::Auto,
+            blink: RecordingCursorBlinkMode::On,
+            blink_period_ns: 500_000_000,
+            color_override: None,
+        };
+        let state = CursorReplayState::default();
+        let mut blink_anchor_ns = None;
+        let _ =
+            compute_cursor_visibility(&options, state, false, 700_000_000, &mut blink_anchor_ns);
+        let (on_a, blink_a) =
+            compute_cursor_visibility(&options, state, true, 700_000_000, &mut blink_anchor_ns);
+        let (on_b, blink_b) =
+            compute_cursor_visibility(&options, state, true, 1_210_000_000, &mut blink_anchor_ns);
+        assert!(on_a && blink_a);
+        assert!(!on_b && !blink_b);
     }
 
     #[test]
