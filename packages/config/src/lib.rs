@@ -313,9 +313,10 @@ pub struct MouseBehaviorConfig {
     pub exit_scrollback_on_bottom: bool,
     /// Optional mouse gesture overrides mapped to action names.
     ///
-    /// Keys are gesture identifiers such as `click_left`, `hover_focus`,
-    /// `scroll_up`, and `scroll_down`. Values use the same action naming
-    /// format as keybindings, including `plugin:<id>:<command>`.
+    /// Supported keys in the current core runtime are `click_left`,
+    /// `hover_focus`, `scroll_up`, and `scroll_down`.
+    /// Values use the same action naming format as keybindings, including
+    /// built-in action names and `plugin:<id>:<command>`.
     pub gesture_actions: BTreeMap<String, String>,
 }
 

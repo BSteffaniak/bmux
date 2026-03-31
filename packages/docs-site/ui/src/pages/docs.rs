@@ -6,8 +6,9 @@ use hyperchad::template::Containers;
 
 use bmux_config::{
     AppearanceConfig, BehaviorConfig, ConfigDocSchema, GeneralConfig, KeyBindingConfig,
-    MultiClientConfig, PluginConfig, RecordingConfig, StatusBarConfig,
+    MouseBehaviorConfig, MultiClientConfig, PluginConfig, RecordingConfig, StatusBarConfig,
 };
+use std::collections::BTreeMap;
 
 use crate::layout;
 use crate::theme;
@@ -171,7 +172,7 @@ fn generate_config_reference() -> String {
 
     doc.push_str(&render_section::<GeneralConfig>());
     doc.push_str(&render_section::<AppearanceConfig>());
-    doc.push_str(&render_section::<BehaviorConfig>());
+    doc.push_str(&render_behavior_section());
     doc.push_str(&render_section::<MultiClientConfig>());
     doc.push_str(&render_section::<KeyBindingConfig>());
     doc.push_str(&render_section::<PluginConfig>());
@@ -182,30 +183,96 @@ fn generate_config_reference() -> String {
 }
 
 fn render_section<T: ConfigDocSchema>() -> String {
-    let section_name = T::section_name();
-    let defaults = T::default_values();
-    let mut s = format!(
-        "## `[{}]`\n\n{}\n\n",
-        section_name,
-        T::section_description()
-    );
+    let fields = T::field_docs()
+        .into_iter()
+        .map(RenderField::from)
+        .collect::<Vec<_>>();
+    render_section_with_fields(
+        T::section_name(),
+        T::section_description(),
+        fields,
+        T::default_values(),
+    )
+}
+
+fn render_behavior_section() -> String {
+    let mut defaults = BehaviorConfig::default_values();
+    let mouse_defaults = MouseBehaviorConfig::default_values();
+
+    let mut fields = BehaviorConfig::field_docs()
+        .into_iter()
+        .filter(|field| field.toml_key != "mouse")
+        .map(RenderField::from)
+        .collect::<Vec<_>>();
+
+    for field in MouseBehaviorConfig::field_docs() {
+        let dotted_key = format!("mouse.{}", field.toml_key);
+        if let Some(default) = mouse_defaults.get(field.toml_key) {
+            defaults.insert(dotted_key.clone(), default.clone());
+        }
+        fields.push(RenderField {
+            toml_key: dotted_key,
+            type_display: field.type_display.to_string(),
+            description: field.description.to_string(),
+            enum_values: field
+                .enum_values
+                .map(|values| values.iter().map(|value| (*value).to_string()).collect()),
+        });
+    }
+
+    render_section_with_fields(
+        BehaviorConfig::section_name(),
+        BehaviorConfig::section_description(),
+        fields,
+        defaults,
+    )
+}
+
+struct RenderField {
+    toml_key: String,
+    type_display: String,
+    description: String,
+    enum_values: Option<Vec<String>>,
+}
+
+impl From<bmux_config::FieldDoc> for RenderField {
+    fn from(value: bmux_config::FieldDoc) -> Self {
+        Self {
+            toml_key: value.toml_key.to_string(),
+            type_display: value.type_display.to_string(),
+            description: value.description.to_string(),
+            enum_values: value
+                .enum_values
+                .map(|values| values.iter().map(|v| (*v).to_string()).collect()),
+        }
+    }
+}
+
+fn render_section_with_fields(
+    section_name: &str,
+    section_description: &str,
+    fields: Vec<RenderField>,
+    defaults: BTreeMap<String, String>,
+) -> String {
+    let mut s = format!("## `[{section_name}]`\n\n{section_description}\n\n",);
 
     s.push_str("| Option | Type | Default | Description |\n");
     s.push_str("|--------|------|---------|-------------|\n");
 
     // Collect table-typed fields with non-empty defaults for rendering after
     // the table as collapsible code blocks.
-    let mut deferred_tables: Vec<(&str, &str)> = Vec::new();
+    let mut deferred_tables: Vec<(String, String, bool)> = Vec::new();
 
-    for field in T::field_docs() {
-        let raw_default = defaults.get(field.toml_key).map(String::as_str);
+    for field in fields {
+        let raw_default = defaults.get(&field.toml_key).map(String::as_str);
         let is_table = field.type_display == "table";
+        let is_multiline_default = raw_default.is_some_and(|v| v.contains('\n'));
 
-        let default_val = if is_table {
+        let default_val = if is_table || is_multiline_default {
             match raw_default {
                 Some(v) if v.is_empty() || v == "{}" => "*(empty)*".to_string(),
                 Some(v) => {
-                    deferred_tables.push((field.toml_key, v));
+                    deferred_tables.push((field.toml_key.clone(), v.to_string(), is_table));
                     format!(
                         "[*(see defaults below)*](#default-{section_name}-{})",
                         field.toml_key
@@ -221,12 +288,13 @@ fn render_section<T: ConfigDocSchema>() -> String {
             }
         };
 
-        let type_info = match field.enum_values {
-            Some(vals) => {
+        let type_info = match &field.enum_values {
+            Some(vals) if !vals.is_empty() => {
                 let joined = vals.join("`, `");
                 format!("{} (`{joined}`)", field.type_display)
             }
             None => field.type_display.to_string(),
+            Some(_) => field.type_display.to_string(),
         };
 
         s.push_str(&format!(
@@ -238,10 +306,15 @@ fn render_section<T: ConfigDocSchema>() -> String {
     s.push('\n');
 
     // Render deferred table defaults as code blocks with anchor IDs
-    for (toml_key, default_val) in &deferred_tables {
+    for (toml_key, default_val, is_table) in &deferred_tables {
+        let heading = if *is_table {
+            format!("Default `{toml_key}` bindings")
+        } else {
+            format!("Default `{toml_key}` value")
+        };
         s.push_str(&format!(
             "<div id=\"default-{section_name}-{toml_key}\"></div>\n\n\
-             ### Default `{toml_key}` bindings\n\n\
+             ### {heading}\n\n\
              ```toml\n[{section_name}.{toml_key}]\n{default_val}\n```\n\n"
         ));
     }
