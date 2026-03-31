@@ -84,7 +84,7 @@ mod tests {
 
     #[test]
     fn roundtrip_f32() {
-        let v: f32 = 3.14;
+        let v: f32 = std::f32::consts::PI;
         let bytes = to_vec(&v).unwrap();
         assert_eq!(from_bytes::<f32>(&bytes).unwrap(), v);
     }
