@@ -1020,6 +1020,14 @@ async fn interactive_mode_basic() {
     .await;
     assert_eq!(resp["status"], "ok", "send-keys response: {resp:#}");
 
+    let resp = send_op(
+        &mut writer,
+        &mut reader,
+        &serde_json::json!({"op":"command","request_id":"basic-wait-marker","dsl":"wait-for pattern='push_test_marker' timeout=3000"}),
+    )
+    .await;
+    assert_eq!(resp["status"], "ok", "wait-for marker response: {resp:#}");
+
     // Read responses/push events until we find an output push event or the
     // screen command response. Push events may arrive before or after the
     // screen response.
@@ -1033,7 +1041,19 @@ async fn interactive_mode_basic() {
     )
     .await;
     assert_eq!(resp["status"], "ok", "screen after subscribe: {resp:#}");
-    assert!(resp["panes"].is_array(), "screen should return panes");
+    // The screen text should contain our marker.
+    let empty_vec = vec![];
+    let panes = resp["panes"].as_array().unwrap_or(&empty_vec);
+    let screen_has_marker = panes.iter().any(|p| {
+        p["screen_text"]
+            .as_str()
+            .unwrap_or("")
+            .contains("push_test_marker")
+    });
+    assert!(
+        screen_has_marker,
+        "screen should contain push_test_marker after subscribe"
+    );
 
     // unsubscribe
     let resp = send_op(
