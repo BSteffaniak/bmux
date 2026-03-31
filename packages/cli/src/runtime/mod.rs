@@ -8,12 +8,15 @@ use crate::status::{AttachTab, build_attach_status_line};
 use anyhow::{Context, Result};
 use bmux_cli_schema::{
     Cli, Command, KeymapCommand, LogLevel, LogsCommand, LogsProfilesCommand, PlaybookCommand,
-    RecordingCommand, RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg,
-    RecordingRenderMode, RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand,
-    TraceFamily,
+    RecordingCommand, RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorShape,
+    RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg, RecordingRenderMode,
+    RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
 };
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
-use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout, TerminfoAutoInstall};
+use bmux_config::{
+    BmuxConfig, ConfigPaths, RecordingExportCursorBlinkMode, RecordingExportCursorMode,
+    RecordingExportCursorShape, ResolvedTimeout, TerminfoAutoInstall,
+};
 use bmux_ipc::{
     AttachRect, AttachViewComponent, ContextSelector, ContextSummary, InvokeServiceKind,
     PaneFocusDirection, PaneSelector, PaneSplitDirection, RecordingEventEnvelope,
@@ -1450,6 +1453,12 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                         font_size,
                         line_height,
                         font_path,
+                        cursor,
+                        cursor_shape,
+                        cursor_blink,
+                        cursor_blink_period_ms,
+                        cursor_color,
+                        export_metadata,
                         no_progress,
                     },
             },
@@ -1471,6 +1480,12 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 *font_size,
                 *line_height,
                 font_path,
+                *cursor,
+                *cursor_shape,
+                *cursor_blink,
+                *cursor_blink_period_ms,
+                cursor_color.as_deref(),
+                export_metadata.as_deref(),
                 !*no_progress,
             )
             .await
@@ -3083,8 +3098,44 @@ async fn run_recording_export(
     font_size: Option<f32>,
     line_height: Option<f32>,
     font_path: &[String],
+    cursor: Option<RecordingCursorMode>,
+    cursor_shape: Option<RecordingCursorShape>,
+    cursor_blink: Option<RecordingCursorBlinkMode>,
+    cursor_blink_period_ms: Option<u32>,
+    cursor_color: Option<&str>,
+    export_metadata: Option<&str>,
     show_progress: bool,
 ) -> Result<u8> {
+    let paths = ConfigPaths::default();
+    let config = BmuxConfig::load_from_path(&paths.config_file()).unwrap_or_default();
+    let export_defaults = &config.recording;
+
+    let resolved_cursor = cursor.unwrap_or(match export_defaults.export_cursor {
+        RecordingExportCursorMode::Auto => RecordingCursorMode::Auto,
+        RecordingExportCursorMode::On => RecordingCursorMode::On,
+        RecordingExportCursorMode::Off => RecordingCursorMode::Off,
+    });
+    let resolved_cursor_shape = cursor_shape.unwrap_or(match export_defaults.export_cursor_shape {
+        RecordingExportCursorShape::Auto => RecordingCursorShape::Auto,
+        RecordingExportCursorShape::Block => RecordingCursorShape::Block,
+        RecordingExportCursorShape::Bar => RecordingCursorShape::Bar,
+        RecordingExportCursorShape::Underline => RecordingCursorShape::Underline,
+    });
+    let resolved_cursor_blink = cursor_blink.unwrap_or(match export_defaults.export_cursor_blink {
+        RecordingExportCursorBlinkMode::Auto => RecordingCursorBlinkMode::Auto,
+        RecordingExportCursorBlinkMode::On => RecordingCursorBlinkMode::On,
+        RecordingExportCursorBlinkMode::Off => RecordingCursorBlinkMode::Off,
+    });
+    let resolved_cursor_blink_period_ms =
+        cursor_blink_period_ms.unwrap_or(export_defaults.export_cursor_blink_period_ms.max(1));
+    let resolved_cursor_color = cursor_color
+        .map(str::to_string)
+        .or_else(|| {
+            let value = export_defaults.export_cursor_color.trim();
+            (!value.is_empty()).then(|| value.to_string())
+        })
+        .unwrap_or_else(|| "auto".to_string());
+
     recording::run_recording_export(
         recording_id,
         format,
@@ -3102,6 +3153,12 @@ async fn run_recording_export(
         font_size,
         line_height,
         font_path,
+        resolved_cursor,
+        resolved_cursor_shape,
+        resolved_cursor_blink,
+        resolved_cursor_blink_period_ms,
+        &resolved_cursor_color,
+        export_metadata,
         show_progress,
     )
     .await
@@ -8727,7 +8784,7 @@ async fn run_playbook_run(
     if let Some(gif_path) = export_gif {
         if let Some(ref rec_id) = result.recording_id {
             let recording_id_str = rec_id.to_string();
-            match recording::run_recording_export(
+            match run_recording_export(
                 &recording_id_str,
                 RecordingExportFormat::Gif,
                 gif_path,
@@ -8744,6 +8801,12 @@ async fn run_playbook_run(
                 None,                        // font_size
                 None,                        // line_height
                 &[],                         // font_path
+                None,                        // cursor
+                None,                        // cursor_shape
+                None,                        // cursor_blink
+                None,                        // cursor_blink_period_ms
+                None,                        // cursor_color
+                None,                        // export_metadata
                 true,                        // show_progress
             )
             .await

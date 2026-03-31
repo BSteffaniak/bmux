@@ -64,6 +64,28 @@ pub enum RecordingRenderMode {
     Bitmap,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RecordingCursorMode {
+    Auto,
+    On,
+    Off,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RecordingCursorShape {
+    Auto,
+    Block,
+    Bar,
+    Underline,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RecordingCursorBlinkMode {
+    Auto,
+    On,
+    Off,
+}
+
 fn parse_cell_size(value: &str) -> Result<(u16, u16), String> {
     let trimmed = value.trim();
     let (width_raw, height_raw) = trimmed
@@ -380,6 +402,24 @@ pub enum RecordingCommand {
         /// Additional font file path (repeatable)
         #[arg(long)]
         font_path: Vec<String>,
+        /// Cursor rendering mode for export
+        #[arg(long, value_enum)]
+        cursor: Option<RecordingCursorMode>,
+        /// Cursor shape override for export
+        #[arg(long, value_enum)]
+        cursor_shape: Option<RecordingCursorShape>,
+        /// Cursor blink mode for export
+        #[arg(long, value_enum)]
+        cursor_blink: Option<RecordingCursorBlinkMode>,
+        /// Cursor blink period in milliseconds
+        #[arg(long)]
+        cursor_blink_period_ms: Option<u32>,
+        /// Cursor color override for export (`auto` or #RRGGBB)
+        #[arg(long)]
+        cursor_color: Option<String>,
+        /// Write export metadata JSON to this path
+        #[arg(long)]
+        export_metadata: Option<String>,
         /// Disable export progress output
         #[arg(long)]
         no_progress: bool,
@@ -723,8 +763,9 @@ pub enum TerminalCommand {
 mod tests {
     use super::{
         Cli, Command, KeymapCommand, LogsCommand, LogsProfilesCommand, RecordingCommand,
-        RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg, RecordingRenderMode,
-        RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
+        RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorShape, RecordingEventKindArg,
+        RecordingExportFormat, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
+        ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
     };
     use clap::Parser;
 
@@ -1846,6 +1887,18 @@ mod tests {
             "/tmp/font.ttf",
             "--font-path",
             "/tmp/font2.ttf",
+            "--cursor",
+            "on",
+            "--cursor-shape",
+            "bar",
+            "--cursor-blink",
+            "off",
+            "--cursor-blink-period-ms",
+            "700",
+            "--cursor-color",
+            "#11aaee",
+            "--export-metadata",
+            "./out.json",
             "--no-progress",
         ])
         .expect("valid CLI args");
@@ -1867,6 +1920,12 @@ mod tests {
                 font_size: Some(size),
                 line_height: Some(line_height),
                 font_path,
+                cursor: Some(RecordingCursorMode::On),
+                cursor_shape: Some(RecordingCursorShape::Bar),
+                cursor_blink: Some(RecordingCursorBlinkMode::Off),
+                cursor_blink_period_ms: Some(700),
+                cursor_color: Some(_),
+                export_metadata: Some(_),
                 no_progress: true,
                 ..
             } if (size - 15.0).abs() < f32::EPSILON

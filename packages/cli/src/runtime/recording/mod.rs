@@ -1,10 +1,11 @@
 use super::{
     AttachDisplayCapturePlan, BmuxConfig, BufWriter, ConfigPaths, ConnectionPolicyScope, Context,
-    GifEncoder, GifFrame, Instant, IsTerminal, Path, PathBuf, RecordingEventEnvelope,
-    RecordingEventKind, RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg,
-    RecordingRenderMode, RecordingReplayMode, RecordingStatus, RecordingSummary, Repeat, Result,
-    Uuid, Write, cleanup_stale_pid_file, connect_if_running, io, map_cli_client_error,
-    parse_uuid_value, terminal,
+    GifEncoder, GifFrame, Instant, IsTerminal, Path, PathBuf, RecordingCursorBlinkMode,
+    RecordingCursorMode, RecordingCursorShape, RecordingEventEnvelope, RecordingEventKind,
+    RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg, RecordingRenderMode,
+    RecordingReplayMode, RecordingStatus, RecordingSummary, Repeat, Result, Uuid, Write,
+    cleanup_stale_pid_file, connect_if_running, io, map_cli_client_error, parse_uuid_value,
+    terminal,
 };
 use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont, point};
 use bmux_fonts::FontPreset;
@@ -469,6 +470,12 @@ pub(super) async fn run_recording_export(
     font_size: Option<f32>,
     line_height: Option<f32>,
     font_path: &[String],
+    cursor: RecordingCursorMode,
+    cursor_shape: RecordingCursorShape,
+    cursor_blink: RecordingCursorBlinkMode,
+    cursor_blink_period_ms: u32,
+    cursor_color: &str,
+    export_metadata: Option<&str>,
     show_progress: bool,
 ) -> Result<u8> {
     let recording_id = parse_uuid_value(recording_id, "recording id")?;
@@ -512,6 +519,12 @@ pub(super) async fn run_recording_export(
             font_size,
             line_height,
             font_path,
+            cursor,
+            cursor_shape,
+            cursor_blink,
+            cursor_blink_period_ms,
+            cursor_color,
+            export_metadata,
             show_progress,
         )?,
     }
@@ -710,6 +723,265 @@ fn capture_stream_open_metrics() -> (Option<u16>, Option<u16>, Option<u16>, Opti
     )
 }
 
+#[derive(Debug, Clone, Copy)]
+enum CursorVisualShape {
+    Block,
+    Bar,
+    Underline,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CursorReplayState {
+    shape: CursorVisualShape,
+    blink_enabled: bool,
+}
+
+impl Default for CursorReplayState {
+    fn default() -> Self {
+        Self {
+            shape: CursorVisualShape::Block,
+            blink_enabled: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct CursorExportOptions {
+    mode: RecordingCursorMode,
+    shape: RecordingCursorShape,
+    blink: RecordingCursorBlinkMode,
+    blink_period_ns: u64,
+    color_override: Option<(u8, u8, u8)>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct ExportCursorFrame {
+    mono_ns: u64,
+    row: u16,
+    col: u16,
+    visible: bool,
+    shape: &'static str,
+    blink_on: bool,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct ExportMetadata<'a> {
+    format: &'a str,
+    output: &'a str,
+    fps: u32,
+    speed: f64,
+    emitted_frames: u32,
+    cursor: CursorMetadata<'a>,
+    frames: Vec<ExportCursorFrame>,
+}
+
+#[derive(Debug, serde::Serialize)]
+struct CursorMetadata<'a> {
+    mode: &'a str,
+    shape: &'a str,
+    blink: &'a str,
+    blink_period_ms: u32,
+    color: &'a str,
+}
+
+fn parse_cursor_color(value: &str) -> Result<Option<(u8, u8, u8)>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto") {
+        return Ok(None);
+    }
+    let hex = trimmed.strip_prefix('#').unwrap_or(trimmed);
+    if hex.len() != 6 || !hex.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        anyhow::bail!("invalid cursor color '{value}'; expected auto or #RRGGBB")
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).context("invalid cursor color red channel")?;
+    let g = u8::from_str_radix(&hex[2..4], 16).context("invalid cursor color green channel")?;
+    let b = u8::from_str_radix(&hex[4..6], 16).context("invalid cursor color blue channel")?;
+    Ok(Some((r, g, b)))
+}
+
+fn update_cursor_replay_state(state: &mut CursorReplayState, data: &[u8]) {
+    let mut index = 0usize;
+    while index + 4 < data.len() {
+        if data[index] != 0x1b || data[index + 1] != b'[' {
+            index += 1;
+            continue;
+        }
+        let mut cursor = index + 2;
+        let mut value: u16 = 0;
+        let mut saw_digit = false;
+        while cursor < data.len() && data[cursor].is_ascii_digit() {
+            saw_digit = true;
+            value = value
+                .saturating_mul(10)
+                .saturating_add(u16::from(data[cursor].saturating_sub(b'0')));
+            cursor += 1;
+        }
+        if cursor + 1 >= data.len() || data[cursor] != b' ' || data[cursor + 1] != b'q' {
+            index += 1;
+            continue;
+        }
+        let ps = if saw_digit { value } else { 0 };
+        match ps {
+            0 | 1 => {
+                state.shape = CursorVisualShape::Block;
+                state.blink_enabled = true;
+            }
+            2 => {
+                state.shape = CursorVisualShape::Block;
+                state.blink_enabled = false;
+            }
+            3 => {
+                state.shape = CursorVisualShape::Underline;
+                state.blink_enabled = true;
+            }
+            4 => {
+                state.shape = CursorVisualShape::Underline;
+                state.blink_enabled = false;
+            }
+            5 => {
+                state.shape = CursorVisualShape::Bar;
+                state.blink_enabled = true;
+            }
+            6 => {
+                state.shape = CursorVisualShape::Bar;
+                state.blink_enabled = false;
+            }
+            _ => {}
+        }
+        index = cursor + 2;
+    }
+}
+
+fn effective_cursor_shape(
+    options: &CursorExportOptions,
+    replay_state: CursorReplayState,
+) -> CursorVisualShape {
+    match options.shape {
+        RecordingCursorShape::Auto => replay_state.shape,
+        RecordingCursorShape::Block => CursorVisualShape::Block,
+        RecordingCursorShape::Bar => CursorVisualShape::Bar,
+        RecordingCursorShape::Underline => CursorVisualShape::Underline,
+    }
+}
+
+fn compute_cursor_visibility(
+    options: &CursorExportOptions,
+    replay_state: CursorReplayState,
+    parser_visible: bool,
+    mono_ns: u64,
+) -> (bool, bool) {
+    let base_visible = match options.mode {
+        RecordingCursorMode::Auto => parser_visible,
+        RecordingCursorMode::On => true,
+        RecordingCursorMode::Off => false,
+    };
+    if !base_visible {
+        return (false, true);
+    }
+    let blink_enabled = match options.blink {
+        RecordingCursorBlinkMode::Auto => replay_state.blink_enabled,
+        RecordingCursorBlinkMode::On => true,
+        RecordingCursorBlinkMode::Off => false,
+    };
+    if !blink_enabled {
+        return (true, true);
+    }
+    let period = options.blink_period_ns.max(1);
+    let blink_on = ((mono_ns / period) % 2) == 0;
+    (blink_on, blink_on)
+}
+
+fn cursor_shape_name(shape: CursorVisualShape) -> &'static str {
+    match shape {
+        CursorVisualShape::Block => "block",
+        CursorVisualShape::Bar => "bar",
+        CursorVisualShape::Underline => "underline",
+    }
+}
+
+fn overlay_cursor_rgba(
+    pixels: &mut [u8],
+    frame_width: usize,
+    frame_height: usize,
+    cell_w: usize,
+    cell_h: usize,
+    row: u16,
+    col: u16,
+    shape: CursorVisualShape,
+    color: (u8, u8, u8),
+) {
+    if frame_width == 0 || frame_height == 0 || cell_w == 0 || cell_h == 0 {
+        return;
+    }
+    let x0 = usize::from(col).saturating_mul(cell_w);
+    let y0 = usize::from(row).saturating_mul(cell_h);
+    if x0 >= frame_width || y0 >= frame_height {
+        return;
+    }
+
+    match shape {
+        CursorVisualShape::Block => {
+            for py in 0..cell_h {
+                let y = y0 + py;
+                if y >= frame_height {
+                    continue;
+                }
+                for px in 0..cell_w {
+                    let x = x0 + px;
+                    if x >= frame_width {
+                        continue;
+                    }
+                    let idx = (y * frame_width + x) * 4;
+                    pixels[idx] = 255_u8.saturating_sub(pixels[idx]);
+                    pixels[idx + 1] = 255_u8.saturating_sub(pixels[idx + 1]);
+                    pixels[idx + 2] = 255_u8.saturating_sub(pixels[idx + 2]);
+                    pixels[idx + 3] = 255;
+                }
+            }
+        }
+        CursorVisualShape::Bar => {
+            let bar_width = (cell_w / 6).max(1);
+            for py in 0..cell_h {
+                let y = y0 + py;
+                if y >= frame_height {
+                    continue;
+                }
+                for px in 0..bar_width {
+                    let x = x0 + px;
+                    if x >= frame_width {
+                        continue;
+                    }
+                    let idx = (y * frame_width + x) * 4;
+                    pixels[idx] = color.0;
+                    pixels[idx + 1] = color.1;
+                    pixels[idx + 2] = color.2;
+                    pixels[idx + 3] = 255;
+                }
+            }
+        }
+        CursorVisualShape::Underline => {
+            let line_height = (cell_h / 8).max(1);
+            let start_y = y0 + cell_h.saturating_sub(line_height);
+            for py in start_y..(start_y + line_height) {
+                if py >= frame_height {
+                    continue;
+                }
+                for px in 0..cell_w {
+                    let x = x0 + px;
+                    if x >= frame_width {
+                        continue;
+                    }
+                    let idx = (py * frame_width + x) * 4;
+                    pixels[idx] = color.0;
+                    pixels[idx + 1] = color.1;
+                    pixels[idx + 2] = color.2;
+                    pixels[idx + 3] = 255;
+                }
+            }
+        }
+    }
+}
+
 fn export_recording_gif(
     events: &[DisplayTrackEnvelope],
     output: &str,
@@ -726,6 +998,12 @@ fn export_recording_gif(
     font_size: Option<f32>,
     line_height: Option<f32>,
     font_path: &[String],
+    cursor_mode: RecordingCursorMode,
+    cursor_shape: RecordingCursorShape,
+    cursor_blink: RecordingCursorBlinkMode,
+    cursor_blink_period_ms: u32,
+    cursor_color: &str,
+    export_metadata: Option<&str>,
     show_progress: bool,
 ) -> Result<()> {
     let speed = if speed <= 0.0 { 1.0 } else { speed };
@@ -733,6 +1011,13 @@ fn export_recording_gif(
     let frame_interval_ns = (1_000_000_000_f64 / f64::from(fps)) as u64;
     let estimate = estimate_export_progress(events, speed, fps, max_duration, max_frames);
     let mut progress = ExportProgress::new(show_progress, estimate);
+    let cursor_options = CursorExportOptions {
+        mode: cursor_mode,
+        shape: cursor_shape,
+        blink: cursor_blink,
+        blink_period_ns: u64::from(cursor_blink_period_ms.max(1)).saturating_mul(1_000_000),
+        color_override: parse_cursor_color(cursor_color)?,
+    };
 
     let mut max_cols = 80_u16;
     let mut max_rows = 24_u16;
@@ -793,6 +1078,8 @@ fn export_recording_gif(
     let mut processed_frame_events = 0_u32;
     let mut previous_emit_ns = None::<u64>;
     let mut first_mono_ns = None::<u64>;
+    let mut cursor_state = CursorReplayState::default();
+    let mut cursor_frames = export_metadata.map(|_| Vec::<ExportCursorFrame>::new());
 
     for event in events {
         if first_mono_ns.is_none() {
@@ -817,6 +1104,7 @@ fn export_recording_gif(
                 parser.screen_mut().set_size(current_rows, current_cols);
             }
             DisplayTrackEvent::FrameBytes { data } => {
+                update_cursor_replay_state(&mut cursor_state, data);
                 parser.process(data);
                 processed_frame_events = processed_frame_events.saturating_add(1);
                 let scaled_ns = (event.mono_ns as f64 / speed) as u64;
@@ -867,6 +1155,45 @@ fn export_recording_gif(
                             &mut bitmap_cache,
                         )
                     };
+                    let (cursor_row, cursor_col) = parser.screen().cursor_position();
+                    let parser_cursor_visible = !parser.screen().hide_cursor();
+                    let shape = effective_cursor_shape(&cursor_options, cursor_state);
+                    let (cursor_visible, blink_on) = compute_cursor_visibility(
+                        &cursor_options,
+                        cursor_state,
+                        parser_cursor_visible,
+                        scaled_ns,
+                    );
+                    if cursor_visible && cursor_row < current_rows && cursor_col < current_cols {
+                        let cursor_color_rgb = cursor_options.color_override.unwrap_or_else(|| {
+                            parser
+                                .screen()
+                                .cell(cursor_row, cursor_col)
+                                .map(|cell| resolved_cell_colors(cell, &palette).0)
+                                .unwrap_or((255, 255, 255))
+                        });
+                        overlay_cursor_rgba(
+                            &mut pixels,
+                            usize::from(width),
+                            usize::from(height),
+                            usize::from(cell_w),
+                            usize::from(cell_h),
+                            cursor_row,
+                            cursor_col,
+                            shape,
+                            cursor_color_rgb,
+                        );
+                    }
+                    if let Some(frames) = cursor_frames.as_mut() {
+                        frames.push(ExportCursorFrame {
+                            mono_ns: scaled_ns,
+                            row: cursor_row,
+                            col: cursor_col,
+                            visible: cursor_visible,
+                            shape: cursor_shape_name(shape),
+                            blink_on,
+                        });
+                    }
                     let mut frame = GifFrame::from_rgba_speed(width, height, &mut pixels, 1);
                     frame.delay = delay_cs;
                     encoder
@@ -885,6 +1212,52 @@ fn export_recording_gif(
 
     if emitted_frames == 0 {
         anyhow::bail!("no drawable frame events found in display track")
+    }
+    if let Some(path) = export_metadata {
+        let metadata_path = PathBuf::from(path);
+        if let Some(parent) = metadata_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed creating export metadata parent directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        let metadata = ExportMetadata {
+            format: "gif",
+            output,
+            fps,
+            speed,
+            emitted_frames,
+            cursor: CursorMetadata {
+                mode: match cursor_options.mode {
+                    RecordingCursorMode::Auto => "auto",
+                    RecordingCursorMode::On => "on",
+                    RecordingCursorMode::Off => "off",
+                },
+                shape: match cursor_options.shape {
+                    RecordingCursorShape::Auto => "auto",
+                    RecordingCursorShape::Block => "block",
+                    RecordingCursorShape::Bar => "bar",
+                    RecordingCursorShape::Underline => "underline",
+                },
+                blink: match cursor_options.blink {
+                    RecordingCursorBlinkMode::Auto => "auto",
+                    RecordingCursorBlinkMode::On => "on",
+                    RecordingCursorBlinkMode::Off => "off",
+                },
+                blink_period_ms: cursor_blink_period_ms.max(1),
+                color: cursor_color,
+            },
+            frames: cursor_frames.unwrap_or_default(),
+        };
+        let json = serde_json::to_vec_pretty(&metadata)
+            .context("failed serializing export cursor metadata")?;
+        std::fs::write(&metadata_path, json).with_context(|| {
+            format!("failed writing export metadata {}", metadata_path.display())
+        })?;
     }
     Ok(())
 }
@@ -2686,5 +3059,25 @@ mod tests {
             format_duration_compact(std::time::Duration::from_secs(3_665)),
             "1:01:05"
         );
+    }
+
+    #[test]
+    fn parse_cursor_color_accepts_auto_and_hex() {
+        assert_eq!(parse_cursor_color("auto").expect("auto should parse"), None);
+        assert_eq!(
+            parse_cursor_color("#11AAee").expect("hex should parse"),
+            Some((0x11, 0xaa, 0xee))
+        );
+    }
+
+    #[test]
+    fn update_cursor_replay_state_parses_decscusr() {
+        let mut state = CursorReplayState::default();
+        update_cursor_replay_state(&mut state, b"\x1b[6 q");
+        assert!(matches!(state.shape, CursorVisualShape::Bar));
+        assert!(!state.blink_enabled);
+        update_cursor_replay_state(&mut state, b"\x1b[3 q");
+        assert!(matches!(state.shape, CursorVisualShape::Underline));
+        assert!(state.blink_enabled);
     }
 }

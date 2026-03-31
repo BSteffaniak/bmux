@@ -89,6 +89,16 @@ pub struct RecordingConfig {
     /// Retention period for completed recordings in days. Set to 0 to disable
     /// automatic pruning and keep recordings indefinitely.
     pub retention_days: u64,
+    /// Cursor rendering default for `recording export`.
+    pub export_cursor: RecordingExportCursorMode,
+    /// Cursor shape default for `recording export`.
+    pub export_cursor_shape: RecordingExportCursorShape,
+    /// Cursor blink default for `recording export`.
+    pub export_cursor_blink: RecordingExportCursorBlinkMode,
+    /// Cursor blink period default for `recording export`.
+    pub export_cursor_blink_period_ms: u32,
+    /// Cursor color default for `recording export` (`auto` or #RRGGBB).
+    pub export_cursor_color: String,
 }
 
 impl Default for RecordingConfig {
@@ -101,8 +111,38 @@ impl Default for RecordingConfig {
             capture_events: true,
             segment_mb: 64,
             retention_days: 30,
+            export_cursor: RecordingExportCursorMode::Auto,
+            export_cursor_shape: RecordingExportCursorShape::Auto,
+            export_cursor_blink: RecordingExportCursorBlinkMode::Auto,
+            export_cursor_blink_period_ms: 500,
+            export_cursor_color: "auto".to_string(),
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ConfigDocEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingExportCursorMode {
+    Auto,
+    On,
+    Off,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ConfigDocEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingExportCursorShape {
+    Auto,
+    Block,
+    Bar,
+    Underline,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ConfigDocEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingExportCursorBlinkMode {
+    Auto,
+    On,
+    Off,
 }
 
 /// Core session defaults: shell, scrollback depth, and server connection settings
@@ -551,6 +591,13 @@ impl BmuxConfig {
             });
         }
 
+        if self.recording.export_cursor_blink_period_ms == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "recording.export_cursor_blink_period_ms".to_string(),
+                value: "0".to_string(),
+            });
+        }
+
         Ok(())
     }
 
@@ -634,6 +681,15 @@ impl BmuxConfig {
             repaired_fields.push(format!(
                 "recording.segment_mb=0 -> {}",
                 recording_defaults.segment_mb
+            ));
+        }
+
+        if self.recording.export_cursor_blink_period_ms == 0 {
+            self.recording.export_cursor_blink_period_ms =
+                recording_defaults.export_cursor_blink_period_ms;
+            repaired_fields.push(format!(
+                "recording.export_cursor_blink_period_ms=0 -> {}",
+                self.recording.export_cursor_blink_period_ms
             ));
         }
 
@@ -975,6 +1031,54 @@ timeout_profile = "missing"
             config.recording.dir,
             Some(std::path::PathBuf::from("recordings/custom"))
         );
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn recording_export_defaults_include_cursor_settings() {
+        let config = BmuxConfig::default();
+        assert_eq!(
+            config.recording.export_cursor,
+            crate::RecordingExportCursorMode::Auto
+        );
+        assert_eq!(
+            config.recording.export_cursor_shape,
+            crate::RecordingExportCursorShape::Auto
+        );
+        assert_eq!(
+            config.recording.export_cursor_blink,
+            crate::RecordingExportCursorBlinkMode::Auto
+        );
+        assert_eq!(config.recording.export_cursor_blink_period_ms, 500);
+        assert_eq!(config.recording.export_cursor_color, "auto");
+    }
+
+    #[test]
+    fn load_parses_recording_export_cursor_defaults() {
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        std::fs::write(
+            &path,
+            "[recording]\nexport_cursor = 'on'\nexport_cursor_shape = 'underline'\nexport_cursor_blink = 'off'\nexport_cursor_blink_period_ms = 650\nexport_cursor_color = '#44aaee'\n",
+        )
+        .expect("failed writing config fixture");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(
+            config.recording.export_cursor,
+            crate::RecordingExportCursorMode::On
+        );
+        assert_eq!(
+            config.recording.export_cursor_shape,
+            crate::RecordingExportCursorShape::Underline
+        );
+        assert_eq!(
+            config.recording.export_cursor_blink,
+            crate::RecordingExportCursorBlinkMode::Off
+        );
+        assert_eq!(config.recording.export_cursor_blink_period_ms, 650);
+        assert_eq!(config.recording.export_cursor_color, "#44aaee");
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
     }
