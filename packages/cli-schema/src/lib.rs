@@ -86,6 +86,13 @@ pub enum RecordingCursorBlinkMode {
     Off,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RecordingCursorProfile {
+    Auto,
+    Ghostty,
+    Generic,
+}
+
 fn parse_cell_size(value: &str) -> Result<(u16, u16), String> {
     let trimmed = value.trim();
     let (width_raw, height_raw) = trimmed
@@ -417,6 +424,12 @@ pub enum RecordingCommand {
         /// Cursor color override for export (`auto` or #RRGGBB)
         #[arg(long)]
         cursor_color: Option<String>,
+        /// Cursor behavior profile for export timing
+        #[arg(long, value_enum)]
+        cursor_profile: Option<RecordingCursorProfile>,
+        /// Keep cursor solid after activity for this duration in ms
+        #[arg(long)]
+        cursor_solid_after_activity_ms: Option<u32>,
         /// Write export metadata JSON to this path
         #[arg(long)]
         export_metadata: Option<String>,
@@ -763,9 +776,10 @@ pub enum TerminalCommand {
 mod tests {
     use super::{
         Cli, Command, KeymapCommand, LogsCommand, LogsProfilesCommand, RecordingCommand,
-        RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorShape, RecordingEventKindArg,
-        RecordingExportFormat, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
-        ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
+        RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorProfile,
+        RecordingCursorShape, RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg,
+        RecordingRenderMode, RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand,
+        TraceFamily,
     };
     use clap::Parser;
 
@@ -1897,6 +1911,10 @@ mod tests {
             "700",
             "--cursor-color",
             "#11aaee",
+            "--cursor-profile",
+            "ghostty",
+            "--cursor-solid-after-activity-ms",
+            "800",
             "--export-metadata",
             "./out.json",
             "--no-progress",
@@ -1925,6 +1943,8 @@ mod tests {
                 cursor_blink: Some(RecordingCursorBlinkMode::Off),
                 cursor_blink_period_ms: Some(700),
                 cursor_color: Some(_),
+                cursor_profile: Some(RecordingCursorProfile::Ghostty),
+                cursor_solid_after_activity_ms: Some(800),
                 export_metadata: Some(_),
                 no_progress: true,
                 ..

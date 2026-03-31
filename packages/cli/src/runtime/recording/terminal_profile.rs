@@ -7,7 +7,40 @@ pub(super) struct DetectedTerminalProfile {
     pub(super) font_families: Vec<String>,
     pub(super) font_size_px: Option<u16>,
     pub(super) background_opacity_permille: Option<u16>,
+    #[serde(default)]
+    pub(super) cursor_defaults: CursorDefaults,
     pub(super) source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Default)]
+pub(super) struct CursorDefaults {
+    pub(super) profile: Option<CursorDefaultProfile>,
+    pub(super) shape: Option<CursorDefaultShape>,
+    pub(super) blink: Option<CursorDefaultBlink>,
+    pub(super) color: Option<String>,
+    pub(super) solid_after_activity_ms: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum CursorDefaultProfile {
+    Ghostty,
+    Generic,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum CursorDefaultShape {
+    Block,
+    Bar,
+    Underline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum CursorDefaultBlink {
+    On,
+    Off,
 }
 
 trait TerminalProfileProvider {
@@ -60,6 +93,7 @@ struct GhosttyConfigProfile {
     font_families: Vec<String>,
     font_size_px: Option<u16>,
     background_opacity_permille: Option<u16>,
+    cursor_defaults: CursorDefaults,
 }
 
 impl GhosttyProvider {
@@ -93,6 +127,7 @@ impl GhosttyProvider {
         if parsed.font_families.is_empty()
             && parsed.font_size_px.is_none()
             && parsed.background_opacity_permille.is_none()
+            && parsed.cursor_defaults == CursorDefaults::default()
         {
             return None;
         }
@@ -105,6 +140,11 @@ impl GhosttyProvider {
             },
             font_size_px: parsed.font_size_px,
             background_opacity_permille: parsed.background_opacity_permille,
+            cursor_defaults: CursorDefaults {
+                profile: Some(CursorDefaultProfile::Ghostty),
+                solid_after_activity_ms: Some(500),
+                ..parsed.cursor_defaults
+            },
             source: format!("ghostty-config:{}", path.display()),
         })
     }
@@ -115,6 +155,11 @@ impl GhosttyProvider {
             font_families: Self::default_font_families(),
             font_size_px: None,
             background_opacity_permille: None,
+            cursor_defaults: CursorDefaults {
+                profile: Some(CursorDefaultProfile::Ghostty),
+                solid_after_activity_ms: Some(500),
+                ..CursorDefaults::default()
+            },
             source: "ghostty-default".to_string(),
         }
     }
@@ -190,10 +235,48 @@ fn parse_ghostty_config_profile(content: &str) -> GhosttyConfigProfile {
                     profile.background_opacity_permille = Some(opacity);
                 }
             }
+            "cursor-style" => {
+                if parsed.is_empty() {
+                    profile.cursor_defaults.shape = None;
+                    continue;
+                }
+                profile.cursor_defaults.shape = parse_ghostty_cursor_style(&parsed);
+            }
+            "cursor-style-blink" => {
+                if parsed.is_empty() {
+                    profile.cursor_defaults.blink = None;
+                    continue;
+                }
+                profile.cursor_defaults.blink = parse_ghostty_cursor_blink(&parsed);
+            }
+            "cursor-color" => {
+                if parsed.is_empty() {
+                    profile.cursor_defaults.color = None;
+                    continue;
+                }
+                profile.cursor_defaults.color = Some(parsed);
+            }
             _ => {}
         }
     }
     profile
+}
+
+fn parse_ghostty_cursor_style(value: &str) -> Option<CursorDefaultShape> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "block" | "block_hollow" => Some(CursorDefaultShape::Block),
+        "bar" => Some(CursorDefaultShape::Bar),
+        "underline" => Some(CursorDefaultShape::Underline),
+        _ => None,
+    }
+}
+
+fn parse_ghostty_cursor_blink(value: &str) -> Option<CursorDefaultBlink> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "true" => Some(CursorDefaultBlink::On),
+        "false" => Some(CursorDefaultBlink::Off),
+        _ => None,
+    }
 }
 
 fn parse_ghostty_font_size_px(value: &str) -> Option<u16> {
@@ -278,11 +361,17 @@ font-family = ""
 font-family = "Iosevka"
 font-size = 16
 background-opacity = 0.9
+cursor-style = bar
+cursor-style-blink = false
+cursor-color = '#33aaee'
 "#,
         );
         assert_eq!(parsed.font_families, vec!["Iosevka".to_string()]);
         assert_eq!(parsed.font_size_px, Some(16));
         assert_eq!(parsed.background_opacity_permille, Some(900));
+        assert_eq!(parsed.cursor_defaults.shape, Some(CursorDefaultShape::Bar));
+        assert_eq!(parsed.cursor_defaults.blink, Some(CursorDefaultBlink::Off));
+        assert_eq!(parsed.cursor_defaults.color, Some("#33aaee".to_string()));
     }
 
     #[test]
@@ -313,6 +402,10 @@ font-family = "Jet#Brains Mono" # inline comment
         let profile = detect_render_profile_for_env(&env).expect("profile should be detected");
         assert_eq!(profile.terminal_id, "ghostty");
         assert!(!profile.font_families.is_empty());
+        assert_eq!(
+            profile.cursor_defaults.profile,
+            Some(CursorDefaultProfile::Ghostty)
+        );
     }
 
     #[test]
@@ -326,7 +419,7 @@ font-family = "Jet#Brains Mono" # inline comment
         std::fs::create_dir_all(&config_dir).expect("create config dir");
         std::fs::write(
             config_dir.join("config"),
-            "font-family = 'Iosevka Term'\nfont-size = 15\n",
+            "font-family = 'Iosevka Term'\nfont-size = 15\ncursor-style = underline\n",
         )
         .expect("write config");
         let env = EnvSnapshot {
@@ -339,6 +432,10 @@ font-family = "Jet#Brains Mono" # inline comment
         assert_eq!(profile.font_families, vec!["Iosevka Term".to_string()]);
         assert_eq!(profile.font_size_px, Some(15));
         assert_eq!(profile.background_opacity_permille, None);
+        assert_eq!(
+            profile.cursor_defaults.shape,
+            Some(CursorDefaultShape::Underline)
+        );
         assert!(profile.source.contains("ghostty-config:"));
         let _ = std::fs::remove_dir_all(&temp);
     }

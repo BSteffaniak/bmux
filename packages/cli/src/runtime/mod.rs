@@ -8,14 +8,15 @@ use crate::status::{AttachTab, build_attach_status_line};
 use anyhow::{Context, Result};
 use bmux_cli_schema::{
     Cli, Command, KeymapCommand, LogLevel, LogsCommand, LogsProfilesCommand, PlaybookCommand,
-    RecordingCommand, RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorShape,
-    RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg, RecordingRenderMode,
-    RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
+    RecordingCommand, RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorProfile,
+    RecordingCursorShape, RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg,
+    RecordingRenderMode, RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand,
+    TraceFamily,
 };
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
 use bmux_config::{
     BmuxConfig, ConfigPaths, RecordingExportCursorBlinkMode, RecordingExportCursorMode,
-    RecordingExportCursorShape, ResolvedTimeout, TerminfoAutoInstall,
+    RecordingExportCursorProfile, RecordingExportCursorShape, ResolvedTimeout, TerminfoAutoInstall,
 };
 use bmux_ipc::{
     AttachRect, AttachViewComponent, ContextSelector, ContextSummary, InvokeServiceKind,
@@ -1458,6 +1459,8 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                         cursor_blink,
                         cursor_blink_period_ms,
                         cursor_color,
+                        cursor_profile,
+                        cursor_solid_after_activity_ms,
                         export_metadata,
                         no_progress,
                     },
@@ -1485,6 +1488,8 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 *cursor_blink,
                 *cursor_blink_period_ms,
                 cursor_color.as_deref(),
+                *cursor_profile,
+                *cursor_solid_after_activity_ms,
                 export_metadata.as_deref(),
                 !*no_progress,
             )
@@ -3103,6 +3108,8 @@ async fn run_recording_export(
     cursor_blink: Option<RecordingCursorBlinkMode>,
     cursor_blink_period_ms: Option<u32>,
     cursor_color: Option<&str>,
+    cursor_profile: Option<RecordingCursorProfile>,
+    cursor_solid_after_activity_ms: Option<u32>,
     export_metadata: Option<&str>,
     show_progress: bool,
 ) -> Result<u8> {
@@ -3135,6 +3142,14 @@ async fn run_recording_export(
             (!value.is_empty()).then(|| value.to_string())
         })
         .unwrap_or_else(|| "auto".to_string());
+    let resolved_cursor_profile =
+        cursor_profile.unwrap_or(match export_defaults.export_cursor_profile {
+            RecordingExportCursorProfile::Auto => RecordingCursorProfile::Auto,
+            RecordingExportCursorProfile::Ghostty => RecordingCursorProfile::Ghostty,
+            RecordingExportCursorProfile::Generic => RecordingCursorProfile::Generic,
+        });
+    let resolved_cursor_solid_after_activity_ms =
+        cursor_solid_after_activity_ms.or(export_defaults.export_cursor_solid_after_activity_ms);
 
     recording::run_recording_export(
         recording_id,
@@ -3158,6 +3173,8 @@ async fn run_recording_export(
         resolved_cursor_blink,
         resolved_cursor_blink_period_ms,
         &resolved_cursor_color,
+        resolved_cursor_profile,
+        resolved_cursor_solid_after_activity_ms,
         export_metadata,
         show_progress,
     )
@@ -8806,6 +8823,8 @@ async fn run_playbook_run(
                 None,                        // cursor_blink
                 None,                        // cursor_blink_period_ms
                 None,                        // cursor_color
+                None,                        // cursor_profile
+                None,                        // cursor_solid_after_activity_ms
                 None,                        // export_metadata
                 true,                        // show_progress
             )
