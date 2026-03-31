@@ -14,19 +14,19 @@ pub fn home() -> Containers {
             flex-grow=1
             justify-content=center
             align-items=center
-            padding-x=(if_responsive("mobile").then::<i32>(24).or_else(80))
-            padding-y=80
+            padding-x=(if_responsive("tablet").then::<i32>(24).or_else(80))
+            padding-y=(if_responsive("mobile").then::<i32>(48).or_else(80))
         {
             // Hero section
             div
                 align-items=center
                 max-width=800
-                gap=32
+                gap=(if_responsive("mobile").then::<i32>(24).or_else(32))
             {
                 // Terminal prompt branding
                 div
                     color=(layout::green())
-                    font-size=(if_responsive("mobile").then::<i32>(48).or_else(64))
+                    font-size=(if_responsive("tablet").then::<i32>(40).or_else(64))
                     font-family=(layout::MONO_FONT)
                     text-align=center
                 {
@@ -36,7 +36,7 @@ pub fn home() -> Containers {
                 // Tagline
                 h1
                     color=(layout::text_primary())
-                    font-size=(if_responsive("mobile").then::<i32>(24).or_else(32))
+                    font-size=(if_responsive("tablet").then::<i32>(22).or_else(32))
                     font-family=(layout::MONO_FONT)
                     text-align=center
                     margin-bottom=16
@@ -46,7 +46,7 @@ pub fn home() -> Containers {
 
                 div
                     color=(layout::text_muted())
-                    font-size=16
+                    font-size=(if_responsive("mobile").then::<i32>(14).or_else(16))
                     font-family=(layout::MONO_FONT)
                     text-align=center
                     max-width=600
@@ -98,12 +98,12 @@ pub fn home() -> Containers {
             // Feature cards
             div
                 direction=(
-                    if_responsive("mobile")
+                    if_responsive("tablet")
                         .then::<LayoutDirection>(LayoutDirection::Column)
                         .or_else(LayoutDirection::Row)
                 )
                 gap=24
-                margin-top=80
+                margin-top=(if_responsive("mobile").then::<i32>(48).or_else(80))
                 max-width=900
             {
                 (feature_card(
@@ -128,13 +128,13 @@ fn feature_card(title: &str, description: &str) -> Containers {
         div
             background=(layout::surface())
             border-radius=8
-            padding=24
+            padding=(if_responsive("mobile").then::<i32>(20).or_else(24))
             flex=1
             border-left="2, #7ee787"
         {
             h3
                 color=(layout::text_primary())
-                font-size=16
+                font-size=(if_responsive("mobile").then::<i32>(14).or_else(16))
                 font-family=(layout::MONO_FONT)
                 margin-bottom=8
             {
@@ -142,7 +142,7 @@ fn feature_card(title: &str, description: &str) -> Containers {
             }
             div
                 color=(layout::text_muted())
-                font-size=13
+                font-size=(if_responsive("mobile").then::<i32>(12).or_else(13))
                 font-family=(layout::MONO_FONT)
             {
                 (description)

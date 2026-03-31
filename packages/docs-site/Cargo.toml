@@ -46,6 +46,8 @@ static-routes = ["hyperchad/router-static-routes"]
 vanilla-js = [
     "html",
     "hyperchad/renderer-vanilla-js",
+    "hyperchad/renderer-vanilla-js-plugin-actions-click",
+    "hyperchad/renderer-vanilla-js-plugin-actions-click-outside",
     "hyperchad/renderer-vanilla-js-plugin-nav",
     "hyperchad/renderer-vanilla-js-plugin-routing",
 ]

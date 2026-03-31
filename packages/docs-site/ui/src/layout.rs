@@ -1,5 +1,6 @@
 //! Layout components: nav bar, sidebar, docs page wrapper.
 
+use hyperchad::actions::ActionType;
 use hyperchad::actions::logic::if_responsive;
 use hyperchad::color::Color;
 use hyperchad::template::{Container, Containers, container};
@@ -41,6 +42,12 @@ pub fn border() -> Color {
 
 pub const MONO_FONT: &str = "'SF Mono', 'Cascadia Code', 'Fira Code', Menlo, Consolas, monospace";
 
+/// Sidebar element ID used for toggle actions.
+const SIDEBAR_ID: &str = "docs-sidebar";
+
+/// Backdrop element ID used for dismissing the sidebar.
+const BACKDROP_ID: &str = "docs-backdrop";
+
 // ── Top navigation bar ──────────────────────────────────────────────────────
 
 /// Top navigation bar shown on every page.
@@ -54,11 +61,28 @@ pub fn nav_bar() -> Containers {
             border-bottom="1, #21262d"
             padding-y=12
         {
+            // Left: hamburger (mobile only) + logo
             div
                 direction=row
                 align-items=center
                 padding-x=(if_responsive("mobile").then::<i32>(16).or_else(24))
+                gap=(if_responsive("mobile").then::<i32>(12).or_else(0))
             {
+                // Hamburger button — visible on mobile only
+                div
+                    hidden=(if_responsive("mobile").then::<bool>(false).or_else(true))
+                    fx-click=(ActionType::Multi(vec![
+                        ActionType::display_by_id(SIDEBAR_ID),
+                        ActionType::display_by_id(BACKDROP_ID),
+                    ]))
+                    cursor="pointer"
+                    color=(text_secondary())
+                    font-size=20
+                    padding=4
+                    user-select="none"
+                {
+                    "\u{2630}"
+                }
                 anchor
                     color=(green())
                     direction=row
@@ -77,7 +101,7 @@ pub fn nav_bar() -> Containers {
                 justify-content=end
                 flex=1
                 padding-x=(if_responsive("mobile").then::<i32>(16).or_else(24))
-                col-gap=(if_responsive("mobile").then::<i32>(16).or_else(24))
+                gap=(if_responsive("mobile").then::<i32>(16).or_else(24))
             {
                 anchor
                     color=(text_secondary())
@@ -106,6 +130,10 @@ pub fn nav_bar() -> Containers {
 // ── Sidebar ─────────────────────────────────────────────────────────────────
 
 /// Docs sidebar with section navigation.
+///
+/// On desktop/tablet the sidebar is a static column (240 px on desktop, 200 px
+/// on tablet widths). On mobile it renders as a fixed overlay drawer that starts
+/// hidden and is toggled via the hamburger button in the nav bar.
 #[must_use]
 pub fn sidebar(current_path: &str) -> Containers {
     let mut sections = Vec::new();
@@ -121,18 +149,77 @@ pub fn sidebar(current_path: &str) -> Containers {
 
     container! {
         aside
+            #docs-sidebar
             direction=column
-            width=240
-            min-width=240
+            // Tablet: 200px, desktop: 240px. On mobile this is overridden to
+            // 280px via the fixed overlay below.
+            width=(if_responsive("tablet").then::<i32>(200).or_else(240))
+            min-width=(if_responsive("tablet").then::<i32>(200).or_else(240))
             background=#010409
             border-right="1, #21262d"
             padding-y=24
             overflow-y=auto
+            // Mobile: fixed overlay, hidden by default (display=none).
+            // Desktop/tablet: normal flow, always visible.
+            position=(
+                if_responsive("mobile")
+                    .then::<hyperchad::transformer::models::Position>(
+                        hyperchad::transformer::models::Position::Fixed
+                    )
+                    .or_else(hyperchad::transformer::models::Position::Static)
+            )
+            top=0
+            left=0
+            height=100%
             hidden=(if_responsive("mobile").then::<bool>(true).or_else(false))
         {
+            // Close button at top of mobile drawer
+            div
+                hidden=(if_responsive("mobile").then::<bool>(false).or_else(true))
+                direction=row
+                justify-content=end
+                padding-x=16
+                padding-bottom=8
+            {
+                div
+                    fx-click=(ActionType::Multi(vec![
+                        ActionType::no_display_by_id(SIDEBAR_ID),
+                        ActionType::no_display_by_id(BACKDROP_ID),
+                    ]))
+                    cursor="pointer"
+                    color=(text_muted())
+                    font-size=18
+                    padding=4
+                    user-select="none"
+                {
+                    "\u{2715}"
+                }
+            }
             @for section in sections {
                 (section)
             }
+        }
+    }
+}
+
+/// Backdrop overlay that dismisses the mobile sidebar when clicked.
+#[must_use]
+fn backdrop() -> Containers {
+    container! {
+        div
+            #docs-backdrop
+            hidden=true
+            position=fixed
+            top=0
+            left=0
+            width=100%
+            height=100%
+            background="rgba(0,0,0,0.5)"
+            fx-click=(ActionType::Multi(vec![
+                ActionType::no_display_by_id(SIDEBAR_ID),
+                ActionType::no_display_by_id(BACKDROP_ID),
+            ]))
+        {
         }
     }
 }
@@ -205,20 +292,23 @@ pub fn docs_layout(current_path: &str, title: &str, content: &Containers) -> Con
             )
             flex-grow=1
             min-height=0
+            position=relative
         {
             (sidebar(current_path))
+            // Backdrop overlay for mobile drawer
+            (backdrop())
             div
                 flex-grow=1
                 min-height=0
                 overflow-y=auto
             {
                 div
-                    padding=(if_responsive("mobile").then::<i32>(16).or_else(48))
+                    padding=(if_responsive("tablet").then::<i32>(24).or_else(48))
                     max-width=900
                 {
                     h1
                         color=(text_primary())
-                        font-size=32
+                        font-size=(if_responsive("mobile").then::<i32>(24).or_else(32))
                         font-family=(MONO_FONT)
                         margin-bottom=24
                         padding-bottom=16
@@ -226,7 +316,13 @@ pub fn docs_layout(current_path: &str, title: &str, content: &Containers) -> Con
                     {
                         (title)
                     }
-                    div color=(text_secondary()) font-family=(MONO_FONT) font-size=14 {
+                    // Content wrapper with overflow-x for wide code blocks / tables
+                    div
+                        color=(text_secondary())
+                        font-family=(MONO_FONT)
+                        font-size=(if_responsive("mobile").then::<i32>(13).or_else(14))
+                        overflow-x=auto
+                    {
                         (content)
                     }
                 }
