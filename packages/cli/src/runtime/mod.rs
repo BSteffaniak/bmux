@@ -96,9 +96,17 @@ use attach::render::{
     render_attach_scene, visible_scene_pane_ids,
 };
 use attach::runtime::*;
+pub(crate) use attach::runtime::{
+    attach_keymap_from_config, handle_attach_plugin_command_action, handle_attach_runtime_action,
+    handle_attach_ui_action, hydrate_attach_state_from_snapshot,
+    runtime_action_to_attach_event_action,
+};
 use attach::state::{
     AttachEventAction, AttachExitReason, AttachScrollbackCursor, AttachScrollbackPosition,
     AttachUiMode, AttachViewState, PaneRect,
+};
+pub(crate) use attach::state::{
+    AttachEventAction as AttachInputEventAction, AttachViewState as PlaybookAttachViewState,
 };
 use bootstrap::*;
 use built_in_commands::{BuiltInHandlerId, built_in_command_by_handler};

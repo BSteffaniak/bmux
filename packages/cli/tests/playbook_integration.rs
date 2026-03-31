@@ -121,6 +121,15 @@ fn playbook_wait_for_regex() {
 }
 
 #[test]
+fn playbook_attach_scrollback() {
+    let (json, pass) = run_playbook_fixture("attach_scrollback.dsl");
+    assert!(
+        pass,
+        "attach scrollback playbook should pass without leaking literal keys: {json:#}"
+    );
+}
+
+#[test]
 fn playbook_env_mode_clean() {
     let fixture = fixtures_dir().join("env_mode_clean.dsl");
 
@@ -266,6 +275,7 @@ fn parse_and_validate_fixtures() {
         "echo_assert.dsl",
         "multi_pane.dsl",
         "wait_for_regex.dsl",
+        "attach_scrollback.dsl",
         "env_mode_clean.dsl",
         "screen_status.dsl",
         "snapshot_capture.dsl",

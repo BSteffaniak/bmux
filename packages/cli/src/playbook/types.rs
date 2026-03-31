@@ -188,6 +188,8 @@ pub enum Action {
     },
     /// Change the terminal viewport size mid-playbook.
     ResizeViewport { cols: u16, rows: u16 },
+    /// Send key chord(s) through the attach keybinding runtime.
+    SendAttach { key: String },
     /// Send the prefix key combo + a key character.
     PrefixKey { key: char },
     /// Wait for a server event.
@@ -357,6 +359,7 @@ impl Action {
             Self::AssertLayout { .. } => "assert-layout",
             Self::AssertCursor { .. } => "assert-cursor",
             Self::ResizeViewport { .. } => "resize-viewport",
+            Self::SendAttach { .. } => "send-attach",
             Self::PrefixKey { .. } => "prefix-key",
             Self::WaitForEvent { .. } => "wait-for-event",
             Self::InvokeService { .. } => "invoke-service",
@@ -460,6 +463,9 @@ impl Action {
             }
             Self::ResizeViewport { cols, rows } => {
                 format!("resize-viewport cols={cols} rows={rows}")
+            }
+            Self::SendAttach { key } => {
+                format!("send-attach key='{}'", escape_single_quote(key))
             }
             Self::PrefixKey { key } => format!("prefix-key key={key}"),
             Self::WaitForEvent { event, timeout } => {
@@ -862,6 +868,17 @@ mod tests {
         match parsed {
             Action::PrefixKey { key } => assert_eq!(key, 'c'),
             other => panic!("expected PrefixKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn to_dsl_round_trip_send_attach() {
+        let (_, parsed) = round_trip(&Action::SendAttach {
+            key: "ctrl+a [".to_string(),
+        });
+        match parsed {
+            Action::SendAttach { key } => assert_eq!(key, "ctrl+a ["),
+            other => panic!("expected SendAttach, got {other:?}"),
         }
     }
 

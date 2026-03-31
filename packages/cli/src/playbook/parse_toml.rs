@@ -185,6 +185,10 @@ fn parse_step_action(step: RawStep) -> Result<Action> {
             let rows = step.rows.context("resize-viewport requires 'rows'")?;
             Ok(Action::ResizeViewport { cols, rows })
         }
+        "send-attach" => {
+            let key = step.key.context("send-attach requires 'key'")?;
+            Ok(Action::SendAttach { key })
+        }
         "prefix-key" => {
             let key_str = step.key.context("prefix-key requires 'key'")?;
             let key = key_str.chars().next().context("empty key")?;

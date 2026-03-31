@@ -577,6 +577,10 @@ pub fn parse_runtime_action_name(value: &str) -> Result<RuntimeAction> {
     parse_action(value)
 }
 
+pub(crate) fn parse_key_chord(value: &str) -> Result<Vec<KeyStroke>> {
+    parse_chord(value)
+}
+
 // ============================================================================
 // Internal helpers
 // ============================================================================

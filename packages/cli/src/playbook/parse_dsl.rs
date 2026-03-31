@@ -297,6 +297,10 @@ pub(crate) fn parse_action_line(line: &str) -> Result<Action> {
                 .context("invalid rows")?;
             Ok(Action::ResizeViewport { cols, rows })
         }
+        "send-attach" => {
+            let key = require_arg(&args, "key", "send-attach")?;
+            Ok(Action::SendAttach { key })
+        }
         "prefix-key" => {
             let key_str = require_arg(&args, "key", "prefix-key")?;
             let key = key_str.chars().next().context("empty key")?;
@@ -662,6 +666,16 @@ snapshot id=final
                 assert_eq!(*key, 'c');
             }
             _ => panic!("expected prefix-key"),
+        }
+    }
+
+    #[test]
+    fn parse_send_attach() {
+        let input = "send-attach key='ctrl+a ['";
+        let (playbook, _includes) = parse_dsl(input).unwrap();
+        match &playbook.steps[0].action {
+            Action::SendAttach { key } => assert_eq!(key, "ctrl+a ["),
+            _ => panic!("expected send-attach"),
         }
     }
 

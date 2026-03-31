@@ -381,9 +381,23 @@ send-bytes hex=<hex-string>
 | ----- | ------ | -------- | ------- | ------------------------------------------------- |
 | `hex` | string | yes      | -       | Hex-encoded bytes (e.g. `1b5b41` for ESC `[` `A`) |
 
+#### `send-attach`
+
+Send a key chord through the attach keybinding runtime (same path as interactive
+attach mode). Use this for UI-mode behaviors like scrollback/copy-mode,
+keybinding-driven pane focus, and runtime/plugin commands.
+
+```
+send-attach key=<chord>
+```
+
+| Arg   | Type   | Required | Default | Description                                  |
+| ----- | ------ | -------- | ------- | -------------------------------------------- |
+| `key` | string | yes      | -       | Key chord string (e.g. `ctrl+a [`, `k`, `esc`) |
+
 #### `prefix-key`
 
-Send a prefix key (tmux-style).
+Compatibility alias that sends `Ctrl-A` plus one key via `send-attach`.
 
 ```
 prefix-key key=<char>

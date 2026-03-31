@@ -771,6 +771,7 @@ async fn run_interactive_session_managed(
     let mut session_id: Option<Uuid> = None;
     let mut attached = false;
     let mut events_subscribed = false;
+    let mut attach_runtime: Option<super::engine::AttachInputRuntime> = None;
     let mut recording_id: Option<Uuid> = None;
     let mut step_counter: usize = 0;
     let mut snapshots: Vec<SnapshotCapture> = Vec::new();
@@ -786,6 +787,7 @@ async fn run_interactive_session_managed(
         &mut session_id,
         &mut attached,
         &mut events_subscribed,
+        &mut attach_runtime,
         &mut recording_id,
         &mut step_counter,
         &mut snapshots,
@@ -824,6 +826,7 @@ async fn run_repl(
     session_id: &mut Option<Uuid>,
     attached: &mut bool,
     events_subscribed: &mut bool,
+    attach_runtime: &mut Option<super::engine::AttachInputRuntime>,
     recording_id: &mut Option<Uuid>,
     step_counter: &mut usize,
     snapshots: &mut Vec<SnapshotCapture>,
@@ -1441,6 +1444,7 @@ async fn run_repl(
             session_id,
             attached,
             events_subscribed,
+            attach_runtime,
             &viewport_cols,
             &viewport_rows,
             snapshots,
@@ -2506,6 +2510,11 @@ fn pane_input_from_action(action: &super::types::Action) -> Option<PaneInputEven
             pane_index: None,
             byte_len: hex.len(),
             printable_preview: String::from_utf8_lossy(hex).to_string(),
+        }),
+        super::types::Action::SendAttach { key } => Some(PaneInputEvent {
+            pane_index: None,
+            byte_len: 0,
+            printable_preview: format!("<attach:{key}>"),
         }),
         super::types::Action::PrefixKey { key } => Some(PaneInputEvent {
             pane_index: None,
