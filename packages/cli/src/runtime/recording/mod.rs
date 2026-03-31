@@ -469,6 +469,7 @@ pub(super) async fn run_recording_export(
     font_size: Option<f32>,
     line_height: Option<f32>,
     font_path: &[String],
+    show_progress: bool,
 ) -> Result<u8> {
     let recording_id = parse_uuid_value(recording_id, "recording id")?;
     let recording_dir = recordings_root_dir().join(recording_id.to_string());
@@ -511,6 +512,7 @@ pub(super) async fn run_recording_export(
             font_size,
             line_height,
             font_path,
+            show_progress,
         )?,
     }
 
@@ -724,10 +726,13 @@ fn export_recording_gif(
     font_size: Option<f32>,
     line_height: Option<f32>,
     font_path: &[String],
+    show_progress: bool,
 ) -> Result<()> {
     let speed = if speed <= 0.0 { 1.0 } else { speed };
     let fps = fps.max(1);
     let frame_interval_ns = (1_000_000_000_f64 / f64::from(fps)) as u64;
+    let estimate = estimate_export_progress(events, speed, fps, max_duration, max_frames);
+    let mut progress = ExportProgress::new(show_progress, estimate);
 
     let mut max_cols = 80_u16;
     let mut max_rows = 24_u16;
@@ -785,6 +790,7 @@ fn export_recording_gif(
     let mut current_cols = max_cols;
     let mut current_rows = max_rows;
     let mut emitted_frames = 0_u32;
+    let mut processed_frame_events = 0_u32;
     let mut previous_emit_ns = None::<u64>;
     let mut first_mono_ns = None::<u64>;
 
@@ -812,29 +818,42 @@ fn export_recording_gif(
             }
             DisplayTrackEvent::FrameBytes { data } => {
                 parser.process(data);
+                processed_frame_events = processed_frame_events.saturating_add(1);
                 let scaled_ns = (event.mono_ns as f64 / speed) as u64;
                 let should_emit = previous_emit_ns
                     .is_none_or(|previous| scaled_ns.saturating_sub(previous) >= frame_interval_ns);
-                if !should_emit {
-                    continue;
-                }
-                let delay_cs = previous_emit_ns.map_or(1_u16, |previous| {
-                    let delta_ns = scaled_ns.saturating_sub(previous);
-                    ((delta_ns / 10_000_000).max(1).min(u64::from(u16::MAX))) as u16
-                });
-                let mut pixels = if render_options.mode == RecordingRenderMode::Font {
-                    render_screen_rgba_resvg(
-                        parser.screen(),
-                        current_rows,
-                        current_cols,
-                        max_rows,
-                        max_cols,
-                        cell_w,
-                        cell_h,
-                        &palette,
-                        &render_options,
-                    )
-                    .unwrap_or_else(|_| {
+                if should_emit {
+                    let delay_cs = previous_emit_ns.map_or(1_u16, |previous| {
+                        let delta_ns = scaled_ns.saturating_sub(previous);
+                        ((delta_ns / 10_000_000).max(1).min(u64::from(u16::MAX))) as u16
+                    });
+                    let mut pixels = if render_options.mode == RecordingRenderMode::Font {
+                        render_screen_rgba_resvg(
+                            parser.screen(),
+                            current_rows,
+                            current_cols,
+                            max_rows,
+                            max_cols,
+                            cell_w,
+                            cell_h,
+                            &palette,
+                            &render_options,
+                        )
+                        .unwrap_or_else(|_| {
+                            render_screen_rgba(
+                                parser.screen(),
+                                current_rows,
+                                current_cols,
+                                max_rows,
+                                max_cols,
+                                cell_w,
+                                cell_h,
+                                &palette,
+                                glyph_renderer.as_mut(),
+                                &mut bitmap_cache,
+                            )
+                        })
+                    } else {
                         render_screen_rgba(
                             parser.screen(),
                             current_rows,
@@ -847,37 +866,189 @@ fn export_recording_gif(
                             glyph_renderer.as_mut(),
                             &mut bitmap_cache,
                         )
-                    })
-                } else {
-                    render_screen_rgba(
-                        parser.screen(),
-                        current_rows,
-                        current_cols,
-                        max_rows,
-                        max_cols,
-                        cell_w,
-                        cell_h,
-                        &palette,
-                        glyph_renderer.as_mut(),
-                        &mut bitmap_cache,
-                    )
-                };
-                let mut frame = GifFrame::from_rgba_speed(width, height, &mut pixels, 1);
-                frame.delay = delay_cs;
-                encoder
-                    .write_frame(&frame)
-                    .context("failed writing gif frame")?;
-                previous_emit_ns = Some(scaled_ns);
-                emitted_frames = emitted_frames.saturating_add(1);
+                    };
+                    let mut frame = GifFrame::from_rgba_speed(width, height, &mut pixels, 1);
+                    frame.delay = delay_cs;
+                    encoder
+                        .write_frame(&frame)
+                        .context("failed writing gif frame")?;
+                    previous_emit_ns = Some(scaled_ns);
+                    emitted_frames = emitted_frames.saturating_add(1);
+                }
+                progress.update(processed_frame_events, emitted_frames, false);
             }
             DisplayTrackEvent::StreamOpened { .. } | DisplayTrackEvent::StreamClosed => {}
         }
     }
 
+    progress.finish(processed_frame_events, emitted_frames);
+
     if emitted_frames == 0 {
         anyhow::bail!("no drawable frame events found in display track")
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ExportProgressEstimate {
+    total_frame_events: u32,
+    estimated_emitted_frames: u32,
+}
+
+fn estimate_export_progress(
+    events: &[DisplayTrackEnvelope],
+    speed: f64,
+    fps: u32,
+    max_duration: Option<u64>,
+    max_frames: Option<u32>,
+) -> ExportProgressEstimate {
+    let speed = if speed <= 0.0 { 1.0 } else { speed };
+    let frame_interval_ns = (1_000_000_000_f64 / f64::from(fps.max(1))) as u64;
+    let mut total_frame_events = 0_u32;
+    let mut estimated_emitted_frames = 0_u32;
+    let mut previous_emit_ns = None::<u64>;
+    let mut first_mono_ns = None::<u64>;
+
+    for event in events {
+        if first_mono_ns.is_none() {
+            first_mono_ns = Some(event.mono_ns);
+        }
+        if let Some(limit_secs) = max_duration
+            && let Some(start_ns) = first_mono_ns
+            && event.mono_ns.saturating_sub(start_ns) / 1_000_000_000 > limit_secs
+        {
+            break;
+        }
+        if let Some(limit) = max_frames
+            && estimated_emitted_frames >= limit
+        {
+            break;
+        }
+        if let DisplayTrackEvent::FrameBytes { .. } = event.event {
+            total_frame_events = total_frame_events.saturating_add(1);
+            let scaled_ns = (event.mono_ns as f64 / speed) as u64;
+            let should_emit = previous_emit_ns
+                .is_none_or(|previous| scaled_ns.saturating_sub(previous) >= frame_interval_ns);
+            if should_emit {
+                previous_emit_ns = Some(scaled_ns);
+                estimated_emitted_frames = estimated_emitted_frames.saturating_add(1);
+            }
+        }
+    }
+
+    ExportProgressEstimate {
+        total_frame_events,
+        estimated_emitted_frames,
+    }
+}
+
+struct ExportProgress {
+    enabled: bool,
+    tty: bool,
+    started_at: Instant,
+    last_update_at: Instant,
+    last_line_len: usize,
+    last_non_tty_bucket: Option<u32>,
+    estimate: ExportProgressEstimate,
+}
+
+impl ExportProgress {
+    fn new(show_progress: bool, estimate: ExportProgressEstimate) -> Self {
+        Self {
+            enabled: show_progress,
+            tty: show_progress && io::stderr().is_terminal(),
+            started_at: Instant::now(),
+            last_update_at: Instant::now(),
+            last_line_len: 0,
+            last_non_tty_bucket: None,
+            estimate,
+        }
+    }
+
+    fn update(&mut self, processed_frame_events: u32, emitted_frames: u32, force: bool) {
+        if !self.enabled || self.estimate.total_frame_events == 0 {
+            return;
+        }
+
+        let now = Instant::now();
+        if !force && now.duration_since(self.last_update_at) < std::time::Duration::from_millis(300)
+        {
+            return;
+        }
+
+        let percent = (f64::from(processed_frame_events)
+            / f64::from(self.estimate.total_frame_events.max(1))
+            * 100.0)
+            .clamp(0.0, 100.0);
+        let elapsed = now.duration_since(self.started_at);
+        let eta = estimate_eta(
+            elapsed,
+            processed_frame_events,
+            self.estimate.total_frame_events,
+        );
+        let estimated_emitted = self.estimate.estimated_emitted_frames.max(emitted_frames);
+        let line = format!(
+            "export {percent:5.1}% events {processed_frame_events}/{} frames {emitted_frames}/{} elapsed {} eta {}",
+            self.estimate.total_frame_events,
+            estimated_emitted,
+            format_duration_compact(elapsed),
+            eta.map_or_else(|| "--:--".to_string(), format_duration_compact),
+        );
+
+        if self.tty {
+            let mut padded = line;
+            if self.last_line_len > padded.len() {
+                padded.push_str(&" ".repeat(self.last_line_len - padded.len()));
+            }
+            eprint!("\r{padded}");
+            let _ = io::stderr().flush();
+            self.last_line_len = padded.len();
+            self.last_update_at = now;
+            return;
+        }
+
+        let bucket = percent.floor() as u32 / 10;
+        if force
+            || self
+                .last_non_tty_bucket
+                .is_none_or(|previous| bucket > previous)
+        {
+            eprintln!("{line}");
+            self.last_non_tty_bucket = Some(bucket);
+            self.last_update_at = now;
+        }
+    }
+
+    fn finish(&mut self, processed_frame_events: u32, emitted_frames: u32) {
+        self.update(processed_frame_events, emitted_frames, true);
+        if self.enabled && self.tty {
+            eprintln!();
+        }
+    }
+}
+
+fn estimate_eta(
+    elapsed: std::time::Duration,
+    completed: u32,
+    total: u32,
+) -> Option<std::time::Duration> {
+    if completed == 0 || completed >= total {
+        return (completed >= total).then_some(std::time::Duration::from_secs(0));
+    }
+    let remaining_ratio = f64::from(total.saturating_sub(completed)) / f64::from(completed);
+    Some(elapsed.mul_f64(remaining_ratio))
+}
+
+fn format_duration_compact(duration: std::time::Duration) -> String {
+    let total_secs = duration.as_secs();
+    let secs = total_secs % 60;
+    let mins = (total_secs / 60) % 60;
+    let hours = total_secs / 3600;
+    if hours > 0 {
+        format!("{hours}:{mins:02}:{secs:02}")
+    } else {
+        format!("{mins:02}:{secs:02}")
+    }
 }
 
 fn render_screen_rgba(
@@ -2350,6 +2521,13 @@ mod tests {
         }
     }
 
+    fn frame_bytes(mono_ns: u64) -> DisplayTrackEnvelope {
+        DisplayTrackEnvelope {
+            mono_ns,
+            event: DisplayTrackEvent::FrameBytes { data: vec![b'x'] },
+        }
+    }
+
     #[test]
     fn display_track_envelope_round_trips_through_codec() {
         let envelope = DisplayTrackEnvelope {
@@ -2468,5 +2646,45 @@ mod tests {
         let second = cache.mask_for('A').expect("mask should exist").to_vec();
         assert_eq!(first, second);
         assert_eq!(cache.masks.len(), 1);
+    }
+
+    #[test]
+    fn estimate_export_progress_counts_events_and_emitted_frames() {
+        let events = vec![
+            stream_opened(Some(8), Some(16), Some(800), Some(600)),
+            frame_bytes(0),
+            frame_bytes(50_000_000),
+            frame_bytes(100_000_000),
+            frame_bytes(200_000_000),
+        ];
+        let estimate = estimate_export_progress(&events, 1.0, 10, None, None);
+        assert_eq!(estimate.total_frame_events, 4);
+        assert_eq!(estimate.estimated_emitted_frames, 3);
+    }
+
+    #[test]
+    fn estimate_export_progress_respects_max_frames_limit() {
+        let events = vec![
+            stream_opened(Some(8), Some(16), Some(800), Some(600)),
+            frame_bytes(0),
+            frame_bytes(50_000_000),
+            frame_bytes(100_000_000),
+            frame_bytes(200_000_000),
+        ];
+        let estimate = estimate_export_progress(&events, 1.0, 10, None, Some(2));
+        assert_eq!(estimate.total_frame_events, 3);
+        assert_eq!(estimate.estimated_emitted_frames, 2);
+    }
+
+    #[test]
+    fn format_duration_compact_uses_mm_ss_and_hh_mm_ss() {
+        assert_eq!(
+            format_duration_compact(std::time::Duration::from_secs(65)),
+            "01:05"
+        );
+        assert_eq!(
+            format_duration_compact(std::time::Duration::from_secs(3_665)),
+            "1:01:05"
+        );
     }
 }

@@ -1450,6 +1450,7 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                         font_size,
                         line_height,
                         font_path,
+                        no_progress,
                     },
             },
         ) => {
@@ -1470,6 +1471,7 @@ async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 *font_size,
                 *line_height,
                 font_path,
+                !*no_progress,
             )
             .await
         }
@@ -3081,6 +3083,7 @@ async fn run_recording_export(
     font_size: Option<f32>,
     line_height: Option<f32>,
     font_path: &[String],
+    show_progress: bool,
 ) -> Result<u8> {
     recording::run_recording_export(
         recording_id,
@@ -3099,6 +3102,7 @@ async fn run_recording_export(
         font_size,
         line_height,
         font_path,
+        show_progress,
     )
     .await
 }
@@ -8740,6 +8744,7 @@ async fn run_playbook_run(
                 None,                        // font_size
                 None,                        // line_height
                 &[],                         // font_path
+                true,                        // show_progress
             )
             .await
             {

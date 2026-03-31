@@ -380,6 +380,9 @@ pub enum RecordingCommand {
         /// Additional font file path (repeatable)
         #[arg(long)]
         font_path: Vec<String>,
+        /// Disable export progress output
+        #[arg(long)]
+        no_progress: bool,
     },
     /// Delete completed recordings older than the retention period
     Prune {
@@ -1843,6 +1846,7 @@ mod tests {
             "/tmp/font.ttf",
             "--font-path",
             "/tmp/font2.ttf",
+            "--no-progress",
         ])
         .expect("valid CLI args");
         let Some(Command::Recording { command }) = cli.command else {
@@ -1863,6 +1867,7 @@ mod tests {
                 font_size: Some(size),
                 line_height: Some(line_height),
                 font_path,
+                no_progress: true,
                 ..
             } if (size - 15.0).abs() < f32::EPSILON
                 && (line_height - 1.1).abs() < f32::EPSILON
@@ -1905,6 +1910,7 @@ mod tests {
             command,
             RecordingCommand::Export {
                 renderer: RecordingRenderMode::Font,
+                no_progress: false,
                 ..
             }
         ));
