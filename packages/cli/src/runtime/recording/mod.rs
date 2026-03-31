@@ -1077,135 +1077,168 @@ fn export_recording_gif(
     let mut emitted_frames = 0_u32;
     let mut processed_frame_events = 0_u32;
     let mut previous_emit_ns = None::<u64>;
-    let mut first_mono_ns = None::<u64>;
     let mut cursor_state = CursorReplayState::default();
     let mut cursor_frames = export_metadata.map(|_| Vec::<ExportCursorFrame>::new());
-
+    let start_mono_ns = events.iter().map(|event| event.mono_ns).min().unwrap_or(0);
+    let frame_cutoff_ns = max_frames.map(|limit| {
+        if limit == 0 {
+            0_u64
+        } else {
+            u64::from(limit.saturating_sub(1)).saturating_mul(frame_interval_ns)
+        }
+    });
+    let mut considered_event_count = 0_usize;
+    let mut end_scaled_ns = 0_u64;
     for event in events {
-        if first_mono_ns.is_none() {
-            first_mono_ns = Some(event.mono_ns);
-        }
+        let rel_mono_ns = event.mono_ns.saturating_sub(start_mono_ns);
         if let Some(limit_secs) = max_duration
-            && let Some(start_ns) = first_mono_ns
-            && event.mono_ns.saturating_sub(start_ns) / 1_000_000_000 > limit_secs
+            && rel_mono_ns / 1_000_000_000 > limit_secs
         {
             break;
         }
-        if let Some(limit) = max_frames
-            && emitted_frames >= limit
+        let scaled_ns = ((rel_mono_ns as f64) / speed) as u64;
+        if let Some(cutoff) = frame_cutoff_ns
+            && scaled_ns > cutoff
         {
             break;
+        }
+        considered_event_count = considered_event_count.saturating_add(1);
+        end_scaled_ns = scaled_ns;
+    }
+
+    let max_timeline_frames = if considered_event_count == 0 {
+        0_u32
+    } else {
+        let base = end_scaled_ns
+            .saturating_div(frame_interval_ns.max(1))
+            .saturating_add(1);
+        base.min(u64::from(u32::MAX)) as u32
+    };
+    let target_frames =
+        max_frames.map_or(max_timeline_frames, |limit| limit.min(max_timeline_frames));
+
+    let mut event_index = 0_usize;
+    for frame_idx in 0..target_frames {
+        let frame_time_ns = u64::from(frame_idx).saturating_mul(frame_interval_ns);
+        while event_index < considered_event_count {
+            let event = &events[event_index];
+            let rel_mono_ns = event.mono_ns.saturating_sub(start_mono_ns);
+            let scaled_ns = ((rel_mono_ns as f64) / speed) as u64;
+            if scaled_ns > frame_time_ns {
+                break;
+            }
+            match &event.event {
+                DisplayTrackEvent::Resize { cols, rows } => {
+                    current_cols = (*cols).max(1);
+                    current_rows = (*rows).max(1);
+                    parser.screen_mut().set_size(current_rows, current_cols);
+                }
+                DisplayTrackEvent::FrameBytes { data } => {
+                    update_cursor_replay_state(&mut cursor_state, data);
+                    parser.process(data);
+                    processed_frame_events = processed_frame_events.saturating_add(1);
+                }
+                DisplayTrackEvent::StreamOpened { .. } | DisplayTrackEvent::StreamClosed => {}
+            }
+            event_index = event_index.saturating_add(1);
         }
 
-        match &event.event {
-            DisplayTrackEvent::Resize { cols, rows } => {
-                current_cols = (*cols).max(1);
-                current_rows = (*rows).max(1);
-                parser.screen_mut().set_size(current_rows, current_cols);
-            }
-            DisplayTrackEvent::FrameBytes { data } => {
-                update_cursor_replay_state(&mut cursor_state, data);
-                parser.process(data);
-                processed_frame_events = processed_frame_events.saturating_add(1);
-                let scaled_ns = (event.mono_ns as f64 / speed) as u64;
-                let should_emit = previous_emit_ns
-                    .is_none_or(|previous| scaled_ns.saturating_sub(previous) >= frame_interval_ns);
-                if should_emit {
-                    let delay_cs = previous_emit_ns.map_or(1_u16, |previous| {
-                        let delta_ns = scaled_ns.saturating_sub(previous);
-                        ((delta_ns / 10_000_000).max(1).min(u64::from(u16::MAX))) as u16
-                    });
-                    let mut pixels = if render_options.mode == RecordingRenderMode::Font {
-                        render_screen_rgba_resvg(
-                            parser.screen(),
-                            current_rows,
-                            current_cols,
-                            max_rows,
-                            max_cols,
-                            cell_w,
-                            cell_h,
-                            &palette,
-                            &render_options,
-                        )
-                        .unwrap_or_else(|_| {
-                            render_screen_rgba(
-                                parser.screen(),
-                                current_rows,
-                                current_cols,
-                                max_rows,
-                                max_cols,
-                                cell_w,
-                                cell_h,
-                                &palette,
-                                glyph_renderer.as_mut(),
-                                &mut bitmap_cache,
-                            )
-                        })
-                    } else {
-                        render_screen_rgba(
-                            parser.screen(),
-                            current_rows,
-                            current_cols,
-                            max_rows,
-                            max_cols,
-                            cell_w,
-                            cell_h,
-                            &palette,
-                            glyph_renderer.as_mut(),
-                            &mut bitmap_cache,
-                        )
-                    };
-                    let (cursor_row, cursor_col) = parser.screen().cursor_position();
-                    let parser_cursor_visible = !parser.screen().hide_cursor();
-                    let shape = effective_cursor_shape(&cursor_options, cursor_state);
-                    let (cursor_visible, blink_on) = compute_cursor_visibility(
-                        &cursor_options,
-                        cursor_state,
-                        parser_cursor_visible,
-                        scaled_ns,
-                    );
-                    if cursor_visible && cursor_row < current_rows && cursor_col < current_cols {
-                        let cursor_color_rgb = cursor_options.color_override.unwrap_or_else(|| {
-                            parser
-                                .screen()
-                                .cell(cursor_row, cursor_col)
-                                .map(|cell| resolved_cell_colors(cell, &palette).0)
-                                .unwrap_or((255, 255, 255))
-                        });
-                        overlay_cursor_rgba(
-                            &mut pixels,
-                            usize::from(width),
-                            usize::from(height),
-                            usize::from(cell_w),
-                            usize::from(cell_h),
-                            cursor_row,
-                            cursor_col,
-                            shape,
-                            cursor_color_rgb,
-                        );
-                    }
-                    if let Some(frames) = cursor_frames.as_mut() {
-                        frames.push(ExportCursorFrame {
-                            mono_ns: scaled_ns,
-                            row: cursor_row,
-                            col: cursor_col,
-                            visible: cursor_visible,
-                            shape: cursor_shape_name(shape),
-                            blink_on,
-                        });
-                    }
-                    let mut frame = GifFrame::from_rgba_speed(width, height, &mut pixels, 1);
-                    frame.delay = delay_cs;
-                    encoder
-                        .write_frame(&frame)
-                        .context("failed writing gif frame")?;
-                    previous_emit_ns = Some(scaled_ns);
-                    emitted_frames = emitted_frames.saturating_add(1);
-                }
-                progress.update(processed_frame_events, emitted_frames, false);
-            }
-            DisplayTrackEvent::StreamOpened { .. } | DisplayTrackEvent::StreamClosed => {}
+        if processed_frame_events == 0 {
+            progress.update(processed_frame_events, emitted_frames, false);
+            continue;
         }
+
+        let delay_cs = previous_emit_ns.map_or(1_u16, |previous| {
+            let delta_ns = frame_time_ns.saturating_sub(previous);
+            ((delta_ns / 10_000_000).max(1).min(u64::from(u16::MAX))) as u16
+        });
+        let mut pixels = if render_options.mode == RecordingRenderMode::Font {
+            render_screen_rgba_resvg(
+                parser.screen(),
+                current_rows,
+                current_cols,
+                max_rows,
+                max_cols,
+                cell_w,
+                cell_h,
+                &palette,
+                &render_options,
+            )
+            .unwrap_or_else(|_| {
+                render_screen_rgba(
+                    parser.screen(),
+                    current_rows,
+                    current_cols,
+                    max_rows,
+                    max_cols,
+                    cell_w,
+                    cell_h,
+                    &palette,
+                    glyph_renderer.as_mut(),
+                    &mut bitmap_cache,
+                )
+            })
+        } else {
+            render_screen_rgba(
+                parser.screen(),
+                current_rows,
+                current_cols,
+                max_rows,
+                max_cols,
+                cell_w,
+                cell_h,
+                &palette,
+                glyph_renderer.as_mut(),
+                &mut bitmap_cache,
+            )
+        };
+        let (cursor_row, cursor_col) = parser.screen().cursor_position();
+        let parser_cursor_visible = !parser.screen().hide_cursor();
+        let shape = effective_cursor_shape(&cursor_options, cursor_state);
+        let (cursor_visible, blink_on) = compute_cursor_visibility(
+            &cursor_options,
+            cursor_state,
+            parser_cursor_visible,
+            frame_time_ns,
+        );
+        if cursor_visible && cursor_row < current_rows && cursor_col < current_cols {
+            let cursor_color_rgb = cursor_options.color_override.unwrap_or_else(|| {
+                parser
+                    .screen()
+                    .cell(cursor_row, cursor_col)
+                    .map(|cell| resolved_cell_colors(cell, &palette).0)
+                    .unwrap_or((255, 255, 255))
+            });
+            overlay_cursor_rgba(
+                &mut pixels,
+                usize::from(width),
+                usize::from(height),
+                usize::from(cell_w),
+                usize::from(cell_h),
+                cursor_row,
+                cursor_col,
+                shape,
+                cursor_color_rgb,
+            );
+        }
+        if let Some(frames) = cursor_frames.as_mut() {
+            frames.push(ExportCursorFrame {
+                mono_ns: frame_time_ns,
+                row: cursor_row,
+                col: cursor_col,
+                visible: cursor_visible,
+                shape: cursor_shape_name(shape),
+                blink_on,
+            });
+        }
+        let mut frame = GifFrame::from_rgba_speed(width, height, &mut pixels, 1);
+        frame.delay = delay_cs;
+        encoder
+            .write_frame(&frame)
+            .context("failed writing gif frame")?;
+        previous_emit_ns = Some(frame_time_ns);
+        emitted_frames = emitted_frames.saturating_add(1);
+        progress.update(processed_frame_events, emitted_frames, false);
     }
 
     progress.finish(processed_frame_events, emitted_frames);
@@ -1278,36 +1311,47 @@ fn estimate_export_progress(
     let speed = if speed <= 0.0 { 1.0 } else { speed };
     let frame_interval_ns = (1_000_000_000_f64 / f64::from(fps.max(1))) as u64;
     let mut total_frame_events = 0_u32;
-    let mut estimated_emitted_frames = 0_u32;
-    let mut previous_emit_ns = None::<u64>;
-    let mut first_mono_ns = None::<u64>;
+    let mut considered_event_count = 0_u32;
+    let start_mono_ns = events.iter().map(|event| event.mono_ns).min().unwrap_or(0);
+    let frame_cutoff_ns = max_frames.map(|limit| {
+        if limit == 0 {
+            0_u64
+        } else {
+            u64::from(limit.saturating_sub(1)).saturating_mul(frame_interval_ns)
+        }
+    });
+    let mut end_scaled_ns = 0_u64;
 
     for event in events {
-        if first_mono_ns.is_none() {
-            first_mono_ns = Some(event.mono_ns);
-        }
+        let rel_mono_ns = event.mono_ns.saturating_sub(start_mono_ns);
         if let Some(limit_secs) = max_duration
-            && let Some(start_ns) = first_mono_ns
-            && event.mono_ns.saturating_sub(start_ns) / 1_000_000_000 > limit_secs
+            && rel_mono_ns / 1_000_000_000 > limit_secs
         {
             break;
         }
-        if let Some(limit) = max_frames
-            && estimated_emitted_frames >= limit
+        let scaled_ns = ((rel_mono_ns as f64) / speed) as u64;
+        if let Some(cutoff) = frame_cutoff_ns
+            && scaled_ns > cutoff
         {
             break;
         }
+        considered_event_count = considered_event_count.saturating_add(1);
+        end_scaled_ns = scaled_ns;
         if let DisplayTrackEvent::FrameBytes { .. } = event.event {
             total_frame_events = total_frame_events.saturating_add(1);
-            let scaled_ns = (event.mono_ns as f64 / speed) as u64;
-            let should_emit = previous_emit_ns
-                .is_none_or(|previous| scaled_ns.saturating_sub(previous) >= frame_interval_ns);
-            if should_emit {
-                previous_emit_ns = Some(scaled_ns);
-                estimated_emitted_frames = estimated_emitted_frames.saturating_add(1);
-            }
         }
     }
+
+    let base_emitted_frames = if considered_event_count == 0 || total_frame_events == 0 {
+        0_u32
+    } else {
+        end_scaled_ns
+            .saturating_div(frame_interval_ns.max(1))
+            .saturating_add(1)
+            .min(u64::from(u32::MAX)) as u32
+    };
+    let estimated_emitted_frames =
+        max_frames.map_or(base_emitted_frames, |limit| limit.min(base_emitted_frames));
 
     ExportProgressEstimate {
         total_frame_events,
@@ -3047,6 +3091,36 @@ mod tests {
         let estimate = estimate_export_progress(&events, 1.0, 10, None, Some(2));
         assert_eq!(estimate.total_frame_events, 3);
         assert_eq!(estimate.estimated_emitted_frames, 2);
+    }
+
+    #[test]
+    fn estimate_export_progress_uses_timeline_frames_for_sparse_events() {
+        let events = vec![
+            stream_opened(Some(8), Some(16), Some(800), Some(600)),
+            frame_bytes(0),
+            frame_bytes(450_000_000),
+        ];
+        let estimate = estimate_export_progress(&events, 1.0, 10, None, None);
+        assert_eq!(estimate.total_frame_events, 2);
+        assert_eq!(estimate.estimated_emitted_frames, 5);
+    }
+
+    #[test]
+    fn compute_cursor_visibility_blinks_on_timeline_clock() {
+        let options = CursorExportOptions {
+            mode: RecordingCursorMode::Auto,
+            shape: RecordingCursorShape::Auto,
+            blink: RecordingCursorBlinkMode::On,
+            blink_period_ns: 500_000_000,
+            color_override: None,
+        };
+        let state = CursorReplayState::default();
+        let (on_a, blink_a) = compute_cursor_visibility(&options, state, true, 0);
+        let (on_b, blink_b) = compute_cursor_visibility(&options, state, true, 510_000_000);
+        let (on_c, blink_c) = compute_cursor_visibility(&options, state, true, 1_020_000_000);
+        assert!(on_a && blink_a);
+        assert!(!on_b && !blink_b);
+        assert!(on_c && blink_c);
     }
 
     #[test]
