@@ -130,6 +130,20 @@ fn playbook_attach_scrollback() {
 }
 
 #[test]
+fn playbook_send_keys_fails_during_attach_scrollback() {
+    let (json, pass) = run_playbook_fixture("send_keys_in_scrollback.dsl");
+    assert!(
+        !pass,
+        "send-keys should fail when attach scrollback is active: {json:#}"
+    );
+    let error = json["error"].as_str().unwrap_or("");
+    assert!(
+        error.contains("send-keys targets pane input while attach scrollback is active"),
+        "error should explain send-keys/send-attach split: {json:#}"
+    );
+}
+
+#[test]
 fn playbook_env_mode_clean() {
     let fixture = fixtures_dir().join("env_mode_clean.dsl");
 
@@ -276,6 +290,7 @@ fn parse_and_validate_fixtures() {
         "multi_pane.dsl",
         "wait_for_regex.dsl",
         "attach_scrollback.dsl",
+        "send_keys_in_scrollback.dsl",
         "env_mode_clean.dsl",
         "screen_status.dsl",
         "snapshot_capture.dsl",

@@ -499,6 +499,15 @@ pub(super) async fn execute_step(
         Action::SendKeys { keys, pane } => {
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
+            if pane.is_none()
+                && attach_runtime
+                    .as_ref()
+                    .is_some_and(|runtime| runtime.state.scrollback_active)
+            {
+                bail!(
+                    "send-keys targets pane input while attach scrollback is active; use send-attach key='<chord>' for UI-mode key handling"
+                );
+            }
             let resolved_keys = runtime_vars.resolve_bytes(keys);
 
             if let Some(target_index) = pane {

@@ -407,6 +407,20 @@ prefix-key key=<char>
 | ----- | ---- | -------- | ------- | ----------------------------------------- |
 | `key` | char | yes      | -       | Single character to send after the prefix |
 
+Do not mix attach UI-mode entry with `send-keys` for follow-up navigation keys.
+`send-keys` writes bytes to the pane shell; `send-attach` runs attach key handling.
+
+```
+# Bad: enters scrollback, then types into shell
+prefix-key key='['
+send-keys keys='k\r'
+
+# Good: all UI-mode keys use attach path
+send-attach key='ctrl+a ['
+send-attach key='k'
+send-attach key='enter'
+```
+
 ### Synchronization
 
 #### `wait-for`
