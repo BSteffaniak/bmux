@@ -224,19 +224,23 @@ pub fn render_attach_scene<W: io::Write>(
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     dirty_pane_ids: &BTreeSet<Uuid>,
     full_pane_redraw: bool,
+    status_top_inset: u16,
+    status_bottom_inset: u16,
     scrollback_active: bool,
     scrollback_offset: usize,
     scrollback_cursor: Option<AttachScrollbackCursor>,
     selection_anchor: Option<AttachScrollbackPosition>,
 ) -> Result<Option<AttachCursorState>> {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
-    if cols == 0 || rows <= 1 {
+    if cols == 0 || rows <= status_top_inset.saturating_add(status_bottom_inset) {
         return Ok(None);
     }
 
     let mut cursor_state = None;
     if full_pane_redraw {
-        for y in 1..rows {
+        let clear_start = status_top_inset.min(rows);
+        let clear_end = rows.saturating_sub(status_bottom_inset).max(clear_start);
+        for y in clear_start..clear_end {
             queue!(stdout, MoveTo(0, y), Print(" ".repeat(usize::from(cols))))
                 .context("failed clearing attach pane row")?;
         }
@@ -540,6 +544,8 @@ mod tests {
             &mut pane_buffers,
             &BTreeSet::from([pane_id]),
             true,
+            1,
+            0,
             true,
             1,
             Some(AttachScrollbackCursor { row: 0, col: 0 }),
@@ -588,6 +594,8 @@ mod tests {
             &mut pane_buffers,
             &BTreeSet::from([pane_id]),
             true,
+            1,
+            0,
             true,
             0,
             Some(AttachScrollbackCursor { row: 0, col: 4 }),

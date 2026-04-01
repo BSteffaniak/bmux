@@ -77,8 +77,14 @@ pub(crate) async fn run_session_attach_with_client(
 
     let mut view_state = AttachViewState::new(attach_info);
     view_state.mouse.config = attach_config.attach_mouse_config();
+    view_state.status_position = attach_config.appearance.status_position;
 
-    update_attach_viewport(&mut client, view_state.attached_id).await?;
+    update_attach_viewport(
+        &mut client,
+        view_state.attached_id,
+        view_state.status_position,
+    )
+    .await?;
     hydrate_attach_state_from_snapshot(&mut client, &mut view_state).await?;
     view_state.set_transient_status(
         initial_attach_status(&attach_keymap, view_state.can_write),
@@ -252,6 +258,7 @@ pub(crate) async fn run_session_attach_with_client(
             &mut client,
             &mut view_state,
             &layout_state,
+            &attach_config.status_bar,
             follow_target_id,
             global,
             &attach_keymap,
@@ -293,7 +300,8 @@ pub(crate) async fn handle_attach_runtime_action(
             view_state.attached_id = attach_info.session_id;
             view_state.attached_context_id = attach_info.context_id.or(Some(context.id));
             view_state.can_write = attach_info.can_write;
-            update_attach_viewport(client, view_state.attached_id).await?;
+            update_attach_viewport(client, view_state.attached_id, view_state.status_position)
+                .await?;
             hydrate_attach_state_from_snapshot(client, view_state).await?;
             let status = attach_context_status(
                 client,
@@ -365,7 +373,7 @@ pub(crate) async fn retarget_attach_to_context(
     view_state.attached_id = attach_info.session_id;
     view_state.attached_context_id = attach_info.context_id.or(Some(context_id));
     view_state.can_write = attach_info.can_write;
-    update_attach_viewport(client, view_state.attached_id).await?;
+    update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
     hydrate_attach_state_from_snapshot(client, view_state).await?;
     view_state.ui_mode = AttachUiMode::Normal;
     let status = attach_context_status(
@@ -1225,7 +1233,8 @@ pub(crate) async fn switch_attach_session_relative(
             view_state.attached_id = attach_info.session_id;
             view_state.attached_context_id = attach_info.context_id.or(Some(target_context_id));
             view_state.can_write = attach_info.can_write;
-            update_attach_viewport(client, view_state.attached_id).await?;
+            update_attach_viewport(client, view_state.attached_id, view_state.status_position)
+                .await?;
             hydrate_attach_state_from_snapshot(client, view_state).await?;
             return Ok(());
         }
@@ -1241,7 +1250,7 @@ pub(crate) async fn switch_attach_session_relative(
     view_state.attached_id = attach_info.session_id;
     view_state.attached_context_id = attach_info.context_id;
     view_state.can_write = attach_info.can_write;
-    update_attach_viewport(client, view_state.attached_id).await?;
+    update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
     hydrate_attach_state_from_snapshot(client, view_state).await?;
     Ok(())
 }
@@ -1296,6 +1305,7 @@ pub(crate) fn relative_context_id(
 
 pub(crate) async fn build_attach_status_line_for_draw(
     client: &mut BmuxClient,
+    status_config: &bmux_config::StatusBarConfig,
     context_id: Option<Uuid>,
     session_id: Uuid,
     can_write: bool,
@@ -1307,10 +1317,13 @@ pub(crate) async fn build_attach_status_line_for_draw(
     help_overlay_open: bool,
     transient_status: Option<&str>,
     keymap: &Keymap,
-) -> std::result::Result<String, ClientError> {
+) -> std::result::Result<AttachStatusLine, ClientError> {
     let (cols, _) = terminal::size().unwrap_or((0, 0));
     if cols == 0 {
-        return Ok(String::new());
+        return Ok(AttachStatusLine {
+            rendered: String::new(),
+            tab_hitboxes: Vec::new(),
+        });
     }
 
     let tabs = build_attach_tabs(client, context_id, session_id).await?;
@@ -1346,6 +1359,8 @@ pub(crate) async fn build_attach_status_line_for_draw(
     };
 
     let status_line = build_attach_status_line(
+        cols,
+        status_config,
         &session_label,
         &current_context_label,
         &tabs,
@@ -1355,18 +1370,7 @@ pub(crate) async fn build_attach_status_line_for_draw(
         &hint,
     );
 
-    Ok(format_status_line_for_width(&status_line, cols))
-}
-
-pub(crate) fn format_status_line_for_width(status_line: &str, cols: u16) -> String {
-    let width = usize::from(cols);
-    let mut rendered = status_line.to_string();
-    if rendered.len() > width {
-        rendered.truncate(width);
-    } else {
-        rendered.push_str(&" ".repeat(width - rendered.len()));
-    }
-    rendered
+    Ok(status_line)
 }
 
 pub(crate) fn attach_mode_hint(_ui_mode: AttachUiMode, keymap: &Keymap) -> String {
@@ -1422,17 +1426,45 @@ pub(crate) fn key_hint_or_unbound(keymap: &Keymap, action: RuntimeAction) -> Str
         .unwrap_or_else(|| "unbound".to_string())
 }
 
-pub(crate) fn queue_attach_status_line(stdout: &mut impl Write, status_line: &str) -> Result<()> {
+pub(crate) const fn status_insets_for_position(status_position: StatusPosition) -> (u16, u16) {
+    match status_position {
+        StatusPosition::Top => (1, 0),
+        StatusPosition::Bottom => (0, 1),
+        StatusPosition::Off => (0, 0),
+    }
+}
+
+pub(crate) const fn status_row_for_position(
+    status_position: StatusPosition,
+    rows: u16,
+) -> Option<u16> {
+    if rows == 0 {
+        return None;
+    }
+    match status_position {
+        StatusPosition::Top => Some(0),
+        StatusPosition::Bottom => Some(rows.saturating_sub(1)),
+        StatusPosition::Off => None,
+    }
+}
+
+pub(crate) fn queue_attach_status_line(
+    stdout: &mut impl Write,
+    status_line: &AttachStatusLine,
+    status_position: StatusPosition,
+) -> Result<()> {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
     if cols == 0 || rows == 0 {
         return Ok(());
     }
-    let rendered = format_status_line_for_width(status_line, cols);
+    let Some(status_row) = status_row_for_position(status_position, rows) else {
+        return Ok(());
+    };
     queue!(
         stdout,
-        MoveTo(0, 0),
+        MoveTo(0, status_row),
         Print("\x1b[7m"),
-        Print(rendered),
+        Print(&status_line.rendered),
         Print("\x1b[0m")
     )
     .context("failed queuing attach status line")
@@ -1677,6 +1709,7 @@ pub(crate) async fn render_attach_frame(
     client: &mut BmuxClient,
     view_state: &mut AttachViewState,
     layout_state: &AttachLayoutState,
+    status_config: &bmux_config::StatusBarConfig,
     follow_target_id: Option<Uuid>,
     follow_global: bool,
     keymap: &crate::input::Keymap,
@@ -1689,6 +1722,7 @@ pub(crate) async fn render_attach_frame(
         view_state.cached_status_line = Some(
             build_attach_status_line_for_draw(
                 client,
+                status_config,
                 view_state.attached_context_id,
                 view_state.attached_id,
                 view_state.can_write,
@@ -1709,15 +1743,19 @@ pub(crate) async fn render_attach_frame(
 
     let mut frame_bytes = Vec::new();
     queue!(frame_bytes, SavePosition).context("failed queuing cursor save for attach frame")?;
-    if let Some(status_line) = view_state.cached_status_line.as_deref() {
-        queue_attach_status_line(&mut frame_bytes, status_line)?;
+    if let Some(status_line) = view_state.cached_status_line.as_ref() {
+        queue_attach_status_line(&mut frame_bytes, status_line, view_state.status_position)?;
     }
+    let (status_top_inset, status_bottom_inset) =
+        status_insets_for_position(view_state.status_position);
     let cursor_state = render_attach_scene(
         &mut frame_bytes,
         &layout_state.scene,
         &mut view_state.pane_buffers,
         &view_state.dirty.pane_dirty_ids,
         view_state.dirty.full_pane_redraw,
+        status_top_inset,
+        status_bottom_inset,
         view_state.scrollback_active,
         view_state.scrollback_offset,
         view_state.scrollback_cursor,
@@ -1760,11 +1798,26 @@ pub(crate) async fn build_attach_tabs(
         return Ok(vec![AttachTab {
             label: "terminal".to_string(),
             active: true,
+            context_id: None,
         }]);
     }
 
+    let mut session_contexts = contexts
+        .iter()
+        .filter(|context| {
+            context
+                .attributes
+                .get("bmux.session_id")
+                .is_some_and(|value| value == &session_id.to_string())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if session_contexts.is_empty() {
+        session_contexts = contexts;
+    }
+
     let current_context_id = context_id.or_else(|| {
-        contexts
+        session_contexts
             .iter()
             .find(|context| {
                 context
@@ -1775,12 +1828,12 @@ pub(crate) async fn build_attach_tabs(
             .map(|context| context.id)
     });
 
-    let tabs = contexts
+    let tabs = session_contexts
         .into_iter()
-        .take(6)
         .map(|context| AttachTab {
             label: context_summary_label(&context),
             active: current_context_id == Some(context.id),
+            context_id: Some(context.id),
         })
         .collect();
     Ok(tabs)
@@ -2349,12 +2402,22 @@ pub(crate) async fn poll_attach_terminal_event(timeout: Duration) -> Result<Opti
 pub(crate) async fn update_attach_viewport(
     client: &mut BmuxClient,
     session_id: Uuid,
+    status_position: StatusPosition,
 ) -> std::result::Result<(), ClientError> {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
     if cols == 0 || rows == 0 {
         return Ok(());
     }
-    client.attach_set_viewport(session_id, cols, rows).await?;
+    let (status_top_inset, status_bottom_inset) = status_insets_for_position(status_position);
+    client
+        .attach_set_viewport_with_insets(
+            session_id,
+            cols,
+            rows,
+            status_top_inset,
+            status_bottom_inset,
+        )
+        .await?;
     Ok(())
 }
 
@@ -2518,7 +2581,8 @@ pub(crate) async fn handle_attach_server_event(
             view_state.attached_id = attach_info.session_id;
             view_state.attached_context_id = attach_info.context_id.or(context_id);
             view_state.can_write = attach_info.can_write;
-            update_attach_viewport(client, view_state.attached_id).await?;
+            update_attach_viewport(client, view_state.attached_id, view_state.status_position)
+                .await?;
             hydrate_attach_state_from_snapshot(client, view_state)
                 .await
                 .map_err(map_attach_client_error)?;
@@ -2626,7 +2690,7 @@ pub(crate) async fn handle_attach_terminal_event(
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
         }
-        update_attach_viewport(client, view_state.attached_id).await?;
+        update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
     }
 
     let mut skip_attach_key_actions = false;
@@ -2813,10 +2877,20 @@ pub(crate) async fn handle_attach_mouse_event(
 ) -> std::result::Result<(), ClientError> {
     record_attach_mouse_event(mouse_event, view_state);
 
-    if !view_state.mouse.config.enabled || !view_state.can_write {
+    if !view_state.mouse.config.enabled {
         return Ok(());
     }
     if view_state.help_overlay_open || view_state.quit_confirmation_pending {
+        return Ok(());
+    }
+
+    if matches!(mouse_event.kind, MouseEventKind::Down(MouseButton::Left))
+        && handle_attach_status_tab_click(client, view_state, mouse_event).await?
+    {
+        return Ok(());
+    }
+
+    if !view_state.can_write {
         return Ok(());
     }
 
@@ -2882,6 +2956,43 @@ pub(crate) async fn handle_attach_mouse_event(
     }
 
     Ok(())
+}
+
+pub(crate) async fn handle_attach_status_tab_click(
+    client: &mut BmuxClient,
+    view_state: &mut AttachViewState,
+    mouse_event: MouseEvent,
+) -> std::result::Result<bool, ClientError> {
+    let (cols, rows) = terminal::size().unwrap_or((0, 0));
+    if cols == 0 || rows == 0 {
+        return Ok(false);
+    }
+    let Some(status_row) = status_row_for_position(view_state.status_position, rows) else {
+        return Ok(false);
+    };
+    if mouse_event.row != status_row {
+        return Ok(false);
+    }
+
+    let Some(status_line) = view_state.cached_status_line.as_ref() else {
+        return Ok(false);
+    };
+    let Some(target_context_id) = status_line
+        .tab_hitboxes
+        .iter()
+        .find(|hitbox| {
+            mouse_event.column >= hitbox.start_col && mouse_event.column <= hitbox.end_col
+        })
+        .map(|hitbox| hitbox.context_id)
+    else {
+        return Ok(false);
+    };
+
+    retarget_attach_to_context(client, view_state, target_context_id).await?;
+    view_state.dirty.status_needs_redraw = true;
+    view_state.dirty.layout_needs_refresh = true;
+    view_state.dirty.full_pane_redraw = true;
+    Ok(true)
 }
 
 pub(crate) async fn handle_attach_mouse_gesture_action(

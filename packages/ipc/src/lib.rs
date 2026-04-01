@@ -325,6 +325,10 @@ pub enum Request {
         session_id: Uuid,
         cols: u16,
         rows: u16,
+        #[serde(default)]
+        status_top_inset: u16,
+        #[serde(default)]
+        status_bottom_inset: u16,
     },
     AttachOutput {
         session_id: Uuid,
@@ -697,6 +701,10 @@ pub enum ResponsePayload {
         session_id: Uuid,
         cols: u16,
         rows: u16,
+        #[serde(default)]
+        status_top_inset: u16,
+        #[serde(default)]
+        status_bottom_inset: u16,
     },
     AttachOutput {
         data: Vec<u8>,
@@ -1265,6 +1273,8 @@ mod tests {
                 session_id: id,
                 cols: 120,
                 rows: 40,
+                status_top_inset: 1,
+                status_bottom_inset: 0,
             },
             Request::AttachOutput {
                 session_id: id,
@@ -1591,6 +1601,8 @@ mod tests {
                 session_id: id,
                 cols: 120,
                 rows: 40,
+                status_top_inset: 1,
+                status_bottom_inset: 0,
             },
             ResponsePayload::AttachOutput {
                 data: vec![27, 91, 72, 27, 91, 50, 74], // ESC[H ESC[2J

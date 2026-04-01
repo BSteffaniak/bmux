@@ -933,6 +933,8 @@ struct SessionRuntimeHandle {
 struct AttachViewport {
     cols: u16,
     rows: u16,
+    status_top_inset: u16,
+    status_bottom_inset: u16,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1381,12 +1383,23 @@ const fn attach_rect_from_layout_rect(rect: LayoutRect) -> AttachRect {
 }
 
 fn scene_root_from_viewport(viewport: Option<AttachViewport>) -> LayoutRect {
-    let (cols, rows) = viewport.map_or((0, 0), |viewport| (viewport.cols, viewport.rows));
+    let (cols, rows, status_top_inset, status_bottom_inset) =
+        viewport.map_or((0, 0, 0, 0), |viewport| {
+            (
+                viewport.cols,
+                viewport.rows,
+                viewport.status_top_inset,
+                viewport.status_bottom_inset,
+            )
+        });
+    let y = status_top_inset.min(rows.saturating_sub(1));
+    let reserved = status_top_inset.saturating_add(status_bottom_inset);
+    let h = rows.saturating_sub(reserved).max(1);
     LayoutRect {
         x: 0,
-        y: 1,
+        y,
         w: cols.max(1),
-        h: rows.saturating_sub(1).max(1),
+        h,
     }
 }
 
@@ -1458,12 +1471,20 @@ fn pane_pty_size(layout_rect: LayoutRect) -> (u16, u16) {
     (rows, cols)
 }
 
-fn resize_session_ptys(runtime: &mut SessionRuntimeHandle, cols: u16, rows: u16) {
+fn resize_session_ptys(
+    runtime: &mut SessionRuntimeHandle,
+    cols: u16,
+    rows: u16,
+    status_top_inset: u16,
+    status_bottom_inset: u16,
+) {
+    let y = status_top_inset.min(rows.saturating_sub(1));
+    let reserved = status_top_inset.saturating_add(status_bottom_inset);
     let root = LayoutRect {
         x: 0,
-        y: 1,
+        y,
         w: cols.max(1),
-        h: rows.saturating_sub(1).max(1),
+        h: rows.saturating_sub(reserved).max(1),
     };
     let mut rects = BTreeMap::new();
     collect_layout_rects(&runtime.layout_root, root, &mut rects);
@@ -2214,7 +2235,13 @@ impl SessionRuntimeManager {
             output.register_client_at_tail(client_id);
         }
         if let Some(viewport) = runtime.attach_viewport {
-            resize_session_ptys(runtime, viewport.cols, viewport.rows);
+            resize_session_ptys(
+                runtime,
+                viewport.cols,
+                viewport.rows,
+                viewport.status_top_inset,
+                viewport.status_bottom_inset,
+            );
         }
         Ok(())
     }
@@ -2238,7 +2265,9 @@ impl SessionRuntimeManager {
         client_id: ClientId,
         cols: u16,
         rows: u16,
-    ) -> Result<(u16, u16), SessionRuntimeError> {
+        status_top_inset: u16,
+        status_bottom_inset: u16,
+    ) -> Result<(u16, u16, u16, u16), SessionRuntimeError> {
         let runtime = self
             .runtimes
             .get_mut(&session_id)
@@ -2250,9 +2279,25 @@ impl SessionRuntimeManager {
 
         let cols = cols.max(1);
         let rows = rows.max(2);
-        runtime.attach_viewport = Some(AttachViewport { cols, rows });
-        resize_session_ptys(runtime, cols, rows);
-        Ok((cols, rows))
+        let mut status_top_inset = status_top_inset.min(1);
+        let mut status_bottom_inset = status_bottom_inset.min(1);
+        while status_top_inset.saturating_add(status_bottom_inset) >= rows {
+            if status_bottom_inset > 0 {
+                status_bottom_inset -= 1;
+            } else if status_top_inset > 0 {
+                status_top_inset -= 1;
+            } else {
+                break;
+            }
+        }
+        runtime.attach_viewport = Some(AttachViewport {
+            cols,
+            rows,
+            status_top_inset,
+            status_bottom_inset,
+        });
+        resize_session_ptys(runtime, cols, rows, status_top_inset, status_bottom_inset);
+        Ok((cols, rows, status_top_inset, status_bottom_inset))
     }
 
     fn apply_stored_attach_viewport(&mut self, session_id: SessionId) {
@@ -2262,7 +2307,13 @@ impl SessionRuntimeManager {
         let Some(viewport) = runtime.attach_viewport else {
             return;
         };
-        resize_session_ptys(runtime, viewport.cols, viewport.rows);
+        resize_session_ptys(
+            runtime,
+            viewport.cols,
+            viewport.rows,
+            viewport.status_top_inset,
+            viewport.status_bottom_inset,
+        );
     }
 
     fn write_input(
@@ -5135,6 +5186,8 @@ async fn handle_request(
             session_id,
             cols,
             rows,
+            status_top_inset,
+            status_bottom_inset,
         } => {
             let session_id = SessionId(session_id);
             if !ensure_attach_session_exists(state, session_id).await? {
@@ -5149,16 +5202,27 @@ async fn handle_request(
                     .session_runtimes
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                runtime_manager.set_attach_viewport(session_id, client_id, cols, rows)
+                runtime_manager.set_attach_viewport(
+                    session_id,
+                    client_id,
+                    cols,
+                    rows,
+                    status_top_inset,
+                    status_bottom_inset,
+                )
             };
 
             match update_result {
-                Ok((cols, rows)) => Response::Ok(ResponsePayload::AttachViewportSet {
-                    context_id: current_context_id_for_client(state, client_id),
-                    session_id: session_id.0,
-                    cols,
-                    rows,
-                }),
+                Ok((cols, rows, status_top_inset, status_bottom_inset)) => {
+                    Response::Ok(ResponsePayload::AttachViewportSet {
+                        context_id: current_context_id_for_client(state, client_id),
+                        session_id: session_id.0,
+                        cols,
+                        rows,
+                        status_top_inset,
+                        status_bottom_inset,
+                    })
+                }
                 Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
                     message: format!("session runtime not found: {}", session_id.0),

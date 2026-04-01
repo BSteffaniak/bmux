@@ -4,7 +4,7 @@ use crate::connection::{
     remove_server_runtime_metadata_file, write_server_runtime_metadata,
 };
 use crate::input::{InputProcessor, Keymap, RuntimeAction};
-use crate::status::{AttachTab, build_attach_status_line};
+use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 use anyhow::{Context, Result};
 use bmux_cli_schema::{
     Cli, Command, KeymapCommand, LogLevel, LogsCommand, LogsProfilesCommand, PlaybookCommand,
@@ -16,7 +16,8 @@ use bmux_cli_schema::{
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
 use bmux_config::{
     BmuxConfig, ConfigPaths, RecordingExportCursorBlinkMode, RecordingExportCursorMode,
-    RecordingExportCursorProfile, RecordingExportCursorShape, ResolvedTimeout, TerminfoAutoInstall,
+    RecordingExportCursorProfile, RecordingExportCursorShape, ResolvedTimeout, StatusPosition,
+    TerminfoAutoInstall,
 };
 use bmux_ipc::{
     AttachRect, AttachViewComponent, ContextSelector, ContextSummary, InvokeServiceKind,

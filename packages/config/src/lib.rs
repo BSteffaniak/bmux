@@ -426,25 +426,77 @@ pub struct PluginConfig {
 
 /// Content and layout of the status bar displayed at the top or bottom
 /// of the terminal
-#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "status_bar")]
 #[serde(default)]
 pub struct StatusBarConfig {
-    /// Format string for the left side of the status bar. Empty string
-    /// disables the left section.
-    pub left: String,
-    /// Format string for the right side of the status bar. Empty string
-    /// disables the right section.
-    pub right: String,
-    /// How often to refresh the status bar content, in seconds
-    pub update_interval: u64,
-    /// Display the active session name in the status bar
+    /// Maximum number of tabs shown in the tab strip before overflow is collapsed.
+    pub max_tabs: usize,
+    /// Maximum display width for each tab label.
+    pub tab_label_max_width: usize,
+    /// Prefix used for active tabs.
+    pub active_tab_prefix: String,
+    /// Suffix used for active tabs.
+    pub active_tab_suffix: String,
+    /// Prefix used for inactive tabs.
+    pub inactive_tab_prefix: String,
+    /// Suffix used for inactive tabs.
+    pub inactive_tab_suffix: String,
+    /// Separator inserted between tab entries.
+    pub tab_separator: String,
+    /// Marker appended when additional tabs are hidden.
+    pub tab_overflow_marker: String,
+    /// Display 1-based tab indexes before labels.
+    pub show_tab_index: bool,
+    /// Display the active session name in the status bar.
     pub show_session_name: bool,
-    /// Display the list of open panes in the status bar
-    pub show_window_list: bool,
-    /// Display the current interaction mode (Normal, Insert, etc.) in
-    /// the status bar
+    /// Display the current context label in the status bar.
+    pub show_context_name: bool,
+    /// Display the current interaction mode (Normal, Scroll, Help, etc.).
     pub show_mode: bool,
+    /// Display the current attach role (write/read-only).
+    pub show_role: bool,
+    /// Display follow target details when following another client.
+    pub show_follow: bool,
+    /// Display runtime hints on the right side.
+    pub show_hint: bool,
+    /// Separator used between non-tab status segments.
+    pub segment_separator: String,
+    /// Hint visibility policy.
+    pub hint_policy: StatusHintPolicy,
+}
+
+impl Default for StatusBarConfig {
+    fn default() -> Self {
+        Self {
+            max_tabs: 12,
+            tab_label_max_width: 20,
+            active_tab_prefix: "[".to_string(),
+            active_tab_suffix: "]".to_string(),
+            inactive_tab_prefix: " ".to_string(),
+            inactive_tab_suffix: " ".to_string(),
+            tab_separator: " ".to_string(),
+            tab_overflow_marker: "+".to_string(),
+            show_tab_index: true,
+            show_session_name: true,
+            show_context_name: false,
+            show_mode: true,
+            show_role: true,
+            show_follow: true,
+            show_hint: true,
+            segment_separator: " | ".to_string(),
+            hint_policy: StatusHintPolicy::Always,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusHintPolicy {
+    #[default]
+    Always,
+    ScrollOnly,
+    Never,
 }
 
 /// Status bar position
@@ -638,6 +690,20 @@ impl BmuxConfig {
             });
         }
 
+        if self.status_bar.max_tabs == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "status_bar.max_tabs".to_string(),
+                value: "0".to_string(),
+            });
+        }
+
+        if self.status_bar.tab_label_max_width == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "status_bar.tab_label_max_width".to_string(),
+                value: "0".to_string(),
+            });
+        }
+
         Ok(())
     }
 
@@ -730,6 +796,22 @@ impl BmuxConfig {
             repaired_fields.push(format!(
                 "recording.export.cursor_blink_period_ms=0 -> {}",
                 self.recording.export.cursor_blink_period_ms
+            ));
+        }
+
+        if self.status_bar.max_tabs == 0 {
+            self.status_bar.max_tabs = StatusBarConfig::default().max_tabs;
+            repaired_fields.push(format!(
+                "status_bar.max_tabs=0 -> {}",
+                self.status_bar.max_tabs
+            ));
+        }
+
+        if self.status_bar.tab_label_max_width == 0 {
+            self.status_bar.tab_label_max_width = StatusBarConfig::default().tab_label_max_width;
+            repaired_fields.push(format!(
+                "status_bar.tab_label_max_width=0 -> {}",
+                self.status_bar.tab_label_max_width
             ));
         }
 

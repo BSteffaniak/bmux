@@ -1050,11 +1050,30 @@ impl BmuxClient {
         cols: u16,
         rows: u16,
     ) -> Result<(u16, u16)> {
+        self.attach_set_viewport_with_insets(session_id, cols, rows, 0, 0)
+            .await
+    }
+
+    /// Update attached viewport dimensions and status insets for pane PTY sizing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn attach_set_viewport_with_insets(
+        &mut self,
+        session_id: Uuid,
+        cols: u16,
+        rows: u16,
+        status_top_inset: u16,
+        status_bottom_inset: u16,
+    ) -> Result<(u16, u16)> {
         match self
             .request(Request::AttachSetViewport {
                 session_id,
                 cols,
                 rows,
+                status_top_inset,
+                status_bottom_inset,
             })
             .await?
         {

@@ -958,6 +958,8 @@ mod tests {
             session_id,
             cols: 120,
             rows: 40,
+            status_top_inset: 0,
+            status_bottom_inset: 0,
         };
 
         let events = vec![

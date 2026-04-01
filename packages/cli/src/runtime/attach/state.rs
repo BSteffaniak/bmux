@@ -1,6 +1,7 @@
 use crate::input::RuntimeAction;
+use crate::status::AttachStatusLine;
 use bmux_client::AttachLayoutState;
-use bmux_config::MouseBehaviorConfig;
+use bmux_config::{MouseBehaviorConfig, StatusPosition};
 use crossterm::event::MouseEvent;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -105,7 +106,8 @@ pub struct AttachViewState {
     pub(crate) transient_status: Option<String>,
     pub(crate) transient_status_until: Option<Instant>,
     pub(crate) pane_buffers: BTreeMap<Uuid, PaneRenderBuffer>,
-    pub(crate) cached_status_line: Option<String>,
+    pub(crate) status_position: StatusPosition,
+    pub(crate) cached_status_line: Option<AttachStatusLine>,
     pub(crate) cached_layout_state: Option<AttachLayoutState>,
     pub(crate) last_cursor_state: Option<AttachCursorState>,
     pub(crate) mouse: AttachMouseState,
@@ -140,6 +142,7 @@ impl AttachViewState {
             transient_status: None,
             transient_status_until: None,
             pane_buffers: BTreeMap::new(),
+            status_position: StatusPosition::Bottom,
             cached_status_line: None,
             cached_layout_state: None,
             last_cursor_state: None,
