@@ -1,6 +1,6 @@
 use super::*;
 use anyhow::Context;
-use bmux_config::{ConnectionTargetConfig, ConnectionTransport};
+use bmux_config::{ConnectionTargetConfig, ConnectionTransport, RemoteServerStartMode};
 use bmux_ipc::transport::ErasedIpcStream;
 use std::ffi::OsString;
 use std::pin::Pin;
@@ -26,7 +26,11 @@ struct SshTarget {
     jump: Option<String>,
     remote_bmux_path: String,
     connect_timeout_ms: u64,
+    server_start_mode: RemoteServerStartMode,
 }
+
+const SSH_RECONNECT_MAX_ATTEMPTS: usize = 4;
+const SSH_RECONNECT_BASE_BACKOFF_MS: u64 = 300;
 
 #[derive(Debug)]
 struct SshBridgeStream {
@@ -87,8 +91,22 @@ pub(super) async fn run_target_proxy_from_current_argv(cli: &Cli) -> Result<u8> 
     };
     let argv = std::env::args_os().collect::<Vec<_>>();
     let remote_args = strip_target_argument(&argv);
+    if command_requires_remote_server(cli.command.as_ref()) {
+        ensure_remote_server_ready(&target).await?;
+    }
     let needs_tty = command_needs_tty(cli.command.as_ref());
     run_ssh_bmux_command(&target, &remote_args, needs_tty)
+}
+
+fn command_requires_remote_server(command: Option<&Command>) -> bool {
+    !matches!(
+        command,
+        Some(Command::Server {
+            command: ServerCommand::Start { .. }
+                | ServerCommand::Status { .. }
+                | ServerCommand::Bridge { .. }
+        })
+    )
 }
 
 pub(super) async fn run_connect(
@@ -121,9 +139,50 @@ pub(super) async fn run_connect(
             } else {
                 resolve_remote_attach_session(&mut client, &ssh_target).await?
             };
-            run_session_attach_with_client(client, target_session.as_deref(), follow, global, None)
-                .await
+            run_remote_attach_with_reconnect(
+                client,
+                &ssh_target,
+                target_session.as_deref(),
+                follow,
+                global,
+            )
+            .await
         }
+    }
+}
+
+async fn run_remote_attach_with_reconnect(
+    mut client: BmuxClient,
+    target: &SshTarget,
+    session: Option<&str>,
+    follow: Option<&str>,
+    global: bool,
+) -> Result<u8> {
+    let mut attempt = 0usize;
+    loop {
+        let outcome = run_session_attach_with_client(client, session, follow, global, None).await?;
+        if outcome.exit_reason != AttachExitReason::StreamClosed {
+            return Ok(outcome.status_code);
+        }
+        if attempt >= SSH_RECONNECT_MAX_ATTEMPTS {
+            println!(
+                "remote connection closed; giving up after {} reconnect attempts",
+                SSH_RECONNECT_MAX_ATTEMPTS
+            );
+            return Ok(1);
+        }
+        attempt = attempt.saturating_add(1);
+        let backoff = Duration::from_millis(
+            SSH_RECONNECT_BASE_BACKOFF_MS.saturating_mul(2u64.saturating_pow((attempt - 1) as u32)),
+        );
+        println!(
+            "remote connection closed; reconnecting to '{}' (attempt {attempt}/{}) in {}ms...",
+            target.label,
+            SSH_RECONNECT_MAX_ATTEMPTS,
+            backoff.as_millis()
+        );
+        tokio::time::sleep(backoff).await;
+        client = connect_remote_bridge(target, "bmux-cli-connect-remote-reconnect").await?;
     }
 }
 
@@ -322,6 +381,7 @@ fn select_session_interactively(
 }
 
 async fn connect_remote_bridge(target: &SshTarget, client_name: &str) -> Result<BmuxClient> {
+    ensure_remote_server_ready(target).await?;
     let mut command = build_ssh_bridge_command(target);
     let mut child = command
         .spawn()
@@ -348,7 +408,72 @@ async fn connect_remote_bridge(target: &SshTarget, client_name: &str) -> Result<
         principal_id,
     )
     .await
-    .map_err(map_cli_client_error)
+    .map_err(|error| {
+        let mapped = map_cli_client_error(error).to_string();
+        if mapped.contains("transport error") {
+            anyhow::anyhow!(
+                "failed establishing remote bridge with '{}': {mapped}\nif your remote shell prints startup output in non-interactive mode, disable it for ssh command sessions",
+                target.label
+            )
+        } else {
+            anyhow::anyhow!(mapped)
+        }
+    })
+}
+
+async fn ensure_remote_server_ready(target: &SshTarget) -> Result<()> {
+    let status = run_ssh_bmux_command_silent(
+        target,
+        &[OsString::from("server"), OsString::from("status")],
+        false,
+    )?;
+    if status == 0 {
+        return Ok(());
+    }
+
+    match target.server_start_mode {
+        RemoteServerStartMode::RequireRunning => {
+            anyhow::bail!(
+                "remote bmux server is not running on '{}' and server_start_mode=require_running.\nstart it with: ssh {} {} server start --daemon",
+                target.label,
+                ssh_destination(target),
+                target.remote_bmux_path
+            );
+        }
+        RemoteServerStartMode::Auto => {
+            println!(
+                "remote bmux server is not running on '{}'; starting it automatically...",
+                target.label
+            );
+            let start_status = run_ssh_bmux_command(
+                target,
+                &[
+                    OsString::from("server"),
+                    OsString::from("start"),
+                    OsString::from("--daemon"),
+                ],
+                false,
+            )?;
+            if start_status != 0 {
+                anyhow::bail!(
+                    "failed to auto-start remote bmux server on '{}'",
+                    target.label
+                );
+            }
+            let verify_status = run_ssh_bmux_command_silent(
+                target,
+                &[OsString::from("server"), OsString::from("status")],
+                false,
+            )?;
+            if verify_status != 0 {
+                anyhow::bail!(
+                    "remote bmux server on '{}' did not become ready after auto-start",
+                    target.label
+                );
+            }
+            Ok(())
+        }
+    }
 }
 
 fn load_or_create_local_principal_id(paths: &ConfigPaths) -> Result<Uuid> {
@@ -375,6 +500,37 @@ fn load_or_create_local_principal_id(paths: &ConfigPaths) -> Result<Uuid> {
 }
 
 fn run_ssh_bmux_command(target: &SshTarget, args: &[OsString], force_tty: bool) -> Result<u8> {
+    run_ssh_bmux_command_inner(target, args, force_tty, true)
+}
+
+fn run_ssh_bmux_command_silent(
+    target: &SshTarget,
+    args: &[OsString],
+    force_tty: bool,
+) -> Result<u8> {
+    run_ssh_bmux_command_inner(target, args, force_tty, false)
+}
+
+fn run_ssh_bmux_command_inner(
+    target: &SshTarget,
+    args: &[OsString],
+    force_tty: bool,
+    print_stdout: bool,
+) -> Result<u8> {
+    if !force_tty {
+        let output = build_ssh_command(target, args, false)
+            .output()
+            .with_context(|| format!("failed executing ssh target {}", target.label))?;
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            if print_stdout && !stdout.trim().is_empty() {
+                print!("{}", stdout);
+            }
+            return Ok(0);
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(map_ssh_execution_error(target, stderr.trim()));
+    }
     let mut command = build_ssh_command(target, args, force_tty);
     let status = command
         .status()
@@ -415,6 +571,12 @@ fn build_ssh_command(target: &SshTarget, args: &[OsString], force_tty: bool) -> 
     command.arg("-o");
     let timeout_secs = (target.connect_timeout_ms.saturating_add(999)) / 1000;
     command.arg(format!("ConnectTimeout={timeout_secs}"));
+    command.arg("-o");
+    command.arg("ServerAliveInterval=15");
+    command.arg("-o");
+    command.arg("ServerAliveCountMax=3");
+    command.arg("-o");
+    command.arg("BatchMode=yes");
     let destination = target.user.as_ref().map_or_else(
         || target.host.clone(),
         |user| format!("{user}@{}", target.host),
@@ -456,6 +618,12 @@ fn build_ssh_bridge_command(target: &SshTarget) -> TokioProcessCommand {
     command.arg("-o");
     let timeout_secs = (target.connect_timeout_ms.saturating_add(999)) / 1000;
     command.arg(format!("ConnectTimeout={timeout_secs}"));
+    command.arg("-o");
+    command.arg("ServerAliveInterval=15");
+    command.arg("-o");
+    command.arg("ServerAliveCountMax=3");
+    command.arg("-o");
+    command.arg("BatchMode=yes");
     let destination = target.user.as_ref().map_or_else(
         || target.host.clone(),
         |user| format!("{user}@{}", target.host),
@@ -469,6 +637,41 @@ fn build_ssh_bridge_command(target: &SshTarget) -> TokioProcessCommand {
     command.stdout(Stdio::piped());
     command.stderr(Stdio::inherit());
     command
+}
+
+fn map_ssh_execution_error(target: &SshTarget, stderr: &str) -> anyhow::Error {
+    if stderr.contains("Host key verification failed") {
+        return anyhow::anyhow!(
+            "ssh host key verification failed for '{}'. verify known_hosts or set known_hosts_file",
+            target.label
+        );
+    }
+    if stderr.contains("Permission denied") {
+        return anyhow::anyhow!(
+            "ssh authentication failed for '{}'. check user/identity_file and remote access",
+            target.label
+        );
+    }
+    if stderr.contains("Could not resolve hostname") {
+        return anyhow::anyhow!(
+            "ssh target '{}' hostname could not be resolved",
+            target.label
+        );
+    }
+    if stderr.contains("Connection timed out") || stderr.contains("Operation timed out") {
+        return anyhow::anyhow!("ssh connection to '{}' timed out", target.label);
+    }
+    if stderr.is_empty() {
+        return anyhow::anyhow!("ssh command failed for '{}'", target.label);
+    }
+    anyhow::anyhow!("ssh command failed for '{}': {stderr}", target.label)
+}
+
+fn ssh_destination(target: &SshTarget) -> String {
+    target.user.as_ref().map_or_else(
+        || target.host.clone(),
+        |user| format!("{user}@{}", target.host),
+    )
 }
 
 fn strip_target_argument(argv: &[OsString]) -> Vec<OsString> {
@@ -564,6 +767,7 @@ fn resolve_named_target(name: &str, target: &ConnectionTargetConfig) -> Result<R
                 jump: target.jump.clone(),
                 remote_bmux_path: target.remote_bmux_path.clone(),
                 connect_timeout_ms: target.connect_timeout_ms.max(1),
+                server_start_mode: target.server_start_mode,
             }))
         }
     }
@@ -605,5 +809,68 @@ fn parse_inline_ssh_target(target: &str) -> Result<ResolvedTarget> {
         jump: None,
         remote_bmux_path: "bmux".to_string(),
         connect_timeout_ms: 8_000,
+        server_start_mode: RemoteServerStartMode::Auto,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_target() -> SshTarget {
+        SshTarget {
+            label: "prod".to_string(),
+            host: "example.com".to_string(),
+            user: Some("bmux".to_string()),
+            port: Some(2222),
+            identity_file: None,
+            known_hosts_file: None,
+            strict_host_key_checking: true,
+            jump: None,
+            remote_bmux_path: "bmux".to_string(),
+            connect_timeout_ms: 8_000,
+            server_start_mode: RemoteServerStartMode::Auto,
+        }
+    }
+
+    #[test]
+    fn strip_target_argument_removes_long_forms() {
+        let argv = vec![
+            OsString::from("bmux"),
+            OsString::from("--target"),
+            OsString::from("prod"),
+            OsString::from("list-sessions"),
+            OsString::from("--target=staging"),
+        ];
+        let filtered = strip_target_argument(&argv);
+        assert_eq!(filtered, vec![OsString::from("list-sessions")]);
+    }
+
+    #[test]
+    fn parse_inline_ssh_target_accepts_user_host_port() {
+        let resolved = parse_inline_ssh_target("alice@example.com:2200").expect("parse target");
+        let ResolvedTarget::Ssh(ssh) = resolved else {
+            panic!("expected ssh target");
+        };
+        assert_eq!(ssh.user.as_deref(), Some("alice"));
+        assert_eq!(ssh.host, "example.com");
+        assert_eq!(ssh.port, Some(2200));
+    }
+
+    #[test]
+    fn parse_inline_ssh_target_accepts_ssh_scheme() {
+        let resolved = parse_inline_ssh_target("ssh://bob@example.com").expect("parse target");
+        let ResolvedTarget::Ssh(ssh) = resolved else {
+            panic!("expected ssh target");
+        };
+        assert_eq!(ssh.user.as_deref(), Some("bob"));
+        assert_eq!(ssh.host, "example.com");
+        assert_eq!(ssh.port, None);
+    }
+
+    #[test]
+    fn map_ssh_execution_error_highlights_auth_failures() {
+        let error = map_ssh_execution_error(&sample_target(), "Permission denied (publickey)");
+        assert!(error.to_string().contains("authentication failed"));
+    }
 }

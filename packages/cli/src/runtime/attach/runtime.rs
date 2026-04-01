@@ -10,7 +10,7 @@ pub(crate) async fn run_session_attach_with_client(
     follow: Option<&str>,
     global: bool,
     capture_plan: Option<AttachDisplayCapturePlan>,
-) -> Result<u8> {
+) -> Result<AttachRunOutcome> {
     if target.is_none() && follow.is_none() {
         anyhow::bail!("attach requires a session target or --follow <client-uuid>");
     }
@@ -311,7 +311,16 @@ pub(crate) async fn run_session_attach_with_client(
         let _ = capture.record_stream_closed();
         let _ = capture.flush();
     }
-    Ok(0)
+    Ok(AttachRunOutcome {
+        status_code: 0,
+        exit_reason,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AttachRunOutcome {
+    pub(crate) status_code: u8,
+    pub(crate) exit_reason: AttachExitReason,
 }
 
 pub(crate) async fn handle_attach_runtime_action(

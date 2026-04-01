@@ -63,7 +63,8 @@ pub(super) async fn run_default_server_attach(options: DefaultAttachOptions) -> 
     let target = target.to_string();
     let attach_result =
         run_session_attach_with_client(client, Some(target.as_str()), None, false, capture_plan)
-            .await;
+            .await
+            .map(|outcome| outcome.status_code);
 
     if let Some(recording_id) = active_recording_id {
         let mut stop_client = connect(
@@ -272,7 +273,9 @@ pub(super) async fn run_session_attach(
     global: bool,
 ) -> Result<u8> {
     let client = connect(ConnectionPolicyScope::Normal, "bmux-cli-attach").await?;
-    run_session_attach_with_client(client, target, follow, global, None).await
+    run_session_attach_with_client(client, target, follow, global, None)
+        .await
+        .map(|outcome| outcome.status_code)
 }
 
 pub(super) fn map_attach_client_error(error: ClientError) -> anyhow::Error {
