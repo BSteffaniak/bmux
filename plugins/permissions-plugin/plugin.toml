@@ -103,6 +103,11 @@ long = "watch"
 name = "watch"
 
 [[commands.arguments]]
+kind = "boolean"
+long = "compact"
+name = "compact"
+
+[[commands.arguments]]
 kind       = "integer"
 long       = "interval-ms"
 name       = "interval-ms"

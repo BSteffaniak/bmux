@@ -182,6 +182,7 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
             };
             let as_json = has_flag(&context.arguments, "json");
             let watch = has_flag(&context.arguments, "watch");
+            let compact = has_flag(&context.arguments, "compact");
             let interval_ms = option_value(&context.arguments, "interval-ms")
                 .as_deref()
                 .map(parse_interval_ms)
@@ -197,6 +198,7 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
                 context,
                 &request,
                 as_json,
+                compact,
                 watch,
                 interval_ms,
                 iterations,
@@ -614,6 +616,7 @@ fn watch_hot_path_policy_decision(
     caller: &impl HostRuntimeApi,
     request: &CheckHotPathDecisionRequest,
     as_json: bool,
+    compact: bool,
     watch: bool,
     interval_ms: u64,
     iterations: usize,
@@ -627,6 +630,8 @@ fn watch_hot_path_policy_decision(
                 let output =
                     serde_json::to_string_pretty(&decision).map_err(|error| error.to_string())?;
                 println!("{output}");
+            } else if compact {
+                println!("{}", format_hot_path_decision_compact(&decision));
             } else {
                 println!(
                     "allowed={} scope={} session={} context={} reason={}",
@@ -654,6 +659,25 @@ fn watch_hot_path_policy_decision(
         std::thread::sleep(std::time::Duration::from_millis(interval_ms));
     }
     Ok(())
+}
+
+fn format_hot_path_decision_compact(decision: &CheckHotPathDecisionResponse) -> String {
+    let status = if decision.allowed { "allow" } else { "deny" };
+    let scope = decision.matched_scope.as_deref().unwrap_or("none");
+    let session = decision
+        .session_id
+        .map_or_else(|| "-".to_string(), |id| id.to_string());
+    let context = decision
+        .context_id
+        .map_or_else(|| "-".to_string(), |id| id.to_string());
+    if decision.allowed {
+        format!("{status} scope={scope} session={session} context={context}")
+    } else {
+        format!(
+            "{status} scope={scope} session={session} context={context} reason={}",
+            decision.reason.as_deref().unwrap_or("-")
+        )
+    }
 }
 
 fn parse_interval_ms(value: &str) -> Result<u64, String> {
@@ -2115,5 +2139,18 @@ mod tests {
         .expect("decision should resolve");
         assert!(decision.allowed);
         assert!(decision.matched_scope.is_none());
+    }
+
+    #[test]
+    fn compact_hot_path_decision_format_includes_reason_for_denies() {
+        let line = format_hot_path_decision_compact(&CheckHotPathDecisionResponse {
+            allowed: false,
+            reason: Some("denied by policy".to_string()),
+            matched_scope: None,
+            session_id: Some(Uuid::from_u128(1)),
+            context_id: None,
+        });
+        assert!(line.contains("deny"));
+        assert!(line.contains("reason=denied by policy"));
     }
 }
