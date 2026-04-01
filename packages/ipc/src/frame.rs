@@ -3,8 +3,12 @@ use thiserror::Error;
 
 const FRAME_LEN_BYTES: usize = 4;
 
-/// Maximum accepted encoded envelope payload size.
-pub const MAX_FRAME_PAYLOAD_SIZE: usize = 1_048_576;
+/// Maximum accepted encoded envelope payload size (8 MiB).
+///
+/// This is the hard ceiling for a single IPC frame over the local Unix socket.
+/// Server-side response assembly should enforce its own budget well below this
+/// limit so that `PayloadTooLarge` is never hit in normal operation.
+pub const MAX_FRAME_PAYLOAD_SIZE: usize = 8 * 1_048_576;
 
 /// Errors returned by frame encoding.
 #[derive(Debug, Error)]

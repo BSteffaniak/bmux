@@ -286,6 +286,14 @@ pub fn map_client_connect_error(error: ClientError) -> anyhow::Error {
         );
     }
 
+    if let ClientError::Transport(bmux_ipc::transport::IpcTransportError::Io(io_error)) = &error {
+        if io_error.kind() == std::io::ErrorKind::UnexpectedEof {
+            return anyhow::anyhow!(
+                "bmux error: server connection lost unexpectedly.\nThe server may have crashed or been stopped. Check `bmux server status` and server logs."
+            );
+        }
+    }
+
     anyhow::Error::from(error)
 }
 

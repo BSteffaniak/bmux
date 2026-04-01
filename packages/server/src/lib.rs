@@ -48,6 +48,16 @@ const DEFAULT_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
 const CONTEXT_SESSION_ID_ATTRIBUTE: &str = "bmux.session_id";
 const MAX_WINDOW_OUTPUT_BUFFER_BYTES: usize = 1_048_576;
+/// Headroom reserved for envelope framing, layout metadata, pane summaries, and
+/// scene data so that the combined output chunks + metadata never exceed the IPC
+/// frame limit.  64 KiB is generous for any realistic layout.
+const RESPONSE_METADATA_HEADROOM: usize = 65_536;
+/// Maximum total bytes of pane output data the server will pack into a single
+/// response (snapshot or output-batch).  Computed as `MAX_FRAME_PAYLOAD_SIZE`
+/// minus generous metadata headroom, ensuring the serialized response always
+/// fits within the frame limit regardless of what the client requests.
+const RESPONSE_OUTPUT_BUDGET: usize =
+    bmux_ipc::frame::MAX_FRAME_PAYLOAD_SIZE - RESPONSE_METADATA_HEADROOM;
 const SNAPSHOT_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(300);
 const OFFLINE_SNAPSHOT_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const OFFLINE_SNAPSHOT_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
@@ -2248,15 +2258,20 @@ impl SessionRuntimeManager {
             .collect::<Vec<_>>();
 
         let mut chunks = Vec::new();
+        let num_panes = pane_ids.len().max(1);
+        let per_pane_budget = (RESPONSE_OUTPUT_BUDGET / num_panes).min(max_bytes_per_pane);
+        let mut budget_remaining = RESPONSE_OUTPUT_BUDGET;
         for pane_id in pane_ids {
             let Some(pane) = session.panes.get(&pane_id) else {
                 continue;
             };
+            let allowed = per_pane_budget.min(budget_remaining);
             let data = pane
                 .output_buffer
                 .lock()
                 .map_err(|_| SessionRuntimeError::Closed)?
-                .read_recent(max_bytes_per_pane);
+                .read_recent(allowed);
+            budget_remaining = budget_remaining.saturating_sub(data.len());
             chunks.push(AttachPaneChunk { pane_id, data });
         }
 
@@ -2289,19 +2304,24 @@ impl SessionRuntimeManager {
 
             let mut chunks = Vec::new();
             let mut closed_active = false;
+            let num_panes = pane_ids.len().max(1);
+            let per_pane_budget = (RESPONSE_OUTPUT_BUDGET / num_panes).min(max_bytes);
+            let mut budget_remaining = RESPONSE_OUTPUT_BUDGET;
             for pane_id in pane_ids {
                 let Some(pane) = session.panes.get_mut(pane_id) else {
                     continue;
                 };
+                let allowed = per_pane_budget.min(budget_remaining);
                 let mut output = pane
                     .output_buffer
                     .lock()
                     .map_err(|_| SessionRuntimeError::Closed)?;
-                let data = output.read_for_client(client_id, max_bytes);
+                let data = output.read_for_client(client_id, allowed);
                 drop(output);
                 if pane.exited.load(Ordering::SeqCst) && *pane_id == session.focused_pane_id {
                     closed_active = true;
                 }
+                budget_remaining = budget_remaining.saturating_sub(data.len());
                 chunks.push(AttachPaneChunk {
                     pane_id: *pane_id,
                     data,
@@ -3110,7 +3130,24 @@ async fn handle_connection(
                 }
             }
         }
-        send_response(&mut stream, envelope.request_id, response).await?;
+        match send_response(&mut stream, envelope.request_id, response).await {
+            Ok(()) => {}
+            Err(err) if is_frame_too_large_error(&err) => {
+                warn!(
+                    client_id = %client_id.0,
+                    request_id = envelope.request_id,
+                    "response exceeded frame size limit, sending error to client: {err:#}"
+                );
+                send_error(
+                    &mut stream,
+                    envelope.request_id,
+                    ErrorCode::Internal,
+                    "response too large".to_string(),
+                )
+                .await?;
+            }
+            Err(err) => return Err(err),
+        }
     }
 
     detach_client_state_on_disconnect(
@@ -6742,6 +6779,21 @@ async fn send_response(
         .send_envelope(&envelope)
         .await
         .context("failed sending response envelope")
+}
+
+/// Returns `true` when `err` was caused by the IPC frame payload exceeding the
+/// maximum size.  Used to degrade gracefully instead of tearing down the entire
+/// client connection.
+fn is_frame_too_large_error(err: &anyhow::Error) -> bool {
+    for cause in err.chain() {
+        if let Some(IpcTransportError::FrameEncode(
+            bmux_ipc::frame::FrameEncodeError::PayloadTooLarge { .. },
+        )) = cause.downcast_ref::<IpcTransportError>()
+        {
+            return true;
+        }
+    }
+    false
 }
 
 #[cfg(test)]
