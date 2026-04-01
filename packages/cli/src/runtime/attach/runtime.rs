@@ -80,7 +80,11 @@ pub(crate) async fn run_session_attach_with_client(
 
     let mut view_state = AttachViewState::new(attach_info);
     view_state.mouse.config = attach_config.attach_mouse_config();
-    view_state.status_position = attach_config.appearance.status_position;
+    view_state.status_position = if attach_config.status_bar.enabled {
+        attach_config.appearance.status_position
+    } else {
+        StatusPosition::Off
+    };
 
     update_attach_viewport(
         &mut client,
@@ -1482,14 +1486,8 @@ pub(crate) fn queue_attach_status_line(
     let Some(status_row) = status_row_for_position(status_position, rows) else {
         return Ok(());
     };
-    queue!(
-        stdout,
-        MoveTo(0, status_row),
-        Print("\x1b[7m"),
-        Print(&status_line.rendered),
-        Print("\x1b[0m")
-    )
-    .context("failed queuing attach status line")
+    queue!(stdout, MoveTo(0, status_row), Print(&status_line.rendered))
+        .context("failed queuing attach status line")
 }
 
 pub(crate) fn help_overlay_visible_rows(lines: &[String]) -> usize {

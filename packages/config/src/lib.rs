@@ -468,22 +468,18 @@ pub struct PluginConfig {
 #[config_doc(section = "status_bar")]
 #[serde(default)]
 pub struct StatusBarConfig {
+    /// Enable status bar rendering in attach UI.
+    pub enabled: bool,
+    /// High-level status bar visual preset.
+    pub preset: StatusBarPreset,
+    /// Layout and spacing options.
+    pub layout: StatusBarLayoutConfig,
+    /// Separator and emphasis options.
+    pub style: StatusBarStyleConfig,
     /// Maximum number of tabs shown in the tab strip before overflow is collapsed.
     pub max_tabs: usize,
     /// Maximum display width for each tab label.
     pub tab_label_max_width: usize,
-    /// Prefix used for active tabs.
-    pub active_tab_prefix: String,
-    /// Suffix used for active tabs.
-    pub active_tab_suffix: String,
-    /// Prefix used for inactive tabs.
-    pub inactive_tab_prefix: String,
-    /// Suffix used for inactive tabs.
-    pub inactive_tab_suffix: String,
-    /// Separator inserted between tab entries.
-    pub tab_separator: String,
-    /// Marker appended when additional tabs are hidden.
-    pub tab_overflow_marker: String,
     /// Display 1-based tab indexes before labels.
     pub show_tab_index: bool,
     /// Which context set to render as tabs.
@@ -502,8 +498,6 @@ pub struct StatusBarConfig {
     pub show_follow: bool,
     /// Display runtime hints on the right side.
     pub show_hint: bool,
-    /// Separator used between non-tab status segments.
-    pub segment_separator: String,
     /// Hint visibility policy.
     pub hint_policy: StatusHintPolicy,
 }
@@ -511,27 +505,143 @@ pub struct StatusBarConfig {
 impl Default for StatusBarConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
+            preset: StatusBarPreset::TabRail,
+            layout: StatusBarLayoutConfig::default(),
+            style: StatusBarStyleConfig::default(),
             max_tabs: 12,
             tab_label_max_width: 20,
-            active_tab_prefix: "[".to_string(),
-            active_tab_suffix: "]".to_string(),
-            inactive_tab_prefix: " ".to_string(),
-            inactive_tab_suffix: " ".to_string(),
-            tab_separator: " ".to_string(),
-            tab_overflow_marker: "+".to_string(),
             show_tab_index: true,
             tab_scope: StatusTabScope::AllContexts,
             tab_order: StatusTabOrder::Stable,
-            show_session_name: true,
+            show_session_name: false,
             show_context_name: false,
             show_mode: true,
             show_role: true,
             show_follow: true,
             show_hint: true,
-            segment_separator: " | ".to_string(),
-            hint_policy: StatusHintPolicy::Always,
+            hint_policy: StatusHintPolicy::ScrollOnly,
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[serde(default)]
+pub struct StatusBarLayoutConfig {
+    /// Spacing density for tabs and right modules.
+    pub density: StatusDensity,
+    /// Left padding before first tab.
+    pub left_padding: usize,
+    /// Right padding after final segment.
+    pub right_padding: usize,
+    /// Number of spaces between tabs.
+    pub tab_gap: usize,
+    /// Number of spaces between right-side modules.
+    pub module_gap: usize,
+    /// Overflow indicator style when tabs are hidden.
+    pub overflow_style: StatusOverflowStyle,
+    /// Behavior used to keep the active tab visible.
+    pub align_active: StatusAlignActive,
+}
+
+impl StatusBarLayoutConfig {
+    #[must_use]
+    pub const fn config_doc_values() -> &'static [&'static str] {
+        &[]
+    }
+}
+
+impl Default for StatusBarLayoutConfig {
+    fn default() -> Self {
+        Self {
+            density: StatusDensity::Cozy,
+            left_padding: 1,
+            right_padding: 1,
+            tab_gap: 1,
+            module_gap: 1,
+            overflow_style: StatusOverflowStyle::Arrows,
+            align_active: StatusAlignActive::KeepVisible,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[serde(default)]
+pub struct StatusBarStyleConfig {
+    /// Separator character set for tabs and modules.
+    pub separator_set: StatusSeparatorSet,
+    /// Prefer Unicode separators when available.
+    pub prefer_unicode: bool,
+    /// Force ASCII separators even when Unicode is enabled.
+    pub force_ascii: bool,
+    /// Dim inactive tabs for stronger active emphasis.
+    pub dim_inactive: bool,
+    /// Bold active tabs for stronger active emphasis.
+    pub bold_active: bool,
+    /// Underline active tabs.
+    pub underline_active: bool,
+}
+
+impl StatusBarStyleConfig {
+    #[must_use]
+    pub const fn config_doc_values() -> &'static [&'static str] {
+        &[]
+    }
+}
+
+impl Default for StatusBarStyleConfig {
+    fn default() -> Self {
+        Self {
+            separator_set: StatusSeparatorSet::AngledSegments,
+            prefer_unicode: true,
+            force_ascii: false,
+            dim_inactive: true,
+            bold_active: true,
+            underline_active: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusBarPreset {
+    #[default]
+    TabRail,
+    Minimal,
+    Classic,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusDensity {
+    Compact,
+    #[default]
+    Cozy,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusOverflowStyle {
+    Count,
+    #[default]
+    Arrows,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusAlignActive {
+    #[default]
+    KeepVisible,
+    FocusBias,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusSeparatorSet {
+    #[default]
+    AngledSegments,
+    Plain,
+    Ascii,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
