@@ -33,7 +33,16 @@ pub(crate) async fn run_session_attach_with_client(
     };
     let attach_keymap = attach_keymap_from_config(&attach_config);
     let attach_help_lines = build_attach_help_lines(&attach_config);
-    let global_theme = bmux_config::ThemeConfig::default();
+    let global_theme = match attach_config.load_theme() {
+        Ok(theme) => theme,
+        Err(error) => {
+            eprintln!(
+                "bmux warning: failed loading global theme '{}', using defaults ({error})",
+                attach_config.appearance.theme
+            );
+            bmux_config::ThemeConfig::default()
+        }
+    };
 
     if let Some(leader_client_id) = follow_target_id {
         client

@@ -781,6 +781,44 @@ impl BmuxConfig {
         Self::load_from_path(&paths.config_file())
     }
 
+    /// Load the configured global theme.
+    ///
+    /// Returns the built-in default theme when `appearance.theme` is empty or
+    /// set to `default`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the named theme file cannot be read or parsed.
+    pub fn load_theme(&self) -> Result<ThemeConfig> {
+        let paths = ConfigPaths::default();
+        self.load_theme_from_paths(&paths)
+    }
+
+    /// Load the configured global theme using explicit config paths.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the named theme file cannot be read or parsed.
+    pub fn load_theme_from_paths(&self, paths: &ConfigPaths) -> Result<ThemeConfig> {
+        let theme_name = self.appearance.theme.trim();
+        if theme_name.is_empty() || theme_name.eq_ignore_ascii_case("default") {
+            return Ok(ThemeConfig::default());
+        }
+
+        let path = paths.themes_dir().join(format!("{theme_name}.toml"));
+        if !path.exists() {
+            return Err(ConfigError::FileNotFound { path });
+        }
+
+        let contents = std::fs::read_to_string(&path).map_err(|e| ConfigError::ReadError {
+            error: e.to_string(),
+        })?;
+
+        toml::from_str(&contents).map_err(|e| ConfigError::ParseError {
+            error: e.to_string(),
+        })
+    }
+
     /// Load configuration from a specific path
     ///
     /// # Errors
@@ -1497,5 +1535,68 @@ timeout_profile = "missing"
         assert_eq!(config.recording.export.cursor_underline_height_pct, 11);
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn load_theme_uses_default_when_appearance_theme_is_empty() {
+        let config = BmuxConfig::default();
+        let paths = ConfigPaths::new(
+            std::path::PathBuf::from("/config"),
+            std::path::PathBuf::from("/runtime"),
+            std::path::PathBuf::from("/data"),
+            std::path::PathBuf::from("/state"),
+        );
+
+        let theme = config
+            .load_theme_from_paths(&paths)
+            .expect("default theme loads");
+        assert_eq!(theme.name, "default");
+    }
+
+    #[test]
+    fn load_theme_reads_named_theme_from_themes_directory() {
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        let themes_dir = dir.join("themes");
+        std::fs::create_dir_all(&themes_dir).expect("create themes dir");
+        std::fs::write(
+            themes_dir.join("night.toml"),
+            "name = 'night'\nforeground = '#eeeeee'\nbackground = '#101010'\n",
+        )
+        .expect("write theme file");
+
+        let mut config = BmuxConfig::default();
+        config.appearance.theme = "night".to_string();
+        let paths = ConfigPaths::new(
+            dir.clone(),
+            std::path::PathBuf::from("/runtime"),
+            std::path::PathBuf::from("/data"),
+            std::path::PathBuf::from("/state"),
+        );
+
+        let theme = config
+            .load_theme_from_paths(&paths)
+            .expect("named theme loads");
+        assert_eq!(theme.name, "night");
+        assert_eq!(theme.background, "#101010");
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn load_theme_errors_when_named_theme_is_missing() {
+        let mut config = BmuxConfig::default();
+        config.appearance.theme = "missing-theme".to_string();
+        let paths = ConfigPaths::new(
+            std::path::PathBuf::from("/config"),
+            std::path::PathBuf::from("/runtime"),
+            std::path::PathBuf::from("/data"),
+            std::path::PathBuf::from("/state"),
+        );
+
+        let error = config
+            .load_theme_from_paths(&paths)
+            .expect_err("missing theme should error");
+        assert!(matches!(error, crate::ConfigError::FileNotFound { .. }));
     }
 }
