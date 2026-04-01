@@ -264,9 +264,9 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
         (
             BuiltInHandlerId::ServerBridge,
             Command::Server {
-                command: ServerCommand::Bridge { stdio },
+                command: ServerCommand::Bridge { stdio, preflight },
             },
-        ) => run_server_bridge(*stdio).await,
+        ) => run_server_bridge(*stdio, *preflight).await,
         (
             BuiltInHandlerId::LogsPath,
             Command::Logs {

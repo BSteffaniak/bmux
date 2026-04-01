@@ -730,6 +730,9 @@ pub enum ServerCommand {
         /// Bridge framed IPC over stdin/stdout
         #[arg(long)]
         stdio: bool,
+        /// Validate bridge stdio cleanliness and readiness
+        #[arg(long, hide = true)]
+        preflight: bool,
     },
 }
 

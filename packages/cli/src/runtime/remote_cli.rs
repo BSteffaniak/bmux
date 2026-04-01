@@ -31,6 +31,7 @@ struct SshTarget {
 
 const SSH_RECONNECT_MAX_ATTEMPTS: usize = 4;
 const SSH_RECONNECT_BASE_BACKOFF_MS: u64 = 300;
+const BRIDGE_PREFLIGHT_TOKEN: &str = "BMUX_BRIDGE_READY";
 
 #[derive(Debug)]
 struct SshBridgeStream {
@@ -172,8 +173,14 @@ async fn run_remote_attach_with_reconnect(
             return Ok(1);
         }
         attempt = attempt.saturating_add(1);
-        let backoff = Duration::from_millis(
-            SSH_RECONNECT_BASE_BACKOFF_MS.saturating_mul(2u64.saturating_pow((attempt - 1) as u32)),
+        let backoff = Duration::from_millis(reconnect_backoff_ms(attempt));
+        tracing::debug!(
+            target = %target.label,
+            attempt,
+            backoff_ms = backoff.as_millis(),
+            follow = %follow.unwrap_or_default(),
+            global,
+            "remote attach stream closed; scheduling reconnect"
         );
         println!(
             "remote connection closed; reconnecting to '{}' (attempt {attempt}/{}) in {}ms...",
@@ -382,6 +389,8 @@ fn select_session_interactively(
 
 async fn connect_remote_bridge(target: &SshTarget, client_name: &str) -> Result<BmuxClient> {
     ensure_remote_server_ready(target).await?;
+    ensure_remote_bridge_stdio_clean(target).await?;
+    tracing::debug!(target = %target.label, "launching remote ssh bridge stream");
     let mut command = build_ssh_bridge_command(target);
     let mut child = command
         .spawn()
@@ -441,6 +450,7 @@ async fn ensure_remote_server_ready(target: &SshTarget) -> Result<()> {
             );
         }
         RemoteServerStartMode::Auto => {
+            tracing::debug!(target = %target.label, "remote server missing; attempting auto start");
             println!(
                 "remote bmux server is not running on '{}'; starting it automatically...",
                 target.label
@@ -476,6 +486,29 @@ async fn ensure_remote_server_ready(target: &SshTarget) -> Result<()> {
     }
 }
 
+async fn ensure_remote_bridge_stdio_clean(target: &SshTarget) -> Result<()> {
+    let output = run_ssh_bmux_command_capture(
+        target,
+        &[
+            OsString::from("server"),
+            OsString::from("bridge"),
+            OsString::from("--stdio"),
+            OsString::from("--preflight"),
+        ],
+    )?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    if trimmed == BRIDGE_PREFLIGHT_TOKEN {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "remote bridge preflight failed for '{}': expected '{}' token, got '{}'.\nthis usually means your remote shell writes output for non-interactive SSH commands (MOTD/profile). disable that output for command sessions.",
+        target.label,
+        BRIDGE_PREFLIGHT_TOKEN,
+        trimmed
+    );
+}
+
 fn load_or_create_local_principal_id(paths: &ConfigPaths) -> Result<Uuid> {
     let path = paths.principal_id_file();
     if let Some(parent) = path.parent() {
@@ -501,6 +534,20 @@ fn load_or_create_local_principal_id(paths: &ConfigPaths) -> Result<Uuid> {
 
 fn run_ssh_bmux_command(target: &SshTarget, args: &[OsString], force_tty: bool) -> Result<u8> {
     run_ssh_bmux_command_inner(target, args, force_tty, true)
+}
+
+fn run_ssh_bmux_command_capture(
+    target: &SshTarget,
+    args: &[OsString],
+) -> Result<std::process::Output> {
+    let output = build_ssh_command(target, args, false)
+        .output()
+        .with_context(|| format!("failed executing ssh target {}", target.label))?;
+    if output.status.success() {
+        return Ok(output);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(map_ssh_execution_error(target, stderr.trim()))
 }
 
 fn run_ssh_bmux_command_silent(
@@ -709,6 +756,11 @@ fn command_needs_tty(command: Option<&Command>) -> bool {
     )
 }
 
+fn reconnect_backoff_ms(attempt: usize) -> u64 {
+    let exponent = attempt.saturating_sub(1).min(10) as u32;
+    SSH_RECONNECT_BASE_BACKOFF_MS.saturating_mul(2u64.saturating_pow(exponent))
+}
+
 fn exit_code_from_status(status: std::process::ExitStatus) -> u8 {
     status
         .code()
@@ -872,5 +924,29 @@ mod tests {
     fn map_ssh_execution_error_highlights_auth_failures() {
         let error = map_ssh_execution_error(&sample_target(), "Permission denied (publickey)");
         assert!(error.to_string().contains("authentication failed"));
+    }
+
+    #[test]
+    fn command_requires_remote_server_skips_server_start() {
+        let command = Command::Server {
+            command: ServerCommand::Start {
+                daemon: false,
+                foreground_internal: false,
+            },
+        };
+        assert!(!command_requires_remote_server(Some(&command)));
+    }
+
+    #[test]
+    fn command_requires_remote_server_keeps_list_sessions() {
+        let command = Command::ListSessions { json: false };
+        assert!(command_requires_remote_server(Some(&command)));
+    }
+
+    #[test]
+    fn reconnect_backoff_grows_exponentially() {
+        assert_eq!(reconnect_backoff_ms(1), 300);
+        assert_eq!(reconnect_backoff_ms(2), 600);
+        assert_eq!(reconnect_backoff_ms(3), 1_200);
     }
 }

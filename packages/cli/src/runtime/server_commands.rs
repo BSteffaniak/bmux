@@ -304,9 +304,16 @@ pub(super) async fn run_server_stop() -> Result<u8> {
     Ok(1)
 }
 
-pub(super) async fn run_server_bridge(stdio: bool) -> Result<u8> {
+const BRIDGE_PREFLIGHT_TOKEN: &str = "BMUX_BRIDGE_READY";
+
+pub(super) async fn run_server_bridge(stdio: bool, preflight: bool) -> Result<u8> {
     if !stdio {
         anyhow::bail!("server bridge currently requires --stdio");
+    }
+
+    if preflight {
+        println!("{BRIDGE_PREFLIGHT_TOKEN}");
+        return Ok(0);
     }
 
     let paths = ConfigPaths::default();
