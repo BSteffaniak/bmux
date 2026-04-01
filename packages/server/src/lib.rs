@@ -973,6 +973,7 @@ struct PaneRuntimeMeta {
 
 struct PaneRuntimeHandle {
     meta: PaneRuntimeMeta,
+    process_group_id: Arc<std::sync::Mutex<Option<i32>>>,
     stop_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
     input_tx: mpsc::UnboundedSender<PaneRuntimeCommand>,
@@ -1682,6 +1683,8 @@ impl SessionRuntimeManager {
         let pane_exit_tx = self.pane_exit_tx.clone();
         let recording_runtime = Arc::clone(&self.recording_runtime);
         let output_buffer_for_reader = Arc::clone(&output_buffer);
+        let process_group_id = Arc::new(std::sync::Mutex::new(None));
+        let process_group_id_for_task = Arc::clone(&process_group_id);
         let exited = Arc::new(AtomicBool::new(false));
         let exited_for_task = Arc::clone(&exited);
 
@@ -1707,6 +1710,11 @@ impl SessionRuntimeManager {
                 exited_for_task.store(true, Ordering::SeqCst);
                 return;
             };
+            if let Ok(mut pgid) = process_group_id_for_task.lock() {
+                *pgid = child
+                    .process_id()
+                    .and_then(resolve_process_group_id_for_pid);
+            }
             let mut child_killer = child.clone_killer();
             drop(pty_pair.slave);
 
@@ -1851,6 +1859,7 @@ impl SessionRuntimeManager {
 
         Ok(PaneRuntimeHandle {
             meta: pane_meta,
+            process_group_id,
             stop_tx: Some(stop_tx),
             task,
             input_tx,
@@ -3401,6 +3410,11 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV4> {
                                         id: pane.meta.id,
                                         name: pane.meta.name.clone(),
                                         shell: pane.meta.shell.clone(),
+                                        process_group_id: pane
+                                            .process_group_id
+                                            .lock()
+                                            .ok()
+                                            .and_then(|value| *value),
                                     })
                                     .ok_or_else(|| {
                                         anyhow::anyhow!(
@@ -6037,6 +6051,7 @@ fn resolve_session_id(manager: &SessionManager, selector: &SessionSelector) -> O
 pub fn offline_kill_sessions(target: OfflineSessionKillTarget) -> Result<OfflineSessionKillReport> {
     let paths = ConfigPaths::default();
     let snapshot_manager = SnapshotManager::from_paths(&paths);
+    let kill_all = matches!(target, OfflineSessionKillTarget::All);
     if !snapshot_manager.path().exists() {
         return Ok(OfflineSessionKillReport {
             had_snapshot: false,
@@ -6052,6 +6067,19 @@ pub fn offline_kill_sessions(target: OfflineSessionKillTarget) -> Result<Offline
         {
             return Ok(OfflineSessionKillReport {
                 had_snapshot: false,
+                ..OfflineSessionKillReport::default()
+            });
+        }
+        Err(error) if kill_all => {
+            if let Err(remove_error) = std::fs::remove_file(snapshot_manager.path())
+                && remove_error.kind() != std::io::ErrorKind::NotFound
+            {
+                anyhow::bail!(
+                    "failed reading snapshot for offline kill ({error}); failed removing invalid snapshot: {remove_error}"
+                );
+            }
+            return Ok(OfflineSessionKillReport {
+                had_snapshot: true,
                 ..OfflineSessionKillReport::default()
             });
         }
@@ -6079,6 +6107,8 @@ pub fn offline_kill_sessions(target: OfflineSessionKillTarget) -> Result<Offline
     }
 
     let removed_session_set = removed_session_ids.iter().copied().collect::<BTreeSet<_>>();
+    kill_removed_snapshot_session_process_groups(&snapshot, &removed_session_set);
+
     snapshot
         .sessions
         .retain(|session| !removed_session_set.contains(&session.id));
@@ -6170,6 +6200,90 @@ fn resolve_snapshot_session_id(snapshot: &SnapshotV4, selector: &SessionSelector
                 .map(|session| session.id)
         }
     }
+}
+
+fn kill_removed_snapshot_session_process_groups(
+    snapshot: &SnapshotV4,
+    removed_session_set: &BTreeSet<Uuid>,
+) {
+    let process_groups = snapshot
+        .sessions
+        .iter()
+        .filter(|session| removed_session_set.contains(&session.id))
+        .flat_map(|session| {
+            session
+                .panes
+                .iter()
+                .filter_map(|pane| pane.process_group_id)
+        })
+        .filter(|pgid| *pgid > 0)
+        .collect::<BTreeSet<_>>();
+
+    for process_group_id in process_groups {
+        let _ = terminate_process_group(process_group_id);
+    }
+}
+
+#[cfg(unix)]
+fn terminate_process_group(process_group_id: i32) -> bool {
+    if process_group_id <= 0 {
+        return false;
+    }
+
+    let sent_term = std::process::Command::new("kill")
+        .arg("-TERM")
+        .arg(format!("-{process_group_id}"))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+
+    std::thread::sleep(Duration::from_millis(120));
+
+    let group_still_alive = std::process::Command::new("kill")
+        .arg("-0")
+        .arg(format!("-{process_group_id}"))
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+
+    if group_still_alive {
+        return std::process::Command::new("kill")
+            .arg("-KILL")
+            .arg(format!("-{process_group_id}"))
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
+            || sent_term;
+    }
+
+    sent_term
+}
+
+#[cfg(not(unix))]
+fn terminate_process_group(_process_group_id: i32) -> bool {
+    false
+}
+
+#[cfg(unix)]
+fn resolve_process_group_id_for_pid(pid: u32) -> Option<i32> {
+    let output = std::process::Command::new("ps")
+        .arg("-o")
+        .arg("pgid=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let value = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    let parsed = value.parse::<i32>().ok()?;
+    (parsed > 0).then_some(parsed)
+}
+
+#[cfg(not(unix))]
+fn resolve_process_group_id_for_pid(_pid: u32) -> Option<i32> {
+    None
 }
 
 struct OfflineSnapshotMutationLock {

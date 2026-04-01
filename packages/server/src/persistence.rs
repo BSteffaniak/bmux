@@ -79,6 +79,8 @@ pub struct PaneSnapshotV2 {
     pub id: Uuid,
     pub name: Option<String>,
     pub shell: String,
+    #[serde(default)]
+    pub process_group_id: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -546,6 +548,7 @@ mod tests {
                     id: window_id,
                     name: Some("pane-1".to_string()),
                     shell: "/bin/sh".to_string(),
+                    process_group_id: None,
                 }],
                 focused_pane_id: Some(window_id),
                 layout_root: Some(PaneLayoutNodeSnapshotV2::Leaf { pane_id: window_id }),
@@ -614,6 +617,7 @@ mod tests {
                     id: Uuid::new_v4(),
                     name: Some("pane-1".to_string()),
                     shell: "/bin/sh".to_string(),
+                    process_group_id: None,
                 }],
                 focused_pane_id: None,
                 layout_root: None,
@@ -675,6 +679,7 @@ mod tests {
                     id: Uuid::new_v4(),
                     name: Some("pane-1".to_string()),
                     shell: "/bin/sh".to_string(),
+                    process_group_id: None,
                 }],
                 focused_pane_id: None,
                 layout_root: None,
