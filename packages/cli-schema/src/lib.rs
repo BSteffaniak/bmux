@@ -765,12 +765,15 @@ pub enum ServerCommand {
         /// Listen address (host:port)
         #[arg(long)]
         listen: String,
+        /// Generate and use self-signed cert/key in runtime dir for quick setup
+        #[arg(long)]
+        quick: bool,
         /// PEM encoded certificate chain path
-        #[arg(long)]
-        cert_file: String,
+        #[arg(long, requires = "key_file")]
+        cert_file: Option<String>,
         /// PEM encoded private key path (PKCS8)
-        #[arg(long)]
-        key_file: String,
+        #[arg(long, requires = "cert_file")]
+        key_file: Option<String>,
     },
     /// Internal stdio bridge used by SSH transport
     #[command(hide = true)]
@@ -1035,9 +1038,13 @@ mod tests {
             command,
             ServerCommand::Gateway {
                 listen,
+                quick,
                 cert_file,
                 key_file,
-            } if listen == "0.0.0.0:7443" && cert_file == "cert.pem" && key_file == "key.pem"
+            } if listen == "0.0.0.0:7443"
+                && !quick
+                && cert_file.as_deref() == Some("cert.pem")
+                && key_file.as_deref() == Some("key.pem")
         ));
     }
 

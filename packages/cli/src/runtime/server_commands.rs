@@ -352,11 +352,13 @@ pub(super) async fn run_server_bridge(stdio: bool, preflight: bool) -> Result<u8
 
 pub(super) async fn run_server_gateway(
     listen: &str,
-    cert_file: &str,
-    key_file: &str,
+    quick: bool,
+    cert_file: Option<&str>,
+    key_file: Option<&str>,
 ) -> Result<u8> {
-    let cert_chain = load_cert_chain(cert_file)?;
-    let private_key = load_private_key(key_file)?;
+    let (cert_file, key_file) = resolve_gateway_tls_files(quick, cert_file, key_file)?;
+    let cert_chain = load_cert_chain(&cert_file)?;
+    let private_key = load_private_key(&key_file)?;
     let tls_config = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(cert_chain, private_key)
@@ -379,6 +381,62 @@ pub(super) async fn run_server_gateway(
             }
         });
     }
+}
+
+fn resolve_gateway_tls_files(
+    quick: bool,
+    cert_file: Option<&str>,
+    key_file: Option<&str>,
+) -> Result<(String, String)> {
+    if quick {
+        if cert_file.is_some() || key_file.is_some() {
+            anyhow::bail!("--quick cannot be combined with --cert-file/--key-file");
+        }
+        return generate_quick_gateway_cert_pair();
+    }
+
+    let cert_file = cert_file
+        .ok_or_else(|| anyhow::anyhow!("--cert-file is required unless --quick is enabled"))?;
+    let key_file = key_file
+        .ok_or_else(|| anyhow::anyhow!("--key-file is required unless --quick is enabled"))?;
+    Ok((cert_file.to_string(), key_file.to_string()))
+}
+
+fn generate_quick_gateway_cert_pair() -> Result<(String, String)> {
+    let paths = ConfigPaths::default();
+    std::fs::create_dir_all(&paths.runtime_dir).with_context(|| {
+        format!(
+            "failed creating runtime dir {}",
+            paths.runtime_dir.display()
+        )
+    })?;
+    let cert_path = paths.runtime_dir.join("gateway-quick-cert.pem");
+    let key_path = paths.runtime_dir.join("gateway-quick-key.pem");
+
+    if cert_path.exists() && key_path.exists() {
+        return Ok((
+            cert_path.display().to_string(),
+            key_path.display().to_string(),
+        ));
+    }
+
+    let cert = rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+        .context("failed generating quick self-signed gateway certificate")?;
+    let cert_pem = cert.cert.pem();
+    let key_pem = cert.key_pair.serialize_pem();
+    std::fs::write(&cert_path, cert_pem)
+        .with_context(|| format!("failed writing {}", cert_path.display()))?;
+    std::fs::write(&key_path, key_pem)
+        .with_context(|| format!("failed writing {}", key_path.display()))?;
+    println!(
+        "generated quick TLS gateway cert/key at '{}' and '{}'",
+        cert_path.display(),
+        key_path.display()
+    );
+    Ok((
+        cert_path.display().to_string(),
+        key_path.display().to_string(),
+    ))
 }
 
 async fn handle_gateway_connection(

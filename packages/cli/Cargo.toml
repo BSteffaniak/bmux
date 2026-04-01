@@ -58,6 +58,7 @@ moosicbox_log_watch = { workspace = true, features = [
     "persistence-json",
 ] }
 portable-pty = { workspace = true }
+rcgen = { workspace = true }
 regex = { workspace = true }
 resvg = { workspace = true }
 rustls = { workspace = true }

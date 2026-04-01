@@ -48,6 +48,7 @@ struct TlsTarget {
 const SSH_RECONNECT_MAX_ATTEMPTS: usize = 4;
 const SSH_RECONNECT_BASE_BACKOFF_MS: u64 = 300;
 const BRIDGE_PREFLIGHT_TOKEN: &str = "BMUX_BRIDGE_READY";
+const RECENT_CACHE_MAX: usize = 10;
 
 #[derive(Debug)]
 struct SshBridgeStream {
@@ -155,7 +156,11 @@ pub(super) async fn run_connect(
             } else {
                 resolve_local_attach_session().await?
             };
-            run_session_attach(target_session.as_deref(), follow, global).await
+            let status = run_session_attach(target_session.as_deref(), follow, global).await?;
+            if status == 0 {
+                remember_recent_selection("local", target_session.as_deref())?;
+            }
+            Ok(status)
         }
         ResolvedTarget::Ssh(ssh_target) => {
             let mut client = connect_remote_bridge(&ssh_target, "bmux-cli-connect-remote").await?;
@@ -166,7 +171,7 @@ pub(super) async fn run_connect(
             } else {
                 resolve_remote_attach_session(&mut client, &ssh_target.label).await?
             };
-            run_remote_attach_with_reconnect(
+            let status = run_remote_attach_with_reconnect(
                 client,
                 &ssh_target,
                 target_session.as_deref(),
@@ -174,7 +179,11 @@ pub(super) async fn run_connect(
                 global,
                 reconnect_forever,
             )
-            .await
+            .await?;
+            if status == 0 {
+                remember_recent_selection(&ssh_target.label, target_session.as_deref())?;
+            }
+            Ok(status)
         }
         ResolvedTarget::Tls(tls_target) => {
             let mut client = connect_tls_bridge(&tls_target, "bmux-cli-connect-remote-tls").await?;
@@ -185,7 +194,7 @@ pub(super) async fn run_connect(
             } else {
                 resolve_remote_attach_session(&mut client, &tls_target.label).await?
             };
-            run_tls_attach_with_reconnect(
+            let status = run_tls_attach_with_reconnect(
                 client,
                 &tls_target,
                 target_session.as_deref(),
@@ -193,7 +202,11 @@ pub(super) async fn run_connect(
                 global,
                 reconnect_forever,
             )
-            .await
+            .await?;
+            if status == 0 {
+                remember_recent_selection(&tls_target.label, target_session.as_deref())?;
+            }
+            Ok(status)
         }
     }
 }
@@ -320,7 +333,13 @@ pub(super) fn run_remote_list(as_json: bool) -> Result<u8> {
         let name = entry["name"].as_str().unwrap_or("-");
         let transport = entry["transport"].as_str().unwrap_or("-");
         let host = entry["host"].as_str().unwrap_or("-");
-        println!("{name}\t{transport}\t{host}");
+        let recent = config
+            .connections
+            .recent_targets
+            .iter()
+            .position(|value| value == name)
+            .map_or("", |_| "* ");
+        println!("{recent}{name}\t{transport}\t{host}");
     }
     Ok(0)
 }
@@ -555,13 +574,14 @@ fn select_session_interactively(
     label: &str,
     sessions: &[SessionSummary],
 ) -> Result<Option<String>> {
-    if sessions.is_empty() {
+    let ordered = sessions_ordered_by_recent(label, sessions)?;
+    if ordered.is_empty() {
         anyhow::bail!(
             "No sessions found on target '{label}'.\nCreate one: bmux --target {label} new-session <name>"
         );
     }
-    if sessions.len() == 1 {
-        let selected = &sessions[0];
+    if ordered.len() == 1 {
+        let selected = &ordered[0];
         let value = selected
             .name
             .clone()
@@ -571,33 +591,88 @@ fn select_session_interactively(
     }
 
     println!("Available sessions on '{label}':");
-    for (index, session) in sessions.iter().enumerate() {
+    for (index, session) in ordered.iter().enumerate() {
         let name = session
             .name
             .clone()
             .unwrap_or_else(|| session.id.to_string());
         println!("{}: {}", index + 1, name);
     }
-    print!("Select session [1-{}]: ", sessions.len());
+    print!("Select session [1-{}] (Enter for 1): ", ordered.len());
     io::stdout().flush().context("failed flushing prompt")?;
     let mut input = String::new();
     io::stdin()
         .read_line(&mut input)
         .context("failed reading session selection")?;
-    let selection = input
-        .trim()
-        .parse::<usize>()
-        .context("invalid session selection")?;
-    if selection == 0 || selection > sessions.len() {
+    let trimmed = input.trim();
+    let selection = if trimmed.is_empty() {
+        1
+    } else {
+        trimmed
+            .parse::<usize>()
+            .context("invalid session selection")?
+    };
+    if selection == 0 || selection > ordered.len() {
         anyhow::bail!("invalid session selection: {selection}");
     }
-    let session = &sessions[selection - 1];
+    let session = &ordered[selection - 1];
     Ok(Some(
         session
             .name
             .clone()
             .unwrap_or_else(|| session.id.to_string()),
     ))
+}
+
+fn sessions_ordered_by_recent(
+    label: &str,
+    sessions: &[SessionSummary],
+) -> Result<Vec<SessionSummary>> {
+    let config = BmuxConfig::load()?;
+    let recents = config
+        .connections
+        .recent_sessions
+        .get(label)
+        .cloned()
+        .unwrap_or_default();
+    if recents.is_empty() {
+        return Ok(sessions.to_vec());
+    }
+    let mut ordered = sessions.to_vec();
+    ordered.sort_by_key(|session| {
+        let name = session
+            .name
+            .clone()
+            .unwrap_or_else(|| session.id.to_string());
+        recents
+            .iter()
+            .position(|value| value == &name)
+            .unwrap_or(usize::MAX)
+    });
+    Ok(ordered)
+}
+
+fn remember_recent_selection(target: &str, session: Option<&str>) -> Result<()> {
+    let mut config = BmuxConfig::load()?;
+    push_recent(&mut config.connections.recent_targets, target.to_string());
+    if let Some(session) = session {
+        let list = config
+            .connections
+            .recent_sessions
+            .entry(target.to_string())
+            .or_default();
+        push_recent(list, session.to_string());
+    }
+    config.save()?;
+    Ok(())
+}
+
+fn push_recent(list: &mut Vec<String>, value: String) {
+    list.retain(|entry| entry != &value);
+    list.insert(0, value);
+    if list.len() > RECENT_CACHE_MAX {
+        list.truncate(RECENT_CACHE_MAX);
+    }
 }
 
 async fn connect_remote_bridge(target: &SshTarget, client_name: &str) -> Result<BmuxClient> {
@@ -1376,8 +1451,9 @@ mod tests {
         let command = Command::Server {
             command: ServerCommand::Gateway {
                 listen: "0.0.0.0:7443".to_string(),
-                cert_file: "cert.pem".to_string(),
-                key_file: "key.pem".to_string(),
+                quick: false,
+                cert_file: Some("cert.pem".to_string()),
+                key_file: Some("key.pem".to_string()),
             },
         };
         assert!(!command_requires_remote_server(Some(&command)));

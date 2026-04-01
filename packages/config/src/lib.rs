@@ -78,6 +78,10 @@ pub struct ConnectionsConfig {
     pub default_target: Option<String>,
     /// Named connection targets.
     pub targets: BTreeMap<String, ConnectionTargetConfig>,
+    /// Most recently used targets (newest first).
+    pub recent_targets: Vec<String>,
+    /// Most recently used sessions per target (newest first).
+    pub recent_sessions: BTreeMap<String, Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]

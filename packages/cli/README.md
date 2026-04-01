@@ -68,9 +68,10 @@ bmux remote doctor prod --fix
 bmux remote init prod --ssh bmux@prod.example.com --set-default
 bmux remote install-server prod
 bmux remote upgrade prod
+bmux connect prod --reconnect-forever
 
 # run an internet-accessible TLS gateway
-bmux server gateway --listen 0.0.0.0:7443 --cert-file cert.pem --key-file key.pem
+bmux server gateway --listen 0.0.0.0:7443 --quick
 
 # target any normal command remotely
 bmux --target prod list-sessions
