@@ -57,6 +57,70 @@ name  = "json"
 short = "j"
 
 [[commands]]
+aliases       = [["session", "hot-path-policy"]]
+expose_in_cli = true
+name          = "hot-path-policy"
+path          = ["hot-path-policy"]
+summary       = "Inspect effective hot-path policy decision"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "plugin"
+name       = "plugin"
+required   = true
+value_name = "PLUGIN"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "capability"
+name       = "capability"
+required   = true
+value_name = "CAPABILITY"
+
+[[commands.arguments]]
+kind       = "choice"
+long       = "execution-class"
+name       = "execution-class"
+required   = true
+value_name = "EXECUTION_CLASS"
+values     = ["native_fast", "native_standard", "interpreter"]
+
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+value_name = "SESSION"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "context"
+name       = "context"
+value_name = "CONTEXT"
+
+[[commands.arguments]]
+kind = "boolean"
+long = "watch"
+name = "watch"
+
+[[commands.arguments]]
+kind       = "integer"
+long       = "interval-ms"
+name       = "interval-ms"
+value_name = "INTERVAL_MS"
+
+[[commands.arguments]]
+kind       = "integer"
+long       = "iterations"
+name       = "iterations"
+value_name = "ITERATIONS"
+
+[[commands.arguments]]
+kind  = "boolean"
+long  = "json"
+name  = "json"
+short = "j"
+
+[[commands]]
 aliases       = [["session", "permissions-current"]]
 expose_in_cli = true
 name          = "permissions-current"

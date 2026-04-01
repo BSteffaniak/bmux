@@ -42,6 +42,10 @@ impl RustPlugin for PermissionsPlugin {
                 list_hot_path_overrides(ctx, req)
                     .map_err(|e| ServiceResponse::error("list_hot_path_overrides_failed", e))
             },
+            "session-policy-query/v1", "resolve-hot-path-decision" => |req: CheckHotPathDecisionRequest, ctx| {
+                inspect_hot_path_decision(ctx, &req)
+                    .map_err(|e| ServiceResponse::error("resolve_hot_path_decision_failed", e))
+            },
             "session-policy-command/v1", "grant-hot-path-override" => |req: GrantHotPathOverrideRequest, ctx| {
                 grant_hot_path_override(ctx, req)
                     .map_err(|e| ServiceResponse::error("grant_hot_path_override_failed", e))?;
@@ -166,6 +170,37 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
                     );
                 }
             }
+            Ok(())
+        }
+        "hot-path-policy" => {
+            let request = CheckHotPathDecisionRequest {
+                plugin_id: required_option_value(&context.arguments, "plugin")?,
+                capability: required_option_value(&context.arguments, "capability")?,
+                execution_class: required_option_value(&context.arguments, "execution-class")?,
+                session: option_value(&context.arguments, "session"),
+                context: option_value(&context.arguments, "context"),
+            };
+            let as_json = has_flag(&context.arguments, "json");
+            let watch = has_flag(&context.arguments, "watch");
+            let interval_ms = option_value(&context.arguments, "interval-ms")
+                .as_deref()
+                .map(parse_interval_ms)
+                .transpose()?
+                .unwrap_or(1000);
+            let iterations = option_value(&context.arguments, "iterations")
+                .as_deref()
+                .map(parse_iterations)
+                .transpose()?
+                .unwrap_or(if watch { 0 } else { 1 });
+
+            watch_hot_path_policy_decision(
+                context,
+                &request,
+                as_json,
+                watch,
+                interval_ms,
+                iterations,
+            )?;
             Ok(())
         }
         _ => Err(format!("unsupported command '{}'", context.command)),
@@ -424,42 +459,15 @@ fn hot_path_override_allows(
     session_id: Uuid,
     context_id: Option<Uuid>,
 ) -> bool {
-    let mut best_rank = 0u8;
-    for candidate in entries {
-        if candidate.plugin_id != plugin_id
-            || candidate.capability != capability
-            || candidate.execution_class != execution_class
-        {
-            continue;
-        }
-        let rank = match candidate.scope.as_str() {
-            "session_context" => {
-                if candidate.session_id == Some(session_id) && candidate.context_id == context_id {
-                    4
-                } else {
-                    0
-                }
-            }
-            "context" => {
-                if context_id.is_some() && candidate.context_id == context_id {
-                    3
-                } else {
-                    0
-                }
-            }
-            "session" => {
-                if candidate.session_id == Some(session_id) {
-                    2
-                } else {
-                    0
-                }
-            }
-            "global" => 1,
-            _ => 0,
-        };
-        best_rank = best_rank.max(rank);
-    }
-    best_rank > 0
+    matched_hot_path_override_scope(
+        entries,
+        plugin_id,
+        capability,
+        execution_class,
+        session_id,
+        context_id,
+    )
+    .is_some()
 }
 
 fn validate_hot_path_override_fields(
@@ -525,6 +533,194 @@ fn resolve_override_scope(
         }
         _ => Err(format!("unsupported scope '{scope}'")),
     }
+}
+
+fn inspect_hot_path_decision(
+    caller: &impl HostRuntimeApi,
+    request: &CheckHotPathDecisionRequest,
+) -> Result<CheckHotPathDecisionResponse, String> {
+    if request.plugin_id.trim().is_empty() {
+        return Err("plugin_id must not be empty".to_string());
+    }
+    if request.capability.trim().is_empty() {
+        return Err("capability must not be empty".to_string());
+    }
+    if !matches!(
+        request.capability.as_str(),
+        "bmux.terminal.input_intercept" | "bmux.terminal.output_intercept"
+    ) {
+        return Err(format!(
+            "invalid hot-path capability '{}'; expected bmux.terminal.input_intercept or bmux.terminal.output_intercept",
+            request.capability
+        ));
+    }
+    if !matches!(
+        request.execution_class.as_str(),
+        "native_fast" | "native_standard" | "interpreter"
+    ) {
+        return Err(format!(
+            "invalid execution_class '{}'; expected native_fast, native_standard, or interpreter",
+            request.execution_class
+        ));
+    }
+
+    let session_name = match request.session.as_deref() {
+        Some(session) => session.to_string(),
+        None => resolve_current_session(caller)?,
+    };
+    let session_id = resolve_session_id(caller, &session_name)?;
+    let context_id = match request.context.as_deref() {
+        Some(context) => Some(resolve_context_id(caller, context)?),
+        None => caller
+            .context_current()
+            .map_err(|error| error.to_string())?
+            .context
+            .map(|entry| entry.id),
+    };
+
+    let state = load_state(caller)?;
+    let matched_scope = matched_hot_path_override_scope(
+        &state.hot_path_overrides,
+        &request.plugin_id,
+        &request.capability,
+        &request.execution_class,
+        session_id,
+        context_id,
+    );
+    let allowed = request.execution_class == "native_fast" || matched_scope.is_some();
+    let reason = if allowed {
+        None
+    } else {
+        Some(format!(
+            "no matching hot-path override for plugin '{}' capability '{}' execution_class '{}' in scope session={} context={}",
+            request.plugin_id,
+            request.capability,
+            request.execution_class,
+            session_id,
+            context_id.map_or_else(|| "-".to_string(), |id| id.to_string())
+        ))
+    };
+
+    Ok(CheckHotPathDecisionResponse {
+        allowed,
+        reason,
+        matched_scope,
+        session_id: Some(session_id),
+        context_id,
+    })
+}
+
+fn watch_hot_path_policy_decision(
+    caller: &impl HostRuntimeApi,
+    request: &CheckHotPathDecisionRequest,
+    as_json: bool,
+    watch: bool,
+    interval_ms: u64,
+    iterations: usize,
+) -> Result<(), String> {
+    let mut printed = 0usize;
+    let mut last: Option<CheckHotPathDecisionResponse> = None;
+    loop {
+        let decision = inspect_hot_path_decision(caller, request)?;
+        if !watch || last.as_ref() != Some(&decision) {
+            if as_json {
+                let output =
+                    serde_json::to_string_pretty(&decision).map_err(|error| error.to_string())?;
+                println!("{output}");
+            } else {
+                println!(
+                    "allowed={} scope={} session={} context={} reason={}",
+                    decision.allowed,
+                    decision.matched_scope.as_deref().unwrap_or("none"),
+                    decision
+                        .session_id
+                        .map_or_else(|| "-".to_string(), |id| id.to_string()),
+                    decision
+                        .context_id
+                        .map_or_else(|| "-".to_string(), |id| id.to_string()),
+                    decision.reason.as_deref().unwrap_or("-")
+                );
+            }
+            printed = printed.saturating_add(1);
+            last = Some(decision);
+        }
+
+        if !watch {
+            break;
+        }
+        if iterations > 0 && printed >= iterations {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+    }
+    Ok(())
+}
+
+fn parse_interval_ms(value: &str) -> Result<u64, String> {
+    let parsed = value
+        .parse::<u64>()
+        .map_err(|error| format!("invalid --interval-ms '{value}': {error}"))?;
+    if parsed == 0 {
+        Err("--interval-ms must be greater than 0".to_string())
+    } else {
+        Ok(parsed)
+    }
+}
+
+fn parse_iterations(value: &str) -> Result<usize, String> {
+    value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid --iterations '{value}': {error}"))
+}
+
+fn matched_hot_path_override_scope(
+    entries: &[HotPathOverrideEntry],
+    plugin_id: &str,
+    capability: &str,
+    execution_class: &str,
+    session_id: Uuid,
+    context_id: Option<Uuid>,
+) -> Option<String> {
+    let mut best_rank = 0u8;
+    let mut best_scope = None;
+    for candidate in entries {
+        if candidate.plugin_id != plugin_id
+            || candidate.capability != capability
+            || candidate.execution_class != execution_class
+        {
+            continue;
+        }
+        let (rank, scope_name) = match candidate.scope.as_str() {
+            "session_context" => {
+                if candidate.session_id == Some(session_id) && candidate.context_id == context_id {
+                    (4, "session_context")
+                } else {
+                    (0, "")
+                }
+            }
+            "context" => {
+                if context_id.is_some() && candidate.context_id == context_id {
+                    (3, "context")
+                } else {
+                    (0, "")
+                }
+            }
+            "session" => {
+                if candidate.session_id == Some(session_id) {
+                    (2, "session")
+                } else {
+                    (0, "")
+                }
+            }
+            "global" => (1, "global"),
+            _ => (0, ""),
+        };
+        if rank > best_rank {
+            best_rank = rank;
+            best_scope = Some(scope_name.to_string());
+        }
+    }
+    best_scope
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -759,6 +955,29 @@ struct ListHotPathOverridesResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CheckHotPathDecisionRequest {
+    plugin_id: String,
+    capability: String,
+    execution_class: String,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct CheckHotPathDecisionResponse {
+    allowed: bool,
+    reason: Option<String>,
+    #[serde(default)]
+    matched_scope: Option<String>,
+    #[serde(default)]
+    session_id: Option<Uuid>,
+    #[serde(default)]
+    context_id: Option<Uuid>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct HotPathOverrideEntry {
     plugin_id: String,
     capability: String,
@@ -897,6 +1116,11 @@ mod tests {
                 ("context-query/v1", "list") => encode_service_message(&ContextListResponse {
                     contexts: self.contexts.clone(),
                 }),
+                ("context-query/v1", "current") => {
+                    encode_service_message(&bmux_plugin_sdk::ContextCurrentResponse {
+                        context: self.contexts.first().cloned(),
+                    })
+                }
                 _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
                     operation: "mock_service",
                 }),
@@ -1828,5 +2052,68 @@ mod tests {
         )
         .expect("policy evaluation should succeed");
         assert!(decision.allowed);
+    }
+
+    #[test]
+    fn inspect_hot_path_decision_reports_precedence_scope() {
+        let session_id = Uuid::new_v4();
+        let host = MockHost::with_session(session_id, "alpha");
+        grant_hot_path_override(
+            &host,
+            GrantHotPathOverrideRequest {
+                plugin_id: "example.interpreter".to_string(),
+                capability: "bmux.terminal.input_intercept".to_string(),
+                execution_class: "interpreter".to_string(),
+                scope: "global".to_string(),
+                session: None,
+                context: None,
+            },
+        )
+        .expect("global grant should succeed");
+        grant_hot_path_override(
+            &host,
+            GrantHotPathOverrideRequest {
+                plugin_id: "example.interpreter".to_string(),
+                capability: "bmux.terminal.input_intercept".to_string(),
+                execution_class: "interpreter".to_string(),
+                scope: "session".to_string(),
+                session: Some("alpha".to_string()),
+                context: None,
+            },
+        )
+        .expect("session grant should succeed");
+
+        let decision = inspect_hot_path_decision(
+            &host,
+            &CheckHotPathDecisionRequest {
+                plugin_id: "example.interpreter".to_string(),
+                capability: "bmux.terminal.input_intercept".to_string(),
+                execution_class: "interpreter".to_string(),
+                session: Some("alpha".to_string()),
+                context: None,
+            },
+        )
+        .expect("decision should resolve");
+        assert!(decision.allowed);
+        assert_eq!(decision.matched_scope.as_deref(), Some("session"));
+    }
+
+    #[test]
+    fn inspect_hot_path_decision_allows_native_fast_without_override() {
+        let session_id = Uuid::new_v4();
+        let host = MockHost::with_session(session_id, "alpha");
+        let decision = inspect_hot_path_decision(
+            &host,
+            &CheckHotPathDecisionRequest {
+                plugin_id: "example.fast".to_string(),
+                capability: "bmux.terminal.output_intercept".to_string(),
+                execution_class: "native_fast".to_string(),
+                session: Some("alpha".to_string()),
+                context: None,
+            },
+        )
+        .expect("decision should resolve");
+        assert!(decision.allowed);
+        assert!(decision.matched_scope.is_none());
     }
 }
