@@ -14,6 +14,7 @@ Command-line interface for bmux terminal multiplexer.
 - Client follow controls (follow/unfollow)
 - Alias-compatible command forms (top-level and grouped)
 - Runtime/terminal diagnostics (`keymap doctor`, `terminal doctor`)
+- First-class SSH targets (`connect`, `remote`, and global `--target`)
 
 Default launch behavior:
 
@@ -46,6 +47,56 @@ Shutdown behavior:
 - If graceful shutdown times out, CLI falls back to PID-based termination.
 - `bmux server restore --yes` replaces the current in-memory server state with the persisted snapshot.
 - `--force-local` kill bypass is allowed only when your profile principal matches the server owner principal (`bmux server whoami-principal`).
+
+## Remote Target Commands
+
+```bash
+# connect directly to a target/session
+bmux connect prod app
+
+# when session is omitted:
+# - 0 sessions: error with next-step command
+# - 1 session: auto-select
+# - many sessions: interactive picker
+bmux connect prod
+
+# remote target utilities
+bmux remote list
+bmux remote list --json
+bmux remote test prod
+bmux remote doctor prod
+
+# target any normal command remotely
+bmux --target prod list-sessions
+bmux --target prod attach app
+```
+
+Target precedence for command routing:
+
+1. `--target`
+2. `BMUX_TARGET`
+3. `[connections].default_target`
+4. local target
+
+Example target config:
+
+```toml
+[connections]
+default_target = "local"
+
+[connections.targets.prod]
+transport = "ssh"
+host = "prod.example.com"
+user = "bmux"
+port = 22
+identity_file = "~/.ssh/id_ed25519"
+known_hosts_file = "~/.ssh/known_hosts"
+strict_host_key_checking = true
+jump = "ops@bastion.example.com"
+remote_bmux_path = "bmux"
+connect_timeout_ms = 8000
+default_session = "main"
+```
 
 ## Logging Commands
 

@@ -157,6 +157,10 @@ pub struct Cli {
     #[arg(long)]
     pub stop_server_on_exit: bool,
 
+    /// Execute command against a configured target (local or remote)
+    #[arg(long, global = true)]
+    pub target: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 
@@ -171,6 +175,19 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Connect to a target and attach to a session
+    Connect {
+        /// Target name or ssh destination (user@host[:port] or ssh://...)
+        target: String,
+        /// Session name or UUID; if omitted in TTY mode a picker is shown
+        session: Option<String>,
+        /// Follow target client UUID and attach to its selected session
+        #[arg(long, conflicts_with = "session")]
+        follow: Option<String>,
+        /// Keep following across target session switches (requires --follow)
+        #[arg(long, requires = "follow")]
+        global: bool,
+    },
     /// Create a new session
     NewSession {
         /// Optional session name
@@ -230,6 +247,11 @@ pub enum Command {
         #[command(subcommand)]
         command: SessionCommand,
     },
+    /// Remote target utilities
+    Remote {
+        #[command(subcommand)]
+        command: RemoteCommand,
+    },
     /// Server lifecycle and status tools
     Server {
         #[command(subcommand)]
@@ -262,6 +284,26 @@ pub enum Command {
     },
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RemoteCommand {
+    /// List configured connection targets
+    List {
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Verify connectivity to a configured target
+    Test {
+        /// Target name or ssh destination
+        target: String,
+    },
+    /// Diagnose remote connectivity and runtime readiness
+    Doctor {
+        /// Target name or ssh destination
+        target: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -815,7 +857,8 @@ mod tests {
         RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
         RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode,
         RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg, RecordingRenderMode,
-        RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
+        RecordingReplayMode, RemoteCommand, ServerCommand, SessionCommand, TerminalCommand,
+        TraceFamily,
     };
     use clap::Parser;
 
@@ -826,6 +869,47 @@ mod tests {
             panic!("expected keymap subcommand");
         };
         assert!(matches!(command, KeymapCommand::Doctor { json: false }));
+    }
+
+    #[test]
+    fn parses_connect_command_with_session() {
+        let cli = Cli::try_parse_from(["bmux", "connect", "prod", "app"]).expect("valid CLI args");
+        let Some(Command::Connect {
+            target,
+            session,
+            follow,
+            global,
+        }) = cli.command
+        else {
+            panic!("expected connect command");
+        };
+        assert_eq!(target, "prod");
+        assert_eq!(session.as_deref(), Some("app"));
+        assert!(follow.is_none());
+        assert!(!global);
+    }
+
+    #[test]
+    fn parses_remote_test_command() {
+        let cli = Cli::try_parse_from(["bmux", "remote", "test", "prod"]).expect("valid CLI args");
+        let Some(Command::Remote { command }) = cli.command else {
+            panic!("expected remote command");
+        };
+        assert!(matches!(
+            command,
+            RemoteCommand::Test { target } if target == "prod"
+        ));
+    }
+
+    #[test]
+    fn parses_global_target_flag() {
+        let cli = Cli::try_parse_from(["bmux", "--target", "prod", "list-sessions"])
+            .expect("valid CLI args");
+        assert_eq!(cli.target.as_deref(), Some("prod"));
+        assert!(matches!(
+            cli.command,
+            Some(Command::ListSessions { json: false })
+        ));
     }
 
     #[test]

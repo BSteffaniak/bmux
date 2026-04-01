@@ -60,6 +60,13 @@ bmux list-clients
 bmux follow <client-uuid>
 bmux unfollow
 
+# Remote targets over SSH
+bmux connect prod app
+bmux connect prod                # picker when multiple sessions
+bmux remote list
+bmux remote test prod
+bmux --target prod list-sessions
+
 # Logging
 bmux logs path
 bmux logs level
@@ -90,6 +97,27 @@ Environment overrides:
 - `BMUX_LOG_LEVEL`: effective runtime log level
 - `BMUX_LOG_DIR`: explicit log directory
 - `BMUX_STATE_DIR`: explicit state directory
+- `BMUX_TARGET`: default command target (same behavior as `--target`)
+
+Connection targets can be configured in `bmux.toml`:
+
+```toml
+[connections]
+default_target = "local"
+
+[connections.targets.prod]
+transport = "ssh"
+host = "prod.example.com"
+user = "bmux"
+port = 22
+identity_file = "~/.ssh/id_ed25519"
+known_hosts_file = "~/.ssh/known_hosts"
+strict_host_key_checking = true
+jump = "ops@bastion.example.com"
+remote_bmux_path = "bmux"
+connect_timeout_ms = 8000
+default_session = "main"
+```
 
 Role policy: `owner` controls session and window mutations plus role changes, `writer` can send attach input, and `observer` is read-only.
 

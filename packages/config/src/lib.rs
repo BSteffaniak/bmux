@@ -60,10 +60,88 @@ pub struct BmuxConfig {
     pub keybindings: KeyBindingConfig,
     /// Plugin discovery, enablement, and per-plugin settings
     pub plugins: PluginConfig,
+    /// Local and remote connection target profiles
+    pub connections: ConnectionsConfig,
     /// Content and layout of the status bar displayed at the top or bottom of the terminal
     pub status_bar: StatusBarConfig,
     /// Session recording for terminal replay, debugging, and playbook generation
     pub recording: RecordingConfig,
+}
+
+/// Local and remote connection target profiles used by `bmux connect` and
+/// global command targeting.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
+#[config_doc(section = "connections")]
+#[serde(default)]
+pub struct ConnectionsConfig {
+    /// Default command target when `--target` is not passed.
+    pub default_target: Option<String>,
+    /// Named connection targets.
+    pub targets: BTreeMap<String, ConnectionTargetConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[serde(default)]
+pub struct ConnectionTargetConfig {
+    /// Transport backend for this target.
+    pub transport: ConnectionTransport,
+    /// SSH host for `transport = "ssh"`.
+    pub host: Option<String>,
+    /// SSH username override.
+    pub user: Option<String>,
+    /// SSH port override.
+    pub port: Option<u16>,
+    /// Private key file path.
+    pub identity_file: Option<PathBuf>,
+    /// Known hosts file path.
+    pub known_hosts_file: Option<PathBuf>,
+    /// Require strict host key checking.
+    pub strict_host_key_checking: bool,
+    /// SSH jump host (`ProxyJump`) value.
+    pub jump: Option<String>,
+    /// Remote bmux executable path.
+    pub remote_bmux_path: String,
+    /// Connection timeout in milliseconds.
+    pub connect_timeout_ms: u64,
+    /// Remote server startup behavior.
+    pub server_start_mode: RemoteServerStartMode,
+    /// Default session name used by clients.
+    pub default_session: Option<String>,
+}
+
+impl Default for ConnectionTargetConfig {
+    fn default() -> Self {
+        Self {
+            transport: ConnectionTransport::Local,
+            host: None,
+            user: None,
+            port: None,
+            identity_file: None,
+            known_hosts_file: None,
+            strict_host_key_checking: true,
+            jump: None,
+            remote_bmux_path: "bmux".to_string(),
+            connect_timeout_ms: 8_000,
+            server_start_mode: RemoteServerStartMode::Auto,
+            default_session: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionTransport {
+    #[default]
+    Local,
+    Ssh,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum RemoteServerStartMode {
+    #[default]
+    Auto,
+    RequireRunning,
 }
 
 /// Session recording for terminal replay, debugging, and playbook generation.
@@ -1195,6 +1273,26 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn load_parses_connection_targets() {
+        let path = temp_config_path();
+        std::fs::write(
+            &path,
+            "[connections]\ndefault_target = 'prod'\n[connections.targets.prod]\ntransport = 'ssh'\nhost = 'prod.example.com'\nport = 2222\n",
+        )
+        .expect("write temp config");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(config.connections.default_target.as_deref(), Some("prod"));
+        let prod = config
+            .connections
+            .targets
+            .get("prod")
+            .expect("prod target missing");
+        assert_eq!(prod.host.as_deref(), Some("prod.example.com"));
+        assert_eq!(prod.port, Some(2222));
     }
 
     #[test]

@@ -340,6 +340,7 @@ mod tests {
             record_profile: None,
             record_event_kind: Vec::new(),
             stop_server_on_exit: false,
+            target: None,
             command: None,
             verbose: false,
             log_level: None,

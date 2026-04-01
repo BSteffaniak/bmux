@@ -11,7 +11,7 @@ use bmux_cli_schema::{
     RecordingCommand, RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
     RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode, RecordingEventKindArg,
     RecordingExportFormat, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
-    ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
+    RemoteCommand, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
 };
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
 use bmux_config::{
@@ -74,6 +74,7 @@ mod plugin_kernel;
 mod plugin_runtime;
 mod recording;
 mod recording_cli;
+mod remote_cli;
 mod server_commands;
 mod server_runtime;
 mod session_cli;
@@ -111,6 +112,7 @@ use plugin_commands::PluginCommandRegistry;
 use plugin_kernel::*;
 use plugin_runtime::*;
 use recording_cli::*;
+use remote_cli::*;
 use server_commands::*;
 use server_runtime::*;
 use session_cli::*;
@@ -153,6 +155,9 @@ pub async fn run() -> Result<u8> {
         } => {
             init_logging(verbose, Some(log_level));
             validate_record_bootstrap_flags(&cli)?;
+            if should_proxy_to_target(&cli)? {
+                return run_target_proxy_from_current_argv(&cli).await;
+            }
 
             if let Some(command) = &cli.command {
                 return run_command(command).await;

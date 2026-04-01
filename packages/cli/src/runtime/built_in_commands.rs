@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltInHandlerId {
+    Connect,
     NewSession,
     ListSessions,
     ListClients,
@@ -21,6 +22,10 @@ pub enum BuiltInHandlerId {
     SessionDetach,
     SessionFollow,
     SessionUnfollow,
+    Remote,
+    RemoteList,
+    RemoteTest,
+    RemoteDoctor,
     Server,
     ServerStart,
     ServerStatus,
@@ -90,6 +95,11 @@ impl BuiltInExecutionCommand {
 
 pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
     vec![
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::Connect,
+            &["connect"],
+            "Connect to a target and attach to a session",
+        ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::NewSession,
             &["new-session"],
@@ -184,6 +194,26 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::SessionUnfollow,
             &["session", "unfollow"],
             "Stop following a client",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::Remote,
+            &["remote"],
+            "Remote target utilities",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RemoteList,
+            &["remote", "list"],
+            "List configured connection targets",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RemoteTest,
+            &["remote", "test"],
+            "Verify connectivity to a target",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RemoteDoctor,
+            &["remote", "doctor"],
+            "Diagnose remote connectivity and bmux readiness",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Server,

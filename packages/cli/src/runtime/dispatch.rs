@@ -9,6 +9,7 @@ pub(super) async fn run_command(command: &Command) -> Result<u8> {
 
 pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
     match command {
+        Command::Connect { .. } => BuiltInHandlerId::Connect,
         Command::NewSession { .. } => BuiltInHandlerId::NewSession,
         Command::ListSessions { .. } => BuiltInHandlerId::ListSessions,
         Command::ListClients { .. } => BuiltInHandlerId::ListClients,
@@ -28,6 +29,11 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             SessionCommand::Detach => BuiltInHandlerId::SessionDetach,
             SessionCommand::Follow { .. } => BuiltInHandlerId::SessionFollow,
             SessionCommand::Unfollow => BuiltInHandlerId::SessionUnfollow,
+        },
+        Command::Remote { command } => match command {
+            RemoteCommand::List { .. } => BuiltInHandlerId::RemoteList,
+            RemoteCommand::Test { .. } => BuiltInHandlerId::RemoteTest,
+            RemoteCommand::Doctor { .. } => BuiltInHandlerId::RemoteDoctor,
         },
         Command::Server { command } => match command {
             ServerCommand::Start { .. } => BuiltInHandlerId::ServerStart,
@@ -84,6 +90,15 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
     let handler = built_in_handler_for_command(command);
     let _descriptor = built_in_command_by_handler(handler);
     match (handler, command) {
+        (
+            BuiltInHandlerId::Connect,
+            Command::Connect {
+                target,
+                session,
+                follow,
+                global,
+            },
+        ) => run_connect(target, session.as_deref(), follow.as_deref(), *global).await,
         (BuiltInHandlerId::NewSession, Command::NewSession { name }) => {
             run_session_new(name.clone()).await
         }
@@ -187,6 +202,24 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 command: SessionCommand::Unfollow,
             },
         ) => run_unfollow().await,
+        (
+            BuiltInHandlerId::RemoteList,
+            Command::Remote {
+                command: RemoteCommand::List { json },
+            },
+        ) => run_remote_list(*json),
+        (
+            BuiltInHandlerId::RemoteTest,
+            Command::Remote {
+                command: RemoteCommand::Test { target },
+            },
+        ) => run_remote_test(target).await,
+        (
+            BuiltInHandlerId::RemoteDoctor,
+            Command::Remote {
+                command: RemoteCommand::Doctor { target },
+            },
+        ) => run_remote_doctor(target).await,
         (
             BuiltInHandlerId::ServerStart,
             Command::Server {
