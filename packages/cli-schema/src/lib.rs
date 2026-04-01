@@ -720,6 +720,13 @@ pub enum ServerCommand {
     },
     /// Request graceful server shutdown
     Stop,
+    /// Internal stdio bridge used by SSH transport
+    #[command(hide = true)]
+    Bridge {
+        /// Bridge framed IPC over stdin/stdout
+        #[arg(long)]
+        stdio: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]

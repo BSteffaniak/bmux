@@ -33,6 +33,7 @@ pub enum BuiltInHandlerId {
     ServerSave,
     ServerRestore,
     ServerStop,
+    ServerBridge,
     Logs,
     LogsPath,
     LogsLevel,
@@ -249,6 +250,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::ServerStop,
             &["server", "stop"],
             "Stop the server",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::ServerBridge,
+            &["server", "bridge"],
+            "Internal stdio bridge used by SSH transport",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Logs,

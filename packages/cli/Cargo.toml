@@ -69,6 +69,8 @@ tokio = { workspace = true, features = [
     "rt",
     "rt-multi-thread",
     "io-util",
+    "io-std",
+    "process",
     "signal",
     "time",
 ] }

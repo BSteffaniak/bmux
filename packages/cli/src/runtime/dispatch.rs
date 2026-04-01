@@ -42,6 +42,7 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             ServerCommand::Save => BuiltInHandlerId::ServerSave,
             ServerCommand::Restore { .. } => BuiltInHandlerId::ServerRestore,
             ServerCommand::Stop => BuiltInHandlerId::ServerStop,
+            ServerCommand::Bridge { .. } => BuiltInHandlerId::ServerBridge,
         },
         Command::Logs { command } => match command {
             LogsCommand::Path { .. } => BuiltInHandlerId::LogsPath,
@@ -260,6 +261,12 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 command: ServerCommand::Stop,
             },
         ) => run_server_stop().await,
+        (
+            BuiltInHandlerId::ServerBridge,
+            Command::Server {
+                command: ServerCommand::Bridge { stdio },
+            },
+        ) => run_server_bridge(*stdio).await,
         (
             BuiltInHandlerId::LogsPath,
             Command::Logs {

@@ -1,4 +1,7 @@
 use super::*;
+use bmux_ipc::IpcEndpoint;
+use bmux_ipc::transport::LocalIpcStream;
+use tokio::io::AsyncWriteExt;
 
 #[derive(Debug, serde::Serialize)]
 pub(super) struct ServerStatusJsonPayload {
@@ -299,4 +302,49 @@ pub(super) async fn run_server_stop() -> Result<u8> {
 
     println!("bmux server is not running");
     Ok(1)
+}
+
+pub(super) async fn run_server_bridge(stdio: bool) -> Result<u8> {
+    if !stdio {
+        anyhow::bail!("server bridge currently requires --stdio");
+    }
+
+    let paths = ConfigPaths::default();
+    let endpoint = local_endpoint_from_paths(&paths);
+    let stream = LocalIpcStream::connect(&endpoint)
+        .await
+        .context("failed connecting local IPC endpoint for bridge")?;
+    let (mut stream_read, mut stream_write) = tokio::io::split(stream);
+    let mut stdin = tokio::io::stdin();
+    let mut stdout = tokio::io::stdout();
+
+    let to_server = tokio::spawn(async move {
+        tokio::io::copy(&mut stdin, &mut stream_write).await?;
+        stream_write.shutdown().await?;
+        Ok::<(), std::io::Error>(())
+    });
+    let from_server = tokio::spawn(async move {
+        tokio::io::copy(&mut stream_read, &mut stdout).await?;
+        stdout.flush().await?;
+        Ok::<(), std::io::Error>(())
+    });
+
+    let to_server_result: std::io::Result<()> =
+        to_server.await.context("bridge stdin task failed")?;
+    let from_server_result: std::io::Result<()> =
+        from_server.await.context("bridge stdout task failed")?;
+    to_server_result.context("bridge stdin copy failed")?;
+    from_server_result.context("bridge stdout copy failed")?;
+    Ok(0)
+}
+
+fn local_endpoint_from_paths(paths: &ConfigPaths) -> IpcEndpoint {
+    #[cfg(unix)]
+    {
+        IpcEndpoint::unix_socket(paths.server_socket())
+    }
+    #[cfg(windows)]
+    {
+        IpcEndpoint::windows_named_pipe(paths.server_named_pipe())
+    }
 }

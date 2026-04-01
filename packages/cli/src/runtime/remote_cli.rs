@@ -1,6 +1,12 @@
 use super::*;
+use anyhow::Context;
 use bmux_config::{ConnectionTargetConfig, ConnectionTransport};
+use bmux_ipc::transport::ErasedIpcStream;
 use std::ffi::OsString;
+use std::pin::Pin;
+use std::task::{Context as TaskContext, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::process::{Child, ChildStdin, ChildStdout, Command as TokioProcessCommand};
 
 #[derive(Debug, Clone)]
 enum ResolvedTarget {
@@ -20,6 +26,45 @@ struct SshTarget {
     jump: Option<String>,
     remote_bmux_path: String,
     connect_timeout_ms: u64,
+}
+
+#[derive(Debug)]
+struct SshBridgeStream {
+    _child: Child,
+    stdin: ChildStdin,
+    stdout: ChildStdout,
+}
+
+impl AsyncRead for SshBridgeStream {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.stdout).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for SshBridgeStream {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut TaskContext<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.stdin).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.stdin).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut TaskContext<'_>) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        Pin::new(&mut this.stdin).poll_shutdown(cx)
+    }
 }
 
 pub(super) fn should_proxy_to_target(cli: &Cli) -> Result<bool> {
@@ -68,14 +113,16 @@ pub(super) async fn run_connect(
             run_session_attach(target_session.as_deref(), follow, global).await
         }
         ResolvedTarget::Ssh(ssh_target) => {
+            let mut client = connect_remote_bridge(&ssh_target, "bmux-cli-connect-remote").await?;
             let target_session = if follow.is_some() {
                 None
             } else if let Some(session) = session {
                 Some(session.to_string())
             } else {
-                resolve_remote_attach_session(&ssh_target)?
+                resolve_remote_attach_session(&mut client, &ssh_target).await?
             };
-            run_remote_attach(&ssh_target, target_session.as_deref(), follow, global)
+            run_session_attach_with_client(client, target_session.as_deref(), follow, global, None)
+                .await
         }
     }
 }
@@ -211,14 +258,17 @@ async fn resolve_local_attach_session() -> Result<Option<String>> {
     select_session_interactively("local", &sessions)
 }
 
-fn resolve_remote_attach_session(target: &SshTarget) -> Result<Option<String>> {
+async fn resolve_remote_attach_session(
+    client: &mut BmuxClient,
+    target: &SshTarget,
+) -> Result<Option<String>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         anyhow::bail!(
             "session argument is required in non-interactive mode.\nList sessions: bmux --target {} list-sessions",
             target.label
         );
     }
-    let sessions = fetch_remote_sessions(target)?;
+    let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
     select_session_interactively(&target.label, &sessions)
 }
 
@@ -271,44 +321,57 @@ fn select_session_interactively(
     ))
 }
 
-fn run_remote_attach(
-    target: &SshTarget,
-    session: Option<&str>,
-    follow: Option<&str>,
-    global: bool,
-) -> Result<u8> {
-    let mut args = vec![OsString::from("attach")];
-    if let Some(session) = session {
-        args.push(OsString::from(session));
-    }
-    if let Some(follow) = follow {
-        args.push(OsString::from("--follow"));
-        args.push(OsString::from(follow));
-    }
-    if global {
-        args.push(OsString::from("--global"));
-    }
-    run_ssh_bmux_command(target, &args, true)
+async fn connect_remote_bridge(target: &SshTarget, client_name: &str) -> Result<BmuxClient> {
+    let mut command = build_ssh_bridge_command(target);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("failed launching SSH bridge for {}", target.label))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed acquiring SSH bridge stdin"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed acquiring SSH bridge stdout"))?;
+    let bridge_stream = SshBridgeStream {
+        _child: child,
+        stdin,
+        stdout,
+    };
+    let timeout = Duration::from_millis(target.connect_timeout_ms.max(1));
+    let principal_id = load_or_create_local_principal_id(&ConfigPaths::default())?;
+    BmuxClient::connect_with_bridge_stream(
+        ErasedIpcStream::new(Box::new(bridge_stream)),
+        timeout,
+        client_name.to_string(),
+        principal_id,
+    )
+    .await
+    .map_err(map_cli_client_error)
 }
 
-fn fetch_remote_sessions(target: &SshTarget) -> Result<Vec<SessionSummary>> {
-    let mut command = build_ssh_command(
-        target,
-        &[OsString::from("list-sessions"), OsString::from("--json")],
-        false,
-    );
-    let output = command
-        .output()
-        .with_context(|| format!("failed executing ssh to {}", target.label))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "failed listing remote sessions for '{}': {}",
-            target.label,
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+fn load_or_create_local_principal_id(paths: &ConfigPaths) -> Result<Uuid> {
+    let path = paths.principal_id_file();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed creating principal id dir {}", parent.display()))?;
     }
-    serde_json::from_slice::<Vec<SessionSummary>>(&output.stdout)
-        .context("failed parsing remote list-sessions output")
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let raw = content.trim();
+            Uuid::parse_str(raw)
+                .with_context(|| format!("invalid principal id in {}: {raw}", path.display()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let principal_id = Uuid::new_v4();
+            std::fs::write(&path, principal_id.to_string())
+                .with_context(|| format!("failed writing principal id file {}", path.display()))?;
+            Ok(principal_id)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("failed reading principal id file {}", path.display())),
+    }
 }
 
 fn run_ssh_bmux_command(target: &SshTarget, args: &[OsString], force_tty: bool) -> Result<u8> {
@@ -359,6 +422,52 @@ fn build_ssh_command(target: &SshTarget, args: &[OsString], force_tty: bool) -> 
     command.arg(destination);
     command.arg(&target.remote_bmux_path);
     command.args(args);
+    command
+}
+
+fn build_ssh_bridge_command(target: &SshTarget) -> TokioProcessCommand {
+    let mut command = TokioProcessCommand::new("ssh");
+    command.arg("-T");
+    if let Some(port) = target.port {
+        command.arg("-p");
+        command.arg(port.to_string());
+    }
+    if let Some(path) = target.identity_file.as_ref() {
+        command.arg("-i");
+        command.arg(path);
+    }
+    if let Some(jump) = target.jump.as_ref() {
+        command.arg("-J");
+        command.arg(jump);
+    }
+    command.arg("-o");
+    command.arg(format!(
+        "StrictHostKeyChecking={}",
+        if target.strict_host_key_checking {
+            "yes"
+        } else {
+            "no"
+        }
+    ));
+    if let Some(known_hosts) = target.known_hosts_file.as_ref() {
+        command.arg("-o");
+        command.arg(format!("UserKnownHostsFile={}", known_hosts.display()));
+    }
+    command.arg("-o");
+    let timeout_secs = (target.connect_timeout_ms.saturating_add(999)) / 1000;
+    command.arg(format!("ConnectTimeout={timeout_secs}"));
+    let destination = target.user.as_ref().map_or_else(
+        || target.host.clone(),
+        |user| format!("{user}@{}", target.host),
+    );
+    command.arg(destination);
+    command.arg(&target.remote_bmux_path);
+    command.arg("server");
+    command.arg("bridge");
+    command.arg("--stdio");
+    command.stdin(Stdio::piped());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::inherit());
     command
 }
 

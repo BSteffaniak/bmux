@@ -32,6 +32,22 @@ pub struct LocalIpcStream {
     inner: StreamInner,
 }
 
+/// Trait alias for erased async duplex streams used by framed IPC wrappers.
+pub trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+
+impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+
+/// Framed IPC stream backed by an erased async duplex transport.
+pub struct ErasedIpcStream {
+    inner: Box<dyn AsyncReadWrite>,
+}
+
+impl std::fmt::Debug for ErasedIpcStream {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ErasedIpcStream(..)")
+    }
+}
+
 #[derive(Debug)]
 enum StreamInner {
     #[cfg(unix)]
@@ -177,6 +193,22 @@ impl LocalIpcStream {
             #[cfg(windows)]
             StreamInner::WindowsClient(stream) => read_frame(stream).await,
         }
+    }
+}
+
+impl ErasedIpcStream {
+    #[must_use]
+    pub fn new(inner: Box<dyn AsyncReadWrite>) -> Self {
+        Self { inner }
+    }
+
+    pub async fn send_envelope(&mut self, envelope: &Envelope) -> Result<(), IpcTransportError> {
+        let frame = encode_frame(envelope)?;
+        write_frame(&mut self.inner, &frame).await
+    }
+
+    pub async fn recv_envelope(&mut self) -> Result<Envelope, IpcTransportError> {
+        read_frame(&mut self.inner).await
     }
 }
 

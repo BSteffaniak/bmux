@@ -7,7 +7,7 @@
 
 use bmux_config::{BmuxConfig, ConfigPaths};
 pub use bmux_ipc::Event as ServerEvent;
-use bmux_ipc::transport::{IpcTransportError, LocalIpcStream};
+use bmux_ipc::transport::{ErasedIpcStream, IpcTransportError, LocalIpcStream};
 use bmux_ipc::{
     AttachGrant, AttachPaneChunk, AttachScene, ClientSummary, ContextSelector, ContextSummary,
     Envelope, EnvelopeKind, ErrorCode, InvokeServiceKind, IpcEndpoint, PaneFocusDirection,
@@ -117,10 +117,35 @@ pub enum ClientError {
 /// Main client API for communicating with bmux server.
 #[derive(Debug)]
 pub struct BmuxClient {
-    stream: LocalIpcStream,
+    stream: ClientStream,
     timeout: Duration,
     next_request_id: u64,
     principal_id: Uuid,
+}
+
+#[derive(Debug)]
+enum ClientStream {
+    Local(LocalIpcStream),
+    Bridge(ErasedIpcStream),
+}
+
+impl ClientStream {
+    async fn send_envelope(
+        &mut self,
+        envelope: &Envelope,
+    ) -> std::result::Result<(), IpcTransportError> {
+        match self {
+            Self::Local(stream) => stream.send_envelope(envelope).await,
+            Self::Bridge(stream) => stream.send_envelope(envelope).await,
+        }
+    }
+
+    async fn recv_envelope(&mut self) -> std::result::Result<Envelope, IpcTransportError> {
+        match self {
+            Self::Local(stream) => stream.recv_envelope().await,
+            Self::Bridge(stream) => stream.recv_envelope().await,
+        }
+    }
 }
 
 impl BmuxClient {
@@ -150,6 +175,41 @@ impl BmuxClient {
         principal_id: Uuid,
     ) -> Result<Self> {
         let stream = LocalIpcStream::connect(endpoint).await?;
+        Self::connect_with_stream(
+            ClientStream::Local(stream),
+            timeout,
+            client_name,
+            principal_id,
+        )
+        .await
+    }
+
+    /// Connect over an already-established framed duplex stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if handshake fails.
+    pub async fn connect_with_bridge_stream(
+        stream: ErasedIpcStream,
+        timeout: Duration,
+        client_name: impl Into<String>,
+        principal_id: Uuid,
+    ) -> Result<Self> {
+        Self::connect_with_stream(
+            ClientStream::Bridge(stream),
+            timeout,
+            client_name,
+            principal_id,
+        )
+        .await
+    }
+
+    async fn connect_with_stream(
+        stream: ClientStream,
+        timeout: Duration,
+        client_name: impl Into<String>,
+        principal_id: Uuid,
+    ) -> Result<Self> {
         let mut client = Self {
             stream,
             timeout,
