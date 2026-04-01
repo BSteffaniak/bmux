@@ -37,6 +37,31 @@ pub(super) fn parse_runtime_cli_with_registry(
     command_config.plugins.enabled = effective_enabled_plugins(config, registry);
     let command_registry = PluginCommandRegistry::build(&command_config, registry)
         .context("failed building plugin CLI command registry")?;
+    if let Some(raw_args) = argv
+        .iter()
+        .skip(1)
+        .map(|arg| arg.to_str().map(ToString::to_string))
+        .collect::<Option<Vec<_>>>()
+        && let Some(resolved) = command_registry.resolve(&raw_args)
+    {
+        let normalized =
+            PluginCommandRegistry::validate_arguments(&resolved.schema, &resolved.arguments)
+                .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let verbose = raw_args.iter().any(|arg| arg == "--verbose" || arg == "-v");
+        let log_level = resolve_log_level(
+            verbose,
+            None,
+            std::env::var("BMUX_LOG_LEVEL").ok().as_deref(),
+        );
+        if !raw_args.iter().any(|arg| arg == "--core-builtins-only") {
+            return Ok(ParsedRuntimeCli::Plugin {
+                log_level,
+                plugin_id: resolved.plugin_id,
+                command_name: resolved.command_name,
+                arguments: normalized,
+            });
+        }
+    }
     let clap_command = command_registry
         .augment_clap_command(Cli::command())
         .context("failed augmenting CLI with plugin commands")?;
@@ -65,16 +90,21 @@ pub(super) fn parse_runtime_cli_with_registry(
         matches.get_one::<LogLevel>("log_level").copied(),
         std::env::var("BMUX_LOG_LEVEL").ok().as_deref(),
     );
-    let (path, leaf_matches) = plugin_commands::selected_subcommand_path(&matches);
-    if let Some(resolved) = command_registry.resolve_exact_path(&path) {
-        let arguments =
-            PluginCommandRegistry::normalize_arguments_from_matches(&resolved.schema, leaf_matches);
-        return Ok(ParsedRuntimeCli::Plugin {
-            log_level,
-            plugin_id: resolved.plugin_id,
-            command_name: resolved.command_name,
-            arguments,
-        });
+    let core_builtins_only = matches.get_flag("core_builtins_only");
+    if !core_builtins_only {
+        let (path, leaf_matches) = plugin_commands::selected_subcommand_path(&matches);
+        if let Some(resolved) = command_registry.resolve_exact_path(&path) {
+            let arguments = PluginCommandRegistry::normalize_arguments_from_matches(
+                &resolved.schema,
+                leaf_matches,
+            );
+            return Ok(ParsedRuntimeCli::Plugin {
+                log_level,
+                plugin_id: resolved.plugin_id,
+                command_name: resolved.command_name,
+                arguments,
+            });
+        }
     }
 
     let cli =

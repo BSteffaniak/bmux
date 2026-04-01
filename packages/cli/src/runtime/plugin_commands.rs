@@ -69,6 +69,7 @@ impl PluginCommandRegistry {
                     &claimed,
                     plugin.declaration.id.as_str(),
                     &command.name,
+                    true,
                 )?;
                 validate_prefix_collision(
                     &canonical,
@@ -76,6 +77,7 @@ impl PluginCommandRegistry {
                     &claimed,
                     plugin.declaration.id.as_str(),
                     &command.name,
+                    true,
                 )?;
                 claimed.insert(
                     canonical.clone(),
@@ -94,6 +96,7 @@ impl PluginCommandRegistry {
                         &claimed,
                         plugin.declaration.id.as_str(),
                         &command.name,
+                        true,
                     )?;
                     validate_prefix_collision(
                         alias,
@@ -101,6 +104,7 @@ impl PluginCommandRegistry {
                         &claimed,
                         plugin.declaration.id.as_str(),
                         &command.name,
+                        true,
                     )?;
                     claimed.insert(
                         alias.clone(),
@@ -270,8 +274,12 @@ impl PluginCommandRegistry {
 
     pub fn augment_clap_command(&self, root: Command) -> Result<Command> {
         let mut root = root;
+        let reserved = reserved_built_in_paths();
         for command in &self.commands {
             for path in std::iter::once(&command.canonical_path).chain(command.aliases.iter()) {
+                if reserved.contains(path) {
+                    continue;
+                }
                 insert_plugin_path(&mut root, path, &command.schema)?;
             }
         }
@@ -404,8 +412,9 @@ fn validate_path_collision(
     claimed: &BTreeMap<Vec<String>, (String, String)>,
     plugin_id: &str,
     command_name: &str,
+    allow_core_override: bool,
 ) -> Result<()> {
-    if reserved.contains(path) {
+    if reserved.contains(path) && !allow_core_override {
         bail!(
             "plugin '{plugin_id}' command '{command_name}' collides with built-in CLI path '{}')",
             path.join(" ")
@@ -426,13 +435,16 @@ fn validate_prefix_collision(
     claimed: &BTreeMap<Vec<String>, (String, String)>,
     plugin_id: &str,
     command_name: &str,
+    allow_core_override: bool,
 ) -> Result<()> {
-    for reserved_path in reserved {
-        if is_prefix_collision(path, reserved_path) {
-            bail!(
-                "plugin '{plugin_id}' command '{command_name}' creates ambiguous CLI nesting with built-in path '{}'",
-                reserved_path.join(" ")
-            );
+    if !allow_core_override {
+        for reserved_path in reserved {
+            if is_prefix_collision(path, reserved_path) {
+                bail!(
+                    "plugin '{plugin_id}' command '{command_name}' creates ambiguous CLI nesting with built-in path '{}'",
+                    reserved_path.join(" ")
+                );
+            }
         }
     }
     for (claimed_path, (owner_plugin, owner_command)) in claimed {
@@ -658,7 +670,7 @@ minimum = "1.0"
     }
 
     #[test]
-    fn plugin_cannot_claim_current_static_core_command_path() {
+    fn plugin_can_claim_current_static_core_command_path_when_owned() {
         let manifest = PluginManifest::from_toml_str(
             r#"
 id = "example.plugin"
@@ -692,9 +704,12 @@ minimum = "1.0"
             )
             .expect("manifest should register");
 
-        let error = PluginCommandRegistry::build(&config_with_enabled("example.plugin"), &registry)
-            .expect_err("plugin should not shadow active static core command path");
-        assert!(error.to_string().contains("new-session"));
+        let built = PluginCommandRegistry::build(&config_with_enabled("example.plugin"), &registry)
+            .expect("plugin should be allowed to own built-in command path");
+        let resolved = built
+            .resolve_exact_path(&["new-session".to_string()])
+            .expect("plugin command should resolve on owned built-in path");
+        assert_eq!(resolved.plugin_id, "example.plugin");
     }
 
     #[test]

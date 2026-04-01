@@ -1,9 +1,131 @@
-execution_class       = "native_fast"
-id                    = "bmux.plugin_cli"
-name                  = "bmux Plugin CLI"
-owns_namespaces       = ["plugin"]
+execution_class = "native_fast"
+id = "bmux.plugin_cli"
+name = "bmux Plugin CLI"
+owns_namespaces = ["plugin"]
+owns_paths = [
+    [
+        "logs",
+        "path",
+    ],
+    [
+        "logs",
+        "level",
+    ],
+    [
+        "logs",
+        "tail",
+    ],
+    [
+        "logs",
+        "watch",
+    ],
+    [
+        "logs",
+        "profiles",
+        "list",
+    ],
+    [
+        "logs",
+        "profiles",
+        "show",
+    ],
+    [
+        "logs",
+        "profiles",
+        "delete",
+    ],
+    [
+        "logs",
+        "profiles",
+        "rename",
+    ],
+    [
+        "keymap",
+        "doctor",
+    ],
+    [
+        "terminal",
+        "doctor",
+    ],
+    [
+        "terminal",
+        "install-terminfo",
+    ],
+    [
+        "recording",
+        "start",
+    ],
+    [
+        "recording",
+        "stop",
+    ],
+    [
+        "recording",
+        "status",
+    ],
+    [
+        "recording",
+        "list",
+    ],
+    [
+        "recording",
+        "delete",
+    ],
+    [
+        "recording",
+        "delete-all",
+    ],
+    [
+        "recording",
+        "inspect",
+    ],
+    [
+        "recording",
+        "replay",
+    ],
+    [
+        "recording",
+        "verify-smoke",
+    ],
+    [
+        "recording",
+        "export",
+    ],
+    [
+        "recording",
+        "prune",
+    ],
+    [
+        "playbook",
+        "run",
+    ],
+    [
+        "playbook",
+        "validate",
+    ],
+    [
+        "playbook",
+        "interactive",
+    ],
+    [
+        "playbook",
+        "from-recording",
+    ],
+    [
+        "playbook",
+        "dry-run",
+    ],
+    [
+        "playbook",
+        "diff",
+    ],
+    [
+        "playbook",
+        "cleanup",
+    ],
+]
 required_capabilities = ["bmux.commands"]
-version               = "0.0.1-alpha.0"
+version = "0.0.1-alpha.0"
 
 [[commands]]
 expose_in_cli = true
@@ -74,3 +196,420 @@ multiple            = true
 name                = "selectors"
 position            = 0
 value_name          = "SELECTOR"
+
+[[commands]]
+expose_in_cli = true
+name          = "logs-path"
+path          = ["logs", "path"]
+summary       = "Core logs path command proxy"
+
+[[commands]]
+expose_in_cli = true
+name          = "logs-level"
+path          = ["logs", "level"]
+summary       = "Core logs level command proxy"
+
+[[commands]]
+expose_in_cli = true
+name          = "logs-tail"
+path          = ["logs", "tail"]
+summary       = "Core logs tail command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "logs-watch"
+path          = ["logs", "watch"]
+summary       = "Core logs watch command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "logs-profiles-list"
+path          = ["logs", "profiles", "list"]
+summary       = "Core logs profiles list command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "logs-profiles-show"
+path          = ["logs", "profiles", "show"]
+summary       = "Core logs profiles show command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "logs-profiles-delete"
+path          = ["logs", "profiles", "delete"]
+summary       = "Core logs profiles delete command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "logs-profiles-rename"
+path          = ["logs", "profiles", "rename"]
+summary       = "Core logs profiles rename command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "keymap-doctor"
+path          = ["keymap", "doctor"]
+summary       = "Core keymap doctor command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "terminal-doctor"
+path          = ["terminal", "doctor"]
+summary       = "Core terminal doctor command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "terminal-install-terminfo"
+path          = ["terminal", "install-terminfo"]
+summary       = "Core terminal install-terminfo command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-start"
+path          = ["recording", "start"]
+summary       = "Core recording start command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-stop"
+path          = ["recording", "stop"]
+summary       = "Core recording stop command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-status"
+path          = ["recording", "status"]
+summary       = "Core recording status command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-list"
+path          = ["recording", "list"]
+summary       = "Core recording list command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-delete"
+path          = ["recording", "delete"]
+summary       = "Core recording delete command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-delete-all"
+path          = ["recording", "delete-all"]
+summary       = "Core recording delete-all command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-inspect"
+path          = ["recording", "inspect"]
+summary       = "Core recording inspect command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-replay"
+path          = ["recording", "replay"]
+summary       = "Core recording replay command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-verify-smoke"
+path          = ["recording", "verify-smoke"]
+summary       = "Core recording verify-smoke command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-export"
+path          = ["recording", "export"]
+summary       = "Core recording export command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-prune"
+path          = ["recording", "prune"]
+summary       = "Core recording prune command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "playbook-run"
+path          = ["playbook", "run"]
+summary       = "Core playbook run command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "playbook-validate"
+path          = ["playbook", "validate"]
+summary       = "Core playbook validate command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "playbook-interactive"
+path          = ["playbook", "interactive"]
+summary       = "Core playbook interactive command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "playbook-from-recording"
+path          = ["playbook", "from-recording"]
+summary       = "Core playbook from-recording command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "playbook-dry-run"
+path          = ["playbook", "dry-run"]
+summary       = "Core playbook dry-run command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "playbook-diff"
+path          = ["playbook", "diff"]
+summary       = "Core playbook diff command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "playbook-cleanup"
+path          = ["playbook", "cleanup"]
+summary       = "Core playbook cleanup command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"

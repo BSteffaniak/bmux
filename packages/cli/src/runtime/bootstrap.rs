@@ -341,6 +341,7 @@ mod tests {
             record_event_kind: Vec::new(),
             stop_server_on_exit: false,
             target: None,
+            core_builtins_only: false,
             command: None,
             verbose: false,
             log_level: None,

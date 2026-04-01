@@ -17,12 +17,75 @@ pub struct PluginCliPlugin;
 
 impl RustPlugin for PluginCliPlugin {
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
-        bmux_plugin_sdk::route_command!(context, {
+        match context.command.as_str() {
             "list" => run_list_command(&context).map_err(PluginCommandError::from),
             "run" => run_run_command(&context).map_err(PluginCommandError::from),
             "rebuild" => run_rebuild_command(&context).map_err(PluginCommandError::from),
-        })
+            "logs-path" => run_core_proxy_command(&context, &["logs", "path"]),
+            "logs-level" => run_core_proxy_command(&context, &["logs", "level"]),
+            "logs-tail" => run_core_proxy_command(&context, &["logs", "tail"]),
+            "logs-watch" => run_core_proxy_command(&context, &["logs", "watch"]),
+            "logs-profiles-list" => run_core_proxy_command(&context, &["logs", "profiles", "list"]),
+            "logs-profiles-show" => run_core_proxy_command(&context, &["logs", "profiles", "show"]),
+            "logs-profiles-delete" => {
+                run_core_proxy_command(&context, &["logs", "profiles", "delete"])
+            }
+            "logs-profiles-rename" => {
+                run_core_proxy_command(&context, &["logs", "profiles", "rename"])
+            }
+            "keymap-doctor" => run_core_proxy_command(&context, &["keymap", "doctor"]),
+            "terminal-doctor" => run_core_proxy_command(&context, &["terminal", "doctor"]),
+            "terminal-install-terminfo" => {
+                run_core_proxy_command(&context, &["terminal", "install-terminfo"])
+            }
+            "recording-start" => run_core_proxy_command(&context, &["recording", "start"]),
+            "recording-stop" => run_core_proxy_command(&context, &["recording", "stop"]),
+            "recording-status" => run_core_proxy_command(&context, &["recording", "status"]),
+            "recording-list" => run_core_proxy_command(&context, &["recording", "list"]),
+            "recording-delete" => run_core_proxy_command(&context, &["recording", "delete"]),
+            "recording-delete-all" => {
+                run_core_proxy_command(&context, &["recording", "delete-all"])
+            }
+            "recording-inspect" => run_core_proxy_command(&context, &["recording", "inspect"]),
+            "recording-replay" => run_core_proxy_command(&context, &["recording", "replay"]),
+            "recording-verify-smoke" => {
+                run_core_proxy_command(&context, &["recording", "verify-smoke"])
+            }
+            "recording-export" => run_core_proxy_command(&context, &["recording", "export"]),
+            "recording-prune" => run_core_proxy_command(&context, &["recording", "prune"]),
+            "playbook-run" => run_core_proxy_command(&context, &["playbook", "run"]),
+            "playbook-validate" => run_core_proxy_command(&context, &["playbook", "validate"]),
+            "playbook-interactive" => {
+                run_core_proxy_command(&context, &["playbook", "interactive"])
+            }
+            "playbook-from-recording" => {
+                run_core_proxy_command(&context, &["playbook", "from-recording"])
+            }
+            "playbook-dry-run" => run_core_proxy_command(&context, &["playbook", "dry-run"]),
+            "playbook-diff" => run_core_proxy_command(&context, &["playbook", "diff"]),
+            "playbook-cleanup" => run_core_proxy_command(&context, &["playbook", "cleanup"]),
+            other => Err(PluginCommandError::from(format!(
+                "unsupported command '{other}'"
+            ))),
+        }
     }
+}
+
+fn run_core_proxy_command(
+    context: &NativeCommandContext,
+    command_path: &[&str],
+) -> Result<i32, PluginCommandError> {
+    let executable = std::env::current_exe().map_err(|error| {
+        PluginCommandError::from(format!("failed resolving current bmux executable: {error}"))
+    })?;
+    let mut command = ProcessCommand::new(executable);
+    command.arg("--core-builtins-only");
+    command.args(command_path);
+    command.args(&context.arguments);
+    let status = command.status().map_err(|error| {
+        PluginCommandError::from(format!("failed running core command: {error}"))
+    })?;
+    Ok(status.code().unwrap_or(EXIT_OK))
 }
 
 fn run_list_command(context: &NativeCommandContext) -> Result<i32, String> {

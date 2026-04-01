@@ -161,6 +161,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub target: Option<String>,
 
+    /// Internal: bypass plugin command dispatch and use core handlers only
+    #[arg(long, hide = true, global = true)]
+    pub core_builtins_only: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 

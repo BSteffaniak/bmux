@@ -416,6 +416,30 @@ const REQUIRED_PLUGIN_OWNERSHIP: &[RequiredPluginOwnership] = &[
         kind: RequiredOwnershipKind::Namespace("plugin"),
     },
     RequiredPluginOwnership {
+        plugin_id: "bmux.plugin_cli",
+        kind: RequiredOwnershipKind::Path(&["logs", "path"]),
+    },
+    RequiredPluginOwnership {
+        plugin_id: "bmux.plugin_cli",
+        kind: RequiredOwnershipKind::Path(&["keymap", "doctor"]),
+    },
+    RequiredPluginOwnership {
+        plugin_id: "bmux.plugin_cli",
+        kind: RequiredOwnershipKind::Path(&["terminal", "doctor"]),
+    },
+    RequiredPluginOwnership {
+        plugin_id: "bmux.plugin_cli",
+        kind: RequiredOwnershipKind::Path(&["terminal", "install-terminfo"]),
+    },
+    RequiredPluginOwnership {
+        plugin_id: "bmux.plugin_cli",
+        kind: RequiredOwnershipKind::Path(&["recording", "start"]),
+    },
+    RequiredPluginOwnership {
+        plugin_id: "bmux.plugin_cli",
+        kind: RequiredOwnershipKind::Path(&["playbook", "run"]),
+    },
+    RequiredPluginOwnership {
         plugin_id: "bmux.permissions",
         kind: RequiredOwnershipKind::Namespace("permissions"),
     },
