@@ -80,6 +80,31 @@ bmux --target prod list-sessions
 bmux --target prod attach app
 ```
 
+Shell completion snippets:
+
+```bash
+# Bash: target completion for `bmux connect <TAB>`
+_bmux_complete_targets() {
+  COMPREPLY=( $(compgen -W "$(bmux remote complete targets 2>/dev/null)" -- "${COMP_WORDS[COMP_CWORD]}") )
+}
+complete -F _bmux_complete_targets bmux
+
+# Bash: session completion helper
+_bmux_complete_sessions() {
+  local target="$1"
+  bmux remote complete sessions "$target" 2>/dev/null
+}
+
+# Zsh helper examples
+_bmux_targets() { bmux remote complete targets 2>/dev/null }
+_bmux_sessions() { bmux remote complete sessions "$1" 2>/dev/null }
+
+# Fish helper examples
+function __bmux_targets
+  bmux remote complete targets 2>/dev/null
+end
+```
+
 Target precedence for command routing:
 
 1. `--target`

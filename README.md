@@ -74,6 +74,10 @@ bmux connect prod --reconnect-forever
 bmux remote complete targets
 bmux remote complete sessions prod
 
+# Bash/Zsh/Fish completion can call:
+# bmux remote complete targets
+# bmux remote complete sessions <target>
+
 # Internet-accessible TLS gateway
 bmux server gateway --listen 0.0.0.0:7443 --quick
 bmux connect tls-prod app
@@ -135,6 +139,24 @@ host = "gateway.example.com"
 port = 7443
 server_name = "gateway.example.com"
 ca_file = "~/.config/bmux/gateway-ca.pem"
+```
+
+Example shell wiring for target/session completion:
+
+```bash
+# Bash helper functions
+_bmux_targets() {
+  bmux remote complete targets 2>/dev/null
+}
+
+_bmux_sessions() {
+  local target="$1"
+  bmux remote complete sessions "$target" 2>/dev/null
+}
+
+# Usage examples:
+# _bmux_targets
+# _bmux_sessions prod
 ```
 
 Plugin command ownership policy is optional and declarative:
