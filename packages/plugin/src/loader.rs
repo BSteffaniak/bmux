@@ -2925,6 +2925,7 @@ minimum = "1.0"
                 description: None,
                 homepage: None,
                 provider_priority: 0,
+                execution_class: crate::PluginExecutionClass::NativeStandard,
                 required_capabilities: BTreeSet::new(),
                 provided_capabilities: BTreeSet::new(),
                 provided_features: BTreeSet::new(),

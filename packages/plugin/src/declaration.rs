@@ -31,6 +31,15 @@ pub enum PluginEntrypoint {
     Native { symbol: String },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginExecutionClass {
+    NativeFast,
+    #[default]
+    NativeStandard,
+    Interpreter,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginLifecycle {
     #[serde(default = "default_true")]
@@ -80,6 +89,8 @@ pub struct PluginDeclaration {
     pub homepage: Option<String>,
     #[serde(default)]
     pub provider_priority: i32,
+    #[serde(default)]
+    pub execution_class: PluginExecutionClass,
     #[serde(default)]
     #[serde(alias = "required_host_scopes")]
     pub required_capabilities: BTreeSet<HostScope>,
@@ -270,6 +281,7 @@ mod tests {
             description: None,
             homepage: None,
             provider_priority: 0,
+            execution_class: super::PluginExecutionClass::NativeStandard,
             required_capabilities: BTreeSet::new(),
             provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::new(),
@@ -322,6 +334,7 @@ mod tests {
             description: None,
             homepage: None,
             provider_priority: 0,
+            execution_class: super::PluginExecutionClass::NativeStandard,
             required_capabilities,
             provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::new(),
@@ -358,6 +371,7 @@ mod tests {
             description: None,
             homepage: None,
             provider_priority: 0,
+            execution_class: super::PluginExecutionClass::NativeStandard,
             required_capabilities: BTreeSet::new(),
             provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::new(),

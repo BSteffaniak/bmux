@@ -872,6 +872,54 @@ pub(super) fn run_plugin_keybinding_command(
     run_plugin_command_internal(plugin_id, command_name, args)
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct PluginCommandPolicyHints {
+    pub(super) execution: bmux_plugin_sdk::CommandExecutionKind,
+    pub(super) execution_class: bmux_plugin::PluginExecutionClass,
+    pub(super) required_capabilities: Vec<HostScope>,
+}
+
+pub(super) fn plugin_command_policy_hints(
+    plugin_id: &str,
+    command_name: &str,
+) -> Result<PluginCommandPolicyHints> {
+    let config = BmuxConfig::load()?;
+    let paths = ConfigPaths::default();
+    let registry = scan_available_plugins(&config, &paths)?;
+    let available = registry.plugin_ids();
+    let plugin = registry
+        .get(plugin_id)
+        .with_context(|| format_plugin_not_found_message(plugin_id, &available))?;
+    let enabled_plugins = effective_enabled_plugins(&config, &registry);
+    if !enabled_plugins.iter().any(|enabled| enabled == plugin_id) {
+        anyhow::bail!(format_plugin_not_enabled_message(plugin_id));
+    }
+
+    let command = plugin
+        .declaration
+        .commands
+        .iter()
+        .find(|entry| entry.name == command_name)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "plugin '{}' does not declare command '{}'",
+                plugin_id,
+                command_name
+            )
+        })?;
+
+    Ok(PluginCommandPolicyHints {
+        execution: command.execution.clone(),
+        execution_class: plugin.declaration.execution_class,
+        required_capabilities: plugin
+            .declaration
+            .required_capabilities
+            .iter()
+            .cloned()
+            .collect(),
+    })
+}
+
 pub(super) struct PluginCommandExecution {
     pub(super) status: i32,
     pub(super) outcome: PluginCommandOutcome,
@@ -1435,6 +1483,7 @@ mod tests {
             description: None,
             homepage: None,
             provider_priority: 0,
+            execution_class: bmux_plugin::PluginExecutionClass::NativeStandard,
             required_capabilities: std::collections::BTreeSet::from([
                 bmux_plugin_sdk::HostScope::new("bmux.commands").expect("capability should parse"),
             ]),
@@ -1587,6 +1636,7 @@ mod tests {
             description: None,
             homepage: None,
             provider_priority: 0,
+            execution_class: bmux_plugin::PluginExecutionClass::NativeStandard,
             required_capabilities: std::collections::BTreeSet::from([
                 bmux_plugin_sdk::HostScope::new("bmux.commands").expect("capability should parse"),
                 bmux_plugin_sdk::HostScope::new("example.base.read")

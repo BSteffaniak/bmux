@@ -38,6 +38,20 @@ impl RustPlugin for PermissionsPlugin {
                 evaluate_policy(ctx, &req)
                     .map_err(|e| ServiceResponse::error("policy_failed", e))
             },
+            "session-policy-query/v1", "list-hot-path-overrides" => |req: ListHotPathOverridesRequest, ctx| {
+                list_hot_path_overrides(ctx, req)
+                    .map_err(|e| ServiceResponse::error("list_hot_path_overrides_failed", e))
+            },
+            "session-policy-command/v1", "grant-hot-path-override" => |req: GrantHotPathOverrideRequest, ctx| {
+                grant_hot_path_override(ctx, req)
+                    .map_err(|e| ServiceResponse::error("grant_hot_path_override_failed", e))?;
+                Ok(CommandAckResponse { ok: true })
+            },
+            "session-policy-command/v1", "revoke-hot-path-override" => |req: RevokeHotPathOverrideRequest, ctx| {
+                revoke_hot_path_override(ctx, req)
+                    .map_err(|e| ServiceResponse::error("revoke_hot_path_override_failed", e))?;
+                Ok(CommandAckResponse { ok: true })
+            },
         })
     }
 }
@@ -97,6 +111,63 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
             println!("revoked permission");
             Ok(())
         }
+        "grant-hot-path-override" => {
+            let request = GrantHotPathOverrideRequest {
+                plugin_id: required_option_value(&context.arguments, "plugin")?,
+                capability: required_option_value(&context.arguments, "capability")?,
+                execution_class: required_option_value(&context.arguments, "execution-class")?,
+                scope: required_option_value(&context.arguments, "scope")?,
+                session: option_value(&context.arguments, "session"),
+                context: option_value(&context.arguments, "context"),
+            };
+            grant_hot_path_override(context, request)?;
+            println!("granted hot-path override");
+            Ok(())
+        }
+        "revoke-hot-path-override" => {
+            let request = RevokeHotPathOverrideRequest {
+                plugin_id: required_option_value(&context.arguments, "plugin")?,
+                capability: required_option_value(&context.arguments, "capability")?,
+                execution_class: required_option_value(&context.arguments, "execution-class")?,
+                scope: required_option_value(&context.arguments, "scope")?,
+                session: option_value(&context.arguments, "session"),
+                context: option_value(&context.arguments, "context"),
+            };
+            revoke_hot_path_override(context, request)?;
+            println!("revoked hot-path override");
+            Ok(())
+        }
+        "list-hot-path-overrides" => {
+            let request = ListHotPathOverridesRequest {
+                session: option_value(&context.arguments, "session"),
+                context: option_value(&context.arguments, "context"),
+            };
+            let response = list_hot_path_overrides(context, request)?;
+            if has_flag(&context.arguments, "json") {
+                let output =
+                    serde_json::to_string_pretty(&response).map_err(|error| error.to_string())?;
+                println!("{output}");
+            } else if response.entries.is_empty() {
+                println!("no hot-path overrides configured");
+            } else {
+                for entry in response.entries {
+                    println!(
+                        "{}\t{}\t{}\t{}\t{}\t{}",
+                        entry.plugin_id,
+                        entry.capability,
+                        entry.execution_class,
+                        entry.scope,
+                        entry
+                            .session_id
+                            .map_or_else(|| "-".to_string(), |id| id.to_string()),
+                        entry
+                            .context_id
+                            .map_or_else(|| "-".to_string(), |id| id.to_string())
+                    );
+                }
+            }
+            Ok(())
+        }
         _ => Err(format!("unsupported command '{}'", context.command)),
     }
 }
@@ -122,12 +193,14 @@ fn resolve_current_session(caller: &impl HostRuntimeApi) -> Result<String, Strin
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredPermissions {
     by_session_id: BTreeMap<Uuid, Vec<PermissionEntry>>,
+    hot_path_overrides: Vec<HotPathOverrideEntry>,
 }
 
 impl StoredPermissions {
     const fn with_default() -> Self {
         Self {
             by_session_id: BTreeMap::new(),
+            hot_path_overrides: Vec::new(),
         }
     }
 }
@@ -179,6 +252,10 @@ fn evaluate_policy(
     caller: &impl HostRuntimeApi,
     request: &SessionPolicyCheckRequest,
 ) -> Result<SessionPolicyCheckResponse, String> {
+    if request.action == "hot_path_execution" {
+        return evaluate_hot_path_execution_policy(caller, request);
+    }
+
     let state = load_state(caller)?;
     let entries = state
         .by_session_id
@@ -198,6 +275,256 @@ fn evaluate_policy(
         Some(role) => evaluate_role_action(role, request.action.as_str()),
     };
     Ok(decision)
+}
+
+fn evaluate_hot_path_execution_policy(
+    caller: &impl HostRuntimeApi,
+    request: &SessionPolicyCheckRequest,
+) -> Result<SessionPolicyCheckResponse, String> {
+    let Some(execution_class) = request.execution_class.as_deref() else {
+        return Ok(SessionPolicyCheckResponse {
+            allowed: false,
+            reason: Some("missing execution_class for hot_path_execution".to_string()),
+        });
+    };
+    if execution_class == "native_fast" {
+        return Ok(SessionPolicyCheckResponse {
+            allowed: true,
+            reason: None,
+        });
+    }
+
+    let Some(plugin_id) = request.plugin_id.as_deref() else {
+        return Ok(SessionPolicyCheckResponse {
+            allowed: false,
+            reason: Some("missing plugin_id for hot_path_execution".to_string()),
+        });
+    };
+    let Some(capability) = request.capability.as_deref() else {
+        return Ok(SessionPolicyCheckResponse {
+            allowed: false,
+            reason: Some("missing capability for hot_path_execution".to_string()),
+        });
+    };
+
+    let state = load_state(caller)?;
+    if hot_path_override_allows(
+        &state.hot_path_overrides,
+        plugin_id,
+        capability,
+        execution_class,
+        request.session_id,
+        request.context_id,
+    ) {
+        Ok(SessionPolicyCheckResponse {
+            allowed: true,
+            reason: None,
+        })
+    } else {
+        Ok(SessionPolicyCheckResponse {
+            allowed: false,
+            reason: Some(format!(
+                "hot-path execution denied for plugin '{plugin_id}' capability '{capability}' execution_class '{execution_class}'"
+            )),
+        })
+    }
+}
+
+fn list_hot_path_overrides(
+    caller: &impl HostRuntimeApi,
+    request: ListHotPathOverridesRequest,
+) -> Result<ListHotPathOverridesResponse, String> {
+    let session_id = match request.session {
+        Some(session) => Some(resolve_session_id(caller, &session)?),
+        None => None,
+    };
+    let context_id = match request.context {
+        Some(context) => Some(resolve_context_id(caller, &context)?),
+        None => None,
+    };
+
+    let state = load_state(caller)?;
+    let entries = state
+        .hot_path_overrides
+        .into_iter()
+        .filter(|entry| session_id.is_none_or(|id| entry.session_id == Some(id)))
+        .filter(|entry| context_id.is_none_or(|id| entry.context_id == Some(id)))
+        .collect();
+    Ok(ListHotPathOverridesResponse { entries })
+}
+
+fn grant_hot_path_override(
+    caller: &impl HostRuntimeApi,
+    request: GrantHotPathOverrideRequest,
+) -> Result<(), String> {
+    validate_hot_path_override_fields(
+        &request.plugin_id,
+        &request.capability,
+        &request.execution_class,
+        &request.scope,
+    )?;
+    let (session_id, context_id) = resolve_override_scope(
+        caller,
+        &request.scope,
+        request.session.as_deref(),
+        request.context.as_deref(),
+    )?;
+    let mut state = load_state(caller)?;
+    let entry = HotPathOverrideEntry {
+        plugin_id: request.plugin_id,
+        capability: request.capability,
+        execution_class: request.execution_class,
+        scope: request.scope,
+        session_id,
+        context_id,
+    };
+    if !state
+        .hot_path_overrides
+        .iter()
+        .any(|candidate| candidate == &entry)
+    {
+        state.hot_path_overrides.push(entry);
+    }
+    save_state(caller, &state)
+}
+
+fn revoke_hot_path_override(
+    caller: &impl HostRuntimeApi,
+    request: RevokeHotPathOverrideRequest,
+) -> Result<(), String> {
+    validate_hot_path_override_fields(
+        &request.plugin_id,
+        &request.capability,
+        &request.execution_class,
+        &request.scope,
+    )?;
+    let (session_id, context_id) = resolve_override_scope(
+        caller,
+        &request.scope,
+        request.session.as_deref(),
+        request.context.as_deref(),
+    )?;
+    let mut state = load_state(caller)?;
+    state.hot_path_overrides.retain(|entry| {
+        !(entry.plugin_id == request.plugin_id
+            && entry.capability == request.capability
+            && entry.execution_class == request.execution_class
+            && entry.scope == request.scope
+            && entry.session_id == session_id
+            && entry.context_id == context_id)
+    });
+    save_state(caller, &state)
+}
+
+fn hot_path_override_allows(
+    entries: &[HotPathOverrideEntry],
+    plugin_id: &str,
+    capability: &str,
+    execution_class: &str,
+    session_id: Uuid,
+    context_id: Option<Uuid>,
+) -> bool {
+    let mut best_rank = 0u8;
+    for candidate in entries {
+        if candidate.plugin_id != plugin_id
+            || candidate.capability != capability
+            || candidate.execution_class != execution_class
+        {
+            continue;
+        }
+        let rank = match candidate.scope.as_str() {
+            "session_context" => {
+                if candidate.session_id == Some(session_id) && candidate.context_id == context_id {
+                    4
+                } else {
+                    0
+                }
+            }
+            "context" => {
+                if context_id.is_some() && candidate.context_id == context_id {
+                    3
+                } else {
+                    0
+                }
+            }
+            "session" => {
+                if candidate.session_id == Some(session_id) {
+                    2
+                } else {
+                    0
+                }
+            }
+            "global" => 1,
+            _ => 0,
+        };
+        best_rank = best_rank.max(rank);
+    }
+    best_rank > 0
+}
+
+fn validate_hot_path_override_fields(
+    plugin_id: &str,
+    capability: &str,
+    execution_class: &str,
+    scope: &str,
+) -> Result<(), String> {
+    if plugin_id.trim().is_empty() {
+        return Err("plugin_id must not be empty".to_string());
+    }
+    if capability.trim().is_empty() {
+        return Err("capability must not be empty".to_string());
+    }
+    if !matches!(
+        capability,
+        "bmux.terminal.input_intercept" | "bmux.terminal.output_intercept"
+    ) {
+        return Err(format!(
+            "invalid hot-path capability '{capability}'; expected bmux.terminal.input_intercept or bmux.terminal.output_intercept"
+        ));
+    }
+    if !matches!(execution_class, "native_standard" | "interpreter") {
+        return Err(format!(
+            "invalid execution_class '{execution_class}'; expected native_standard or interpreter"
+        ));
+    }
+    if !matches!(scope, "global" | "session" | "context" | "session_context") {
+        return Err(format!(
+            "invalid scope '{scope}'; expected global, session, context, or session_context"
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_override_scope(
+    caller: &impl HostRuntimeApi,
+    scope: &str,
+    session: Option<&str>,
+    context: Option<&str>,
+) -> Result<(Option<Uuid>, Option<Uuid>), String> {
+    match scope {
+        "global" => Ok((None, None)),
+        "session" => {
+            let session =
+                session.ok_or_else(|| "--session is required for scope=session".to_string())?;
+            Ok((Some(resolve_session_id(caller, session)?), None))
+        }
+        "context" => {
+            let context =
+                context.ok_or_else(|| "--context is required for scope=context".to_string())?;
+            Ok((None, Some(resolve_context_id(caller, context)?)))
+        }
+        "session_context" => {
+            let session = session
+                .ok_or_else(|| "--session is required for scope=session_context".to_string())?;
+            let context = context
+                .ok_or_else(|| "--context is required for scope=session_context".to_string())?;
+            Ok((
+                Some(resolve_session_id(caller, session)?),
+                Some(resolve_context_id(caller, context)?),
+            ))
+        }
+        _ => Err(format!("unsupported scope '{scope}'")),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -303,6 +630,30 @@ fn resolve_session_id(caller: &impl HostRuntimeApi, session: &str) -> Result<Uui
         .ok_or_else(|| format!("session '{session}' not found"))
 }
 
+fn resolve_context_id(caller: &impl HostRuntimeApi, context: &str) -> Result<Uuid, String> {
+    let selector = if let Ok(id) = Uuid::parse_str(context) {
+        bmux_plugin_sdk::ContextSelector::ById(id)
+    } else if context.trim().is_empty() {
+        return Err("context must not be empty".to_string());
+    } else {
+        bmux_plugin_sdk::ContextSelector::ByName(context.to_string())
+    };
+    let contexts = caller
+        .context_list()
+        .map_err(|error| error.to_string())?
+        .contexts;
+    contexts
+        .into_iter()
+        .find(|entry| match &selector {
+            bmux_plugin_sdk::ContextSelector::ById(id) => entry.id == *id,
+            bmux_plugin_sdk::ContextSelector::ByName(name) => {
+                entry.name.as_deref() == Some(name.as_str())
+            }
+        })
+        .map(|entry| entry.id)
+        .ok_or_else(|| format!("context '{context}' not found"))
+}
+
 fn validate_role(role: &str) -> Result<(), String> {
     if matches!(role, "owner" | "writer" | "observer") {
         Ok(())
@@ -351,15 +702,72 @@ struct RevokeRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SessionPolicyCheckRequest {
     session_id: Uuid,
+    #[serde(default)]
+    context_id: Option<Uuid>,
     client_id: Uuid,
     principal_id: Uuid,
     action: String,
+    #[serde(default)]
+    plugin_id: Option<String>,
+    #[serde(default)]
+    capability: Option<String>,
+    #[serde(default)]
+    execution_class: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SessionPolicyCheckResponse {
     allowed: bool,
     reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct GrantHotPathOverrideRequest {
+    plugin_id: String,
+    capability: String,
+    execution_class: String,
+    scope: String,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct RevokeHotPathOverrideRequest {
+    plugin_id: String,
+    capability: String,
+    execution_class: String,
+    scope: String,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ListHotPathOverridesRequest {
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    context: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ListHotPathOverridesResponse {
+    entries: Vec<HotPathOverrideEntry>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct HotPathOverrideEntry {
+    plugin_id: String,
+    capability: String,
+    execution_class: String,
+    scope: String,
+    #[serde(default)]
+    session_id: Option<Uuid>,
+    #[serde(default)]
+    context_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -385,15 +793,16 @@ mod tests {
     use super::*;
     use bmux_plugin::ServiceCaller;
     use bmux_plugin_sdk::{
-        ApiVersion, HostConnectionInfo, HostKernelBridge, HostMetadata, HostScope,
-        NativeServiceContext, ProviderId, RegisteredService, ServiceKind, ServiceRequest,
-        SessionListResponse, SessionSummary,
+        ApiVersion, ContextListResponse, ContextSummary, HostConnectionInfo, HostKernelBridge,
+        HostMetadata, HostScope, NativeServiceContext, ProviderId, RegisteredService, ServiceKind,
+        ServiceRequest, SessionListResponse, SessionSummary,
     };
     use std::path::PathBuf;
     use std::sync::Mutex;
 
     struct MockHost {
         sessions: Vec<SessionSummary>,
+        contexts: Vec<ContextSummary>,
         selected_session_id: Option<Uuid>,
         storage: Mutex<BTreeMap<String, Vec<u8>>>,
     }
@@ -406,6 +815,11 @@ mod tests {
                     name: Some(name.to_string()),
                     client_count: 1,
                 }],
+                contexts: vec![ContextSummary {
+                    id: Uuid::from_u128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbbbbbbbbbb),
+                    name: Some("default".to_string()),
+                    attributes: BTreeMap::new(),
+                }],
                 selected_session_id: Some(id),
                 storage: Mutex::new(BTreeMap::new()),
             }
@@ -413,6 +827,11 @@ mod tests {
 
         fn with_sessions(sessions: Vec<SessionSummary>) -> Self {
             Self {
+                contexts: vec![ContextSummary {
+                    id: Uuid::from_u128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbbbbbbbbbb),
+                    name: Some("default".to_string()),
+                    attributes: BTreeMap::new(),
+                }],
                 selected_session_id: sessions.first().map(|session| session.id),
                 sessions,
                 storage: Mutex::new(BTreeMap::new()),
@@ -425,6 +844,11 @@ mod tests {
         ) -> Self {
             Self {
                 sessions,
+                contexts: vec![ContextSummary {
+                    id: Uuid::from_u128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbbbbbbbbbb),
+                    name: Some("default".to_string()),
+                    attributes: BTreeMap::new(),
+                }],
                 selected_session_id,
                 storage: Mutex::new(BTreeMap::new()),
             }
@@ -470,6 +894,9 @@ mod tests {
                         .insert(request.key, request.value);
                     encode_service_message(&())
                 }
+                ("context-query/v1", "list") => encode_service_message(&ContextListResponse {
+                    contexts: self.contexts.clone(),
+                }),
                 _ => Err(bmux_plugin_sdk::PluginError::UnsupportedHostOperation {
                     operation: "mock_service",
                 }),
@@ -725,6 +1152,10 @@ mod tests {
                 client_id,
                 principal_id: Uuid::new_v4(),
                 action: "mutation".to_string(),
+                context_id: None,
+                plugin_id: None,
+                capability: None,
+                execution_class: None,
             },
         )
         .expect("policy evaluation should succeed");
@@ -737,6 +1168,10 @@ mod tests {
                 client_id,
                 principal_id: Uuid::new_v4(),
                 action: "admin".to_string(),
+                context_id: None,
+                plugin_id: None,
+                capability: None,
+                execution_class: None,
             },
         )
         .expect("policy evaluation should succeed");
@@ -766,6 +1201,10 @@ mod tests {
                 client_id,
                 principal_id: Uuid::new_v4(),
                 action: "mutation".to_string(),
+                context_id: None,
+                plugin_id: None,
+                capability: None,
+                execution_class: None,
             },
         )
         .expect("policy evaluation should succeed");
@@ -778,6 +1217,10 @@ mod tests {
                 client_id,
                 principal_id: Uuid::new_v4(),
                 action: "admin".to_string(),
+                context_id: None,
+                plugin_id: None,
+                capability: None,
+                execution_class: None,
             },
         )
         .expect("policy evaluation should succeed");
@@ -807,6 +1250,10 @@ mod tests {
                 client_id,
                 principal_id: Uuid::new_v4(),
                 action: "admin".to_string(),
+                context_id: None,
+                plugin_id: None,
+                capability: None,
+                execution_class: None,
             },
         )
         .expect("policy evaluation should succeed");
@@ -836,6 +1283,10 @@ mod tests {
                 client_id,
                 principal_id: Uuid::new_v4(),
                 action: "context.close".to_string(),
+                context_id: None,
+                plugin_id: None,
+                capability: None,
+                execution_class: None,
             },
         )
         .expect("policy evaluation should succeed");
@@ -865,6 +1316,10 @@ mod tests {
                 client_id,
                 principal_id: Uuid::new_v4(),
                 action: "context.select".to_string(),
+                context_id: None,
+                plugin_id: None,
+                capability: None,
+                execution_class: None,
             },
         )
         .expect("policy evaluation should succeed");
@@ -894,6 +1349,10 @@ mod tests {
                 client_id,
                 principal_id: Uuid::new_v4(),
                 action: "pane_split".to_string(),
+                context_id: None,
+                plugin_id: None,
+                capability: None,
+                execution_class: None,
             },
         )
         .expect("policy evaluation should succeed");
@@ -919,6 +1378,10 @@ mod tests {
                 client_id,
                 principal_id: Uuid::new_v4(),
                 action: "mutation".to_string(),
+                context_id: None,
+                plugin_id: None,
+                capability: None,
+                execution_class: None,
             },
         )
         .expect("policy evaluation should succeed");
@@ -956,6 +1419,10 @@ mod tests {
                 client_id,
                 principal_id: Uuid::new_v4(),
                 action: "admin".to_string(),
+                context_id: None,
+                plugin_id: None,
+                capability: None,
+                execution_class: None,
             },
         )
         .expect("policy evaluation should succeed");
@@ -1086,6 +1553,10 @@ mod tests {
                 client_id,
                 principal_id: Uuid::new_v4(),
                 action: "mutation".to_string(),
+                context_id: None,
+                plugin_id: None,
+                capability: None,
+                execution_class: None,
             })
             .expect("policy request should encode"),
             "bmux.sessions.policy",
@@ -1180,6 +1651,10 @@ mod tests {
                 client_id: Uuid::new_v4(),
                 principal_id: Uuid::new_v4(),
                 action: "mutation".to_string(),
+                context_id: None,
+                plugin_id: None,
+                capability: None,
+                execution_class: None,
             })
             .expect("policy request should encode"),
             "bmux.sessions.policy",
@@ -1271,6 +1746,10 @@ mod tests {
                 client_id,
                 principal_id: Uuid::new_v4(),
                 action: "unknown-action".to_string(),
+                context_id: None,
+                plugin_id: None,
+                capability: None,
+                execution_class: None,
             })
             .expect("policy request should encode"),
             "bmux.sessions.policy",
@@ -1292,5 +1771,62 @@ mod tests {
                 .reason
                 .is_some_and(|reason| reason.contains("invalid session policy action"))
         );
+    }
+
+    #[test]
+    fn hot_path_execution_denies_interpreter_without_override() {
+        let session_id = Uuid::new_v4();
+        let context_id = Uuid::from_u128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbbbbbbbbbb);
+        let host = MockHost::with_session(session_id, "alpha");
+        let decision = evaluate_policy(
+            &host,
+            &SessionPolicyCheckRequest {
+                session_id,
+                context_id: Some(context_id),
+                client_id: Uuid::new_v4(),
+                principal_id: Uuid::new_v4(),
+                action: "hot_path_execution".to_string(),
+                plugin_id: Some("example.interpreter".to_string()),
+                capability: Some("bmux.terminal.input_intercept".to_string()),
+                execution_class: Some("interpreter".to_string()),
+            },
+        )
+        .expect("policy evaluation should succeed");
+        assert!(!decision.allowed);
+    }
+
+    #[test]
+    fn hot_path_execution_allows_with_scoped_override() {
+        let session_id = Uuid::new_v4();
+        let context_id = Uuid::from_u128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbbbbbbbbbb);
+        let host = MockHost::with_session(session_id, "alpha");
+        grant_hot_path_override(
+            &host,
+            GrantHotPathOverrideRequest {
+                plugin_id: "example.interpreter".to_string(),
+                capability: "bmux.terminal.input_intercept".to_string(),
+                execution_class: "interpreter".to_string(),
+                scope: "session_context".to_string(),
+                session: Some("alpha".to_string()),
+                context: Some("default".to_string()),
+            },
+        )
+        .expect("override grant should succeed");
+
+        let decision = evaluate_policy(
+            &host,
+            &SessionPolicyCheckRequest {
+                session_id,
+                context_id: Some(context_id),
+                client_id: Uuid::new_v4(),
+                principal_id: Uuid::new_v4(),
+                action: "hot_path_execution".to_string(),
+                plugin_id: Some("example.interpreter".to_string()),
+                capability: Some("bmux.terminal.input_intercept".to_string()),
+                execution_class: Some("interpreter".to_string()),
+            },
+        )
+        .expect("policy evaluation should succeed");
+        assert!(decision.allowed);
     }
 }

@@ -1,3 +1,4 @@
+execution_class = "native_fast"
 id = "bmux.permissions"
 name = "bmux Permissions"
 provided_capabilities = [
@@ -28,6 +29,11 @@ kind         = "command"
 capability   = "bmux.sessions.policy"
 interface_id = "session-policy-query/v1"
 kind         = "query"
+
+[[services]]
+capability   = "bmux.sessions.policy"
+interface_id = "session-policy-command/v1"
+kind         = "command"
 
 [[commands]]
 aliases       = [["session", "permissions"]]
@@ -120,3 +126,126 @@ value_name = "CLIENT"
 
 [keybindings.runtime]
 "shift+p" = "plugin:bmux.permissions:permissions-current"
+
+[[commands]]
+aliases       = [["session", "grant-hot-path-override"]]
+expose_in_cli = true
+name          = "grant-hot-path-override"
+path          = ["grant-hot-path-override"]
+summary       = "Grant scoped hot-path override"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "plugin"
+name       = "plugin"
+required   = true
+value_name = "PLUGIN"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "capability"
+name       = "capability"
+required   = true
+value_name = "CAPABILITY"
+
+[[commands.arguments]]
+kind       = "choice"
+long       = "execution-class"
+name       = "execution-class"
+required   = true
+value_name = "EXECUTION_CLASS"
+values     = ["native_standard", "interpreter"]
+
+[[commands.arguments]]
+kind       = "choice"
+long       = "scope"
+name       = "scope"
+required   = true
+value_name = "SCOPE"
+values     = ["global", "session", "context", "session_context"]
+
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+value_name = "SESSION"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "context"
+name       = "context"
+value_name = "CONTEXT"
+
+[[commands]]
+aliases       = [["session", "revoke-hot-path-override"]]
+expose_in_cli = true
+name          = "revoke-hot-path-override"
+path          = ["revoke-hot-path-override"]
+summary       = "Revoke scoped hot-path override"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "plugin"
+name       = "plugin"
+required   = true
+value_name = "PLUGIN"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "capability"
+name       = "capability"
+required   = true
+value_name = "CAPABILITY"
+
+[[commands.arguments]]
+kind       = "choice"
+long       = "execution-class"
+name       = "execution-class"
+required   = true
+value_name = "EXECUTION_CLASS"
+values     = ["native_standard", "interpreter"]
+
+[[commands.arguments]]
+kind       = "choice"
+long       = "scope"
+name       = "scope"
+required   = true
+value_name = "SCOPE"
+values     = ["global", "session", "context", "session_context"]
+
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+value_name = "SESSION"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "context"
+name       = "context"
+value_name = "CONTEXT"
+
+[[commands]]
+aliases       = [["session", "list-hot-path-overrides"]]
+expose_in_cli = true
+name          = "list-hot-path-overrides"
+path          = ["list-hot-path-overrides"]
+summary       = "List scoped hot-path overrides"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "session"
+name       = "session"
+value_name = "SESSION"
+
+[[commands.arguments]]
+kind       = "string"
+long       = "context"
+name       = "context"
+value_name = "CONTEXT"
+
+[[commands.arguments]]
+kind  = "boolean"
+long  = "json"
+name  = "json"
+short = "j"

@@ -1,4 +1,5 @@
 use super::super::*;
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 const ATTACH_CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
@@ -468,6 +469,114 @@ pub(crate) fn plugin_fallback_new_context_id(
     after_context_id.filter(|context_id| new_context_ids.contains(context_id))
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct HotPathExecutionPolicyCheckRequest {
+    session_id: Uuid,
+    #[serde(default)]
+    context_id: Option<Uuid>,
+    client_id: Uuid,
+    principal_id: Uuid,
+    action: String,
+    plugin_id: String,
+    capability: String,
+    execution_class: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct HotPathExecutionPolicyCheckResponse {
+    allowed: bool,
+    reason: Option<String>,
+}
+
+async fn enforce_hot_path_plugin_policy(
+    client: &mut BmuxClient,
+    plugin_id: &str,
+    command_name: &str,
+    attached_session_id: Uuid,
+    attached_context_id: Option<Uuid>,
+) -> std::result::Result<(), ClientError> {
+    let hints = plugin_command_policy_hints(plugin_id, command_name).map_err(|error| {
+        ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::InvalidRequest,
+            message: error.to_string(),
+        }
+    })?;
+
+    if !matches!(
+        hints.execution,
+        bmux_plugin_sdk::CommandExecutionKind::RuntimeHook
+    ) {
+        return Ok(());
+    }
+
+    if matches!(
+        hints.execution_class,
+        bmux_plugin::PluginExecutionClass::NativeFast
+    ) {
+        return Ok(());
+    }
+
+    let Some(hot_path_capability) = hints
+        .required_capabilities
+        .iter()
+        .find(|capability| capability.is_hot_path())
+    else {
+        return Ok(());
+    };
+
+    let client_id = client.whoami().await?;
+    let principal_info = client.whoami_principal().await?;
+    let request = HotPathExecutionPolicyCheckRequest {
+        session_id: attached_session_id,
+        context_id: attached_context_id,
+        client_id,
+        principal_id: principal_info.principal_id,
+        action: "hot_path_execution".to_string(),
+        plugin_id: plugin_id.to_string(),
+        capability: hot_path_capability.to_string(),
+        execution_class: match hints.execution_class {
+            bmux_plugin::PluginExecutionClass::NativeFast => "native_fast",
+            bmux_plugin::PluginExecutionClass::NativeStandard => "native_standard",
+            bmux_plugin::PluginExecutionClass::Interpreter => "interpreter",
+        }
+        .to_string(),
+    };
+    let payload = bmux_plugin_sdk::encode_service_message(&request).map_err(|error| {
+        ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::Internal,
+            message: format!("failed to encode hot-path policy request: {error}"),
+        }
+    })?;
+    let response_payload = client
+        .invoke_service_raw(
+            "bmux.sessions.policy",
+            InvokeServiceKind::Query,
+            "session-policy-query/v1",
+            "check",
+            payload,
+        )
+        .await?;
+    let response: HotPathExecutionPolicyCheckResponse =
+        bmux_plugin_sdk::decode_service_message(&response_payload).map_err(|error| {
+            ClientError::ServerError {
+                code: bmux_ipc::ErrorCode::Internal,
+                message: format!("failed to decode hot-path policy response: {error}"),
+            }
+        })?;
+    if response.allowed {
+        Ok(())
+    } else {
+        Err(ClientError::ServerError {
+            code: bmux_ipc::ErrorCode::InvalidRequest,
+            message: response.reason.unwrap_or_else(|| {
+                format!(
+                    "hot-path plugin execution denied for {plugin_id}:{command_name}; grant scoped override or use execution_class=native_fast"
+                )
+            }),
+        })
+    }
+}
+
 pub(crate) async fn handle_attach_plugin_command_action(
     client: &mut BmuxClient,
     plugin_id: &str,
@@ -492,6 +601,33 @@ pub(crate) async fn handle_attach_plugin_command_action(
         attached_session_id = %view_state.attached_id,
         "attach.plugin_command.start"
     );
+    if let Err(error) = enforce_hot_path_plugin_policy(
+        client,
+        plugin_id,
+        command_name,
+        view_state.attached_id,
+        view_state.attached_context_id,
+    )
+    .await
+    {
+        warn!(
+            plugin_id = %plugin_id,
+            command_name = %command_name,
+            error = %error,
+            attached_context_id = ?view_state.attached_context_id,
+            attached_session_id = %view_state.attached_id,
+            "attach.plugin_command.policy_denied"
+        );
+        view_state.set_transient_status(
+            format!(
+                "plugin action denied by policy: {}",
+                map_attach_client_error(error)
+            ),
+            Instant::now(),
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
+        return Ok(());
+    }
     match run_plugin_keybinding_command(plugin_id, command_name, &[]) {
         Err(error) => {
             warn!(

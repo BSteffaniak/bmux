@@ -1,4 +1,6 @@
-use crate::{PluginDeclaration, PluginDependency, PluginEntrypoint, PluginId};
+use crate::{
+    PluginDeclaration, PluginDependency, PluginEntrypoint, PluginExecutionClass, PluginId,
+};
 use bmux_plugin_sdk::{
     ApiVersion, HostScope, PluginCommand, PluginError, PluginEventSubscription, PluginFeature,
     PluginService, Result, VersionRange,
@@ -67,6 +69,8 @@ pub struct PluginManifest {
     pub homepage: Option<String>,
     #[serde(default)]
     pub provider_priority: i32,
+    #[serde(default)]
+    pub execution_class: PluginExecutionClass,
     #[serde(default)]
     pub runtime: PluginRuntime,
     #[serde(default)]
@@ -151,6 +155,7 @@ impl PluginManifest {
             description: self.description.clone(),
             homepage: self.homepage.clone(),
             provider_priority: self.provider_priority,
+            execution_class: self.execution_class,
             required_capabilities: self.required_capabilities.clone(),
             provided_capabilities: self.provided_capabilities.clone(),
             provided_features: self.provided_features.clone(),
@@ -200,6 +205,7 @@ fn default_dependency_version_req() -> String {
 #[cfg(test)]
 mod tests {
     use super::PluginManifest;
+    use crate::PluginExecutionClass;
     use bmux_plugin_sdk::HostScope;
 
     #[test]
@@ -347,5 +353,35 @@ minimum = "1.5"
 
         let declaration = manifest.to_declaration().expect("declaration should build");
         assert_eq!(declaration.id.as_str(), "test.custom_compat");
+    }
+
+    #[test]
+    fn execution_class_defaults_to_native_standard() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "test.execution.default"
+name = "Execution Default"
+version = "0.1.0"
+"#,
+        )
+        .expect("manifest should parse");
+        assert_eq!(
+            manifest.execution_class,
+            PluginExecutionClass::NativeStandard
+        );
+    }
+
+    #[test]
+    fn execution_class_parses_interpreter() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "test.execution.interpreter"
+name = "Execution Interpreter"
+version = "0.1.0"
+execution_class = "interpreter"
+"#,
+        )
+        .expect("manifest should parse");
+        assert_eq!(manifest.execution_class, PluginExecutionClass::Interpreter);
     }
 }

@@ -6371,9 +6371,17 @@ fn resolve_session_request_session_id(
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct SessionPolicyCheckRequest {
     session_id: Uuid,
+    #[serde(default)]
+    context_id: Option<Uuid>,
     client_id: Uuid,
     principal_id: Uuid,
     action: String,
+    #[serde(default)]
+    plugin_id: Option<String>,
+    #[serde(default)]
+    capability: Option<String>,
+    #[serde(default)]
+    execution_class: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -6398,9 +6406,13 @@ async fn check_session_policy(
     };
     let payload = encode(&SessionPolicyCheckRequest {
         session_id: session_id.0,
+        context_id: None,
         client_id: client_id.0,
         principal_id: client_principal_id,
         action: action.to_string(),
+        plugin_id: None,
+        capability: None,
+        execution_class: None,
     })
     .map_err(|error| ErrorResponse {
         code: ErrorCode::Internal,
