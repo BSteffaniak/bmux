@@ -183,6 +183,9 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
             let as_json = has_flag(&context.arguments, "json");
             let requested_watch = has_flag(&context.arguments, "watch");
             let compact = has_flag(&context.arguments, "compact");
+            if as_json && compact {
+                return Err("--json and --compact cannot be used together".to_string());
+            }
             let iterations_arg = option_value(&context.arguments, "iterations");
             let watch = requested_watch || (compact && iterations_arg.is_none());
             let interval_ms = option_value(&context.arguments, "interval-ms")
