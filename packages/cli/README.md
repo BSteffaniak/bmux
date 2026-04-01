@@ -69,6 +69,8 @@ bmux remote init prod --ssh bmux@prod.example.com --set-default
 bmux remote install-server prod
 bmux remote upgrade prod
 bmux connect prod --reconnect-forever
+bmux remote complete targets
+bmux remote complete sessions prod
 
 # run an internet-accessible TLS gateway
 bmux server gateway --listen 0.0.0.0:7443 --quick

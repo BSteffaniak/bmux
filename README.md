@@ -71,6 +71,8 @@ bmux remote install-server prod
 bmux remote upgrade prod
 bmux --target prod list-sessions
 bmux connect prod --reconnect-forever
+bmux remote complete targets
+bmux remote complete sessions prod
 
 # Internet-accessible TLS gateway
 bmux server gateway --listen 0.0.0.0:7443 --quick

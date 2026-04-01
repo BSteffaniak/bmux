@@ -344,6 +344,22 @@ pub enum RemoteCommand {
         /// Target name (omit to upgrade all configured targets)
         target: Option<String>,
     },
+    /// Shell completion helpers for targets/sessions
+    Complete {
+        #[command(subcommand)]
+        command: RemoteCompleteCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RemoteCompleteCommand {
+    /// Print target names for completion
+    Targets,
+    /// Print session names for a target
+    Sessions {
+        /// Target name
+        target: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -922,8 +938,8 @@ mod tests {
         RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
         RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode,
         RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg, RecordingRenderMode,
-        RecordingReplayMode, RemoteCommand, ServerCommand, SessionCommand, TerminalCommand,
-        TraceFamily,
+        RecordingReplayMode, RemoteCommand, RemoteCompleteCommand, ServerCommand, SessionCommand,
+        TerminalCommand, TraceFamily,
     };
     use clap::Parser;
 
@@ -978,6 +994,21 @@ mod tests {
         assert!(matches!(
             command,
             RemoteCommand::Doctor { target, fix } if target == "prod" && fix
+        ));
+    }
+
+    #[test]
+    fn parses_remote_complete_sessions_command() {
+        let cli = Cli::try_parse_from(["bmux", "remote", "complete", "sessions", "prod"])
+            .expect("valid CLI args");
+        let Some(Command::Remote { command }) = cli.command else {
+            panic!("expected remote command");
+        };
+        assert!(matches!(
+            command,
+            RemoteCommand::Complete {
+                command: RemoteCompleteCommand::Sessions { target }
+            } if target == "prod"
         ));
     }
 
@@ -1045,6 +1076,31 @@ mod tests {
                 && !quick
                 && cert_file.as_deref() == Some("cert.pem")
                 && key_file.as_deref() == Some("key.pem")
+        ));
+    }
+
+    #[test]
+    fn parses_server_gateway_quick_mode() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "server",
+            "gateway",
+            "--listen",
+            "0.0.0.0:7443",
+            "--quick",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Gateway {
+                listen,
+                quick,
+                cert_file,
+                key_file,
+            } if listen == "0.0.0.0:7443" && quick && cert_file.is_none() && key_file.is_none()
         ));
     }
 

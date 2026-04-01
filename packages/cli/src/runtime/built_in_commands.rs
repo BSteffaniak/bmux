@@ -29,6 +29,9 @@ pub enum BuiltInHandlerId {
     RemoteInit,
     RemoteInstallServer,
     RemoteUpgrade,
+    RemoteComplete,
+    RemoteCompleteTargets,
+    RemoteCompleteSessions,
     Server,
     ServerStart,
     ServerStatus,
@@ -234,6 +237,21 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::RemoteUpgrade,
             &["remote", "upgrade"],
             "Upgrade remote bmux runtime on targets",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RemoteComplete,
+            &["remote", "complete"],
+            "Shell completion helpers",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RemoteCompleteTargets,
+            &["remote", "complete", "targets"],
+            "Print target completions",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RemoteCompleteSessions,
+            &["remote", "complete", "sessions"],
+            "Print session completions",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Server,

@@ -37,6 +37,10 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             RemoteCommand::Init { .. } => BuiltInHandlerId::RemoteInit,
             RemoteCommand::InstallServer { .. } => BuiltInHandlerId::RemoteInstallServer,
             RemoteCommand::Upgrade { .. } => BuiltInHandlerId::RemoteUpgrade,
+            RemoteCommand::Complete { command } => match command {
+                RemoteCompleteCommand::Targets => BuiltInHandlerId::RemoteCompleteTargets,
+                RemoteCompleteCommand::Sessions { .. } => BuiltInHandlerId::RemoteCompleteSessions,
+            },
         },
         Command::Server { command } => match command {
             ServerCommand::Start { .. } => BuiltInHandlerId::ServerStart,
@@ -271,6 +275,24 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 command: RemoteCommand::Upgrade { target },
             },
         ) => run_remote_upgrade(target.as_deref()).await,
+        (
+            BuiltInHandlerId::RemoteCompleteTargets,
+            Command::Remote {
+                command:
+                    RemoteCommand::Complete {
+                        command: RemoteCompleteCommand::Targets,
+                    },
+            },
+        ) => run_remote_complete_targets(),
+        (
+            BuiltInHandlerId::RemoteCompleteSessions,
+            Command::Remote {
+                command:
+                    RemoteCommand::Complete {
+                        command: RemoteCompleteCommand::Sessions { target },
+                    },
+            },
+        ) => run_remote_complete_sessions(target).await,
         (
             BuiltInHandlerId::ServerStart,
             Command::Server {

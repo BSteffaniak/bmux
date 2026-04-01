@@ -11,7 +11,8 @@ use bmux_cli_schema::{
     RecordingCommand, RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
     RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode, RecordingEventKindArg,
     RecordingExportFormat, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
-    RemoteCommand, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
+    RemoteCommand, RemoteCompleteCommand, ServerCommand, SessionCommand, TerminalCommand,
+    TraceFamily,
 };
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
 use bmux_config::{

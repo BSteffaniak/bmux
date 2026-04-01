@@ -379,13 +379,14 @@ pub(super) async fn run_remote_test(target: &str) -> Result<u8> {
 pub(super) async fn run_remote_doctor(target: &str, fix: bool) -> Result<u8> {
     let config = BmuxConfig::load()?;
     let resolved = resolve_target_reference(&config, target)?;
+    println!("remote doctor: target='{target}' fix={fix}");
     match resolved {
         ResolvedTarget::Local => {
-            println!("target '{target}' transport: local");
+            print_doctor_step_ok("transport", "local");
             let mut client =
                 connect(ConnectionPolicyScope::Normal, "bmux-cli-remote-doctor").await?;
             client.ping().await.map_err(map_cli_client_error)?;
-            println!("local server reachable");
+            print_doctor_step_ok("server", "local server reachable");
             Ok(0)
         }
         ResolvedTarget::Ssh(ssh_target) => {
@@ -398,19 +399,23 @@ pub(super) async fn run_remote_doctor(target: &str, fix: bool) -> Result<u8> {
             }
             let stderr = String::from_utf8_lossy(&version.stderr);
             if !stderr.trim().is_empty() {
-                println!("{}", stderr.trim());
+                print_doctor_step_ok("ssh", stderr.trim());
             }
             if let Err(error) =
                 run_ssh_bmux_command(&ssh_target, &[OsString::from("--version")], false)
             {
                 if fix {
-                    println!(
-                        "doctor: remote bmux missing/unhealthy; attempting install-server fix..."
+                    print_doctor_step_warn(
+                        "bmux",
+                        "remote bmux missing/unhealthy; attempting install-server fix",
                     );
                     run_remote_install_server_for_target(&ssh_target).await?;
+                    print_doctor_step_ok("bmux", "install-server fix succeeded");
                 } else {
                     return Err(error);
                 }
+            } else {
+                print_doctor_step_ok("bmux", "remote bmux binary is available");
             }
             run_ssh_bmux_command(
                 &ssh_target,
@@ -421,16 +426,21 @@ pub(super) async fn run_remote_doctor(target: &str, fix: bool) -> Result<u8> {
                 ],
                 false,
             )?;
-            println!("target '{}' doctor: OK", ssh_target.label);
+            print_doctor_step_ok("server", "remote server status check succeeded");
+            println!("doctor result: OK ({})", ssh_target.label);
             Ok(0)
         }
         ResolvedTarget::Tls(tls_target) => {
             let mut client = connect_tls_bridge(&tls_target, "bmux-cli-remote-doctor-tls").await?;
             client.ping().await.map_err(map_cli_client_error)?;
-            println!(
-                "target '{}' doctor: OK (tls {}:{})",
-                tls_target.label, tls_target.host, tls_target.port
+            print_doctor_step_ok(
+                "tls",
+                &format!(
+                    "handshake and ping succeeded ({}:{})",
+                    tls_target.host, tls_target.port
+                ),
             );
+            println!("doctor result: OK ({})", tls_target.label);
             Ok(0)
         }
     }
@@ -539,6 +549,64 @@ pub(super) async fn run_remote_upgrade(target: Option<&str>) -> Result<u8> {
     }
     println!("remote upgrade completed for {upgraded} SSH target(s)");
     Ok(0)
+}
+
+pub(super) fn run_remote_complete_targets() -> Result<u8> {
+    let config = BmuxConfig::load()?;
+    let mut names = config
+        .connections
+        .targets
+        .keys()
+        .cloned()
+        .collect::<Vec<_>>();
+    names.sort();
+    names.sort_by_key(|name| {
+        config
+            .connections
+            .recent_targets
+            .iter()
+            .position(|value| value == name)
+            .unwrap_or(usize::MAX)
+    });
+    for name in names {
+        println!("{name}");
+    }
+    Ok(0)
+}
+
+pub(super) async fn run_remote_complete_sessions(target: &str) -> Result<u8> {
+    let config = BmuxConfig::load()?;
+    let resolved = resolve_target_reference(&config, target)?;
+    let mut client = match resolved {
+        ResolvedTarget::Local => {
+            connect(
+                ConnectionPolicyScope::Normal,
+                "bmux-cli-complete-sessions-local",
+            )
+            .await?
+        }
+        ResolvedTarget::Ssh(ssh_target) => {
+            connect_remote_bridge(&ssh_target, "bmux-cli-complete-sessions-ssh").await?
+        }
+        ResolvedTarget::Tls(tls_target) => {
+            connect_tls_bridge(&tls_target, "bmux-cli-complete-sessions-tls").await?
+        }
+    };
+    let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
+    let ordered = sessions_ordered_by_recent(target, &sessions)?;
+    for session in ordered {
+        let value = session.name.unwrap_or_else(|| session.id.to_string());
+        println!("{value}");
+    }
+    Ok(0)
+}
+
+fn print_doctor_step_ok(step: &str, message: &str) {
+    println!("[OK] {step}: {message}");
+}
+
+fn print_doctor_step_warn(step: &str, message: &str) {
+    println!("[WARN] {step}: {message}");
 }
 
 async fn resolve_local_attach_session() -> Result<Option<String>> {
