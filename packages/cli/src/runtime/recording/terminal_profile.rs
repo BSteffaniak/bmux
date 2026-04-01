@@ -168,8 +168,8 @@ impl GhosttyProvider {
                 solid_after_cursor_ms: Some(500),
                 paint_mode: Some(CursorDefaultPaintMode::Fill),
                 text_mode: Some(CursorDefaultTextMode::SwapFgBg),
-                bar_width_pct: Some(12),
-                underline_height_pct: Some(10),
+                bar_width_pct: Some(10),
+                underline_height_pct: Some(8),
                 ..parsed.cursor_defaults
             },
             source: format!("ghostty-config:{}", path.display()),
@@ -189,8 +189,8 @@ impl GhosttyProvider {
                 solid_after_cursor_ms: Some(500),
                 paint_mode: Some(CursorDefaultPaintMode::Fill),
                 text_mode: Some(CursorDefaultTextMode::SwapFgBg),
-                bar_width_pct: Some(12),
-                underline_height_pct: Some(10),
+                bar_width_pct: Some(10),
+                underline_height_pct: Some(8),
                 ..CursorDefaults::default()
             },
             source: "ghostty-default".to_string(),
