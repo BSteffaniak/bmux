@@ -5164,7 +5164,13 @@ async fn handle_request(
                     .lock()
                     .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
                 let mut grant = attach_tokens.issue(next_session_id);
-                grant.context_id = current_context_id_for_client(state, client_id);
+                // Prefer the context that maps to the target session so that
+                // the client's first `refresh_attached_session_from_context`
+                // does not resolve a stale MRU context belonging to a
+                // different session (which would cause a session-id mismatch
+                // and "client is not attached to session runtime" errors).
+                grant.context_id = current_context_id_for_session(state, next_session_id)
+                    .or_else(|| current_context_id_for_client(state, client_id));
                 Response::Ok(ResponsePayload::Attached { grant })
             } else {
                 drop(manager);

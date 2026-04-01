@@ -2288,8 +2288,22 @@ pub(crate) async fn refresh_attached_session_from_context(
             .attach_context_grant(ContextSelector::ById(context_id))
             .await?;
         let previous_session_id = view_state.attached_id;
-        view_state.attached_id = grant.session_id;
-        view_state.attached_context_id = grant.context_id.or(Some(context_id));
+
+        if grant.session_id != previous_session_id {
+            // The context now maps to a different session (e.g. after
+            // snapshot restore or context reassignment).  We must open a
+            // new attach stream so the server registers this client in the
+            // new session's `attached_clients`; without this the next
+            // `attach_layout` or `attach_pane_output_batch` call would
+            // fail with "client is not attached to session runtime".
+            let attach_info = client.open_attach_stream_info(&grant).await?;
+            view_state.attached_id = attach_info.session_id;
+            view_state.attached_context_id = grant.context_id.or(Some(context_id));
+        } else {
+            view_state.attached_id = grant.session_id;
+            view_state.attached_context_id = grant.context_id.or(Some(context_id));
+        }
+
         view_state.last_context_refresh_at = Some(Instant::now());
         trace!(
                 context_id = ?view_state.attached_context_id,
