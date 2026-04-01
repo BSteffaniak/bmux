@@ -1,6 +1,17 @@
 execution_class = "native_fast"
 id = "bmux.permissions"
 name = "bmux Permissions"
+owns_namespaces = [
+    "session",
+    "permissions",
+    "permissions-current",
+    "grant",
+    "revoke",
+    "hot-path-policy",
+    "grant-hot-path-override",
+    "revoke-hot-path-override",
+    "list-hot-path-overrides",
+]
 provided_capabilities = [
     "bmux.permissions.read",
     "bmux.permissions.write",

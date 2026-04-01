@@ -1,6 +1,17 @@
 execution_class = "native_fast"
 id = "bmux.windows"
 name = "bmux Windows"
+owns_namespaces = [
+    "window",
+    "new-window",
+    "list-windows",
+    "kill-window",
+    "kill-all-windows",
+    "switch-window",
+    "next-window",
+    "prev-window",
+    "last-window",
+]
 provided_capabilities = ["bmux.windows.read", "bmux.windows.write"]
 provided_features = ["bmux.windows"]
 required_capabilities = [

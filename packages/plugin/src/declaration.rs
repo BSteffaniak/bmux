@@ -6,6 +6,21 @@ use semver::VersionReq;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PluginOwnedPath(pub Vec<String>);
+
+impl PluginOwnedPath {
+    #[must_use]
+    pub fn matches(&self, path: &[String]) -> bool {
+        self.0 == path
+    }
+
+    #[must_use]
+    pub fn is_valid(&self) -> bool {
+        !self.0.is_empty() && self.0.iter().all(|segment| !segment.trim().is_empty())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct PluginId(String);
 
@@ -92,6 +107,10 @@ pub struct PluginDeclaration {
     #[serde(default)]
     pub execution_class: PluginExecutionClass,
     #[serde(default)]
+    pub owns_namespaces: BTreeSet<String>,
+    #[serde(default)]
+    pub owns_paths: BTreeSet<PluginOwnedPath>,
+    #[serde(default)]
     #[serde(alias = "required_host_scopes")]
     pub required_capabilities: BTreeSet<HostScope>,
     #[serde(default)]
@@ -161,6 +180,23 @@ impl PluginDeclaration {
                         command: command.name.clone(),
                     });
                 }
+            }
+        }
+
+        for namespace in &self.owns_namespaces {
+            if namespace.trim().is_empty() || namespace.split_whitespace().count() != 1 {
+                return Err(PluginError::InvalidPluginCommandPath {
+                    plugin_id: self.id.as_str().to_string(),
+                    command: format!("namespace:{namespace}"),
+                });
+            }
+        }
+        for path in &self.owns_paths {
+            if !path.is_valid() {
+                return Err(PluginError::InvalidPluginCommandPath {
+                    plugin_id: self.id.as_str().to_string(),
+                    command: format!("owned_path:{}", path.0.join(" ")),
+                });
             }
         }
 
@@ -282,6 +318,8 @@ mod tests {
             homepage: None,
             provider_priority: 0,
             execution_class: super::PluginExecutionClass::NativeStandard,
+            owns_namespaces: BTreeSet::new(),
+            owns_paths: BTreeSet::new(),
             required_capabilities: BTreeSet::new(),
             provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::new(),
@@ -335,6 +373,8 @@ mod tests {
             homepage: None,
             provider_priority: 0,
             execution_class: super::PluginExecutionClass::NativeStandard,
+            owns_namespaces: BTreeSet::new(),
+            owns_paths: BTreeSet::new(),
             required_capabilities,
             provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::new(),
@@ -372,6 +412,8 @@ mod tests {
             homepage: None,
             provider_priority: 0,
             execution_class: super::PluginExecutionClass::NativeStandard,
+            owns_namespaces: BTreeSet::new(),
+            owns_paths: BTreeSet::new(),
             required_capabilities: BTreeSet::new(),
             provided_capabilities: BTreeSet::new(),
             provided_features: BTreeSet::new(),

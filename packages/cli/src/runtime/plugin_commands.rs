@@ -1,7 +1,7 @@
 use super::built_in_commands::reserved_built_in_paths;
 use anyhow::{Context, Result, bail};
 use bmux_config::BmuxConfig;
-use bmux_plugin::PluginRegistry;
+use bmux_plugin::{PluginDeclaration, PluginRegistry};
 use bmux_plugin_sdk::{PluginCommand, PluginCommandArgument, PluginCommandArgumentKind};
 use clap::{Arg, ArgAction, ArgMatches, Command};
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,6 +26,8 @@ pub struct RegisteredPluginCommand {
 #[derive(Debug, Default, Clone)]
 pub struct PluginCommandRegistry {
     commands: Vec<RegisteredPluginCommand>,
+    owned_exact_paths: BTreeMap<Vec<String>, String>,
+    owned_namespaces: BTreeMap<String, String>,
 }
 
 impl PluginCommandRegistry {
@@ -36,7 +38,20 @@ impl PluginCommandRegistry {
         let mut claimed: BTreeMap<Vec<String>, (String, String)> = BTreeMap::new();
 
         for plugin in plugins.iter() {
-            if !enabled.contains(&plugin.declaration.id.as_str().to_string()) {
+            let plugin_id = plugin.declaration.id.as_str().to_string();
+            if !enabled.contains(&plugin_id) {
+                continue;
+            }
+            register_plugin_ownership(
+                &mut registry.owned_exact_paths,
+                &mut registry.owned_namespaces,
+                &plugin.declaration,
+            )?;
+        }
+
+        for plugin in plugins.iter() {
+            let plugin_id = plugin.declaration.id.as_str().to_string();
+            if !enabled.contains(&plugin_id) {
                 continue;
             }
 
@@ -47,6 +62,7 @@ impl PluginCommandRegistry {
                 .filter(|command| command.expose_in_cli)
             {
                 let canonical = command.canonical_path();
+                validate_plugin_owns_path(&plugin.declaration, &canonical, &command.name)?;
                 validate_path_collision(
                     &canonical,
                     &reserved,
@@ -71,6 +87,7 @@ impl PluginCommandRegistry {
 
                 let mut aliases = Vec::new();
                 for alias in &command.aliases {
+                    validate_plugin_owns_path(&plugin.declaration, alias, &command.name)?;
                     validate_path_collision(
                         alias,
                         &reserved,
@@ -106,6 +123,16 @@ impl PluginCommandRegistry {
         }
 
         Ok(registry)
+    }
+
+    #[must_use]
+    pub fn owner_for_path(&self, path: &[String]) -> Option<String> {
+        if let Some(owner) = self.owned_exact_paths.get(path) {
+            return Some(owner.clone());
+        }
+        path.first()
+            .and_then(|namespace| self.owned_namespaces.get(namespace))
+            .cloned()
     }
 
     pub fn resolve(&self, raw: &[String]) -> Option<ResolvedPluginCommand> {
@@ -423,6 +450,61 @@ fn is_prefix_collision(left: &[String], right: &[String]) -> bool {
     left != right && (left.starts_with(right) || right.starts_with(left))
 }
 
+fn register_plugin_ownership(
+    owned_exact_paths: &mut BTreeMap<Vec<String>, String>,
+    owned_namespaces: &mut BTreeMap<String, String>,
+    declaration: &PluginDeclaration,
+) -> Result<()> {
+    let plugin_id = declaration.id.as_str().to_string();
+    for namespace in &declaration.owns_namespaces {
+        if let Some(existing) = owned_namespaces.get(namespace)
+            && existing != &plugin_id
+        {
+            bail!(
+                "plugin '{plugin_id}' ownership conflict: namespace '{}' already owned by plugin '{existing}'",
+                namespace
+            );
+        }
+        owned_namespaces.insert(namespace.clone(), plugin_id.clone());
+    }
+
+    for path in &declaration.owns_paths {
+        if let Some(existing) = owned_exact_paths.get(&path.0)
+            && existing != &plugin_id
+        {
+            bail!(
+                "plugin '{plugin_id}' ownership conflict: path '{}' already owned by plugin '{existing}'",
+                path.0.join(" ")
+            );
+        }
+        owned_exact_paths.insert(path.0.clone(), plugin_id.clone());
+    }
+    Ok(())
+}
+
+fn validate_plugin_owns_path(
+    declaration: &PluginDeclaration,
+    path: &[String],
+    command_name: &str,
+) -> Result<()> {
+    let exact = declaration
+        .owns_paths
+        .iter()
+        .any(|candidate| candidate.matches(path));
+    let namespace_owned = path
+        .first()
+        .is_some_and(|segment| declaration.owns_namespaces.contains(segment));
+    if exact || namespace_owned {
+        return Ok(());
+    }
+    bail!(
+        "plugin '{}' command '{}' path '{}' is not within declared ownership (owns_paths/owns_namespaces)",
+        declaration.id.as_str(),
+        command_name,
+        path.join(" ")
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::PluginCommandRegistry;
@@ -446,6 +528,7 @@ id = "example.plugin"
 name = "Example"
 version = "0.1.0"
 entry = "plugin.dylib"
+owns_namespaces = ["acl"]
 
 [[commands]]
 name = "roles"
@@ -489,6 +572,7 @@ name = "Policy"
 version = "0.1.0"
 entry = "plugin.dylib"
 required_capabilities = ["bmux.commands"]
+owns_namespaces = ["roles", "assign", "session"]
 
 [[commands]]
 name = "roles"
@@ -535,6 +619,7 @@ name = "Workspace"
 version = "0.1.0"
 entry = "plugin.dylib"
 required_capabilities = ["bmux.commands"]
+owns_namespaces = ["item", "item-open", "item-focus"]
 
 [[commands]]
 name = "item-open"
@@ -581,6 +666,7 @@ name = "Example"
 version = "0.1.0"
 entry = "plugin.dylib"
 required_capabilities = ["bmux.commands"]
+owns_namespaces = ["new-session"]
 
 [[commands]]
 name = "new-session"
@@ -620,6 +706,7 @@ name = "Workspace"
 version = "0.1.0"
 entry = "plugin.dylib"
 required_capabilities = ["bmux.commands"]
+owns_namespaces = ["item", "item-open"]
 
 [[commands]]
 name = "item-open"
@@ -668,6 +755,7 @@ name = "Policy"
 version = "0.1.0"
 entry = "plugin.dylib"
 required_capabilities = ["bmux.commands"]
+owns_namespaces = ["roles", "session"]
 
 [[commands]]
 name = "roles"
@@ -705,5 +793,152 @@ minimum = "1.0"
             .expect("plugin session alias should parse under mixed namespace");
         let (path, _) = super::selected_subcommand_path(&matches);
         assert_eq!(path, vec!["session".to_string(), "roles".to_string()]);
+    }
+
+    #[test]
+    fn ownership_exact_path_takes_precedence_over_namespace() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "owner.plugin"
+name = "Owner"
+version = "0.1.0"
+entry = "owner.dylib"
+owns_namespaces = ["workspace"]
+owns_paths = [["workspace", "doctor"]]
+required_capabilities = ["bmux.commands"]
+
+[[commands]]
+name = "doctor"
+path = ["workspace", "doctor"]
+summary = "doctor"
+execution = "provider_exec"
+expose_in_cli = true
+
+[[commands]]
+name = "probe"
+path = ["workspace", "probe"]
+summary = "probe"
+execution = "provider_exec"
+expose_in_cli = true
+"#,
+        )
+        .expect("manifest should parse");
+        let mut plugins = PluginRegistry::new();
+        plugins
+            .register_manifest_from_root(
+                Path::new("/plugins"),
+                Path::new("/plugins/plugin.toml"),
+                manifest,
+            )
+            .expect("manifest should register");
+        let registry = PluginCommandRegistry::build(&config_with_enabled("owner.plugin"), &plugins)
+            .expect("registry should build");
+        assert_eq!(
+            registry.owner_for_path(&["workspace".to_string(), "doctor".to_string()]),
+            Some("owner.plugin".to_string())
+        );
+        assert_eq!(
+            registry.owner_for_path(&["workspace".to_string(), "probe".to_string()]),
+            Some("owner.plugin".to_string())
+        );
+        assert_eq!(
+            registry.owner_for_path(&["workspace".to_string(), "doctor".to_string()]),
+            Some("owner.plugin".to_string())
+        );
+    }
+
+    #[test]
+    fn build_rejects_command_outside_declared_ownership() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "invalid.plugin"
+name = "Invalid"
+version = "0.1.0"
+entry = "invalid.dylib"
+owns_namespaces = ["window"]
+required_capabilities = ["bmux.commands"]
+
+[[commands]]
+name = "bad"
+path = ["logs", "tail"]
+summary = "bad"
+execution = "provider_exec"
+expose_in_cli = true
+"#,
+        )
+        .expect("manifest should parse");
+        let mut plugins = PluginRegistry::new();
+        plugins
+            .register_manifest_from_root(
+                Path::new("/plugins"),
+                Path::new("/plugins/plugin.toml"),
+                manifest,
+            )
+            .expect("manifest should register");
+        let error = PluginCommandRegistry::build(&config_with_enabled("invalid.plugin"), &plugins)
+            .expect_err("registry build should fail for unowned command path");
+        assert!(error.to_string().contains("not within declared ownership"));
+    }
+
+    #[test]
+    fn build_rejects_namespace_ownership_conflicts() {
+        let first = PluginManifest::from_toml_str(
+            r#"
+id = "first.plugin"
+name = "First"
+version = "0.1.0"
+entry = "first.dylib"
+owns_namespaces = ["logs"]
+required_capabilities = ["bmux.commands"]
+
+[[commands]]
+name = "list"
+path = ["logs", "list"]
+summary = "list"
+execution = "provider_exec"
+expose_in_cli = true
+"#,
+        )
+        .expect("first manifest should parse");
+        let second = PluginManifest::from_toml_str(
+            r#"
+id = "second.plugin"
+name = "Second"
+version = "0.1.0"
+entry = "second.dylib"
+owns_namespaces = ["logs"]
+required_capabilities = ["bmux.commands"]
+
+[[commands]]
+name = "tail"
+path = ["logs", "tail"]
+summary = "tail"
+execution = "provider_exec"
+expose_in_cli = true
+"#,
+        )
+        .expect("second manifest should parse");
+
+        let mut plugins = PluginRegistry::new();
+        plugins
+            .register_manifest_from_root(
+                Path::new("/plugins"),
+                Path::new("/plugins/first.toml"),
+                first,
+            )
+            .expect("first should register");
+        plugins
+            .register_manifest_from_root(
+                Path::new("/plugins"),
+                Path::new("/plugins/second.toml"),
+                second,
+            )
+            .expect("second should register");
+
+        let mut config = BmuxConfig::default();
+        config.plugins.enabled = vec!["first.plugin".to_string(), "second.plugin".to_string()];
+        let error = PluginCommandRegistry::build(&config, &plugins)
+            .expect_err("registry build should fail for namespace ownership conflict");
+        assert!(error.to_string().contains("ownership conflict"));
     }
 }

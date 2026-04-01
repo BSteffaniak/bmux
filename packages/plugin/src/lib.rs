@@ -21,7 +21,7 @@ mod registry;
 
 pub use declaration::{
     NativePlugin, PluginDeclaration, PluginDependency, PluginEntrypoint, PluginExecutionClass,
-    PluginId, PluginLifecycle,
+    PluginId, PluginLifecycle, PluginOwnedPath,
 };
 pub use discovery::{
     DEFAULT_PLUGIN_MANIFEST_FILE, PluginDiscoveryReport, discover_plugin_manifests,

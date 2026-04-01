@@ -362,6 +362,7 @@ pub(super) fn validate_enabled_plugins(
         .collect::<std::collections::BTreeSet<_>>();
     let enabled_plugins = effective_enabled_plugins(config, registry);
     if enabled_plugins.is_empty() {
+        validate_required_plugin_ownership(config, registry)?;
         return Ok(());
     }
 
@@ -392,7 +393,85 @@ pub(super) fn validate_enabled_plugins(
     command_config.plugins.enabled = enabled_plugins;
     PluginCommandRegistry::build(&command_config, registry)
         .context("failed building plugin CLI command registry")?;
+    validate_required_plugin_ownership(config, registry)?;
 
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RequiredOwnershipKind {
+    Namespace(&'static str),
+    Path(&'static [&'static str]),
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RequiredPluginOwnership {
+    plugin_id: &'static str,
+    kind: RequiredOwnershipKind,
+}
+
+const REQUIRED_PLUGIN_OWNERSHIP: &[RequiredPluginOwnership] = &[
+    RequiredPluginOwnership {
+        plugin_id: "bmux.plugin_cli",
+        kind: RequiredOwnershipKind::Namespace("plugin"),
+    },
+    RequiredPluginOwnership {
+        plugin_id: "bmux.permissions",
+        kind: RequiredOwnershipKind::Namespace("permissions"),
+    },
+    RequiredPluginOwnership {
+        plugin_id: "bmux.windows",
+        kind: RequiredOwnershipKind::Path(&["new-window"]),
+    },
+];
+
+fn validate_required_plugin_ownership(
+    config: &BmuxConfig,
+    registry: &PluginRegistry,
+) -> Result<()> {
+    let enabled = effective_enabled_plugins(config, registry)
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    for requirement in REQUIRED_PLUGIN_OWNERSHIP {
+        if registry.get(requirement.plugin_id).is_none() {
+            continue;
+        }
+        if !enabled.contains(requirement.plugin_id) {
+            anyhow::bail!(
+                "required plugin '{}' is not enabled (required for command ownership contract)",
+                requirement.plugin_id
+            );
+        }
+        let plugin = registry.get(requirement.plugin_id).with_context(|| {
+            format!(
+                "required plugin '{}' is not discoverable in registry",
+                requirement.plugin_id
+            )
+        })?;
+        match requirement.kind {
+            RequiredOwnershipKind::Namespace(namespace) => {
+                if !plugin.declaration.owns_namespaces.contains(namespace) {
+                    anyhow::bail!(
+                        "required plugin '{}' must own namespace '{}'",
+                        requirement.plugin_id,
+                        namespace
+                    );
+                }
+            }
+            RequiredOwnershipKind::Path(path) => {
+                let owned = plugin.declaration.owns_paths.iter().any(|candidate| {
+                    candidate.0 == path.iter().map(ToString::to_string).collect::<Vec<_>>()
+                }) || plugin.declaration.owns_namespaces.contains(path[0]);
+                if !owned {
+                    anyhow::bail!(
+                        "required plugin '{}' must own path '{}'",
+                        requirement.plugin_id,
+                        path.join(" ")
+                    );
+                }
+            }
+        }
+    }
     Ok(())
 }
 
@@ -1135,6 +1214,37 @@ mod tests {
     }
 
     #[test]
+    fn validate_enabled_plugins_rejects_when_required_owned_plugin_is_disabled() {
+        let dir = temp_dir();
+        let plugin_dir = dir.join("plugin-cli");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir should exist");
+        fs::write(plugin_dir.join("plugin-cli.dylib"), []).expect("entry should be written");
+
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(
+                &plugin_dir.join("plugin.toml"),
+                plugin_manifest_with_commands(
+                    "bmux.plugin_cli",
+                    "plugin-cli.dylib",
+                    "owns_namespaces=['plugin']\n[[commands]]\nname='list'\npath=['plugin','list']\nsummary='list'\nexecution='provider_exec'\nexpose_in_cli=true\n",
+                ),
+            )
+            .expect("plugin should register");
+
+        let mut config = BmuxConfig::default();
+        config.plugins.disabled.push("bmux.plugin_cli".to_string());
+
+        let error = crate::runtime::validate_enabled_plugins(&config, &registry)
+            .expect_err("required ownership plugin should not be disableable");
+        assert!(
+            error
+                .to_string()
+                .contains("required plugin 'bmux.plugin_cli' is not enabled")
+        );
+    }
+
+    #[test]
     fn effective_enabled_plugins_includes_bundled_plugins_by_default() {
         let Some(bundled_root) = crate::runtime::bundled_plugin_root() else {
             return;
@@ -1317,7 +1427,7 @@ mod tests {
                     plugin_manifest_with_commands(
                         "policy.plugin",
                         "policy.dylib",
-                        "[[commands]]\nname='roles'\npath=['roles']\naliases=[[\"session\",\"roles\"]]\nsummary='list'\nexecution='provider_exec'\nexpose_in_cli=true\n[[commands.arguments]]\nname='session'\nkind='string'\nlong='session'\nrequired=true\n",
+                        "owns_namespaces=['roles','session']\n[[commands]]\nname='roles'\npath=['roles']\naliases=[[\"session\",\"roles\"]]\nsummary='list'\nexecution='provider_exec'\nexpose_in_cli=true\n[[commands.arguments]]\nname='session'\nkind='string'\nlong='session'\nrequired=true\n",
                     ),
                 )
                 .expect("plugin should register");
@@ -1363,7 +1473,7 @@ mod tests {
                     plugin_manifest_with_commands(
                         "bmux.plugin_cli",
                         "plugin-cli.dylib",
-                        "[[commands]]\nname='list'\npath=['plugin','list']\nsummary='list'\nexecution='provider_exec'\nexpose_in_cli=true\n",
+                        "owns_namespaces=['plugin']\n[[commands]]\nname='list'\npath=['plugin','list']\nsummary='list'\nexecution='provider_exec'\nexpose_in_cli=true\n",
                     ),
                 )
                 .expect("plugin should register");
@@ -1408,7 +1518,7 @@ mod tests {
                     plugin_manifest_with_commands(
                         "bmux.windows",
                         "windows.dylib",
-                        "[[commands]]\nname='new-window'\npath=['new-window']\nsummary='new'\nexecution='provider_exec'\nexpose_in_cli=true\n",
+                        "owns_namespaces=['new-window']\n[[commands]]\nname='new-window'\npath=['new-window']\nsummary='new'\nexecution='provider_exec'\nexpose_in_cli=true\n",
                     ),
                 )
                 .expect("plugin should register");
@@ -1484,6 +1594,8 @@ mod tests {
             homepage: None,
             provider_priority: 0,
             execution_class: bmux_plugin::PluginExecutionClass::NativeStandard,
+            owns_namespaces: std::collections::BTreeSet::new(),
+            owns_paths: std::collections::BTreeSet::new(),
             required_capabilities: std::collections::BTreeSet::from([
                 bmux_plugin_sdk::HostScope::new("bmux.commands").expect("capability should parse"),
             ]),
@@ -1637,6 +1749,8 @@ mod tests {
             homepage: None,
             provider_priority: 0,
             execution_class: bmux_plugin::PluginExecutionClass::NativeStandard,
+            owns_namespaces: std::collections::BTreeSet::new(),
+            owns_paths: std::collections::BTreeSet::new(),
             required_capabilities: std::collections::BTreeSet::from([
                 bmux_plugin_sdk::HostScope::new("bmux.commands").expect("capability should parse"),
                 bmux_plugin_sdk::HostScope::new("example.base.read")

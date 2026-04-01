@@ -1,5 +1,6 @@
 use crate::{
     PluginDeclaration, PluginDependency, PluginEntrypoint, PluginExecutionClass, PluginId,
+    PluginOwnedPath,
 };
 use bmux_plugin_sdk::{
     ApiVersion, HostScope, PluginCommand, PluginError, PluginEventSubscription, PluginFeature,
@@ -71,6 +72,10 @@ pub struct PluginManifest {
     pub provider_priority: i32,
     #[serde(default)]
     pub execution_class: PluginExecutionClass,
+    #[serde(default)]
+    pub owns_namespaces: BTreeSet<String>,
+    #[serde(default)]
+    pub owns_paths: BTreeSet<PluginOwnedPath>,
     #[serde(default)]
     pub runtime: PluginRuntime,
     #[serde(default)]
@@ -156,6 +161,8 @@ impl PluginManifest {
             homepage: self.homepage.clone(),
             provider_priority: self.provider_priority,
             execution_class: self.execution_class,
+            owns_namespaces: self.owns_namespaces.clone(),
+            owns_paths: self.owns_paths.clone(),
             required_capabilities: self.required_capabilities.clone(),
             provided_capabilities: self.provided_capabilities.clone(),
             provided_features: self.provided_features.clone(),
@@ -383,5 +390,26 @@ execution_class = "interpreter"
         )
         .expect("manifest should parse");
         assert_eq!(manifest.execution_class, PluginExecutionClass::Interpreter);
+    }
+
+    #[test]
+    fn parses_command_ownership_fields() {
+        let manifest = PluginManifest::from_toml_str(
+            r#"
+id = "test.ownership"
+name = "Ownership"
+version = "0.1.0"
+owns_namespaces = ["logs", "recording"]
+owns_paths = [["terminal", "doctor"], ["terminal", "install-terminfo"]]
+"#,
+        )
+        .expect("manifest should parse");
+        assert!(manifest.owns_namespaces.contains("logs"));
+        assert!(
+            manifest
+                .owns_paths
+                .iter()
+                .any(|path| path.0 == vec!["terminal".to_string(), "doctor".to_string()])
+        );
     }
 }

@@ -1,6 +1,7 @@
 execution_class       = "native_fast"
 id                    = "bmux.plugin_cli"
 name                  = "bmux Plugin CLI"
+owns_namespaces       = ["plugin"]
 required_capabilities = ["bmux.commands"]
 version               = "0.0.1-alpha.0"
 
