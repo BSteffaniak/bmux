@@ -178,6 +178,71 @@ fn generate_config_reference() -> String {
     doc.push_str(&render_section::<KeyBindingConfig>());
     doc.push_str(&render_section::<PluginConfig>());
     doc.push_str(&render_section::<StatusBarConfig>());
+    doc.push_str("\n## Status Bar Preset Examples\n\n");
+    doc.push_str("### Tab Rail (recommended)\n\n");
+    doc.push_str(
+        "```toml\n\
+[status_bar]\n\
+enabled = true\n\
+preset = \"tab_rail\"\n\
+tab_scope = \"all_contexts\"\n\
+tab_order = \"stable\"\n\
+max_tabs = 14\n\
+tab_label_max_width = 22\n\
+show_tab_index = true\n\
+show_mode = true\n\
+show_role = true\n\
+show_follow = true\n\
+show_hint = true\n\
+hint_policy = \"scroll_only\"\n\
+\n\
+[status_bar.layout]\n\
+density = \"cozy\"\n\
+left_padding = 1\n\
+right_padding = 1\n\
+tab_gap = 1\n\
+module_gap = 1\n\
+overflow_style = \"arrows\"\n\
+align_active = \"keep_visible\"\n\
+\n\
+[status_bar.style]\n\
+separator_set = \"angled_segments\"\n\
+prefer_unicode = true\n\
+force_ascii = false\n\
+dim_inactive = true\n\
+bold_active = true\n\
+underline_active = false\n\
+```\n\n",
+    );
+    doc.push_str("### Minimal\n\n");
+    doc.push_str(
+        "```toml\n\
+[status_bar]\n\
+enabled = true\n\
+preset = \"minimal\"\n\
+tab_scope = \"all_contexts\"\n\
+tab_order = \"stable\"\n\
+show_tab_index = false\n\
+show_follow = false\n\
+show_hint = true\n\
+hint_policy = \"scroll_only\"\n\
+\n\
+[status_bar.layout]\n\
+density = \"compact\"\n\
+tab_gap = 1\n\
+module_gap = 1\n\
+overflow_style = \"count\"\n\
+align_active = \"keep_visible\"\n\
+\n\
+[status_bar.style]\n\
+separator_set = \"plain\"\n\
+prefer_unicode = false\n\
+force_ascii = true\n\
+dim_inactive = true\n\
+bold_active = false\n\
+underline_active = false\n\
+```\n\n",
+    );
     doc.push_str(&render_recording_section());
 
     doc
