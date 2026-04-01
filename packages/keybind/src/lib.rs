@@ -63,6 +63,7 @@ pub enum RuntimeAction {
     PluginCommand {
         plugin_id: String,
         command_name: String,
+        args: Vec<String>,
     },
     ForwardToPane(Vec<u8>),
 }
@@ -134,7 +135,14 @@ pub fn action_to_config_name(action: &RuntimeAction) -> String {
         RuntimeAction::PluginCommand {
             plugin_id,
             command_name,
-        } => format!("plugin:{plugin_id}:{command_name}"),
+            args,
+        } => {
+            if args.is_empty() {
+                format!("plugin:{plugin_id}:{command_name}")
+            } else {
+                format!("plugin:{plugin_id}:{command_name} {}", args.join(" "))
+            }
+        }
         _ => action_to_name(action).to_string(),
     }
 }
@@ -204,7 +212,7 @@ pub fn parse_action(value: &str) -> Result<RuntimeAction> {
 
 fn parse_plugin_action(value: &str) -> Option<Result<RuntimeAction>> {
     let rest = value.strip_prefix("plugin:")?;
-    let (plugin_id, command_name) = match rest.split_once(':') {
+    let (plugin_id, remainder) = match rest.split_once(':') {
         Some(parts) => parts,
         None => {
             return Some(Err(anyhow::anyhow!(
@@ -212,14 +220,30 @@ fn parse_plugin_action(value: &str) -> Option<Result<RuntimeAction>> {
             )));
         }
     };
-    if plugin_id.trim().is_empty() || command_name.trim().is_empty() {
+    if plugin_id.trim().is_empty() || remainder.trim().is_empty() {
         return Some(Err(anyhow::anyhow!(
             "invalid plugin keymap action '{value}' (plugin id and command are required)"
+        )));
+    }
+    let (command_name, args) = match remainder.split_once(' ') {
+        Some((cmd, args_str)) => (
+            cmd,
+            args_str
+                .split_whitespace()
+                .map(String::from)
+                .collect::<Vec<_>>(),
+        ),
+        None => (remainder, Vec::new()),
+    };
+    if command_name.trim().is_empty() {
+        return Some(Err(anyhow::anyhow!(
+            "invalid plugin keymap action '{value}' (command name is required)"
         )));
     }
     Some(Ok(RuntimeAction::PluginCommand {
         plugin_id: plugin_id.to_string(),
         command_name: command_name.to_string(),
+        args,
     }))
 }
 
@@ -244,6 +268,35 @@ mod tests {
             RuntimeAction::PluginCommand {
                 plugin_id: "bmux.windows".to_string(),
                 command_name: "new-window".to_string(),
+                args: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_action_accepts_plugin_command_with_args() {
+        let action = parse_action("plugin:bmux.windows:goto-window 1")
+            .expect("plugin action with args should parse");
+        assert_eq!(
+            action,
+            RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "goto-window".to_string(),
+                args: vec!["1".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_action_accepts_plugin_command_with_multiple_args() {
+        let action = parse_action("plugin:bmux.windows:switch-window --session dev")
+            .expect("plugin action with multiple args should parse");
+        assert_eq!(
+            action,
+            RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "switch-window".to_string(),
+                args: vec!["--session".to_string(), "dev".to_string()],
             }
         );
     }
@@ -253,10 +306,24 @@ mod tests {
         let action = RuntimeAction::PluginCommand {
             plugin_id: "bmux.windows".to_string(),
             command_name: "new-window".to_string(),
+            args: vec![],
         };
         assert_eq!(
             action_to_config_name(&action),
             "plugin:bmux.windows:new-window"
+        );
+    }
+
+    #[test]
+    fn action_to_config_name_serializes_plugin_command_with_args() {
+        let action = RuntimeAction::PluginCommand {
+            plugin_id: "bmux.windows".to_string(),
+            command_name: "goto-window".to_string(),
+            args: vec!["1".to_string()],
+        };
+        assert_eq!(
+            action_to_config_name(&action),
+            "plugin:bmux.windows:goto-window 1"
         );
     }
 }

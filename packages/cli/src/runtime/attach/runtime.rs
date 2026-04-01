@@ -633,6 +633,7 @@ pub(crate) async fn handle_attach_plugin_command_action(
     client: &mut BmuxClient,
     plugin_id: &str,
     command_name: &str,
+    args: &[String],
     view_state: &mut AttachViewState,
 ) -> std::result::Result<(), ClientError> {
     let before_context_id = match client.current_context().await {
@@ -680,7 +681,7 @@ pub(crate) async fn handle_attach_plugin_command_action(
         );
         return Ok(());
     }
-    match run_plugin_keybinding_command(plugin_id, command_name, &[]) {
+    match run_plugin_keybinding_command(plugin_id, command_name, args) {
         Err(error) => {
             warn!(
                 plugin_id = %plugin_id,
@@ -3102,6 +3103,7 @@ pub(crate) async fn handle_attach_terminal_event(
             AttachEventAction::PluginCommand {
                 plugin_id,
                 command_name,
+                args,
             } => {
                 if view_state.help_overlay_open {
                     continue;
@@ -3110,6 +3112,7 @@ pub(crate) async fn handle_attach_terminal_event(
                     client,
                     &plugin_id,
                     &command_name,
+                    &args,
                     view_state,
                 )
                 .await
@@ -3350,9 +3353,16 @@ pub(crate) async fn handle_attach_mouse_gesture_action(
         AttachEventAction::PluginCommand {
             plugin_id,
             command_name,
+            args,
         } => {
-            handle_attach_plugin_command_action(client, &plugin_id, &command_name, view_state)
-                .await?;
+            handle_attach_plugin_command_action(
+                client,
+                &plugin_id,
+                &command_name,
+                &args,
+                view_state,
+            )
+            .await?;
             Ok(true)
         }
         AttachEventAction::Runtime(action) => {
@@ -3578,9 +3588,11 @@ pub(crate) fn runtime_action_to_attach_event_action(action: RuntimeAction) -> At
         RuntimeAction::PluginCommand {
             plugin_id,
             command_name,
+            args,
         } => AttachEventAction::PluginCommand {
             plugin_id,
             command_name,
+            args,
         },
         RuntimeAction::SessionPrev
         | RuntimeAction::SessionNext
@@ -3896,8 +3908,9 @@ mod tests {
             resolved,
             Some(crate::runtime::AttachEventAction::PluginCommand {
                 plugin_id,
-                command_name
-            }) if plugin_id == "bmux.windows" && command_name == "new-window"
+                command_name,
+                args,
+            }) if plugin_id == "bmux.windows" && command_name == "new-window" && args.is_empty()
         ));
     }
 
@@ -4007,8 +4020,8 @@ mod tests {
         .expect("attach key action should parse");
         assert!(matches!(
             new_window.first(),
-            Some(crate::runtime::AttachEventAction::PluginCommand { plugin_id, command_name })
-                if plugin_id == "bmux.windows" && command_name == "new-window"
+            Some(crate::runtime::AttachEventAction::PluginCommand { plugin_id, command_name, args })
+                if plugin_id == "bmux.windows" && command_name == "new-window" && args.is_empty()
         ));
 
         let _ = crate::runtime::attach_key_event_actions(
@@ -4033,8 +4046,8 @@ mod tests {
         .expect("attach key action should parse");
         assert!(matches!(
             next_window.first(),
-            Some(crate::runtime::AttachEventAction::PluginCommand { plugin_id, command_name })
-                if plugin_id == "bmux.windows" && command_name == "next-window"
+            Some(crate::runtime::AttachEventAction::PluginCommand { plugin_id, command_name, args })
+                if plugin_id == "bmux.windows" && command_name == "next-window" && args.is_empty()
         ));
 
         let _ = crate::runtime::attach_key_event_actions(
@@ -4059,8 +4072,8 @@ mod tests {
         .expect("attach key action should parse");
         assert!(matches!(
             previous_window.first(),
-            Some(crate::runtime::AttachEventAction::PluginCommand { plugin_id, command_name })
-                if plugin_id == "bmux.windows" && command_name == "prev-window"
+            Some(crate::runtime::AttachEventAction::PluginCommand { plugin_id, command_name, args })
+                if plugin_id == "bmux.windows" && command_name == "prev-window" && args.is_empty()
         ));
 
         let _ = crate::runtime::attach_key_event_actions(
@@ -4085,8 +4098,8 @@ mod tests {
         .expect("attach key action should parse");
         assert!(matches!(
             last_window.first(),
-            Some(crate::runtime::AttachEventAction::PluginCommand { plugin_id, command_name })
-                if plugin_id == "bmux.windows" && command_name == "last-window"
+            Some(crate::runtime::AttachEventAction::PluginCommand { plugin_id, command_name, args })
+                if plugin_id == "bmux.windows" && command_name == "last-window" && args.is_empty()
         ));
 
         let _ = crate::runtime::attach_key_event_actions(
@@ -4213,6 +4226,40 @@ mod tests {
         ));
 
         let _ = processor;
+    }
+
+    #[test]
+    fn global_plugin_command_with_args_maps_to_plugin_action() {
+        let mut config = BmuxConfig::default();
+        config.keybindings.global.insert(
+            "alt+1".to_string(),
+            "plugin:bmux.windows:goto-window 1".to_string(),
+        );
+        let mut processor = InputProcessor::new(attach_keymap_from_config(&config), false);
+
+        let actions = crate::runtime::attach_key_event_actions(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Char('1'),
+                KeyModifiers::ALT,
+                CrosstermKeyEventKind::Press,
+            ),
+            &mut processor,
+            crate::runtime::AttachUiMode::Normal,
+        )
+        .expect("attach key action should parse");
+        assert!(
+            matches!(
+                actions.first(),
+                Some(crate::runtime::AttachEventAction::PluginCommand {
+                    plugin_id,
+                    command_name,
+                    args,
+                }) if plugin_id == "bmux.windows"
+                    && command_name == "goto-window"
+                    && args == &["1".to_string()]
+            ),
+            "global alt+1 should map to PluginCommand with args"
+        );
     }
 
     #[test]

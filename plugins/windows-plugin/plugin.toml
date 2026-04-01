@@ -11,6 +11,8 @@ owns_namespaces = [
     "next-window",
     "prev-window",
     "last-window",
+    "goto-window",
+    "close-current-window",
 ]
 provided_capabilities = ["bmux.windows.read", "bmux.windows.write"]
 provided_features = ["bmux.windows"]
@@ -160,6 +162,27 @@ expose_in_cli = true
 name          = "last-window"
 path          = ["last-window"]
 summary       = "Switch to the previously active workspace window"
+
+[[commands]]
+aliases       = [["window", "goto"]]
+expose_in_cli = true
+name          = "goto-window"
+path          = ["goto-window"]
+summary       = "Switch to a workspace window by 1-based index"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "index"
+position   = 0
+required   = true
+value_name = "INDEX"
+
+[[commands]]
+aliases       = [["window", "close-current"]]
+expose_in_cli = true
+name          = "close-current-window"
+path          = ["close-current-window"]
+summary       = "Close the current workspace window"
 
 [keybindings.runtime]
 c = "plugin:bmux.windows:new-window"

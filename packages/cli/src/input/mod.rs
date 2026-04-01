@@ -1341,6 +1341,7 @@ mod tests {
             RuntimeAction::PluginCommand {
                 plugin_id: "bmux.windows".to_string(),
                 command_name: "new-window".to_string(),
+                args: vec![],
             }
         );
     }

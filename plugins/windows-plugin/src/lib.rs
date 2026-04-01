@@ -174,6 +174,28 @@ fn handle_command(
             }
             Ok(())
         }
+        "goto-window" => {
+            let index_str = positional_value(&context.arguments)
+                .ok_or_else(|| "missing required INDEX argument".to_string())?;
+            let index: usize = index_str.parse().map_err(|_| {
+                format!("invalid window index '{index_str}' (expected 1-based number)")
+            })?;
+            if index == 0 {
+                return Err("window index must be 1 or greater".to_string());
+            }
+            let ack = goto_window_by_index(context, index, &mut plugin.last_selected_by_client)?;
+            if let Some(id) = ack.id {
+                println!("goto-window {index} selected context {id}");
+            }
+            Ok(())
+        }
+        "close-current-window" => {
+            let ack = close_current_window(context, &mut plugin.last_selected_by_client)?;
+            if let Some(id) = ack.id {
+                println!("closed current window context {id}");
+            }
+            Ok(())
+        }
         _ => Err(format!("unsupported command '{}'", context.command)),
     }
 }
@@ -361,6 +383,81 @@ fn cycle_window(
         ContextSelector::ById(target_id),
         last_selected_by_client,
     )
+}
+
+fn goto_window_by_index(
+    caller: &impl HostRuntimeApi,
+    index: usize,
+    last_selected_by_client: &mut BTreeMap<Uuid, Uuid>,
+) -> Result<WindowCommandAck, String> {
+    if index == 0 {
+        return Err("window index must be 1 or greater".to_string());
+    }
+    let contexts = caller
+        .context_list()
+        .map_err(|error| error.to_string())?
+        .contexts;
+    if contexts.is_empty() {
+        return Err("no windows available".to_string());
+    }
+    let zero_based = index - 1;
+    if zero_based >= contexts.len() {
+        return Err(format!(
+            "window index {index} out of range (have {} window{})",
+            contexts.len(),
+            if contexts.len() == 1 { "" } else { "s" }
+        ));
+    }
+    let target_id = contexts[zero_based].id;
+    switch_window(
+        caller,
+        ContextSelector::ById(target_id),
+        last_selected_by_client,
+    )
+}
+
+fn close_current_window(
+    caller: &impl HostRuntimeApi,
+    last_selected_by_client: &mut BTreeMap<Uuid, Uuid>,
+) -> Result<WindowCommandAck, String> {
+    let contexts = caller
+        .context_list()
+        .map_err(|error| error.to_string())?
+        .contexts;
+    let current_id = resolve_effective_current_context_with_contexts(caller, &contexts)?
+        .ok_or_else(|| "no current window to close".to_string())?;
+
+    // If there is another window to switch to, do so before closing.
+    if contexts.len() > 1 {
+        let current_index = contexts
+            .iter()
+            .position(|context| context.id == current_id)
+            .unwrap_or(0);
+        // Switch to the next window (wrapping), or previous if we are at the end.
+        let fallback_index = if current_index + 1 < contexts.len() {
+            current_index + 1
+        } else {
+            current_index.saturating_sub(1)
+        };
+        let fallback_id = contexts[fallback_index].id;
+        let _ = switch_window(
+            caller,
+            ContextSelector::ById(fallback_id),
+            last_selected_by_client,
+        );
+    }
+
+    caller
+        .context_close(&ContextCloseRequest {
+            selector: ContextSelector::ById(current_id),
+            force: false,
+        })
+        .map_err(|error| error.to_string())?;
+
+    Ok(WindowCommandAck {
+        ok: true,
+        id: Some(current_id.to_string()),
+    })
 }
 
 fn resolve_context_id_from_contexts(
@@ -1379,5 +1476,79 @@ mod tests {
             .error
             .expect("expected unsupported operation error");
         assert_eq!(error.code, "unsupported_service_operation");
+    }
+
+    #[test]
+    fn goto_window_by_index_selects_first_context() {
+        let sessions = sample_sessions();
+        let first_id = sessions[0].id;
+        let host = MockHost::with_sessions(sessions);
+        let mut last_selected_by_client = BTreeMap::new();
+
+        let ack = goto_window_by_index(&host, 1, &mut last_selected_by_client)
+            .expect("goto index 1 should succeed");
+        assert!(ack.ok);
+        let first_text = first_id.to_string();
+        assert_eq!(ack.id.as_deref(), Some(first_text.as_str()));
+    }
+
+    #[test]
+    fn goto_window_by_index_selects_second_context() {
+        let sessions = sample_sessions();
+        let second_id = sessions[1].id;
+        let host = MockHost::with_sessions(sessions);
+        let mut last_selected_by_client = BTreeMap::new();
+
+        let ack = goto_window_by_index(&host, 2, &mut last_selected_by_client)
+            .expect("goto index 2 should succeed");
+        assert!(ack.ok);
+        let second_text = second_id.to_string();
+        assert_eq!(ack.id.as_deref(), Some(second_text.as_str()));
+    }
+
+    #[test]
+    fn goto_window_by_index_rejects_zero() {
+        let host = MockHost::with_sessions(sample_sessions());
+        let mut last_selected_by_client = BTreeMap::new();
+
+        let error = goto_window_by_index(&host, 0, &mut last_selected_by_client)
+            .expect_err("index 0 should fail");
+        assert!(error.contains("1 or greater"));
+    }
+
+    #[test]
+    fn goto_window_by_index_rejects_out_of_range() {
+        let host = MockHost::with_sessions(sample_sessions());
+        let mut last_selected_by_client = BTreeMap::new();
+
+        let error = goto_window_by_index(&host, 99, &mut last_selected_by_client)
+            .expect_err("index 99 should fail");
+        assert!(error.contains("out of range"));
+    }
+
+    #[test]
+    fn close_current_window_closes_and_switches() {
+        let sessions = sample_sessions();
+        let first_id = sessions[0].id;
+        let host = MockHost::with_sessions(sessions);
+        let mut last_selected_by_client = BTreeMap::new();
+
+        let ack = close_current_window(&host, &mut last_selected_by_client)
+            .expect("close current should succeed");
+        assert!(ack.ok);
+        let first_text = first_id.to_string();
+        assert_eq!(ack.id.as_deref(), Some(first_text.as_str()));
+
+        // Verify that a context select was issued (switch to fallback window)
+        let selects = host.selects.lock().expect("select log lock should succeed");
+        assert!(
+            !selects.is_empty(),
+            "should have switched to a fallback window"
+        );
+
+        // Verify that the current window was closed
+        let kills = host.kills.lock().expect("kill log lock should succeed");
+        assert_eq!(kills.len(), 1);
+        assert!(matches!(kills[0].selector, SessionSelector::ById(id) if id == first_id));
     }
 }

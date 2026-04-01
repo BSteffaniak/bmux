@@ -13,6 +13,7 @@ pub enum AttachEventAction {
     PluginCommand {
         plugin_id: String,
         command_name: String,
+        args: Vec<String>,
     },
     Mouse(MouseEvent),
     Ui(RuntimeAction),
