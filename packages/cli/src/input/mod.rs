@@ -5,7 +5,6 @@ mod parse;
 use anyhow::{Result, bail};
 use bmux_config::{MAX_TIMEOUT_MS, MIN_TIMEOUT_MS};
 pub use bmux_keybind::RuntimeAction;
-#[cfg(test)]
 use bmux_keybind::action_to_name;
 use bmux_keybind::{action_to_config_name, parse_action};
 use bmux_keyboard::{KeyCode, KeyStroke};
@@ -81,7 +80,6 @@ struct PendingChord {
 // ============================================================================
 
 impl Keymap {
-    #[cfg(test)]
     pub(crate) fn default_runtime() -> Self {
         let runtime = [
             ("shift+c", RuntimeAction::NewSession),
@@ -348,7 +346,6 @@ impl Keymap {
     }
 }
 
-#[cfg(test)]
 fn default_scroll_bindings() -> BTreeMap<String, String> {
     [
         ("escape", RuntimeAction::ExitScrollMode),

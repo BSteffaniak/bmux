@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bmux_client::BmuxClient;
-use bmux_ipc::{InvokeServiceKind, PaneSplitDirection, SessionSelector};
+use bmux_ipc::{InvokeServiceKind, PaneFocusDirection, PaneSplitDirection, SessionSelector};
 use bmux_keyboard::{KeyCode as BmuxKeyCode, KeyStroke};
 use crossterm::event::{
     Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent, KeyEventKind, KeyEventState,
@@ -31,15 +31,26 @@ const ATTACH_OUTPUT_MAX_BYTES: usize = 256 * 1024;
 
 pub(super) struct AttachInputRuntime {
     processor: crate::input::InputProcessor,
-    view_state: crate::runtime::PlaybookAttachViewState,
+    state: AttachInputState,
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct AttachInputState {
+    attached_id: Uuid,
+    scrollback_active: bool,
+    scrollback_offset: usize,
 }
 
 impl AttachInputRuntime {
     fn new(attach_info: bmux_client::AttachOpenInfo) -> Self {
-        let keymap = crate::runtime::attach_keymap_from_config(&bmux_config::BmuxConfig::default());
+        let keymap = crate::input::Keymap::default_runtime();
         Self {
             processor: crate::input::InputProcessor::new(keymap, false),
-            view_state: crate::runtime::PlaybookAttachViewState::new(attach_info),
+            state: AttachInputState {
+                attached_id: attach_info.session_id,
+                scrollback_active: false,
+                scrollback_offset: 0,
+            },
         }
     }
 }
@@ -401,12 +412,10 @@ pub(super) async fn execute_step(
             *attached = true;
             *attach_runtime = Some(AttachInputRuntime::new(attach_info));
             if let Some(runtime) = attach_runtime.as_mut() {
-                crate::runtime::hydrate_attach_state_from_snapshot(client, &mut runtime.view_state)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("attach snapshot hydrate failed: {e}"))?;
-                runtime
-                    .processor
-                    .set_scroll_mode(runtime.view_state.scrollback_active);
+                runtime.state.attached_id = sid;
+                runtime.state.scrollback_active = false;
+                runtime.state.scrollback_offset = 0;
+                runtime.processor.set_scroll_mode(false);
             }
 
             // Drain initial output to let the shell start up
@@ -777,7 +786,7 @@ pub(super) async fn execute_step(
             let detail = attach_runtime.as_ref().map(|runtime| {
                 format!(
                     "scrollback_active={} scrollback_offset={}",
-                    runtime.view_state.scrollback_active, runtime.view_state.scrollback_offset
+                    runtime.state.scrollback_active, runtime.state.scrollback_offset
                 )
             });
             Ok(detail)
@@ -799,7 +808,7 @@ pub(super) async fn execute_step(
             let detail = attach_runtime.as_ref().map(|runtime| {
                 format!(
                     "scrollback_active={} scrollback_offset={}",
-                    runtime.view_state.scrollback_active, runtime.view_state.scrollback_offset
+                    runtime.state.scrollback_active, runtime.state.scrollback_offset
                 )
             });
             Ok(detail)
@@ -919,14 +928,10 @@ async fn execute_attach_chord(
         .as_mut()
         .context("attach input runtime not initialized; create a session first")?;
 
-    if !runtime.view_state.scrollback_active || runtime.view_state.cached_layout_state.is_none() {
-        crate::runtime::hydrate_attach_state_from_snapshot(client, &mut runtime.view_state)
-            .await
-            .map_err(|e| anyhow::anyhow!("attach snapshot hydrate failed: {e}"))?;
-    }
+    runtime.state.attached_id = sid;
     runtime
         .processor
-        .set_scroll_mode(runtime.view_state.scrollback_active);
+        .set_scroll_mode(runtime.state.scrollback_active);
 
     let strokes = crate::input::parse_key_chord(chord)
         .map_err(|e| anyhow::anyhow!("invalid attach key chord '{chord}': {e}"))?;
@@ -939,12 +944,10 @@ async fn execute_attach_chord(
     let trailing_actions = runtime.processor.process_stream_bytes(&[]);
     apply_attach_runtime_actions(trailing_actions, client, sid, runtime).await?;
 
-    *session_id = Some(runtime.view_state.attached_id);
+    *session_id = Some(runtime.state.attached_id);
     *attached = true;
 
-    let snapshot = inspector
-        .refresh(client, runtime.view_state.attached_id)
-        .await?;
+    let snapshot = inspector.refresh(client, runtime.state.attached_id).await?;
     runtime_vars.pane_count = snapshot.panes.len() as u32;
     if let Some(focused) = snapshot.panes.iter().find(|pane| pane.focused) {
         runtime_vars.focused_pane = focused.index;
@@ -960,51 +963,181 @@ async fn apply_attach_runtime_actions(
     runtime: &mut AttachInputRuntime,
 ) -> Result<()> {
     for runtime_action in actions {
-        let attach_action = crate::runtime::runtime_action_to_attach_event_action(runtime_action);
-        match attach_action {
-            crate::runtime::AttachInputEventAction::Send(bytes) => {
+        match runtime_action {
+            crate::input::RuntimeAction::ForwardToPane(bytes) => {
                 client
                     .attach_input(sid, bytes)
                     .await
                     .map_err(|e| anyhow::anyhow!("attach input failed: {e}"))?;
             }
-            crate::runtime::AttachInputEventAction::Runtime(action) => {
-                crate::runtime::handle_attach_runtime_action(
-                    client,
-                    action,
-                    &mut runtime.view_state,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("attach runtime action failed: {e}"))?;
-            }
-            crate::runtime::AttachInputEventAction::PluginCommand {
-                plugin_id,
-                command_name,
-            } => {
-                crate::runtime::handle_attach_plugin_command_action(
-                    client,
-                    &plugin_id,
-                    &command_name,
-                    &mut runtime.view_state,
-                )
-                .await
-                .map_err(|e| anyhow::anyhow!("attach plugin command failed: {e}"))?;
-            }
-            crate::runtime::AttachInputEventAction::Ui(action) => {
-                crate::runtime::handle_attach_ui_action(client, action, &mut runtime.view_state)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("attach ui action failed: {e}"))?;
-            }
-            crate::runtime::AttachInputEventAction::Detach => {
+            crate::input::RuntimeAction::Detach => {
                 bail!("attach input requested detach; unsupported inside playbook step")
             }
-            crate::runtime::AttachInputEventAction::Ignore
-            | crate::runtime::AttachInputEventAction::Redraw
-            | crate::runtime::AttachInputEventAction::Mouse(_) => {}
+            crate::input::RuntimeAction::SplitFocusedVertical => {
+                client
+                    .split_pane(
+                        Some(SessionSelector::ById(runtime.state.attached_id)),
+                        PaneSplitDirection::Vertical,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("split focused vertical failed: {e}"))?;
+            }
+            crate::input::RuntimeAction::SplitFocusedHorizontal => {
+                client
+                    .split_pane(
+                        Some(SessionSelector::ById(runtime.state.attached_id)),
+                        PaneSplitDirection::Horizontal,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("split focused horizontal failed: {e}"))?;
+            }
+            crate::input::RuntimeAction::FocusNext => {
+                client
+                    .focus_pane(
+                        Some(SessionSelector::ById(runtime.state.attached_id)),
+                        PaneFocusDirection::Next,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("focus next failed: {e}"))?;
+            }
+            crate::input::RuntimeAction::FocusLeft => {
+                client
+                    .focus_pane(
+                        Some(SessionSelector::ById(runtime.state.attached_id)),
+                        PaneFocusDirection::Prev,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("focus left failed: {e}"))?;
+            }
+            crate::input::RuntimeAction::FocusRight => {
+                client
+                    .focus_pane(
+                        Some(SessionSelector::ById(runtime.state.attached_id)),
+                        PaneFocusDirection::Next,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("focus right failed: {e}"))?;
+            }
+            crate::input::RuntimeAction::FocusUp => {
+                client
+                    .focus_pane(
+                        Some(SessionSelector::ById(runtime.state.attached_id)),
+                        PaneFocusDirection::Prev,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("focus up failed: {e}"))?;
+            }
+            crate::input::RuntimeAction::FocusDown => {
+                client
+                    .focus_pane(
+                        Some(SessionSelector::ById(runtime.state.attached_id)),
+                        PaneFocusDirection::Next,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("focus down failed: {e}"))?;
+            }
+            crate::input::RuntimeAction::CloseFocusedPane => {
+                client
+                    .close_pane(Some(SessionSelector::ById(runtime.state.attached_id)))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("close focused pane failed: {e}"))?;
+            }
+            crate::input::RuntimeAction::IncreaseSplit
+            | crate::input::RuntimeAction::ResizeRight
+            | crate::input::RuntimeAction::ResizeDown => {
+                client
+                    .resize_pane(Some(SessionSelector::ById(runtime.state.attached_id)), 1)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("resize increase failed: {e}"))?;
+            }
+            crate::input::RuntimeAction::DecreaseSplit
+            | crate::input::RuntimeAction::ResizeLeft
+            | crate::input::RuntimeAction::ResizeUp => {
+                client
+                    .resize_pane(Some(SessionSelector::ById(runtime.state.attached_id)), -1)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("resize decrease failed: {e}"))?;
+            }
+            crate::input::RuntimeAction::EnterScrollMode => {
+                runtime.state.scrollback_active = true;
+            }
+            crate::input::RuntimeAction::ExitScrollMode
+            | crate::input::RuntimeAction::ConfirmScrollback => {
+                runtime.state.scrollback_active = false;
+                runtime.state.scrollback_offset = 0;
+            }
+            crate::input::RuntimeAction::ScrollUpLine => {
+                if runtime.state.scrollback_active {
+                    runtime.state.scrollback_offset =
+                        runtime.state.scrollback_offset.saturating_add(1);
+                }
+            }
+            crate::input::RuntimeAction::ScrollDownLine => {
+                if runtime.state.scrollback_active {
+                    runtime.state.scrollback_offset =
+                        runtime.state.scrollback_offset.saturating_sub(1);
+                }
+            }
+            crate::input::RuntimeAction::ScrollUpPage => {
+                if runtime.state.scrollback_active {
+                    runtime.state.scrollback_offset =
+                        runtime.state.scrollback_offset.saturating_add(20);
+                }
+            }
+            crate::input::RuntimeAction::ScrollDownPage => {
+                if runtime.state.scrollback_active {
+                    runtime.state.scrollback_offset =
+                        runtime.state.scrollback_offset.saturating_sub(20);
+                }
+            }
+            crate::input::RuntimeAction::ScrollTop => {
+                if runtime.state.scrollback_active {
+                    runtime.state.scrollback_offset = usize::MAX / 2;
+                }
+            }
+            crate::input::RuntimeAction::ScrollBottom => {
+                if runtime.state.scrollback_active {
+                    runtime.state.scrollback_offset = 0;
+                }
+            }
+            crate::input::RuntimeAction::NewSession | crate::input::RuntimeAction::NewWindow => {
+                let new_sid = client
+                    .new_session(None)
+                    .await
+                    .map_err(|e| anyhow::anyhow!("new session failed from attach action: {e}"))?;
+                runtime.state.attached_id = new_sid;
+            }
+            crate::input::RuntimeAction::PluginCommand { .. }
+            | crate::input::RuntimeAction::Quit
+            | crate::input::RuntimeAction::SessionPrev
+            | crate::input::RuntimeAction::SessionNext
+            | crate::input::RuntimeAction::ToggleSplitDirection
+            | crate::input::RuntimeAction::RestartFocusedPane
+            | crate::input::RuntimeAction::ShowHelp
+            | crate::input::RuntimeAction::BeginSelection
+            | crate::input::RuntimeAction::MoveCursorLeft
+            | crate::input::RuntimeAction::MoveCursorRight
+            | crate::input::RuntimeAction::MoveCursorUp
+            | crate::input::RuntimeAction::MoveCursorDown
+            | crate::input::RuntimeAction::CopyScrollback
+            | crate::input::RuntimeAction::EnterWindowMode
+            | crate::input::RuntimeAction::ExitMode
+            | crate::input::RuntimeAction::WindowPrev
+            | crate::input::RuntimeAction::WindowNext
+            | crate::input::RuntimeAction::WindowGoto1
+            | crate::input::RuntimeAction::WindowGoto2
+            | crate::input::RuntimeAction::WindowGoto3
+            | crate::input::RuntimeAction::WindowGoto4
+            | crate::input::RuntimeAction::WindowGoto5
+            | crate::input::RuntimeAction::WindowGoto6
+            | crate::input::RuntimeAction::WindowGoto7
+            | crate::input::RuntimeAction::WindowGoto8
+            | crate::input::RuntimeAction::WindowGoto9
+            | crate::input::RuntimeAction::WindowClose => {}
         }
         runtime
             .processor
-            .set_scroll_mode(runtime.view_state.scrollback_active);
+            .set_scroll_mode(runtime.state.scrollback_active);
     }
     Ok(())
 }
