@@ -97,10 +97,7 @@ pub(super) fn should_proxy_to_target(cli: &Cli) -> Result<bool> {
     }
     let config = BmuxConfig::load()?;
     let target = resolve_effective_target(&config, cli.target.as_deref())?;
-    Ok(matches!(
-        target,
-        ResolvedTarget::Ssh(_) | ResolvedTarget::Tls(_)
-    ))
+    Ok(matches!(target, ResolvedTarget::Ssh(_)))
 }
 
 pub(super) async fn run_target_proxy_from_current_argv(cli: &Cli) -> Result<u8> {
@@ -118,8 +115,7 @@ pub(super) async fn run_target_proxy_from_current_argv(cli: &Cli) -> Result<u8> 
         }
         ResolvedTarget::Tls(target) => {
             anyhow::bail!(
-                "TLS target '{}' currently supports 'bmux connect' and 'bmux remote test/doctor'. use 'bmux connect {} <session>'",
-                target.label,
+                "unexpected TLS target proxy path for '{}'; this should route through direct client transport",
                 target.label
             );
         }

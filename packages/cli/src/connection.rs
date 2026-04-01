@@ -1,6 +1,12 @@
 use anyhow::{Context, Result};
 use bmux_client::{BmuxClient, ClientError};
-use bmux_config::{BmuxConfig, StaleBuildAction};
+use bmux_config::{BmuxConfig, ConnectionTargetConfig, ConnectionTransport, StaleBuildAction};
+use bmux_ipc::transport::ErasedIpcStream;
+use rustls::RootCertStore;
+use rustls::pki_types::ServerName;
+use std::sync::Arc;
+use tokio::net::TcpStream;
+use tokio_rustls::TlsConnector;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ServerRuntimeMetadata {
     pub(crate) pid: u32,
@@ -26,9 +32,7 @@ pub async fn connect(
     client_name: &'static str,
 ) -> Result<BmuxClient> {
     apply_stale_build_policy(scope)?;
-    BmuxClient::connect_default(client_name)
-        .await
-        .map_err(map_client_connect_error)
+    connect_for_active_target(client_name).await
 }
 
 pub async fn connect_if_running(
@@ -36,17 +40,215 @@ pub async fn connect_if_running(
     client_name: &'static str,
 ) -> Result<Option<BmuxClient>> {
     apply_stale_build_policy(scope)?;
-    match BmuxClient::connect_default(client_name).await {
+    match connect_for_active_target(client_name).await {
         Ok(client) => Ok(Some(client)),
-        Err(error) if is_server_unavailable_client_error(&error) => Ok(None),
-        Err(error) => Err(map_client_connect_error(error)),
+        Err(error)
+            if error
+                .to_string()
+                .contains("server is not running (IPC endpoint unavailable)")
+                || error.to_string().contains("TLS target unreachable") =>
+        {
+            Ok(None)
+        }
+        Err(error) => Err(error),
     }
 }
 
 pub async fn connect_raw(client_name: &'static str) -> Result<BmuxClient> {
-    BmuxClient::connect_default(client_name)
+    connect_for_active_target(client_name).await
+}
+
+#[derive(Debug, Clone)]
+enum ActiveTarget {
+    Local,
+    Tls(TlsTarget),
+}
+
+#[derive(Debug, Clone)]
+struct TlsTarget {
+    label: String,
+    host: String,
+    port: u16,
+    server_name: String,
+    ca_file: Option<std::path::PathBuf>,
+    connect_timeout_ms: u64,
+}
+
+async fn connect_for_active_target(client_name: &'static str) -> Result<BmuxClient> {
+    match resolve_active_target()? {
+        ActiveTarget::Local => BmuxClient::connect_default(client_name)
+            .await
+            .map_err(map_client_connect_error),
+        ActiveTarget::Tls(target) => connect_tls_target(&target, client_name).await,
+    }
+}
+
+async fn connect_tls_target(target: &TlsTarget, client_name: &'static str) -> Result<BmuxClient> {
+    let connector = build_tls_connector(target)?;
+    let address = format!("{}:{}", target.host, target.port);
+    let connect_future = TcpStream::connect(&address);
+    let tcp_stream = tokio::time::timeout(
+        std::time::Duration::from_millis(target.connect_timeout_ms.max(1)),
+        connect_future,
+    )
+    .await
+    .with_context(|| format!("TLS target '{}' connect timed out", target.label))?
+    .with_context(|| format!("TLS target unreachable: {}", target.label))?;
+    let server_name = ServerName::try_from(target.server_name.clone())
+        .map_err(|_| anyhow::anyhow!("invalid TLS server_name '{}'", target.server_name))?;
+    let tls_stream = connector
+        .connect(server_name, tcp_stream)
         .await
-        .map_err(map_client_connect_error)
+        .with_context(|| format!("TLS handshake failed for target '{}'", target.label))?;
+    let principal_id = load_or_create_local_principal_id()?;
+    BmuxClient::connect_with_bridge_stream(
+        ErasedIpcStream::new(Box::new(tls_stream)),
+        std::time::Duration::from_millis(target.connect_timeout_ms.max(1)),
+        client_name.to_string(),
+        principal_id,
+    )
+    .await
+    .map_err(map_client_connect_error)
+}
+
+fn build_tls_connector(target: &TlsTarget) -> Result<TlsConnector> {
+    let mut roots = RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        let _ = roots.add(cert);
+    }
+
+    if let Some(ca_file) = target.ca_file.as_ref() {
+        let pem = std::fs::read(ca_file)
+            .with_context(|| format!("failed reading CA bundle {}", ca_file.display()))?;
+        let mut reader = std::io::Cursor::new(pem);
+        let certs = rustls_pemfile::certs(&mut reader)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| format!("failed parsing CA bundle {}", ca_file.display()))?;
+        for cert in certs {
+            roots.add(cert).with_context(|| {
+                format!("failed adding CA certificate from {}", ca_file.display())
+            })?;
+        }
+    }
+
+    if roots.is_empty() {
+        anyhow::bail!(
+            "no TLS trust roots available for target '{}'; install system certs or set ca_file",
+            target.label
+        );
+    }
+
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(TlsConnector::from(Arc::new(config)))
+}
+
+fn resolve_active_target() -> Result<ActiveTarget> {
+    let config = BmuxConfig::load().context("failed loading bmux config")?;
+    let selected = std::env::var("BMUX_TARGET")
+        .ok()
+        .or_else(|| config.connections.default_target.clone());
+    let Some(target) = selected else {
+        return Ok(ActiveTarget::Local);
+    };
+    resolve_target_reference(&config, target.trim())
+}
+
+fn resolve_target_reference(config: &BmuxConfig, target: &str) -> Result<ActiveTarget> {
+    if target.is_empty() || target == "local" {
+        return Ok(ActiveTarget::Local);
+    }
+    if let Some(named) = config.connections.targets.get(target) {
+        return resolve_named_target(target, named);
+    }
+    if target.starts_with("tls://") {
+        return parse_inline_tls_target(target);
+    }
+    Ok(ActiveTarget::Local)
+}
+
+fn resolve_named_target(name: &str, target: &ConnectionTargetConfig) -> Result<ActiveTarget> {
+    match target.transport {
+        ConnectionTransport::Local => Ok(ActiveTarget::Local),
+        ConnectionTransport::Tls => {
+            let host = target
+                .host
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("TLS target '{name}' requires host"))?
+                .to_string();
+            let port = target.port.unwrap_or(443);
+            let server_name = target.server_name.clone().unwrap_or_else(|| host.clone());
+            Ok(ActiveTarget::Tls(TlsTarget {
+                label: name.to_string(),
+                host,
+                port,
+                server_name,
+                ca_file: target.ca_file.clone(),
+                connect_timeout_ms: target.connect_timeout_ms.max(1),
+            }))
+        }
+        ConnectionTransport::Ssh => {
+            anyhow::bail!(
+                "SSH targets require CLI target proxying; run command with --target {}",
+                name
+            )
+        }
+    }
+}
+
+fn parse_inline_tls_target(target: &str) -> Result<ActiveTarget> {
+    let raw = target
+        .strip_prefix("tls://")
+        .ok_or_else(|| anyhow::anyhow!("TLS target must start with tls://"))?;
+    let (host, port) = if let Some((host, port_raw)) = raw.rsplit_once(':') {
+        if port_raw.is_empty() {
+            (raw.to_string(), 443)
+        } else {
+            let parsed = port_raw
+                .parse::<u16>()
+                .with_context(|| format!("invalid TLS port in target '{target}'"))?;
+            (host.to_string(), parsed)
+        }
+    } else {
+        (raw.to_string(), 443)
+    };
+    if host.trim().is_empty() {
+        anyhow::bail!("TLS target must include a host");
+    }
+    Ok(ActiveTarget::Tls(TlsTarget {
+        label: target.to_string(),
+        host: host.clone(),
+        port,
+        server_name: host,
+        ca_file: None,
+        connect_timeout_ms: 8_000,
+    }))
+}
+
+fn load_or_create_local_principal_id() -> Result<uuid::Uuid> {
+    let path = bmux_config::ConfigPaths::default().principal_id_file();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("failed creating principal id dir {}", parent.display()))?;
+    }
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let raw = content.trim();
+            uuid::Uuid::parse_str(raw)
+                .with_context(|| format!("invalid principal id in {}: {raw}", path.display()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let principal_id = uuid::Uuid::new_v4();
+            std::fs::write(&path, principal_id.to_string())
+                .with_context(|| format!("failed writing principal id file {}", path.display()))?;
+            Ok(principal_id)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("failed reading principal id file {}", path.display())),
+    }
 }
 
 pub fn is_server_unavailable_client_error(error: &ClientError) -> bool {

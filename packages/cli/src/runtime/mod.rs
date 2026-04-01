@@ -155,6 +155,13 @@ pub async fn run() -> Result<u8> {
         } => {
             init_logging(verbose, Some(log_level));
             validate_record_bootstrap_flags(&cli)?;
+            if let Some(target) = cli.target.as_deref() {
+                // SAFETY: runtime CLI is single-process command execution and intentionally
+                // propagates the selected target to connection helpers that read BMUX_TARGET.
+                unsafe {
+                    std::env::set_var("BMUX_TARGET", target);
+                }
+            }
             if should_proxy_to_target(&cli)? {
                 return run_target_proxy_from_current_argv(&cli).await;
             }
