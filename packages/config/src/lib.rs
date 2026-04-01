@@ -134,6 +134,14 @@ pub struct RecordingExportConfig {
     pub cursor_solid_after_output_ms: Option<u32>,
     /// Keep cursor solid after cursor movement activity for this duration in milliseconds.
     pub cursor_solid_after_cursor_ms: Option<u32>,
+    /// Cursor paint mode default for `recording export`.
+    pub cursor_paint_mode: RecordingExportCursorPaintMode,
+    /// Cursor text mode default for `recording export`.
+    pub cursor_text_mode: RecordingExportCursorTextMode,
+    /// Cursor bar width default as a percent of cell width.
+    pub cursor_bar_width_pct: u8,
+    /// Cursor underline height default as a percent of cell height.
+    pub cursor_underline_height_pct: u8,
 }
 
 impl Default for RecordingExportConfig {
@@ -149,6 +157,10 @@ impl Default for RecordingExportConfig {
             cursor_solid_after_input_ms: None,
             cursor_solid_after_output_ms: None,
             cursor_solid_after_cursor_ms: None,
+            cursor_paint_mode: RecordingExportCursorPaintMode::Auto,
+            cursor_text_mode: RecordingExportCursorTextMode::Auto,
+            cursor_bar_width_pct: 16,
+            cursor_underline_height_pct: 12,
         }
     }
 }
@@ -191,6 +203,23 @@ pub enum RecordingExportCursorProfile {
     Auto,
     Ghostty,
     Generic,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ConfigDocEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingExportCursorPaintMode {
+    Auto,
+    Invert,
+    Fill,
+    Outline,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, ConfigDocEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingExportCursorTextMode {
+    Auto,
+    SwapFgBg,
+    ForceContrast,
 }
 
 /// Core session defaults: shell, scrollback depth, and server connection settings
@@ -710,6 +739,26 @@ impl BmuxConfig {
                 value: "0".to_string(),
             });
         }
+        if self.recording.export.cursor_bar_width_pct == 0
+            || self.recording.export.cursor_bar_width_pct > 100
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "recording.export.cursor_bar_width_pct".to_string(),
+                value: self.recording.export.cursor_bar_width_pct.to_string(),
+            });
+        }
+        if self.recording.export.cursor_underline_height_pct == 0
+            || self.recording.export.cursor_underline_height_pct > 100
+        {
+            return Err(ConfigError::InvalidValue {
+                field: "recording.export.cursor_underline_height_pct".to_string(),
+                value: self
+                    .recording
+                    .export
+                    .cursor_underline_height_pct
+                    .to_string(),
+            });
+        }
 
         if self.status_bar.max_tabs == 0 {
             return Err(ConfigError::InvalidValue {
@@ -817,6 +866,26 @@ impl BmuxConfig {
             repaired_fields.push(format!(
                 "recording.export.cursor_blink_period_ms=0 -> {}",
                 self.recording.export.cursor_blink_period_ms
+            ));
+        }
+        if self.recording.export.cursor_bar_width_pct == 0
+            || self.recording.export.cursor_bar_width_pct > 100
+        {
+            self.recording.export.cursor_bar_width_pct =
+                recording_defaults.export.cursor_bar_width_pct;
+            repaired_fields.push(format!(
+                "recording.export.cursor_bar_width_pct out of range -> {}",
+                self.recording.export.cursor_bar_width_pct
+            ));
+        }
+        if self.recording.export.cursor_underline_height_pct == 0
+            || self.recording.export.cursor_underline_height_pct > 100
+        {
+            self.recording.export.cursor_underline_height_pct =
+                recording_defaults.export.cursor_underline_height_pct;
+            repaired_fields.push(format!(
+                "recording.export.cursor_underline_height_pct out of range -> {}",
+                self.recording.export.cursor_underline_height_pct
             ));
         }
 
@@ -1203,6 +1272,16 @@ timeout_profile = "missing"
         assert_eq!(config.recording.export.cursor_solid_after_input_ms, None);
         assert_eq!(config.recording.export.cursor_solid_after_output_ms, None);
         assert_eq!(config.recording.export.cursor_solid_after_cursor_ms, None);
+        assert_eq!(
+            config.recording.export.cursor_paint_mode,
+            crate::RecordingExportCursorPaintMode::Auto
+        );
+        assert_eq!(
+            config.recording.export.cursor_text_mode,
+            crate::RecordingExportCursorTextMode::Auto
+        );
+        assert_eq!(config.recording.export.cursor_bar_width_pct, 16);
+        assert_eq!(config.recording.export.cursor_underline_height_pct, 12);
     }
 
     #[test]
@@ -1211,7 +1290,7 @@ timeout_profile = "missing"
         let dir = path.parent().expect("temp dir").to_path_buf();
         std::fs::write(
             &path,
-            "[recording.export]\ncursor = 'on'\ncursor_shape = 'underline'\ncursor_blink = 'off'\ncursor_blink_period_ms = 650\ncursor_color = '#44aaee'\ncursor_profile = 'ghostty'\ncursor_solid_after_activity_ms = 900\ncursor_solid_after_input_ms = 910\ncursor_solid_after_output_ms = 920\ncursor_solid_after_cursor_ms = 930\n",
+            "[recording.export]\ncursor = 'on'\ncursor_shape = 'underline'\ncursor_blink = 'off'\ncursor_blink_period_ms = 650\ncursor_color = '#44aaee'\ncursor_profile = 'ghostty'\ncursor_solid_after_activity_ms = 900\ncursor_solid_after_input_ms = 910\ncursor_solid_after_output_ms = 920\ncursor_solid_after_cursor_ms = 930\ncursor_paint_mode = 'fill'\ncursor_text_mode = 'swap_fg_bg'\ncursor_bar_width_pct = 14\ncursor_underline_height_pct = 11\n",
         )
         .expect("failed writing config fixture");
 
@@ -1250,6 +1329,16 @@ timeout_profile = "missing"
             config.recording.export.cursor_solid_after_cursor_ms,
             Some(930)
         );
+        assert_eq!(
+            config.recording.export.cursor_paint_mode,
+            crate::RecordingExportCursorPaintMode::Fill
+        );
+        assert_eq!(
+            config.recording.export.cursor_text_mode,
+            crate::RecordingExportCursorTextMode::SwapFgBg
+        );
+        assert_eq!(config.recording.export.cursor_bar_width_pct, 14);
+        assert_eq!(config.recording.export.cursor_underline_height_pct, 11);
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
     }

@@ -21,6 +21,10 @@ pub(super) struct CursorDefaults {
     pub(super) solid_after_input_ms: Option<u32>,
     pub(super) solid_after_output_ms: Option<u32>,
     pub(super) solid_after_cursor_ms: Option<u32>,
+    pub(super) paint_mode: Option<CursorDefaultPaintMode>,
+    pub(super) text_mode: Option<CursorDefaultTextMode>,
+    pub(super) bar_width_pct: Option<u8>,
+    pub(super) underline_height_pct: Option<u8>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -43,6 +47,21 @@ pub(super) enum CursorDefaultShape {
 pub(super) enum CursorDefaultBlink {
     On,
     Off,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum CursorDefaultPaintMode {
+    Invert,
+    Fill,
+    Outline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum CursorDefaultTextMode {
+    SwapFgBg,
+    ForceContrast,
 }
 
 trait TerminalProfileProvider {
@@ -147,6 +166,10 @@ impl GhosttyProvider {
                 solid_after_input_ms: Some(500),
                 solid_after_output_ms: Some(500),
                 solid_after_cursor_ms: Some(500),
+                paint_mode: Some(CursorDefaultPaintMode::Fill),
+                text_mode: Some(CursorDefaultTextMode::SwapFgBg),
+                bar_width_pct: Some(12),
+                underline_height_pct: Some(10),
                 ..parsed.cursor_defaults
             },
             source: format!("ghostty-config:{}", path.display()),
@@ -164,6 +187,10 @@ impl GhosttyProvider {
                 solid_after_input_ms: Some(500),
                 solid_after_output_ms: Some(500),
                 solid_after_cursor_ms: Some(500),
+                paint_mode: Some(CursorDefaultPaintMode::Fill),
+                text_mode: Some(CursorDefaultTextMode::SwapFgBg),
+                bar_width_pct: Some(12),
+                underline_height_pct: Some(10),
                 ..CursorDefaults::default()
             },
             source: "ghostty-default".to_string(),
@@ -262,6 +289,18 @@ fn parse_ghostty_config_profile(content: &str) -> GhosttyConfigProfile {
                 }
                 profile.cursor_defaults.color = Some(parsed);
             }
+            "cursor-paint-mode" => {
+                profile.cursor_defaults.paint_mode = parse_ghostty_cursor_paint_mode(&parsed);
+            }
+            "cursor-text-mode" => {
+                profile.cursor_defaults.text_mode = parse_ghostty_cursor_text_mode(&parsed);
+            }
+            "cursor-bar-width-pct" => {
+                profile.cursor_defaults.bar_width_pct = parsed.parse::<u8>().ok();
+            }
+            "cursor-underline-height-pct" => {
+                profile.cursor_defaults.underline_height_pct = parsed.parse::<u8>().ok();
+            }
             _ => {}
         }
     }
@@ -281,6 +320,23 @@ fn parse_ghostty_cursor_blink(value: &str) -> Option<CursorDefaultBlink> {
     match value.trim().to_ascii_lowercase().as_str() {
         "true" => Some(CursorDefaultBlink::On),
         "false" => Some(CursorDefaultBlink::Off),
+        _ => None,
+    }
+}
+
+fn parse_ghostty_cursor_paint_mode(value: &str) -> Option<CursorDefaultPaintMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "invert" => Some(CursorDefaultPaintMode::Invert),
+        "fill" => Some(CursorDefaultPaintMode::Fill),
+        "outline" => Some(CursorDefaultPaintMode::Outline),
+        _ => None,
+    }
+}
+
+fn parse_ghostty_cursor_text_mode(value: &str) -> Option<CursorDefaultTextMode> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "swap_fg_bg" | "swap-fg-bg" => Some(CursorDefaultTextMode::SwapFgBg),
+        "force_contrast" | "force-contrast" => Some(CursorDefaultTextMode::ForceContrast),
         _ => None,
     }
 }
@@ -370,6 +426,10 @@ background-opacity = 0.9
 cursor-style = bar
 cursor-style-blink = false
 cursor-color = '#33aaee'
+cursor-paint-mode = fill
+cursor-text-mode = swap_fg_bg
+cursor-bar-width-pct = 13
+cursor-underline-height-pct = 9
 "#,
         );
         assert_eq!(parsed.font_families, vec!["Iosevka".to_string()]);
@@ -378,6 +438,16 @@ cursor-color = '#33aaee'
         assert_eq!(parsed.cursor_defaults.shape, Some(CursorDefaultShape::Bar));
         assert_eq!(parsed.cursor_defaults.blink, Some(CursorDefaultBlink::Off));
         assert_eq!(parsed.cursor_defaults.color, Some("#33aaee".to_string()));
+        assert_eq!(
+            parsed.cursor_defaults.paint_mode,
+            Some(CursorDefaultPaintMode::Fill)
+        );
+        assert_eq!(
+            parsed.cursor_defaults.text_mode,
+            Some(CursorDefaultTextMode::SwapFgBg)
+        );
+        assert_eq!(parsed.cursor_defaults.bar_width_pct, Some(13));
+        assert_eq!(parsed.cursor_defaults.underline_height_pct, Some(9));
     }
 
     #[test]

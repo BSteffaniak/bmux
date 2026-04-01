@@ -1,11 +1,11 @@
 use super::{
     AttachDisplayCapturePlan, BmuxConfig, BufWriter, ConfigPaths, ConnectionPolicyScope, Context,
     GifEncoder, GifFrame, Instant, IsTerminal, Path, PathBuf, RecordingCursorBlinkMode,
-    RecordingCursorMode, RecordingCursorProfile, RecordingCursorShape, RecordingEventEnvelope,
-    RecordingEventKind, RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg,
-    RecordingRenderMode, RecordingReplayMode, RecordingStatus, RecordingSummary, Repeat, Result,
-    Uuid, Write, cleanup_stale_pid_file, connect_if_running, io, map_cli_client_error,
-    parse_uuid_value, terminal,
+    RecordingCursorMode, RecordingCursorPaintMode, RecordingCursorProfile, RecordingCursorShape,
+    RecordingCursorTextMode, RecordingEventEnvelope, RecordingEventKind, RecordingEventKindArg,
+    RecordingExportFormat, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
+    RecordingStatus, RecordingSummary, Repeat, Result, Uuid, Write, cleanup_stale_pid_file,
+    connect_if_running, io, map_cli_client_error, parse_uuid_value, terminal,
 };
 use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont, point};
 use bmux_fonts::FontPreset;
@@ -480,6 +480,10 @@ pub(super) async fn run_recording_export(
     cursor_solid_after_input_ms: Option<u32>,
     cursor_solid_after_output_ms: Option<u32>,
     cursor_solid_after_cursor_ms: Option<u32>,
+    cursor_paint_mode: RecordingCursorPaintMode,
+    cursor_text_mode: RecordingCursorTextMode,
+    cursor_bar_width_pct: u8,
+    cursor_underline_height_pct: u8,
     export_metadata: Option<&str>,
     show_progress: bool,
 ) -> Result<u8> {
@@ -542,6 +546,10 @@ pub(super) async fn run_recording_export(
             cursor_solid_after_input_ms,
             cursor_solid_after_output_ms,
             cursor_solid_after_cursor_ms,
+            cursor_paint_mode,
+            cursor_text_mode,
+            cursor_bar_width_pct,
+            cursor_underline_height_pct,
             export_metadata,
             show_progress,
         )?,
@@ -776,6 +784,10 @@ struct CursorExportOptions {
     solid_after_input_ns: u64,
     solid_after_output_ns: u64,
     solid_after_cursor_ns: u64,
+    paint_mode: RecordingCursorPaintMode,
+    text_mode: RecordingCursorTextMode,
+    bar_width_pct: u8,
+    underline_height_pct: u8,
     color_label: String,
     color_override: Option<(u8, u8, u8)>,
 }
@@ -801,6 +813,19 @@ enum CursorVisibilityReason {
     BlinkOff,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockPaintMode {
+    Invert,
+    Fill,
+    Outline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlockTextMode {
+    SwapFgBg,
+    ForceContrast,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 struct ExportCursorFrame {
     mono_ns: u64,
@@ -811,6 +836,9 @@ struct ExportCursorFrame {
     blink_on: bool,
     cursor_source: &'static str,
     visible_reason: CursorVisibilityReason,
+    paint_mode_used: &'static str,
+    text_mode_used: &'static str,
+    paint_fallback_reason: Option<&'static str>,
     last_input_activity_ns: Option<u64>,
     last_output_activity_ns: Option<u64>,
     last_cursor_activity_ns: Option<u64>,
@@ -837,6 +865,10 @@ struct CursorMetadata<'a> {
     solid_after_input_ms: u32,
     solid_after_output_ms: u32,
     solid_after_cursor_ms: u32,
+    paint_mode: &'a str,
+    text_mode: &'a str,
+    bar_width_pct: u8,
+    underline_height_pct: u8,
     color: &'a str,
 }
 
@@ -1008,6 +1040,48 @@ fn cursor_shape_name(shape: CursorVisualShape) -> &'static str {
     }
 }
 
+fn paint_mode_name(mode: BlockPaintMode) -> &'static str {
+    match mode {
+        BlockPaintMode::Invert => "invert",
+        BlockPaintMode::Fill => "fill",
+        BlockPaintMode::Outline => "outline",
+    }
+}
+
+fn text_mode_name(mode: BlockTextMode) -> &'static str {
+    match mode {
+        BlockTextMode::SwapFgBg => "swap_fg_bg",
+        BlockTextMode::ForceContrast => "force_contrast",
+    }
+}
+
+fn relative_luminance(rgb: (u8, u8, u8)) -> f32 {
+    let channel = |value: u8| {
+        let v = f32::from(value) / 255.0;
+        if v <= 0.04045 {
+            v / 12.92
+        } else {
+            ((v + 0.055) / 1.055).powf(2.4)
+        }
+    };
+    (0.2126 * channel(rgb.0)) + (0.7152 * channel(rgb.1)) + (0.0722 * channel(rgb.2))
+}
+
+fn contrast_ratio(a: (u8, u8, u8), b: (u8, u8, u8)) -> f32 {
+    let l1 = relative_luminance(a);
+    let l2 = relative_luminance(b);
+    let (high, low) = if l1 >= l2 { (l1, l2) } else { (l2, l1) };
+    (high + 0.05) / (low + 0.05)
+}
+
+fn pick_contrast_text_color(fill: (u8, u8, u8)) -> (u8, u8, u8) {
+    if contrast_ratio((0, 0, 0), fill) >= contrast_ratio((255, 255, 255), fill) {
+        (0, 0, 0)
+    } else {
+        (255, 255, 255)
+    }
+}
+
 fn overlay_cursor_rgba(
     pixels: &mut [u8],
     frame_width: usize,
@@ -1017,39 +1091,128 @@ fn overlay_cursor_rgba(
     row: u16,
     col: u16,
     shape: CursorVisualShape,
+    paint_mode: BlockPaintMode,
+    text_mode: BlockTextMode,
+    bar_width_pct: u8,
+    underline_height_pct: u8,
+    cell_fg: (u8, u8, u8),
+    cell_bg: (u8, u8, u8),
     color: (u8, u8, u8),
-) {
+) -> (BlockPaintMode, BlockTextMode, Option<&'static str>) {
     if frame_width == 0 || frame_height == 0 || cell_w == 0 || cell_h == 0 {
-        return;
+        return (paint_mode, text_mode, None);
     }
     let x0 = usize::from(col).saturating_mul(cell_w);
     let y0 = usize::from(row).saturating_mul(cell_h);
     if x0 >= frame_width || y0 >= frame_height {
-        return;
+        return (paint_mode, text_mode, None);
     }
-
+    let resolved_paint_mode = paint_mode;
+    let mut resolved_text_mode = text_mode;
+    let mut fallback_reason = None;
     match shape {
-        CursorVisualShape::Block => {
-            for py in 0..cell_h {
-                let y = y0 + py;
-                if y >= frame_height {
-                    continue;
-                }
-                for px in 0..cell_w {
-                    let x = x0 + px;
-                    if x >= frame_width {
+        CursorVisualShape::Block => match resolved_paint_mode {
+            BlockPaintMode::Invert => {
+                for py in 0..cell_h {
+                    let y = y0 + py;
+                    if y >= frame_height {
                         continue;
                     }
-                    let idx = (y * frame_width + x) * 4;
-                    pixels[idx] = 255_u8.saturating_sub(pixels[idx]);
-                    pixels[idx + 1] = 255_u8.saturating_sub(pixels[idx + 1]);
-                    pixels[idx + 2] = 255_u8.saturating_sub(pixels[idx + 2]);
-                    pixels[idx + 3] = 255;
+                    for px in 0..cell_w {
+                        let x = x0 + px;
+                        if x >= frame_width {
+                            continue;
+                        }
+                        let idx = (y * frame_width + x) * 4;
+                        pixels[idx] = 255_u8.saturating_sub(pixels[idx]);
+                        pixels[idx + 1] = 255_u8.saturating_sub(pixels[idx + 1]);
+                        pixels[idx + 2] = 255_u8.saturating_sub(pixels[idx + 2]);
+                        pixels[idx + 3] = 255;
+                    }
                 }
             }
-        }
+            BlockPaintMode::Fill => {
+                let mut effective_text_mode = text_mode;
+                if matches!(text_mode, BlockTextMode::SwapFgBg)
+                    && contrast_ratio(cell_bg, color) < 2.0
+                {
+                    effective_text_mode = BlockTextMode::ForceContrast;
+                    fallback_reason = Some("swap_fg_bg_low_contrast");
+                }
+                resolved_text_mode = effective_text_mode;
+                let fill_text = match effective_text_mode {
+                    BlockTextMode::SwapFgBg => cell_bg,
+                    BlockTextMode::ForceContrast => pick_contrast_text_color(color),
+                };
+                for py in 0..cell_h {
+                    let y = y0 + py;
+                    if y >= frame_height {
+                        continue;
+                    }
+                    for px in 0..cell_w {
+                        let x = x0 + px;
+                        if x >= frame_width {
+                            continue;
+                        }
+                        let idx = (y * frame_width + x) * 4;
+                        pixels[idx] = color.0;
+                        pixels[idx + 1] = color.1;
+                        pixels[idx + 2] = color.2;
+                        pixels[idx + 3] = 255;
+                    }
+                }
+                let inset_x = (cell_w / 8).max(1);
+                let inset_y = (cell_h / 8).max(1);
+                if cell_w > inset_x.saturating_mul(2) && cell_h > inset_y.saturating_mul(2) {
+                    for py in inset_y..(cell_h - inset_y) {
+                        let y = y0 + py;
+                        if y >= frame_height {
+                            continue;
+                        }
+                        for px in inset_x..(cell_w - inset_x) {
+                            let x = x0 + px;
+                            if x >= frame_width {
+                                continue;
+                            }
+                            let idx = (y * frame_width + x) * 4;
+                            pixels[idx] = fill_text.0;
+                            pixels[idx + 1] = fill_text.1;
+                            pixels[idx + 2] = fill_text.2;
+                            pixels[idx + 3] = 255;
+                        }
+                    }
+                }
+            }
+            BlockPaintMode::Outline => {
+                for py in 0..cell_h {
+                    let y = y0 + py;
+                    if y >= frame_height {
+                        continue;
+                    }
+                    for px in 0..cell_w {
+                        let x = x0 + px;
+                        if x >= frame_width {
+                            continue;
+                        }
+                        if px > 0
+                            && py > 0
+                            && px < cell_w.saturating_sub(1)
+                            && py < cell_h.saturating_sub(1)
+                        {
+                            continue;
+                        }
+                        let idx = (y * frame_width + x) * 4;
+                        pixels[idx] = color.0;
+                        pixels[idx + 1] = color.1;
+                        pixels[idx + 2] = color.2;
+                        pixels[idx + 3] = 255;
+                    }
+                }
+            }
+        },
         CursorVisualShape::Bar => {
-            let bar_width = (cell_w / 6).max(1);
+            let bar_width =
+                ((cell_w.saturating_mul(usize::from(bar_width_pct.clamp(1, 100)))) / 100).max(1);
             for py in 0..cell_h {
                 let y = y0 + py;
                 if y >= frame_height {
@@ -1069,7 +1232,9 @@ fn overlay_cursor_rgba(
             }
         }
         CursorVisualShape::Underline => {
-            let line_height = (cell_h / 8).max(1);
+            let line_height =
+                ((cell_h.saturating_mul(usize::from(underline_height_pct.clamp(1, 100)))) / 100)
+                    .max(1);
             let start_y = y0 + cell_h.saturating_sub(line_height);
             for py in start_y..(start_y + line_height) {
                 if py >= frame_height {
@@ -1089,6 +1254,8 @@ fn overlay_cursor_rgba(
             }
         }
     }
+    let _ = cell_fg;
+    (resolved_paint_mode, resolved_text_mode, fallback_reason)
 }
 
 fn export_recording_gif(
@@ -1117,6 +1284,10 @@ fn export_recording_gif(
     cursor_solid_after_input_ms: Option<u32>,
     cursor_solid_after_output_ms: Option<u32>,
     cursor_solid_after_cursor_ms: Option<u32>,
+    cursor_paint_mode: RecordingCursorPaintMode,
+    cursor_text_mode: RecordingCursorTextMode,
+    cursor_bar_width_pct: u8,
+    cursor_underline_height_pct: u8,
     export_metadata: Option<&str>,
     show_progress: bool,
 ) -> Result<()> {
@@ -1161,6 +1332,51 @@ fn export_recording_gif(
     } else {
         cursor_profile
     };
+    let resolved_paint_mode = if matches!(cursor_paint_mode, RecordingCursorPaintMode::Auto) {
+        profile_defaults
+            .and_then(|defaults| defaults.paint_mode)
+            .map(|mode| match mode {
+                terminal_profile::CursorDefaultPaintMode::Invert => {
+                    RecordingCursorPaintMode::Invert
+                }
+                terminal_profile::CursorDefaultPaintMode::Fill => RecordingCursorPaintMode::Fill,
+                terminal_profile::CursorDefaultPaintMode::Outline => {
+                    RecordingCursorPaintMode::Outline
+                }
+            })
+            .unwrap_or(match resolved_profile {
+                RecordingCursorProfile::Ghostty => RecordingCursorPaintMode::Fill,
+                _ => RecordingCursorPaintMode::Invert,
+            })
+    } else {
+        cursor_paint_mode
+    };
+    let resolved_text_mode = if matches!(cursor_text_mode, RecordingCursorTextMode::Auto) {
+        profile_defaults
+            .and_then(|defaults| defaults.text_mode)
+            .map(|mode| match mode {
+                terminal_profile::CursorDefaultTextMode::SwapFgBg => {
+                    RecordingCursorTextMode::SwapFgBg
+                }
+                terminal_profile::CursorDefaultTextMode::ForceContrast => {
+                    RecordingCursorTextMode::ForceContrast
+                }
+            })
+            .unwrap_or(match resolved_profile {
+                RecordingCursorProfile::Ghostty => RecordingCursorTextMode::SwapFgBg,
+                _ => RecordingCursorTextMode::ForceContrast,
+            })
+    } else {
+        cursor_text_mode
+    };
+    let resolved_bar_width_pct = profile_defaults
+        .and_then(|defaults| defaults.bar_width_pct)
+        .unwrap_or(cursor_bar_width_pct)
+        .clamp(1, 100);
+    let resolved_underline_height_pct = profile_defaults
+        .and_then(|defaults| defaults.underline_height_pct)
+        .unwrap_or(cursor_underline_height_pct)
+        .clamp(1, 100);
     let resolved_solid_after_input_ms = cursor_solid_after_input_ms
         .or(cursor_solid_after_activity_ms)
         .or_else(|| profile_defaults.and_then(|defaults| defaults.solid_after_input_ms))
@@ -1201,6 +1417,10 @@ fn export_recording_gif(
         solid_after_input_ns: u64::from(resolved_solid_after_input_ms).saturating_mul(1_000_000),
         solid_after_output_ns: u64::from(resolved_solid_after_output_ms).saturating_mul(1_000_000),
         solid_after_cursor_ns: u64::from(resolved_solid_after_cursor_ms).saturating_mul(1_000_000),
+        paint_mode: resolved_paint_mode,
+        text_mode: resolved_text_mode,
+        bar_width_pct: resolved_bar_width_pct,
+        underline_height_pct: resolved_underline_height_pct,
         color_label: resolved_color_label,
         color_override: resolved_color_override,
     };
@@ -1484,14 +1704,13 @@ fn export_recording_gif(
             )
         };
         if cursor_visible && cursor_row < current_rows && cursor_col < current_cols {
-            let cursor_color_rgb = cursor_options.color_override.unwrap_or_else(|| {
-                parser
-                    .screen()
-                    .cell(cursor_row, cursor_col)
-                    .map(|cell| resolved_cell_colors(cell, &palette).0)
-                    .unwrap_or((255, 255, 255))
-            });
-            overlay_cursor_rgba(
+            let (cell_fg, cell_bg) = parser
+                .screen()
+                .cell(cursor_row, cursor_col)
+                .map(|cell| resolved_cell_colors(cell, &palette))
+                .unwrap_or(((255, 255, 255), (0, 0, 0)));
+            let cursor_color_rgb = cursor_options.color_override.unwrap_or(cell_fg);
+            let (paint_mode_used, text_mode_used, paint_fallback_reason) = overlay_cursor_rgba(
                 &mut pixels,
                 usize::from(width),
                 usize::from(height),
@@ -1500,11 +1719,44 @@ fn export_recording_gif(
                 cursor_row,
                 cursor_col,
                 shape,
+                match cursor_options.paint_mode {
+                    RecordingCursorPaintMode::Auto | RecordingCursorPaintMode::Invert => {
+                        BlockPaintMode::Invert
+                    }
+                    RecordingCursorPaintMode::Fill => BlockPaintMode::Fill,
+                    RecordingCursorPaintMode::Outline => BlockPaintMode::Outline,
+                },
+                match cursor_options.text_mode {
+                    RecordingCursorTextMode::Auto | RecordingCursorTextMode::SwapFgBg => {
+                        BlockTextMode::SwapFgBg
+                    }
+                    RecordingCursorTextMode::ForceContrast => BlockTextMode::ForceContrast,
+                },
+                cursor_options.bar_width_pct,
+                cursor_options.underline_height_pct,
+                cell_fg,
+                cell_bg,
                 cursor_color_rgb,
             );
-        }
-        profiler.record_render(render_started_at);
-        if let Some(frames) = cursor_frames.as_mut() {
+            if let Some(frames) = cursor_frames.as_mut() {
+                frames.push(ExportCursorFrame {
+                    mono_ns: frame_time_ns,
+                    row: cursor_row,
+                    col: cursor_col,
+                    visible: cursor_visible,
+                    shape: cursor_shape_name(shape),
+                    blink_on,
+                    cursor_source: "snapshot",
+                    visible_reason,
+                    paint_mode_used: paint_mode_name(paint_mode_used),
+                    text_mode_used: text_mode_name(text_mode_used),
+                    paint_fallback_reason,
+                    last_input_activity_ns,
+                    last_output_activity_ns,
+                    last_cursor_activity_ns,
+                });
+            }
+        } else if let Some(frames) = cursor_frames.as_mut() {
             frames.push(ExportCursorFrame {
                 mono_ns: frame_time_ns,
                 row: cursor_row,
@@ -1514,11 +1766,26 @@ fn export_recording_gif(
                 blink_on,
                 cursor_source: "snapshot",
                 visible_reason,
+                paint_mode_used: paint_mode_name(match cursor_options.paint_mode {
+                    RecordingCursorPaintMode::Auto | RecordingCursorPaintMode::Invert => {
+                        BlockPaintMode::Invert
+                    }
+                    RecordingCursorPaintMode::Fill => BlockPaintMode::Fill,
+                    RecordingCursorPaintMode::Outline => BlockPaintMode::Outline,
+                }),
+                text_mode_used: text_mode_name(match cursor_options.text_mode {
+                    RecordingCursorTextMode::Auto | RecordingCursorTextMode::SwapFgBg => {
+                        BlockTextMode::SwapFgBg
+                    }
+                    RecordingCursorTextMode::ForceContrast => BlockTextMode::ForceContrast,
+                }),
+                paint_fallback_reason: None,
                 last_input_activity_ns,
                 last_output_activity_ns,
                 last_cursor_activity_ns,
             });
         }
+        profiler.record_render(render_started_at);
         let encode_started_at = profiler.stage_started();
         let mut frame = GifFrame::from_rgba_speed(width, height, &mut pixels, 1);
         frame.delay = delay_cs;
@@ -1583,6 +1850,19 @@ fn export_recording_gif(
                 solid_after_input_ms: resolved_solid_after_input_ms,
                 solid_after_output_ms: resolved_solid_after_output_ms,
                 solid_after_cursor_ms: resolved_solid_after_cursor_ms,
+                paint_mode: match cursor_options.paint_mode {
+                    RecordingCursorPaintMode::Auto => "auto",
+                    RecordingCursorPaintMode::Invert => "invert",
+                    RecordingCursorPaintMode::Fill => "fill",
+                    RecordingCursorPaintMode::Outline => "outline",
+                },
+                text_mode: match cursor_options.text_mode {
+                    RecordingCursorTextMode::Auto => "auto",
+                    RecordingCursorTextMode::SwapFgBg => "swap_fg_bg",
+                    RecordingCursorTextMode::ForceContrast => "force_contrast",
+                },
+                bar_width_pct: cursor_options.bar_width_pct,
+                underline_height_pct: cursor_options.underline_height_pct,
                 color: &cursor_options.color_label,
             },
             frames: cursor_frames.unwrap_or_default(),
@@ -3604,6 +3884,10 @@ mod tests {
             solid_after_input_ns: 0,
             solid_after_output_ns: 0,
             solid_after_cursor_ns: 0,
+            paint_mode: RecordingCursorPaintMode::Invert,
+            text_mode: RecordingCursorTextMode::SwapFgBg,
+            bar_width_pct: 16,
+            underline_height_pct: 12,
             color_label: "auto".to_string(),
             color_override: None,
         };
@@ -3658,6 +3942,10 @@ mod tests {
             solid_after_input_ns: 0,
             solid_after_output_ns: 0,
             solid_after_cursor_ns: 0,
+            paint_mode: RecordingCursorPaintMode::Invert,
+            text_mode: RecordingCursorTextMode::SwapFgBg,
+            bar_width_pct: 16,
+            underline_height_pct: 12,
             color_label: "auto".to_string(),
             color_override: None,
         };
@@ -3711,6 +3999,10 @@ mod tests {
             solid_after_input_ns: 500_000_000,
             solid_after_output_ns: 500_000_000,
             solid_after_cursor_ns: 500_000_000,
+            paint_mode: RecordingCursorPaintMode::Invert,
+            text_mode: RecordingCursorTextMode::SwapFgBg,
+            bar_width_pct: 16,
+            underline_height_pct: 12,
             color_label: "auto".to_string(),
             color_override: None,
         };

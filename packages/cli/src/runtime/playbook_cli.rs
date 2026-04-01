@@ -83,6 +83,10 @@ pub(super) async fn run_playbook_run(
                 None,                        // cursor_solid_after_input_ms
                 None,                        // cursor_solid_after_output_ms
                 None,                        // cursor_solid_after_cursor_ms
+                None,                        // cursor_paint_mode
+                None,                        // cursor_text_mode
+                None,                        // cursor_bar_width_pct
+                None,                        // cursor_underline_height_pct
                 None,                        // export_metadata
                 true,                        // show_progress
             )

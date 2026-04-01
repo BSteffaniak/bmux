@@ -111,6 +111,10 @@ pub(super) async fn run_recording_export(
     cursor_solid_after_input_ms: Option<u32>,
     cursor_solid_after_output_ms: Option<u32>,
     cursor_solid_after_cursor_ms: Option<u32>,
+    cursor_paint_mode: Option<RecordingCursorPaintMode>,
+    cursor_text_mode: Option<RecordingCursorTextMode>,
+    cursor_bar_width_pct: Option<u8>,
+    cursor_underline_height_pct: Option<u8>,
     export_metadata: Option<&str>,
     show_progress: bool,
 ) -> Result<u8> {
@@ -156,6 +160,23 @@ pub(super) async fn run_recording_export(
         cursor_solid_after_output_ms.or(export_defaults.cursor_solid_after_output_ms);
     let resolved_cursor_solid_after_cursor_ms =
         cursor_solid_after_cursor_ms.or(export_defaults.cursor_solid_after_cursor_ms);
+    let resolved_cursor_paint_mode =
+        cursor_paint_mode.unwrap_or(match export_defaults.cursor_paint_mode {
+            RecordingExportCursorPaintMode::Auto => RecordingCursorPaintMode::Auto,
+            RecordingExportCursorPaintMode::Invert => RecordingCursorPaintMode::Invert,
+            RecordingExportCursorPaintMode::Fill => RecordingCursorPaintMode::Fill,
+            RecordingExportCursorPaintMode::Outline => RecordingCursorPaintMode::Outline,
+        });
+    let resolved_cursor_text_mode =
+        cursor_text_mode.unwrap_or(match export_defaults.cursor_text_mode {
+            RecordingExportCursorTextMode::Auto => RecordingCursorTextMode::Auto,
+            RecordingExportCursorTextMode::SwapFgBg => RecordingCursorTextMode::SwapFgBg,
+            RecordingExportCursorTextMode::ForceContrast => RecordingCursorTextMode::ForceContrast,
+        });
+    let resolved_cursor_bar_width_pct =
+        cursor_bar_width_pct.unwrap_or(export_defaults.cursor_bar_width_pct.clamp(1, 100));
+    let resolved_cursor_underline_height_pct = cursor_underline_height_pct
+        .unwrap_or(export_defaults.cursor_underline_height_pct.clamp(1, 100));
 
     recording::run_recording_export(
         recording_id,
@@ -184,6 +205,10 @@ pub(super) async fn run_recording_export(
         resolved_cursor_solid_after_input_ms,
         resolved_cursor_solid_after_output_ms,
         resolved_cursor_solid_after_cursor_ms,
+        resolved_cursor_paint_mode,
+        resolved_cursor_text_mode,
+        resolved_cursor_bar_width_pct,
+        resolved_cursor_underline_height_pct,
         export_metadata,
         show_progress,
     )

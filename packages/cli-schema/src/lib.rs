@@ -93,6 +93,21 @@ pub enum RecordingCursorProfile {
     Generic,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RecordingCursorPaintMode {
+    Auto,
+    Invert,
+    Fill,
+    Outline,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RecordingCursorTextMode {
+    Auto,
+    SwapFgBg,
+    ForceContrast,
+}
+
 fn parse_cell_size(value: &str) -> Result<(u16, u16), String> {
     let trimmed = value.trim();
     let (width_raw, height_raw) = trimmed
@@ -439,6 +454,18 @@ pub enum RecordingCommand {
         /// Keep cursor solid after cursor movement activity for this duration in ms
         #[arg(long)]
         cursor_solid_after_cursor_ms: Option<u32>,
+        /// Cursor paint mode for block cursor rendering
+        #[arg(long, value_enum)]
+        cursor_paint_mode: Option<RecordingCursorPaintMode>,
+        /// Cursor text mode for filled block cursor glyph readability
+        #[arg(long, value_enum)]
+        cursor_text_mode: Option<RecordingCursorTextMode>,
+        /// Cursor bar width as a percent of cell width (1-100)
+        #[arg(long)]
+        cursor_bar_width_pct: Option<u8>,
+        /// Cursor underline height as a percent of cell height (1-100)
+        #[arg(long)]
+        cursor_underline_height_pct: Option<u8>,
         /// Write export metadata JSON to this path
         #[arg(long)]
         export_metadata: Option<String>,
@@ -785,10 +812,10 @@ pub enum TerminalCommand {
 mod tests {
     use super::{
         Cli, Command, KeymapCommand, LogsCommand, LogsProfilesCommand, RecordingCommand,
-        RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorProfile,
-        RecordingCursorShape, RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg,
-        RecordingRenderMode, RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand,
-        TraceFamily,
+        RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
+        RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode,
+        RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg, RecordingRenderMode,
+        RecordingReplayMode, ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
     };
     use clap::Parser;
 
@@ -1924,6 +1951,14 @@ mod tests {
             "ghostty",
             "--cursor-solid-after-activity-ms",
             "800",
+            "--cursor-paint-mode",
+            "fill",
+            "--cursor-text-mode",
+            "swap-fg-bg",
+            "--cursor-bar-width-pct",
+            "14",
+            "--cursor-underline-height-pct",
+            "11",
             "--export-metadata",
             "./out.json",
             "--no-progress",
@@ -1954,6 +1989,10 @@ mod tests {
                 cursor_color: Some(_),
                 cursor_profile: Some(RecordingCursorProfile::Ghostty),
                 cursor_solid_after_activity_ms: Some(800),
+                cursor_paint_mode: Some(RecordingCursorPaintMode::Fill),
+                cursor_text_mode: Some(RecordingCursorTextMode::SwapFgBg),
+                cursor_bar_width_pct: Some(14),
+                cursor_underline_height_pct: Some(11),
                 export_metadata: Some(_),
                 no_progress: true,
                 ..
