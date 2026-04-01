@@ -56,6 +56,7 @@ pub enum BuiltInHandlerId {
     ConfigShow,
     ConfigGet,
     ConfigSet,
+    Doctor,
     Keymap,
     KeymapDoctor,
     Terminal,
@@ -377,6 +378,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::ConfigSet,
             &["config", "set"],
             "Set a configuration value",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::Doctor,
+            &["doctor"],
+            "Run system-wide health checks",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Keymap,

@@ -70,6 +70,7 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             ConfigCommand::Get { .. } => BuiltInHandlerId::ConfigGet,
             ConfigCommand::Set { .. } => BuiltInHandlerId::ConfigSet,
         },
+        Command::Doctor { .. } => BuiltInHandlerId::Doctor,
         Command::Keymap { .. } => BuiltInHandlerId::KeymapDoctor,
         Command::Terminal { command } => match command {
             TerminalCommand::Doctor { .. } => BuiltInHandlerId::TerminalDoctor,
@@ -463,6 +464,7 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 command: ConfigCommand::Set { key, value },
             },
         ) => run_config_set(key, value),
+        (BuiltInHandlerId::Doctor, Command::Doctor { json }) => run_doctor(*json).await,
         (
             BuiltInHandlerId::KeymapDoctor,
             Command::Keymap {

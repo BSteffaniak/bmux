@@ -274,6 +274,12 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Run system-wide health checks
+    Doctor {
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Keymap tools and diagnostics
     Keymap {
         #[command(subcommand)]
