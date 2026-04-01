@@ -191,6 +191,9 @@ pub enum Command {
         /// Keep following across target session switches (requires --follow)
         #[arg(long, requires = "follow")]
         global: bool,
+        /// Keep reconnecting instead of stopping after bounded retries
+        #[arg(long)]
+        reconnect_forever: bool,
     },
     /// Create a new session
     NewSession {
@@ -307,6 +310,39 @@ pub enum RemoteCommand {
     Doctor {
         /// Target name or ssh destination
         target: String,
+        /// Apply safe automatic fixes when possible
+        #[arg(long)]
+        fix: bool,
+    },
+    /// Create and validate a named remote target profile
+    Init {
+        /// Name for the target profile
+        name: String,
+        /// Configure as an SSH target (user@host[:port] or host)
+        #[arg(long, conflicts_with = "tls")]
+        ssh: Option<String>,
+        /// Configure as a TLS target (host[:port])
+        #[arg(long, conflicts_with = "ssh")]
+        tls: Option<String>,
+        /// SSH username override
+        #[arg(long)]
+        user: Option<String>,
+        /// SSH/TLS port override
+        #[arg(long)]
+        port: Option<u16>,
+        /// Mark as default target
+        #[arg(long)]
+        set_default: bool,
+    },
+    /// Ensure remote bmux runtime is installed and reachable
+    InstallServer {
+        /// Target name
+        target: String,
+    },
+    /// Upgrade remote bmux runtime for one or all targets
+    Upgrade {
+        /// Target name (omit to upgrade all configured targets)
+        target: Option<String>,
     },
 }
 
@@ -905,6 +941,7 @@ mod tests {
             session,
             follow,
             global,
+            reconnect_forever,
         }) = cli.command
         else {
             panic!("expected connect command");
@@ -913,6 +950,7 @@ mod tests {
         assert_eq!(session.as_deref(), Some("app"));
         assert!(follow.is_none());
         assert!(!global);
+        assert!(!reconnect_forever);
     }
 
     #[test]
@@ -924,6 +962,19 @@ mod tests {
         assert!(matches!(
             command,
             RemoteCommand::Test { target } if target == "prod"
+        ));
+    }
+
+    #[test]
+    fn parses_remote_doctor_fix_flag() {
+        let cli = Cli::try_parse_from(["bmux", "remote", "doctor", "prod", "--fix"])
+            .expect("valid CLI args");
+        let Some(Command::Remote { command }) = cli.command else {
+            panic!("expected remote command");
+        };
+        assert!(matches!(
+            command,
+            RemoteCommand::Doctor { target, fix } if target == "prod" && fix
         ));
     }
 

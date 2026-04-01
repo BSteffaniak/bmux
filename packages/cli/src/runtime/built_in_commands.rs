@@ -26,6 +26,9 @@ pub enum BuiltInHandlerId {
     RemoteList,
     RemoteTest,
     RemoteDoctor,
+    RemoteInit,
+    RemoteInstallServer,
+    RemoteUpgrade,
     Server,
     ServerStart,
     ServerStatus,
@@ -216,6 +219,21 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::RemoteDoctor,
             &["remote", "doctor"],
             "Diagnose remote connectivity and bmux readiness",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RemoteInit,
+            &["remote", "init"],
+            "Create and validate remote target profile",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RemoteInstallServer,
+            &["remote", "install-server"],
+            "Install or validate remote bmux server runtime",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RemoteUpgrade,
+            &["remote", "upgrade"],
+            "Upgrade remote bmux runtime on targets",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Server,

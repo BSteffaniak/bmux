@@ -34,6 +34,9 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             RemoteCommand::List { .. } => BuiltInHandlerId::RemoteList,
             RemoteCommand::Test { .. } => BuiltInHandlerId::RemoteTest,
             RemoteCommand::Doctor { .. } => BuiltInHandlerId::RemoteDoctor,
+            RemoteCommand::Init { .. } => BuiltInHandlerId::RemoteInit,
+            RemoteCommand::InstallServer { .. } => BuiltInHandlerId::RemoteInstallServer,
+            RemoteCommand::Upgrade { .. } => BuiltInHandlerId::RemoteUpgrade,
         },
         Command::Server { command } => match command {
             ServerCommand::Start { .. } => BuiltInHandlerId::ServerStart,
@@ -99,8 +102,18 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 session,
                 follow,
                 global,
+                reconnect_forever,
             },
-        ) => run_connect(target, session.as_deref(), follow.as_deref(), *global).await,
+        ) => {
+            run_connect(
+                target,
+                session.as_deref(),
+                follow.as_deref(),
+                *global,
+                *reconnect_forever,
+            )
+            .await
+        }
         (BuiltInHandlerId::NewSession, Command::NewSession { name }) => {
             run_session_new(name.clone()).await
         }
@@ -219,9 +232,45 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
         (
             BuiltInHandlerId::RemoteDoctor,
             Command::Remote {
-                command: RemoteCommand::Doctor { target },
+                command: RemoteCommand::Doctor { target, fix },
             },
-        ) => run_remote_doctor(target).await,
+        ) => run_remote_doctor(target, *fix).await,
+        (
+            BuiltInHandlerId::RemoteInit,
+            Command::Remote {
+                command:
+                    RemoteCommand::Init {
+                        name,
+                        ssh,
+                        tls,
+                        user,
+                        port,
+                        set_default,
+                    },
+            },
+        ) => {
+            run_remote_init(
+                name,
+                ssh.as_deref(),
+                tls.as_deref(),
+                user.as_deref(),
+                *port,
+                *set_default,
+            )
+            .await
+        }
+        (
+            BuiltInHandlerId::RemoteInstallServer,
+            Command::Remote {
+                command: RemoteCommand::InstallServer { target },
+            },
+        ) => run_remote_install_server(target).await,
+        (
+            BuiltInHandlerId::RemoteUpgrade,
+            Command::Remote {
+                command: RemoteCommand::Upgrade { target },
+            },
+        ) => run_remote_upgrade(target.as_deref()).await,
         (
             BuiltInHandlerId::ServerStart,
             Command::Server {

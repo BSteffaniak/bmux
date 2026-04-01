@@ -65,6 +65,10 @@ bmux connect prod app
 bmux connect prod                # picker when multiple sessions
 bmux remote list
 bmux remote test prod
+bmux remote doctor prod --fix
+bmux remote init prod --ssh bmux@prod.example.com --set-default
+bmux remote install-server prod
+bmux remote upgrade prod
 bmux --target prod list-sessions
 
 # Internet-accessible TLS gateway

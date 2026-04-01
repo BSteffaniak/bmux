@@ -64,7 +64,10 @@ bmux connect prod
 bmux remote list
 bmux remote list --json
 bmux remote test prod
-bmux remote doctor prod
+bmux remote doctor prod --fix
+bmux remote init prod --ssh bmux@prod.example.com --set-default
+bmux remote install-server prod
+bmux remote upgrade prod
 
 # run an internet-accessible TLS gateway
 bmux server gateway --listen 0.0.0.0:7443 --cert-file cert.pem --key-file key.pem
@@ -108,7 +111,9 @@ server_name = "gateway.example.com"
 ca_file = "~/.config/bmux/gateway-ca.pem"
 ```
 
-Current TLS target support: `bmux connect`, `bmux remote test`, and `bmux remote doctor`.
+TLS targets support standard command routing via `--target` (for commands that use normal client connections), plus `bmux connect` and remote utility commands.
+
+For long-lived unstable links, `bmux connect` supports `--reconnect-forever`.
 
 ## Logging Commands
 

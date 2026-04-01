@@ -140,6 +140,7 @@ pub(super) async fn run_connect(
     session: Option<&str>,
     follow: Option<&str>,
     global: bool,
+    reconnect_forever: bool,
 ) -> Result<u8> {
     if session.is_some() && follow.is_some() {
         anyhow::bail!("--follow cannot be used with an explicit session argument");
@@ -171,6 +172,7 @@ pub(super) async fn run_connect(
                 target_session.as_deref(),
                 follow,
                 global,
+                reconnect_forever,
             )
             .await
         }
@@ -189,6 +191,7 @@ pub(super) async fn run_connect(
                 target_session.as_deref(),
                 follow,
                 global,
+                reconnect_forever,
             )
             .await
         }
@@ -201,6 +204,7 @@ async fn run_tls_attach_with_reconnect(
     session: Option<&str>,
     follow: Option<&str>,
     global: bool,
+    reconnect_forever: bool,
 ) -> Result<u8> {
     let mut attempt = 0usize;
     loop {
@@ -208,7 +212,7 @@ async fn run_tls_attach_with_reconnect(
         if outcome.exit_reason != AttachExitReason::StreamClosed {
             return Ok(outcome.status_code);
         }
-        if attempt >= SSH_RECONNECT_MAX_ATTEMPTS {
+        if !reconnect_forever && attempt >= SSH_RECONNECT_MAX_ATTEMPTS {
             println!(
                 "remote TLS connection closed; giving up after {} reconnect attempts",
                 SSH_RECONNECT_MAX_ATTEMPTS
@@ -234,6 +238,7 @@ async fn run_remote_attach_with_reconnect(
     session: Option<&str>,
     follow: Option<&str>,
     global: bool,
+    reconnect_forever: bool,
 ) -> Result<u8> {
     let mut attempt = 0usize;
     loop {
@@ -241,7 +246,7 @@ async fn run_remote_attach_with_reconnect(
         if outcome.exit_reason != AttachExitReason::StreamClosed {
             return Ok(outcome.status_code);
         }
-        if attempt >= SSH_RECONNECT_MAX_ATTEMPTS {
+        if !reconnect_forever && attempt >= SSH_RECONNECT_MAX_ATTEMPTS {
             println!(
                 "remote connection closed; giving up after {} reconnect attempts",
                 SSH_RECONNECT_MAX_ATTEMPTS
@@ -352,7 +357,7 @@ pub(super) async fn run_remote_test(target: &str) -> Result<u8> {
     }
 }
 
-pub(super) async fn run_remote_doctor(target: &str) -> Result<u8> {
+pub(super) async fn run_remote_doctor(target: &str, fix: bool) -> Result<u8> {
     let config = BmuxConfig::load()?;
     let resolved = resolve_target_reference(&config, target)?;
     match resolved {
@@ -376,7 +381,18 @@ pub(super) async fn run_remote_doctor(target: &str) -> Result<u8> {
             if !stderr.trim().is_empty() {
                 println!("{}", stderr.trim());
             }
-            run_ssh_bmux_command(&ssh_target, &[OsString::from("--version")], false)?;
+            if let Err(error) =
+                run_ssh_bmux_command(&ssh_target, &[OsString::from("--version")], false)
+            {
+                if fix {
+                    println!(
+                        "doctor: remote bmux missing/unhealthy; attempting install-server fix..."
+                    );
+                    run_remote_install_server_for_target(&ssh_target).await?;
+                } else {
+                    return Err(error);
+                }
+            }
             run_ssh_bmux_command(
                 &ssh_target,
                 &[
@@ -399,6 +415,111 @@ pub(super) async fn run_remote_doctor(target: &str) -> Result<u8> {
             Ok(0)
         }
     }
+}
+
+pub(super) async fn run_remote_init(
+    name: &str,
+    ssh: Option<&str>,
+    tls: Option<&str>,
+    user: Option<&str>,
+    port: Option<u16>,
+    set_default: bool,
+) -> Result<u8> {
+    if ssh.is_none() && tls.is_none() {
+        anyhow::bail!("remote init requires one of --ssh or --tls");
+    }
+    if ssh.is_some() && tls.is_some() {
+        anyhow::bail!("remote init accepts either --ssh or --tls (not both)");
+    }
+
+    let mut config = BmuxConfig::load()?;
+    let mut target = ConnectionTargetConfig::default();
+    if let Some(ssh_value) = ssh {
+        let (parsed_user, host, parsed_port) = parse_ssh_target_parts(ssh_value)?;
+        target.transport = ConnectionTransport::Ssh;
+        target.host = Some(host);
+        target.user = user
+            .map(ToString::to_string)
+            .or(parsed_user)
+            .or(target.user);
+        target.port = port.or(parsed_port).or(Some(22));
+    }
+    if let Some(tls_value) = tls {
+        let (host, parsed_port) = parse_host_port_with_default(tls_value, 443)?;
+        target.transport = ConnectionTransport::Tls;
+        target.host = Some(host.clone());
+        target.server_name = Some(host);
+        target.port = Some(port.unwrap_or(parsed_port));
+    }
+
+    config.connections.targets.insert(name.to_string(), target);
+    if set_default {
+        config.connections.default_target = Some(name.to_string());
+    }
+    config.save()?;
+
+    println!("saved remote target '{name}'");
+    let test_status = run_remote_test(name).await?;
+    if test_status == 0 {
+        println!("remote init validation succeeded for '{name}'");
+    }
+    Ok(0)
+}
+
+pub(super) async fn run_remote_install_server(target: &str) -> Result<u8> {
+    let config = BmuxConfig::load()?;
+    let resolved = resolve_target_reference(&config, target)?;
+    match resolved {
+        ResolvedTarget::Ssh(ssh_target) => {
+            run_remote_install_server_for_target(&ssh_target).await?;
+            println!("remote install-server completed for '{}'", ssh_target.label);
+            Ok(0)
+        }
+        ResolvedTarget::Tls(_) => {
+            anyhow::bail!(
+                "install-server is only supported for SSH targets; install and run bmux gateway on the remote host"
+            );
+        }
+        ResolvedTarget::Local => {
+            println!("local target does not require remote install");
+            Ok(0)
+        }
+    }
+}
+
+pub(super) async fn run_remote_upgrade(target: Option<&str>) -> Result<u8> {
+    let config = BmuxConfig::load()?;
+    if let Some(target) = target {
+        let resolved = resolve_target_reference(&config, target)?;
+        match resolved {
+            ResolvedTarget::Ssh(ssh_target) => {
+                run_remote_upgrade_for_target(&ssh_target)?;
+                println!("remote upgrade completed for '{}'", ssh_target.label);
+                return Ok(0);
+            }
+            ResolvedTarget::Tls(_) => {
+                anyhow::bail!("remote upgrade currently supports SSH targets only");
+            }
+            ResolvedTarget::Local => {
+                println!("local target does not require remote upgrade");
+                return Ok(0);
+            }
+        }
+    }
+
+    let mut upgraded = 0usize;
+    for (name, target_config) in &config.connections.targets {
+        if target_config.transport != ConnectionTransport::Ssh {
+            continue;
+        }
+        let ResolvedTarget::Ssh(ssh_target) = resolve_named_target(name, target_config)? else {
+            continue;
+        };
+        run_remote_upgrade_for_target(&ssh_target)?;
+        upgraded = upgraded.saturating_add(1);
+    }
+    println!("remote upgrade completed for {upgraded} SSH target(s)");
+    Ok(0)
 }
 
 async fn resolve_local_attach_session() -> Result<Option<String>> {
@@ -706,6 +827,52 @@ fn run_ssh_bmux_command_capture(
     }
     let stderr = String::from_utf8_lossy(&output.stderr);
     Err(map_ssh_execution_error(target, stderr.trim()))
+}
+
+async fn run_remote_install_server_for_target(target: &SshTarget) -> Result<()> {
+    let mut command = build_ssh_command(
+        target,
+        &[
+            OsString::from("sh"),
+            OsString::from("-lc"),
+            OsString::from(
+                "command -v bmux >/dev/null 2>&1 || cargo install --locked bmux_cli --bin bmux",
+            ),
+        ],
+        false,
+    );
+    let status = command
+        .status()
+        .with_context(|| format!("failed running install command on '{}'", target.label))?;
+    if !status.success() {
+        anyhow::bail!(
+            "remote install command failed on '{}'; ensure cargo is installed and reachable on the remote host",
+            target.label
+        );
+    }
+    ensure_remote_server_ready(target).await
+}
+
+fn run_remote_upgrade_for_target(target: &SshTarget) -> Result<()> {
+    let mut command = build_ssh_command(
+        target,
+        &[
+            OsString::from("sh"),
+            OsString::from("-lc"),
+            OsString::from("cargo install --locked --force bmux_cli --bin bmux"),
+        ],
+        false,
+    );
+    let status = command
+        .status()
+        .with_context(|| format!("failed running upgrade command on '{}'", target.label))?;
+    if !status.success() {
+        anyhow::bail!(
+            "remote upgrade command failed on '{}'; verify cargo/network access on remote host",
+            target.label
+        );
+    }
+    Ok(())
 }
 
 fn run_ssh_bmux_command_silent(
@@ -1072,6 +1239,54 @@ fn parse_inline_tls_target(target: &str) -> Result<ResolvedTarget> {
         ca_file: None,
         connect_timeout_ms: 8_000,
     }))
+}
+
+fn parse_ssh_target_parts(target: &str) -> Result<(Option<String>, String, Option<u16>)> {
+    let mut raw = target.trim();
+    if let Some(without_scheme) = raw.strip_prefix("ssh://") {
+        raw = without_scheme;
+    }
+    let (user, host_port) = if let Some((user, rest)) = raw.split_once('@') {
+        (Some(user.to_string()), rest)
+    } else {
+        (None, raw)
+    };
+    let (host, port) = if let Some((host, port_raw)) = host_port.rsplit_once(':') {
+        if port_raw.is_empty() {
+            (host_port.to_string(), None)
+        } else {
+            let parsed = port_raw
+                .parse::<u16>()
+                .with_context(|| format!("invalid SSH port in target '{target}'"))?;
+            (host.to_string(), Some(parsed))
+        }
+    } else {
+        (host_port.to_string(), None)
+    };
+    if host.trim().is_empty() {
+        anyhow::bail!("target must include a host");
+    }
+    Ok((user, host, port))
+}
+
+fn parse_host_port_with_default(value: &str, default_port: u16) -> Result<(String, u16)> {
+    let raw = value.trim();
+    if let Some((host, port_raw)) = raw.rsplit_once(':') {
+        if port_raw.is_empty() {
+            return Ok((raw.to_string(), default_port));
+        }
+        let port = port_raw
+            .parse::<u16>()
+            .with_context(|| format!("invalid port in '{value}'"))?;
+        if host.trim().is_empty() {
+            anyhow::bail!("host is required");
+        }
+        return Ok((host.to_string(), port));
+    }
+    if raw.is_empty() {
+        anyhow::bail!("host is required");
+    }
+    Ok((raw.to_string(), default_port))
 }
 
 #[cfg(test)]
