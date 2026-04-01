@@ -345,6 +345,23 @@ You can still explicitly enable additional non-bundled plugins:
 enabled = ["example.native"]
 ```
 
+Optional routing policy can enforce required plugin command ownership at startup
+without hardcoding plugin IDs in core runtime:
+
+```toml
+[plugins.routing]
+conflict_mode = "fail_startup"
+
+[[plugins.routing.required_namespaces]]
+namespace = "plugin"
+
+[[plugins.routing.required_paths]]
+path = ["playbook", "run"]
+```
+
+`required_namespaces` and `required_paths` support optional `owner = "plugin.id"`
+when you want a specific plugin to own the claim.
+
 ## Permission Commands
 
 Top-level and grouped forms are exact aliases.

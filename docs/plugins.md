@@ -131,6 +131,35 @@ Expected behavior:
 - Keep parity contract tests for bundled windows/permissions command surfaces.
 - Required validation for runtime/code changes follows `AGENTS.md`.
 
+## Routing Policy (Config)
+
+Command ownership requirements are host-policy driven, not hardcoded by plugin ID.
+
+```toml
+[plugins.routing]
+conflict_mode = "fail_startup"
+
+[[plugins.routing.required_namespaces]]
+namespace = "plugin"
+
+[[plugins.routing.required_paths]]
+path = ["terminal", "doctor"]
+```
+
+Claims may optionally pin ownership to a specific plugin:
+
+```toml
+[[plugins.routing.required_namespaces]]
+namespace = "playbook"
+owner = "example.playbook"
+```
+
+Resolution behavior is deterministic:
+
+- exact path claim takes precedence over namespace claim
+- conflicting plugin claims fail startup
+- unmet required claims fail startup
+
 ## Migration Direction
 
 As context substrate work lands:

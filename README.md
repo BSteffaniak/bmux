@@ -119,6 +119,19 @@ connect_timeout_ms = 8000
 default_session = "main"
 ```
 
+Plugin command ownership policy is optional and declarative:
+
+```toml
+[plugins.routing]
+conflict_mode = "fail_startup"
+
+[[plugins.routing.required_namespaces]]
+namespace = "plugin"
+
+[[plugins.routing.required_paths]]
+path = ["recording", "start"]
+```
+
 Role policy: `owner` controls session and window mutations plus role changes, `writer` can send attach input, and `observer` is read-only.
 
 ## Development
