@@ -49,6 +49,21 @@ const ATTACH_TOKEN_TTL: Duration = Duration::from_secs(10);
 const CONTEXT_SESSION_ID_ATTRIBUTE: &str = "bmux.session_id";
 const MAX_WINDOW_OUTPUT_BUFFER_BYTES: usize = 1_048_576;
 const SNAPSHOT_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(300);
+const OFFLINE_SNAPSHOT_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
+const OFFLINE_SNAPSHOT_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OfflineSessionKillTarget {
+    One(SessionSelector),
+    All,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OfflineSessionKillReport {
+    pub had_snapshot: bool,
+    pub removed_session_ids: Vec<Uuid>,
+    pub removed_context_ids: Vec<Uuid>,
+}
 
 /// Main server implementation.
 #[derive(Clone)]
@@ -6015,6 +6030,193 @@ fn resolve_session_id(manager: &SessionManager, selector: &SessionSelector) -> O
                         .starts_with(&value_lower)
                 })
                 .map(|session| session.id)
+        }
+    }
+}
+
+pub fn offline_kill_sessions(target: OfflineSessionKillTarget) -> Result<OfflineSessionKillReport> {
+    let paths = ConfigPaths::default();
+    let snapshot_manager = SnapshotManager::from_paths(&paths);
+    if !snapshot_manager.path().exists() {
+        return Ok(OfflineSessionKillReport {
+            had_snapshot: false,
+            ..OfflineSessionKillReport::default()
+        });
+    }
+
+    let _lock = acquire_offline_snapshot_lock(snapshot_manager.path())?;
+    let mut snapshot = match snapshot_manager.read_snapshot() {
+        Ok(snapshot) => snapshot,
+        Err(persistence::SnapshotError::Io(error))
+            if error.kind() == std::io::ErrorKind::NotFound =>
+        {
+            return Ok(OfflineSessionKillReport {
+                had_snapshot: false,
+                ..OfflineSessionKillReport::default()
+            });
+        }
+        Err(error) => anyhow::bail!("failed reading snapshot for offline kill: {error}"),
+    };
+
+    let removed_session_ids = match target {
+        OfflineSessionKillTarget::All => snapshot
+            .sessions
+            .iter()
+            .map(|session| session.id)
+            .collect::<Vec<_>>(),
+        OfflineSessionKillTarget::One(selector) => {
+            resolve_snapshot_session_id(&snapshot, &selector)
+                .into_iter()
+                .collect::<Vec<_>>()
+        }
+    };
+
+    if removed_session_ids.is_empty() {
+        return Ok(OfflineSessionKillReport {
+            had_snapshot: true,
+            ..OfflineSessionKillReport::default()
+        });
+    }
+
+    let removed_session_set = removed_session_ids.iter().copied().collect::<BTreeSet<_>>();
+    snapshot
+        .sessions
+        .retain(|session| !removed_session_set.contains(&session.id));
+
+    for selected in &mut snapshot.selected_sessions {
+        if selected
+            .session_id
+            .is_some_and(|session_id| removed_session_set.contains(&session_id))
+        {
+            selected.session_id = None;
+        }
+    }
+
+    let removed_context_set = snapshot
+        .context_session_bindings
+        .iter()
+        .filter_map(|binding| {
+            removed_session_set
+                .contains(&binding.session_id)
+                .then_some(binding.context_id)
+        })
+        .collect::<BTreeSet<_>>();
+
+    snapshot
+        .context_session_bindings
+        .retain(|binding| !removed_context_set.contains(&binding.context_id));
+    snapshot
+        .contexts
+        .retain(|context| !removed_context_set.contains(&context.id));
+
+    for selected in &mut snapshot.selected_contexts {
+        if selected
+            .context_id
+            .is_some_and(|context_id| removed_context_set.contains(&context_id))
+        {
+            selected.context_id = None;
+        }
+    }
+    snapshot
+        .mru_contexts
+        .retain(|context_id| !removed_context_set.contains(context_id));
+
+    snapshot_manager
+        .write_snapshot(&snapshot)
+        .map_err(|error| anyhow::anyhow!("failed writing snapshot for offline kill: {error}"))?;
+
+    Ok(OfflineSessionKillReport {
+        had_snapshot: true,
+        removed_session_ids,
+        removed_context_ids: removed_context_set.into_iter().collect(),
+    })
+}
+
+fn resolve_snapshot_session_id(snapshot: &SnapshotV4, selector: &SessionSelector) -> Option<Uuid> {
+    match selector {
+        SessionSelector::ById(raw_id) => snapshot
+            .sessions
+            .iter()
+            .find(|session| session.id == *raw_id)
+            .map(|session| session.id),
+        SessionSelector::ByName(value) => {
+            if let Some(session) = snapshot
+                .sessions
+                .iter()
+                .find(|session| session.name.as_deref() == Some(value.as_str()))
+            {
+                return Some(session.id);
+            }
+
+            if let Some(session) = snapshot
+                .sessions
+                .iter()
+                .find(|session| session.id.to_string().eq_ignore_ascii_case(value))
+            {
+                return Some(session.id);
+            }
+
+            let value_lower = value.to_ascii_lowercase();
+            snapshot
+                .sessions
+                .iter()
+                .find(|session| {
+                    session
+                        .id
+                        .to_string()
+                        .to_ascii_lowercase()
+                        .starts_with(&value_lower)
+                })
+                .map(|session| session.id)
+        }
+    }
+}
+
+struct OfflineSnapshotMutationLock {
+    path: std::path::PathBuf,
+}
+
+impl Drop for OfflineSnapshotMutationLock {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+fn acquire_offline_snapshot_lock(
+    snapshot_path: &std::path::Path,
+) -> Result<OfflineSnapshotMutationLock> {
+    let parent = snapshot_path.parent().ok_or_else(|| {
+        anyhow::anyhow!("failed acquiring offline snapshot lock: snapshot has no parent directory")
+    })?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("failed creating snapshot directory {}", parent.display()))?;
+    let lock_path = parent.join("server-snapshot-v1.lock");
+    let started = Instant::now();
+
+    loop {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock_path)
+        {
+            Ok(mut file) => {
+                let _ = writeln!(file, "pid={}", std::process::id());
+                return Ok(OfflineSnapshotMutationLock { path: lock_path });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                if started.elapsed() >= OFFLINE_SNAPSHOT_LOCK_TIMEOUT {
+                    anyhow::bail!(
+                        "timed out waiting for snapshot lock {}; retry once no other snapshot mutation is in progress",
+                        lock_path.display()
+                    );
+                }
+                std::thread::sleep(OFFLINE_SNAPSHOT_LOCK_RETRY_INTERVAL);
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed acquiring snapshot lock {}", lock_path.display())
+                });
+            }
         }
     }
 }

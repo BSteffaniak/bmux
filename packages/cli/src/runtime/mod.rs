@@ -35,7 +35,7 @@ use bmux_plugin_sdk::{
     PluginCommandOutcome, PluginEvent, PluginEventKind, RegisteredService, ServiceKind,
     ServiceRequest,
 };
-use bmux_server::BmuxServer;
+use bmux_server::{BmuxServer, OfflineSessionKillTarget, offline_kill_sessions};
 use clap::{CommandFactory, FromArgMatches};
 use crossterm::cursor::{MoveTo, SavePosition, Show};
 use crossterm::event::{

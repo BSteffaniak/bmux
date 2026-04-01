@@ -255,7 +255,26 @@ pub(super) fn attach_quit_failure_status(error: &ClientError) -> &'static str {
 
 pub(super) async fn run_session_kill(target: &str, force_local: bool) -> Result<u8> {
     let selector = parse_session_selector(target);
-    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-kill-session").await?;
+    let mut client = match connect_if_running(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-kill-session",
+    )
+    .await?
+    {
+        Some(client) => client,
+        None => {
+            let report = offline_kill_sessions(OfflineSessionKillTarget::One(selector.clone()))?;
+            let Some(killed_id) = report.removed_session_ids.first().copied() else {
+                anyhow::bail!("{}", session_not_found_message_for_selector(&selector));
+            };
+            println!("killed session: {killed_id}");
+            println!(
+                "bmux server is not running; pruned session from snapshot for next startup (live pane processes may still be running)"
+            );
+            return Ok(0);
+        }
+    };
+
     let _ = kill_preflight_identity(&mut client, force_local).await?;
     let killed_id = client
         .kill_session_with_options(selector, force_local)
@@ -268,7 +287,31 @@ pub(super) async fn run_session_kill(target: &str, force_local: bool) -> Result<
 }
 
 pub(super) async fn run_session_kill_all(force_local: bool) -> Result<u8> {
-    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-kill-all-sessions").await?;
+    let mut client = match connect_if_running(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-kill-all-sessions",
+    )
+    .await?
+    {
+        Some(client) => client,
+        None => {
+            let report = offline_kill_sessions(OfflineSessionKillTarget::All)?;
+            let killed_count = report.removed_session_ids.len();
+            if killed_count == 0 {
+                println!("no sessions");
+                return Ok(0);
+            }
+            for session_id in report.removed_session_ids {
+                println!("killed session: {session_id}");
+            }
+            println!("kill-all-sessions complete: killed {killed_count}, failed 0");
+            println!(
+                "bmux server is not running; pruned sessions from snapshot for next startup (live pane processes may still be running)"
+            );
+            return Ok(0);
+        }
+    };
+
     let _ = print_bulk_kill_preflight(&mut client, "sessions", force_local).await?;
     let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
 
@@ -302,4 +345,11 @@ pub(super) async fn run_session_kill_all(force_local: bool) -> Result<u8> {
     println!("kill-all-sessions complete: killed {killed_count}, failed {failed_count}");
     print_bulk_kill_failure_summary("session", failure_summary);
     Ok(u8::from(failed_count != 0))
+}
+
+fn session_not_found_message_for_selector(selector: &SessionSelector) -> String {
+    match selector {
+        SessionSelector::ById(id) => format!("session not found: {id}"),
+        SessionSelector::ByName(name) => format!("session not found: {name}"),
+    }
 }
