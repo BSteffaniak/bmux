@@ -128,6 +128,22 @@ impl ConfigPaths {
         format!(r"\\.\pipe\bmux-{user}-{runtime_hash:016x}")
     }
 
+    /// Return all candidate config directories in priority order.
+    ///
+    /// During default resolution, the first existing directory wins.
+    /// When `BMUX_CONFIG_DIR` is set, returns only that single entry.
+    ///
+    /// On macOS the candidates are the OS-native `~/Library/Application Support/bmux`
+    /// followed by the XDG-style `~/.config/bmux`. On other platforms (where the
+    /// native path *is* the XDG path) only one candidate is returned.
+    #[must_use]
+    pub fn config_dir_candidates() -> Vec<PathBuf> {
+        if let Some(path) = std::env::var_os("BMUX_CONFIG_DIR") {
+            return vec![PathBuf::from(path)];
+        }
+        build_config_dir_candidates()
+    }
+
     /// Ensure all necessary directories exist
     ///
     /// # Errors
@@ -241,19 +257,55 @@ fn stable_fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
+/// Build the ordered list of candidate config directories.
+///
+/// The primary (OS-native) directory is always first. On macOS, the XDG-style
+/// `~/.config/bmux` is appended as a fallback when it differs from the primary.
+fn build_config_dir_candidates() -> Vec<PathBuf> {
+    let primary = dirs::config_dir().map_or_else(
+        || {
+            dirs::home_dir().map_or_else(
+                || PathBuf::from(".bmux"),
+                |d| d.join(".config").join("bmux"),
+            )
+        },
+        |d| d.join("bmux"),
+    );
+
+    #[cfg(target_os = "macos")]
+    {
+        let mut candidates = vec![primary];
+        if let Some(home) = dirs::home_dir() {
+            let xdg = home.join(".config").join("bmux");
+            if candidates[0] != xdg {
+                candidates.push(xdg);
+            }
+        }
+        return candidates;
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    vec![primary]
+}
+
+/// Resolve a config directory from an ordered list of candidates.
+///
+/// Returns the first candidate directory that exists on disk, or the first
+/// candidate (the canonical/primary path) if none exist.
+fn resolve_config_dir(candidates: &[PathBuf]) -> PathBuf {
+    candidates
+        .iter()
+        .find(|p| p.exists())
+        .unwrap_or(&candidates[0])
+        .clone()
+}
+
 impl Default for ConfigPaths {
     fn default() -> Self {
         let config_dir = std::env::var_os("BMUX_CONFIG_DIR").map_or_else(
             || {
-                dirs::config_dir().map_or_else(
-                    || {
-                        dirs::home_dir().map_or_else(
-                            || PathBuf::from(".bmux"),
-                            |d| d.join(".config").join("bmux"),
-                        )
-                    },
-                    |d| d.join("bmux"),
-                )
+                let candidates = build_config_dir_candidates();
+                resolve_config_dir(&candidates)
             },
             PathBuf::from,
         );
@@ -289,7 +341,7 @@ impl Default for ConfigPaths {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigPaths, stable_fnv1a64};
+    use super::{ConfigPaths, resolve_config_dir, stable_fnv1a64};
     use std::path::PathBuf;
 
     #[test]
@@ -372,5 +424,71 @@ mod tests {
     #[test]
     fn hash_fnv1a_known_vector() {
         assert_eq!(stable_fnv1a64(b"bmux"), 0xbb09969bbc2c17fd);
+    }
+
+    #[test]
+    fn resolve_config_dir_returns_first_existing() {
+        let tmp = std::env::temp_dir().join("bmux_test_resolve_first_existing");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let primary = tmp.join("primary");
+        let fallback = tmp.join("fallback");
+
+        // Neither exists — returns primary (canonical default).
+        let result = resolve_config_dir(&[primary.clone(), fallback.clone()]);
+        assert_eq!(result, primary);
+
+        // Only fallback exists — returns fallback.
+        std::fs::create_dir_all(&fallback).unwrap();
+        let result = resolve_config_dir(&[primary.clone(), fallback.clone()]);
+        assert_eq!(result, fallback);
+
+        // Both exist — primary wins (higher priority).
+        std::fs::create_dir_all(&primary).unwrap();
+        let result = resolve_config_dir(&[primary.clone(), fallback.clone()]);
+        assert_eq!(result, primary);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_config_dir_single_candidate() {
+        let tmp = std::env::temp_dir().join("bmux_test_resolve_single");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let only = tmp.join("only");
+
+        // Single candidate, doesn't exist — returns it anyway.
+        let result = resolve_config_dir(&[only.clone()]);
+        assert_eq!(result, only);
+
+        // Single candidate exists — returns it.
+        std::fs::create_dir_all(&only).unwrap();
+        let result = resolve_config_dir(&[only.clone()]);
+        assert_eq!(result, only);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn config_dir_candidates_returns_at_least_one() {
+        let candidates = ConfigPaths::config_dir_candidates();
+        assert!(
+            !candidates.is_empty(),
+            "config_dir_candidates must return at least one path"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn config_dir_candidates_includes_xdg_fallback_on_macos() {
+        let candidates = ConfigPaths::config_dir_candidates();
+        assert!(
+            candidates.len() >= 2,
+            "macOS should have at least 2 candidates (native + XDG), got {candidates:?}"
+        );
+        let xdg = dirs::home_dir().unwrap().join(".config").join("bmux");
+        assert!(
+            candidates.contains(&xdg),
+            "candidates should include XDG path {xdg:?}, got {candidates:?}"
+        );
     }
 }

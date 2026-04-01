@@ -6,11 +6,24 @@ pub(super) fn run_config_path(as_json: bool) -> Result<u8> {
     let exists = path.exists();
 
     if as_json {
+        let candidates: Vec<serde_json::Value> = ConfigPaths::config_dir_candidates()
+            .into_iter()
+            .map(|dir| {
+                let file = dir.join("bmux.toml");
+                let file_exists = file.exists();
+                serde_json::json!({
+                    "path": file,
+                    "exists": file_exists,
+                })
+            })
+            .collect();
+
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "path": path,
                 "exists": exists,
+                "candidates": candidates,
             }))
             .context("failed to encode config path json")?
         );
