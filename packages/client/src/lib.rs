@@ -40,6 +40,7 @@ pub struct AttachLayoutState {
     pub panes: Vec<PaneSummary>,
     pub layout_root: PaneLayoutNode,
     pub scene: AttachScene,
+    pub zoomed: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +52,7 @@ pub struct AttachSnapshotState {
     pub layout_root: PaneLayoutNode,
     pub scene: AttachScene,
     pub chunks: Vec<AttachPaneChunk>,
+    pub zoomed: bool,
 }
 
 /// Server status details returned by status RPC.
@@ -926,6 +928,15 @@ impl BmuxClient {
         }
     }
 
+    pub async fn zoom_pane(&mut self, session: Option<SessionSelector>) -> Result<(Uuid, bool)> {
+        match self.request(Request::ZoomPane { session }).await? {
+            ResponsePayload::PaneZoomed {
+                pane_id, zoomed, ..
+            } => Ok((pane_id, zoomed)),
+            _ => Err(ClientError::UnexpectedResponse("expected pane zoomed")),
+        }
+    }
+
     pub async fn list_panes(
         &mut self,
         session: Option<SessionSelector>,
@@ -1173,6 +1184,7 @@ impl BmuxClient {
                 panes,
                 layout_root,
                 scene,
+                zoomed,
             } => Ok(AttachLayoutState {
                 context_id,
                 session_id,
@@ -1180,6 +1192,7 @@ impl BmuxClient {
                 panes,
                 layout_root,
                 scene,
+                zoomed,
             }),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected attach layout response",
@@ -1228,6 +1241,7 @@ impl BmuxClient {
                 layout_root,
                 scene,
                 chunks,
+                zoomed,
             } => Ok(AttachSnapshotState {
                 context_id,
                 session_id,
@@ -1236,6 +1250,7 @@ impl BmuxClient {
                 layout_root,
                 scene,
                 chunks,
+                zoomed,
             }),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected attach snapshot response",
@@ -1318,6 +1333,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::FocusPane { .. } => "focus_pane",
         Request::ResizePane { .. } => "resize_pane",
         Request::ClosePane { .. } => "close_pane",
+        Request::ZoomPane { .. } => "zoom_pane",
         Request::FollowClient { .. } => "follow_client",
         Request::Unfollow => "unfollow",
         Request::Attach { .. } => "attach",
@@ -1372,6 +1388,7 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::PaneFocused { .. } => "pane_focused",
             ResponsePayload::PaneResized { .. } => "pane_resized",
             ResponsePayload::PaneClosed { .. } => "pane_closed",
+            ResponsePayload::PaneZoomed { .. } => "pane_zoomed",
             ResponsePayload::FollowStarted { .. } => "follow_started",
             ResponsePayload::FollowStopped { .. } => "follow_stopped",
             ResponsePayload::Attached { .. } => "attached",

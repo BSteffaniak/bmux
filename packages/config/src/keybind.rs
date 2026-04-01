@@ -127,6 +127,7 @@ fn default_runtime_bindings() -> BTreeMap<String, String> {
         ("shift+arrow_down", RuntimeAction::ResizeDown),
         ("r", RuntimeAction::RestartFocusedPane),
         ("x", RuntimeAction::CloseFocusedPane),
+        ("z", RuntimeAction::ZoomPane),
         ("?", RuntimeAction::ShowHelp),
         ("[", RuntimeAction::EnterScrollMode),
         ("]", RuntimeAction::ExitScrollMode),
@@ -349,7 +350,7 @@ fn default_normal_bindings() -> BTreeMap<String, String> {
     bindings.insert("\"".to_string(), "split-horizontal".to_string());
     bindings.insert("%".to_string(), "split-vertical".to_string());
     bindings.insert("x".to_string(), "kill-pane".to_string());
-    bindings.insert("z".to_string(), "zoom-pane".to_string());
+    bindings.insert("z".to_string(), "zoom_pane".to_string());
 
     // Mode switching
     bindings.insert("i".to_string(), "enter-insert-mode".to_string());

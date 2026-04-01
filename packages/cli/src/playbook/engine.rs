@@ -1060,6 +1060,12 @@ async fn apply_attach_runtime_actions(
                     .await
                     .map_err(|e| anyhow::anyhow!("close focused pane failed: {e}"))?;
             }
+            crate::input::RuntimeAction::ZoomPane => {
+                client
+                    .zoom_pane(Some(SessionSelector::ById(runtime.state.attached_id)))
+                    .await
+                    .map_err(|e| anyhow::anyhow!("zoom pane failed: {e}"))?;
+            }
             crate::input::RuntimeAction::IncreaseSplit
             | crate::input::RuntimeAction::ResizeRight
             | crate::input::RuntimeAction::ResizeDown => {

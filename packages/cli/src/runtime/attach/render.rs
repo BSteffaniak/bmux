@@ -230,6 +230,7 @@ pub fn render_attach_scene<W: io::Write>(
     scrollback_offset: usize,
     scrollback_cursor: Option<AttachScrollbackCursor>,
     selection_anchor: Option<AttachScrollbackPosition>,
+    zoomed: bool,
 ) -> Result<Option<AttachCursorState>> {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
     if cols == 0 || rows <= status_top_inset.saturating_add(status_bottom_inset) {
@@ -285,9 +286,16 @@ pub fn render_attach_scene<W: io::Write>(
             || focused_surface_id == Some(surface.id)
             || focused_pane_id == Some(pane_id);
         if should_draw {
-            let hch = if focus { '=' } else { '-' };
-            let top = draw_box_line(usize::from(rect.w), '+', hch, '+');
-            let bottom = draw_box_line(usize::from(rect.w), '+', hch, '+');
+            let (corner, hch, vch) = if zoomed && focus {
+                // Zoomed pane: double-line box drawing characters.
+                ('#', '=', '\u{2551}') // ║ for sides, # corners, = top/bottom
+            } else if focus {
+                ('+', '=', '|')
+            } else {
+                ('+', '-', '|')
+            };
+            let top = draw_box_line(usize::from(rect.w), corner, hch, corner);
+            let bottom = draw_box_line(usize::from(rect.w), corner, hch, corner);
             queue!(stdout, MoveTo(rect.x, rect.y), Print(top))
                 .context("failed drawing pane top")?;
             queue!(
@@ -298,12 +306,12 @@ pub fn render_attach_scene<W: io::Write>(
             .context("failed drawing pane bottom")?;
 
             for y in rect.y.saturating_add(1)..rect.y.saturating_add(rect.h.saturating_sub(1)) {
-                queue!(stdout, MoveTo(rect.x, y), Print("|"))
+                queue!(stdout, MoveTo(rect.x, y), Print(vch))
                     .context("failed drawing pane left border")?;
                 queue!(
                     stdout,
                     MoveTo(rect.x.saturating_add(rect.w.saturating_sub(1)), y),
-                    Print("|")
+                    Print(vch)
                 )
                 .context("failed drawing pane right border")?;
             }
@@ -550,6 +558,7 @@ mod tests {
             1,
             Some(AttachScrollbackCursor { row: 0, col: 0 }),
             None,
+            false,
         )
         .expect("render should succeed");
 
@@ -600,6 +609,7 @@ mod tests {
             0,
             Some(AttachScrollbackCursor { row: 0, col: 4 }),
             Some(AttachScrollbackPosition { row: 0, col: 1 }),
+            false,
         )
         .expect("render should succeed");
 

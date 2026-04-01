@@ -938,6 +938,7 @@ struct SessionRuntimeHandle {
     panes: BTreeMap<Uuid, PaneRuntimeHandle>,
     layout_root: PaneLayoutNode,
     focused_pane_id: Uuid,
+    zoomed_pane_id: Option<Uuid>,
     floating_surfaces: Vec<FloatingSurfaceRuntime>,
     attached_clients: BTreeSet<ClientId>,
     attach_viewport: Option<AttachViewport>,
@@ -1123,6 +1124,7 @@ struct AttachLayoutState {
     panes: Vec<PaneSummary>,
     layout_root: IpcPaneLayoutNode,
     scene: AttachScene,
+    zoomed: bool,
 }
 
 struct AttachSnapshotState {
@@ -1132,6 +1134,7 @@ struct AttachSnapshotState {
     layout_root: IpcPaneLayoutNode,
     scene: AttachScene,
     chunks: Vec<AttachPaneChunk>,
+    zoomed: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1424,12 +1427,57 @@ fn build_attach_scene(
     runtime: &SessionRuntimeHandle,
     viewport: Option<AttachViewport>,
 ) -> AttachScene {
+    let scene_root = scene_root_from_viewport(viewport);
+
+    // When a pane is zoomed, produce a single-pane scene that fills the viewport.
+    if let Some(zoomed_id) = runtime.zoomed_pane_id {
+        if runtime.panes.contains_key(&zoomed_id) {
+            let zoomed_surface = AttachSurface {
+                id: zoomed_id,
+                kind: AttachSurfaceKind::Pane,
+                layer: AttachLayer::Pane,
+                z: 0,
+                rect: attach_rect_from_layout_rect(scene_root),
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+                pane_id: Some(zoomed_id),
+            };
+
+            let mut surfaces = vec![zoomed_surface];
+
+            // Floating surfaces still render on top of the zoomed pane.
+            surfaces.extend(
+                runtime
+                    .floating_surfaces
+                    .iter()
+                    .filter(|surface| runtime.panes.contains_key(&surface.pane_id))
+                    .map(|surface| AttachSurface {
+                        id: surface.id,
+                        kind: AttachSurfaceKind::FloatingPane,
+                        layer: AttachLayer::FloatingPane,
+                        z: surface.z,
+                        rect: attach_rect_from_layout_rect(surface.rect),
+                        opaque: surface.opaque,
+                        visible: surface.visible,
+                        accepts_input: surface.accepts_input,
+                        cursor_owner: surface.cursor_owner,
+                        pane_id: Some(surface.pane_id),
+                    }),
+            );
+
+            return AttachScene {
+                session_id: session_id.0,
+                focus: AttachFocusTarget::Pane { pane_id: zoomed_id },
+                surfaces,
+            };
+        }
+        // Zoomed pane was removed; fall through to normal rendering.
+    }
+
     let mut rects = BTreeMap::new();
-    collect_layout_rects(
-        &runtime.layout_root,
-        scene_root_from_viewport(viewport),
-        &mut rects,
-    );
+    collect_layout_rects(&runtime.layout_root, scene_root, &mut rects);
 
     let mut pane_ids = Vec::new();
     runtime.layout_root.pane_order(&mut pane_ids);
@@ -1502,6 +1550,18 @@ fn resize_session_ptys(
         w: cols.max(1),
         h: rows.saturating_sub(reserved).max(1),
     };
+
+    // When zoomed, only resize the zoomed pane to fill the viewport.
+    if let Some(zoomed_id) = runtime.zoomed_pane_id {
+        if let Some(pane) = runtime.panes.get(&zoomed_id) {
+            if !pane.exited.load(Ordering::SeqCst) {
+                let (zoom_rows, zoom_cols) = pane_pty_size(root);
+                pane.resize_pty(zoom_rows, zoom_cols);
+            }
+        }
+        return;
+    }
+
     let mut rects = BTreeMap::new();
     collect_layout_rects(&runtime.layout_root, root, &mut rects);
     for (pane_id, pane) in &runtime.panes {
@@ -1611,6 +1671,7 @@ impl SessionRuntimeManager {
                     pane_id: first_pane_id,
                 },
                 focused_pane_id: first_pane_id,
+                zoomed_pane_id: None,
                 floating_surfaces: Vec::new(),
                 attached_clients: BTreeSet::new(),
                 attach_viewport: None,
@@ -1655,6 +1716,7 @@ impl SessionRuntimeManager {
                 panes: runtime_panes,
                 layout_root: runtime_layout_root,
                 focused_pane_id,
+                zoomed_pane_id: None,
                 floating_surfaces,
                 attached_clients: BTreeSet::new(),
                 attach_viewport: None,
@@ -1875,6 +1937,10 @@ impl SessionRuntimeManager {
         target: Option<PaneSelector>,
         direction: PaneSplitDirection,
     ) -> Result<Uuid> {
+        // Auto-unzoom on layout mutation.
+        if let Some(session) = self.runtimes.get_mut(&session_id) {
+            session.zoomed_pane_id = None;
+        }
         let (target_pane_id, next_pane_name, shell, client_ids) = {
             let session = self
                 .runtimes
@@ -1934,6 +2000,8 @@ impl SessionRuntimeManager {
             .runtimes
             .get_mut(&session_id)
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        // Auto-unzoom on focus change.
+        session.zoomed_pane_id = None;
         let mut pane_ids = Vec::new();
         session.layout_root.pane_order(&mut pane_ids);
         if pane_ids.is_empty() {
@@ -1963,6 +2031,8 @@ impl SessionRuntimeManager {
             .runtimes
             .get_mut(&session_id)
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        // Auto-unzoom on focus change.
+        session.zoomed_pane_id = None;
         let pane_id = resolve_pane_id_from_selector(session, target)
             .ok_or_else(|| anyhow::anyhow!("target pane not found"))?;
         session.focused_pane_id = pane_id;
@@ -1974,6 +2044,10 @@ impl SessionRuntimeManager {
         session_id: SessionId,
         target: Option<PaneSelector>,
     ) -> Result<(Uuid, Option<RemovedRuntime>)> {
+        // Auto-unzoom on layout mutation.
+        if let Some(session) = self.runtimes.get_mut(&session_id) {
+            session.zoomed_pane_id = None;
+        }
         let (pane_id, remove_runtime) = {
             let session = self
                 .runtimes
@@ -2025,6 +2099,8 @@ impl SessionRuntimeManager {
             .runtimes
             .get_mut(&session_id)
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        // Auto-unzoom on layout mutation.
+        session.zoomed_pane_id = None;
         let pane_id =
             resolve_pane_id_from_selector(session, target.unwrap_or(PaneSelector::Active))
                 .ok_or_else(|| anyhow::anyhow!("target pane not found"))?;
@@ -2032,6 +2108,29 @@ impl SessionRuntimeManager {
         let _ = session.layout_root.adjust_focused_ratio(pane_id, step);
         self.apply_stored_attach_viewport(session_id);
         Ok(())
+    }
+
+    fn toggle_zoom(&mut self, session_id: SessionId) -> Result<(Uuid, bool)> {
+        let session = self
+            .runtimes
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        let focused = session.focused_pane_id;
+        if session.zoomed_pane_id.is_some() {
+            session.zoomed_pane_id = None;
+            self.apply_stored_attach_viewport(session_id);
+            Ok((focused, false))
+        } else {
+            // Only zoom if there are at least 2 panes (zooming a single pane is a no-op).
+            let mut pane_ids = Vec::new();
+            session.layout_root.pane_order(&mut pane_ids);
+            if pane_ids.len() < 2 {
+                return Ok((focused, false));
+            }
+            session.zoomed_pane_id = Some(focused);
+            self.apply_stored_attach_viewport(session_id);
+            Ok((focused, true))
+        }
     }
 
     fn list_panes(&self, session_id: SessionId) -> Result<Vec<PaneSummary>> {
@@ -2088,6 +2187,7 @@ impl SessionRuntimeManager {
             panes,
             layout_root: ipc_layout_from_runtime(&session.layout_root),
             scene,
+            zoomed: session.zoomed_pane_id.is_some(),
         })
     }
 
@@ -2159,6 +2259,7 @@ impl SessionRuntimeManager {
             layout_root: ipc_layout_from_runtime(&session.layout_root),
             scene,
             chunks,
+            zoomed: session.zoomed_pane_id.is_some(),
         })
     }
 
@@ -4588,6 +4689,50 @@ async fn handle_request(
                 session_closed,
             })
         }
+        Request::ZoomPane { session } => {
+            let session_id = {
+                let manager = state
+                    .session_manager
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                match resolve_session_request_session_id(&manager, &session, selected_session) {
+                    Ok(session_id) => session_id,
+                    Err(response) => return Ok(Response::Err(response)),
+                }
+            };
+            if let Err(response) = ensure_session_mutation_allowed(
+                state,
+                shutdown_tx,
+                session_id,
+                client_id,
+                client_principal_id,
+                "pane.zoom",
+            )
+            .await
+            {
+                return Ok(Response::Err(response));
+            }
+            let mut runtime_manager = state
+                .session_runtimes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+            let (pane_id, zoomed) = match runtime_manager.toggle_zoom(session_id) {
+                Ok(result) => result,
+                Err(error) => {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::Internal,
+                        message: format!("failed toggling zoom: {error:#}"),
+                    }));
+                }
+            };
+            drop(runtime_manager);
+            emit_attach_view_changed_for_layout(state, session_id)?;
+            Response::Ok(ResponsePayload::PaneZoomed {
+                session_id: session_id.0,
+                pane_id,
+                zoomed,
+            })
+        }
         Request::ListSessions => {
             let manager = state
                 .session_manager
@@ -5371,6 +5516,7 @@ async fn handle_request(
                     panes: snapshot.panes,
                     layout_root: snapshot.layout_root,
                     scene: snapshot.scene,
+                    zoomed: snapshot.zoomed,
                 }),
                 Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
@@ -5425,6 +5571,7 @@ async fn handle_request(
                     layout_root: snapshot.layout_root,
                     scene: snapshot.scene,
                     chunks: snapshot.chunks,
+                    zoomed: snapshot.zoomed,
                 }),
                 Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
@@ -5788,6 +5935,7 @@ const fn request_requires_exclusive(request: &Request) -> bool {
             | Request::FocusPane { .. }
             | Request::ResizePane { .. }
             | Request::ClosePane { .. }
+            | Request::ZoomPane { .. }
             | Request::FollowClient { .. }
             | Request::Unfollow
             | Request::Attach { .. }
@@ -5853,6 +6001,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::FocusPane { .. } => "focus_pane",
         Request::ResizePane { .. } => "resize_pane",
         Request::ClosePane { .. } => "close_pane",
+        Request::ZoomPane { .. } => "zoom_pane",
         Request::FollowClient { .. } => "follow_client",
         Request::Unfollow => "unfollow",
         Request::Attach { .. } => "attach",
@@ -5934,6 +6083,7 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::PaneFocused { .. } => "pane_focused",
         ResponsePayload::PaneResized { .. } => "pane_resized",
         ResponsePayload::PaneClosed { .. } => "pane_closed",
+        ResponsePayload::PaneZoomed { .. } => "pane_zoomed",
         ResponsePayload::FollowStarted { .. } => "follow_started",
         ResponsePayload::FollowStopped { .. } => "follow_stopped",
         ResponsePayload::Attached { .. } => "attached",

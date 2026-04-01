@@ -1012,6 +1012,12 @@ pub(crate) async fn handle_attach_ui_action(
             let selector = attached_session_selector(client, view_state).await?;
             client.close_pane(Some(selector)).await?;
         }
+        RuntimeAction::ZoomPane => {
+            let selector = attached_session_selector(client, view_state).await?;
+            let (_pane_id, zoomed) = client.zoom_pane(Some(selector)).await?;
+            let status = if zoomed { "Pane zoomed" } else { "Zoom exited" };
+            view_state.set_transient_status(status, Instant::now(), ATTACH_TRANSIENT_STATUS_TTL);
+        }
         RuntimeAction::NewWindow | RuntimeAction::NewSession => {
             handle_attach_runtime_action(client, action, view_state).await?;
         }
@@ -1509,10 +1515,16 @@ pub(crate) async fn build_attach_status_line_for_draw(
         .iter()
         .position(|tab| tab.active)
         .map(|active_index| format!("tab:{}/{}", active_index + 1, tabs.len()));
+    let zoomed = view_state
+        .cached_layout_state
+        .as_ref()
+        .is_some_and(|s| s.zoomed);
     let mode_label = if help_overlay_open {
         "HELP"
     } else if scrollback_active {
         "SCROLL"
+    } else if zoomed {
+        "ZOOM"
     } else {
         let _ = ui_mode;
         "NORMAL"
@@ -1942,6 +1954,7 @@ pub(crate) async fn render_attach_frame(
         view_state.scrollback_offset,
         view_state.scrollback_cursor,
         view_state.selection_anchor,
+        layout_state.zoomed,
     )?;
     let previous_cursor_state = view_state.last_cursor_state;
     if view_state.help_overlay_open {
@@ -2535,6 +2548,7 @@ pub(crate) const fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
             | RuntimeAction::ResizeUp
             | RuntimeAction::ResizeDown
             | RuntimeAction::CloseFocusedPane
+            | RuntimeAction::ZoomPane
             | RuntimeAction::ShowHelp
     )
 }
@@ -2677,6 +2691,7 @@ pub(crate) async fn hydrate_attach_state_from_snapshot(
         layout_root,
         scene,
         chunks,
+        zoomed,
     } = client
         .attach_snapshot(view_state.attached_id, ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE)
         .await?;
@@ -2688,6 +2703,7 @@ pub(crate) async fn hydrate_attach_state_from_snapshot(
         panes,
         layout_root,
         scene,
+        zoomed,
     });
     view_state.mouse.last_focused_pane_id = Some(focused_pane_id);
     view_state.pane_buffers.clear();
@@ -3540,6 +3556,7 @@ pub(crate) fn runtime_action_to_attach_event_action(action: RuntimeAction) -> At
         | RuntimeAction::ResizeUp
         | RuntimeAction::ResizeDown
         | RuntimeAction::CloseFocusedPane
+        | RuntimeAction::ZoomPane
         | RuntimeAction::ExitMode
         | RuntimeAction::WindowPrev
         | RuntimeAction::WindowNext
@@ -3646,6 +3663,7 @@ mod tests {
                     cursor_owner: true,
                 }],
             },
+            zoomed: false,
         });
         let buffer = view_state.pane_buffers.entry(pane_id).or_insert_with(|| {
             crate::runtime::attach::state::PaneRenderBuffer {
@@ -3900,6 +3918,7 @@ mod tests {
                     },
                 ],
             },
+            zoomed: false,
         });
 
         assert_eq!(

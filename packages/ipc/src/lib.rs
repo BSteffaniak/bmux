@@ -299,6 +299,9 @@ pub enum Request {
         session: Option<SessionSelector>,
         target: Option<PaneSelector>,
     },
+    ZoomPane {
+        session: Option<SessionSelector>,
+    },
     ListPanes {
         session: Option<SessionSelector>,
     },
@@ -672,6 +675,11 @@ pub enum ResponsePayload {
         session_id: Uuid,
         session_closed: bool,
     },
+    PaneZoomed {
+        session_id: Uuid,
+        pane_id: Uuid,
+        zoomed: bool,
+    },
     PaneList {
         panes: Vec<PaneSummary>,
     },
@@ -717,6 +725,8 @@ pub enum ResponsePayload {
         panes: Vec<PaneSummary>,
         layout_root: PaneLayoutNode,
         scene: AttachScene,
+        #[serde(default)]
+        zoomed: bool,
     },
     AttachPaneOutputBatch {
         chunks: Vec<AttachPaneChunk>,
@@ -730,6 +740,8 @@ pub enum ResponsePayload {
         layout_root: PaneLayoutNode,
         scene: AttachScene,
         chunks: Vec<AttachPaneChunk>,
+        #[serde(default)]
+        zoomed: bool,
     },
     EventsSubscribed,
     EventBatch {
@@ -1049,6 +1061,7 @@ mod tests {
                     pane_id: Some(pane_id),
                 }],
             },
+            zoomed: false,
         });
         let bytes = encode(&response).expect("response should encode");
         let decoded: Response = decode(&bytes).expect("response should decode");
@@ -1271,6 +1284,10 @@ mod tests {
             Request::ClosePane {
                 session: None,
                 target: None,
+            },
+            Request::ZoomPane { session: None },
+            Request::ZoomPane {
+                session: Some(SessionSelector::ByName("s".into())),
             },
             Request::ListPanes {
                 session: Some(SessionSelector::ById(id)),
@@ -1579,6 +1596,11 @@ mod tests {
                 session_id: id,
                 session_closed: false,
             },
+            ResponsePayload::PaneZoomed {
+                session_id: id,
+                pane_id,
+                zoomed: true,
+            },
             ResponsePayload::PaneList {
                 panes: vec![
                     PaneSummary {
@@ -1645,6 +1667,7 @@ mod tests {
                 }],
                 layout_root: layout.clone(),
                 scene: scene.clone(),
+                zoomed: false,
             },
             ResponsePayload::AttachPaneOutputBatch {
                 chunks: vec![
@@ -1674,6 +1697,7 @@ mod tests {
                     pane_id,
                     data: vec![0; 100],
                 }],
+                zoomed: false,
             },
             ResponsePayload::EventsSubscribed,
             ResponsePayload::EventBatch {
