@@ -958,7 +958,7 @@ impl BmuxConfig {
             return Ok(ThemeConfig::default());
         }
 
-        let path = paths.themes_dir().join(format!("{theme_name}.toml"));
+        let path = paths.resolve_theme_file(theme_name);
         if !path.exists() {
             return Err(ConfigError::FileNotFound { path });
         }

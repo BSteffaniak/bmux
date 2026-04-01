@@ -6,8 +6,9 @@ pub(super) fn run_config_path(as_json: bool) -> Result<u8> {
     let exists = path.exists();
 
     if as_json {
-        let candidates: Vec<serde_json::Value> = ConfigPaths::config_dir_candidates()
-            .into_iter()
+        let candidates: Vec<serde_json::Value> = paths
+            .config_dir_candidates()
+            .iter()
             .map(|dir| {
                 let file = dir.join("bmux.toml");
                 let file_exists = file.exists();

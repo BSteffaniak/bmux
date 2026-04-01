@@ -7,8 +7,19 @@ use std::path::PathBuf;
 /// Configuration paths for bmux
 #[derive(Debug, Clone)]
 pub struct ConfigPaths {
-    /// Base configuration directory
+    /// Primary (canonical) configuration directory.
+    ///
+    /// On macOS this is `~/Library/Application Support/bmux`, on Linux
+    /// `~/.config/bmux`, etc.  Used by [`ensure_dirs`] to create the
+    /// directory structure and passed to plugins as the authoritative
+    /// config root.
     pub config_dir: PathBuf,
+    /// Ordered list of candidate config directories (primary first).
+    ///
+    /// File lookups probe each candidate in order and return the first
+    /// hit, giving users a fallback chain (e.g. `~/.config/bmux` on
+    /// macOS when the native location has no matching file).
+    config_dir_candidates: Vec<PathBuf>,
     /// Runtime directory for sockets and temporary files
     pub runtime_dir: PathBuf,
     /// Data directory for persistent data
@@ -18,32 +29,61 @@ pub struct ConfigPaths {
 }
 
 impl ConfigPaths {
-    /// Create a new `ConfigPaths` with explicit directories
+    /// Create a new `ConfigPaths` with explicit directories.
+    ///
+    /// The candidate chain defaults to `[config_dir]` (no fallback).
+    /// Use [`Default::default`] to get the platform-aware fallback chain.
     #[must_use]
-    pub const fn new(
+    pub fn new(
         config_dir: PathBuf,
         runtime_dir: PathBuf,
         data_dir: PathBuf,
         state_dir: PathBuf,
     ) -> Self {
+        let config_dir_candidates = vec![config_dir.clone()];
         Self {
             config_dir,
+            config_dir_candidates,
             runtime_dir,
             data_dir,
             state_dir,
         }
     }
 
-    /// Get the config file path
+    /// Resolve a relative path against the config directory candidate chain.
+    ///
+    /// Returns the first candidate where `candidate/relative` exists on disk,
+    /// or `primary/relative` if none match (so callers always get a usable
+    /// path for creation).
     #[must_use]
-    pub fn config_file(&self) -> PathBuf {
-        self.config_dir.join("bmux.toml")
+    pub fn resolve(&self, relative: impl AsRef<std::path::Path>) -> PathBuf {
+        let relative = relative.as_ref();
+        self.config_dir_candidates
+            .iter()
+            .map(|dir| dir.join(relative))
+            .find(|p| p.exists())
+            .unwrap_or_else(|| self.config_dir.join(relative))
     }
 
-    /// Get the themes directory path
+    /// Get the config file path, resolved through the candidate chain.
+    #[must_use]
+    pub fn config_file(&self) -> PathBuf {
+        self.resolve("bmux.toml")
+    }
+
+    /// Get the themes directory path (primary, for directory creation).
     #[must_use]
     pub fn themes_dir(&self) -> PathBuf {
         self.config_dir.join("themes")
+    }
+
+    /// Resolve a theme file by name through the candidate chain.
+    ///
+    /// Checks `themes/{name}.toml` in each candidate directory and returns
+    /// the first that exists, or the primary path if none match.
+    #[must_use]
+    pub fn resolve_theme_file(&self, name: &str) -> PathBuf {
+        self.resolve(format!("themes/{name}.toml"))
     }
 
     /// Get the plugins directory path
@@ -128,20 +168,15 @@ impl ConfigPaths {
         format!(r"\\.\pipe\bmux-{user}-{runtime_hash:016x}")
     }
 
-    /// Return all candidate config directories in priority order.
-    ///
-    /// During default resolution, the first existing directory wins.
-    /// When `BMUX_CONFIG_DIR` is set, returns only that single entry.
+    /// Return the candidate config directories in priority order.
     ///
     /// On macOS the candidates are the OS-native `~/Library/Application Support/bmux`
     /// followed by the XDG-style `~/.config/bmux`. On other platforms (where the
     /// native path *is* the XDG path) only one candidate is returned.
+    /// When `BMUX_CONFIG_DIR` is set, returns only that single entry.
     #[must_use]
-    pub fn config_dir_candidates() -> Vec<PathBuf> {
-        if let Some(path) = std::env::var_os("BMUX_CONFIG_DIR") {
-            return vec![PathBuf::from(path)];
-        }
-        build_config_dir_candidates()
+    pub fn config_dir_candidates(&self) -> &[PathBuf] {
+        &self.config_dir_candidates
     }
 
     /// Ensure all necessary directories exist
@@ -292,7 +327,8 @@ fn build_config_dir_candidates() -> Vec<PathBuf> {
 ///
 /// Returns the first candidate directory that exists on disk, or the first
 /// candidate (the canonical/primary path) if none exist.
-fn resolve_config_dir(candidates: &[PathBuf]) -> PathBuf {
+#[cfg(test)]
+fn resolve_first_existing(candidates: &[PathBuf]) -> PathBuf {
     candidates
         .iter()
         .find(|p| p.exists())
@@ -302,13 +338,10 @@ fn resolve_config_dir(candidates: &[PathBuf]) -> PathBuf {
 
 impl Default for ConfigPaths {
     fn default() -> Self {
-        let config_dir = std::env::var_os("BMUX_CONFIG_DIR").map_or_else(
-            || {
-                let candidates = build_config_dir_candidates();
-                resolve_config_dir(&candidates)
-            },
-            PathBuf::from,
-        );
+        let config_dir_candidates = std::env::var_os("BMUX_CONFIG_DIR")
+            .map_or_else(build_config_dir_candidates, |p| vec![PathBuf::from(p)]);
+        // Primary is always first in the candidate list.
+        let config_dir = config_dir_candidates[0].clone();
 
         let data_dir = std::env::var_os("BMUX_DATA_DIR").map_or_else(
             || {
@@ -335,14 +368,28 @@ impl Default for ConfigPaths {
             std::env::temp_dir().join("bmux")
         };
 
-        Self::new(config_dir, runtime_dir, data_dir, default_state_dir())
+        let mut paths = Self::new(config_dir, runtime_dir, data_dir, default_state_dir());
+        paths.config_dir_candidates = config_dir_candidates;
+        paths
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigPaths, resolve_config_dir, stable_fnv1a64};
+    use super::{ConfigPaths, resolve_first_existing, stable_fnv1a64};
     use std::path::PathBuf;
+
+    /// Build a `ConfigPaths` with a custom candidate chain for testing.
+    fn paths_with_candidates(candidates: Vec<PathBuf>) -> ConfigPaths {
+        let mut paths = ConfigPaths::new(
+            candidates[0].clone(),
+            PathBuf::from("/runtime"),
+            PathBuf::from("/data"),
+            PathBuf::from("/state"),
+        );
+        paths.config_dir_candidates = candidates;
+        paths
+    }
 
     #[test]
     fn server_socket_uses_runtime_dir() {
@@ -426,53 +473,173 @@ mod tests {
         assert_eq!(stable_fnv1a64(b"bmux"), 0xbb09969bbc2c17fd);
     }
 
+    // -- resolve_first_existing (the old directory-level helper, kept for unit coverage) --
+
     #[test]
-    fn resolve_config_dir_returns_first_existing() {
+    fn resolve_first_existing_returns_primary_when_none_exist() {
         let tmp = std::env::temp_dir().join("bmux_test_resolve_first_existing");
         let _ = std::fs::remove_dir_all(&tmp);
         let primary = tmp.join("primary");
         let fallback = tmp.join("fallback");
 
-        // Neither exists — returns primary (canonical default).
-        let result = resolve_config_dir(&[primary.clone(), fallback.clone()]);
-        assert_eq!(result, primary);
-
-        // Only fallback exists — returns fallback.
-        std::fs::create_dir_all(&fallback).unwrap();
-        let result = resolve_config_dir(&[primary.clone(), fallback.clone()]);
-        assert_eq!(result, fallback);
-
-        // Both exist — primary wins (higher priority).
-        std::fs::create_dir_all(&primary).unwrap();
-        let result = resolve_config_dir(&[primary.clone(), fallback.clone()]);
+        let result = resolve_first_existing(&[primary.clone(), fallback.clone()]);
         assert_eq!(result, primary);
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
-    fn resolve_config_dir_single_candidate() {
-        let tmp = std::env::temp_dir().join("bmux_test_resolve_single");
+    fn resolve_first_existing_returns_fallback_when_primary_absent() {
+        let tmp = std::env::temp_dir().join("bmux_test_resolve_fallback");
         let _ = std::fs::remove_dir_all(&tmp);
-        let only = tmp.join("only");
+        let primary = tmp.join("primary");
+        let fallback = tmp.join("fallback");
 
-        // Single candidate, doesn't exist — returns it anyway.
-        let result = resolve_config_dir(&[only.clone()]);
-        assert_eq!(result, only);
+        std::fs::create_dir_all(&fallback).unwrap();
+        let result = resolve_first_existing(&[primary, fallback.clone()]);
+        assert_eq!(result, fallback);
 
-        // Single candidate exists — returns it.
-        std::fs::create_dir_all(&only).unwrap();
-        let result = resolve_config_dir(&[only.clone()]);
-        assert_eq!(result, only);
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_first_existing_prefers_primary_when_both_exist() {
+        let tmp = std::env::temp_dir().join("bmux_test_resolve_both");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let primary = tmp.join("primary");
+        let fallback = tmp.join("fallback");
+
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&fallback).unwrap();
+        let result = resolve_first_existing(&[primary.clone(), fallback]);
+        assert_eq!(result, primary);
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    // -- ConfigPaths::resolve (file-level candidate chain) --
+
+    #[test]
+    fn resolve_returns_primary_path_when_no_candidate_has_file() {
+        let tmp = std::env::temp_dir().join("bmux_test_resolve_none");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let primary = tmp.join("primary");
+        let fallback = tmp.join("fallback");
+
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&fallback).unwrap();
+
+        let paths = paths_with_candidates(vec![primary.clone(), fallback]);
+        assert_eq!(paths.resolve("bmux.toml"), primary.join("bmux.toml"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_finds_file_in_fallback_when_primary_lacks_it() {
+        let tmp = std::env::temp_dir().join("bmux_test_resolve_fallback_file");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let primary = tmp.join("primary");
+        let fallback = tmp.join("fallback");
+
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&fallback).unwrap();
+        std::fs::write(fallback.join("bmux.toml"), "# fallback").unwrap();
+
+        let paths = paths_with_candidates(vec![primary, fallback.clone()]);
+        assert_eq!(paths.resolve("bmux.toml"), fallback.join("bmux.toml"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_prefers_primary_when_both_have_file() {
+        let tmp = std::env::temp_dir().join("bmux_test_resolve_primary_file");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let primary = tmp.join("primary");
+        let fallback = tmp.join("fallback");
+
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&fallback).unwrap();
+        std::fs::write(primary.join("bmux.toml"), "# primary").unwrap();
+        std::fs::write(fallback.join("bmux.toml"), "# fallback").unwrap();
+
+        let paths = paths_with_candidates(vec![primary.clone(), fallback]);
+        assert_eq!(paths.resolve("bmux.toml"), primary.join("bmux.toml"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_works_for_nested_paths() {
+        let tmp = std::env::temp_dir().join("bmux_test_resolve_nested");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let primary = tmp.join("primary");
+        let fallback = tmp.join("fallback");
+
+        std::fs::create_dir_all(primary.join("themes")).unwrap();
+        std::fs::create_dir_all(fallback.join("themes")).unwrap();
+        // Theme only in fallback
+        std::fs::write(fallback.join("themes").join("night.toml"), "name='night'").unwrap();
+
+        let paths = paths_with_candidates(vec![primary.clone(), fallback.clone()]);
+        assert_eq!(
+            paths.resolve("themes/night.toml"),
+            fallback.join("themes").join("night.toml")
+        );
+
+        // Now also create in primary — primary should win.
+        std::fs::write(primary.join("themes").join("night.toml"), "name='night'").unwrap();
+        assert_eq!(
+            paths.resolve("themes/night.toml"),
+            primary.join("themes").join("night.toml")
+        );
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn config_file_uses_resolve() {
+        let tmp = std::env::temp_dir().join("bmux_test_config_file_resolve");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let primary = tmp.join("primary");
+        let fallback = tmp.join("fallback");
+
+        std::fs::create_dir_all(&primary).unwrap();
+        std::fs::create_dir_all(&fallback).unwrap();
+        std::fs::write(fallback.join("bmux.toml"), "# config").unwrap();
+
+        let paths = paths_with_candidates(vec![primary, fallback.clone()]);
+        assert_eq!(paths.config_file(), fallback.join("bmux.toml"));
+
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn resolve_theme_file_uses_resolve() {
+        let tmp = std::env::temp_dir().join("bmux_test_resolve_theme");
+        let _ = std::fs::remove_dir_all(&tmp);
+        let primary = tmp.join("primary");
+        let fallback = tmp.join("fallback");
+
+        std::fs::create_dir_all(primary.join("themes")).unwrap();
+        std::fs::create_dir_all(fallback.join("themes")).unwrap();
+        std::fs::write(fallback.join("themes").join("dracula.toml"), "").unwrap();
+
+        let paths = paths_with_candidates(vec![primary, fallback.clone()]);
+        assert_eq!(
+            paths.resolve_theme_file("dracula"),
+            fallback.join("themes").join("dracula.toml")
+        );
 
         let _ = std::fs::remove_dir_all(&tmp);
     }
 
     #[test]
     fn config_dir_candidates_returns_at_least_one() {
-        let candidates = ConfigPaths::config_dir_candidates();
+        let paths = ConfigPaths::default();
         assert!(
-            !candidates.is_empty(),
+            !paths.config_dir_candidates().is_empty(),
             "config_dir_candidates must return at least one path"
         );
     }
@@ -480,7 +647,8 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn config_dir_candidates_includes_xdg_fallback_on_macos() {
-        let candidates = ConfigPaths::config_dir_candidates();
+        let paths = ConfigPaths::default();
+        let candidates = paths.config_dir_candidates();
         assert!(
             candidates.len() >= 2,
             "macOS should have at least 2 candidates (native + XDG), got {candidates:?}"
