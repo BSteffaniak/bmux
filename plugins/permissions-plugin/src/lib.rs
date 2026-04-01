@@ -181,14 +181,16 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
                 context: option_value(&context.arguments, "context"),
             };
             let as_json = has_flag(&context.arguments, "json");
-            let watch = has_flag(&context.arguments, "watch");
+            let requested_watch = has_flag(&context.arguments, "watch");
             let compact = has_flag(&context.arguments, "compact");
+            let iterations_arg = option_value(&context.arguments, "iterations");
+            let watch = requested_watch || (compact && iterations_arg.is_none());
             let interval_ms = option_value(&context.arguments, "interval-ms")
                 .as_deref()
                 .map(parse_interval_ms)
                 .transpose()?
                 .unwrap_or(1000);
-            let iterations = option_value(&context.arguments, "iterations")
+            let iterations = iterations_arg
                 .as_deref()
                 .map(parse_iterations)
                 .transpose()?
