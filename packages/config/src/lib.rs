@@ -448,6 +448,8 @@ pub struct StatusBarConfig {
     pub tab_overflow_marker: String,
     /// Display 1-based tab indexes before labels.
     pub show_tab_index: bool,
+    /// Which context set to render as tabs.
+    pub tab_scope: StatusTabScope,
     /// Display the active session name in the status bar.
     pub show_session_name: bool,
     /// Display the current context label in the status bar.
@@ -478,6 +480,7 @@ impl Default for StatusBarConfig {
             tab_separator: " ".to_string(),
             tab_overflow_marker: "+".to_string(),
             show_tab_index: true,
+            tab_scope: StatusTabScope::AllContexts,
             show_session_name: true,
             show_context_name: false,
             show_mode: true,
@@ -488,6 +491,15 @@ impl Default for StatusBarConfig {
             hint_policy: StatusHintPolicy::Always,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusTabScope {
+    #[default]
+    AllContexts,
+    SessionContexts,
+    Mru,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]

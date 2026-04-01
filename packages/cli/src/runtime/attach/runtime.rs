@@ -1,5 +1,7 @@
 use super::super::*;
 
+const ATTACH_CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+
 pub(crate) async fn run_session_attach_with_client(
     mut client: BmuxClient,
     target: Option<&str>,
@@ -157,9 +159,11 @@ pub(crate) async fn run_session_attach_with_client(
             break;
         }
 
-        let _ = view_state.clear_expired_transient_status(Instant::now());
-        if let Err(error) =
-            refresh_attached_session_from_context(&mut client, &mut view_state).await
+        let now = Instant::now();
+        let _ = view_state.clear_expired_transient_status(now);
+        if should_refresh_attached_session(&view_state, now)
+            && let Err(error) =
+                refresh_attached_session_from_context(&mut client, &mut view_state).await
         {
             view_state.set_transient_status(
                 format!(
@@ -1326,10 +1330,15 @@ pub(crate) async fn build_attach_status_line_for_draw(
         });
     }
 
-    let tabs = build_attach_tabs(client, context_id, session_id).await?;
-    let session_label = resolve_attach_session_label(client, session_id).await?;
+    let tabs = build_attach_tabs(client, status_config, context_id, session_id).await?;
+    let (session_label, session_count) =
+        resolve_attach_session_label_and_count(client, session_id).await?;
     let current_context_label =
         resolve_attach_context_label(client, context_id, session_id).await?;
+    let tab_position_label = tabs
+        .iter()
+        .position(|tab| tab.active)
+        .map(|active_index| format!("tab:{}/{}", active_index + 1, tabs.len()));
     let mode_label = if help_overlay_open {
         "HELP"
     } else if scrollback_active {
@@ -1362,8 +1371,10 @@ pub(crate) async fn build_attach_status_line_for_draw(
         cols,
         status_config,
         &session_label,
+        session_count,
         &current_context_label,
         &tabs,
+        tab_position_label.as_deref(),
         mode_label,
         role_label,
         follow_label.as_deref(),
@@ -1377,7 +1388,9 @@ pub(crate) fn attach_mode_hint(_ui_mode: AttachUiMode, keymap: &Keymap) -> Strin
     let detach = key_hint_or_unbound(keymap, RuntimeAction::Detach);
     let quit = key_hint_or_unbound(keymap, RuntimeAction::Quit);
     let help = key_hint_or_unbound(keymap, RuntimeAction::ShowHelp);
-    format!("{detach} detach | {quit} quit | {help} help")
+    let prev = key_hint_or_unbound(keymap, RuntimeAction::SessionPrev);
+    let next = key_hint_or_unbound(keymap, RuntimeAction::SessionNext);
+    format!("{prev}/{next} tabs | {detach} detach | {quit} quit | {help} help")
 }
 
 pub(crate) fn initial_attach_status(keymap: &Keymap, can_write: bool) -> String {
@@ -1790,6 +1803,7 @@ pub(crate) async fn render_attach_frame(
 
 pub(crate) async fn build_attach_tabs(
     client: &mut BmuxClient,
+    status_config: &bmux_config::StatusBarConfig,
     context_id: Option<Uuid>,
     session_id: Uuid,
 ) -> std::result::Result<Vec<AttachTab>, ClientError> {
@@ -1802,22 +1816,29 @@ pub(crate) async fn build_attach_tabs(
         }]);
     }
 
-    let mut session_contexts = contexts
-        .iter()
-        .filter(|context| {
-            context
-                .attributes
-                .get("bmux.session_id")
-                .is_some_and(|value| value == &session_id.to_string())
-        })
-        .cloned()
-        .collect::<Vec<_>>();
-    if session_contexts.is_empty() {
-        session_contexts = contexts;
-    }
+    let tab_contexts = match status_config.tab_scope {
+        bmux_config::StatusTabScope::AllContexts | bmux_config::StatusTabScope::Mru => contexts,
+        bmux_config::StatusTabScope::SessionContexts => {
+            let filtered = contexts
+                .iter()
+                .filter(|context| {
+                    context
+                        .attributes
+                        .get("bmux.session_id")
+                        .is_some_and(|value| value == &session_id.to_string())
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            if filtered.is_empty() {
+                contexts
+            } else {
+                filtered
+            }
+        }
+    };
 
     let current_context_id = context_id.or_else(|| {
-        session_contexts
+        tab_contexts
             .iter()
             .find(|context| {
                 context
@@ -1828,7 +1849,7 @@ pub(crate) async fn build_attach_tabs(
             .map(|context| context.id)
     });
 
-    let tabs = session_contexts
+    let tabs = tab_contexts
         .into_iter()
         .map(|context| AttachTab {
             label: context_summary_label(&context),
@@ -1878,14 +1899,24 @@ pub(crate) async fn resolve_attach_session_label(
     client: &mut BmuxClient,
     session_id: Uuid,
 ) -> std::result::Result<String, ClientError> {
+    let (label, _count) = resolve_attach_session_label_and_count(client, session_id).await?;
+    Ok(label)
+}
+
+pub(crate) async fn resolve_attach_session_label_and_count(
+    client: &mut BmuxClient,
+    session_id: Uuid,
+) -> std::result::Result<(String, usize), ClientError> {
     let sessions = client.list_sessions().await?;
-    Ok(sessions
+    let count = sessions.len();
+    let label = sessions
         .into_iter()
         .find(|session| session.id == session_id)
         .map_or_else(
             || format!("session-{}", short_uuid(session_id)),
             |session| session_summary_label(&session),
-        ))
+        );
+    Ok((label, count))
 }
 
 pub(crate) fn session_summary_label(session: &bmux_ipc::SessionSummary) -> String {
@@ -1996,15 +2027,22 @@ pub(crate) async fn refresh_attached_session_from_context(
         let previous_session_id = view_state.attached_id;
         view_state.attached_id = grant.session_id;
         view_state.attached_context_id = grant.context_id.or(Some(context_id));
+        view_state.last_context_refresh_at = Some(Instant::now());
         trace!(
-            context_id = ?view_state.attached_context_id,
-            previous_session_id = %previous_session_id,
+                context_id = ?view_state.attached_context_id,
+                previous_session_id = %previous_session_id,
             refreshed_session_id = %view_state.attached_id,
             elapsed_ms = started_at.elapsed().as_millis(),
             "attach.context_refresh.done"
         );
     }
     Ok(())
+}
+
+pub(crate) fn should_refresh_attached_session(view_state: &AttachViewState, now: Instant) -> bool {
+    view_state
+        .last_context_refresh_at
+        .is_none_or(|last| now.duration_since(last) >= ATTACH_CONTEXT_REFRESH_INTERVAL)
 }
 
 pub(crate) fn attach_keymap_from_config(config: &BmuxConfig) -> crate::input::Keymap {
@@ -2965,18 +3003,32 @@ pub(crate) async fn handle_attach_status_tab_click(
 ) -> std::result::Result<bool, ClientError> {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
     if cols == 0 || rows == 0 {
+        trace!("attach.status_click.ignored.empty_terminal");
         return Ok(false);
     }
     let Some(status_row) = status_row_for_position(view_state.status_position, rows) else {
+        trace!("attach.status_click.ignored.status_off");
         return Ok(false);
     };
-    if mouse_event.row != status_row {
+    if !status_row_matches_mouse(status_row, mouse_event.row, rows) {
+        trace!(
+            mouse_row = mouse_event.row,
+            status_row, rows, "attach.status_click.ignored.row_mismatch"
+        );
         return Ok(false);
     }
 
     let Some(status_line) = view_state.cached_status_line.as_ref() else {
+        trace!("attach.status_click.ignored.no_cached_status");
         return Ok(false);
     };
+    trace!(
+        mouse_col = mouse_event.column,
+        mouse_row = mouse_event.row,
+        status_row,
+        hitbox_count = status_line.tab_hitboxes.len(),
+        "attach.status_click.inspect"
+    );
     let Some(target_context_id) = status_line
         .tab_hitboxes
         .iter()
@@ -2985,14 +3037,27 @@ pub(crate) async fn handle_attach_status_tab_click(
         })
         .map(|hitbox| hitbox.context_id)
     else {
+        trace!("attach.status_click.ignored.no_hitbox_match");
         return Ok(false);
     };
+
+    debug!(target_context_id = %target_context_id, "attach.status_click.retarget");
 
     retarget_attach_to_context(client, view_state, target_context_id).await?;
     view_state.dirty.status_needs_redraw = true;
     view_state.dirty.layout_needs_refresh = true;
     view_state.dirty.full_pane_redraw = true;
     Ok(true)
+}
+
+pub(crate) const fn status_row_matches_mouse(status_row: u16, mouse_row: u16, rows: u16) -> bool {
+    if mouse_row == status_row {
+        return true;
+    }
+    if mouse_row > 0 && mouse_row.saturating_sub(1) == status_row {
+        return true;
+    }
+    rows > 0 && mouse_row == rows && status_row == rows.saturating_sub(1)
 }
 
 pub(crate) async fn handle_attach_mouse_gesture_action(

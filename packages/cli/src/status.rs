@@ -25,8 +25,10 @@ pub fn build_attach_status_line(
     width: u16,
     config: &StatusBarConfig,
     session_label: &str,
+    session_count: usize,
     current_context_label: &str,
     tabs: &[AttachTab],
+    tab_position_label: Option<&str>,
     mode_label: &str,
     role_label: &str,
     follow_label: Option<&str>,
@@ -41,7 +43,7 @@ pub fn build_attach_status_line(
         append_segment(
             &mut left,
             &config.segment_separator,
-            &format!("session:{session_label}"),
+            &format!("session:{session_label} ({session_count})"),
         );
     }
     if config.show_context_name {
@@ -58,6 +60,9 @@ pub fn build_attach_status_line(
     }
     if config.show_role {
         right_segments.push(role_label.to_string());
+    }
+    if let Some(tab_position_label) = tab_position_label {
+        right_segments.push(tab_position_label.to_string());
     }
     if config.show_follow
         && let Some(follow) = follow_label
