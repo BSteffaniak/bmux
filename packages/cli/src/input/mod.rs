@@ -668,6 +668,18 @@ fn find_overlaps(bindings: &[KeyBinding], label: &str) -> Vec<String> {
     warnings
 }
 
+/// Canonicalize a chord string by parsing and re-serializing it.
+///
+/// This normalizes aliases (e.g. `"left"` -> `"arrow_left"`, `"esc"` -> `"escape"`)
+/// so that two strings representing the same keystroke produce the same canonical key.
+/// Returns the original string unchanged if parsing fails.
+pub(crate) fn canonical_chord_key(chord_str: &str) -> String {
+    match parse_chord(chord_str) {
+        Ok(strokes) => chord_to_string(&strokes),
+        Err(_) => chord_str.to_string(),
+    }
+}
+
 fn chord_to_string(chord: &[KeyStroke]) -> String {
     chord
         .iter()

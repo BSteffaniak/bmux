@@ -272,6 +272,20 @@ pub(super) fn plugin_keybinding_proposals(
     (runtime, global, scroll)
 }
 
+/// Canonicalize the chord keys in a keybinding map so that aliases resolve to
+/// the same canonical form (e.g. `"shift+left"` and `"shift+arrow_left"` both
+/// become `"shift+arrow_left"`).  When two raw keys collapse to the same
+/// canonical key, the last inserted value wins (matching `BTreeMap::extend`
+/// semantics).
+fn canonicalize_keybindings(
+    bindings: std::collections::BTreeMap<String, String>,
+) -> std::collections::BTreeMap<String, String> {
+    bindings
+        .into_iter()
+        .map(|(chord_str, action)| (crate::input::canonical_chord_key(&chord_str), action))
+        .collect()
+}
+
 pub(super) fn merged_runtime_keybindings(
     config: &BmuxConfig,
 ) -> (
@@ -282,17 +296,17 @@ pub(super) fn merged_runtime_keybindings(
     let defaults = BmuxConfig::default();
     let (plugin_runtime, plugin_global, plugin_scroll) = plugin_keybinding_proposals(config);
 
-    let mut runtime = defaults.keybindings.runtime;
-    runtime.extend(plugin_runtime);
-    runtime.extend(config.keybindings.runtime.clone());
+    let mut runtime = canonicalize_keybindings(defaults.keybindings.runtime);
+    runtime.extend(canonicalize_keybindings(plugin_runtime));
+    runtime.extend(canonicalize_keybindings(config.keybindings.runtime.clone()));
 
-    let mut global = defaults.keybindings.global;
-    global.extend(plugin_global);
-    global.extend(config.keybindings.global.clone());
+    let mut global = canonicalize_keybindings(defaults.keybindings.global);
+    global.extend(canonicalize_keybindings(plugin_global));
+    global.extend(canonicalize_keybindings(config.keybindings.global.clone()));
 
-    let mut scroll = defaults.keybindings.scroll;
-    scroll.extend(plugin_scroll);
-    scroll.extend(config.keybindings.scroll.clone());
+    let mut scroll = canonicalize_keybindings(defaults.keybindings.scroll);
+    scroll.extend(canonicalize_keybindings(plugin_scroll));
+    scroll.extend(canonicalize_keybindings(config.keybindings.scroll.clone()));
 
     (runtime, global, scroll)
 }

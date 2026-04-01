@@ -4832,4 +4832,24 @@ mod tests {
         assert_eq!(row, 46, "cursor row should clamp to pane inner height");
         assert_eq!(col, 117, "cursor col should clamp to pane inner width");
     }
+
+    #[test]
+    fn keymap_compiles_when_user_config_uses_arrow_aliases() {
+        // Regression test: user config uses "shift+left" while defaults use
+        // "shift+arrow_left". Both parse to the same keystroke. Without chord
+        // canonicalization this produces a "duplicate runtime key binding chord"
+        // error that prevents the entire keymap from loading.
+        let mut config = BmuxConfig::default();
+        config
+            .keybindings
+            .runtime
+            .insert("shift+left".to_string(), "resize_left".to_string());
+        config
+            .keybindings
+            .runtime
+            .insert("left".to_string(), "focus_left_pane".to_string());
+
+        // This must not panic or return Err.
+        let _keymap = attach_keymap_from_config(&config);
+    }
 }
