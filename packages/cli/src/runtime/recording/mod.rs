@@ -727,7 +727,7 @@ fn capture_stream_open_metrics() -> (Option<u16>, Option<u16>, Option<u16>, Opti
     )
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CursorVisualShape {
     Block,
     Bar,
@@ -1033,6 +1033,7 @@ fn export_recording_gif(
     export_metadata: Option<&str>,
     show_progress: bool,
 ) -> Result<()> {
+    let mut profiler = ExportProfiler::new();
     let speed = if speed <= 0.0 { 1.0 } else { speed };
     let fps = fps.max(1);
     let frame_interval_ns = (1_000_000_000_f64 / f64::from(fps)) as u64;
@@ -1129,12 +1130,29 @@ fn export_recording_gif(
         line_height,
         font_path,
     )?;
+    let renderer_init_started_at = profiler.stage_started();
     let palette = xterm_256_palette();
     let mut glyph_renderer = match render_options.mode {
         RecordingRenderMode::Font => GlyphRenderer::new(cell_w, cell_h, &render_options),
         RecordingRenderMode::Bitmap => None,
     };
+    let mut resvg_renderer = match render_options.mode {
+        RecordingRenderMode::Font => Some(
+            ResvgFrameRenderer::new(max_rows, max_cols, cell_w, cell_h, &render_options)
+                .map_err(|error| {
+                    profiler.note_resvg_fallback();
+                    tracing::warn!(
+                        "recording export: resvg renderer init failed, falling back to bitmap: {error:#}"
+                    );
+                    error
+                })
+                .ok(),
+        ),
+        RecordingRenderMode::Bitmap => None,
+    }
+    .flatten();
     let mut bitmap_cache = BitmapGlyphCache::new(usize::from(cell_w), usize::from(cell_h));
+    profiler.record_renderer_init(renderer_init_started_at);
 
     let output_path = PathBuf::from(output);
     if let Some(parent) = output_path.parent()
@@ -1169,6 +1187,7 @@ fn export_recording_gif(
     let mut cursor_frames = export_metadata.map(|_| Vec::<ExportCursorFrame>::new());
     let mut blink_anchor_ns = None::<u64>;
     let mut last_activity_ns = None::<u64>;
+    let mut previous_visual_state = None::<FrameVisualState>;
     let start_mono_ns = events.iter().map(|event| event.mono_ns).min().unwrap_or(0);
     let frame_cutoff_ns = max_frames.map(|limit| {
         if limit == 0 {
@@ -1209,7 +1228,10 @@ fn export_recording_gif(
 
     let mut event_index = 0_usize;
     for frame_idx in 0..target_frames {
+        profiler.record_frame_considered();
         let frame_time_ns = u64::from(frame_idx).saturating_mul(frame_interval_ns);
+        let apply_started_at = profiler.stage_started();
+        let mut frame_had_display_change = false;
         while event_index < considered_event_count {
             let event = &events[event_index];
             let rel_mono_ns = event.mono_ns.saturating_sub(start_mono_ns);
@@ -1222,19 +1244,48 @@ fn export_recording_gif(
                     current_cols = (*cols).max(1);
                     current_rows = (*rows).max(1);
                     parser.screen_mut().set_size(current_rows, current_cols);
+                    frame_had_display_change = true;
                 }
                 DisplayTrackEvent::FrameBytes { data } => {
                     update_cursor_replay_state(&mut cursor_state, data);
                     parser.process(data);
                     processed_frame_events = processed_frame_events.saturating_add(1);
                     last_activity_ns = Some(scaled_ns);
+                    frame_had_display_change = true;
                 }
                 DisplayTrackEvent::StreamOpened { .. } | DisplayTrackEvent::StreamClosed => {}
             }
             event_index = event_index.saturating_add(1);
         }
+        profiler.record_apply_events(apply_started_at);
 
         if processed_frame_events == 0 {
+            progress.update(processed_frame_events, emitted_frames, false);
+            continue;
+        }
+
+        let (cursor_row, cursor_col) = parser.screen().cursor_position();
+        let parser_cursor_visible = !parser.screen().hide_cursor();
+        let shape = effective_cursor_shape(&cursor_options, cursor_state);
+        let (cursor_visible, blink_on) = compute_cursor_visibility(
+            &cursor_options,
+            cursor_state,
+            parser_cursor_visible,
+            frame_time_ns,
+            last_activity_ns,
+            &mut blink_anchor_ns,
+        );
+        let visual_state = FrameVisualState {
+            rows: current_rows,
+            cols: current_cols,
+            cursor_row,
+            cursor_col,
+            cursor_visible,
+            shape,
+            blink_on,
+        };
+        if !frame_had_display_change && previous_visual_state == Some(visual_state) {
+            profiler.record_frame_skipped();
             progress.update(processed_frame_events, emitted_frames, false);
             continue;
         }
@@ -1243,19 +1294,32 @@ fn export_recording_gif(
             let delta_ns = frame_time_ns.saturating_sub(previous);
             ((delta_ns / 10_000_000).max(1).min(u64::from(u16::MAX))) as u16
         });
+        let render_started_at = profiler.stage_started();
         let mut pixels = if render_options.mode == RecordingRenderMode::Font {
-            render_screen_rgba_resvg(
-                parser.screen(),
-                current_rows,
-                current_cols,
-                max_rows,
-                max_cols,
-                cell_w,
-                cell_h,
-                &palette,
-                &render_options,
-            )
-            .unwrap_or_else(|_| {
+            if let Some(renderer) = resvg_renderer.as_mut() {
+                match renderer.render(parser.screen(), current_rows, current_cols, &palette) {
+                    Ok(pixels) => pixels,
+                    Err(error) => {
+                        profiler.note_resvg_fallback();
+                        tracing::warn!(
+                            "recording export: resvg frame render failed, falling back to bitmap: {error:#}"
+                        );
+                        resvg_renderer = None;
+                        render_screen_rgba(
+                            parser.screen(),
+                            current_rows,
+                            current_cols,
+                            max_rows,
+                            max_cols,
+                            cell_w,
+                            cell_h,
+                            &palette,
+                            glyph_renderer.as_mut(),
+                            &mut bitmap_cache,
+                        )
+                    }
+                }
+            } else {
                 render_screen_rgba(
                     parser.screen(),
                     current_rows,
@@ -1268,7 +1332,7 @@ fn export_recording_gif(
                     glyph_renderer.as_mut(),
                     &mut bitmap_cache,
                 )
-            })
+            }
         } else {
             render_screen_rgba(
                 parser.screen(),
@@ -1283,17 +1347,6 @@ fn export_recording_gif(
                 &mut bitmap_cache,
             )
         };
-        let (cursor_row, cursor_col) = parser.screen().cursor_position();
-        let parser_cursor_visible = !parser.screen().hide_cursor();
-        let shape = effective_cursor_shape(&cursor_options, cursor_state);
-        let (cursor_visible, blink_on) = compute_cursor_visibility(
-            &cursor_options,
-            cursor_state,
-            parser_cursor_visible,
-            frame_time_ns,
-            last_activity_ns,
-            &mut blink_anchor_ns,
-        );
         if cursor_visible && cursor_row < current_rows && cursor_col < current_cols {
             let cursor_color_rgb = cursor_options.color_override.unwrap_or_else(|| {
                 parser
@@ -1314,6 +1367,7 @@ fn export_recording_gif(
                 cursor_color_rgb,
             );
         }
+        profiler.record_render(render_started_at);
         if let Some(frames) = cursor_frames.as_mut() {
             frames.push(ExportCursorFrame {
                 mono_ns: frame_time_ns,
@@ -1324,17 +1378,22 @@ fn export_recording_gif(
                 blink_on,
             });
         }
+        let encode_started_at = profiler.stage_started();
         let mut frame = GifFrame::from_rgba_speed(width, height, &mut pixels, 1);
         frame.delay = delay_cs;
         encoder
             .write_frame(&frame)
             .context("failed writing gif frame")?;
+        profiler.record_encode(encode_started_at);
+        previous_visual_state = Some(visual_state);
         previous_emit_ns = Some(frame_time_ns);
         emitted_frames = emitted_frames.saturating_add(1);
+        profiler.record_frame_emitted();
         progress.update(processed_frame_events, emitted_frames, false);
     }
 
     progress.finish(processed_frame_events, emitted_frames);
+    profiler.finish(processed_frame_events, emitted_frames);
 
     if emitted_frames == 0 {
         anyhow::bail!("no drawable frame events found in display track")
@@ -1398,6 +1457,123 @@ fn export_recording_gif(
 struct ExportProgressEstimate {
     total_frame_events: u32,
     estimated_emitted_frames: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FrameVisualState {
+    rows: u16,
+    cols: u16,
+    cursor_row: u16,
+    cursor_col: u16,
+    cursor_visible: bool,
+    shape: CursorVisualShape,
+    blink_on: bool,
+}
+
+#[derive(Debug)]
+struct ExportProfiler {
+    enabled: bool,
+    started_at: Instant,
+    renderer_init: std::time::Duration,
+    apply_events: std::time::Duration,
+    render: std::time::Duration,
+    encode: std::time::Duration,
+    frames_considered: u32,
+    frames_emitted: u32,
+    frames_skipped: u32,
+    resvg_fallbacks: u32,
+}
+
+impl ExportProfiler {
+    fn new() -> Self {
+        let enabled = std::env::var("BMUX_RECORDING_EXPORT_PROFILE")
+            .ok()
+            .map(|value| {
+                let normalized = value.trim().to_ascii_lowercase();
+                matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+            })
+            .unwrap_or(false);
+        Self {
+            enabled,
+            started_at: Instant::now(),
+            renderer_init: std::time::Duration::ZERO,
+            apply_events: std::time::Duration::ZERO,
+            render: std::time::Duration::ZERO,
+            encode: std::time::Duration::ZERO,
+            frames_considered: 0,
+            frames_emitted: 0,
+            frames_skipped: 0,
+            resvg_fallbacks: 0,
+        }
+    }
+
+    fn stage_started(&self) -> Option<Instant> {
+        self.enabled.then(Instant::now)
+    }
+
+    fn record_renderer_init(&mut self, started_at: Option<Instant>) {
+        if let Some(started_at) = started_at {
+            self.renderer_init += started_at.elapsed();
+        }
+    }
+
+    fn record_apply_events(&mut self, started_at: Option<Instant>) {
+        if let Some(started_at) = started_at {
+            self.apply_events += started_at.elapsed();
+        }
+    }
+
+    fn record_render(&mut self, started_at: Option<Instant>) {
+        if let Some(started_at) = started_at {
+            self.render += started_at.elapsed();
+        }
+    }
+
+    fn record_encode(&mut self, started_at: Option<Instant>) {
+        if let Some(started_at) = started_at {
+            self.encode += started_at.elapsed();
+        }
+    }
+
+    fn record_frame_considered(&mut self) {
+        self.frames_considered = self.frames_considered.saturating_add(1);
+    }
+
+    fn record_frame_emitted(&mut self) {
+        self.frames_emitted = self.frames_emitted.saturating_add(1);
+    }
+
+    fn record_frame_skipped(&mut self) {
+        self.frames_skipped = self.frames_skipped.saturating_add(1);
+    }
+
+    fn note_resvg_fallback(&mut self) {
+        self.resvg_fallbacks = self.resvg_fallbacks.saturating_add(1);
+    }
+
+    fn finish(&self, processed_frame_events: u32, emitted_frames: u32) {
+        if !self.enabled {
+            return;
+        }
+        let elapsed = self.started_at.elapsed();
+        let considered = self.frames_considered.max(1);
+        let avg_render_ms = self.render.as_secs_f64() * 1000.0 / f64::from(considered);
+        let avg_encode_ms = self.encode.as_secs_f64() * 1000.0 / f64::from(considered);
+        tracing::info!(
+            "recording export profile: elapsed={} init={} apply={} render={} encode={} frames_considered={} frames_emitted={} frames_skipped={} processed_frame_events={} emitted_frames={} resvg_fallbacks={} avg_render_ms={avg_render_ms:.3} avg_encode_ms={avg_encode_ms:.3}",
+            format_duration_compact(elapsed),
+            format_duration_compact(self.renderer_init),
+            format_duration_compact(self.apply_events),
+            format_duration_compact(self.render),
+            format_duration_compact(self.encode),
+            self.frames_considered,
+            self.frames_emitted,
+            self.frames_skipped,
+            processed_frame_events,
+            emitted_frames,
+            self.resvg_fallbacks,
+        );
+    }
 }
 
 fn estimate_export_progress(
@@ -1660,168 +1836,209 @@ fn render_screen_rgba(
     pixels
 }
 
-fn render_screen_rgba_resvg(
-    screen: &vt100::Screen,
-    rows: u16,
-    cols: u16,
-    max_rows: u16,
-    max_cols: u16,
-    cell_w: u16,
-    cell_h: u16,
-    palette: &[(u8, u8, u8)],
-    options: &RenderOptions,
-) -> Result<Vec<u8>> {
-    let width = usize::from(max_cols.saturating_mul(cell_w));
-    let height = usize::from(max_rows.saturating_mul(cell_h));
-    let width_u32 = u32::try_from(width).context("render width exceeds u32")?;
-    let height_u32 = u32::try_from(height).context("render height exceeds u32")?;
-    let cell_w_usize = usize::from(cell_w);
-    let cell_h_usize = usize::from(cell_h);
+struct ResvgFrameRenderer {
+    width: usize,
+    height: usize,
+    width_u32: u32,
+    height_u32: u32,
+    cell_w_usize: usize,
+    cell_h_usize: usize,
+    background_opacity: f32,
+    backdrop_rgb: (u8, u8, u8),
+    top_to_baseline: f32,
+    font_size: f32,
+    font_family_attr: String,
+    options_usvg: usvg::Options<'static>,
+    svg: String,
+}
 
-    let preset = font_preset_for_options(options);
-    let mut families = if options.font_families.is_empty() {
-        bmux_fonts::default_families_for_preset(preset)
-    } else {
-        options.font_families.clone()
-    };
-    if families.is_empty() {
-        families.push("monospace".to_string());
-    }
-    let metrics = compute_font_grid_metrics(cell_w, cell_h, options);
-    let font_size = options
-        .font_size_px
-        .or_else(|| metrics.as_ref().map(|value| value.font_size_px))
-        .unwrap_or((f32::from(cell_h) * 0.9).max(8.0));
-    let top_to_baseline = metrics
-        .as_ref()
-        .map_or(f32::from(cell_h) * 0.8, |value| value.top_to_baseline_px);
-    let font_family_attr = svg_font_family_list(&families);
+impl ResvgFrameRenderer {
+    fn new(
+        max_rows: u16,
+        max_cols: u16,
+        cell_w: u16,
+        cell_h: u16,
+        options: &RenderOptions,
+    ) -> Result<Self> {
+        let width = usize::from(max_cols.saturating_mul(cell_w));
+        let height = usize::from(max_rows.saturating_mul(cell_h));
+        let width_u32 = u32::try_from(width).context("render width exceeds u32")?;
+        let height_u32 = u32::try_from(height).context("render height exceeds u32")?;
+        let cell_w_usize = usize::from(cell_w);
+        let cell_h_usize = usize::from(cell_h);
+        let preset = font_preset_for_options(options);
 
-    let mut svg = String::with_capacity(width.saturating_mul(height / 4).max(1024));
-    write!(
-        &mut svg,
-        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{width}\" height=\"{height}\" viewBox=\"0 0 {width} {height}\">"
-    )
-    .expect("svg write cannot fail");
-    write!(
-        &mut svg,
-        "<g font-family=\"{}\" font-size=\"{:.3}\" text-rendering=\"optimizeLegibility\" dominant-baseline=\"alphabetic\" font-kerning=\"none\" font-variant-ligatures=\"none\">",
-        xml_escape_attr(&font_family_attr),
-        font_size
-    )
-    .expect("svg write cannot fail");
+        let mut families = if options.font_families.is_empty() {
+            bmux_fonts::default_families_for_preset(preset)
+        } else {
+            options.font_families.clone()
+        };
+        if families.is_empty() {
+            families.push("monospace".to_string());
+        }
 
-    for row in 0..rows {
-        let mut row_runs = Vec::<TextRun>::new();
-        let mut current_run = None::<TextRun>;
-        for col in 0..cols {
-            let Some(cell) = screen.cell(row, col) else {
+        let metrics = compute_font_grid_metrics(cell_w, cell_h, options);
+        let font_size = options
+            .font_size_px
+            .or_else(|| metrics.as_ref().map(|value| value.font_size_px))
+            .unwrap_or((f32::from(cell_h) * 0.9).max(8.0));
+        let top_to_baseline = metrics
+            .as_ref()
+            .map_or(f32::from(cell_h) * 0.8, |value| value.top_to_baseline_px);
+        let font_family_attr = svg_font_family_list(&families);
+
+        let mut options_usvg = usvg::Options::default();
+        options_usvg.font_family = families
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "monospace".to_string());
+        options_usvg.font_size = font_size;
+        let fontdb = options_usvg.fontdb_mut();
+        let _ = bmux_fonts::register_preset_fonts(fontdb, preset);
+        fontdb.load_system_fonts();
+        for path in &options.font_paths {
+            let Ok(meta) = std::fs::metadata(path) else {
                 continue;
             };
-            let (mut fg_rgb, bg_rgb) = resolved_cell_colors(cell, palette);
-            if cell.dim() {
-                fg_rgb = dim_rgb(fg_rgb);
-            }
-            let bg_rgb =
-                composite_with_backdrop(bg_rgb, options.background_opacity, options.backdrop_rgb);
-            let x0 = usize::from(col).saturating_mul(cell_w_usize);
-            let y0 = usize::from(row).saturating_mul(cell_h_usize);
-            write!(
-                &mut svg,
-                "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"rgb({},{},{})\"/>",
-                x0, y0, cell_w_usize, cell_h_usize, bg_rgb.0, bg_rgb.1, bg_rgb.2
-            )
-            .expect("svg write cannot fail");
-
-            let cell_text = if cell.has_contents() {
-                let text = cell.contents();
-                if text.is_empty() { " " } else { text }
-            } else {
-                " "
-            };
-            let style = TextStyle {
-                fg_rgb,
-                bold: cell.bold(),
-                italic: cell.italic(),
-                underline: cell.underline(),
-            };
-            match current_run.take() {
-                Some(mut run) if run.style == style => {
-                    run.text.push_str(cell_text);
-                    run.cell_count = run.cell_count.saturating_add(1);
-                    current_run = Some(run);
-                }
-                Some(run) => {
-                    row_runs.push(run);
-                    current_run = Some(TextRun {
-                        start_col: col,
-                        text: cell_text.to_string(),
-                        cell_count: 1,
-                        style,
-                    });
-                }
-                None => {
-                    current_run = Some(TextRun {
-                        start_col: col,
-                        text: cell_text.to_string(),
-                        cell_count: 1,
-                        style,
-                    });
-                }
+            if meta.is_dir() {
+                fontdb.load_fonts_dir(path);
+            } else if meta.is_file() {
+                let _ = fontdb.load_font_file(path);
             }
         }
-        if let Some(run) = current_run.take() {
-            row_runs.push(run);
-        }
-        for run in row_runs {
-            let x0 = usize::from(run.start_col).saturating_mul(cell_w_usize);
-            let y0 = usize::from(row).saturating_mul(cell_h_usize);
-            let text_y = y0 as f32 + top_to_baseline;
-            let style_attrs = svg_style_attrs(&run.style);
-            let text_length = usize::from(run.cell_count).saturating_mul(cell_w_usize);
-            write!(
-                &mut svg,
-                "<text x=\"{}\" y=\"{:.3}\" fill=\"rgb({},{},{})\" xml:space=\"preserve\" textLength=\"{}\" lengthAdjust=\"spacingAndGlyphs\"{}>{}</text>",
-                x0,
-                text_y,
-                run.style.fg_rgb.0,
-                run.style.fg_rgb.1,
-                run.style.fg_rgb.2,
-                text_length,
-                style_attrs,
-                xml_escape_text(&run.text)
-            )
-            .expect("svg write cannot fail");
-        }
+
+        Ok(Self {
+            width,
+            height,
+            width_u32,
+            height_u32,
+            cell_w_usize,
+            cell_h_usize,
+            background_opacity: options.background_opacity,
+            backdrop_rgb: options.backdrop_rgb,
+            top_to_baseline,
+            font_size,
+            font_family_attr,
+            options_usvg,
+            svg: String::with_capacity(width.saturating_mul(height / 4).max(1024)),
+        })
     }
 
-    svg.push_str("</g></svg>");
+    fn render(
+        &mut self,
+        screen: &vt100::Screen,
+        rows: u16,
+        cols: u16,
+        palette: &[(u8, u8, u8)],
+    ) -> Result<Vec<u8>> {
+        self.svg.clear();
+        write!(
+            &mut self.svg,
+            "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{}\" height=\"{}\" viewBox=\"0 0 {} {}\">",
+            self.width, self.height, self.width, self.height
+        )
+        .expect("svg write cannot fail");
+        write!(
+            &mut self.svg,
+            "<g font-family=\"{}\" font-size=\"{:.3}\" text-rendering=\"optimizeLegibility\" dominant-baseline=\"alphabetic\" font-kerning=\"none\" font-variant-ligatures=\"none\">",
+            xml_escape_attr(&self.font_family_attr),
+            self.font_size
+        )
+        .expect("svg write cannot fail");
 
-    let mut options_usvg = usvg::Options::default();
-    options_usvg.font_family = families
-        .first()
-        .cloned()
-        .unwrap_or_else(|| "monospace".to_string());
-    options_usvg.font_size = font_size;
-    let fontdb = options_usvg.fontdb_mut();
-    let _ = bmux_fonts::register_preset_fonts(fontdb, preset);
-    fontdb.load_system_fonts();
-    for path in &options.font_paths {
-        let Ok(meta) = std::fs::metadata(path) else {
-            continue;
-        };
-        if meta.is_dir() {
-            fontdb.load_fonts_dir(path);
-        } else if meta.is_file() {
-            let _ = fontdb.load_font_file(path);
+        for row in 0..rows {
+            let mut row_runs = Vec::<TextRun>::new();
+            let mut current_run = None::<TextRun>;
+            for col in 0..cols {
+                let Some(cell) = screen.cell(row, col) else {
+                    continue;
+                };
+                let (mut fg_rgb, bg_rgb) = resolved_cell_colors(cell, palette);
+                if cell.dim() {
+                    fg_rgb = dim_rgb(fg_rgb);
+                }
+                let bg_rgb =
+                    composite_with_backdrop(bg_rgb, self.background_opacity, self.backdrop_rgb);
+                let x0 = usize::from(col).saturating_mul(self.cell_w_usize);
+                let y0 = usize::from(row).saturating_mul(self.cell_h_usize);
+                write!(
+                    &mut self.svg,
+                    "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"rgb({},{},{})\"/>",
+                    x0, y0, self.cell_w_usize, self.cell_h_usize, bg_rgb.0, bg_rgb.1, bg_rgb.2
+                )
+                .expect("svg write cannot fail");
+
+                let cell_text = if cell.has_contents() {
+                    let text = cell.contents();
+                    if text.is_empty() { " " } else { text }
+                } else {
+                    " "
+                };
+                let style = TextStyle {
+                    fg_rgb,
+                    bold: cell.bold(),
+                    italic: cell.italic(),
+                    underline: cell.underline(),
+                };
+                match current_run.take() {
+                    Some(mut run) if run.style == style => {
+                        run.text.push_str(cell_text);
+                        run.cell_count = run.cell_count.saturating_add(1);
+                        current_run = Some(run);
+                    }
+                    Some(run) => {
+                        row_runs.push(run);
+                        current_run = Some(TextRun {
+                            start_col: col,
+                            text: cell_text.to_string(),
+                            cell_count: 1,
+                            style,
+                        });
+                    }
+                    None => {
+                        current_run = Some(TextRun {
+                            start_col: col,
+                            text: cell_text.to_string(),
+                            cell_count: 1,
+                            style,
+                        });
+                    }
+                }
+            }
+            if let Some(run) = current_run.take() {
+                row_runs.push(run);
+            }
+            for run in row_runs {
+                let x0 = usize::from(run.start_col).saturating_mul(self.cell_w_usize);
+                let y0 = usize::from(row).saturating_mul(self.cell_h_usize);
+                let text_y = y0 as f32 + self.top_to_baseline;
+                let style_attrs = svg_style_attrs(&run.style);
+                let text_length = usize::from(run.cell_count).saturating_mul(self.cell_w_usize);
+                write!(
+                    &mut self.svg,
+                    "<text x=\"{}\" y=\"{:.3}\" fill=\"rgb({},{},{})\" xml:space=\"preserve\" textLength=\"{}\" lengthAdjust=\"spacingAndGlyphs\"{}>{}</text>",
+                    x0,
+                    text_y,
+                    run.style.fg_rgb.0,
+                    run.style.fg_rgb.1,
+                    run.style.fg_rgb.2,
+                    text_length,
+                    style_attrs,
+                    xml_escape_text(&run.text)
+                )
+                .expect("svg write cannot fail");
+            }
         }
-    }
 
-    let tree = usvg::Tree::from_str(&svg, &options_usvg).context("failed to parse SVG frame")?;
-    let mut pixmap = tiny_skia::Pixmap::new(width_u32, height_u32)
-        .ok_or_else(|| anyhow::anyhow!("failed to allocate pixmap for SVG frame"))?;
-    resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
-    Ok(pixmap.take())
+        self.svg.push_str("</g></svg>");
+
+        let tree = usvg::Tree::from_str(&self.svg, &self.options_usvg)
+            .context("failed to parse SVG frame")?;
+        let mut pixmap = tiny_skia::Pixmap::new(self.width_u32, self.height_u32)
+            .ok_or_else(|| anyhow::anyhow!("failed to allocate pixmap for SVG frame"))?;
+        resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
+        Ok(pixmap.take())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
