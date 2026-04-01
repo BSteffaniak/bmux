@@ -1,4 +1,5 @@
 use super::super::*;
+use std::collections::BTreeMap;
 
 const ATTACH_CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -1316,6 +1317,7 @@ pub(crate) fn relative_context_id(
 
 pub(crate) async fn build_attach_status_line_for_draw(
     client: &mut BmuxClient,
+    view_state: &mut AttachViewState,
     status_config: &bmux_config::StatusBarConfig,
     context_id: Option<Uuid>,
     session_id: Uuid,
@@ -1337,7 +1339,7 @@ pub(crate) async fn build_attach_status_line_for_draw(
         });
     }
 
-    let tabs = build_attach_tabs(client, status_config, context_id, session_id).await?;
+    let tabs = build_attach_tabs(client, view_state, status_config, context_id, session_id).await?;
     let (session_label, session_count) =
         resolve_attach_session_label_and_count(client, session_id).await?;
     let current_context_label =
@@ -1739,9 +1741,11 @@ pub(crate) async fn render_attach_frame(
 ) -> Result<()> {
     if view_state.dirty.status_needs_redraw {
         let now = Instant::now();
+        let transient_status = view_state.transient_status_text(now).map(str::to_owned);
         view_state.cached_status_line = Some(
             build_attach_status_line_for_draw(
                 client,
+                view_state,
                 status_config,
                 view_state.attached_context_id,
                 view_state.attached_id,
@@ -1752,7 +1756,7 @@ pub(crate) async fn render_attach_frame(
                 follow_global,
                 view_state.quit_confirmation_pending,
                 view_state.help_overlay_open,
-                view_state.transient_status_text(now),
+                transient_status.as_deref(),
                 keymap,
             )
             .await
@@ -1816,6 +1820,7 @@ pub(crate) async fn render_attach_frame(
 
 pub(crate) async fn build_attach_tabs(
     client: &mut BmuxClient,
+    view_state: &mut AttachViewState,
     status_config: &bmux_config::StatusBarConfig,
     context_id: Option<Uuid>,
     session_id: Uuid,
@@ -1850,6 +1855,14 @@ pub(crate) async fn build_attach_tabs(
         }
     };
 
+    let tab_contexts = if matches!(status_config.tab_scope, bmux_config::StatusTabScope::Mru)
+        || matches!(status_config.tab_order, bmux_config::StatusTabOrder::Mru)
+    {
+        tab_contexts
+    } else {
+        stabilize_tab_order(tab_contexts, &mut view_state.cached_tab_order)
+    };
+
     let current_context_id = context_id.or_else(|| {
         tab_contexts
             .iter()
@@ -1871,6 +1884,28 @@ pub(crate) async fn build_attach_tabs(
         })
         .collect();
     Ok(tabs)
+}
+
+pub(crate) fn stabilize_tab_order(
+    contexts: Vec<ContextSummary>,
+    cached_tab_order: &mut Vec<Uuid>,
+) -> Vec<ContextSummary> {
+    let mut by_id = BTreeMap::new();
+    for context in contexts {
+        by_id.insert(context.id, context);
+    }
+
+    cached_tab_order.retain(|id| by_id.contains_key(id));
+    for id in by_id.keys() {
+        if !cached_tab_order.contains(id) {
+            cached_tab_order.push(*id);
+        }
+    }
+
+    cached_tab_order
+        .iter()
+        .filter_map(|id| by_id.remove(id))
+        .collect()
 }
 
 pub(crate) async fn resolve_attach_context_label(

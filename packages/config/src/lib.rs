@@ -488,6 +488,8 @@ pub struct StatusBarConfig {
     pub show_tab_index: bool,
     /// Which context set to render as tabs.
     pub tab_scope: StatusTabScope,
+    /// How tab entries are ordered when rendered.
+    pub tab_order: StatusTabOrder,
     /// Display the active session name in the status bar.
     pub show_session_name: bool,
     /// Display the current context label in the status bar.
@@ -519,6 +521,7 @@ impl Default for StatusBarConfig {
             tab_overflow_marker: "+".to_string(),
             show_tab_index: true,
             tab_scope: StatusTabScope::AllContexts,
+            tab_order: StatusTabOrder::Stable,
             show_session_name: true,
             show_context_name: false,
             show_mode: true,
@@ -537,6 +540,14 @@ pub enum StatusTabScope {
     #[default]
     AllContexts,
     SessionContexts,
+    Mru,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusTabOrder {
+    #[default]
+    Stable,
     Mru,
 }
 
