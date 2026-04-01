@@ -362,7 +362,7 @@ pub(super) fn validate_enabled_plugins(
         .collect::<std::collections::BTreeSet<_>>();
     let enabled_plugins = effective_enabled_plugins(config, registry);
     if enabled_plugins.is_empty() {
-        validate_required_plugin_ownership(config, registry)?;
+        validate_plugin_routing_policy(config, registry)?;
         return Ok(());
     }
 
@@ -393,108 +393,90 @@ pub(super) fn validate_enabled_plugins(
     command_config.plugins.enabled = enabled_plugins;
     PluginCommandRegistry::build(&command_config, registry)
         .context("failed building plugin CLI command registry")?;
-    validate_required_plugin_ownership(config, registry)?;
+    validate_plugin_routing_policy(config, registry)?;
 
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
-enum RequiredOwnershipKind {
-    Namespace(&'static str),
-    Path(&'static [&'static str]),
+fn validate_plugin_routing_policy(config: &BmuxConfig, registry: &PluginRegistry) -> Result<()> {
+    let mut command_config = config.clone();
+    command_config.plugins.enabled = effective_enabled_plugins(config, registry);
+    let command_registry = PluginCommandRegistry::build(&command_config, registry)
+        .context("failed building plugin CLI command registry")?;
+
+    match config.plugins.routing.conflict_mode {
+        bmux_config::PluginRoutingConflictMode::FailStartup => {}
+    }
+
+    for claim in &config.plugins.routing.required_namespaces {
+        validate_required_namespace_claim(claim, &command_registry)?;
+    }
+    for claim in &config.plugins.routing.required_paths {
+        validate_required_path_claim(claim, &command_registry)?;
+    }
+
+    Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
-struct RequiredPluginOwnership {
-    plugin_id: &'static str,
-    kind: RequiredOwnershipKind,
-}
-
-const REQUIRED_PLUGIN_OWNERSHIP: &[RequiredPluginOwnership] = &[
-    RequiredPluginOwnership {
-        plugin_id: "bmux.plugin_cli",
-        kind: RequiredOwnershipKind::Namespace("plugin"),
-    },
-    RequiredPluginOwnership {
-        plugin_id: "bmux.plugin_cli",
-        kind: RequiredOwnershipKind::Path(&["logs", "path"]),
-    },
-    RequiredPluginOwnership {
-        plugin_id: "bmux.plugin_cli",
-        kind: RequiredOwnershipKind::Path(&["keymap", "doctor"]),
-    },
-    RequiredPluginOwnership {
-        plugin_id: "bmux.plugin_cli",
-        kind: RequiredOwnershipKind::Path(&["terminal", "doctor"]),
-    },
-    RequiredPluginOwnership {
-        plugin_id: "bmux.plugin_cli",
-        kind: RequiredOwnershipKind::Path(&["terminal", "install-terminfo"]),
-    },
-    RequiredPluginOwnership {
-        plugin_id: "bmux.plugin_cli",
-        kind: RequiredOwnershipKind::Path(&["recording", "start"]),
-    },
-    RequiredPluginOwnership {
-        plugin_id: "bmux.plugin_cli",
-        kind: RequiredOwnershipKind::Path(&["playbook", "run"]),
-    },
-    RequiredPluginOwnership {
-        plugin_id: "bmux.permissions",
-        kind: RequiredOwnershipKind::Namespace("permissions"),
-    },
-    RequiredPluginOwnership {
-        plugin_id: "bmux.windows",
-        kind: RequiredOwnershipKind::Path(&["new-window"]),
-    },
-];
-
-fn validate_required_plugin_ownership(
-    config: &BmuxConfig,
-    registry: &PluginRegistry,
+fn validate_required_namespace_claim(
+    claim: &bmux_config::RequiredNamespaceClaim,
+    command_registry: &PluginCommandRegistry,
 ) -> Result<()> {
-    let enabled = effective_enabled_plugins(config, registry)
-        .into_iter()
-        .collect::<std::collections::BTreeSet<_>>();
-    for requirement in REQUIRED_PLUGIN_OWNERSHIP {
-        if registry.get(requirement.plugin_id).is_none() {
-            continue;
-        }
-        if !enabled.contains(requirement.plugin_id) {
-            anyhow::bail!(
-                "required plugin '{}' is not enabled (required for command ownership contract)",
-                requirement.plugin_id
-            );
-        }
-        let plugin = registry.get(requirement.plugin_id).with_context(|| {
-            format!(
-                "required plugin '{}' is not discoverable in registry",
-                requirement.plugin_id
+    let namespace = claim.namespace.trim();
+    if namespace.is_empty() {
+        anyhow::bail!("plugins.routing.required_namespaces.namespace must not be empty");
+    }
+    let owner = command_registry
+        .owner_for_namespace(namespace)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "required namespace claim '{}' is not owned by any enabled plugin",
+                namespace
             )
         })?;
-        match requirement.kind {
-            RequiredOwnershipKind::Namespace(namespace) => {
-                if !plugin.declaration.owns_namespaces.contains(namespace) {
-                    anyhow::bail!(
-                        "required plugin '{}' must own namespace '{}'",
-                        requirement.plugin_id,
-                        namespace
-                    );
-                }
-            }
-            RequiredOwnershipKind::Path(path) => {
-                let owned = plugin.declaration.owns_paths.iter().any(|candidate| {
-                    candidate.0 == path.iter().map(ToString::to_string).collect::<Vec<_>>()
-                }) || plugin.declaration.owns_namespaces.contains(path[0]);
-                if !owned {
-                    anyhow::bail!(
-                        "required plugin '{}' must own path '{}'",
-                        requirement.plugin_id,
-                        path.join(" ")
-                    );
-                }
-            }
-        }
+    if let Some(expected_owner) = claim.owner.as_deref()
+        && owner != expected_owner
+    {
+        anyhow::bail!(
+            "required namespace claim '{}' must be owned by plugin '{}' (actual owner '{}')",
+            namespace,
+            expected_owner,
+            owner
+        );
+    }
+    Ok(())
+}
+
+fn validate_required_path_claim(
+    claim: &bmux_config::RequiredPathClaim,
+    command_registry: &PluginCommandRegistry,
+) -> Result<()> {
+    if claim.path.is_empty() {
+        anyhow::bail!("plugins.routing.required_paths.path must not be empty");
+    }
+    if claim.path.iter().any(|segment| segment.trim().is_empty()) {
+        anyhow::bail!(
+            "plugins.routing.required_paths.path must not contain empty command segments"
+        );
+    }
+
+    let owner = command_registry
+        .owner_for_path(&claim.path)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "required path claim '{}' is not owned by any enabled plugin",
+                claim.path.join(" ")
+            )
+        })?;
+    if let Some(expected_owner) = claim.owner.as_deref()
+        && owner != expected_owner
+    {
+        anyhow::bail!(
+            "required path claim '{}' must be owned by plugin '{}' (actual owner '{}')",
+            claim.path.join(" "),
+            expected_owner,
+            owner
+        );
     }
     Ok(())
 }
@@ -1238,7 +1220,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_enabled_plugins_rejects_when_required_owned_plugin_is_disabled() {
+    fn validate_enabled_plugins_rejects_when_required_namespace_is_unowned() {
         let dir = temp_dir();
         let plugin_dir = dir.join("plugin-cli");
         fs::create_dir_all(&plugin_dir).expect("plugin dir should exist");
@@ -1258,13 +1240,59 @@ mod tests {
 
         let mut config = BmuxConfig::default();
         config.plugins.disabled.push("bmux.plugin_cli".to_string());
+        config
+            .plugins
+            .routing
+            .required_namespaces
+            .push(bmux_config::RequiredNamespaceClaim {
+                namespace: "plugin".to_string(),
+                owner: None,
+            });
 
         let error = crate::runtime::validate_enabled_plugins(&config, &registry)
-            .expect_err("required ownership plugin should not be disableable");
+            .expect_err("required namespace claim should fail when unowned");
         assert!(
             error
                 .to_string()
-                .contains("required plugin 'bmux.plugin_cli' is not enabled")
+                .contains("required namespace claim 'plugin' is not owned")
+        );
+    }
+
+    #[test]
+    fn validate_enabled_plugins_rejects_when_required_namespace_owner_mismatches() {
+        let dir = temp_dir();
+        let plugin_dir = dir.join("plugin-cli");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir should exist");
+        fs::write(plugin_dir.join("plugin-cli.dylib"), []).expect("entry should be written");
+
+        let mut registry = PluginRegistry::new();
+        registry
+            .register_manifest(
+                &plugin_dir.join("plugin.toml"),
+                plugin_manifest_with_commands(
+                    "bmux.plugin_cli",
+                    "plugin-cli.dylib",
+                    "owns_namespaces=['plugin']\n[[commands]]\nname='list'\npath=['plugin','list']\nsummary='list'\nexecution='provider_exec'\nexpose_in_cli=true\n",
+                ),
+            )
+            .expect("plugin should register");
+
+        let mut config = BmuxConfig::default();
+        config
+            .plugins
+            .routing
+            .required_namespaces
+            .push(bmux_config::RequiredNamespaceClaim {
+                namespace: "plugin".to_string(),
+                owner: Some("third.party".to_string()),
+            });
+
+        let error = crate::runtime::validate_enabled_plugins(&config, &registry)
+            .expect_err("owner mismatch should fail startup validation");
+        assert!(
+            error
+                .to_string()
+                .contains("required namespace claim 'plugin'")
         );
     }
 

@@ -538,6 +538,52 @@ pub struct PluginConfig {
     /// Per-plugin settings keyed by plugin ID. Each plugin defines its own
     /// accepted keys and values.
     pub settings: BTreeMap<String, toml::Value>,
+    /// Command routing policy for plugin ownership and startup validation.
+    pub routing: PluginRoutingPolicyConfig,
+}
+
+/// Command routing policy for plugin CLI ownership.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
+#[serde(default)]
+pub struct PluginRoutingPolicyConfig {
+    /// Conflict behavior when multiple plugins claim overlapping command ownership.
+    pub conflict_mode: PluginRoutingConflictMode,
+    /// Required namespace claims that must be satisfied at startup.
+    pub required_namespaces: Vec<RequiredNamespaceClaim>,
+    /// Required path claims that must be satisfied at startup.
+    pub required_paths: Vec<RequiredPathClaim>,
+}
+
+impl PluginRoutingPolicyConfig {
+    #[must_use]
+    pub const fn config_doc_values() -> &'static [&'static str] {
+        &[]
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, ConfigDocEnum, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginRoutingConflictMode {
+    #[default]
+    FailStartup,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
+#[serde(default)]
+pub struct RequiredNamespaceClaim {
+    /// Namespace segment that must be owned by a plugin.
+    pub namespace: String,
+    /// Optional owner plugin ID; when omitted, any plugin may own the namespace.
+    pub owner: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
+#[serde(default)]
+pub struct RequiredPathClaim {
+    /// Command path that must be owned by a plugin.
+    pub path: Vec<String>,
+    /// Optional owner plugin ID; when omitted, any plugin may own the path.
+    pub owner: Option<String>,
 }
 
 /// Content and layout of the status bar displayed at the top or bottom
@@ -1215,6 +1261,8 @@ mod tests {
         assert_eq!(config.behavior.stale_build_action, StaleBuildAction::Error);
         assert!(config.plugins.enabled.is_empty());
         assert!(config.plugins.disabled.is_empty());
+        assert!(config.plugins.routing.required_namespaces.is_empty());
+        assert!(config.plugins.routing.required_paths.is_empty());
         assert_eq!(
             config
                 .keybindings
@@ -1270,6 +1318,33 @@ mod tests {
         assert_eq!(
             config.plugins.disabled,
             vec!["bmux.permissions".to_string()]
+        );
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn load_parses_plugin_routing_policy_claims() {
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        std::fs::write(
+            &path,
+            "[plugins.routing]\nconflict_mode = 'fail_startup'\n[[plugins.routing.required_namespaces]]\nnamespace = 'logs'\nowner = 'third.party.logs'\n[[plugins.routing.required_paths]]\npath = ['playbook','run']\n",
+        )
+        .expect("failed writing config fixture");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(config.plugins.routing.required_namespaces.len(), 1);
+        assert_eq!(config.plugins.routing.required_paths.len(), 1);
+        assert_eq!(
+            config.plugins.routing.required_namespaces[0]
+                .owner
+                .as_deref(),
+            Some("third.party.logs")
+        );
+        assert_eq!(
+            config.plugins.routing.required_paths[0].path,
+            vec!["playbook".to_string(), "run".to_string()]
         );
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");

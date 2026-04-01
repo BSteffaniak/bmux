@@ -1,4 +1,3 @@
-use super::built_in_commands::reserved_built_in_paths;
 use anyhow::{Context, Result, bail};
 use bmux_config::BmuxConfig;
 use bmux_plugin::{PluginDeclaration, PluginRegistry};
@@ -34,7 +33,6 @@ impl PluginCommandRegistry {
     pub fn build(config: &BmuxConfig, plugins: &PluginRegistry) -> Result<Self> {
         let mut registry = Self::default();
         let enabled = config.plugins.enabled.iter().collect::<BTreeSet<_>>();
-        let reserved = reserved_built_in_paths();
         let mut claimed: BTreeMap<Vec<String>, (String, String)> = BTreeMap::new();
 
         for plugin in plugins.iter() {
@@ -65,19 +63,15 @@ impl PluginCommandRegistry {
                 validate_plugin_owns_path(&plugin.declaration, &canonical, &command.name)?;
                 validate_path_collision(
                     &canonical,
-                    &reserved,
                     &claimed,
                     plugin.declaration.id.as_str(),
                     &command.name,
-                    true,
                 )?;
                 validate_prefix_collision(
                     &canonical,
-                    &reserved,
                     &claimed,
                     plugin.declaration.id.as_str(),
                     &command.name,
-                    true,
                 )?;
                 claimed.insert(
                     canonical.clone(),
@@ -92,19 +86,15 @@ impl PluginCommandRegistry {
                     validate_plugin_owns_path(&plugin.declaration, alias, &command.name)?;
                     validate_path_collision(
                         alias,
-                        &reserved,
                         &claimed,
                         plugin.declaration.id.as_str(),
                         &command.name,
-                        true,
                     )?;
                     validate_prefix_collision(
                         alias,
-                        &reserved,
                         &claimed,
                         plugin.declaration.id.as_str(),
                         &command.name,
-                        true,
                     )?;
                     claimed.insert(
                         alias.clone(),
@@ -135,8 +125,12 @@ impl PluginCommandRegistry {
             return Some(owner.clone());
         }
         path.first()
-            .and_then(|namespace| self.owned_namespaces.get(namespace))
-            .cloned()
+            .and_then(|namespace| self.owner_for_namespace(namespace))
+    }
+
+    #[must_use]
+    pub fn owner_for_namespace(&self, namespace: &str) -> Option<String> {
+        self.owned_namespaces.get(namespace).cloned()
     }
 
     pub fn resolve(&self, raw: &[String]) -> Option<ResolvedPluginCommand> {
@@ -274,10 +268,9 @@ impl PluginCommandRegistry {
 
     pub fn augment_clap_command(&self, root: Command) -> Result<Command> {
         let mut root = root;
-        let reserved = reserved_built_in_paths();
         for command in &self.commands {
             for path in std::iter::once(&command.canonical_path).chain(command.aliases.iter()) {
-                if reserved.contains(path) {
+                if clap_path_exists(&root, path) {
                     continue;
                 }
                 insert_plugin_path(&mut root, path, &command.schema)?;
@@ -408,18 +401,10 @@ fn leak_string(value: &str) -> &'static str {
 
 fn validate_path_collision(
     path: &[String],
-    reserved: &BTreeSet<Vec<String>>,
     claimed: &BTreeMap<Vec<String>, (String, String)>,
     plugin_id: &str,
     command_name: &str,
-    allow_core_override: bool,
 ) -> Result<()> {
-    if reserved.contains(path) && !allow_core_override {
-        bail!(
-            "plugin '{plugin_id}' command '{command_name}' collides with built-in CLI path '{}')",
-            path.join(" ")
-        );
-    }
     if let Some((owner_plugin, owner_command)) = claimed.get(path) {
         bail!(
             "plugin '{plugin_id}' command '{command_name}' collides with plugin '{owner_plugin}' command '{owner_command}' on CLI path '{}'",
@@ -431,22 +416,10 @@ fn validate_path_collision(
 
 fn validate_prefix_collision(
     path: &[String],
-    reserved: &BTreeSet<Vec<String>>,
     claimed: &BTreeMap<Vec<String>, (String, String)>,
     plugin_id: &str,
     command_name: &str,
-    allow_core_override: bool,
 ) -> Result<()> {
-    if !allow_core_override {
-        for reserved_path in reserved {
-            if is_prefix_collision(path, reserved_path) {
-                bail!(
-                    "plugin '{plugin_id}' command '{command_name}' creates ambiguous CLI nesting with built-in path '{}'",
-                    reserved_path.join(" ")
-                );
-            }
-        }
-    }
     for (claimed_path, (owner_plugin, owner_command)) in claimed {
         if is_prefix_collision(path, claimed_path) {
             bail!(
@@ -456,6 +429,20 @@ fn validate_prefix_collision(
         }
     }
     Ok(())
+}
+
+fn clap_path_exists(root: &Command, path: &[String]) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let mut current = root;
+    for segment in path {
+        let Some(next) = current.find_subcommand(segment) else {
+            return false;
+        };
+        current = next;
+    }
+    true
 }
 
 fn is_prefix_collision(left: &[String], right: &[String]) -> bool {
