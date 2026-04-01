@@ -7,12 +7,12 @@ use crate::input::{InputProcessor, Keymap, RuntimeAction};
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 use anyhow::{Context, Result};
 use bmux_cli_schema::{
-    Cli, Command, KeymapCommand, LogLevel, LogsCommand, LogsProfilesCommand, PlaybookCommand,
-    RecordingCommand, RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
-    RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode, RecordingEventKindArg,
-    RecordingExportFormat, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
-    RemoteCommand, RemoteCompleteCommand, ServerCommand, SessionCommand, TerminalCommand,
-    TraceFamily,
+    Cli, Command, ConfigCommand, KeymapCommand, LogLevel, LogsCommand, LogsProfilesCommand,
+    PlaybookCommand, RecordingCommand, RecordingCursorBlinkMode, RecordingCursorMode,
+    RecordingCursorPaintMode, RecordingCursorProfile, RecordingCursorShape,
+    RecordingCursorTextMode, RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg,
+    RecordingRenderMode, RecordingReplayMode, RemoteCommand, RemoteCompleteCommand, ServerCommand,
+    SessionCommand, TerminalCommand, TraceFamily,
 };
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
 use bmux_config::{
@@ -66,6 +66,7 @@ mod attach;
 mod bootstrap;
 mod built_in_commands;
 mod cli_parse;
+mod config_cli;
 mod dispatch;
 mod logs_cli;
 mod logs_watch;
@@ -107,6 +108,7 @@ use attach::state::{
 use bootstrap::*;
 use built_in_commands::{BuiltInHandlerId, built_in_command_by_handler};
 use cli_parse::*;
+use config_cli::*;
 use dispatch::*;
 use logs_cli::*;
 use playbook_cli::*;

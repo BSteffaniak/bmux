@@ -64,6 +64,12 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
                 LogsProfilesCommand::Rename { .. } => BuiltInHandlerId::LogsProfilesRename,
             },
         },
+        Command::Config { command } => match command {
+            ConfigCommand::Path { .. } => BuiltInHandlerId::ConfigPath,
+            ConfigCommand::Show { .. } => BuiltInHandlerId::ConfigShow,
+            ConfigCommand::Get { .. } => BuiltInHandlerId::ConfigGet,
+            ConfigCommand::Set { .. } => BuiltInHandlerId::ConfigSet,
+        },
         Command::Keymap { .. } => BuiltInHandlerId::KeymapDoctor,
         Command::Terminal { command } => match command {
             TerminalCommand::Doctor { .. } => BuiltInHandlerId::TerminalDoctor,
@@ -433,6 +439,30 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                     },
             },
         ) => run_logs_profiles_rename(from, to),
+        (
+            BuiltInHandlerId::ConfigPath,
+            Command::Config {
+                command: ConfigCommand::Path { json },
+            },
+        ) => run_config_path(*json),
+        (
+            BuiltInHandlerId::ConfigShow,
+            Command::Config {
+                command: ConfigCommand::Show { json },
+            },
+        ) => run_config_show(*json),
+        (
+            BuiltInHandlerId::ConfigGet,
+            Command::Config {
+                command: ConfigCommand::Get { key, json },
+            },
+        ) => run_config_get(key, *json),
+        (
+            BuiltInHandlerId::ConfigSet,
+            Command::Config {
+                command: ConfigCommand::Set { key, value },
+            },
+        ) => run_config_set(key, value),
         (
             BuiltInHandlerId::KeymapDoctor,
             Command::Keymap {

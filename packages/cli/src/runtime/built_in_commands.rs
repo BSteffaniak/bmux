@@ -51,6 +51,11 @@ pub enum BuiltInHandlerId {
     LogsProfilesShow,
     LogsProfilesDelete,
     LogsProfilesRename,
+    Config,
+    ConfigPath,
+    ConfigShow,
+    ConfigGet,
+    ConfigSet,
     Keymap,
     KeymapDoctor,
     Terminal,
@@ -347,6 +352,31 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::LogsProfilesRename,
             &["logs", "profiles", "rename"],
             "Rename a saved watch profile",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::Config,
+            &["config"],
+            "Configuration management and inspection",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::ConfigPath,
+            &["config", "path"],
+            "Print the config file path",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::ConfigShow,
+            &["config", "show"],
+            "Print the effective configuration",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::ConfigGet,
+            &["config", "get"],
+            "Get a configuration value by key",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::ConfigSet,
+            &["config", "set"],
+            "Set a configuration value",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Keymap,

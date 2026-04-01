@@ -163,6 +163,10 @@ time = { version = "0.3.47", default-features = false }
 tokio = { version = "1.45.1", default-features = false }
 tokio-rustls = { version = "0.26.1", default-features = false }
 toml = { version = "0.8.23", default-features = false, features = ["display"] }
+toml_edit = { version = "0.22.26", default-features = false, features = [
+    "parse",
+    "display",
+] }
 tracing = { version = "0.1.44", default-features = false }
 ttf-parser = { version = "0.25.1", default-features = true }
 unicode-width = { version = "0.2.2", default-features = false }

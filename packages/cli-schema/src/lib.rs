@@ -269,6 +269,11 @@ pub enum Command {
         #[command(subcommand)]
         command: LogsCommand,
     },
+    /// Configuration management and inspection
+    Config {
+        #[command(subcommand)]
+        command: ConfigCommand,
+    },
     /// Keymap tools and diagnostics
     Keymap {
         #[command(subcommand)]
@@ -901,6 +906,37 @@ pub enum LogsProfilesCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Print the config file path
+    Path {
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the effective configuration
+    Show {
+        /// Print output as JSON instead of TOML
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get a configuration value by dotted key path
+    Get {
+        /// Dotted key path (e.g. appearance.theme, behavior.mouse.enabled)
+        key: String,
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Set a configuration value in the config file
+    Set {
+        /// Dotted key path (e.g. appearance.theme, behavior.mouse.enabled)
+        key: String,
+        /// Value to set (booleans, integers, and strings are auto-detected)
+        value: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum TerminalCommand {
     /// Show terminal capability profile used for panes
     Doctor {
@@ -934,8 +970,8 @@ pub enum TerminalCommand {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, KeymapCommand, LogsCommand, LogsProfilesCommand, RecordingCommand,
-        RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
+        Cli, Command, ConfigCommand, KeymapCommand, LogsCommand, LogsProfilesCommand,
+        RecordingCommand, RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
         RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode,
         RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg, RecordingRenderMode,
         RecordingReplayMode, RemoteCommand, RemoteCompleteCommand, ServerCommand, SessionCommand,

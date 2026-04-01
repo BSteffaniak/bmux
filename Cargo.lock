@@ -764,6 +764,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "toml",
+ "toml_edit",
  "tracing",
  "ttf-parser",
  "unicode-width",
