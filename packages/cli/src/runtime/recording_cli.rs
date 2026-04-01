@@ -108,6 +108,9 @@ pub(super) async fn run_recording_export(
     cursor_color: Option<&str>,
     cursor_profile: Option<RecordingCursorProfile>,
     cursor_solid_after_activity_ms: Option<u32>,
+    cursor_solid_after_input_ms: Option<u32>,
+    cursor_solid_after_output_ms: Option<u32>,
+    cursor_solid_after_cursor_ms: Option<u32>,
     export_metadata: Option<&str>,
     show_progress: bool,
 ) -> Result<u8> {
@@ -147,6 +150,12 @@ pub(super) async fn run_recording_export(
     });
     let resolved_cursor_solid_after_activity_ms =
         cursor_solid_after_activity_ms.or(export_defaults.cursor_solid_after_activity_ms);
+    let resolved_cursor_solid_after_input_ms =
+        cursor_solid_after_input_ms.or(export_defaults.cursor_solid_after_input_ms);
+    let resolved_cursor_solid_after_output_ms =
+        cursor_solid_after_output_ms.or(export_defaults.cursor_solid_after_output_ms);
+    let resolved_cursor_solid_after_cursor_ms =
+        cursor_solid_after_cursor_ms.or(export_defaults.cursor_solid_after_cursor_ms);
 
     recording::run_recording_export(
         recording_id,
@@ -172,6 +181,9 @@ pub(super) async fn run_recording_export(
         &resolved_cursor_color,
         resolved_cursor_profile,
         resolved_cursor_solid_after_activity_ms,
+        resolved_cursor_solid_after_input_ms,
+        resolved_cursor_solid_after_output_ms,
+        resolved_cursor_solid_after_cursor_ms,
         export_metadata,
         show_progress,
     )

@@ -477,6 +477,9 @@ pub(super) async fn run_recording_export(
     cursor_color: &str,
     cursor_profile: RecordingCursorProfile,
     cursor_solid_after_activity_ms: Option<u32>,
+    cursor_solid_after_input_ms: Option<u32>,
+    cursor_solid_after_output_ms: Option<u32>,
+    cursor_solid_after_cursor_ms: Option<u32>,
     export_metadata: Option<&str>,
     show_progress: bool,
 ) -> Result<u8> {
@@ -484,6 +487,14 @@ pub(super) async fn run_recording_export(
     let recording_dir = recordings_root_dir().join(recording_id.to_string());
     if !recording_dir.exists() {
         anyhow::bail!("recording not found: {recording_id}")
+    }
+    let manifest_summary = read_recording_manifest(&recording_dir.join("manifest.json"))?;
+    if manifest_summary.format_version != bmux_ipc::RECORDING_FORMAT_VERSION {
+        anyhow::bail!(
+            "recording format version {} is unsupported; expected {}. re-record with current bmux",
+            manifest_summary.format_version,
+            bmux_ipc::RECORDING_FORMAT_VERSION
+        )
     }
 
     let selected_client = if let Some(raw) = view_client {
@@ -528,6 +539,9 @@ pub(super) async fn run_recording_export(
             cursor_color,
             cursor_profile,
             cursor_solid_after_activity_ms,
+            cursor_solid_after_input_ms,
+            cursor_solid_after_output_ms,
+            cursor_solid_after_cursor_ms,
             export_metadata,
             show_progress,
         )?,
@@ -660,7 +674,10 @@ fn recording_cell_metrics(events: &[DisplayTrackEnvelope]) -> Option<CellMetrics
                     fallback_cols_rows = Some((cols, rows));
                 }
             }
-            DisplayTrackEvent::FrameBytes { .. } | DisplayTrackEvent::StreamClosed => {}
+            DisplayTrackEvent::FrameBytes { .. }
+            | DisplayTrackEvent::CursorSnapshot { .. }
+            | DisplayTrackEvent::Activity { .. }
+            | DisplayTrackEvent::StreamClosed => {}
         }
     }
 
@@ -756,9 +773,32 @@ struct CursorExportOptions {
     blink: RecordingCursorBlinkMode,
     profile: RecordingCursorProfile,
     blink_period_ns: u64,
-    solid_after_activity_ns: u64,
+    solid_after_input_ns: u64,
+    solid_after_output_ns: u64,
+    solid_after_cursor_ns: u64,
     color_label: String,
     color_override: Option<(u8, u8, u8)>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RecordedCursorSnapshot {
+    x: u16,
+    y: u16,
+    visible: bool,
+    shape: bmux_ipc::DisplayCursorShape,
+    blink_enabled: bool,
+}
+
+#[derive(Debug, Clone, Copy, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CursorVisibilityReason {
+    Hidden,
+    ForcedOn,
+    HoldInput,
+    HoldOutput,
+    HoldCursor,
+    BlinkOn,
+    BlinkOff,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -769,6 +809,11 @@ struct ExportCursorFrame {
     visible: bool,
     shape: &'static str,
     blink_on: bool,
+    cursor_source: &'static str,
+    visible_reason: CursorVisibilityReason,
+    last_input_activity_ns: Option<u64>,
+    last_output_activity_ns: Option<u64>,
+    last_cursor_activity_ns: Option<u64>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -789,7 +834,9 @@ struct CursorMetadata<'a> {
     blink: &'a str,
     profile: &'a str,
     blink_period_ms: u32,
-    solid_after_activity_ms: u32,
+    solid_after_input_ms: u32,
+    solid_after_output_ms: u32,
+    solid_after_cursor_ms: u32,
     color: &'a str,
 }
 
@@ -864,9 +911,14 @@ fn update_cursor_replay_state(state: &mut CursorReplayState, data: &[u8]) {
 fn effective_cursor_shape(
     options: &CursorExportOptions,
     replay_state: CursorReplayState,
+    snapshot_shape: bmux_ipc::DisplayCursorShape,
 ) -> CursorVisualShape {
     match options.shape {
-        RecordingCursorShape::Auto => replay_state.shape,
+        RecordingCursorShape::Auto => match snapshot_shape {
+            bmux_ipc::DisplayCursorShape::Block => replay_state.shape,
+            bmux_ipc::DisplayCursorShape::Bar => CursorVisualShape::Bar,
+            bmux_ipc::DisplayCursorShape::Underline => CursorVisualShape::Underline,
+        },
         RecordingCursorShape::Block => CursorVisualShape::Block,
         RecordingCursorShape::Bar => CursorVisualShape::Bar,
         RecordingCursorShape::Underline => CursorVisualShape::Underline,
@@ -876,44 +928,76 @@ fn effective_cursor_shape(
 fn compute_cursor_visibility(
     options: &CursorExportOptions,
     replay_state: CursorReplayState,
+    snapshot_blink_enabled: bool,
     parser_visible: bool,
     mono_ns: u64,
-    last_activity_ns: Option<u64>,
+    last_input_activity_ns: Option<u64>,
+    last_output_activity_ns: Option<u64>,
+    last_cursor_activity_ns: Option<u64>,
     blink_anchor_ns: &mut Option<u64>,
-) -> (bool, bool) {
+) -> (bool, bool, CursorVisibilityReason) {
     let base_visible = match options.mode {
         RecordingCursorMode::Auto => parser_visible,
         RecordingCursorMode::On => true,
         RecordingCursorMode::Off => false,
     };
     if !base_visible {
-        return (false, true);
+        return (false, true, CursorVisibilityReason::Hidden);
+    }
+    if matches!(options.mode, RecordingCursorMode::On) {
+        return (true, true, CursorVisibilityReason::ForcedOn);
     }
     let blink_enabled = match options.blink {
-        RecordingCursorBlinkMode::Auto => replay_state.blink_enabled,
+        RecordingCursorBlinkMode::Auto => replay_state.blink_enabled && snapshot_blink_enabled,
         RecordingCursorBlinkMode::On => true,
         RecordingCursorBlinkMode::Off => false,
     };
     if !blink_enabled {
-        return (true, true);
+        return (true, true, CursorVisibilityReason::ForcedOn);
     }
-    if let Some(last_activity) = last_activity_ns {
-        let within_hold = mono_ns.saturating_sub(last_activity) < options.solid_after_activity_ns;
-        if within_hold {
-            return (true, true);
-        }
-        if matches!(options.profile, RecordingCursorProfile::Ghostty)
-            && last_activity <= mono_ns
-            && blink_anchor_ns.is_none_or(|anchor| last_activity > anchor)
-        {
-            *blink_anchor_ns = Some(last_activity);
-        }
+    if last_input_activity_ns
+        .is_some_and(|last| mono_ns.saturating_sub(last) < options.solid_after_input_ns)
+    {
+        return (true, true, CursorVisibilityReason::HoldInput);
+    }
+    if last_output_activity_ns
+        .is_some_and(|last| mono_ns.saturating_sub(last) < options.solid_after_output_ns)
+    {
+        return (true, true, CursorVisibilityReason::HoldOutput);
+    }
+    if last_cursor_activity_ns
+        .is_some_and(|last| mono_ns.saturating_sub(last) < options.solid_after_cursor_ns)
+    {
+        return (true, true, CursorVisibilityReason::HoldCursor);
+    }
+    let latest_activity = [
+        last_input_activity_ns,
+        last_output_activity_ns,
+        last_cursor_activity_ns,
+    ]
+    .into_iter()
+    .flatten()
+    .max();
+    if let Some(last_activity) = latest_activity
+        && matches!(options.profile, RecordingCursorProfile::Ghostty)
+        && last_activity <= mono_ns
+        && blink_anchor_ns.is_none_or(|anchor| last_activity > anchor)
+    {
+        *blink_anchor_ns = Some(last_activity);
     }
     let period = options.blink_period_ns.max(1);
     let anchor = *blink_anchor_ns.get_or_insert(mono_ns);
     let phase_ns = mono_ns.saturating_sub(anchor);
     let blink_on = ((phase_ns / period) % 2) == 0;
-    (blink_on, blink_on)
+    (
+        blink_on,
+        blink_on,
+        if blink_on {
+            CursorVisibilityReason::BlinkOn
+        } else {
+            CursorVisibilityReason::BlinkOff
+        },
+    )
 }
 
 fn cursor_shape_name(shape: CursorVisualShape) -> &'static str {
@@ -1030,6 +1114,9 @@ fn export_recording_gif(
     cursor_color: &str,
     cursor_profile: RecordingCursorProfile,
     cursor_solid_after_activity_ms: Option<u32>,
+    cursor_solid_after_input_ms: Option<u32>,
+    cursor_solid_after_output_ms: Option<u32>,
+    cursor_solid_after_cursor_ms: Option<u32>,
     export_metadata: Option<&str>,
     show_progress: bool,
 ) -> Result<()> {
@@ -1074,8 +1161,17 @@ fn export_recording_gif(
     } else {
         cursor_profile
     };
-    let resolved_solid_after_activity_ms = cursor_solid_after_activity_ms
-        .or_else(|| profile_defaults.and_then(|defaults| defaults.solid_after_activity_ms))
+    let resolved_solid_after_input_ms = cursor_solid_after_input_ms
+        .or(cursor_solid_after_activity_ms)
+        .or_else(|| profile_defaults.and_then(|defaults| defaults.solid_after_input_ms))
+        .unwrap_or(500);
+    let resolved_solid_after_output_ms = cursor_solid_after_output_ms
+        .or(cursor_solid_after_activity_ms)
+        .or_else(|| profile_defaults.and_then(|defaults| defaults.solid_after_output_ms))
+        .unwrap_or(500);
+    let resolved_solid_after_cursor_ms = cursor_solid_after_cursor_ms
+        .or(cursor_solid_after_activity_ms)
+        .or_else(|| profile_defaults.and_then(|defaults| defaults.solid_after_cursor_ms))
         .unwrap_or(500);
     let color_input = cursor_color.trim();
     let (resolved_color_label, resolved_color_override) = if color_input.is_empty()
@@ -1102,8 +1198,9 @@ fn export_recording_gif(
         blink: resolved_blink,
         profile: resolved_profile,
         blink_period_ns: u64::from(cursor_blink_period_ms.max(1)).saturating_mul(1_000_000),
-        solid_after_activity_ns: u64::from(resolved_solid_after_activity_ms)
-            .saturating_mul(1_000_000),
+        solid_after_input_ns: u64::from(resolved_solid_after_input_ms).saturating_mul(1_000_000),
+        solid_after_output_ns: u64::from(resolved_solid_after_output_ms).saturating_mul(1_000_000),
+        solid_after_cursor_ns: u64::from(resolved_solid_after_cursor_ms).saturating_mul(1_000_000),
         color_label: resolved_color_label,
         color_override: resolved_color_override,
     };
@@ -1184,9 +1281,12 @@ fn export_recording_gif(
     let mut processed_frame_events = 0_u32;
     let mut previous_emit_ns = None::<u64>;
     let mut cursor_state = CursorReplayState::default();
+    let mut snapshot_cursor_state = None::<RecordedCursorSnapshot>;
     let mut cursor_frames = export_metadata.map(|_| Vec::<ExportCursorFrame>::new());
     let mut blink_anchor_ns = None::<u64>;
-    let mut last_activity_ns = None::<u64>;
+    let mut last_input_activity_ns = None::<u64>;
+    let mut last_output_activity_ns = None::<u64>;
+    let mut last_cursor_activity_ns = None::<u64>;
     let mut previous_visual_state = None::<FrameVisualState>;
     let start_mono_ns = events.iter().map(|event| event.mono_ns).min().unwrap_or(0);
     let frame_cutoff_ns = max_frames.map(|limit| {
@@ -1250,9 +1350,35 @@ fn export_recording_gif(
                     update_cursor_replay_state(&mut cursor_state, data);
                     parser.process(data);
                     processed_frame_events = processed_frame_events.saturating_add(1);
-                    last_activity_ns = Some(scaled_ns);
                     frame_had_display_change = true;
                 }
+                DisplayTrackEvent::CursorSnapshot {
+                    x,
+                    y,
+                    visible,
+                    shape,
+                    blink_enabled,
+                } => {
+                    snapshot_cursor_state = Some(RecordedCursorSnapshot {
+                        x: *x,
+                        y: *y,
+                        visible: *visible,
+                        shape: *shape,
+                        blink_enabled: *blink_enabled,
+                    });
+                    frame_had_display_change = true;
+                }
+                DisplayTrackEvent::Activity { kind } => match kind {
+                    bmux_ipc::DisplayActivityKind::Input => {
+                        last_input_activity_ns = Some(scaled_ns)
+                    }
+                    bmux_ipc::DisplayActivityKind::Output => {
+                        last_output_activity_ns = Some(scaled_ns)
+                    }
+                    bmux_ipc::DisplayActivityKind::Cursor => {
+                        last_cursor_activity_ns = Some(scaled_ns)
+                    }
+                },
                 DisplayTrackEvent::StreamOpened { .. } | DisplayTrackEvent::StreamClosed => {}
             }
             event_index = event_index.saturating_add(1);
@@ -1264,15 +1390,25 @@ fn export_recording_gif(
             continue;
         }
 
-        let (cursor_row, cursor_col) = parser.screen().cursor_position();
-        let parser_cursor_visible = !parser.screen().hide_cursor();
-        let shape = effective_cursor_shape(&cursor_options, cursor_state);
-        let (cursor_visible, blink_on) = compute_cursor_visibility(
+        let snapshot = snapshot_cursor_state.ok_or_else(|| {
+            anyhow::anyhow!(
+                "display track is missing cursor snapshots; re-record with format {}",
+                bmux_ipc::RECORDING_FORMAT_VERSION
+            )
+        })?;
+        let cursor_row = snapshot.y;
+        let cursor_col = snapshot.x;
+        let parser_cursor_visible = snapshot.visible;
+        let shape = effective_cursor_shape(&cursor_options, cursor_state, snapshot.shape);
+        let (cursor_visible, blink_on, visible_reason) = compute_cursor_visibility(
             &cursor_options,
             cursor_state,
+            snapshot.blink_enabled,
             parser_cursor_visible,
             frame_time_ns,
-            last_activity_ns,
+            last_input_activity_ns,
+            last_output_activity_ns,
+            last_cursor_activity_ns,
             &mut blink_anchor_ns,
         );
         let visual_state = FrameVisualState {
@@ -1376,6 +1512,11 @@ fn export_recording_gif(
                 visible: cursor_visible,
                 shape: cursor_shape_name(shape),
                 blink_on,
+                cursor_source: "snapshot",
+                visible_reason,
+                last_input_activity_ns,
+                last_output_activity_ns,
+                last_cursor_activity_ns,
             });
         }
         let encode_started_at = profiler.stage_started();
@@ -1439,7 +1580,9 @@ fn export_recording_gif(
                     RecordingCursorProfile::Generic => "generic",
                 },
                 blink_period_ms: cursor_blink_period_ms.max(1),
-                solid_after_activity_ms: resolved_solid_after_activity_ms,
+                solid_after_input_ms: resolved_solid_after_input_ms,
+                solid_after_output_ms: resolved_solid_after_output_ms,
+                solid_after_cursor_ms: resolved_solid_after_cursor_ms,
                 color: &cursor_options.color_label,
             },
             frames: cursor_frames.unwrap_or_default(),
@@ -3126,6 +3269,7 @@ use bmux_ipc::{DisplayTrackEnvelope, DisplayTrackEvent};
 pub(super) struct DisplayCaptureWriter {
     started_at: Instant,
     writer: BufWriter<std::fs::File>,
+    cursor_replay_state: CursorReplayState,
 }
 
 impl DisplayCaptureWriter {
@@ -3157,6 +3301,7 @@ impl DisplayCaptureWriter {
         let mut capture = Self {
             started_at: Instant::now(),
             writer: BufWriter::new(file),
+            cursor_replay_state: CursorReplayState::default(),
         };
         let (cell_width_px, cell_height_px, window_width_px, window_height_px) =
             capture_stream_open_metrics();
@@ -3190,8 +3335,33 @@ impl DisplayCaptureWriter {
         if data.is_empty() {
             return Ok(());
         }
+        update_cursor_replay_state(&mut self.cursor_replay_state, data);
         self.record(DisplayTrackEvent::FrameBytes {
             data: data.to_vec(),
+        })
+    }
+
+    pub(super) fn record_activity(&mut self, kind: bmux_ipc::DisplayActivityKind) -> Result<()> {
+        self.record(DisplayTrackEvent::Activity { kind })
+    }
+
+    pub(super) fn record_cursor_snapshot(
+        &mut self,
+        cursor_state: Option<crate::runtime::attach::state::AttachCursorState>,
+    ) -> Result<()> {
+        let (x, y, visible) = cursor_state
+            .map(|state| (state.x, state.y, state.visible))
+            .unwrap_or((0, 0, false));
+        self.record(DisplayTrackEvent::CursorSnapshot {
+            x,
+            y,
+            visible,
+            shape: match self.cursor_replay_state.shape {
+                CursorVisualShape::Block => bmux_ipc::DisplayCursorShape::Block,
+                CursorVisualShape::Bar => bmux_ipc::DisplayCursorShape::Bar,
+                CursorVisualShape::Underline => bmux_ipc::DisplayCursorShape::Underline,
+            },
+            blink_enabled: self.cursor_replay_state.blink_enabled,
         })
     }
 
@@ -3431,27 +3601,44 @@ mod tests {
             blink: RecordingCursorBlinkMode::On,
             profile: RecordingCursorProfile::Generic,
             blink_period_ns: 500_000_000,
-            solid_after_activity_ns: 0,
+            solid_after_input_ns: 0,
+            solid_after_output_ns: 0,
+            solid_after_cursor_ns: 0,
             color_label: "auto".to_string(),
             color_override: None,
         };
         let state = CursorReplayState::default();
         let mut blink_anchor_ns = None;
-        let (on_a, blink_a) =
-            compute_cursor_visibility(&options, state, true, 0, None, &mut blink_anchor_ns);
-        let (on_b, blink_b) = compute_cursor_visibility(
+        let (on_a, blink_a, _) = compute_cursor_visibility(
             &options,
             state,
             true,
-            510_000_000,
+            true,
+            0,
+            None,
+            None,
             None,
             &mut blink_anchor_ns,
         );
-        let (on_c, blink_c) = compute_cursor_visibility(
+        let (on_b, blink_b, _) = compute_cursor_visibility(
             &options,
             state,
             true,
+            true,
+            510_000_000,
+            None,
+            None,
+            None,
+            &mut blink_anchor_ns,
+        );
+        let (on_c, blink_c, _) = compute_cursor_visibility(
+            &options,
+            state,
+            true,
+            true,
             1_020_000_000,
+            None,
+            None,
             None,
             &mut blink_anchor_ns,
         );
@@ -3468,7 +3655,9 @@ mod tests {
             blink: RecordingCursorBlinkMode::On,
             profile: RecordingCursorProfile::Generic,
             blink_period_ns: 500_000_000,
-            solid_after_activity_ns: 0,
+            solid_after_input_ns: 0,
+            solid_after_output_ns: 0,
+            solid_after_cursor_ns: 0,
             color_label: "auto".to_string(),
             color_override: None,
         };
@@ -3478,23 +3667,32 @@ mod tests {
             &options,
             state,
             false,
-            700_000_000,
-            None,
-            &mut blink_anchor_ns,
-        );
-        let (on_a, blink_a) = compute_cursor_visibility(
-            &options,
-            state,
             true,
             700_000_000,
             None,
+            None,
+            None,
             &mut blink_anchor_ns,
         );
-        let (on_b, blink_b) = compute_cursor_visibility(
+        let (on_a, blink_a, _) = compute_cursor_visibility(
             &options,
             state,
+            true,
+            true,
+            700_000_000,
+            None,
+            None,
+            None,
+            &mut blink_anchor_ns,
+        );
+        let (on_b, blink_b, _) = compute_cursor_visibility(
+            &options,
+            state,
+            true,
             true,
             1_210_000_000,
+            None,
+            None,
             None,
             &mut blink_anchor_ns,
         );
@@ -3510,26 +3708,34 @@ mod tests {
             blink: RecordingCursorBlinkMode::On,
             profile: RecordingCursorProfile::Ghostty,
             blink_period_ns: 500_000_000,
-            solid_after_activity_ns: 500_000_000,
+            solid_after_input_ns: 500_000_000,
+            solid_after_output_ns: 500_000_000,
+            solid_after_cursor_ns: 500_000_000,
             color_label: "auto".to_string(),
             color_override: None,
         };
         let state = CursorReplayState::default();
         let mut blink_anchor_ns = None;
-        let (on_a, blink_a) = compute_cursor_visibility(
+        let (on_a, blink_a, _) = compute_cursor_visibility(
             &options,
             state,
+            true,
             true,
             300_000_000,
             Some(250_000_000),
+            None,
+            None,
             &mut blink_anchor_ns,
         );
-        let (on_b, blink_b) = compute_cursor_visibility(
+        let (on_b, blink_b, _) = compute_cursor_visibility(
             &options,
             state,
             true,
+            true,
             900_000_000,
             Some(250_000_000),
+            None,
+            None,
             &mut blink_anchor_ns,
         );
         assert!(on_a && blink_a);

@@ -143,6 +143,7 @@ pub(crate) async fn run_session_attach_with_client(
                 global,
                 &attach_help_lines,
                 &mut view_state,
+                display_capture.as_mut(),
             )
             .await?
             {
@@ -183,7 +184,10 @@ pub(crate) async fn run_session_attach_with_client(
             let previous_layout = view_state.cached_layout_state.clone();
             let layout_state = match client.attach_layout(view_state.attached_id).await {
                 Ok(state) => state,
-                Err(error) if is_attach_stream_closed_error(&error) => {
+                Err(error)
+                    if is_attach_stream_closed_error(&error)
+                        || is_attach_not_attached_runtime_error(&error) =>
+                {
                     exit_reason = AttachExitReason::StreamClosed;
                     break;
                 }
@@ -236,7 +240,10 @@ pub(crate) async fn run_session_attach_with_client(
             .await
         {
             Ok(chunks) => chunks,
-            Err(error) if is_attach_stream_closed_error(&error) => {
+            Err(error)
+                if is_attach_stream_closed_error(&error)
+                    || is_attach_not_attached_runtime_error(&error) =>
+            {
                 exit_reason = AttachExitReason::StreamClosed;
                 break;
             }
@@ -1774,6 +1781,7 @@ pub(crate) async fn render_attach_frame(
         view_state.scrollback_cursor,
         view_state.selection_anchor,
     )?;
+    let previous_cursor_state = view_state.last_cursor_state;
     if view_state.help_overlay_open {
         if let Some(help_surface) = help_overlay_surface(help_lines) {
             queue_attach_help_overlay(&mut frame_bytes, &help_surface, help_lines, help_scroll)?;
@@ -1789,6 +1797,11 @@ pub(crate) async fn render_attach_frame(
 
     if let Some(capture) = display_capture {
         let _ = capture.record_frame_bytes(&frame_bytes);
+        let _ = capture.record_activity(bmux_ipc::DisplayActivityKind::Output);
+        let _ = capture.record_cursor_snapshot(view_state.last_cursor_state);
+        if previous_cursor_state != view_state.last_cursor_state {
+            let _ = capture.record_activity(bmux_ipc::DisplayActivityKind::Cursor);
+        }
     }
 
     let mut stdout = io::stdout();
@@ -2555,6 +2568,7 @@ pub(crate) async fn handle_attach_loop_event(
     global: bool,
     help_lines: &[String],
     view_state: &mut AttachViewState,
+    mut display_capture: Option<&mut recording::DisplayCaptureWriter>,
 ) -> Result<AttachLoopControl> {
     match event {
         AttachLoopEvent::Server(server_event) => {
@@ -2575,6 +2589,7 @@ pub(crate) async fn handle_attach_loop_event(
                 attach_input_processor,
                 help_lines,
                 view_state,
+                display_capture.as_deref_mut(),
             )
             .await
         }
@@ -2716,7 +2731,9 @@ pub(crate) async fn handle_attach_terminal_event(
     attach_input_processor: &mut InputProcessor,
     help_lines: &[String],
     view_state: &mut AttachViewState,
+    display_capture: Option<&mut recording::DisplayCaptureWriter>,
 ) -> Result<AttachLoopControl> {
+    let mut display_capture = display_capture;
     if matches!(terminal_event, Event::Resize(_, _)) {
         if let Err(error) = refresh_attached_session_from_context(client, view_state).await {
             view_state.set_transient_status(
@@ -2801,8 +2818,16 @@ pub(crate) async fn handle_attach_terminal_event(
                         );
                     }
                     match client.attach_input(view_state.attached_id, bytes).await {
-                        Ok(_) => {}
-                        Err(error) if is_attach_stream_closed_error(&error) => {
+                        Ok(_) => {
+                            if let Some(capture) = display_capture.as_deref_mut() {
+                                let _ =
+                                    capture.record_activity(bmux_ipc::DisplayActivityKind::Input);
+                            }
+                        }
+                        Err(error)
+                            if is_attach_stream_closed_error(&error)
+                                || is_attach_not_attached_runtime_error(&error) =>
+                        {
                             return Ok(AttachLoopControl::Break(AttachExitReason::StreamClosed));
                         }
                         Err(error) => return Err(map_attach_client_error(error)),
@@ -3364,6 +3389,14 @@ pub(crate) const fn is_attach_stream_closed_error(error: &ClientError) -> bool {
             code: bmux_ipc::ErrorCode::NotFound,
             ..
         }
+    )
+}
+
+pub(crate) fn is_attach_not_attached_runtime_error(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::ServerError { message, .. }
+            if message.contains("not attached to session runtime")
     )
 }
 #[cfg(test)]

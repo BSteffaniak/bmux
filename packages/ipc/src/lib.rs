@@ -486,7 +486,7 @@ pub struct RecordingSummary {
 }
 
 /// Current recording format version.
-pub const RECORDING_FORMAT_VERSION: u32 = 3;
+pub const RECORDING_FORMAT_VERSION: u32 = 4;
 
 const fn recording_format_version_default() -> u32 {
     1 // pre-versioning recordings are treated as version 1
@@ -896,7 +896,33 @@ pub enum DisplayTrackEvent {
     FrameBytes {
         data: Vec<u8>,
     },
+    CursorSnapshot {
+        x: u16,
+        y: u16,
+        visible: bool,
+        shape: DisplayCursorShape,
+        blink_enabled: bool,
+    },
+    Activity {
+        kind: DisplayActivityKind,
+    },
     StreamClosed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayCursorShape {
+    Block,
+    Bar,
+    Underline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayActivityKind {
+    Input,
+    Output,
+    Cursor,
 }
 
 /// Display track envelope — wraps an event with a monotonic timestamp.
@@ -1983,6 +2009,16 @@ mod tests {
             DisplayTrackEvent::FrameBytes {
                 data: vec![27, 91, 72],
             },
+            DisplayTrackEvent::CursorSnapshot {
+                x: 5,
+                y: 7,
+                visible: true,
+                shape: DisplayCursorShape::Bar,
+                blink_enabled: false,
+            },
+            DisplayTrackEvent::Activity {
+                kind: DisplayActivityKind::Input,
+            },
             DisplayTrackEvent::FrameBytes { data: vec![] },
             DisplayTrackEvent::StreamClosed,
         ];
@@ -2023,6 +2059,22 @@ mod tests {
             },
             DisplayTrackEnvelope {
                 mono_ns: 3000,
+                event: DisplayTrackEvent::CursorSnapshot {
+                    x: 10,
+                    y: 11,
+                    visible: true,
+                    shape: DisplayCursorShape::Block,
+                    blink_enabled: true,
+                },
+            },
+            DisplayTrackEnvelope {
+                mono_ns: 3500,
+                event: DisplayTrackEvent::Activity {
+                    kind: DisplayActivityKind::Output,
+                },
+            },
+            DisplayTrackEnvelope {
+                mono_ns: 3600,
                 event: DisplayTrackEvent::StreamClosed,
             },
         ];

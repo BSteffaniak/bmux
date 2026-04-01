@@ -519,11 +519,17 @@ pub(super) async fn execute_step(
                     .pane_direct_input(sid, pane_id, resolved_keys.clone())
                     .await
                     .map_err(|e| anyhow::anyhow!("send-keys to pane {target_index} failed: {e}"))?;
+                if let Some(dt) = display_track.as_mut() {
+                    let _ = dt.record_activity(bmux_ipc::DisplayActivityKind::Input);
+                }
             } else {
                 client
                     .attach_input(sid, resolved_keys)
                     .await
                     .map_err(|e| anyhow::anyhow!("send-keys failed: {e}"))?;
+                if let Some(dt) = display_track.as_mut() {
+                    let _ = dt.record_activity(bmux_ipc::DisplayActivityKind::Input);
+                }
             }
             Ok(None)
         }
@@ -535,6 +541,9 @@ pub(super) async fn execute_step(
                 .attach_input(sid, hex.clone())
                 .await
                 .map_err(|e| anyhow::anyhow!("send-bytes failed: {e}"))?;
+            if let Some(dt) = display_track.as_mut() {
+                let _ = dt.record_activity(bmux_ipc::DisplayActivityKind::Input);
+            }
             Ok(None)
         }
 

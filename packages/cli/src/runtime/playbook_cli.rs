@@ -80,6 +80,9 @@ pub(super) async fn run_playbook_run(
                 None,                        // cursor_color
                 None,                        // cursor_profile
                 None,                        // cursor_solid_after_activity_ms
+                None,                        // cursor_solid_after_input_ms
+                None,                        // cursor_solid_after_output_ms
+                None,                        // cursor_solid_after_cursor_ms
                 None,                        // export_metadata
                 true,                        // show_progress
             )

@@ -128,6 +128,12 @@ pub struct RecordingExportConfig {
     /// Keep cursor solid after activity for this duration in milliseconds.
     /// `None` lets terminal profiles choose an emulator-specific default.
     pub cursor_solid_after_activity_ms: Option<u32>,
+    /// Keep cursor solid after input activity for this duration in milliseconds.
+    pub cursor_solid_after_input_ms: Option<u32>,
+    /// Keep cursor solid after output activity for this duration in milliseconds.
+    pub cursor_solid_after_output_ms: Option<u32>,
+    /// Keep cursor solid after cursor movement activity for this duration in milliseconds.
+    pub cursor_solid_after_cursor_ms: Option<u32>,
 }
 
 impl Default for RecordingExportConfig {
@@ -140,6 +146,9 @@ impl Default for RecordingExportConfig {
             cursor_color: "auto".to_string(),
             cursor_profile: RecordingExportCursorProfile::Auto,
             cursor_solid_after_activity_ms: None,
+            cursor_solid_after_input_ms: None,
+            cursor_solid_after_output_ms: None,
+            cursor_solid_after_cursor_ms: None,
         }
     }
 }
@@ -1191,6 +1200,9 @@ timeout_profile = "missing"
             crate::RecordingExportCursorProfile::Auto
         );
         assert_eq!(config.recording.export.cursor_solid_after_activity_ms, None);
+        assert_eq!(config.recording.export.cursor_solid_after_input_ms, None);
+        assert_eq!(config.recording.export.cursor_solid_after_output_ms, None);
+        assert_eq!(config.recording.export.cursor_solid_after_cursor_ms, None);
     }
 
     #[test]
@@ -1199,7 +1211,7 @@ timeout_profile = "missing"
         let dir = path.parent().expect("temp dir").to_path_buf();
         std::fs::write(
             &path,
-            "[recording.export]\ncursor = 'on'\ncursor_shape = 'underline'\ncursor_blink = 'off'\ncursor_blink_period_ms = 650\ncursor_color = '#44aaee'\ncursor_profile = 'ghostty'\ncursor_solid_after_activity_ms = 900\n",
+            "[recording.export]\ncursor = 'on'\ncursor_shape = 'underline'\ncursor_blink = 'off'\ncursor_blink_period_ms = 650\ncursor_color = '#44aaee'\ncursor_profile = 'ghostty'\ncursor_solid_after_activity_ms = 900\ncursor_solid_after_input_ms = 910\ncursor_solid_after_output_ms = 920\ncursor_solid_after_cursor_ms = 930\n",
         )
         .expect("failed writing config fixture");
 
@@ -1225,6 +1237,18 @@ timeout_profile = "missing"
         assert_eq!(
             config.recording.export.cursor_solid_after_activity_ms,
             Some(900)
+        );
+        assert_eq!(
+            config.recording.export.cursor_solid_after_input_ms,
+            Some(910)
+        );
+        assert_eq!(
+            config.recording.export.cursor_solid_after_output_ms,
+            Some(920)
+        );
+        assert_eq!(
+            config.recording.export.cursor_solid_after_cursor_ms,
+            Some(930)
         );
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");

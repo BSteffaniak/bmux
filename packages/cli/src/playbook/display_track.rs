@@ -10,13 +10,16 @@ use std::path::Path;
 use std::time::Instant;
 
 use anyhow::{Context, Result};
-use bmux_ipc::{DisplayTrackEnvelope, DisplayTrackEvent};
+use bmux_ipc::{DisplayActivityKind, DisplayCursorShape, DisplayTrackEnvelope, DisplayTrackEvent};
 use uuid::Uuid;
 
 /// Writer that produces the display track binary file alongside a recording.
 pub struct PlaybookDisplayTrackWriter {
     started_at: Instant,
     writer: std::io::BufWriter<std::fs::File>,
+    parser: vt100::Parser,
+    cursor_shape: DisplayCursorShape,
+    cursor_blink_enabled: bool,
 }
 
 impl PlaybookDisplayTrackWriter {
@@ -50,6 +53,9 @@ impl PlaybookDisplayTrackWriter {
         let mut writer = Self {
             started_at: Instant::now(),
             writer: std::io::BufWriter::new(file),
+            parser: vt100::Parser::new(rows.max(1), cols.max(1), 4_096),
+            cursor_shape: DisplayCursorShape::Block,
+            cursor_blink_enabled: true,
         };
 
         // Write initial events
@@ -74,14 +80,25 @@ impl PlaybookDisplayTrackWriter {
         if data.is_empty() {
             return Ok(());
         }
+        self.update_cursor_style(data);
+        self.parser.process(data);
         self.record(DisplayTrackEvent::FrameBytes {
             data: data.to_vec(),
-        })
+        })?;
+        self.record(DisplayTrackEvent::Activity {
+            kind: DisplayActivityKind::Output,
+        })?;
+        self.record_cursor_snapshot()
     }
 
     /// Record a viewport resize.
     pub fn record_resize(&mut self, cols: u16, rows: u16) -> Result<()> {
+        self.parser.screen_mut().set_size(rows.max(1), cols.max(1));
         self.record(DisplayTrackEvent::Resize { cols, rows })
+    }
+
+    pub fn record_activity(&mut self, kind: DisplayActivityKind) -> Result<()> {
+        self.record(DisplayTrackEvent::Activity { kind })
     }
 
     /// Record the stream closed event and flush.
@@ -104,5 +121,69 @@ impl PlaybookDisplayTrackWriter {
         bmux_ipc::write_frame(&mut self.writer, &envelope)
             .map_err(|e| anyhow::anyhow!("display track write_frame failed: {e}"))?;
         Ok(())
+    }
+
+    fn record_cursor_snapshot(&mut self) -> Result<()> {
+        let (y, x) = self.parser.screen().cursor_position();
+        self.record(DisplayTrackEvent::CursorSnapshot {
+            x,
+            y,
+            visible: !self.parser.screen().hide_cursor(),
+            shape: self.cursor_shape,
+            blink_enabled: self.cursor_blink_enabled,
+        })
+    }
+
+    fn update_cursor_style(&mut self, data: &[u8]) {
+        let mut index = 0usize;
+        while index + 4 < data.len() {
+            if data[index] != 0x1b || data[index + 1] != b'[' {
+                index += 1;
+                continue;
+            }
+            let mut cursor = index + 2;
+            let mut value: u16 = 0;
+            let mut saw_digit = false;
+            while cursor < data.len() && data[cursor].is_ascii_digit() {
+                saw_digit = true;
+                value = value
+                    .saturating_mul(10)
+                    .saturating_add(u16::from(data[cursor].saturating_sub(b'0')));
+                cursor += 1;
+            }
+            if cursor + 1 >= data.len() || data[cursor] != b' ' || data[cursor + 1] != b'q' {
+                index += 1;
+                continue;
+            }
+            let ps = if saw_digit { value } else { 0 };
+            match ps {
+                0 | 1 => {
+                    self.cursor_shape = DisplayCursorShape::Block;
+                    self.cursor_blink_enabled = true;
+                }
+                2 => {
+                    self.cursor_shape = DisplayCursorShape::Block;
+                    self.cursor_blink_enabled = false;
+                }
+                3 => {
+                    self.cursor_shape = DisplayCursorShape::Underline;
+                    self.cursor_blink_enabled = true;
+                }
+                4 => {
+                    self.cursor_shape = DisplayCursorShape::Underline;
+                    self.cursor_blink_enabled = false;
+                }
+                5 => {
+                    self.cursor_shape = DisplayCursorShape::Bar;
+                    self.cursor_blink_enabled = true;
+                }
+                6 => {
+                    self.cursor_shape = DisplayCursorShape::Bar;
+                    self.cursor_blink_enabled = false;
+                }
+                _ => {}
+            }
+            index = cursor + 2;
+        }
     }
 }

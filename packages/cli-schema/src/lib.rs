@@ -430,6 +430,15 @@ pub enum RecordingCommand {
         /// Keep cursor solid after activity for this duration in ms
         #[arg(long)]
         cursor_solid_after_activity_ms: Option<u32>,
+        /// Keep cursor solid after input activity for this duration in ms
+        #[arg(long)]
+        cursor_solid_after_input_ms: Option<u32>,
+        /// Keep cursor solid after output activity for this duration in ms
+        #[arg(long)]
+        cursor_solid_after_output_ms: Option<u32>,
+        /// Keep cursor solid after cursor movement activity for this duration in ms
+        #[arg(long)]
+        cursor_solid_after_cursor_ms: Option<u32>,
         /// Write export metadata JSON to this path
         #[arg(long)]
         export_metadata: Option<String>,

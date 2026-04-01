@@ -18,7 +18,9 @@ pub(super) struct CursorDefaults {
     pub(super) shape: Option<CursorDefaultShape>,
     pub(super) blink: Option<CursorDefaultBlink>,
     pub(super) color: Option<String>,
-    pub(super) solid_after_activity_ms: Option<u32>,
+    pub(super) solid_after_input_ms: Option<u32>,
+    pub(super) solid_after_output_ms: Option<u32>,
+    pub(super) solid_after_cursor_ms: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -142,7 +144,9 @@ impl GhosttyProvider {
             background_opacity_permille: parsed.background_opacity_permille,
             cursor_defaults: CursorDefaults {
                 profile: Some(CursorDefaultProfile::Ghostty),
-                solid_after_activity_ms: Some(500),
+                solid_after_input_ms: Some(500),
+                solid_after_output_ms: Some(500),
+                solid_after_cursor_ms: Some(500),
                 ..parsed.cursor_defaults
             },
             source: format!("ghostty-config:{}", path.display()),
@@ -157,7 +161,9 @@ impl GhosttyProvider {
             background_opacity_permille: None,
             cursor_defaults: CursorDefaults {
                 profile: Some(CursorDefaultProfile::Ghostty),
-                solid_after_activity_ms: Some(500),
+                solid_after_input_ms: Some(500),
+                solid_after_output_ms: Some(500),
+                solid_after_cursor_ms: Some(500),
                 ..CursorDefaults::default()
             },
             source: "ghostty-default".to_string(),
