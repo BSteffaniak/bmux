@@ -2001,6 +2001,7 @@ impl SessionRuntimeManager {
             .get_mut(&session_id)
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
         // Auto-unzoom on focus change.
+        let was_zoomed = session.zoomed_pane_id.is_some();
         session.zoomed_pane_id = None;
         let mut pane_ids = Vec::new();
         session.layout_root.pane_order(&mut pane_ids);
@@ -2023,7 +2024,10 @@ impl SessionRuntimeManager {
             }
         };
         session.focused_pane_id = pane_ids[next_index];
-        Ok(session.focused_pane_id)
+        if was_zoomed {
+            self.apply_stored_attach_viewport(session_id);
+        }
+        Ok(self.runtimes[&session_id].focused_pane_id)
     }
 
     fn focus_pane_target(&mut self, session_id: SessionId, target: PaneSelector) -> Result<Uuid> {
@@ -2032,10 +2036,14 @@ impl SessionRuntimeManager {
             .get_mut(&session_id)
             .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
         // Auto-unzoom on focus change.
+        let was_zoomed = session.zoomed_pane_id.is_some();
         session.zoomed_pane_id = None;
         let pane_id = resolve_pane_id_from_selector(session, target)
             .ok_or_else(|| anyhow::anyhow!("target pane not found"))?;
         session.focused_pane_id = pane_id;
+        if was_zoomed {
+            self.apply_stored_attach_viewport(session_id);
+        }
         Ok(pane_id)
     }
 

@@ -16,9 +16,10 @@ use bmux_cli_schema::{
 };
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
 use bmux_config::{
-    BmuxConfig, ConfigPaths, RecordingExportCursorBlinkMode, RecordingExportCursorMode,
-    RecordingExportCursorPaintMode, RecordingExportCursorProfile, RecordingExportCursorShape,
-    RecordingExportCursorTextMode, ResolvedTimeout, StatusPosition, TerminfoAutoInstall,
+    BmuxConfig, ConfigPaths, PaneRestoreMethod, RecordingExportCursorBlinkMode,
+    RecordingExportCursorMode, RecordingExportCursorPaintMode, RecordingExportCursorProfile,
+    RecordingExportCursorShape, RecordingExportCursorTextMode, ResolvedTimeout, StatusPosition,
+    TerminfoAutoInstall,
 };
 use bmux_ipc::{
     AttachRect, AttachViewComponent, ContextSelector, ContextSummary, InvokeServiceKind,

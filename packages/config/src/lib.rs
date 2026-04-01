@@ -417,6 +417,10 @@ pub struct BehaviorConfig {
     /// terminal, allowing modified special keys like Ctrl+Enter to be
     /// correctly forwarded to pane programs.
     pub kitty_keyboard: bool,
+    /// How to restore pane content when hidden panes become visible again
+    /// (e.g. after exiting zoom). SNAPSHOT re-fetches from the server for
+    /// guaranteed accuracy. RETAIN keeps parsers in memory for instant restore.
+    pub pane_restore_method: PaneRestoreMethod,
     /// Mouse interaction settings for attach mode (focus/scroll gestures).
     pub mouse: MouseBehaviorConfig,
 }
@@ -438,6 +442,7 @@ impl Default for BehaviorConfig {
             terminfo_prompt_cooldown_days: 7,
             stale_build_action: StaleBuildAction::Error,
             kitty_keyboard: true,
+            pane_restore_method: PaneRestoreMethod::Snapshot,
             mouse: MouseBehaviorConfig::default(),
         }
     }
@@ -508,6 +513,19 @@ pub enum TerminfoAutoInstall {
     Always,
     #[default]
     Never,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneRestoreMethod {
+    /// Re-fetch full pane content from the server ring buffer when panes
+    /// become visible again (e.g. after unzoom). Most robust — always correct.
+    #[default]
+    Snapshot,
+    /// Keep hidden pane terminal parsers alive in client memory. Instant
+    /// restore with no network cost, but content may appear briefly stale
+    /// until incremental output catches up.
+    Retain,
 }
 
 /// Settings for multiple clients attached to the same session, controlling
@@ -1782,5 +1800,62 @@ timeout_profile = "missing"
             .load_theme_from_paths(&paths)
             .expect_err("missing theme should error");
         assert!(matches!(error, crate::ConfigError::FileNotFound { .. }));
+    }
+
+    #[test]
+    fn pane_restore_method_default_is_snapshot() {
+        let config = BmuxConfig::default();
+        assert_eq!(
+            config.behavior.pane_restore_method,
+            crate::PaneRestoreMethod::Snapshot
+        );
+    }
+
+    #[test]
+    fn pane_restore_method_deserializes_snapshot() {
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        std::fs::write(&path, "[behavior]\npane_restore_method = \"snapshot\"\n")
+            .expect("failed writing config fixture");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(
+            config.behavior.pane_restore_method,
+            crate::PaneRestoreMethod::Snapshot
+        );
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn pane_restore_method_deserializes_retain() {
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        std::fs::write(&path, "[behavior]\npane_restore_method = \"retain\"\n")
+            .expect("failed writing config fixture");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(
+            config.behavior.pane_restore_method,
+            crate::PaneRestoreMethod::Retain
+        );
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn pane_restore_method_defaults_when_missing_from_config() {
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        std::fs::write(&path, "[behavior]\nexit_empty = true\n")
+            .expect("failed writing config fixture");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(
+            config.behavior.pane_restore_method,
+            crate::PaneRestoreMethod::Snapshot
+        );
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
     }
 }

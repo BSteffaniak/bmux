@@ -196,6 +196,8 @@ pub(crate) async fn run_session_attach_with_client(
             || view_state.dirty.full_pane_redraw
             || !view_state.dirty.pane_dirty_ids.is_empty();
 
+        let mut scene_hydrated = false;
+
         if view_state.dirty.layout_needs_refresh || view_state.cached_layout_state.is_none() {
             let previous_layout = view_state.cached_layout_state.clone();
             let layout_state = match client.attach_layout(view_state.attached_id).await {
@@ -221,7 +223,20 @@ pub(crate) async fn run_session_attach_with_client(
                     }
                     Some(previous) => {
                         if previous.scene != layout_state.scene {
-                            view_state.dirty.full_pane_redraw = true;
+                            if attach_config.behavior.pane_restore_method
+                                == PaneRestoreMethod::Snapshot
+                            {
+                                // Scene changed (e.g. zoom/unzoom): re-hydrate all pane
+                                // content from the server ring buffer so hidden panes
+                                // whose client-side parsers were dropped get fully
+                                // reconstructed. hydrate_attach_state_from_snapshot
+                                // overwrites cached_layout_state and mouse state.
+                                hydrate_attach_state_from_snapshot(&mut client, &mut view_state)
+                                    .await?;
+                                scene_hydrated = true;
+                            } else {
+                                view_state.dirty.full_pane_redraw = true;
+                            }
                         } else if previous.focused_pane_id != layout_state.focused_pane_id {
                             view_state
                                 .dirty
@@ -234,8 +249,10 @@ pub(crate) async fn run_session_attach_with_client(
                         }
                     }
                 }
-                view_state.mouse.last_focused_pane_id = Some(layout_state.focused_pane_id);
-                view_state.cached_layout_state = Some(layout_state);
+                if !scene_hydrated {
+                    view_state.mouse.last_focused_pane_id = Some(layout_state.focused_pane_id);
+                    view_state.cached_layout_state = Some(layout_state);
+                }
             }
             view_state.dirty.layout_needs_refresh = false;
         }
@@ -244,12 +261,38 @@ pub(crate) async fn run_session_attach_with_client(
             continue;
         };
 
+        // When scene was just re-hydrated from snapshot, skip incremental
+        // output fetch — the hydration already populated all pane buffers.
+        if scene_hydrated {
+            let help_scroll = view_state.help_overlay_scroll;
+            render_attach_frame(
+                &mut client,
+                &mut view_state,
+                &layout_state,
+                &attach_config.status_bar,
+                &global_theme,
+                follow_target_id,
+                global,
+                &attach_keymap,
+                &attach_help_lines,
+                help_scroll,
+                display_capture.as_mut(),
+            )
+            .await?;
+            continue;
+        }
+
         resize_attach_parsers_for_scene(&mut view_state.pane_buffers, &layout_state.scene);
 
         let pane_ids = visible_scene_pane_ids(&layout_state.scene);
-        view_state
-            .pane_buffers
-            .retain(|pane_id, _| pane_ids.iter().any(|id| id == pane_id));
+        // In Retain mode, keep hidden pane parsers alive in memory so their
+        // content survives scene transitions (e.g. zoom/unzoom) without a
+        // full re-hydration from the server.
+        if attach_config.behavior.pane_restore_method != PaneRestoreMethod::Retain {
+            view_state
+                .pane_buffers
+                .retain(|pane_id, _| pane_ids.iter().any(|id| id == pane_id));
+        }
 
         let chunks = match client
             .attach_pane_output_batch(view_state.attached_id, pane_ids.clone(), 8 * 1024)
