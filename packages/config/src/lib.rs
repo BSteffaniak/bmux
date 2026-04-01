@@ -95,6 +95,10 @@ pub struct ConnectionTargetConfig {
     pub identity_file: Option<PathBuf>,
     /// Known hosts file path.
     pub known_hosts_file: Option<PathBuf>,
+    /// Optional CA certificate bundle used for TLS transport.
+    pub ca_file: Option<PathBuf>,
+    /// Optional TLS server name override (defaults to host).
+    pub server_name: Option<String>,
     /// Require strict host key checking.
     pub strict_host_key_checking: bool,
     /// SSH jump host (`ProxyJump`) value.
@@ -118,6 +122,8 @@ impl Default for ConnectionTargetConfig {
             port: None,
             identity_file: None,
             known_hosts_file: None,
+            ca_file: None,
+            server_name: None,
             strict_host_key_checking: true,
             jump: None,
             remote_bmux_path: "bmux".to_string(),
@@ -134,6 +140,7 @@ pub enum ConnectionTransport {
     #[default]
     Local,
     Ssh,
+    Tls,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]

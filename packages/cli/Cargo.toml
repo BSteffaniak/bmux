@@ -60,6 +60,9 @@ moosicbox_log_watch = { workspace = true, features = [
 portable-pty = { workspace = true }
 regex = { workspace = true }
 resvg = { workspace = true }
+rustls = { workspace = true }
+rustls-native-certs = { workspace = true }
+rustls-pemfile = { workspace = true }
 serde = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 similar = { workspace = true }
@@ -69,11 +72,13 @@ tokio = { workspace = true, features = [
     "rt",
     "rt-multi-thread",
     "io-util",
+    "net",
     "io-std",
     "process",
     "signal",
     "time",
 ] }
+tokio-rustls = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true, features = ["std"] }
 ttf-parser = { workspace = true }

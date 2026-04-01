@@ -33,6 +33,7 @@ pub enum BuiltInHandlerId {
     ServerSave,
     ServerRestore,
     ServerStop,
+    ServerGateway,
     ServerBridge,
     Logs,
     LogsPath,
@@ -250,6 +251,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::ServerStop,
             &["server", "stop"],
             "Stop the server",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::ServerGateway,
+            &["server", "gateway"],
+            "Run TLS gateway for remote clients",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::ServerBridge,

@@ -66,6 +66,9 @@ bmux remote list --json
 bmux remote test prod
 bmux remote doctor prod
 
+# run an internet-accessible TLS gateway
+bmux server gateway --listen 0.0.0.0:7443 --cert-file cert.pem --key-file key.pem
+
 # target any normal command remotely
 bmux --target prod list-sessions
 bmux --target prod attach app
@@ -96,7 +99,16 @@ jump = "ops@bastion.example.com"
 remote_bmux_path = "bmux"
 connect_timeout_ms = 8000
 default_session = "main"
+
+[connections.targets.tls-prod]
+transport = "tls"
+host = "gateway.example.com"
+port = 7443
+server_name = "gateway.example.com"
+ca_file = "~/.config/bmux/gateway-ca.pem"
 ```
+
+Current TLS target support: `bmux connect`, `bmux remote test`, and `bmux remote doctor`.
 
 ## Logging Commands
 

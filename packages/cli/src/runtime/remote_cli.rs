@@ -2,16 +2,22 @@ use super::*;
 use anyhow::Context;
 use bmux_config::{ConnectionTargetConfig, ConnectionTransport, RemoteServerStartMode};
 use bmux_ipc::transport::ErasedIpcStream;
+use rustls::RootCertStore;
+use rustls::pki_types::ServerName;
 use std::ffi::OsString;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command as TokioProcessCommand};
+use tokio_rustls::TlsConnector;
 
 #[derive(Debug, Clone)]
 enum ResolvedTarget {
     Local,
     Ssh(SshTarget),
+    Tls(TlsTarget),
 }
 
 #[derive(Debug, Clone)]
@@ -27,6 +33,16 @@ struct SshTarget {
     remote_bmux_path: String,
     connect_timeout_ms: u64,
     server_start_mode: RemoteServerStartMode,
+}
+
+#[derive(Debug, Clone)]
+struct TlsTarget {
+    label: String,
+    host: String,
+    port: u16,
+    server_name: String,
+    ca_file: Option<PathBuf>,
+    connect_timeout_ms: u64,
 }
 
 const SSH_RECONNECT_MAX_ATTEMPTS: usize = 4;
@@ -81,22 +97,34 @@ pub(super) fn should_proxy_to_target(cli: &Cli) -> Result<bool> {
     }
     let config = BmuxConfig::load()?;
     let target = resolve_effective_target(&config, cli.target.as_deref())?;
-    Ok(matches!(target, ResolvedTarget::Ssh(_)))
+    Ok(matches!(
+        target,
+        ResolvedTarget::Ssh(_) | ResolvedTarget::Tls(_)
+    ))
 }
 
 pub(super) async fn run_target_proxy_from_current_argv(cli: &Cli) -> Result<u8> {
     let config = BmuxConfig::load()?;
     let target = resolve_effective_target(&config, cli.target.as_deref())?;
-    let ResolvedTarget::Ssh(target) = target else {
-        return Ok(1);
-    };
-    let argv = std::env::args_os().collect::<Vec<_>>();
-    let remote_args = strip_target_argument(&argv);
-    if command_requires_remote_server(cli.command.as_ref()) {
-        ensure_remote_server_ready(&target).await?;
+    match target {
+        ResolvedTarget::Ssh(target) => {
+            let argv = std::env::args_os().collect::<Vec<_>>();
+            let remote_args = strip_target_argument(&argv);
+            if command_requires_remote_server(cli.command.as_ref()) {
+                ensure_remote_server_ready(&target).await?;
+            }
+            let needs_tty = command_needs_tty(cli.command.as_ref());
+            run_ssh_bmux_command(&target, &remote_args, needs_tty)
+        }
+        ResolvedTarget::Tls(target) => {
+            anyhow::bail!(
+                "TLS target '{}' currently supports 'bmux connect' and 'bmux remote test/doctor'. use 'bmux connect {} <session>'",
+                target.label,
+                target.label
+            );
+        }
+        ResolvedTarget::Local => Ok(1),
     }
-    let needs_tty = command_needs_tty(cli.command.as_ref());
-    run_ssh_bmux_command(&target, &remote_args, needs_tty)
 }
 
 fn command_requires_remote_server(command: Option<&Command>) -> bool {
@@ -105,6 +133,7 @@ fn command_requires_remote_server(command: Option<&Command>) -> bool {
         Some(Command::Server {
             command: ServerCommand::Start { .. }
                 | ServerCommand::Status { .. }
+                | ServerCommand::Gateway { .. }
                 | ServerCommand::Bridge { .. }
         })
     )
@@ -138,7 +167,7 @@ pub(super) async fn run_connect(
             } else if let Some(session) = session {
                 Some(session.to_string())
             } else {
-                resolve_remote_attach_session(&mut client, &ssh_target).await?
+                resolve_remote_attach_session(&mut client, &ssh_target.label).await?
             };
             run_remote_attach_with_reconnect(
                 client,
@@ -149,6 +178,57 @@ pub(super) async fn run_connect(
             )
             .await
         }
+        ResolvedTarget::Tls(tls_target) => {
+            let mut client = connect_tls_bridge(&tls_target, "bmux-cli-connect-remote-tls").await?;
+            let target_session = if follow.is_some() {
+                None
+            } else if let Some(session) = session {
+                Some(session.to_string())
+            } else {
+                resolve_remote_attach_session(&mut client, &tls_target.label).await?
+            };
+            run_tls_attach_with_reconnect(
+                client,
+                &tls_target,
+                target_session.as_deref(),
+                follow,
+                global,
+            )
+            .await
+        }
+    }
+}
+
+async fn run_tls_attach_with_reconnect(
+    mut client: BmuxClient,
+    target: &TlsTarget,
+    session: Option<&str>,
+    follow: Option<&str>,
+    global: bool,
+) -> Result<u8> {
+    let mut attempt = 0usize;
+    loop {
+        let outcome = run_session_attach_with_client(client, session, follow, global, None).await?;
+        if outcome.exit_reason != AttachExitReason::StreamClosed {
+            return Ok(outcome.status_code);
+        }
+        if attempt >= SSH_RECONNECT_MAX_ATTEMPTS {
+            println!(
+                "remote TLS connection closed; giving up after {} reconnect attempts",
+                SSH_RECONNECT_MAX_ATTEMPTS
+            );
+            return Ok(1);
+        }
+        attempt = attempt.saturating_add(1);
+        let backoff = Duration::from_millis(reconnect_backoff_ms(attempt));
+        println!(
+            "remote TLS connection closed; reconnecting to '{}' (attempt {attempt}/{}) in {}ms...",
+            target.label,
+            SSH_RECONNECT_MAX_ATTEMPTS,
+            backoff.as_millis()
+        );
+        tokio::time::sleep(backoff).await;
+        client = connect_tls_bridge(target, "bmux-cli-connect-remote-tls-reconnect").await?;
     }
 }
 
@@ -203,6 +283,7 @@ pub(super) fn run_remote_list(as_json: bool) -> Result<u8> {
             let transport = match value.transport {
                 ConnectionTransport::Local => "local",
                 ConnectionTransport::Ssh => "ssh",
+                ConnectionTransport::Tls => "tls",
             };
             serde_json::json!({
                 "name": name,
@@ -266,6 +347,12 @@ pub(super) async fn run_remote_test(target: &str) -> Result<u8> {
             println!("target '{}' OK (ssh)", ssh_target.label);
             Ok(0)
         }
+        ResolvedTarget::Tls(tls_target) => {
+            let mut client = connect_tls_bridge(&tls_target, "bmux-cli-remote-test-tls").await?;
+            client.ping().await.map_err(map_cli_client_error)?;
+            println!("target '{}' OK (tls)", tls_target.label);
+            Ok(0)
+        }
     }
 }
 
@@ -306,6 +393,15 @@ pub(super) async fn run_remote_doctor(target: &str) -> Result<u8> {
             println!("target '{}' doctor: OK", ssh_target.label);
             Ok(0)
         }
+        ResolvedTarget::Tls(tls_target) => {
+            let mut client = connect_tls_bridge(&tls_target, "bmux-cli-remote-doctor-tls").await?;
+            client.ping().await.map_err(map_cli_client_error)?;
+            println!(
+                "target '{}' doctor: OK (tls {}:{})",
+                tls_target.label, tls_target.host, tls_target.port
+            );
+            Ok(0)
+        }
     }
 }
 
@@ -326,16 +422,16 @@ async fn resolve_local_attach_session() -> Result<Option<String>> {
 
 async fn resolve_remote_attach_session(
     client: &mut BmuxClient,
-    target: &SshTarget,
+    target_label: &str,
 ) -> Result<Option<String>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         anyhow::bail!(
             "session argument is required in non-interactive mode.\nList sessions: bmux --target {} list-sessions",
-            target.label
+            target_label
         );
     }
     let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
-    select_session_interactively(&target.label, &sessions)
+    select_session_interactively(target_label, &sessions)
 }
 
 fn select_session_interactively(
@@ -428,6 +524,72 @@ async fn connect_remote_bridge(target: &SshTarget, client_name: &str) -> Result<
             anyhow::anyhow!(mapped)
         }
     })
+}
+
+async fn connect_tls_bridge(target: &TlsTarget, client_name: &str) -> Result<BmuxClient> {
+    let connector = build_tls_connector(target)?;
+    let address = format!("{}:{}", target.host, target.port);
+    let connect_future = TcpStream::connect(&address);
+    let tcp_stream = tokio::time::timeout(
+        Duration::from_millis(target.connect_timeout_ms.max(1)),
+        connect_future,
+    )
+    .await
+    .with_context(|| format!("timed out connecting TLS target '{}'", target.label))?
+    .with_context(|| format!("failed connecting TLS target '{}'", target.label))?;
+    let server_name = ServerName::try_from(target.server_name.clone())
+        .map_err(|_| anyhow::anyhow!("invalid TLS server name '{}'", target.server_name))?;
+    let tls_stream = connector
+        .connect(server_name, tcp_stream)
+        .await
+        .with_context(|| format!("TLS handshake failed for target '{}'", target.label))?;
+    let timeout = Duration::from_millis(target.connect_timeout_ms.max(1));
+    let principal_id = load_or_create_local_principal_id(&ConfigPaths::default())?;
+    BmuxClient::connect_with_bridge_stream(
+        ErasedIpcStream::new(Box::new(tls_stream)),
+        timeout,
+        client_name.to_string(),
+        principal_id,
+    )
+    .await
+    .map_err(map_cli_client_error)
+}
+
+fn build_tls_connector(target: &TlsTarget) -> Result<TlsConnector> {
+    let mut roots = RootCertStore::empty();
+    let native = rustls_native_certs::load_native_certs();
+    for cert in native.certs {
+        let _ = roots.add(cert);
+    }
+    if let Some(error) = native.errors.first() {
+        tracing::debug!(?error, "failed loading one or more native TLS certificates");
+    }
+
+    if let Some(ca_file) = target.ca_file.as_ref() {
+        let pem = std::fs::read(ca_file)
+            .with_context(|| format!("failed reading CA bundle {}", ca_file.display()))?;
+        let mut reader = std::io::Cursor::new(pem);
+        let certs = rustls_pemfile::certs(&mut reader)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .with_context(|| format!("failed parsing CA bundle {}", ca_file.display()))?;
+        for cert in certs {
+            roots.add(cert).with_context(|| {
+                format!("failed adding CA certificate from {}", ca_file.display())
+            })?;
+        }
+    }
+
+    if roots.is_empty() {
+        anyhow::bail!(
+            "no TLS trust roots available for target '{}'; install system certs or set ca_file",
+            target.label
+        );
+    }
+
+    let config = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    Ok(TlsConnector::from(Arc::new(config)))
 }
 
 async fn ensure_remote_server_ready(target: &SshTarget) -> Result<()> {
@@ -795,6 +957,9 @@ fn resolve_target_reference(config: &BmuxConfig, target: &str) -> Result<Resolve
     if let Some(named) = config.connections.targets.get(target) {
         return resolve_named_target(target, named);
     }
+    if target.trim().starts_with("tls://") {
+        return parse_inline_tls_target(target);
+    }
     parse_inline_ssh_target(target)
 }
 
@@ -820,6 +985,24 @@ fn resolve_named_target(name: &str, target: &ConnectionTargetConfig) -> Result<R
                 remote_bmux_path: target.remote_bmux_path.clone(),
                 connect_timeout_ms: target.connect_timeout_ms.max(1),
                 server_start_mode: target.server_start_mode,
+            }))
+        }
+        ConnectionTransport::Tls => {
+            let host = target
+                .host
+                .as_deref()
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("TLS target '{name}' requires host"))?
+                .to_string();
+            let port = target.port.unwrap_or(443);
+            let server_name = target.server_name.clone().unwrap_or_else(|| host.clone());
+            Ok(ResolvedTarget::Tls(TlsTarget {
+                label: name.to_string(),
+                host,
+                port,
+                server_name,
+                ca_file: target.ca_file.clone(),
+                connect_timeout_ms: target.connect_timeout_ms.max(1),
             }))
         }
     }
@@ -862,6 +1045,36 @@ fn parse_inline_ssh_target(target: &str) -> Result<ResolvedTarget> {
         remote_bmux_path: "bmux".to_string(),
         connect_timeout_ms: 8_000,
         server_start_mode: RemoteServerStartMode::Auto,
+    }))
+}
+
+fn parse_inline_tls_target(target: &str) -> Result<ResolvedTarget> {
+    let raw = target
+        .trim()
+        .strip_prefix("tls://")
+        .ok_or_else(|| anyhow::anyhow!("TLS target must start with tls://"))?;
+    let (host, port) = if let Some((host, port_raw)) = raw.rsplit_once(':') {
+        if port_raw.is_empty() {
+            (raw.to_string(), 443)
+        } else {
+            let parsed = port_raw
+                .parse::<u16>()
+                .with_context(|| format!("invalid TLS port in target '{target}'"))?;
+            (host.to_string(), parsed)
+        }
+    } else {
+        (raw.to_string(), 443)
+    };
+    if host.trim().is_empty() {
+        anyhow::bail!("TLS target must include a host");
+    }
+    Ok(ResolvedTarget::Tls(TlsTarget {
+        label: target.to_string(),
+        host: host.clone(),
+        port,
+        server_name: host,
+        ca_file: None,
+        connect_timeout_ms: 8_000,
     }))
 }
 
@@ -921,6 +1134,16 @@ mod tests {
     }
 
     #[test]
+    fn parse_inline_tls_target_accepts_host_and_default_port() {
+        let resolved = parse_inline_tls_target("tls://example.com").expect("parse tls target");
+        let ResolvedTarget::Tls(tls) = resolved else {
+            panic!("expected tls target");
+        };
+        assert_eq!(tls.host, "example.com");
+        assert_eq!(tls.port, 443);
+    }
+
+    #[test]
     fn map_ssh_execution_error_highlights_auth_failures() {
         let error = map_ssh_execution_error(&sample_target(), "Permission denied (publickey)");
         assert!(error.to_string().contains("authentication failed"));
@@ -932,6 +1155,18 @@ mod tests {
             command: ServerCommand::Start {
                 daemon: false,
                 foreground_internal: false,
+            },
+        };
+        assert!(!command_requires_remote_server(Some(&command)));
+    }
+
+    #[test]
+    fn command_requires_remote_server_skips_server_gateway() {
+        let command = Command::Server {
+            command: ServerCommand::Gateway {
+                listen: "0.0.0.0:7443".to_string(),
+                cert_file: "cert.pem".to_string(),
+                key_file: "key.pem".to_string(),
             },
         };
         assert!(!command_requires_remote_server(Some(&command)));

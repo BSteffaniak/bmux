@@ -724,6 +724,18 @@ pub enum ServerCommand {
     },
     /// Request graceful server shutdown
     Stop,
+    /// Run a TLS gateway that exposes bmux over TCP/TLS
+    Gateway {
+        /// Listen address (host:port)
+        #[arg(long)]
+        listen: String,
+        /// PEM encoded certificate chain path
+        #[arg(long)]
+        cert_file: String,
+        /// PEM encoded private key path (PKCS8)
+        #[arg(long)]
+        key_file: String,
+    },
     /// Internal stdio bridge used by SSH transport
     #[command(hide = true)]
     Bridge {
@@ -948,6 +960,33 @@ mod tests {
                 daemon: false,
                 foreground_internal: false
             }
+        ));
+    }
+
+    #[test]
+    fn parses_server_gateway_command() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "server",
+            "gateway",
+            "--listen",
+            "0.0.0.0:7443",
+            "--cert-file",
+            "cert.pem",
+            "--key-file",
+            "key.pem",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Gateway {
+                listen,
+                cert_file,
+                key_file,
+            } if listen == "0.0.0.0:7443" && cert_file == "cert.pem" && key_file == "key.pem"
         ));
     }
 

@@ -1,7 +1,12 @@
 use super::*;
 use bmux_ipc::IpcEndpoint;
 use bmux_ipc::transport::LocalIpcStream;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer};
+use rustls_pemfile::{certs, pkcs8_private_keys};
+use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 
 #[derive(Debug, serde::Serialize)]
 pub(super) struct ServerStatusJsonPayload {
@@ -343,6 +348,97 @@ pub(super) async fn run_server_bridge(stdio: bool, preflight: bool) -> Result<u8
     to_server_result.context("bridge stdin copy failed")?;
     from_server_result.context("bridge stdout copy failed")?;
     Ok(0)
+}
+
+pub(super) async fn run_server_gateway(
+    listen: &str,
+    cert_file: &str,
+    key_file: &str,
+) -> Result<u8> {
+    let cert_chain = load_cert_chain(cert_file)?;
+    let private_key = load_private_key(key_file)?;
+    let tls_config = rustls::ServerConfig::builder()
+        .with_no_client_auth()
+        .with_single_cert(cert_chain, private_key)
+        .context("failed building TLS server config")?;
+    let acceptor = TlsAcceptor::from(Arc::new(tls_config));
+    let listener = TcpListener::bind(listen)
+        .await
+        .with_context(|| format!("failed binding TLS gateway on {listen}"))?;
+
+    println!("bmux TLS gateway listening on {listen}");
+    loop {
+        let (tcp_stream, peer_addr) = listener
+            .accept()
+            .await
+            .context("failed accepting TLS gateway connection")?;
+        let acceptor = acceptor.clone();
+        tokio::spawn(async move {
+            if let Err(error) = handle_gateway_connection(acceptor, tcp_stream).await {
+                tracing::warn!(peer = %peer_addr, ?error, "tls gateway connection failed");
+            }
+        });
+    }
+}
+
+async fn handle_gateway_connection(
+    acceptor: TlsAcceptor,
+    tcp_stream: tokio::net::TcpStream,
+) -> Result<()> {
+    let tls_stream = acceptor
+        .accept(tcp_stream)
+        .await
+        .context("TLS accept failed")?;
+    let endpoint = local_endpoint_from_paths(&ConfigPaths::default());
+    let ipc_stream = LocalIpcStream::connect(&endpoint)
+        .await
+        .context("failed connecting local IPC endpoint for TLS gateway")?;
+    let (mut tls_read, mut tls_write) = tokio::io::split(tls_stream);
+    let (mut ipc_read, mut ipc_write) = tokio::io::split(ipc_stream);
+
+    let inbound = tokio::spawn(async move {
+        tokio::io::copy(&mut tls_read, &mut ipc_write).await?;
+        ipc_write.shutdown().await?;
+        Ok::<(), std::io::Error>(())
+    });
+    let outbound = tokio::spawn(async move {
+        tokio::io::copy(&mut ipc_read, &mut tls_write).await?;
+        tls_write.shutdown().await?;
+        Ok::<(), std::io::Error>(())
+    });
+
+    let inbound_result: std::io::Result<()> = inbound.await.context("TLS inbound task failed")?;
+    let outbound_result: std::io::Result<()> =
+        outbound.await.context("TLS outbound task failed")?;
+    inbound_result.context("TLS inbound copy failed")?;
+    outbound_result.context("TLS outbound copy failed")?;
+    Ok(())
+}
+
+fn load_cert_chain(path: &str) -> Result<Vec<CertificateDer<'static>>> {
+    let pem =
+        std::fs::read(path).with_context(|| format!("failed reading certificate file {path}"))?;
+    let mut reader = std::io::Cursor::new(pem);
+    let chain = certs(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed parsing PEM certificates from {path}"))?;
+    if chain.is_empty() {
+        anyhow::bail!("certificate file {path} did not contain any certificates");
+    }
+    Ok(chain)
+}
+
+fn load_private_key(path: &str) -> Result<PrivateKeyDer<'static>> {
+    let pem =
+        std::fs::read(path).with_context(|| format!("failed reading private key file {path}"))?;
+    let mut reader = std::io::Cursor::new(pem);
+    let keys = pkcs8_private_keys(&mut reader)
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .with_context(|| format!("failed parsing PEM private key from {path}"))?;
+    let Some(key) = keys.into_iter().next() else {
+        anyhow::bail!("private key file {path} did not contain a PKCS8 private key");
+    };
+    Ok(PrivateKeyDer::from(key))
 }
 
 fn local_endpoint_from_paths(paths: &ConfigPaths) -> IpcEndpoint {

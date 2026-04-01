@@ -67,6 +67,10 @@ bmux remote list
 bmux remote test prod
 bmux --target prod list-sessions
 
+# Internet-accessible TLS gateway
+bmux server gateway --listen 0.0.0.0:7443 --cert-file cert.pem --key-file key.pem
+bmux connect tls-prod app
+
 # Logging
 bmux logs path
 bmux logs level
@@ -117,6 +121,13 @@ jump = "ops@bastion.example.com"
 remote_bmux_path = "bmux"
 connect_timeout_ms = 8000
 default_session = "main"
+
+[connections.targets.tls-prod]
+transport = "tls"
+host = "gateway.example.com"
+port = 7443
+server_name = "gateway.example.com"
+ca_file = "~/.config/bmux/gateway-ca.pem"
 ```
 
 Plugin command ownership policy is optional and declarative:
