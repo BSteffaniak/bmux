@@ -33,6 +33,7 @@ pub(crate) async fn run_session_attach_with_client(
     };
     let attach_keymap = attach_keymap_from_config(&attach_config);
     let attach_help_lines = build_attach_help_lines(&attach_config);
+    let global_theme = bmux_config::ThemeConfig::default();
 
     if let Some(leader_client_id) = follow_target_id {
         client
@@ -275,6 +276,7 @@ pub(crate) async fn run_session_attach_with_client(
             &mut view_state,
             &layout_state,
             &attach_config.status_bar,
+            &global_theme,
             follow_target_id,
             global,
             &attach_keymap,
@@ -1323,6 +1325,7 @@ pub(crate) async fn build_attach_status_line_for_draw(
     client: &mut BmuxClient,
     view_state: &mut AttachViewState,
     status_config: &bmux_config::StatusBarConfig,
+    global_theme: &bmux_config::ThemeConfig,
     context_id: Option<Uuid>,
     session_id: Uuid,
     can_write: bool,
@@ -1383,6 +1386,7 @@ pub(crate) async fn build_attach_status_line_for_draw(
     let status_line = build_attach_status_line(
         cols,
         status_config,
+        global_theme,
         &session_label,
         session_count,
         &current_context_label,
@@ -1730,6 +1734,7 @@ pub(crate) async fn render_attach_frame(
     view_state: &mut AttachViewState,
     layout_state: &AttachLayoutState,
     status_config: &bmux_config::StatusBarConfig,
+    global_theme: &bmux_config::ThemeConfig,
     follow_target_id: Option<Uuid>,
     follow_global: bool,
     keymap: &crate::input::Keymap,
@@ -1745,6 +1750,7 @@ pub(crate) async fn render_attach_frame(
                 client,
                 view_state,
                 status_config,
+                global_theme,
                 view_state.attached_context_id,
                 view_state.attached_id,
                 view_state.can_write,

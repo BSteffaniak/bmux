@@ -243,6 +243,17 @@ bold_active = false\n\
 underline_active = false\n\
 ```\n\n",
     );
+    doc.push_str("### Status Theme Override (partial)\n\n");
+    doc.push_str(
+        "```toml\n\
+[status_bar.theme]\n\
+# Unset fields inherit from the global appearance theme defaults\n\
+tab_active_bg = \"#7aa2f7\"\n\
+tab_active_fg = \"#1a1b26\"\n\
+tab_inactive_bg = \"#2a2f45\"\n\
+module_bg = \"#343a55\"\n\
+```\n\n",
+    );
     doc.push_str(&render_recording_section());
 
     doc

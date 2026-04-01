@@ -1,6 +1,6 @@
 use bmux_config::{
     StatusAlignActive, StatusBarConfig, StatusBarPreset, StatusDensity, StatusHintPolicy,
-    StatusOverflowStyle, StatusSeparatorSet,
+    StatusOverflowStyle, StatusSeparatorSet, ThemeConfig,
 };
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
@@ -27,6 +27,7 @@ pub struct AttachStatusLine {
 pub fn build_attach_status_line(
     width: u16,
     config: &StatusBarConfig,
+    global_theme: &ThemeConfig,
     session_label: &str,
     session_count: usize,
     current_context_label: &str,
@@ -43,12 +44,22 @@ pub fn build_attach_status_line(
             tab_hitboxes: Vec::new(),
         };
     }
+
     let style = StatusRenderStyle::from_config(config);
+    let resolved_theme = ResolvedStatusTheme::resolve(config, global_theme);
     let mut left = String::new();
     let mut tab_hitboxes = Vec::new();
+    let mut overflow_ranges = Vec::new();
     left.push_str(&" ".repeat(config.layout.left_padding));
 
-    append_tabs(&mut left, &mut tab_hitboxes, config, tabs, &style);
+    append_tabs(
+        &mut left,
+        &mut tab_hitboxes,
+        &mut overflow_ranges,
+        config,
+        tabs,
+        &style,
+    );
 
     if config.show_session_name {
         append_segment(
@@ -88,8 +99,19 @@ pub fn build_attach_status_line(
         right.push_str(&" ".repeat(config.layout.right_padding));
     }
 
-    let rendered = compose_status_line(width, &left, &right);
+    let composed = compose_status_line(width, &left, &right);
     clamp_hitboxes_to_width(&mut tab_hitboxes, width);
+
+    let rendered = stylize_status_line(
+        &composed.rendered,
+        width,
+        config,
+        &resolved_theme,
+        tabs,
+        &tab_hitboxes,
+        &overflow_ranges,
+        composed.right_start_col,
+    );
 
     AttachStatusLine {
         rendered,
@@ -108,6 +130,7 @@ fn hint_allowed(policy: StatusHintPolicy, mode_label: &str) -> bool {
 fn append_tabs(
     out: &mut String,
     hitboxes: &mut Vec<AttachStatusTabHitbox>,
+    overflow_ranges: &mut Vec<(usize, usize)>,
     config: &StatusBarConfig,
     tabs: &[AttachTab],
     style: &StatusRenderStyle,
@@ -119,15 +142,17 @@ fn append_tabs(
 
     let max_tabs = config.max_tabs.max(1);
     let (visible, hidden_left, hidden_right) = visible_tabs_for_layout(tabs, max_tabs, config);
-    let mut col = 0usize;
+    let mut col = display_width(out);
 
     if hidden_left > 0 {
         let marker = style.overflow_marker(hidden_left);
+        let start = col;
         out.push_str(&marker);
+        col = col.saturating_add(display_width(&marker));
+        let end = col.saturating_sub(1);
+        overflow_ranges.push((start, end));
         out.push_str(&style.tab_separator);
-        col = col
-            .saturating_add(display_width(&marker))
-            .saturating_add(display_width(&style.tab_separator));
+        col = col.saturating_add(display_width(&style.tab_separator));
     }
 
     for (index, tab) in visible.iter().enumerate() {
@@ -164,7 +189,13 @@ fn append_tabs(
 
     if hidden_right > 0 {
         out.push_str(&style.tab_separator);
-        out.push_str(&style.overflow_marker(hidden_right));
+        col = col.saturating_add(display_width(&style.tab_separator));
+        let marker = style.overflow_marker(hidden_right);
+        let start = col;
+        out.push_str(&marker);
+        col = col.saturating_add(display_width(&marker));
+        let end = col.saturating_sub(1);
+        overflow_ranges.push((start, end));
     }
 }
 
@@ -235,7 +266,7 @@ impl StatusRenderStyle {
             badge_left,
             badge_right,
         ) = match config.preset {
-            StatusBarPreset::TabRail => ("[", "]", " ", " ", "{", "}"),
+            StatusBarPreset::TabRail => (" ", " ", " ", " ", " ", " "),
             StatusBarPreset::Minimal => ("", "", "", "", "", ""),
             StatusBarPreset::Classic => ("(", ")", " ", " ", "[", "]"),
         };
@@ -295,26 +326,327 @@ fn append_segment(out: &mut String, separator: &str, value: &str) {
     }
 }
 
-fn compose_status_line(width: u16, left: &str, right: &str) -> String {
+struct ComposedStatusLine {
+    rendered: String,
+    right_start_col: Option<usize>,
+}
+
+fn compose_status_line(width: u16, left: &str, right: &str) -> ComposedStatusLine {
     let width = usize::from(width);
     if width == 0 {
-        return String::new();
+        return ComposedStatusLine {
+            rendered: String::new(),
+            right_start_col: None,
+        };
     }
 
     if right.is_empty() {
-        return pad_or_truncate(left, width);
+        return ComposedStatusLine {
+            rendered: pad_or_truncate(left, width),
+            right_start_col: None,
+        };
     }
 
     let right_width = display_width(right);
     if right_width >= width {
-        return truncate_cells(right, width);
+        return ComposedStatusLine {
+            rendered: truncate_cells(right, width),
+            right_start_col: Some(0),
+        };
     }
 
     let available_left = width.saturating_sub(right_width + 1);
     let left_trimmed = truncate_cells(left, available_left);
     let left_width = display_width(&left_trimmed);
     let spacer = " ".repeat(width.saturating_sub(left_width + right_width));
-    format!("{left_trimmed}{spacer}{right}")
+    ComposedStatusLine {
+        rendered: format!("{left_trimmed}{spacer}{right}"),
+        right_start_col: Some(width.saturating_sub(right_width)),
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SegmentKind {
+    Base,
+    ActiveTab,
+    InactiveTab,
+    Module,
+    Overflow,
+}
+
+#[derive(Clone, Copy)]
+struct RgbColor {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+#[derive(Clone, Copy)]
+struct SegmentStyle {
+    fg: RgbColor,
+    bg: RgbColor,
+    bold: bool,
+    dim: bool,
+    underline: bool,
+}
+
+struct ResolvedStatusTheme {
+    base: SegmentStyle,
+    active_tab: SegmentStyle,
+    inactive_tab: SegmentStyle,
+    module: SegmentStyle,
+    overflow: SegmentStyle,
+}
+
+impl ResolvedStatusTheme {
+    fn resolve(config: &StatusBarConfig, global_theme: &ThemeConfig) -> Self {
+        let fallback_bar_bg =
+            parse_hex_color(&global_theme.status.background).unwrap_or(RgbColor {
+                r: 30,
+                g: 30,
+                b: 30,
+            });
+        let fallback_bar_fg =
+            parse_hex_color(&global_theme.status.foreground).unwrap_or(RgbColor {
+                r: 220,
+                g: 220,
+                b: 220,
+            });
+        let fallback_active_bg =
+            parse_hex_color(&global_theme.status.active_window).unwrap_or(RgbColor {
+                r: 110,
+                g: 170,
+                b: 240,
+            });
+        let fallback_active_fg = parse_hex_color(&global_theme.background).unwrap_or(RgbColor {
+            r: 20,
+            g: 20,
+            b: 20,
+        });
+
+        let bar_bg = config
+            .theme
+            .bar_bg
+            .as_deref()
+            .and_then(parse_hex_color)
+            .unwrap_or(fallback_bar_bg);
+        let bar_fg = config
+            .theme
+            .bar_fg
+            .as_deref()
+            .and_then(parse_hex_color)
+            .unwrap_or(fallback_bar_fg);
+        let active_bg = config
+            .theme
+            .tab_active_bg
+            .as_deref()
+            .and_then(parse_hex_color)
+            .unwrap_or(fallback_active_bg);
+        let active_fg = config
+            .theme
+            .tab_active_fg
+            .as_deref()
+            .and_then(parse_hex_color)
+            .unwrap_or(fallback_active_fg);
+        let inactive_bg = config
+            .theme
+            .tab_inactive_bg
+            .as_deref()
+            .and_then(parse_hex_color)
+            .unwrap_or(adjust_rgb(bar_bg, 18));
+        let inactive_fg = config
+            .theme
+            .tab_inactive_fg
+            .as_deref()
+            .and_then(parse_hex_color)
+            .unwrap_or(bar_fg);
+        let module_bg = config
+            .theme
+            .module_bg
+            .as_deref()
+            .and_then(parse_hex_color)
+            .unwrap_or(adjust_rgb(bar_bg, 10));
+        let module_fg = config
+            .theme
+            .module_fg
+            .as_deref()
+            .and_then(parse_hex_color)
+            .unwrap_or(bar_fg);
+        let overflow_bg = config
+            .theme
+            .overflow_bg
+            .as_deref()
+            .and_then(parse_hex_color)
+            .unwrap_or(adjust_rgb(bar_bg, 26));
+        let overflow_fg = config
+            .theme
+            .overflow_fg
+            .as_deref()
+            .and_then(parse_hex_color)
+            .unwrap_or(bar_fg);
+
+        Self {
+            base: SegmentStyle {
+                fg: bar_fg,
+                bg: bar_bg,
+                bold: false,
+                dim: false,
+                underline: false,
+            },
+            active_tab: SegmentStyle {
+                fg: active_fg,
+                bg: active_bg,
+                bold: config.style.bold_active,
+                dim: false,
+                underline: config.style.underline_active,
+            },
+            inactive_tab: SegmentStyle {
+                fg: inactive_fg,
+                bg: inactive_bg,
+                bold: false,
+                dim: config.style.dim_inactive,
+                underline: false,
+            },
+            module: SegmentStyle {
+                fg: module_fg,
+                bg: module_bg,
+                bold: false,
+                dim: false,
+                underline: false,
+            },
+            overflow: SegmentStyle {
+                fg: overflow_fg,
+                bg: overflow_bg,
+                bold: false,
+                dim: false,
+                underline: false,
+            },
+        }
+    }
+}
+
+fn stylize_status_line(
+    rendered_plain: &str,
+    width: u16,
+    config: &StatusBarConfig,
+    theme: &ResolvedStatusTheme,
+    tabs: &[AttachTab],
+    hitboxes: &[AttachStatusTabHitbox],
+    overflow_ranges: &[(usize, usize)],
+    right_start_col: Option<usize>,
+) -> String {
+    let width = usize::from(width);
+    if width == 0 {
+        return String::new();
+    }
+
+    let mut segments = vec![SegmentKind::Base; width];
+    if let Some(start) = right_start_col {
+        for col in start.min(width)..width {
+            segments[col] = SegmentKind::Module;
+        }
+    }
+
+    for (start, end) in overflow_ranges {
+        if *start >= width {
+            continue;
+        }
+        for col in *start..=(*end).min(width.saturating_sub(1)) {
+            segments[col] = SegmentKind::Overflow;
+        }
+    }
+
+    for hitbox in hitboxes {
+        let kind = tabs
+            .iter()
+            .find(|tab| tab.context_id == Some(hitbox.context_id))
+            .map(|tab| {
+                if tab.active {
+                    SegmentKind::ActiveTab
+                } else {
+                    SegmentKind::InactiveTab
+                }
+            })
+            .unwrap_or(SegmentKind::InactiveTab);
+        let start = usize::from(hitbox.start_col).min(width.saturating_sub(1));
+        let end = usize::from(hitbox.end_col).min(width.saturating_sub(1));
+        for col in start..=end {
+            segments[col] = kind;
+        }
+    }
+
+    let mut rendered = String::new();
+    let mut current_style = None;
+    let mut col = 0usize;
+    for ch in rendered_plain.chars() {
+        let char_width = UnicodeWidthChar::width(ch).unwrap_or(0);
+        if char_width == 0 {
+            rendered.push(ch);
+            continue;
+        }
+        if col >= width {
+            break;
+        }
+        let style = style_for_segment(segments[col], config, theme);
+        if current_style != Some(segments[col]) {
+            rendered.push_str(&style_sgr(style));
+            current_style = Some(segments[col]);
+        }
+        rendered.push(ch);
+        col = col.saturating_add(char_width);
+    }
+    rendered.push_str("\x1b[0m");
+    rendered
+}
+
+fn style_for_segment(
+    segment: SegmentKind,
+    _config: &StatusBarConfig,
+    theme: &ResolvedStatusTheme,
+) -> SegmentStyle {
+    match segment {
+        SegmentKind::Base => theme.base,
+        SegmentKind::ActiveTab => theme.active_tab,
+        SegmentKind::InactiveTab => theme.inactive_tab,
+        SegmentKind::Module => theme.module,
+        SegmentKind::Overflow => theme.overflow,
+    }
+}
+
+fn style_sgr(style: SegmentStyle) -> String {
+    let mut parts = vec!["0".to_string()];
+    if style.bold {
+        parts.push("1".to_string());
+    }
+    if style.dim {
+        parts.push("2".to_string());
+    }
+    if style.underline {
+        parts.push("4".to_string());
+    }
+    parts.push(format!("38;2;{};{};{}", style.fg.r, style.fg.g, style.fg.b));
+    parts.push(format!("48;2;{};{};{}", style.bg.r, style.bg.g, style.bg.b));
+    format!("\x1b[{}m", parts.join(";"))
+}
+
+fn parse_hex_color(value: &str) -> Option<RgbColor> {
+    let hex = value.strip_prefix('#').unwrap_or(value);
+    if hex.len() != 6 {
+        return None;
+    }
+    let r = u8::from_str_radix(&hex[0..2], 16).ok()?;
+    let g = u8::from_str_radix(&hex[2..4], 16).ok()?;
+    let b = u8::from_str_radix(&hex[4..6], 16).ok()?;
+    Some(RgbColor { r, g, b })
+}
+
+fn adjust_rgb(value: RgbColor, delta: i16) -> RgbColor {
+    let adjust = |channel: u8| -> u8 { (i16::from(channel) + delta).clamp(0, 255) as u8 };
+    RgbColor {
+        r: adjust(value.r),
+        g: adjust(value.g),
+        b: adjust(value.b),
+    }
 }
 
 fn pad_or_truncate(value: &str, width: usize) -> String {

@@ -476,6 +476,8 @@ pub struct StatusBarConfig {
     pub layout: StatusBarLayoutConfig,
     /// Separator and emphasis options.
     pub style: StatusBarStyleConfig,
+    /// Optional status-specific color overrides.
+    pub theme: StatusBarThemeConfig,
     /// Maximum number of tabs shown in the tab strip before overflow is collapsed.
     pub max_tabs: usize,
     /// Maximum display width for each tab label.
@@ -509,6 +511,7 @@ impl Default for StatusBarConfig {
             preset: StatusBarPreset::TabRail,
             layout: StatusBarLayoutConfig::default(),
             style: StatusBarStyleConfig::default(),
+            theme: StatusBarThemeConfig::default(),
             max_tabs: 12,
             tab_label_max_width: 20,
             show_tab_index: true,
@@ -522,6 +525,38 @@ impl Default for StatusBarConfig {
             show_hint: true,
             hint_policy: StatusHintPolicy::ScrollOnly,
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc, Default)]
+#[serde(default)]
+pub struct StatusBarThemeConfig {
+    /// Bar background color (hex `#RRGGBB`).
+    pub bar_bg: Option<String>,
+    /// Bar foreground color (hex `#RRGGBB`).
+    pub bar_fg: Option<String>,
+    /// Active tab background color (hex `#RRGGBB`).
+    pub tab_active_bg: Option<String>,
+    /// Active tab foreground color (hex `#RRGGBB`).
+    pub tab_active_fg: Option<String>,
+    /// Inactive tab background color (hex `#RRGGBB`).
+    pub tab_inactive_bg: Option<String>,
+    /// Inactive tab foreground color (hex `#RRGGBB`).
+    pub tab_inactive_fg: Option<String>,
+    /// Right-side module background color (hex `#RRGGBB`).
+    pub module_bg: Option<String>,
+    /// Right-side module foreground color (hex `#RRGGBB`).
+    pub module_fg: Option<String>,
+    /// Overflow marker background color (hex `#RRGGBB`).
+    pub overflow_bg: Option<String>,
+    /// Overflow marker foreground color (hex `#RRGGBB`).
+    pub overflow_fg: Option<String>,
+}
+
+impl StatusBarThemeConfig {
+    #[must_use]
+    pub const fn config_doc_values() -> &'static [&'static str] {
+        &[]
     }
 }
 
