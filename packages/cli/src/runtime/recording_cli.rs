@@ -5,28 +5,51 @@ pub(super) async fn run_recording_start(
     capture_input: bool,
     profile: Option<RecordingProfileArg>,
     event_kinds: &[RecordingEventKindArg],
+    connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
-    recording::run_recording_start(session_id, capture_input, profile, event_kinds).await
+    recording::run_recording_start(
+        session_id,
+        capture_input,
+        profile,
+        event_kinds,
+        connection_context,
+    )
+    .await
 }
 
-pub(super) async fn run_recording_stop(recording_id: Option<&str>) -> Result<u8> {
-    recording::run_recording_stop(recording_id).await
+pub(super) async fn run_recording_stop(
+    recording_id: Option<&str>,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
+    recording::run_recording_stop(recording_id, connection_context).await
 }
 
-pub(super) async fn run_recording_status(as_json: bool) -> Result<u8> {
-    recording::run_recording_status(as_json).await
+pub(super) async fn run_recording_status(
+    as_json: bool,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
+    recording::run_recording_status(as_json, connection_context).await
 }
 
-pub(super) async fn run_recording_list(as_json: bool) -> Result<u8> {
-    recording::run_recording_list(as_json).await
+pub(super) async fn run_recording_list(
+    as_json: bool,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
+    recording::run_recording_list(as_json, connection_context).await
 }
 
-pub(super) async fn run_recording_delete(recording_id_or_prefix: &str) -> Result<u8> {
-    recording::run_recording_delete(recording_id_or_prefix).await
+pub(super) async fn run_recording_delete(
+    recording_id_or_prefix: &str,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
+    recording::run_recording_delete(recording_id_or_prefix, connection_context).await
 }
 
-pub(super) async fn run_recording_delete_all(yes: bool) -> Result<u8> {
-    recording::run_recording_delete_all(yes).await
+pub(super) async fn run_recording_delete_all(
+    yes: bool,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
+    recording::run_recording_delete_all(yes, connection_context).await
 }
 
 pub(super) fn run_recording_inspect(

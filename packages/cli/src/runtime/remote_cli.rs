@@ -238,7 +238,13 @@ pub(super) async fn run_connect(
             } else {
                 resolve_local_attach_session().await?
             };
-            let status = run_session_attach(target_session.as_deref(), follow, global).await?;
+            let status = run_session_attach(
+                target_session.as_deref(),
+                follow,
+                global,
+                ConnectionContext::new(Some("local")),
+            )
+            .await?;
             if status == 0 {
                 remember_recent_selection("local", target_session.as_deref())?;
             }
@@ -1458,9 +1464,10 @@ pub(super) async fn run_remote_complete_sessions(target: &str) -> Result<u8> {
     let resolved = resolve_target_reference(&config, target).await?;
     let mut client = match resolved {
         ResolvedTarget::Local => {
-            connect(
+            connect_with_context(
                 ConnectionPolicyScope::Normal,
                 "bmux-cli-complete-sessions-local",
+                ConnectionContext::new(Some("local")),
             )
             .await?
         }
@@ -1497,9 +1504,10 @@ async fn resolve_local_attach_session() -> Result<Option<String>> {
             "session argument is required in non-interactive mode.\nList sessions: bmux list-sessions"
         );
     }
-    let mut client = connect(
+    let mut client = connect_with_context(
         ConnectionPolicyScope::Normal,
         "bmux-cli-connect-local-picker",
+        ConnectionContext::new(Some("local")),
     )
     .await?;
     let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;

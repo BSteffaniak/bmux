@@ -24,9 +24,12 @@ pub(super) struct ServerStatusJsonPayload {
     stale_warning: Option<String>,
 }
 
-pub(super) async fn run_server_status(as_json: bool) -> Result<u8> {
+pub(super) async fn run_server_status(
+    as_json: bool,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
     cleanup_stale_pid_file().await?;
-    let status = fetch_server_status().await?;
+    let status = fetch_server_status(connection_context).await?;
     let metadata = read_server_runtime_metadata()?;
     let current_build_id = current_cli_build_id().ok();
     let stale_warning = metadata.as_ref().and_then(|entry| {
@@ -44,7 +47,9 @@ pub(super) async fn run_server_status(as_json: bool) -> Result<u8> {
 
     if as_json {
         let latest_event = if matches!(status, Some(ref s) if s.running) {
-            latest_server_event_name().await?.map(str::to_string)
+            latest_server_event_name(connection_context)
+                .await?
+                .map(str::to_string)
         } else {
             None
         };
@@ -73,7 +78,7 @@ pub(super) async fn run_server_status(as_json: bool) -> Result<u8> {
 
     match status {
         Some(status) if status.running => {
-            if let Some(event_name) = latest_server_event_name().await? {
+            if let Some(event_name) = latest_server_event_name(connection_context).await? {
                 println!("latest server event: {event_name}");
             }
             if let Some(metadata) = metadata.as_ref() {
@@ -153,9 +158,13 @@ pub(super) struct ServerWhoAmIPrincipalJsonPayload {
     force_local_permitted: bool,
 }
 
-pub(super) async fn run_server_whoami_principal(as_json: bool) -> Result<u8> {
+pub(super) async fn run_server_whoami_principal(
+    as_json: bool,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
     cleanup_stale_pid_file().await?;
-    let mut client = connect_raw("bmux-cli-server-whoami-principal").await?;
+    let mut client =
+        connect_raw_with_context("bmux-cli-server-whoami-principal", connection_context).await?;
     let identity = client
         .whoami_principal()
         .await
@@ -191,9 +200,14 @@ pub(super) async fn run_server_whoami_principal(as_json: bool) -> Result<u8> {
     Ok(0)
 }
 
-pub(super) async fn run_server_save() -> Result<u8> {
+pub(super) async fn run_server_save(connection_context: ConnectionContext<'_>) -> Result<u8> {
     cleanup_stale_pid_file().await?;
-    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-server-save").await?;
+    let mut client = connect_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-server-save",
+        connection_context,
+    )
+    .await?;
     let path = client.server_save().await.map_err(map_cli_client_error)?;
 
     match path {
@@ -203,16 +217,21 @@ pub(super) async fn run_server_save() -> Result<u8> {
     Ok(0)
 }
 
-pub(super) async fn run_server_restore(dry_run: bool, yes: bool) -> Result<u8> {
+pub(super) async fn run_server_restore(
+    dry_run: bool,
+    yes: bool,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
     if !dry_run && !yes {
         anyhow::bail!("server restore requires either --dry-run or --yes");
     }
     cleanup_stale_pid_file().await?;
 
     if dry_run {
-        let mut client = connect(
+        let mut client = connect_with_context(
             ConnectionPolicyScope::Normal,
             "bmux-cli-server-restore-dry-run",
+            connection_context,
         )
         .await?;
         let (ok, message) = client
@@ -228,9 +247,10 @@ pub(super) async fn run_server_restore(dry_run: bool, yes: bool) -> Result<u8> {
         return Ok(1);
     }
 
-    let mut client = connect(
+    let mut client = connect_with_context(
         ConnectionPolicyScope::Normal,
         "bmux-cli-server-restore-apply",
+        connection_context,
     )
     .await?;
     let summary = client
@@ -245,9 +265,14 @@ pub(super) async fn run_server_restore(dry_run: bool, yes: bool) -> Result<u8> {
     Ok(0)
 }
 
-pub(super) async fn latest_server_event_name() -> Result<Option<&'static str>> {
-    let connect =
-        tokio::time::timeout(SERVER_STATUS_TIMEOUT, connect_raw("bmux-cli-status-events")).await;
+pub(super) async fn latest_server_event_name(
+    connection_context: ConnectionContext<'_>,
+) -> Result<Option<&'static str>> {
+    let connect = tokio::time::timeout(
+        SERVER_STATUS_TIMEOUT,
+        connect_raw_with_context("bmux-cli-status-events", connection_context),
+    )
+    .await;
 
     let mut client = match connect {
         Ok(Ok(client)) => client,
@@ -279,16 +304,20 @@ pub(super) const fn server_event_name(event: &bmux_client::ServerEvent) -> &'sta
     }
 }
 
-pub(super) async fn run_server_stop() -> Result<u8> {
+pub(super) async fn run_server_stop(connection_context: ConnectionContext<'_>) -> Result<u8> {
     cleanup_stale_pid_file().await?;
-    let graceful_stopped =
-        match tokio::time::timeout(SERVER_STOP_TIMEOUT, connect_raw("bmux-cli-stop")).await {
-            Ok(Ok(mut client)) => {
-                client.stop_server().await.map_err(map_cli_client_error)?;
-                wait_until_server_stopped(SERVER_STOP_TIMEOUT).await?
-            }
-            Ok(Err(_)) | Err(_) => false,
-        };
+    let graceful_stopped = match tokio::time::timeout(
+        SERVER_STOP_TIMEOUT,
+        connect_raw_with_context("bmux-cli-stop", connection_context),
+    )
+    .await
+    {
+        Ok(Ok(mut client)) => {
+            client.stop_server().await.map_err(map_cli_client_error)?;
+            wait_until_server_stopped(SERVER_STOP_TIMEOUT, connection_context).await?
+        }
+        Ok(Err(_)) | Err(_) => false,
+    };
 
     if graceful_stopped {
         println!("bmux server stopped gracefully");

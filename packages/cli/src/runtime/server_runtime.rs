@@ -1,17 +1,25 @@
 use super::*;
 
-pub(super) async fn server_is_running() -> Result<bool> {
-    probe_server_running().await
+pub(super) async fn server_is_running(connection_context: ConnectionContext<'_>) -> Result<bool> {
+    probe_server_running(connection_context).await
 }
 
-pub(super) async fn probe_server_running() -> Result<bool> {
-    Ok(fetch_server_status()
+pub(super) async fn probe_server_running(
+    connection_context: ConnectionContext<'_>,
+) -> Result<bool> {
+    Ok(fetch_server_status(connection_context)
         .await?
         .is_some_and(|status| status.running))
 }
 
-pub(super) async fn fetch_server_status() -> Result<Option<bmux_client::ServerStatusInfo>> {
-    let connect = tokio::time::timeout(SERVER_STATUS_TIMEOUT, connect_raw("bmux-cli-status")).await;
+pub(super) async fn fetch_server_status(
+    connection_context: ConnectionContext<'_>,
+) -> Result<Option<bmux_client::ServerStatusInfo>> {
+    let connect = tokio::time::timeout(
+        SERVER_STATUS_TIMEOUT,
+        connect_raw_with_context("bmux-cli-status", connection_context),
+    )
+    .await;
 
     let mut client = match connect {
         Ok(Ok(client)) => client,
@@ -24,11 +32,17 @@ pub(super) async fn fetch_server_status() -> Result<Option<bmux_client::ServerSt
     }
 }
 
-pub(super) async fn wait_for_server_running(timeout: Duration) -> Result<bool> {
+pub(super) async fn wait_for_server_running(
+    timeout: Duration,
+    connection_context: ConnectionContext<'_>,
+) -> Result<bool> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        let connect =
-            tokio::time::timeout(SERVER_STATUS_TIMEOUT, connect_raw("bmux-cli-start-wait")).await;
+        let connect = tokio::time::timeout(
+            SERVER_STATUS_TIMEOUT,
+            connect_raw_with_context("bmux-cli-start-wait", connection_context),
+        )
+        .await;
         if let Ok(Ok(mut client)) = connect
             && let Ok(Ok(status)) =
                 tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.server_status()).await
@@ -41,11 +55,17 @@ pub(super) async fn wait_for_server_running(timeout: Duration) -> Result<bool> {
     Ok(false)
 }
 
-pub(super) async fn wait_until_server_stopped(timeout: Duration) -> Result<bool> {
+pub(super) async fn wait_until_server_stopped(
+    timeout: Duration,
+    connection_context: ConnectionContext<'_>,
+) -> Result<bool> {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        let reconnect =
-            tokio::time::timeout(SERVER_STATUS_TIMEOUT, connect_raw("bmux-cli-stop-check")).await;
+        let reconnect = tokio::time::timeout(
+            SERVER_STATUS_TIMEOUT,
+            connect_raw_with_context("bmux-cli-stop-check", connection_context),
+        )
+        .await;
         if reconnect.is_err() || matches!(reconnect, Ok(Err(_))) {
             return Ok(true);
         }
@@ -176,7 +196,7 @@ pub(super) async fn cleanup_stale_pid_file() -> Result<()> {
         return Ok(());
     };
 
-    if !is_pid_running(pid)? && !probe_server_running().await? {
+    if !is_pid_running(pid)? && !probe_server_running(ConnectionContext::default()).await? {
         remove_server_pid_file()?;
     }
 

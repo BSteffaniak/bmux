@@ -1,15 +1,29 @@
 use super::*;
 
-pub(super) async fn run_session_detach() -> Result<u8> {
-    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-detach").await?;
+pub(super) async fn run_session_detach(connection_context: ConnectionContext<'_>) -> Result<u8> {
+    let mut client = connect_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-detach",
+        connection_context,
+    )
+    .await?;
     client.detach().await.map_err(map_cli_client_error)?;
     println!("detached");
     Ok(0)
 }
 
-pub(super) async fn run_follow(target_client_id: &str, global: bool) -> Result<u8> {
+pub(super) async fn run_follow(
+    target_client_id: &str,
+    global: bool,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
     let target_client_id = parse_uuid_value(target_client_id, "target client id")?;
-    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-follow").await?;
+    let mut client = connect_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-follow",
+        connection_context,
+    )
+    .await?;
     client
         .follow_client(target_client_id, global)
         .await
@@ -22,8 +36,13 @@ pub(super) async fn run_follow(target_client_id: &str, global: bool) -> Result<u
     Ok(0)
 }
 
-pub(super) async fn run_unfollow() -> Result<u8> {
-    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-unfollow").await?;
+pub(super) async fn run_unfollow(connection_context: ConnectionContext<'_>) -> Result<u8> {
+    let mut client = connect_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-unfollow",
+        connection_context,
+    )
+    .await?;
     client.unfollow().await.map_err(map_cli_client_error)?;
     println!("follow stopped");
     Ok(0)

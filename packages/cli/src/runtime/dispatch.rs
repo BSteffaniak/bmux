@@ -1,9 +1,12 @@
 use super::*;
 
-pub(super) async fn run_command(command: &Command) -> Result<u8> {
+pub(super) async fn run_command(
+    command: &Command,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
     match command {
         Command::External(args) => run_external_plugin_command(args).await,
-        _ => dispatch_built_in_command(command).await,
+        _ => dispatch_built_in_command(command, connection_context).await,
     }
 }
 
@@ -113,7 +116,10 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
     }
 }
 
-pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
+pub(super) async fn dispatch_built_in_command(
+    command: &Command,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
     let handler = built_in_handler_for_command(command);
     let _descriptor = built_in_command_by_handler(handler);
     match (handler, command) {
@@ -167,13 +173,13 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
             .await
         }
         (BuiltInHandlerId::NewSession, Command::NewSession { name }) => {
-            run_session_new(name.clone()).await
+            run_session_new(name.clone(), connection_context).await
         }
         (BuiltInHandlerId::ListSessions, Command::ListSessions { json }) => {
-            run_session_list(*json).await
+            run_session_list(*json, connection_context).await
         }
         (BuiltInHandlerId::ListClients, Command::ListClients { json }) => {
-            run_client_list(*json).await
+            run_client_list(*json, connection_context).await
         }
         (
             BuiltInHandlerId::KillSession,
@@ -181,9 +187,9 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 target,
                 force_local,
             },
-        ) => run_session_kill(target, *force_local).await,
+        ) => run_session_kill(target, *force_local, connection_context).await,
         (BuiltInHandlerId::KillAllSessions, Command::KillAllSessions { force_local }) => {
-            run_session_kill_all(*force_local).await
+            run_session_kill_all(*force_local, connection_context).await
         }
         (
             BuiltInHandlerId::Attach,
@@ -192,34 +198,42 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 follow,
                 global,
             },
-        ) => run_session_attach(target.as_deref(), follow.as_deref(), *global).await,
-        (BuiltInHandlerId::Detach, Command::Detach) => run_session_detach().await,
+        ) => {
+            run_session_attach(
+                target.as_deref(),
+                follow.as_deref(),
+                *global,
+                connection_context,
+            )
+            .await
+        }
+        (BuiltInHandlerId::Detach, Command::Detach) => run_session_detach(connection_context).await,
         (
             BuiltInHandlerId::Follow,
             Command::Follow {
                 target_client_id,
                 global,
             },
-        ) => run_follow(target_client_id, *global).await,
-        (BuiltInHandlerId::Unfollow, Command::Unfollow) => run_unfollow().await,
+        ) => run_follow(target_client_id, *global, connection_context).await,
+        (BuiltInHandlerId::Unfollow, Command::Unfollow) => run_unfollow(connection_context).await,
         (
             BuiltInHandlerId::SessionNew,
             Command::Session {
                 command: SessionCommand::New { name },
             },
-        ) => run_session_new(name.clone()).await,
+        ) => run_session_new(name.clone(), connection_context).await,
         (
             BuiltInHandlerId::SessionList,
             Command::Session {
                 command: SessionCommand::List { json },
             },
-        ) => run_session_list(*json).await,
+        ) => run_session_list(*json, connection_context).await,
         (
             BuiltInHandlerId::SessionClients,
             Command::Session {
                 command: SessionCommand::Clients { json },
             },
-        ) => run_client_list(*json).await,
+        ) => run_client_list(*json, connection_context).await,
         (
             BuiltInHandlerId::SessionKill,
             Command::Session {
@@ -229,13 +243,13 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                         force_local,
                     },
             },
-        ) => run_session_kill(target, *force_local).await,
+        ) => run_session_kill(target, *force_local, connection_context).await,
         (
             BuiltInHandlerId::SessionKillAll,
             Command::Session {
                 command: SessionCommand::KillAll { force_local },
             },
-        ) => run_session_kill_all(*force_local).await,
+        ) => run_session_kill_all(*force_local, connection_context).await,
         (
             BuiltInHandlerId::SessionAttach,
             Command::Session {
@@ -246,13 +260,21 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                         global,
                     },
             },
-        ) => run_session_attach(target.as_deref(), follow.as_deref(), *global).await,
+        ) => {
+            run_session_attach(
+                target.as_deref(),
+                follow.as_deref(),
+                *global,
+                connection_context,
+            )
+            .await
+        }
         (
             BuiltInHandlerId::SessionDetach,
             Command::Session {
                 command: SessionCommand::Detach,
             },
-        ) => run_session_detach().await,
+        ) => run_session_detach(connection_context).await,
         (
             BuiltInHandlerId::SessionFollow,
             Command::Session {
@@ -262,13 +284,13 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                         global,
                     },
             },
-        ) => run_follow(target_client_id, *global).await,
+        ) => run_follow(target_client_id, *global, connection_context).await,
         (
             BuiltInHandlerId::SessionUnfollow,
             Command::Session {
                 command: SessionCommand::Unfollow,
             },
-        ) => run_unfollow().await,
+        ) => run_unfollow(connection_context).await,
         (
             BuiltInHandlerId::RemoteList,
             Command::Remote {
@@ -358,31 +380,31 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
             Command::Server {
                 command: ServerCommand::Status { json },
             },
-        ) => run_server_status(*json).await,
+        ) => run_server_status(*json, connection_context).await,
         (
             BuiltInHandlerId::ServerWhoamiPrincipal,
             Command::Server {
                 command: ServerCommand::WhoamiPrincipal { json },
             },
-        ) => run_server_whoami_principal(*json).await,
+        ) => run_server_whoami_principal(*json, connection_context).await,
         (
             BuiltInHandlerId::ServerSave,
             Command::Server {
                 command: ServerCommand::Save,
             },
-        ) => run_server_save().await,
+        ) => run_server_save(connection_context).await,
         (
             BuiltInHandlerId::ServerRestore,
             Command::Server {
                 command: ServerCommand::Restore { dry_run, yes },
             },
-        ) => run_server_restore(*dry_run, *yes).await,
+        ) => run_server_restore(*dry_run, *yes, connection_context).await,
         (
             BuiltInHandlerId::ServerStop,
             Command::Server {
                 command: ServerCommand::Stop,
             },
-        ) => run_server_stop().await,
+        ) => run_server_stop(connection_context).await,
         (
             BuiltInHandlerId::ServerGateway,
             Command::Server {
@@ -564,6 +586,7 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 !*no_capture_input,
                 *profile,
                 event_kind,
+                connection_context,
             )
             .await
         }
@@ -572,31 +595,31 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
             Command::Recording {
                 command: RecordingCommand::Stop { recording_id },
             },
-        ) => run_recording_stop(recording_id.as_deref()).await,
+        ) => run_recording_stop(recording_id.as_deref(), connection_context).await,
         (
             BuiltInHandlerId::RecordingStatus,
             Command::Recording {
                 command: RecordingCommand::Status { json },
             },
-        ) => run_recording_status(*json).await,
+        ) => run_recording_status(*json, connection_context).await,
         (
             BuiltInHandlerId::RecordingList,
             Command::Recording {
                 command: RecordingCommand::List { json },
             },
-        ) => run_recording_list(*json).await,
+        ) => run_recording_list(*json, connection_context).await,
         (
             BuiltInHandlerId::RecordingDelete,
             Command::Recording {
                 command: RecordingCommand::Delete { recording_id },
             },
-        ) => run_recording_delete(recording_id).await,
+        ) => run_recording_delete(recording_id, connection_context).await,
         (
             BuiltInHandlerId::RecordingDeleteAll,
             Command::Recording {
                 command: RecordingCommand::DeleteAll { yes },
             },
-        ) => run_recording_delete_all(*yes).await,
+        ) => run_recording_delete_all(*yes, connection_context).await,
         (
             BuiltInHandlerId::RecordingInspect,
             Command::Recording {
@@ -746,7 +769,7 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
             Command::Recording {
                 command: RecordingCommand::Prune { older_than, json },
             },
-        ) => recording::run_recording_prune(*older_than, *json).await,
+        ) => recording::run_recording_prune(*older_than, *json, connection_context).await,
         (
             BuiltInHandlerId::PlaybookRun,
             Command::Playbook {

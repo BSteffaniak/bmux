@@ -74,7 +74,7 @@ async fn run_doctor_text(paths: &ConfigPaths) -> Result<bool> {
     }
 
     // 3. Server status
-    match fetch_server_status().await {
+    match fetch_server_status(ConnectionContext::default()).await {
         Ok(Some(status)) if status.running => {
             let meta = read_server_runtime_metadata();
             let version_str = meta
@@ -371,7 +371,7 @@ async fn build_doctor_report(paths: &ConfigPaths) -> DoctorReport {
 
     // Server
     let (server_running, server_pid, server_version, stale_build) =
-        match fetch_server_status().await {
+        match fetch_server_status(ConnectionContext::default()).await {
             Ok(Some(status)) if status.running => {
                 let meta = read_server_runtime_metadata();
                 let pid = meta.as_ref().ok().and_then(|m| m.as_ref()).map(|m| m.pid);

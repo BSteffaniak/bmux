@@ -16,18 +16,22 @@ pub(super) struct AttachDisplayCapturePlan {
     pub(super) recording_path: PathBuf,
 }
 
-pub(super) async fn run_default_server_attach(options: DefaultAttachOptions) -> Result<u8> {
+pub(super) async fn run_default_server_attach(
+    options: DefaultAttachOptions,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
     if options.record {
-        ensure_server_not_running_for_record_bootstrap().await?;
+        ensure_server_not_running_for_record_bootstrap(connection_context).await?;
     }
-    ensure_server_running_for_default_attach().await?;
+    ensure_server_running_for_default_attach(connection_context).await?;
 
     let mut active_recording_id = None;
     let mut capture_plan = None;
     if options.record {
-        let mut recording_client = connect(
+        let mut recording_client = connect_with_context(
             ConnectionPolicyScope::Normal,
             "bmux-cli-default-attach-recording-start",
+            connection_context,
         )
         .await?;
         let started = recording_client
@@ -58,7 +62,12 @@ pub(super) async fn run_default_server_attach(options: DefaultAttachOptions) -> 
         }
     }
 
-    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-default-attach").await?;
+    let mut client = connect_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-default-attach",
+        connection_context,
+    )
+    .await?;
     let target = resolve_default_attach_target(&mut client).await?;
     let target = target.to_string();
     let attach_result =
@@ -67,9 +76,10 @@ pub(super) async fn run_default_server_attach(options: DefaultAttachOptions) -> 
             .map(|outcome| outcome.status_code);
 
     if let Some(recording_id) = active_recording_id {
-        let mut stop_client = connect(
+        let mut stop_client = connect_with_context(
             ConnectionPolicyScope::Normal,
             "bmux-cli-default-attach-recording-stop",
+            connection_context,
         )
         .await?;
         let stopped_id = stop_client
@@ -77,9 +87,10 @@ pub(super) async fn run_default_server_attach(options: DefaultAttachOptions) -> 
             .await
             .map_err(map_cli_client_error)
             .with_context(|| format!("failed stopping recording {recording_id}"))?;
-        let mut list_client = connect(
+        let mut list_client = connect_with_context(
             ConnectionPolicyScope::Normal,
             "bmux-cli-default-attach-recording-list",
+            connection_context,
         )
         .await?;
         let recording = list_client
@@ -99,14 +110,16 @@ pub(super) async fn run_default_server_attach(options: DefaultAttachOptions) -> 
     }
 
     if options.record && options.stop_server_on_exit {
-        let _ = run_server_stop().await;
+        let _ = run_server_stop(connection_context).await;
     }
 
     attach_result
 }
 
-pub(super) async fn ensure_server_not_running_for_record_bootstrap() -> Result<()> {
-    if server_is_running().await? {
+pub(super) async fn ensure_server_not_running_for_record_bootstrap(
+    connection_context: ConnectionContext<'_>,
+) -> Result<()> {
+    if server_is_running(connection_context).await? {
         anyhow::bail!(
             "--record requires a fresh start but server is already running; stop it first or run without --record"
         )
@@ -114,13 +127,15 @@ pub(super) async fn ensure_server_not_running_for_record_bootstrap() -> Result<(
     Ok(())
 }
 
-pub(super) async fn ensure_server_running_for_default_attach() -> Result<()> {
-    if server_is_running().await? {
+pub(super) async fn ensure_server_running_for_default_attach(
+    connection_context: ConnectionContext<'_>,
+) -> Result<()> {
+    if server_is_running(connection_context).await? {
         return Ok(());
     }
 
     let _ = run_server_start(true, false).await?;
-    if !server_is_running().await? {
+    if !server_is_running(connection_context).await? {
         anyhow::bail!("bmux server failed to start for default attach")
     }
     Ok(())
@@ -180,7 +195,7 @@ pub(super) fn next_default_session_name(sessions: &[SessionSummary]) -> String {
 
 pub(super) async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8> {
     cleanup_stale_pid_file().await?;
-    if server_is_running().await? {
+    if server_is_running(ConnectionContext::default()).await? {
         println!("bmux server is already running");
         return Ok(1);
     }
@@ -217,7 +232,7 @@ pub(super) async fn run_server_start(daemon: bool, foreground_internal: bool) ->
         write_server_pid_file(child.id())?;
         write_server_runtime_metadata(child.id())?;
 
-        if !wait_for_server_running(SERVER_START_TIMEOUT).await? {
+        if !wait_for_server_running(SERVER_START_TIMEOUT, ConnectionContext::default()).await? {
             let _ = try_kill_pid(child.id());
             let _ = remove_server_pid_file();
             anyhow::bail!("background server did not become ready before timeout")
@@ -271,8 +286,14 @@ pub(super) async fn run_session_attach(
     target: Option<&str>,
     follow: Option<&str>,
     global: bool,
+    connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
-    let client = connect(ConnectionPolicyScope::Normal, "bmux-cli-attach").await?;
+    let client = connect_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-attach",
+        connection_context,
+    )
+    .await?;
     run_session_attach_with_client(client, target, follow, global, None)
         .await
         .map(|outcome| outcome.status_code)

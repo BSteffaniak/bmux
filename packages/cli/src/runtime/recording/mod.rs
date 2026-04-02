@@ -1,11 +1,12 @@
 use super::{
-    AttachDisplayCapturePlan, BmuxConfig, BufWriter, ConfigPaths, ConnectionPolicyScope, Context,
-    GifEncoder, GifFrame, Instant, IsTerminal, Path, PathBuf, RecordingCursorBlinkMode,
-    RecordingCursorMode, RecordingCursorPaintMode, RecordingCursorProfile, RecordingCursorShape,
-    RecordingCursorTextMode, RecordingEventEnvelope, RecordingEventKind, RecordingEventKindArg,
-    RecordingExportFormat, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
-    RecordingStatus, RecordingSummary, Repeat, Result, Uuid, Write, cleanup_stale_pid_file,
-    connect_if_running, io, map_cli_client_error, parse_uuid_value, terminal,
+    AttachDisplayCapturePlan, BmuxConfig, BufWriter, ConfigPaths, ConnectionContext,
+    ConnectionPolicyScope, Context, GifEncoder, GifFrame, Instant, IsTerminal, Path, PathBuf,
+    RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
+    RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode, RecordingEventEnvelope,
+    RecordingEventKind, RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg,
+    RecordingRenderMode, RecordingReplayMode, RecordingStatus, RecordingSummary, Repeat, Result,
+    Uuid, Write, cleanup_stale_pid_file, connect_if_running_with_context, io, map_cli_client_error,
+    parse_uuid_value, terminal,
 };
 use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont, point};
 use bmux_fonts::FontPreset;
@@ -21,10 +22,15 @@ pub(super) async fn run_recording_start(
     capture_input: bool,
     profile: Option<RecordingProfileArg>,
     event_kinds: &[RecordingEventKindArg],
+    connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
     cleanup_stale_pid_file().await?;
-    let mut client = connect_if_running(ConnectionPolicyScope::Normal, "bmux-cli-recording-start")
-        .await?
+    let mut client = connect_if_running_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-recording-start",
+        connection_context,
+    )
+    .await?
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "recording start requires a running bmux server.\nRun `bmux server start --daemon` and retry."
@@ -151,10 +157,17 @@ fn default_event_kinds_from_config(capture_input: bool) -> Vec<RecordingEventKin
     kinds
 }
 
-pub(super) async fn run_recording_stop(recording_id: Option<&str>) -> Result<u8> {
+pub(super) async fn run_recording_stop(
+    recording_id: Option<&str>,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
     cleanup_stale_pid_file().await?;
-    let mut client = connect_if_running(ConnectionPolicyScope::Normal, "bmux-cli-recording-stop")
-        .await?
+    let mut client = connect_if_running_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-recording-stop",
+        connection_context,
+    )
+    .await?
         .ok_or_else(|| {
             anyhow::anyhow!(
                 "recording stop requires a running bmux server.\nRun `bmux server start --daemon` and retry."
@@ -172,17 +185,24 @@ pub(super) async fn run_recording_stop(recording_id: Option<&str>) -> Result<u8>
     Ok(0)
 }
 
-pub(super) async fn run_recording_status(as_json: bool) -> Result<u8> {
+pub(super) async fn run_recording_status(
+    as_json: bool,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
     cleanup_stale_pid_file().await?;
-    let status =
-        match connect_if_running(ConnectionPolicyScope::Normal, "bmux-cli-recording-status").await?
-        {
-            Some(mut client) => client
-                .recording_status()
-                .await
-                .map_err(map_cli_client_error)?,
-            None => offline_recording_status(),
-        };
+    let status = match connect_if_running_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-recording-status",
+        connection_context,
+    )
+    .await?
+    {
+        Some(mut client) => client
+            .recording_status()
+            .await
+            .map_err(map_cli_client_error)?,
+        None => offline_recording_status(),
+    };
     if as_json {
         println!(
             "{}",
@@ -213,16 +233,24 @@ pub(super) async fn run_recording_status(as_json: bool) -> Result<u8> {
     Ok(0)
 }
 
-pub(super) async fn run_recording_list(as_json: bool) -> Result<u8> {
+pub(super) async fn run_recording_list(
+    as_json: bool,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
     cleanup_stale_pid_file().await?;
-    let recordings =
-        match connect_if_running(ConnectionPolicyScope::Normal, "bmux-cli-recording-list").await? {
-            Some(mut client) => client
-                .recording_list()
-                .await
-                .map_err(map_cli_client_error)?,
-            None => list_recordings_from_disk()?,
-        };
+    let recordings = match connect_if_running_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-recording-list",
+        connection_context,
+    )
+    .await?
+    {
+        Some(mut client) => client
+            .recording_list()
+            .await
+            .map_err(map_cli_client_error)?,
+        None => list_recordings_from_disk()?,
+    };
     if as_json {
         println!(
             "{}",
@@ -255,10 +283,17 @@ pub(super) async fn run_recording_list(as_json: bool) -> Result<u8> {
     Ok(0)
 }
 
-pub(super) async fn run_recording_delete(recording_id_or_prefix: &str) -> Result<u8> {
+pub(super) async fn run_recording_delete(
+    recording_id_or_prefix: &str,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
     cleanup_stale_pid_file().await?;
-    if let Some(mut client) =
-        connect_if_running(ConnectionPolicyScope::Normal, "bmux-cli-recording-delete").await?
+    if let Some(mut client) = connect_if_running_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-recording-delete",
+        connection_context,
+    )
+    .await?
     {
         let status = client
             .recording_status()
@@ -296,16 +331,20 @@ pub(super) async fn run_recording_delete(recording_id_or_prefix: &str) -> Result
     Ok(0)
 }
 
-pub(super) async fn run_recording_delete_all(yes: bool) -> Result<u8> {
+pub(super) async fn run_recording_delete_all(
+    yes: bool,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
     if !confirm_delete_all_recordings(yes)? {
         println!("skipped recording delete-all");
         return Ok(0);
     }
 
     cleanup_stale_pid_file().await?;
-    if let Some(mut client) = connect_if_running(
+    if let Some(mut client) = connect_if_running_with_context(
         ConnectionPolicyScope::Normal,
         "bmux-cli-recording-delete-all",
+        connection_context,
     )
     .await?
     {
@@ -332,10 +371,18 @@ pub(super) async fn run_recording_delete_all(yes: bool) -> Result<u8> {
     Ok(0)
 }
 
-pub(super) async fn run_recording_prune(older_than: Option<u64>, json: bool) -> Result<u8> {
+pub(super) async fn run_recording_prune(
+    older_than: Option<u64>,
+    json: bool,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
     cleanup_stale_pid_file().await?;
-    let deleted_count = if let Some(mut client) =
-        connect_if_running(ConnectionPolicyScope::Normal, "bmux-cli-recording-prune").await?
+    let deleted_count = if let Some(mut client) = connect_if_running_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-recording-prune",
+        connection_context,
+    )
+    .await?
     {
         client
             .recording_prune(older_than)

@@ -1,7 +1,15 @@
 use super::*;
 
-pub(super) async fn run_session_new(name: Option<String>) -> Result<u8> {
-    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-new-session").await?;
+pub(super) async fn run_session_new(
+    name: Option<String>,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
+    let mut client = connect_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-new-session",
+        connection_context,
+    )
+    .await?;
     let session_id = client
         .new_session(name)
         .await
@@ -10,8 +18,16 @@ pub(super) async fn run_session_new(name: Option<String>) -> Result<u8> {
     Ok(0)
 }
 
-pub(super) async fn run_session_list(as_json: bool) -> Result<u8> {
-    let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-list-sessions").await?;
+pub(super) async fn run_session_list(
+    as_json: bool,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
+    let mut client = connect_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-list-sessions",
+        connection_context,
+    )
+    .await?;
     let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
 
     if as_json {
@@ -36,8 +52,16 @@ pub(super) async fn run_session_list(as_json: bool) -> Result<u8> {
     Ok(0)
 }
 
-pub(super) async fn run_client_list(as_json: bool) -> Result<u8> {
-    let mut api = connect(ConnectionPolicyScope::Normal, "bmux-cli-list-clients").await?;
+pub(super) async fn run_client_list(
+    as_json: bool,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
+    let mut api = connect_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-list-clients",
+        connection_context,
+    )
+    .await?;
     let self_id = api.whoami().await.map_err(map_cli_client_error)?;
     let clients = api.list_clients().await.map_err(map_cli_client_error)?;
     let mut clients = clients;
@@ -253,11 +277,16 @@ pub(super) fn attach_quit_failure_status(error: &ClientError) -> &'static str {
     }
 }
 
-pub(super) async fn run_session_kill(target: &str, force_local: bool) -> Result<u8> {
+pub(super) async fn run_session_kill(
+    target: &str,
+    force_local: bool,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
     let selector = parse_session_selector(target);
-    let mut client = match connect_if_running(
+    let mut client = match connect_if_running_with_context(
         ConnectionPolicyScope::Normal,
         "bmux-cli-kill-session",
+        connection_context,
     )
     .await?
     {
@@ -286,10 +315,14 @@ pub(super) async fn run_session_kill(target: &str, force_local: bool) -> Result<
     Ok(0)
 }
 
-pub(super) async fn run_session_kill_all(force_local: bool) -> Result<u8> {
-    let mut client = match connect_if_running(
+pub(super) async fn run_session_kill_all(
+    force_local: bool,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
+    let mut client = match connect_if_running_with_context(
         ConnectionPolicyScope::Normal,
         "bmux-cli-kill-all-sessions",
+        connection_context,
     )
     .await?
     {

@@ -1,5 +1,6 @@
 use crate::connection::{
-    ConnectionPolicyScope, ServerRuntimeMetadata, connect, connect_if_running, connect_raw,
+    ConnectionContext, ConnectionPolicyScope, ServerRuntimeMetadata, connect,
+    connect_if_running_with_context, connect_raw, connect_raw_with_context, connect_with_context,
     current_cli_build_id, expand_bmux_target_if_needed, map_client_connect_error,
     read_server_runtime_metadata, remove_server_runtime_metadata_file,
     write_server_runtime_metadata,
@@ -163,19 +164,13 @@ pub async fn run() -> Result<u8> {
         } => {
             init_logging(verbose, Some(log_level));
             validate_record_bootstrap_flags(&cli)?;
-            if let Some(target) = cli.target.as_deref() {
-                // SAFETY: runtime CLI is single-process command execution and intentionally
-                // propagates the selected target to connection helpers that read BMUX_TARGET.
-                unsafe {
-                    std::env::set_var("BMUX_TARGET", target);
-                }
-            }
+            let connection_context = ConnectionContext::new(cli.target.as_deref());
             if should_proxy_to_target(&cli).await? {
                 return run_target_proxy_from_current_argv(&cli).await;
             }
 
             if let Some(command) = &cli.command {
-                return run_command(command).await;
+                return run_command(command, connection_context).await;
             }
 
             let options = DefaultAttachOptions {
@@ -186,7 +181,7 @@ pub async fn run() -> Result<u8> {
                 recording_id_file: cli.recording_id_file.clone(),
                 stop_server_on_exit: cli.stop_server_on_exit,
             };
-            run_default_server_attach(options).await
+            run_default_server_attach(options, connection_context).await
         }
         ParsedRuntimeCli::Plugin {
             log_level,

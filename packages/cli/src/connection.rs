@@ -39,20 +39,47 @@ pub enum ServerBuildPolicyEffect {
     Warn(String),
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ConnectionContext<'a> {
+    pub target_override: Option<&'a str>,
+}
+
+impl<'a> ConnectionContext<'a> {
+    pub const fn new(target_override: Option<&'a str>) -> Self {
+        Self { target_override }
+    }
+}
+
 pub async fn connect(
     scope: ConnectionPolicyScope,
     client_name: &'static str,
 ) -> Result<BmuxClient> {
+    connect_with_context(scope, client_name, ConnectionContext::default()).await
+}
+
+pub async fn connect_with_context(
+    scope: ConnectionPolicyScope,
+    client_name: &'static str,
+    context: ConnectionContext<'_>,
+) -> Result<BmuxClient> {
     apply_stale_build_policy(scope)?;
-    connect_for_active_target(client_name).await
+    connect_for_active_target(client_name, context).await
 }
 
 pub async fn connect_if_running(
     scope: ConnectionPolicyScope,
     client_name: &'static str,
 ) -> Result<Option<BmuxClient>> {
+    connect_if_running_with_context(scope, client_name, ConnectionContext::default()).await
+}
+
+pub async fn connect_if_running_with_context(
+    scope: ConnectionPolicyScope,
+    client_name: &'static str,
+    context: ConnectionContext<'_>,
+) -> Result<Option<BmuxClient>> {
     apply_stale_build_policy(scope)?;
-    match connect_for_active_target(client_name).await {
+    match connect_for_active_target(client_name, context).await {
         Ok(client) => Ok(Some(client)),
         Err(error)
             if error
@@ -68,7 +95,14 @@ pub async fn connect_if_running(
 }
 
 pub async fn connect_raw(client_name: &'static str) -> Result<BmuxClient> {
-    connect_for_active_target(client_name).await
+    connect_raw_with_context(client_name, ConnectionContext::default()).await
+}
+
+pub async fn connect_raw_with_context(
+    client_name: &'static str,
+    context: ConnectionContext<'_>,
+) -> Result<BmuxClient> {
+    connect_for_active_target(client_name, context).await
 }
 
 #[derive(Debug, Clone)]
@@ -98,8 +132,11 @@ struct IrohTarget {
 
 const BMUX_IROH_ALPN: &[u8] = b"bmux/gateway/iroh/1";
 
-async fn connect_for_active_target(client_name: &'static str) -> Result<BmuxClient> {
-    match resolve_active_target().await? {
+async fn connect_for_active_target(
+    client_name: &'static str,
+    context: ConnectionContext<'_>,
+) -> Result<BmuxClient> {
+    match resolve_active_target(context).await? {
         ActiveTarget::Local => BmuxClient::connect_default(client_name)
             .await
             .map_err(map_client_connect_error),
@@ -221,10 +258,14 @@ fn build_tls_connector(target: &TlsTarget) -> Result<TlsConnector> {
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
-async fn resolve_active_target() -> Result<ActiveTarget> {
+async fn resolve_active_target(context: ConnectionContext<'_>) -> Result<ActiveTarget> {
     let config = BmuxConfig::load().context("failed loading bmux config")?;
-    let selected = std::env::var("BMUX_TARGET")
-        .ok()
+    let selected = context
+        .target_override
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| std::env::var("BMUX_TARGET").ok())
         .or_else(|| config.connections.default_target.clone());
     let Some(target) = selected else {
         return Ok(ActiveTarget::Local);

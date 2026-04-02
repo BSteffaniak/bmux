@@ -151,11 +151,11 @@ mod tests {
 
     #[test]
     fn resolve_env_var() {
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("BMUX_TEST_VAR_XYZ", "from-env") };
+        let Some(home) = std::env::var("HOME").ok() else {
+            return;
+        };
         let rv = RuntimeVars::new(BTreeMap::new());
-        assert_eq!(rv.resolve("val=${BMUX_TEST_VAR_XYZ}"), "val=from-env");
-        unsafe { std::env::remove_var("BMUX_TEST_VAR_XYZ") };
+        assert_eq!(rv.resolve("val=${HOME}"), format!("val={home}"));
     }
 
     #[test]
@@ -199,13 +199,13 @@ mod tests {
 
     #[test]
     fn static_takes_priority_over_env() {
-        // SAFETY: test-only, single-threaded test runner.
-        unsafe { std::env::set_var("BMUX_TEST_PRIORITY", "env-val") };
+        let Some(_home) = std::env::var("HOME").ok() else {
+            return;
+        };
         let mut vars = BTreeMap::new();
-        vars.insert("BMUX_TEST_PRIORITY".to_string(), "static-val".to_string());
+        vars.insert("HOME".to_string(), "static-val".to_string());
         let rv = RuntimeVars::new(vars);
-        assert_eq!(rv.resolve("${BMUX_TEST_PRIORITY}"), "static-val");
-        unsafe { std::env::remove_var("BMUX_TEST_PRIORITY") };
+        assert_eq!(rv.resolve("${HOME}"), "static-val");
     }
 
     #[test]
