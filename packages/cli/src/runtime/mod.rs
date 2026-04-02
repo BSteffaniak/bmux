@@ -15,7 +15,9 @@ use bmux_cli_schema::{
     RecordingRenderMode, RecordingReplayMode, RemoteCommand, RemoteCompleteCommand, ServerCommand,
     SessionCommand, TerminalCommand, TraceFamily,
 };
-use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError};
+use bmux_client::{
+    AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError, StreamingBmuxClient,
+};
 use bmux_config::{
     BmuxConfig, ConfigPaths, PaneRestoreMethod, RecordingExportCursorBlinkMode,
     RecordingExportCursorMode, RecordingExportCursorPaintMode, RecordingExportCursorProfile,
@@ -97,7 +99,7 @@ use self::logs_watch::{
     run_logs_profiles_rename, run_logs_profiles_show, run_logs_watch,
 };
 use attach::cursor::apply_attach_cursor_state;
-use attach::events::{AttachLoopControl, AttachLoopEvent, collect_attach_loop_events};
+use attach::events::{AttachLoopControl, AttachLoopEvent};
 use attach::render::{
     AttachLayer, AttachLayerSurface, append_pane_output, opaque_row_text, queue_layer_fill,
     render_attach_scene, visible_scene_pane_ids,
@@ -135,7 +137,6 @@ const SERVER_START_TIMEOUT: Duration = Duration::from_secs(5);
 const SERVER_STATUS_TIMEOUT: Duration = Duration::from_millis(1000);
 const SERVER_STOP_TIMEOUT: Duration = Duration::from_millis(5000);
 const VERIFY_SERVER_START_TIMEOUT_DEFAULT: Duration = Duration::from_secs(30);
-const ATTACH_IO_POLL_INTERVAL: Duration = Duration::from_millis(15);
 const ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE: usize = 512 * 1024;
 const ATTACH_SCROLLBACK_UNAVAILABLE_STATUS: &str = "scrollback unavailable for focused pane";
 const ATTACH_SELECTION_STARTED_STATUS: &str = "selection started";

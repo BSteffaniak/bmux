@@ -353,6 +353,13 @@ pub enum Request {
     PollEvents {
         max_events: usize,
     },
+    /// Enable server-push event delivery on this connection.
+    ///
+    /// After the server responds with `EventPushEnabled`, it will write
+    /// `EnvelopeKind::Event` frames asynchronously. Only streaming-capable
+    /// clients (which split the socket into read/write halves and demux
+    /// incoming frames) should send this request.
+    EnableEventPush,
     RecordingStart {
         #[serde(default)]
         session_id: Option<Uuid>,
@@ -747,6 +754,8 @@ pub enum ResponsePayload {
     EventBatch {
         events: Vec<Event>,
     },
+    /// Acknowledgement that server-push event delivery has been enabled.
+    EventPushEnabled,
     RecordingStarted {
         recording: RecordingSummary,
     },
@@ -853,6 +862,13 @@ pub enum Event {
         session_id: Uuid,
         revision: u64,
         components: Vec<AttachViewComponent>,
+    },
+    /// Notification that new pane output is available for reading.
+    /// Emitted by the server when PTY output arrives; streaming clients use
+    /// this to fetch output on demand instead of polling.
+    PaneOutputAvailable {
+        session_id: Uuid,
+        pane_id: Uuid,
     },
 }
 
@@ -1828,6 +1844,10 @@ mod tests {
                     AttachViewComponent::Layout,
                     AttachViewComponent::Status,
                 ],
+            },
+            Event::PaneOutputAvailable {
+                session_id: id,
+                pane_id: id2,
             },
         ];
 

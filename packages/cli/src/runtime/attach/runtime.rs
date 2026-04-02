@@ -1,4 +1,5 @@
 use super::super::*;
+use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -60,10 +61,40 @@ pub(crate) async fn run_session_attach_with_client(
     let mut display_capture = recording::DisplayCaptureWriter::new(capture_plan, self_client_id)?;
 
     let attach_info = if let Some(leader_client_id) = follow_target_id {
-        let context_id = resolve_follow_target_context(&mut client, leader_client_id)
+        // Inline follow target resolution using BmuxClient (before streaming upgrade).
+        let clients = client
+            .list_clients()
             .await
             .map_err(map_attach_client_error)?;
-        open_attach_for_context(&mut client, context_id)
+        let leader = clients
+            .into_iter()
+            .find(|entry| entry.id == leader_client_id)
+            .ok_or_else(|| anyhow::anyhow!("follow target not found"))?;
+        let context_id = if let Some(cid) = leader.selected_context_id {
+            cid
+        } else if let Some(sid) = leader.selected_session_id {
+            let contexts = client
+                .list_contexts()
+                .await
+                .map_err(map_attach_client_error)?;
+            contexts
+                .into_iter()
+                .find(|ctx| {
+                    ctx.attributes
+                        .get("bmux.session_id")
+                        .is_some_and(|v| v == &sid.to_string())
+                })
+                .map(|ctx| ctx.id)
+                .ok_or_else(|| anyhow::anyhow!("follow target has no selected context"))?
+        } else {
+            anyhow::bail!("follow target has no selected context");
+        };
+        let grant = client
+            .attach_context_grant(ContextSelector::ById(context_id))
+            .await
+            .map_err(map_attach_client_error)?;
+        client
+            .open_attach_stream_info(&grant)
             .await
             .map_err(map_attach_client_error)?
     } else {
@@ -88,6 +119,19 @@ pub(crate) async fn run_session_attach_with_client(
     } else {
         println!("attached to session: {}", attach_info.session_id);
     }
+
+    // Upgrade to streaming client for event-driven operation.
+    // All subsequent operations use the streaming client.
+    let mut client =
+        bmux_client::StreamingBmuxClient::from_client(client).map_err(map_attach_client_error)?;
+    client
+        .subscribe_events()
+        .await
+        .map_err(map_attach_client_error)?;
+    client
+        .enable_event_push()
+        .await
+        .map_err(map_attach_client_error)?;
 
     let mut view_state = AttachViewState::new(attach_info);
     view_state.mouse.config = attach_config.attach_mouse_config();
@@ -118,14 +162,6 @@ pub(crate) async fn run_session_attach_with_client(
     } else {
         println!("detach is unbound in current keymap");
     }
-    client
-        .subscribe_events()
-        .await
-        .map_err(map_attach_client_error)?;
-    let _ = client
-        .poll_events(256)
-        .await
-        .map_err(map_attach_client_error)?;
 
     let raw_mode_guard = RawModeGuard::enable(
         attach_config.behavior.kitty_keyboard,
@@ -136,61 +172,118 @@ pub(crate) async fn run_session_attach_with_client(
         InputProcessor::new(attach_keymap.clone(), raw_mode_guard.keyboard_enhanced);
     let mut exit_reason = AttachExitReason::Detached;
 
+    // Async terminal event stream — replaces spawn_blocking + poll(15ms).
+    let mut terminal_stream = crossterm::event::EventStream::new();
+    let mut context_refresh_interval = tokio::time::interval(ATTACH_CONTEXT_REFRESH_INTERVAL);
+    context_refresh_interval.tick().await;
+    let mut pane_output_pending = false;
+
     loop {
-        let server_events = client
-            .poll_events(16)
-            .await
-            .map_err(map_attach_client_error)?;
-        let terminal_event = poll_attach_terminal_event(ATTACH_IO_POLL_INTERVAL).await?;
-        let loop_events = collect_attach_loop_events(server_events, terminal_event);
-        let mut should_break = false;
-        for loop_event in loop_events {
-            if let AttachLoopEvent::Terminal(Event::Resize(cols, rows)) = loop_event
-                && let Some(capture) = display_capture.as_mut()
-            {
-                let _ = capture.record_resize(cols, rows);
-            }
-            match handle_attach_loop_event(
-                loop_event,
-                &mut client,
-                &mut attach_input_processor,
-                follow_target_id,
-                Some(self_client_id),
-                global,
-                &attach_help_lines,
-                &mut view_state,
-                display_capture.as_mut(),
-            )
-            .await?
-            {
-                AttachLoopControl::Continue => {}
-                AttachLoopControl::Break(reason) => {
-                    exit_reason = reason;
-                    should_break = true;
+        // ── Event-driven select: sleep until something happens ────────
+        tokio::select! {
+            // Server-pushed events (layout changes, session events, pane output)
+            event = client.event_receiver().recv() => {
+                let Some(server_event) = event else {
+                    // Event stream closed — server disconnected.
+                    exit_reason = AttachExitReason::StreamClosed;
                     break;
+                };
+
+                // PaneOutputAvailable sets a flag; fall through to the
+                // post-event processing block which fetches output.
+                if matches!(
+                    server_event,
+                    bmux_client::ServerEvent::PaneOutputAvailable { .. }
+                ) {
+                    pane_output_pending = true;
+                    // Fall through to post-event processing (no event dispatch needed).
+                } else {
+                    if let bmux_client::ServerEvent::AttachViewChanged { .. } = &server_event {
+                        pane_output_pending = true;
+                    }
+
+                    match handle_attach_loop_event(
+                        AttachLoopEvent::Server(server_event),
+                        &mut client,
+                        &mut attach_input_processor,
+                        follow_target_id,
+                        Some(self_client_id),
+                        global,
+                        &attach_help_lines,
+                        &mut view_state,
+                        display_capture.as_mut(),
+                    )
+                    .await?
+                    {
+                        AttachLoopControl::Continue => {}
+                        AttachLoopControl::Break(reason) => {
+                            exit_reason = reason;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // Terminal input (keyboard, mouse, resize) via async EventStream.
+            terminal_result = terminal_stream.next() => {
+                let Some(result) = terminal_result else {
+                    // Terminal stream ended unexpectedly.
+                    exit_reason = AttachExitReason::StreamClosed;
+                    break;
+                };
+                let terminal_event = result.context("failed reading terminal event")?;
+
+                if let Event::Resize(cols, rows) = terminal_event
+                    && let Some(capture) = display_capture.as_mut()
+                {
+                    let _ = capture.record_resize(cols, rows);
+                }
+
+                match handle_attach_loop_event(
+                    AttachLoopEvent::Terminal(terminal_event),
+                    &mut client,
+                    &mut attach_input_processor,
+                    follow_target_id,
+                    Some(self_client_id),
+                    global,
+                    &attach_help_lines,
+                    &mut view_state,
+                    display_capture.as_mut(),
+                )
+                .await?
+                {
+                    AttachLoopControl::Continue => {}
+                    AttachLoopControl::Break(reason) => {
+                        exit_reason = reason;
+                        break;
+                    }
+                }
+            }
+
+            // Periodic context refresh (safety net, 2s interval).
+            _ = context_refresh_interval.tick() => {
+                let now = Instant::now();
+                let _ = view_state.clear_expired_transient_status(now);
+                if should_refresh_attached_session(&view_state, now) {
+                    if let Err(error) =
+                        refresh_attached_session_from_context(&mut client, &mut view_state).await
+                    {
+                        view_state.set_transient_status(
+                            format!(
+                                "context refresh delayed: {}",
+                                map_attach_client_error(error)
+                            ),
+                            Instant::now(),
+                            ATTACH_TRANSIENT_STATUS_TTL,
+                        );
+                    }
                 }
             }
         }
 
-        if should_break {
-            break;
-        }
+        // ── Post-event processing: layout, output fetch, render ──────
 
-        let now = Instant::now();
-        let _ = view_state.clear_expired_transient_status(now);
-        if should_refresh_attached_session(&view_state, now)
-            && let Err(error) =
-                refresh_attached_session_from_context(&mut client, &mut view_state).await
-        {
-            view_state.set_transient_status(
-                format!(
-                    "context refresh delayed: {}",
-                    map_attach_client_error(error)
-                ),
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
-        }
+        let _ = view_state.clear_expired_transient_status(Instant::now());
 
         let mut frame_needs_render = view_state.dirty.status_needs_redraw
             || view_state.dirty.full_pane_redraw
@@ -226,11 +319,6 @@ pub(crate) async fn run_session_attach_with_client(
                             if attach_config.behavior.pane_restore_method
                                 == PaneRestoreMethod::Snapshot
                             {
-                                // Scene changed (e.g. zoom/unzoom): re-hydrate all pane
-                                // content from the server ring buffer so hidden panes
-                                // whose client-side parsers were dropped get fully
-                                // reconstructed. hydrate_attach_state_from_snapshot
-                                // overwrites cached_layout_state and mouse state.
                                 hydrate_attach_state_from_snapshot(&mut client, &mut view_state)
                                     .await?;
                                 scene_hydrated = true;
@@ -261,8 +349,6 @@ pub(crate) async fn run_session_attach_with_client(
             continue;
         };
 
-        // When scene was just re-hydrated from snapshot, skip incremental
-        // output fetch — the hydration already populated all pane buffers.
         if scene_hydrated {
             let help_scroll = view_state.help_overlay_scroll;
             render_attach_frame(
@@ -279,44 +365,47 @@ pub(crate) async fn run_session_attach_with_client(
                 display_capture.as_mut(),
             )
             .await?;
+            pane_output_pending = false;
             continue;
         }
 
         resize_attach_parsers_for_scene(&mut view_state.pane_buffers, &layout_state.scene);
 
-        let pane_ids = visible_scene_pane_ids(&layout_state.scene);
-        // In Retain mode, keep hidden pane parsers alive in memory so their
-        // content survives scene transitions (e.g. zoom/unzoom) without a
-        // full re-hydration from the server.
-        if attach_config.behavior.pane_restore_method != PaneRestoreMethod::Retain {
-            view_state
-                .pane_buffers
-                .retain(|pane_id, _| pane_ids.iter().any(|id| id == pane_id));
-        }
+        // Only fetch pane output when the server notified us there's new data,
+        // or when dirty flags indicate we need a redraw.
+        if pane_output_pending || frame_needs_render {
+            let pane_ids = visible_scene_pane_ids(&layout_state.scene);
+            if attach_config.behavior.pane_restore_method != PaneRestoreMethod::Retain {
+                view_state
+                    .pane_buffers
+                    .retain(|pane_id, _| pane_ids.iter().any(|id| id == pane_id));
+            }
 
-        let chunks = match client
-            .attach_pane_output_batch(view_state.attached_id, pane_ids.clone(), 8 * 1024)
-            .await
-        {
-            Ok(chunks) => chunks,
-            Err(error)
-                if is_attach_stream_closed_error(&error)
-                    || is_attach_not_attached_runtime_error(&error) =>
+            let chunks = match client
+                .attach_pane_output_batch(view_state.attached_id, pane_ids, 8 * 1024)
+                .await
             {
-                exit_reason = AttachExitReason::StreamClosed;
-                break;
-            }
-            Err(error) => return Err(map_attach_client_error(error)),
-        };
+                Ok(chunks) => chunks,
+                Err(error)
+                    if is_attach_stream_closed_error(&error)
+                        || is_attach_not_attached_runtime_error(&error) =>
+                {
+                    exit_reason = AttachExitReason::StreamClosed;
+                    break;
+                }
+                Err(error) => return Err(map_attach_client_error(error)),
+            };
 
-        for chunk in chunks {
-            if chunk.data.is_empty() {
-                continue;
+            for chunk in chunks {
+                if chunk.data.is_empty() {
+                    continue;
+                }
+                let buffer = view_state.pane_buffers.entry(chunk.pane_id).or_default();
+                append_pane_output(buffer, &chunk.data);
+                view_state.dirty.pane_dirty_ids.insert(chunk.pane_id);
+                frame_needs_render = true;
             }
-            let buffer = view_state.pane_buffers.entry(chunk.pane_id).or_default();
-            append_pane_output(buffer, &chunk.data);
-            view_state.dirty.pane_dirty_ids.insert(chunk.pane_id);
-            frame_needs_render = true;
+            pane_output_pending = false;
         }
 
         if !frame_needs_render {
@@ -367,7 +456,7 @@ pub(crate) struct AttachRunOutcome {
 }
 
 pub(crate) async fn handle_attach_runtime_action(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     action: RuntimeAction,
     view_state: &mut AttachViewState,
 ) -> std::result::Result<(), ClientError> {
@@ -406,7 +495,7 @@ pub(crate) async fn handle_attach_runtime_action(
 }
 
 pub(crate) async fn apply_plugin_command_outcome(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     outcome: PluginCommandOutcome,
 ) -> std::result::Result<bool, ClientError> {
@@ -435,7 +524,7 @@ pub(crate) async fn apply_plugin_command_outcome(
 }
 
 pub(crate) async fn retarget_attach_to_context(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     context_id: Uuid,
 ) -> std::result::Result<(), ClientError> {
@@ -541,7 +630,7 @@ struct HotPathExecutionPolicyCheckResponse {
 }
 
 async fn enforce_hot_path_plugin_policy(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     plugin_id: &str,
     command_name: &str,
     attached_session_id: Uuid,
@@ -630,7 +719,7 @@ async fn enforce_hot_path_plugin_policy(
 }
 
 pub(crate) async fn handle_attach_plugin_command_action(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     plugin_id: &str,
     command_name: &str,
     args: &[String],
@@ -854,7 +943,7 @@ pub(crate) async fn handle_attach_plugin_command_action(
 }
 
 pub(crate) async fn handle_attach_ui_action(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     action: RuntimeAction,
     view_state: &mut AttachViewState,
 ) -> std::result::Result<(), ClientError> {
@@ -1441,7 +1530,7 @@ pub(crate) fn focused_attach_pane_inner_size(
 }
 
 pub(crate) async fn switch_attach_session_relative(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     step: isize,
 ) -> std::result::Result<(), ClientError> {
@@ -1526,7 +1615,7 @@ pub(crate) fn relative_context_id(
 }
 
 pub(crate) async fn build_attach_status_line_for_draw(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     status_config: &bmux_config::StatusBarConfig,
     global_theme: &bmux_config::ThemeConfig,
@@ -1940,7 +2029,7 @@ pub(crate) fn queue_attach_help_overlay(
 }
 
 pub(crate) async fn render_attach_frame(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     layout_state: &AttachLayoutState,
     status_config: &bmux_config::StatusBarConfig,
@@ -2034,7 +2123,7 @@ pub(crate) async fn render_attach_frame(
 }
 
 pub(crate) async fn build_attach_tabs(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     status_config: &bmux_config::StatusBarConfig,
     context_id: Option<Uuid>,
@@ -2124,7 +2213,7 @@ pub(crate) fn stabilize_tab_order(
 }
 
 pub(crate) async fn resolve_attach_context_label(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     context_id: Option<Uuid>,
     session_id: Uuid,
 ) -> std::result::Result<String, ClientError> {
@@ -2159,7 +2248,7 @@ pub(crate) fn context_summary_label(context: &ContextSummary) -> String {
 }
 
 pub(crate) async fn resolve_attach_session_label(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     session_id: Uuid,
 ) -> std::result::Result<String, ClientError> {
     let (label, _count) = resolve_attach_session_label_and_count(client, session_id).await?;
@@ -2167,7 +2256,7 @@ pub(crate) async fn resolve_attach_session_label(
 }
 
 pub(crate) async fn resolve_attach_session_label_and_count(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     session_id: Uuid,
 ) -> std::result::Result<(String, usize), ClientError> {
     let sessions = client.list_sessions().await?;
@@ -2190,7 +2279,7 @@ pub(crate) fn session_summary_label(session: &bmux_ipc::SessionSummary) -> Strin
 }
 
 pub(crate) async fn attach_context_status(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     context_id: Option<Uuid>,
     session_id: Uuid,
 ) -> std::result::Result<String, ClientError> {
@@ -2215,7 +2304,7 @@ pub(crate) fn short_uuid(id: Uuid) -> String {
 }
 
 pub(crate) async fn resolve_follow_target_context(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     leader_client_id: Uuid,
 ) -> std::result::Result<Uuid, ClientError> {
     let clients = client.list_clients().await?;
@@ -2246,7 +2335,7 @@ pub(crate) async fn resolve_follow_target_context(
 }
 
 pub(crate) async fn open_attach_for_session(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     session_id: Uuid,
 ) -> std::result::Result<bmux_client::AttachOpenInfo, ClientError> {
     let grant = client
@@ -2256,7 +2345,7 @@ pub(crate) async fn open_attach_for_session(
 }
 
 pub(crate) async fn open_attach_for_context(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     context_id: Uuid,
 ) -> std::result::Result<bmux_client::AttachOpenInfo, ClientError> {
     let grant = client
@@ -2266,7 +2355,7 @@ pub(crate) async fn open_attach_for_context(
 }
 
 pub(crate) async fn attached_session_selector(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
 ) -> std::result::Result<SessionSelector, ClientError> {
     refresh_attached_session_from_context(client, view_state).await?;
@@ -2274,7 +2363,7 @@ pub(crate) async fn attached_session_selector(
 }
 
 pub(crate) async fn refresh_attached_session_from_context(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
 ) -> std::result::Result<(), ClientError> {
     if let Some(context_id) = view_state.attached_context_id {
@@ -2702,21 +2791,8 @@ impl Drop for RawModeGuard {
     }
 }
 
-pub(crate) async fn poll_attach_terminal_event(timeout: Duration) -> Result<Option<Event>> {
-    tokio::task::spawn_blocking(move || {
-        if event::poll(timeout).context("failed polling terminal events")? {
-            let event = event::read().context("failed reading terminal event")?;
-            return Ok(Some(event));
-        }
-
-        Ok(None)
-    })
-    .await
-    .context("failed to join terminal event task")?
-}
-
 pub(crate) async fn update_attach_viewport(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     session_id: Uuid,
     status_position: StatusPosition,
 ) -> std::result::Result<(), ClientError> {
@@ -2738,7 +2814,7 @@ pub(crate) async fn update_attach_viewport(
 }
 
 pub(crate) async fn hydrate_attach_state_from_snapshot(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
 ) -> std::result::Result<(), ClientError> {
     let AttachSnapshotState {
@@ -2828,7 +2904,7 @@ pub(crate) fn resize_attach_parsers_for_scene_with_size(
 
 pub(crate) async fn handle_attach_loop_event(
     event: AttachLoopEvent,
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     attach_input_processor: &mut InputProcessor,
     follow_target_id: Option<Uuid>,
     self_client_id: Option<Uuid>,
@@ -2864,7 +2940,7 @@ pub(crate) async fn handle_attach_loop_event(
 }
 
 pub(crate) async fn handle_attach_server_event(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     server_event: bmux_client::ServerEvent,
     follow_target_id: Option<Uuid>,
     self_client_id: Option<Uuid>,
@@ -2993,7 +3069,7 @@ pub(crate) fn attach_view_event_matches_target(
 }
 
 pub(crate) async fn handle_attach_terminal_event(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     terminal_event: Event,
     attach_input_processor: &mut InputProcessor,
     help_lines: &[String],
@@ -3203,7 +3279,7 @@ pub(crate) fn record_attach_mouse_event(mouse_event: MouseEvent, view_state: &mu
 }
 
 pub(crate) async fn handle_attach_mouse_event(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     mouse_event: MouseEvent,
     view_state: &mut AttachViewState,
 ) -> std::result::Result<(), ClientError> {
@@ -3291,7 +3367,7 @@ pub(crate) async fn handle_attach_mouse_event(
 }
 
 pub(crate) async fn handle_attach_status_tab_click(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     mouse_event: MouseEvent,
 ) -> std::result::Result<bool, ClientError> {
@@ -3355,7 +3431,7 @@ pub(crate) const fn status_row_matches_mouse(status_row: u16, mouse_row: u16, ro
 }
 
 pub(crate) async fn handle_attach_mouse_gesture_action(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     gesture: &str,
 ) -> std::result::Result<bool, ClientError> {
@@ -3473,7 +3549,7 @@ pub(crate) fn handle_attach_mouse_scrollback(
 }
 
 pub(crate) async fn focus_attach_pane(
-    client: &mut BmuxClient,
+    client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     pane_id: Uuid,
 ) -> std::result::Result<(), ClientError> {

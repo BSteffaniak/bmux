@@ -1306,6 +1306,7 @@ fn event_matches(event: &bmux_ipc::Event, name: &str) -> bool {
         (bmux_ipc::Event::ClientAttached { .. }, "client_attached") => true,
         (bmux_ipc::Event::ClientDetached { .. }, "client_detached") => true,
         (bmux_ipc::Event::AttachViewChanged { .. }, "attach_view_changed") => true,
+        (bmux_ipc::Event::PaneOutputAvailable { .. }, "pane_output_available") => true,
         _ => false,
     }
 }

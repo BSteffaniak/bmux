@@ -2538,6 +2538,7 @@ fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
         bmux_client::ServerEvent::FollowTargetGone { .. } => "follow_target_gone",
         bmux_client::ServerEvent::FollowTargetChanged { .. } => "follow_target_changed",
         bmux_client::ServerEvent::AttachViewChanged { .. } => "attach_view_changed",
+        bmux_client::ServerEvent::PaneOutputAvailable { .. } => "pane_output_available",
     }
 }
 

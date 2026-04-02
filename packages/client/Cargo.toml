@@ -23,7 +23,7 @@ bmux_codec = { workspace = true }
 crossterm  = { workspace = true }
 serde      = { workspace = true, features = ["derive"], optional = true }
 thiserror  = { workspace = true }
-tokio      = { workspace = true, features = ["time"] }
+tokio      = { workspace = true, features = ["time", "sync", "rt"] }
 tracing    = { workspace = true }
 uuid       = { workspace = true, features = ["std"] }
 

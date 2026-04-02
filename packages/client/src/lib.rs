@@ -7,7 +7,7 @@
 
 use bmux_config::{BmuxConfig, ConfigPaths};
 pub use bmux_ipc::Event as ServerEvent;
-use bmux_ipc::transport::{ErasedIpcStream, IpcTransportError, LocalIpcStream};
+use bmux_ipc::transport::{ErasedIpcStream, IpcStreamWriter, IpcTransportError, LocalIpcStream};
 use bmux_ipc::{
     AttachGrant, AttachPaneChunk, AttachScene, ClientSummary, ContextSelector, ContextSummary,
     Envelope, EnvelopeKind, ErrorCode, InvokeServiceKind, IpcEndpoint, PaneFocusDirection,
@@ -16,6 +16,7 @@ use bmux_ipc::{
     ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary, decode, encode,
 };
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, trace, warn};
@@ -1307,6 +1308,759 @@ impl BmuxClient {
     }
 }
 
+// ── Streaming client with server-push event support ──────────────────────────
+
+/// Thread-safe map of in-flight request IDs to their response channels.
+type PendingMap =
+    Arc<tokio::sync::Mutex<BTreeMap<u64, tokio::sync::oneshot::Sender<Result<Response>>>>>;
+
+/// Event-driven client that receives server-pushed events without polling.
+///
+/// After the initial handshake (performed as a regular [`BmuxClient`]), the
+/// underlying socket is split into read/write halves. A background reader task
+/// demuxes incoming frames: `Response` envelopes are routed by `request_id`,
+/// `Event` envelopes are pushed to a channel consumed via [`event_receiver`].
+///
+/// Call [`enable_event_push`] after construction to enable server-side push
+/// delivery.
+#[derive(Debug)]
+pub struct StreamingBmuxClient {
+    writer: IpcStreamWriter,
+    timeout: Duration,
+    next_request_id: u64,
+    principal_id: Uuid,
+    pending: PendingMap,
+    event_rx: tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
+    _reader_task: tokio::task::JoinHandle<()>,
+}
+
+impl StreamingBmuxClient {
+    /// Upgrade an existing [`BmuxClient`] (already handshaken) into a streaming
+    /// client. The `BmuxClient` is consumed; its socket is split and a reader
+    /// task is spawned on the current tokio runtime.
+    ///
+    /// Only `Local` (Unix socket) streams can be upgraded.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the client uses a bridge stream.
+    pub fn from_client(client: BmuxClient) -> Result<Self> {
+        let BmuxClient {
+            stream,
+            timeout,
+            next_request_id,
+            principal_id,
+        } = client;
+
+        let local_stream = match stream {
+            ClientStream::Local(s) => s,
+            ClientStream::Bridge(_) => {
+                return Err(ClientError::UnexpectedResponse(
+                    "streaming client requires a local IPC stream, not a bridge stream",
+                ));
+            }
+        };
+
+        let (reader, writer) = local_stream.into_split();
+        let pending: PendingMap = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
+        let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
+
+        let reader_pending = Arc::clone(&pending);
+        let reader_task = tokio::spawn(async move {
+            Self::reader_loop(reader, reader_pending, event_tx).await;
+        });
+
+        Ok(Self {
+            writer,
+            timeout,
+            next_request_id,
+            principal_id,
+            pending,
+            event_rx,
+            _reader_task: reader_task,
+        })
+    }
+
+    /// Background reader loop that demuxes incoming envelopes.
+    async fn reader_loop(
+        mut reader: bmux_ipc::transport::IpcStreamReader,
+        pending: PendingMap,
+        event_tx: tokio::sync::mpsc::UnboundedSender<ServerEvent>,
+    ) {
+        loop {
+            let envelope = match reader.recv_envelope().await {
+                Ok(envelope) => envelope,
+                Err(_) => {
+                    // Connection closed or error — wake all pending requests.
+                    let mut map = pending.lock().await;
+                    for (_, tx) in std::mem::take(&mut *map) {
+                        let _ = tx.send(Err(ClientError::Transport(IpcTransportError::Io(
+                            std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "server connection closed",
+                            ),
+                        ))));
+                    }
+                    return;
+                }
+            };
+
+            match envelope.kind {
+                EnvelopeKind::Response => {
+                    let mut map = pending.lock().await;
+                    if let Some(tx) = map.remove(&envelope.request_id) {
+                        match decode::<Response>(&envelope.payload) {
+                            Ok(response) => {
+                                let _ = tx.send(Ok(response));
+                            }
+                            Err(e) => {
+                                let _ = tx.send(Err(ClientError::Serialization(e)));
+                            }
+                        }
+                    } else {
+                        warn!(
+                            request_id = envelope.request_id,
+                            "streaming client received response for unknown request id"
+                        );
+                    }
+                }
+                EnvelopeKind::Event => match decode::<ServerEvent>(&envelope.payload) {
+                    Ok(event) => {
+                        let _ = event_tx.send(event);
+                    }
+                    Err(e) => {
+                        warn!("streaming client failed to decode event: {e:#}");
+                    }
+                },
+                EnvelopeKind::Request => {
+                    warn!("streaming client received unexpected request envelope");
+                }
+            }
+        }
+    }
+
+    /// Borrow the event receiver for use in `tokio::select!`.
+    pub fn event_receiver(&mut self) -> &mut tokio::sync::mpsc::UnboundedReceiver<ServerEvent> {
+        &mut self.event_rx
+    }
+
+    /// Return this connection's principal identity.
+    #[must_use]
+    pub const fn principal_id(&self) -> Uuid {
+        self.principal_id
+    }
+
+    /// Execute a request and return the full response.
+    pub async fn request_raw(&mut self, request: Request) -> Result<Response> {
+        let request_id = self.take_request_id();
+        let request_kind = request_kind_name(&request);
+        let started_at = std::time::Instant::now();
+        debug!(
+            request_id,
+            request = request_kind,
+            "streaming_ipc.request.start"
+        );
+
+        let payload = encode(&request)?;
+        let envelope = Envelope::new(request_id, EnvelopeKind::Request, payload);
+
+        // Register pending response before sending to avoid races.
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        {
+            let mut map = self.pending.lock().await;
+            map.insert(request_id, tx);
+        }
+
+        if let Err(e) = tokio::time::timeout(self.timeout, self.writer.send_envelope(&envelope))
+            .await
+            .map_err(|_| ClientError::Timeout(self.timeout))?
+        {
+            let mut map = self.pending.lock().await;
+            map.remove(&request_id);
+            return Err(ClientError::Transport(e));
+        }
+
+        let response = tokio::time::timeout(self.timeout, rx)
+            .await
+            .map_err(|_| ClientError::Timeout(self.timeout))?
+            .map_err(|_| {
+                ClientError::Transport(IpcTransportError::Io(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "reader task dropped before response",
+                )))
+            })??;
+
+        debug!(
+            request_id,
+            request = request_kind,
+            response = response_kind_name(&response),
+            duration_ms = started_at.elapsed().as_millis(),
+            "streaming_ipc.request.done"
+        );
+        Ok(response)
+    }
+
+    async fn request(&mut self, request: Request) -> Result<ResponsePayload> {
+        let response = self.request_raw(request).await?;
+        match response {
+            Response::Ok(payload) => Ok(payload),
+            Response::Err(error) => Err(ClientError::ServerError {
+                code: error.code,
+                message: error.message,
+            }),
+        }
+    }
+
+    fn take_request_id(&mut self) -> u64 {
+        let request_id = self.next_request_id;
+        self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
+        request_id
+    }
+
+    // ── Event push control ───────────────────────────────────────────────
+
+    /// Enable server-push event delivery on this connection.
+    ///
+    /// After this call, the server will push `Event` frames asynchronously.
+    /// Events are received via [`event_receiver`].
+    pub async fn enable_event_push(&mut self) -> Result<()> {
+        match self.request(Request::EnableEventPush).await? {
+            ResponsePayload::EventPushEnabled => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected event push enabled",
+            )),
+        }
+    }
+
+    // ── Delegated request methods ────────────────────────────────────────
+
+    pub async fn ping(&mut self) -> Result<()> {
+        match self.request(Request::Ping).await? {
+            ResponsePayload::Pong => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse("expected pong")),
+        }
+    }
+
+    pub async fn whoami(&mut self) -> Result<Uuid> {
+        match self.request(Request::WhoAmI).await? {
+            ResponsePayload::ClientIdentity { id } => Ok(id),
+            _ => Err(ClientError::UnexpectedResponse("expected client identity")),
+        }
+    }
+
+    pub async fn whoami_principal(&mut self) -> Result<PrincipalIdentityInfo> {
+        match self.request(Request::WhoAmIPrincipal).await? {
+            ResponsePayload::PrincipalIdentity {
+                principal_id,
+                server_control_principal_id,
+                force_local_permitted,
+            } => Ok(PrincipalIdentityInfo {
+                principal_id,
+                server_control_principal_id,
+                force_local_permitted,
+            }),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected principal identity",
+            )),
+        }
+    }
+
+    pub async fn subscribe_events(&mut self) -> Result<()> {
+        match self.request(Request::SubscribeEvents).await? {
+            ResponsePayload::EventsSubscribed => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected events subscribed",
+            )),
+        }
+    }
+
+    pub async fn poll_events(&mut self, max_events: usize) -> Result<Vec<ServerEvent>> {
+        match self.request(Request::PollEvents { max_events }).await? {
+            ResponsePayload::EventBatch { events } => Ok(events),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected event batch response",
+            )),
+        }
+    }
+
+    pub async fn list_sessions(&mut self) -> Result<Vec<SessionSummary>> {
+        match self.request(Request::ListSessions).await? {
+            ResponsePayload::SessionList { sessions } => Ok(sessions),
+            _ => Err(ClientError::UnexpectedResponse("expected session list")),
+        }
+    }
+
+    pub async fn list_clients(&mut self) -> Result<Vec<ClientSummary>> {
+        match self.request(Request::ListClients).await? {
+            ResponsePayload::ClientList { clients } => Ok(clients),
+            _ => Err(ClientError::UnexpectedResponse("expected client list")),
+        }
+    }
+
+    pub async fn create_context(
+        &mut self,
+        name: Option<String>,
+        attributes: BTreeMap<String, String>,
+    ) -> Result<ContextSummary> {
+        match self
+            .request(Request::CreateContext { name, attributes })
+            .await?
+        {
+            ResponsePayload::ContextCreated { context } => Ok(context),
+            _ => Err(ClientError::UnexpectedResponse("expected context created")),
+        }
+    }
+
+    pub async fn list_contexts(&mut self) -> Result<Vec<ContextSummary>> {
+        match self.request(Request::ListContexts).await? {
+            ResponsePayload::ContextList { contexts } => Ok(contexts),
+            _ => Err(ClientError::UnexpectedResponse("expected context list")),
+        }
+    }
+
+    pub async fn select_context(&mut self, selector: ContextSelector) -> Result<ContextSummary> {
+        match self.request(Request::SelectContext { selector }).await? {
+            ResponsePayload::ContextSelected { context } => Ok(context),
+            _ => Err(ClientError::UnexpectedResponse("expected context selected")),
+        }
+    }
+
+    pub async fn current_context(&mut self) -> Result<Option<ContextSummary>> {
+        match self.request(Request::CurrentContext).await? {
+            ResponsePayload::CurrentContext { context } => Ok(context),
+            _ => Err(ClientError::UnexpectedResponse("expected current context")),
+        }
+    }
+
+    pub async fn kill_session(&mut self, selector: SessionSelector) -> Result<Uuid> {
+        self.kill_session_with_options(selector, false).await
+    }
+
+    pub async fn kill_session_with_options(
+        &mut self,
+        selector: SessionSelector,
+        force_local: bool,
+    ) -> Result<Uuid> {
+        match self
+            .request(Request::KillSession {
+                selector,
+                force_local,
+            })
+            .await?
+        {
+            ResponsePayload::SessionKilled { id } => Ok(id),
+            _ => Err(ClientError::UnexpectedResponse("expected session killed")),
+        }
+    }
+
+    pub async fn follow_client(&mut self, target_client_id: Uuid, global: bool) -> Result<()> {
+        match self
+            .request(Request::FollowClient {
+                target_client_id,
+                global,
+            })
+            .await?
+        {
+            ResponsePayload::FollowStarted { .. } => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse("expected follow started")),
+        }
+    }
+
+    pub async fn unfollow(&mut self) -> Result<()> {
+        match self.request(Request::Unfollow).await? {
+            ResponsePayload::FollowStopped { .. } => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse("expected follow stopped")),
+        }
+    }
+
+    pub async fn attach_grant(&mut self, selector: SessionSelector) -> Result<AttachGrant> {
+        match self.request(Request::Attach { selector }).await? {
+            ResponsePayload::Attached { grant } => Ok(grant),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attached response",
+            )),
+        }
+    }
+
+    pub async fn attach_context_grant(&mut self, selector: ContextSelector) -> Result<AttachGrant> {
+        match self.request(Request::AttachContext { selector }).await? {
+            ResponsePayload::Attached { grant } => Ok(grant),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attached response",
+            )),
+        }
+    }
+
+    pub async fn open_attach_stream_info(&mut self, grant: &AttachGrant) -> Result<AttachOpenInfo> {
+        match self
+            .request(Request::AttachOpen {
+                session_id: grant.session_id,
+                attach_token: grant.attach_token,
+            })
+            .await?
+        {
+            ResponsePayload::AttachReady {
+                context_id,
+                session_id,
+                can_write,
+            } => Ok(AttachOpenInfo {
+                context_id,
+                session_id,
+                can_write,
+            }),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attach ready response",
+            )),
+        }
+    }
+
+    pub async fn attach_set_viewport_with_insets(
+        &mut self,
+        session_id: Uuid,
+        cols: u16,
+        rows: u16,
+        status_top_inset: u16,
+        status_bottom_inset: u16,
+    ) -> Result<(u16, u16)> {
+        match self
+            .request(Request::AttachSetViewport {
+                session_id,
+                cols,
+                rows,
+                status_top_inset,
+                status_bottom_inset,
+            })
+            .await?
+        {
+            ResponsePayload::AttachViewportSet { cols, rows, .. } => Ok((cols, rows)),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attach viewport set response",
+            )),
+        }
+    }
+
+    pub async fn attach_input(&mut self, session_id: Uuid, data: Vec<u8>) -> Result<()> {
+        match self
+            .request(Request::AttachInput { session_id, data })
+            .await?
+        {
+            ResponsePayload::AttachInputAccepted { .. } => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attach input accepted response",
+            )),
+        }
+    }
+
+    pub async fn attach_layout(&mut self, session_id: Uuid) -> Result<AttachLayoutState> {
+        match self.request(Request::AttachLayout { session_id }).await? {
+            ResponsePayload::AttachLayout {
+                context_id,
+                session_id,
+                focused_pane_id,
+                panes,
+                layout_root,
+                scene,
+                zoomed,
+            } => Ok(AttachLayoutState {
+                context_id,
+                session_id,
+                focused_pane_id,
+                panes,
+                layout_root,
+                scene,
+                zoomed,
+            }),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attach layout response",
+            )),
+        }
+    }
+
+    pub async fn attach_pane_output_batch(
+        &mut self,
+        session_id: Uuid,
+        pane_ids: Vec<Uuid>,
+        max_bytes: usize,
+    ) -> Result<Vec<AttachPaneChunk>> {
+        match self
+            .request(Request::AttachPaneOutputBatch {
+                session_id,
+                pane_ids,
+                max_bytes,
+            })
+            .await?
+        {
+            ResponsePayload::AttachPaneOutputBatch { chunks } => Ok(chunks),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attach pane output batch response",
+            )),
+        }
+    }
+
+    pub async fn attach_snapshot(
+        &mut self,
+        session_id: Uuid,
+        max_bytes_per_pane: usize,
+    ) -> Result<AttachSnapshotState> {
+        match self
+            .request(Request::AttachSnapshot {
+                session_id,
+                max_bytes_per_pane,
+            })
+            .await?
+        {
+            ResponsePayload::AttachSnapshot {
+                context_id,
+                session_id,
+                focused_pane_id,
+                panes,
+                layout_root,
+                scene,
+                chunks,
+                zoomed,
+            } => Ok(AttachSnapshotState {
+                context_id,
+                session_id,
+                focused_pane_id,
+                panes,
+                layout_root,
+                scene,
+                chunks,
+                zoomed,
+            }),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attach snapshot response",
+            )),
+        }
+    }
+
+    pub async fn split_pane(
+        &mut self,
+        session: Option<SessionSelector>,
+        direction: PaneSplitDirection,
+    ) -> Result<Uuid> {
+        match self
+            .request(Request::SplitPane {
+                session,
+                target: None,
+                direction,
+                ratio_pct: None,
+            })
+            .await?
+        {
+            ResponsePayload::PaneSplit { id, .. } => Ok(id),
+            _ => Err(ClientError::UnexpectedResponse("expected pane split")),
+        }
+    }
+
+    pub async fn split_pane_target(
+        &mut self,
+        session: Option<SessionSelector>,
+        target: PaneSelector,
+        direction: PaneSplitDirection,
+    ) -> Result<Uuid> {
+        match self
+            .request(Request::SplitPane {
+                session,
+                target: Some(target),
+                direction,
+                ratio_pct: None,
+            })
+            .await?
+        {
+            ResponsePayload::PaneSplit { id, .. } => Ok(id),
+            _ => Err(ClientError::UnexpectedResponse("expected pane split")),
+        }
+    }
+
+    pub async fn focus_pane(
+        &mut self,
+        session: Option<SessionSelector>,
+        direction: PaneFocusDirection,
+    ) -> Result<Uuid> {
+        match self
+            .request(Request::FocusPane {
+                session,
+                target: None,
+                direction: Some(direction),
+            })
+            .await?
+        {
+            ResponsePayload::PaneFocused { id, .. } => Ok(id),
+            _ => Err(ClientError::UnexpectedResponse("expected pane focused")),
+        }
+    }
+
+    pub async fn focus_pane_target(
+        &mut self,
+        session: Option<SessionSelector>,
+        target: PaneSelector,
+    ) -> Result<Uuid> {
+        match self
+            .request(Request::FocusPane {
+                session,
+                target: Some(target),
+                direction: None,
+            })
+            .await?
+        {
+            ResponsePayload::PaneFocused { id, .. } => Ok(id),
+            _ => Err(ClientError::UnexpectedResponse("expected pane focused")),
+        }
+    }
+
+    pub async fn resize_pane(
+        &mut self,
+        session: Option<SessionSelector>,
+        delta: i16,
+    ) -> Result<()> {
+        match self
+            .request(Request::ResizePane {
+                session,
+                target: None,
+                delta,
+            })
+            .await?
+        {
+            ResponsePayload::PaneResized { .. } => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse("expected pane resized")),
+        }
+    }
+
+    pub async fn close_pane(&mut self, session: Option<SessionSelector>) -> Result<()> {
+        match self
+            .request(Request::ClosePane {
+                session,
+                target: None,
+            })
+            .await?
+        {
+            ResponsePayload::PaneClosed { .. } => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse("expected pane closed")),
+        }
+    }
+
+    pub async fn zoom_pane(&mut self, session: Option<SessionSelector>) -> Result<(Uuid, bool)> {
+        match self.request(Request::ZoomPane { session }).await? {
+            ResponsePayload::PaneZoomed {
+                pane_id, zoomed, ..
+            } => Ok((pane_id, zoomed)),
+            _ => Err(ClientError::UnexpectedResponse("expected pane zoomed")),
+        }
+    }
+
+    pub async fn detach(&mut self) -> Result<()> {
+        match self.request(Request::Detach).await? {
+            ResponsePayload::Detached => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse("expected detached")),
+        }
+    }
+
+    pub async fn invoke_service_raw(
+        &mut self,
+        capability: impl Into<String>,
+        kind: InvokeServiceKind,
+        interface_id: impl Into<String>,
+        operation: impl Into<String>,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>> {
+        match self
+            .request(Request::InvokeService {
+                capability: capability.into(),
+                kind,
+                interface_id: interface_id.into(),
+                operation: operation.into(),
+                payload,
+            })
+            .await?
+        {
+            ResponsePayload::ServiceInvoked { payload } => Ok(payload),
+            _ => Err(ClientError::UnexpectedResponse("expected service invoked")),
+        }
+    }
+
+    pub async fn pane_direct_input(
+        &mut self,
+        session_id: Uuid,
+        pane_id: Uuid,
+        data: Vec<u8>,
+    ) -> Result<()> {
+        match self
+            .request(Request::PaneDirectInput {
+                session_id,
+                pane_id,
+                data,
+            })
+            .await?
+        {
+            ResponsePayload::PaneDirectInputAccepted { .. } => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected pane direct input accepted",
+            )),
+        }
+    }
+
+    pub async fn recording_start(
+        &mut self,
+        session_id: Option<Uuid>,
+        capture_input: bool,
+        profile: Option<RecordingProfile>,
+        event_kinds: Option<Vec<RecordingEventKind>>,
+    ) -> Result<RecordingSummary> {
+        match self
+            .request(Request::RecordingStart {
+                session_id,
+                capture_input,
+                profile,
+                event_kinds,
+            })
+            .await?
+        {
+            ResponsePayload::RecordingStarted { recording } => Ok(recording),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording started",
+            )),
+        }
+    }
+
+    pub async fn recording_stop(&mut self, recording_id: Option<Uuid>) -> Result<Uuid> {
+        match self
+            .request(Request::RecordingStop { recording_id })
+            .await?
+        {
+            ResponsePayload::RecordingStopped { recording_id } => Ok(recording_id),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording stopped",
+            )),
+        }
+    }
+
+    pub async fn recording_write_custom_event(
+        &mut self,
+        session_id: Option<Uuid>,
+        pane_id: Option<Uuid>,
+        source: String,
+        name: String,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        match self
+            .request(Request::RecordingWriteCustomEvent {
+                session_id,
+                pane_id,
+                source,
+                name,
+                payload,
+            })
+            .await?
+        {
+            ResponsePayload::RecordingCustomEventWritten { .. } => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording custom event written",
+            )),
+        }
+    }
+}
+
 const fn request_kind_name(request: &Request) -> &'static str {
     match request {
         Request::Hello { .. } => "hello",
@@ -1356,6 +2110,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::Detach => "detach",
         Request::SubscribeEvents => "subscribe_events",
         Request::PollEvents { .. } => "poll_events",
+        Request::EnableEventPush => "enable_event_push",
         Request::PaneDirectInput { .. } => "pane_direct_input",
     }
 }
@@ -1411,6 +2166,7 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::PaneDirectInputAccepted { .. } => "pane_direct_input_accepted",
             ResponsePayload::EventsSubscribed => "events_subscribed",
             ResponsePayload::EventBatch { .. } => "event_batch",
+            ResponsePayload::EventPushEnabled => "event_push_enabled",
         },
         Response::Err(_) => "error",
     }

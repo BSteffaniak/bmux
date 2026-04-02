@@ -130,7 +130,75 @@ impl LocalIpcListener {
     }
 }
 
+/// Write half of a split [`LocalIpcStream`].
+pub struct IpcStreamWriter {
+    inner: tokio::io::WriteHalf<LocalIpcStream>,
+}
+
+impl std::fmt::Debug for IpcStreamWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IpcStreamWriter(..)")
+    }
+}
+
+/// Read half of a split [`LocalIpcStream`].
+pub struct IpcStreamReader {
+    inner: tokio::io::ReadHalf<LocalIpcStream>,
+}
+
+impl std::fmt::Debug for IpcStreamReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("IpcStreamReader(..)")
+    }
+}
+
+impl IpcStreamWriter {
+    /// Send a single framed envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if frame encoding or socket writes fail.
+    pub async fn send_envelope(&mut self, envelope: &Envelope) -> Result<(), IpcTransportError> {
+        let frame = encode_frame(envelope)?;
+        write_frame(&mut self.inner, &frame).await
+    }
+
+    /// Write a pre-encoded frame (length-prefixed bytes) directly to the socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing fails.
+    pub async fn write_raw_frame(&mut self, frame: &[u8]) -> Result<(), IpcTransportError> {
+        write_frame(&mut self.inner, frame).await
+    }
+}
+
+impl IpcStreamReader {
+    /// Receive a single framed envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if frame reads fail or the frame is invalid.
+    pub async fn recv_envelope(&mut self) -> Result<Envelope, IpcTransportError> {
+        read_frame(&mut self.inner).await
+    }
+}
+
 impl LocalIpcStream {
+    /// Split this stream into independent read and write halves.
+    ///
+    /// This allows concurrent reading and writing on the same underlying
+    /// connection, which is required for server-push event delivery alongside
+    /// request/response traffic.
+    #[must_use]
+    pub fn into_split(self) -> (IpcStreamReader, IpcStreamWriter) {
+        let (read_half, write_half) = tokio::io::split(self);
+        (
+            IpcStreamReader { inner: read_half },
+            IpcStreamWriter { inner: write_half },
+        )
+    }
+
     /// Connect to a local endpoint.
     ///
     /// # Errors

@@ -870,7 +870,7 @@ pub(super) async fn plugin_event_bridge_loop(
         return Ok(());
     }
 
-    let mut client = loop {
+    let client = loop {
         if *shutdown_rx.borrow() {
             return Ok(());
         }
@@ -890,10 +890,23 @@ pub(super) async fn plugin_event_bridge_loop(
         }
     };
 
-    client
+    // Upgrade to streaming client for server-push event delivery.
+    let mut streaming_client = match bmux_client::StreamingBmuxClient::from_client(client) {
+        Ok(sc) => sc,
+        Err(_) => {
+            // Fallback: if upgrade fails (e.g., bridge stream), just return.
+            return Ok(());
+        }
+    };
+    streaming_client
         .subscribe_events()
         .await
         .map_err(map_cli_client_error)?;
+    streaming_client
+        .enable_event_push()
+        .await
+        .map_err(map_cli_client_error)?;
+
     loop {
         tokio::select! {
             _ = shutdown_rx.changed() => {
@@ -901,11 +914,15 @@ pub(super) async fn plugin_event_bridge_loop(
                     return Ok(());
                 }
             }
-            result = client.poll_events(32) => {
-                let events = result.map_err(map_cli_client_error)?;
-                for event in events {
-                    dispatch_loaded_plugin_event(loaded_plugins, plugin_event_from_server_event(&event)?)?;
+            event = streaming_client.event_receiver().recv() => {
+                let Some(event) = event else {
+                    return Ok(()); // server disconnected
+                };
+                // Skip high-frequency pane output notifications for plugins.
+                if matches!(event, bmux_client::ServerEvent::PaneOutputAvailable { .. }) {
+                    continue;
                 }
+                dispatch_loaded_plugin_event(loaded_plugins, plugin_event_from_server_event(&event)?)?;
             }
         }
     }
@@ -936,7 +953,8 @@ pub(super) const fn plugin_event_kind_from_server_event(
         | bmux_client::ServerEvent::FollowTargetChanged { .. } => PluginEventKind::Session,
         bmux_client::ServerEvent::ClientAttached { .. }
         | bmux_client::ServerEvent::ClientDetached { .. } => PluginEventKind::Client,
-        bmux_client::ServerEvent::AttachViewChanged { .. } => PluginEventKind::Pane,
+        bmux_client::ServerEvent::AttachViewChanged { .. }
+        | bmux_client::ServerEvent::PaneOutputAvailable { .. } => PluginEventKind::Pane,
     }
 }
 

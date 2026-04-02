@@ -93,6 +93,8 @@ struct ServerState {
     recording_runtime: Arc<Mutex<RecordingRuntime>>,
     operation_lock: AsyncMutex<()>,
     event_hub: Mutex<EventHub>,
+    /// Broadcast channel for pushing events to streaming clients.
+    event_broadcast: tokio::sync::broadcast::Sender<Event>,
     client_principals: Mutex<BTreeMap<ClientId, Uuid>>,
     server_control_principal_id: Uuid,
     handshake_timeout: Duration,
@@ -942,6 +944,8 @@ struct SessionRuntimeManager {
     protocol_profile: ProtocolProfile,
     pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
     recording_runtime: Arc<Mutex<RecordingRuntime>>,
+    /// Broadcast sender for pushing pane output notifications to streaming clients.
+    event_broadcast: tokio::sync::broadcast::Sender<Event>,
 }
 
 struct SessionRuntimeHandle {
@@ -991,6 +995,10 @@ struct PaneRuntimeHandle {
     output_buffer: Arc<std::sync::Mutex<OutputFanoutBuffer>>,
     exited: Arc<AtomicBool>,
     last_requested_size: Arc<std::sync::Mutex<(u16, u16)>>,
+    /// Set to `true` by the PTY reader when new output arrives. The broadcast
+    /// event is only emitted on the `false→true` transition, coalescing
+    /// thousands of per-chunk writes into ~1 event per fetch cycle.
+    output_dirty: Arc<AtomicBool>,
 }
 
 enum PaneRuntimeCommand {
@@ -1641,12 +1649,13 @@ fn runtime_layout_from_snapshot(node: &PaneLayoutNodeSnapshotV2) -> PaneLayoutNo
 }
 
 impl SessionRuntimeManager {
-    const fn new(
+    fn new(
         shell: String,
         pane_term: String,
         protocol_profile: ProtocolProfile,
         pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
         recording_runtime: Arc<Mutex<RecordingRuntime>>,
+        event_broadcast: tokio::sync::broadcast::Sender<Event>,
     ) -> Self {
         Self {
             runtimes: BTreeMap::new(),
@@ -1655,6 +1664,7 @@ impl SessionRuntimeManager {
             protocol_profile,
             pane_exit_tx,
             recording_runtime,
+            event_broadcast,
         }
     }
 
@@ -1759,6 +1769,9 @@ impl SessionRuntimeManager {
         let process_group_id_for_task = Arc::clone(&process_group_id);
         let exited = Arc::new(AtomicBool::new(false));
         let exited_for_task = Arc::clone(&exited);
+        let event_broadcast_for_reader = self.event_broadcast.clone();
+        let output_dirty = Arc::new(AtomicBool::new(false));
+        let output_dirty_for_reader = Arc::clone(&output_dirty);
 
         let task = tokio::spawn(async move {
             let pty_system = native_pty_system();
@@ -1839,6 +1852,25 @@ impl SessionRuntimeManager {
                                     output.push_chunk(chunk);
                                 } else {
                                     break;
+                                }
+                                // Notify streaming clients that new output is available.
+                                // Only emit when transitioning false→true to coalesce
+                                // thousands of per-chunk writes into ~1 event per fetch cycle.
+                                if output_dirty_for_reader
+                                    .compare_exchange(
+                                        false,
+                                        true,
+                                        Ordering::SeqCst,
+                                        Ordering::SeqCst,
+                                    )
+                                    .is_ok()
+                                {
+                                    let _ = event_broadcast_for_reader.send(
+                                        Event::PaneOutputAvailable {
+                                            session_id: session_id.0,
+                                            pane_id,
+                                        },
+                                    );
                                 }
                                 if let Ok(runtime) = recording_runtime.lock() {
                                     let _ = runtime.record(
@@ -1938,6 +1970,7 @@ impl SessionRuntimeManager {
             output_buffer,
             exited,
             last_requested_size,
+            output_dirty,
         })
     }
 
@@ -2625,6 +2658,7 @@ impl BmuxServer {
             segment_mb,
             retention_days,
         )));
+        let (event_broadcast_tx, _) = tokio::sync::broadcast::channel::<Event>(256);
         Self {
             endpoint,
             state: Arc::new(ServerState {
@@ -2635,6 +2669,7 @@ impl BmuxServer {
                     protocol_profile,
                     pane_exit_tx,
                     Arc::clone(&recording_runtime),
+                    event_broadcast_tx.clone(),
                 )),
                 attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
                 follow_state: Mutex::new(FollowState::default()),
@@ -2643,6 +2678,7 @@ impl BmuxServer {
                 recording_runtime,
                 operation_lock: AsyncMutex::new(()),
                 event_hub: Mutex::new(EventHub::new(1024)),
+                event_broadcast: event_broadcast_tx,
                 client_principals: Mutex::new(BTreeMap::new()),
                 server_control_principal_id,
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
@@ -2937,6 +2973,8 @@ async fn handle_connection(
     let mut selected_session: Option<SessionId> = None;
     let mut attached_stream_session: Option<SessionId> = None;
 
+    // ── Handshake (serial, before split) ─────────────────────────────────
+
     let first_envelope = tokio::time::timeout(state.handshake_timeout, stream.recv_envelope())
         .await
         .context("handshake timed out")??;
@@ -3001,8 +3039,28 @@ async fn handle_connection(
         principals.insert(client_id, client_principal_id);
     }
 
+    // ── Split stream for concurrent read/write ───────────────────────────
+
+    let (mut reader, mut writer) = stream.into_split();
+
+    // Channel-based writer: all outgoing frames (responses + pushed events)
+    // are sent through this channel to a single writer task. This eliminates
+    // mutex contention between the request loop and the event push task.
+    let (frame_tx, mut frame_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+    let writer_task = tokio::spawn(async move {
+        while let Some(frame) = frame_rx.recv().await {
+            if writer.write_raw_frame(&frame).await.is_err() {
+                return;
+            }
+        }
+    });
+
+    let mut event_push_task: Option<tokio::task::JoinHandle<()>> = None;
+
+    // ── Request loop ─────────────────────────────────────────────────────
+
     loop {
-        let envelope = match stream.recv_envelope().await {
+        let envelope = match reader.recv_envelope().await {
             Ok(envelope) => envelope,
             Err(IpcTransportError::Io(error))
                 if error.kind() == std::io::ErrorKind::UnexpectedEof =>
@@ -3015,16 +3073,18 @@ async fn handle_connection(
         let request = match parse_request(&envelope) {
             Ok(request) => request,
             Err(error) => {
-                send_error(
-                    &mut stream,
+                send_error_via_channel(
+                    &frame_tx,
                     envelope.request_id,
                     ErrorCode::InvalidRequest,
                     format!("failed parsing request: {error:#}"),
-                )
-                .await?;
+                )?;
                 continue;
             }
         };
+
+        // Track whether this request enables event push delivery.
+        let is_enable_push = matches!(request, Request::EnableEventPush);
 
         let request_kind = request_kind_name(&request);
         let exclusive = request_requires_exclusive(&request);
@@ -3130,7 +3190,7 @@ async fn handle_connection(
                 }
             }
         }
-        match send_response(&mut stream, envelope.request_id, response).await {
+        match send_response_via_channel(&frame_tx, envelope.request_id, response) {
             Ok(()) => {}
             Err(err) if is_frame_too_large_error(&err) => {
                 warn!(
@@ -3138,17 +3198,56 @@ async fn handle_connection(
                     request_id = envelope.request_id,
                     "response exceeded frame size limit, sending error to client: {err:#}"
                 );
-                send_error(
-                    &mut stream,
+                send_error_via_channel(
+                    &frame_tx,
                     envelope.request_id,
                     ErrorCode::Internal,
                     "response too large".to_string(),
-                )
-                .await?;
+                )?;
             }
             Err(err) => return Err(err),
         }
+
+        // After responding to EnableEventPush, spawn the event push task.
+        // It receives events from the broadcast channel and forwards them
+        // as serialized frames through the writer channel — no mutex needed.
+        if is_enable_push && event_push_task.is_none() {
+            let mut event_rx = state.event_broadcast.subscribe();
+            let push_frame_tx = frame_tx.clone();
+            event_push_task = Some(tokio::spawn(async move {
+                loop {
+                    match event_rx.recv().await {
+                        Ok(event) => {
+                            let Ok(payload) = encode(&event) else {
+                                continue;
+                            };
+                            let envelope = Envelope::new(0, EnvelopeKind::Event, payload);
+                            let Ok(frame) = bmux_ipc::frame::encode_frame(&envelope) else {
+                                continue;
+                            };
+                            if push_frame_tx.send(frame).is_err() {
+                                return; // writer dropped (client disconnected)
+                            }
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("event push task lagged by {n} events for client");
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                            return; // server shutting down
+                        }
+                    }
+                }
+            }));
+        }
     }
+
+    // Abort the event push task if running.
+    if let Some(task) = event_push_task {
+        task.abort();
+    }
+    // Drop the frame sender so the writer task exits.
+    drop(frame_tx);
+    let _ = writer_task.await;
 
     detach_client_state_on_disconnect(
         &state,
@@ -3184,7 +3283,8 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
             | Event::ServerStopping
             | Event::FollowStarted { .. }
             | Event::FollowStopped { .. }
-            | Event::FollowTargetGone { .. } => None,
+            | Event::FollowTargetGone { .. }
+            | Event::PaneOutputAvailable { .. } => None,
         };
         let _ = runtime.record(
             RecordingEventKind::ServerEvent,
@@ -3198,6 +3298,8 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
             },
         );
     }
+    // Broadcast to streaming clients (ignore errors — no receivers is fine).
+    let _ = state.event_broadcast.send(event.clone());
     let mut hub = state
         .event_hub
         .lock()
@@ -5665,6 +5767,15 @@ async fn handle_request(
                     .session_runtimes
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+                // Clear output_dirty flags for requested panes so the PTY reader
+                // can re-notify on the next chunk of output.
+                if let Some(runtime) = runtime_manager.runtimes.get(&session_id) {
+                    for pane_id in &pane_ids {
+                        if let Some(pane) = runtime.panes.get(pane_id) {
+                            pane.output_dirty.store(false, Ordering::SeqCst);
+                        }
+                    }
+                }
                 runtime_manager.read_pane_output_batch(session_id, client_id, &pane_ids, max_bytes)
             };
             match chunks {
@@ -5743,6 +5854,10 @@ async fn handle_request(
                 }),
             }
         }
+        // EnableEventPush is handled in handle_connection after the response
+        // is sent — the actual push task spawning happens there. Here we just
+        // acknowledge the request.
+        Request::EnableEventPush => Response::Ok(ResponsePayload::EventPushEnabled),
         Request::RecordingStart {
             session_id,
             capture_input,
@@ -6075,6 +6190,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::Detach => "detach",
         Request::SubscribeEvents => "subscribe_events",
         Request::PollEvents { .. } => "poll_events",
+        Request::EnableEventPush => "enable_event_push",
         Request::PaneDirectInput { .. } => "pane_direct_input",
     }
 }
@@ -6157,6 +6273,7 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::PaneDirectInputAccepted { .. } => "pane_direct_input_accepted",
         ResponsePayload::EventsSubscribed => "events_subscribed",
         ResponsePayload::EventBatch { .. } => "event_batch",
+        ResponsePayload::EventPushEnabled => "event_push_enabled",
     }
 }
 
@@ -6785,6 +6902,31 @@ async fn send_response(
         .send_envelope(&envelope)
         .await
         .context("failed sending response envelope")
+}
+
+fn send_error_via_channel(
+    frame_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    request_id: u64,
+    code: ErrorCode,
+    message: String,
+) -> Result<()> {
+    let response = Response::Err(ErrorResponse { code, message });
+    send_response_via_channel(frame_tx, request_id, response)
+}
+
+fn send_response_via_channel(
+    frame_tx: &mpsc::UnboundedSender<Vec<u8>>,
+    request_id: u64,
+    response: Response,
+) -> Result<()> {
+    let payload = encode(&response).context("failed encoding response payload")?;
+    let envelope = Envelope::new(request_id, EnvelopeKind::Response, payload);
+    let frame =
+        bmux_ipc::frame::encode_frame(&envelope).context("failed encoding response frame")?;
+    frame_tx
+        .send(frame)
+        .map_err(|_| anyhow::anyhow!("writer channel closed"))?;
+    Ok(())
 }
 
 /// Returns `true` when `err` was caused by the IPC frame payload exceeding the
