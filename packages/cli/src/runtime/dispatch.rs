@@ -9,6 +9,15 @@ pub(super) async fn run_command(command: &Command) -> Result<u8> {
 
 pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
     match command {
+        Command::Setup => BuiltInHandlerId::Setup,
+        Command::Host { .. } => BuiltInHandlerId::Host,
+        Command::Join { .. } => BuiltInHandlerId::Join,
+        Command::Hosts => BuiltInHandlerId::Hosts,
+        Command::Auth { command } => match command {
+            AuthCommand::Login => BuiltInHandlerId::AuthLogin,
+        },
+        Command::Share { .. } => BuiltInHandlerId::Share,
+        Command::Unshare { .. } => BuiltInHandlerId::Unshare,
         Command::Connect { .. } => BuiltInHandlerId::Connect,
         Command::NewSession { .. } => BuiltInHandlerId::NewSession,
         Command::ListSessions { .. } => BuiltInHandlerId::ListSessions,
@@ -106,6 +115,24 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
     let handler = built_in_handler_for_command(command);
     let _descriptor = built_in_command_by_handler(handler);
     match (handler, command) {
+        (BuiltInHandlerId::Setup, Command::Setup) => run_setup().await,
+        (BuiltInHandlerId::Host, Command::Host { listen, name }) => {
+            run_host(listen, name.as_deref()).await
+        }
+        (BuiltInHandlerId::Join, Command::Join { link, session }) => {
+            run_join(link.as_deref(), session.as_deref()).await
+        }
+        (BuiltInHandlerId::Hosts, Command::Hosts) => run_hosts(),
+        (
+            BuiltInHandlerId::AuthLogin,
+            Command::Auth {
+                command: AuthCommand::Login,
+            },
+        ) => run_auth_login(),
+        (BuiltInHandlerId::Share, Command::Share { target, name, role }) => {
+            run_share(target.as_deref(), name.as_deref(), role)
+        }
+        (BuiltInHandlerId::Unshare, Command::Unshare { name }) => run_unshare(name),
         (
             BuiltInHandlerId::Connect,
             Command::Connect {
@@ -117,7 +144,7 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
             },
         ) => {
             run_connect(
-                target,
+                target.as_deref(),
                 session.as_deref(),
                 follow.as_deref(),
                 *global,

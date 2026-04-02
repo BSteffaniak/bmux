@@ -82,6 +82,8 @@ pub struct ConnectionsConfig {
     pub recent_targets: Vec<String>,
     /// Most recently used sessions per target (newest first).
     pub recent_sessions: BTreeMap<String, Vec<String>>,
+    /// User-defined share links (bmux://<name> -> target reference)
+    pub share_links: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]

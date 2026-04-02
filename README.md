@@ -74,6 +74,12 @@ bmux connect prod --reconnect-forever
 bmux remote complete targets
 bmux remote complete sessions prod
 
+# Streamlined hosted workflow (iroh default)
+bmux setup
+bmux host
+bmux share --name my-host
+bmux join bmux://my-host
+
 # Bash/Zsh/Fish completion can call:
 # bmux remote complete targets
 # bmux remote complete sessions <target>

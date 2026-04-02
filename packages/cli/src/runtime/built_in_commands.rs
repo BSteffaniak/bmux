@@ -2,6 +2,14 @@ use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltInHandlerId {
+    Setup,
+    Host,
+    Join,
+    Hosts,
+    Auth,
+    AuthLogin,
+    Share,
+    Unshare,
     Connect,
     NewSession,
     ListSessions,
@@ -109,6 +117,42 @@ impl BuiltInExecutionCommand {
 
 pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
     vec![
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::Setup,
+            &["setup"],
+            "Run first-time hosted setup",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::Host,
+            &["host"],
+            "Start hosted mode using iroh",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::Join,
+            &["join"],
+            "Join a hosted link quickly",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::Hosts,
+            &["hosts"],
+            "List known hosts and targets",
+        ),
+        BuiltInExecutionCommand::new(BuiltInHandlerId::Auth, &["auth"], "Authentication helpers"),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::AuthLogin,
+            &["auth", "login"],
+            "Login/register local device",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::Share,
+            &["share"],
+            "Create a shareable bmux:// link",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::Unshare,
+            &["unshare"],
+            "Remove a share link",
+        ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Connect,
             &["connect"],

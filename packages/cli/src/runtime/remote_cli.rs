@@ -154,7 +154,7 @@ fn command_requires_remote_server(command: Option<&Command>) -> bool {
 }
 
 pub(super) async fn run_connect(
-    target: &str,
+    target: Option<&str>,
     session: Option<&str>,
     follow: Option<&str>,
     global: bool,
@@ -165,7 +165,12 @@ pub(super) async fn run_connect(
     }
 
     let config = BmuxConfig::load()?;
-    let resolved = resolve_target_reference(&config, target)?;
+    let resolved_target = if let Some(target) = target {
+        target.to_string()
+    } else {
+        choose_default_target_interactively(&config)?
+    };
+    let resolved = resolve_target_reference(&config, &resolved_target)?;
     match resolved {
         ResolvedTarget::Local => {
             let target_session = if let Some(session) = session {
@@ -250,6 +255,141 @@ pub(super) async fn run_connect(
             Ok(status)
         }
     }
+}
+
+pub(super) async fn run_setup() -> Result<u8> {
+    println!("bmux setup");
+    run_auth_login()?;
+    println!("next: bmux host");
+    Ok(0)
+}
+
+pub(super) async fn run_host(listen: &str, name: Option<&str>) -> Result<u8> {
+    if let Some(name) = name {
+        println!("host name hint: {name}");
+    }
+    run_server_gateway(
+        listen,
+        true,
+        bmux_cli_schema::GatewayHostMode::Iroh,
+        "nokey@localhost.run",
+        false,
+        None,
+        None,
+    )
+    .await
+}
+
+pub(super) async fn run_join(link: Option<&str>, session: Option<&str>) -> Result<u8> {
+    let config = BmuxConfig::load()?;
+    let target = if let Some(link) = link {
+        link.to_string()
+    } else {
+        choose_default_target_interactively(&config)?
+    };
+    let resumed_session = session.or_else(|| {
+        config
+            .connections
+            .recent_sessions
+            .get(&target)
+            .and_then(|values| values.first())
+            .map(String::as_str)
+    });
+    run_connect(Some(&target), resumed_session, None, false, true).await
+}
+
+pub(super) fn run_hosts() -> Result<u8> {
+    let config = BmuxConfig::load()?;
+    println!("known targets:");
+    for target in &config.connections.recent_targets {
+        println!("- {target}");
+    }
+    for name in config.connections.targets.keys() {
+        if !config
+            .connections
+            .recent_targets
+            .iter()
+            .any(|value| value == name)
+        {
+            println!("- {name}");
+        }
+    }
+    if !config.connections.share_links.is_empty() {
+        println!("share links:");
+        for (name, target) in &config.connections.share_links {
+            println!("- bmux://{name} -> {target}");
+        }
+    }
+    Ok(0)
+}
+
+pub(super) fn run_auth_login() -> Result<u8> {
+    let paths = ConfigPaths::default();
+    std::fs::create_dir_all(&paths.runtime_dir).with_context(|| {
+        format!(
+            "failed creating runtime dir {}",
+            paths.runtime_dir.display()
+        )
+    })?;
+    let token_path = paths.runtime_dir.join("auth-device-token");
+    if !token_path.exists() {
+        let token = Uuid::new_v4().to_string();
+        std::fs::write(&token_path, token)
+            .with_context(|| format!("failed writing auth token {}", token_path.display()))?;
+    }
+    println!("auth login complete ({})", token_path.display());
+    Ok(0)
+}
+
+pub(super) fn run_share(target: Option<&str>, name: Option<&str>, role: &str) -> Result<u8> {
+    let mut config = BmuxConfig::load()?;
+    let resolved_target = if let Some(target) = target {
+        target.to_string()
+    } else if let Some(default_target) = config.connections.default_target.clone() {
+        default_target
+    } else {
+        config
+            .connections
+            .recent_targets
+            .first()
+            .cloned()
+            .unwrap_or_else(|| "local".to_string())
+    };
+    let slug = name
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("share-{}", Uuid::new_v4().simple()));
+    config
+        .connections
+        .share_links
+        .insert(slug.clone(), resolved_target.clone());
+    config.save()?;
+    println!("created share link: bmux://{slug}");
+    println!("target: {resolved_target}");
+    println!("role: {role}");
+    Ok(0)
+}
+
+pub(super) fn run_unshare(name: &str) -> Result<u8> {
+    let mut config = BmuxConfig::load()?;
+    if config.connections.share_links.remove(name).is_some() {
+        config.save()?;
+        println!("removed share link bmux://{name}");
+        return Ok(0);
+    }
+    anyhow::bail!("share link not found: bmux://{name}");
+}
+
+fn choose_default_target_interactively(config: &BmuxConfig) -> Result<String> {
+    if let Some(target) = config.connections.recent_targets.first() {
+        return Ok(target.clone());
+    }
+    if let Some(default_target) = config.connections.default_target.as_deref() {
+        return Ok(default_target.to_string());
+    }
+    if let Some(first_named) = config.connections.targets.keys().next() {
+        return Ok(first_named.clone());
+    }
+    Ok("local".to_string())
 }
 
 async fn run_iroh_attach_with_reconnect(
@@ -1433,6 +1573,15 @@ fn resolve_effective_target(
 fn resolve_target_reference(config: &BmuxConfig, target: &str) -> Result<ResolvedTarget> {
     if target.trim().is_empty() || target == "local" {
         return Ok(ResolvedTarget::Local);
+    }
+    if let Some(name) = target.trim().strip_prefix("bmux://") {
+        let mapped = config
+            .connections
+            .share_links
+            .get(name)
+            .map(|value| value.as_str())
+            .unwrap_or(name);
+        return resolve_target_reference(config, mapped);
     }
     if let Some(named) = config.connections.targets.get(target) {
         return resolve_named_target(target, named);

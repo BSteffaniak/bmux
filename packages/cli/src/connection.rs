@@ -226,6 +226,15 @@ fn resolve_target_reference(config: &BmuxConfig, target: &str) -> Result<ActiveT
     if target.is_empty() || target == "local" {
         return Ok(ActiveTarget::Local);
     }
+    if let Some(name) = target.strip_prefix("bmux://") {
+        let mapped = config
+            .connections
+            .share_links
+            .get(name)
+            .map(|value| value.as_str())
+            .unwrap_or(name);
+        return resolve_target_reference(config, mapped);
+    }
     if let Some(named) = config.connections.targets.get(target) {
         return resolve_named_target(target, named);
     }

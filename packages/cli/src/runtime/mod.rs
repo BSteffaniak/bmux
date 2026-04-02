@@ -7,9 +7,9 @@ use crate::input::{InputProcessor, Keymap, RuntimeAction};
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 use anyhow::{Context, Result};
 use bmux_cli_schema::{
-    Cli, Command, ConfigCommand, KeymapCommand, LogLevel, LogsCommand, LogsProfilesCommand,
-    PlaybookCommand, RecordingCommand, RecordingCursorBlinkMode, RecordingCursorMode,
-    RecordingCursorPaintMode, RecordingCursorProfile, RecordingCursorShape,
+    AuthCommand, Cli, Command, ConfigCommand, KeymapCommand, LogLevel, LogsCommand,
+    LogsProfilesCommand, PlaybookCommand, RecordingCommand, RecordingCursorBlinkMode,
+    RecordingCursorMode, RecordingCursorPaintMode, RecordingCursorProfile, RecordingCursorShape,
     RecordingCursorTextMode, RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg,
     RecordingRenderMode, RecordingReplayMode, RemoteCommand, RemoteCompleteCommand, ServerCommand,
     SessionCommand, TerminalCommand, TraceFamily,

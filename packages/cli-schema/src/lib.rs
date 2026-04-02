@@ -179,10 +179,51 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// First-run setup wizard for hosted mode
+    Setup,
+    /// Start hosted mode (iroh by default)
+    Host {
+        /// Optional listen address for local gateway bridge
+        #[arg(long, default_value = "127.0.0.1:7443")]
+        listen: String,
+        /// Optional friendly name hint
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Join a hosted link/target quickly
+    Join {
+        /// Link or target name (bmux://, iroh://, https://, or configured target)
+        link: Option<String>,
+        /// Session name or UUID
+        session: Option<String>,
+    },
+    /// List known hosts/targets (recent first)
+    Hosts,
+    /// Authentication commands
+    Auth {
+        #[command(subcommand)]
+        command: AuthCommand,
+    },
+    /// Share helpers for hosted links
+    Share {
+        /// Target/link to share
+        target: Option<String>,
+        /// Optional stable share name
+        #[arg(long)]
+        name: Option<String>,
+        /// Optional access role hint
+        #[arg(long, default_value = "control")]
+        role: String,
+    },
+    /// Remove a named shared link
+    Unshare {
+        /// Share name/slug to remove
+        name: String,
+    },
     /// Connect to a target and attach to a session
     Connect {
         /// Target name or ssh destination (user@host[:port] or ssh://...)
-        target: String,
+        target: Option<String>,
         /// Session name or UUID; if omitted in TTY mode a picker is shown
         session: Option<String>,
         /// Follow target client UUID and attach to its selected session
@@ -302,6 +343,12 @@ pub enum Command {
     },
     #[command(external_subcommand)]
     External(Vec<String>),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    /// Login and register this device for hosted mode
+    Login,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1025,7 +1072,7 @@ mod tests {
         else {
             panic!("expected connect command");
         };
-        assert_eq!(target, "prod");
+        assert_eq!(target.as_deref(), Some("prod"));
         assert_eq!(session.as_deref(), Some("app"));
         assert!(follow.is_none());
         assert!(!global);
@@ -1070,6 +1117,27 @@ mod tests {
                 command: RemoteCompleteCommand::Sessions { target }
             } if target == "prod"
         ));
+    }
+
+    #[test]
+    fn parses_host_command_defaults() {
+        let cli = Cli::try_parse_from(["bmux", "host"]).expect("valid CLI args");
+        let Some(Command::Host { listen, name }) = cli.command else {
+            panic!("expected host command");
+        };
+        assert_eq!(listen, "127.0.0.1:7443");
+        assert!(name.is_none());
+    }
+
+    #[test]
+    fn parses_join_command_with_link() {
+        let cli =
+            Cli::try_parse_from(["bmux", "join", "bmux://demo", "main"]).expect("valid CLI args");
+        let Some(Command::Join { link, session }) = cli.command else {
+            panic!("expected join command");
+        };
+        assert_eq!(link.as_deref(), Some("bmux://demo"));
+        assert_eq!(session.as_deref(), Some("main"));
     }
 
     #[test]

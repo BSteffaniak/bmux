@@ -72,6 +72,15 @@ bmux connect prod --reconnect-forever
 bmux remote complete targets
 bmux remote complete sessions prod
 
+# streamlined aliases
+bmux setup
+bmux host
+bmux join bmux://my-host
+bmux hosts
+bmux auth login
+bmux share --name my-host
+bmux unshare my-host
+
 # run an internet-accessible TLS gateway
 bmux server gateway --listen 0.0.0.0:7443 --quick
 
