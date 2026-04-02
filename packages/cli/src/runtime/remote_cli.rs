@@ -1752,12 +1752,9 @@ fn resolve_target_reference_inner(config: &BmuxConfig, target: &str) -> Result<R
         return Ok(ResolvedTarget::Local);
     }
     if let Some(name) = target.trim().strip_prefix("bmux://") {
-        let mapped = config
-            .connections
-            .share_links
-            .get(name)
-            .map(|value| value.as_str())
-            .unwrap_or(name);
+        let mapped = config.connections.share_links.get(name).ok_or_else(|| {
+            anyhow::anyhow!("share link not found: bmux://{name}; run 'bmux share' or 'bmux hosts'")
+        })?;
         return resolve_target_reference_inner(config, mapped);
     }
     if let Some(named) = config.connections.targets.get(target) {
@@ -2218,6 +2215,71 @@ mod tests {
             should_proxy_to_target(&cli)
                 .await
                 .expect("resolve proxy target")
+        );
+
+        let request = request_rx.await.expect("capture request");
+        assert!(request.contains("GET /v1/share-links/demo HTTP/1.1"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn should_proxy_to_target_does_not_proxy_when_control_plane_denies_lookup() {
+        let runtime_dir = TempDirGuard::new("proxy-control-plane-denied-runtime");
+        let config_dir = TempDirGuard::new("proxy-control-plane-denied-config");
+        let data_dir = TempDirGuard::new("proxy-control-plane-denied-data");
+        let _runtime_guard = EnvVarGuard::set("BMUX_RUNTIME_DIR", runtime_dir.path());
+        let _config_guard = EnvVarGuard::set("BMUX_CONFIG_DIR", config_dir.path());
+        let _data_guard = EnvVarGuard::set("BMUX_DATA_DIR", data_dir.path());
+        let _target_guard = EnvVarGuard::set("BMUX_TARGET", "bmux://demo");
+
+        let auth_state_path = runtime_dir.path().join("auth-state.json");
+        std::fs::write(&auth_state_path, r#"{"access_token":"token-123"}"#)
+            .expect("write auth state");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock control plane");
+        let address = listener.local_addr().expect("listener addr");
+        let control_plane_url = format!("http://{}", address);
+        let _control_plane_guard = EnvVarGuard::set("BMUX_CONTROL_PLANE_URL", &control_plane_url);
+
+        let (request_tx, request_rx) = oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept connection");
+            let mut buffer = [0_u8; 4096];
+            let bytes_read = socket.read(&mut buffer).await.expect("read request");
+            let request = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+            let _ = request_tx.send(request);
+
+            let response =
+                "HTTP/1.1 401 Unauthorized\r\ncontent-length: 0\r\nconnection: close\r\n\r\n";
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let cli = Cli {
+            record: false,
+            no_capture_input: false,
+            recording_id_file: None,
+            record_profile: None,
+            record_event_kind: Vec::new(),
+            stop_server_on_exit: false,
+            target: None,
+            core_builtins_only: false,
+            command: Some(Command::ListSessions { json: false }),
+            verbose: false,
+            log_level: None,
+        };
+
+        let error = should_proxy_to_target(&cli)
+            .await
+            .expect_err("lookup denial should not proxy to ssh");
+        assert!(
+            error
+                .to_string()
+                .contains("share link not found: bmux://demo")
         );
 
         let request = request_rx.await.expect("capture request");

@@ -243,7 +243,7 @@ pub(crate) async fn expand_bmux_target_if_needed(
         return Ok(mapped.clone());
     }
     let Some(auth_state) = load_auth_state_optional(&ConfigPaths::default())? else {
-        return Ok(name.to_string());
+        return Ok(target.to_string());
     };
     let control_plane = control_plane_url(config);
     let client = reqwest::Client::new();
@@ -254,7 +254,7 @@ pub(crate) async fn expand_bmux_target_if_needed(
         .await
         .with_context(|| format!("failed contacting {control_plane}"))?;
     if !response.status().is_success() {
-        return Ok(name.to_string());
+        return Ok(target.to_string());
     }
     let payload = response
         .json::<serde_json::Value>()
@@ -263,7 +263,7 @@ pub(crate) async fn expand_bmux_target_if_needed(
     Ok(payload
         .get("target")
         .and_then(|value| value.as_str())
-        .map_or_else(|| name.to_string(), ToString::to_string))
+        .map_or_else(|| target.to_string(), ToString::to_string))
 }
 
 fn control_plane_url(config: &BmuxConfig) -> String {
@@ -292,12 +292,9 @@ fn resolve_target_reference(config: &BmuxConfig, target: &str) -> Result<ActiveT
         return Ok(ActiveTarget::Local);
     }
     if let Some(name) = target.strip_prefix("bmux://") {
-        let mapped = config
-            .connections
-            .share_links
-            .get(name)
-            .map(|value| value.as_str())
-            .unwrap_or(name);
+        let mapped = config.connections.share_links.get(name).ok_or_else(|| {
+            anyhow::anyhow!("share link not found: bmux://{name}; run 'bmux share' or 'bmux hosts'")
+        })?;
         return resolve_target_reference(config, mapped);
     }
     if let Some(named) = config.connections.targets.get(target) {
@@ -847,7 +844,7 @@ mod tests {
 
     #[tokio::test]
     #[serial]
-    async fn expand_bmux_target_without_auth_falls_back_to_name() {
+    async fn expand_bmux_target_without_auth_preserves_bmux_link() {
         let runtime_dir = TempDirGuard::new("no-auth");
         let _runtime_guard = EnvVarGuard::set("BMUX_RUNTIME_DIR", runtime_dir.path());
         let _control_plane_guard = EnvVarGuard::set("BMUX_CONTROL_PLANE_URL", "http://127.0.0.1:9");
@@ -857,7 +854,7 @@ mod tests {
             .await
             .expect("expand target");
 
-        assert_eq!(resolved, "demo");
+        assert_eq!(resolved, "bmux://demo");
     }
 
     #[tokio::test]
