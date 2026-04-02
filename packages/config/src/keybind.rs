@@ -96,12 +96,69 @@ impl ResolvedTimeout {
     }
 }
 
-const fn default_global_runtime_bindings() -> BTreeMap<String, String> {
-    BTreeMap::new()
+fn default_global_runtime_bindings() -> BTreeMap<String, String> {
+    let mut map = action_bindings(&[
+        // Session navigation
+        ("ctrl+o", RuntimeAction::SessionPrev),
+        // Pane focus navigation
+        ("alt+h", RuntimeAction::FocusLeft),
+        ("alt+left", RuntimeAction::FocusLeft),
+        ("alt+j", RuntimeAction::FocusDown),
+        ("alt+down", RuntimeAction::FocusDown),
+        ("alt+k", RuntimeAction::FocusUp),
+        ("alt+up", RuntimeAction::FocusUp),
+        ("alt+right", RuntimeAction::FocusRight),
+        // Pane cycling
+        ("ctrl+k", RuntimeAction::FocusPrev),
+        ("ctrl+t", RuntimeAction::FocusPrev),
+        ("alt+t", RuntimeAction::FocusNext),
+        // Resize
+        ("alt+plus", RuntimeAction::IncreaseSplit),
+        ("alt+=", RuntimeAction::IncreaseSplit),
+        ("alt+minus", RuntimeAction::DecreaseSplit),
+        // New pane
+        ("alt+n", RuntimeAction::SplitFocusedHorizontal),
+    ]);
+    // Window navigation via plugin (no-op if plugin not loaded)
+    for i in 1..=9 {
+        map.insert(
+            format!("alt+{i}"),
+            format!("plugin:bmux.windows:goto-window {i}"),
+        );
+    }
+    map.insert(
+        "alt+0".to_string(),
+        "plugin:bmux.windows:goto-window 10".to_string(),
+    );
+    map.insert(
+        "ctrl+h".to_string(),
+        "plugin:bmux.windows:prev-window".to_string(),
+    );
+    map.insert(
+        "ctrl+j".to_string(),
+        "plugin:bmux.windows:prev-window".to_string(),
+    );
+    map.insert(
+        "ctrl+left".to_string(),
+        "plugin:bmux.windows:prev-window".to_string(),
+    );
+    map.insert(
+        "ctrl+s".to_string(),
+        "plugin:bmux.windows:next-window".to_string(),
+    );
+    map.insert(
+        "ctrl+right".to_string(),
+        "plugin:bmux.windows:next-window".to_string(),
+    );
+    map.insert(
+        "ctrl+l".to_string(),
+        "plugin:bmux.windows:last-window".to_string(),
+    );
+    map
 }
 
 fn default_runtime_bindings() -> BTreeMap<String, String> {
-    action_bindings(&[
+    let mut map = action_bindings(&[
         ("shift+c", RuntimeAction::NewSession),
         ("o", RuntimeAction::FocusNext),
         ("h", RuntimeAction::FocusLeft),
@@ -140,12 +197,22 @@ fn default_runtime_bindings() -> BTreeMap<String, String> {
         ("v", RuntimeAction::BeginSelection),
         ("d", RuntimeAction::Detach),
         ("q", RuntimeAction::Quit),
-    ])
+        // Session prev/next
+        ("(", RuntimeAction::SessionPrev),
+        (")", RuntimeAction::SessionNext),
+    ]);
+    // Plugin command: toggle last window (no-op if plugin not loaded)
+    map.insert(
+        "^".to_string(),
+        "plugin:bmux.windows:last-window".to_string(),
+    );
+    map
 }
 
 fn default_scroll_bindings() -> BTreeMap<String, String> {
     action_bindings(&[
         ("escape", RuntimeAction::ExitScrollMode),
+        ("ctrl+c", RuntimeAction::ExitScrollMode),
         ("ctrl+a ]", RuntimeAction::ExitScrollMode),
         ("enter", RuntimeAction::ConfirmScrollback),
         ("arrow_left", RuntimeAction::MoveCursorLeft),
@@ -158,6 +225,7 @@ fn default_scroll_bindings() -> BTreeMap<String, String> {
         ("j", RuntimeAction::MoveCursorDown),
         ("ctrl+y", RuntimeAction::ScrollUpLine),
         ("ctrl+e", RuntimeAction::ScrollDownLine),
+        ("ctrl+b", RuntimeAction::ScrollUpPage),
         ("page_up", RuntimeAction::ScrollUpPage),
         ("page_down", RuntimeAction::ScrollDownPage),
         ("g", RuntimeAction::ScrollTop),

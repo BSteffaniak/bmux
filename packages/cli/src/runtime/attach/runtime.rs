@@ -2637,18 +2637,10 @@ pub(crate) fn normalize_attach_keybindings(
 }
 
 pub(crate) fn inject_attach_global_defaults(
-    global: &mut std::collections::BTreeMap<String, String>,
+    _global: &mut std::collections::BTreeMap<String, String>,
 ) {
-    let defaults = [
-        ("alt+h", RuntimeAction::SessionPrev),
-        ("alt+l", RuntimeAction::SessionNext),
-    ];
-
-    for (key, action) in defaults {
-        global
-            .entry(key.to_string())
-            .or_insert_with(|| action_to_config_name(&action));
-    }
+    // Global defaults are now provided by KeyBindingConfig::default_global_runtime_bindings().
+    // This function is retained as a hook for future attach-specific global defaults.
 }
 
 pub(crate) const fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
@@ -4282,7 +4274,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_key_event_action_forwards_ctrl_t_to_pane_by_default() {
+    fn attach_key_event_action_routes_ctrl_t_as_focus_prev_pane_by_default() {
         let mut processor =
             InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
         let actions = crate::runtime::attach_key_event_actions(
@@ -4298,7 +4290,9 @@ mod tests {
 
         assert!(matches!(
             actions.first(),
-            Some(crate::runtime::AttachEventAction::Send(bytes)) if bytes.as_slice() == [0x14]
+            Some(crate::runtime::AttachEventAction::Ui(
+                crate::input::RuntimeAction::FocusPrev
+            ))
         ));
     }
 
@@ -4394,7 +4388,7 @@ mod tests {
     }
 
     #[test]
-    fn attach_key_event_action_routes_alt_h_as_session_ui() {
+    fn attach_key_event_action_routes_alt_h_as_focus_left() {
         let mut processor =
             InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
 
@@ -4411,7 +4405,7 @@ mod tests {
         assert!(matches!(
             actions.first(),
             Some(crate::runtime::AttachEventAction::Ui(
-                crate::input::RuntimeAction::SessionPrev
+                crate::input::RuntimeAction::FocusLeft
             ))
         ));
     }
@@ -4789,8 +4783,8 @@ mod tests {
         assert!(entries.iter().any(|entry| {
             entry.scope == crate::runtime::AttachKeybindingScope::Global
                 && entry.chord == "alt+h"
-                && entry.action_name == "session_prev"
-                && entry.action == crate::input::RuntimeAction::SessionPrev
+                && entry.action_name == "focus_left_pane"
+                && entry.action == crate::input::RuntimeAction::FocusLeft
         }));
     }
 
