@@ -1140,6 +1140,17 @@ impl OutputFanoutBuffer {
             .copied()
             .collect()
     }
+
+    /// Advance an existing client's read cursor to the end of the buffer,
+    /// so the next `read_for_client` call only returns data written after
+    /// this point. Used after snapshot reads to avoid re-delivering bytes
+    /// the client already received via `read_recent`.
+    fn advance_client_to_end(&mut self, client_id: ClientId) {
+        let end = self.end_offset();
+        if let Some(cursor) = self.cursors.get_mut(&client_id) {
+            *cursor = end;
+        }
+    }
 }
 
 struct RemovedRuntime {
@@ -5721,7 +5732,28 @@ async fn handle_request(
                     .session_runtimes
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                runtime_manager.attach_snapshot_state(session_id, client_id, max_bytes_per_pane)
+                let result = runtime_manager.attach_snapshot_state(
+                    session_id,
+                    client_id,
+                    max_bytes_per_pane,
+                );
+                // After reading snapshot data, advance this client's read
+                // cursors to the buffer end and clear output_dirty so the
+                // PTY reader can re-notify on new output.  Mirrors the
+                // cleanup in AttachPaneOutputBatch.
+                if let Ok(ref snapshot) = result {
+                    if let Some(runtime) = runtime_manager.runtimes.get(&session_id) {
+                        for chunk in &snapshot.chunks {
+                            if let Some(pane) = runtime.panes.get(&chunk.pane_id) {
+                                pane.output_dirty.store(false, Ordering::SeqCst);
+                                if let Ok(mut output) = pane.output_buffer.lock() {
+                                    output.advance_client_to_end(client_id);
+                                }
+                            }
+                        }
+                    }
+                }
+                result
             };
 
             match snapshot {
