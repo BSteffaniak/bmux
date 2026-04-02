@@ -866,6 +866,7 @@ dependencies = [
  "portable-pty",
  "rcgen",
  "regex",
+ "reqwest",
  "resvg",
  "rustls",
  "rustls-native-certs",

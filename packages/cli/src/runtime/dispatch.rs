@@ -128,11 +128,11 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
             Command::Auth {
                 command: AuthCommand::Login,
             },
-        ) => run_auth_login(),
+        ) => run_auth_login().await,
         (BuiltInHandlerId::Share, Command::Share { target, name, role }) => {
-            run_share(target.as_deref(), name.as_deref(), role)
+            run_share(target.as_deref(), name.as_deref(), role).await
         }
-        (BuiltInHandlerId::Unshare, Command::Unshare { name }) => run_unshare(name),
+        (BuiltInHandlerId::Unshare, Command::Unshare { name }) => run_unshare(name).await,
         (
             BuiltInHandlerId::Connect,
             Command::Connect {

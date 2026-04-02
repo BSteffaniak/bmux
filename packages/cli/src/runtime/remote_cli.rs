@@ -5,6 +5,7 @@ use bmux_ipc::transport::ErasedIpcStream;
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
+use serde::{Deserialize, Serialize};
 use std::ffi::OsString;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -60,6 +61,34 @@ const SSH_RECONNECT_BASE_BACKOFF_MS: u64 = 300;
 const BRIDGE_PREFLIGHT_TOKEN: &str = "BMUX_BRIDGE_READY";
 const RECENT_CACHE_MAX: usize = 10;
 const BMUX_IROH_ALPN: &[u8] = b"bmux/gateway/iroh/1";
+const DEFAULT_CONTROL_PLANE_URL: &str = "https://api.bmux.run";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuthState {
+    access_token: String,
+    account_id: Option<String>,
+    account_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WhoAmIResponse {
+    account_id: Option<String>,
+    account_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct CreateShareRequest {
+    name: String,
+    target: String,
+    role: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ShareLinkResponse {
+    name: Option<String>,
+    target: Option<String>,
+    url: Option<String>,
+}
 
 #[derive(Debug)]
 struct SshBridgeStream {
@@ -165,11 +194,14 @@ pub(super) async fn run_connect(
     }
 
     let config = BmuxConfig::load()?;
-    let resolved_target = if let Some(target) = target {
+    let selected_target = if let Some(target) = target {
         target.to_string()
     } else {
         choose_default_target_interactively(&config)?
     };
+    let resolved_target = resolve_bmux_link_if_needed(&config, &selected_target)
+        .await?
+        .unwrap_or(selected_target);
     let resolved = resolve_target_reference(&config, &resolved_target)?;
     match resolved {
         ResolvedTarget::Local => {
@@ -259,7 +291,7 @@ pub(super) async fn run_connect(
 
 pub(super) async fn run_setup() -> Result<u8> {
     println!("bmux setup");
-    run_auth_login()?;
+    run_auth_login().await?;
     println!("next: bmux host");
     Ok(0)
 }
@@ -323,25 +355,45 @@ pub(super) fn run_hosts() -> Result<u8> {
     Ok(0)
 }
 
-pub(super) fn run_auth_login() -> Result<u8> {
+pub(super) async fn run_auth_login() -> Result<u8> {
+    let config = BmuxConfig::load()?;
+    let control_plane_url = control_plane_url(&config);
+    let token = if let Ok(value) = std::env::var("BMUX_AUTH_TOKEN") {
+        value
+    } else if io::stdin().is_terminal() {
+        print!("Enter bmux access token: ");
+        io::stdout()
+            .flush()
+            .context("failed flushing auth prompt")?;
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .context("failed reading auth token")?;
+        let value = input.trim().to_string();
+        if value.is_empty() {
+            anyhow::bail!("empty auth token");
+        }
+        value
+    } else {
+        anyhow::bail!("BMUX_AUTH_TOKEN is required in non-interactive mode for auth login");
+    };
+
+    let whoami = verify_access_token(&control_plane_url, &token).await?;
     let paths = ConfigPaths::default();
-    std::fs::create_dir_all(&paths.runtime_dir).with_context(|| {
-        format!(
-            "failed creating runtime dir {}",
-            paths.runtime_dir.display()
-        )
-    })?;
-    let token_path = paths.runtime_dir.join("auth-device-token");
-    if !token_path.exists() {
-        let token = Uuid::new_v4().to_string();
-        std::fs::write(&token_path, token)
-            .with_context(|| format!("failed writing auth token {}", token_path.display()))?;
-    }
-    println!("auth login complete ({})", token_path.display());
+    let state = AuthState {
+        access_token: token,
+        account_id: whoami.account_id,
+        account_name: whoami.account_name,
+    };
+    save_auth_state(&paths, &state)?;
+    println!(
+        "auth login complete ({})",
+        auth_state_path(&paths).display()
+    );
     Ok(0)
 }
 
-pub(super) fn run_share(target: Option<&str>, name: Option<&str>, role: &str) -> Result<u8> {
+pub(super) async fn run_share(target: Option<&str>, name: Option<&str>, role: &str) -> Result<u8> {
     let mut config = BmuxConfig::load()?;
     let resolved_target = if let Some(target) = target {
         target.to_string()
@@ -358,19 +410,43 @@ pub(super) fn run_share(target: Option<&str>, name: Option<&str>, role: &str) ->
     let slug = name
         .map(ToString::to_string)
         .unwrap_or_else(|| format!("share-{}", Uuid::new_v4().simple()));
+
+    let control_plane_url = control_plane_url(&config);
+    let auth_state = load_auth_state_optional(&ConfigPaths::default())?
+        .ok_or_else(|| anyhow::anyhow!("not authenticated. run 'bmux auth login' first"))?;
+    let created = create_share_link(
+        &control_plane_url,
+        &auth_state.access_token,
+        &CreateShareRequest {
+            name: slug.clone(),
+            target: resolved_target.clone(),
+            role: role.to_string(),
+        },
+    )
+    .await?;
+
     config
         .connections
         .share_links
         .insert(slug.clone(), resolved_target.clone());
     config.save()?;
-    println!("created share link: bmux://{slug}");
+    let link_name = created.name.clone().unwrap_or(slug);
+    println!("created share link: bmux://{link_name}");
+    if let Some(url) = created.url {
+        println!("url: {url}");
+    }
     println!("target: {resolved_target}");
     println!("role: {role}");
     Ok(0)
 }
 
-pub(super) fn run_unshare(name: &str) -> Result<u8> {
+pub(super) async fn run_unshare(name: &str) -> Result<u8> {
     let mut config = BmuxConfig::load()?;
+    let control_plane_url = control_plane_url(&config);
+    let auth_state = load_auth_state_optional(&ConfigPaths::default())?
+        .ok_or_else(|| anyhow::anyhow!("not authenticated. run 'bmux auth login' first"))?;
+    delete_share_link(&control_plane_url, &auth_state.access_token, name).await?;
+
     if config.connections.share_links.remove(name).is_some() {
         config.save()?;
         println!("removed share link bmux://{name}");
@@ -390,6 +466,136 @@ fn choose_default_target_interactively(config: &BmuxConfig) -> Result<String> {
         return Ok(first_named.clone());
     }
     Ok("local".to_string())
+}
+
+fn control_plane_url(config: &BmuxConfig) -> String {
+    std::env::var("BMUX_CONTROL_PLANE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| config.connections.control_plane_url.clone())
+        .unwrap_or_else(|| DEFAULT_CONTROL_PLANE_URL.to_string())
+}
+
+fn auth_state_path(paths: &ConfigPaths) -> PathBuf {
+    paths.runtime_dir.join("auth-state.json")
+}
+
+fn load_auth_state_optional(paths: &ConfigPaths) -> Result<Option<AuthState>> {
+    let path = auth_state_path(paths);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let state = serde_json::from_str::<AuthState>(&content)
+                .with_context(|| format!("failed parsing auth state {}", path.display()))?;
+            Ok(Some(state))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed reading {}", path.display())),
+    }
+}
+
+fn save_auth_state(paths: &ConfigPaths, state: &AuthState) -> Result<()> {
+    std::fs::create_dir_all(&paths.runtime_dir).with_context(|| {
+        format!(
+            "failed creating runtime dir {}",
+            paths.runtime_dir.display()
+        )
+    })?;
+    let path = auth_state_path(paths);
+    let encoded = serde_json::to_string_pretty(state).context("failed serializing auth state")?;
+    std::fs::write(&path, encoded).with_context(|| format!("failed writing {}", path.display()))?;
+    Ok(())
+}
+
+async fn verify_access_token(control_plane_url: &str, token: &str) -> Result<WhoAmIResponse> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{control_plane_url}/v1/auth/whoami"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .with_context(|| format!("failed contacting {control_plane_url}"))?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "authentication failed (status {})",
+            response.status().as_u16()
+        );
+    }
+    response
+        .json::<WhoAmIResponse>()
+        .await
+        .context("failed parsing auth response")
+}
+
+async fn create_share_link(
+    control_plane_url: &str,
+    token: &str,
+    request: &CreateShareRequest,
+) -> Result<ShareLinkResponse> {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{control_plane_url}/v1/share-links"))
+        .bearer_auth(token)
+        .json(request)
+        .send()
+        .await
+        .with_context(|| format!("failed contacting {control_plane_url}"))?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "share creation failed (status {})",
+            response.status().as_u16()
+        );
+    }
+    response
+        .json::<ShareLinkResponse>()
+        .await
+        .context("failed parsing share response")
+}
+
+async fn delete_share_link(control_plane_url: &str, token: &str, name: &str) -> Result<()> {
+    let client = reqwest::Client::new();
+    let response = client
+        .delete(format!("{control_plane_url}/v1/share-links/{name}"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .with_context(|| format!("failed contacting {control_plane_url}"))?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "share removal failed (status {})",
+            response.status().as_u16()
+        );
+    }
+    Ok(())
+}
+
+async fn resolve_bmux_link_if_needed(config: &BmuxConfig, target: &str) -> Result<Option<String>> {
+    let Some(name) = target.strip_prefix("bmux://") else {
+        return Ok(None);
+    };
+    if let Some(mapped) = config.connections.share_links.get(name) {
+        return Ok(Some(mapped.clone()));
+    }
+
+    let auth_state = load_auth_state_optional(&ConfigPaths::default())?;
+    let Some(auth_state) = auth_state else {
+        return Ok(None);
+    };
+    let control_plane = control_plane_url(config);
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{control_plane}/v1/share-links/{name}"))
+        .bearer_auth(auth_state.access_token)
+        .send()
+        .await
+        .with_context(|| format!("failed contacting {control_plane}"))?;
+    if !response.status().is_success() {
+        return Ok(None);
+    }
+    let payload = response
+        .json::<ShareLinkResponse>()
+        .await
+        .context("failed parsing share lookup response")?;
+    Ok(payload.target)
 }
 
 async fn run_iroh_attach_with_reconnect(

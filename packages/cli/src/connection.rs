@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use bmux_client::{BmuxClient, ClientError};
-use bmux_config::{BmuxConfig, ConnectionTargetConfig, ConnectionTransport, StaleBuildAction};
+use bmux_config::{
+    BmuxConfig, ConfigPaths, ConnectionTargetConfig, ConnectionTransport, StaleBuildAction,
+};
 use bmux_ipc::transport::ErasedIpcStream;
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
 use rustls::RootCertStore;
@@ -9,6 +11,13 @@ use std::sync::Arc;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
+
+const DEFAULT_CONTROL_PLANE_URL: &str = "https://api.bmux.run";
+
+#[derive(Debug, Clone, serde::Deserialize)]
+struct AuthState {
+    access_token: String,
+}
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ServerRuntimeMetadata {
     pub(crate) pid: u32,
@@ -89,7 +98,7 @@ struct IrohTarget {
 const BMUX_IROH_ALPN: &[u8] = b"bmux/gateway/iroh/1";
 
 async fn connect_for_active_target(client_name: &'static str) -> Result<BmuxClient> {
-    match resolve_active_target()? {
+    match resolve_active_target().await? {
         ActiveTarget::Local => BmuxClient::connect_default(client_name)
             .await
             .map_err(map_client_connect_error),
@@ -211,7 +220,7 @@ fn build_tls_connector(target: &TlsTarget) -> Result<TlsConnector> {
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
-fn resolve_active_target() -> Result<ActiveTarget> {
+async fn resolve_active_target() -> Result<ActiveTarget> {
     let config = BmuxConfig::load().context("failed loading bmux config")?;
     let selected = std::env::var("BMUX_TARGET")
         .ok()
@@ -219,7 +228,60 @@ fn resolve_active_target() -> Result<ActiveTarget> {
     let Some(target) = selected else {
         return Ok(ActiveTarget::Local);
     };
-    resolve_target_reference(&config, target.trim())
+    let expanded = expand_bmux_link_if_needed(&config, target.trim()).await?;
+    resolve_target_reference(&config, &expanded)
+}
+
+async fn expand_bmux_link_if_needed(config: &BmuxConfig, target: &str) -> Result<String> {
+    let Some(name) = target.strip_prefix("bmux://") else {
+        return Ok(target.to_string());
+    };
+    if let Some(mapped) = config.connections.share_links.get(name) {
+        return Ok(mapped.clone());
+    }
+    let Some(auth_state) = load_auth_state_optional(&ConfigPaths::default())? else {
+        return Ok(name.to_string());
+    };
+    let control_plane = control_plane_url(config);
+    let client = reqwest::Client::new();
+    let response = client
+        .get(format!("{control_plane}/v1/share-links/{name}"))
+        .bearer_auth(auth_state.access_token)
+        .send()
+        .await
+        .with_context(|| format!("failed contacting {control_plane}"))?;
+    if !response.status().is_success() {
+        return Ok(name.to_string());
+    }
+    let payload = response
+        .json::<serde_json::Value>()
+        .await
+        .context("failed parsing share lookup response")?;
+    Ok(payload
+        .get("target")
+        .and_then(|value| value.as_str())
+        .map_or_else(|| name.to_string(), ToString::to_string))
+}
+
+fn control_plane_url(config: &BmuxConfig) -> String {
+    std::env::var("BMUX_CONTROL_PLANE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| config.connections.control_plane_url.clone())
+        .unwrap_or_else(|| DEFAULT_CONTROL_PLANE_URL.to_string())
+}
+
+fn load_auth_state_optional(paths: &ConfigPaths) -> Result<Option<AuthState>> {
+    let path = paths.runtime_dir.join("auth-state.json");
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let state = serde_json::from_str::<AuthState>(&content)
+                .with_context(|| format!("failed parsing auth state {}", path.display()))?;
+            Ok(Some(state))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed reading {}", path.display())),
+    }
 }
 
 fn resolve_target_reference(config: &BmuxConfig, target: &str) -> Result<ActiveTarget> {

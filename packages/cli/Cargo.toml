@@ -61,6 +61,7 @@ moosicbox_log_watch = { workspace = true, features = [
 portable-pty = { workspace = true }
 rcgen = { workspace = true }
 regex = { workspace = true }
+reqwest = { workspace = true }
 resvg = { workspace = true }
 rustls = { workspace = true }
 rustls-native-certs = { workspace = true }

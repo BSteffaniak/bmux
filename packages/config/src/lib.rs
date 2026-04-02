@@ -76,6 +76,8 @@ pub struct BmuxConfig {
 pub struct ConnectionsConfig {
     /// Default command target when `--target` is not passed.
     pub default_target: Option<String>,
+    /// Optional control-plane base URL for hosted auth/share resolution.
+    pub control_plane_url: Option<String>,
     /// Named connection targets.
     pub targets: BTreeMap<String, ConnectionTargetConfig>,
     /// Most recently used targets (newest first).
