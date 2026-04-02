@@ -1997,6 +1997,59 @@ fn parse_host_port_with_default(value: &str, default_port: u16) -> Result<(Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.as_ref() {
+                unsafe { std::env::set_var(self.key, previous) };
+            } else {
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
+
+    struct TempDirGuard {
+        path: PathBuf,
+    }
+
+    impl TempDirGuard {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "bmux-remote-cli-tests-{label}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 
     fn sample_target() -> SshTarget {
         SshTarget {
@@ -2103,5 +2156,71 @@ mod tests {
         assert_eq!(reconnect_backoff_ms(1), 300);
         assert_eq!(reconnect_backoff_ms(2), 600);
         assert_eq!(reconnect_backoff_ms(3), 1_200);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn should_proxy_to_target_resolves_bmux_target_via_control_plane() {
+        let runtime_dir = TempDirGuard::new("proxy-control-plane-runtime");
+        let config_dir = TempDirGuard::new("proxy-control-plane-config");
+        let data_dir = TempDirGuard::new("proxy-control-plane-data");
+        let _runtime_guard = EnvVarGuard::set("BMUX_RUNTIME_DIR", runtime_dir.path());
+        let _config_guard = EnvVarGuard::set("BMUX_CONFIG_DIR", config_dir.path());
+        let _data_guard = EnvVarGuard::set("BMUX_DATA_DIR", data_dir.path());
+        let _target_guard = EnvVarGuard::set("BMUX_TARGET", "bmux://demo");
+
+        let auth_state_path = runtime_dir.path().join("auth-state.json");
+        std::fs::write(&auth_state_path, r#"{"access_token":"token-123"}"#)
+            .expect("write auth state");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock control plane");
+        let address = listener.local_addr().expect("listener addr");
+        let control_plane_url = format!("http://{}", address);
+        let _control_plane_guard = EnvVarGuard::set("BMUX_CONTROL_PLANE_URL", &control_plane_url);
+
+        let (request_tx, request_rx) = oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept connection");
+            let mut buffer = [0_u8; 4096];
+            let bytes_read = socket.read(&mut buffer).await.expect("read request");
+            let request = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+            let _ = request_tx.send(request);
+
+            let body = r#"{"target":"ssh://alice@example.com"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let cli = Cli {
+            record: false,
+            no_capture_input: false,
+            recording_id_file: None,
+            record_profile: None,
+            record_event_kind: Vec::new(),
+            stop_server_on_exit: false,
+            target: None,
+            core_builtins_only: false,
+            command: Some(Command::ListSessions { json: false }),
+            verbose: false,
+            log_level: None,
+        };
+
+        assert!(
+            should_proxy_to_target(&cli)
+                .await
+                .expect("resolve proxy target")
+        );
+
+        let request = request_rx.await.expect("capture request");
+        assert!(request.contains("GET /v1/share-links/demo HTTP/1.1"));
     }
 }
