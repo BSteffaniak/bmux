@@ -643,12 +643,66 @@ pub fn remove_server_runtime_metadata_file() -> Result<()> {
 mod tests {
     use super::{
         ConnectionPolicyScope, ServerBuildPolicyEffect, ServerRuntimeMetadata,
-        evaluate_stale_build_policy, is_server_unavailable_client_error, map_client_connect_error,
+        evaluate_stale_build_policy, expand_bmux_target_if_needed,
+        is_server_unavailable_client_error, map_client_connect_error,
     };
     use bmux_client::ClientError;
-    use bmux_config::StaleBuildAction;
+    use bmux_config::{BmuxConfig, StaleBuildAction};
     use bmux_ipc::frame::FrameDecodeError;
     use bmux_ipc::transport::IpcTransportError;
+    use serial_test::serial;
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: impl AsRef<std::ffi::OsStr>) -> Self {
+            let previous = std::env::var_os(key);
+            unsafe { std::env::set_var(key, value) };
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(previous) = self.previous.as_ref() {
+                unsafe { std::env::set_var(self.key, previous) };
+            } else {
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
+
+    struct TempDirGuard {
+        path: PathBuf,
+    }
+
+    impl TempDirGuard {
+        fn new(label: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "bmux-connection-tests-{label}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&path).expect("create temp dir");
+            Self { path }
+        }
+
+        fn path(&self) -> &Path {
+            &self.path
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
 
     #[test]
     fn stale_build_policy_blocks_normal_commands_by_default() {
@@ -774,5 +828,87 @@ mod tests {
     fn runtime_command_handlers_do_not_bypass_connection_module() {
         let runtime_source = include_str!("runtime/mod.rs");
         assert!(!runtime_source.contains("BmuxClient::connect_default"));
+    }
+
+    #[tokio::test]
+    async fn expand_bmux_target_prefers_local_share_link_map() {
+        let mut config = BmuxConfig::default();
+        config
+            .connections
+            .share_links
+            .insert("demo".to_string(), "iroh://local-endpoint".to_string());
+
+        let resolved = expand_bmux_target_if_needed(&config, "bmux://demo")
+            .await
+            .expect("expand target");
+
+        assert_eq!(resolved, "iroh://local-endpoint");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn expand_bmux_target_without_auth_falls_back_to_name() {
+        let runtime_dir = TempDirGuard::new("no-auth");
+        let _runtime_guard = EnvVarGuard::set("BMUX_RUNTIME_DIR", runtime_dir.path());
+        let _control_plane_guard = EnvVarGuard::set("BMUX_CONTROL_PLANE_URL", "http://127.0.0.1:9");
+
+        let config = BmuxConfig::default();
+        let resolved = expand_bmux_target_if_needed(&config, "bmux://demo")
+            .await
+            .expect("expand target");
+
+        assert_eq!(resolved, "demo");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn expand_bmux_target_uses_control_plane_lookup() {
+        let runtime_dir = TempDirGuard::new("control-plane");
+        let _runtime_guard = EnvVarGuard::set("BMUX_RUNTIME_DIR", runtime_dir.path());
+
+        let auth_state_path = runtime_dir.path().join("auth-state.json");
+        std::fs::write(&auth_state_path, r#"{"access_token":"token-123"}"#)
+            .expect("write auth state");
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind mock control plane");
+        let address = listener.local_addr().expect("listener addr");
+        let control_plane_url = format!("http://{}", address);
+        let _control_plane_guard = EnvVarGuard::set("BMUX_CONTROL_PLANE_URL", &control_plane_url);
+
+        let (request_tx, request_rx) = oneshot::channel::<String>();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept connection");
+            let mut buffer = [0_u8; 4096];
+            let bytes_read = socket.read(&mut buffer).await.expect("read request");
+            let request = String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+            let _ = request_tx.send(request);
+
+            let body = r#"{"target":"iroh://remote-endpoint"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket
+                .write_all(response.as_bytes())
+                .await
+                .expect("write response");
+        });
+
+        let config = BmuxConfig::default();
+        let resolved = expand_bmux_target_if_needed(&config, "bmux://demo")
+            .await
+            .expect("expand target");
+        assert_eq!(resolved, "iroh://remote-endpoint");
+
+        let request = request_rx.await.expect("capture request");
+        assert!(request.contains("GET /v1/share-links/demo HTTP/1.1"));
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("authorization: bearer token-123")
+        );
     }
 }
