@@ -169,7 +169,7 @@ pub async fn run() -> Result<u8> {
                     std::env::set_var("BMUX_TARGET", target);
                 }
             }
-            if should_proxy_to_target(&cli)? {
+            if should_proxy_to_target(&cli).await? {
                 return run_target_proxy_from_current_argv(&cli).await;
             }
 

@@ -128,7 +128,7 @@ impl AsyncWrite for SshBridgeStream {
     }
 }
 
-pub(super) fn should_proxy_to_target(cli: &Cli) -> Result<bool> {
+pub(super) async fn should_proxy_to_target(cli: &Cli) -> Result<bool> {
     let Some(command) = cli.command.as_ref() else {
         return Ok(false);
     };
@@ -136,13 +136,13 @@ pub(super) fn should_proxy_to_target(cli: &Cli) -> Result<bool> {
         return Ok(false);
     }
     let config = BmuxConfig::load()?;
-    let target = resolve_effective_target(&config, cli.target.as_deref())?;
+    let target = resolve_effective_target(&config, cli.target.as_deref()).await?;
     Ok(matches!(target, ResolvedTarget::Ssh(_)))
 }
 
 pub(super) async fn run_target_proxy_from_current_argv(cli: &Cli) -> Result<u8> {
     let config = BmuxConfig::load()?;
-    let target = resolve_effective_target(&config, cli.target.as_deref())?;
+    let target = resolve_effective_target(&config, cli.target.as_deref()).await?;
     match target {
         ResolvedTarget::Ssh(target) => {
             let argv = std::env::args_os().collect::<Vec<_>>();
@@ -198,8 +198,7 @@ pub(super) async fn run_connect(
     } else {
         choose_default_target_interactively(&config)?
     };
-    let resolved_target = expand_bmux_target_if_needed(&config, &selected_target).await?;
-    let resolved = resolve_target_reference(&config, &resolved_target)?;
+    let resolved = resolve_target_reference(&config, &selected_target).await?;
     match resolved {
         ResolvedTarget::Local => {
             let target_session = if let Some(session) = session {
@@ -735,7 +734,7 @@ pub(super) fn run_remote_list(as_json: bool) -> Result<u8> {
 
 pub(super) async fn run_remote_test(target: &str) -> Result<u8> {
     let config = BmuxConfig::load()?;
-    let resolved = resolve_target_reference(&config, target)?;
+    let resolved = resolve_target_reference(&config, target).await?;
     match resolved {
         ResolvedTarget::Local => {
             let mut client = connect(ConnectionPolicyScope::Normal, "bmux-cli-remote-test").await?;
@@ -773,7 +772,7 @@ pub(super) async fn run_remote_test(target: &str) -> Result<u8> {
 
 pub(super) async fn run_remote_doctor(target: &str, fix: bool) -> Result<u8> {
     let config = BmuxConfig::load()?;
-    let resolved = resolve_target_reference(&config, target)?;
+    let resolved = resolve_target_reference(&config, target).await?;
     println!("remote doctor: target='{target}' fix={fix}");
     match resolved {
         ResolvedTarget::Local => {
@@ -917,7 +916,7 @@ pub(super) async fn run_remote_init(
 
 pub(super) async fn run_remote_install_server(target: &str) -> Result<u8> {
     let config = BmuxConfig::load()?;
-    let resolved = resolve_target_reference(&config, target)?;
+    let resolved = resolve_target_reference(&config, target).await?;
     match resolved {
         ResolvedTarget::Ssh(ssh_target) => {
             run_remote_install_server_for_target(&ssh_target).await?;
@@ -944,7 +943,7 @@ pub(super) async fn run_remote_install_server(target: &str) -> Result<u8> {
 pub(super) async fn run_remote_upgrade(target: Option<&str>) -> Result<u8> {
     let config = BmuxConfig::load()?;
     if let Some(target) = target {
-        let resolved = resolve_target_reference(&config, target)?;
+        let resolved = resolve_target_reference(&config, target).await?;
         match resolved {
             ResolvedTarget::Ssh(ssh_target) => {
                 run_remote_upgrade_for_target(&ssh_target)?;
@@ -1004,7 +1003,7 @@ pub(super) fn run_remote_complete_targets() -> Result<u8> {
 
 pub(super) async fn run_remote_complete_sessions(target: &str) -> Result<u8> {
     let config = BmuxConfig::load()?;
-    let resolved = resolve_target_reference(&config, target)?;
+    let resolved = resolve_target_reference(&config, target).await?;
     let mut client = match resolved {
         ResolvedTarget::Local => {
             connect(
@@ -1723,27 +1722,32 @@ fn exit_code_from_status(status: std::process::ExitStatus) -> u8 {
         .unwrap_or(1)
 }
 
-fn resolve_effective_target(
+async fn resolve_effective_target(
     config: &BmuxConfig,
     cli_target: Option<&str>,
 ) -> Result<ResolvedTarget> {
     if let Some(value) = cli_target {
-        return resolve_target_reference(config, value);
+        return resolve_target_reference(config, value).await;
     }
     if let Ok(value) = std::env::var("BMUX_TARGET")
         && !value.trim().is_empty()
     {
-        return resolve_target_reference(config, value.trim());
+        return resolve_target_reference(config, value.trim()).await;
     }
     if let Some(default) = config.connections.default_target.as_deref()
         && !default.trim().is_empty()
     {
-        return resolve_target_reference(config, default.trim());
+        return resolve_target_reference(config, default.trim()).await;
     }
     Ok(ResolvedTarget::Local)
 }
 
-fn resolve_target_reference(config: &BmuxConfig, target: &str) -> Result<ResolvedTarget> {
+async fn resolve_target_reference(config: &BmuxConfig, target: &str) -> Result<ResolvedTarget> {
+    let target = expand_bmux_target_if_needed(config, target).await?;
+    resolve_target_reference_inner(config, &target)
+}
+
+fn resolve_target_reference_inner(config: &BmuxConfig, target: &str) -> Result<ResolvedTarget> {
     if target.trim().is_empty() || target == "local" {
         return Ok(ResolvedTarget::Local);
     }
@@ -1754,7 +1758,7 @@ fn resolve_target_reference(config: &BmuxConfig, target: &str) -> Result<Resolve
             .get(name)
             .map(|value| value.as_str())
             .unwrap_or(name);
-        return resolve_target_reference(config, mapped);
+        return resolve_target_reference_inner(config, mapped);
     }
     if let Some(named) = config.connections.targets.get(target) {
         return resolve_named_target(target, named);
