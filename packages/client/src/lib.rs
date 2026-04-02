@@ -9,11 +9,13 @@ use bmux_config::{BmuxConfig, ConfigPaths};
 pub use bmux_ipc::Event as ServerEvent;
 use bmux_ipc::transport::{ErasedIpcStream, IpcStreamWriter, IpcTransportError, LocalIpcStream};
 use bmux_ipc::{
-    AttachGrant, AttachPaneChunk, AttachScene, ClientSummary, ContextSelector, ContextSummary,
-    Envelope, EnvelopeKind, ErrorCode, InvokeServiceKind, IpcEndpoint, PaneFocusDirection,
-    PaneLayoutNode, PaneSelector, PaneSplitDirection, PaneSummary, ProtocolVersion,
+    AttachGrant, AttachPaneChunk, AttachScene, CORE_PROTOCOL_CAPABILITIES, ClientSummary,
+    ContextSelector, ContextSummary, Envelope, EnvelopeKind, ErrorCode, IncompatibilityReason,
+    InvokeServiceKind, IpcEndpoint, NegotiatedProtocol, PaneFocusDirection, PaneLayoutNode,
+    PaneSelector, PaneSplitDirection, PaneSummary, ProtocolContract, ProtocolVersion,
     RecordingEventKind, RecordingProfile, RecordingStatus, RecordingSummary, Request, Response,
-    ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary, decode, encode,
+    ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary, decode,
+    default_supported_capabilities, encode,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -101,6 +103,8 @@ pub enum ClientError {
     ServerError { code: ErrorCode, message: String },
     #[error("unexpected response payload: {0}")]
     UnexpectedResponse(&'static str),
+    #[error("protocol negotiation failed: {reason:?}")]
+    ProtocolIncompatible { reason: IncompatibilityReason },
     #[error("failed loading config: {0}")]
     ConfigLoad(#[from] bmux_config::ConfigError),
     #[error("failed reading principal id file {path}: {source}")]
@@ -124,6 +128,7 @@ pub struct BmuxClient {
     timeout: Duration,
     next_request_id: u64,
     principal_id: Uuid,
+    negotiated_protocol: Option<NegotiatedProtocol>,
 }
 
 #[derive(Debug)]
@@ -152,6 +157,21 @@ impl ClientStream {
 }
 
 impl BmuxClient {
+    #[must_use]
+    pub fn negotiated_protocol(&self) -> Option<&NegotiatedProtocol> {
+        self.negotiated_protocol.as_ref()
+    }
+
+    #[must_use]
+    pub fn supports_capability(&self, capability: &str) -> bool {
+        self.negotiated_protocol.as_ref().is_some_and(|negotiated| {
+            negotiated
+                .capabilities
+                .iter()
+                .any(|supported| supported == capability)
+        }) || CORE_PROTOCOL_CAPABILITIES.contains(&capability)
+    }
+
     /// Connect to a server endpoint and complete protocol handshake.
     ///
     /// # Errors
@@ -213,26 +233,50 @@ impl BmuxClient {
         client_name: impl Into<String>,
         principal_id: Uuid,
     ) -> Result<Self> {
+        let client_name = client_name.into();
         let mut client = Self {
             stream,
             timeout,
             next_request_id: 1,
             principal_id,
+            negotiated_protocol: None,
         };
 
-        let hello_response = client
-            .request(Request::Hello {
-                protocol_version: ProtocolVersion::current(),
-                client_name: client_name.into(),
+        let v2_attempt = client
+            .request(Request::HelloV2 {
+                contract: ProtocolContract::current(default_supported_capabilities()),
+                client_name: client_name.clone(),
                 principal_id,
             })
-            .await?;
+            .await;
 
-        match hello_response {
-            ResponsePayload::ServerStatus { running: true, .. } => Ok(client),
-            _ => Err(ClientError::UnexpectedResponse(
-                "handshake expected running server status",
+        match v2_attempt {
+            Ok(ResponsePayload::HelloNegotiated { negotiated }) => {
+                client.negotiated_protocol = Some(negotiated);
+                Ok(client)
+            }
+            Ok(ResponsePayload::HelloIncompatible { reason }) => {
+                Err(ClientError::ProtocolIncompatible { reason })
+            }
+            Ok(_) => Err(ClientError::UnexpectedResponse(
+                "handshake expected hello negotiation response",
             )),
+            Err(error) if should_fallback_to_legacy_hello(&error) => {
+                let hello_response = client
+                    .request(Request::Hello {
+                        protocol_version: ProtocolVersion::current(),
+                        client_name,
+                        principal_id,
+                    })
+                    .await?;
+                match hello_response {
+                    ResponsePayload::ServerStatus { running: true, .. } => Ok(client),
+                    _ => Err(ClientError::UnexpectedResponse(
+                        "handshake expected running server status",
+                    )),
+                }
+            }
+            Err(error) => Err(error),
         }
     }
 
@@ -1350,6 +1394,7 @@ impl StreamingBmuxClient {
             timeout,
             next_request_id,
             principal_id,
+            negotiated_protocol: _,
         } = client;
 
         let local_stream = match stream {
@@ -2064,6 +2109,7 @@ impl StreamingBmuxClient {
 const fn request_kind_name(request: &Request) -> &'static str {
     match request {
         Request::Hello { .. } => "hello",
+        Request::HelloV2 { .. } => "hello_v2",
         Request::Ping => "ping",
         Request::WhoAmI => "whoami",
         Request::WhoAmIPrincipal => "whoami_principal",
@@ -2121,6 +2167,8 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::Pong => "pong",
             ResponsePayload::ClientIdentity { .. } => "client_identity",
             ResponsePayload::PrincipalIdentity { .. } => "principal_identity",
+            ResponsePayload::HelloNegotiated { .. } => "hello_negotiated",
+            ResponsePayload::HelloIncompatible { .. } => "hello_incompatible",
             ResponsePayload::ServerStatus { .. } => "server_status",
             ResponsePayload::ServerSnapshotSaved { .. } => "server_snapshot_saved",
             ResponsePayload::ServerSnapshotRestoreDryRun { .. } => {
@@ -2182,6 +2230,16 @@ fn endpoint_from_paths(paths: &ConfigPaths) -> IpcEndpoint {
     {
         IpcEndpoint::windows_named_pipe(paths.server_named_pipe())
     }
+}
+
+fn should_fallback_to_legacy_hello(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::ServerError {
+            code: ErrorCode::InvalidRequest,
+            ..
+        } | ClientError::Serialization(_)
+    )
 }
 
 fn load_or_create_principal_id(paths: &ConfigPaths) -> Result<Uuid> {

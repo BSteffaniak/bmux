@@ -5,7 +5,7 @@
 //! Cross-platform IPC protocol models for bmux.
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
@@ -54,6 +54,154 @@ impl IpcEndpoint {
 
 /// Current IPC protocol version.
 pub const CURRENT_PROTOCOL_VERSION: u16 = 3;
+
+/// Current wire-compatibility epoch for IPC framing.
+pub const CURRENT_WIRE_EPOCH: u16 = CURRENT_PROTOCOL_VERSION;
+
+/// Current negotiated protocol revision.
+pub const CURRENT_PROTOCOL_REVISION: u32 = 1;
+
+/// Minimum protocol revision this build can negotiate.
+pub const MIN_SUPPORTED_PROTOCOL_REVISION: u32 = 1;
+
+pub const CORE_CAPABILITY_SESSION: &str = "core.session";
+pub const CORE_CAPABILITY_ATTACH: &str = "core.attach";
+pub const CORE_CAPABILITY_PANE_IO: &str = "core.pane_io";
+pub const CORE_CAPABILITY_DETACH: &str = "core.detach";
+
+/// Core protocol capabilities required for baseline bmux operation.
+pub const CORE_PROTOCOL_CAPABILITIES: &[&str] = &[
+    CORE_CAPABILITY_SESSION,
+    CORE_CAPABILITY_ATTACH,
+    CORE_CAPABILITY_PANE_IO,
+    CORE_CAPABILITY_DETACH,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolRevisionRange {
+    pub min: u32,
+    pub max: u32,
+}
+
+impl ProtocolRevisionRange {
+    #[must_use]
+    pub const fn new(min: u32, max: u32) -> Self {
+        Self { min, max }
+    }
+
+    #[must_use]
+    pub const fn current() -> Self {
+        Self {
+            min: MIN_SUPPORTED_PROTOCOL_REVISION,
+            max: CURRENT_PROTOCOL_REVISION,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProtocolContract {
+    pub wire_epoch: u16,
+    pub revisions: ProtocolRevisionRange,
+    pub capabilities: Vec<String>,
+}
+
+impl ProtocolContract {
+    #[must_use]
+    pub fn current(capabilities: Vec<String>) -> Self {
+        Self {
+            wire_epoch: CURRENT_WIRE_EPOCH,
+            revisions: ProtocolRevisionRange::current(),
+            capabilities,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NegotiatedProtocol {
+    pub wire_epoch: u16,
+    pub revision: u32,
+    pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IncompatibilityReason {
+    WireEpochMismatch {
+        client: u16,
+        server: u16,
+    },
+    NoCommonRevision {
+        client_min: u32,
+        client_max: u32,
+        server_min: u32,
+        server_max: u32,
+    },
+    MissingCoreCapabilities {
+        missing: Vec<String>,
+    },
+}
+
+#[must_use]
+pub fn default_supported_capabilities() -> Vec<String> {
+    vec![
+        CORE_CAPABILITY_SESSION.to_string(),
+        CORE_CAPABILITY_ATTACH.to_string(),
+        CORE_CAPABILITY_PANE_IO.to_string(),
+        CORE_CAPABILITY_DETACH.to_string(),
+        "feature.contexts".to_string(),
+        "feature.attach_snapshot".to_string(),
+        "feature.recording.v4".to_string(),
+    ]
+}
+
+pub fn negotiate_protocol(
+    client: &ProtocolContract,
+    server: &ProtocolContract,
+    core_required: &[&str],
+) -> Result<NegotiatedProtocol, IncompatibilityReason> {
+    if client.wire_epoch != server.wire_epoch {
+        return Err(IncompatibilityReason::WireEpochMismatch {
+            client: client.wire_epoch,
+            server: server.wire_epoch,
+        });
+    }
+
+    let overlap_min = client.revisions.min.max(server.revisions.min);
+    let overlap_max = client.revisions.max.min(server.revisions.max);
+    if overlap_min > overlap_max {
+        return Err(IncompatibilityReason::NoCommonRevision {
+            client_min: client.revisions.min,
+            client_max: client.revisions.max,
+            server_min: server.revisions.min,
+            server_max: server.revisions.max,
+        });
+    }
+
+    let server_caps: BTreeSet<&str> = server.capabilities.iter().map(String::as_str).collect();
+    let client_caps: BTreeSet<&str> = client.capabilities.iter().map(String::as_str).collect();
+
+    let negotiated_caps: Vec<String> = server_caps
+        .intersection(&client_caps)
+        .map(|cap| (*cap).to_string())
+        .collect();
+
+    let negotiated_set: BTreeSet<&str> = negotiated_caps.iter().map(String::as_str).collect();
+    let missing: Vec<String> = core_required
+        .iter()
+        .copied()
+        .filter(|required| !negotiated_set.contains(required))
+        .map(std::string::ToString::to_string)
+        .collect();
+    if !missing.is_empty() {
+        return Err(IncompatibilityReason::MissingCoreCapabilities { missing });
+    }
+
+    Ok(NegotiatedProtocol {
+        wire_epoch: server.wire_epoch,
+        revision: overlap_max,
+        capabilities: negotiated_caps,
+    })
+}
 
 /// Protocol version used in IPC envelopes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -400,6 +548,11 @@ pub enum Request {
         session_id: Uuid,
         pane_id: Uuid,
         data: Vec<u8>,
+    },
+    HelloV2 {
+        contract: ProtocolContract,
+        client_name: String,
+        principal_id: Uuid,
     },
 }
 
@@ -789,6 +942,12 @@ pub enum ResponsePayload {
     ServiceInvoked {
         payload: Vec<u8>,
     },
+    HelloNegotiated {
+        negotiated: NegotiatedProtocol,
+    },
+    HelloIncompatible {
+        reason: IncompatibilityReason,
+    },
 }
 
 /// Canonical error codes returned over IPC.
@@ -1144,6 +1303,81 @@ mod tests {
     }
 
     #[test]
+    fn negotiate_protocol_selects_highest_common_revision() {
+        let client = ProtocolContract {
+            wire_epoch: CURRENT_WIRE_EPOCH,
+            revisions: ProtocolRevisionRange::new(1, 4),
+            capabilities: vec![
+                CORE_CAPABILITY_SESSION.to_string(),
+                CORE_CAPABILITY_ATTACH.to_string(),
+                CORE_CAPABILITY_PANE_IO.to_string(),
+                CORE_CAPABILITY_DETACH.to_string(),
+                "feature.recording.v4".to_string(),
+            ],
+        };
+        let server = ProtocolContract {
+            wire_epoch: CURRENT_WIRE_EPOCH,
+            revisions: ProtocolRevisionRange::new(2, 3),
+            capabilities: default_supported_capabilities(),
+        };
+
+        let negotiated = negotiate_protocol(&client, &server, CORE_PROTOCOL_CAPABILITIES)
+            .expect("negotiation should succeed");
+        assert_eq!(negotiated.revision, 3);
+        assert!(
+            negotiated
+                .capabilities
+                .contains(&"feature.recording.v4".to_string())
+        );
+    }
+
+    #[test]
+    fn negotiate_protocol_rejects_wire_epoch_mismatch() {
+        let client = ProtocolContract {
+            wire_epoch: 10,
+            revisions: ProtocolRevisionRange::new(1, 1),
+            capabilities: default_supported_capabilities(),
+        };
+        let server = ProtocolContract {
+            wire_epoch: 11,
+            revisions: ProtocolRevisionRange::new(1, 1),
+            capabilities: default_supported_capabilities(),
+        };
+
+        let error = negotiate_protocol(&client, &server, CORE_PROTOCOL_CAPABILITIES)
+            .expect_err("wire mismatch should fail");
+        assert!(matches!(
+            error,
+            IncompatibilityReason::WireEpochMismatch {
+                client: 10,
+                server: 11,
+            }
+        ));
+    }
+
+    #[test]
+    fn negotiate_protocol_rejects_missing_core_capability() {
+        let client = ProtocolContract {
+            wire_epoch: CURRENT_WIRE_EPOCH,
+            revisions: ProtocolRevisionRange::new(1, 1),
+            capabilities: vec![CORE_CAPABILITY_SESSION.to_string()],
+        };
+        let server = ProtocolContract {
+            wire_epoch: CURRENT_WIRE_EPOCH,
+            revisions: ProtocolRevisionRange::new(1, 1),
+            capabilities: vec![CORE_CAPABILITY_SESSION.to_string()],
+        };
+
+        let error = negotiate_protocol(&client, &server, CORE_PROTOCOL_CAPABILITIES)
+            .expect_err("missing core capabilities should fail");
+        assert!(matches!(
+            error,
+            IncompatibilityReason::MissingCoreCapabilities { missing }
+                if missing.contains(&CORE_CAPABILITY_ATTACH.to_string())
+        ));
+    }
+
+    #[test]
     fn endpoint_helpers_report_correct_transport() {
         let unix_endpoint = IpcEndpoint::unix_socket("/tmp/bmux.sock");
         assert_eq!(
@@ -1199,6 +1433,11 @@ mod tests {
             Request::Hello {
                 protocol_version: ProtocolVersion::current(),
                 client_name: "test-client".into(),
+                principal_id: id,
+            },
+            Request::HelloV2 {
+                contract: ProtocolContract::current(default_supported_capabilities()),
+                client_name: "test-client-v2".into(),
                 principal_id: id,
             },
             Request::Ping,

@@ -3,6 +3,7 @@ use bmux_client::{BmuxClient, ClientError};
 use bmux_config::{
     BmuxConfig, ConfigPaths, ConnectionTargetConfig, ConnectionTransport, StaleBuildAction,
 };
+use bmux_ipc::IncompatibilityReason;
 use bmux_ipc::transport::ErasedIpcStream;
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
 use rustls::RootCertStore;
@@ -471,6 +472,10 @@ pub fn is_server_unavailable_client_error(error: &ClientError) -> bool {
 }
 
 pub fn map_client_connect_error(error: ClientError) -> anyhow::Error {
+    if let ClientError::ProtocolIncompatible { reason } = &error {
+        return anyhow::anyhow!(format_protocol_incompatibility(reason));
+    }
+
     if let ClientError::ServerError { code, .. } = &error
         && *code == bmux_ipc::ErrorCode::VersionMismatch
     {
@@ -503,6 +508,28 @@ pub fn map_client_connect_error(error: ClientError) -> anyhow::Error {
     }
 
     anyhow::Error::from(error)
+}
+
+fn format_protocol_incompatibility(reason: &IncompatibilityReason) -> String {
+    match reason {
+        IncompatibilityReason::WireEpochMismatch { client, server } => {
+            format!(
+                "bmux error: incompatible IPC wire epoch (client={client}, server={server}). Restart or update the server so both sides share a wire epoch."
+            )
+        }
+        IncompatibilityReason::NoCommonRevision {
+            client_min,
+            client_max,
+            server_min,
+            server_max,
+        } => format!(
+            "bmux error: no overlapping protocol revision (client={client_min}-{client_max}, server={server_min}-{server_max}). Update either side to overlapping revisions."
+        ),
+        IncompatibilityReason::MissingCoreCapabilities { missing } => format!(
+            "bmux error: missing shared core protocol capabilities: {}. Update server/client so core contracts align.",
+            missing.join(", ")
+        ),
+    }
 }
 
 pub fn apply_stale_build_policy(scope: ConnectionPolicyScope) -> Result<()> {
@@ -645,6 +672,7 @@ mod tests {
     };
     use bmux_client::ClientError;
     use bmux_config::{BmuxConfig, StaleBuildAction};
+    use bmux_ipc::IncompatibilityReason;
     use bmux_ipc::frame::FrameDecodeError;
     use bmux_ipc::transport::IpcTransportError;
     use serial_test::serial;
@@ -801,6 +829,23 @@ mod tests {
         assert!(message.contains("bmux server is not running"));
         assert!(message.contains("bmux server start --daemon"));
         assert!(message.contains("stale socket"));
+    }
+
+    #[test]
+    fn map_client_connect_error_formats_protocol_incompatible_reason() {
+        let error = map_client_connect_error(ClientError::ProtocolIncompatible {
+            reason: IncompatibilityReason::NoCommonRevision {
+                client_min: 3,
+                client_max: 5,
+                server_min: 1,
+                server_max: 2,
+            },
+        });
+
+        let message = error.to_string();
+        assert!(message.contains("no overlapping protocol revision"));
+        assert!(message.contains("client=3-5"));
+        assert!(message.contains("server=1-2"));
     }
 
     #[test]

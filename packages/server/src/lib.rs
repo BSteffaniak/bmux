@@ -13,12 +13,13 @@ use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
     AttachFocusTarget, AttachGrant, AttachLayer, AttachPaneChunk, AttachRect, AttachScene,
-    AttachSurface, AttachSurfaceKind, AttachViewComponent, CURRENT_PROTOCOL_VERSION, ClientSummary,
-    ContextSelector, ContextSummary, Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event,
-    IpcEndpoint, PaneFocusDirection, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector,
-    PaneSplitDirection, PaneSummary, ProtocolVersion, RecordingEventKind, RecordingPayload,
-    RecordingProfile, Request, Response, ResponsePayload, ServerSnapshotStatus, SessionSelector,
-    SessionSummary, decode, encode,
+    AttachSurface, AttachSurfaceKind, AttachViewComponent, CORE_PROTOCOL_CAPABILITIES,
+    ClientSummary, ContextSelector, ContextSummary, Envelope, EnvelopeKind, ErrorCode,
+    ErrorResponse, Event, IpcEndpoint, PaneFocusDirection, PaneLayoutNode as IpcPaneLayoutNode,
+    PaneSelector, PaneSplitDirection, PaneSummary, ProtocolContract, ProtocolVersion,
+    RecordingEventKind, RecordingPayload, RecordingProfile, Request, Response, ResponsePayload,
+    ServerSnapshotStatus, SessionSelector, SessionSummary, decode, default_supported_capabilities,
+    encode, negotiate_protocol,
 };
 use bmux_session::{ClientId, Session, SessionId, SessionManager};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
@@ -2980,48 +2981,83 @@ async fn handle_connection(
         .context("handshake timed out")??;
 
     let handshake = parse_request(&first_envelope)?;
-    if let Request::Hello {
-        protocol_version,
-        client_name,
-        principal_id,
-    } = handshake
-    {
-        if protocol_version != ProtocolVersion::current() {
+    match handshake {
+        Request::Hello {
+            protocol_version,
+            client_name,
+            principal_id,
+        } => {
+            if protocol_version != ProtocolVersion::current() {
+                send_error(
+                    &mut stream,
+                    first_envelope.request_id,
+                    ErrorCode::VersionMismatch,
+                    format!(
+                        "unsupported protocol version {}; expected {}",
+                        protocol_version.0,
+                        ProtocolVersion::current().0
+                    ),
+                )
+                .await?;
+                return Ok(());
+            }
+            client_principal_id = principal_id;
+            debug!("accepted client handshake (legacy): {client_name}");
+            let snapshot = snapshot_status(&state)?;
+            send_ok(
+                &mut stream,
+                first_envelope.request_id,
+                ResponsePayload::ServerStatus {
+                    running: true,
+                    snapshot,
+                    principal_id,
+                    server_control_principal_id: state.server_control_principal_id,
+                },
+            )
+            .await?;
+        }
+        Request::HelloV2 {
+            contract,
+            client_name,
+            principal_id,
+        } => {
+            let server_contract = ProtocolContract::current(default_supported_capabilities());
+            match negotiate_protocol(&contract, &server_contract, CORE_PROTOCOL_CAPABILITIES) {
+                Ok(negotiated) => {
+                    client_principal_id = principal_id;
+                    debug!(
+                        "accepted client handshake (v2): {client_name} revision={} caps={}",
+                        negotiated.revision,
+                        negotiated.capabilities.join(",")
+                    );
+                    send_ok(
+                        &mut stream,
+                        first_envelope.request_id,
+                        ResponsePayload::HelloNegotiated { negotiated },
+                    )
+                    .await?;
+                }
+                Err(reason) => {
+                    send_ok(
+                        &mut stream,
+                        first_envelope.request_id,
+                        ResponsePayload::HelloIncompatible { reason },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            }
+        }
+        _ => {
             send_error(
                 &mut stream,
                 first_envelope.request_id,
-                ErrorCode::VersionMismatch,
-                format!(
-                    "unsupported protocol version {}; expected {}",
-                    protocol_version.0, CURRENT_PROTOCOL_VERSION
-                ),
+                ErrorCode::InvalidRequest,
+                "first request must be hello".to_string(),
             )
             .await?;
             return Ok(());
         }
-        client_principal_id = principal_id;
-        debug!("accepted client handshake: {client_name}");
-        let snapshot = snapshot_status(&state)?;
-        send_ok(
-            &mut stream,
-            first_envelope.request_id,
-            ResponsePayload::ServerStatus {
-                running: true,
-                snapshot,
-                principal_id,
-                server_control_principal_id: state.server_control_principal_id,
-            },
-        )
-        .await?;
-    } else {
-        send_error(
-            &mut stream,
-            first_envelope.request_id,
-            ErrorCode::InvalidRequest,
-            "first request must be hello".to_string(),
-        )
-        .await?;
-        return Ok(());
     }
 
     {
@@ -4354,7 +4390,7 @@ async fn handle_request(
     )?;
 
     let response = match request {
-        Request::Hello { .. } => Response::Err(ErrorResponse {
+        Request::Hello { .. } | Request::HelloV2 { .. } => Response::Err(ErrorResponse {
             code: ErrorCode::InvalidRequest,
             message: "hello request is only valid during handshake".to_string(),
         }),
@@ -6144,6 +6180,7 @@ const fn response_requires_snapshot(response: &Response) -> bool {
 const fn request_kind_name(request: &Request) -> &'static str {
     match request {
         Request::Hello { .. } => "hello",
+        Request::HelloV2 { .. } => "hello_v2",
         Request::Ping => "ping",
         Request::WhoAmI => "whoami",
         Request::WhoAmIPrincipal => "whoami_principal",
@@ -6230,6 +6267,8 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::Pong => "pong",
         ResponsePayload::ClientIdentity { .. } => "client_identity",
         ResponsePayload::PrincipalIdentity { .. } => "principal_identity",
+        ResponsePayload::HelloNegotiated { .. } => "hello_negotiated",
+        ResponsePayload::HelloIncompatible { .. } => "hello_incompatible",
         ResponsePayload::ServerStatus { .. } => "server_status",
         ResponsePayload::ServerSnapshotSaved { .. } => "server_snapshot_saved",
         ResponsePayload::ServerSnapshotRestoreDryRun { .. } => "server_snapshot_restore_dry_run",
