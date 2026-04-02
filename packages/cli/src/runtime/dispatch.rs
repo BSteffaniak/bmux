@@ -14,7 +14,9 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
         Command::Join { .. } => BuiltInHandlerId::Join,
         Command::Hosts => BuiltInHandlerId::Hosts,
         Command::Auth { command } => match command {
-            AuthCommand::Login => BuiltInHandlerId::AuthLogin,
+            AuthCommand::Login { .. } => BuiltInHandlerId::AuthLogin,
+            AuthCommand::Status => BuiltInHandlerId::AuthStatus,
+            AuthCommand::Logout => BuiltInHandlerId::AuthLogout,
         },
         Command::Share { .. } => BuiltInHandlerId::Share,
         Command::Unshare { .. } => BuiltInHandlerId::Unshare,
@@ -116,8 +118,8 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
     let _descriptor = built_in_command_by_handler(handler);
     match (handler, command) {
         (BuiltInHandlerId::Setup, Command::Setup) => run_setup().await,
-        (BuiltInHandlerId::Host, Command::Host { listen, name }) => {
-            run_host(listen, name.as_deref()).await
+        (BuiltInHandlerId::Host, Command::Host { listen, name, copy }) => {
+            run_host(listen, name.as_deref(), *copy).await
         }
         (BuiltInHandlerId::Join, Command::Join { link, session }) => {
             run_join(link.as_deref(), session.as_deref()).await
@@ -126,9 +128,21 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
         (
             BuiltInHandlerId::AuthLogin,
             Command::Auth {
-                command: AuthCommand::Login,
+                command: AuthCommand::Login { no_browser },
             },
-        ) => run_auth_login().await,
+        ) => run_auth_login(*no_browser).await,
+        (
+            BuiltInHandlerId::AuthStatus,
+            Command::Auth {
+                command: AuthCommand::Status,
+            },
+        ) => run_auth_status(),
+        (
+            BuiltInHandlerId::AuthLogout,
+            Command::Auth {
+                command: AuthCommand::Logout,
+            },
+        ) => run_auth_logout(),
         (BuiltInHandlerId::Share, Command::Share { target, name, role }) => {
             run_share(target.as_deref(), name.as_deref(), role).await
         }

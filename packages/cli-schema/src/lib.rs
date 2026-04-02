@@ -189,6 +189,9 @@ pub enum Command {
         /// Optional friendly name hint
         #[arg(long)]
         name: Option<String>,
+        /// Copy the resulting join link to clipboard
+        #[arg(long)]
+        copy: bool,
     },
     /// Join a hosted link/target quickly
     Join {
@@ -348,7 +351,15 @@ pub enum Command {
 #[derive(Debug, Subcommand)]
 pub enum AuthCommand {
     /// Login and register this device for hosted mode
-    Login,
+    Login {
+        /// Do not try to open a browser automatically
+        #[arg(long)]
+        no_browser: bool,
+    },
+    /// Show current authentication state
+    Status,
+    /// Clear locally stored authentication state
+    Logout,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1041,7 +1052,7 @@ pub enum TerminalCommand {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, ConfigCommand, GatewayHostMode, KeymapCommand, LogsCommand,
+        AuthCommand, Cli, Command, GatewayHostMode, KeymapCommand, LogsCommand,
         LogsProfilesCommand, RecordingCommand, RecordingCursorBlinkMode, RecordingCursorMode,
         RecordingCursorPaintMode, RecordingCursorProfile, RecordingCursorShape,
         RecordingCursorTextMode, RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg,
@@ -1122,11 +1133,49 @@ mod tests {
     #[test]
     fn parses_host_command_defaults() {
         let cli = Cli::try_parse_from(["bmux", "host"]).expect("valid CLI args");
-        let Some(Command::Host { listen, name }) = cli.command else {
+        let Some(Command::Host { listen, name, copy }) = cli.command else {
             panic!("expected host command");
         };
         assert_eq!(listen, "127.0.0.1:7443");
         assert!(name.is_none());
+        assert!(!copy);
+    }
+
+    #[test]
+    fn parses_host_copy_flag() {
+        let cli = Cli::try_parse_from(["bmux", "host", "--copy"]).expect("valid CLI args");
+        let Some(Command::Host { copy, .. }) = cli.command else {
+            panic!("expected host command");
+        };
+        assert!(copy);
+    }
+
+    #[test]
+    fn parses_auth_login_no_browser_flag() {
+        let cli =
+            Cli::try_parse_from(["bmux", "auth", "login", "--no-browser"]).expect("valid CLI args");
+        let Some(Command::Auth { command }) = cli.command else {
+            panic!("expected auth command");
+        };
+        assert!(matches!(command, AuthCommand::Login { no_browser: true }));
+    }
+
+    #[test]
+    fn parses_auth_status_command() {
+        let cli = Cli::try_parse_from(["bmux", "auth", "status"]).expect("valid CLI args");
+        let Some(Command::Auth { command }) = cli.command else {
+            panic!("expected auth command");
+        };
+        assert!(matches!(command, AuthCommand::Status));
+    }
+
+    #[test]
+    fn parses_auth_logout_command() {
+        let cli = Cli::try_parse_from(["bmux", "auth", "logout"]).expect("valid CLI args");
+        let Some(Command::Auth { command }) = cli.command else {
+            panic!("expected auth command");
+        };
+        assert!(matches!(command, AuthCommand::Logout));
     }
 
     #[test]

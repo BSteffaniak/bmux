@@ -8,6 +8,8 @@ pub enum BuiltInHandlerId {
     Hosts,
     Auth,
     AuthLogin,
+    AuthStatus,
+    AuthLogout,
     Share,
     Unshare,
     Connect,
@@ -142,6 +144,16 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::AuthLogin,
             &["auth", "login"],
             "Login/register local device",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::AuthStatus,
+            &["auth", "status"],
+            "Show current login status",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::AuthLogout,
+            &["auth", "logout"],
+            "Remove local login credentials",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Share,

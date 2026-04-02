@@ -1,7 +1,8 @@
 use super::*;
 use anyhow::Context;
 use bmux_config::{ConnectionTargetConfig, ConnectionTransport, RemoteServerStartMode};
-use bmux_ipc::transport::ErasedIpcStream;
+use bmux_ipc::IpcEndpoint;
+use bmux_ipc::transport::{ErasedIpcStream, LocalIpcStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
@@ -13,6 +14,7 @@ use std::task::{Context as TaskContext, Poll};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command as TokioProcessCommand};
+use tokio::time::sleep;
 use tokio_rustls::TlsConnector;
 
 #[derive(Debug, Clone)]
@@ -68,12 +70,34 @@ struct AuthState {
     access_token: String,
     account_id: Option<String>,
     account_name: Option<String>,
+    expires_at_unix: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 struct WhoAmIResponse {
     account_id: Option<String>,
     account_name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DeviceStartResponse {
+    device_code: String,
+    user_code: String,
+    verification_uri: String,
+    interval_seconds: Option<u64>,
+    expires_in: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DevicePollRequest {
+    device_code: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct DevicePollResponse {
+    status: Option<String>,
+    access_token: Option<String>,
+    error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -87,6 +111,12 @@ struct CreateShareRequest {
 struct ShareLinkResponse {
     name: Option<String>,
     url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct RegisterHostRequest {
+    name: Option<String>,
+    target: String,
 }
 
 #[derive(Debug)]
@@ -299,31 +329,143 @@ fn map_connect_target_resolution_error(target: &str, error: anyhow::Error) -> an
 
 pub(super) async fn run_setup() -> Result<u8> {
     println!("bmux setup");
-    run_auth_login().await?;
+    run_auth_login(false).await?;
     println!("next: bmux host");
     Ok(0)
 }
 
-pub(super) async fn run_host(listen: &str, name: Option<&str>) -> Result<u8> {
-    if let Some(name) = name {
-        println!("host name hint: {name}");
-    }
-    run_server_gateway(
-        listen,
-        true,
-        bmux_cli_schema::GatewayHostMode::Iroh,
-        "nokey@localhost.run",
-        false,
-        None,
-        None,
+pub(super) async fn run_host(listen: &str, name: Option<&str>, copy: bool) -> Result<u8> {
+    let mut config = BmuxConfig::load()?;
+    let control_plane_url = control_plane_url(&config);
+    let auth_state = ensure_authenticated(&config).await?;
+
+    let endpoint = Endpoint::builder(presets::N0)
+        .alpns(vec![BMUX_IROH_ALPN.to_vec()])
+        .bind()
+        .await
+        .context("failed binding iroh endpoint")?;
+    endpoint.online().await;
+    let addr = endpoint.addr();
+    let endpoint_id = endpoint.id();
+    let relay = addr.relay_urls().next().map(|value| value.to_string());
+    let target = relay.as_ref().map_or_else(
+        || format!("iroh://{endpoint_id}"),
+        |relay_url| format!("iroh://{endpoint_id}?relay={relay_url}"),
+    );
+
+    let share_name = suggest_share_name(name, &auth_state);
+    let share_result = ensure_host_share_link(
+        &mut config,
+        &control_plane_url,
+        &auth_state.access_token,
+        &share_name,
+        &target,
+    )
+    .await;
+    let resolved_share = match share_result {
+        Ok(value) => Some(value),
+        Err(error) => {
+            eprintln!("warning: failed to create share link: {error}");
+            None
+        }
+    };
+    if let Err(error) = register_host_presence(
+        &control_plane_url,
+        &auth_state.access_token,
+        name.map(ToString::to_string)
+            .or_else(|| resolved_share.clone()),
+        &target,
     )
     .await
+    {
+        eprintln!("warning: host registration failed: {error}");
+    }
+
+    let join_link = resolved_share
+        .as_ref()
+        .map(|value| format!("bmux://{value}"))
+        .unwrap_or_else(|| target.clone());
+    if copy {
+        match crate::runtime::attach::runtime::copy_text_with_clipboard_plugin(&join_link) {
+            Ok(()) => println!("copied to clipboard: {join_link}"),
+            Err(error) => eprintln!(
+                "warning: clipboard copy failed: {}",
+                crate::runtime::attach::runtime::format_clipboard_service_error(&error)
+            ),
+        }
+    }
+
+    println!("bmux iroh gateway online");
+    if listen != "127.0.0.1:7443" {
+        println!("note: --listen is ignored for iroh host mode ({listen})");
+    }
+    println!("connect URL: {target}");
+    if let Some(share) = resolved_share.as_deref() {
+        println!("share link: bmux://{share}");
+        println!("join: bmux join bmux://{share}");
+    } else {
+        println!("join: bmux join {target}");
+    }
+
+    while let Some(incoming) = endpoint.accept().await {
+        let mut accepting = match incoming.accept() {
+            Ok(accepting) => accepting,
+            Err(error) => {
+                tracing::warn!(?error, "iroh incoming accept failed");
+                continue;
+            }
+        };
+        tokio::spawn(async move {
+            let result: Result<()> = async {
+                let alpn = accepting.alpn().await.context("failed reading ALPN")?;
+                if alpn.as_slice() != BMUX_IROH_ALPN {
+                    anyhow::bail!("unexpected iroh ALPN");
+                }
+                let conn = accepting
+                    .await
+                    .context("failed accepting iroh connection")?;
+                let (mut send, mut recv) = conn
+                    .accept_bi()
+                    .await
+                    .context("failed accepting iroh stream")?;
+                let endpoint = local_ipc_endpoint_from_paths(&ConfigPaths::default());
+                let ipc_stream = LocalIpcStream::connect(&endpoint)
+                    .await
+                    .context("failed connecting local IPC endpoint for iroh gateway")?;
+                let (mut ipc_read, mut ipc_write) = tokio::io::split(ipc_stream);
+
+                let inbound = tokio::spawn(async move {
+                    tokio::io::copy(&mut recv, &mut ipc_write).await?;
+                    ipc_write.shutdown().await?;
+                    Ok::<(), std::io::Error>(())
+                });
+                let outbound = tokio::spawn(async move {
+                    tokio::io::copy(&mut ipc_read, &mut send).await?;
+                    send.finish()?;
+                    Ok::<(), anyhow::Error>(())
+                });
+
+                let inbound_result: std::io::Result<()> =
+                    inbound.await.context("iroh inbound task failed")?;
+                let outbound_result: anyhow::Result<()> =
+                    outbound.await.context("iroh outbound task failed")?;
+                inbound_result.context("iroh inbound copy failed")?;
+                outbound_result.context("iroh outbound copy failed")?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(?error, "iroh connection handling failed");
+            }
+        });
+    }
+    Ok(0)
 }
 
 pub(super) async fn run_join(link: Option<&str>, session: Option<&str>) -> Result<u8> {
     let config = BmuxConfig::load()?;
     let target = if let Some(link) = link {
-        link.to_string()
+        normalize_join_target_input(link)?
     } else {
         choose_default_target_interactively(&config)?
     };
@@ -363,27 +505,29 @@ pub(super) fn run_hosts() -> Result<u8> {
     Ok(0)
 }
 
-pub(super) async fn run_auth_login() -> Result<u8> {
+pub(super) async fn run_auth_login(no_browser: bool) -> Result<u8> {
     let config = BmuxConfig::load()?;
     let control_plane_url = control_plane_url(&config);
     let token = if let Ok(value) = std::env::var("BMUX_AUTH_TOKEN") {
         value
     } else if io::stdin().is_terminal() {
-        print!("Enter bmux access token: ");
-        io::stdout()
-            .flush()
-            .context("failed flushing auth prompt")?;
-        let mut input = String::new();
-        io::stdin()
-            .read_line(&mut input)
-            .context("failed reading auth token")?;
-        let value = input.trim().to_string();
-        if value.is_empty() {
-            anyhow::bail!("empty auth token");
+        let started = start_device_login(&control_plane_url).await?;
+        println!("Complete sign-in to continue.");
+        println!("URL: {}", started.verification_uri);
+        println!("Code: {}", started.user_code);
+        if !no_browser {
+            if open_browser(&started.verification_uri) {
+                println!("Opened browser for sign-in.");
+            } else {
+                println!("Could not open browser automatically; open the URL manually.");
+            }
         }
-        value
+        println!("Waiting for confirmation...");
+        wait_for_device_token(&control_plane_url, &started).await?
     } else {
-        anyhow::bail!("BMUX_AUTH_TOKEN is required in non-interactive mode for auth login");
+        anyhow::bail!(
+            "BMUX_AUTH_TOKEN is required in non-interactive mode; interactive login supports device flow"
+        );
     };
 
     let whoami = verify_access_token(&control_plane_url, &token).await?;
@@ -392,6 +536,7 @@ pub(super) async fn run_auth_login() -> Result<u8> {
         access_token: token,
         account_id: whoami.account_id,
         account_name: whoami.account_name,
+        expires_at_unix: None,
     };
     save_auth_state(&paths, &state)?;
     println!(
@@ -399,6 +544,42 @@ pub(super) async fn run_auth_login() -> Result<u8> {
         auth_state_path(&paths).display()
     );
     Ok(0)
+}
+
+pub(super) fn run_auth_status() -> Result<u8> {
+    let paths = ConfigPaths::default();
+    let Some(state) = load_auth_state_optional(&paths)? else {
+        println!("not authenticated");
+        return Ok(1);
+    };
+    println!("authenticated");
+    if let Some(account_name) = state.account_name.as_deref() {
+        println!("account: {account_name}");
+    }
+    if let Some(account_id) = state.account_id.as_deref() {
+        println!("account id: {account_id}");
+    }
+    if let Some(expires_at) = state.expires_at_unix {
+        println!("expires_at_unix: {expires_at}");
+    }
+    println!("state file: {}", auth_state_path(&paths).display());
+    Ok(0)
+}
+
+pub(super) fn run_auth_logout() -> Result<u8> {
+    let paths = ConfigPaths::default();
+    let path = auth_state_path(&paths);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {
+            println!("auth state removed ({})", path.display());
+            Ok(0)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            println!("already logged out");
+            Ok(0)
+        }
+        Err(error) => Err(error).with_context(|| format!("failed removing {}", path.display())),
+    }
 }
 
 pub(super) async fn run_share(target: Option<&str>, name: Option<&str>, role: &str) -> Result<u8> {
@@ -512,6 +693,265 @@ fn save_auth_state(paths: &ConfigPaths, state: &AuthState) -> Result<()> {
     let encoded = serde_json::to_string_pretty(state).context("failed serializing auth state")?;
     std::fs::write(&path, encoded).with_context(|| format!("failed writing {}", path.display()))?;
     Ok(())
+}
+
+async fn ensure_authenticated(config: &BmuxConfig) -> Result<AuthState> {
+    let paths = ConfigPaths::default();
+    if let Some(state) = load_auth_state_optional(&paths)? {
+        return Ok(state);
+    }
+    println!("not authenticated; starting login...");
+    run_auth_login(false).await?;
+    load_auth_state_optional(&paths)?
+        .ok_or_else(|| anyhow::anyhow!("auth login succeeded but no auth state was stored"))
+        .map(|mut state| {
+            if state.account_name.is_none() {
+                state.account_name = config
+                    .connections
+                    .default_target
+                    .as_deref()
+                    .map(ToString::to_string);
+            }
+            state
+        })
+}
+
+fn suggest_share_name(name: Option<&str>, auth_state: &AuthState) -> String {
+    if let Some(value) = name
+        && !value.trim().is_empty()
+    {
+        return value.trim().to_string();
+    }
+    if let Some(account_name) = auth_state.account_name.as_deref() {
+        let slug = account_name
+            .chars()
+            .map(|ch| {
+                if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                    ch
+                } else {
+                    '-'
+                }
+            })
+            .collect::<String>()
+            .trim_matches('-')
+            .to_string();
+        if !slug.is_empty() {
+            return slug;
+        }
+    }
+    format!("host-{}", Uuid::new_v4().simple())
+}
+
+async fn ensure_host_share_link(
+    config: &mut BmuxConfig,
+    control_plane_url: &str,
+    token: &str,
+    name: &str,
+    target: &str,
+) -> Result<String> {
+    if let Some(mapped) = config.connections.share_links.get(name)
+        && mapped == target
+    {
+        return Ok(name.to_string());
+    }
+    let created = create_share_link(
+        control_plane_url,
+        token,
+        &CreateShareRequest {
+            name: name.to_string(),
+            target: target.to_string(),
+            role: "control".to_string(),
+        },
+    )
+    .await?;
+    let resolved_name = created.name.unwrap_or_else(|| name.to_string());
+    config
+        .connections
+        .share_links
+        .insert(resolved_name.clone(), target.to_string());
+    config.save()?;
+    Ok(resolved_name)
+}
+
+async fn register_host_presence(
+    control_plane_url: &str,
+    token: &str,
+    name: Option<String>,
+    target: &str,
+) -> Result<()> {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{control_plane_url}/v1/hosts"))
+        .bearer_auth(token)
+        .json(&RegisterHostRequest {
+            name,
+            target: target.to_string(),
+        })
+        .send()
+        .await
+        .with_context(|| format!("failed contacting {control_plane_url}"))?;
+    if response.status().is_success() || response.status().as_u16() == 404 {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "host registration failed (status {})",
+        response.status().as_u16()
+    )
+}
+
+fn normalize_join_target_input(link: &str) -> Result<String> {
+    let value = link.trim();
+    if value.is_empty() {
+        anyhow::bail!("join target cannot be empty");
+    }
+    if let Some(extracted) = extract_target_from_text(value) {
+        return Ok(extracted);
+    }
+    if value.contains("://") {
+        return Ok(value.to_string());
+    }
+    if value.contains(char::is_whitespace) {
+        anyhow::bail!("could not find a valid invite link in input");
+    }
+    Ok(format!("bmux://{value}"))
+}
+
+fn extract_target_from_text(value: &str) -> Option<String> {
+    value
+        .split_whitespace()
+        .map(|token| token.trim_matches(|ch: char| "()[]{}<>,.;\"'".contains(ch)))
+        .find_map(|token| {
+            if token.starts_with("bmux://")
+                || token.starts_with("iroh://")
+                || token.starts_with("https://")
+                || token.starts_with("ssh://")
+                || token.starts_with("tls://")
+            {
+                Some(token.to_string())
+            } else {
+                None
+            }
+        })
+}
+
+fn open_browser(url: &str) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        return std::process::Command::new("open")
+            .arg(url)
+            .status()
+            .is_ok_and(|status| status.success());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        return std::process::Command::new("cmd")
+            .args(["/C", "start", "", url])
+            .status()
+            .is_ok_and(|status| status.success());
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(url)
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+}
+
+async fn start_device_login(control_plane_url: &str) -> Result<DeviceStartResponse> {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{control_plane_url}/v1/auth/device/start"))
+        .send()
+        .await
+        .with_context(|| format!("failed contacting {control_plane_url}"))?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "device login start failed (status {})",
+            response.status().as_u16()
+        );
+    }
+    response
+        .json::<DeviceStartResponse>()
+        .await
+        .context("failed parsing device login response")
+}
+
+async fn wait_for_device_token(
+    control_plane_url: &str,
+    started: &DeviceStartResponse,
+) -> Result<String> {
+    let mut interval = started.interval_seconds.unwrap_or(2).max(1);
+    let expires_after = started.expires_in.unwrap_or(600);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(expires_after);
+    loop {
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!("device login expired; run 'bmux auth login' again")
+        }
+        let result = poll_device_login(control_plane_url, &started.device_code).await?;
+        let status = result.status.as_deref().unwrap_or("approved");
+        match status {
+            "approved" | "complete" => {
+                if let Some(token) = result.access_token {
+                    return Ok(token);
+                }
+                anyhow::bail!("device login response missing access token")
+            }
+            "pending" | "authorization_pending" => {}
+            "slow_down" => {
+                interval += 1;
+            }
+            "denied" | "access_denied" => {
+                anyhow::bail!("device login denied")
+            }
+            "expired" | "expired_token" => {
+                anyhow::bail!("device login expired; run 'bmux auth login' again")
+            }
+            other => {
+                if let Some(error) = result.error.as_deref() {
+                    anyhow::bail!("device login failed: {error}")
+                }
+                anyhow::bail!("device login failed with status {other}")
+            }
+        }
+        sleep(std::time::Duration::from_secs(interval)).await;
+    }
+}
+
+async fn poll_device_login(
+    control_plane_url: &str,
+    device_code: &str,
+) -> Result<DevicePollResponse> {
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("{control_plane_url}/v1/auth/device/poll"))
+        .json(&DevicePollRequest {
+            device_code: device_code.to_string(),
+        })
+        .send()
+        .await
+        .with_context(|| format!("failed contacting {control_plane_url}"))?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "device login poll failed (status {})",
+            response.status().as_u16()
+        );
+    }
+    response
+        .json::<DevicePollResponse>()
+        .await
+        .context("failed parsing device poll response")
+}
+
+fn local_ipc_endpoint_from_paths(paths: &ConfigPaths) -> IpcEndpoint {
+    #[cfg(unix)]
+    {
+        IpcEndpoint::unix_socket(paths.server_socket())
+    }
+    #[cfg(windows)]
+    {
+        IpcEndpoint::windows_named_pipe(paths.server_named_pipe())
+    }
 }
 
 async fn verify_access_token(control_plane_url: &str, token: &str) -> Result<WhoAmIResponse> {
@@ -2165,6 +2605,19 @@ mod tests {
         assert_eq!(reconnect_backoff_ms(1), 300);
         assert_eq!(reconnect_backoff_ms(2), 600);
         assert_eq!(reconnect_backoff_ms(3), 1_200);
+    }
+
+    #[test]
+    fn normalize_join_target_input_promotes_plain_name_to_bmux_link() {
+        let normalized = normalize_join_target_input("team-dev").expect("normalize link");
+        assert_eq!(normalized, "bmux://team-dev");
+    }
+
+    #[test]
+    fn normalize_join_target_input_extracts_embedded_link_from_text() {
+        let normalized = normalize_join_target_input("Invite code: (bmux://demo-host), join now")
+            .expect("normalize link");
+        assert_eq!(normalized, "bmux://demo-host");
     }
 
     #[test]
