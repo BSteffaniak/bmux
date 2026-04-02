@@ -86,7 +86,6 @@ struct CreateShareRequest {
 #[derive(Debug, Clone, Deserialize)]
 struct ShareLinkResponse {
     name: Option<String>,
-    target: Option<String>,
     url: Option<String>,
 }
 
@@ -199,9 +198,7 @@ pub(super) async fn run_connect(
     } else {
         choose_default_target_interactively(&config)?
     };
-    let resolved_target = resolve_bmux_link_if_needed(&config, &selected_target)
-        .await?
-        .unwrap_or(selected_target);
+    let resolved_target = expand_bmux_target_if_needed(&config, &selected_target).await?;
     let resolved = resolve_target_reference(&config, &resolved_target)?;
     match resolved {
         ResolvedTarget::Local => {
@@ -566,36 +563,6 @@ async fn delete_share_link(control_plane_url: &str, token: &str, name: &str) -> 
         );
     }
     Ok(())
-}
-
-async fn resolve_bmux_link_if_needed(config: &BmuxConfig, target: &str) -> Result<Option<String>> {
-    let Some(name) = target.strip_prefix("bmux://") else {
-        return Ok(None);
-    };
-    if let Some(mapped) = config.connections.share_links.get(name) {
-        return Ok(Some(mapped.clone()));
-    }
-
-    let auth_state = load_auth_state_optional(&ConfigPaths::default())?;
-    let Some(auth_state) = auth_state else {
-        return Ok(None);
-    };
-    let control_plane = control_plane_url(config);
-    let client = reqwest::Client::new();
-    let response = client
-        .get(format!("{control_plane}/v1/share-links/{name}"))
-        .bearer_auth(auth_state.access_token)
-        .send()
-        .await
-        .with_context(|| format!("failed contacting {control_plane}"))?;
-    if !response.status().is_success() {
-        return Ok(None);
-    }
-    let payload = response
-        .json::<ShareLinkResponse>()
-        .await
-        .context("failed parsing share lookup response")?;
-    Ok(payload.target)
 }
 
 async fn run_iroh_attach_with_reconnect(

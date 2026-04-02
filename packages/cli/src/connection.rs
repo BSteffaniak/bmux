@@ -228,11 +228,14 @@ async fn resolve_active_target() -> Result<ActiveTarget> {
     let Some(target) = selected else {
         return Ok(ActiveTarget::Local);
     };
-    let expanded = expand_bmux_link_if_needed(&config, target.trim()).await?;
+    let expanded = expand_bmux_target_if_needed(&config, target.trim()).await?;
     resolve_target_reference(&config, &expanded)
 }
 
-async fn expand_bmux_link_if_needed(config: &BmuxConfig, target: &str) -> Result<String> {
+pub(crate) async fn expand_bmux_target_if_needed(
+    config: &BmuxConfig,
+    target: &str,
+) -> Result<String> {
     let Some(name) = target.strip_prefix("bmux://") else {
         return Ok(target.to_string());
     };

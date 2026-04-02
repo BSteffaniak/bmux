@@ -1,7 +1,8 @@
 use crate::connection::{
     ConnectionPolicyScope, ServerRuntimeMetadata, connect, connect_if_running, connect_raw,
-    current_cli_build_id, map_client_connect_error, read_server_runtime_metadata,
-    remove_server_runtime_metadata_file, write_server_runtime_metadata,
+    current_cli_build_id, expand_bmux_target_if_needed, map_client_connect_error,
+    read_server_runtime_metadata, remove_server_runtime_metadata_file,
+    write_server_runtime_metadata,
 };
 use crate::input::{InputProcessor, Keymap, RuntimeAction};
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
