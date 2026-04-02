@@ -3421,7 +3421,9 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
             | Event::FollowStarted { .. }
             | Event::FollowStopped { .. }
             | Event::FollowTargetGone { .. }
-            | Event::PaneOutputAvailable { .. } => None,
+            | Event::PaneOutputAvailable { .. }
+            | Event::RecordingStarted { .. }
+            | Event::RecordingStopped { .. } => None,
         };
         let _ = runtime.record(
             RecordingEventKind::ServerEvent,
@@ -5859,7 +5861,15 @@ async fn handle_request(
             let event_kinds = event_kinds
                 .unwrap_or_else(|| default_recording_event_kinds(profile, capture_input));
             match runtime.start(session_id, capture_input, profile, event_kinds) {
-                Ok(recording) => Response::Ok(ResponsePayload::RecordingStarted { recording }),
+                Ok(recording) => {
+                    let event = Event::RecordingStarted {
+                        recording_id: recording.id,
+                        path: recording.path.clone(),
+                    };
+                    drop(runtime);
+                    let _ = emit_event(state, event);
+                    Response::Ok(ResponsePayload::RecordingStarted { recording })
+                }
                 Err(error) => Response::Err(ErrorResponse {
                     code: ErrorCode::InvalidRequest,
                     message: format!("failed starting recording: {error}"),
@@ -5872,9 +5882,12 @@ async fn handle_request(
                 .lock()
                 .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
             match runtime.stop(recording_id) {
-                Ok(recording) => Response::Ok(ResponsePayload::RecordingStopped {
-                    recording_id: recording.id,
-                }),
+                Ok(recording) => {
+                    let recording_id = recording.id;
+                    drop(runtime);
+                    let _ = emit_event(state, Event::RecordingStopped { recording_id });
+                    Response::Ok(ResponsePayload::RecordingStopped { recording_id })
+                }
                 Err(error) => Response::Err(ErrorResponse {
                     code: ErrorCode::InvalidRequest,
                     message: format!("failed stopping recording: {error}"),

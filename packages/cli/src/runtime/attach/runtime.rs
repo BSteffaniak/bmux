@@ -10,7 +10,6 @@ pub(crate) async fn run_session_attach_with_client(
     target: Option<&str>,
     follow: Option<&str>,
     global: bool,
-    capture_plan: Option<AttachDisplayCapturePlan>,
 ) -> Result<AttachRunOutcome> {
     if target.is_none() && follow.is_none() {
         anyhow::bail!("attach requires a session target or --follow <client-uuid>");
@@ -58,7 +57,6 @@ pub(crate) async fn run_session_attach_with_client(
     }
 
     let self_client_id = client.whoami().await.map_err(map_attach_client_error)?;
-    let mut display_capture = recording::DisplayCaptureWriter::new(capture_plan, self_client_id)?;
 
     let attach_info = if let Some(leader_client_id) = follow_target_id {
         // Inline follow target resolution using BmuxClient (before streaming upgrade).
@@ -133,6 +131,37 @@ pub(crate) async fn run_session_attach_with_client(
         .await
         .map_err(map_attach_client_error)?;
 
+    // Query the server for an active recording so that display capture starts
+    // automatically — handles `bmux --record` (recording already started before
+    // attach) and `bmux recording start` issued before this client attached.
+    let mut display_capture: Option<recording::DisplayCaptureWriter> =
+        match client.recording_status().await {
+            Ok(status) => {
+                if let Some(active) = status.active {
+                    match recording::DisplayCaptureWriter::open(
+                        active.id,
+                        Path::new(&active.path),
+                        self_client_id,
+                    ) {
+                        Ok(writer) => Some(writer),
+                        Err(error) => {
+                            tracing::warn!(
+                                "failed starting display capture for active recording {}: {error}",
+                                active.id
+                            );
+                            None
+                        }
+                    }
+                } else {
+                    None
+                }
+            }
+            Err(error) => {
+                tracing::warn!("failed querying recording status on attach: {error}");
+                None
+            }
+        };
+
     let mut view_state = AttachViewState::new(attach_info);
     view_state.mouse.config = attach_config.attach_mouse_config();
     view_state.status_position = if attach_config.status_bar.enabled {
@@ -197,6 +226,40 @@ pub(crate) async fn run_session_attach_with_client(
                 ) {
                     pane_output_pending = true;
                     // Fall through to post-event processing (no event dispatch needed).
+                } else if let bmux_client::ServerEvent::RecordingStarted {
+                    recording_id,
+                    ref path,
+                } = server_event
+                {
+                    // Dynamically start display capture when a recording begins.
+                    if display_capture.is_none() {
+                        match recording::DisplayCaptureWriter::open(
+                            recording_id,
+                            Path::new(path),
+                            self_client_id,
+                        ) {
+                            Ok(writer) => {
+                                display_capture = Some(writer);
+                            }
+                            Err(error) => {
+                                tracing::warn!(
+                                    "failed starting display capture for recording {recording_id}: {error}"
+                                );
+                            }
+                        }
+                    }
+                } else if let bmux_client::ServerEvent::RecordingStopped {
+                    recording_id,
+                } = server_event
+                {
+                    // Flush and close display capture when the recording stops.
+                    if let Some(ref mut capture) = display_capture {
+                        if capture.recording_id() == recording_id {
+                            let _ = capture.record_stream_closed();
+                            let _ = capture.flush();
+                            display_capture = None;
+                        }
+                    }
                 } else {
                     if let bmux_client::ServerEvent::AttachViewChanged { .. } = &server_event {
                         pane_output_pending = true;

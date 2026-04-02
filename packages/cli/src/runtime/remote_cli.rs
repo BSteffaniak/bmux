@@ -1032,7 +1032,7 @@ async fn run_iroh_attach_with_reconnect(
 ) -> Result<u8> {
     let mut attempt = 0usize;
     loop {
-        let outcome = run_session_attach_with_client(client, session, follow, global, None).await?;
+        let outcome = run_session_attach_with_client(client, session, follow, global).await?;
         if outcome.exit_reason != AttachExitReason::StreamClosed {
             return Ok(outcome.status_code);
         }
@@ -1066,7 +1066,7 @@ async fn run_tls_attach_with_reconnect(
 ) -> Result<u8> {
     let mut attempt = 0usize;
     loop {
-        let outcome = run_session_attach_with_client(client, session, follow, global, None).await?;
+        let outcome = run_session_attach_with_client(client, session, follow, global).await?;
         if outcome.exit_reason != AttachExitReason::StreamClosed {
             return Ok(outcome.status_code);
         }
@@ -1100,7 +1100,7 @@ async fn run_remote_attach_with_reconnect(
 ) -> Result<u8> {
     let mut attempt = 0usize;
     loop {
-        let outcome = run_session_attach_with_client(client, session, follow, global, None).await?;
+        let outcome = run_session_attach_with_client(client, session, follow, global).await?;
         if outcome.exit_reason != AttachExitReason::StreamClosed {
             return Ok(outcome.status_code);
         }

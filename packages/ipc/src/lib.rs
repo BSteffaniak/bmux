@@ -1049,6 +1049,17 @@ pub enum Event {
         session_id: Uuid,
         pane_id: Uuid,
     },
+    /// A server-side recording has started.  Attached clients use this to
+    /// begin writing their own display tracks into the recording directory.
+    RecordingStarted {
+        recording_id: Uuid,
+        path: String,
+    },
+    /// A server-side recording has stopped.  Attached clients use this to
+    /// flush and close any in-progress display track.
+    RecordingStopped {
+        recording_id: Uuid,
+    },
 }
 
 /// Serialize any protocol message using the bmux binary codec.

@@ -2147,6 +2147,13 @@ impl StreamingBmuxClient {
             )),
         }
     }
+
+    pub async fn recording_status(&mut self) -> Result<RecordingStatus> {
+        match self.request(Request::RecordingStatus).await? {
+            ResponsePayload::RecordingStatus { status } => Ok(status),
+            _ => Err(ClientError::UnexpectedResponse("expected recording status")),
+        }
+    }
 }
 
 const fn request_kind_name(request: &Request) -> &'static str {

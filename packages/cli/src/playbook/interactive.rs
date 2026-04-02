@@ -2539,6 +2539,8 @@ fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
         bmux_client::ServerEvent::FollowTargetChanged { .. } => "follow_target_changed",
         bmux_client::ServerEvent::AttachViewChanged { .. } => "attach_view_changed",
         bmux_client::ServerEvent::PaneOutputAvailable { .. } => "pane_output_available",
+        bmux_client::ServerEvent::RecordingStarted { .. } => "recording_started",
+        bmux_client::ServerEvent::RecordingStopped { .. } => "recording_stopped",
     }
 }
 

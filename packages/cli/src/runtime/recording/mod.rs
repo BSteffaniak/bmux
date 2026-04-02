@@ -1,5 +1,5 @@
 use super::{
-    AttachDisplayCapturePlan, BmuxConfig, BufWriter, ConfigPaths, ConnectionContext,
+    BmuxConfig, BufWriter, ConfigPaths, ConnectionContext,
     ConnectionPolicyScope, Context, GifEncoder, GifFrame, Instant, IsTerminal, Path, PathBuf,
     RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
     RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode, RecordingEventEnvelope,
@@ -550,10 +550,24 @@ pub(super) async fn run_recording_export(
 
     let selected_client = if let Some(raw) = view_client {
         parse_uuid_value(raw, "view client id")?
+    } else if let Some(owner) = read_recording_owner_client(&recording_dir)? {
+        owner
     } else {
-        read_recording_owner_client(&recording_dir)?.ok_or_else(|| {
-            anyhow::anyhow!("recording missing owner client id; pass --view-client")
-        })?
+        match infer_display_track_client(&recording_dir) {
+            InferredClient::One(id) => id,
+            InferredClient::Multiple(ids) => {
+                anyhow::bail!(
+                    "multiple display tracks found; pass --view-client with one of: {}",
+                    ids.iter()
+                        .map(|id| id.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
+            InferredClient::None => {
+                anyhow::bail!("no display tracks found in recording; cannot export");
+            }
+        }
     };
 
     let events = load_display_track_events(&recording_dir, selected_client)?;
@@ -620,6 +634,39 @@ fn read_recording_owner_client(recording_dir: &Path) -> Result<Option<Uuid>> {
         return Ok(None);
     }
     Ok(Some(parse_uuid_value(trimmed, "owner client id")?))
+}
+
+enum InferredClient {
+    One(Uuid),
+    Multiple(Vec<Uuid>),
+    None,
+}
+
+/// When `owner-client-id.txt` is missing, scan the recording directory for
+/// `display-{uuid}.bin` files. If exactly one exists, return its client id so
+/// the export can proceed without requiring `--view-client`.
+fn infer_display_track_client(recording_dir: &Path) -> InferredClient {
+    let entries = match std::fs::read_dir(recording_dir) {
+        Ok(entries) => entries,
+        Err(_) => return InferredClient::None,
+    };
+    let mut found: Vec<Uuid> = Vec::new();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if let Some(rest) = name.strip_prefix("display-") {
+            if let Some(uuid_str) = rest.strip_suffix(".bin") {
+                if let Ok(id) = uuid_str.parse::<Uuid>() {
+                    found.push(id);
+                }
+            }
+        }
+    }
+    match found.len() {
+        1 => InferredClient::One(found[0]),
+        n if n > 1 => InferredClient::Multiple(found),
+        _ => InferredClient::None,
+    }
 }
 
 fn load_display_track_events(
@@ -3594,27 +3641,24 @@ pub(super) const fn offline_recording_status() -> RecordingStatus {
 use bmux_ipc::{DisplayTrackEnvelope, DisplayTrackEvent};
 
 pub(super) struct DisplayCaptureWriter {
+    recording_id: Uuid,
     started_at: Instant,
     writer: BufWriter<std::fs::File>,
     cursor_replay_state: CursorReplayState,
 }
 
 impl DisplayCaptureWriter {
-    pub(super) fn new(
-        plan: Option<AttachDisplayCapturePlan>,
-        client_id: Uuid,
-    ) -> Result<Option<Self>> {
-        let Some(plan) = plan else {
-            return Ok(None);
-        };
-        std::fs::create_dir_all(&plan.recording_path).with_context(|| {
+    /// Create a new display capture writer that records terminal frames into
+    /// the given recording directory.  Returns the writer directly (not wrapped
+    /// in `Option`) — callers decide whether to create one.
+    pub(super) fn open(recording_id: Uuid, recording_path: &Path, client_id: Uuid) -> Result<Self> {
+        std::fs::create_dir_all(recording_path).with_context(|| {
             format!(
                 "failed creating recording path {}",
-                plan.recording_path.display()
+                recording_path.display()
             )
         })?;
-        write_recording_owner_client(&plan.recording_path, client_id)?;
-        let display_track_path = display_track_path(&plan.recording_path, client_id);
+        let display_track_path = display_track_path(recording_path, client_id);
         let file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -3626,6 +3670,7 @@ impl DisplayCaptureWriter {
                 )
             })?;
         let mut capture = Self {
+            recording_id,
             started_at: Instant::now(),
             writer: BufWriter::new(file),
             cursor_replay_state: CursorReplayState::default(),
@@ -3638,7 +3683,7 @@ impl DisplayCaptureWriter {
             .and_then(|p| bmux_ipc::encode(p).ok());
         capture.record(DisplayTrackEvent::StreamOpened {
             client_id,
-            recording_id: plan.recording_id,
+            recording_id,
             cell_width_px,
             cell_height_px,
             window_width_px,
@@ -3651,7 +3696,12 @@ impl DisplayCaptureWriter {
         {
             capture.record(DisplayTrackEvent::Resize { cols, rows })?;
         }
-        Ok(Some(capture))
+        Ok(capture)
+    }
+
+    /// Returns the recording id this writer is associated with.
+    pub(super) fn recording_id(&self) -> Uuid {
+        self.recording_id
     }
 
     pub(super) fn record_resize(&mut self, cols: u16, rows: u16) -> Result<()> {
@@ -3719,12 +3769,6 @@ impl DisplayCaptureWriter {
 
 fn display_track_path(recording_path: &Path, client_id: Uuid) -> PathBuf {
     recording_path.join(format!("display-{client_id}.bin"))
-}
-
-fn write_recording_owner_client(recording_path: &Path, client_id: Uuid) -> Result<()> {
-    let owner_path = recording_path.join("owner-client-id.txt");
-    std::fs::write(&owner_path, format!("{client_id}\n"))
-        .with_context(|| format!("failed writing owner client file {}", owner_path.display()))
 }
 
 #[cfg(test)]

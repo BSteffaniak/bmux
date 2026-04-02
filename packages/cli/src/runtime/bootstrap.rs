@@ -10,12 +10,6 @@ pub(super) struct DefaultAttachOptions {
     pub(super) stop_server_on_exit: bool,
 }
 
-#[derive(Debug, Clone)]
-pub(super) struct AttachDisplayCapturePlan {
-    pub(super) recording_id: Uuid,
-    pub(super) recording_path: PathBuf,
-}
-
 pub(super) async fn run_default_server_attach(
     options: DefaultAttachOptions,
     connection_context: ConnectionContext<'_>,
@@ -26,7 +20,6 @@ pub(super) async fn run_default_server_attach(
     ensure_server_running_for_default_attach(connection_context).await?;
 
     let mut active_recording_id = None;
-    let mut capture_plan = None;
     if options.record {
         let mut recording_client = connect_with_context(
             ConnectionPolicyScope::Normal,
@@ -48,10 +41,6 @@ pub(super) async fn run_default_server_attach(
             .await
             .map_err(map_cli_client_error)?;
         active_recording_id = Some(started.id);
-        capture_plan = Some(AttachDisplayCapturePlan {
-            recording_id: started.id,
-            recording_path: PathBuf::from(&started.path),
-        });
         println!(
             "recording started: {} (capture_input={})",
             started.id, started.capture_input
@@ -70,10 +59,9 @@ pub(super) async fn run_default_server_attach(
     .await?;
     let target = resolve_default_attach_target(&mut client).await?;
     let target = target.to_string();
-    let attach_result =
-        run_session_attach_with_client(client, Some(target.as_str()), None, false, capture_plan)
-            .await
-            .map(|outcome| outcome.status_code);
+    let attach_result = run_session_attach_with_client(client, Some(target.as_str()), None, false)
+        .await
+        .map(|outcome| outcome.status_code);
 
     if let Some(recording_id) = active_recording_id {
         let mut stop_client = connect_with_context(
@@ -294,7 +282,7 @@ pub(super) async fn run_session_attach(
         connection_context,
     )
     .await?;
-    run_session_attach_with_client(client, target, follow, global, None)
+    run_session_attach_with_client(client, target, follow, global)
         .await
         .map(|outcome| outcome.status_code)
 }
