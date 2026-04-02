@@ -163,6 +163,9 @@ fn resolve_target_reference(config: &BmuxConfig, target: &str) -> Result<ActiveT
     if let Some(named) = config.connections.targets.get(target) {
         return resolve_named_target(target, named);
     }
+    if target.starts_with("https://") {
+        return parse_https_target(target);
+    }
     if target.starts_with("tls://") {
         return parse_inline_tls_target(target);
     }
@@ -217,6 +220,36 @@ fn parse_inline_tls_target(target: &str) -> Result<ActiveTarget> {
     };
     if host.trim().is_empty() {
         anyhow::bail!("TLS target must include a host");
+    }
+    Ok(ActiveTarget::Tls(TlsTarget {
+        label: target.to_string(),
+        host: host.clone(),
+        port,
+        server_name: host,
+        ca_file: None,
+        connect_timeout_ms: 8_000,
+    }))
+}
+
+fn parse_https_target(target: &str) -> Result<ActiveTarget> {
+    let raw = target
+        .strip_prefix("https://")
+        .ok_or_else(|| anyhow::anyhow!("hosted target must start with https://"))?;
+    let host = raw.split('/').next().unwrap_or_default();
+    let (host, port) = if let Some((host, port_raw)) = host.rsplit_once(':') {
+        if port_raw.is_empty() {
+            (host.to_string(), 443)
+        } else {
+            let parsed = port_raw
+                .parse::<u16>()
+                .with_context(|| format!("invalid TLS port in target '{target}'"))?;
+            (host.to_string(), parsed)
+        }
+    } else {
+        (host.to_string(), 443)
+    };
+    if host.trim().is_empty() {
+        anyhow::bail!("hosted target must include a host");
     }
     Ok(ActiveTarget::Tls(TlsTarget {
         label: target.to_string(),

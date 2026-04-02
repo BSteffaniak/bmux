@@ -75,6 +75,9 @@ bmux remote complete sessions prod
 # run an internet-accessible TLS gateway
 bmux server gateway --listen 0.0.0.0:7443 --quick
 
+# or ask bmux to bootstrap reverse SSH hosting helper
+bmux server gateway --listen 127.0.0.1:7443 --quick --host
+
 # target any normal command remotely
 bmux --target prod list-sessions
 bmux --target prod attach app
@@ -140,6 +143,8 @@ ca_file = "~/.config/bmux/gateway-ca.pem"
 ```
 
 TLS targets support standard command routing via `--target` (for commands that use normal client connections), plus `bmux connect` and remote utility commands.
+
+Hosted URLs are accepted directly by connect (for example: `bmux connect https://abc123.example.net app`).
 
 For long-lived unstable links, `bmux connect` supports `--reconnect-forever`.
 

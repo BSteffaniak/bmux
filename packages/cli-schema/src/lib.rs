@@ -792,6 +792,12 @@ pub enum ServerCommand {
         /// Listen address (host:port)
         #[arg(long)]
         listen: String,
+        /// Expose gateway publicly via reverse SSH tunnel helper
+        #[arg(long)]
+        host: bool,
+        /// Reverse SSH relay destination (user@host)
+        #[arg(long, default_value = "nokey@localhost.run")]
+        host_relay: String,
         /// Generate and use self-signed cert/key in runtime dir for quick setup
         #[arg(long)]
         quick: bool,
@@ -1111,10 +1117,14 @@ mod tests {
             command,
             ServerCommand::Gateway {
                 listen,
+                host,
+                host_relay,
                 quick,
                 cert_file,
                 key_file,
             } if listen == "0.0.0.0:7443"
+                && !host
+                && host_relay == "nokey@localhost.run"
                 && !quick
                 && cert_file.as_deref() == Some("cert.pem")
                 && key_file.as_deref() == Some("key.pem")
@@ -1139,10 +1149,17 @@ mod tests {
             command,
             ServerCommand::Gateway {
                 listen,
+                host,
+                host_relay,
                 quick,
                 cert_file,
                 key_file,
-            } if listen == "0.0.0.0:7443" && quick && cert_file.is_none() && key_file.is_none()
+            } if listen == "0.0.0.0:7443"
+                && !host
+                && host_relay == "nokey@localhost.run"
+                && quick
+                && cert_file.is_none()
+                && key_file.is_none()
         ));
     }
 

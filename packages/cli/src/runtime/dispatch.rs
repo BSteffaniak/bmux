@@ -346,12 +346,24 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 command:
                     ServerCommand::Gateway {
                         listen,
+                        host,
+                        host_relay,
                         quick,
                         cert_file,
                         key_file,
                     },
             },
-        ) => run_server_gateway(listen, *quick, cert_file.as_deref(), key_file.as_deref()).await,
+        ) => {
+            run_server_gateway(
+                listen,
+                *host,
+                host_relay,
+                *quick,
+                cert_file.as_deref(),
+                key_file.as_deref(),
+            )
+            .await
+        }
         (
             BuiltInHandlerId::ServerBridge,
             Command::Server {

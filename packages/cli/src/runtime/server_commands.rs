@@ -352,6 +352,8 @@ pub(super) async fn run_server_bridge(stdio: bool, preflight: bool) -> Result<u8
 
 pub(super) async fn run_server_gateway(
     listen: &str,
+    host: bool,
+    host_relay: &str,
     quick: bool,
     cert_file: Option<&str>,
     key_file: Option<&str>,
@@ -369,6 +371,17 @@ pub(super) async fn run_server_gateway(
         .with_context(|| format!("failed binding TLS gateway on {listen}"))?;
 
     println!("bmux TLS gateway listening on {listen}");
+    if host {
+        let tunnel_target = format!("80:127.0.0.1:{}", parse_listen_port(listen)?);
+        println!(
+            "starting hosted reverse tunnel via '{}' (target: {})",
+            host_relay, tunnel_target
+        );
+        spawn_reverse_tunnel(host_relay, &tunnel_target)?;
+        println!(
+            "when tunnel is ready, your public URL will be shown by ssh output. use that URL with 'bmux connect <url>'"
+        );
+    }
     loop {
         let (tcp_stream, peer_addr) = listener
             .accept()
@@ -381,6 +394,36 @@ pub(super) async fn run_server_gateway(
             }
         });
     }
+}
+
+fn parse_listen_port(listen: &str) -> Result<u16> {
+    let (_, port) = listen
+        .rsplit_once(':')
+        .ok_or_else(|| anyhow::anyhow!("listen address must include host:port"))?;
+    port.parse::<u16>()
+        .with_context(|| format!("invalid listen port in {listen}"))
+}
+
+fn spawn_reverse_tunnel(host_relay: &str, tunnel_target: &str) -> Result<()> {
+    let mut command = ProcessCommand::new("ssh");
+    command
+        .arg("-N")
+        .arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=3")
+        .arg("-R")
+        .arg(tunnel_target)
+        .arg(host_relay)
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .stdin(Stdio::null());
+    command
+        .spawn()
+        .with_context(|| format!("failed launching reverse tunnel via {host_relay}"))?;
+    Ok(())
 }
 
 fn resolve_gateway_tls_files(

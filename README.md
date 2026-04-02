@@ -82,6 +82,10 @@ bmux remote complete sessions prod
 bmux server gateway --listen 0.0.0.0:7443 --quick
 bmux connect tls-prod app
 
+# Reverse-SSH hosted helper (prints public URL in ssh output)
+bmux server gateway --listen 127.0.0.1:7443 --quick --host
+bmux connect https://your-public-url app
+
 # Logging
 bmux logs path
 bmux logs level
