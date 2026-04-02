@@ -198,7 +198,9 @@ pub(super) async fn run_connect(
     } else {
         choose_default_target_interactively(&config)?
     };
-    let resolved = resolve_target_reference(&config, &selected_target).await?;
+    let resolved = resolve_target_reference(&config, &selected_target)
+        .await
+        .map_err(|error| map_connect_target_resolution_error(&selected_target, error))?;
     match resolved {
         ResolvedTarget::Local => {
             let target_session = if let Some(session) = session {
@@ -283,6 +285,16 @@ pub(super) async fn run_connect(
             Ok(status)
         }
     }
+}
+
+fn map_connect_target_resolution_error(target: &str, error: anyhow::Error) -> anyhow::Error {
+    if target.starts_with("bmux://") && error.to_string().contains("share link not found:") {
+        return anyhow::anyhow!(
+            "{}\nHint: run 'bmux hosts' to list known links, or ask the owner to share it again with 'bmux share'.",
+            error
+        );
+    }
+    error
 }
 
 pub(super) async fn run_setup() -> Result<u8> {
@@ -2153,6 +2165,13 @@ mod tests {
         assert_eq!(reconnect_backoff_ms(1), 300);
         assert_eq!(reconnect_backoff_ms(2), 600);
         assert_eq!(reconnect_backoff_ms(3), 1_200);
+    }
+
+    #[test]
+    fn connect_target_resolution_error_adds_share_link_hint() {
+        let error = anyhow::anyhow!("share link not found: bmux://demo");
+        let mapped = map_connect_target_resolution_error("bmux://demo", error);
+        assert!(mapped.to_string().contains("run 'bmux hosts'"));
     }
 
     #[tokio::test]
