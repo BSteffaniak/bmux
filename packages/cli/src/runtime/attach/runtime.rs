@@ -1110,11 +1110,15 @@ pub(crate) async fn handle_attach_ui_action(
                 .await?;
         }
         RuntimeAction::FocusNext
+        | RuntimeAction::FocusPrev
         | RuntimeAction::FocusLeft
         | RuntimeAction::FocusRight
         | RuntimeAction::FocusUp
         | RuntimeAction::FocusDown => {
-            let direction = if matches!(action, RuntimeAction::FocusLeft | RuntimeAction::FocusUp) {
+            let direction = if matches!(
+                action,
+                RuntimeAction::FocusLeft | RuntimeAction::FocusUp | RuntimeAction::FocusPrev
+            ) {
                 PaneFocusDirection::Prev
             } else {
                 PaneFocusDirection::Next
@@ -2541,6 +2545,7 @@ pub(crate) fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
             RuntimeAction::SplitFocusedVertical
             | RuntimeAction::SplitFocusedHorizontal
             | RuntimeAction::FocusNext
+            | RuntimeAction::FocusPrev
             | RuntimeAction::FocusLeft
             | RuntimeAction::FocusRight
             | RuntimeAction::FocusUp
@@ -2684,6 +2689,7 @@ pub(crate) const fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
             | RuntimeAction::SplitFocusedVertical
             | RuntimeAction::SplitFocusedHorizontal
             | RuntimeAction::FocusNext
+            | RuntimeAction::FocusPrev
             | RuntimeAction::FocusLeft
             | RuntimeAction::FocusRight
             | RuntimeAction::FocusUp
@@ -3690,6 +3696,7 @@ pub(crate) fn runtime_action_to_attach_event_action(action: RuntimeAction) -> At
         | RuntimeAction::SplitFocusedVertical
         | RuntimeAction::SplitFocusedHorizontal
         | RuntimeAction::FocusNext
+        | RuntimeAction::FocusPrev
         | RuntimeAction::FocusLeft
         | RuntimeAction::FocusRight
         | RuntimeAction::FocusUp

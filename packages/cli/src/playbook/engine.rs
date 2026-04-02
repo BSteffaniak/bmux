@@ -1018,6 +1018,15 @@ async fn apply_attach_runtime_actions(
                     .await
                     .map_err(|e| anyhow::anyhow!("focus next failed: {e}"))?;
             }
+            crate::input::RuntimeAction::FocusPrev => {
+                client
+                    .focus_pane(
+                        Some(SessionSelector::ById(runtime.state.attached_id)),
+                        PaneFocusDirection::Prev,
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("focus prev failed: {e}"))?;
+            }
             crate::input::RuntimeAction::FocusLeft => {
                 client
                     .focus_pane(
