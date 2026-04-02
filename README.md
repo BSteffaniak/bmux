@@ -83,8 +83,13 @@ bmux server gateway --listen 0.0.0.0:7443 --quick
 bmux connect tls-prod app
 
 # Reverse-SSH hosted helper (prints public URL in ssh output)
-bmux server gateway --listen 127.0.0.1:7443 --quick --host
+bmux server gateway --listen 127.0.0.1:7443 --quick --host --host-mode ssh
 bmux connect https://your-public-url app
+
+# Iroh hosted mode (default for --host)
+bmux server gateway --listen 127.0.0.1:7443 --host
+# prints: iroh://<endpoint_id>?relay=<url>
+bmux connect iroh://<endpoint_id>?relay=<url> app
 
 # Logging
 bmux logs path

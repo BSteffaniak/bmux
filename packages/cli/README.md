@@ -75,8 +75,13 @@ bmux remote complete sessions prod
 # run an internet-accessible TLS gateway
 bmux server gateway --listen 0.0.0.0:7443 --quick
 
-# or ask bmux to bootstrap reverse SSH hosting helper
-bmux server gateway --listen 127.0.0.1:7443 --quick --host
+# or force reverse-SSH hosting helper instead of iroh
+bmux server gateway --listen 127.0.0.1:7443 --quick --host --host-mode ssh
+
+# iroh hosted mode is default when --host is enabled
+bmux server gateway --listen 127.0.0.1:7443 --host
+# prints iroh://<endpoint_id>?relay=<url>
+bmux connect iroh://<endpoint_id>?relay=<url> app
 
 # target any normal command remotely
 bmux --target prod list-sessions

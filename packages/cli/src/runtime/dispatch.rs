@@ -254,6 +254,7 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                         name,
                         ssh,
                         tls,
+                        iroh,
                         user,
                         port,
                         set_default,
@@ -264,6 +265,7 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                 name,
                 ssh.as_deref(),
                 tls.as_deref(),
+                iroh.as_deref(),
                 user.as_deref(),
                 *port,
                 *set_default,
@@ -347,6 +349,7 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
                     ServerCommand::Gateway {
                         listen,
                         host,
+                        host_mode,
                         host_relay,
                         quick,
                         cert_file,
@@ -357,6 +360,7 @@ pub(super) async fn dispatch_built_in_command(command: &Command) -> Result<u8> {
             run_server_gateway(
                 listen,
                 *host,
+                *host_mode,
                 host_relay,
                 *quick,
                 cert_file.as_deref(),

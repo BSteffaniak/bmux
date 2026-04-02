@@ -2,13 +2,14 @@ use super::*;
 use anyhow::Context;
 use bmux_config::{ConnectionTargetConfig, ConnectionTransport, RemoteServerStartMode};
 use bmux_ipc::transport::ErasedIpcStream;
+use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
 use std::ffi::OsString;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context as TaskContext, Poll};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::TcpStream;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command as TokioProcessCommand};
 use tokio_rustls::TlsConnector;
@@ -18,6 +19,7 @@ enum ResolvedTarget {
     Local,
     Ssh(SshTarget),
     Tls(TlsTarget),
+    Iroh(IrohTarget),
 }
 
 #[derive(Debug, Clone)]
@@ -45,10 +47,19 @@ struct TlsTarget {
     connect_timeout_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+struct IrohTarget {
+    label: String,
+    endpoint_id: String,
+    relay_url: Option<String>,
+    connect_timeout_ms: u64,
+}
+
 const SSH_RECONNECT_MAX_ATTEMPTS: usize = 4;
 const SSH_RECONNECT_BASE_BACKOFF_MS: u64 = 300;
 const BRIDGE_PREFLIGHT_TOKEN: &str = "BMUX_BRIDGE_READY";
 const RECENT_CACHE_MAX: usize = 10;
+const BMUX_IROH_ALPN: &[u8] = b"bmux/gateway/iroh/1";
 
 #[derive(Debug)]
 struct SshBridgeStream {
@@ -117,6 +128,12 @@ pub(super) async fn run_target_proxy_from_current_argv(cli: &Cli) -> Result<u8> 
         ResolvedTarget::Tls(target) => {
             anyhow::bail!(
                 "unexpected TLS target proxy path for '{}'; this should route through direct client transport",
+                target.label
+            );
+        }
+        ResolvedTarget::Iroh(target) => {
+            anyhow::bail!(
+                "unexpected iroh target proxy path for '{}'; this should route through direct client transport",
                 target.label
             );
         }
@@ -208,6 +225,64 @@ pub(super) async fn run_connect(
             }
             Ok(status)
         }
+        ResolvedTarget::Iroh(iroh_target) => {
+            let mut client =
+                connect_iroh_bridge(&iroh_target, "bmux-cli-connect-remote-iroh").await?;
+            let target_session = if follow.is_some() {
+                None
+            } else if let Some(session) = session {
+                Some(session.to_string())
+            } else {
+                resolve_remote_attach_session(&mut client, &iroh_target.label).await?
+            };
+            let status = run_iroh_attach_with_reconnect(
+                client,
+                &iroh_target,
+                target_session.as_deref(),
+                follow,
+                global,
+                reconnect_forever,
+            )
+            .await?;
+            if status == 0 {
+                remember_recent_selection(&iroh_target.label, target_session.as_deref())?;
+            }
+            Ok(status)
+        }
+    }
+}
+
+async fn run_iroh_attach_with_reconnect(
+    mut client: BmuxClient,
+    target: &IrohTarget,
+    session: Option<&str>,
+    follow: Option<&str>,
+    global: bool,
+    reconnect_forever: bool,
+) -> Result<u8> {
+    let mut attempt = 0usize;
+    loop {
+        let outcome = run_session_attach_with_client(client, session, follow, global, None).await?;
+        if outcome.exit_reason != AttachExitReason::StreamClosed {
+            return Ok(outcome.status_code);
+        }
+        if !reconnect_forever && attempt >= SSH_RECONNECT_MAX_ATTEMPTS {
+            println!(
+                "remote iroh connection closed; giving up after {} reconnect attempts",
+                SSH_RECONNECT_MAX_ATTEMPTS
+            );
+            return Ok(1);
+        }
+        attempt = attempt.saturating_add(1);
+        let backoff = Duration::from_millis(reconnect_backoff_ms(attempt));
+        println!(
+            "remote iroh connection closed; reconnecting to '{}' (attempt {attempt}/{}) in {}ms...",
+            target.label,
+            SSH_RECONNECT_MAX_ATTEMPTS,
+            backoff.as_millis()
+        );
+        tokio::time::sleep(backoff).await;
+        client = connect_iroh_bridge(target, "bmux-cli-connect-remote-iroh-reconnect").await?;
     }
 }
 
@@ -298,6 +373,7 @@ pub(super) fn run_remote_list(as_json: bool) -> Result<u8> {
                 ConnectionTransport::Local => "local",
                 ConnectionTransport::Ssh => "ssh",
                 ConnectionTransport::Tls => "tls",
+                ConnectionTransport::Iroh => "iroh",
             };
             serde_json::json!({
                 "name": name,
@@ -373,6 +449,12 @@ pub(super) async fn run_remote_test(target: &str) -> Result<u8> {
             println!("target '{}' OK (tls)", tls_target.label);
             Ok(0)
         }
+        ResolvedTarget::Iroh(iroh_target) => {
+            let mut client = connect_iroh_bridge(&iroh_target, "bmux-cli-remote-test-iroh").await?;
+            client.ping().await.map_err(map_cli_client_error)?;
+            println!("target '{}' OK (iroh)", iroh_target.label);
+            Ok(0)
+        }
     }
 }
 
@@ -443,6 +525,14 @@ pub(super) async fn run_remote_doctor(target: &str, fix: bool) -> Result<u8> {
             println!("doctor result: OK ({})", tls_target.label);
             Ok(0)
         }
+        ResolvedTarget::Iroh(iroh_target) => {
+            let mut client =
+                connect_iroh_bridge(&iroh_target, "bmux-cli-remote-doctor-iroh").await?;
+            client.ping().await.map_err(map_cli_client_error)?;
+            print_doctor_step_ok("iroh", "connectivity and ping succeeded");
+            println!("doctor result: OK ({})", iroh_target.label);
+            Ok(0)
+        }
     }
 }
 
@@ -450,15 +540,18 @@ pub(super) async fn run_remote_init(
     name: &str,
     ssh: Option<&str>,
     tls: Option<&str>,
+    iroh: Option<&str>,
     user: Option<&str>,
     port: Option<u16>,
     set_default: bool,
 ) -> Result<u8> {
-    if ssh.is_none() && tls.is_none() {
-        anyhow::bail!("remote init requires one of --ssh or --tls");
+    let selected =
+        usize::from(ssh.is_some()) + usize::from(tls.is_some()) + usize::from(iroh.is_some());
+    if selected == 0 {
+        anyhow::bail!("remote init requires one of --ssh, --tls, or --iroh");
     }
-    if ssh.is_some() && tls.is_some() {
-        anyhow::bail!("remote init accepts either --ssh or --tls (not both)");
+    if selected > 1 {
+        anyhow::bail!("remote init accepts only one transport selector (--ssh, --tls, or --iroh)");
     }
 
     let mut config = BmuxConfig::load()?;
@@ -479,6 +572,20 @@ pub(super) async fn run_remote_init(
         target.host = Some(host.clone());
         target.server_name = Some(host);
         target.port = Some(port.unwrap_or(parsed_port));
+    }
+    if let Some(iroh_value) = iroh {
+        target.transport = ConnectionTransport::Iroh;
+        let (endpoint_id, relay_url) =
+            if let Some((endpoint, relay)) = iroh_value.split_once("?relay=") {
+                (endpoint.to_string(), Some(relay.to_string()))
+            } else {
+                (iroh_value.to_string(), None)
+            };
+        target.endpoint_id = Some(endpoint_id.clone());
+        target.host = Some(endpoint_id);
+        target.relay_url = relay_url;
+        target.port = None;
+        target.user = None;
     }
 
     config.connections.targets.insert(name.to_string(), target);
@@ -509,6 +616,11 @@ pub(super) async fn run_remote_install_server(target: &str) -> Result<u8> {
                 "install-server is only supported for SSH targets; install and run bmux gateway on the remote host"
             );
         }
+        ResolvedTarget::Iroh(_) => {
+            anyhow::bail!(
+                "install-server is not supported for iroh targets; run install on the host machine"
+            );
+        }
         ResolvedTarget::Local => {
             println!("local target does not require remote install");
             Ok(0)
@@ -527,6 +639,9 @@ pub(super) async fn run_remote_upgrade(target: Option<&str>) -> Result<u8> {
                 return Ok(0);
             }
             ResolvedTarget::Tls(_) => {
+                anyhow::bail!("remote upgrade currently supports SSH targets only");
+            }
+            ResolvedTarget::Iroh(_) => {
                 anyhow::bail!("remote upgrade currently supports SSH targets only");
             }
             ResolvedTarget::Local => {
@@ -590,6 +705,9 @@ pub(super) async fn run_remote_complete_sessions(target: &str) -> Result<u8> {
         }
         ResolvedTarget::Tls(tls_target) => {
             connect_tls_bridge(&tls_target, "bmux-cli-complete-sessions-tls").await?
+        }
+        ResolvedTarget::Iroh(iroh_target) => {
+            connect_iroh_bridge(&iroh_target, "bmux-cli-complete-sessions-iroh").await?
         }
     };
     let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
@@ -807,6 +925,62 @@ async fn connect_tls_bridge(target: &TlsTarget, client_name: &str) -> Result<Bmu
     let principal_id = load_or_create_local_principal_id(&ConfigPaths::default())?;
     BmuxClient::connect_with_bridge_stream(
         ErasedIpcStream::new(Box::new(tls_stream)),
+        timeout,
+        client_name.to_string(),
+        principal_id,
+    )
+    .await
+    .map_err(map_cli_client_error)
+}
+
+async fn connect_iroh_bridge(target: &IrohTarget, client_name: &str) -> Result<BmuxClient> {
+    let endpoint = Endpoint::builder(presets::N0)
+        .alpns(vec![BMUX_IROH_ALPN.to_vec()])
+        .bind()
+        .await
+        .context("failed binding iroh client endpoint")?;
+    endpoint.online().await;
+    let endpoint_id: EndpointId = target
+        .endpoint_id
+        .parse()
+        .with_context(|| format!("invalid iroh endpoint id '{}'", target.endpoint_id))?;
+    let remote_addr = if let Some(relay_url) = target.relay_url.as_deref() {
+        let relay = relay_url
+            .parse()
+            .with_context(|| format!("invalid iroh relay url '{relay_url}'"))?;
+        EndpointAddr::new(endpoint_id).with_relay_url(relay)
+    } else {
+        EndpointAddr::new(endpoint_id)
+    };
+    let connection = tokio::time::timeout(
+        Duration::from_millis(target.connect_timeout_ms.max(1)),
+        endpoint.connect(remote_addr, BMUX_IROH_ALPN),
+    )
+    .await
+    .with_context(|| format!("timed out connecting iroh target '{}'", target.label))?
+    .with_context(|| format!("failed connecting iroh target '{}'", target.label))?;
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .context("failed opening iroh bi-directional stream")?;
+    let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
+    let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge_stream);
+    tokio::spawn(async move {
+        if let Err(error) = tokio::io::copy(&mut recv, &mut bridge_write).await {
+            tracing::debug!(?error, "iroh bridge recv->client copy failed");
+        }
+        let _ = bridge_write.shutdown().await;
+    });
+    tokio::spawn(async move {
+        if let Err(error) = tokio::io::copy(&mut bridge_read, &mut send).await {
+            tracing::debug!(?error, "iroh bridge client->send copy failed");
+        }
+        let _ = send.finish();
+    });
+    let timeout = Duration::from_millis(target.connect_timeout_ms.max(1));
+    let principal_id = load_or_create_local_principal_id(&ConfigPaths::default())?;
+    BmuxClient::connect_with_bridge_stream(
+        ErasedIpcStream::new(Box::new(client_stream)),
         timeout,
         client_name.to_string(),
         principal_id,
@@ -1266,6 +1440,9 @@ fn resolve_target_reference(config: &BmuxConfig, target: &str) -> Result<Resolve
     if target.trim().starts_with("https://") {
         return parse_https_target(target);
     }
+    if target.trim().starts_with("iroh://") {
+        return parse_iroh_target(target);
+    }
     if target.trim().starts_with("tls://") {
         return parse_inline_tls_target(target);
     }
@@ -1311,6 +1488,21 @@ fn resolve_named_target(name: &str, target: &ConnectionTargetConfig) -> Result<R
                 port,
                 server_name,
                 ca_file: target.ca_file.clone(),
+                connect_timeout_ms: target.connect_timeout_ms.max(1),
+            }))
+        }
+        ConnectionTransport::Iroh => {
+            let endpoint_id = target
+                .endpoint_id
+                .as_deref()
+                .or(target.host.as_deref())
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("iroh target '{name}' requires endpoint_id"))?
+                .to_string();
+            Ok(ResolvedTarget::Iroh(IrohTarget {
+                label: name.to_string(),
+                endpoint_id,
+                relay_url: target.relay_url.clone(),
                 connect_timeout_ms: target.connect_timeout_ms.max(1),
             }))
         }
@@ -1403,6 +1595,27 @@ fn parse_https_target(target: &str) -> Result<ResolvedTarget> {
         port,
         server_name: host,
         ca_file: None,
+        connect_timeout_ms: 8_000,
+    }))
+}
+
+fn parse_iroh_target(target: &str) -> Result<ResolvedTarget> {
+    let raw = target
+        .trim()
+        .strip_prefix("iroh://")
+        .ok_or_else(|| anyhow::anyhow!("iroh target must start with iroh://"))?;
+    let (endpoint_id, relay_url) = if let Some((endpoint, relay)) = raw.split_once("?relay=") {
+        (endpoint.to_string(), Some(relay.to_string()))
+    } else {
+        (raw.to_string(), None)
+    };
+    if endpoint_id.trim().is_empty() {
+        anyhow::bail!("iroh target must include an endpoint id");
+    }
+    Ok(ResolvedTarget::Iroh(IrohTarget {
+        label: target.to_string(),
+        endpoint_id,
+        relay_url,
         connect_timeout_ms: 8_000,
     }))
 }
@@ -1543,6 +1756,7 @@ mod tests {
             command: ServerCommand::Gateway {
                 listen: "0.0.0.0:7443".to_string(),
                 host: false,
+                host_mode: bmux_cli_schema::GatewayHostMode::Iroh,
                 host_relay: "nokey@localhost.run".to_string(),
                 quick: false,
                 cert_file: Some("cert.pem".to_string()),

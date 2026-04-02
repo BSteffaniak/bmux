@@ -330,11 +330,14 @@ pub enum RemoteCommand {
         /// Name for the target profile
         name: String,
         /// Configure as an SSH target (user@host[:port] or host)
-        #[arg(long, conflicts_with = "tls")]
+        #[arg(long, conflicts_with_all = ["tls", "iroh"])]
         ssh: Option<String>,
         /// Configure as a TLS target (host[:port])
-        #[arg(long, conflicts_with = "ssh")]
+        #[arg(long, conflicts_with_all = ["ssh", "iroh"])]
         tls: Option<String>,
+        /// Configure as an iroh target (endpoint_id[?relay=https://...])
+        #[arg(long, conflicts_with_all = ["ssh", "tls"])]
+        iroh: Option<String>,
         /// SSH username override
         #[arg(long)]
         user: Option<String>,
@@ -795,6 +798,9 @@ pub enum ServerCommand {
         /// Expose gateway publicly via reverse SSH tunnel helper
         #[arg(long)]
         host: bool,
+        /// Hosting mode used by --host (iroh is default)
+        #[arg(long, value_enum, default_value_t = GatewayHostMode::Iroh)]
+        host_mode: GatewayHostMode,
         /// Reverse SSH relay destination (user@host)
         #[arg(long, default_value = "nokey@localhost.run")]
         host_relay: String,
@@ -818,6 +824,12 @@ pub enum ServerCommand {
         #[arg(long, hide = true)]
         preflight: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+pub enum GatewayHostMode {
+    Iroh,
+    Ssh,
 }
 
 #[derive(Debug, Subcommand)]
@@ -982,12 +994,12 @@ pub enum TerminalCommand {
 #[cfg(test)]
 mod tests {
     use super::{
-        Cli, Command, ConfigCommand, KeymapCommand, LogsCommand, LogsProfilesCommand,
-        RecordingCommand, RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
-        RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode,
-        RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg, RecordingRenderMode,
-        RecordingReplayMode, RemoteCommand, RemoteCompleteCommand, ServerCommand, SessionCommand,
-        TerminalCommand, TraceFamily,
+        Cli, Command, ConfigCommand, GatewayHostMode, KeymapCommand, LogsCommand,
+        LogsProfilesCommand, RecordingCommand, RecordingCursorBlinkMode, RecordingCursorMode,
+        RecordingCursorPaintMode, RecordingCursorProfile, RecordingCursorShape,
+        RecordingCursorTextMode, RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg,
+        RecordingRenderMode, RecordingReplayMode, RemoteCommand, RemoteCompleteCommand,
+        ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
     };
     use clap::Parser;
 
@@ -1118,12 +1130,14 @@ mod tests {
             ServerCommand::Gateway {
                 listen,
                 host,
+                host_mode,
                 host_relay,
                 quick,
                 cert_file,
                 key_file,
             } if listen == "0.0.0.0:7443"
                 && !host
+                && host_mode == GatewayHostMode::Iroh
                 && host_relay == "nokey@localhost.run"
                 && !quick
                 && cert_file.as_deref() == Some("cert.pem")
@@ -1150,12 +1164,14 @@ mod tests {
             ServerCommand::Gateway {
                 listen,
                 host,
+                host_mode,
                 host_relay,
                 quick,
                 cert_file,
                 key_file,
             } if listen == "0.0.0.0:7443"
                 && !host
+                && host_mode == GatewayHostMode::Iroh
                 && host_relay == "nokey@localhost.run"
                 && quick
                 && cert_file.is_none()

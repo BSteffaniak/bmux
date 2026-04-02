@@ -2,9 +2,11 @@ use anyhow::{Context, Result};
 use bmux_client::{BmuxClient, ClientError};
 use bmux_config::{BmuxConfig, ConnectionTargetConfig, ConnectionTransport, StaleBuildAction};
 use bmux_ipc::transport::ErasedIpcStream;
+use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -46,7 +48,8 @@ pub async fn connect_if_running(
             if error
                 .to_string()
                 .contains("server is not running (IPC endpoint unavailable)")
-                || error.to_string().contains("TLS target unreachable") =>
+                || error.to_string().contains("TLS target unreachable")
+                || error.to_string().contains("iroh target unreachable") =>
         {
             Ok(None)
         }
@@ -62,6 +65,7 @@ pub async fn connect_raw(client_name: &'static str) -> Result<BmuxClient> {
 enum ActiveTarget {
     Local,
     Tls(TlsTarget),
+    Iroh(IrohTarget),
 }
 
 #[derive(Debug, Clone)]
@@ -74,12 +78,23 @@ struct TlsTarget {
     connect_timeout_ms: u64,
 }
 
+#[derive(Debug, Clone)]
+struct IrohTarget {
+    label: String,
+    endpoint_id: String,
+    relay_url: Option<String>,
+    connect_timeout_ms: u64,
+}
+
+const BMUX_IROH_ALPN: &[u8] = b"bmux/gateway/iroh/1";
+
 async fn connect_for_active_target(client_name: &'static str) -> Result<BmuxClient> {
     match resolve_active_target()? {
         ActiveTarget::Local => BmuxClient::connect_default(client_name)
             .await
             .map_err(map_client_connect_error),
         ActiveTarget::Tls(target) => connect_tls_target(&target, client_name).await,
+        ActiveTarget::Iroh(target) => connect_iroh_target(&target, client_name).await,
     }
 }
 
@@ -103,6 +118,57 @@ async fn connect_tls_target(target: &TlsTarget, client_name: &'static str) -> Re
     let principal_id = load_or_create_local_principal_id()?;
     BmuxClient::connect_with_bridge_stream(
         ErasedIpcStream::new(Box::new(tls_stream)),
+        std::time::Duration::from_millis(target.connect_timeout_ms.max(1)),
+        client_name.to_string(),
+        principal_id,
+    )
+    .await
+    .map_err(map_client_connect_error)
+}
+
+async fn connect_iroh_target(target: &IrohTarget, client_name: &'static str) -> Result<BmuxClient> {
+    let endpoint = Endpoint::builder(presets::N0)
+        .alpns(vec![BMUX_IROH_ALPN.to_vec()])
+        .bind()
+        .await
+        .context("failed binding iroh client endpoint")?;
+    endpoint.online().await;
+    let endpoint_id: EndpointId = target
+        .endpoint_id
+        .parse()
+        .with_context(|| format!("invalid iroh endpoint id '{}'", target.endpoint_id))?;
+    let remote_addr = if let Some(relay_url) = target.relay_url.as_deref() {
+        let relay = relay_url
+            .parse()
+            .with_context(|| format!("invalid iroh relay url '{relay_url}'"))?;
+        EndpointAddr::new(endpoint_id).with_relay_url(relay)
+    } else {
+        EndpointAddr::new(endpoint_id)
+    };
+    let connection = tokio::time::timeout(
+        std::time::Duration::from_millis(target.connect_timeout_ms.max(1)),
+        endpoint.connect(remote_addr, BMUX_IROH_ALPN),
+    )
+    .await
+    .with_context(|| format!("iroh target '{}' connect timed out", target.label))?
+    .with_context(|| format!("iroh target unreachable: {}", target.label))?;
+    let (mut send, mut recv) = connection
+        .open_bi()
+        .await
+        .context("failed opening iroh stream")?;
+    let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
+    let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge_stream);
+    tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut recv, &mut bridge_write).await;
+        let _ = bridge_write.shutdown().await;
+    });
+    tokio::spawn(async move {
+        let _ = tokio::io::copy(&mut bridge_read, &mut send).await;
+        let _ = send.finish();
+    });
+    let principal_id = load_or_create_local_principal_id()?;
+    BmuxClient::connect_with_bridge_stream(
+        ErasedIpcStream::new(Box::new(client_stream)),
         std::time::Duration::from_millis(target.connect_timeout_ms.max(1)),
         client_name.to_string(),
         principal_id,
@@ -166,6 +232,9 @@ fn resolve_target_reference(config: &BmuxConfig, target: &str) -> Result<ActiveT
     if target.starts_with("https://") {
         return parse_https_target(target);
     }
+    if target.starts_with("iroh://") {
+        return parse_iroh_target(target);
+    }
     if target.starts_with("tls://") {
         return parse_inline_tls_target(target);
     }
@@ -198,6 +267,21 @@ fn resolve_named_target(name: &str, target: &ConnectionTargetConfig) -> Result<A
                 "SSH targets require CLI target proxying; run command with --target {}",
                 name
             )
+        }
+        ConnectionTransport::Iroh => {
+            let endpoint_id = target
+                .endpoint_id
+                .as_deref()
+                .or(target.host.as_deref())
+                .filter(|value| !value.trim().is_empty())
+                .ok_or_else(|| anyhow::anyhow!("iroh target '{name}' requires endpoint_id"))?
+                .to_string();
+            Ok(ActiveTarget::Iroh(IrohTarget {
+                label: name.to_string(),
+                endpoint_id,
+                relay_url: target.relay_url.clone(),
+                connect_timeout_ms: target.connect_timeout_ms.max(1),
+            }))
         }
     }
 }
@@ -257,6 +341,26 @@ fn parse_https_target(target: &str) -> Result<ActiveTarget> {
         port,
         server_name: host,
         ca_file: None,
+        connect_timeout_ms: 8_000,
+    }))
+}
+
+fn parse_iroh_target(target: &str) -> Result<ActiveTarget> {
+    let raw = target
+        .strip_prefix("iroh://")
+        .ok_or_else(|| anyhow::anyhow!("iroh target must start with iroh://"))?;
+    let (endpoint_id, relay_url) = if let Some((endpoint, relay)) = raw.split_once("?relay=") {
+        (endpoint.to_string(), Some(relay.to_string()))
+    } else {
+        (raw.to_string(), None)
+    };
+    if endpoint_id.trim().is_empty() {
+        anyhow::bail!("iroh target must include an endpoint id");
+    }
+    Ok(ActiveTarget::Iroh(IrohTarget {
+        label: target.to_string(),
+        endpoint_id,
+        relay_url,
         connect_timeout_ms: 8_000,
     }))
 }

@@ -103,6 +103,10 @@ pub struct ConnectionTargetConfig {
     pub ca_file: Option<PathBuf>,
     /// Optional TLS server name override (defaults to host).
     pub server_name: Option<String>,
+    /// Iroh endpoint id for hosted transport.
+    pub endpoint_id: Option<String>,
+    /// Optional Iroh relay URL for hosted transport.
+    pub relay_url: Option<String>,
     /// Require strict host key checking.
     pub strict_host_key_checking: bool,
     /// SSH jump host (`ProxyJump`) value.
@@ -128,6 +132,8 @@ impl Default for ConnectionTargetConfig {
             known_hosts_file: None,
             ca_file: None,
             server_name: None,
+            endpoint_id: None,
+            relay_url: None,
             strict_host_key_checking: true,
             jump: None,
             remote_bmux_path: "bmux".to_string(),
@@ -145,6 +151,7 @@ pub enum ConnectionTransport {
     Local,
     Ssh,
     Tls,
+    Iroh,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]

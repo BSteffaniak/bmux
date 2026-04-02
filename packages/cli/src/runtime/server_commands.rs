@@ -1,6 +1,8 @@
 use super::*;
+use bmux_cli_schema::GatewayHostMode;
 use bmux_ipc::IpcEndpoint;
 use bmux_ipc::transport::LocalIpcStream;
+use iroh::{Endpoint, endpoint::presets};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use std::sync::Arc;
@@ -353,11 +355,16 @@ pub(super) async fn run_server_bridge(stdio: bool, preflight: bool) -> Result<u8
 pub(super) async fn run_server_gateway(
     listen: &str,
     host: bool,
+    host_mode: GatewayHostMode,
     host_relay: &str,
     quick: bool,
     cert_file: Option<&str>,
     key_file: Option<&str>,
 ) -> Result<u8> {
+    if host && host_mode == GatewayHostMode::Iroh {
+        return run_server_gateway_iroh().await;
+    }
+
     let (cert_file, key_file) = resolve_gateway_tls_files(quick, cert_file, key_file)?;
     let cert_chain = load_cert_chain(&cert_file)?;
     let private_key = load_private_key(&key_file)?;
@@ -394,6 +401,79 @@ pub(super) async fn run_server_gateway(
             }
         });
     }
+}
+
+async fn run_server_gateway_iroh() -> Result<u8> {
+    const BMUX_IROH_ALPN: &[u8] = b"bmux/gateway/iroh/1";
+    let endpoint = Endpoint::builder(presets::N0)
+        .alpns(vec![BMUX_IROH_ALPN.to_vec()])
+        .bind()
+        .await
+        .context("failed binding iroh endpoint")?;
+    endpoint.online().await;
+    let addr = endpoint.addr();
+    let endpoint_id = endpoint.id();
+    let relay = addr.relay_urls().next().map(|value| value.to_string());
+    let url = relay.as_ref().map_or_else(
+        || format!("iroh://{endpoint_id}"),
+        |relay| format!("iroh://{endpoint_id}?relay={relay}"),
+    );
+    println!("bmux iroh gateway online");
+    println!("connect URL: {url}");
+
+    while let Some(incoming) = endpoint.accept().await {
+        let mut accepting = match incoming.accept() {
+            Ok(accepting) => accepting,
+            Err(error) => {
+                tracing::warn!(?error, "iroh incoming accept failed");
+                continue;
+            }
+        };
+        tokio::spawn(async move {
+            let result: Result<()> = async {
+                let alpn = accepting.alpn().await.context("failed reading ALPN")?;
+                if alpn.as_slice() != BMUX_IROH_ALPN {
+                    anyhow::bail!("unexpected iroh ALPN");
+                }
+                let conn = accepting
+                    .await
+                    .context("failed accepting iroh connection")?;
+                let (mut send, mut recv) = conn
+                    .accept_bi()
+                    .await
+                    .context("failed accepting iroh stream")?;
+                let endpoint = local_endpoint_from_paths(&ConfigPaths::default());
+                let ipc_stream = LocalIpcStream::connect(&endpoint)
+                    .await
+                    .context("failed connecting local IPC endpoint for iroh gateway")?;
+                let (mut ipc_read, mut ipc_write) = tokio::io::split(ipc_stream);
+
+                let inbound = tokio::spawn(async move {
+                    tokio::io::copy(&mut recv, &mut ipc_write).await?;
+                    ipc_write.shutdown().await?;
+                    Ok::<(), std::io::Error>(())
+                });
+                let outbound = tokio::spawn(async move {
+                    tokio::io::copy(&mut ipc_read, &mut send).await?;
+                    send.finish()?;
+                    Ok::<(), anyhow::Error>(())
+                });
+
+                let inbound_result: std::io::Result<()> =
+                    inbound.await.context("iroh inbound task failed")?;
+                let outbound_result: anyhow::Result<()> =
+                    outbound.await.context("iroh outbound task failed")?;
+                inbound_result.context("iroh inbound copy failed")?;
+                outbound_result.context("iroh outbound copy failed")?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = result {
+                tracing::warn!(?error, "iroh connection handling failed");
+            }
+        });
+    }
+    Ok(0)
 }
 
 fn parse_listen_port(listen: &str) -> Result<u16> {
