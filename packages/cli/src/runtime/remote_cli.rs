@@ -353,7 +353,7 @@ pub(super) async fn run_setup() -> Result<u8> {
     println!("Step 1/2: auth");
     let _ = ensure_authenticated(&BmuxConfig::load()?).await?;
     println!("Step 2/2: host");
-    let code = run_host("127.0.0.1:7443", None, false, false, false).await?;
+    let code = run_host("127.0.0.1:7443", None, false, false, false, true).await?;
     println!("Setup complete.");
     Ok(code)
 }
@@ -364,6 +364,7 @@ pub(super) async fn run_host(
     copy: bool,
     status: bool,
     stop: bool,
+    setup_summary: bool,
 ) -> Result<u8> {
     if status && stop {
         anyhow::bail!("--status and --stop cannot be used together")
@@ -452,17 +453,32 @@ pub(super) async fn run_host(
         }
     }
 
-    println!("bmux iroh gateway online");
-    println!("Host online: {host_name}");
-    if listen != "127.0.0.1:7443" {
-        println!("note: --listen is ignored for iroh host mode ({listen})");
-    }
-    println!("connect URL: {target}");
-    if let Some(share) = resolved_share.as_deref() {
-        println!("Share link: bmux://{share}");
-        println!("Join from another machine: bmux join bmux://{share}");
+    let summary_share_link = resolved_share
+        .as_ref()
+        .map(|value| format!("bmux://{value}"));
+    if setup_summary {
+        let account = auth_state.account_name.as_deref();
+        for line in format_setup_summary_lines(
+            account,
+            &host_name,
+            summary_share_link.as_deref(),
+            &join_link,
+        ) {
+            println!("{line}");
+        }
     } else {
-        println!("Join from another machine: bmux join {target}");
+        println!("bmux iroh gateway online");
+        println!("Host online: {host_name}");
+        if listen != "127.0.0.1:7443" {
+            println!("note: --listen is ignored for iroh host mode ({listen})");
+        }
+        println!("connect URL: {target}");
+        if let Some(share) = resolved_share.as_deref() {
+            println!("Share link: bmux://{share}");
+            println!("Join from another machine: bmux join bmux://{share}");
+        } else {
+            println!("Join from another machine: bmux join {target}");
+        }
     }
 
     while let Some(incoming) = endpoint.accept().await {
@@ -519,6 +535,22 @@ pub(super) async fn run_host(
     }
     let _ = clear_host_runtime_state(&ConfigPaths::default());
     Ok(0)
+}
+
+fn format_setup_summary_lines(
+    account_name: Option<&str>,
+    host_name: &str,
+    share_link: Option<&str>,
+    join_target: &str,
+) -> Vec<String> {
+    let account = account_name.unwrap_or("unknown");
+    let share_line = share_link.unwrap_or("unavailable");
+    vec![
+        format!("Signed in as {account}"),
+        format!("Host online: {host_name}"),
+        format!("Share link: {share_line}"),
+        format!("Join from another machine: bmux join {join_target}"),
+    ]
 }
 
 pub(super) async fn run_join(link: Option<&str>, session: Option<&str>) -> Result<u8> {
@@ -3027,6 +3059,42 @@ mod tests {
         let lines = render_text_qr("bmux://demo").expect("render qr");
         assert!(lines.len() > 4);
         assert!(lines.iter().any(|line| !line.trim().is_empty()));
+    }
+
+    #[test]
+    fn setup_summary_lines_snapshot_is_stable() {
+        let lines = format_setup_summary_lines(
+            Some("alice@example.com"),
+            "alice-mbp",
+            Some("bmux://alice"),
+            "bmux://alice",
+        );
+        assert_eq!(
+            lines,
+            vec![
+                "Signed in as alice@example.com".to_string(),
+                "Host online: alice-mbp".to_string(),
+                "Share link: bmux://alice".to_string(),
+                "Join from another machine: bmux join bmux://alice".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn setup_summary_lines_falls_back_to_unknown_account() {
+        let lines =
+            format_setup_summary_lines(None, "demo-host", Some("bmux://demo"), "bmux://demo");
+        assert_eq!(lines[0], "Signed in as unknown");
+    }
+
+    #[test]
+    fn setup_summary_lines_reports_unavailable_share_link() {
+        let lines = format_setup_summary_lines(Some("alice"), "demo-host", None, "iroh://endpoint");
+        assert_eq!(lines[2], "Share link: unavailable");
+        assert_eq!(
+            lines[3],
+            "Join from another machine: bmux join iroh://endpoint"
+        );
     }
 
     #[test]

@@ -133,7 +133,7 @@ pub(super) async fn dispatch_built_in_command(
                 status,
                 stop,
             },
-        ) => run_host(listen, name.as_deref(), *copy, *status, *stop).await,
+        ) => run_host(listen, name.as_deref(), *copy, *status, *stop, false).await,
         (BuiltInHandlerId::Join, Command::Join { link, session }) => {
             run_join(link.as_deref(), session.as_deref()).await
         }
