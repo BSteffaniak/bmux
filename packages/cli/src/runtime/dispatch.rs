@@ -123,7 +123,7 @@ pub(super) async fn dispatch_built_in_command(
     let handler = built_in_handler_for_command(command);
     let _descriptor = built_in_command_by_handler(handler);
     match (handler, command) {
-        (BuiltInHandlerId::Setup, Command::Setup { check }) => run_setup(*check).await,
+        (BuiltInHandlerId::Setup, Command::Setup { check, mode }) => run_setup(*check, *mode).await,
         (
             BuiltInHandlerId::Host,
             Command::Host {
@@ -134,6 +134,7 @@ pub(super) async fn dispatch_built_in_command(
                 status,
                 stop,
                 restart,
+                mode,
             },
         ) => {
             run_host(
@@ -144,6 +145,7 @@ pub(super) async fn dispatch_built_in_command(
                 *status,
                 *stop,
                 *restart,
+                *mode,
                 false,
             )
             .await

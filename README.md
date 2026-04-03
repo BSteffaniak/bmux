@@ -74,9 +74,12 @@ bmux connect prod --reconnect-forever
 bmux remote complete targets
 bmux remote complete sessions prod
 
-# Streamlined hosted workflow (iroh default)
+# Streamlined hosted workflow (p2p default, no bmux control-plane required)
 bmux setup
 bmux host
+# Optional control-plane mode for account/share links
+bmux setup --mode control-plane
+bmux host --mode control-plane
 bmux share --name my-host
 bmux join bmux://my-host
 
@@ -133,6 +136,7 @@ Connection targets can be configured in `bmux.toml`:
 
 ```toml
 [connections]
+hosted_mode = "p2p" # or "control_plane" (hard-fail on control-plane errors)
 default_target = "local"
 
 [connections.targets.prod]

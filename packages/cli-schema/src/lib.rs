@@ -108,6 +108,12 @@ pub enum RecordingCursorTextMode {
     ForceContrast,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum HostedModeArg {
+    P2p,
+    ControlPlane,
+}
+
 fn parse_cell_size(value: &str) -> Result<(u16, u16), String> {
     let trimmed = value.trim();
     let (width_raw, height_raw) = trimmed
@@ -179,13 +185,16 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
-    /// First-run setup wizard for hosted mode
+    /// First-run setup wizard for hosted mode (p2p default)
     Setup {
         /// Check hosted readiness without starting or changing runtime state
         #[arg(long)]
         check: bool,
+        /// Hosted operation mode (`p2p` is infra-light default)
+        #[arg(long, value_enum)]
+        mode: Option<HostedModeArg>,
     },
-    /// Start hosted mode (iroh by default)
+    /// Start hosted mode (p2p default, control-plane opt-in)
     Host {
         /// Optional listen address for local gateway bridge
         #[arg(long, default_value = "127.0.0.1:7443")]
@@ -208,6 +217,9 @@ pub enum Command {
         /// Restart hosted-mode runtime in background
         #[arg(long, conflicts_with_all = ["status", "stop", "daemon"])]
         restart: bool,
+        /// Hosted operation mode (`p2p` is infra-light default)
+        #[arg(long, value_enum)]
+        mode: Option<HostedModeArg>,
     },
     /// Join a hosted link/target quickly
     Join {
@@ -1085,7 +1097,7 @@ pub enum TerminalCommand {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthCommand, Cli, Command, GatewayHostMode, KeymapCommand, LogsCommand,
+        AuthCommand, Cli, Command, GatewayHostMode, HostedModeArg, KeymapCommand, LogsCommand,
         LogsProfilesCommand, RecordingCommand, RecordingCursorBlinkMode, RecordingCursorMode,
         RecordingCursorPaintMode, RecordingCursorProfile, RecordingCursorShape,
         RecordingCursorTextMode, RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg,
@@ -1166,19 +1178,31 @@ mod tests {
     #[test]
     fn parses_setup_command_defaults() {
         let cli = Cli::try_parse_from(["bmux", "setup"]).expect("valid CLI args");
-        let Some(Command::Setup { check }) = cli.command else {
+        let Some(Command::Setup { check, mode }) = cli.command else {
             panic!("expected setup command");
         };
         assert!(!check);
+        assert!(mode.is_none());
     }
 
     #[test]
     fn parses_setup_check_flag() {
         let cli = Cli::try_parse_from(["bmux", "setup", "--check"]).expect("valid CLI args");
-        let Some(Command::Setup { check }) = cli.command else {
+        let Some(Command::Setup { check, mode }) = cli.command else {
             panic!("expected setup command");
         };
         assert!(check);
+        assert!(mode.is_none());
+    }
+
+    #[test]
+    fn parses_setup_mode_flag() {
+        let cli = Cli::try_parse_from(["bmux", "setup", "--mode", "control-plane"])
+            .expect("valid CLI args");
+        let Some(Command::Setup { mode, .. }) = cli.command else {
+            panic!("expected setup command");
+        };
+        assert_eq!(mode, Some(HostedModeArg::ControlPlane));
     }
 
     #[test]
@@ -1192,6 +1216,7 @@ mod tests {
             status,
             stop,
             restart,
+            mode,
         }) = cli.command
         else {
             panic!("expected host command");
@@ -1203,6 +1228,7 @@ mod tests {
         assert!(!status);
         assert!(!stop);
         assert!(!restart);
+        assert!(mode.is_none());
     }
 
     #[test]
@@ -1248,6 +1274,15 @@ mod tests {
             panic!("expected host command");
         };
         assert!(restart);
+    }
+
+    #[test]
+    fn parses_host_mode_flag() {
+        let cli = Cli::try_parse_from(["bmux", "host", "--mode", "p2p"]).expect("valid CLI args");
+        let Some(Command::Host { mode, .. }) = cli.command else {
+            panic!("expected host command");
+        };
+        assert_eq!(mode, Some(HostedModeArg::P2p));
     }
 
     #[test]

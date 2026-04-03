@@ -75,6 +75,9 @@ bmux remote complete sessions prod
 # streamlined aliases
 bmux setup
 bmux host
+# opt-in control-plane mode (hard-fails if control-plane operations fail)
+bmux setup --mode control-plane
+bmux host --mode control-plane
 bmux join bmux://my-host
 bmux hosts
 bmux auth login

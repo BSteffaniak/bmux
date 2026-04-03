@@ -1,6 +1,7 @@
 use super::*;
 use anyhow::Context;
-use bmux_config::{ConnectionTargetConfig, ConnectionTransport, RemoteServerStartMode};
+use bmux_cli_schema::HostedModeArg;
+use bmux_config::{ConnectionTargetConfig, ConnectionTransport, HostedMode, RemoteServerStartMode};
 use bmux_ipc::IpcEndpoint;
 use bmux_ipc::transport::{ErasedIpcStream, LocalIpcStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
@@ -354,31 +355,42 @@ fn map_connect_target_resolution_error(target: &str, error: anyhow::Error) -> an
     error
 }
 
-pub(super) async fn run_setup(check: bool) -> Result<u8> {
+pub(super) async fn run_setup(check: bool, mode: Option<HostedModeArg>) -> Result<u8> {
+    let config = BmuxConfig::load()?;
+    let hosted_mode = resolve_hosted_mode(&config, mode);
     if check {
-        return run_setup_check();
+        return run_setup_check(hosted_mode);
     }
 
     println!("bmux setup");
-    println!("Step 1/2: auth");
-    let config = BmuxConfig::load()?;
-    let auth_state = ensure_authenticated(&config).await?;
-
-    println!("Step 2/2: host");
-    let _ = spawn_host_daemon("127.0.0.1:7443", None)?;
+    if hosted_mode == HostedMode::ControlPlane {
+        println!("Step 1/2: auth");
+        let _ = ensure_authenticated(&config).await?;
+        println!("Step 2/2: host");
+    } else {
+        println!("Step 1/1: host");
+    }
+    let _ = spawn_host_daemon("127.0.0.1:7443", None, hosted_mode)?;
     let host_state = wait_for_running_host_state(std::time::Duration::from_secs(5)).await?;
 
-    let account = auth_state.account_name.as_deref();
+    let account = if hosted_mode == HostedMode::ControlPlane {
+        load_auth_state_optional(&ConfigPaths::default())?
+            .and_then(|state| state.account_name)
+            .or_else(|| config.connections.default_target.clone())
+    } else {
+        None
+    };
     let host_name = host_state.name.as_deref().unwrap_or("host");
     let join_target = host_state
         .share_link
         .as_deref()
         .unwrap_or(host_state.target.as_str());
     for line in format_setup_summary_lines(
-        account,
+        account.as_deref(),
         host_name,
         host_state.share_link.as_deref(),
         join_target,
+        hosted_mode == HostedMode::ControlPlane,
     ) {
         println!("{line}");
     }
@@ -386,17 +398,18 @@ pub(super) async fn run_setup(check: bool) -> Result<u8> {
     Ok(0)
 }
 
-fn run_setup_check() -> Result<u8> {
+fn run_setup_check(mode: HostedMode) -> Result<u8> {
     println!("bmux setup --check");
     let paths = ConfigPaths::default();
     let auth_state = load_auth_state_optional(&paths)?;
     let host_state = load_host_runtime_state(&paths)?;
     let auth_ready = auth_state.is_some();
+    let auth_required = mode == HostedMode::ControlPlane;
     let host_alive = host_state
         .as_ref()
         .is_some_and(|state| is_process_alive(state.pid));
 
-    if auth_ready && host_alive {
+    if (!auth_required || auth_ready) && host_alive {
         let account = auth_state
             .as_ref()
             .and_then(|state| state.account_name.as_deref());
@@ -405,28 +418,38 @@ fn run_setup_check() -> Result<u8> {
         };
         let host_name = state.name.as_deref().unwrap_or("host");
         let join_target = state.share_link.as_deref().unwrap_or(state.target.as_str());
-        for line in
-            format_setup_summary_lines(account, host_name, state.share_link.as_deref(), join_target)
-        {
+        for line in format_setup_summary_lines(
+            account,
+            host_name,
+            state.share_link.as_deref(),
+            join_target,
+            auth_required,
+        ) {
             println!("{line}");
         }
         println!("Setup check: ready");
         return Ok(0);
     }
 
-    for line in format_setup_check_not_ready_lines(auth_ready, host_state.as_ref(), host_alive) {
+    for line in format_setup_check_not_ready_lines(
+        auth_required,
+        auth_ready,
+        host_state.as_ref(),
+        host_alive,
+    ) {
         println!("{line}");
     }
     Ok(1)
 }
 
 fn format_setup_check_not_ready_lines(
+    auth_required: bool,
     auth_ready: bool,
     host_state: Option<&HostRuntimeState>,
     host_alive: bool,
 ) -> Vec<String> {
     let mut reasons = Vec::new();
-    if !auth_ready {
+    if auth_required && !auth_ready {
         reasons.push("not signed in".to_string());
     }
     if !host_alive {
@@ -447,7 +470,7 @@ fn format_setup_check_not_ready_lines(
         format!("Reason: {reason_text}"),
         "Fix: bmux setup".to_string(),
     ];
-    if !auth_ready {
+    if auth_required && !auth_ready {
         lines.push("Advanced: bmux auth login".to_string());
     } else if !host_alive {
         lines.push(match host_state {
@@ -496,17 +519,11 @@ pub(super) async fn run_host(
     status: bool,
     stop: bool,
     restart: bool,
+    mode: Option<HostedModeArg>,
     setup_summary: bool,
 ) -> Result<u8> {
     if status && stop {
         anyhow::bail!("--status and --stop cannot be used together")
-    }
-    if restart {
-        let _ = run_host_stop()?;
-        return spawn_host_daemon(listen, name);
-    }
-    if daemon {
-        return spawn_host_daemon(listen, name);
     }
     if status {
         return run_host_status();
@@ -515,8 +532,21 @@ pub(super) async fn run_host(
         return run_host_stop();
     }
     let mut config = BmuxConfig::load()?;
+    let hosted_mode = resolve_hosted_mode(&config, mode);
+    if restart {
+        let _ = run_host_stop()?;
+        return spawn_host_daemon(listen, name, hosted_mode);
+    }
+    if daemon {
+        return spawn_host_daemon(listen, name, hosted_mode);
+    }
+
     let control_plane_url = control_plane_url(&config);
-    let auth_state = ensure_authenticated(&config).await?;
+    let auth_state = if hosted_mode == HostedMode::ControlPlane {
+        Some(ensure_authenticated(&config).await?)
+    } else {
+        None
+    };
 
     let endpoint = Endpoint::builder(presets::N0)
         .alpns(vec![BMUX_IROH_ALPN.to_vec()])
@@ -532,33 +562,31 @@ pub(super) async fn run_host(
         |relay_url| format!("iroh://{endpoint_id}?relay={relay_url}"),
     );
 
-    let share_name = suggest_share_name(name, &auth_state);
-    let share_result = ensure_host_share_link(
-        &mut config,
-        &control_plane_url,
-        &auth_state.access_token,
-        &share_name,
-        &target,
-    )
-    .await;
-    let resolved_share = match share_result {
-        Ok(value) => Some(value),
-        Err(error) => {
-            eprintln!("warning: failed to create share link: {error}");
-            None
-        }
+    let resolved_share = if hosted_mode == HostedMode::ControlPlane {
+        let auth_state = auth_state
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("internal error: missing auth state"))?;
+        let share_name = suggest_share_name(name, auth_state);
+        let resolved_share = ensure_host_share_link(
+            &mut config,
+            &control_plane_url,
+            &auth_state.access_token,
+            &share_name,
+            &target,
+        )
+        .await?;
+        register_host_presence(
+            &control_plane_url,
+            &auth_state.access_token,
+            name.map(ToString::to_string)
+                .or_else(|| Some(resolved_share.clone())),
+            &target,
+        )
+        .await?;
+        Some(resolved_share)
+    } else {
+        None
     };
-    if let Err(error) = register_host_presence(
-        &control_plane_url,
-        &auth_state.access_token,
-        name.map(ToString::to_string)
-            .or_else(|| resolved_share.clone()),
-        &target,
-    )
-    .await
-    {
-        eprintln!("warning: host registration failed: {error}");
-    }
 
     let join_link = resolved_share
         .as_ref()
@@ -567,7 +595,11 @@ pub(super) async fn run_host(
 
     let host_name = name
         .map(ToString::to_string)
-        .or_else(|| auth_state.account_name.clone())
+        .or_else(|| {
+            auth_state
+                .as_ref()
+                .and_then(|state| state.account_name.clone())
+        })
         .unwrap_or_else(|| "host".to_string());
     save_host_runtime_state(
         &ConfigPaths::default(),
@@ -596,12 +628,15 @@ pub(super) async fn run_host(
         .as_ref()
         .map(|value| format!("bmux://{value}"));
     if setup_summary {
-        let account = auth_state.account_name.as_deref();
+        let account = auth_state
+            .as_ref()
+            .and_then(|state| state.account_name.as_deref());
         for line in format_setup_summary_lines(
             account,
             &host_name,
             summary_share_link.as_deref(),
             &join_link,
+            hosted_mode == HostedMode::ControlPlane,
         ) {
             println!("{line}");
         }
@@ -681,15 +716,28 @@ fn format_setup_summary_lines(
     host_name: &str,
     share_link: Option<&str>,
     join_target: &str,
+    include_auth_line: bool,
 ) -> Vec<String> {
-    let account = account_name.unwrap_or("unknown");
     let share_line = share_link.unwrap_or("unavailable");
-    vec![
-        format!("Signed in as {account}"),
-        format!("Host online: {host_name}"),
-        format!("Share link: {share_line}"),
-        format!("Join from another machine: bmux join {join_target}"),
-    ]
+    let mut lines = Vec::new();
+    if include_auth_line {
+        let account = account_name.unwrap_or("unknown");
+        lines.push(format!("Signed in as {account}"));
+    }
+    lines.push(format!("Host online: {host_name}"));
+    lines.push(format!("Share link: {share_line}"));
+    lines.push(format!(
+        "Join from another machine: bmux join {join_target}"
+    ));
+    lines
+}
+
+fn resolve_hosted_mode(config: &BmuxConfig, mode: Option<HostedModeArg>) -> HostedMode {
+    match mode {
+        Some(HostedModeArg::P2p) => HostedMode::P2p,
+        Some(HostedModeArg::ControlPlane) => HostedMode::ControlPlane,
+        None => config.connections.hosted_mode,
+    }
 }
 
 pub(super) async fn run_join(link: Option<&str>, session: Option<&str>) -> Result<u8> {
@@ -1310,7 +1358,7 @@ fn run_host_stop() -> Result<u8> {
     Ok(0)
 }
 
-fn spawn_host_daemon(listen: &str, name: Option<&str>) -> Result<u8> {
+fn spawn_host_daemon(listen: &str, name: Option<&str>, mode: HostedMode) -> Result<u8> {
     let paths = ConfigPaths::default();
     if let Some(state) = load_host_runtime_state(&paths)?
         && is_process_alive(state.pid)
@@ -1322,6 +1370,7 @@ fn spawn_host_daemon(listen: &str, name: Option<&str>) -> Result<u8> {
     let current_exe = std::env::current_exe().context("failed resolving current executable")?;
     let mut command = std::process::Command::new(current_exe);
     command.args(["host", "--listen", listen]);
+    command.args(["--mode", hosted_mode_to_cli_value(mode)]);
     if let Some(value) = name {
         command.args(["--name", value]);
     }
@@ -1332,6 +1381,13 @@ fn spawn_host_daemon(listen: &str, name: Option<&str>) -> Result<u8> {
     println!("host runtime started in background (pid {})", child.id());
     println!("check status: bmux host --status");
     Ok(0)
+}
+
+fn hosted_mode_to_cli_value(mode: HostedMode) -> &'static str {
+    match mode {
+        HostedMode::P2p => "p2p",
+        HostedMode::ControlPlane => "control-plane",
+    }
 }
 
 fn is_process_alive(pid: u32) -> bool {
@@ -3604,6 +3660,7 @@ mod tests {
             "alice-mbp",
             Some("bmux://alice"),
             "bmux://alice",
+            true,
         );
         assert_eq!(
             lines,
@@ -3619,13 +3676,14 @@ mod tests {
     #[test]
     fn setup_summary_lines_falls_back_to_unknown_account() {
         let lines =
-            format_setup_summary_lines(None, "demo-host", Some("bmux://demo"), "bmux://demo");
+            format_setup_summary_lines(None, "demo-host", Some("bmux://demo"), "bmux://demo", true);
         assert_eq!(lines[0], "Signed in as unknown");
     }
 
     #[test]
     fn setup_summary_lines_reports_unavailable_share_link() {
-        let lines = format_setup_summary_lines(Some("alice"), "demo-host", None, "iroh://endpoint");
+        let lines =
+            format_setup_summary_lines(Some("alice"), "demo-host", None, "iroh://endpoint", true);
         assert_eq!(lines[2], "Share link: unavailable");
         assert_eq!(
             lines[3],
@@ -3634,8 +3692,30 @@ mod tests {
     }
 
     #[test]
+    fn setup_summary_lines_omit_auth_line_for_p2p_mode() {
+        let lines =
+            format_setup_summary_lines(Some("alice"), "demo-host", None, "iroh://endpoint", false);
+        assert_eq!(lines[0], "Host online: demo-host");
+    }
+
+    #[test]
+    fn resolve_hosted_mode_prefers_cli_override() {
+        let config = BmuxConfig::default();
+        let mode = resolve_hosted_mode(&config, Some(HostedModeArg::ControlPlane));
+        assert_eq!(mode, HostedMode::ControlPlane);
+    }
+
+    #[test]
+    fn resolve_hosted_mode_falls_back_to_config() {
+        let mut config = BmuxConfig::default();
+        config.connections.hosted_mode = HostedMode::ControlPlane;
+        let mode = resolve_hosted_mode(&config, None);
+        assert_eq!(mode, HostedMode::ControlPlane);
+    }
+
+    #[test]
     fn setup_check_not_ready_lines_prefers_setup_fix_and_auth_advanced() {
-        let lines = format_setup_check_not_ready_lines(false, None, false);
+        let lines = format_setup_check_not_ready_lines(true, false, None, false);
         assert_eq!(lines[0], "Setup check: not ready");
         assert_eq!(lines[1], "Reason: not signed in; host is offline");
         assert_eq!(lines[2], "Fix: bmux setup");
@@ -3651,10 +3731,18 @@ mod tests {
             name: Some("demo-host".to_string()),
             started_at_unix: 1,
         };
-        let lines = format_setup_check_not_ready_lines(true, Some(&state), false);
+        let lines = format_setup_check_not_ready_lines(true, true, Some(&state), false);
         assert_eq!(lines[1], "Reason: host state is stale (pid 4242)");
         assert_eq!(lines[2], "Fix: bmux setup");
         assert_eq!(lines[3], "Advanced: bmux host --restart");
+    }
+
+    #[test]
+    fn setup_check_not_ready_lines_p2p_does_not_require_auth() {
+        let lines = format_setup_check_not_ready_lines(false, false, None, false);
+        assert_eq!(lines[1], "Reason: host is offline");
+        assert_eq!(lines[2], "Fix: bmux setup");
+        assert_eq!(lines[3], "Advanced: bmux host --daemon");
     }
 
     #[test]

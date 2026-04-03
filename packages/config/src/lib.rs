@@ -74,6 +74,8 @@ pub struct BmuxConfig {
 #[config_doc(section = "connections")]
 #[serde(default)]
 pub struct ConnectionsConfig {
+    /// Hosted mode strategy. `p2p` avoids control-plane dependencies by default.
+    pub hosted_mode: HostedMode,
     /// Default command target when `--target` is not passed.
     pub default_target: Option<String>,
     /// Optional control-plane base URL for hosted auth/share resolution.
@@ -86,6 +88,14 @@ pub struct ConnectionsConfig {
     pub recent_sessions: BTreeMap<String, Vec<String>>,
     /// User-defined share links (bmux://<name> -> target reference)
     pub share_links: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum HostedMode {
+    #[default]
+    P2p,
+    ControlPlane,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
