@@ -1,5 +1,6 @@
 use super::state::{
-    AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
+    AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition, PaneRect,
+    PaneRenderBuffer, SYNC_UPDATE_TIMEOUT,
 };
 use anyhow::{Context, Result};
 use bmux_ipc::{AttachFocusTarget, AttachScene, AttachSurfaceKind, PaneState, PaneSummary};
@@ -9,6 +10,7 @@ use crossterm::style::Print;
 use crossterm::terminal;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
+use std::time::Instant;
 use unicode_width::UnicodeWidthStr;
 use uuid::Uuid;
 
@@ -45,6 +47,12 @@ pub fn append_pane_output(buffer: &mut PaneRenderBuffer, bytes: &[u8]) -> bool {
     let is_alternate = buffer.parser.screen().alternate_screen();
     buffer.last_alternate_screen = is_alternate;
 
+    // Track DEC private mode 2026 (synchronized update) so the renderer
+    // can defer drawing this pane while the inner application is mid-
+    // redraw.  We scan the raw bytes for the last occurrence of the
+    // begin/end sequences and update the flag accordingly.
+    update_sync_update_state(buffer, bytes);
+
     let toggled_alternate =
         was_alternate != is_alternate || contains_alternate_screen_sequence(bytes);
     if toggled_alternate {
@@ -55,6 +63,55 @@ pub fn append_pane_output(buffer: &mut PaneRenderBuffer, bytes: &[u8]) -> bool {
     }
 
     toggled_alternate
+}
+
+/// Scan `bytes` for DEC mode 2026 begin (`\x1b[?2026h`) and end
+/// (`\x1b[?2026l`) sequences and update `buffer.sync_update_in_progress`.
+///
+/// We only care about the *final* state after processing the chunk: find the
+/// last occurrence of either sequence and set the flag based on which one
+/// wins.  This correctly handles chunks that contain a complete begin+end
+/// pair (the end is later, so the flag ends up false).
+fn update_sync_update_state(buffer: &mut PaneRenderBuffer, bytes: &[u8]) {
+    const BEGIN: &[u8] = b"\x1b[?2026h";
+    const END: &[u8] = b"\x1b[?2026l";
+
+    let last_begin = rfind_subsequence(bytes, BEGIN);
+    let last_end = rfind_subsequence(bytes, END);
+
+    match (last_begin, last_end) {
+        (Some(b_pos), Some(e_pos)) => {
+            if b_pos > e_pos {
+                // Begin is later → entering a new sync update.
+                buffer.sync_update_in_progress = true;
+                buffer.sync_update_started_at = Some(Instant::now());
+            } else {
+                // End is later → sync update completed in this chunk.
+                buffer.sync_update_in_progress = false;
+                buffer.sync_update_started_at = None;
+            }
+        }
+        (Some(_), None) => {
+            buffer.sync_update_in_progress = true;
+            buffer.sync_update_started_at = Some(Instant::now());
+        }
+        (None, Some(_)) => {
+            buffer.sync_update_in_progress = false;
+            buffer.sync_update_started_at = None;
+        }
+        (None, None) => { /* no change */ }
+    }
+}
+
+/// Find the last occurrence of `needle` in `haystack`, returning the byte
+/// offset of its start.
+fn rfind_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .rposition(|window| window == needle)
 }
 
 fn contains_alternate_screen_sequence(bytes: &[u8]) -> bool {
@@ -321,6 +378,34 @@ pub fn render_attach_scene<W: io::Write>(
             continue;
         }
         let should_draw = full_pane_redraw || dirty_pane_ids.contains(&pane_id);
+
+        // Defer drawing pane content while the inner application is inside a
+        // DEC mode 2026 synchronized update.  The host terminal still shows
+        // the previous (complete) frame, so skipping the render keeps the
+        // display consistent.  We never defer during a full_pane_redraw
+        // because the screen area has already been cleared and must be
+        // repopulated, and we enforce a timeout to avoid permanently stale
+        // panes if the closing sequence is lost.
+        let sync_deferred = if let Some(entry) = pane_buffers.get_mut(&pane_id) {
+            if entry.sync_update_in_progress && !full_pane_redraw {
+                let within_deadline = entry
+                    .sync_update_started_at
+                    .map_or(false, |t| t.elapsed() < SYNC_UPDATE_TIMEOUT);
+                if within_deadline {
+                    true
+                } else {
+                    // Timeout expired — force-clear the flag and render.
+                    entry.sync_update_in_progress = false;
+                    entry.sync_update_started_at = None;
+                    false
+                }
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+
         let focus = surface.cursor_owner
             || focused_surface_id == Some(surface.id)
             || focused_pane_id == Some(pane_id);
@@ -423,7 +508,7 @@ pub fn render_attach_scene<W: io::Write>(
                     visible: use_scrollback || !screen.hide_cursor(),
                 });
             }
-            if !should_draw {
+            if !should_draw || sync_deferred {
                 continue;
             }
             for row in 0..inner_h {
@@ -524,7 +609,7 @@ pub fn render_attach_scene<W: io::Write>(
 mod tests {
     use super::{
         AttachLayer, AttachLayerSurface, append_pane_output, opaque_row_text, queue_layer_fill,
-        render_attach_scene,
+        render_attach_scene, rfind_subsequence, update_sync_update_state,
     };
     use crate::runtime::attach::state::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -774,5 +859,187 @@ mod tests {
         if !rendered.is_empty() {
             assert!(rendered.contains("[EXITED]"));
         }
+    }
+
+    // ── Synchronized update (DEC mode 2026) tests ────────────────────
+
+    #[test]
+    fn rfind_subsequence_finds_last_occurrence() {
+        let haystack = b"aaa\x1b[?2026hbbb\x1b[?2026h";
+        let pos = rfind_subsequence(haystack, b"\x1b[?2026h");
+        // "aaa" (3) + "\x1b[?2026h" (8) + "bbb" (3) = offset 14
+        assert_eq!(pos, Some(14));
+    }
+
+    #[test]
+    fn rfind_subsequence_returns_none_when_absent() {
+        assert_eq!(rfind_subsequence(b"hello world", b"\x1b[?2026h"), None);
+    }
+
+    #[test]
+    fn sync_update_begin_sets_flag() {
+        let mut buffer = PaneRenderBuffer::default();
+        assert!(!buffer.sync_update_in_progress);
+        assert!(buffer.sync_update_started_at.is_none());
+
+        update_sync_update_state(&mut buffer, b"\x1b[?2026h");
+        assert!(buffer.sync_update_in_progress);
+        assert!(buffer.sync_update_started_at.is_some());
+    }
+
+    #[test]
+    fn sync_update_end_clears_flag() {
+        let mut buffer = PaneRenderBuffer::default();
+        update_sync_update_state(&mut buffer, b"\x1b[?2026h");
+        assert!(buffer.sync_update_in_progress);
+
+        update_sync_update_state(&mut buffer, b"\x1b[?2026l");
+        assert!(!buffer.sync_update_in_progress);
+        assert!(buffer.sync_update_started_at.is_none());
+    }
+
+    #[test]
+    fn sync_update_complete_pair_in_single_chunk() {
+        let mut buffer = PaneRenderBuffer::default();
+        // Begin + content + end in one chunk: flag should be false after.
+        update_sync_update_state(&mut buffer, b"\x1b[?2026h...content...\x1b[?2026l");
+        assert!(!buffer.sync_update_in_progress);
+    }
+
+    #[test]
+    fn sync_update_no_change_on_unrelated_bytes() {
+        let mut buffer = PaneRenderBuffer::default();
+        update_sync_update_state(&mut buffer, b"hello world");
+        assert!(!buffer.sync_update_in_progress);
+        assert!(buffer.sync_update_started_at.is_none());
+
+        // Set it, then feed unrelated bytes — flag should persist.
+        update_sync_update_state(&mut buffer, b"\x1b[?2026h");
+        assert!(buffer.sync_update_in_progress);
+        update_sync_update_state(&mut buffer, b"more output");
+        assert!(buffer.sync_update_in_progress);
+    }
+
+    #[test]
+    fn append_pane_output_tracks_sync_update() {
+        let mut buffer = PaneRenderBuffer::default();
+        append_pane_output(&mut buffer, b"\x1b[?2026hpartial redraw");
+        assert!(buffer.sync_update_in_progress);
+
+        append_pane_output(&mut buffer, b"more content\x1b[?2026l");
+        assert!(!buffer.sync_update_in_progress);
+    }
+
+    #[test]
+    fn sync_deferred_pane_skips_content_render() {
+        let pane_id = Uuid::from_u128(42);
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(43),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![AttachSurface {
+                id: pane_id,
+                kind: AttachSurfaceKind::Pane,
+                layer: SurfaceLayer::Pane,
+                z: 0,
+                rect: AttachRect {
+                    x: 0,
+                    y: 1,
+                    w: 12,
+                    h: 4,
+                },
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+                pane_id: Some(pane_id),
+            }],
+        };
+        let mut pane_buffers = BTreeMap::new();
+        let mut buffer = PaneRenderBuffer::default();
+        buffer.parser.screen_mut().set_size(2, 10);
+        buffer.parser.process(b"hello");
+
+        // Populate prev_rows with an initial render.
+        let mut output1 = Vec::new();
+        pane_buffers.insert(pane_id, buffer);
+        let _ = render_attach_scene(
+            &mut output1,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &BTreeSet::from([pane_id]),
+            true, // full redraw
+            1,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+        )
+        .expect("initial render should succeed");
+        assert!(!output1.is_empty(), "initial render should produce output");
+
+        // Now simulate a sync update in progress: feed partial content and
+        // mark the buffer as mid-sync-update.
+        let entry = pane_buffers.get_mut(&pane_id).unwrap();
+        append_pane_output(entry, b"\x1b[?2026hpartial");
+
+        // Render with the pane dirty but NOT a full redraw.
+        let mut output2 = Vec::new();
+        let _ = render_attach_scene(
+            &mut output2,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &BTreeSet::from([pane_id]),
+            false, // incremental — sync deferral should kick in
+            1,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+        )
+        .expect("deferred render should succeed");
+
+        // The output should NOT contain the partial content "partial" because
+        // the pane was sync-deferred.  It may still contain border characters
+        // from should_draw, but the pane content rows should be skipped.
+        let rendered2 = String::from_utf8(output2).expect("render output should be utf8");
+        assert!(
+            !rendered2.contains("partial"),
+            "sync-deferred render should not contain partial pane content"
+        );
+
+        // Now complete the sync update and re-render.
+        let entry = pane_buffers.get_mut(&pane_id).unwrap();
+        append_pane_output(entry, b" done\x1b[?2026l");
+        assert!(!entry.sync_update_in_progress);
+
+        let mut output3 = Vec::new();
+        let _ = render_attach_scene(
+            &mut output3,
+            &scene,
+            &[],
+            &mut pane_buffers,
+            &BTreeSet::from([pane_id]),
+            false,
+            1,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+        )
+        .expect("completed render should succeed");
+
+        // After the sync update ends, the pane content should be rendered.
+        assert!(
+            !output3.is_empty(),
+            "completed render should produce output"
+        );
     }
 }

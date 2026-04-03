@@ -4704,6 +4704,8 @@ mod tests {
                 parser: vt100::Parser::new(4, 20, 4_096),
                 last_alternate_screen: false,
                 prev_rows: Vec::new(),
+                sync_update_in_progress: false,
+                sync_update_started_at: None,
             }
         });
         append_pane_output(buffer, b"one\r\n  four\r\n     five\r\n  six\r\n\x1b[4;3H");
