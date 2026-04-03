@@ -192,12 +192,18 @@ pub enum Command {
         /// Copy the resulting join link to clipboard
         #[arg(long)]
         copy: bool,
+        /// Run host runtime in the background
+        #[arg(long, conflicts_with_all = ["status", "stop", "restart"])]
+        daemon: bool,
         /// Show hosted-mode runtime status
-        #[arg(long, conflicts_with = "stop")]
+        #[arg(long, conflicts_with_all = ["stop", "restart", "daemon"])]
         status: bool,
         /// Stop hosted-mode runtime if running
-        #[arg(long, conflicts_with = "status")]
+        #[arg(long, conflicts_with_all = ["status", "restart", "daemon"])]
         stop: bool,
+        /// Restart hosted-mode runtime in background
+        #[arg(long, conflicts_with_all = ["status", "stop", "daemon"])]
+        restart: bool,
     },
     /// Join a hosted link/target quickly
     Join {
@@ -1160,8 +1166,10 @@ mod tests {
             listen,
             name,
             copy,
+            daemon,
             status,
             stop,
+            restart,
         }) = cli.command
         else {
             panic!("expected host command");
@@ -1169,8 +1177,10 @@ mod tests {
         assert_eq!(listen, "127.0.0.1:7443");
         assert!(name.is_none());
         assert!(!copy);
+        assert!(!daemon);
         assert!(!status);
         assert!(!stop);
+        assert!(!restart);
     }
 
     #[test]
@@ -1198,6 +1208,24 @@ mod tests {
             panic!("expected host command");
         };
         assert!(stop);
+    }
+
+    #[test]
+    fn parses_host_daemon_flag() {
+        let cli = Cli::try_parse_from(["bmux", "host", "--daemon"]).expect("valid CLI args");
+        let Some(Command::Host { daemon, .. }) = cli.command else {
+            panic!("expected host command");
+        };
+        assert!(daemon);
+    }
+
+    #[test]
+    fn parses_host_restart_flag() {
+        let cli = Cli::try_parse_from(["bmux", "host", "--restart"]).expect("valid CLI args");
+        let Some(Command::Host { restart, .. }) = cli.command else {
+            panic!("expected host command");
+        };
+        assert!(restart);
     }
 
     #[test]

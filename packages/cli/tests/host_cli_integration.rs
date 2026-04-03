@@ -40,8 +40,9 @@ fn host_status_prints_runtime_state_from_file() {
     std::fs::create_dir_all(&config_dir).expect("create config dir");
     std::fs::create_dir_all(&data_dir).expect("create data dir");
 
+    let current_pid = std::process::id();
     let host_state = serde_json::json!({
-        "pid": 9001,
+        "pid": current_pid,
         "target": "iroh://endpoint-123",
         "share_link": "bmux://demo-host",
         "name": "demo-host",
@@ -71,7 +72,7 @@ fn host_status_prints_runtime_state_from_file() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("host runtime: running"));
     assert!(stdout.contains("name: demo-host"));
-    assert!(stdout.contains("pid: 9001"));
+    assert!(stdout.contains(&format!("pid: {current_pid}")));
     assert!(stdout.contains("target: iroh://endpoint-123"));
     assert!(stdout.contains("share link: bmux://demo-host"));
     assert!(stdout.contains("started_at_unix: 1700000123"));

@@ -353,7 +353,17 @@ pub(super) async fn run_setup() -> Result<u8> {
     println!("Step 1/2: auth");
     let _ = ensure_authenticated(&BmuxConfig::load()?).await?;
     println!("Step 2/2: host");
-    let code = run_host("127.0.0.1:7443", None, false, false, false, true).await?;
+    let code = run_host(
+        "127.0.0.1:7443",
+        None,
+        false,
+        false,
+        false,
+        false,
+        false,
+        true,
+    )
+    .await?;
     println!("Setup complete.");
     Ok(code)
 }
@@ -362,12 +372,21 @@ pub(super) async fn run_host(
     listen: &str,
     name: Option<&str>,
     copy: bool,
+    daemon: bool,
     status: bool,
     stop: bool,
+    restart: bool,
     setup_summary: bool,
 ) -> Result<u8> {
     if status && stop {
         anyhow::bail!("--status and --stop cannot be used together")
+    }
+    if restart {
+        let _ = run_host_stop()?;
+        return spawn_host_daemon(listen, name);
+    }
+    if daemon {
+        return spawn_host_daemon(listen, name);
     }
     if status {
         return run_host_status();
@@ -961,6 +980,11 @@ fn run_host_status() -> Result<u8> {
         println!("host runtime is not running");
         return Ok(1);
     };
+    if !is_process_alive(state.pid) {
+        clear_host_runtime_state(&paths)?;
+        println!("host runtime is not running");
+        return Ok(1);
+    }
     for line in format_host_status_lines(&state) {
         println!("{line}");
     }
@@ -988,6 +1012,12 @@ fn run_host_stop() -> Result<u8> {
         return Ok(0);
     };
 
+    if !is_process_alive(state.pid) {
+        clear_host_runtime_state(&paths)?;
+        println!("host runtime is not running");
+        return Ok(0);
+    }
+
     #[cfg(unix)]
     {
         let status = std::process::Command::new("kill")
@@ -1012,6 +1042,50 @@ fn run_host_stop() -> Result<u8> {
     clear_host_runtime_state(&paths)?;
     println!("stopped host runtime (pid {})", state.pid);
     Ok(0)
+}
+
+fn spawn_host_daemon(listen: &str, name: Option<&str>) -> Result<u8> {
+    let paths = ConfigPaths::default();
+    if let Some(state) = load_host_runtime_state(&paths)?
+        && is_process_alive(state.pid)
+    {
+        println!("host runtime already running (pid {})", state.pid);
+        return Ok(0);
+    }
+
+    let current_exe = std::env::current_exe().context("failed resolving current executable")?;
+    let mut command = std::process::Command::new(current_exe);
+    command.args(["host", "--listen", listen]);
+    if let Some(value) = name {
+        command.args(["--name", value]);
+    }
+    command.stdin(std::process::Stdio::null());
+    command.stdout(std::process::Stdio::null());
+    command.stderr(std::process::Stdio::null());
+    let child = command.spawn().context("failed starting host daemon")?;
+    println!("host runtime started in background (pid {})", child.id());
+    println!("check status: bmux host --status");
+    Ok(0)
+}
+
+fn is_process_alive(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        return std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success());
+    }
+    #[cfg(windows)]
+    {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}")])
+            .output()
+            .is_ok_and(|output| {
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout).contains(&pid.to_string())
+            })
+    }
 }
 
 fn load_auth_state_optional(paths: &ConfigPaths) -> Result<Option<AuthState>> {
@@ -2893,6 +2967,65 @@ mod tests {
 
         let code = run_host_stop().expect("run host stop");
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    fn is_process_alive_returns_true_for_current_process() {
+        assert!(is_process_alive(std::process::id()));
+    }
+
+    #[test]
+    #[serial]
+    fn host_status_clears_stale_runtime_state() {
+        let runtime_dir = TempDirGuard::new("host-status-stale");
+        let _runtime_guard = EnvVarGuard::set("BMUX_RUNTIME_DIR", runtime_dir.path());
+        let paths = ConfigPaths::default();
+        save_host_runtime_state(
+            &paths,
+            &HostRuntimeState {
+                pid: 999_999,
+                target: "iroh://stale".to_string(),
+                share_link: Some("bmux://stale".to_string()),
+                name: Some("stale".to_string()),
+                started_at_unix: 1,
+            },
+        )
+        .expect("save stale state");
+
+        let code = run_host_status().expect("run status");
+        assert_eq!(code, 1);
+        assert!(
+            load_host_runtime_state(&paths)
+                .expect("load state")
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn host_stop_clears_stale_runtime_state() {
+        let runtime_dir = TempDirGuard::new("host-stop-stale");
+        let _runtime_guard = EnvVarGuard::set("BMUX_RUNTIME_DIR", runtime_dir.path());
+        let paths = ConfigPaths::default();
+        save_host_runtime_state(
+            &paths,
+            &HostRuntimeState {
+                pid: 999_999,
+                target: "iroh://stale".to_string(),
+                share_link: Some("bmux://stale".to_string()),
+                name: Some("stale".to_string()),
+                started_at_unix: 1,
+            },
+        )
+        .expect("save stale state");
+
+        let code = run_host_stop().expect("run stop");
+        assert_eq!(code, 0);
+        assert!(
+            load_host_runtime_state(&paths)
+                .expect("load state")
+                .is_none()
+        );
     }
 
     #[test]
