@@ -3863,16 +3863,31 @@ pub(crate) async fn maybe_forward_attach_mouse_event(
         return Ok(false);
     }
 
-    let Some(protocol) = attach_pane_mouse_protocol(view_state, target_pane) else {
-        return Ok(false);
-    };
-
-    let Some(bytes) = encode_attach_mouse_for_protocol(mouse_event, protocol) else {
+    let Some(bytes) = attach_mouse_forward_bytes_for_target(
+        view_state,
+        mouse_event,
+        Some(target_pane),
+        in_focused_pane || focus_before_forward,
+    ) else {
         return Ok(false);
     };
 
     let _ = client.attach_input(view_state.attached_id, bytes).await?;
     Ok(true)
+}
+
+pub(crate) fn attach_mouse_forward_bytes_for_target(
+    view_state: &AttachViewState,
+    mouse_event: MouseEvent,
+    target_pane: Option<Uuid>,
+    in_focused_pane: bool,
+) -> Option<Vec<u8>> {
+    if !in_focused_pane {
+        return None;
+    }
+    let target_pane = target_pane?;
+    let protocol = attach_pane_mouse_protocol(view_state, target_pane)?;
+    encode_attach_mouse_for_protocol(mouse_event, protocol)
 }
 
 pub(crate) fn encode_attach_mouse_sgr(mouse_event: MouseEvent) -> Option<Vec<u8>> {
@@ -4777,6 +4792,65 @@ mod tests {
         .expect("utf8-encoded mouse event");
 
         assert_eq!(encoded, vec![0x1b, b'[', b'M', 32, 0xC4, 0x80, 33]);
+    }
+
+    #[test]
+    fn attach_loop_mouse_moved_without_pane_mouse_mode_does_not_forward_bytes() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        let mut processor =
+            InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
+        let event = CrosstermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 2,
+            row: 2,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        let actions = crate::runtime::attach_event_actions(
+            &event,
+            &mut processor,
+            crate::runtime::AttachUiMode::Normal,
+        )
+        .expect("mouse event should map through attach loop");
+        let mouse_event = match actions.as_slice() {
+            [crate::runtime::AttachEventAction::Mouse(mouse)] => *mouse,
+            _ => panic!("unexpected attach actions for mouse event"),
+        };
+
+        let target_pane =
+            crate::runtime::attach_scene_pane_at(&view_state, mouse_event.column, mouse_event.row);
+        let focused_pane = view_state
+            .cached_layout_state
+            .as_ref()
+            .map(|layout| layout.focused_pane_id);
+        let in_focused_pane = target_pane.is_some() && target_pane == focused_pane;
+
+        let forwarded = crate::runtime::attach_mouse_forward_bytes_for_target(
+            &view_state,
+            mouse_event,
+            target_pane,
+            in_focused_pane,
+        );
+        assert!(
+            forwarded.is_none(),
+            "mouse move should not forward when pane mouse mode is disabled"
+        );
+
+        let pane_id = crate::runtime::focused_attach_pane_id(&view_state).expect("focused pane id");
+        let buffer = view_state
+            .pane_buffers
+            .get_mut(&pane_id)
+            .expect("pane render buffer");
+        append_pane_output(buffer, b"\x1b[?1003h\x1b[?1006h");
+
+        let forwarded = crate::runtime::attach_mouse_forward_bytes_for_target(
+            &view_state,
+            mouse_event,
+            target_pane,
+            in_focused_pane,
+        )
+        .expect("mouse move should forward once pane enables any-motion mode");
+        assert_eq!(forwarded, b"\x1b[<35;3;3M".to_vec());
     }
 
     #[test]
