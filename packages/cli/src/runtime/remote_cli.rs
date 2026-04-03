@@ -123,6 +123,15 @@ struct RegisterHostRequest {
     target: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HostRuntimeState {
+    pid: u32,
+    target: String,
+    share_link: Option<String>,
+    name: Option<String>,
+    started_at_unix: i64,
+}
+
 #[derive(Debug)]
 struct SshBridgeStream {
     _child: Child,
@@ -342,10 +351,22 @@ pub(super) async fn run_setup() -> Result<u8> {
     println!("Step 1/2: auth");
     let _ = ensure_authenticated(&BmuxConfig::load()?).await?;
     println!("Step 2/2: host");
-    run_host("127.0.0.1:7443", None, false).await
+    run_host("127.0.0.1:7443", None, false, false, false).await
 }
 
-pub(super) async fn run_host(listen: &str, name: Option<&str>, copy: bool) -> Result<u8> {
+pub(super) async fn run_host(
+    listen: &str,
+    name: Option<&str>,
+    copy: bool,
+    status: bool,
+    stop: bool,
+) -> Result<u8> {
+    if status {
+        return run_host_status();
+    }
+    if stop {
+        return run_host_stop();
+    }
     let mut config = BmuxConfig::load()?;
     let control_plane_url = control_plane_url(&config);
     let auth_state = ensure_authenticated(&config).await?;
@@ -396,6 +417,24 @@ pub(super) async fn run_host(listen: &str, name: Option<&str>, copy: bool) -> Re
         .as_ref()
         .map(|value| format!("bmux://{value}"))
         .unwrap_or_else(|| target.clone());
+
+    let host_name = name
+        .map(ToString::to_string)
+        .or_else(|| auth_state.account_name.clone())
+        .unwrap_or_else(|| "host".to_string());
+    save_host_runtime_state(
+        &ConfigPaths::default(),
+        &HostRuntimeState {
+            pid: std::process::id(),
+            target: target.clone(),
+            share_link: resolved_share
+                .as_ref()
+                .map(|value| format!("bmux://{value}")),
+            name: Some(host_name.clone()),
+            started_at_unix: current_unix_timestamp(),
+        },
+    )?;
+
     if copy {
         match crate::runtime::attach::runtime::copy_text_with_clipboard_plugin(&join_link) {
             Ok(()) => println!("copied to clipboard: {join_link}"),
@@ -407,6 +446,7 @@ pub(super) async fn run_host(listen: &str, name: Option<&str>, copy: bool) -> Re
     }
 
     println!("bmux iroh gateway online");
+    println!("Host online: {host_name}");
     if listen != "127.0.0.1:7443" {
         println!("note: --listen is ignored for iroh host mode ({listen})");
     }
@@ -470,13 +510,18 @@ pub(super) async fn run_host(listen: &str, name: Option<&str>, copy: bool) -> Re
             }
         });
     }
+    let _ = clear_host_runtime_state(&ConfigPaths::default());
     Ok(0)
 }
 
 pub(super) async fn run_join(link: Option<&str>, session: Option<&str>) -> Result<u8> {
     let config = BmuxConfig::load()?;
     let target = if let Some(link) = link {
-        normalize_join_target_input(link)?
+        let normalized = normalize_join_target_input(link)?;
+        if normalized != link.trim() {
+            println!("Resolved invite: {normalized}");
+        }
+        normalized
     } else {
         choose_default_target_interactively(&config)?
     };
@@ -488,6 +533,7 @@ pub(super) async fn run_join(link: Option<&str>, session: Option<&str>) -> Resul
             .and_then(|values| values.first())
             .map(String::as_str)
     });
+    println!("Connecting...");
     run_connect(Some(&target), resumed_session, None, false, true).await
 }
 
@@ -635,13 +681,13 @@ pub(super) async fn run_share(
     let created = create_share_link(
         &control_plane_url,
         &auth_state.access_token,
-        &CreateShareRequest {
-            name: slug.clone(),
-            target: resolved_target.clone(),
-            role: role.to_string(),
-            ttl: ttl.map(ToString::to_string),
+        &build_create_share_request(
+            slug.clone(),
+            resolved_target.clone(),
+            role.to_string(),
+            ttl.map(ToString::to_string),
             one_time,
-        },
+        ),
     )
     .await?;
 
@@ -729,6 +775,120 @@ fn control_plane_url(config: &BmuxConfig) -> String {
 
 fn auth_state_path(paths: &ConfigPaths) -> PathBuf {
     paths.runtime_dir.join("auth-state.json")
+}
+
+fn host_runtime_state_path(paths: &ConfigPaths) -> PathBuf {
+    paths.runtime_dir.join("host-state.json")
+}
+
+fn save_host_runtime_state(paths: &ConfigPaths, state: &HostRuntimeState) -> Result<()> {
+    std::fs::create_dir_all(&paths.runtime_dir).with_context(|| {
+        format!(
+            "failed creating runtime dir {}",
+            paths.runtime_dir.display()
+        )
+    })?;
+    let path = host_runtime_state_path(paths);
+    let encoded =
+        serde_json::to_string_pretty(state).context("failed serializing host runtime state")?;
+    std::fs::write(&path, encoded).with_context(|| format!("failed writing {}", path.display()))
+}
+
+fn load_host_runtime_state(paths: &ConfigPaths) -> Result<Option<HostRuntimeState>> {
+    let path = host_runtime_state_path(paths);
+    match std::fs::read_to_string(&path) {
+        Ok(content) => {
+            let state = serde_json::from_str::<HostRuntimeState>(&content)
+                .with_context(|| format!("failed parsing host runtime state {}", path.display()))?;
+            Ok(Some(state))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error).with_context(|| format!("failed reading {}", path.display())),
+    }
+}
+
+fn clear_host_runtime_state(paths: &ConfigPaths) -> Result<()> {
+    let path = host_runtime_state_path(paths);
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).with_context(|| format!("failed removing {}", path.display())),
+    }
+}
+
+fn current_unix_timestamp() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|value| value.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+fn build_create_share_request(
+    name: String,
+    target: String,
+    role: String,
+    ttl: Option<String>,
+    one_time: bool,
+) -> CreateShareRequest {
+    CreateShareRequest {
+        name,
+        target,
+        role,
+        ttl,
+        one_time,
+    }
+}
+
+fn run_host_status() -> Result<u8> {
+    let paths = ConfigPaths::default();
+    let Some(state) = load_host_runtime_state(&paths)? else {
+        println!("host runtime is not running");
+        return Ok(1);
+    };
+    println!("host runtime: running");
+    if let Some(name) = state.name.as_deref() {
+        println!("name: {name}");
+    }
+    println!("pid: {}", state.pid);
+    println!("target: {}", state.target);
+    if let Some(link) = state.share_link.as_deref() {
+        println!("share link: {link}");
+    }
+    println!("started_at_unix: {}", state.started_at_unix);
+    Ok(0)
+}
+
+fn run_host_stop() -> Result<u8> {
+    let paths = ConfigPaths::default();
+    let Some(state) = load_host_runtime_state(&paths)? else {
+        println!("host runtime is not running");
+        return Ok(0);
+    };
+
+    #[cfg(unix)]
+    {
+        let status = std::process::Command::new("kill")
+            .args(["-TERM", &state.pid.to_string()])
+            .status()
+            .context("failed running kill")?;
+        if !status.success() {
+            anyhow::bail!("failed stopping host runtime pid {}", state.pid);
+        }
+    }
+    #[cfg(windows)]
+    {
+        let status = std::process::Command::new("taskkill")
+            .args(["/PID", &state.pid.to_string(), "/T", "/F"])
+            .status()
+            .context("failed running taskkill")?;
+        if !status.success() {
+            anyhow::bail!("failed stopping host runtime pid {}", state.pid);
+        }
+    }
+
+    clear_host_runtime_state(&paths)?;
+    println!("stopped host runtime (pid {})", state.pid);
+    Ok(0)
 }
 
 fn load_auth_state_optional(paths: &ConfigPaths) -> Result<Option<AuthState>> {
@@ -819,13 +979,13 @@ async fn ensure_host_share_link(
     let created = create_share_link(
         control_plane_url,
         token,
-        &CreateShareRequest {
-            name: name.to_string(),
-            target: target.to_string(),
-            role: "control".to_string(),
-            ttl: None,
-            one_time: false,
-        },
+        &build_create_share_request(
+            name.to_string(),
+            target.to_string(),
+            "control".to_string(),
+            None,
+            false,
+        ),
     )
     .await?;
     let resolved_name = created.name.unwrap_or_else(|| name.to_string());
@@ -2684,6 +2844,32 @@ mod tests {
         let normalized = normalize_join_target_input("Invite code: (bmux://demo-host), join now")
             .expect("normalize link");
         assert_eq!(normalized, "bmux://demo-host");
+    }
+
+    #[test]
+    fn build_create_share_request_keeps_ttl_and_one_time() {
+        let request = build_create_share_request(
+            "demo".to_string(),
+            "iroh://host".to_string(),
+            "view".to_string(),
+            Some("24h".to_string()),
+            true,
+        );
+        assert_eq!(request.ttl.as_deref(), Some("24h"));
+        assert!(request.one_time);
+    }
+
+    #[test]
+    fn build_create_share_request_allows_unbounded_reusable_link() {
+        let request = build_create_share_request(
+            "demo".to_string(),
+            "iroh://host".to_string(),
+            "control".to_string(),
+            None,
+            false,
+        );
+        assert!(request.ttl.is_none());
+        assert!(!request.one_time);
     }
 
     #[test]

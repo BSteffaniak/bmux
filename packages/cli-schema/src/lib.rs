@@ -192,6 +192,12 @@ pub enum Command {
         /// Copy the resulting join link to clipboard
         #[arg(long)]
         copy: bool,
+        /// Show hosted-mode runtime status
+        #[arg(long)]
+        status: bool,
+        /// Stop hosted-mode runtime if running
+        #[arg(long)]
+        stop: bool,
     },
     /// Join a hosted link/target quickly
     Join {
@@ -1142,12 +1148,21 @@ mod tests {
     #[test]
     fn parses_host_command_defaults() {
         let cli = Cli::try_parse_from(["bmux", "host"]).expect("valid CLI args");
-        let Some(Command::Host { listen, name, copy }) = cli.command else {
+        let Some(Command::Host {
+            listen,
+            name,
+            copy,
+            status,
+            stop,
+        }) = cli.command
+        else {
             panic!("expected host command");
         };
         assert_eq!(listen, "127.0.0.1:7443");
         assert!(name.is_none());
         assert!(!copy);
+        assert!(!status);
+        assert!(!stop);
     }
 
     #[test]
@@ -1157,6 +1172,24 @@ mod tests {
             panic!("expected host command");
         };
         assert!(copy);
+    }
+
+    #[test]
+    fn parses_host_status_flag() {
+        let cli = Cli::try_parse_from(["bmux", "host", "--status"]).expect("valid CLI args");
+        let Some(Command::Host { status, .. }) = cli.command else {
+            panic!("expected host command");
+        };
+        assert!(status);
+    }
+
+    #[test]
+    fn parses_host_stop_flag() {
+        let cli = Cli::try_parse_from(["bmux", "host", "--stop"]).expect("valid CLI args");
+        let Some(Command::Host { stop, .. }) = cli.command else {
+            panic!("expected host command");
+        };
+        assert!(stop);
     }
 
     #[test]

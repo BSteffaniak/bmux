@@ -124,9 +124,16 @@ pub(super) async fn dispatch_built_in_command(
     let _descriptor = built_in_command_by_handler(handler);
     match (handler, command) {
         (BuiltInHandlerId::Setup, Command::Setup) => run_setup().await,
-        (BuiltInHandlerId::Host, Command::Host { listen, name, copy }) => {
-            run_host(listen, name.as_deref(), *copy).await
-        }
+        (
+            BuiltInHandlerId::Host,
+            Command::Host {
+                listen,
+                name,
+                copy,
+                status,
+                stop,
+            },
+        ) => run_host(listen, name.as_deref(), *copy, *status, *stop).await,
         (BuiltInHandlerId::Join, Command::Join { link, session }) => {
             run_join(link.as_deref(), session.as_deref()).await
         }
