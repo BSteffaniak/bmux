@@ -854,17 +854,24 @@ fn run_host_status() -> Result<u8> {
         println!("host runtime is not running");
         return Ok(1);
     };
-    println!("host runtime: running");
-    if let Some(name) = state.name.as_deref() {
-        println!("name: {name}");
+    for line in format_host_status_lines(&state) {
+        println!("{line}");
     }
-    println!("pid: {}", state.pid);
-    println!("target: {}", state.target);
-    if let Some(link) = state.share_link.as_deref() {
-        println!("share link: {link}");
-    }
-    println!("started_at_unix: {}", state.started_at_unix);
     Ok(0)
+}
+
+fn format_host_status_lines(state: &HostRuntimeState) -> Vec<String> {
+    let mut lines = vec!["host runtime: running".to_string()];
+    if let Some(name) = state.name.as_deref() {
+        lines.push(format!("name: {name}"));
+    }
+    lines.push(format!("pid: {}", state.pid));
+    lines.push(format!("target: {}", state.target));
+    if let Some(link) = state.share_link.as_deref() {
+        lines.push(format!("share link: {link}"));
+    }
+    lines.push(format!("started_at_unix: {}", state.started_at_unix));
+    lines
 }
 
 fn run_host_stop() -> Result<u8> {
@@ -2779,6 +2786,39 @@ mod tests {
 
         let code = run_host_stop().expect("run host stop");
         assert_eq!(code, 0);
+    }
+
+    #[test]
+    #[serial]
+    fn host_status_output_matches_state_file_fields() {
+        let runtime_dir = TempDirGuard::new("host-status-output");
+        let _runtime_guard = EnvVarGuard::set("BMUX_RUNTIME_DIR", runtime_dir.path());
+
+        let paths = ConfigPaths::default();
+        let state = HostRuntimeState {
+            pid: 9001,
+            target: "iroh://endpoint-123".to_string(),
+            share_link: Some("bmux://demo-host".to_string()),
+            name: Some("demo-host".to_string()),
+            started_at_unix: 1_700_000_123,
+        };
+        save_host_runtime_state(&paths, &state).expect("save host runtime state");
+
+        let loaded = load_host_runtime_state(&paths)
+            .expect("load host runtime state")
+            .expect("state present");
+        let lines = format_host_status_lines(&loaded);
+        assert_eq!(
+            lines,
+            vec![
+                "host runtime: running".to_string(),
+                "name: demo-host".to_string(),
+                "pid: 9001".to_string(),
+                "target: iroh://endpoint-123".to_string(),
+                "share link: bmux://demo-host".to_string(),
+                "started_at_unix: 1700000123".to_string(),
+            ]
+        );
     }
 
     fn sample_target() -> SshTarget {
