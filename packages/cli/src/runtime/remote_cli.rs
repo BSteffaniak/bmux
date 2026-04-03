@@ -123,7 +123,7 @@ struct RegisterHostRequest {
     target: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct HostRuntimeState {
     pid: u32,
     target: String,
@@ -2733,6 +2733,52 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.path);
         }
+    }
+
+    #[test]
+    #[serial]
+    fn host_runtime_state_round_trips_and_clears() {
+        let runtime_dir = TempDirGuard::new("host-state-roundtrip");
+        let _runtime_guard = EnvVarGuard::set("BMUX_RUNTIME_DIR", runtime_dir.path());
+
+        let paths = ConfigPaths::default();
+        let expected = HostRuntimeState {
+            pid: 4242,
+            target: "iroh://endpoint".to_string(),
+            share_link: Some("bmux://demo".to_string()),
+            name: Some("demo-host".to_string()),
+            started_at_unix: 1_700_000_000,
+        };
+
+        save_host_runtime_state(&paths, &expected).expect("save host state");
+        let loaded = load_host_runtime_state(&paths)
+            .expect("load host state")
+            .expect("host state present");
+        assert_eq!(loaded, expected);
+
+        clear_host_runtime_state(&paths).expect("clear host state");
+        let cleared = load_host_runtime_state(&paths).expect("load after clear");
+        assert!(cleared.is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn host_status_returns_not_running_without_state() {
+        let runtime_dir = TempDirGuard::new("host-status-empty");
+        let _runtime_guard = EnvVarGuard::set("BMUX_RUNTIME_DIR", runtime_dir.path());
+
+        let code = run_host_status().expect("run host status");
+        assert_eq!(code, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn host_stop_is_noop_without_state() {
+        let runtime_dir = TempDirGuard::new("host-stop-empty");
+        let _runtime_guard = EnvVarGuard::set("BMUX_RUNTIME_DIR", runtime_dir.path());
+
+        let code = run_host_stop().expect("run host stop");
+        assert_eq!(code, 0);
     }
 
     fn sample_target() -> SshTarget {
