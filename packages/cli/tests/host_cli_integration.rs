@@ -76,3 +76,26 @@ fn host_status_prints_runtime_state_from_file() {
     assert!(stdout.contains("share link: bmux://demo-host"));
     assert!(stdout.contains("started_at_unix: 1700000123"));
 }
+
+#[test]
+fn host_status_without_state_returns_not_running_message() {
+    let root = TempDirGuard::new("status-empty");
+    let runtime_dir = root.path().join("runtime");
+    let config_dir = root.path().join("config");
+    let data_dir = root.path().join("data");
+    std::fs::create_dir_all(&runtime_dir).expect("create runtime dir");
+    std::fs::create_dir_all(&config_dir).expect("create config dir");
+    std::fs::create_dir_all(&data_dir).expect("create data dir");
+
+    let output = Command::new(bmux_binary())
+        .args(["host", "--status"])
+        .env("BMUX_RUNTIME_DIR", &runtime_dir)
+        .env("BMUX_CONFIG_DIR", &config_dir)
+        .env("BMUX_DATA_DIR", &data_dir)
+        .output()
+        .expect("run bmux host --status");
+
+    assert_eq!(output.status.code(), Some(1));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("host runtime is not running"));
+}
