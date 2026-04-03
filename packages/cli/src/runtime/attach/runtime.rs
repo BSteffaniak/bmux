@@ -3575,6 +3575,13 @@ pub(crate) async fn handle_attach_mouse_event(
         return Ok(());
     }
 
+    let target_pane = attach_scene_pane_at(view_state, mouse_event.column, mouse_event.row);
+    let focused_pane = view_state
+        .cached_layout_state
+        .as_ref()
+        .map(|layout| layout.focused_pane_id);
+    let in_focused_pane = target_pane.is_some() && target_pane == focused_pane;
+
     if matches!(mouse_event.kind, MouseEventKind::ScrollUp)
         && handle_attach_mouse_gesture_action(client, view_state, "scroll_up").await?
     {
@@ -3586,57 +3593,229 @@ pub(crate) async fn handle_attach_mouse_event(
         return Ok(());
     }
 
-    if handle_attach_mouse_scrollback(view_state, mouse_event.kind) {
-        return Ok(());
+    if matches!(
+        mouse_event.kind,
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+    ) {
+        match view_state.mouse.config.effective_wheel_propagation() {
+            bmux_config::MouseWheelPropagation::ForwardOnly => {
+                let _ = maybe_forward_attach_mouse_event(
+                    client,
+                    view_state,
+                    mouse_event,
+                    target_pane,
+                    in_focused_pane,
+                    false,
+                )
+                .await?;
+                return Ok(());
+            }
+            bmux_config::MouseWheelPropagation::ScrollbackOnly => {
+                let _ = handle_attach_mouse_scrollback(view_state, mouse_event.kind);
+                return Ok(());
+            }
+            bmux_config::MouseWheelPropagation::ForwardAndScrollback => {
+                let _ = maybe_forward_attach_mouse_event(
+                    client,
+                    view_state,
+                    mouse_event,
+                    target_pane,
+                    in_focused_pane,
+                    false,
+                )
+                .await?;
+                let _ = handle_attach_mouse_scrollback(view_state, mouse_event.kind);
+                return Ok(());
+            }
+        }
     }
 
     match mouse_event.kind {
-        MouseEventKind::Down(MouseButton::Left) if view_state.mouse.config.focus_on_click => {
-            let target = attach_scene_pane_at(view_state, mouse_event.column, mouse_event.row);
+        MouseEventKind::Down(MouseButton::Left) => {
+            let target = target_pane;
             view_state.mouse.hovered_pane_id = target;
             view_state.mouse.hover_started_at = Some(Instant::now());
-            if let Some(pane_id) = target {
-                if !handle_attach_mouse_gesture_action(client, view_state, "click_left").await? {
-                    focus_attach_pane(client, view_state, pane_id).await?;
+            if !handle_attach_mouse_gesture_action(client, view_state, "click_left").await? {
+                match view_state.mouse.config.effective_click_propagation() {
+                    bmux_config::MouseClickPropagation::FocusOnly => {
+                        if let Some(pane_id) = target {
+                            focus_attach_pane(client, view_state, pane_id).await?;
+                        }
+                    }
+                    bmux_config::MouseClickPropagation::ForwardOnly => {
+                        let _ = maybe_forward_attach_mouse_event(
+                            client,
+                            view_state,
+                            mouse_event,
+                            target,
+                            in_focused_pane,
+                            false,
+                        )
+                        .await?;
+                    }
+                    bmux_config::MouseClickPropagation::FocusAndForward => {
+                        let _ = maybe_forward_attach_mouse_event(
+                            client,
+                            view_state,
+                            mouse_event,
+                            target,
+                            in_focused_pane,
+                            true,
+                        )
+                        .await?;
+                    }
                 }
             }
         }
-        MouseEventKind::Moved if view_state.mouse.config.focus_on_hover => {
-            let now = Instant::now();
-            let target = attach_scene_pane_at(view_state, mouse_event.column, mouse_event.row);
-            if target != view_state.mouse.hovered_pane_id {
-                view_state.mouse.hovered_pane_id = target;
-                view_state.mouse.hover_started_at = Some(now);
-                return Ok(());
-            }
-
-            let Some(pane_id) = target else {
-                view_state.mouse.hover_started_at = None;
-                return Ok(());
-            };
-
-            if view_state.mouse.last_focused_pane_id == Some(pane_id) {
-                return Ok(());
-            }
-
-            let Some(hover_started_at) = view_state.mouse.hover_started_at else {
-                view_state.mouse.hover_started_at = Some(now);
-                return Ok(());
-            };
-
-            if now.duration_since(hover_started_at)
-                >= Duration::from_millis(view_state.mouse.config.hover_delay_ms)
-            {
-                if !handle_attach_mouse_gesture_action(client, view_state, "hover_focus").await? {
-                    focus_attach_pane(client, view_state, pane_id).await?;
-                }
-                view_state.mouse.hover_started_at = Some(now);
+        MouseEventKind::Down(_) | MouseEventKind::Up(_) | MouseEventKind::Drag(_) => {
+            if should_forward_click_like_mouse(view_state) {
+                let _ = maybe_forward_attach_mouse_event(
+                    client,
+                    view_state,
+                    mouse_event,
+                    target_pane,
+                    in_focused_pane,
+                    false,
+                )
+                .await?;
             }
         }
-        _ => {}
+        MouseEventKind::Moved => {
+            let _ = maybe_forward_attach_mouse_event(
+                client,
+                view_state,
+                mouse_event,
+                target_pane,
+                in_focused_pane,
+                false,
+            )
+            .await?;
+
+            if view_state.mouse.config.focus_on_hover {
+                let now = Instant::now();
+                let target = target_pane;
+                if target != view_state.mouse.hovered_pane_id {
+                    view_state.mouse.hovered_pane_id = target;
+                    view_state.mouse.hover_started_at = Some(now);
+                    return Ok(());
+                }
+
+                let Some(pane_id) = target else {
+                    view_state.mouse.hover_started_at = None;
+                    return Ok(());
+                };
+
+                if view_state.mouse.last_focused_pane_id == Some(pane_id) {
+                    return Ok(());
+                }
+
+                let Some(hover_started_at) = view_state.mouse.hover_started_at else {
+                    view_state.mouse.hover_started_at = Some(now);
+                    return Ok(());
+                };
+
+                if now.duration_since(hover_started_at)
+                    >= Duration::from_millis(view_state.mouse.config.hover_delay_ms)
+                {
+                    if !handle_attach_mouse_gesture_action(client, view_state, "hover_focus")
+                        .await?
+                    {
+                        focus_attach_pane(client, view_state, pane_id).await?;
+                    }
+                    view_state.mouse.hover_started_at = Some(now);
+                }
+            }
+        }
+        MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight => {
+            let _ = maybe_forward_attach_mouse_event(
+                client,
+                view_state,
+                mouse_event,
+                target_pane,
+                in_focused_pane,
+                false,
+            )
+            .await?;
+        }
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {}
     }
 
     Ok(())
+}
+
+pub(crate) fn should_forward_click_like_mouse(view_state: &AttachViewState) -> bool {
+    !matches!(
+        view_state.mouse.config.effective_click_propagation(),
+        bmux_config::MouseClickPropagation::FocusOnly
+    )
+}
+
+pub(crate) async fn maybe_forward_attach_mouse_event(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    mouse_event: MouseEvent,
+    target_pane: Option<Uuid>,
+    in_focused_pane: bool,
+    focus_before_forward: bool,
+) -> std::result::Result<bool, ClientError> {
+    if target_pane.is_none() {
+        return Ok(false);
+    }
+    if focus_before_forward
+        && let Some(pane_id) = target_pane
+        && !in_focused_pane
+    {
+        focus_attach_pane(client, view_state, pane_id).await?;
+    } else if !in_focused_pane {
+        return Ok(false);
+    }
+
+    let Some(bytes) = encode_attach_mouse_sgr(mouse_event) else {
+        return Ok(false);
+    };
+    let _ = client.attach_input(view_state.attached_id, bytes).await?;
+    Ok(true)
+}
+
+pub(crate) fn encode_attach_mouse_sgr(mouse_event: MouseEvent) -> Option<Vec<u8>> {
+    let (cb, suffix) = encode_attach_mouse_sgr_cb(mouse_event.kind, mouse_event.modifiers)?;
+    let x = mouse_event.column.saturating_add(1);
+    let y = mouse_event.row.saturating_add(1);
+    Some(format!("\x1b[<{cb};{x};{y}{suffix}").into_bytes())
+}
+
+pub(crate) fn encode_attach_mouse_sgr_cb(
+    kind: MouseEventKind,
+    modifiers: KeyModifiers,
+) -> Option<(u16, char)> {
+    let mut cb: u16 = if modifiers.contains(KeyModifiers::SHIFT) {
+        4
+    } else {
+        0
+    };
+    if modifiers.contains(KeyModifiers::ALT) {
+        cb += 8;
+    }
+    if modifiers.contains(KeyModifiers::CONTROL) {
+        cb += 16;
+    }
+
+    match kind {
+        MouseEventKind::Down(MouseButton::Left) => Some((cb, 'M')),
+        MouseEventKind::Down(MouseButton::Middle) => Some((cb + 1, 'M')),
+        MouseEventKind::Down(MouseButton::Right) => Some((cb + 2, 'M')),
+        MouseEventKind::Up(MouseButton::Left)
+        | MouseEventKind::Up(MouseButton::Middle)
+        | MouseEventKind::Up(MouseButton::Right) => Some((cb, 'm')),
+        MouseEventKind::Drag(MouseButton::Left) => Some((cb + 32, 'M')),
+        MouseEventKind::Drag(MouseButton::Middle) => Some((cb + 33, 'M')),
+        MouseEventKind::Drag(MouseButton::Right) => Some((cb + 34, 'M')),
+        MouseEventKind::Moved => Some((cb + 35, 'M')),
+        MouseEventKind::ScrollUp => Some((cb + 64, 'M')),
+        MouseEventKind::ScrollDown => Some((cb + 65, 'M')),
+        MouseEventKind::ScrollLeft => Some((cb + 66, 'M')),
+        MouseEventKind::ScrollRight => Some((cb + 67, 'M')),
+    }
 }
 
 pub(crate) async fn handle_attach_status_tab_click(
@@ -4040,7 +4219,7 @@ mod tests {
     use crate::runtime::attach::state::AttachViewState;
     use crate::runtime::*;
     use bmux_client::{AttachLayoutState, AttachOpenInfo};
-    use bmux_config::BmuxConfig;
+    use bmux_config::{BmuxConfig, MouseClickPropagation, MouseWheelPropagation};
     use bmux_ipc::{
         AttachFocusTarget, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
         AttachViewComponent, PaneLayoutNode, SessionSummary,
@@ -4246,6 +4425,83 @@ mod tests {
 
         assert_eq!(view_state.mouse.last_position, Some((3, 4)));
         assert!(view_state.mouse.last_event_at.is_some());
+    }
+
+    #[test]
+    fn encode_attach_mouse_sgr_encodes_button_down() {
+        let encoded = crate::runtime::encode_attach_mouse_sgr(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 4,
+            modifiers: KeyModifiers::NONE,
+        })
+        .expect("mouse down should encode");
+
+        assert_eq!(encoded, b"\x1b[<0;3;5M".to_vec());
+    }
+
+    #[test]
+    fn encode_attach_mouse_sgr_encodes_release_with_modifier_bits() {
+        let encoded = crate::runtime::encode_attach_mouse_sgr(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Right),
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::CONTROL | KeyModifiers::ALT,
+        })
+        .expect("mouse up should encode");
+
+        assert_eq!(encoded, b"\x1b[<24;1;1m".to_vec());
+    }
+
+    #[test]
+    fn encode_attach_mouse_sgr_encodes_scroll_and_move_events() {
+        let scroll = crate::runtime::encode_attach_mouse_sgr(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 10,
+            row: 1,
+            modifiers: KeyModifiers::SHIFT,
+        })
+        .expect("scroll should encode");
+        let moved = crate::runtime::encode_attach_mouse_sgr(MouseEvent {
+            kind: MouseEventKind::Moved,
+            column: 10,
+            row: 1,
+            modifiers: KeyModifiers::SHIFT,
+        })
+        .expect("moved should encode");
+
+        assert_eq!(scroll, b"\x1b[<69;11;2M".to_vec());
+        assert_eq!(moved, b"\x1b[<39;11;2M".to_vec());
+    }
+
+    #[test]
+    fn click_forwarding_policy_disables_click_forward_for_focus_only() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        view_state.mouse.config.click_propagation = MouseClickPropagation::FocusOnly;
+
+        assert!(!crate::runtime::should_forward_click_like_mouse(
+            &view_state
+        ));
+    }
+
+    #[test]
+    fn click_forwarding_policy_enables_click_forward_for_focus_and_forward() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        view_state.mouse.config.click_propagation = MouseClickPropagation::FocusAndForward;
+
+        assert!(crate::runtime::should_forward_click_like_mouse(&view_state));
+    }
+
+    #[test]
+    fn wheel_policy_forward_and_scrollback_is_available() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        view_state.mouse.config.wheel_propagation = MouseWheelPropagation::ForwardAndScrollback;
+        view_state.mouse.config.scroll_scrollback = true;
+
+        assert_eq!(
+            view_state.mouse.config.effective_wheel_propagation(),
+            MouseWheelPropagation::ForwardAndScrollback
+        );
     }
 
     #[test]

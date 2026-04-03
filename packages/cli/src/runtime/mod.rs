@@ -46,7 +46,7 @@ use clap::{CommandFactory, FromArgMatches};
 use crossterm::cursor::{MoveTo, SavePosition, Show};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    MouseButton, MouseEvent, MouseEventKind,
+    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::queue;
 use crossterm::style::Print;

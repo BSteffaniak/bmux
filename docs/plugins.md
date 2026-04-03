@@ -82,8 +82,10 @@ Mouse gestures can trigger built-in runtime actions or plugin commands through
 [behavior.mouse]
 enabled = true
 focus_on_click = true
+click_propagation = "focus_and_forward"
 focus_on_hover = false
 scroll_scrollback = true
+wheel_propagation = "forward_only"
 scroll_lines_per_tick = 3
 exit_scrollback_on_bottom = true
 

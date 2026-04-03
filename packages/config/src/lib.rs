@@ -478,12 +478,16 @@ pub struct MouseBehaviorConfig {
     pub enabled: bool,
     /// Focus pane when clicking inside it.
     pub focus_on_click: bool,
+    /// How pane-area mouse clicks are routed between bmux and pane TUIs.
+    pub click_propagation: MouseClickPropagation,
     /// Focus pane when hovering over it.
     pub focus_on_hover: bool,
     /// Hover dwell time before focus is applied.
     pub hover_delay_ms: u64,
     /// Route wheel scrolling to focused pane scrollback.
     pub scroll_scrollback: bool,
+    /// How wheel events are routed between pane TUIs and bmux scrollback.
+    pub wheel_propagation: MouseWheelPropagation,
     /// Number of scrollback lines per mouse wheel tick.
     pub scroll_lines_per_tick: u16,
     /// Exit scrollback mode automatically when wheel scrolling reaches bottom.
@@ -502,9 +506,11 @@ impl Default for MouseBehaviorConfig {
         Self {
             enabled: true,
             focus_on_click: true,
+            click_propagation: MouseClickPropagation::default(),
             focus_on_hover: false,
             hover_delay_ms: 175,
             scroll_scrollback: true,
+            wheel_propagation: MouseWheelPropagation::default(),
             scroll_lines_per_tick: 3,
             exit_scrollback_on_bottom: true,
             gesture_actions: BTreeMap::new(),
@@ -512,10 +518,47 @@ impl Default for MouseBehaviorConfig {
     }
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseClickPropagation {
+    FocusOnly,
+    ForwardOnly,
+    #[default]
+    FocusAndForward,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum MouseWheelPropagation {
+    #[default]
+    ForwardOnly,
+    ScrollbackOnly,
+    ForwardAndScrollback,
+}
+
 impl MouseBehaviorConfig {
     #[must_use]
     pub const fn config_doc_values() -> &'static [&'static str] {
         &[]
+    }
+
+    #[must_use]
+    pub const fn effective_click_propagation(&self) -> MouseClickPropagation {
+        if !self.focus_on_click {
+            return MouseClickPropagation::ForwardOnly;
+        }
+        self.click_propagation
+    }
+
+    #[must_use]
+    pub const fn effective_wheel_propagation(&self) -> MouseWheelPropagation {
+        match (self.wheel_propagation, self.scroll_scrollback) {
+            (MouseWheelPropagation::ScrollbackOnly, false)
+            | (MouseWheelPropagation::ForwardAndScrollback, false) => {
+                MouseWheelPropagation::ForwardOnly
+            }
+            (other, _) => other,
+        }
     }
 }
 
@@ -1286,7 +1329,9 @@ impl BmuxConfig {
 
 #[cfg(test)]
 mod tests {
-    use super::{BmuxConfig, ResolvedTimeout, StaleBuildAction};
+    use super::{
+        BmuxConfig, MouseClickPropagation, MouseWheelPropagation, ResolvedTimeout, StaleBuildAction,
+    };
     use crate::ConfigPaths;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1599,6 +1644,56 @@ timeout_profile = "missing"
         assert!(persisted.contains("scroll_lines_per_tick = 0"));
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn mouse_defaults_prioritize_tui_forwarding() {
+        let mouse = BmuxConfig::default().behavior.mouse;
+        assert_eq!(
+            mouse.click_propagation,
+            MouseClickPropagation::FocusAndForward
+        );
+        assert_eq!(mouse.wheel_propagation, MouseWheelPropagation::ForwardOnly);
+    }
+
+    #[test]
+    fn load_parses_mouse_propagation_modes() {
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        std::fs::write(
+            &path,
+            "[behavior.mouse]\nclick_propagation = \"forward_only\"\nwheel_propagation = \"forward_and_scrollback\"\n",
+        )
+        .expect("failed writing config fixture");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(
+            config.behavior.mouse.click_propagation,
+            MouseClickPropagation::ForwardOnly
+        );
+        assert_eq!(
+            config.behavior.mouse.wheel_propagation,
+            MouseWheelPropagation::ForwardAndScrollback
+        );
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn effective_mouse_propagation_honors_legacy_flags() {
+        let mut config = BmuxConfig::default();
+        config.behavior.mouse.focus_on_click = false;
+        config.behavior.mouse.wheel_propagation = MouseWheelPropagation::ForwardAndScrollback;
+        config.behavior.mouse.scroll_scrollback = false;
+
+        assert_eq!(
+            config.behavior.mouse.effective_click_propagation(),
+            MouseClickPropagation::ForwardOnly
+        );
+        assert_eq!(
+            config.behavior.mouse.effective_wheel_propagation(),
+            MouseWheelPropagation::ForwardOnly
+        );
     }
 
     #[test]
