@@ -1177,6 +1177,61 @@ impl PaneMouseProtocolTracker {
     }
 }
 
+struct PaneCursorTracker {
+    parser: vt100::Parser,
+    rows: u16,
+    cols: u16,
+}
+
+impl PaneCursorTracker {
+    fn new(rows: u16, cols: u16) -> Self {
+        let (rows, cols) = sanitize_pty_size(rows, cols);
+        Self {
+            parser: vt100::Parser::new(rows, cols, 0),
+            rows,
+            cols,
+        }
+    }
+
+    fn resize(&mut self, rows: u16, cols: u16) {
+        let (rows, cols) = sanitize_pty_size(rows, cols);
+        if self.rows == rows && self.cols == cols {
+            return;
+        }
+        self.parser.screen_mut().set_size(rows, cols);
+        self.rows = rows;
+        self.cols = cols;
+    }
+
+    fn process(&mut self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            self.parser.process(bytes);
+        }
+    }
+
+    fn cursor_position(&self) -> (u16, u16) {
+        self.parser.screen().cursor_position()
+    }
+}
+
+fn sanitize_pty_size(rows: u16, cols: u16) -> (u16, u16) {
+    (rows.max(1), cols.max(1))
+}
+
+fn protocol_reply_for_chunk(
+    protocol_engine: &mut TerminalProtocolEngine,
+    cursor_tracker: &mut PaneCursorTracker,
+    chunk: &[u8],
+) -> Vec<u8> {
+    let mut reply = Vec::new();
+    for byte in chunk {
+        let byte_slice = std::slice::from_ref(byte);
+        cursor_tracker.process(byte_slice);
+        reply.extend(protocol_engine.process_output(byte_slice, cursor_tracker.cursor_position()));
+    }
+    reply
+}
+
 fn parse_private_mode_number(bytes: &[u8]) -> Option<u16> {
     if bytes.is_empty() {
         return None;
@@ -1972,6 +2027,7 @@ impl SessionRuntimeManager {
         let event_broadcast_for_reader = self.event_broadcast.clone();
         let output_dirty = Arc::new(AtomicBool::new(false));
         let output_dirty_for_reader = Arc::clone(&output_dirty);
+        let last_requested_size_for_reader = Arc::clone(&last_requested_size);
         let mouse_protocol_state =
             Arc::new(std::sync::Mutex::new(AttachMouseProtocolState::default()));
         let mouse_protocol_state_for_reader = Arc::clone(&mouse_protocol_state);
@@ -2088,12 +2144,22 @@ impl SessionRuntimeManager {
                 .spawn(move || {
                     let mut buffer = [0_u8; 8192];
                     let mut protocol_engine = TerminalProtocolEngine::new(protocol_profile);
+                    let (initial_rows, initial_cols) = last_requested_size_for_reader
+                        .lock()
+                        .map(|size| *size)
+                        .unwrap_or((24, 80));
+                    let mut cursor_tracker = PaneCursorTracker::new(initial_rows, initial_cols);
                     let mut mouse_protocol_tracker = PaneMouseProtocolTracker::default();
                     loop {
                         match reader.read(&mut buffer) {
                             Ok(0) => break,
                             Ok(bytes_read) => {
                                 let chunk = &buffer[..bytes_read];
+                                if let Ok((rows, cols)) =
+                                    last_requested_size_for_reader.lock().map(|size| *size)
+                                {
+                                    cursor_tracker.resize(rows, cols);
+                                }
                                 if let Ok(mut output) = reader_output.lock() {
                                     output.push_chunk(chunk);
                                 } else {
@@ -2135,7 +2201,11 @@ impl SessionRuntimeManager {
                                 if let Ok(mut protocol) = mouse_protocol_state_for_reader.lock() {
                                     *protocol = mouse_protocol_tracker.current_protocol();
                                 }
-                                let reply = protocol_engine.process_output(chunk, (0, 0));
+                                let reply = protocol_reply_for_chunk(
+                                    &mut protocol_engine,
+                                    &mut cursor_tracker,
+                                    chunk,
+                                );
                                 if !reply.is_empty() {
                                     if let Ok(runtime) = recording_runtime.lock() {
                                         let _ = runtime.record(
@@ -7336,6 +7406,48 @@ mod tests {
             tracker.current_protocol(),
             AttachMouseProtocolState::default()
         );
+    }
+
+    #[test]
+    fn protocol_reply_tracks_cursor_position_for_cpr_queries() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
+        let mut cursor_tracker = PaneCursorTracker::new(24, 80);
+
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[12;34H");
+
+        let cpr_reply = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n");
+        assert_eq!(cpr_reply, b"\x1b[12;34R");
+
+        let dec_cpr_reply = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[?6n");
+        assert_eq!(dec_cpr_reply, b"\x1b[?12;34R");
+    }
+
+    #[test]
+    fn protocol_reply_handles_split_cpr_sequences_across_chunks() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
+        let mut cursor_tracker = PaneCursorTracker::new(24, 80);
+
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[20;7H");
+
+        assert!(protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[").is_empty());
+        assert!(protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"6").is_empty());
+        let cpr_reply = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"n");
+        assert_eq!(cpr_reply, b"\x1b[20;7R");
+    }
+
+    #[test]
+    fn cursor_tracker_resize_updates_cursor_bounds() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
+        let mut cursor_tracker = PaneCursorTracker::new(5, 5);
+
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[24;80H");
+        let clamped_reply = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n");
+        assert_eq!(clamped_reply, b"\x1b[5;5R");
+
+        cursor_tracker.resize(40, 120);
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[24;80H");
+        let resized_reply = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n");
+        assert_eq!(resized_reply, b"\x1b[24;80R");
     }
 
     #[tokio::test]

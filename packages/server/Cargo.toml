@@ -28,6 +28,7 @@ thiserror    = { workspace = true }
 tokio        = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 tracing      = { workspace = true, features = ["std"] }
 uuid         = { workspace = true, features = ["std", "v4"] }
+vt100        = { workspace = true }
 
 
 [features]
