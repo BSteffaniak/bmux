@@ -477,6 +477,7 @@ fn payload_size(payload: &RecordingPayload) -> u64 {
             name,
             payload,
         } => (source.len() + name.len() + payload.len()) as u64,
+        RecordingPayload::Image { data, .. } => data.len() as u64,
     }
 }
 

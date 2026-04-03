@@ -1051,7 +1051,9 @@ dependencies = [
 name = "bmux_image"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_ipc",
  "serde",
+ "uuid",
 ]
 
 [[package]]

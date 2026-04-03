@@ -97,6 +97,7 @@ pub(super) fn resolve_event_kind_override(
         RecordingProfileArg::Full => vec![
             RecordingEventKind::PaneOutputRaw,
             RecordingEventKind::ProtocolReplyRaw,
+            RecordingEventKind::PaneImage,
             RecordingEventKind::ServerEvent,
             RecordingEventKind::RequestStart,
             RecordingEventKind::RequestDone,
@@ -105,6 +106,7 @@ pub(super) fn resolve_event_kind_override(
         ],
         RecordingProfileArg::Functional => vec![
             RecordingEventKind::PaneOutputRaw,
+            RecordingEventKind::PaneImage,
             RecordingEventKind::ServerEvent,
             RecordingEventKind::RequestStart,
             RecordingEventKind::RequestDone,
@@ -124,6 +126,7 @@ const fn recording_event_kind_arg_to_ipc(kind: RecordingEventKindArg) -> Recordi
         RecordingEventKindArg::PaneInputRaw => RecordingEventKind::PaneInputRaw,
         RecordingEventKindArg::PaneOutputRaw => RecordingEventKind::PaneOutputRaw,
         RecordingEventKindArg::ProtocolReplyRaw => RecordingEventKind::ProtocolReplyRaw,
+        RecordingEventKindArg::PaneImage => RecordingEventKind::PaneImage,
         RecordingEventKindArg::ServerEvent => RecordingEventKind::ServerEvent,
         RecordingEventKindArg::RequestStart => RecordingEventKind::RequestStart,
         RecordingEventKindArg::RequestDone => RecordingEventKind::RequestDone,
@@ -3395,6 +3398,7 @@ pub(super) fn recording_event_kind_name(kind: RecordingEventKind) -> String {
         RecordingEventKind::PaneInputRaw => "pane_input_raw",
         RecordingEventKind::PaneOutputRaw => "pane_output_raw",
         RecordingEventKind::ProtocolReplyRaw => "protocol_reply_raw",
+        RecordingEventKind::PaneImage => "pane_image",
         RecordingEventKind::ServerEvent => "server_event",
         RecordingEventKind::RequestStart => "request_start",
         RecordingEventKind::RequestDone => "request_done",

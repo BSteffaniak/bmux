@@ -40,7 +40,12 @@ default = []
 fail-on-warnings = []
 
 # Terminal image protocol support (feature-gated, optional)
-image-registry = ["dep:bmux_image"]
+image-registry = [
+    "dep:bmux_image",
+    "bmux_image/sixel",
+    "bmux_image/kitty",
+    "bmux_image/iterm2",
+]
 
 # Serialization features
 serde = []

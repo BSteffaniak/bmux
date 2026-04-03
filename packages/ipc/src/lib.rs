@@ -484,6 +484,12 @@ pub enum Request {
         status_top_inset: u16,
         #[serde(default)]
         status_bottom_inset: u16,
+        /// Cell width in pixels (0 = unknown). Used for image placement sizing.
+        #[serde(default)]
+        cell_pixel_width: u16,
+        /// Cell height in pixels (0 = unknown). Used for image placement sizing.
+        #[serde(default)]
+        cell_pixel_height: u16,
     },
     AttachOutput {
         session_id: Uuid,
@@ -496,6 +502,13 @@ pub enum Request {
         session_id: Uuid,
         pane_ids: Vec<Uuid>,
         max_bytes: usize,
+    },
+    AttachPaneImages {
+        session_id: Uuid,
+        pane_ids: Vec<Uuid>,
+        /// Per-pane sequence numbers from the last delta received.
+        /// Parallel to `pane_ids`.  Use 0 for a full snapshot.
+        since_sequences: Vec<u64>,
     },
     AttachSnapshot {
         session_id: Uuid,
@@ -614,6 +627,39 @@ pub struct AttachPaneChunk {
     pub data: Vec<u8>,
 }
 
+/// Image protocol identifier for IPC transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachImageProtocol {
+    Sixel,
+    KittyGraphics,
+    ITerm2,
+}
+
+/// A single image placed within a pane, for IPC transport.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachPaneImage {
+    pub id: u64,
+    pub protocol: AttachImageProtocol,
+    /// Raw protocol bytes (sixel body, kitty payload, iTerm2 data).
+    pub raw_data: Vec<u8>,
+    pub position_row: u16,
+    pub position_col: u16,
+    pub cell_rows: u16,
+    pub cell_cols: u16,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
+}
+
+/// Incremental image update for a single pane.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachPaneImageDelta {
+    pub pane_id: Uuid,
+    pub added: Vec<AttachPaneImage>,
+    pub removed: Vec<u64>,
+    pub sequence: u64,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum AttachMouseProtocolMode {
@@ -719,6 +765,7 @@ fn recording_event_kinds_default() -> Vec<RecordingEventKind> {
         RecordingEventKind::PaneInputRaw,
         RecordingEventKind::PaneOutputRaw,
         RecordingEventKind::ProtocolReplyRaw,
+        RecordingEventKind::PaneImage,
         RecordingEventKind::ServerEvent,
         RecordingEventKind::RequestStart,
         RecordingEventKind::RequestDone,
@@ -749,6 +796,7 @@ pub enum RecordingEventKind {
     PaneInputRaw,
     PaneOutputRaw,
     ProtocolReplyRaw,
+    PaneImage,
     ServerEvent,
     RequestStart,
     RequestDone,
@@ -795,6 +843,19 @@ pub enum RecordingPayload {
         name: String,
         /// Pre-serialized JSON payload bytes.
         payload: Vec<u8>,
+    },
+    /// A terminal image extracted from pane output.
+    Image {
+        /// Protocol identifier: 0=Sixel, 1=KittyGraphics, 2=ITerm2.
+        protocol: u8,
+        position_row: u16,
+        position_col: u16,
+        cell_rows: u16,
+        cell_cols: u16,
+        pixel_width: u32,
+        pixel_height: u32,
+        /// Raw protocol bytes (sixel body, kitty payload, iTerm2 data).
+        data: Vec<u8>,
     },
 }
 
@@ -945,6 +1006,9 @@ pub enum ResponsePayload {
     },
     AttachPaneOutputBatch {
         chunks: Vec<AttachPaneChunk>,
+    },
+    AttachPaneImages {
+        deltas: Vec<AttachPaneImageDelta>,
     },
     AttachSnapshot {
         #[serde(default)]
@@ -1655,6 +1719,8 @@ mod tests {
                 rows: 40,
                 status_top_inset: 1,
                 status_bottom_inset: 0,
+                cell_pixel_width: 8,
+                cell_pixel_height: 16,
             },
             Request::AttachOutput {
                 session_id: id,

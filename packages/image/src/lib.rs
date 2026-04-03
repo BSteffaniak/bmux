@@ -11,6 +11,7 @@ pub mod compositor;
 pub mod config;
 pub mod host_caps;
 pub mod intercept;
+pub mod ipc_convert;
 pub mod model;
 pub mod registry;
 

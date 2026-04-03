@@ -960,6 +960,8 @@ mod tests {
             rows: 40,
             status_top_inset: 0,
             status_bottom_inset: 0,
+            cell_pixel_width: 0,
+            cell_pixel_height: 0,
         };
 
         let events = vec![

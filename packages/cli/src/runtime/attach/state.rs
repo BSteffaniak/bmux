@@ -126,6 +126,29 @@ pub struct AttachViewState {
     pub(crate) force_cursor_move_next_frame: bool,
     pub(crate) mouse: AttachMouseState,
     pub(crate) dirty: AttachDirtyFlags,
+
+    // -- Image protocol support (feature-gated) --
+    /// Per-pane image cache received from the server.
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    pub(crate) pane_images: BTreeMap<Uuid, Vec<bmux_ipc::AttachPaneImage>>,
+    /// Per-pane last-seen image sequence numbers for delta queries.
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    pub(crate) image_sequences: BTreeMap<Uuid, u64>,
+    /// Detected host terminal image capabilities.
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    pub(crate) host_image_caps: bmux_image::HostImageCapabilities,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -170,6 +193,24 @@ impl AttachViewState {
                 ..AttachMouseState::default()
             },
             dirty: AttachDirtyFlags::default(),
+            #[cfg(any(
+                feature = "image-sixel",
+                feature = "image-kitty",
+                feature = "image-iterm2"
+            ))]
+            pane_images: BTreeMap::new(),
+            #[cfg(any(
+                feature = "image-sixel",
+                feature = "image-kitty",
+                feature = "image-iterm2"
+            ))]
+            image_sequences: BTreeMap::new(),
+            #[cfg(any(
+                feature = "image-sixel",
+                feature = "image-kitty",
+                feature = "image-iterm2"
+            ))]
+            host_image_caps: bmux_image::HostImageCapabilities::default(),
         }
     }
 

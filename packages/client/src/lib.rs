@@ -9,13 +9,13 @@ use bmux_config::{BmuxConfig, ConfigPaths};
 pub use bmux_ipc::Event as ServerEvent;
 use bmux_ipc::transport::{ErasedIpcStream, IpcStreamWriter, IpcTransportError, LocalIpcStream};
 use bmux_ipc::{
-    AttachGrant, AttachPaneChunk, AttachPaneMouseProtocol, AttachScene, CORE_PROTOCOL_CAPABILITIES,
-    ClientSummary, ContextSelector, ContextSummary, Envelope, EnvelopeKind, ErrorCode,
-    IncompatibilityReason, InvokeServiceKind, IpcEndpoint, NegotiatedProtocol, PaneFocusDirection,
-    PaneLayoutNode, PaneSelector, PaneSplitDirection, PaneSummary, ProtocolContract,
-    ProtocolVersion, RecordingEventKind, RecordingProfile, RecordingStatus, RecordingSummary,
-    Request, Response, ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary,
-    decode, default_supported_capabilities, encode,
+    AttachGrant, AttachPaneChunk, AttachPaneImageDelta, AttachPaneMouseProtocol, AttachScene,
+    CORE_PROTOCOL_CAPABILITIES, ClientSummary, ContextSelector, ContextSummary, Envelope,
+    EnvelopeKind, ErrorCode, IncompatibilityReason, InvokeServiceKind, IpcEndpoint,
+    NegotiatedProtocol, PaneFocusDirection, PaneLayoutNode, PaneSelector, PaneSplitDirection,
+    PaneSummary, ProtocolContract, ProtocolVersion, RecordingEventKind, RecordingProfile,
+    RecordingStatus, RecordingSummary, Request, Response, ResponsePayload, ServerSnapshotStatus,
+    SessionSelector, SessionSummary, decode, default_supported_capabilities, encode,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -1221,6 +1221,8 @@ impl BmuxClient {
                 rows,
                 status_top_inset,
                 status_bottom_inset,
+                cell_pixel_width: 0,
+                cell_pixel_height: 0,
             })
             .await?
         {
@@ -1293,6 +1295,27 @@ impl BmuxClient {
             ResponsePayload::AttachPaneOutputBatch { chunks } => Ok(chunks),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected attach pane output batch response",
+            )),
+        }
+    }
+
+    pub async fn attach_pane_images(
+        &mut self,
+        session_id: Uuid,
+        pane_ids: Vec<Uuid>,
+        since_sequences: Vec<u64>,
+    ) -> Result<Vec<AttachPaneImageDelta>> {
+        match self
+            .request(Request::AttachPaneImages {
+                session_id,
+                pane_ids,
+                since_sequences,
+            })
+            .await?
+        {
+            ResponsePayload::AttachPaneImages { deltas } => Ok(deltas),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attach pane images response",
             )),
         }
     }
@@ -1807,6 +1830,8 @@ impl StreamingBmuxClient {
                 rows,
                 status_top_inset,
                 status_bottom_inset,
+                cell_pixel_width: 0,
+                cell_pixel_height: 0,
             })
             .await?
         {
@@ -1871,6 +1896,27 @@ impl StreamingBmuxClient {
             ResponsePayload::AttachPaneOutputBatch { chunks } => Ok(chunks),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected attach pane output batch response",
+            )),
+        }
+    }
+
+    pub async fn attach_pane_images(
+        &mut self,
+        session_id: Uuid,
+        pane_ids: Vec<Uuid>,
+        since_sequences: Vec<u64>,
+    ) -> Result<Vec<AttachPaneImageDelta>> {
+        match self
+            .request(Request::AttachPaneImages {
+                session_id,
+                pane_ids,
+                since_sequences,
+            })
+            .await?
+        {
+            ResponsePayload::AttachPaneImages { deltas } => Ok(deltas),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attach pane images response",
             )),
         }
     }
@@ -2201,6 +2247,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::AttachLayout { .. } => "attach_layout",
         Request::AttachSnapshot { .. } => "attach_snapshot",
         Request::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
+        Request::AttachPaneImages { .. } => "attach_pane_images",
         Request::RecordingStart { .. } => "recording_start",
         Request::RecordingStop { .. } => "recording_stop",
         Request::RecordingStatus => "recording_status",
@@ -2259,6 +2306,7 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::AttachLayout { .. } => "attach_layout",
             ResponsePayload::AttachSnapshot { .. } => "attach_snapshot",
             ResponsePayload::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
+            ResponsePayload::AttachPaneImages { .. } => "attach_pane_images",
             ResponsePayload::RecordingStarted { .. } => "recording_started",
             ResponsePayload::RecordingStopped { .. } => "recording_stopped",
             ResponsePayload::RecordingStatus { .. } => "recording_status",

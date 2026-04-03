@@ -234,15 +234,16 @@ pub(crate) async fn run_session_attach_with_client(
         InputProcessor::new(attach_keymap.clone(), raw_mode_guard.keyboard_enhanced);
     let mut exit_reason = AttachExitReason::Detached;
 
-    // Detect host terminal image capabilities (Sixel, Kitty graphics, iTerm2).
-    // Stored here for future use by the image compositor once the full
-    // server-side interceptor and IPC transport are wired up.
+    // Detect host terminal image capabilities (Sixel, Kitty graphics, iTerm2)
+    // and store in view_state for the compositor.
     #[cfg(any(
         feature = "image-sixel",
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    let _host_image_caps = bmux_image::host_caps::detect_from_env();
+    {
+        view_state.host_image_caps = bmux_image::host_caps::detect_from_env();
+    }
 
     // Async terminal event stream — replaces spawn_blocking + poll(15ms).
     let mut terminal_stream = crossterm::event::EventStream::new();
@@ -537,6 +538,36 @@ pub(crate) async fn run_session_attach_with_client(
             // If the final allowed drain round still produced bytes, keep
             // output pending so the next loop continues draining.
             pane_output_pending = last_round_had_data;
+        }
+
+        // Fetch image deltas for dirty panes (feature-gated).
+        #[cfg(any(
+            feature = "image-sixel",
+            feature = "image-kitty",
+            feature = "image-iterm2"
+        ))]
+        if view_state.host_image_caps.any_supported() && !view_state.dirty.pane_dirty_ids.is_empty()
+        {
+            let dirty_panes: Vec<Uuid> = view_state.dirty.pane_dirty_ids.iter().copied().collect();
+            let sequences: Vec<u64> = dirty_panes
+                .iter()
+                .map(|id| view_state.image_sequences.get(id).copied().unwrap_or(0))
+                .collect();
+            if let Ok(deltas) = client
+                .attach_pane_images(view_state.attached_id, dirty_panes, sequences)
+                .await
+            {
+                for delta in deltas {
+                    if !delta.added.is_empty() || !delta.removed.is_empty() {
+                        view_state
+                            .image_sequences
+                            .insert(delta.pane_id, delta.sequence);
+                        // Replace the full image list for this pane.
+                        view_state.pane_images.insert(delta.pane_id, delta.added);
+                        frame_needs_render = true;
+                    }
+                }
+            }
         }
 
         if !frame_needs_render {
@@ -2314,11 +2345,39 @@ pub(crate) async fn render_attach_frame(
     )?;
 
     // Image overlay: render terminal images (Sixel, Kitty, iTerm2) on top
-    // of the cell content.  This is a no-op when no image features are
-    // enabled or when the host terminal has no image support.
-    // TODO(image-phase-2): Once the server-side interceptor and IPC image
-    // transport are wired up, fetch pane images here and pass them to
-    // bmux_image::compositor::render_pane_images().
+    // of the cell content, translated to host terminal coordinates.
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    if view_state.host_image_caps.any_supported() {
+        for surface in &layout_state.scene.surfaces {
+            let Some(pane_id) = surface.pane_id else {
+                continue;
+            };
+            if let Some(images) = view_state.pane_images.get(&pane_id) {
+                if !images.is_empty() {
+                    let pane_images: Vec<bmux_image::PaneImage> =
+                        images.iter().map(bmux_image::PaneImage::from).collect();
+                    let pane_rect = bmux_image::compositor::PaneRect {
+                        x: surface.rect.x,
+                        y: surface.rect.y,
+                        w: surface.rect.w,
+                        h: surface.rect.h,
+                    };
+                    let decode_mode = bmux_image::config::ImageDecodeMode::Passthrough;
+                    let _ = bmux_image::compositor::render_pane_images(
+                        &mut frame_bytes,
+                        &pane_images,
+                        pane_rect,
+                        &view_state.host_image_caps,
+                        decode_mode,
+                    );
+                }
+            }
+        }
+    }
 
     let previous_cursor_state = view_state.last_cursor_state;
     if view_state.help_overlay_open {

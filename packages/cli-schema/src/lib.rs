@@ -46,6 +46,7 @@ pub enum RecordingEventKindArg {
     PaneInputRaw,
     PaneOutputRaw,
     ProtocolReplyRaw,
+    PaneImage,
     ServerEvent,
     RequestStart,
     RequestDone,

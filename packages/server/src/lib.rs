@@ -1019,6 +1019,8 @@ struct PaneRuntimeHandle {
     /// thousands of per-chunk writes into ~1 event per fetch cycle.
     output_dirty: Arc<AtomicBool>,
     mouse_protocol_state: Arc<std::sync::Mutex<AttachMouseProtocolState>>,
+    #[cfg(feature = "image-registry")]
+    image_registry: Arc<std::sync::Mutex<bmux_image::ImageRegistry>>,
 }
 
 enum PaneRuntimeCommand {
@@ -1181,15 +1183,23 @@ struct PaneCursorTracker {
     parser: vt100::Parser,
     rows: u16,
     cols: u16,
+    /// Cumulative number of lines that have scrolled off the top.
+    /// Used by the image registry to shift image positions on scroll.
+    #[cfg(feature = "image-registry")]
+    total_scrollback: u64,
 }
 
 impl PaneCursorTracker {
     fn new(rows: u16, cols: u16) -> Self {
         let (rows, cols) = sanitize_pty_size(rows, cols);
         Self {
-            parser: vt100::Parser::new(rows, cols, 0),
+            // Use scrollback of 1 so we can detect scroll events via
+            // screen().scrollback() incrementing from 0 to 1.
+            parser: vt100::Parser::new(rows, cols, 1),
             rows,
             cols,
+            #[cfg(feature = "image-registry")]
+            total_scrollback: 0,
         }
     }
 
@@ -1212,10 +1222,72 @@ impl PaneCursorTracker {
     fn cursor_position(&self) -> (u16, u16) {
         self.parser.screen().cursor_position()
     }
+
+    /// Consume any scrollback that accumulated since the last call.
+    /// Returns the number of lines that scrolled since last drain.
+    #[cfg(feature = "image-registry")]
+    fn drain_scroll_delta(&mut self) -> u16 {
+        let scrollback = self.parser.screen().scrollback() as u16;
+        if scrollback > 0 {
+            self.total_scrollback += scrollback as u64;
+            // Reset scrollback to 0 so we can detect the next scroll.
+            self.parser.screen_mut().set_scrollback(0);
+            scrollback
+        } else {
+            0
+        }
+    }
 }
 
 fn sanitize_pty_size(rows: u16, cols: u16) -> (u16, u16) {
     (rows.max(1), cols.max(1))
+}
+
+/// Convert an image event to a recording payload.
+#[cfg(feature = "image-registry")]
+fn image_event_to_recording_payload(event: &bmux_image::ImageEvent) -> RecordingPayload {
+    match event {
+        #[cfg(feature = "image-registry")]
+        bmux_image::ImageEvent::SixelImage {
+            data,
+            position,
+            pixel_size,
+        } => RecordingPayload::Image {
+            protocol: 0,
+            position_row: position.row,
+            position_col: position.col,
+            cell_rows: 0,
+            cell_cols: 0,
+            pixel_width: pixel_size.width,
+            pixel_height: pixel_size.height,
+            data: data.clone(),
+        },
+        #[cfg(feature = "image-registry")]
+        bmux_image::ImageEvent::KittyCommand(cmd) => {
+            let _ = cmd;
+            RecordingPayload::Image {
+                protocol: 1,
+                position_row: 0,
+                position_col: 0,
+                cell_rows: 0,
+                cell_cols: 0,
+                pixel_width: 0,
+                pixel_height: 0,
+                data: Vec::new(),
+            }
+        }
+        #[cfg(feature = "image-registry")]
+        bmux_image::ImageEvent::ITerm2Image { data, position } => RecordingPayload::Image {
+            protocol: 2,
+            position_row: position.row,
+            position_col: position.col,
+            cell_rows: 0,
+            cell_cols: 0,
+            pixel_width: 0,
+            pixel_height: 0,
+            data: data.clone(),
+        },
+    }
 }
 
 fn protocol_reply_for_chunk(
@@ -2032,6 +2104,11 @@ impl SessionRuntimeManager {
             Arc::new(std::sync::Mutex::new(AttachMouseProtocolState::default()));
         let mouse_protocol_state_for_reader = Arc::clone(&mouse_protocol_state);
 
+        #[cfg(feature = "image-registry")]
+        let image_registry = Arc::new(std::sync::Mutex::new(bmux_image::ImageRegistry::default()));
+        #[cfg(feature = "image-registry")]
+        let image_registry_for_reader = Arc::clone(&image_registry);
+
         let task = tokio::spawn(async move {
             let pty_system = native_pty_system();
             let pty_pair = if let Ok(pair) = pty_system.openpty(PtySize {
@@ -2157,8 +2234,6 @@ impl SessionRuntimeManager {
                     // protocols are enabled.
                     #[cfg(feature = "image-registry")]
                     let mut image_interceptor = bmux_image::ImageInterceptor::new();
-                    #[cfg(feature = "image-registry")]
-                    let mut image_registry = bmux_image::ImageRegistry::default();
 
                     loop {
                         match reader.read(&mut buffer) {
@@ -2179,9 +2254,29 @@ impl SessionRuntimeManager {
                                 let chunk = {
                                     let cursor_pos = cursor_tracker.cursor_position();
                                     let result = image_interceptor.process(chunk, cursor_pos);
-                                    for event in result.events {
-                                        // TODO: get cell pixel size from terminal.
-                                        image_registry.handle_event(event, 8, 16);
+                                    if !result.events.is_empty() {
+                                        if let Ok(mut reg) = image_registry_for_reader.lock() {
+                                            for event in &result.events {
+                                                // TODO(step 7): get cell pixel size from client.
+                                                reg.handle_event(event.clone(), 8, 16);
+                                            }
+                                        }
+                                        // Record image events to the recording timeline.
+                                        if let Ok(runtime) = recording_runtime.lock() {
+                                            for event in &result.events {
+                                                let payload =
+                                                    image_event_to_recording_payload(event);
+                                                let _ = runtime.record(
+                                                    RecordingEventKind::PaneImage,
+                                                    payload,
+                                                    RecordMeta {
+                                                        session_id: Some(session_id.0),
+                                                        pane_id: Some(pane_id),
+                                                        client_id: None,
+                                                    },
+                                                );
+                                            }
+                                        }
                                     }
                                     result.filtered
                                 };
@@ -2234,6 +2329,16 @@ impl SessionRuntimeManager {
                                     &mut cursor_tracker,
                                     chunk,
                                 );
+                                // Detect scroll events and shift image positions.
+                                #[cfg(feature = "image-registry")]
+                                {
+                                    let scroll_delta = cursor_tracker.drain_scroll_delta();
+                                    if scroll_delta > 0 {
+                                        if let Ok(mut reg) = image_registry_for_reader.lock() {
+                                            reg.scroll_up(scroll_delta);
+                                        }
+                                    }
+                                }
                                 if !reply.is_empty() {
                                     if let Ok(runtime) = recording_runtime.lock() {
                                         let _ = runtime.record(
@@ -2321,6 +2426,8 @@ impl SessionRuntimeManager {
             last_requested_size,
             output_dirty,
             mouse_protocol_state,
+            #[cfg(feature = "image-registry")]
+            image_registry,
         })
     }
 
@@ -5914,6 +6021,8 @@ async fn handle_request(
             rows,
             status_top_inset,
             status_bottom_inset,
+            cell_pixel_width: _cell_pixel_width,
+            cell_pixel_height: _cell_pixel_height,
         } => {
             let session_id = SessionId(session_id);
             if !ensure_attach_session_exists(state, session_id).await? {
@@ -6146,6 +6255,50 @@ async fn handle_request(
                     message: "active pane is closed".to_string(),
                 }),
             }
+        }
+        Request::AttachPaneImages {
+            session_id,
+            pane_ids,
+            since_sequences,
+        } => {
+            let session_id = SessionId(session_id);
+            if !ensure_attach_session_exists(state, session_id).await? {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!("session runtime not found: {}", session_id.0),
+                }));
+            }
+            let deltas = {
+                let runtime_manager = state
+                    .session_runtimes
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+                let mut result = Vec::new();
+                if let Some(runtime) = runtime_manager.runtimes.get(&session_id) {
+                    for (i, pane_id) in pane_ids.iter().enumerate() {
+                        let since = since_sequences.get(i).copied().unwrap_or(0);
+                        if let Some(pane) = runtime.panes.get(pane_id) {
+                            #[cfg(feature = "image-registry")]
+                            if let Ok(reg) = pane.image_registry.lock() {
+                                let delta = reg.delta_since(since);
+                                result.push(delta.to_ipc(*pane_id));
+                            }
+                            #[cfg(not(feature = "image-registry"))]
+                            {
+                                let _ = (pane, since);
+                                result.push(bmux_ipc::AttachPaneImageDelta {
+                                    pane_id: *pane_id,
+                                    added: Vec::new(),
+                                    removed: Vec::new(),
+                                    sequence: 0,
+                                });
+                            }
+                        }
+                    }
+                }
+                result
+            };
+            Response::Ok(ResponsePayload::AttachPaneImages { deltas })
         }
         Request::Detach => {
             let mut manager = state
@@ -6537,6 +6690,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::AttachLayout { .. } => "attach_layout",
         Request::AttachSnapshot { .. } => "attach_snapshot",
         Request::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
+        Request::AttachPaneImages { .. } => "attach_pane_images",
         Request::RecordingStart { .. } => "recording_start",
         Request::RecordingStop { .. } => "recording_stop",
         Request::RecordingStatus => "recording_status",
@@ -6561,6 +6715,7 @@ fn default_recording_event_kinds(
         RecordingProfile::Full => vec![
             RecordingEventKind::PaneOutputRaw,
             RecordingEventKind::ProtocolReplyRaw,
+            RecordingEventKind::PaneImage,
             RecordingEventKind::ServerEvent,
             RecordingEventKind::RequestStart,
             RecordingEventKind::RequestDone,
@@ -6569,6 +6724,7 @@ fn default_recording_event_kinds(
         ],
         RecordingProfile::Functional => vec![
             RecordingEventKind::PaneOutputRaw,
+            RecordingEventKind::PaneImage,
             RecordingEventKind::ServerEvent,
             RecordingEventKind::RequestStart,
             RecordingEventKind::RequestDone,
@@ -6622,6 +6778,7 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::AttachLayout { .. } => "attach_layout",
         ResponsePayload::AttachSnapshot { .. } => "attach_snapshot",
         ResponsePayload::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
+        ResponsePayload::AttachPaneImages { .. } => "attach_pane_images",
         ResponsePayload::RecordingStarted { .. } => "recording_started",
         ResponsePayload::RecordingStopped { .. } => "recording_stopped",
         ResponsePayload::RecordingStatus { .. } => "recording_status",
