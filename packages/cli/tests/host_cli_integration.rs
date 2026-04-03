@@ -98,5 +98,7 @@ fn host_status_without_state_returns_not_running_message() {
 
     assert_eq!(output.status.code(), Some(1));
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("host runtime is not running"));
+    assert!(stdout.contains("host runtime: not running"));
+    assert!(stdout.contains("Fix: bmux setup"));
+    assert!(stdout.contains("Advanced: bmux host --daemon"));
 }

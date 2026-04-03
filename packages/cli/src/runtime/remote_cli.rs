@@ -349,10 +349,7 @@ pub(super) async fn run_connect(
 
 fn map_connect_target_resolution_error(target: &str, error: anyhow::Error) -> anyhow::Error {
     if target.starts_with("bmux://") && error.to_string().contains("share link not found:") {
-        return anyhow::anyhow!(
-            "{}\nHint: run 'bmux hosts' to list known links, or ask the owner to share it again with 'bmux share'.",
-            error
-        );
+        return actionable_error(&error.to_string(), "bmux setup", Some("bmux hosts"));
     }
     error
 }
@@ -459,6 +456,18 @@ fn format_setup_check_not_ready_lines(
         });
     }
     lines
+}
+
+fn format_actionable_error_lines(reason: &str, fix: &str, advanced: Option<&str>) -> Vec<String> {
+    let mut lines = vec![format!("Reason: {reason}"), format!("Fix: {fix}")];
+    if let Some(value) = advanced {
+        lines.push(format!("Advanced: {value}"));
+    }
+    lines
+}
+
+fn actionable_error(reason: &str, fix: &str, advanced: Option<&str>) -> anyhow::Error {
+    anyhow::anyhow!(format_actionable_error_lines(reason, fix, advanced).join("\n"))
 }
 
 async fn wait_for_running_host_state(timeout: std::time::Duration) -> Result<HostRuntimeState> {
@@ -836,9 +845,13 @@ pub(super) async fn run_share(
     qr: bool,
 ) -> Result<u8> {
     if target == Some("revoke") {
-        let revoke_name = secondary
-            .or(name)
-            .ok_or_else(|| anyhow::anyhow!("usage: bmux share revoke <name>"))?;
+        let revoke_name = secondary.or(name).ok_or_else(|| {
+            actionable_error(
+                "missing share name",
+                "bmux unshare <name>",
+                Some("bmux hosts"),
+            )
+        })?;
         return run_unshare(revoke_name).await;
     }
 
@@ -860,8 +873,9 @@ pub(super) async fn run_share(
         .unwrap_or_else(|| format!("share-{}", Uuid::new_v4().simple()));
 
     let control_plane_url = control_plane_url(&config);
-    let auth_state = load_auth_state_optional(&ConfigPaths::default())?
-        .ok_or_else(|| anyhow::anyhow!("not authenticated. run 'bmux auth login' first"))?;
+    let auth_state = load_auth_state_optional(&ConfigPaths::default())?.ok_or_else(|| {
+        actionable_error("not authenticated", "bmux setup", Some("bmux auth login"))
+    })?;
     let created = create_share_link(
         &control_plane_url,
         &auth_state.access_token,
@@ -918,8 +932,9 @@ pub(super) async fn run_share(
 pub(super) async fn run_unshare(name: &str) -> Result<u8> {
     let mut config = BmuxConfig::load()?;
     let control_plane_url = control_plane_url(&config);
-    let auth_state = load_auth_state_optional(&ConfigPaths::default())?
-        .ok_or_else(|| anyhow::anyhow!("not authenticated. run 'bmux auth login' first"))?;
+    let auth_state = load_auth_state_optional(&ConfigPaths::default())?.ok_or_else(|| {
+        actionable_error("not authenticated", "bmux setup", Some("bmux auth login"))
+    })?;
     delete_share_link(&control_plane_url, &auth_state.access_token, name).await?;
 
     if config.connections.share_links.remove(name).is_some() {
@@ -927,7 +942,11 @@ pub(super) async fn run_unshare(name: &str) -> Result<u8> {
         println!("Revoked share link: bmux://{name}");
         return Ok(0);
     }
-    anyhow::bail!("share link not found: bmux://{name}");
+    Err(actionable_error(
+        &format!("share link not found: bmux://{name}"),
+        "bmux hosts",
+        Some("bmux share <target> --name <name>"),
+    ))
 }
 
 fn choose_default_target_interactively(config: &BmuxConfig) -> Result<String> {
@@ -1036,9 +1055,11 @@ fn confirm_risky_invite(target: &str, metadata: Option<&InviteMetadata>) -> Resu
         return Ok(());
     }
     if !io::stdin().is_terminal() {
-        anyhow::bail!(
-            "invite {target} grants control access with unknown owner; rerun interactively to confirm"
-        );
+        return Err(actionable_error(
+            &format!("invite {target} grants control access with unknown owner"),
+            &format!("bmux join {target}"),
+            Some("bmux hosts"),
+        ));
     }
     print!("Invite grants control access but owner is unknown. Continue? [y/N]: ");
     io::stdout()
@@ -1052,7 +1073,11 @@ fn confirm_risky_invite(target: &str, metadata: Option<&InviteMetadata>) -> Resu
     if value == "y" || value == "yes" {
         return Ok(());
     }
-    anyhow::bail!("join cancelled")
+    Err(actionable_error(
+        "join cancelled",
+        &format!("bmux join {target}"),
+        Some("bmux hosts"),
+    ))
 }
 
 fn invite_requires_confirmation(metadata: Option<&InviteMetadata>) -> bool {
@@ -1211,12 +1236,17 @@ fn render_text_qr(payload: &str) -> Result<Vec<String>> {
 fn run_host_status() -> Result<u8> {
     let paths = ConfigPaths::default();
     let Some(state) = load_host_runtime_state(&paths)? else {
-        println!("host runtime is not running");
+        println!("host runtime: not running");
+        println!("Fix: bmux setup");
+        println!("Advanced: bmux host --daemon");
         return Ok(1);
     };
     if !is_process_alive(state.pid) {
         clear_host_runtime_state(&paths)?;
-        println!("host runtime is not running");
+        println!("host runtime: not running");
+        println!("Reason: stale runtime state was cleared");
+        println!("Fix: bmux setup");
+        println!("Advanced: bmux host --restart");
         return Ok(1);
     }
     for line in format_host_status_lines(&state) {
@@ -1461,7 +1491,11 @@ async fn register_host_presence(
 fn normalize_join_target_input(link: &str) -> Result<String> {
     let value = link.trim();
     if value.is_empty() {
-        anyhow::bail!("join target cannot be empty");
+        return Err(actionable_error(
+            "join target cannot be empty",
+            "bmux join <invite>",
+            Some("bmux hosts"),
+        ));
     }
     if let Some(extracted) = extract_target_from_text(value) {
         return Ok(extracted);
@@ -1470,7 +1504,11 @@ fn normalize_join_target_input(link: &str) -> Result<String> {
         return Ok(value.to_string());
     }
     if value.contains(char::is_whitespace) {
-        anyhow::bail!("could not find a valid invite link in input");
+        return Err(actionable_error(
+            "could not find a valid invite link in input",
+            "bmux join <invite>",
+            Some("bmux hosts"),
+        ));
     }
     Ok(format!("bmux://{value}"))
 }
@@ -3420,6 +3458,25 @@ mod tests {
     }
 
     #[test]
+    fn normalize_join_target_input_empty_is_actionable() {
+        let error = normalize_join_target_input("   ").expect_err("empty target should fail");
+        assert!(error.to_string().contains("Fix: bmux join <invite>"));
+        assert!(error.to_string().contains("Advanced: bmux hosts"));
+    }
+
+    #[test]
+    fn normalize_join_target_input_whitespace_noise_is_actionable() {
+        let error = normalize_join_target_input("invite demo code")
+            .expect_err("invalid invite should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("could not find a valid invite link in input")
+        );
+        assert!(error.to_string().contains("Fix: bmux join <invite>"));
+    }
+
+    #[test]
     fn build_join_target_options_prioritizes_recent_then_links_then_named_then_local() {
         let mut config = BmuxConfig::default();
         config.connections.recent_targets = vec!["ssh-prod".to_string(), "bmux://demo".to_string()];
@@ -3604,7 +3661,8 @@ mod tests {
     fn connect_target_resolution_error_adds_share_link_hint() {
         let error = anyhow::anyhow!("share link not found: bmux://demo");
         let mapped = map_connect_target_resolution_error("bmux://demo", error);
-        assert!(mapped.to_string().contains("run 'bmux hosts'"));
+        assert!(mapped.to_string().contains("Fix: bmux setup"));
+        assert!(mapped.to_string().contains("Advanced: bmux hosts"));
     }
 
     #[tokio::test]
