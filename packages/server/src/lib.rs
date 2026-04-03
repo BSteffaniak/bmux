@@ -2150,6 +2150,16 @@ impl SessionRuntimeManager {
                         .unwrap_or((24, 80));
                     let mut cursor_tracker = PaneCursorTracker::new(initial_rows, initial_cols);
                     let mut mouse_protocol_tracker = PaneMouseProtocolTracker::default();
+
+                    // Image interceptor: detects and extracts image escape sequences
+                    // (Sixel, Kitty, iTerm2) from PTY output before they reach the
+                    // output buffer.  Feature-gated to compile away when no image
+                    // protocols are enabled.
+                    #[cfg(feature = "image-registry")]
+                    let mut image_interceptor = bmux_image::ImageInterceptor::new();
+                    #[cfg(feature = "image-registry")]
+                    let mut image_registry = bmux_image::ImageRegistry::default();
+
                     loop {
                         match reader.read(&mut buffer) {
                             Ok(0) => break,
@@ -2160,6 +2170,24 @@ impl SessionRuntimeManager {
                                 {
                                     cursor_tracker.resize(rows, cols);
                                 }
+
+                                // When image support is enabled, run the interceptor
+                                // to extract image sequences from the byte stream.
+                                // The filtered bytes (images stripped) are what gets
+                                // pushed to the output buffer for vt100 parsing.
+                                #[cfg(feature = "image-registry")]
+                                let chunk = {
+                                    let cursor_pos = cursor_tracker.cursor_position();
+                                    let result = image_interceptor.process(chunk, cursor_pos);
+                                    for event in result.events {
+                                        // TODO: get cell pixel size from terminal.
+                                        image_registry.handle_event(event, 8, 16);
+                                    }
+                                    result.filtered
+                                };
+                                #[cfg(feature = "image-registry")]
+                                let chunk = chunk.as_slice();
+
                                 if let Ok(mut output) = reader_output.lock() {
                                     output.push_chunk(chunk);
                                 } else {

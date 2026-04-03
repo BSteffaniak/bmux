@@ -13,6 +13,7 @@ version     = { workspace = true }
 # Internal bmux packages
 bmux_config            = { workspace = true }
 bmux_event             = { workspace = true }
+bmux_image             = { workspace = true, optional = true }
 bmux_ipc               = { workspace = true }
 bmux_session           = { workspace = true }
 bmux_terminal          = { workspace = true }
@@ -37,6 +38,9 @@ default = []
 
 # Development features
 fail-on-warnings = []
+
+# Terminal image protocol support (feature-gated, optional)
+image-registry = ["dep:bmux_image"]
 
 # Serialization features
 serde = []

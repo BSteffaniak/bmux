@@ -1,0 +1,20 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Terminal image protocol support for bmux (Sixel, Kitty graphics, iTerm2)"
+edition     = { workspace = true }
+keywords    = ["bmux", "image", "sixel", "kitty", "terminal"]
+license     = { workspace = true }
+name        = "bmux_image"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+serde = { workspace = true, features = ["derive", "std"] }
+
+[features]
+default          = []
+fail-on-warnings = []
+iterm2           = []
+kitty            = []
+sixel            = []

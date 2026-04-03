@@ -234,6 +234,16 @@ pub(crate) async fn run_session_attach_with_client(
         InputProcessor::new(attach_keymap.clone(), raw_mode_guard.keyboard_enhanced);
     let mut exit_reason = AttachExitReason::Detached;
 
+    // Detect host terminal image capabilities (Sixel, Kitty graphics, iTerm2).
+    // Stored here for future use by the image compositor once the full
+    // server-side interceptor and IPC transport are wired up.
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    let _host_image_caps = bmux_image::host_caps::detect_from_env();
+
     // Async terminal event stream — replaces spawn_blocking + poll(15ms).
     let mut terminal_stream = crossterm::event::EventStream::new();
     let mut context_refresh_interval = tokio::time::interval(ATTACH_CONTEXT_REFRESH_INTERVAL);
@@ -2302,6 +2312,14 @@ pub(crate) async fn render_attach_frame(
         view_state.selection_anchor,
         layout_state.zoomed,
     )?;
+
+    // Image overlay: render terminal images (Sixel, Kitty, iTerm2) on top
+    // of the cell content.  This is a no-op when no image features are
+    // enabled or when the host terminal has no image support.
+    // TODO(image-phase-2): Once the server-side interceptor and IPC image
+    // transport are wired up, fetch pane images here and pass them to
+    // bmux_image::compositor::render_pane_images().
+
     let previous_cursor_state = view_state.last_cursor_state;
     if view_state.help_overlay_open {
         if let Some(help_surface) = help_overlay_surface(help_lines) {

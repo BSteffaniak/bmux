@@ -44,9 +44,10 @@ bmux_windows_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
 
-# External dependencies
+# Image protocol support (optional, feature-gated per protocol)
 ab_glyph = { workspace = true }
 anyhow = { workspace = true, features = ["std"] }
+bmux_image = { workspace = true, optional = true }
 clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
 crossterm = { workspace = true, features = ["events", "event-stream"] }
 font8x8 = { workspace = true }
@@ -94,7 +95,12 @@ vt100 = { workspace = true }
 
 [features]
 # Default features
-default = ["bundled-fonts", "bundled-plugins", "kitty-keyboard"]
+default = [
+    "bundled-fonts",
+    "bundled-plugins",
+    "kitty-keyboard",
+    "image-protocols",
+]
 
 # Development features
 fail-on-warnings = []
@@ -124,6 +130,24 @@ bundled-fonts = ["bmux_fonts/bundled-nerd-fonts"]
 
 # Serialization features
 serde = ["bmux_event/serde", "bmux_session/serde", "bmux_terminal/serde"]
+
+# Terminal image protocol support
+image-iterm2 = [
+    "dep:bmux_image",
+    "bmux_image/iterm2",
+    "bmux_server/image-registry",
+]
+image-kitty = [
+    "dep:bmux_image",
+    "bmux_image/kitty",
+    "bmux_server/image-registry",
+]
+image-protocols = ["image-sixel", "image-kitty", "image-iterm2"]
+image-sixel = [
+    "dep:bmux_image",
+    "bmux_image/sixel",
+    "bmux_server/image-registry",
+]
 
 [dev-dependencies]
 serde_json  = { workspace = true }

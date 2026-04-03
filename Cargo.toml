@@ -26,6 +26,7 @@ members = [
     "packages/terminal/models",
     "packages/terminal_protocol",
     "packages/keyboard",
+    "packages/image",
     "packages/docs-site",
     "packages/docs-site/ui",
     "plugins/clipboard-plugin",
@@ -88,6 +89,7 @@ bmux_config_doc_derive = { version = "0.0.1-alpha.0", default-features = false, 
 bmux_event             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event" }
 bmux_event_models      = { version = "0.0.1-alpha.0", default-features = false, path = "packages/event/models" }
 bmux_fonts             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/fonts" }
+bmux_image             = { version = "0.0.1-alpha.0", default-features = false, path = "packages/image" }
 bmux_ipc               = { version = "0.0.1-alpha.0", default-features = false, path = "packages/ipc" }
 bmux_keybind           = { version = "0.0.1-alpha.0", default-features = false, path = "packages/keybind" }
 bmux_keyboard          = { version = "0.0.1-alpha.0", default-features = false, path = "packages/keyboard" }
