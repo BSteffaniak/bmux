@@ -351,7 +351,9 @@ pub(super) async fn run_setup() -> Result<u8> {
     println!("Step 1/2: auth");
     let _ = ensure_authenticated(&BmuxConfig::load()?).await?;
     println!("Step 2/2: host");
-    run_host("127.0.0.1:7443", None, false, false, false).await
+    let code = run_host("127.0.0.1:7443", None, false, false, false).await?;
+    println!("Setup complete.");
+    Ok(code)
 }
 
 pub(super) async fn run_host(
@@ -361,6 +363,9 @@ pub(super) async fn run_host(
     status: bool,
     stop: bool,
 ) -> Result<u8> {
+    if status && stop {
+        anyhow::bail!("--status and --stop cannot be used together")
+    }
     if status {
         return run_host_status();
     }
@@ -437,7 +442,7 @@ pub(super) async fn run_host(
 
     if copy {
         match crate::runtime::attach::runtime::copy_text_with_clipboard_plugin(&join_link) {
-            Ok(()) => println!("copied to clipboard: {join_link}"),
+            Ok(()) => println!("Copied to clipboard: {join_link}"),
             Err(error) => eprintln!(
                 "warning: clipboard copy failed: {}",
                 crate::runtime::attach::runtime::format_clipboard_service_error(&error)
@@ -452,10 +457,10 @@ pub(super) async fn run_host(
     }
     println!("connect URL: {target}");
     if let Some(share) = resolved_share.as_deref() {
-        println!("share link: bmux://{share}");
-        println!("join: bmux join bmux://{share}");
+        println!("Share link: bmux://{share}");
+        println!("Join from another machine: bmux join bmux://{share}");
     } else {
-        println!("join: bmux join {target}");
+        println!("Join from another machine: bmux join {target}");
     }
 
     while let Some(incoming) = endpoint.accept().await {
@@ -599,6 +604,7 @@ pub(super) async fn run_auth_login(no_browser: bool) -> Result<u8> {
     };
 
     let whoami = verify_access_token(&control_plane_url, &token).await?;
+    let account_name_for_output = whoami.account_name.clone();
     let paths = ConfigPaths::default();
     let state = AuthState {
         access_token: token,
@@ -607,10 +613,12 @@ pub(super) async fn run_auth_login(no_browser: bool) -> Result<u8> {
         expires_at_unix: None,
     };
     save_auth_state(&paths, &state)?;
-    println!(
-        "auth login complete ({})",
-        auth_state_path(&paths).display()
-    );
+    if let Some(account) = account_name_for_output.as_deref() {
+        println!("Signed in as {account}");
+    } else {
+        println!("Signed in");
+    }
+    println!("auth state: {}", auth_state_path(&paths).display());
     Ok(0)
 }
 
@@ -697,22 +705,23 @@ pub(super) async fn run_share(
         .insert(slug.clone(), resolved_target.clone());
     config.save()?;
     let link_name = created.name.clone().unwrap_or(slug);
-    println!("created share link: bmux://{link_name}");
+    println!("Share link: bmux://{link_name}");
     if let Some(url) = created.url {
-        println!("url: {url}");
+        println!("Invite URL: {url}");
     }
-    println!("target: {resolved_target}");
-    println!("role: {role}");
+    println!("Join from another machine: bmux join bmux://{link_name}");
+    println!("Target: {resolved_target}");
+    println!("Role: {role}");
     if let Some(value) = ttl {
-        println!("ttl: {value}");
+        println!("TTL: {value}");
     }
     if one_time {
-        println!("one-time: true");
+        println!("One-time: true");
     }
     if copy {
         let share_link = format!("bmux://{link_name}");
         match crate::runtime::attach::runtime::copy_text_with_clipboard_plugin(&share_link) {
-            Ok(()) => println!("copied to clipboard: {share_link}"),
+            Ok(()) => println!("Copied to clipboard: {share_link}"),
             Err(error) => eprintln!(
                 "warning: clipboard copy failed: {}",
                 crate::runtime::attach::runtime::format_clipboard_service_error(&error)

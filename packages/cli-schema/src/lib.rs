@@ -193,10 +193,10 @@ pub enum Command {
         #[arg(long)]
         copy: bool,
         /// Show hosted-mode runtime status
-        #[arg(long)]
+        #[arg(long, conflicts_with = "stop")]
         status: bool,
         /// Stop hosted-mode runtime if running
-        #[arg(long)]
+        #[arg(long, conflicts_with = "status")]
         stop: bool,
     },
     /// Join a hosted link/target quickly
