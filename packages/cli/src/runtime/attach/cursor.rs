@@ -8,10 +8,16 @@ pub fn apply_attach_cursor_state(
     stdout: &mut impl Write,
     cursor_state: Option<AttachCursorState>,
     last_cursor_state: &mut Option<AttachCursorState>,
+    force_move: bool,
 ) -> Result<()> {
     match (cursor_state, *last_cursor_state) {
         (Some(current), Some(previous)) if current == previous => {
-            queue!(stdout, RestorePosition).context("failed restoring cursor position")?;
+            if force_move {
+                queue!(stdout, MoveTo(current.x, current.y))
+                    .context("failed forcing attach cursor move")?;
+            } else {
+                queue!(stdout, RestorePosition).context("failed restoring cursor position")?;
+            }
         }
         (Some(current), Some(previous)) => {
             if current.visible != previous.visible {
@@ -41,4 +47,46 @@ pub fn apply_attach_cursor_state(
 
     *last_cursor_state = cursor_state;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn equal_cursor_state_uses_restore_position_without_force() {
+        let mut out = Vec::new();
+        let cursor = AttachCursorState {
+            x: 4,
+            y: 2,
+            visible: false,
+        };
+        let mut last = Some(cursor);
+
+        apply_attach_cursor_state(&mut out, Some(cursor), &mut last, false)
+            .expect("cursor apply should succeed");
+
+        assert_eq!(out, b"\x1b8");
+    }
+
+    #[test]
+    fn equal_cursor_state_forces_explicit_move_when_requested() {
+        let mut out = Vec::new();
+        let cursor = AttachCursorState {
+            x: 4,
+            y: 2,
+            visible: false,
+        };
+        let mut last = Some(cursor);
+
+        apply_attach_cursor_state(&mut out, Some(cursor), &mut last, true)
+            .expect("cursor apply should succeed");
+
+        assert_ne!(out, b"\x1b8");
+        assert!(
+            std::str::from_utf8(&out)
+                .expect("cursor bytes should be utf8")
+                .ends_with('H')
+        );
+    }
 }

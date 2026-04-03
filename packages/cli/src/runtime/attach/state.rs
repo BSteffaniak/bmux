@@ -70,6 +70,7 @@ pub struct AttachCursorState {
 
 pub struct PaneRenderBuffer {
     pub(crate) parser: vt100::Parser,
+    pub(crate) last_alternate_screen: bool,
     /// Cached rendered row strings from the previous frame.  When a row's
     /// string matches the cached version we skip emitting it, avoiding
     /// unnecessary terminal I/O for unchanged content.
@@ -80,6 +81,7 @@ impl Default for PaneRenderBuffer {
     fn default() -> Self {
         Self {
             parser: vt100::Parser::new(24, 80, 4_096),
+            last_alternate_screen: false,
             prev_rows: Vec::new(),
         }
     }
@@ -119,6 +121,7 @@ pub struct AttachViewState {
     pub(crate) cached_status_line: Option<AttachStatusLine>,
     pub(crate) cached_layout_state: Option<AttachLayoutState>,
     pub(crate) last_cursor_state: Option<AttachCursorState>,
+    pub(crate) force_cursor_move_next_frame: bool,
     pub(crate) mouse: AttachMouseState,
     pub(crate) dirty: AttachDirtyFlags,
 }
@@ -158,6 +161,7 @@ impl AttachViewState {
             cached_status_line: None,
             cached_layout_state: None,
             last_cursor_state: None,
+            force_cursor_move_next_frame: false,
             mouse: AttachMouseState {
                 config: MouseBehaviorConfig::default(),
                 ..AttachMouseState::default()

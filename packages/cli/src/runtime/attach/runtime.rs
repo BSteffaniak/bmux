@@ -4,6 +4,31 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 const ATTACH_CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
+const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
+
+fn apply_attach_output_bytes(
+    view_state: &mut AttachViewState,
+    pane_id: Uuid,
+    bytes: &[u8],
+    frame_needs_render: &mut bool,
+) -> bool {
+    if bytes.is_empty() {
+        return false;
+    }
+
+    let buffer = view_state.pane_buffers.entry(pane_id).or_default();
+    let toggled_alternate = append_pane_output(buffer, bytes);
+    view_state.dirty.pane_dirty_ids.insert(pane_id);
+    *frame_needs_render = true;
+
+    if toggled_alternate {
+        view_state.dirty.full_pane_redraw = true;
+        view_state.force_cursor_move_next_frame = true;
+    }
+
+    true
+}
 
 pub(crate) async fn run_session_attach_with_client(
     mut client: BmuxClient,
@@ -448,14 +473,13 @@ pub(crate) async fn run_session_attach_with_client(
             // visible tearing from partial redraws.  TUI programs like
             // lazygit can emit 20-30 KB when switching views; with 8 KB
             // per fetch we need a few rounds to consume the full burst.
-            const OUTPUT_BATCH_MAX: usize = 8 * 1024;
-            const DRAIN_MAX_ROUNDS: usize = 8;
-            for _round in 0..DRAIN_MAX_ROUNDS {
+            let mut last_round_had_data = false;
+            for _round in 0..ATTACH_OUTPUT_DRAIN_MAX_ROUNDS {
                 let chunks = match client
                     .attach_pane_output_batch(
                         view_state.attached_id,
                         pane_ids.clone(),
-                        OUTPUT_BATCH_MAX,
+                        ATTACH_OUTPUT_BATCH_MAX_BYTES,
                     )
                     .await
                 {
@@ -465,6 +489,7 @@ pub(crate) async fn run_session_attach_with_client(
                             || is_attach_not_attached_runtime_error(&error) =>
                     {
                         exit_reason = AttachExitReason::StreamClosed;
+                        last_round_had_data = false;
                         break;
                     }
                     Err(error) => return Err(map_attach_client_error(error)),
@@ -472,21 +497,22 @@ pub(crate) async fn run_session_attach_with_client(
 
                 let mut had_data = false;
                 for chunk in chunks {
-                    if chunk.data.is_empty() {
-                        continue;
-                    }
-                    had_data = true;
-                    let buffer = view_state.pane_buffers.entry(chunk.pane_id).or_default();
-                    append_pane_output(buffer, &chunk.data);
-                    view_state.dirty.pane_dirty_ids.insert(chunk.pane_id);
-                    frame_needs_render = true;
+                    had_data |= apply_attach_output_bytes(
+                        &mut view_state,
+                        chunk.pane_id,
+                        &chunk.data,
+                        &mut frame_needs_render,
+                    );
                 }
+                last_round_had_data = had_data;
 
                 if !had_data {
                     break;
                 }
             }
-            pane_output_pending = false;
+            // If the final allowed drain round still produced bytes, keep
+            // output pending so the next loop continues draining.
+            pane_output_pending = last_round_had_data;
         }
 
         if !frame_needs_render {
@@ -2267,12 +2293,19 @@ pub(crate) async fn render_attach_frame(
         if let Some(help_surface) = help_overlay_surface(help_lines) {
             queue_attach_help_overlay(&mut frame_bytes, &help_surface, help_lines, help_scroll)?;
         }
-        apply_attach_cursor_state(&mut frame_bytes, None, &mut view_state.last_cursor_state)?;
+        apply_attach_cursor_state(
+            &mut frame_bytes,
+            None,
+            &mut view_state.last_cursor_state,
+            false,
+        )?;
     } else {
+        let force_cursor_move = std::mem::take(&mut view_state.force_cursor_move_next_frame);
         apply_attach_cursor_state(
             &mut frame_bytes,
             cursor_state,
             &mut view_state.last_cursor_state,
+            force_cursor_move,
         )?;
     }
 
@@ -3019,13 +3052,14 @@ pub(crate) async fn hydrate_attach_state_from_snapshot(
     if let Some(layout_state) = view_state.cached_layout_state.as_ref() {
         resize_attach_parsers_for_scene(&mut view_state.pane_buffers, &layout_state.scene);
     }
+    let mut frame_needs_render = false;
     for chunk in chunks {
-        if chunk.data.is_empty() {
-            continue;
-        }
-        let buffer = view_state.pane_buffers.entry(chunk.pane_id).or_default();
-        append_pane_output(buffer, &chunk.data);
-        view_state.dirty.pane_dirty_ids.insert(chunk.pane_id);
+        let _ = apply_attach_output_bytes(
+            view_state,
+            chunk.pane_id,
+            &chunk.data,
+            &mut frame_needs_render,
+        );
     }
     view_state.dirty.layout_needs_refresh = false;
     view_state.dirty.full_pane_redraw = true;
@@ -4449,11 +4483,53 @@ mod tests {
         let buffer = view_state.pane_buffers.entry(pane_id).or_insert_with(|| {
             crate::runtime::attach::state::PaneRenderBuffer {
                 parser: vt100::Parser::new(4, 20, 4_096),
+                last_alternate_screen: false,
                 prev_rows: Vec::new(),
             }
         });
         append_pane_output(buffer, b"one\r\n  four\r\n     five\r\n  six\r\n\x1b[4;3H");
         view_state
+    }
+
+    #[test]
+    fn apply_attach_output_marks_full_redraw_on_alt_screen_toggle() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        view_state.dirty.full_pane_redraw = false;
+        view_state.force_cursor_move_next_frame = false;
+
+        let pane_id = view_state
+            .cached_layout_state
+            .as_ref()
+            .map(|layout| layout.focused_pane_id)
+            .expect("focused pane id");
+
+        let mut payload = Vec::new();
+        payload.extend_from_slice(b"\x1b[?1049h");
+        payload.extend(std::iter::repeat_n(
+            b'x',
+            super::ATTACH_OUTPUT_BATCH_MAX_BYTES * super::ATTACH_OUTPUT_DRAIN_MAX_ROUNDS + 64,
+        ));
+        payload.extend_from_slice(b"\x1b[?1049l\r\n$ ");
+
+        let mut frame_needs_render = false;
+        let had_data = super::apply_attach_output_bytes(
+            &mut view_state,
+            pane_id,
+            &payload,
+            &mut frame_needs_render,
+        );
+
+        assert!(had_data);
+        assert!(frame_needs_render);
+        assert!(view_state.dirty.pane_dirty_ids.contains(&pane_id));
+        assert!(view_state.dirty.full_pane_redraw);
+        assert!(view_state.force_cursor_move_next_frame);
+
+        let buffer = view_state
+            .pane_buffers
+            .get(&pane_id)
+            .expect("pane render buffer");
+        assert!(!buffer.parser.screen().alternate_screen());
     }
 
     #[test]

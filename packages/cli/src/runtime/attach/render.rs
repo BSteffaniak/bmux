@@ -36,11 +36,40 @@ impl AttachLayerSurface {
     }
 }
 
-pub fn append_pane_output(buffer: &mut PaneRenderBuffer, bytes: &[u8]) {
+pub fn append_pane_output(buffer: &mut PaneRenderBuffer, bytes: &[u8]) -> bool {
     if bytes.is_empty() {
-        return;
+        return false;
     }
+    let was_alternate = buffer.last_alternate_screen;
     buffer.parser.process(bytes);
+    let is_alternate = buffer.parser.screen().alternate_screen();
+    buffer.last_alternate_screen = is_alternate;
+
+    let toggled_alternate =
+        was_alternate != is_alternate || contains_alternate_screen_sequence(bytes);
+    if toggled_alternate {
+        // Alternate-screen transitions can restore or replace rows without
+        // re-emitting every line. Invalidate row diff cache so next render
+        // repaints the pane deterministically.
+        buffer.prev_rows.clear();
+    }
+
+    toggled_alternate
+}
+
+fn contains_alternate_screen_sequence(bytes: &[u8]) -> bool {
+    const SEQUENCES: [&[u8]; 6] = [
+        b"\x1b[?47h",
+        b"\x1b[?47l",
+        b"\x1b[?1047h",
+        b"\x1b[?1047l",
+        b"\x1b[?1049h",
+        b"\x1b[?1049l",
+    ];
+
+    SEQUENCES
+        .iter()
+        .any(|needle| bytes.windows(needle.len()).any(|window| window == *needle))
 }
 
 fn draw_box_line(width: usize, left: char, mid: char, right: char) -> String {
@@ -494,7 +523,8 @@ pub fn render_attach_scene<W: io::Write>(
 #[cfg(test)]
 mod tests {
     use super::{
-        AttachLayer, AttachLayerSurface, opaque_row_text, queue_layer_fill, render_attach_scene,
+        AttachLayer, AttachLayerSurface, append_pane_output, opaque_row_text, queue_layer_fill,
+        render_attach_scene,
     };
     use crate::runtime::attach::state::{
         AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
@@ -559,6 +589,26 @@ mod tests {
         parser.process(&bytes);
 
         assert_eq!(screen_row(parser.screen(), 1, 12), "0help      b");
+    }
+
+    #[test]
+    fn append_output_detects_alternate_screen_toggle() {
+        let mut buffer = PaneRenderBuffer::default();
+        buffer.prev_rows.push("cached".to_string());
+
+        let toggled = append_pane_output(&mut buffer, b"\x1b[?1049h");
+        assert!(toggled);
+        assert!(buffer.parser.screen().alternate_screen());
+        assert!(buffer.prev_rows.is_empty());
+    }
+
+    #[test]
+    fn append_output_detects_enter_and_exit_same_chunk() {
+        let mut buffer = PaneRenderBuffer::default();
+
+        let toggled = append_pane_output(&mut buffer, b"\x1b[?1049hhello\x1b[?1049l");
+        assert!(toggled);
+        assert!(!buffer.parser.screen().alternate_screen());
     }
 
     #[test]
