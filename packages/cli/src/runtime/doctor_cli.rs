@@ -1,6 +1,9 @@
 use super::*;
 
-pub(super) async fn run_doctor(as_json: bool) -> Result<u8> {
+pub(super) async fn run_doctor(as_json: bool, hosted: bool) -> Result<u8> {
+    if hosted {
+        return run_hosted_doctor(as_json).await;
+    }
     let paths = ConfigPaths::default();
 
     let has_warnings = if as_json {
@@ -17,6 +20,104 @@ pub(super) async fn run_doctor(as_json: bool) -> Result<u8> {
     };
 
     Ok(if has_warnings { 1 } else { 0 })
+}
+
+async fn run_hosted_doctor(as_json: bool) -> Result<u8> {
+    let paths = ConfigPaths::default();
+    let config = BmuxConfig::load().unwrap_or_default();
+    let control_plane_url = std::env::var("BMUX_CONTROL_PLANE_URL")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| config.connections.control_plane_url.clone())
+        .unwrap_or_else(|| "https://api.bmux.run".to_string());
+    let auth_path = paths.runtime_dir.join("auth-state.json");
+    let auth_token = std::fs::read_to_string(&auth_path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<serde_json::Value>(&content).ok())
+        .and_then(|json| {
+            json.get("access_token")
+                .and_then(|value| value.as_str())
+                .map(ToString::to_string)
+        });
+
+    let auth_ok = auth_token.is_some();
+    let control_plane_ok = if let Some(token) = auth_token.as_deref() {
+        let client = reqwest::Client::new();
+        let response = client
+            .get(format!("{control_plane_url}/v1/auth/whoami"))
+            .bearer_auth(token)
+            .send()
+            .await;
+        matches!(response, Ok(resp) if resp.status().is_success())
+    } else {
+        false
+    };
+
+    let host_state_path = paths.runtime_dir.join("host-state.json");
+    let host_runtime_ok = host_state_path.exists();
+    let share_lookup_ok = if config.connections.share_links.is_empty() {
+        false
+    } else if auth_token.is_none() {
+        true
+    } else {
+        true
+    };
+
+    let lines = vec![
+        (
+            "auth",
+            auth_ok,
+            "run 'bmux auth login'",
+            format!("state: {}", auth_path.display()),
+        ),
+        (
+            "control-plane",
+            control_plane_ok,
+            "check network or BMUX_CONTROL_PLANE_URL",
+            control_plane_url.clone(),
+        ),
+        (
+            "host-runtime",
+            host_runtime_ok,
+            "run 'bmux host'",
+            format!("state: {}", host_state_path.display()),
+        ),
+        (
+            "share-lookup",
+            share_lookup_ok,
+            "run 'bmux share --name <name>'",
+            format!("known links: {}", config.connections.share_links.len()),
+        ),
+    ];
+
+    if as_json {
+        let checks: serde_json::Map<String, serde_json::Value> = lines
+            .iter()
+            .map(|(name, ok, hint, detail)| {
+                (
+                    (*name).to_string(),
+                    serde_json::json!({ "ok": ok, "detail": detail, "hint": if *ok { serde_json::Value::Null } else { serde_json::Value::String((*hint).to_string()) }}),
+                )
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({"hosted": checks}))
+                .context("failed to encode hosted doctor json")?
+        );
+    } else {
+        for (name, ok, hint, detail) in &lines {
+            if *ok {
+                println!("{name}: PASS ({detail})");
+            } else {
+                println!("{name}: FAIL ({detail})");
+                println!("  fix: {hint}");
+            }
+        }
+    }
+
+    let has_failures = lines.iter().any(|(_, ok, _, _)| !*ok);
+    Ok(if has_failures { 1 } else { 0 })
 }
 
 // ── text output ─────────────────────────────────────────────────────────

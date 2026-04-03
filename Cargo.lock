@@ -865,6 +865,7 @@ dependencies = [
  "moosicbox_log_runtime",
  "moosicbox_log_watch",
  "portable-pty",
+ "qrcode",
  "rcgen",
  "regex",
  "reqwest",
@@ -5955,6 +5956,12 @@ dependencies = [
  "memchr",
  "unicase 2.9.0",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
 
 [[package]]
 name = "qstring"

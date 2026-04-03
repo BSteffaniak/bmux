@@ -217,6 +217,8 @@ pub enum Command {
     Share {
         /// Target/link to share
         target: Option<String>,
+        /// Optional second positional argument (used by `bmux share revoke <name>`)
+        secondary: Option<String>,
         /// Optional stable share name
         #[arg(long)]
         name: Option<String>,
@@ -232,6 +234,9 @@ pub enum Command {
         /// Copy resulting share link to clipboard
         #[arg(long)]
         copy: bool,
+        /// Render a terminal QR code for the share link
+        #[arg(long)]
+        qr: bool,
     },
     /// Remove a named shared link
     Unshare {
@@ -338,6 +343,9 @@ pub enum Command {
         /// Print output as JSON
         #[arg(long)]
         json: bool,
+        /// Run hosted-mode focused checks
+        #[arg(long)]
+        hosted: bool,
     },
     /// Keymap tools and diagnostics
     Keymap {
@@ -1237,21 +1245,57 @@ mod tests {
         .expect("valid CLI args");
         let Some(Command::Share {
             target,
+            secondary,
             name,
             role,
             ttl,
             one_time,
             copy,
+            qr,
         }) = cli.command
         else {
             panic!("expected share command");
         };
         assert!(target.is_none());
+        assert!(secondary.is_none());
         assert_eq!(name.as_deref(), Some("demo"));
         assert_eq!(role, "view");
         assert_eq!(ttl.as_deref(), Some("24h"));
         assert!(one_time);
         assert!(copy);
+        assert!(!qr);
+    }
+
+    #[test]
+    fn parses_share_revoke_alias_style() {
+        let cli = Cli::try_parse_from(["bmux", "share", "revoke", "demo"]).expect("valid CLI args");
+        let Some(Command::Share {
+            target, secondary, ..
+        }) = cli.command
+        else {
+            panic!("expected share command");
+        };
+        assert_eq!(target.as_deref(), Some("revoke"));
+        assert_eq!(secondary.as_deref(), Some("demo"));
+    }
+
+    #[test]
+    fn parses_share_qr_flag() {
+        let cli = Cli::try_parse_from(["bmux", "share", "--qr"]).expect("valid CLI args");
+        let Some(Command::Share { qr, .. }) = cli.command else {
+            panic!("expected share command");
+        };
+        assert!(qr);
+    }
+
+    #[test]
+    fn parses_doctor_hosted_flag() {
+        let cli = Cli::try_parse_from(["bmux", "doctor", "--hosted"]).expect("valid CLI args");
+        let Some(Command::Doctor { hosted, json }) = cli.command else {
+            panic!("expected doctor command");
+        };
+        assert!(hosted);
+        assert!(!json);
     }
 
     #[test]

@@ -4,6 +4,8 @@ use bmux_config::{ConnectionTargetConfig, ConnectionTransport, RemoteServerStart
 use bmux_ipc::IpcEndpoint;
 use bmux_ipc::transport::{ErasedIpcStream, LocalIpcStream};
 use iroh::{Endpoint, EndpointAddr, EndpointId, endpoint::presets};
+use qrcode::QrCode;
+use qrcode::render::unicode;
 use rustls::RootCertStore;
 use rustls::pki_types::ServerName;
 use serde::{Deserialize, Serialize};
@@ -660,12 +662,21 @@ pub(super) fn run_auth_logout() -> Result<u8> {
 
 pub(super) async fn run_share(
     target: Option<&str>,
+    secondary: Option<&str>,
     name: Option<&str>,
     role: &str,
     ttl: Option<&str>,
     one_time: bool,
     copy: bool,
+    qr: bool,
 ) -> Result<u8> {
+    if target == Some("revoke") {
+        let revoke_name = secondary
+            .or(name)
+            .ok_or_else(|| anyhow::anyhow!("usage: bmux share revoke <name>"))?;
+        return run_unshare(revoke_name).await;
+    }
+
     let mut config = BmuxConfig::load()?;
     let resolved_target = if let Some(target) = target {
         target.to_string()
@@ -705,8 +716,9 @@ pub(super) async fn run_share(
         .insert(slug.clone(), resolved_target.clone());
     config.save()?;
     let link_name = created.name.clone().unwrap_or(slug);
+    let invite_url = created.url.clone();
     println!("Share link: bmux://{link_name}");
-    if let Some(url) = created.url {
+    if let Some(url) = invite_url.as_deref() {
         println!("Invite URL: {url}");
     }
     println!("Join from another machine: bmux join bmux://{link_name}");
@@ -728,6 +740,13 @@ pub(super) async fn run_share(
             ),
         }
     }
+    if qr {
+        let qr_payload = invite_url.unwrap_or_else(|| format!("bmux://{link_name}"));
+        println!("QR:");
+        for line in render_text_qr(&qr_payload)? {
+            println!("{line}");
+        }
+    }
     Ok(0)
 }
 
@@ -740,7 +759,7 @@ pub(super) async fn run_unshare(name: &str) -> Result<u8> {
 
     if config.connections.share_links.remove(name).is_some() {
         config.save()?;
-        println!("removed share link bmux://{name}");
+        println!("Revoked share link: bmux://{name}");
         return Ok(0);
     }
     anyhow::bail!("share link not found: bmux://{name}");
@@ -757,8 +776,32 @@ fn choose_default_target_interactively(config: &BmuxConfig) -> Result<String> {
         return Ok(first_named.clone());
     }
     if io::stdin().is_terminal() {
-        println!("No recent targets found.");
-        print!("Paste an invite link (or press Enter to use local): ");
+        let mut options = Vec::new();
+        for target in &config.connections.recent_targets {
+            if !options.iter().any(|value| value == target) {
+                options.push(target.clone());
+            }
+        }
+        for name in config.connections.share_links.keys() {
+            let share = format!("bmux://{name}");
+            if !options.iter().any(|value| value == &share) {
+                options.push(share);
+            }
+        }
+        for name in config.connections.targets.keys() {
+            if !options.iter().any(|value| value == name) {
+                options.push(name.clone());
+            }
+        }
+        if !options.is_empty() {
+            println!("Choose a host or paste an invite (bmux://, https://, iroh://):");
+            for (index, option) in options.iter().enumerate() {
+                println!("  {}. {option}", index + 1);
+            }
+        } else {
+            println!("No recent targets found.");
+        }
+        print!("Selection, invite, or Enter for local: ");
         io::stdout()
             .flush()
             .context("failed flushing join prompt")?;
@@ -767,6 +810,12 @@ fn choose_default_target_interactively(config: &BmuxConfig) -> Result<String> {
             .read_line(&mut input)
             .context("failed reading join target")?;
         let value = input.trim();
+        if let Ok(index) = value.parse::<usize>()
+            && index > 0
+            && index <= options.len()
+        {
+            return Ok(options[index - 1].clone());
+        }
         if !value.is_empty() {
             return normalize_join_target_input(value);
         }
@@ -846,6 +895,12 @@ fn build_create_share_request(
         ttl,
         one_time,
     }
+}
+
+fn render_text_qr(payload: &str) -> Result<Vec<String>> {
+    let code = QrCode::new(payload.as_bytes()).context("failed generating QR code")?;
+    let rendered = code.render::<unicode::Dense1x2>().quiet_zone(true).build();
+    Ok(rendered.lines().map(ToString::to_string).collect())
 }
 
 fn run_host_status() -> Result<u8> {
@@ -2965,6 +3020,13 @@ mod tests {
         );
         assert!(request.ttl.is_none());
         assert!(!request.one_time);
+    }
+
+    #[test]
+    fn render_text_qr_produces_multiline_output() {
+        let lines = render_text_qr("bmux://demo").expect("render qr");
+        assert!(lines.len() > 4);
+        assert!(lines.iter().any(|line| !line.trim().is_empty()));
     }
 
     #[test]

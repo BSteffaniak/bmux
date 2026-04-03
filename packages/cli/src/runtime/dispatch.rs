@@ -160,20 +160,24 @@ pub(super) async fn dispatch_built_in_command(
             BuiltInHandlerId::Share,
             Command::Share {
                 target,
+                secondary,
                 name,
                 role,
                 ttl,
                 one_time,
                 copy,
+                qr,
             },
         ) => {
             run_share(
                 target.as_deref(),
+                secondary.as_deref(),
                 name.as_deref(),
                 role,
                 ttl.as_deref(),
                 *one_time,
                 *copy,
+                *qr,
             )
             .await
         }
@@ -568,7 +572,9 @@ pub(super) async fn dispatch_built_in_command(
                 command: ConfigCommand::Set { key, value },
             },
         ) => run_config_set(key, value),
-        (BuiltInHandlerId::Doctor, Command::Doctor { json }) => run_doctor(*json).await,
+        (BuiltInHandlerId::Doctor, Command::Doctor { json, hosted }) => {
+            run_doctor(*json, *hosted).await
+        }
         (
             BuiltInHandlerId::KeymapDoctor,
             Command::Keymap {
