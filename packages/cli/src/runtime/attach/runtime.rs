@@ -2228,7 +2228,20 @@ pub(crate) async fn render_attach_frame(
     }
 
     let mut frame_bytes = Vec::new();
+    // Wrap the entire frame in a synchronized update so the terminal
+    // buffers all output and displays it atomically (Mode 2026).
+    // Terminals that don't support this silently ignore the sequences.
+    queue!(frame_bytes, BeginSynchronizedUpdate)
+        .context("failed queuing begin synchronized update")?;
     queue!(frame_bytes, SavePosition).context("failed queuing cursor save for attach frame")?;
+    // Hide the cursor during the frame render to prevent it from visibly
+    // jumping to every MoveTo position as pane content is drawn.
+    queue!(frame_bytes, Hide).context("failed queuing cursor hide for attach frame")?;
+    // Reflect the forced-hide in tracked state so apply_attach_cursor_state
+    // will re-emit Show if the cursor should be visible after the frame.
+    if let Some(ref mut cs) = view_state.last_cursor_state {
+        cs.visible = false;
+    }
     if let Some(status_line) = view_state.cached_status_line.as_ref() {
         queue_attach_status_line(&mut frame_bytes, status_line, view_state.status_position)?;
     }
@@ -2271,6 +2284,8 @@ pub(crate) async fn render_attach_frame(
             let _ = capture.record_activity(bmux_ipc::DisplayActivityKind::Cursor);
         }
     }
+
+    queue!(frame_bytes, EndSynchronizedUpdate).context("failed queuing end synchronized update")?;
 
     let mut stdout = io::stdout();
     stdout

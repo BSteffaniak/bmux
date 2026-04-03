@@ -43,7 +43,7 @@ use bmux_plugin_sdk::{
 };
 use bmux_server::{BmuxServer, OfflineSessionKillTarget, offline_kill_sessions};
 use clap::{CommandFactory, FromArgMatches};
-use crossterm::cursor::{MoveTo, SavePosition, Show};
+use crossterm::cursor::{Hide, MoveTo, SavePosition, Show};
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
     KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
@@ -51,7 +51,7 @@ use crossterm::event::{
 use crossterm::queue;
 use crossterm::style::Print;
 use crossterm::terminal;
-use crossterm::terminal::{Clear, ClearType};
+use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use gif::{Encoder as GifEncoder, Frame as GifFrame, Repeat};
 use std::cell::RefCell;
