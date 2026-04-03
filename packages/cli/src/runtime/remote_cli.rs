@@ -558,7 +558,10 @@ pub(super) async fn run_host(
     endpoint.online().await;
     let addr = endpoint.addr();
     let endpoint_id = endpoint.id();
-    let relay = addr.relay_urls().next().map(|value| value.to_string());
+    let relay = addr
+        .relay_urls()
+        .next()
+        .map(|value| normalize_relay_url_for_display(&value.to_string()));
     let target = relay.as_ref().map_or_else(
         || format!("iroh://{endpoint_id}"),
         |relay_url| format!("iroh://{endpoint_id}?relay={relay_url}"),
@@ -733,6 +736,53 @@ fn format_setup_summary_lines(
         "Join from another machine: bmux join {join_target}"
     ));
     lines
+}
+
+fn normalize_relay_url_for_display(raw: &str) -> String {
+    let Some(scheme_sep) = raw.find("://") else {
+        return raw.to_string();
+    };
+    let authority_start = scheme_sep + 3;
+    let tail = &raw[authority_start..];
+    let suffix_start = tail
+        .find(['/', '?', '#'])
+        .map(|value| authority_start + value)
+        .unwrap_or(raw.len());
+    let authority = &raw[authority_start..suffix_start];
+    let suffix = &raw[suffix_start..];
+    let normalized_authority = normalize_url_authority_host(authority);
+    format!(
+        "{}{}{}",
+        &raw[..authority_start],
+        normalized_authority,
+        suffix
+    )
+}
+
+fn normalize_url_authority_host(authority: &str) -> String {
+    let (prefix, host_port) = authority
+        .rsplit_once('@')
+        .map_or(("", authority), |(left, right)| (left, right));
+    let normalized_host_port = if host_port.starts_with('[') {
+        host_port.to_string()
+    } else if let Some((host, port)) = host_port.rsplit_once(':') {
+        if !host.is_empty()
+            && !port.is_empty()
+            && port.chars().all(|value| value.is_ascii_digit())
+            && host.contains('.')
+        {
+            format!("{}:{}", host.trim_end_matches('.'), port)
+        } else {
+            host_port.trim_end_matches('.').to_string()
+        }
+    } else {
+        host_port.trim_end_matches('.').to_string()
+    };
+    if prefix.is_empty() {
+        normalized_host_port
+    } else {
+        format!("{prefix}@{normalized_host_port}")
+    }
 }
 
 fn resolve_hosted_mode(config: &BmuxConfig, mode: Option<HostedModeArg>) -> HostedMode {
@@ -2559,6 +2609,8 @@ async fn connect_iroh_bridge(target: &IrohTarget, client_name: &str) -> Result<B
         let _ = bridge_write.shutdown().await;
     });
     tokio::spawn(async move {
+        let _endpoint_keepalive = endpoint;
+        let _connection_keepalive = connection;
         if let Err(error) = tokio::io::copy(&mut bridge_read, &mut send).await {
             tracing::debug!(?error, "iroh bridge client->send copy failed");
         }
@@ -3761,6 +3813,19 @@ mod tests {
         let lines =
             format_setup_summary_lines(Some("alice"), "demo-host", None, "iroh://endpoint", false);
         assert_eq!(lines[0], "Host online: demo-host");
+    }
+
+    #[test]
+    fn normalize_relay_url_for_display_trims_trailing_dot() {
+        let normalized =
+            normalize_relay_url_for_display("https://use1-1.relay.n0.iroh-canary.iroh.link./");
+        assert_eq!(normalized, "https://use1-1.relay.n0.iroh-canary.iroh.link/");
+    }
+
+    #[test]
+    fn normalize_relay_url_for_display_keeps_non_url_strings() {
+        let normalized = normalize_relay_url_for_display("not-a-url");
+        assert_eq!(normalized, "not-a-url");
     }
 
     #[test]

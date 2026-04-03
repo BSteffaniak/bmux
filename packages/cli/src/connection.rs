@@ -210,6 +210,8 @@ async fn connect_iroh_target(target: &IrohTarget, client_name: &'static str) -> 
         let _ = bridge_write.shutdown().await;
     });
     tokio::spawn(async move {
+        let _endpoint_keepalive = endpoint;
+        let _connection_keepalive = connection;
         let _ = tokio::io::copy(&mut bridge_read, &mut send).await;
         let _ = send.finish();
     });
@@ -549,7 +551,7 @@ pub fn map_client_connect_error(error: ClientError) -> anyhow::Error {
                 .filter(|value| !value.is_empty())
                 .unwrap_or_else(|| "default".to_string());
             return anyhow::anyhow!(
-                "bmux error: server connection lost unexpectedly.\nThe server may have crashed or been stopped, or a hosted bridge could not reach the local IPC endpoint.\nRuntime: {runtime}\nIPC endpoint: {}\nCheck `bmux --runtime {runtime} server status` and server logs.",
+                "bmux error: server connection lost unexpectedly.\nThe server may have crashed or been stopped, or a hosted bridge could not reach its local IPC endpoint.\nLocal CLI runtime: {runtime}\nLocal CLI IPC endpoint: {}\nCheck `bmux --runtime {runtime} server status` on this machine and host logs on the remote machine.",
                 local_ipc_endpoint_label_for_error(&paths)
             );
         }
