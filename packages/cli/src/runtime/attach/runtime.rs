@@ -3765,6 +3765,86 @@ pub(crate) fn should_forward_click_like_mouse(view_state: &AttachViewState) -> b
     )
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct AttachPaneMouseProtocol {
+    pub(crate) mode: vt100::MouseProtocolMode,
+    pub(crate) encoding: vt100::MouseProtocolEncoding,
+}
+
+pub(crate) fn attach_pane_mouse_protocol(
+    view_state: &AttachViewState,
+    pane_id: Uuid,
+) -> Option<AttachPaneMouseProtocol> {
+    let buffer = view_state.pane_buffers.get(&pane_id)?;
+    let screen = buffer.parser.screen();
+    Some(AttachPaneMouseProtocol {
+        mode: screen.mouse_protocol_mode(),
+        encoding: screen.mouse_protocol_encoding(),
+    })
+}
+
+pub(crate) fn mouse_protocol_mode_reports_event(
+    mode: vt100::MouseProtocolMode,
+    kind: MouseEventKind,
+) -> bool {
+    match mode {
+        vt100::MouseProtocolMode::None => false,
+        vt100::MouseProtocolMode::Press => matches!(
+            kind,
+            MouseEventKind::Down(_)
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+        ),
+        vt100::MouseProtocolMode::PressRelease => matches!(
+            kind,
+            MouseEventKind::Down(_)
+                | MouseEventKind::Up(_)
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+        ),
+        vt100::MouseProtocolMode::ButtonMotion => matches!(
+            kind,
+            MouseEventKind::Down(_)
+                | MouseEventKind::Up(_)
+                | MouseEventKind::Drag(_)
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+        ),
+        vt100::MouseProtocolMode::AnyMotion => matches!(
+            kind,
+            MouseEventKind::Down(_)
+                | MouseEventKind::Up(_)
+                | MouseEventKind::Drag(_)
+                | MouseEventKind::Moved
+                | MouseEventKind::ScrollUp
+                | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollLeft
+                | MouseEventKind::ScrollRight
+        ),
+    }
+}
+
+pub(crate) fn encode_attach_mouse_for_protocol(
+    mouse_event: MouseEvent,
+    protocol: AttachPaneMouseProtocol,
+) -> Option<Vec<u8>> {
+    if !mouse_protocol_mode_reports_event(protocol.mode, mouse_event.kind) {
+        return None;
+    }
+
+    match protocol.encoding {
+        vt100::MouseProtocolEncoding::Sgr => encode_attach_mouse_sgr(mouse_event),
+        vt100::MouseProtocolEncoding::Default => encode_attach_mouse_x10(mouse_event, false),
+        vt100::MouseProtocolEncoding::Utf8 => encode_attach_mouse_x10(mouse_event, true),
+    }
+}
+
 pub(crate) async fn maybe_forward_attach_mouse_event(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
@@ -3773,21 +3853,24 @@ pub(crate) async fn maybe_forward_attach_mouse_event(
     in_focused_pane: bool,
     focus_before_forward: bool,
 ) -> std::result::Result<bool, ClientError> {
-    if target_pane.is_none() {
+    let Some(target_pane) = target_pane else {
         return Ok(false);
-    }
-    if focus_before_forward
-        && let Some(pane_id) = target_pane
-        && !in_focused_pane
-    {
-        focus_attach_pane(client, view_state, pane_id).await?;
+    };
+
+    if focus_before_forward && !in_focused_pane {
+        focus_attach_pane(client, view_state, target_pane).await?;
     } else if !in_focused_pane {
         return Ok(false);
     }
 
-    let Some(bytes) = encode_attach_mouse_sgr(mouse_event) else {
+    let Some(protocol) = attach_pane_mouse_protocol(view_state, target_pane) else {
         return Ok(false);
     };
+
+    let Some(bytes) = encode_attach_mouse_for_protocol(mouse_event, protocol) else {
+        return Ok(false);
+    };
+
     let _ = client.attach_input(view_state.attached_id, bytes).await?;
     Ok(true)
 }
@@ -3799,10 +3882,42 @@ pub(crate) fn encode_attach_mouse_sgr(mouse_event: MouseEvent) -> Option<Vec<u8>
     Some(format!("\x1b[<{cb};{x};{y}{suffix}").into_bytes())
 }
 
-pub(crate) fn encode_attach_mouse_sgr_cb(
-    kind: MouseEventKind,
-    modifiers: KeyModifiers,
-) -> Option<(u16, char)> {
+pub(crate) fn encode_attach_mouse_x10(
+    mouse_event: MouseEvent,
+    utf8_coordinates: bool,
+) -> Option<Vec<u8>> {
+    let cb = encode_attach_mouse_x10_cb(mouse_event.kind, mouse_event.modifiers)?;
+    let x = mouse_event.column.saturating_add(1);
+    let y = mouse_event.row.saturating_add(1);
+
+    let mut bytes = Vec::with_capacity(if utf8_coordinates { 12 } else { 6 });
+    bytes.extend_from_slice(b"\x1b[M");
+
+    if utf8_coordinates {
+        encode_utf8_mouse_component(&mut bytes, cb.saturating_add(32))?;
+        encode_utf8_mouse_component(&mut bytes, x.saturating_add(32))?;
+        encode_utf8_mouse_component(&mut bytes, y.saturating_add(32))?;
+    } else {
+        if x > 223 || y > 223 {
+            return None;
+        }
+        bytes.push(u8::try_from(cb.saturating_add(32)).ok()?);
+        bytes.push(u8::try_from(x.saturating_add(32)).ok()?);
+        bytes.push(u8::try_from(y.saturating_add(32)).ok()?);
+    }
+
+    Some(bytes)
+}
+
+pub(crate) fn encode_utf8_mouse_component(bytes: &mut Vec<u8>, value: u16) -> Option<()> {
+    let codepoint = char::from_u32(u32::from(value))?;
+    let mut buffer = [0_u8; 4];
+    let encoded = codepoint.encode_utf8(&mut buffer);
+    bytes.extend_from_slice(encoded.as_bytes());
+    Some(())
+}
+
+pub(crate) fn encode_attach_mouse_modifier_bits(modifiers: KeyModifiers) -> u16 {
     let mut cb: u16 = if modifiers.contains(KeyModifiers::SHIFT) {
         4
     } else {
@@ -3814,14 +3929,46 @@ pub(crate) fn encode_attach_mouse_sgr_cb(
     if modifiers.contains(KeyModifiers::CONTROL) {
         cb += 16;
     }
+    cb
+}
+
+pub(crate) fn encode_attach_mouse_x10_cb(
+    kind: MouseEventKind,
+    modifiers: KeyModifiers,
+) -> Option<u16> {
+    let modifier_bits = encode_attach_mouse_modifier_bits(modifiers);
+    let button_bits = match kind {
+        MouseEventKind::Down(MouseButton::Left) => 0,
+        MouseEventKind::Down(MouseButton::Middle) => 1,
+        MouseEventKind::Down(MouseButton::Right) => 2,
+        MouseEventKind::Up(MouseButton::Left)
+        | MouseEventKind::Up(MouseButton::Middle)
+        | MouseEventKind::Up(MouseButton::Right) => 3,
+        MouseEventKind::Drag(MouseButton::Left) => 32,
+        MouseEventKind::Drag(MouseButton::Middle) => 33,
+        MouseEventKind::Drag(MouseButton::Right) => 34,
+        MouseEventKind::Moved => 35,
+        MouseEventKind::ScrollUp => 64,
+        MouseEventKind::ScrollDown => 65,
+        MouseEventKind::ScrollLeft => 66,
+        MouseEventKind::ScrollRight => 67,
+    };
+    Some(modifier_bits + button_bits)
+}
+
+pub(crate) fn encode_attach_mouse_sgr_cb(
+    kind: MouseEventKind,
+    modifiers: KeyModifiers,
+) -> Option<(u16, char)> {
+    let cb = encode_attach_mouse_modifier_bits(modifiers);
 
     match kind {
         MouseEventKind::Down(MouseButton::Left) => Some((cb, 'M')),
         MouseEventKind::Down(MouseButton::Middle) => Some((cb + 1, 'M')),
         MouseEventKind::Down(MouseButton::Right) => Some((cb + 2, 'M')),
-        MouseEventKind::Up(MouseButton::Left)
-        | MouseEventKind::Up(MouseButton::Middle)
-        | MouseEventKind::Up(MouseButton::Right) => Some((cb, 'm')),
+        MouseEventKind::Up(MouseButton::Left) => Some((cb, 'm')),
+        MouseEventKind::Up(MouseButton::Middle) => Some((cb + 1, 'm')),
+        MouseEventKind::Up(MouseButton::Right) => Some((cb + 2, 'm')),
         MouseEventKind::Drag(MouseButton::Left) => Some((cb + 32, 'M')),
         MouseEventKind::Drag(MouseButton::Middle) => Some((cb + 33, 'M')),
         MouseEventKind::Drag(MouseButton::Right) => Some((cb + 34, 'M')),
@@ -4465,7 +4612,7 @@ mod tests {
         })
         .expect("mouse up should encode");
 
-        assert_eq!(encoded, b"\x1b[<24;1;1m".to_vec());
+        assert_eq!(encoded, b"\x1b[<26;1;1m".to_vec());
     }
 
     #[test]
@@ -4517,6 +4664,119 @@ mod tests {
             view_state.mouse.config.effective_wheel_propagation(),
             MouseWheelPropagation::ForwardAndScrollback
         );
+    }
+
+    #[test]
+    fn attach_pane_mouse_protocol_reads_parser_state() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        let pane_id = crate::runtime::focused_attach_pane_id(&view_state).expect("focused pane id");
+        let buffer = view_state
+            .pane_buffers
+            .get_mut(&pane_id)
+            .expect("pane render buffer");
+        append_pane_output(buffer, b"\x1b[?1000h\x1b[?1006h");
+
+        let protocol = crate::runtime::attach_pane_mouse_protocol(&view_state, pane_id)
+            .expect("pane protocol");
+        assert_eq!(protocol.mode, vt100::MouseProtocolMode::PressRelease);
+        assert_eq!(protocol.encoding, vt100::MouseProtocolEncoding::Sgr);
+    }
+
+    #[test]
+    fn encode_attach_mouse_for_protocol_skips_when_mode_is_disabled() {
+        let encoded = crate::runtime::encode_attach_mouse_for_protocol(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 1,
+                row: 1,
+                modifiers: KeyModifiers::NONE,
+            },
+            crate::runtime::AttachPaneMouseProtocol {
+                mode: vt100::MouseProtocolMode::None,
+                encoding: vt100::MouseProtocolEncoding::Sgr,
+            },
+        );
+        assert!(encoded.is_none());
+    }
+
+    #[test]
+    fn mouse_protocol_mode_reports_event_rejects_move_without_any_motion_mode() {
+        assert!(!crate::runtime::mouse_protocol_mode_reports_event(
+            vt100::MouseProtocolMode::PressRelease,
+            MouseEventKind::Moved,
+        ));
+        assert!(crate::runtime::mouse_protocol_mode_reports_event(
+            vt100::MouseProtocolMode::AnyMotion,
+            MouseEventKind::Moved,
+        ));
+    }
+
+    #[test]
+    fn mouse_protocol_mode_reports_event_rejects_release_in_press_mode() {
+        assert!(!crate::runtime::mouse_protocol_mode_reports_event(
+            vt100::MouseProtocolMode::Press,
+            MouseEventKind::Up(MouseButton::Left),
+        ));
+        assert!(crate::runtime::mouse_protocol_mode_reports_event(
+            vt100::MouseProtocolMode::Press,
+            MouseEventKind::Down(MouseButton::Left),
+        ));
+    }
+
+    #[test]
+    fn encode_attach_mouse_default_uses_csi_m_sequence() {
+        let encoded = crate::runtime::encode_attach_mouse_for_protocol(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 0,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            crate::runtime::AttachPaneMouseProtocol {
+                mode: vt100::MouseProtocolMode::PressRelease,
+                encoding: vt100::MouseProtocolEncoding::Default,
+            },
+        )
+        .expect("default-encoded mouse event");
+
+        assert_eq!(encoded, vec![0x1b, b'[', b'M', 32, 33, 33]);
+    }
+
+    #[test]
+    fn encode_attach_mouse_default_rejects_wide_coordinates() {
+        let encoded = crate::runtime::encode_attach_mouse_for_protocol(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 223,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            crate::runtime::AttachPaneMouseProtocol {
+                mode: vt100::MouseProtocolMode::PressRelease,
+                encoding: vt100::MouseProtocolEncoding::Default,
+            },
+        );
+
+        assert!(encoded.is_none());
+    }
+
+    #[test]
+    fn encode_attach_mouse_utf8_supports_wide_coordinates() {
+        let encoded = crate::runtime::encode_attach_mouse_for_protocol(
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: 223,
+                row: 0,
+                modifiers: KeyModifiers::NONE,
+            },
+            crate::runtime::AttachPaneMouseProtocol {
+                mode: vt100::MouseProtocolMode::PressRelease,
+                encoding: vt100::MouseProtocolEncoding::Utf8,
+            },
+        )
+        .expect("utf8-encoded mouse event");
+
+        assert_eq!(encoded, vec![0x1b, b'[', b'M', 32, 0xC4, 0x80, 33]);
     }
 
     #[test]

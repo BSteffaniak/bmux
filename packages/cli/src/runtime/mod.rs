@@ -45,8 +45,8 @@ use bmux_server::{BmuxServer, OfflineSessionKillTarget, offline_kill_sessions};
 use clap::{CommandFactory, FromArgMatches};
 use crossterm::cursor::{Hide, MoveTo, SavePosition, Show};
 use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
 };
 use crossterm::queue;
 use crossterm::style::Print;
