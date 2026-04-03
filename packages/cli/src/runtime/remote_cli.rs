@@ -394,11 +394,12 @@ fn run_setup_check() -> Result<u8> {
     let paths = ConfigPaths::default();
     let auth_state = load_auth_state_optional(&paths)?;
     let host_state = load_host_runtime_state(&paths)?;
+    let auth_ready = auth_state.is_some();
     let host_alive = host_state
         .as_ref()
         .is_some_and(|state| is_process_alive(state.pid));
 
-    if auth_state.is_some() && host_alive {
+    if auth_ready && host_alive {
         let account = auth_state
             .as_ref()
             .and_then(|state| state.account_name.as_deref());
@@ -416,24 +417,48 @@ fn run_setup_check() -> Result<u8> {
         return Ok(0);
     }
 
-    println!("Setup check: not ready");
-    if auth_state.is_none() {
-        println!("- auth: missing (run: bmux auth login)");
+    for line in format_setup_check_not_ready_lines(auth_ready, host_state.as_ref(), host_alive) {
+        println!("{line}");
     }
-    match host_state {
-        Some(state) if !host_alive => {
-            println!(
-                "- host: stale runtime state (pid {}) (run: bmux setup)",
-                state.pid
-            );
-        }
-        None => {
-            println!("- host: offline (run: bmux setup)");
-        }
-        Some(_) => {}
-    }
-    println!("Fix: bmux setup");
     Ok(1)
+}
+
+fn format_setup_check_not_ready_lines(
+    auth_ready: bool,
+    host_state: Option<&HostRuntimeState>,
+    host_alive: bool,
+) -> Vec<String> {
+    let mut reasons = Vec::new();
+    if !auth_ready {
+        reasons.push("not signed in".to_string());
+    }
+    if !host_alive {
+        reasons.push(match host_state {
+            Some(state) => format!("host state is stale (pid {})", state.pid),
+            None => "host is offline".to_string(),
+        });
+    }
+
+    let reason_text = if reasons.is_empty() {
+        "not ready".to_string()
+    } else {
+        reasons.join("; ")
+    };
+
+    let mut lines = vec![
+        "Setup check: not ready".to_string(),
+        format!("Reason: {reason_text}"),
+        "Fix: bmux setup".to_string(),
+    ];
+    if !auth_ready {
+        lines.push("Advanced: bmux auth login".to_string());
+    } else if !host_alive {
+        lines.push(match host_state {
+            Some(_) => "Advanced: bmux host --restart".to_string(),
+            None => "Advanced: bmux host --daemon".to_string(),
+        });
+    }
+    lines
 }
 
 async fn wait_for_running_host_state(timeout: std::time::Duration) -> Result<HostRuntimeState> {
@@ -3549,6 +3574,30 @@ mod tests {
             lines[3],
             "Join from another machine: bmux join iroh://endpoint"
         );
+    }
+
+    #[test]
+    fn setup_check_not_ready_lines_prefers_setup_fix_and_auth_advanced() {
+        let lines = format_setup_check_not_ready_lines(false, None, false);
+        assert_eq!(lines[0], "Setup check: not ready");
+        assert_eq!(lines[1], "Reason: not signed in; host is offline");
+        assert_eq!(lines[2], "Fix: bmux setup");
+        assert_eq!(lines[3], "Advanced: bmux auth login");
+    }
+
+    #[test]
+    fn setup_check_not_ready_lines_uses_host_restart_for_stale_runtime() {
+        let state = HostRuntimeState {
+            pid: 4242,
+            target: "iroh://demo".to_string(),
+            share_link: Some("bmux://demo".to_string()),
+            name: Some("demo-host".to_string()),
+            started_at_unix: 1,
+        };
+        let lines = format_setup_check_not_ready_lines(true, Some(&state), false);
+        assert_eq!(lines[1], "Reason: host state is stale (pid 4242)");
+        assert_eq!(lines[2], "Fix: bmux setup");
+        assert_eq!(lines[3], "Advanced: bmux host --restart");
     }
 
     #[test]
