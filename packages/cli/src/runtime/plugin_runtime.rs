@@ -954,7 +954,9 @@ pub(super) const fn plugin_event_kind_from_server_event(
         bmux_client::ServerEvent::ClientAttached { .. }
         | bmux_client::ServerEvent::ClientDetached { .. } => PluginEventKind::Client,
         bmux_client::ServerEvent::AttachViewChanged { .. }
-        | bmux_client::ServerEvent::PaneOutputAvailable { .. } => PluginEventKind::Pane,
+        | bmux_client::ServerEvent::PaneOutputAvailable { .. }
+        | bmux_client::ServerEvent::PaneExited { .. }
+        | bmux_client::ServerEvent::PaneRestarted { .. } => PluginEventKind::Pane,
         bmux_client::ServerEvent::RecordingStarted { .. }
         | bmux_client::ServerEvent::RecordingStopped { .. } => PluginEventKind::System,
     }

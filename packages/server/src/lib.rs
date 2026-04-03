@@ -947,6 +947,13 @@ fn push_pane_runtime_notice(
     }
 }
 
+fn format_pane_exit_reason(status: portable_pty::ExitStatus) -> String {
+    if let Some(signal) = status.signal() {
+        return format!("process terminated by signal {signal}");
+    }
+    format!("process exited with status {}", status.exit_code())
+}
+
 struct SessionRuntimeManager {
     runtimes: BTreeMap<SessionId, SessionRuntimeHandle>,
     shell: String,
@@ -1880,12 +1887,15 @@ impl SessionRuntimeManager {
             let child_waiter = std::thread::Builder::new()
                 .name(format!("bmux-server-pane-{pane_id}-wait"))
                 .spawn(move || {
-                    let _ = child.wait();
+                    let wait_result = child.wait();
                     exited_for_waiter.store(true, Ordering::SeqCst);
                     if let Ok(mut reason) = exit_reason_for_waiter.lock()
                         && reason.is_none()
                     {
-                        *reason = Some("process exited".to_string());
+                        *reason = Some(match wait_result {
+                            Ok(status) => format_pane_exit_reason(status),
+                            Err(error) => format!("process wait failed: {error}"),
+                        });
                     }
                     push_pane_runtime_notice(
                         &output_buffer_for_waiter,
@@ -3426,13 +3436,15 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
             | Event::ClientAttached { id }
             | Event::ClientDetached { id } => Some(*id),
             Event::FollowTargetChanged { session_id, .. }
-            | Event::AttachViewChanged { session_id, .. } => Some(*session_id),
+            | Event::AttachViewChanged { session_id, .. }
+            | Event::PaneOutputAvailable { session_id, .. }
+            | Event::PaneExited { session_id, .. }
+            | Event::PaneRestarted { session_id, .. } => Some(*session_id),
             Event::ServerStarted
             | Event::ServerStopping
             | Event::FollowStarted { .. }
             | Event::FollowStopped { .. }
             | Event::FollowTargetGone { .. }
-            | Event::PaneOutputAvailable { .. }
             | Event::RecordingStarted { .. }
             | Event::RecordingStopped { .. } => None,
         };
@@ -4294,7 +4306,25 @@ async fn reap_exited_pane(
     session_id: SessionId,
     pane_id: Uuid,
 ) -> Result<()> {
-    let _ = pane_id;
+    let state_reason = {
+        let runtime_manager = state
+            .session_runtimes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+        runtime_manager
+            .runtimes
+            .get(&session_id)
+            .and_then(|session| session.panes.get(&pane_id))
+            .and_then(pane_state_reason_for_handle)
+    };
+    emit_event(
+        state,
+        Event::PaneExited {
+            session_id: session_id.0,
+            pane_id,
+            reason: state_reason,
+        },
+    )?;
     emit_attach_view_changed_for_layout(state, session_id)?;
 
     Ok(())
@@ -4913,6 +4943,13 @@ async fn handle_request(
                     .map_err(|error| anyhow::anyhow!("failed restarting pane: {error:#}"))?
             };
 
+            emit_event(
+                state,
+                Event::PaneRestarted {
+                    session_id: session_id.0,
+                    pane_id,
+                },
+            )?;
             emit_attach_view_changed_for_layout(state, session_id)?;
             Response::Ok(ResponsePayload::PaneRestarted {
                 id: pane_id,
@@ -7097,6 +7134,158 @@ mod tests {
             }
             response => panic!("expected successful split response, got {response:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn exited_pane_keeps_layout_and_restart_reuses_same_pane_id() {
+        let server = BmuxServer::new(test_endpoint());
+        let client_id = ClientId::new();
+        let principal_id = Uuid::new_v4();
+        let mut selected_session = None;
+        let mut attached_stream_session = None;
+
+        let created = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::NewSession { name: None },
+        )
+        .await;
+        let session_id = match created {
+            Response::Ok(ResponsePayload::SessionCreated { id, .. }) => id,
+            response => panic!("expected session created response, got {response:?}"),
+        };
+
+        let split = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::SplitPane {
+                session: Some(SessionSelector::ById(session_id)),
+                target: None,
+                direction: PaneSplitDirection::Vertical,
+                ratio_pct: None,
+            },
+        )
+        .await;
+        match split {
+            Response::Ok(ResponsePayload::PaneSplit { .. }) => {}
+            response => panic!("expected split response, got {response:?}"),
+        }
+
+        let list_before = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::ListPanes {
+                session: Some(SessionSelector::ById(session_id)),
+            },
+        )
+        .await;
+        let panes_before = match list_before {
+            Response::Ok(ResponsePayload::PaneList { panes }) => panes,
+            response => panic!("expected pane list response, got {response:?}"),
+        };
+        assert_eq!(panes_before.len(), 2);
+        let target_pane_id = panes_before[0].id;
+
+        {
+            let mut runtime_manager = server
+                .state
+                .session_runtimes
+                .lock()
+                .expect("session runtime manager lock should succeed");
+            let runtime = runtime_manager
+                .runtimes
+                .get_mut(&SessionId(session_id))
+                .expect("session runtime should exist");
+            let pane = runtime
+                .panes
+                .get_mut(&target_pane_id)
+                .expect("target pane should exist");
+            pane.exited.store(true, Ordering::SeqCst);
+            if let Ok(mut reason) = pane.exit_reason.lock() {
+                *reason = Some("process exited with status 130".to_string());
+            }
+        }
+
+        reap_exited_pane(&server.state, SessionId(session_id), target_pane_id)
+            .await
+            .expect("reap should succeed");
+
+        let list_exited = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::ListPanes {
+                session: Some(SessionSelector::ById(session_id)),
+            },
+        )
+        .await;
+        let panes_exited = match list_exited {
+            Response::Ok(ResponsePayload::PaneList { panes }) => panes,
+            response => panic!("expected pane list response, got {response:?}"),
+        };
+        assert_eq!(panes_exited.len(), 2);
+        let exited_summary = panes_exited
+            .iter()
+            .find(|pane| pane.id == target_pane_id)
+            .expect("target pane summary should exist");
+        assert_eq!(exited_summary.state, PaneState::Exited);
+
+        let restarted = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::RestartPane {
+                session: Some(SessionSelector::ById(session_id)),
+                target: Some(PaneSelector::ById(target_pane_id)),
+            },
+        )
+        .await;
+        match restarted {
+            Response::Ok(ResponsePayload::PaneRestarted {
+                id,
+                session_id: sid,
+            }) => {
+                assert_eq!(id, target_pane_id);
+                assert_eq!(sid, session_id);
+            }
+            response => panic!("expected pane restarted response, got {response:?}"),
+        }
+
+        let list_after = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::ListPanes {
+                session: Some(SessionSelector::ById(session_id)),
+            },
+        )
+        .await;
+        let panes_after = match list_after {
+            Response::Ok(ResponsePayload::PaneList { panes }) => panes,
+            response => panic!("expected pane list response, got {response:?}"),
+        };
+        assert_eq!(panes_after.len(), 2);
+        let restarted_summary = panes_after
+            .iter()
+            .find(|pane| pane.id == target_pane_id)
+            .expect("target pane summary should exist");
+        assert_eq!(restarted_summary.state, PaneState::Running);
+        assert!(restarted_summary.state_reason.is_none());
     }
 
     #[tokio::test]

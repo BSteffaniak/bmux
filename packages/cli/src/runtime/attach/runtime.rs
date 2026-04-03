@@ -1037,7 +1037,7 @@ pub(crate) async fn handle_attach_ui_action(
             );
         }
         RuntimeAction::ExitMode => {
-            if view_state.close_pane_confirmation_pending.take().is_some() {
+            if cancel_close_pane_confirmation(view_state) {
                 view_state.set_transient_status(
                     "close pane canceled",
                     Instant::now(),
@@ -1233,30 +1233,31 @@ pub(crate) async fn handle_attach_ui_action(
             client.resize_pane(Some(selector), delta).await?;
         }
         RuntimeAction::CloseFocusedPane => {
-            let Some(focused_pane_id) = focused_attach_pane_id(view_state) else {
-                view_state.set_transient_status(
-                    "no focused pane",
-                    Instant::now(),
-                    ATTACH_TRANSIENT_STATUS_TTL,
-                );
-                return Ok(());
-            };
-            if view_state.close_pane_confirmation_pending == Some(focused_pane_id) {
-                let selector = attached_session_selector(client, view_state).await?;
-                client.close_pane(Some(selector)).await?;
-                view_state.close_pane_confirmation_pending = None;
-                view_state.set_transient_status(
-                    "pane closed",
-                    Instant::now(),
-                    ATTACH_TRANSIENT_STATUS_TTL,
-                );
-            } else {
-                view_state.close_pane_confirmation_pending = Some(focused_pane_id);
-                view_state.set_transient_status(
-                    "press close pane again to confirm; Esc to cancel",
-                    Instant::now(),
-                    ATTACH_TRANSIENT_STATUS_TTL,
-                );
+            match process_close_pane_confirmation(view_state, focused_attach_pane_id(view_state)) {
+                ClosePaneConfirmationAction::NoFocusedPane => {
+                    view_state.set_transient_status(
+                        "no focused pane",
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                    return Ok(());
+                }
+                ClosePaneConfirmationAction::Armed => {
+                    view_state.set_transient_status(
+                        "press close pane again to confirm; Esc to cancel",
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                }
+                ClosePaneConfirmationAction::Confirmed => {
+                    let selector = attached_session_selector(client, view_state).await?;
+                    client.close_pane(Some(selector)).await?;
+                    view_state.set_transient_status(
+                        "pane closed",
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                }
             }
         }
         RuntimeAction::ZoomPane => {
@@ -1308,6 +1309,33 @@ pub(crate) fn begin_attach_selection(view_state: &mut AttachViewState) -> bool {
     }
     view_state.selection_anchor = attach_scrollback_cursor_absolute_position(view_state);
     view_state.selection_anchor.is_some()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClosePaneConfirmationAction {
+    NoFocusedPane,
+    Armed,
+    Confirmed,
+}
+
+pub(crate) fn process_close_pane_confirmation(
+    view_state: &mut AttachViewState,
+    focused_pane_id: Option<Uuid>,
+) -> ClosePaneConfirmationAction {
+    let Some(focused_pane_id) = focused_pane_id else {
+        return ClosePaneConfirmationAction::NoFocusedPane;
+    };
+    if view_state.close_pane_confirmation_pending == Some(focused_pane_id) {
+        view_state.close_pane_confirmation_pending = None;
+        ClosePaneConfirmationAction::Confirmed
+    } else {
+        view_state.close_pane_confirmation_pending = Some(focused_pane_id);
+        ClosePaneConfirmationAction::Armed
+    }
+}
+
+pub(crate) fn cancel_close_pane_confirmation(view_state: &mut AttachViewState) -> bool {
+    view_state.close_pane_confirmation_pending.take().is_some()
 }
 
 pub(crate) fn clear_attach_selection(view_state: &mut AttachViewState, show_status: bool) {
@@ -1832,9 +1860,12 @@ pub(crate) fn attach_mode_hint(_ui_mode: AttachUiMode, keymap: &Keymap) -> Strin
     let detach = key_hint_or_unbound(keymap, RuntimeAction::Detach);
     let quit = key_hint_or_unbound(keymap, RuntimeAction::Quit);
     let help = key_hint_or_unbound(keymap, RuntimeAction::ShowHelp);
+    let restart = key_hint_or_unbound(keymap, RuntimeAction::RestartFocusedPane);
     let prev = key_hint_or_unbound(keymap, RuntimeAction::SessionPrev);
     let next = key_hint_or_unbound(keymap, RuntimeAction::SessionNext);
-    format!("{prev}/{next} tabs | {detach} detach | {quit} quit | {help} help")
+    format!(
+        "{prev}/{next} tabs | {detach} detach | {restart} restart pane | {quit} quit | {help} help"
+    )
 }
 
 pub(crate) fn initial_attach_status(keymap: &Keymap, can_write: bool) -> String {
@@ -2206,6 +2237,7 @@ pub(crate) async fn render_attach_frame(
     let cursor_state = render_attach_scene(
         &mut frame_bytes,
         &layout_state.scene,
+        &layout_state.panes,
         &mut view_state.pane_buffers,
         &view_state.dirty.pane_dirty_ids,
         view_state.dirty.full_pane_redraw,
@@ -2639,6 +2671,8 @@ pub(crate) fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
     let help = key_hint_or_unbound(&keymap, RuntimeAction::ShowHelp);
     let detach = key_hint_or_unbound(&keymap, RuntimeAction::Detach);
     let scroll = key_hint_or_unbound(&keymap, RuntimeAction::EnterScrollMode);
+    let close = key_hint_or_unbound(&keymap, RuntimeAction::CloseFocusedPane);
+    let restart = key_hint_or_unbound(&keymap, RuntimeAction::RestartFocusedPane);
     let mut groups: Vec<(&str, Vec<AttachKeybindingEntry>)> = vec![
         ("Session", Vec::new()),
         ("Pane", Vec::new()),
@@ -2680,7 +2714,8 @@ pub(crate) fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
             | RuntimeAction::ResizeRight
             | RuntimeAction::ResizeUp
             | RuntimeAction::ResizeDown
-            | RuntimeAction::CloseFocusedPane => "Pane",
+            | RuntimeAction::CloseFocusedPane
+            | RuntimeAction::RestartFocusedPane => "Pane",
             RuntimeAction::EnterWindowMode
             | RuntimeAction::ExitMode
             | RuntimeAction::EnterScrollMode
@@ -2707,6 +2742,9 @@ pub(crate) fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
     lines.push("Attach Help".to_string());
     lines.push(format!(
         "Normal mode sends typing to the pane. Use {scroll} for scrollback, {detach} to detach, and {help} to toggle help."
+    ));
+    lines.push(format!(
+        "Pane recovery: use {restart} to restart an exited pane in place; {close} requires pressing it twice on the same pane (Esc cancels)."
     ));
     lines.push(String::new());
     for (category, mut entries) in groups {
@@ -3136,6 +3174,30 @@ pub(crate) async fn handle_attach_server_event(
         } if attach_view_event_matches_target(view_state, context_id, session_id) => {
             apply_attach_view_change_components(&components, view_state);
         }
+        bmux_client::ServerEvent::PaneExited {
+            session_id,
+            pane_id,
+            reason,
+        } if session_id == view_state.attached_id => {
+            let message = if let Some(reason) = reason {
+                format!("pane {} exited: {}", short_uuid(pane_id), reason)
+            } else {
+                format!("pane {} exited", short_uuid(pane_id))
+            };
+            view_state.set_transient_status(message, Instant::now(), ATTACH_TRANSIENT_STATUS_TTL);
+            view_state.dirty.status_needs_redraw = true;
+        }
+        bmux_client::ServerEvent::PaneRestarted {
+            session_id,
+            pane_id,
+        } if session_id == view_state.attached_id => {
+            view_state.set_transient_status(
+                format!("pane {} restarted", short_uuid(pane_id)),
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+            view_state.dirty.status_needs_redraw = true;
+        }
         _ => {}
     }
 
@@ -3256,7 +3318,7 @@ pub(crate) async fn handle_attach_terminal_event(
         && key.kind == KeyEventKind::Press
         && matches!(key.code, KeyCode::Esc)
     {
-        view_state.close_pane_confirmation_pending = None;
+        let _ = cancel_close_pane_confirmation(view_state);
         view_state.set_transient_status(
             "close pane canceled",
             Instant::now(),
@@ -5007,9 +5069,61 @@ mod tests {
         let lines = crate::runtime::build_attach_help_lines(&BmuxConfig::default());
         assert_eq!(lines.first().map(String::as_str), Some("Attach Help"));
         assert!(lines[1].contains("Normal mode sends typing to the pane"));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("restart an exited pane in place"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("requires pressing it twice on the same pane"))
+        );
         assert!(lines.iter().any(|line| line == "-- Session --"));
         assert!(lines.iter().any(|line| line == "-- Pane --"));
         assert!(lines.iter().any(|line| line == "-- Mode --"));
+    }
+
+    #[test]
+    fn close_pane_confirmation_is_scoped_per_pane() {
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id: Uuid::new_v4(),
+            can_write: true,
+        });
+        let pane_a = Uuid::new_v4();
+        let pane_b = Uuid::new_v4();
+
+        assert_eq!(
+            process_close_pane_confirmation(&mut view_state, Some(pane_a)),
+            ClosePaneConfirmationAction::Armed
+        );
+        assert_eq!(view_state.close_pane_confirmation_pending, Some(pane_a));
+
+        assert_eq!(
+            process_close_pane_confirmation(&mut view_state, Some(pane_b)),
+            ClosePaneConfirmationAction::Armed
+        );
+        assert_eq!(view_state.close_pane_confirmation_pending, Some(pane_b));
+
+        assert_eq!(
+            process_close_pane_confirmation(&mut view_state, Some(pane_b)),
+            ClosePaneConfirmationAction::Confirmed
+        );
+        assert_eq!(view_state.close_pane_confirmation_pending, None);
+    }
+
+    #[test]
+    fn cancel_close_pane_confirmation_requires_pending_state() {
+        let mut view_state = AttachViewState::new(AttachOpenInfo {
+            context_id: None,
+            session_id: Uuid::new_v4(),
+            can_write: true,
+        });
+        assert!(!cancel_close_pane_confirmation(&mut view_state));
+        view_state.close_pane_confirmation_pending = Some(Uuid::new_v4());
+        assert!(cancel_close_pane_confirmation(&mut view_state));
+        assert_eq!(view_state.close_pane_confirmation_pending, None);
     }
 
     #[test]

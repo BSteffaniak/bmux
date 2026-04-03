@@ -2,7 +2,7 @@ use super::state::{
     AttachCursorState, AttachScrollbackCursor, AttachScrollbackPosition, PaneRect, PaneRenderBuffer,
 };
 use anyhow::{Context, Result};
-use bmux_ipc::{AttachFocusTarget, AttachScene, AttachSurfaceKind};
+use bmux_ipc::{AttachFocusTarget, AttachScene, AttachSurfaceKind, PaneState, PaneSummary};
 use crossterm::cursor::MoveTo;
 use crossterm::queue;
 use crossterm::style::Print;
@@ -221,6 +221,7 @@ pub fn visible_scene_pane_ids(scene: &AttachScene) -> Vec<Uuid> {
 pub fn render_attach_scene<W: io::Write>(
     stdout: &mut W,
     scene: &AttachScene,
+    panes: &[PaneSummary],
     pane_buffers: &mut BTreeMap<Uuid, PaneRenderBuffer>,
     dirty_pane_ids: &BTreeSet<Uuid>,
     full_pane_redraw: bool,
@@ -236,6 +237,11 @@ pub fn render_attach_scene<W: io::Write>(
     if cols == 0 || rows <= status_top_inset.saturating_add(status_bottom_inset) {
         return Ok(None);
     }
+
+    let pane_states = panes
+        .iter()
+        .map(|pane| (pane.id, pane.state))
+        .collect::<BTreeMap<Uuid, PaneState>>();
 
     let mut cursor_state = None;
     if full_pane_redraw {
@@ -314,6 +320,25 @@ pub fn render_attach_scene<W: io::Write>(
                     Print(vch)
                 )
                 .context("failed drawing pane right border")?;
+            }
+
+            if rect.w > 6 {
+                let badge = match pane_states
+                    .get(&pane_id)
+                    .copied()
+                    .unwrap_or(PaneState::Running)
+                {
+                    PaneState::Running => "[RUNNING]",
+                    PaneState::Exited => "[EXITED]",
+                };
+                let max_badge_width = usize::from(rect.w.saturating_sub(4));
+                let badge_text = opaque_row_text(badge, badge.len().min(max_badge_width));
+                queue!(
+                    stdout,
+                    MoveTo(rect.x.saturating_add(2), rect.y),
+                    Print(badge_text)
+                )
+                .context("failed drawing pane state badge")?;
             }
         }
 
@@ -453,7 +478,7 @@ mod tests {
     };
     use bmux_ipc::{
         AttachFocusTarget, AttachLayer as SurfaceLayer, AttachRect, AttachScene, AttachSurface,
-        AttachSurfaceKind,
+        AttachSurfaceKind, PaneState, PaneSummary,
     };
     use crossterm::cursor::MoveTo;
     use crossterm::queue;
@@ -549,6 +574,7 @@ mod tests {
         let cursor_state = render_attach_scene(
             &mut output,
             &scene,
+            &[],
             &mut pane_buffers,
             &BTreeSet::from([pane_id]),
             true,
@@ -601,6 +627,7 @@ mod tests {
         let _ = render_attach_scene(
             &mut output,
             &scene,
+            &[],
             &mut pane_buffers,
             &BTreeSet::from([pane_id]),
             true,
@@ -615,5 +642,64 @@ mod tests {
         .expect("render should succeed");
 
         let _rendered = String::from_utf8(output).expect("render output should be utf8");
+    }
+
+    #[test]
+    fn render_attach_scene_draws_exited_badge() {
+        let pane_id = Uuid::from_u128(31);
+        let scene = AttachScene {
+            session_id: Uuid::from_u128(32),
+            focus: AttachFocusTarget::Pane { pane_id },
+            surfaces: vec![AttachSurface {
+                id: pane_id,
+                kind: AttachSurfaceKind::Pane,
+                layer: SurfaceLayer::Pane,
+                z: 0,
+                rect: AttachRect {
+                    x: 0,
+                    y: 1,
+                    w: 20,
+                    h: 5,
+                },
+                opaque: true,
+                visible: true,
+                accepts_input: true,
+                cursor_owner: true,
+                pane_id: Some(pane_id),
+            }],
+        };
+        let panes = vec![PaneSummary {
+            id: pane_id,
+            index: 1,
+            name: None,
+            focused: true,
+            state: PaneState::Exited,
+            state_reason: Some("process exited with status 130".to_string()),
+        }];
+        let mut pane_buffers = BTreeMap::new();
+        pane_buffers.insert(pane_id, PaneRenderBuffer::default());
+
+        let mut output = Vec::new();
+        let _ = render_attach_scene(
+            &mut output,
+            &scene,
+            &panes,
+            &mut pane_buffers,
+            &BTreeSet::from([pane_id]),
+            true,
+            1,
+            0,
+            false,
+            0,
+            None,
+            None,
+            false,
+        )
+        .expect("render should succeed");
+
+        let rendered = String::from_utf8(output).expect("render output should be utf8");
+        if !rendered.is_empty() {
+            assert!(rendered.contains("[EXITED]"));
+        }
     }
 }

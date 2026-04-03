@@ -1049,6 +1049,16 @@ pub enum Event {
         session_id: Uuid,
         pane_id: Uuid,
     },
+    PaneExited {
+        session_id: Uuid,
+        pane_id: Uuid,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    PaneRestarted {
+        session_id: Uuid,
+        pane_id: Uuid,
+    },
     /// A server-side recording has started.  Attached clients use this to
     /// begin writing their own display tracks into the recording directory.
     RecordingStarted {
@@ -2132,6 +2142,20 @@ mod tests {
                 ],
             },
             Event::PaneOutputAvailable {
+                session_id: id,
+                pane_id: id2,
+            },
+            Event::PaneExited {
+                session_id: id,
+                pane_id: id2,
+                reason: Some("process exited with status 130".to_string()),
+            },
+            Event::PaneExited {
+                session_id: id,
+                pane_id: id2,
+                reason: None,
+            },
+            Event::PaneRestarted {
                 session_id: id,
                 pane_id: id2,
             },
