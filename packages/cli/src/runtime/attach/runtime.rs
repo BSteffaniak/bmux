@@ -444,29 +444,47 @@ pub(crate) async fn run_session_attach_with_client(
                     .retain(|pane_id, _| pane_ids.iter().any(|id| id == pane_id));
             }
 
-            let chunks = match client
-                .attach_pane_output_batch(view_state.attached_id, pane_ids, 8 * 1024)
-                .await
-            {
-                Ok(chunks) => chunks,
-                Err(error)
-                    if is_attach_stream_closed_error(&error)
-                        || is_attach_not_attached_runtime_error(&error) =>
+            // Drain all available pane output before rendering to avoid
+            // visible tearing from partial redraws.  TUI programs like
+            // lazygit can emit 20-30 KB when switching views; with 8 KB
+            // per fetch we need a few rounds to consume the full burst.
+            const OUTPUT_BATCH_MAX: usize = 8 * 1024;
+            const DRAIN_MAX_ROUNDS: usize = 8;
+            for _round in 0..DRAIN_MAX_ROUNDS {
+                let chunks = match client
+                    .attach_pane_output_batch(
+                        view_state.attached_id,
+                        pane_ids.clone(),
+                        OUTPUT_BATCH_MAX,
+                    )
+                    .await
                 {
-                    exit_reason = AttachExitReason::StreamClosed;
+                    Ok(chunks) => chunks,
+                    Err(error)
+                        if is_attach_stream_closed_error(&error)
+                            || is_attach_not_attached_runtime_error(&error) =>
+                    {
+                        exit_reason = AttachExitReason::StreamClosed;
+                        break;
+                    }
+                    Err(error) => return Err(map_attach_client_error(error)),
+                };
+
+                let mut had_data = false;
+                for chunk in chunks {
+                    if chunk.data.is_empty() {
+                        continue;
+                    }
+                    had_data = true;
+                    let buffer = view_state.pane_buffers.entry(chunk.pane_id).or_default();
+                    append_pane_output(buffer, &chunk.data);
+                    view_state.dirty.pane_dirty_ids.insert(chunk.pane_id);
+                    frame_needs_render = true;
+                }
+
+                if !had_data {
                     break;
                 }
-                Err(error) => return Err(map_attach_client_error(error)),
-            };
-
-            for chunk in chunks {
-                if chunk.data.is_empty() {
-                    continue;
-                }
-                let buffer = view_state.pane_buffers.entry(chunk.pane_id).or_default();
-                append_pane_output(buffer, &chunk.data);
-                view_state.dirty.pane_dirty_ids.insert(chunk.pane_id);
-                frame_needs_render = true;
             }
             pane_output_pending = false;
         }
