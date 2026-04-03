@@ -1779,6 +1779,8 @@ mod tests {
                         index: 1,
                         name: Some("pane-1".to_string()),
                         focused: true,
+                        state: bmux_ipc::PaneState::Running,
+                        state_reason: None,
                     }],
                 })
             }

@@ -973,6 +973,36 @@ impl BmuxClient {
         }
     }
 
+    pub async fn restart_pane(&mut self, session: Option<SessionSelector>) -> Result<Uuid> {
+        match self
+            .request(Request::RestartPane {
+                session,
+                target: None,
+            })
+            .await?
+        {
+            ResponsePayload::PaneRestarted { id, .. } => Ok(id),
+            _ => Err(ClientError::UnexpectedResponse("expected pane restarted")),
+        }
+    }
+
+    pub async fn restart_pane_target(
+        &mut self,
+        session: Option<SessionSelector>,
+        target: PaneSelector,
+    ) -> Result<Uuid> {
+        match self
+            .request(Request::RestartPane {
+                session,
+                target: Some(target),
+            })
+            .await?
+        {
+            ResponsePayload::PaneRestarted { id, .. } => Ok(id),
+            _ => Err(ClientError::UnexpectedResponse("expected pane restarted")),
+        }
+    }
+
     pub async fn zoom_pane(&mut self, session: Option<SessionSelector>) -> Result<(Uuid, bool)> {
         match self.request(Request::ZoomPane { session }).await? {
             ResponsePayload::PaneZoomed {
@@ -1985,6 +2015,19 @@ impl StreamingBmuxClient {
         }
     }
 
+    pub async fn restart_pane(&mut self, session: Option<SessionSelector>) -> Result<Uuid> {
+        match self
+            .request(Request::RestartPane {
+                session,
+                target: None,
+            })
+            .await?
+        {
+            ResponsePayload::PaneRestarted { id, .. } => Ok(id),
+            _ => Err(ClientError::UnexpectedResponse("expected pane restarted")),
+        }
+    }
+
     pub async fn zoom_pane(&mut self, session: Option<SessionSelector>) -> Result<(Uuid, bool)> {
         match self.request(Request::ZoomPane { session }).await? {
             ResponsePayload::PaneZoomed {
@@ -2133,6 +2176,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::FocusPane { .. } => "focus_pane",
         Request::ResizePane { .. } => "resize_pane",
         Request::ClosePane { .. } => "close_pane",
+        Request::RestartPane { .. } => "restart_pane",
         Request::ZoomPane { .. } => "zoom_pane",
         Request::FollowClient { .. } => "follow_client",
         Request::Unfollow => "unfollow",
@@ -2191,6 +2235,7 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::PaneFocused { .. } => "pane_focused",
             ResponsePayload::PaneResized { .. } => "pane_resized",
             ResponsePayload::PaneClosed { .. } => "pane_closed",
+            ResponsePayload::PaneRestarted { .. } => "pane_restarted",
             ResponsePayload::PaneZoomed { .. } => "pane_zoomed",
             ResponsePayload::FollowStarted { .. } => "follow_started",
             ResponsePayload::FollowStopped { .. } => "follow_stopped",

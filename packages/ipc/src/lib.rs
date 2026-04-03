@@ -447,6 +447,10 @@ pub enum Request {
         session: Option<SessionSelector>,
         target: Option<PaneSelector>,
     },
+    RestartPane {
+        session: Option<SessionSelector>,
+        target: Option<PaneSelector>,
+    },
     ZoomPane {
         session: Option<SessionSelector>,
     },
@@ -590,6 +594,18 @@ pub struct PaneSummary {
     pub index: u32,
     pub name: Option<String>,
     pub focused: bool,
+    #[serde(default)]
+    pub state: PaneState,
+    #[serde(default)]
+    pub state_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PaneState {
+    #[default]
+    Running,
+    Exited,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -834,6 +850,10 @@ pub enum ResponsePayload {
         id: Uuid,
         session_id: Uuid,
         session_closed: bool,
+    },
+    PaneRestarted {
+        id: Uuid,
+        session_id: Uuid,
     },
     PaneZoomed {
         session_id: Uuid,
@@ -1540,6 +1560,10 @@ mod tests {
                 session: None,
                 target: None,
             },
+            Request::RestartPane {
+                session: None,
+                target: Some(PaneSelector::Active),
+            },
             Request::ZoomPane { session: None },
             Request::ZoomPane {
                 session: Some(SessionSelector::ByName("s".into())),
@@ -1851,6 +1875,10 @@ mod tests {
                 session_id: id,
                 session_closed: false,
             },
+            ResponsePayload::PaneRestarted {
+                id: pane_id,
+                session_id: id,
+            },
             ResponsePayload::PaneZoomed {
                 session_id: id,
                 pane_id,
@@ -1863,12 +1891,16 @@ mod tests {
                         index: 0,
                         name: Some("shell".into()),
                         focused: true,
+                        state: PaneState::Running,
+                        state_reason: None,
                     },
                     PaneSummary {
                         id: id2,
                         index: 1,
                         name: None,
                         focused: false,
+                        state: PaneState::Exited,
+                        state_reason: Some("process exited".into()),
                     },
                 ],
             },
@@ -1919,6 +1951,8 @@ mod tests {
                     index: 0,
                     name: None,
                     focused: true,
+                    state: PaneState::Running,
+                    state_reason: None,
                 }],
                 layout_root: layout.clone(),
                 scene: scene.clone(),
@@ -1945,6 +1979,8 @@ mod tests {
                     index: 0,
                     name: None,
                     focused: true,
+                    state: PaneState::Running,
+                    state_reason: None,
                 }],
                 layout_root: layout,
                 scene,

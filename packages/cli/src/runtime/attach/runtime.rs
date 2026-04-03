@@ -956,7 +956,13 @@ pub(crate) async fn handle_attach_ui_action(
             );
         }
         RuntimeAction::ExitMode => {
-            let _ = view_state;
+            if view_state.close_pane_confirmation_pending.take().is_some() {
+                view_state.set_transient_status(
+                    "close pane canceled",
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            }
         }
         RuntimeAction::EnterScrollMode => {
             if enter_attach_scrollback(view_state) {
@@ -1146,8 +1152,31 @@ pub(crate) async fn handle_attach_ui_action(
             client.resize_pane(Some(selector), delta).await?;
         }
         RuntimeAction::CloseFocusedPane => {
-            let selector = attached_session_selector(client, view_state).await?;
-            client.close_pane(Some(selector)).await?;
+            let Some(focused_pane_id) = focused_attach_pane_id(view_state) else {
+                view_state.set_transient_status(
+                    "no focused pane",
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+                return Ok(());
+            };
+            if view_state.close_pane_confirmation_pending == Some(focused_pane_id) {
+                let selector = attached_session_selector(client, view_state).await?;
+                client.close_pane(Some(selector)).await?;
+                view_state.close_pane_confirmation_pending = None;
+                view_state.set_transient_status(
+                    "pane closed",
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            } else {
+                view_state.close_pane_confirmation_pending = Some(focused_pane_id);
+                view_state.set_transient_status(
+                    "press close pane again to confirm; Esc to cancel",
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            }
         }
         RuntimeAction::ZoomPane => {
             let selector = attached_session_selector(client, view_state).await?;
@@ -1157,6 +1186,16 @@ pub(crate) async fn handle_attach_ui_action(
         }
         RuntimeAction::NewWindow | RuntimeAction::NewSession => {
             handle_attach_runtime_action(client, action, view_state).await?;
+        }
+        RuntimeAction::RestartFocusedPane => {
+            let selector = attached_session_selector(client, view_state).await?;
+            let _ = client.restart_pane(Some(selector)).await?;
+            view_state.close_pane_confirmation_pending = None;
+            view_state.set_transient_status(
+                "pane restarted",
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
         }
         _ => {}
     }
@@ -1512,8 +1551,12 @@ pub(crate) fn attach_scrollback_page_size(view_state: &AttachViewState) -> usize
 pub(crate) fn focused_attach_pane_buffer(
     view_state: &mut AttachViewState,
 ) -> Option<&mut attach::state::PaneRenderBuffer> {
-    let focused_pane_id = view_state.cached_layout_state.as_ref()?.focused_pane_id;
+    let focused_pane_id = focused_attach_pane_id(view_state)?;
     view_state.pane_buffers.get_mut(&focused_pane_id)
+}
+
+pub(crate) fn focused_attach_pane_id(view_state: &AttachViewState) -> Option<Uuid> {
+    Some(view_state.cached_layout_state.as_ref()?.focused_pane_id)
 }
 
 pub(crate) fn focused_attach_pane_inner_size(
@@ -3127,6 +3170,20 @@ pub(crate) async fn handle_attach_terminal_event(
         return Ok(AttachLoopControl::Continue);
     }
 
+    if view_state.close_pane_confirmation_pending.is_some()
+        && let Event::Key(key) = &terminal_event
+        && key.kind == KeyEventKind::Press
+        && matches!(key.code, KeyCode::Esc)
+    {
+        view_state.close_pane_confirmation_pending = None;
+        view_state.set_transient_status(
+            "close pane canceled",
+            Instant::now(),
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
+        return Ok(AttachLoopControl::Continue);
+    }
+
     if view_state.help_overlay_open
         && let Event::Key(key) = &terminal_event
         && handle_help_overlay_key_event(key, help_lines, view_state)
@@ -3170,6 +3227,13 @@ pub(crate) async fn handle_attach_terminal_event(
                                 || is_attach_not_attached_runtime_error(&error) =>
                         {
                             return Ok(AttachLoopControl::Break(AttachExitReason::StreamClosed));
+                        }
+                        Err(error) if is_attach_active_pane_closed_error(&error) => {
+                            view_state.set_transient_status(
+                                "focused pane process exited; use restart pane or close pane",
+                                Instant::now(),
+                                ATTACH_TRANSIENT_STATUS_TTL,
+                            );
                         }
                         Err(error) => return Err(map_attach_client_error(error)),
                     }
@@ -3736,13 +3800,11 @@ pub(crate) fn runtime_action_to_attach_event_action(action: RuntimeAction) -> At
     }
 }
 
-pub(crate) const fn is_attach_stream_closed_error(error: &ClientError) -> bool {
+pub(crate) fn is_attach_stream_closed_error(error: &ClientError) -> bool {
     matches!(
         error,
-        ClientError::ServerError {
-            code: bmux_ipc::ErrorCode::NotFound,
-            ..
-        }
+        ClientError::ServerError { code: bmux_ipc::ErrorCode::NotFound, message }
+            if message.contains("session runtime not found")
     )
 }
 
@@ -3751,6 +3813,14 @@ pub(crate) fn is_attach_not_attached_runtime_error(error: &ClientError) -> bool 
         error,
         ClientError::ServerError { message, .. }
             if message.contains("not attached to session runtime")
+    )
+}
+
+pub(crate) fn is_attach_active_pane_closed_error(error: &ClientError) -> bool {
+    matches!(
+        error,
+        ClientError::ServerError { message, .. }
+            if message.contains("active pane is closed")
     )
 }
 #[cfg(test)]

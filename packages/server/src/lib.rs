@@ -16,7 +16,7 @@ use bmux_ipc::{
     AttachSurface, AttachSurfaceKind, AttachViewComponent, CORE_PROTOCOL_CAPABILITIES,
     ClientSummary, ContextSelector, ContextSummary, Envelope, EnvelopeKind, ErrorCode,
     ErrorResponse, Event, IpcEndpoint, PaneFocusDirection, PaneLayoutNode as IpcPaneLayoutNode,
-    PaneSelector, PaneSplitDirection, PaneSummary, ProtocolContract, ProtocolVersion,
+    PaneSelector, PaneSplitDirection, PaneState, PaneSummary, ProtocolContract, ProtocolVersion,
     RecordingEventKind, RecordingPayload, RecordingProfile, Request, Response, ResponsePayload,
     ServerSnapshotStatus, SessionSelector, SessionSummary, decode, default_supported_capabilities,
     encode, negotiate_protocol,
@@ -938,6 +938,15 @@ async fn shutdown_pane_handle(mut pane: PaneRuntimeHandle) {
     }
 }
 
+fn push_pane_runtime_notice(
+    output_buffer: &Arc<std::sync::Mutex<OutputFanoutBuffer>>,
+    message: impl AsRef<str>,
+) {
+    if let Ok(mut output) = output_buffer.lock() {
+        output.push_chunk(message.as_ref().as_bytes());
+    }
+}
+
 struct SessionRuntimeManager {
     runtimes: BTreeMap<SessionId, SessionRuntimeHandle>,
     shell: String,
@@ -990,6 +999,7 @@ struct PaneRuntimeMeta {
 struct PaneRuntimeHandle {
     meta: PaneRuntimeMeta,
     process_group_id: Arc<std::sync::Mutex<Option<i32>>>,
+    exit_reason: Arc<std::sync::Mutex<Option<String>>>,
     stop_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
     input_tx: mpsc::UnboundedSender<PaneRuntimeCommand>,
@@ -1768,6 +1778,8 @@ impl SessionRuntimeManager {
         let output_buffer_for_reader = Arc::clone(&output_buffer);
         let process_group_id = Arc::new(std::sync::Mutex::new(None));
         let process_group_id_for_task = Arc::clone(&process_group_id);
+        let exit_reason = Arc::new(std::sync::Mutex::new(None::<String>));
+        let exit_reason_for_task = Arc::clone(&exit_reason);
         let exited = Arc::new(AtomicBool::new(false));
         let exited_for_task = Arc::clone(&exited);
         let event_broadcast_for_reader = self.event_broadcast.clone();
@@ -1784,6 +1796,13 @@ impl SessionRuntimeManager {
             }) {
                 pair
             } else {
+                if let Ok(mut reason) = exit_reason_for_task.lock() {
+                    *reason = Some("failed to allocate PTY".to_string());
+                }
+                push_pane_runtime_notice(
+                    &output_buffer_for_reader,
+                    "\r\n[bmux] pane failed to start: failed to allocate PTY\r\n",
+                );
                 exited_for_task.store(true, Ordering::SeqCst);
                 return;
             };
@@ -1793,6 +1812,13 @@ impl SessionRuntimeManager {
             let mut child = if let Ok(child) = pty_pair.slave.spawn_command(command) {
                 child
             } else {
+                if let Ok(mut reason) = exit_reason_for_task.lock() {
+                    *reason = Some(format!("failed to spawn shell '{shell}'"));
+                }
+                push_pane_runtime_notice(
+                    &output_buffer_for_reader,
+                    format!("\r\n[bmux] pane failed to start: failed to spawn shell '{shell}'\r\n"),
+                );
                 exited_for_task.store(true, Ordering::SeqCst);
                 return;
             };
@@ -1809,6 +1835,13 @@ impl SessionRuntimeManager {
             let mut reader = if let Ok(reader) = master.try_clone_reader() {
                 reader
             } else {
+                if let Ok(mut reason) = exit_reason_for_task.lock() {
+                    *reason = Some("failed to open PTY reader".to_string());
+                }
+                push_pane_runtime_notice(
+                    &output_buffer_for_reader,
+                    "\r\n[bmux] pane failed to start: failed to open PTY reader\r\n",
+                );
                 let _ = child.kill();
                 exited_for_task.store(true, Ordering::SeqCst);
                 return;
@@ -1816,6 +1849,13 @@ impl SessionRuntimeManager {
             let writer = if let Ok(writer) = master.take_writer() {
                 writer
             } else {
+                if let Ok(mut reason) = exit_reason_for_task.lock() {
+                    *reason = Some("failed to open PTY writer".to_string());
+                }
+                push_pane_runtime_notice(
+                    &output_buffer_for_reader,
+                    "\r\n[bmux] pane failed to start: failed to open PTY writer\r\n",
+                );
                 let _ = child.kill();
                 exited_for_task.store(true, Ordering::SeqCst);
                 return;
@@ -1824,11 +1864,22 @@ impl SessionRuntimeManager {
 
             let (child_exit_tx, mut child_exit_rx) = mpsc::unbounded_channel::<()>();
             let exited_for_waiter = Arc::clone(&exited_for_task);
+            let exit_reason_for_waiter = Arc::clone(&exit_reason_for_task);
+            let output_buffer_for_waiter = Arc::clone(&output_buffer_for_reader);
             let child_waiter = std::thread::Builder::new()
                 .name(format!("bmux-server-pane-{pane_id}-wait"))
                 .spawn(move || {
                     let _ = child.wait();
                     exited_for_waiter.store(true, Ordering::SeqCst);
+                    if let Ok(mut reason) = exit_reason_for_waiter.lock()
+                        && reason.is_none()
+                    {
+                        *reason = Some("process exited".to_string());
+                    }
+                    push_pane_runtime_notice(
+                        &output_buffer_for_waiter,
+                        "\r\n[bmux] pane process exited; layout preserved. Use restart pane or close pane.\r\n",
+                    );
                     let _ = pane_exit_tx.send(PaneExitEvent {
                         session_id,
                         pane_id,
@@ -1965,6 +2016,7 @@ impl SessionRuntimeManager {
         Ok(PaneRuntimeHandle {
             meta: pane_meta,
             process_group_id,
+            exit_reason,
             stop_tx: Some(stop_tx),
             task,
             input_tx,
@@ -2141,6 +2193,71 @@ impl SessionRuntimeManager {
         Ok((pane_id, None))
     }
 
+    fn restart_pane(
+        &mut self,
+        session_id: SessionId,
+        target: Option<PaneSelector>,
+    ) -> Result<Uuid> {
+        let pane_meta = {
+            let session = self
+                .runtimes
+                .get(&session_id)
+                .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+            let pane_id =
+                resolve_pane_id_from_selector(session, target.unwrap_or(PaneSelector::Active))
+                    .ok_or_else(|| anyhow::anyhow!("target pane not found"))?;
+            let pane = session
+                .panes
+                .get(&pane_id)
+                .ok_or_else(|| anyhow::anyhow!("target pane not found"))?;
+            PaneRuntimeMeta {
+                id: pane_id,
+                name: pane.meta.name.clone(),
+                shell: pane.meta.shell.clone(),
+            }
+        };
+
+        let old_pane = {
+            let session = self
+                .runtimes
+                .get_mut(&session_id)
+                .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+            session
+                .panes
+                .remove(&pane_meta.id)
+                .ok_or_else(|| anyhow::anyhow!("target pane not found"))?
+        };
+        tokio::spawn(async move {
+            shutdown_pane_handle(old_pane).await;
+        });
+
+        let new_pane = self.spawn_pane_runtime(session_id, pane_meta.clone())?;
+        let client_ids = {
+            let session = self
+                .runtimes
+                .get(&session_id)
+                .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+            session.attached_clients.iter().copied().collect::<Vec<_>>()
+        };
+        for client_id in client_ids {
+            if let Ok(mut output) = new_pane.output_buffer.lock() {
+                output.register_client_at_tail(client_id);
+            }
+        }
+        if let Ok(mut reason) = new_pane.exit_reason.lock() {
+            *reason = None;
+        }
+
+        let session = self
+            .runtimes
+            .get_mut(&session_id)
+            .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
+        session.panes.insert(pane_meta.id, new_pane);
+        session.focused_pane_id = pane_meta.id;
+        self.apply_stored_attach_viewport(session_id);
+        Ok(pane_meta.id)
+    }
+
     fn resize_pane(
         &mut self,
         session_id: SessionId,
@@ -2201,6 +2318,8 @@ impl SessionRuntimeManager {
                     index: (index + 1) as u32,
                     name: pane.meta.name.clone(),
                     focused: *pane_id == session.focused_pane_id,
+                    state: pane_state_for_handle(pane),
+                    state_reason: pane_state_reason_for_handle(pane),
                 })
             })
             .collect::<Vec<_>>();
@@ -2231,6 +2350,8 @@ impl SessionRuntimeManager {
                     index: (index + 1) as u32,
                     name: pane.meta.name.clone(),
                     focused: *pane_id == session.focused_pane_id,
+                    state: pane_state_for_handle(pane),
+                    state_reason: pane_state_reason_for_handle(pane),
                 })
             })
             .collect::<Vec<_>>();
@@ -2241,25 +2362,6 @@ impl SessionRuntimeManager {
             scene,
             zoomed: session.zoomed_pane_id.is_some(),
         })
-    }
-
-    fn active_pane_exited(
-        &self,
-        session_id: SessionId,
-        client_id: ClientId,
-    ) -> Result<bool, SessionRuntimeError> {
-        let session = self
-            .runtimes
-            .get(&session_id)
-            .ok_or(SessionRuntimeError::NotFound)?;
-        if !session.attached_clients.contains(&client_id) {
-            return Err(SessionRuntimeError::NotAttached);
-        }
-        let pane = session
-            .panes
-            .get(&session.focused_pane_id)
-            .ok_or(SessionRuntimeError::NotFound)?;
-        Ok(pane.exited.load(Ordering::SeqCst))
     }
 
     fn attach_snapshot_state(
@@ -2287,6 +2389,8 @@ impl SessionRuntimeManager {
                     index: (index + 1) as u32,
                     name: pane.meta.name.clone(),
                     focused: *pane_id == session.focused_pane_id,
+                    state: pane_state_for_handle(pane),
+                    state_reason: pane_state_reason_for_handle(pane),
                 })
             })
             .collect::<Vec<_>>();
@@ -2327,7 +2431,7 @@ impl SessionRuntimeManager {
         pane_ids: &[Uuid],
         max_bytes: usize,
     ) -> Result<Vec<AttachPaneChunk>, SessionRuntimeError> {
-        let (chunks, closed_active) = {
+        let chunks = {
             let session = self
                 .runtimes
                 .get_mut(&session_id)
@@ -2337,7 +2441,6 @@ impl SessionRuntimeManager {
             }
 
             let mut chunks = Vec::new();
-            let mut closed_active = false;
             let num_panes = pane_ids.len().max(1);
             let per_pane_budget = (RESPONSE_OUTPUT_BUDGET / num_panes).min(max_bytes);
             let mut budget_remaining = RESPONSE_OUTPUT_BUDGET;
@@ -2352,21 +2455,14 @@ impl SessionRuntimeManager {
                     .map_err(|_| SessionRuntimeError::Closed)?;
                 let data = output.read_for_client(client_id, allowed);
                 drop(output);
-                if pane.exited.load(Ordering::SeqCst) && *pane_id == session.focused_pane_id {
-                    closed_active = true;
-                }
                 budget_remaining = budget_remaining.saturating_sub(data.len());
                 chunks.push(AttachPaneChunk {
                     pane_id: *pane_id,
                     data,
                 });
             }
-            (chunks, closed_active)
+            chunks
         };
-
-        if closed_active {
-            return Err(SessionRuntimeError::Closed);
-        }
 
         Ok(chunks)
     }
@@ -2405,13 +2501,10 @@ impl SessionRuntimeManager {
             .get_mut(&session_id)
             .ok_or(SessionRuntimeError::NotFound)?;
 
-        let pane = runtime
+        let _pane = runtime
             .panes
             .get(&runtime.focused_pane_id)
             .ok_or(SessionRuntimeError::NotFound)?;
-        if pane.exited.load(Ordering::SeqCst) {
-            return Err(SessionRuntimeError::Closed);
-        }
 
         runtime.attached_clients.insert(client_id);
         for pane in runtime.panes.values_mut() {
@@ -2580,9 +2673,6 @@ impl SessionRuntimeManager {
             .ok_or(SessionRuntimeError::NotFound)?;
 
         if max_bytes == 0 {
-            if pane.exited.load(Ordering::SeqCst) {
-                return Err(SessionRuntimeError::Closed);
-            }
             return Ok(Vec::new());
         }
 
@@ -2592,10 +2682,6 @@ impl SessionRuntimeManager {
             .map_err(|_| SessionRuntimeError::Closed)?;
         let bytes = output.read_for_client(client_id, max_bytes);
         drop(output);
-
-        if bytes.is_empty() && pane.exited.load(Ordering::SeqCst) {
-            return Err(SessionRuntimeError::Closed);
-        }
 
         Ok(bytes)
     }
@@ -2632,6 +2718,21 @@ fn resolve_pane_id_from_selector(
             runtime.panes.contains_key(&pane_id).then_some(pane_id)
         }
     }
+}
+
+fn pane_state_for_handle(pane: &PaneRuntimeHandle) -> PaneState {
+    if pane.exited.load(Ordering::SeqCst) {
+        PaneState::Exited
+    } else {
+        PaneState::Running
+    }
+}
+
+fn pane_state_reason_for_handle(pane: &PaneRuntimeHandle) -> Option<String> {
+    pane.exit_reason
+        .lock()
+        .ok()
+        .and_then(|reason| reason.clone())
 }
 
 impl BmuxServer {
@@ -4175,132 +4276,13 @@ async fn restore_snapshot_replace(
     apply_snapshot_state(state, &snapshot)
 }
 
-async fn reap_closed_active_pane(
-    state: &Arc<ServerState>,
-    session_id: SessionId,
-    client_id: ClientId,
-    selected_session: &mut Option<SessionId>,
-    attached_stream_session: &mut Option<SessionId>,
-) -> Result<()> {
-    let removed_session = {
-        let mut runtime_manager = state
-            .session_runtimes
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-        match runtime_manager.close_pane(session_id, Some(PaneSelector::Active)) {
-            Ok((_, removed_session)) => removed_session,
-            Err(_) => None,
-        }
-    };
-
-    if let Some(removed_session) = removed_session {
-        let removed_session_id = removed_session.session_id;
-        if removed_session.had_attached_clients {
-            emit_event(
-                state,
-                Event::ClientDetached {
-                    id: removed_session_id.0,
-                },
-            )?;
-        }
-        shutdown_runtime_handle(removed_session).await;
-        let mut manager = state
-            .session_manager
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-        let _ = manager.remove_session(&removed_session_id);
-        drop(manager);
-        let _ = prune_context_mappings_for_session(state, removed_session_id)?;
-        if *selected_session == Some(removed_session_id) {
-            *selected_session = None;
-            persist_selected_session(state, client_id, None)?;
-        }
-        if *attached_stream_session == Some(removed_session_id) {
-            *attached_stream_session = None;
-        }
-
-        let mut attach_tokens = state
-            .attach_tokens
-            .lock()
-            .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
-        attach_tokens.remove_for_session(removed_session_id);
-        drop(attach_tokens);
-
-        clear_selected_session_for_all(state, removed_session_id)?;
-
-        emit_event(
-            state,
-            Event::SessionRemoved {
-                id: removed_session_id.0,
-            },
-        )?;
-    } else {
-        emit_attach_view_changed_for_pane_close(state, session_id, false)?;
-    }
-
-    Ok(())
-}
-
 async fn reap_exited_pane(
     state: &Arc<ServerState>,
     session_id: SessionId,
     pane_id: Uuid,
 ) -> Result<()> {
-    let removed_session = {
-        let mut runtime_manager = state
-            .session_runtimes
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-        let Some(runtime) = runtime_manager.runtimes.get(&session_id) else {
-            return Ok(());
-        };
-        if runtime.attached_clients.is_empty() {
-            return Ok(());
-        }
-        match runtime_manager.close_pane(session_id, Some(PaneSelector::ById(pane_id))) {
-            Ok((_, removed_session)) => removed_session,
-            Err(_) => None,
-        }
-    };
-
-    if let Some(removed_session) = removed_session {
-        let removed_session_id = removed_session.session_id;
-        if removed_session.had_attached_clients {
-            emit_event(
-                state,
-                Event::ClientDetached {
-                    id: removed_session_id.0,
-                },
-            )?;
-        }
-        shutdown_runtime_handle(removed_session).await;
-
-        let mut manager = state
-            .session_manager
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-        let _ = manager.remove_session(&removed_session_id);
-        drop(manager);
-        let _ = prune_context_mappings_for_session(state, removed_session_id)?;
-
-        let mut attach_tokens = state
-            .attach_tokens
-            .lock()
-            .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
-        attach_tokens.remove_for_session(removed_session_id);
-        drop(attach_tokens);
-
-        clear_selected_session_for_all(state, removed_session_id)?;
-
-        emit_event(
-            state,
-            Event::SessionRemoved {
-                id: removed_session_id.0,
-            },
-        )?;
-    } else {
-        emit_attach_view_changed_for_pane_close(state, session_id, false)?;
-    }
+    let _ = pane_id;
+    emit_attach_view_changed_for_layout(state, session_id)?;
 
     Ok(())
 }
@@ -4882,6 +4864,46 @@ async fn handle_request(
                 id: closed_pane_id,
                 session_id: session_id.0,
                 session_closed,
+            })
+        }
+        Request::RestartPane { session, target } => {
+            let session_id = {
+                let manager = state
+                    .session_manager
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
+                match resolve_session_request_session_id(&manager, &session, selected_session) {
+                    Ok(session_id) => session_id,
+                    Err(response) => return Ok(Response::Err(response)),
+                }
+            };
+            if let Err(response) = ensure_session_mutation_allowed(
+                state,
+                shutdown_tx,
+                session_id,
+                client_id,
+                client_principal_id,
+                "pane.restart",
+            )
+            .await
+            {
+                return Ok(Response::Err(response));
+            }
+
+            let pane_id = {
+                let mut runtime_manager = state
+                    .session_runtimes
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+                runtime_manager
+                    .restart_pane(session_id, target)
+                    .map_err(|error| anyhow::anyhow!("failed restarting pane: {error:#}"))?
+            };
+
+            emit_attach_view_changed_for_layout(state, session_id)?;
+            Response::Ok(ResponsePayload::PaneRestarted {
+                id: pane_id,
+                session_id: session_id.0,
             })
         }
         Request::ZoomPane { session } => {
@@ -5473,20 +5495,10 @@ async fn handle_request(
                             code: ErrorCode::Internal,
                             message: "failed opening attach stream".to_string(),
                         }),
-                        Err(SessionRuntimeError::Closed) => {
-                            let _ = reap_closed_active_pane(
-                                state,
-                                session_id,
-                                client_id,
-                                selected_session,
-                                attached_stream_session,
-                            )
-                            .await;
-                            Response::Err(ErrorResponse {
-                                code: ErrorCode::NotFound,
-                                message: format!("session runtime not found: {}", session_id.0),
-                            })
-                        }
+                        Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
+                            code: ErrorCode::NotFound,
+                            message: format!("session runtime not found: {}", session_id.0),
+                        }),
                     }
                 }
                 Err(AttachTokenValidationError::NotFound) => Response::Err(ErrorResponse {
@@ -5556,20 +5568,10 @@ async fn handle_request(
                     code: ErrorCode::InvalidRequest,
                     message: "client is not attached to session runtime".to_string(),
                 }),
-                Err(SessionRuntimeError::Closed) => {
-                    let _ = reap_closed_active_pane(
-                        state,
-                        session_id,
-                        client_id,
-                        selected_session,
-                        attached_stream_session,
-                    )
-                    .await;
-                    Response::Err(ErrorResponse {
-                        code: ErrorCode::NotFound,
-                        message: "active pane is closed".to_string(),
-                    })
-                }
+                Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: "active pane is closed".to_string(),
+                }),
             }
         }
         Request::AttachSetViewport {
@@ -5655,20 +5657,10 @@ async fn handle_request(
                     code: ErrorCode::InvalidRequest,
                     message: "client is not attached to session runtime".to_string(),
                 }),
-                Err(SessionRuntimeError::Closed) => {
-                    let _ = reap_closed_active_pane(
-                        state,
-                        session_id,
-                        client_id,
-                        selected_session,
-                        attached_stream_session,
-                    )
-                    .await;
-                    Response::Err(ErrorResponse {
-                        code: ErrorCode::NotFound,
-                        message: "active pane is closed".to_string(),
-                    })
-                }
+                Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: "active pane is closed".to_string(),
+                }),
             }
         }
         Request::AttachLayout { session_id } => {
@@ -5678,44 +5670,6 @@ async fn handle_request(
                     code: ErrorCode::NotFound,
                     message: format!("session runtime not found: {}", session_id.0),
                 }));
-            }
-            let active_pane_exited = {
-                let runtime_manager = state
-                    .session_runtimes
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                runtime_manager.active_pane_exited(session_id, client_id)
-            };
-            match active_pane_exited {
-                Ok(true) => {
-                    let _ = reap_closed_active_pane(
-                        state,
-                        session_id,
-                        client_id,
-                        selected_session,
-                        attached_stream_session,
-                    )
-                    .await;
-                }
-                Ok(false) => {}
-                Err(SessionRuntimeError::NotFound) => {
-                    return Ok(Response::Err(ErrorResponse {
-                        code: ErrorCode::NotFound,
-                        message: format!("session runtime not found: {}", session_id.0),
-                    }));
-                }
-                Err(SessionRuntimeError::NotAttached) => {
-                    return Ok(Response::Err(ErrorResponse {
-                        code: ErrorCode::InvalidRequest,
-                        message: "client is not attached to session runtime".to_string(),
-                    }));
-                }
-                Err(SessionRuntimeError::Closed) => {
-                    return Ok(Response::Err(ErrorResponse {
-                        code: ErrorCode::NotFound,
-                        message: "active pane is closed".to_string(),
-                    }));
-                }
             }
             let state_snapshot = {
                 let runtime_manager = state
@@ -5742,20 +5696,10 @@ async fn handle_request(
                     code: ErrorCode::InvalidRequest,
                     message: "client is not attached to session runtime".to_string(),
                 }),
-                Err(SessionRuntimeError::Closed) => {
-                    let _ = reap_closed_active_pane(
-                        state,
-                        session_id,
-                        client_id,
-                        selected_session,
-                        attached_stream_session,
-                    )
-                    .await;
-                    Response::Err(ErrorResponse {
-                        code: ErrorCode::NotFound,
-                        message: "active pane is closed".to_string(),
-                    })
-                }
+                Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: "active pane is closed".to_string(),
+                }),
             }
         }
         Request::AttachSnapshot {
@@ -5797,20 +5741,10 @@ async fn handle_request(
                     code: ErrorCode::InvalidRequest,
                     message: "client is not attached to session runtime".to_string(),
                 }),
-                Err(SessionRuntimeError::Closed) => {
-                    let _ = reap_closed_active_pane(
-                        state,
-                        session_id,
-                        client_id,
-                        selected_session,
-                        attached_stream_session,
-                    )
-                    .await;
-                    Response::Err(ErrorResponse {
-                        code: ErrorCode::NotFound,
-                        message: "active pane is closed".to_string(),
-                    })
-                }
+                Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: "active pane is closed".to_string(),
+                }),
             }
         }
         Request::AttachPaneOutputBatch {
@@ -5851,20 +5785,10 @@ async fn handle_request(
                     code: ErrorCode::InvalidRequest,
                     message: "client is not attached to session runtime".to_string(),
                 }),
-                Err(SessionRuntimeError::Closed) => {
-                    let _ = reap_closed_active_pane(
-                        state,
-                        session_id,
-                        client_id,
-                        selected_session,
-                        attached_stream_session,
-                    )
-                    .await;
-                    Response::Err(ErrorResponse {
-                        code: ErrorCode::NotFound,
-                        message: "active pane is closed".to_string(),
-                    })
-                }
+                Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: "active pane is closed".to_string(),
+                }),
             }
         }
         Request::Detach => {
@@ -6164,6 +6088,7 @@ const fn request_requires_exclusive(request: &Request) -> bool {
             | Request::FocusPane { .. }
             | Request::ResizePane { .. }
             | Request::ClosePane { .. }
+            | Request::RestartPane { .. }
             | Request::ZoomPane { .. }
             | Request::FollowClient { .. }
             | Request::Unfollow
@@ -6195,6 +6120,7 @@ const fn response_requires_snapshot(response: &Response) -> bool {
                 | ResponsePayload::PaneFocused { .. }
                 | ResponsePayload::PaneResized { .. }
                 | ResponsePayload::PaneClosed { .. }
+                | ResponsePayload::PaneRestarted { .. }
                 | ResponsePayload::SessionKilled { .. }
                 | ResponsePayload::FollowStarted { .. }
                 | ResponsePayload::FollowStopped { .. }
@@ -6231,6 +6157,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::FocusPane { .. } => "focus_pane",
         Request::ResizePane { .. } => "resize_pane",
         Request::ClosePane { .. } => "close_pane",
+        Request::RestartPane { .. } => "restart_pane",
         Request::ZoomPane { .. } => "zoom_pane",
         Request::FollowClient { .. } => "follow_client",
         Request::Unfollow => "unfollow",
@@ -6316,6 +6243,7 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::PaneFocused { .. } => "pane_focused",
         ResponsePayload::PaneResized { .. } => "pane_resized",
         ResponsePayload::PaneClosed { .. } => "pane_closed",
+        ResponsePayload::PaneRestarted { .. } => "pane_restarted",
         ResponsePayload::PaneZoomed { .. } => "pane_zoomed",
         ResponsePayload::FollowStarted { .. } => "follow_started",
         ResponsePayload::FollowStopped { .. } => "follow_stopped",
