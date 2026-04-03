@@ -4346,6 +4346,18 @@ async fn ensure_attach_session_exists(
     };
 
     if exists {
+        let mut runtime_manager = state
+            .session_runtimes
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+        if !runtime_manager.runtimes.contains_key(&session_id) {
+            runtime_manager.start_runtime(session_id).with_context(|| {
+                format!(
+                    "failed starting missing session runtime for existing session {}",
+                    session_id.0
+                )
+            })?;
+        }
         return Ok(true);
     }
 
@@ -5384,14 +5396,7 @@ async fn handle_request(
         } => {
             let session_id = SessionId(session_id);
 
-            let session_exists = {
-                let manager = state
-                    .session_manager
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                manager.get_session(&session_id).is_some()
-            };
-            if !session_exists {
+            if !ensure_attach_session_exists(state, session_id).await? {
                 return Ok(Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
                     message: format!("session not found: {}", session_id.0),
@@ -5425,7 +5430,29 @@ async fn handle_request(
                                 },
                             )?;
                         }
-                        runtime_manager.begin_attach(session_id, client_id)
+                        match runtime_manager.begin_attach(session_id, client_id) {
+                            Ok(()) => Ok(()),
+                            Err(SessionRuntimeError::NotFound) => {
+                                if let Err(error) = runtime_manager.start_runtime(session_id) {
+                                    warn!(
+                                        "failed restarting missing session runtime {} before attach-open: {error:#}",
+                                        session_id.0
+                                    );
+                                }
+                                runtime_manager.begin_attach(session_id, client_id)
+                            }
+                            Err(SessionRuntimeError::Closed) => {
+                                let _ = runtime_manager.remove_runtime(session_id);
+                                if let Err(error) = runtime_manager.start_runtime(session_id) {
+                                    warn!(
+                                        "failed restarting closed session runtime {} before attach-open: {error:#}",
+                                        session_id.0
+                                    );
+                                }
+                                runtime_manager.begin_attach(session_id, client_id)
+                            }
+                            Err(error) => Err(error),
+                        }
                     };
 
                     match begin_result {
