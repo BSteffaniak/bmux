@@ -134,6 +134,15 @@ struct HostRuntimeState {
     started_at_unix: i64,
 }
 
+#[derive(Debug, Clone, Default)]
+struct InviteMetadata {
+    resolved_target: Option<String>,
+    owner: Option<String>,
+    role: Option<String>,
+    expires_at: Option<String>,
+    one_time: Option<bool>,
+}
+
 #[derive(Debug)]
 struct SshBridgeStream {
     _child: Child,
@@ -591,7 +600,9 @@ pub(super) async fn run_join(link: Option<&str>, session: Option<&str>) -> Resul
             .and_then(|values| values.first())
             .map(String::as_str)
     });
-    print_join_preview(&config, &target, resumed_session);
+    let invite_metadata = fetch_invite_metadata(&config, &target).await;
+    print_join_preview(&config, &target, resumed_session, invite_metadata.as_ref());
+    confirm_risky_invite(&target, invite_metadata.as_ref())?;
     println!("Connecting...");
     run_connect(Some(&target), resumed_session, None, false, true).await
 }
@@ -883,15 +894,136 @@ fn resolve_join_prompt_selection(input: &str, options: &[String]) -> Result<Opti
     Ok(Some(normalize_join_target_input(value)?))
 }
 
-fn print_join_preview(config: &BmuxConfig, target: &str, session: Option<&str>) {
-    if let Some(name) = target.strip_prefix("bmux://")
-        && let Some(mapped) = config.connections.share_links.get(name)
-    {
-        println!("Resolved target: {mapped}");
+fn print_join_preview(
+    config: &BmuxConfig,
+    target: &str,
+    session: Option<&str>,
+    metadata: Option<&InviteMetadata>,
+) {
+    let resolved_target = metadata
+        .and_then(|meta| meta.resolved_target.as_deref())
+        .or_else(|| {
+            target
+                .strip_prefix("bmux://")
+                .and_then(|name| config.connections.share_links.get(name).map(String::as_str))
+        });
+    if let Some(resolved) = resolved_target {
+        println!("Resolved target: {resolved}");
+    }
+    if let Some(meta) = metadata {
+        if let Some(owner) = meta.owner.as_deref() {
+            println!("Owner: {owner}");
+        }
+        if let Some(role) = meta.role.as_deref() {
+            println!("Role: {role}");
+        }
+        if let Some(expires_at) = meta.expires_at.as_deref() {
+            println!("Expires: {expires_at}");
+        }
+        if meta.one_time == Some(true) {
+            println!("One-time: true");
+        }
     }
     if let Some(session_id) = session {
         println!("Session: {session_id}");
     }
+}
+
+fn confirm_risky_invite(target: &str, metadata: Option<&InviteMetadata>) -> Result<()> {
+    if !invite_requires_confirmation(metadata) {
+        return Ok(());
+    }
+    if !io::stdin().is_terminal() {
+        anyhow::bail!(
+            "invite {target} grants control access with unknown owner; rerun interactively to confirm"
+        );
+    }
+    print!("Invite grants control access but owner is unknown. Continue? [y/N]: ");
+    io::stdout()
+        .flush()
+        .context("failed flushing invite confirmation prompt")?;
+    let mut input = String::new();
+    io::stdin()
+        .read_line(&mut input)
+        .context("failed reading invite confirmation")?;
+    let value = input.trim().to_ascii_lowercase();
+    if value == "y" || value == "yes" {
+        return Ok(());
+    }
+    anyhow::bail!("join cancelled")
+}
+
+fn invite_requires_confirmation(metadata: Option<&InviteMetadata>) -> bool {
+    let Some(meta) = metadata else {
+        return false;
+    };
+    let is_control = meta
+        .role
+        .as_deref()
+        .map(|value| value.eq_ignore_ascii_case("control"))
+        .unwrap_or(false);
+    let owner_is_unknown = meta
+        .owner
+        .as_deref()
+        .map(str::trim)
+        .is_none_or(str::is_empty);
+    is_control && owner_is_unknown
+}
+
+async fn fetch_invite_metadata(config: &BmuxConfig, target: &str) -> Option<InviteMetadata> {
+    let name = target.strip_prefix("bmux://")?;
+    let mut metadata = InviteMetadata {
+        resolved_target: config.connections.share_links.get(name).cloned(),
+        ..InviteMetadata::default()
+    };
+
+    let control_plane = control_plane_url(config);
+    let client = reqwest::Client::new();
+    let mut request = client.get(format!("{control_plane}/v1/share-links/{name}"));
+    if let Ok(Some(state)) = load_auth_state_optional(&ConfigPaths::default()) {
+        request = request.bearer_auth(state.access_token);
+    }
+    let Ok(response) = request.send().await else {
+        return Some(metadata);
+    };
+    if !response.status().is_success() {
+        return Some(metadata);
+    }
+    let Ok(payload) = response.json::<serde_json::Value>().await else {
+        return Some(metadata);
+    };
+
+    if metadata.resolved_target.is_none() {
+        metadata.resolved_target = json_string(&payload, &["target"]);
+    }
+    metadata.role = json_string(&payload, &["role"]);
+    metadata.owner = json_string(
+        &payload,
+        &[
+            "owner",
+            "owner_name",
+            "account_name",
+            "creator",
+            "created_by",
+        ],
+    );
+    metadata.expires_at = json_string(&payload, &["expires_at", "expiresAt", "expiration"]);
+    metadata.one_time = json_bool(&payload, &["one_time", "oneTime", "single_use"]);
+    Some(metadata)
+}
+
+fn json_string(payload: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter().find_map(|key| {
+        payload
+            .get(*key)
+            .and_then(|value| value.as_str())
+            .map(ToString::to_string)
+    })
+}
+
+fn json_bool(payload: &serde_json::Value, keys: &[&str]) -> Option<bool> {
+    keys.iter()
+        .find_map(|key| payload.get(*key).and_then(|value| value.as_bool()))
 }
 
 fn control_plane_url(config: &BmuxConfig) -> String {
@@ -1022,6 +1154,8 @@ fn run_host_stop() -> Result<u8> {
     {
         let status = std::process::Command::new("kill")
             .args(["-TERM", &state.pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .context("failed running kill")?;
         if !status.success() {
@@ -1073,6 +1207,8 @@ fn is_process_alive(pid: u32) -> bool {
     {
         return std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|status| status.success());
     }
@@ -3227,6 +3363,46 @@ mod tests {
         let options = vec!["bmux://demo".to_string()];
         let error = resolve_join_prompt_selection("9", &options).expect_err("out of range");
         assert!(error.to_string().contains("selection out of range"));
+    }
+
+    #[test]
+    fn invite_requires_confirmation_for_unknown_control_owner() {
+        let metadata = InviteMetadata {
+            role: Some("control".to_string()),
+            owner: None,
+            ..InviteMetadata::default()
+        };
+        assert!(invite_requires_confirmation(Some(&metadata)));
+    }
+
+    #[test]
+    fn invite_requires_confirmation_is_false_when_owner_known() {
+        let metadata = InviteMetadata {
+            role: Some("control".to_string()),
+            owner: Some("alice@example.com".to_string()),
+            ..InviteMetadata::default()
+        };
+        assert!(!invite_requires_confirmation(Some(&metadata)));
+    }
+
+    #[test]
+    fn invite_requires_confirmation_when_owner_is_blank() {
+        let metadata = InviteMetadata {
+            role: Some("control".to_string()),
+            owner: Some("   ".to_string()),
+            ..InviteMetadata::default()
+        };
+        assert!(invite_requires_confirmation(Some(&metadata)));
+    }
+
+    #[test]
+    fn invite_requires_confirmation_is_false_for_non_control_roles() {
+        let metadata = InviteMetadata {
+            role: Some("view".to_string()),
+            owner: None,
+            ..InviteMetadata::default()
+        };
+        assert!(!invite_requires_confirmation(Some(&metadata)));
     }
 
     #[test]
