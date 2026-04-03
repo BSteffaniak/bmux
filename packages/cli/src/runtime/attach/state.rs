@@ -70,12 +70,17 @@ pub struct AttachCursorState {
 
 pub struct PaneRenderBuffer {
     pub(crate) parser: vt100::Parser,
+    /// Cached rendered row strings from the previous frame.  When a row's
+    /// string matches the cached version we skip emitting it, avoiding
+    /// unnecessary terminal I/O for unchanged content.
+    pub(crate) prev_rows: Vec<String>,
 }
 
 impl Default for PaneRenderBuffer {
     fn default() -> Self {
         Self {
             parser: vt100::Parser::new(24, 80, 4_096),
+            prev_rows: Vec::new(),
         }
     }
 }

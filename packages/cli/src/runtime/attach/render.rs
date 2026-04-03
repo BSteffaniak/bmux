@@ -251,6 +251,10 @@ pub fn render_attach_scene<W: io::Write>(
             queue!(stdout, MoveTo(0, y), Print(" ".repeat(usize::from(cols))))
                 .context("failed clearing attach pane row")?;
         }
+        // Invalidate all row caches so every row is re-emitted.
+        for buffer in pane_buffers.values_mut() {
+            buffer.prev_rows.clear();
+        }
     }
 
     let focused_surface_id = match scene.focus {
@@ -347,10 +351,17 @@ pub fn render_attach_scene<W: io::Write>(
         let inner_w = usize::from(inner_w_u16);
         let inner_h = usize::from(inner_h_u16);
         if let Some(entry) = pane_buffers.get_mut(&pane_id) {
+            let (old_rows, old_cols) = entry.parser.screen().size();
             entry
                 .parser
                 .screen_mut()
                 .set_size(inner_h_u16.max(1), inner_w_u16.max(1));
+            // Invalidate the row cache when the pane dimensions change, since
+            // the row strings are no longer comparable at a different size.
+            let (new_rows, new_cols) = entry.parser.screen().size();
+            if (new_rows, new_cols) != (old_rows, old_cols) {
+                entry.prev_rows.clear();
+            }
             let use_scrollback = scrollback_active && focus;
             let previous_scrollback = entry.parser.screen().scrollback();
             if use_scrollback {
@@ -443,9 +454,21 @@ pub fn render_attach_scene<W: io::Write>(
                     line.push_str("\x1b[0m");
                 }
 
-                queue!(stdout, MoveTo(rect.x.saturating_add(1), y), Print(line))
-                    .context("failed drawing pane content")?;
+                // Row-level diff: skip emitting if the rendered string
+                // matches the previous frame's cached version for this row.
+                let cached = entry.prev_rows.get(row);
+                if cached.map_or(true, |c| *c != line) {
+                    queue!(stdout, MoveTo(rect.x.saturating_add(1), y), Print(&line))
+                        .context("failed drawing pane content")?;
+                    if row < entry.prev_rows.len() {
+                        entry.prev_rows[row] = line;
+                    } else {
+                        entry.prev_rows.push(line);
+                    }
+                }
             }
+            // Trim stale cache entries if the visible row count shrank.
+            entry.prev_rows.truncate(inner_h);
             if use_scrollback {
                 entry
                     .parser

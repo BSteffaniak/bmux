@@ -4449,6 +4449,7 @@ mod tests {
         let buffer = view_state.pane_buffers.entry(pane_id).or_insert_with(|| {
             crate::runtime::attach::state::PaneRenderBuffer {
                 parser: vt100::Parser::new(4, 20, 4_096),
+                prev_rows: Vec::new(),
             }
         });
         append_pane_output(buffer, b"one\r\n  four\r\n     five\r\n  six\r\n\x1b[4;3H");
