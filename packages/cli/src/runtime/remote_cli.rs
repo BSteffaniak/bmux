@@ -357,24 +357,101 @@ fn map_connect_target_resolution_error(target: &str, error: anyhow::Error) -> an
     error
 }
 
-pub(super) async fn run_setup() -> Result<u8> {
+pub(super) async fn run_setup(check: bool) -> Result<u8> {
+    if check {
+        return run_setup_check();
+    }
+
     println!("bmux setup");
     println!("Step 1/2: auth");
-    let _ = ensure_authenticated(&BmuxConfig::load()?).await?;
+    let config = BmuxConfig::load()?;
+    let auth_state = ensure_authenticated(&config).await?;
+
     println!("Step 2/2: host");
-    let code = run_host(
-        "127.0.0.1:7443",
-        None,
-        false,
-        false,
-        false,
-        false,
-        false,
-        true,
-    )
-    .await?;
+    let _ = spawn_host_daemon("127.0.0.1:7443", None)?;
+    let host_state = wait_for_running_host_state(std::time::Duration::from_secs(5)).await?;
+
+    let account = auth_state.account_name.as_deref();
+    let host_name = host_state.name.as_deref().unwrap_or("host");
+    let join_target = host_state
+        .share_link
+        .as_deref()
+        .unwrap_or(host_state.target.as_str());
+    for line in format_setup_summary_lines(
+        account,
+        host_name,
+        host_state.share_link.as_deref(),
+        join_target,
+    ) {
+        println!("{line}");
+    }
     println!("Setup complete.");
-    Ok(code)
+    Ok(0)
+}
+
+fn run_setup_check() -> Result<u8> {
+    println!("bmux setup --check");
+    let paths = ConfigPaths::default();
+    let auth_state = load_auth_state_optional(&paths)?;
+    let host_state = load_host_runtime_state(&paths)?;
+    let host_alive = host_state
+        .as_ref()
+        .is_some_and(|state| is_process_alive(state.pid));
+
+    if auth_state.is_some() && host_alive {
+        let account = auth_state
+            .as_ref()
+            .and_then(|state| state.account_name.as_deref());
+        let Some(state) = host_state else {
+            anyhow::bail!("host runtime status became unavailable during setup check");
+        };
+        let host_name = state.name.as_deref().unwrap_or("host");
+        let join_target = state.share_link.as_deref().unwrap_or(state.target.as_str());
+        for line in
+            format_setup_summary_lines(account, host_name, state.share_link.as_deref(), join_target)
+        {
+            println!("{line}");
+        }
+        println!("Setup check: ready");
+        return Ok(0);
+    }
+
+    println!("Setup check: not ready");
+    if auth_state.is_none() {
+        println!("- auth: missing (run: bmux auth login)");
+    }
+    match host_state {
+        Some(state) if !host_alive => {
+            println!(
+                "- host: stale runtime state (pid {}) (run: bmux setup)",
+                state.pid
+            );
+        }
+        None => {
+            println!("- host: offline (run: bmux setup)");
+        }
+        Some(_) => {}
+    }
+    println!("Fix: bmux setup");
+    Ok(1)
+}
+
+async fn wait_for_running_host_state(timeout: std::time::Duration) -> Result<HostRuntimeState> {
+    let paths = ConfigPaths::default();
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(state) = load_host_runtime_state(&paths)?
+            && is_process_alive(state.pid)
+        {
+            return Ok(state);
+        }
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "host runtime did not become ready in time; run 'bmux host --status' or retry 'bmux setup'"
+            );
+        }
+        sleep(std::time::Duration::from_millis(100)).await;
+    }
 }
 
 pub(super) async fn run_host(

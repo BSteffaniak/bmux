@@ -180,7 +180,11 @@ pub struct Cli {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// First-run setup wizard for hosted mode
-    Setup,
+    Setup {
+        /// Check hosted readiness without starting or changing runtime state
+        #[arg(long)]
+        check: bool,
+    },
     /// Start hosted mode (iroh by default)
     Host {
         /// Optional listen address for local gateway bridge
@@ -1157,6 +1161,24 @@ mod tests {
                 command: RemoteCompleteCommand::Sessions { target }
             } if target == "prod"
         ));
+    }
+
+    #[test]
+    fn parses_setup_command_defaults() {
+        let cli = Cli::try_parse_from(["bmux", "setup"]).expect("valid CLI args");
+        let Some(Command::Setup { check }) = cli.command else {
+            panic!("expected setup command");
+        };
+        assert!(!check);
+    }
+
+    #[test]
+    fn parses_setup_check_flag() {
+        let cli = Cli::try_parse_from(["bmux", "setup", "--check"]).expect("valid CLI args");
+        let Some(Command::Setup { check }) = cli.command else {
+            panic!("expected setup command");
+        };
+        assert!(check);
     }
 
     #[test]

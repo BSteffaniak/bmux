@@ -12,7 +12,7 @@ pub(super) async fn run_command(
 
 pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerId {
     match command {
-        Command::Setup => BuiltInHandlerId::Setup,
+        Command::Setup { .. } => BuiltInHandlerId::Setup,
         Command::Host { .. } => BuiltInHandlerId::Host,
         Command::Join { .. } => BuiltInHandlerId::Join,
         Command::Hosts => BuiltInHandlerId::Hosts,
@@ -123,7 +123,7 @@ pub(super) async fn dispatch_built_in_command(
     let handler = built_in_handler_for_command(command);
     let _descriptor = built_in_command_by_handler(handler);
     match (handler, command) {
-        (BuiltInHandlerId::Setup, Command::Setup) => run_setup().await,
+        (BuiltInHandlerId::Setup, Command::Setup { check }) => run_setup(*check).await,
         (
             BuiltInHandlerId::Host,
             Command::Host {
