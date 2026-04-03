@@ -547,6 +547,8 @@ pub(super) async fn run_host(
     } else {
         None
     };
+    let bridge_paths = ConfigPaths::default();
+    ensure_local_ipc_backend_ready(&bridge_paths, hosted_mode).await?;
 
     let endpoint = Endpoint::builder(presets::N0)
         .alpns(vec![BMUX_IROH_ALPN.to_vec()])
@@ -663,6 +665,7 @@ pub(super) async fn run_host(
                 continue;
             }
         };
+        let bridge_paths = bridge_paths.clone();
         tokio::spawn(async move {
             let result: Result<()> = async {
                 let alpn = accepting.alpn().await.context("failed reading ALPN")?;
@@ -676,7 +679,7 @@ pub(super) async fn run_host(
                     .accept_bi()
                     .await
                     .context("failed accepting iroh stream")?;
-                let endpoint = local_ipc_endpoint_from_paths(&ConfigPaths::default());
+                let endpoint = local_ipc_endpoint_from_paths(&bridge_paths);
                 let ipc_stream = LocalIpcStream::connect(&endpoint)
                     .await
                     .context("failed connecting local IPC endpoint for iroh gateway")?;
@@ -1285,6 +1288,8 @@ fn run_host_status() -> Result<u8> {
     let paths = ConfigPaths::default();
     let Some(state) = load_host_runtime_state(&paths)? else {
         println!("host runtime: not running");
+        println!("runtime: {}", active_runtime_name());
+        println!("local ipc endpoint: {}", local_ipc_endpoint_label(&paths));
         println!("Fix: bmux setup");
         println!("Advanced: bmux host --daemon");
         return Ok(1);
@@ -1292,6 +1297,8 @@ fn run_host_status() -> Result<u8> {
     if !is_process_alive(state.pid) {
         clear_host_runtime_state(&paths)?;
         println!("host runtime: not running");
+        println!("runtime: {}", active_runtime_name());
+        println!("local ipc endpoint: {}", local_ipc_endpoint_label(&paths));
         println!("Reason: stale runtime state was cleared");
         println!("Fix: bmux setup");
         println!("Advanced: bmux host --restart");
@@ -1305,6 +1312,11 @@ fn run_host_status() -> Result<u8> {
 
 fn format_host_status_lines(state: &HostRuntimeState) -> Vec<String> {
     let mut lines = vec!["host runtime: running".to_string()];
+    lines.push(format!("runtime: {}", active_runtime_name()));
+    lines.push(format!(
+        "local ipc endpoint: {}",
+        local_ipc_endpoint_label(&ConfigPaths::default())
+    ));
     if let Some(name) = state.name.as_deref() {
         lines.push(format!("name: {name}"));
     }
@@ -1369,6 +1381,7 @@ fn spawn_host_daemon(listen: &str, name: Option<&str>, mode: HostedMode) -> Resu
 
     let current_exe = std::env::current_exe().context("failed resolving current executable")?;
     let mut command = std::process::Command::new(current_exe);
+    append_runtime_arg(&mut command);
     command.args(["host", "--listen", listen]);
     command.args(["--mode", hosted_mode_to_cli_value(mode)]);
     if let Some(value) = name {
@@ -1379,8 +1392,63 @@ fn spawn_host_daemon(listen: &str, name: Option<&str>, mode: HostedMode) -> Resu
     command.stderr(std::process::Stdio::null());
     let child = command.spawn().context("failed starting host daemon")?;
     println!("host runtime started in background (pid {})", child.id());
-    println!("check status: bmux host --status");
+    println!(
+        "check status: bmux --runtime {} host --status",
+        active_runtime_name()
+    );
     Ok(0)
+}
+
+async fn ensure_local_ipc_backend_ready(paths: &ConfigPaths, mode: HostedMode) -> Result<()> {
+    let endpoint = local_ipc_endpoint_from_paths(paths);
+    if local_ipc_connectable(&endpoint).await {
+        return Ok(());
+    }
+
+    if mode == HostedMode::P2p {
+        eprintln!(
+            "local IPC backend unavailable for runtime '{}'; attempting to start bmux server...",
+            active_runtime_name()
+        );
+        let _ = run_server_start(true, false).await?;
+        if wait_for_local_ipc_ready(&endpoint, Duration::from_secs(3)).await {
+            return Ok(());
+        }
+    }
+
+    let endpoint_label = local_ipc_endpoint_label(paths);
+    anyhow::bail!(
+        "host bridge could not reach local IPC endpoint '{}' for runtime '{}'.\nRun `bmux --runtime {} server start --daemon` and retry.",
+        endpoint_label,
+        active_runtime_name(),
+        active_runtime_name(),
+    );
+}
+
+async fn local_ipc_connectable(endpoint: &IpcEndpoint) -> bool {
+    LocalIpcStream::connect(endpoint).await.is_ok()
+}
+
+async fn wait_for_local_ipc_ready(endpoint: &IpcEndpoint, timeout: Duration) -> bool {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if local_ipc_connectable(endpoint).await {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+fn local_ipc_endpoint_label(paths: &ConfigPaths) -> String {
+    #[cfg(unix)]
+    {
+        paths.server_socket().display().to_string()
+    }
+    #[cfg(windows)]
+    {
+        paths.server_named_pipe()
+    }
 }
 
 fn hosted_mode_to_cli_value(mode: HostedMode) -> &'static str {
@@ -3380,17 +3448,14 @@ mod tests {
             .expect("load host runtime state")
             .expect("state present");
         let lines = format_host_status_lines(&loaded);
-        assert_eq!(
-            lines,
-            vec![
-                "host runtime: running".to_string(),
-                "name: demo-host".to_string(),
-                "pid: 9001".to_string(),
-                "target: iroh://endpoint-123".to_string(),
-                "share link: bmux://demo-host".to_string(),
-                "started_at_unix: 1700000123".to_string(),
-            ]
-        );
+        assert_eq!(lines[0], "host runtime: running");
+        assert_eq!(lines[1], "runtime: default");
+        assert!(lines[2].starts_with("local ipc endpoint: "));
+        assert!(lines.contains(&"name: demo-host".to_string()));
+        assert!(lines.contains(&"pid: 9001".to_string()));
+        assert!(lines.contains(&"target: iroh://endpoint-123".to_string()));
+        assert!(lines.contains(&"share link: bmux://demo-host".to_string()));
+        assert!(lines.contains(&"started_at_unix: 1700000123".to_string()));
     }
 
     fn sample_target() -> SshTarget {
@@ -3803,6 +3868,7 @@ mod tests {
             record_event_kind: Vec::new(),
             stop_server_on_exit: false,
             target: None,
+            runtime: None,
             core_builtins_only: false,
             command: Some(Command::ListSessions { json: false }),
             verbose: false,
@@ -3865,6 +3931,7 @@ mod tests {
             record_event_kind: Vec::new(),
             stop_server_on_exit: false,
             target: None,
+            runtime: None,
             core_builtins_only: false,
             command: Some(Command::ListSessions { json: false }),
             verbose: false,

@@ -147,6 +147,19 @@ const ATTACH_SELECTION_EMPTY_STATUS: &str = "no selection";
 const ATTACH_TRANSIENT_STATUS_TTL: Duration = Duration::from_millis(1800);
 const ATTACH_WELCOME_STATUS_TTL: Duration = Duration::from_millis(2600);
 const HELP_OVERLAY_SURFACE_ID: Uuid = Uuid::from_u128(1);
+
+pub(super) fn active_runtime_name() -> String {
+    std::env::var("BMUX_RUNTIME_NAME")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "default".to_string())
+}
+
+pub(super) fn append_runtime_arg(command: &mut ProcessCommand) {
+    command.arg("--runtime").arg(active_runtime_name());
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TerminalProfile {
     Bmux256Color,

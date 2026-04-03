@@ -338,6 +338,11 @@ fn resolve_first_existing(candidates: &[PathBuf]) -> PathBuf {
 
 impl Default for ConfigPaths {
     fn default() -> Self {
+        let runtime_name = std::env::var("BMUX_RUNTIME_NAME")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "default".to_string());
         let config_dir_candidates = std::env::var_os("BMUX_CONFIG_DIR")
             .map_or_else(build_config_dir_candidates, |p| vec![PathBuf::from(p)]);
         // Primary is always first in the candidate list.
@@ -358,7 +363,7 @@ impl Default for ConfigPaths {
             PathBuf::from,
         );
 
-        let runtime_dir = if let Some(path) = std::env::var_os("BMUX_RUNTIME_DIR") {
+        let runtime_root = if let Some(path) = std::env::var_os("BMUX_RUNTIME_DIR") {
             PathBuf::from(path)
         } else if cfg!(unix) {
             std::env::var("XDG_RUNTIME_DIR")
@@ -366,6 +371,11 @@ impl Default for ConfigPaths {
                 .map_or_else(|_| std::env::temp_dir().join("bmux"), |d| d.join("bmux"))
         } else {
             std::env::temp_dir().join("bmux")
+        };
+        let runtime_dir = if runtime_name == "default" {
+            runtime_root
+        } else {
+            runtime_root.join("runtimes").join(runtime_name)
         };
 
         let mut paths = Self::new(config_dir, runtime_dir, data_dir, default_state_dir());
@@ -378,6 +388,39 @@ impl Default for ConfigPaths {
 mod tests {
     use super::{ConfigPaths, resolve_first_existing, stable_fnv1a64};
     use std::path::PathBuf;
+
+    struct EnvVarGuard {
+        key: &'static str,
+        original: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let original = std::env::var_os(key);
+            // SAFETY: test-only, called in a controlled scope.
+            unsafe { std::env::set_var(key, value) };
+            Self { key, original }
+        }
+
+        fn unset(key: &'static str) -> Self {
+            let original = std::env::var_os(key);
+            // SAFETY: test-only, called in a controlled scope.
+            unsafe { std::env::remove_var(key) };
+            Self { key, original }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = self.original.take() {
+                // SAFETY: restoring process env in test teardown.
+                unsafe { std::env::set_var(self.key, value) };
+            } else {
+                // SAFETY: restoring process env in test teardown.
+                unsafe { std::env::remove_var(self.key) };
+            }
+        }
+    }
 
     /// Build a `ConfigPaths` with a custom candidate chain for testing.
     fn paths_with_candidates(candidates: Vec<PathBuf>) -> ConfigPaths {
@@ -642,6 +685,35 @@ mod tests {
             !paths.config_dir_candidates().is_empty(),
             "config_dir_candidates must return at least one path"
         );
+    }
+
+    #[test]
+    fn default_runtime_name_uses_root_runtime_dir() {
+        let _runtime_name = EnvVarGuard::set("BMUX_RUNTIME_NAME", "default");
+        let _runtime_dir = EnvVarGuard::set("BMUX_RUNTIME_DIR", "/tmp/bmux-runtime-root");
+        let paths = ConfigPaths::default();
+        assert_eq!(paths.runtime_dir, PathBuf::from("/tmp/bmux-runtime-root"));
+    }
+
+    #[test]
+    fn named_runtime_name_uses_namespaced_runtime_dir() {
+        let _runtime_name = EnvVarGuard::set("BMUX_RUNTIME_NAME", "dev");
+        let _runtime_dir = EnvVarGuard::set("BMUX_RUNTIME_DIR", "/tmp/bmux-runtime-root");
+        let paths = ConfigPaths::default();
+        assert_eq!(
+            paths.runtime_dir,
+            PathBuf::from("/tmp/bmux-runtime-root")
+                .join("runtimes")
+                .join("dev")
+        );
+    }
+
+    #[test]
+    fn missing_runtime_name_defaults_to_default_runtime() {
+        let _runtime_name = EnvVarGuard::unset("BMUX_RUNTIME_NAME");
+        let _runtime_dir = EnvVarGuard::set("BMUX_RUNTIME_DIR", "/tmp/bmux-runtime-root");
+        let paths = ConfigPaths::default();
+        assert_eq!(paths.runtime_dir, PathBuf::from("/tmp/bmux-runtime-root"));
     }
 
     #[cfg(target_os = "macos")]

@@ -77,6 +77,9 @@ bmux remote complete sessions prod
 # Streamlined hosted workflow (p2p default, no bmux control-plane required)
 bmux setup
 bmux host
+# Optional runtime instance selection (for parallel local runtimes)
+bmux --runtime dev server start --daemon
+bmux --runtime dev host
 # Optional control-plane mode for account/share links
 bmux setup --mode control-plane
 bmux host --mode control-plane

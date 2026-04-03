@@ -198,6 +198,7 @@ pub(super) async fn run_server_start(daemon: bool, foreground_internal: bool) ->
         let executable =
             std::env::current_exe().context("failed to resolve bmux executable path")?;
         let mut child = ProcessCommand::new(executable);
+        append_runtime_arg(&mut child);
         let log_level = EFFECTIVE_LOG_LEVEL.get().copied().unwrap_or(Level::INFO);
         child
             .arg("server")
@@ -353,6 +354,7 @@ mod tests {
             record_event_kind: Vec::new(),
             stop_server_on_exit: false,
             target: None,
+            runtime: None,
             core_builtins_only: false,
             command: None,
             verbose: false,

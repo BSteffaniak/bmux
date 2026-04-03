@@ -78,6 +78,7 @@ pub(super) async fn run_server_status(
 
     match status {
         Some(status) if status.running => {
+            let paths = ConfigPaths::default();
             if let Some(event_name) = latest_server_event_name(connection_context).await? {
                 println!("latest server event: {event_name}");
             }
@@ -109,6 +110,11 @@ pub(super) async fn run_server_status(
                     "no"
                 }
             );
+            println!("runtime: {}", active_runtime_name());
+            #[cfg(unix)]
+            println!("server socket: {}", paths.server_socket().display());
+            #[cfg(windows)]
+            println!("server pipe: {}", paths.server_named_pipe());
             println!(
                 "snapshot: {}{}",
                 if status.snapshot.enabled {

@@ -75,6 +75,9 @@ bmux remote complete sessions prod
 # streamlined aliases
 bmux setup
 bmux host
+# optional runtime instance selection (parallel local runtimes)
+bmux --runtime dev server start --daemon
+bmux --runtime dev host
 # opt-in control-plane mode (hard-fails if control-plane operations fail)
 bmux setup --mode control-plane
 bmux host --mode control-plane

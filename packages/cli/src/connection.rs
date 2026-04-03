@@ -542,13 +542,31 @@ pub fn map_client_connect_error(error: ClientError) -> anyhow::Error {
 
     if let ClientError::Transport(bmux_ipc::transport::IpcTransportError::Io(io_error)) = &error {
         if io_error.kind() == std::io::ErrorKind::UnexpectedEof {
+            let paths = ConfigPaths::default();
+            let runtime = std::env::var("BMUX_RUNTIME_NAME")
+                .ok()
+                .map(|value| value.trim().to_string())
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "default".to_string());
             return anyhow::anyhow!(
-                "bmux error: server connection lost unexpectedly.\nThe server may have crashed or been stopped. Check `bmux server status` and server logs."
+                "bmux error: server connection lost unexpectedly.\nThe server may have crashed or been stopped, or a hosted bridge could not reach the local IPC endpoint.\nRuntime: {runtime}\nIPC endpoint: {}\nCheck `bmux --runtime {runtime} server status` and server logs.",
+                local_ipc_endpoint_label_for_error(&paths)
             );
         }
     }
 
     anyhow::Error::from(error)
+}
+
+fn local_ipc_endpoint_label_for_error(paths: &ConfigPaths) -> String {
+    #[cfg(unix)]
+    {
+        paths.server_socket().display().to_string()
+    }
+    #[cfg(windows)]
+    {
+        paths.server_named_pipe()
+    }
 }
 
 fn format_protocol_incompatibility(reason: &IncompatibilityReason) -> String {

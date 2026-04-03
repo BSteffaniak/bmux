@@ -22,10 +22,52 @@ pub(super) enum ParsedRuntimeCli {
 
 pub(super) fn parse_runtime_cli() -> Result<ParsedRuntimeCli> {
     let argv = std::env::args_os().collect::<Vec<_>>();
+    apply_runtime_override_from_raw_args(&argv)?;
     let config = BmuxConfig::load()?;
     let paths = ConfigPaths::default();
     let registry = scan_available_plugins(&config, &paths)?;
     parse_runtime_cli_with_registry(&argv, &config, &registry)
+}
+
+fn apply_runtime_override_from_raw_args(argv: &[std::ffi::OsString]) -> Result<()> {
+    let mut index = 1usize;
+    while index < argv.len() {
+        let arg = argv[index].to_string_lossy();
+        if let Some(value) = arg.strip_prefix("--runtime=") {
+            let runtime = validate_runtime_name(value)?;
+            // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
+            unsafe { std::env::set_var("BMUX_RUNTIME_NAME", runtime) };
+            return Ok(());
+        }
+        if arg == "--runtime" {
+            let Some(value) = argv.get(index + 1) else {
+                anyhow::bail!("--runtime requires a value")
+            };
+            let runtime = validate_runtime_name(&value.to_string_lossy())?;
+            // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
+            unsafe { std::env::set_var("BMUX_RUNTIME_NAME", runtime) };
+            return Ok(());
+        }
+        index += 1;
+    }
+    Ok(())
+}
+
+fn validate_runtime_name(value: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("runtime name cannot be empty")
+    }
+    if trimmed == "default" {
+        return Ok(trimmed.to_string());
+    }
+    if trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Ok(trimmed.to_string());
+    }
+    anyhow::bail!("runtime name can only include letters, numbers, '-', '_' or '.'")
 }
 
 pub(super) fn parse_runtime_cli_with_registry(

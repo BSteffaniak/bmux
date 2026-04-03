@@ -134,6 +134,23 @@ fn parse_cell_size(value: &str) -> Result<(u16, u16), String> {
     Ok((width, height))
 }
 
+fn parse_runtime_name(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("runtime name cannot be empty".to_string());
+    }
+    if trimmed == "default" {
+        return Ok(trimmed.to_string());
+    }
+    if trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.'))
+    {
+        return Ok(trimmed.to_string());
+    }
+    Err("runtime name can only include letters, numbers, '-', '_' or '.'".to_string())
+}
+
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(name = "bmux")]
@@ -166,6 +183,10 @@ pub struct Cli {
     /// Execute command against a configured target (local or remote)
     #[arg(long, global = true)]
     pub target: Option<String>,
+
+    /// Select named runtime instance (default: `default`)
+    #[arg(long, global = true, value_parser = parse_runtime_name)]
+    pub runtime: Option<String>,
 
     /// Internal: bypass plugin command dispatch and use core handlers only
     #[arg(long, hide = true, global = true)]
@@ -1403,6 +1424,21 @@ mod tests {
             cli.command,
             Some(Command::ListSessions { json: false })
         ));
+    }
+
+    #[test]
+    fn parses_global_runtime_flag() {
+        let cli = Cli::try_parse_from(["bmux", "--runtime", "dev", "server", "status"])
+            .expect("valid CLI args");
+        assert_eq!(cli.runtime.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn rejects_invalid_runtime_flag() {
+        let error = Cli::try_parse_from(["bmux", "--runtime", "dev/runtime", "server", "status"])
+            .expect_err("invalid runtime should fail");
+        let text = error.to_string();
+        assert!(text.contains("invalid value") || text.contains("runtime name"));
     }
 
     #[test]
