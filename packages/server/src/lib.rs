@@ -12,14 +12,15 @@ use anyhow::{Context, Result};
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
-    AttachFocusTarget, AttachGrant, AttachLayer, AttachPaneChunk, AttachRect, AttachScene,
-    AttachSurface, AttachSurfaceKind, AttachViewComponent, CORE_PROTOCOL_CAPABILITIES,
-    ClientSummary, ContextSelector, ContextSummary, Envelope, EnvelopeKind, ErrorCode,
-    ErrorResponse, Event, IpcEndpoint, PaneFocusDirection, PaneLayoutNode as IpcPaneLayoutNode,
-    PaneSelector, PaneSplitDirection, PaneState, PaneSummary, ProtocolContract, ProtocolVersion,
-    RecordingEventKind, RecordingPayload, RecordingProfile, Request, Response, ResponsePayload,
-    ServerSnapshotStatus, SessionSelector, SessionSummary, decode, default_supported_capabilities,
-    encode, negotiate_protocol,
+    AttachFocusTarget, AttachGrant, AttachLayer, AttachMouseProtocolEncoding,
+    AttachMouseProtocolMode, AttachMouseProtocolState, AttachPaneChunk, AttachPaneMouseProtocol,
+    AttachRect, AttachScene, AttachSurface, AttachSurfaceKind, AttachViewComponent,
+    CORE_PROTOCOL_CAPABILITIES, ClientSummary, ContextSelector, ContextSummary, Envelope,
+    EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, PaneFocusDirection,
+    PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection, PaneState, PaneSummary,
+    ProtocolContract, ProtocolVersion, RecordingEventKind, RecordingPayload, RecordingProfile,
+    Request, Response, ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary,
+    decode, default_supported_capabilities, encode, negotiate_protocol,
 };
 use bmux_session::{ClientId, Session, SessionId, SessionManager};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
@@ -1017,11 +1018,178 @@ struct PaneRuntimeHandle {
     /// event is only emitted on the `false→true` transition, coalescing
     /// thousands of per-chunk writes into ~1 event per fetch cycle.
     output_dirty: Arc<AtomicBool>,
+    mouse_protocol_state: Arc<std::sync::Mutex<AttachMouseProtocolState>>,
 }
 
 enum PaneRuntimeCommand {
     Input(Vec<u8>),
     Resize { rows: u16, cols: u16 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MouseTrackerParseState {
+    Ground,
+    Esc,
+    Csi,
+}
+
+#[derive(Debug)]
+struct PaneMouseProtocolTracker {
+    parse_state: MouseTrackerParseState,
+    csi_buffer: Vec<u8>,
+    x10_mode: bool,
+    press_release_mode: bool,
+    button_motion_mode: bool,
+    any_motion_mode: bool,
+    utf8_encoding: bool,
+    sgr_encoding: bool,
+}
+
+impl Default for PaneMouseProtocolTracker {
+    fn default() -> Self {
+        Self {
+            parse_state: MouseTrackerParseState::Ground,
+            csi_buffer: Vec::new(),
+            x10_mode: false,
+            press_release_mode: false,
+            button_motion_mode: false,
+            any_motion_mode: false,
+            utf8_encoding: false,
+            sgr_encoding: false,
+        }
+    }
+}
+
+impl PaneMouseProtocolTracker {
+    fn process(&mut self, bytes: &[u8]) {
+        for byte in bytes {
+            match self.parse_state {
+                MouseTrackerParseState::Ground => {
+                    if *byte == 0x1b {
+                        self.parse_state = MouseTrackerParseState::Esc;
+                    }
+                }
+                MouseTrackerParseState::Esc => {
+                    if *byte == b'[' {
+                        self.parse_state = MouseTrackerParseState::Csi;
+                        self.csi_buffer.clear();
+                    } else if *byte == b'c' {
+                        self.reset();
+                    } else if *byte == 0x1b {
+                        self.parse_state = MouseTrackerParseState::Esc;
+                    } else {
+                        self.parse_state = MouseTrackerParseState::Ground;
+                    }
+                }
+                MouseTrackerParseState::Csi => {
+                    if *byte == 0x1b {
+                        self.parse_state = MouseTrackerParseState::Esc;
+                        self.csi_buffer.clear();
+                        continue;
+                    }
+                    self.csi_buffer.push(*byte);
+                    if (0x40..=0x7e).contains(byte) {
+                        let sequence = std::mem::take(&mut self.csi_buffer);
+                        self.apply_csi_sequence(&sequence);
+                        self.parse_state = MouseTrackerParseState::Ground;
+                    } else if self.csi_buffer.len() > 64 {
+                        self.parse_state = MouseTrackerParseState::Ground;
+                        self.csi_buffer.clear();
+                    }
+                }
+            }
+        }
+    }
+
+    fn current_protocol(&self) -> AttachMouseProtocolState {
+        let mode = if self.any_motion_mode {
+            AttachMouseProtocolMode::AnyMotion
+        } else if self.button_motion_mode {
+            AttachMouseProtocolMode::ButtonMotion
+        } else if self.press_release_mode {
+            AttachMouseProtocolMode::PressRelease
+        } else if self.x10_mode {
+            AttachMouseProtocolMode::Press
+        } else {
+            AttachMouseProtocolMode::None
+        };
+
+        let encoding = if self.sgr_encoding {
+            AttachMouseProtocolEncoding::Sgr
+        } else if self.utf8_encoding {
+            AttachMouseProtocolEncoding::Utf8
+        } else {
+            AttachMouseProtocolEncoding::Default
+        };
+
+        AttachMouseProtocolState { mode, encoding }
+    }
+
+    fn reset(&mut self) {
+        self.parse_state = MouseTrackerParseState::Ground;
+        self.csi_buffer.clear();
+        self.x10_mode = false;
+        self.press_release_mode = false;
+        self.button_motion_mode = false;
+        self.any_motion_mode = false;
+        self.utf8_encoding = false;
+        self.sgr_encoding = false;
+    }
+
+    fn apply_csi_sequence(&mut self, sequence: &[u8]) {
+        if sequence == b"!p" {
+            self.reset();
+            return;
+        }
+
+        let Some((&final_byte, params)) = sequence.split_last() else {
+            return;
+        };
+
+        let enable = match final_byte {
+            b'h' => true,
+            b'l' => false,
+            _ => return,
+        };
+
+        let Some(private_modes) = params.strip_prefix(b"?") else {
+            return;
+        };
+
+        for mode in private_modes
+            .split(|byte| *byte == b';')
+            .filter_map(parse_private_mode_number)
+        {
+            self.apply_private_mode(mode, enable);
+        }
+    }
+
+    fn apply_private_mode(&mut self, mode: u16, enable: bool) {
+        match mode {
+            9 => self.x10_mode = enable,
+            1000 => self.press_release_mode = enable,
+            1002 => self.button_motion_mode = enable,
+            1003 => self.any_motion_mode = enable,
+            1005 => self.utf8_encoding = enable,
+            1006 => self.sgr_encoding = enable,
+            _ => {}
+        }
+    }
+}
+
+fn parse_private_mode_number(bytes: &[u8]) -> Option<u16> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut value: u16 = 0;
+    for byte in bytes {
+        if !byte.is_ascii_digit() {
+            return None;
+        }
+        value = value.checked_mul(10)?;
+        value = value.checked_add(u16::from(*byte - b'0'))?;
+    }
+    Some(value)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1181,6 +1349,7 @@ struct AttachSnapshotState {
     layout_root: IpcPaneLayoutNode,
     scene: AttachScene,
     chunks: Vec<AttachPaneChunk>,
+    pane_mouse_protocols: Vec<AttachPaneMouseProtocol>,
     zoomed: bool,
 }
 
@@ -1803,6 +1972,9 @@ impl SessionRuntimeManager {
         let event_broadcast_for_reader = self.event_broadcast.clone();
         let output_dirty = Arc::new(AtomicBool::new(false));
         let output_dirty_for_reader = Arc::clone(&output_dirty);
+        let mouse_protocol_state =
+            Arc::new(std::sync::Mutex::new(AttachMouseProtocolState::default()));
+        let mouse_protocol_state_for_reader = Arc::clone(&mouse_protocol_state);
 
         let task = tokio::spawn(async move {
             let pty_system = native_pty_system();
@@ -1916,6 +2088,7 @@ impl SessionRuntimeManager {
                 .spawn(move || {
                     let mut buffer = [0_u8; 8192];
                     let mut protocol_engine = TerminalProtocolEngine::new(protocol_profile);
+                    let mut mouse_protocol_tracker = PaneMouseProtocolTracker::default();
                     loop {
                         match reader.read(&mut buffer) {
                             Ok(0) => break,
@@ -1957,6 +2130,10 @@ impl SessionRuntimeManager {
                                             client_id: None,
                                         },
                                     );
+                                }
+                                mouse_protocol_tracker.process(chunk);
+                                if let Ok(mut protocol) = mouse_protocol_state_for_reader.lock() {
+                                    *protocol = mouse_protocol_tracker.current_protocol();
                                 }
                                 let reply = protocol_engine.process_output(chunk, (0, 0));
                                 if !reply.is_empty() {
@@ -2045,6 +2222,7 @@ impl SessionRuntimeManager {
             exited,
             last_requested_size,
             output_dirty,
+            mouse_protocol_state,
         })
     }
 
@@ -2417,6 +2595,7 @@ impl SessionRuntimeManager {
             .collect::<Vec<_>>();
 
         let mut chunks = Vec::new();
+        let mut pane_mouse_protocols = Vec::new();
         let num_panes = pane_ids.len().max(1);
         let per_pane_budget = (RESPONSE_OUTPUT_BUDGET / num_panes).min(max_bytes_per_pane);
         let mut budget_remaining = RESPONSE_OUTPUT_BUDGET;
@@ -2424,6 +2603,12 @@ impl SessionRuntimeManager {
             let Some(pane) = session.panes.get(&pane_id) else {
                 continue;
             };
+            let protocol = pane
+                .mouse_protocol_state
+                .lock()
+                .map(|state| *state)
+                .unwrap_or_default();
+            pane_mouse_protocols.push(AttachPaneMouseProtocol { pane_id, protocol });
             let allowed = per_pane_budget.min(budget_remaining);
             let data = pane
                 .output_buffer
@@ -2441,6 +2626,7 @@ impl SessionRuntimeManager {
             layout_root: ipc_layout_from_runtime(&session.layout_root),
             scene,
             chunks,
+            pane_mouse_protocols,
             zoomed: session.zoomed_pane_id.is_some(),
         })
     }
@@ -5802,6 +5988,7 @@ async fn handle_request(
                     layout_root: snapshot.layout_root,
                     scene: snapshot.scene,
                     chunks: snapshot.chunks,
+                    pane_mouse_protocols: snapshot.pane_mouse_protocols,
                     zoomed: snapshot.zoomed,
                 }),
                 Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
@@ -7056,6 +7243,99 @@ mod tests {
         {
             IpcEndpoint::windows_named_pipe(PathBuf::from(r"\\.\pipe\bmux-server-policy-test"))
         }
+    }
+
+    #[test]
+    fn pane_mouse_protocol_tracker_tracks_dec_private_modes() {
+        let mut tracker = PaneMouseProtocolTracker::default();
+
+        assert_eq!(
+            tracker.current_protocol().mode,
+            AttachMouseProtocolMode::None
+        );
+        assert_eq!(
+            tracker.current_protocol().encoding,
+            AttachMouseProtocolEncoding::Default
+        );
+
+        tracker.process(b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(
+            tracker.current_protocol(),
+            AttachMouseProtocolState {
+                mode: AttachMouseProtocolMode::PressRelease,
+                encoding: AttachMouseProtocolEncoding::Sgr,
+            }
+        );
+
+        tracker.process(b"\x1b[?1003h");
+        assert_eq!(
+            tracker.current_protocol().mode,
+            AttachMouseProtocolMode::AnyMotion
+        );
+
+        tracker.process(b"\x1b[?1003l");
+        assert_eq!(
+            tracker.current_protocol().mode,
+            AttachMouseProtocolMode::PressRelease
+        );
+
+        tracker.process(b"\x1b[?1000l\x1b[?1006l");
+        assert_eq!(
+            tracker.current_protocol(),
+            AttachMouseProtocolState {
+                mode: AttachMouseProtocolMode::None,
+                encoding: AttachMouseProtocolEncoding::Default,
+            }
+        );
+    }
+
+    #[test]
+    fn pane_mouse_protocol_tracker_handles_sequences_split_across_chunks() {
+        let mut tracker = PaneMouseProtocolTracker::default();
+
+        tracker.process(b"\x1b[?10");
+        tracker.process(b"03h\x1b[");
+        tracker.process(b"?1006h");
+
+        assert_eq!(
+            tracker.current_protocol(),
+            AttachMouseProtocolState {
+                mode: AttachMouseProtocolMode::AnyMotion,
+                encoding: AttachMouseProtocolEncoding::Sgr,
+            }
+        );
+    }
+
+    #[test]
+    fn pane_mouse_protocol_tracker_resets_on_terminal_resets() {
+        let mut tracker = PaneMouseProtocolTracker::default();
+
+        tracker.process(b"\x1b[?1002h\x1b[?1005h");
+        assert_eq!(
+            tracker.current_protocol().mode,
+            AttachMouseProtocolMode::ButtonMotion
+        );
+        assert_eq!(
+            tracker.current_protocol().encoding,
+            AttachMouseProtocolEncoding::Utf8
+        );
+
+        tracker.process(b"\x1bc");
+        assert_eq!(
+            tracker.current_protocol(),
+            AttachMouseProtocolState::default()
+        );
+
+        tracker.process(b"\x1b[?1000h\x1b[?1006h");
+        assert_eq!(
+            tracker.current_protocol().mode,
+            AttachMouseProtocolMode::PressRelease
+        );
+        tracker.process(b"\x1b[!p");
+        assert_eq!(
+            tracker.current_protocol(),
+            AttachMouseProtocolState::default()
+        );
     }
 
     #[tokio::test]

@@ -19,6 +19,14 @@ fn apply_attach_output_bytes(
 
     let buffer = view_state.pane_buffers.entry(pane_id).or_default();
     let toggled_alternate = append_pane_output(buffer, bytes);
+    let screen = buffer.parser.screen();
+    view_state.pane_mouse_protocol_hints.insert(
+        pane_id,
+        bmux_ipc::AttachMouseProtocolState {
+            mode: mouse_protocol_mode_to_ipc(screen.mouse_protocol_mode()),
+            encoding: mouse_protocol_encoding_to_ipc(screen.mouse_protocol_encoding()),
+        },
+    );
     view_state.dirty.pane_dirty_ids.insert(pane_id);
     *frame_needs_render = true;
 
@@ -406,6 +414,10 @@ pub(crate) async fn run_session_attach_with_client(
                         if previous.scene != layout_state.scene {
                             if attach_config.behavior.pane_restore_method
                                 == PaneRestoreMethod::Snapshot
+                                && attach_layout_requires_snapshot_hydration(
+                                    &previous,
+                                    &layout_state,
+                                )
                             {
                                 hydrate_attach_state_from_snapshot(&mut client, &mut view_state)
                                     .await?;
@@ -463,11 +475,13 @@ pub(crate) async fn run_session_attach_with_client(
         // or when dirty flags indicate we need a redraw.
         if pane_output_pending || frame_needs_render {
             let pane_ids = visible_scene_pane_ids(&layout_state.scene);
-            if attach_config.behavior.pane_restore_method != PaneRestoreMethod::Retain {
-                view_state
-                    .pane_buffers
-                    .retain(|pane_id, _| pane_ids.iter().any(|id| id == pane_id));
-            }
+            let active_pane_ids = attach_layout_pane_id_set(&layout_state);
+            view_state
+                .pane_buffers
+                .retain(|pane_id, _| active_pane_ids.contains(pane_id));
+            view_state
+                .pane_mouse_protocol_hints
+                .retain(|pane_id, _| active_pane_ids.contains(pane_id));
 
             // Drain all available pane output before rendering to avoid
             // visible tearing from partial redraws.  TUI programs like
@@ -3033,10 +3047,36 @@ pub(crate) async fn hydrate_attach_state_from_snapshot(
         layout_root,
         scene,
         chunks,
+        pane_mouse_protocols,
         zoomed,
     } = client
         .attach_snapshot(view_state.attached_id, ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE)
         .await?;
+
+    let active_pane_ids = panes
+        .iter()
+        .map(|pane| pane.id)
+        .collect::<std::collections::BTreeSet<_>>();
+    let session_changed = view_state
+        .cached_layout_state
+        .as_ref()
+        .is_none_or(|layout| layout.session_id != session_id);
+    if session_changed {
+        view_state.pane_buffers.clear();
+        view_state.pane_mouse_protocol_hints.clear();
+    } else {
+        view_state
+            .pane_buffers
+            .retain(|pane_id, _| active_pane_ids.contains(pane_id));
+        view_state
+            .pane_mouse_protocol_hints
+            .retain(|pane_id, _| active_pane_ids.contains(pane_id));
+    }
+    let retained_pane_ids = view_state
+        .pane_buffers
+        .keys()
+        .copied()
+        .collect::<std::collections::BTreeSet<_>>();
 
     view_state.cached_layout_state = Some(AttachLayoutState {
         context_id: None,
@@ -3048,12 +3088,23 @@ pub(crate) async fn hydrate_attach_state_from_snapshot(
         zoomed,
     });
     view_state.mouse.last_focused_pane_id = Some(focused_pane_id);
-    view_state.pane_buffers.clear();
+
+    for pane_protocol in pane_mouse_protocols {
+        if active_pane_ids.contains(&pane_protocol.pane_id) {
+            view_state
+                .pane_mouse_protocol_hints
+                .insert(pane_protocol.pane_id, pane_protocol.protocol);
+        }
+    }
+
     if let Some(layout_state) = view_state.cached_layout_state.as_ref() {
         resize_attach_parsers_for_scene(&mut view_state.pane_buffers, &layout_state.scene);
     }
     let mut frame_needs_render = false;
     for chunk in chunks {
+        if !session_changed && retained_pane_ids.contains(&chunk.pane_id) {
+            continue;
+        }
         let _ = apply_attach_output_bytes(
             view_state,
             chunk.pane_id,
@@ -3065,6 +3116,25 @@ pub(crate) async fn hydrate_attach_state_from_snapshot(
     view_state.dirty.full_pane_redraw = true;
     view_state.dirty.status_needs_redraw = true;
     Ok(())
+}
+
+pub(crate) fn attach_layout_pane_id_set(
+    layout_state: &AttachLayoutState,
+) -> std::collections::BTreeSet<Uuid> {
+    layout_state.panes.iter().map(|pane| pane.id).collect()
+}
+
+pub(crate) fn attach_layout_requires_snapshot_hydration(
+    previous: &AttachLayoutState,
+    next: &AttachLayoutState,
+) -> bool {
+    if previous.session_id != next.session_id {
+        return true;
+    }
+    if previous.layout_root != next.layout_root {
+        return true;
+    }
+    attach_layout_pane_id_set(previous) != attach_layout_pane_id_set(next)
 }
 
 pub(crate) fn resize_attach_parsers_for_scene(
@@ -3805,16 +3875,81 @@ pub(crate) struct AttachPaneMouseProtocol {
     pub(crate) encoding: vt100::MouseProtocolEncoding,
 }
 
+pub(crate) const fn mouse_protocol_mode_to_ipc(
+    mode: vt100::MouseProtocolMode,
+) -> bmux_ipc::AttachMouseProtocolMode {
+    match mode {
+        vt100::MouseProtocolMode::None => bmux_ipc::AttachMouseProtocolMode::None,
+        vt100::MouseProtocolMode::Press => bmux_ipc::AttachMouseProtocolMode::Press,
+        vt100::MouseProtocolMode::PressRelease => bmux_ipc::AttachMouseProtocolMode::PressRelease,
+        vt100::MouseProtocolMode::ButtonMotion => bmux_ipc::AttachMouseProtocolMode::ButtonMotion,
+        vt100::MouseProtocolMode::AnyMotion => bmux_ipc::AttachMouseProtocolMode::AnyMotion,
+    }
+}
+
+pub(crate) const fn mouse_protocol_encoding_to_ipc(
+    encoding: vt100::MouseProtocolEncoding,
+) -> bmux_ipc::AttachMouseProtocolEncoding {
+    match encoding {
+        vt100::MouseProtocolEncoding::Default => bmux_ipc::AttachMouseProtocolEncoding::Default,
+        vt100::MouseProtocolEncoding::Utf8 => bmux_ipc::AttachMouseProtocolEncoding::Utf8,
+        vt100::MouseProtocolEncoding::Sgr => bmux_ipc::AttachMouseProtocolEncoding::Sgr,
+    }
+}
+
+pub(crate) const fn mouse_protocol_mode_from_ipc(
+    mode: bmux_ipc::AttachMouseProtocolMode,
+) -> vt100::MouseProtocolMode {
+    match mode {
+        bmux_ipc::AttachMouseProtocolMode::None => vt100::MouseProtocolMode::None,
+        bmux_ipc::AttachMouseProtocolMode::Press => vt100::MouseProtocolMode::Press,
+        bmux_ipc::AttachMouseProtocolMode::PressRelease => vt100::MouseProtocolMode::PressRelease,
+        bmux_ipc::AttachMouseProtocolMode::ButtonMotion => vt100::MouseProtocolMode::ButtonMotion,
+        bmux_ipc::AttachMouseProtocolMode::AnyMotion => vt100::MouseProtocolMode::AnyMotion,
+    }
+}
+
+pub(crate) const fn mouse_protocol_encoding_from_ipc(
+    encoding: bmux_ipc::AttachMouseProtocolEncoding,
+) -> vt100::MouseProtocolEncoding {
+    match encoding {
+        bmux_ipc::AttachMouseProtocolEncoding::Default => vt100::MouseProtocolEncoding::Default,
+        bmux_ipc::AttachMouseProtocolEncoding::Utf8 => vt100::MouseProtocolEncoding::Utf8,
+        bmux_ipc::AttachMouseProtocolEncoding::Sgr => vt100::MouseProtocolEncoding::Sgr,
+    }
+}
+
 pub(crate) fn attach_pane_mouse_protocol(
     view_state: &AttachViewState,
     pane_id: Uuid,
 ) -> Option<AttachPaneMouseProtocol> {
-    let buffer = view_state.pane_buffers.get(&pane_id)?;
-    let screen = buffer.parser.screen();
-    Some(AttachPaneMouseProtocol {
-        mode: screen.mouse_protocol_mode(),
-        encoding: screen.mouse_protocol_encoding(),
-    })
+    let parser_protocol = view_state.pane_buffers.get(&pane_id).map(|buffer| {
+        let screen = buffer.parser.screen();
+        AttachPaneMouseProtocol {
+            mode: screen.mouse_protocol_mode(),
+            encoding: screen.mouse_protocol_encoding(),
+        }
+    });
+
+    let hint_protocol = view_state
+        .pane_mouse_protocol_hints
+        .get(&pane_id)
+        .map(|hint| AttachPaneMouseProtocol {
+            mode: mouse_protocol_mode_from_ipc(hint.mode),
+            encoding: mouse_protocol_encoding_from_ipc(hint.encoding),
+        });
+
+    match (parser_protocol, hint_protocol) {
+        (Some(protocol), Some(hint))
+            if protocol.mode == vt100::MouseProtocolMode::None
+                && hint.mode != vt100::MouseProtocolMode::None =>
+        {
+            Some(hint)
+        }
+        (Some(protocol), _) => Some(protocol),
+        (None, Some(hint)) => Some(hint),
+        (None, None) => None,
+    }
 }
 
 pub(crate) fn mouse_protocol_mode_reports_event(
@@ -4433,7 +4568,7 @@ mod tests {
     use bmux_config::{BmuxConfig, MouseClickPropagation, MouseWheelPropagation};
     use bmux_ipc::{
         AttachFocusTarget, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
-        AttachViewComponent, PaneLayoutNode, SessionSummary,
+        AttachViewComponent, PaneLayoutNode, PaneState, PaneSummary, SessionSummary,
     };
     use crossterm::event::{
         Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
@@ -4455,7 +4590,14 @@ mod tests {
             context_id: None,
             session_id,
             focused_pane_id: pane_id,
-            panes: Vec::new(),
+            panes: vec![PaneSummary {
+                id: pane_id,
+                index: 1,
+                name: None,
+                focused: true,
+                state: PaneState::Running,
+                state_reason: None,
+            }],
             layout_root: PaneLayoutNode::Leaf { pane_id },
             scene: AttachScene {
                 session_id,
@@ -4772,6 +4914,73 @@ mod tests {
             .expect("pane protocol");
         assert_eq!(protocol.mode, vt100::MouseProtocolMode::PressRelease);
         assert_eq!(protocol.encoding, vt100::MouseProtocolEncoding::Sgr);
+    }
+
+    #[test]
+    fn attach_pane_mouse_protocol_uses_snapshot_hint_when_parser_mode_is_none() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        let pane_id = crate::runtime::focused_attach_pane_id(&view_state).expect("focused pane id");
+
+        view_state.pane_mouse_protocol_hints.insert(
+            pane_id,
+            bmux_ipc::AttachMouseProtocolState {
+                mode: bmux_ipc::AttachMouseProtocolMode::AnyMotion,
+                encoding: bmux_ipc::AttachMouseProtocolEncoding::Sgr,
+            },
+        );
+
+        let protocol = crate::runtime::attach_pane_mouse_protocol(&view_state, pane_id)
+            .expect("pane protocol");
+        assert_eq!(protocol.mode, vt100::MouseProtocolMode::AnyMotion);
+        assert_eq!(protocol.encoding, vt100::MouseProtocolEncoding::Sgr);
+    }
+
+    #[test]
+    fn attach_layout_requires_snapshot_hydration_ignores_focus_only_scene_change() {
+        let view_state = attach_view_state_with_scrollback_fixture();
+        let previous = view_state
+            .cached_layout_state
+            .clone()
+            .expect("layout state");
+        let mut next = previous.clone();
+        next.scene.surfaces[0].cursor_owner = false;
+
+        assert_ne!(previous.scene, next.scene);
+        assert!(!crate::runtime::attach_layout_requires_snapshot_hydration(
+            &previous, &next
+        ));
+    }
+
+    #[test]
+    fn attach_layout_requires_snapshot_hydration_on_layout_tree_change() {
+        let view_state = attach_view_state_with_scrollback_fixture();
+        let previous = view_state
+            .cached_layout_state
+            .clone()
+            .expect("layout state");
+        let existing_pane = previous.panes[0].id;
+        let new_pane = Uuid::new_v4();
+        let mut next = previous.clone();
+        next.panes.push(PaneSummary {
+            id: new_pane,
+            index: 2,
+            name: None,
+            focused: false,
+            state: PaneState::Running,
+            state_reason: None,
+        });
+        next.layout_root = PaneLayoutNode::Split {
+            direction: bmux_ipc::PaneSplitDirection::Vertical,
+            ratio_percent: 50,
+            first: Box::new(PaneLayoutNode::Leaf {
+                pane_id: existing_pane,
+            }),
+            second: Box::new(PaneLayoutNode::Leaf { pane_id: new_pane }),
+        };
+
+        assert!(crate::runtime::attach_layout_requires_snapshot_hydration(
+            &previous, &next
+        ));
     }
 
     #[test]

@@ -614,6 +614,41 @@ pub struct AttachPaneChunk {
     pub data: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachMouseProtocolMode {
+    #[default]
+    None,
+    Press,
+    PressRelease,
+    ButtonMotion,
+    AnyMotion,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachMouseProtocolEncoding {
+    #[default]
+    Default,
+    Utf8,
+    Sgr,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AttachMouseProtocolState {
+    #[serde(default)]
+    pub mode: AttachMouseProtocolMode,
+    #[serde(default)]
+    pub encoding: AttachMouseProtocolEncoding,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachPaneMouseProtocol {
+    pub pane_id: Uuid,
+    #[serde(default)]
+    pub protocol: AttachMouseProtocolState,
+}
+
 /// Summary returned when listing connected clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientSummary {
@@ -920,6 +955,8 @@ pub enum ResponsePayload {
         layout_root: PaneLayoutNode,
         scene: AttachScene,
         chunks: Vec<AttachPaneChunk>,
+        #[serde(default)]
+        pane_mouse_protocols: Vec<AttachPaneMouseProtocol>,
         #[serde(default)]
         zoomed: bool,
     },
@@ -2008,6 +2045,13 @@ mod tests {
                 chunks: vec![AttachPaneChunk {
                     pane_id,
                     data: vec![0; 100],
+                }],
+                pane_mouse_protocols: vec![AttachPaneMouseProtocol {
+                    pane_id,
+                    protocol: AttachMouseProtocolState {
+                        mode: AttachMouseProtocolMode::AnyMotion,
+                        encoding: AttachMouseProtocolEncoding::Sgr,
+                    },
                 }],
                 zoomed: false,
             },

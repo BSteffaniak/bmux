@@ -9,13 +9,13 @@ use bmux_config::{BmuxConfig, ConfigPaths};
 pub use bmux_ipc::Event as ServerEvent;
 use bmux_ipc::transport::{ErasedIpcStream, IpcStreamWriter, IpcTransportError, LocalIpcStream};
 use bmux_ipc::{
-    AttachGrant, AttachPaneChunk, AttachScene, CORE_PROTOCOL_CAPABILITIES, ClientSummary,
-    ContextSelector, ContextSummary, Envelope, EnvelopeKind, ErrorCode, IncompatibilityReason,
-    InvokeServiceKind, IpcEndpoint, NegotiatedProtocol, PaneFocusDirection, PaneLayoutNode,
-    PaneSelector, PaneSplitDirection, PaneSummary, ProtocolContract, ProtocolVersion,
-    RecordingEventKind, RecordingProfile, RecordingStatus, RecordingSummary, Request, Response,
-    ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary, decode,
-    default_supported_capabilities, encode,
+    AttachGrant, AttachPaneChunk, AttachPaneMouseProtocol, AttachScene, CORE_PROTOCOL_CAPABILITIES,
+    ClientSummary, ContextSelector, ContextSummary, Envelope, EnvelopeKind, ErrorCode,
+    IncompatibilityReason, InvokeServiceKind, IpcEndpoint, NegotiatedProtocol, PaneFocusDirection,
+    PaneLayoutNode, PaneSelector, PaneSplitDirection, PaneSummary, ProtocolContract,
+    ProtocolVersion, RecordingEventKind, RecordingProfile, RecordingStatus, RecordingSummary,
+    Request, Response, ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary,
+    decode, default_supported_capabilities, encode,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -55,6 +55,7 @@ pub struct AttachSnapshotState {
     pub layout_root: PaneLayoutNode,
     pub scene: AttachScene,
     pub chunks: Vec<AttachPaneChunk>,
+    pub pane_mouse_protocols: Vec<AttachPaneMouseProtocol>,
     pub zoomed: bool,
 }
 
@@ -1316,6 +1317,7 @@ impl BmuxClient {
                 layout_root,
                 scene,
                 chunks,
+                pane_mouse_protocols,
                 zoomed,
             } => Ok(AttachSnapshotState {
                 context_id,
@@ -1325,6 +1327,7 @@ impl BmuxClient {
                 layout_root,
                 scene,
                 chunks,
+                pane_mouse_protocols,
                 zoomed,
             }),
             _ => Err(ClientError::UnexpectedResponse(
@@ -1892,6 +1895,7 @@ impl StreamingBmuxClient {
                 layout_root,
                 scene,
                 chunks,
+                pane_mouse_protocols,
                 zoomed,
             } => Ok(AttachSnapshotState {
                 context_id,
@@ -1901,6 +1905,7 @@ impl StreamingBmuxClient {
                 layout_root,
                 scene,
                 chunks,
+                pane_mouse_protocols,
                 zoomed,
             }),
             _ => Err(ClientError::UnexpectedResponse(
