@@ -1,12 +1,11 @@
 use super::{
-    BmuxConfig, BufWriter, ConfigPaths, ConnectionContext,
-    ConnectionPolicyScope, Context, GifEncoder, GifFrame, Instant, IsTerminal, Path, PathBuf,
-    RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
-    RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode, RecordingEventEnvelope,
-    RecordingEventKind, RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg,
-    RecordingRenderMode, RecordingReplayMode, RecordingStatus, RecordingSummary, Repeat, Result,
-    Uuid, Write, cleanup_stale_pid_file, connect_if_running_with_context, io, map_cli_client_error,
-    parse_uuid_value, terminal,
+    BmuxConfig, BufWriter, ConfigPaths, ConnectionContext, ConnectionPolicyScope, Context,
+    GifEncoder, GifFrame, Instant, IsTerminal, Path, PathBuf, RecordingCursorBlinkMode,
+    RecordingCursorMode, RecordingCursorPaintMode, RecordingCursorProfile, RecordingCursorShape,
+    RecordingCursorTextMode, RecordingEventEnvelope, RecordingEventKind, RecordingEventKindArg,
+    RecordingExportFormat, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
+    RecordingStatus, RecordingSummary, Repeat, Result, Uuid, Write, cleanup_stale_pid_file,
+    connect_if_running_with_context, io, map_cli_client_error, parse_uuid_value, terminal,
 };
 use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont, point};
 use bmux_fonts::FontPreset;

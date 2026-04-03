@@ -105,6 +105,10 @@ struct CreateShareRequest {
     name: String,
     target: String,
     role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ttl: Option<String>,
+    #[serde(default)]
+    one_time: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -335,9 +339,10 @@ fn map_connect_target_resolution_error(target: &str, error: anyhow::Error) -> an
 
 pub(super) async fn run_setup() -> Result<u8> {
     println!("bmux setup");
-    run_auth_login(false).await?;
-    println!("next: bmux host");
-    Ok(0)
+    println!("Step 1/2: auth");
+    let _ = ensure_authenticated(&BmuxConfig::load()?).await?;
+    println!("Step 2/2: host");
+    run_host("127.0.0.1:7443", None, false).await
 }
 
 pub(super) async fn run_host(listen: &str, name: Option<&str>, copy: bool) -> Result<u8> {
@@ -488,25 +493,36 @@ pub(super) async fn run_join(link: Option<&str>, session: Option<&str>) -> Resul
 
 pub(super) fn run_hosts() -> Result<u8> {
     let config = BmuxConfig::load()?;
-    println!("known targets:");
-    for target in &config.connections.recent_targets {
-        println!("- {target}");
+    if !config.connections.recent_targets.is_empty() {
+        println!("recent:");
+        for target in &config.connections.recent_targets {
+            println!("- {target}");
+        }
     }
-    for name in config.connections.targets.keys() {
-        if !config
-            .connections
-            .recent_targets
-            .iter()
-            .any(|value| value == name)
-        {
-            println!("- {name}");
+    if !config.connections.targets.is_empty() {
+        println!("configured targets:");
+        for (name, target) in &config.connections.targets {
+            let transport = match target.transport {
+                ConnectionTransport::Local => "local",
+                ConnectionTransport::Ssh => "ssh",
+                ConnectionTransport::Tls => "tls",
+                ConnectionTransport::Iroh => "iroh",
+            };
+            println!("- {name} ({transport})");
         }
     }
     if !config.connections.share_links.is_empty() {
         println!("share links:");
         for (name, target) in &config.connections.share_links {
             println!("- bmux://{name} -> {target}");
+            println!("  join: bmux join bmux://{name}");
         }
+    }
+    if config.connections.recent_targets.is_empty()
+        && config.connections.targets.is_empty()
+        && config.connections.share_links.is_empty()
+    {
+        println!("no hosts configured");
     }
     Ok(0)
 }
@@ -588,7 +604,14 @@ pub(super) fn run_auth_logout() -> Result<u8> {
     }
 }
 
-pub(super) async fn run_share(target: Option<&str>, name: Option<&str>, role: &str) -> Result<u8> {
+pub(super) async fn run_share(
+    target: Option<&str>,
+    name: Option<&str>,
+    role: &str,
+    ttl: Option<&str>,
+    one_time: bool,
+    copy: bool,
+) -> Result<u8> {
     let mut config = BmuxConfig::load()?;
     let resolved_target = if let Some(target) = target {
         target.to_string()
@@ -616,6 +639,8 @@ pub(super) async fn run_share(target: Option<&str>, name: Option<&str>, role: &s
             name: slug.clone(),
             target: resolved_target.clone(),
             role: role.to_string(),
+            ttl: ttl.map(ToString::to_string),
+            one_time,
         },
     )
     .await?;
@@ -632,6 +657,22 @@ pub(super) async fn run_share(target: Option<&str>, name: Option<&str>, role: &s
     }
     println!("target: {resolved_target}");
     println!("role: {role}");
+    if let Some(value) = ttl {
+        println!("ttl: {value}");
+    }
+    if one_time {
+        println!("one-time: true");
+    }
+    if copy {
+        let share_link = format!("bmux://{link_name}");
+        match crate::runtime::attach::runtime::copy_text_with_clipboard_plugin(&share_link) {
+            Ok(()) => println!("copied to clipboard: {share_link}"),
+            Err(error) => eprintln!(
+                "warning: clipboard copy failed: {}",
+                crate::runtime::attach::runtime::format_clipboard_service_error(&error)
+            ),
+        }
+    }
     Ok(0)
 }
 
@@ -659,6 +700,21 @@ fn choose_default_target_interactively(config: &BmuxConfig) -> Result<String> {
     }
     if let Some(first_named) = config.connections.targets.keys().next() {
         return Ok(first_named.clone());
+    }
+    if io::stdin().is_terminal() {
+        println!("No recent targets found.");
+        print!("Paste an invite link (or press Enter to use local): ");
+        io::stdout()
+            .flush()
+            .context("failed flushing join prompt")?;
+        let mut input = String::new();
+        io::stdin()
+            .read_line(&mut input)
+            .context("failed reading join target")?;
+        let value = input.trim();
+        if !value.is_empty() {
+            return normalize_join_target_input(value);
+        }
     }
     Ok("local".to_string())
 }
@@ -767,6 +823,8 @@ async fn ensure_host_share_link(
             name: name.to_string(),
             target: target.to_string(),
             role: "control".to_string(),
+            ttl: None,
+            one_time: false,
         },
     )
     .await?;

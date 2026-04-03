@@ -217,6 +217,15 @@ pub enum Command {
         /// Optional access role hint
         #[arg(long, default_value = "control")]
         role: String,
+        /// Optional invite TTL (example: 24h, 30m)
+        #[arg(long)]
+        ttl: Option<String>,
+        /// Mark the share as one-time use
+        #[arg(long)]
+        one_time: bool,
+        /// Copy resulting share link to clipboard
+        #[arg(long)]
+        copy: bool,
     },
     /// Remove a named shared link
     Unshare {
@@ -1176,6 +1185,40 @@ mod tests {
             panic!("expected auth command");
         };
         assert!(matches!(command, AuthCommand::Logout));
+    }
+
+    #[test]
+    fn parses_share_flags() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "share",
+            "--name",
+            "demo",
+            "--role",
+            "view",
+            "--ttl",
+            "24h",
+            "--one-time",
+            "--copy",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Share {
+            target,
+            name,
+            role,
+            ttl,
+            one_time,
+            copy,
+        }) = cli.command
+        else {
+            panic!("expected share command");
+        };
+        assert!(target.is_none());
+        assert_eq!(name.as_deref(), Some("demo"));
+        assert_eq!(role, "view");
+        assert_eq!(ttl.as_deref(), Some("24h"));
+        assert!(one_time);
+        assert!(copy);
     }
 
     #[test]

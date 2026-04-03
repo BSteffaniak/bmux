@@ -149,8 +149,26 @@ pub(super) async fn dispatch_built_in_command(
                 command: AuthCommand::Logout,
             },
         ) => run_auth_logout(),
-        (BuiltInHandlerId::Share, Command::Share { target, name, role }) => {
-            run_share(target.as_deref(), name.as_deref(), role).await
+        (
+            BuiltInHandlerId::Share,
+            Command::Share {
+                target,
+                name,
+                role,
+                ttl,
+                one_time,
+                copy,
+            },
+        ) => {
+            run_share(
+                target.as_deref(),
+                name.as_deref(),
+                role,
+                ttl.as_deref(),
+                *one_time,
+                *copy,
+            )
+            .await
         }
         (BuiltInHandlerId::Unshare, Command::Unshare { name }) => run_unshare(name).await,
         (
