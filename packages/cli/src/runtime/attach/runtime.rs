@@ -6,6 +6,13 @@ use std::collections::BTreeMap;
 const ATTACH_CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
 const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
+/// Maximum wall-clock time the drain loop may spend waiting for an in-
+/// progress output burst to complete (e.g. when the server indicates
+/// `output_still_pending` or the inner application is mid-synchronized-
+/// update).  Each IPC round-trip (~50-200 µs on a local Unix socket)
+/// naturally yields CPU time to the PTY reader thread, so no explicit
+/// sleep/yield is needed between rounds.
+const ATTACH_OUTPUT_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(4);
 
 fn apply_attach_output_bytes(
     view_state: &mut AttachViewState,
@@ -498,9 +505,19 @@ pub(crate) async fn run_session_attach_with_client(
             // visible tearing from partial redraws.  TUI programs like
             // lazygit can emit 20-30 KB when switching views; with 8 KB
             // per fetch we need a few rounds to consume the full burst.
+            //
+            // Two server-side signals tell us the burst is not yet complete:
+            //  1. `output_still_pending` — the PTY reader has flagged new
+            //     data that was not included in the batch.
+            //  2. `sync_update_active` per pane — the server's byte-by-byte
+            //     CSI parser has seen `\x1b[?2026h` but not `\x1b[?2026l`.
+            //
+            // We keep draining while either signal is active, bounded by a
+            // time budget to keep the event loop responsive.
             let mut last_round_had_data = false;
+            let drain_start = Instant::now();
             for _round in 0..ATTACH_OUTPUT_DRAIN_MAX_ROUNDS {
-                let chunks = match client
+                let result = match client
                     .attach_pane_output_batch(
                         view_state.attached_id,
                         pane_ids.clone(),
@@ -508,7 +525,7 @@ pub(crate) async fn run_session_attach_with_client(
                     )
                     .await
                 {
-                    Ok(chunks) => chunks,
+                    Ok(result) => result,
                     Err(error)
                         if is_attach_stream_closed_error(&error)
                             || is_attach_not_attached_runtime_error(&error) =>
@@ -521,23 +538,46 @@ pub(crate) async fn run_session_attach_with_client(
                 };
 
                 let mut had_data = false;
-                for chunk in chunks {
+                let mut any_sync_active = false;
+                for chunk in result.chunks {
                     had_data |= apply_attach_output_bytes(
                         &mut view_state,
                         chunk.pane_id,
                         &chunk.data,
                         &mut frame_needs_render,
                     );
+                    // Store server-side sync state on the pane buffer so the
+                    // renderer can defer drawing mid-update panes.
+                    if let Some(buffer) = view_state.pane_buffers.get_mut(&chunk.pane_id) {
+                        buffer.sync_update_in_progress = chunk.sync_update_active;
+                    }
+                    any_sync_active |= chunk.sync_update_active;
                 }
                 last_round_had_data = had_data;
 
                 if !had_data {
-                    break;
+                    // No data this round.  Check whether the burst is truly
+                    // complete before breaking out of the drain loop.
+                    if !result.output_still_pending && !any_sync_active {
+                        break; // Burst complete.
+                    }
+
+                    // More data expected — continue if within time budget.
+                    // Each IPC round-trip gives the PTY reader thread CPU
+                    // time to push pending data, so no explicit yield needed.
+                    if drain_start.elapsed() >= ATTACH_OUTPUT_DRAIN_TIME_BUDGET {
+                        break; // Safety valve.
+                    }
                 }
             }
-            // If the final allowed drain round still produced bytes, keep
-            // output pending so the next loop continues draining.
-            pane_output_pending = last_round_had_data;
+            // Keep output pending if the last round still produced bytes OR
+            // if any pane is mid-synchronized-update so the next iteration
+            // re-enters the drain immediately.
+            let any_sync_still_active = view_state
+                .pane_buffers
+                .values()
+                .any(|b| b.sync_update_in_progress);
+            pane_output_pending = last_round_had_data || any_sync_still_active;
         }
 
         // Fetch image deltas for dirty panes (feature-gated).
@@ -4705,7 +4745,6 @@ mod tests {
                 last_alternate_screen: false,
                 prev_rows: Vec::new(),
                 sync_update_in_progress: false,
-                sync_update_started_at: None,
             }
         });
         append_pane_output(buffer, b"one\r\n  four\r\n     five\r\n  six\r\n\x1b[4;3H");

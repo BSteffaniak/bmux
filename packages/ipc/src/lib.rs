@@ -625,6 +625,11 @@ pub enum PaneState {
 pub struct AttachPaneChunk {
     pub pane_id: Uuid,
     pub data: Vec<u8>,
+    /// True when the inner application is inside a DEC mode 2026
+    /// synchronized update — the server's PTY reader has seen
+    /// `\x1b[?2026h` but not yet `\x1b[?2026l` for this pane.
+    #[serde(default)]
+    pub sync_update_active: bool,
 }
 
 /// Image protocol identifier for IPC transport.
@@ -1006,6 +1011,11 @@ pub enum ResponsePayload {
     },
     AttachPaneOutputBatch {
         chunks: Vec<AttachPaneChunk>,
+        /// True when at least one requested pane's PTY reader has flagged
+        /// new output that was not included in this batch.  The client
+        /// should continue draining instead of proceeding to render.
+        #[serde(default)]
+        output_still_pending: bool,
     },
     AttachPaneImages {
         deltas: Vec<AttachPaneImageDelta>,
@@ -2087,12 +2097,15 @@ mod tests {
                     AttachPaneChunk {
                         pane_id,
                         data: vec![65, 66, 67],
+                        sync_update_active: false,
                     },
                     AttachPaneChunk {
                         pane_id: id2,
                         data: vec![],
+                        sync_update_active: false,
                     },
                 ],
+                output_still_pending: false,
             },
             ResponsePayload::AttachSnapshot {
                 context_id: None,
@@ -2111,6 +2124,7 @@ mod tests {
                 chunks: vec![AttachPaneChunk {
                     pane_id,
                     data: vec![0; 100],
+                    sync_update_active: false,
                 }],
                 pane_mouse_protocols: vec![AttachPaneMouseProtocol {
                     pane_id,

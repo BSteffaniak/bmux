@@ -69,12 +69,6 @@ pub struct AttachCursorState {
     pub(crate) visible: bool,
 }
 
-/// Maximum time we will defer rendering a pane that is inside a DEC mode
-/// 2026 synchronized update.  If the closing `\x1b[?2026l` hasn't arrived
-/// after this deadline we render anyway to avoid a permanently stale pane
-/// (e.g. if the inner application crashes mid-update).
-pub(crate) const SYNC_UPDATE_TIMEOUT: Duration = Duration::from_millis(100);
-
 pub struct PaneRenderBuffer {
     pub(crate) parser: vt100::Parser,
     pub(crate) last_alternate_screen: bool,
@@ -82,14 +76,13 @@ pub struct PaneRenderBuffer {
     /// string matches the cached version we skip emitting it, avoiding
     /// unnecessary terminal I/O for unchanged content.
     pub(crate) prev_rows: Vec<String>,
-    /// True while the inner application has sent `\x1b[?2026h` (begin
-    /// synchronized update) but has not yet sent `\x1b[?2026l` (end).
-    /// When set, the renderer defers drawing this pane's content so the
-    /// user never sees a partially-updated screen.
+    /// True while the inner application is inside a DEC mode 2026
+    /// synchronized update.  Populated from the server's per-pane
+    /// `sync_update_active` flag (tracked by the PTY reader's byte-by-
+    /// byte CSI parser, so no cross-chunk splitting issues).  When set,
+    /// the renderer defers drawing this pane's content so the user never
+    /// sees a partially-updated screen.
     pub(crate) sync_update_in_progress: bool,
-    /// Timestamp of the most recent `\x1b[?2026h` transition, used to
-    /// enforce [`SYNC_UPDATE_TIMEOUT`].
-    pub(crate) sync_update_started_at: Option<Instant>,
 }
 
 impl Default for PaneRenderBuffer {
@@ -99,7 +92,6 @@ impl Default for PaneRenderBuffer {
             last_alternate_screen: false,
             prev_rows: Vec::new(),
             sync_update_in_progress: false,
-            sync_update_started_at: None,
         }
     }
 }

@@ -1018,6 +1018,10 @@ struct PaneRuntimeHandle {
     /// event is only emitted on the `false→true` transition, coalescing
     /// thousands of per-chunk writes into ~1 event per fetch cycle.
     output_dirty: Arc<AtomicBool>,
+    /// True while the inner application is inside a DEC mode 2026
+    /// synchronized update (`\x1b[?2026h` seen, `\x1b[?2026l` not yet).
+    /// Set by the PTY reader thread via the `PaneMouseProtocolTracker`.
+    sync_update_in_progress: Arc<AtomicBool>,
     mouse_protocol_state: Arc<std::sync::Mutex<AttachMouseProtocolState>>,
     #[cfg(feature = "image-registry")]
     image_registry: Arc<std::sync::Mutex<bmux_image::ImageRegistry>>,
@@ -1045,6 +1049,9 @@ struct PaneMouseProtocolTracker {
     any_motion_mode: bool,
     utf8_encoding: bool,
     sgr_encoding: bool,
+    /// DEC mode 2026: the inner application has begun a synchronized
+    /// update (`\x1b[?2026h`) but has not yet ended it (`\x1b[?2026l`).
+    sync_update: bool,
 }
 
 impl Default for PaneMouseProtocolTracker {
@@ -1058,6 +1065,7 @@ impl Default for PaneMouseProtocolTracker {
             any_motion_mode: false,
             utf8_encoding: false,
             sgr_encoding: false,
+            sync_update: false,
         }
     }
 }
@@ -1136,6 +1144,7 @@ impl PaneMouseProtocolTracker {
         self.any_motion_mode = false;
         self.utf8_encoding = false;
         self.sgr_encoding = false;
+        self.sync_update = false;
     }
 
     fn apply_csi_sequence(&mut self, sequence: &[u8]) {
@@ -1174,6 +1183,7 @@ impl PaneMouseProtocolTracker {
             1003 => self.any_motion_mode = enable,
             1005 => self.utf8_encoding = enable,
             1006 => self.sgr_encoding = enable,
+            2026 => self.sync_update = enable,
             _ => {}
         }
     }
@@ -2100,6 +2110,8 @@ impl SessionRuntimeManager {
         let output_dirty = Arc::new(AtomicBool::new(false));
         let output_dirty_for_reader = Arc::clone(&output_dirty);
         let last_requested_size_for_reader = Arc::clone(&last_requested_size);
+        let sync_update_in_progress = Arc::new(AtomicBool::new(false));
+        let sync_update_for_reader = Arc::clone(&sync_update_in_progress);
         let mouse_protocol_state =
             Arc::new(std::sync::Mutex::new(AttachMouseProtocolState::default()));
         let mouse_protocol_state_for_reader = Arc::clone(&mouse_protocol_state);
@@ -2324,6 +2336,8 @@ impl SessionRuntimeManager {
                                 if let Ok(mut protocol) = mouse_protocol_state_for_reader.lock() {
                                     *protocol = mouse_protocol_tracker.current_protocol();
                                 }
+                                sync_update_for_reader
+                                    .store(mouse_protocol_tracker.sync_update, Ordering::SeqCst);
                                 let reply = protocol_reply_for_chunk(
                                     &mut protocol_engine,
                                     &mut cursor_tracker,
@@ -2425,6 +2439,7 @@ impl SessionRuntimeManager {
             exited,
             last_requested_size,
             output_dirty,
+            sync_update_in_progress,
             mouse_protocol_state,
             #[cfg(feature = "image-registry")]
             image_registry,
@@ -2821,7 +2836,11 @@ impl SessionRuntimeManager {
                 .map_err(|_| SessionRuntimeError::Closed)?
                 .read_recent(allowed);
             budget_remaining = budget_remaining.saturating_sub(data.len());
-            chunks.push(AttachPaneChunk { pane_id, data });
+            chunks.push(AttachPaneChunk {
+                pane_id,
+                data,
+                sync_update_active: false,
+            });
         }
 
         Ok(AttachSnapshotState {
@@ -2868,9 +2887,11 @@ impl SessionRuntimeManager {
                 let data = output.read_for_client(client_id, allowed);
                 drop(output);
                 budget_remaining = budget_remaining.saturating_sub(data.len());
+                let sync_update_active = pane.sync_update_in_progress.load(Ordering::SeqCst);
                 chunks.push(AttachPaneChunk {
                     pane_id: *pane_id,
                     data,
+                    sync_update_active,
                 });
             }
             chunks
@@ -6224,7 +6245,7 @@ async fn handle_request(
                     message: format!("session runtime not found: {}", session_id.0),
                 }));
             }
-            let chunks = {
+            let (chunks, output_still_pending) = {
                 let mut runtime_manager = state
                     .session_runtimes
                     .lock()
@@ -6238,10 +6259,28 @@ async fn handle_request(
                         }
                     }
                 }
-                runtime_manager.read_pane_output_batch(session_id, client_id, &pane_ids, max_bytes)
+                let chunks = runtime_manager
+                    .read_pane_output_batch(session_id, client_id, &pane_ids, max_bytes);
+                // Re-check output_dirty: if the PTY reader pushed new data
+                // between the clear above and this check, the client should
+                // keep draining instead of proceeding to render.
+                let still_pending = runtime_manager
+                    .runtimes
+                    .get(&session_id)
+                    .map_or(false, |rt| {
+                        pane_ids.iter().any(|pane_id| {
+                            rt.panes
+                                .get(pane_id)
+                                .map_or(false, |p| p.output_dirty.load(Ordering::SeqCst))
+                        })
+                    });
+                (chunks, still_pending)
             };
             match chunks {
-                Ok(chunks) => Response::Ok(ResponsePayload::AttachPaneOutputBatch { chunks }),
+                Ok(chunks) => Response::Ok(ResponsePayload::AttachPaneOutputBatch {
+                    chunks,
+                    output_still_pending,
+                }),
                 Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
                     message: format!("session runtime not found: {}", session_id.0),

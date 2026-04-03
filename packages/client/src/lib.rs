@@ -46,6 +46,17 @@ pub struct AttachLayoutState {
     pub zoomed: bool,
 }
 
+/// Result of a pane output batch fetch, including whether the server's PTY
+/// reader has flagged additional output that was not included in this batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneOutputBatchResult {
+    pub chunks: Vec<AttachPaneChunk>,
+    /// True when the server indicates at least one requested pane's PTY
+    /// reader has pushed new output since the batch was read.  The client
+    /// should continue draining.
+    pub output_still_pending: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttachSnapshotState {
     pub context_id: Option<Uuid>,
@@ -1283,7 +1294,7 @@ impl BmuxClient {
         session_id: Uuid,
         pane_ids: Vec<Uuid>,
         max_bytes: usize,
-    ) -> Result<Vec<AttachPaneChunk>> {
+    ) -> Result<PaneOutputBatchResult> {
         match self
             .request(Request::AttachPaneOutputBatch {
                 session_id,
@@ -1292,7 +1303,13 @@ impl BmuxClient {
             })
             .await?
         {
-            ResponsePayload::AttachPaneOutputBatch { chunks } => Ok(chunks),
+            ResponsePayload::AttachPaneOutputBatch {
+                chunks,
+                output_still_pending,
+            } => Ok(PaneOutputBatchResult {
+                chunks,
+                output_still_pending,
+            }),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected attach pane output batch response",
             )),
@@ -1884,7 +1901,7 @@ impl StreamingBmuxClient {
         session_id: Uuid,
         pane_ids: Vec<Uuid>,
         max_bytes: usize,
-    ) -> Result<Vec<AttachPaneChunk>> {
+    ) -> Result<PaneOutputBatchResult> {
         match self
             .request(Request::AttachPaneOutputBatch {
                 session_id,
@@ -1893,7 +1910,13 @@ impl StreamingBmuxClient {
             })
             .await?
         {
-            ResponsePayload::AttachPaneOutputBatch { chunks } => Ok(chunks),
+            ResponsePayload::AttachPaneOutputBatch {
+                chunks,
+                output_still_pending,
+            } => Ok(PaneOutputBatchResult {
+                chunks,
+                output_still_pending,
+            }),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected attach pane output batch response",
             )),
