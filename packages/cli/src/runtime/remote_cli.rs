@@ -572,6 +572,7 @@ pub(super) async fn run_join(link: Option<&str>, session: Option<&str>) -> Resul
             .and_then(|values| values.first())
             .map(String::as_str)
     });
+    print_join_preview(&config, &target, resumed_session);
     println!("Connecting...");
     run_connect(Some(&target), resumed_session, None, false, true).await
 }
@@ -798,42 +799,13 @@ pub(super) async fn run_unshare(name: &str) -> Result<u8> {
 }
 
 fn choose_default_target_interactively(config: &BmuxConfig) -> Result<String> {
-    if let Some(target) = config.connections.recent_targets.first() {
-        return Ok(target.clone());
-    }
-    if let Some(default_target) = config.connections.default_target.as_deref() {
-        return Ok(default_target.to_string());
-    }
-    if let Some(first_named) = config.connections.targets.keys().next() {
-        return Ok(first_named.clone());
-    }
+    let options = build_join_target_options(config);
     if io::stdin().is_terminal() {
-        let mut options = Vec::new();
-        for target in &config.connections.recent_targets {
-            if !options.iter().any(|value| value == target) {
-                options.push(target.clone());
-            }
+        println!("Choose a host or paste an invite (bmux://, https://, iroh://):");
+        for (index, option) in options.iter().enumerate() {
+            println!("  {}. {option}", index + 1);
         }
-        for name in config.connections.share_links.keys() {
-            let share = format!("bmux://{name}");
-            if !options.iter().any(|value| value == &share) {
-                options.push(share);
-            }
-        }
-        for name in config.connections.targets.keys() {
-            if !options.iter().any(|value| value == name) {
-                options.push(name.clone());
-            }
-        }
-        if !options.is_empty() {
-            println!("Choose a host or paste an invite (bmux://, https://, iroh://):");
-            for (index, option) in options.iter().enumerate() {
-                println!("  {}. {option}", index + 1);
-            }
-        } else {
-            println!("No recent targets found.");
-        }
-        print!("Selection, invite, or Enter for local: ");
+        print!("Selection or invite (Enter for {}): ", options[0]);
         io::stdout()
             .flush()
             .context("failed flushing join prompt")?;
@@ -841,18 +813,66 @@ fn choose_default_target_interactively(config: &BmuxConfig) -> Result<String> {
         io::stdin()
             .read_line(&mut input)
             .context("failed reading join target")?;
-        let value = input.trim();
-        if let Ok(index) = value.parse::<usize>()
-            && index > 0
-            && index <= options.len()
-        {
-            return Ok(options[index - 1].clone());
+        if let Some(selected) = resolve_join_prompt_selection(input.trim(), &options)? {
+            return Ok(selected);
         }
-        if !value.is_empty() {
-            return normalize_join_target_input(value);
+        return Ok(options[0].clone());
+    }
+    Ok(options[0].clone())
+}
+
+fn build_join_target_options(config: &BmuxConfig) -> Vec<String> {
+    let mut options = Vec::new();
+    for target in &config.connections.recent_targets {
+        if !options.iter().any(|value| value == target) {
+            options.push(target.clone());
         }
     }
-    Ok("local".to_string())
+    if let Some(default_target) = config.connections.default_target.as_deref()
+        && !options.iter().any(|value| value == default_target)
+    {
+        options.push(default_target.to_string());
+    }
+    for name in config.connections.share_links.keys() {
+        let share = format!("bmux://{name}");
+        if !options.iter().any(|value| value == &share) {
+            options.push(share);
+        }
+    }
+    for name in config.connections.targets.keys() {
+        if !options.iter().any(|value| value == name) {
+            options.push(name.clone());
+        }
+    }
+    if !options.iter().any(|value| value == "local") {
+        options.push("local".to_string());
+    }
+    options
+}
+
+fn resolve_join_prompt_selection(input: &str, options: &[String]) -> Result<Option<String>> {
+    let value = input.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if let Ok(index) = value.parse::<usize>() {
+        if index == 0 || index > options.len() {
+            anyhow::bail!("selection out of range: {index}")
+        }
+        return Ok(Some(options[index - 1].clone()));
+    }
+    Ok(Some(normalize_join_target_input(value)?))
+}
+
+fn print_join_preview(config: &BmuxConfig, target: &str, session: Option<&str>) {
+    if let Some(name) = target.strip_prefix("bmux://")
+        && let Some(mapped) = config.connections.share_links.get(name)
+    {
+        println!("Resolved target: {mapped}");
+    }
+    if let Some(session_id) = session {
+        println!("Session: {session_id}");
+    }
 }
 
 fn control_plane_url(config: &BmuxConfig) -> String {
@@ -3026,6 +3046,54 @@ mod tests {
         let normalized = normalize_join_target_input("Invite code: (bmux://demo-host), join now")
             .expect("normalize link");
         assert_eq!(normalized, "bmux://demo-host");
+    }
+
+    #[test]
+    fn build_join_target_options_prioritizes_recent_then_links_then_named_then_local() {
+        let mut config = BmuxConfig::default();
+        config.connections.recent_targets = vec!["ssh-prod".to_string(), "bmux://demo".to_string()];
+        config.connections.default_target = Some("default-target".to_string());
+        config
+            .connections
+            .share_links
+            .insert("demo".to_string(), "iroh://demo-endpoint".to_string());
+        config
+            .connections
+            .share_links
+            .insert("team".to_string(), "iroh://team-endpoint".to_string());
+        config
+            .connections
+            .targets
+            .insert("staging".to_string(), ConnectionTargetConfig::default());
+
+        let options = build_join_target_options(&config);
+        assert_eq!(options[0], "ssh-prod");
+        assert_eq!(options[1], "bmux://demo");
+        assert!(options.contains(&"default-target".to_string()));
+        assert!(options.contains(&"bmux://team".to_string()));
+        assert!(options.contains(&"staging".to_string()));
+        assert_eq!(options.last().map(String::as_str), Some("local"));
+    }
+
+    #[test]
+    fn resolve_join_prompt_selection_accepts_numeric_and_invite_text() {
+        let options = vec!["bmux://demo".to_string(), "local".to_string()];
+        let selected = resolve_join_prompt_selection("1", &options)
+            .expect("parse selection")
+            .expect("has value");
+        assert_eq!(selected, "bmux://demo");
+
+        let pasted = resolve_join_prompt_selection("Invite: bmux://team", &options)
+            .expect("parse invite")
+            .expect("has value");
+        assert_eq!(pasted, "bmux://team");
+    }
+
+    #[test]
+    fn resolve_join_prompt_selection_rejects_out_of_range_index() {
+        let options = vec!["bmux://demo".to_string()];
+        let error = resolve_join_prompt_selection("9", &options).expect_err("out of range");
+        assert!(error.to_string().contains("selection out of range"));
     }
 
     #[test]
