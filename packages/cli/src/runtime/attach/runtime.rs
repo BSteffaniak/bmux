@@ -3107,7 +3107,21 @@ pub(crate) async fn handle_attach_server_event(
     _global: bool,
     view_state: &mut AttachViewState,
 ) -> Result<AttachLoopControl> {
-    if is_attach_terminal_server_exit_event(&server_event, view_state.attached_id) {
+    if let bmux_client::ServerEvent::SessionRemoved { id } = &server_event
+        && *id == view_state.attached_id
+    {
+        let removed_session_id = view_state.attached_id;
+        if recover_attach_after_session_removed(client, view_state).await? {
+            view_state.set_transient_status(
+                format!(
+                    "session {} closed; switched to active session",
+                    short_uuid(removed_session_id)
+                ),
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+            return Ok(AttachLoopControl::Continue);
+        }
         return Ok(AttachLoopControl::Break(AttachExitReason::StreamClosed));
     }
 
@@ -3234,11 +3248,65 @@ pub(crate) fn apply_attach_view_change_components(
     }
 }
 
-pub(crate) fn is_attach_terminal_server_exit_event(
-    event: &bmux_client::ServerEvent,
-    attached_id: Uuid,
-) -> bool {
-    matches!(event, bmux_client::ServerEvent::SessionRemoved { id } if *id == attached_id)
+pub(crate) async fn recover_attach_after_session_removed(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+) -> std::result::Result<bool, ClientError> {
+    if let Ok(Some(context)) = client.current_context().await
+        && retarget_attach_to_context(client, view_state, context.id)
+            .await
+            .is_ok()
+    {
+        return Ok(true);
+    }
+
+    if let Ok(contexts) = client.list_contexts().await {
+        for context in contexts {
+            if Some(context.id) == view_state.attached_context_id {
+                continue;
+            }
+            if retarget_attach_to_context(client, view_state, context.id)
+                .await
+                .is_ok()
+            {
+                return Ok(true);
+            }
+        }
+    }
+
+    let previous_session_id = view_state.attached_id;
+    if let Ok(sessions) = client.list_sessions().await {
+        for session in sessions {
+            if session.id == previous_session_id {
+                continue;
+            }
+            let Ok(attach_info) = open_attach_for_session(client, session.id).await else {
+                continue;
+            };
+            view_state.attached_id = attach_info.session_id;
+            view_state.attached_context_id = attach_info.context_id;
+            view_state.can_write = attach_info.can_write;
+            update_attach_viewport(client, view_state.attached_id, view_state.status_position)
+                .await?;
+            hydrate_attach_state_from_snapshot(client, view_state).await?;
+            view_state.ui_mode = AttachUiMode::Normal;
+            let status = attach_context_status(
+                client,
+                view_state.attached_context_id,
+                view_state.attached_id,
+            )
+            .await?;
+            set_attach_context_status(
+                view_state,
+                status,
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 pub(crate) fn attach_view_event_matches_target(
@@ -4062,19 +4130,6 @@ mod tests {
         assert!(view_state.dirty.status_needs_redraw);
         assert!(view_state.dirty.layout_needs_refresh);
         assert!(view_state.dirty.full_pane_redraw);
-    }
-
-    #[test]
-    fn attach_exit_events_ignore_session_scoped_client_detach() {
-        let session_id = uuid::Uuid::new_v4();
-        assert!(crate::runtime::is_attach_terminal_server_exit_event(
-            &bmux_client::ServerEvent::SessionRemoved { id: session_id },
-            session_id,
-        ));
-        assert!(!crate::runtime::is_attach_terminal_server_exit_event(
-            &bmux_client::ServerEvent::ClientDetached { id: session_id },
-            session_id,
-        ));
     }
 
     #[test]
