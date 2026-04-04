@@ -625,6 +625,20 @@ pub enum PaneState {
 pub struct AttachPaneChunk {
     pub pane_id: Uuid,
     pub data: Vec<u8>,
+    /// Inclusive start offset (in pane output stream bytes) for `data`.
+    ///
+    /// This is monotonic per pane/output stream and allows clients to verify
+    /// continuity when feeding persistent terminal parsers.
+    #[serde(default)]
+    pub stream_start: u64,
+    /// Exclusive end offset (in pane output stream bytes) for `data`.
+    #[serde(default)]
+    pub stream_end: u64,
+    /// True when bytes were dropped before `stream_start` for this client
+    /// (cursor fell behind ring-buffer retention and was clamped). Clients
+    /// must treat this as a continuity break and resync state.
+    #[serde(default)]
+    pub stream_gap: bool,
     /// True when the inner application is inside a DEC mode 2026
     /// synchronized update — the server's PTY reader has seen
     /// `\x1b[?2026h` but not yet `\x1b[?2026l` for this pane.
@@ -2110,11 +2124,17 @@ mod tests {
                     AttachPaneChunk {
                         pane_id,
                         data: vec![65, 66, 67],
+                        stream_start: 0,
+                        stream_end: 3,
+                        stream_gap: false,
                         sync_update_active: false,
                     },
                     AttachPaneChunk {
                         pane_id: id2,
                         data: vec![],
+                        stream_start: 0,
+                        stream_end: 0,
+                        stream_gap: false,
                         sync_update_active: false,
                     },
                 ],
@@ -2137,6 +2157,9 @@ mod tests {
                 chunks: vec![AttachPaneChunk {
                     pane_id,
                     data: vec![0; 100],
+                    stream_start: 0,
+                    stream_end: 100,
+                    stream_gap: false,
                     sync_update_active: false,
                 }],
                 pane_mouse_protocols: vec![AttachPaneMouseProtocol {

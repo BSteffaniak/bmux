@@ -1659,11 +1659,11 @@ pub(super) async fn execute_step(
             if let Some(target_index) = pane {
                 // Pane-targeted send: resolve the pane index to a UUID and use
                 // PaneDirectInput to write bytes directly without focus changes.
-                let snapshot = client
-                    .attach_snapshot(sid, 0)
+                let layout = client
+                    .attach_layout(sid)
                     .await
-                    .map_err(|e| anyhow::anyhow!("snapshot for pane lookup failed: {e}"))?;
-                let pane_id = snapshot
+                    .map_err(|e| anyhow::anyhow!("layout for pane lookup failed: {e}"))?;
+                let pane_id = layout
                     .panes
                     .iter()
                     .find(|p| p.index == *target_index)
@@ -2517,21 +2517,27 @@ pub(super) async fn drain_output_with_threshold(
         )
         .await?;
 
-        let data = client
-            .attach_output(session_id, ATTACH_OUTPUT_MAX_BYTES)
+        let drain = inspector
+            .drain_incremental_output(client, session_id, ATTACH_OUTPUT_MAX_BYTES)
             .await
             .map_err(|e| anyhow::anyhow!("drain output failed: {e}"))?;
 
-        if data.is_empty() {
+        if !drain.focused_output.is_empty() {
+            if let Some(ref mut dt) = *display_track {
+                let _ = dt.record_frame_bytes(&drain.focused_output);
+            }
+        }
+
+        if drain.had_activity {
+            idle_polls = 0;
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        } else if !drain.output_still_pending && !drain.any_sync_update_active {
             idle_polls += 1;
             if idle_polls >= idle_threshold {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
         } else {
-            if let Some(ref mut dt) = *display_track {
-                let _ = dt.record_frame_bytes(&data);
-            }
             idle_polls = 0;
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

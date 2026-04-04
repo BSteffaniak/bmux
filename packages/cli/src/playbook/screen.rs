@@ -1,15 +1,14 @@
-//! Screen inspector: parse terminal output and extract text content for assertions.
+//! Screen inspector: maintain persistent terminal parsers per pane and expose
+//! text/cursor state for playbook assertions.
 //!
-//! On each `refresh()`, a fresh `vt100::Parser` is created per pane and fed the
-//! snapshot chunk data. This avoids the re-feed problem: `attach_snapshot` returns
-//! the most recent bytes from a ring buffer (not cursor-based), so appending to an
-//! existing parser would double-process overlapping data and corrupt state.
-//!
-//! Pane dimensions are extracted from the `AttachScene` surface rects, which give
-//! exact pixel-accurate (cell-accurate) sizes for each pane including after splits.
+//! Unlike snapshot-tail reparsing, this keeps parser state alive and feeds
+//! incremental pane output chunks in stream order. This matches the incremental
+//! parser model used by mature multiplexers.
+
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, bail};
-use bmux_client::{AttachSnapshotState, BmuxClient};
+use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient};
 use regex::Regex;
 use serde::Serialize;
 use uuid::Uuid;
@@ -18,8 +17,10 @@ use super::types::PaneCapture;
 
 /// Maximum bytes to request per pane in a snapshot.
 const SNAPSHOT_MAX_BYTES_PER_PANE: usize = 256 * 1024;
+/// Maximum bytes to request per pane from incremental pane-output batches.
+const OUTPUT_BATCH_MAX_BYTES: usize = 256 * 1024;
 
-/// Parsed screen state for a single pane after one `refresh()` cycle.
+/// Parsed screen state for a single pane after one synchronization cycle.
 struct ParsedPane {
     _pane_id: Uuid,
     pane_index: u32,
@@ -29,15 +30,40 @@ struct ParsedPane {
     cursor_col: u16,
 }
 
+struct PaneStreamState {
+    pane_id: Uuid,
+    pane_index: u32,
+    focused: bool,
+    rows: u16,
+    cols: u16,
+    parser: vt100::Parser,
+    /// Expected start offset of the next incremental chunk for this pane.
+    /// None means no continuity baseline has been established yet.
+    expected_stream_start: Option<u64>,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct OutputDrainResult {
+    /// True when bytes were processed or a deterministic resync happened.
+    pub had_activity: bool,
+    /// Bytes from the currently focused pane in this drain call.
+    pub focused_output: Vec<u8>,
+    /// Server-side hint that more pane output remains to drain.
+    pub output_still_pending: bool,
+    /// True when at least one pane reports DEC 2026 synchronized-update active.
+    pub any_sync_update_active: bool,
+}
+
 /// Inspector that parses terminal output into text for assertions.
-///
-/// Stateless between `refresh()` calls — each refresh produces a complete,
-/// self-contained view of every pane's screen content.
 pub struct ScreenInspector {
-    /// Parsed pane state from the most recent `refresh()` call.
+    /// Parsed pane state from the most recent synchronization cycle.
     panes: Vec<ParsedPane>,
+    /// Persistent parser state keyed by pane id.
+    pane_states: BTreeMap<Uuid, PaneStreamState>,
     viewport_rows: u16,
     viewport_cols: u16,
+    session_id: Option<Uuid>,
+    needs_bootstrap: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -92,8 +118,11 @@ impl ScreenInspector {
     pub fn new(viewport_cols: u16, viewport_rows: u16) -> Self {
         Self {
             panes: Vec::new(),
+            pane_states: BTreeMap::new(),
             viewport_rows,
             viewport_cols,
+            session_id: None,
+            needs_bootstrap: true,
         }
     }
 
@@ -101,14 +130,124 @@ impl ScreenInspector {
         self.viewport_cols = cols;
         self.viewport_rows = rows;
         self.panes.clear();
+        self.pane_states.clear();
+        self.session_id = None;
+        self.needs_bootstrap = true;
     }
 
-    /// Fetch a fresh snapshot from the server and parse all pane screens.
-    ///
-    /// This creates a **fresh** vt100 parser for each pane on every call,
-    /// avoiding the re-feed problem with `read_recent` (sliding window) data.
-    /// Pane dimensions come from the scene's surface rects when available.
+    /// Synchronize layout/output and update parsed pane state.
     pub async fn refresh(
+        &mut self,
+        client: &mut BmuxClient,
+        session_id: Uuid,
+    ) -> Result<AttachSnapshotState> {
+        let (layout, _) = self
+            .sync_and_drain(client, session_id, OUTPUT_BATCH_MAX_BYTES)
+            .await?;
+        Ok(snapshot_from_layout(layout))
+    }
+
+    /// Drain one incremental pane-output batch and update parser state.
+    pub async fn drain_incremental_output(
+        &mut self,
+        client: &mut BmuxClient,
+        session_id: Uuid,
+        max_bytes_per_pane: usize,
+    ) -> Result<OutputDrainResult> {
+        let (_, drain) = self
+            .sync_and_drain(client, session_id, max_bytes_per_pane.max(1))
+            .await?;
+        Ok(drain)
+    }
+
+    async fn sync_and_drain(
+        &mut self,
+        client: &mut BmuxClient,
+        session_id: Uuid,
+        max_bytes_per_pane: usize,
+    ) -> Result<(AttachLayoutState, OutputDrainResult)> {
+        self.reset_for_session(session_id);
+
+        let mut layout = client
+            .attach_layout(session_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("layout failed: {e}"))?;
+
+        let pane_set_changed = self.apply_layout_state(&layout);
+        if pane_set_changed {
+            self.needs_bootstrap = true;
+        }
+
+        if self.needs_bootstrap {
+            let snapshot = self.bootstrap_from_snapshot(client, session_id).await?;
+            layout = layout_from_snapshot(&snapshot);
+            let _ = self.apply_layout_state(&layout);
+        }
+
+        let drain = self
+            .drain_output_batch(client, session_id, &layout, max_bytes_per_pane)
+            .await?;
+
+        self.rebuild_parsed_panes();
+        Ok((layout, drain))
+    }
+
+    fn reset_for_session(&mut self, session_id: Uuid) {
+        if self.session_id == Some(session_id) {
+            return;
+        }
+        self.session_id = Some(session_id);
+        self.panes.clear();
+        self.pane_states.clear();
+        self.needs_bootstrap = true;
+    }
+
+    fn apply_layout_state(&mut self, layout: &AttachLayoutState) -> bool {
+        let pane_ids = layout
+            .panes
+            .iter()
+            .map(|pane| pane.id)
+            .collect::<BTreeSet<_>>();
+        let existing_ids = self.pane_states.keys().copied().collect::<BTreeSet<_>>();
+        let pane_set_changed = pane_ids != existing_ids;
+
+        self.pane_states
+            .retain(|pane_id, _| pane_ids.contains(pane_id));
+
+        let pane_dims = build_pane_dimensions_from_scene(&layout.scene);
+        for pane in &layout.panes {
+            let (cols, rows) = pane_dims
+                .get(&pane.id)
+                .copied()
+                .unwrap_or_else(|| self.default_pane_dimensions());
+
+            let state = self
+                .pane_states
+                .entry(pane.id)
+                .or_insert_with(|| PaneStreamState {
+                    pane_id: pane.id,
+                    pane_index: pane.index,
+                    focused: pane.focused,
+                    rows,
+                    cols,
+                    parser: vt100::Parser::new(rows, cols, 4_096),
+                    expected_stream_start: None,
+                });
+
+            state.pane_index = pane.index;
+            state.focused = pane.focused;
+
+            if state.rows != rows || state.cols != cols {
+                state.rows = rows;
+                state.cols = cols;
+                state.parser.screen_mut().set_size(rows, cols);
+            }
+        }
+
+        pane_set_changed
+    }
+
+    async fn bootstrap_from_snapshot(
         &mut self,
         client: &mut BmuxClient,
         session_id: Uuid,
@@ -118,51 +257,153 @@ impl ScreenInspector {
             .await
             .map_err(|e| anyhow::anyhow!("snapshot failed: {e}"))?;
 
-        // Build pane dimension map from the scene surfaces.
-        let pane_dims = build_pane_dimensions(&snapshot);
+        let pane_dims = build_pane_dimensions_from_scene(&snapshot.scene);
 
-        // Parse each pane's chunk data with a fresh parser.
-        let mut parsed = Vec::new();
-        for pane_summary in &snapshot.panes {
-            let chunk = snapshot
+        let mut next_states = BTreeMap::new();
+        for pane in &snapshot.panes {
+            let (cols, rows) = pane_dims
+                .get(&pane.id)
+                .copied()
+                .unwrap_or_else(|| self.default_pane_dimensions());
+
+            let mut parser = vt100::Parser::new(rows, cols, 4_096);
+            if let Some(chunk) = snapshot
                 .chunks
                 .iter()
-                .find(|c| c.pane_id == pane_summary.id);
-
-            // Get pane dimensions: prefer scene rect, fall back to viewport estimate.
-            let (cols, rows) = pane_dims
-                .iter()
-                .find(|(id, _, _)| *id == pane_summary.id)
-                .map(|(_, w, h)| (*w, *h))
-                .unwrap_or_else(|| {
-                    (
-                        self.viewport_cols.saturating_sub(2).max(1),
-                        self.viewport_rows.saturating_sub(2).max(1),
-                    )
-                });
-
-            let mut parser = vt100::Parser::new(rows, cols, 4096);
-
-            if let Some(chunk) = chunk {
+                .find(|chunk| chunk.pane_id == pane.id)
+            {
                 parser.process(&chunk.data);
             }
 
-            let screen = parser.screen();
-            let text = screen_to_text(screen);
-            let (cursor_row, cursor_col) = screen.cursor_position();
-
-            parsed.push(ParsedPane {
-                _pane_id: pane_summary.id,
-                pane_index: pane_summary.index,
-                focused: pane_summary.focused,
-                screen_text: text,
-                cursor_row,
-                cursor_col,
-            });
+            next_states.insert(
+                pane.id,
+                PaneStreamState {
+                    pane_id: pane.id,
+                    pane_index: pane.index,
+                    focused: pane.focused,
+                    rows,
+                    cols,
+                    parser,
+                    // Snapshot data is a recent tail, not offset-addressed stream
+                    // data, so continuity baseline starts with the first batch.
+                    expected_stream_start: None,
+                },
+            );
         }
 
-        self.panes = parsed;
+        self.pane_states = next_states;
+        self.needs_bootstrap = false;
+        self.rebuild_parsed_panes();
+
         Ok(snapshot)
+    }
+
+    async fn drain_output_batch(
+        &mut self,
+        client: &mut BmuxClient,
+        session_id: Uuid,
+        layout: &AttachLayoutState,
+        max_bytes_per_pane: usize,
+    ) -> Result<OutputDrainResult> {
+        let pane_ids = layout.panes.iter().map(|pane| pane.id).collect::<Vec<_>>();
+        if pane_ids.is_empty() {
+            return Ok(OutputDrainResult::default());
+        }
+
+        let batch = client
+            .attach_pane_output_batch(session_id, pane_ids, max_bytes_per_pane.max(1))
+            .await
+            .map_err(|e| anyhow::anyhow!("pane output batch failed: {e}"))?;
+
+        self.apply_batch(layout, batch, client, session_id).await
+    }
+
+    async fn apply_batch(
+        &mut self,
+        layout: &AttachLayoutState,
+        batch: bmux_client::PaneOutputBatchResult,
+        client: &mut BmuxClient,
+        session_id: Uuid,
+    ) -> Result<OutputDrainResult> {
+        let mut result = OutputDrainResult {
+            had_activity: false,
+            focused_output: Vec::new(),
+            output_still_pending: batch.output_still_pending,
+            any_sync_update_active: false,
+        };
+
+        let mut needs_resync = false;
+        for chunk in batch.chunks {
+            if chunk.pane_id == layout.focused_pane_id && !chunk.data.is_empty() {
+                result.focused_output.extend_from_slice(&chunk.data);
+            }
+
+            result.any_sync_update_active |= chunk.sync_update_active;
+
+            let Some(state) = self.pane_states.get_mut(&chunk.pane_id) else {
+                needs_resync = true;
+                continue;
+            };
+
+            if chunk.stream_end < chunk.stream_start {
+                needs_resync = true;
+                continue;
+            }
+
+            if chunk.stream_gap {
+                needs_resync = true;
+                continue;
+            }
+
+            if let Some(expected) = state.expected_stream_start {
+                if chunk.stream_start != expected {
+                    needs_resync = true;
+                    continue;
+                }
+            }
+
+            if !chunk.data.is_empty() {
+                state.parser.process(&chunk.data);
+                result.had_activity = true;
+            }
+
+            state.expected_stream_start = Some(chunk.stream_end);
+        }
+
+        if needs_resync {
+            let _ = self.bootstrap_from_snapshot(client, session_id).await?;
+            result.had_activity = true;
+        }
+
+        Ok(result)
+    }
+
+    fn rebuild_parsed_panes(&mut self) {
+        let mut panes = self
+            .pane_states
+            .values()
+            .map(|state| {
+                let screen = state.parser.screen();
+                let (cursor_row, cursor_col) = screen.cursor_position();
+                ParsedPane {
+                    _pane_id: state.pane_id,
+                    pane_index: state.pane_index,
+                    focused: state.focused,
+                    screen_text: screen_to_text(screen),
+                    cursor_row,
+                    cursor_col,
+                }
+            })
+            .collect::<Vec<_>>();
+        panes.sort_by_key(|pane| pane.pane_index);
+        self.panes = panes;
+    }
+
+    fn default_pane_dimensions(&self) -> (u16, u16) {
+        (
+            self.viewport_cols.saturating_sub(2).max(1),
+            self.viewport_rows.saturating_sub(2).max(1),
+        )
     }
 
     /// Get the full screen text of a specific pane (by index).
@@ -229,7 +470,7 @@ impl ScreenInspector {
     /// Check if a pane's screen text contains a substring.
     pub fn pane_contains(&self, pane_index: u32, needle: &str) -> bool {
         self.pane_text(pane_index)
-            .map_or(false, |text| text.contains(needle))
+            .is_some_and(|text| text.contains(needle))
     }
 
     /// Check if a pane's screen text matches a regex.
@@ -242,7 +483,7 @@ impl ScreenInspector {
     /// Use this in hot loops (e.g. `wait-for` polling) to avoid recompiling.
     pub fn pane_matches_compiled(&self, pane_index: u32, re: &Regex) -> bool {
         self.pane_text(pane_index)
-            .map_or(false, |text| re.is_match(&text))
+            .is_some_and(|text| re.is_match(&text))
     }
 
     /// Resolve which pane index to inspect. If `pane` is `None`, uses the focused pane.
@@ -266,6 +507,32 @@ impl ScreenInspector {
                 .map(|p| p.index)
                 .context("no focused pane"),
         }
+    }
+}
+
+fn snapshot_from_layout(layout: AttachLayoutState) -> AttachSnapshotState {
+    AttachSnapshotState {
+        context_id: layout.context_id,
+        session_id: layout.session_id,
+        focused_pane_id: layout.focused_pane_id,
+        panes: layout.panes,
+        layout_root: layout.layout_root,
+        scene: layout.scene,
+        chunks: Vec::new(),
+        pane_mouse_protocols: Vec::new(),
+        zoomed: layout.zoomed,
+    }
+}
+
+fn layout_from_snapshot(snapshot: &AttachSnapshotState) -> AttachLayoutState {
+    AttachLayoutState {
+        context_id: snapshot.context_id,
+        session_id: snapshot.session_id,
+        focused_pane_id: snapshot.focused_pane_id,
+        panes: snapshot.panes.clone(),
+        layout_root: snapshot.layout_root.clone(),
+        scene: snapshot.scene.clone(),
+        zoomed: snapshot.zoomed,
     }
 }
 
@@ -388,24 +655,19 @@ fn text_hash(text: &str) -> String {
     format!("{hash:016x}")
 }
 
-/// Extract per-pane (cols, rows) from the scene's surface rects.
-///
-/// Each pane has an `AttachSurface` in the scene with `pane_id` set and a `rect`
-/// giving the exact cell dimensions.
-fn build_pane_dimensions(snapshot: &AttachSnapshotState) -> Vec<(Uuid, u16, u16)> {
-    snapshot
-        .scene
+/// Extract per-pane (cols, rows) from scene surface rects.
+fn build_pane_dimensions_from_scene(scene: &bmux_ipc::AttachScene) -> BTreeMap<Uuid, (u16, u16)> {
+    scene
         .surfaces
         .iter()
         .filter_map(|surface| {
             let pane_id = surface.pane_id?;
-            // Only consider visible pane surfaces
             if !surface.visible {
                 return None;
             }
-            let w = surface.rect.w.max(1);
-            let h = surface.rect.h.max(1);
-            Some((pane_id, w, h))
+            let cols = surface.rect.w.max(1);
+            let rows = surface.rect.h.max(1);
+            Some((pane_id, (cols, rows)))
         })
         .collect()
 }
@@ -420,7 +682,7 @@ fn screen_to_text(screen: &vt100::Screen) -> String {
     }
 
     // Trim trailing empty lines
-    while lines.last().map_or(false, |l| l.is_empty()) {
+    while lines.last().is_some_and(String::is_empty) {
         lines.pop();
     }
 
@@ -451,26 +713,16 @@ mod tests {
     }
 
     #[test]
-    fn fresh_parser_avoids_double_processing() {
-        // Simulates what would happen if we re-fed the same data twice
-        // to an accumulated parser vs. using a fresh one each time.
-        let data = b"hello\r\nworld\r\n";
+    fn incremental_parser_handles_split_alt_exit_sequence() {
+        let mut parser = vt100::Parser::new(30, 120, 4_096);
 
-        // Accumulated parser (old buggy approach): process same data twice
-        let mut accumulated = vt100::Parser::new(24, 80, 100);
-        accumulated.process(data);
-        accumulated.process(data); // re-feed!
-        let accumulated_text = screen_to_text(accumulated.screen());
+        parser.process(b"\x1b[12;34H");
+        parser.process(b"\x1b[?1049h\x1b[2J\x1b[HSEQ_TUI");
+        parser.process(b"\x1b[?10");
+        parser.process(b"49l");
 
-        // Fresh parser (correct approach): process once
-        let mut fresh = vt100::Parser::new(24, 80, 100);
-        fresh.process(data);
-        let fresh_text = screen_to_text(fresh.screen());
-
-        // The fresh parser should show "hello\nworld"
-        assert_eq!(fresh_text, "hello\nworld");
-        // The accumulated parser shows doubled output — this is the bug we fixed
-        assert_ne!(accumulated_text, fresh_text);
+        let (row, col) = parser.screen().cursor_position();
+        assert_eq!((row, col), (11, 33));
     }
 
     #[test]

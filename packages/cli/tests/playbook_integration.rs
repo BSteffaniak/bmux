@@ -209,7 +209,7 @@ fn playbook_synthetic_alt_sigint_reentry_restores_cursor() {
     let (json, pass) = run_playbook_fixture("synthetic_alt_sigint_reentry.dsl");
     assert!(
         pass,
-        "synthetic split 1049 exit sequence should restore cursor to pre-alt anchor: {json:#}"
+        "synthetic SIGINT alt-screen reentry should restore cursor to pre-alt anchor: {json:#}"
     );
 
     let steps = json["steps"].as_array().expect("steps should be array");
@@ -220,6 +220,25 @@ fn playbook_synthetic_alt_sigint_reentry_restores_cursor() {
     assert_eq!(
         cursor_step["status"], "pass",
         "cursor assertion should pass once reentry is correct: {json:#}"
+    );
+}
+
+#[test]
+fn playbook_synthetic_alt_split_exit_reentry_restores_cursor() {
+    let (json, pass) = run_playbook_fixture("synthetic_alt_split_exit_reentry.dsl");
+    assert!(
+        pass,
+        "synthetic split 1049 exit sequence should restore cursor to pre-alt anchor: {json:#}"
+    );
+
+    let steps = json["steps"].as_array().expect("steps should be array");
+    let cursor_step = steps
+        .iter()
+        .find(|step| step["action"] == "assert-cursor")
+        .expect("expected assert-cursor step in synthetic fixture");
+    assert_eq!(
+        cursor_step["status"], "pass",
+        "cursor assertion should pass once split-sequence parsing is correct: {json:#}"
     );
 }
 
@@ -381,6 +400,7 @@ fn parse_and_validate_fixtures() {
     let fixtures = [
         "alt_screen_exit_cursor.dsl",
         "synthetic_alt_sigint_reentry.dsl",
+        "synthetic_alt_split_exit_reentry.dsl",
         "echo_hello.dsl",
         "echo_assert.dsl",
         "multi_pane.dsl",
@@ -1262,10 +1282,14 @@ async fn interactive_mode_json_screen_delta_formats() {
 
     async fn read_json(reader: &mut (impl AsyncBufReadExt + Unpin)) -> serde_json::Value {
         let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .await
-            .expect("failed to read response line");
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            reader.read_line(&mut line),
+        )
+        .await
+        .expect("timed out waiting for response line")
+        .expect("failed to read response line");
+        assert!(read > 0, "unexpected EOF while waiting for response line");
         serde_json::from_str(line.trim())
             .unwrap_or_else(|e| panic!("failed to parse json line: {e}\nline: {line}"))
     }
@@ -1421,10 +1445,14 @@ async fn interactive_mode_watchpoint_event_burst_cursor_delta_hit() {
 
     async fn read_json(reader: &mut (impl AsyncBufReadExt + Unpin)) -> serde_json::Value {
         let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .await
-            .expect("failed to read response line");
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            reader.read_line(&mut line),
+        )
+        .await
+        .expect("timed out waiting for response line")
+        .expect("failed to read response line");
+        assert!(read > 0, "unexpected EOF while waiting for response line");
         serde_json::from_str(line.trim())
             .unwrap_or_else(|e| panic!("failed to parse json line: {e}\nline: {line}"))
     }
@@ -1573,10 +1601,14 @@ async fn interactive_mode_watchpoint_event_burst_screen_delta_hit_and_blocks_rec
 
     async fn read_json(reader: &mut (impl AsyncBufReadExt + Unpin)) -> serde_json::Value {
         let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .await
-            .expect("failed to read response line");
+        let read = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            reader.read_line(&mut line),
+        )
+        .await
+        .expect("timed out waiting for response line")
+        .expect("failed to read response line");
+        assert!(read > 0, "unexpected EOF while waiting for response line");
         serde_json::from_str(line.trim())
             .unwrap_or_else(|e| panic!("failed to parse json line: {e}\nline: {line}"))
     }

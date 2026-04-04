@@ -1469,6 +1469,13 @@ struct OutputFanoutBuffer {
     cursors: BTreeMap<ClientId, u64>,
 }
 
+struct OutputRead {
+    bytes: Vec<u8>,
+    stream_start: u64,
+    stream_end: u64,
+    stream_gap: bool,
+}
+
 impl OutputFanoutBuffer {
     fn new(max_bytes: usize) -> Self {
         Self {
@@ -1505,30 +1512,46 @@ impl OutputFanoutBuffer {
         }
     }
 
-    fn read_for_client(&mut self, client_id: ClientId, max_bytes: usize) -> Vec<u8> {
+    fn read_for_client(&mut self, client_id: ClientId, max_bytes: usize) -> OutputRead {
         let limit = max_bytes.max(1);
         let end = self.end_offset();
         let cursor = self.cursors.entry(client_id).or_insert(end);
+
+        let mut stream_gap = false;
         if *cursor < self.start_offset {
             *cursor = self.start_offset;
+            stream_gap = true;
         }
+
+        let stream_start = *cursor;
 
         let available = end.saturating_sub(*cursor) as usize;
         if available == 0 {
-            return Vec::new();
+            return OutputRead {
+                bytes: Vec::new(),
+                stream_start,
+                stream_end: stream_start,
+                stream_gap,
+            };
         }
 
         let to_read = available.min(limit);
         let start_index = (*cursor - self.start_offset) as usize;
-        let output = self
+        let bytes = self
             .data
             .iter()
             .skip(start_index)
             .take(to_read)
             .copied()
             .collect::<Vec<_>>();
-        *cursor = cursor.saturating_add(output.len() as u64);
-        output
+        *cursor = cursor.saturating_add(bytes.len() as u64);
+
+        OutputRead {
+            bytes,
+            stream_start,
+            stream_end: *cursor,
+            stream_gap,
+        }
     }
 
     fn read_recent(&self, max_bytes: usize) -> Vec<u8> {
@@ -3031,6 +3054,9 @@ impl SessionRuntimeManager {
             chunks.push(AttachPaneChunk {
                 pane_id,
                 data,
+                stream_start: 0,
+                stream_end: 0,
+                stream_gap: false,
                 sync_update_active: false,
             });
         }
@@ -3076,13 +3102,16 @@ impl SessionRuntimeManager {
                     .output_buffer
                     .lock()
                     .map_err(|_| SessionRuntimeError::Closed)?;
-                let data = output.read_for_client(client_id, allowed);
+                let read = output.read_for_client(client_id, allowed);
                 drop(output);
-                budget_remaining = budget_remaining.saturating_sub(data.len());
+                budget_remaining = budget_remaining.saturating_sub(read.bytes.len());
                 let sync_update_active = pane.sync_update_in_progress.load(Ordering::SeqCst);
                 chunks.push(AttachPaneChunk {
                     pane_id: *pane_id,
-                    data,
+                    data: read.bytes,
+                    stream_start: read.stream_start,
+                    stream_end: read.stream_end,
+                    stream_gap: read.stream_gap,
                     sync_update_active,
                 });
             }
@@ -3320,10 +3349,10 @@ impl SessionRuntimeManager {
             .output_buffer
             .lock()
             .map_err(|_| SessionRuntimeError::Closed)?;
-        let bytes = output.read_for_client(client_id, max_bytes);
+        let read = output.read_for_client(client_id, max_bytes);
         drop(output);
 
-        Ok(bytes)
+        Ok(read.bytes)
     }
 
     #[cfg(test)]
