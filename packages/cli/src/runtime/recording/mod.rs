@@ -1645,6 +1645,11 @@ fn export_recording_gif(
         max_frames.map_or(max_timeline_frames, |limit| limit.min(max_timeline_frames));
 
     let mut event_index = 0_usize;
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
     let mut active_images: Vec<bmux_ipc::AttachPaneImage> = Vec::new();
     for frame_idx in 0..target_frames {
         profiler.record_frame_considered();
@@ -1700,7 +1705,15 @@ fn export_recording_gif(
                 },
                 DisplayTrackEvent::StreamOpened { .. } | DisplayTrackEvent::StreamClosed => {}
                 DisplayTrackEvent::ImageUpdate { images } => {
-                    active_images = images.clone();
+                    #[cfg(any(
+                        feature = "image-sixel",
+                        feature = "image-kitty",
+                        feature = "image-iterm2"
+                    ))]
+                    {
+                        active_images = images.clone();
+                    }
+                    let _ = images; // suppress unused warning when no image features
                     frame_had_display_change = true;
                 }
             }
@@ -3719,8 +3732,11 @@ fn decode_attach_image_to_rgba(image: &bmux_ipc::AttachPaneImage) -> Option<(u32
 
         #[cfg(feature = "image-iterm2")]
         bmux_ipc::AttachImageProtocol::ITerm2 => {
-            // iTerm2 raw_data is the decoded file bytes (PNG, JPEG, GIF, etc.).
-            decode_image_bytes_to_rgba(&image.raw_data)
+            // iTerm2 raw_data is the OSC body (params + base64-encoded file).
+            // Parse the body to extract decoded image file bytes, then decode
+            // the image format (PNG, JPEG, GIF, etc.) to RGBA pixels.
+            let (_params, file_bytes) = bmux_image::codec::iterm2::parse_body(&image.raw_data)?;
+            decode_image_bytes_to_rgba(&file_bytes)
         }
 
         // When a protocol feature is disabled, we can't decode.
@@ -3846,6 +3862,10 @@ pub(super) struct DisplayCaptureWriter {
     started_at: Instant,
     writer: BufWriter<std::fs::File>,
     cursor_replay_state: CursorReplayState,
+    /// Whether the last recorded `ImageUpdate` had any images.
+    /// Used to avoid writing redundant empty `ImageUpdate` events on every
+    /// frame for sessions that never use images.
+    last_image_count: usize,
 }
 
 impl DisplayCaptureWriter {
@@ -3875,6 +3895,7 @@ impl DisplayCaptureWriter {
             started_at: Instant::now(),
             writer: BufWriter::new(file),
             cursor_replay_state: CursorReplayState::default(),
+            last_image_count: 0,
         };
         let (cell_width_px, cell_height_px, window_width_px, window_height_px) =
             capture_stream_open_metrics();
@@ -3949,9 +3970,18 @@ impl DisplayCaptureWriter {
 
     /// Record a snapshot of all visible pane images at the current frame time.
     /// The GIF exporter uses these to decode and overlay images onto the
-    /// rasterized text cell grid.  An empty list signals that all images were
-    /// cleared (screen clear, scroll off, etc.) and should not be skipped.
+    /// rasterized text cell grid.
+    ///
+    /// Skips the write when both the previous and current frames have no
+    /// images (avoids ~15 bytes/frame overhead for sessions without images).
+    /// An empty list IS recorded when transitioning from non-empty to empty,
+    /// which signals the GIF exporter to clear stale overlays.
     pub(super) fn record_images(&mut self, images: &[bmux_ipc::AttachPaneImage]) -> Result<()> {
+        let count = images.len();
+        if count == 0 && self.last_image_count == 0 {
+            return Ok(());
+        }
+        self.last_image_count = count;
         self.record(DisplayTrackEvent::ImageUpdate {
             images: images.to_vec(),
         })

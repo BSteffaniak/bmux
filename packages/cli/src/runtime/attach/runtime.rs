@@ -652,8 +652,16 @@ pub(crate) async fn run_session_attach_with_client(
                         view_state
                             .image_sequences
                             .insert(delta.pane_id, delta.sequence);
-                        // Replace the full image list for this pane.
-                        view_state.pane_images.insert(delta.pane_id, delta.added);
+                        // Apply delta incrementally: remove deleted images,
+                        // then append newly added ones.
+                        let images = view_state
+                            .pane_images
+                            .entry(delta.pane_id)
+                            .or_insert_with(Vec::new);
+                        if !delta.removed.is_empty() {
+                            images.retain(|img| !delta.removed.contains(&img.id));
+                        }
+                        images.extend(delta.added);
                         frame_needs_render = true;
                     }
                 }

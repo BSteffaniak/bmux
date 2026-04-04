@@ -214,8 +214,9 @@ impl ImageRegistry {
         self.images.retain_mut(|img| {
             if img.position.row < lines {
                 if img.position.row + img.cell_size.rows > lines {
+                    let original_row = img.position.row;
                     img.position.row = 0;
-                    img.cell_size.rows -= lines - img.position.row;
+                    img.cell_size.rows -= lines - original_row;
                     true
                 } else {
                     change_log.push(ChangeLogEntry::Removed {

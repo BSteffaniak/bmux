@@ -765,7 +765,7 @@ pub struct RecordingSummary {
 }
 
 /// Current recording format version.
-pub const RECORDING_FORMAT_VERSION: u32 = 4;
+pub const RECORDING_FORMAT_VERSION: u32 = 5;
 
 const fn recording_format_version_default() -> u32 {
     1 // pre-versioning recordings are treated as version 1
@@ -1266,13 +1266,17 @@ pub enum DisplayTrackEvent {
     Activity {
         kind: DisplayActivityKind,
     },
+    StreamClosed,
     /// Snapshot of all visible images for a set of panes at frame time.
     /// Used by the GIF exporter to overlay decoded images onto the
     /// rasterized text cell grid.
+    ///
+    /// Added in format version 5.  Placed after `StreamClosed` to preserve
+    /// the existing variant indices for backwards-compatible display track
+    /// deserialization.
     ImageUpdate {
         images: Vec<AttachPaneImage>,
     },
-    StreamClosed,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
