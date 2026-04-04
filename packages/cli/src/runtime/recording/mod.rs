@@ -1808,6 +1808,11 @@ fn export_recording_gif(
         };
 
         // Overlay decoded images onto the rasterized text frame.
+        #[cfg(any(
+            feature = "image-sixel",
+            feature = "image-kitty",
+            feature = "image-iterm2"
+        ))]
         if !active_images.is_empty() {
             overlay_display_track_images(
                 &mut pixels,
@@ -3669,6 +3674,11 @@ use bmux_ipc::{DisplayTrackEnvelope, DisplayTrackEvent};
 ///
 /// Returns `(width, height, rgba_pixels)` or `None` if decoding fails or the
 /// protocol is not supported at compile time.
+#[cfg(any(
+    feature = "image-sixel",
+    feature = "image-kitty",
+    feature = "image-iterm2"
+))]
 fn decode_attach_image_to_rgba(image: &bmux_ipc::AttachPaneImage) -> Option<(u32, u32, Vec<u8>)> {
     match image.protocol {
         #[cfg(feature = "image-sixel")]
@@ -3702,16 +3712,15 @@ fn decode_attach_image_to_rgba(image: &bmux_ipc::AttachPaneImage) -> Option<(u32
                 }
                 Some((w, h, rgba))
             } else {
-                // Likely PNG-compressed — decode via tiny_skia
-                decode_png_to_rgba(&image.raw_data)
+                // Likely PNG-compressed — decode via image crate
+                decode_image_bytes_to_rgba(&image.raw_data)
             }
         }
 
         #[cfg(feature = "image-iterm2")]
         bmux_ipc::AttachImageProtocol::ITerm2 => {
             // iTerm2 raw_data is the decoded file bytes (PNG, JPEG, GIF, etc.).
-            // Try PNG first via tiny_skia.
-            decode_png_to_rgba(&image.raw_data)
+            decode_image_bytes_to_rgba(&image.raw_data)
         }
 
         // When a protocol feature is disabled, we can't decode.
@@ -3720,29 +3729,27 @@ fn decode_attach_image_to_rgba(image: &bmux_ipc::AttachPaneImage) -> Option<(u32
     }
 }
 
-/// Attempt to decode PNG bytes to RGBA pixels using `tiny_skia::Pixmap`.
-fn decode_png_to_rgba(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
-    let pixmap = tiny_skia::Pixmap::decode_png(data).ok()?;
-    let w = pixmap.width();
-    let h = pixmap.height();
-    // tiny_skia stores premultiplied RGBA; we need straight RGBA for blitting.
-    let mut rgba = pixmap.take();
-    for pixel in rgba.chunks_exact_mut(4) {
-        let a = pixel[3];
-        if a > 0 && a < 255 {
-            // Un-premultiply: component = premultiplied * 255 / alpha
-            pixel[0] = ((u16::from(pixel[0]) * 255) / u16::from(a)).min(255) as u8;
-            pixel[1] = ((u16::from(pixel[1]) * 255) / u16::from(a)).min(255) as u8;
-            pixel[2] = ((u16::from(pixel[2]) * 255) / u16::from(a)).min(255) as u8;
-        }
-    }
-    Some((w, h, rgba))
+/// Decode image bytes (PNG, JPEG, GIF, BMP, etc.) to RGBA pixels using the
+/// `image` crate.  This is the primary decoder for kitty PNG payloads and
+/// all iTerm2 inline image formats.
+#[cfg(any(feature = "image-kitty", feature = "image-iterm2"))]
+fn decode_image_bytes_to_rgba(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let img = ::image::load_from_memory(data).ok()?;
+    let rgba = img.to_rgba8();
+    let w = rgba.width();
+    let h = rgba.height();
+    Some((w, h, rgba.into_raw()))
 }
 
 /// Composite decoded images onto an RGBA pixel frame buffer.
 ///
 /// Each image's position is in cell coordinates; we convert to pixels using
 /// the provided cell dimensions.
+#[cfg(any(
+    feature = "image-sixel",
+    feature = "image-kitty",
+    feature = "image-iterm2"
+))]
 fn overlay_display_track_images(
     frame: &mut [u8],
     frame_width: u32,
@@ -3773,6 +3780,11 @@ fn overlay_display_track_images(
 /// Alpha-blend `src` RGBA pixels onto `dst` RGBA frame at pixel offset (x, y).
 ///
 /// Pixels outside the frame bounds are silently clipped.
+#[cfg(any(
+    feature = "image-sixel",
+    feature = "image-kitty",
+    feature = "image-iterm2"
+))]
 fn blit_rgba(
     dst: &mut [u8],
     dst_w: u32,
@@ -3937,11 +3949,9 @@ impl DisplayCaptureWriter {
 
     /// Record a snapshot of all visible pane images at the current frame time.
     /// The GIF exporter uses these to decode and overlay images onto the
-    /// rasterized text cell grid.
+    /// rasterized text cell grid.  An empty list signals that all images were
+    /// cleared (screen clear, scroll off, etc.) and should not be skipped.
     pub(super) fn record_images(&mut self, images: &[bmux_ipc::AttachPaneImage]) -> Result<()> {
-        if images.is_empty() {
-            return Ok(());
-        }
         self.record(DisplayTrackEvent::ImageUpdate {
             images: images.to_vec(),
         })

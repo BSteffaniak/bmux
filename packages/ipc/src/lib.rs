@@ -2534,6 +2534,20 @@ mod tests {
                 kind: DisplayActivityKind::Input,
             },
             DisplayTrackEvent::FrameBytes { data: vec![] },
+            DisplayTrackEvent::ImageUpdate {
+                images: vec![AttachPaneImage {
+                    id: 42,
+                    protocol: AttachImageProtocol::Sixel,
+                    raw_data: vec![0x1b, 0x50, 0x71],
+                    position_row: 3,
+                    position_col: 5,
+                    cell_rows: 10,
+                    cell_cols: 20,
+                    pixel_width: 160,
+                    pixel_height: 80,
+                }],
+            },
+            DisplayTrackEvent::ImageUpdate { images: vec![] },
             DisplayTrackEvent::StreamClosed,
         ];
 

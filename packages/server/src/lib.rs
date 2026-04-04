@@ -2562,6 +2562,23 @@ impl SessionRuntimeManager {
                                         if let Ok(mut reg) = image_registry_for_reader.lock() {
                                             reg.scroll_up(scroll_delta);
                                         }
+                                        // Notify streaming clients that image positions shifted.
+                                        if image_dirty_for_reader
+                                            .compare_exchange(
+                                                false,
+                                                true,
+                                                Ordering::SeqCst,
+                                                Ordering::SeqCst,
+                                            )
+                                            .is_ok()
+                                        {
+                                            let _ = event_broadcast_for_reader.send(
+                                                Event::PaneImageAvailable {
+                                                    session_id: session_id.0,
+                                                    pane_id,
+                                                },
+                                            );
+                                        }
                                     }
                                 }
                                 if !reply.is_empty() {

@@ -54,6 +54,7 @@ font8x8 = { workspace = true }
 fontdb = { workspace = true }
 futures = { workspace = true }
 gif = { workspace = true }
+image = { workspace = true, optional = true }
 iroh = { workspace = true }
 moosicbox_log_runtime = { workspace = true, features = ["file"] }
 moosicbox_log_watch = { workspace = true, features = [
@@ -134,11 +135,13 @@ serde = ["bmux_event/serde", "bmux_session/serde", "bmux_terminal/serde"]
 # Terminal image protocol support
 image-iterm2 = [
     "dep:bmux_image",
+    "dep:image",
     "bmux_image/iterm2",
     "bmux_server/image-registry",
 ]
 image-kitty = [
     "dep:bmux_image",
+    "dep:image",
     "bmux_image/kitty",
     "bmux_server/image-registry",
 ]

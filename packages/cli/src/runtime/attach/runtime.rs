@@ -2505,20 +2505,27 @@ pub(crate) async fn render_attach_frame(
             feature = "image-iterm2"
         ))]
         {
-            let all_images: Vec<bmux_ipc::AttachPaneImage> = layout_state
-                .scene
-                .surfaces
-                .iter()
-                .filter_map(|surface| surface.pane_id)
-                .flat_map(|pane_id| {
-                    view_state
-                        .pane_images
-                        .get(&pane_id)
-                        .into_iter()
-                        .flatten()
-                        .cloned()
-                })
-                .collect();
+            let mut all_images: Vec<bmux_ipc::AttachPaneImage> = Vec::new();
+            for surface in &layout_state.scene.surfaces {
+                let Some(pane_id) = surface.pane_id else {
+                    continue;
+                };
+                if let Some(images) = view_state.pane_images.get(&pane_id) {
+                    for img in images {
+                        let mut adjusted = img.clone();
+                        // Offset pane-local coords by surface position + 1
+                        // for the pane border, matching the live compositor's
+                        // PaneRect translation in render_pane_images.
+                        adjusted.position_col = adjusted
+                            .position_col
+                            .saturating_add(surface.rect.x.saturating_add(1));
+                        adjusted.position_row = adjusted
+                            .position_row
+                            .saturating_add(surface.rect.y.saturating_add(1));
+                        all_images.push(adjusted);
+                    }
+                }
+            }
             let _ = capture.record_images(&all_images);
         }
     }
