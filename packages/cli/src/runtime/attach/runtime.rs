@@ -250,11 +250,19 @@ pub(crate) async fn run_session_attach_with_client(
     ))]
     {
         let mut caps = bmux_image::host_caps::detect_with_queries();
-        // Query cell pixel dimensions while we're in raw mode.
         let (cpw, cph) = bmux_image::host_caps::query_cell_pixel_size();
         caps.cell_pixel_width = cpw;
         caps.cell_pixel_height = cph;
         view_state.host_image_caps = caps;
+        // Cache the decode mode from config so we don't read config per-frame.
+        let img_cfg = attach_config.behavior.images.decode_mode;
+        view_state.image_decode_mode = match img_cfg {
+            bmux_config::ImageDecodeMode::Server => bmux_image::config::ImageDecodeMode::Server,
+            bmux_config::ImageDecodeMode::Client => bmux_image::config::ImageDecodeMode::Client,
+            bmux_config::ImageDecodeMode::Passthrough => {
+                bmux_image::config::ImageDecodeMode::Passthrough
+            }
+        };
     }
 
     // Async terminal event stream — replaces spawn_blocking + poll(15ms).
@@ -2423,24 +2431,7 @@ pub(crate) async fn render_attach_frame(
                         w: surface.rect.w,
                         h: surface.rect.h,
                     };
-                    let decode_mode = {
-                        let cfg = bmux_config::BmuxConfig::load()
-                            .unwrap_or_default()
-                            .behavior
-                            .images
-                            .decode_mode;
-                        match cfg {
-                            bmux_config::ImageDecodeMode::Server => {
-                                bmux_image::config::ImageDecodeMode::Server
-                            }
-                            bmux_config::ImageDecodeMode::Client => {
-                                bmux_image::config::ImageDecodeMode::Client
-                            }
-                            bmux_config::ImageDecodeMode::Passthrough => {
-                                bmux_image::config::ImageDecodeMode::Passthrough
-                            }
-                        }
-                    };
+                    let decode_mode = view_state.image_decode_mode;
                     let _ = bmux_image::compositor::render_pane_images(
                         &mut frame_bytes,
                         &pane_images,

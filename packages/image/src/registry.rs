@@ -86,6 +86,7 @@ impl ImageRegistry {
                 data,
                 position,
                 pixel_size,
+                ..
             } => {
                 let cell_size =
                     pixel_size_to_cells(pixel_size, cell_pixel_width, cell_pixel_height);
@@ -102,12 +103,12 @@ impl ImageRegistry {
             }
 
             #[cfg(feature = "kitty")]
-            ImageEvent::KittyCommand(cmd) => {
+            ImageEvent::KittyCommand { command: cmd, .. } => {
                 self.handle_kitty_command(cmd, cell_pixel_width, cell_pixel_height);
             }
 
             #[cfg(feature = "iterm2")]
-            ImageEvent::ITerm2Image { data, position } => {
+            ImageEvent::ITerm2Image { data, position, .. } => {
                 // iTerm2 images are base64-encoded; we don't know pixel size
                 // until decoding. Store with a placeholder size.
                 let pixel_size = ImagePixelSize {

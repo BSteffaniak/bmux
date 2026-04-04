@@ -307,4 +307,26 @@ mod tests {
         assert_eq!(caps.preferred_protocol(), None);
         assert!(!caps.any_supported());
     }
+
+    #[test]
+    fn parse_da1_with_sixel_attribute() {
+        // DA1 response with attribute 4 (sixel) present.
+        let response = b"\x1b[?62;4;6;22c";
+        let attrs = parse_da1_response(response).unwrap();
+        assert!(attrs.contains(&4));
+        assert!(attrs.contains(&62));
+    }
+
+    #[test]
+    fn parse_da1_without_sixel() {
+        let response = b"\x1b[?62;6;22c";
+        let attrs = parse_da1_response(response).unwrap();
+        assert!(!attrs.contains(&4));
+    }
+
+    #[test]
+    fn parse_da1_invalid_response() {
+        assert!(parse_da1_response(b"garbage").is_none());
+        assert!(parse_da1_response(b"\x1b[1;2R").is_none()); // not a DA response
+    }
 }

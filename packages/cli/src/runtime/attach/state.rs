@@ -157,13 +157,19 @@ pub struct AttachViewState {
         feature = "image-iterm2"
     ))]
     pub(crate) host_image_caps: bmux_image::HostImageCapabilities,
-    /// Tracks kitty images already transmitted to the host terminal.
     #[cfg(any(
         feature = "image-sixel",
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
     pub(crate) kitty_host_state: bmux_image::compositor::KittyHostState,
+    /// Cached image decode mode from config (read once at attach time).
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    pub(crate) image_decode_mode: bmux_image::config::ImageDecodeMode,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -232,6 +238,12 @@ impl AttachViewState {
                 feature = "image-iterm2"
             ))]
             kitty_host_state: bmux_image::compositor::KittyHostState::default(),
+            #[cfg(any(
+                feature = "image-sixel",
+                feature = "image-kitty",
+                feature = "image-iterm2"
+            ))]
+            image_decode_mode: bmux_image::config::ImageDecodeMode::Passthrough,
         }
     }
 

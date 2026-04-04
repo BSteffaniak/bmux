@@ -173,17 +173,27 @@ pub enum ImageEvent {
         data: Vec<u8>,
         position: ImagePosition,
         pixel_size: ImagePixelSize,
+        /// Byte offset in the filtered output where this image's ESC started.
+        /// Used by the caller to feed preceding bytes to the cursor tracker
+        /// before capturing the cursor position for image placement.
+        filtered_byte_offset: usize,
     },
 
     /// A kitty graphics command was extracted.
     #[cfg(feature = "kitty")]
-    KittyCommand(KittyCommand),
+    KittyCommand {
+        command: KittyCommand,
+        /// Byte offset in the filtered output where this command's ESC started.
+        filtered_byte_offset: usize,
+    },
 
     /// An iTerm2 inline image was extracted.
     #[cfg(feature = "iterm2")]
     ITerm2Image {
         data: Vec<u8>,
         position: ImagePosition,
+        /// Byte offset in the filtered output where this image's ESC started.
+        filtered_byte_offset: usize,
     },
 }
 
@@ -218,4 +228,39 @@ pub enum KittyDeleteSpecifier {
     All,
     ByImageId(u32),
     ByPlacementId { image_id: u32, placement_id: u32 },
+}
+
+impl ImageEvent {
+    /// Get the byte offset in the filtered output where this image started.
+    pub fn filtered_byte_offset(&self) -> usize {
+        match self {
+            #[cfg(feature = "sixel")]
+            Self::SixelImage {
+                filtered_byte_offset,
+                ..
+            } => *filtered_byte_offset,
+            #[cfg(feature = "kitty")]
+            Self::KittyCommand {
+                filtered_byte_offset,
+                ..
+            } => *filtered_byte_offset,
+            #[cfg(feature = "iterm2")]
+            Self::ITerm2Image {
+                filtered_byte_offset,
+                ..
+            } => *filtered_byte_offset,
+        }
+    }
+
+    /// Set the image position (used by the caller after resolving cursor pos).
+    pub fn set_position(&mut self, pos: ImagePosition) {
+        match self {
+            #[cfg(feature = "sixel")]
+            Self::SixelImage { position, .. } => *position = pos,
+            #[cfg(feature = "kitty")]
+            Self::KittyCommand { .. } => {}
+            #[cfg(feature = "iterm2")]
+            Self::ITerm2Image { position, .. } => *position = pos,
+        }
+    }
 }

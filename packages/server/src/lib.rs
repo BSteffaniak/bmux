@@ -1268,6 +1268,7 @@ fn image_event_to_recording_payload(event: &bmux_image::ImageEvent) -> Recording
             data,
             position,
             pixel_size,
+            ..
         } => RecordingPayload::Image {
             protocol: 0,
             position_row: position.row,
@@ -1279,8 +1280,7 @@ fn image_event_to_recording_payload(event: &bmux_image::ImageEvent) -> Recording
             data: data.clone(),
         },
         #[cfg(feature = "image-registry")]
-        bmux_image::ImageEvent::KittyCommand(cmd) => {
-            // Serialize the kitty command as raw APC bytes for recording.
+        bmux_image::ImageEvent::KittyCommand { command: cmd, .. } => {
             let mut apc_body = Vec::new();
             match cmd {
                 bmux_image::KittyCommand::Transmit {
@@ -1320,7 +1320,7 @@ fn image_event_to_recording_payload(event: &bmux_image::ImageEvent) -> Recording
             }
         }
         #[cfg(feature = "image-registry")]
-        bmux_image::ImageEvent::ITerm2Image { data, position } => RecordingPayload::Image {
+        bmux_image::ImageEvent::ITerm2Image { data, position, .. } => RecordingPayload::Image {
             protocol: 2,
             position_row: position.row,
             position_col: position.col,
@@ -2334,9 +2334,28 @@ impl SessionRuntimeManager {
                                 // pushed to the output buffer for vt100 parsing.
                                 #[cfg(feature = "image-registry")]
                                 let chunk = {
-                                    let cursor_pos = cursor_tracker.cursor_position();
-                                    let result = image_interceptor.process(chunk, cursor_pos);
+                                    let mut result = image_interceptor.process(chunk);
+
                                     if !result.events.is_empty() {
+                                        // Resolve cursor positions for each image event.
+                                        // Feed filtered bytes up to each event's offset
+                                        // to the cursor tracker, then capture position.
+                                        let mut cursor_fed_to = 0usize;
+                                        for event in &mut result.events {
+                                            let offset = event.filtered_byte_offset();
+                                            if offset > cursor_fed_to {
+                                                cursor_tracker.process(
+                                                    &result.filtered[cursor_fed_to..offset],
+                                                );
+                                                cursor_fed_to = offset;
+                                            }
+                                            let (row, col) = cursor_tracker.cursor_position();
+                                            event.set_position(bmux_image::ImagePosition {
+                                                row,
+                                                col,
+                                            });
+                                        }
+
                                         let (cpw, cph) = cell_pixel_size_for_reader
                                             .lock()
                                             .map(|s| *s)
@@ -2349,7 +2368,6 @@ impl SessionRuntimeManager {
                                             }
                                         }
                                         image_dirty_for_reader.store(true, Ordering::SeqCst);
-                                        // Record image events to the recording timeline.
                                         if let Ok(runtime) = recording_runtime.lock() {
                                             for event in &result.events {
                                                 let payload =

@@ -312,6 +312,11 @@ pub fn encode(pixels: &PixelBuffer) -> Option<Vec<u8>> {
                     }
                     let offset = (y * width + x) * bpp;
                     if offset + 2 < pixel_data.len() {
+                        // Skip transparent pixels (alpha < 128) for RGBA format.
+                        if bpp == 4 && offset + 3 < pixel_data.len() && pixel_data[offset + 3] < 128
+                        {
+                            continue;
+                        }
                         let pr = pixel_data[offset];
                         let pg = pixel_data[offset + 1];
                         let pb = pixel_data[offset + 2];

@@ -64,16 +64,14 @@ pub struct InterceptResult {
 /// trait shape suitable for future plugin extraction.
 pub struct ImageInterceptor {
     state: State,
-    /// Accumulation buffer for the current image sequence payload.
     buf: Vec<u8>,
-    /// Cursor position captured when an image sequence starts.
     capture_position: ImagePosition,
+    /// Byte offset in the filtered output when the current image's ESC was seen.
+    capture_filtered_offset: usize,
 
-    /// Buffer for DCS intermediate/parameter bytes before final byte.
     #[cfg(feature = "sixel")]
     dcs_intermediates: Vec<u8>,
 
-    /// Buffer for OSC prefix bytes to match `1337;File=`.
     #[cfg(feature = "iterm2")]
     osc_prefix: Vec<u8>,
 }
@@ -85,6 +83,7 @@ impl ImageInterceptor {
             state: State::Ground,
             buf: Vec::with_capacity(4096),
             capture_position: ImagePosition { row: 0, col: 0 },
+            capture_filtered_offset: 0,
             #[cfg(feature = "sixel")]
             dcs_intermediates: Vec::new(),
             #[cfg(feature = "iterm2")]
@@ -94,9 +93,12 @@ impl ImageInterceptor {
 
     /// Process a chunk of raw PTY output bytes.
     ///
-    /// `cursor_pos` is the current (row, col) of the pane's vt100 cursor,
-    /// used to record the placement position of images.
-    pub fn process(&mut self, input: &[u8], cursor_pos: (u16, u16)) -> InterceptResult {
+    /// Returns filtered bytes (images stripped) and image events with
+    /// `filtered_byte_offset` set.  The caller should use each event's
+    /// offset to feed filtered bytes to the cursor tracker and capture
+    /// the cursor position at the right moment, then call
+    /// `event.set_position(pos)` before passing to the registry.
+    pub fn process(&mut self, input: &[u8]) -> InterceptResult {
         let mut filtered = Vec::with_capacity(input.len());
         let mut events = Vec::new();
 
@@ -105,6 +107,9 @@ impl ImageInterceptor {
                 State::Ground => {
                     if byte == 0x1B {
                         self.state = State::Escape;
+                        // Record the filtered byte count at the ESC that
+                        // starts a potential image sequence.
+                        self.capture_filtered_offset = filtered.len();
                     } else {
                         filtered.push(byte);
                     }
@@ -118,10 +123,8 @@ impl ImageInterceptor {
                             self.state = State::DcsEntry;
                             self.dcs_intermediates.clear();
                             self.buf.clear();
-                            self.capture_position = ImagePosition {
-                                row: cursor_pos.0,
-                                col: cursor_pos.1,
-                            };
+                            // Position will be set by the caller using filtered_byte_offset.
+                            self.capture_position = ImagePosition { row: 0, col: 0 };
                         }
 
                         // APC: ESC _ — potential kitty graphics
@@ -129,10 +132,7 @@ impl ImageInterceptor {
                         b'_' => {
                             self.state = State::KittyBody;
                             self.buf.clear();
-                            self.capture_position = ImagePosition {
-                                row: cursor_pos.0,
-                                col: cursor_pos.1,
-                            };
+                            self.capture_position = ImagePosition { row: 0, col: 0 };
                         }
 
                         // OSC: ESC ] — potential iTerm2 inline image
@@ -141,10 +141,7 @@ impl ImageInterceptor {
                             self.state = State::OscEntry;
                             self.osc_prefix.clear();
                             self.buf.clear();
-                            self.capture_position = ImagePosition {
-                                row: cursor_pos.0,
-                                col: cursor_pos.1,
-                            };
+                            self.capture_position = ImagePosition { row: 0, col: 0 };
                         }
 
                         // Not an image-related sequence — pass through ESC + byte
@@ -194,12 +191,12 @@ impl ImageInterceptor {
                 #[cfg(feature = "sixel")]
                 State::SixelEscape => {
                     if byte == b'\\' {
-                        // ST — sixel complete.
                         let pixel_size = crate::codec::sixel::estimate_pixel_size(&self.buf);
                         events.push(ImageEvent::SixelImage {
                             data: std::mem::take(&mut self.buf),
                             position: self.capture_position,
                             pixel_size,
+                            filtered_byte_offset: self.capture_filtered_offset,
                         });
                         self.state = State::Ground;
                     } else {
@@ -220,7 +217,10 @@ impl ImageInterceptor {
                             if let Some(cmd) =
                                 crate::codec::kitty::parse_command(&self.buf, self.capture_position)
                             {
-                                events.push(ImageEvent::KittyCommand(cmd));
+                                events.push(ImageEvent::KittyCommand {
+                                    command: cmd,
+                                    filtered_byte_offset: self.capture_filtered_offset,
+                                });
                             }
                             self.buf.clear();
                             self.state = State::Ground;
@@ -247,7 +247,10 @@ impl ImageInterceptor {
                         if let Some(cmd) =
                             crate::codec::kitty::parse_command(&self.buf, self.capture_position)
                         {
-                            events.push(ImageEvent::KittyCommand(cmd));
+                            events.push(ImageEvent::KittyCommand {
+                                command: cmd,
+                                filtered_byte_offset: self.capture_filtered_offset,
+                            });
                         }
                         self.buf.clear();
                         self.state = State::Ground;
@@ -299,6 +302,7 @@ impl ImageInterceptor {
                             events.push(ImageEvent::ITerm2Image {
                                 data: std::mem::take(&mut self.buf),
                                 position: self.capture_position,
+                                filtered_byte_offset: self.capture_filtered_offset,
                             });
                             self.state = State::Ground;
                         }
@@ -309,10 +313,10 @@ impl ImageInterceptor {
                 #[cfg(feature = "iterm2")]
                 State::ITerm2Escape => {
                     if byte == b'\\' {
-                        // ST — iTerm2 image complete.
                         events.push(ImageEvent::ITerm2Image {
                             data: std::mem::take(&mut self.buf),
                             position: self.capture_position,
+                            filtered_byte_offset: self.capture_filtered_offset,
                         });
                         self.state = State::Ground;
                     } else {
@@ -356,7 +360,7 @@ mod tests {
     fn passthrough_non_image_data() {
         let mut interceptor = ImageInterceptor::new();
         let input = b"hello world\x1b[31mred\x1b[0m";
-        let result = interceptor.process(input, (0, 0));
+        let result = interceptor.process(input);
         assert_eq!(result.filtered, input.to_vec());
         assert!(result.events.is_empty());
     }
@@ -372,13 +376,16 @@ mod tests {
         input.extend_from_slice(b"\x1b\\");
         input.extend_from_slice(b"after");
 
-        let result = interceptor.process(&input, (5, 10));
+        let result = interceptor.process(&input);
         assert_eq!(result.filtered, b"after");
         assert_eq!(result.events.len(), 1);
         match &result.events[0] {
-            ImageEvent::SixelImage { position, .. } => {
-                assert_eq!(position.row, 5);
-                assert_eq!(position.col, 10);
+            ImageEvent::SixelImage {
+                filtered_byte_offset,
+                ..
+            } => {
+                // Position is (0,0) placeholder; caller resolves via offset.
+                assert_eq!(*filtered_byte_offset, 0); // ESC was at start, no filtered bytes before it.
             }
             #[allow(unreachable_patterns)]
             _ => panic!("expected SixelImage event"),
@@ -391,7 +398,7 @@ mod tests {
         let mut interceptor = ImageInterceptor::new();
         // ESC _ X ... ESC \  (not 'G', so not kitty graphics)
         let input = b"\x1b_Xhello\x1b\\";
-        let result = interceptor.process(input, (0, 0));
+        let result = interceptor.process(input);
         // The ESC _ X should be passed through, then "hello\x1b\\" are ground bytes
         assert!(!result.filtered.is_empty());
         assert!(result.events.is_empty());
@@ -407,16 +414,9 @@ mod tests {
         input.push(0x07); // BEL terminator
         input.extend_from_slice(b"after");
 
-        let result = interceptor.process(&input, (3, 7));
+        let result = interceptor.process(&input);
         assert_eq!(result.filtered, b"after");
         assert_eq!(result.events.len(), 1);
-        match &result.events[0] {
-            ImageEvent::ITerm2Image { position, .. } => {
-                assert_eq!(position.row, 3);
-                assert_eq!(position.col, 7);
-            }
-            #[allow(unreachable_patterns)]
-            _ => panic!("expected ITerm2Image event"),
-        }
+        assert_eq!(result.events[0].filtered_byte_offset(), 0);
     }
 }
