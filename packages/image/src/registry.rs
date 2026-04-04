@@ -535,4 +535,36 @@ mod tests {
         assert_eq!(reg.images().len(), 1);
         assert_eq!(reg.images()[0].position.row, 2);
     }
+
+    #[test]
+    fn scroll_up_partial_clip_preserves_visible_rows() {
+        let mut reg = ImageRegistry::new(10, 0);
+        // Image at row 2, spanning 5 rows (rows 2..7).
+        reg.add_image(
+            ImageProtocol::Sixel,
+            ImagePayload::default(),
+            ImagePosition { row: 2, col: 0 },
+            ImageCellSize { rows: 5, cols: 5 },
+            ImagePixelSize {
+                width: 40,
+                height: 80,
+            },
+        );
+
+        // Scroll up by 4: rows 0..4 disappear. The image originally at rows
+        // 2..7 loses its top 2 rows (rows 2..4) and keeps the bottom 3 (rows
+        // 4..7, now shifted to 0..3).
+        reg.scroll_up(4);
+
+        assert_eq!(reg.images().len(), 1);
+        let img = &reg.images()[0];
+        assert_eq!(
+            img.position.row, 0,
+            "partially clipped image should be at row 0"
+        );
+        assert_eq!(
+            img.cell_size.rows, 3,
+            "image should keep 3 visible rows (original 5 minus 2 clipped)"
+        );
+    }
 }

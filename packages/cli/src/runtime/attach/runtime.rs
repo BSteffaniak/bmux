@@ -571,6 +571,7 @@ pub(crate) async fn run_session_attach_with_client(
             ))]
             {
                 view_state.image_sequences.clear();
+                view_state.pane_images.clear();
                 view_state.kitty_host_state.transmitted.clear();
                 image_fetch_pending = true;
             }
@@ -612,6 +613,14 @@ pub(crate) async fn run_session_attach_with_client(
                 .retain(|pane_id, _| active_pane_ids.contains(pane_id));
             view_state
                 .pane_mouse_protocol_hints
+                .retain(|pane_id, _| active_pane_ids.contains(pane_id));
+            #[cfg(any(
+                feature = "image-sixel",
+                feature = "image-kitty",
+                feature = "image-iterm2"
+            ))]
+            view_state
+                .pane_images
                 .retain(|pane_id, _| active_pane_ids.contains(pane_id));
 
             // Drain all available pane output before rendering to avoid
