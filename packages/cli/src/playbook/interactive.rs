@@ -817,6 +817,17 @@ async fn run_interactive_session_managed(
     }
 }
 
+enum ReplLoopEvent {
+    Timeout,
+    InputLine(String),
+    InputEof,
+    InputError(String),
+    PaneOutput(u32, String),
+    PaneOutputClosed,
+    ServerEvent(bmux_client::ServerEvent),
+    ServerEventClosed,
+}
+
 /// The core read-eval-respond loop.
 #[allow(clippy::too_many_arguments)]
 async fn run_repl(
@@ -838,8 +849,7 @@ async fn run_repl(
     sandbox: &super::sandbox::SandboxServer,
 ) -> Result<()> {
     let (reader, mut writer) = tokio::io::split(stream);
-    let mut reader = BufReader::new(reader);
-    let mut line = String::new();
+    let mut input_lines = BufReader::new(reader).lines();
 
     // Channel for push output events (populated when subscribed).
     let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<(u32, String)>(64);
@@ -855,238 +865,90 @@ async fn run_repl(
     let mut watchpoints = WatchpointRegistry::default();
 
     loop {
-        // Check session timeout.
-        if let Some(dl) = deadline {
-            if Instant::now() >= dl {
+        let loop_event = tokio::select! {
+            _ = async {
+                if let Some(dl) = deadline {
+                    tokio::time::sleep_until(tokio::time::Instant::from_std(dl)).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => ReplLoopEvent::Timeout,
+            message = input_lines.next_line() => {
+                match message {
+                    Ok(Some(line)) => ReplLoopEvent::InputLine(line),
+                    Ok(None) => ReplLoopEvent::InputEof,
+                    Err(error) => ReplLoopEvent::InputError(error.to_string()),
+                }
+            }
+            event = output_rx.recv(), if subscription.active => {
+                match event {
+                    Some((pane_idx, data)) => ReplLoopEvent::PaneOutput(pane_idx, data),
+                    None => ReplLoopEvent::PaneOutputClosed,
+                }
+            }
+            event = server_event_rx.recv(), if subscription.active => {
+                match event {
+                    Some(server_event) => ReplLoopEvent::ServerEvent(server_event),
+                    None => ReplLoopEvent::ServerEventClosed,
+                }
+            }
+        };
+
+        let mut trimmed = match loop_event {
+            ReplLoopEvent::Timeout => {
                 let resp = InteractiveResponse::error("session timeout exceeded".to_string());
                 send_response(&mut writer, &mut sequencer, resp, "error", None).await?;
                 break;
             }
-        }
-
-        // Read next command, optionally interleaved with push events.
-        line.clear();
-
-        // Drain any pending push events before blocking on the next command.
-        if subscription.active {
-            while let Ok((pane_idx, data)) = output_rx.try_recv() {
-                let mut output_seq = None;
-                if subscription.wants("pane_output") && subscription.allows_pane(pane_idx) {
-                    let mut push = InteractiveResponse::push_output(pane_idx, data.clone());
-                    push.event_type = Some("pane_output".to_string());
-                    output_seq = send_event_if_allowed(
-                        &mut writer,
-                        &mut sequencer,
-                        &mut event_buffer,
-                        &subscription,
-                        &mut budget_state,
-                        push,
-                        "pane_output",
-                        Some(pane_idx),
-                    )
-                    .await?;
+            ReplLoopEvent::InputLine(line) => {
+                let trimmed = line.trim().to_string();
+                if trimmed.is_empty() {
+                    continue;
                 }
-                if subscription.wants("watchpoint_hit")
-                    && !watchpoints.is_empty()
-                    && subscription.allows_pane(pane_idx)
-                {
-                    for hit in evaluate_watchpoints(
-                        &mut watchpoints,
-                        "pane_output",
-                        Some(pane_idx),
-                        output_seq,
-                        None,
-                        Some(&data),
-                    ) {
-                        let response = InteractiveResponse::event_watchpoint_hit(hit);
-                        send_response(&mut writer, &mut sequencer, response, "event", None).await?;
-                    }
-                }
-                emit_screen_events(
-                    &mut writer,
-                    &mut sequencer,
-                    &mut event_buffer,
-                    &mut budget_state,
-                    client,
-                    inspector,
-                    session_id,
-                    attached,
-                    &subscription,
-                    &mut pane_cache,
-                    &mut watchpoints,
-                )
-                .await?;
+                trimmed
             }
-            while let Ok(event) = server_event_rx.try_recv() {
-                let mut event_seq = None;
-                if subscription.wants("server_event") {
-                    let payload = ServerEventPayload {
-                        name: server_event_name(&event).to_string(),
-                        payload: serde_json::to_value(&event)?,
-                    };
-                    let response = InteractiveResponse::event_server_event(payload);
-                    event_seq = send_event_if_allowed(
-                        &mut writer,
-                        &mut sequencer,
-                        &mut event_buffer,
-                        &subscription,
-                        &mut budget_state,
-                        response,
-                        "server_event",
-                        None,
-                    )
-                    .await?;
-                }
-                if subscription.wants("watchpoint_hit") && !watchpoints.is_empty() {
-                    for hit in evaluate_watchpoints(
-                        &mut watchpoints,
-                        "server_event",
-                        None,
-                        event_seq,
-                        None,
-                        Some(server_event_name(&event)),
-                    ) {
-                        let response = InteractiveResponse::event_watchpoint_hit(hit);
-                        let _ = send_event_if_allowed(
-                            &mut writer,
-                            &mut sequencer,
-                            &mut event_buffer,
-                            &subscription,
-                            &mut budget_state,
-                            response,
-                            "watchpoint_hit",
-                            None,
-                        )
-                        .await?;
-                    }
-                }
-            }
-        }
-
-        let read_result = if let Some(dl) = deadline {
-            let remaining = dl.saturating_duration_since(Instant::now());
-            match tokio::time::timeout(remaining, reader.read_line(&mut line)).await {
-                Ok(result) => result,
-                Err(_) => {
-                    let resp = InteractiveResponse::error("session timeout exceeded".to_string());
-                    send_response(&mut writer, &mut sequencer, resp, "error", None).await?;
-                    break;
-                }
-            }
-        } else {
-            reader.read_line(&mut line).await
-        };
-
-        match read_result {
-            Ok(0) => break, // EOF — client disconnected
-            Ok(_) => {}
-            Err(e) => {
-                warn!("read error: {e}");
+            ReplLoopEvent::InputEof => break,
+            ReplLoopEvent::InputError(error) => {
+                warn!("read error: {error}");
                 break;
             }
-        }
-
-        let mut trimmed = line.trim().to_string();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let active_request_id: Option<String>;
-
-        // Drain push events that arrived during the command read.
-        if subscription.active {
-            while let Ok((pane_idx, data)) = output_rx.try_recv() {
-                let mut output_seq = None;
-                if subscription.wants("pane_output") && subscription.allows_pane(pane_idx) {
-                    let mut push = InteractiveResponse::push_output(pane_idx, data.clone());
-                    push.event_type = Some("pane_output".to_string());
-                    output_seq = send_event_if_allowed(
-                        &mut writer,
-                        &mut sequencer,
-                        &mut event_buffer,
-                        &subscription,
-                        &mut budget_state,
-                        push,
-                        "pane_output",
-                        Some(pane_idx),
-                    )
-                    .await?;
-                }
-                if subscription.wants("watchpoint_hit")
-                    && !watchpoints.is_empty()
-                    && subscription.allows_pane(pane_idx)
-                {
-                    for hit in evaluate_watchpoints(
-                        &mut watchpoints,
-                        "pane_output",
-                        Some(pane_idx),
-                        output_seq,
-                        None,
-                        Some(&data),
-                    ) {
-                        let response = InteractiveResponse::event_watchpoint_hit(hit);
-                        send_response(&mut writer, &mut sequencer, response, "event", None).await?;
-                    }
-                }
-                emit_screen_events(
+            ReplLoopEvent::PaneOutput(pane_idx, data) => {
+                process_pane_output_event(
                     &mut writer,
                     &mut sequencer,
                     &mut event_buffer,
+                    &subscription,
                     &mut budget_state,
+                    &mut watchpoints,
                     client,
                     inspector,
                     session_id,
                     attached,
-                    &subscription,
                     &mut pane_cache,
-                    &mut watchpoints,
+                    pane_idx,
+                    data,
                 )
                 .await?;
+                continue;
             }
-            while let Ok(event) = server_event_rx.try_recv() {
-                let mut event_seq = None;
-                if subscription.wants("server_event") {
-                    let payload = ServerEventPayload {
-                        name: server_event_name(&event).to_string(),
-                        payload: serde_json::to_value(&event)?,
-                    };
-                    let response = InteractiveResponse::event_server_event(payload);
-                    event_seq = send_event_if_allowed(
-                        &mut writer,
-                        &mut sequencer,
-                        &mut event_buffer,
-                        &subscription,
-                        &mut budget_state,
-                        response,
-                        "server_event",
-                        None,
-                    )
-                    .await?;
-                }
-                if subscription.wants("watchpoint_hit") && !watchpoints.is_empty() {
-                    for hit in evaluate_watchpoints(
-                        &mut watchpoints,
-                        "server_event",
-                        None,
-                        event_seq,
-                        None,
-                        Some(server_event_name(&event)),
-                    ) {
-                        let response = InteractiveResponse::event_watchpoint_hit(hit);
-                        let _ = send_event_if_allowed(
-                            &mut writer,
-                            &mut sequencer,
-                            &mut event_buffer,
-                            &subscription,
-                            &mut budget_state,
-                            response,
-                            "watchpoint_hit",
-                            None,
-                        )
-                        .await?;
-                    }
-                }
+            ReplLoopEvent::ServerEvent(event) => {
+                process_server_event(
+                    &mut writer,
+                    &mut sequencer,
+                    &mut event_buffer,
+                    &subscription,
+                    &mut budget_state,
+                    &mut watchpoints,
+                    event,
+                )
+                .await?;
+                continue;
             }
-        }
+            ReplLoopEvent::PaneOutputClosed | ReplLoopEvent::ServerEventClosed => {
+                continue;
+            }
+        };
+        let active_request_id: Option<String>;
 
         if let Ok(json) = serde_json::from_str::<InteractiveJsonRequest>(&trimmed) {
             if json.op == "command" {
@@ -1799,6 +1661,128 @@ fn update_pane_cache_from_inspector(
     for pane in inspector.capture_all() {
         pane_cache.insert(pane.index, pane);
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn process_pane_output_event<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    sequencer: &mut MessageSequencer,
+    event_buffer: &mut EventBuffer,
+    subscription: &LiveSubscription,
+    budget_state: &mut EventBudgetState,
+    watchpoints: &mut WatchpointRegistry,
+    client: &mut bmux_client::BmuxClient,
+    inspector: &mut ScreenInspector,
+    session_id: &Option<Uuid>,
+    attached: &bool,
+    pane_cache: &mut std::collections::HashMap<u32, PaneCapture>,
+    pane_idx: u32,
+    data: String,
+) -> Result<()> {
+    let mut output_seq = None;
+    if subscription.wants("pane_output") && subscription.allows_pane(pane_idx) {
+        let mut push = InteractiveResponse::push_output(pane_idx, data.clone());
+        push.event_type = Some("pane_output".to_string());
+        output_seq = send_event_if_allowed(
+            writer,
+            sequencer,
+            event_buffer,
+            subscription,
+            budget_state,
+            push,
+            "pane_output",
+            Some(pane_idx),
+        )
+        .await?;
+    }
+
+    if subscription.wants("watchpoint_hit")
+        && !watchpoints.is_empty()
+        && subscription.allows_pane(pane_idx)
+    {
+        for hit in evaluate_watchpoints(
+            watchpoints,
+            "pane_output",
+            Some(pane_idx),
+            output_seq,
+            None,
+            Some(&data),
+        ) {
+            let response = InteractiveResponse::event_watchpoint_hit(hit);
+            send_response(writer, sequencer, response, "event", None).await?;
+        }
+    }
+
+    emit_screen_events(
+        writer,
+        sequencer,
+        event_buffer,
+        budget_state,
+        client,
+        inspector,
+        session_id,
+        attached,
+        subscription,
+        pane_cache,
+        watchpoints,
+    )
+    .await
+}
+
+async fn process_server_event<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    sequencer: &mut MessageSequencer,
+    event_buffer: &mut EventBuffer,
+    subscription: &LiveSubscription,
+    budget_state: &mut EventBudgetState,
+    watchpoints: &mut WatchpointRegistry,
+    event: bmux_client::ServerEvent,
+) -> Result<()> {
+    let mut event_seq = None;
+    if subscription.wants("server_event") {
+        let payload = ServerEventPayload {
+            name: server_event_name(&event).to_string(),
+            payload: serde_json::to_value(&event)?,
+        };
+        let response = InteractiveResponse::event_server_event(payload);
+        event_seq = send_event_if_allowed(
+            writer,
+            sequencer,
+            event_buffer,
+            subscription,
+            budget_state,
+            response,
+            "server_event",
+            None,
+        )
+        .await?;
+    }
+
+    if subscription.wants("watchpoint_hit") && !watchpoints.is_empty() {
+        for hit in evaluate_watchpoints(
+            watchpoints,
+            "server_event",
+            None,
+            event_seq,
+            None,
+            Some(server_event_name(&event)),
+        ) {
+            let response = InteractiveResponse::event_watchpoint_hit(hit);
+            let _ = send_event_if_allowed(
+                writer,
+                sequencer,
+                event_buffer,
+                subscription,
+                budget_state,
+                response,
+                "watchpoint_hit",
+                None,
+            )
+            .await?;
+        }
+    }
+
+    Ok(())
 }
 
 async fn emit_screen_events<W: tokio::io::AsyncWrite + Unpin>(

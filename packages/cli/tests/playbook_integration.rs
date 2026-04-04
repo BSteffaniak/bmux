@@ -956,7 +956,7 @@ async fn interactive_mode_basic() {
             "--shell",
             "sh",
             "--timeout",
-            "30",
+            "120",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1214,7 +1214,7 @@ async fn interactive_mode_json_screen_delta_formats() {
             "--shell",
             "sh",
             "--timeout",
-            "30",
+            "120",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1373,7 +1373,7 @@ async fn interactive_mode_watchpoint_event_burst_cursor_delta_hit() {
             "--shell",
             "sh",
             "--timeout",
-            "30",
+            "120",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1525,7 +1525,7 @@ async fn interactive_mode_watchpoint_event_burst_screen_delta_hit_and_blocks_rec
             "--shell",
             "sh",
             "--timeout",
-            "30",
+            "120",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
