@@ -1437,6 +1437,7 @@ async fn run_repl(
 
         let step_start = Instant::now();
         let mut no_display_track: Option<super::display_track::PlaybookDisplayTrackWriter> = None;
+        let mut no_visual_interactive: Option<super::engine::VisualInteractiveState> = None;
         let result = execute_step(
             &step,
             client,
@@ -1451,6 +1452,9 @@ async fn run_repl(
             step_deadline,
             &mut no_display_track,
             runtime_vars,
+            &mut no_visual_interactive,
+            step.index,
+            step.index.saturating_add(1),
         )
         .await;
 
@@ -1709,7 +1713,18 @@ async fn drain_and_capture(
     inspector: &mut ScreenInspector,
     session_id: Uuid,
 ) -> Result<Vec<PaneCapture>> {
-    drain_output_until_idle(client, session_id, Duration::from_millis(200), &mut None).await?;
+    let mut no_visual_interactive: Option<super::engine::VisualInteractiveState> = None;
+    let mut no_display_track: Option<super::display_track::PlaybookDisplayTrackWriter> = None;
+    drain_output_until_idle(
+        client,
+        inspector,
+        session_id,
+        Duration::from_millis(200),
+        &mut no_display_track,
+        &mut no_visual_interactive,
+        true,
+    )
+    .await?;
     let _snapshot = inspector.refresh(client, session_id).await?;
     Ok(inspector.capture_all())
 }

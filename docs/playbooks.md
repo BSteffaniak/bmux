@@ -57,16 +57,20 @@ bmux playbook run <source> [flags]
 echo 'new-session\nsend-keys keys="echo hi\\r"\nwait-for pattern="hi"' | bmux playbook run - --json
 ```
 
-**Interactive step control:**
+**Interactive live tour:**
 
-Use `--interactive` to pause before each step. Controls are read from stdin and
-status text is printed to stderr:
+Use `--interactive` from a real terminal (TTY) to enter a full-screen live tour
+that continuously renders pane output while the playbook runs.
 
-- `n` or Enter: run next step
-- `c`: continue remaining steps without pausing
-- `s`: print current pane screen capture
-- `:<dsl>`: execute an ad-hoc DSL action in the same session
-- `q`: abort run (remaining steps are marked skipped)
+- `space`: pause/resume live playback
+- `n`: single-step one playbook step (when paused)
+- `c` / `l`: return to live running mode
+- `:<dsl>`: run an ad-hoc DSL action at step boundaries
+- `q`: abort run (remaining scheduled steps are marked skipped)
+- `?`: show control help in the status line
+
+If stdin/stdout are not TTYs (for example piped input in CI), `--interactive`
+automatically falls back to the line-prompt controls.
 
 ### `bmux playbook validate`
 

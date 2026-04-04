@@ -2,17 +2,24 @@
 //!
 //! Orchestrates the full lifecycle: parse → sandbox → execute steps → report.
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use bmux_client::BmuxClient;
 use bmux_ipc::{InvokeServiceKind, PaneFocusDirection, PaneSplitDirection, SessionSelector};
 use bmux_keyboard::{KeyCode as BmuxKeyCode, KeyStroke};
+use crossterm::cursor::{Hide, MoveTo, Show};
 use crossterm::event::{
     Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent, KeyEventKind, KeyEventState,
     KeyModifiers,
 };
+use crossterm::style::Print;
+use crossterm::terminal::{
+    self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode,
+    enable_raw_mode,
+};
+use crossterm::{execute, queue};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -31,6 +38,476 @@ const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Max bytes to read from attach output per drain cycle.
 const ATTACH_OUTPUT_MAX_BYTES: usize = 256 * 1024;
+
+const VISUAL_RENDER_INTERVAL: Duration = Duration::from_millis(50);
+const VISUAL_REFRESH_INTERVAL: Duration = Duration::from_millis(60);
+const VISUAL_PAUSE_POLL_INTERVAL: Duration = Duration::from_millis(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PlaybookInteractiveMode {
+    Disabled,
+    Prompt,
+    Visual,
+}
+
+fn resolve_interactive_mode(
+    interactive_requested: bool,
+    stdin_is_tty: bool,
+    stdout_is_tty: bool,
+) -> PlaybookInteractiveMode {
+    if !interactive_requested {
+        return PlaybookInteractiveMode::Disabled;
+    }
+    if stdin_is_tty && stdout_is_tty {
+        PlaybookInteractiveMode::Visual
+    } else {
+        PlaybookInteractiveMode::Prompt
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisualCheckpointPhase {
+    BeforeStep,
+    InStep,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisualControlAction {
+    TogglePause,
+    StepOnce,
+    ContinueLive,
+    Abort,
+    Help,
+    PromptDsl,
+}
+
+#[derive(Debug)]
+struct InteractiveAbort;
+
+impl std::fmt::Display for InteractiveAbort {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "interactive run aborted by operator")
+    }
+}
+
+impl std::error::Error for InteractiveAbort {}
+
+fn parse_visual_control_action(key: KeyEvent) -> Option<VisualControlAction> {
+    if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return None;
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(
+            key.code,
+            CrosstermKeyCode::Char('c') | CrosstermKeyCode::Char('d')
+        )
+    {
+        return Some(VisualControlAction::Abort);
+    }
+
+    match key.code {
+        CrosstermKeyCode::Char(' ') => Some(VisualControlAction::TogglePause),
+        CrosstermKeyCode::Char('n') => Some(VisualControlAction::StepOnce),
+        CrosstermKeyCode::Char('c') | CrosstermKeyCode::Char('l') => {
+            Some(VisualControlAction::ContinueLive)
+        }
+        CrosstermKeyCode::Char('q') | CrosstermKeyCode::Esc => Some(VisualControlAction::Abort),
+        CrosstermKeyCode::Char(':') => Some(VisualControlAction::PromptDsl),
+        CrosstermKeyCode::Char('?') | CrosstermKeyCode::Char('h') => {
+            Some(VisualControlAction::Help)
+        }
+        _ => None,
+    }
+}
+
+struct VisualTerminalGuard {
+    active: bool,
+}
+
+impl VisualTerminalGuard {
+    fn enter() -> Result<Self> {
+        enable_raw_mode().context("failed enabling raw mode for visual playbook mode")?;
+        if let Err(error) = execute!(std::io::stdout(), EnterAlternateScreen, Hide) {
+            let _ = disable_raw_mode();
+            return Err(anyhow::anyhow!(
+                "failed entering alternate screen for visual playbook mode: {error}"
+            ));
+        }
+        Ok(Self { active: true })
+    }
+
+    fn suspend_for_line_input(&mut self) -> Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        execute!(std::io::stdout(), Show, LeaveAlternateScreen)
+            .context("failed leaving alternate screen for DSL prompt")?;
+        disable_raw_mode().context("failed disabling raw mode for DSL prompt")?;
+        self.active = false;
+        Ok(())
+    }
+
+    fn resume_after_line_input(&mut self) -> Result<()> {
+        if self.active {
+            return Ok(());
+        }
+        enable_raw_mode().context("failed re-enabling raw mode for visual mode")?;
+        execute!(std::io::stdout(), EnterAlternateScreen, Hide)
+            .context("failed restoring alternate screen for visual mode")?;
+        self.active = true;
+        Ok(())
+    }
+}
+
+impl Drop for VisualTerminalGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let _ = execute!(std::io::stdout(), Show, LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+        }
+    }
+}
+
+pub(super) struct VisualInteractiveState {
+    terminal: VisualTerminalGuard,
+    paused: bool,
+    step_once_requested: bool,
+    single_step_inflight: bool,
+    abort_requested: bool,
+    status_line: String,
+    current_step_label: String,
+    current_step_position: usize,
+    total_steps: usize,
+    last_step_line: String,
+    started_at: Instant,
+    last_render_at: Instant,
+    last_refresh_at: Instant,
+}
+
+impl VisualInteractiveState {
+    fn enter(total_steps: usize) -> Result<Self> {
+        let now = Instant::now();
+        Ok(Self {
+            terminal: VisualTerminalGuard::enter()?,
+            paused: false,
+            step_once_requested: false,
+            single_step_inflight: false,
+            abort_requested: false,
+            status_line: "running".to_string(),
+            current_step_label: "<waiting>".to_string(),
+            current_step_position: 0,
+            total_steps,
+            last_step_line: String::new(),
+            started_at: now,
+            last_render_at: now - VISUAL_RENDER_INTERVAL,
+            last_refresh_at: now - VISUAL_REFRESH_INTERVAL,
+        })
+    }
+
+    fn set_current_step(&mut self, step_position: usize, step: &Step) {
+        self.current_step_position = step_position;
+        self.current_step_label = step.to_dsl();
+        self.force_render();
+    }
+
+    fn mark_step_result(
+        &mut self,
+        step_position: usize,
+        action_name: &str,
+        status: StepStatus,
+        elapsed_ms: u128,
+        detail: Option<&str>,
+    ) {
+        let symbol = match status {
+            StepStatus::Pass => "+",
+            StepStatus::Fail => "-",
+            StepStatus::Skip => "~",
+        };
+        self.last_step_line = if let Some(detail) = detail {
+            format!(
+                "[{symbol}] step {}/{} {action_name} ({elapsed_ms}ms) {detail}",
+                step_position + 1,
+                self.total_steps,
+            )
+        } else {
+            format!(
+                "[{symbol}] step {}/{} {action_name} ({elapsed_ms}ms)",
+                step_position + 1,
+                self.total_steps,
+            )
+        };
+
+        if self.single_step_inflight {
+            self.single_step_inflight = false;
+            self.paused = true;
+            self.step_once_requested = false;
+            self.status_line = "paused after single-step".to_string();
+        }
+        self.force_render();
+    }
+
+    fn mark_status(&mut self, status: impl Into<String>) {
+        self.status_line = status.into();
+        self.force_render();
+    }
+
+    fn force_render(&mut self) {
+        self.last_render_at = Instant::now() - VISUAL_RENDER_INTERVAL;
+    }
+
+    fn parse_next_control_action(&mut self) -> Result<Option<VisualControlAction>> {
+        loop {
+            if !crossterm::event::poll(Duration::ZERO).context("failed polling visual controls")? {
+                return Ok(None);
+            }
+            match crossterm::event::read().context("failed reading visual control event")? {
+                crossterm::event::Event::Key(key) => {
+                    if let Some(action) = parse_visual_control_action(key) {
+                        return Ok(Some(action));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn apply_control_action(
+        &mut self,
+        action: VisualControlAction,
+        phase: VisualCheckpointPhase,
+    ) -> bool {
+        match action {
+            VisualControlAction::TogglePause => {
+                self.paused = !self.paused;
+                self.status_line = if self.paused {
+                    "paused".to_string()
+                } else {
+                    "resumed".to_string()
+                };
+                self.step_once_requested = false;
+                self.force_render();
+                false
+            }
+            VisualControlAction::StepOnce => {
+                match phase {
+                    VisualCheckpointPhase::BeforeStep => {
+                        self.paused = true;
+                        self.step_once_requested = true;
+                        self.status_line = "single-step armed".to_string();
+                    }
+                    VisualCheckpointPhase::InStep => {
+                        self.paused = false;
+                        self.status_line = "resumed current step".to_string();
+                    }
+                }
+                self.force_render();
+                false
+            }
+            VisualControlAction::ContinueLive => {
+                self.paused = false;
+                self.step_once_requested = false;
+                self.status_line = "running live".to_string();
+                self.force_render();
+                false
+            }
+            VisualControlAction::Abort => {
+                self.abort_requested = true;
+                self.status_line = "abort requested".to_string();
+                self.force_render();
+                false
+            }
+            VisualControlAction::Help => {
+                self.status_line =
+                    "space pause/resume | n step | c/l live | : ad-hoc dsl | q quit".to_string();
+                self.force_render();
+                false
+            }
+            VisualControlAction::PromptDsl => true,
+        }
+    }
+
+    fn prompt_for_dsl_command(&mut self) -> Result<Option<String>> {
+        self.terminal.suspend_for_line_input()?;
+
+        let read_result = (|| -> Result<Option<String>> {
+            eprint!("playbook:dsl> ");
+            std::io::stderr()
+                .flush()
+                .context("failed flushing visual DSL prompt")?;
+            let mut line = String::new();
+            let read = std::io::stdin()
+                .read_line(&mut line)
+                .context("failed reading visual DSL command")?;
+            if read == 0 {
+                return Ok(None);
+            }
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        })();
+
+        let resume_result = self.terminal.resume_after_line_input();
+        if let Err(error) = resume_result {
+            return Err(error);
+        }
+
+        self.force_render();
+        read_result
+    }
+
+    async fn maybe_refresh_and_render(
+        &mut self,
+        client: &mut BmuxClient,
+        inspector: &mut ScreenInspector,
+        session_id: Option<Uuid>,
+        attached: bool,
+        force: bool,
+    ) -> Result<()> {
+        let now = Instant::now();
+        if force || now.duration_since(self.last_refresh_at) >= VISUAL_REFRESH_INTERVAL {
+            if attached {
+                if let Some(sid) = session_id {
+                    if let Err(error) = inspector.refresh(client, sid).await {
+                        self.status_line = format!("screen refresh failed: {error:#}");
+                    }
+                }
+            }
+            self.last_refresh_at = now;
+        }
+
+        if force || now.duration_since(self.last_render_at) >= VISUAL_RENDER_INTERVAL {
+            self.render(inspector, attached, session_id)?;
+            self.last_render_at = Instant::now();
+        }
+
+        Ok(())
+    }
+
+    fn render(
+        &mut self,
+        inspector: &ScreenInspector,
+        attached: bool,
+        session_id: Option<Uuid>,
+    ) -> Result<()> {
+        let (cols, rows) = terminal::size().unwrap_or((80, 24));
+        let cols_usize = usize::from(cols.max(1));
+        let rows_usize = usize::from(rows.max(1));
+
+        let mut lines = Vec::new();
+        let mode = if self.abort_requested {
+            "ABORTING"
+        } else if self.paused {
+            "PAUSED"
+        } else {
+            "RUNNING"
+        };
+        lines.push(truncate_display_line(
+            &format!(
+                "bmux playbook live tour [{mode}] step {}/{} elapsed {}ms",
+                self.current_step_position.saturating_add(1),
+                self.total_steps,
+                self.started_at.elapsed().as_millis(),
+            ),
+            cols_usize,
+        ));
+        lines.push(truncate_display_line(
+            "keys: space pause/resume | n step | c/l live | : dsl | q quit | ? help",
+            cols_usize,
+        ));
+        lines.push(truncate_display_line(
+            &format!("step: {}", self.current_step_label),
+            cols_usize,
+        ));
+        let last_line = if self.last_step_line.is_empty() {
+            "last: <none>".to_string()
+        } else {
+            format!("last: {}", self.last_step_line)
+        };
+        lines.push(truncate_display_line(&last_line, cols_usize));
+        lines.push(truncate_display_line(
+            &format!(
+                "status: {} | session: {}",
+                self.status_line,
+                session_id
+                    .map(|id| id.to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ),
+            cols_usize,
+        ));
+        lines.push("-".repeat(cols_usize));
+
+        if !attached {
+            lines.push(truncate_display_line(
+                "waiting for session attach (run will start with new-session)",
+                cols_usize,
+            ));
+        } else if let Some(panes) = inspector.capture_all_safe() {
+            if panes.is_empty() {
+                lines.push(truncate_display_line("no panes captured", cols_usize));
+            } else {
+                for pane in panes {
+                    let focus_marker = if pane.focused { "*" } else { " " };
+                    lines.push(truncate_display_line(
+                        &format!(
+                            "[{focus_marker}] pane {} cursor {}:{}",
+                            pane.index,
+                            pane.cursor_row.saturating_add(1),
+                            pane.cursor_col.saturating_add(1)
+                        ),
+                        cols_usize,
+                    ));
+                    for pane_line in pane.screen_text.lines() {
+                        lines.push(truncate_display_line(pane_line, cols_usize));
+                        if lines.len() >= rows_usize {
+                            break;
+                        }
+                    }
+                    if lines.len() >= rows_usize {
+                        break;
+                    }
+                    lines.push("".to_string());
+                }
+            }
+        } else {
+            lines.push(truncate_display_line(
+                "waiting for first screen snapshot",
+                cols_usize,
+            ));
+        }
+
+        if lines.len() > rows_usize {
+            lines.truncate(rows_usize);
+        }
+
+        let mut stdout = std::io::stdout().lock();
+        queue!(stdout, MoveTo(0, 0), Clear(ClearType::All))
+            .context("failed clearing visual playbook frame")?;
+        for (row, line) in lines.iter().enumerate() {
+            let row = u16::try_from(row).unwrap_or(u16::MAX);
+            queue!(stdout, MoveTo(0, row), Print(line))
+                .context("failed writing visual playbook frame line")?;
+        }
+        stdout
+            .flush()
+            .context("failed flushing visual playbook frame")?;
+        Ok(())
+    }
+}
+
+fn truncate_display_line(input: &str, max_cols: usize) -> String {
+    if max_cols == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    for ch in input.chars().take(max_cols) {
+        out.push(ch);
+    }
+    out
+}
 
 pub(super) struct AttachInputRuntime {
     processor: crate::input::InputProcessor,
@@ -174,17 +651,66 @@ async fn run_playbook_inner(
     let playbook_start = Instant::now();
     let deadline = playbook_start + playbook.config.timeout;
     let total_steps = playbook.steps.len();
-    let mut interactive_prompt_active = options.interactive;
+    let interactive_mode = resolve_interactive_mode(
+        options.interactive,
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    );
+    let mut interactive_prompt_active = matches!(interactive_mode, PlaybookInteractiveMode::Prompt);
+    let mut visual_interactive = if matches!(interactive_mode, PlaybookInteractiveMode::Visual) {
+        Some(VisualInteractiveState::enter(total_steps)?)
+    } else {
+        None
+    };
     let mut interactive_abort_from_step: Option<usize> = None;
 
-    if options.interactive {
+    if matches!(interactive_mode, PlaybookInteractiveMode::Prompt) && options.interactive {
         eprintln!(
-            "interactive playbook controls: n next | c continue | s screen | :<dsl> command | q quit"
+            "bmux: --interactive visual live tour requires a TTY; using prompt fallback controls"
+        );
+        eprintln!(
+            "interactive playbook controls: n next | c/l continue | s screen | :<dsl> command | q quit"
         );
     }
 
     for (step_position, step) in playbook.steps.iter().enumerate() {
-        if interactive_prompt_active {
+        if let Some(ref mut visual_state) = visual_interactive {
+            let prompt_decision = visual_wait_for_step_permission(
+                visual_state,
+                step,
+                step_position,
+                total_steps,
+                &mut client,
+                &mut inspector,
+                &mut session_id,
+                &mut attached,
+                &mut events_subscribed,
+                &mut attach_runtime,
+                &playbook.config.viewport.cols,
+                &playbook.config.viewport.rows,
+                &mut snapshots,
+                deadline,
+                &mut display_track,
+                &mut runtime_vars,
+            )
+            .await?;
+
+            match prompt_decision {
+                InteractivePromptDecision::RunNextStep => {}
+                InteractivePromptDecision::ContinueRemaining => {
+                    visual_state.mark_status("running live");
+                }
+                InteractivePromptDecision::AbortRun => {
+                    interactive_abort_from_step = Some(step_position);
+                    error_msg = Some(format!(
+                        "interactive run aborted before step {} ({})",
+                        step.index,
+                        step.action.name()
+                    ));
+                    break;
+                }
+            }
+        } else if interactive_prompt_active {
             let prompt_decision = interactive_step_prompt(
                 step,
                 step_position,
@@ -201,6 +727,7 @@ async fn run_playbook_inner(
                 deadline,
                 &mut display_track,
                 &mut runtime_vars,
+                &mut visual_interactive,
             )
             .await?;
 
@@ -264,6 +791,9 @@ async fn run_playbook_inner(
             deadline,
             &mut display_track,
             &mut runtime_vars,
+            &mut visual_interactive,
+            step_position,
+            total_steps,
         )
         .await;
 
@@ -277,6 +807,7 @@ async fn run_playbook_inner(
                     step.action.name(),
                     elapsed_ms
                 );
+                let detail_for_visual = detail.clone();
                 step_results.push(StepResult {
                     index: step.index,
                     action: step.action.name().to_string(),
@@ -288,8 +819,49 @@ async fn run_playbook_inner(
                     failure_captures: None,
                     continue_on_error: step.continue_on_error,
                 });
+                if let Some(state) = visual_interactive.as_mut() {
+                    state.mark_step_result(
+                        step_position,
+                        step.action.name(),
+                        StepStatus::Pass,
+                        u128::from(elapsed_ms),
+                        detail_for_visual.as_deref(),
+                    );
+                    state
+                        .maybe_refresh_and_render(
+                            &mut client,
+                            &mut inspector,
+                            session_id,
+                            attached,
+                            true,
+                        )
+                        .await?;
+                }
             }
             Err(err) => {
+                if err.downcast_ref::<InteractiveAbort>().is_some() {
+                    interactive_abort_from_step = Some(step_position);
+                    let msg = format!(
+                        "interactive run aborted during step {} ({})",
+                        step.index,
+                        step.action.name()
+                    );
+                    error_msg = Some(msg.clone());
+                    if let Some(state) = visual_interactive.as_mut() {
+                        state.mark_status(msg);
+                        state
+                            .maybe_refresh_and_render(
+                                &mut client,
+                                &mut inspector,
+                                session_id,
+                                attached,
+                                true,
+                            )
+                            .await?;
+                    }
+                    break;
+                }
+
                 if playbook.config.verbose {
                     eprintln!(" FAIL ({elapsed_ms}ms)");
                 }
@@ -325,6 +897,24 @@ async fn run_playbook_inner(
                     failure_captures,
                     continue_on_error: step.continue_on_error,
                 });
+                if let Some(state) = visual_interactive.as_mut() {
+                    state.mark_step_result(
+                        step_position,
+                        step.action.name(),
+                        StepStatus::Fail,
+                        u128::from(elapsed_ms),
+                        Some(msg.as_str()),
+                    );
+                    state
+                        .maybe_refresh_and_render(
+                            &mut client,
+                            &mut inspector,
+                            session_id,
+                            attached,
+                            true,
+                        )
+                        .await?;
+                }
                 if step.continue_on_error {
                     // Record the failure but keep going.
                     warn!(
@@ -440,7 +1030,7 @@ fn parse_interactive_prompt_command(raw: &str) -> Result<InteractivePromptComman
     if trimmed.is_empty() || matches!(trimmed, "n" | "next") {
         return Ok(InteractivePromptCommand::RunNextStep);
     }
-    if matches!(trimmed, "c" | "continue") {
+    if matches!(trimmed, "c" | "continue" | "l" | "live") {
         return Ok(InteractivePromptCommand::ContinueRemaining);
     }
     if matches!(trimmed, "q" | "quit" | "abort") {
@@ -460,7 +1050,7 @@ fn parse_interactive_prompt_command(raw: &str) -> Result<InteractivePromptComman
         return Ok(InteractivePromptCommand::RunDsl(dsl.to_string()));
     }
 
-    bail!("unknown interactive command '{trimmed}' (expected n/c/s/:<dsl>/q/help)",)
+    bail!("unknown interactive command '{trimmed}' (expected n/c/l/s/:<dsl>/q/help)",)
 }
 
 fn read_interactive_prompt_line() -> Result<Option<String>> {
@@ -477,10 +1067,200 @@ fn read_interactive_prompt_line() -> Result<Option<String>> {
 fn print_interactive_prompt_help() {
     eprintln!("interactive commands:");
     eprintln!("  n / <enter>   run next playbook step");
-    eprintln!("  c             continue remaining steps without pausing");
+    eprintln!("  c / l         continue remaining steps without pausing");
     eprintln!("  s             show current pane screen capture");
     eprintln!("  :<dsl>        run ad-hoc DSL command in this session");
     eprintln!("  q             abort run (remaining steps become skipped)");
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_visual_dsl_command(
+    dsl: &str,
+    step_index: usize,
+    step_position: usize,
+    total_steps: usize,
+    client: &mut BmuxClient,
+    inspector: &mut ScreenInspector,
+    session_id: &mut Option<Uuid>,
+    attached: &mut bool,
+    events_subscribed: &mut bool,
+    attach_runtime: &mut Option<AttachInputRuntime>,
+    viewport_cols: &u16,
+    viewport_rows: &u16,
+    snapshots: &mut Vec<SnapshotCapture>,
+    deadline: Instant,
+    display_track: &mut Option<super::display_track::PlaybookDisplayTrackWriter>,
+    runtime_vars: &mut RuntimeVars,
+) -> Result<String> {
+    let action = match parse_action_line(dsl) {
+        Ok(action) => action,
+        Err(err) => {
+            return Ok(format!("DSL parse failed: {err:#}"));
+        }
+    };
+
+    let action_name = action.name().to_string();
+    let command_step = Step {
+        index: step_index,
+        action,
+        continue_on_error: false,
+    };
+    let started = Instant::now();
+    let mut no_visual = None;
+
+    match execute_step(
+        &command_step,
+        client,
+        inspector,
+        session_id,
+        attached,
+        events_subscribed,
+        attach_runtime,
+        viewport_cols,
+        viewport_rows,
+        snapshots,
+        deadline,
+        display_track,
+        runtime_vars,
+        &mut no_visual,
+        step_position,
+        total_steps,
+    )
+    .await
+    {
+        Ok(detail) => {
+            let elapsed_ms = started.elapsed().as_millis();
+            if let Some(detail) = detail {
+                Ok(format!(
+                    "interactive command ok: {action_name} ({elapsed_ms}ms) - {detail}"
+                ))
+            } else {
+                Ok(format!(
+                    "interactive command ok: {action_name} ({elapsed_ms}ms)"
+                ))
+            }
+        }
+        Err(err) => {
+            if err.downcast_ref::<InteractiveAbort>().is_some() {
+                Ok("interactive command aborted".to_string())
+            } else {
+                Ok(format!("interactive command failed: {err:#}"))
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn visual_wait_for_step_permission(
+    visual_state: &mut VisualInteractiveState,
+    step: &Step,
+    step_position: usize,
+    total_steps: usize,
+    client: &mut BmuxClient,
+    inspector: &mut ScreenInspector,
+    session_id: &mut Option<Uuid>,
+    attached: &mut bool,
+    events_subscribed: &mut bool,
+    attach_runtime: &mut Option<AttachInputRuntime>,
+    viewport_cols: &u16,
+    viewport_rows: &u16,
+    snapshots: &mut Vec<SnapshotCapture>,
+    deadline: Instant,
+    display_track: &mut Option<super::display_track::PlaybookDisplayTrackWriter>,
+    runtime_vars: &mut RuntimeVars,
+) -> Result<InteractivePromptDecision> {
+    visual_state.set_current_step(step_position, step);
+
+    loop {
+        visual_state
+            .maybe_refresh_and_render(client, inspector, *session_id, *attached, false)
+            .await?;
+
+        while let Some(action) = visual_state.parse_next_control_action()? {
+            let needs_dsl_prompt =
+                visual_state.apply_control_action(action, VisualCheckpointPhase::BeforeStep);
+            if needs_dsl_prompt {
+                let Some(dsl) = visual_state.prompt_for_dsl_command()? else {
+                    visual_state.mark_status("DSL prompt cancelled");
+                    continue;
+                };
+                let status = run_visual_dsl_command(
+                    &dsl,
+                    step.index,
+                    step_position,
+                    total_steps,
+                    client,
+                    inspector,
+                    session_id,
+                    attached,
+                    events_subscribed,
+                    attach_runtime,
+                    viewport_cols,
+                    viewport_rows,
+                    snapshots,
+                    deadline,
+                    display_track,
+                    runtime_vars,
+                )
+                .await?;
+                visual_state.mark_status(status);
+            }
+        }
+
+        if visual_state.abort_requested {
+            return Ok(InteractivePromptDecision::AbortRun);
+        }
+
+        if visual_state.step_once_requested {
+            visual_state.step_once_requested = false;
+            visual_state.single_step_inflight = true;
+            visual_state.paused = false;
+            visual_state.mark_status("running single-step");
+            return Ok(InteractivePromptDecision::RunNextStep);
+        }
+
+        if !visual_state.paused {
+            return Ok(InteractivePromptDecision::RunNextStep);
+        }
+
+        tokio::time::sleep(VISUAL_PAUSE_POLL_INTERVAL).await;
+    }
+}
+
+async fn visual_checkpoint_during_step(
+    visual_interactive: &mut Option<VisualInteractiveState>,
+    client: &mut BmuxClient,
+    inspector: &mut ScreenInspector,
+    session_id: Option<Uuid>,
+    attached: bool,
+) -> Result<()> {
+    let Some(visual_state) = visual_interactive.as_mut() else {
+        return Ok(());
+    };
+
+    loop {
+        visual_state
+            .maybe_refresh_and_render(client, inspector, session_id, attached, false)
+            .await?;
+
+        while let Some(action) = visual_state.parse_next_control_action()? {
+            let needs_dsl_prompt =
+                visual_state.apply_control_action(action, VisualCheckpointPhase::InStep);
+            if needs_dsl_prompt {
+                visual_state.mark_status("pause at step boundary to run ':<dsl>' command");
+            }
+        }
+
+        if visual_state.abort_requested {
+            return Err(InteractiveAbort.into());
+        }
+
+        if !visual_state.paused {
+            return Ok(());
+        }
+
+        tokio::time::sleep(VISUAL_PAUSE_POLL_INTERVAL).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -500,6 +1280,7 @@ async fn interactive_step_prompt(
     deadline: Instant,
     display_track: &mut Option<super::display_track::PlaybookDisplayTrackWriter>,
     runtime_vars: &mut RuntimeVars,
+    visual_interactive: &mut Option<VisualInteractiveState>,
 ) -> Result<InteractivePromptDecision> {
     loop {
         {
@@ -541,6 +1322,8 @@ async fn interactive_step_prompt(
                 run_interactive_dsl_command(
                     &dsl,
                     step.index,
+                    step_position,
+                    total_steps,
                     client,
                     inspector,
                     session_id,
@@ -553,6 +1336,7 @@ async fn interactive_step_prompt(
                     deadline,
                     display_track,
                     runtime_vars,
+                    visual_interactive,
                 )
                 .await?;
             }
@@ -610,6 +1394,8 @@ async fn print_interactive_screen_snapshot(
 async fn run_interactive_dsl_command(
     dsl: &str,
     step_index: usize,
+    step_position: usize,
+    total_steps: usize,
     client: &mut BmuxClient,
     inspector: &mut ScreenInspector,
     session_id: &mut Option<Uuid>,
@@ -622,6 +1408,7 @@ async fn run_interactive_dsl_command(
     deadline: Instant,
     display_track: &mut Option<super::display_track::PlaybookDisplayTrackWriter>,
     runtime_vars: &mut RuntimeVars,
+    visual_interactive: &mut Option<VisualInteractiveState>,
 ) -> Result<()> {
     let action = match parse_action_line(dsl) {
         Ok(action) => action,
@@ -653,6 +1440,9 @@ async fn run_interactive_dsl_command(
         deadline,
         display_track,
         runtime_vars,
+        visual_interactive,
+        step_position,
+        total_steps,
     )
     .await
     {
@@ -704,7 +1494,19 @@ pub(super) async fn execute_step(
     deadline: Instant,
     display_track: &mut Option<super::display_track::PlaybookDisplayTrackWriter>,
     runtime_vars: &mut RuntimeVars,
+    visual_interactive: &mut Option<VisualInteractiveState>,
+    _step_position: usize,
+    _total_steps: usize,
 ) -> Result<Option<String>> {
+    visual_checkpoint_during_step(
+        visual_interactive,
+        client,
+        inspector,
+        *session_id,
+        *attached,
+    )
+    .await?;
+
     match &step.action {
         Action::NewSession { name } => {
             let resolved_name = name.as_ref().map(|n| runtime_vars.resolve_opt(n));
@@ -745,7 +1547,16 @@ pub(super) async fn execute_step(
             }
 
             // Drain initial output to let the shell start up
-            drain_output_until_idle(client, sid, Duration::from_millis(500), display_track).await?;
+            drain_output_until_idle(
+                client,
+                inspector,
+                sid,
+                Duration::from_millis(500),
+                display_track,
+                visual_interactive,
+                *attached,
+            )
+            .await?;
 
             Ok(Some(format!("session_id={sid}")))
         }
@@ -781,7 +1592,16 @@ pub(super) async fn execute_step(
                 .map_err(|e| anyhow::anyhow!("split-pane failed: {e}"))?;
 
             // Let the new pane shell start
-            drain_output_until_idle(client, sid, Duration::from_millis(300), display_track).await?;
+            drain_output_until_idle(
+                client,
+                inspector,
+                sid,
+                Duration::from_millis(300),
+                display_track,
+                visual_interactive,
+                *attached,
+            )
+            .await?;
 
             runtime_vars.pane_count += 1;
 
@@ -885,7 +1705,23 @@ pub(super) async fn execute_step(
         Action::Sleep { duration } => {
             let remaining = deadline.saturating_duration_since(Instant::now());
             let sleep_dur = (*duration).min(remaining);
-            tokio::time::sleep(sleep_dur).await;
+            let sleep_start = Instant::now();
+            while sleep_start.elapsed() < sleep_dur {
+                visual_checkpoint_during_step(
+                    visual_interactive,
+                    client,
+                    inspector,
+                    *session_id,
+                    *attached,
+                )
+                .await?;
+                let remaining_chunk = sleep_dur.saturating_sub(sleep_start.elapsed());
+                let chunk = remaining_chunk.min(Duration::from_millis(50));
+                if chunk.is_zero() {
+                    break;
+                }
+                tokio::time::sleep(chunk).await;
+            }
             Ok(None)
         }
 
@@ -911,20 +1747,40 @@ pub(super) async fn execute_step(
             for attempt in 0..max_attempts {
                 if attempt > 0 {
                     // Brief drain between retry attempts.
-                    drain_output_until_idle(client, sid, Duration::from_millis(200), display_track)
-                        .await?;
+                    drain_output_until_idle(
+                        client,
+                        inspector,
+                        sid,
+                        Duration::from_millis(200),
+                        display_track,
+                        visual_interactive,
+                        *attached,
+                    )
+                    .await?;
                 }
 
                 let wait_deadline = Instant::now() + (*timeout).min(deadline - Instant::now());
                 let mut poll_delay = Duration::from_millis(10);
 
                 let result = loop {
+                    visual_checkpoint_during_step(
+                        visual_interactive,
+                        client,
+                        inspector,
+                        *session_id,
+                        *attached,
+                    )
+                    .await?;
+
                     // Drain any pending output (lower threshold for WaitFor's retry loop)
                     drain_output_with_threshold(
                         client,
+                        inspector,
                         sid,
                         Duration::from_millis(100),
                         display_track,
+                        visual_interactive,
+                        *attached,
                         3,
                     )
                     .await?;
@@ -954,6 +1810,14 @@ pub(super) async fn execute_step(
                         ));
                     }
 
+                    visual_checkpoint_during_step(
+                        visual_interactive,
+                        client,
+                        inspector,
+                        *session_id,
+                        *attached,
+                    )
+                    .await?;
                     tokio::time::sleep(poll_delay).await;
                     poll_delay = (poll_delay * 2).min(Duration::from_millis(200));
                 };
@@ -981,7 +1845,16 @@ pub(super) async fn execute_step(
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
 
-            drain_output_until_idle(client, sid, Duration::from_millis(200), display_track).await?;
+            drain_output_until_idle(
+                client,
+                inspector,
+                sid,
+                Duration::from_millis(200),
+                display_track,
+                visual_interactive,
+                *attached,
+            )
+            .await?;
             let _snapshot = inspector.refresh(client, sid).await?;
             let panes = inspector.capture_all();
 
@@ -1002,7 +1875,16 @@ pub(super) async fn execute_step(
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
 
-            drain_output_until_idle(client, sid, Duration::from_millis(200), display_track).await?;
+            drain_output_until_idle(
+                client,
+                inspector,
+                sid,
+                Duration::from_millis(200),
+                display_track,
+                visual_interactive,
+                *attached,
+            )
+            .await?;
             let snapshot = inspector.refresh(client, sid).await?;
             let pane_idx = inspector.resolve_pane_index(*pane, &snapshot)?;
 
@@ -1175,6 +2057,15 @@ pub(super) async fn execute_step(
             let mut poll_delay = Duration::from_millis(25);
 
             loop {
+                visual_checkpoint_during_step(
+                    visual_interactive,
+                    client,
+                    inspector,
+                    *session_id,
+                    *attached,
+                )
+                .await?;
+
                 let events = client
                     .poll_events(32)
                     .await
@@ -1194,6 +2085,14 @@ pub(super) async fn execute_step(
                     .into());
                 }
 
+                visual_checkpoint_during_step(
+                    visual_interactive,
+                    client,
+                    inspector,
+                    *session_id,
+                    *attached,
+                )
+                .await?;
                 tokio::time::sleep(poll_delay).await;
                 poll_delay = (poll_delay * 2).min(Duration::from_millis(250));
             }
@@ -1236,7 +2135,16 @@ pub(super) async fn execute_step(
         Action::Screen => {
             let sid = require_session(*session_id)?;
             require_attached(*attached)?;
-            drain_output_until_idle(client, sid, Duration::from_millis(200), display_track).await?;
+            drain_output_until_idle(
+                client,
+                inspector,
+                sid,
+                Duration::from_millis(200),
+                display_track,
+                visual_interactive,
+                *attached,
+            )
+            .await?;
             let snapshot = inspector.refresh(client, sid).await?;
             let _ = snapshot; // satisfy the borrow checker
             let captures = inspector.capture_all();
@@ -1565,25 +2473,50 @@ pub(super) fn require_attached(attached: bool) -> Result<()> {
 /// Optionally captures output bytes to a display track writer for GIF export.
 pub(super) async fn drain_output_until_idle(
     client: &mut BmuxClient,
+    inspector: &mut ScreenInspector,
     session_id: Uuid,
     max_wait: Duration,
     display_track: &mut Option<super::display_track::PlaybookDisplayTrackWriter>,
+    visual_interactive: &mut Option<VisualInteractiveState>,
+    attached: bool,
 ) -> Result<()> {
-    drain_output_with_threshold(client, session_id, max_wait, display_track, 5).await
+    drain_output_with_threshold(
+        client,
+        inspector,
+        session_id,
+        max_wait,
+        display_track,
+        visual_interactive,
+        attached,
+        5,
+    )
+    .await
 }
 
 /// Same as `drain_output_until_idle` but with a configurable idle threshold.
 pub(super) async fn drain_output_with_threshold(
     client: &mut BmuxClient,
+    inspector: &mut ScreenInspector,
     session_id: Uuid,
     max_wait: Duration,
     display_track: &mut Option<super::display_track::PlaybookDisplayTrackWriter>,
+    visual_interactive: &mut Option<VisualInteractiveState>,
+    attached: bool,
     idle_threshold: u8,
 ) -> Result<()> {
     let started = Instant::now();
     let mut idle_polls = 0u8;
 
     while started.elapsed() < max_wait {
+        visual_checkpoint_during_step(
+            visual_interactive,
+            client,
+            inspector,
+            Some(session_id),
+            attached,
+        )
+        .await?;
+
         let data = client
             .attach_output(session_id, ATTACH_OUTPUT_MAX_BYTES)
             .await
@@ -1668,6 +2601,10 @@ mod tests {
             InteractivePromptCommand::ContinueRemaining
         );
         assert_eq!(
+            parse_interactive_prompt_command("l").expect("l should parse"),
+            InteractivePromptCommand::ContinueRemaining
+        );
+        assert_eq!(
             parse_interactive_prompt_command("s").expect("s should parse"),
             InteractivePromptCommand::ShowScreen
         );
@@ -1695,6 +2632,56 @@ mod tests {
                 .to_string()
                 .contains("unknown interactive command 'mystery'"),
             "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn resolve_interactive_mode_prefers_visual_for_tty() {
+        assert_eq!(
+            resolve_interactive_mode(true, true, true),
+            PlaybookInteractiveMode::Visual
+        );
+        assert_eq!(
+            resolve_interactive_mode(true, true, false),
+            PlaybookInteractiveMode::Prompt
+        );
+        assert_eq!(
+            resolve_interactive_mode(false, true, true),
+            PlaybookInteractiveMode::Disabled
+        );
+    }
+
+    #[test]
+    fn parse_visual_control_action_maps_live_controls() {
+        let make_key = |code, modifiers| KeyEvent {
+            code,
+            modifiers,
+            kind: KeyEventKind::Press,
+            state: KeyEventState::NONE,
+        };
+
+        assert_eq!(
+            parse_visual_control_action(make_key(CrosstermKeyCode::Char(' '), KeyModifiers::NONE)),
+            Some(VisualControlAction::TogglePause)
+        );
+        assert_eq!(
+            parse_visual_control_action(make_key(CrosstermKeyCode::Char('l'), KeyModifiers::NONE)),
+            Some(VisualControlAction::ContinueLive)
+        );
+        assert_eq!(
+            parse_visual_control_action(make_key(CrosstermKeyCode::Char('n'), KeyModifiers::NONE)),
+            Some(VisualControlAction::StepOnce)
+        );
+        assert_eq!(
+            parse_visual_control_action(make_key(CrosstermKeyCode::Char(':'), KeyModifiers::NONE)),
+            Some(VisualControlAction::PromptDsl)
+        );
+        assert_eq!(
+            parse_visual_control_action(make_key(
+                CrosstermKeyCode::Char('c'),
+                KeyModifiers::CONTROL
+            )),
+            Some(VisualControlAction::Abort)
         );
     }
 }

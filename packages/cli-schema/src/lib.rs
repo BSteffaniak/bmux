@@ -731,7 +731,7 @@ pub enum PlaybookCommand {
         /// Output results as JSON
         #[arg(long)]
         json: bool,
-        /// Pause at each step for interactive control
+        /// Run visual interactive live tour (TTY; non-TTY falls back to prompt controls)
         #[arg(long)]
         interactive: bool,
         /// Run against the live server instead of an ephemeral sandbox
