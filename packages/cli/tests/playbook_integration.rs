@@ -196,6 +196,34 @@ fn playbook_attach_scrollback() {
 }
 
 #[test]
+fn playbook_alt_screen_exit_cursor() {
+    let (json, pass) = run_playbook_fixture("alt_screen_exit_cursor.dsl");
+    assert!(
+        pass,
+        "alt-screen enter/exit cursor restoration playbook should pass: {json:#}"
+    );
+}
+
+#[test]
+fn playbook_synthetic_alt_sigint_reentry_restores_cursor() {
+    let (json, pass) = run_playbook_fixture("synthetic_alt_sigint_reentry.dsl");
+    assert!(
+        pass,
+        "synthetic split 1049 exit sequence should restore cursor to pre-alt anchor: {json:#}"
+    );
+
+    let steps = json["steps"].as_array().expect("steps should be array");
+    let cursor_step = steps
+        .iter()
+        .find(|step| step["action"] == "assert-cursor")
+        .expect("expected assert-cursor step in synthetic fixture");
+    assert_eq!(
+        cursor_step["status"], "pass",
+        "cursor assertion should pass once reentry is correct: {json:#}"
+    );
+}
+
+#[test]
 fn playbook_send_keys_fails_during_attach_scrollback() {
     let (json, pass) = run_playbook_fixture("send_keys_in_scrollback.dsl");
     assert!(
@@ -351,6 +379,8 @@ fn playbook_failing_assert() {
 #[test]
 fn parse_and_validate_fixtures() {
     let fixtures = [
+        "alt_screen_exit_cursor.dsl",
+        "synthetic_alt_sigint_reentry.dsl",
         "echo_hello.dsl",
         "echo_assert.dsl",
         "multi_pane.dsl",

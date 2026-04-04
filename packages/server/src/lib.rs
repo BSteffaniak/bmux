@@ -41,7 +41,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, trace, warn};
 use uuid::Uuid;
 
 use crate::recording::{RecordMeta, RecordingRuntime};
@@ -1357,9 +1357,53 @@ fn protocol_reply_for_chunk(
     for byte in chunk {
         let byte_slice = std::slice::from_ref(byte);
         cursor_tracker.process(byte_slice);
-        reply.extend(protocol_engine.process_output(byte_slice, cursor_tracker.cursor_position()));
+        let byte_reply =
+            protocol_engine.process_output(byte_slice, cursor_tracker.cursor_position());
+        if let Some((query_kind, reply_row, reply_col)) = parse_cpr_reply(&byte_reply) {
+            let (tracked_row, tracked_col) = cursor_tracker.cursor_position();
+            trace!(
+                query_kind,
+                reply_row,
+                reply_col,
+                tracked_row = tracked_row.saturating_add(1),
+                tracked_col = tracked_col.saturating_add(1),
+                pane_rows = cursor_tracker.rows,
+                pane_cols = cursor_tracker.cols,
+                alternate_screen = cursor_tracker.parser.screen().alternate_screen(),
+                "pane protocol reply: cursor position report"
+            );
+        }
+        reply.extend(byte_reply);
     }
     reply
+}
+
+fn parse_cpr_reply(reply: &[u8]) -> Option<(&'static str, u16, u16)> {
+    if let Some(body) = reply.strip_prefix(b"\x1b[?")
+        && let Some((row, col)) = parse_cpr_coords(body, true)
+    {
+        return Some(("dec_cpr", row, col));
+    }
+    let body = reply.strip_prefix(b"\x1b[")?;
+    parse_cpr_coords(body, false).map(|(row, col)| ("cpr", row, col))
+}
+
+fn parse_cpr_coords(body: &[u8], dec: bool) -> Option<(u16, u16)> {
+    let body = body.strip_suffix(b"R")?;
+    if !dec && body.starts_with(b"?") {
+        return None;
+    }
+
+    let mut parts = body.splitn(2, |byte| *byte == b';');
+    let row = std::str::from_utf8(parts.next()?)
+        .ok()?
+        .parse::<u16>()
+        .ok()?;
+    let col = std::str::from_utf8(parts.next()?)
+        .ok()?
+        .parse::<u16>()
+        .ok()?;
+    Some((row, col))
 }
 
 fn parse_private_mode_number(bytes: &[u8]) -> Option<u16> {
@@ -7833,6 +7877,55 @@ mod tests {
         assert!(protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"6").is_empty());
         let cpr_reply = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"n");
         assert_eq!(cpr_reply, b"\x1b[20;7R");
+    }
+
+    #[test]
+    fn protocol_reply_reports_saved_cursor_after_alt_screen_exit() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
+        let mut cursor_tracker = PaneCursorTracker::new(24, 80);
+
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[12;34H");
+        assert_eq!(
+            protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n"),
+            b"\x1b[12;34R"
+        );
+
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[?1049h");
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[4;7H");
+        assert_eq!(
+            protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n"),
+            b"\x1b[4;7R"
+        );
+        assert_eq!(
+            protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[?6n"),
+            b"\x1b[?4;7R"
+        );
+
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[?1049l");
+        assert_eq!(
+            protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n"),
+            b"\x1b[12;34R"
+        );
+        assert_eq!(
+            protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[?6n"),
+            b"\x1b[?12;34R"
+        );
+    }
+
+    #[test]
+    fn protocol_reply_handles_split_dec_cpr_after_alt_screen_exit() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
+        let mut cursor_tracker = PaneCursorTracker::new(24, 80);
+
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[20;7H");
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[?1049h");
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[2;2H");
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[?1049l");
+
+        assert!(protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[").is_empty());
+        assert!(protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"?6").is_empty());
+        let dec_cpr_reply = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"n");
+        assert_eq!(dec_cpr_reply, b"\x1b[?20;7R");
     }
 
     #[test]
