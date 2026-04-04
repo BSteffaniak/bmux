@@ -238,33 +238,300 @@ pub(super) async fn run_recording_export(
     .await
 }
 
-pub(super) fn replay_watch(events: &[RecordingEventEnvelope], speed: f64) -> Result<u8> {
-    let clamped_speed = if speed <= 0.0 { 1.0 } else { speed };
-    let mut last_ns = 0_u64;
-    let mut stdout = io::stdout().lock();
-    for event in events {
-        if event.mono_ns > last_ns {
-            let delta = event.mono_ns.saturating_sub(last_ns);
-            let delay = (delta as f64 / clamped_speed) as u64;
-            if delay > 0 {
-                std::thread::sleep(Duration::from_nanos(delay));
-            }
+const REPLAY_SPEED_MIN: f64 = 0.125;
+const REPLAY_SPEED_MAX: f64 = 32.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractiveReplayAction {
+    TogglePause,
+    Step,
+    SlowDown,
+    SpeedUp,
+    OpenShell,
+    Quit,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct InteractiveReplayState {
+    paused: bool,
+    speed: f64,
+}
+
+impl InteractiveReplayState {
+    fn new(speed: f64) -> Self {
+        Self {
+            paused: false,
+            speed: normalize_replay_speed(speed),
         }
-        match &event.payload {
-            RecordingPayload::Bytes { data }
-                if matches!(
-                    event.kind,
-                    RecordingEventKind::PaneOutputRaw | RecordingEventKind::ProtocolReplyRaw
-                ) =>
-            {
-                stdout.write_all(data)?;
-            }
-            _ => {}
-        }
-        last_ns = event.mono_ns;
     }
+}
+
+struct ReplayTimeline<'a> {
+    events: &'a [RecordingEventEnvelope],
+    next_index: usize,
+    last_ns: u64,
+}
+
+impl<'a> ReplayTimeline<'a> {
+    fn new(events: &'a [RecordingEventEnvelope]) -> Self {
+        Self {
+            events,
+            next_index: 0,
+            last_ns: 0,
+        }
+    }
+
+    fn is_finished(&self) -> bool {
+        self.next_index >= self.events.len()
+    }
+
+    fn next_delay(&self, speed: f64) -> Duration {
+        let Some(event) = self.events.get(self.next_index) else {
+            return Duration::ZERO;
+        };
+        if event.mono_ns <= self.last_ns {
+            return Duration::ZERO;
+        }
+        let delta = event.mono_ns.saturating_sub(self.last_ns);
+        Duration::from_nanos(((delta as f64) / normalize_replay_speed(speed)) as u64)
+    }
+
+    fn advance(&mut self, stdout: &mut impl Write) -> Result<bool> {
+        let Some(event) = self.events.get(self.next_index) else {
+            return Ok(false);
+        };
+        let wrote_bytes = write_replay_event(stdout, event)?;
+        self.last_ns = event.mono_ns;
+        self.next_index = self.next_index.saturating_add(1);
+        Ok(wrote_bytes)
+    }
+
+    fn step_to_next_output(&mut self, stdout: &mut impl Write) -> Result<bool> {
+        while !self.is_finished() {
+            if self.advance(stdout)? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+}
+
+pub(super) fn replay_watch(events: &[RecordingEventEnvelope], speed: f64) -> Result<u8> {
+    let mut timeline = ReplayTimeline::new(events);
+    let mut stdout = io::stdout().lock();
+
+    while !timeline.is_finished() {
+        let delay = timeline.next_delay(speed);
+        if !delay.is_zero() {
+            std::thread::sleep(delay);
+        }
+        let _ = timeline.advance(&mut stdout)?;
+    }
+
     stdout.flush()?;
     Ok(0)
+}
+
+pub(super) fn replay_interactive(events: &[RecordingEventEnvelope], speed: f64) -> Result<u8> {
+    if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
+        anyhow::bail!("interactive replay requires a TTY on stdin/stdout")
+    }
+
+    let _raw_mode_guard = ReplayRawModeGuard::enable()?;
+    eprintln!(
+        "interactive replay controls: space pause/resume | . step | [ slower | ] faster | ! shell | q quit"
+    );
+
+    let mut stdout = io::stdout().lock();
+    let mut timeline = ReplayTimeline::new(events);
+    let mut state = InteractiveReplayState::new(speed);
+
+    while !timeline.is_finished() {
+        let action = if state.paused {
+            read_interactive_replay_action_blocking()?
+        } else {
+            read_interactive_replay_action_timeout(timeline.next_delay(state.speed))?
+        };
+
+        if let Some(action) = action {
+            match action {
+                InteractiveReplayAction::TogglePause => {
+                    state.paused = !state.paused;
+                    eprintln!("replay {}", if state.paused { "paused" } else { "resumed" });
+                }
+                InteractiveReplayAction::Step => {
+                    state.paused = true;
+                    let wrote_output = timeline.step_to_next_output(&mut stdout)?;
+                    stdout.flush()?;
+                    if !wrote_output {
+                        eprintln!("replay complete");
+                        break;
+                    }
+                    eprintln!("replay stepped");
+                }
+                InteractiveReplayAction::SlowDown => {
+                    state.speed = normalize_replay_speed((state.speed / 2.0).max(REPLAY_SPEED_MIN));
+                    eprintln!("replay speed {:.3}x", state.speed);
+                }
+                InteractiveReplayAction::SpeedUp => {
+                    state.speed = normalize_replay_speed((state.speed * 2.0).min(REPLAY_SPEED_MAX));
+                    eprintln!("replay speed {:.3}x", state.speed);
+                }
+                InteractiveReplayAction::OpenShell => {
+                    state.paused = true;
+                    stdout
+                        .flush()
+                        .context("failed flushing replay output before shell")?;
+                    eprintln!("replay shell: type 'exit' to return");
+                    open_replay_shell()?;
+                    eprintln!("replay shell closed (paused)");
+                }
+                InteractiveReplayAction::Quit => {
+                    eprintln!("replay stopped");
+                    return Ok(0);
+                }
+            }
+            continue;
+        }
+
+        if state.paused {
+            continue;
+        }
+
+        let _ = timeline.advance(&mut stdout)?;
+        stdout.flush()?;
+    }
+
+    Ok(0)
+}
+
+struct ReplayRawModeGuard;
+
+impl ReplayRawModeGuard {
+    fn enable() -> Result<Self> {
+        enable_raw_mode().context("failed enabling raw mode for interactive replay")?;
+        Ok(Self)
+    }
+}
+
+impl Drop for ReplayRawModeGuard {
+    fn drop(&mut self) {
+        let _ = disable_raw_mode();
+    }
+}
+
+fn normalize_replay_speed(speed: f64) -> f64 {
+    if !speed.is_finite() || speed <= 0.0 {
+        return 1.0;
+    }
+    speed.clamp(REPLAY_SPEED_MIN, REPLAY_SPEED_MAX)
+}
+
+fn replay_action_from_key_event(key: KeyEvent) -> Option<InteractiveReplayAction> {
+    replay_action_from_key(key.code, key.modifiers, key.kind)
+}
+
+fn replay_action_from_key(
+    code: KeyCode,
+    modifiers: KeyModifiers,
+    kind: KeyEventKind,
+) -> Option<InteractiveReplayAction> {
+    if !matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+        return None;
+    }
+
+    if modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(code, KeyCode::Char('c') | KeyCode::Char('d'))
+    {
+        return Some(InteractiveReplayAction::Quit);
+    }
+
+    match code {
+        KeyCode::Char(' ') => Some(InteractiveReplayAction::TogglePause),
+        KeyCode::Char('.') => Some(InteractiveReplayAction::Step),
+        KeyCode::Char('[') => Some(InteractiveReplayAction::SlowDown),
+        KeyCode::Char(']') => Some(InteractiveReplayAction::SpeedUp),
+        KeyCode::Char('!') => Some(InteractiveReplayAction::OpenShell),
+        KeyCode::Char('q') | KeyCode::Esc => Some(InteractiveReplayAction::Quit),
+        _ => None,
+    }
+}
+
+fn read_interactive_replay_action_timeout(
+    timeout: Duration,
+) -> Result<Option<InteractiveReplayAction>> {
+    if timeout.is_zero() {
+        return read_interactive_replay_action_poll(Duration::ZERO);
+    }
+
+    let started = Instant::now();
+    while started.elapsed() < timeout {
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if let Some(action) = read_interactive_replay_action_poll(remaining)? {
+            return Ok(Some(action));
+        }
+        if started.elapsed() >= timeout {
+            return Ok(None);
+        }
+    }
+
+    Ok(None)
+}
+
+fn read_interactive_replay_action_blocking() -> Result<Option<InteractiveReplayAction>> {
+    loop {
+        if let Event::Key(key) = crossterm::event::read().context("failed reading replay input")?
+            && let Some(action) = replay_action_from_key_event(key)
+        {
+            return Ok(Some(action));
+        }
+    }
+}
+
+fn read_interactive_replay_action_poll(
+    timeout: Duration,
+) -> Result<Option<InteractiveReplayAction>> {
+    if !crossterm::event::poll(timeout).context("failed polling replay input")? {
+        return Ok(None);
+    }
+
+    let event = crossterm::event::read().context("failed reading replay input")?;
+    match event {
+        Event::Key(key) => Ok(replay_action_from_key_event(key)),
+        _ => Ok(None),
+    }
+}
+
+fn open_replay_shell() -> Result<()> {
+    let shell = std::env::var("SHELL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "/bin/sh".to_string());
+
+    disable_raw_mode().context("failed disabling raw mode for replay shell")?;
+    let status = ProcessCommand::new(&shell)
+        .status()
+        .with_context(|| format!("failed launching replay shell '{shell}'"));
+    enable_raw_mode().context("failed re-enabling raw mode after replay shell")?;
+
+    status?;
+    Ok(())
+}
+
+fn write_replay_event(stdout: &mut impl Write, event: &RecordingEventEnvelope) -> Result<bool> {
+    match &event.payload {
+        RecordingPayload::Bytes { data }
+            if matches!(
+                event.kind,
+                RecordingEventKind::PaneOutputRaw | RecordingEventKind::ProtocolReplyRaw
+            ) =>
+        {
+            stdout.write_all(data)?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -1259,4 +1526,107 @@ pub(super) fn recording_event_kind_name(kind: RecordingEventKind) -> String {
 
 pub(super) fn load_recording_events(recording_id: &str) -> Result<Vec<RecordingEventEnvelope>> {
     recording::load_recording_events(recording_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_event(
+        kind: RecordingEventKind,
+        mono_ns: u64,
+        payload: RecordingPayload,
+    ) -> RecordingEventEnvelope {
+        RecordingEventEnvelope {
+            seq: mono_ns,
+            mono_ns,
+            wall_epoch_ms: 0,
+            session_id: None,
+            pane_id: None,
+            client_id: None,
+            kind,
+            payload,
+        }
+    }
+
+    #[test]
+    fn replay_speed_normalization_clamps_invalid_values() {
+        assert_eq!(normalize_replay_speed(0.0), 1.0);
+        assert_eq!(normalize_replay_speed(-4.0), 1.0);
+        assert_eq!(normalize_replay_speed(f64::NAN), 1.0);
+        assert_eq!(
+            normalize_replay_speed(REPLAY_SPEED_MIN / 8.0),
+            REPLAY_SPEED_MIN
+        );
+        assert_eq!(
+            normalize_replay_speed(REPLAY_SPEED_MAX * 4.0),
+            REPLAY_SPEED_MAX
+        );
+    }
+
+    #[test]
+    fn replay_controls_map_expected_keys() {
+        assert_eq!(
+            replay_action_from_key(KeyCode::Char(' '), KeyModifiers::NONE, KeyEventKind::Press),
+            Some(InteractiveReplayAction::TogglePause)
+        );
+        assert_eq!(
+            replay_action_from_key(KeyCode::Char('.'), KeyModifiers::NONE, KeyEventKind::Press),
+            Some(InteractiveReplayAction::Step)
+        );
+        assert_eq!(
+            replay_action_from_key(KeyCode::Char('!'), KeyModifiers::NONE, KeyEventKind::Press),
+            Some(InteractiveReplayAction::OpenShell)
+        );
+        assert_eq!(
+            replay_action_from_key(
+                KeyCode::Char('c'),
+                KeyModifiers::CONTROL,
+                KeyEventKind::Press
+            ),
+            Some(InteractiveReplayAction::Quit)
+        );
+        assert_eq!(
+            replay_action_from_key(KeyCode::Char('x'), KeyModifiers::NONE, KeyEventKind::Press),
+            None
+        );
+        assert_eq!(
+            replay_action_from_key(
+                KeyCode::Char('q'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn replay_timeline_step_consumes_until_visible_output() {
+        let events = vec![
+            make_event(
+                RecordingEventKind::PaneInputRaw,
+                5,
+                RecordingPayload::Bytes { data: vec![b'i'] },
+            ),
+            make_event(
+                RecordingEventKind::PaneOutputRaw,
+                10,
+                RecordingPayload::Bytes {
+                    data: b"hello".to_vec(),
+                },
+            ),
+        ];
+        let mut timeline = ReplayTimeline::new(&events);
+        let mut out = Vec::new();
+
+        let wrote_output = timeline
+            .step_to_next_output(&mut out)
+            .expect("step should succeed");
+
+        assert!(wrote_output);
+        assert_eq!(out, b"hello");
+        assert_eq!(timeline.last_ns, 10);
+        assert_eq!(timeline.next_index, 2);
+        assert!(timeline.is_finished());
+    }
 }

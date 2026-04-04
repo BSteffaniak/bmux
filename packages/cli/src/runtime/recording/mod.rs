@@ -459,6 +459,7 @@ pub(super) async fn run_recording_replay(
     let events = load_recording_events(recording_id)?;
     match mode {
         RecordingReplayMode::Watch => super::replay_watch(&events, speed),
+        RecordingReplayMode::Interactive => super::replay_interactive(&events, speed),
         RecordingReplayMode::Verify => {
             super::replay_verify(
                 &events,

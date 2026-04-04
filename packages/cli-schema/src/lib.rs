@@ -31,6 +31,7 @@ pub enum LogLevel {
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum RecordingReplayMode {
     Watch,
+    Interactive,
     Verify,
 }
 
@@ -2494,6 +2495,29 @@ mod tests {
             command,
             RecordingCommand::Replay {
                 mode: RecordingReplayMode::Verify,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_recording_replay_interactive_mode() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "recording",
+            "replay",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "--mode",
+            "interactive",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(
+            command,
+            RecordingCommand::Replay {
+                mode: RecordingReplayMode::Interactive,
                 ..
             }
         ));
