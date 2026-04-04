@@ -42,12 +42,20 @@ struct PaneStreamState {
     expected_stream_start: Option<u64>,
 }
 
+#[derive(Debug, Clone)]
+pub struct PaneOutputChunk {
+    pub pane_index: u32,
+    pub data: Vec<u8>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct OutputDrainResult {
     /// True when bytes were processed or a deterministic resync happened.
     pub had_activity: bool,
     /// Bytes from the currently focused pane in this drain call.
     pub focused_output: Vec<u8>,
+    /// Raw incremental output bytes grouped by pane index.
+    pub pane_outputs: Vec<PaneOutputChunk>,
     /// Server-side hint that more pane output remains to drain.
     pub output_still_pending: bool,
     /// True when at least one pane reports DEC 2026 synchronized-update active.
@@ -328,46 +336,60 @@ impl ScreenInspector {
         let mut result = OutputDrainResult {
             had_activity: false,
             focused_output: Vec::new(),
+            pane_outputs: Vec::new(),
             output_still_pending: batch.output_still_pending,
             any_sync_update_active: false,
         };
 
         let mut needs_resync = false;
         for chunk in batch.chunks {
-            if chunk.pane_id == layout.focused_pane_id && !chunk.data.is_empty() {
-                result.focused_output.extend_from_slice(&chunk.data);
-            }
+            let bmux_ipc::AttachPaneChunk {
+                pane_id,
+                data,
+                stream_start,
+                stream_end,
+                stream_gap,
+                sync_update_active,
+            } = chunk;
 
-            result.any_sync_update_active |= chunk.sync_update_active;
+            result.any_sync_update_active |= sync_update_active;
 
-            let Some(state) = self.pane_states.get_mut(&chunk.pane_id) else {
+            let Some(state) = self.pane_states.get_mut(&pane_id) else {
                 needs_resync = true;
                 continue;
             };
 
-            if chunk.stream_end < chunk.stream_start {
+            if stream_end < stream_start {
                 needs_resync = true;
                 continue;
             }
 
-            if chunk.stream_gap {
+            if stream_gap {
                 needs_resync = true;
                 continue;
             }
 
             if let Some(expected) = state.expected_stream_start {
-                if chunk.stream_start != expected {
+                if stream_start != expected {
                     needs_resync = true;
                     continue;
                 }
             }
 
-            if !chunk.data.is_empty() {
-                state.parser.process(&chunk.data);
+            if pane_id == layout.focused_pane_id && !data.is_empty() {
+                result.focused_output.extend_from_slice(&data);
+            }
+
+            if !data.is_empty() {
+                state.parser.process(&data);
+                result.pane_outputs.push(PaneOutputChunk {
+                    pane_index: state.pane_index,
+                    data,
+                });
                 result.had_activity = true;
             }
 
-            state.expected_stream_start = Some(chunk.stream_end);
+            state.expected_stream_start = Some(stream_end);
         }
 
         if needs_resync {

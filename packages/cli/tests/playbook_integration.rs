@@ -31,6 +31,62 @@ fn endpoint_from_socket_path(path: &str) -> bmux_ipc::IpcEndpoint {
     }
 }
 
+async fn send_json_line(
+    writer: &mut (impl tokio::io::AsyncWrite + Unpin),
+    payload: &serde_json::Value,
+) {
+    use tokio::io::AsyncWriteExt;
+
+    writer
+        .write_all(format!("{}\n", payload).as_bytes())
+        .await
+        .expect("failed to write json command");
+    writer.flush().await.expect("failed to flush");
+}
+
+async fn read_json_line(reader: &mut (impl tokio::io::AsyncBufRead + Unpin)) -> serde_json::Value {
+    use tokio::io::AsyncBufReadExt;
+
+    let mut line = String::new();
+    let read = reader
+        .read_line(&mut line)
+        .await
+        .expect("failed to read response line");
+    assert!(read > 0, "unexpected EOF while waiting for response line");
+    serde_json::from_str(line.trim())
+        .unwrap_or_else(|e| panic!("failed to parse json line: {e}\nline: {line}"))
+}
+
+async fn read_until_json(
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+    max_messages: usize,
+    context: &str,
+    mut predicate: impl FnMut(&serde_json::Value) -> bool,
+) -> serde_json::Value {
+    let mut last_message = None;
+    for _ in 0..max_messages {
+        let msg = read_json_line(reader).await;
+        if predicate(&msg) {
+            return msg;
+        }
+        last_message = Some(msg);
+    }
+    panic!(
+        "did not observe expected message for {context} within {max_messages} messages; last={:#}",
+        last_message.unwrap_or(serde_json::json!({"status":"none"}))
+    );
+}
+
+async fn read_response_for_request_id(
+    reader: &mut (impl tokio::io::AsyncBufRead + Unpin),
+    request_id: &str,
+) -> serde_json::Value {
+    read_until_json(reader, 80, request_id, |msg| {
+        msg["request_id"] == request_id && (msg["type"] == "response" || msg["type"] == "error")
+    })
+    .await
+}
+
 /// Run a playbook fixture via the bmux binary and return parsed JSON output.
 fn run_playbook_fixture(name: &str) -> (serde_json::Value, bool) {
     let fixture = fixtures_dir().join(name);
@@ -1223,7 +1279,7 @@ async fn interactive_mode_basic() {
 #[tokio::test]
 async fn interactive_mode_json_screen_delta_formats() {
     use std::process::Stdio;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+    use tokio::io::BufReader as TokioBufReader;
 
     let mut child = std::process::Command::new(bmux_binary())
         .args([
@@ -1269,41 +1325,16 @@ async fn interactive_mode_json_screen_delta_formats() {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = TokioBufReader::new(reader);
 
-    async fn send_json(
-        writer: &mut (impl tokio::io::AsyncWrite + Unpin),
-        payload: &serde_json::Value,
-    ) {
-        writer
-            .write_all(format!("{}\n", payload).as_bytes())
-            .await
-            .expect("failed to write json command");
-        writer.flush().await.expect("failed to flush");
-    }
-
-    async fn read_json(reader: &mut (impl AsyncBufReadExt + Unpin)) -> serde_json::Value {
-        let mut line = String::new();
-        let read = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            reader.read_line(&mut line),
-        )
-        .await
-        .expect("timed out waiting for response line")
-        .expect("failed to read response line");
-        assert!(read > 0, "unexpected EOF while waiting for response line");
-        serde_json::from_str(line.trim())
-            .unwrap_or_else(|e| panic!("failed to parse json line: {e}\nline: {line}"))
-    }
-
-    send_json(
+    send_json_line(
         &mut writer,
         &serde_json::json!({"op":"command","request_id":"r-new","dsl":"new-session"}),
     )
     .await;
-    let new_session = read_json(&mut reader).await;
+    let new_session = read_response_for_request_id(&mut reader, "r-new").await;
     assert_eq!(new_session["action"], "new-session", "new-session response");
     assert_eq!(new_session["request_id"], "r-new");
 
-    send_json(
+    send_json_line(
         &mut writer,
         &serde_json::json!({
             "op":"subscribe",
@@ -1314,27 +1345,24 @@ async fn interactive_mode_json_screen_delta_formats() {
         }),
     )
     .await;
-    let subscribe_1 = read_json(&mut reader).await;
+    let subscribe_1 = read_response_for_request_id(&mut reader, "r-sub-1").await;
     assert_eq!(subscribe_1["action"], "subscribe");
 
-    send_json(
+    send_json_line(
         &mut writer,
         &serde_json::json!({"op":"command","request_id":"r-keys-1","dsl":"send-keys keys='echo line_ops_marker\\r'"}),
     )
     .await;
+    let keys_1 = read_response_for_request_id(&mut reader, "r-keys-1").await;
+    assert_eq!(keys_1["status"], "ok");
 
-    let mut saw_line_ops = false;
-    for _ in 0..20 {
-        let msg = read_json(&mut reader).await;
-        if msg["event_type"] == "screen_delta" {
-            assert_eq!(msg["screen_delta"]["format"], "line_ops");
-            saw_line_ops = true;
-            break;
-        }
-    }
-    assert!(saw_line_ops, "expected line_ops screen_delta event");
+    let line_ops_event = read_until_json(&mut reader, 80, "line_ops screen_delta", |msg| {
+        msg["type"] == "event" && msg["event_type"] == "screen_delta"
+    })
+    .await;
+    assert_eq!(line_ops_event["screen_delta"]["format"], "line_ops");
 
-    send_json(
+    send_json_line(
         &mut writer,
         &serde_json::json!({
             "op":"subscribe",
@@ -1344,41 +1372,37 @@ async fn interactive_mode_json_screen_delta_formats() {
         }),
     )
     .await;
-    let subscribe_2 = read_json(&mut reader).await;
+    let subscribe_2 = read_response_for_request_id(&mut reader, "r-sub-2").await;
     assert_eq!(subscribe_2["action"], "subscribe");
 
-    send_json(
+    send_json_line(
         &mut writer,
         &serde_json::json!({"op":"command","request_id":"r-keys-2","dsl":"send-keys keys='echo unified_diff_marker\\r'"}),
     )
     .await;
+    let keys_2 = read_response_for_request_id(&mut reader, "r-keys-2").await;
+    assert_eq!(keys_2["status"], "ok");
 
-    let mut saw_unified_diff = false;
-    for _ in 0..20 {
-        let msg = read_json(&mut reader).await;
-        if msg["event_type"] == "screen_delta" {
-            assert_eq!(msg["screen_delta"]["format"], "unified_diff");
-            let diff = msg["screen_delta"]["diff"].as_str().unwrap_or("");
-            assert!(
-                diff.contains("@@"),
-                "unified diff payload should include hunks"
-            );
-            saw_unified_diff = true;
-            break;
-        }
-    }
-    assert!(saw_unified_diff, "expected unified_diff screen_delta event");
+    let unified_diff_event = read_until_json(&mut reader, 80, "unified_diff screen_delta", |msg| {
+        msg["type"] == "event" && msg["event_type"] == "screen_delta"
+    })
+    .await;
+    assert_eq!(unified_diff_event["screen_delta"]["format"], "unified_diff");
+    let diff = unified_diff_event["screen_delta"]["diff"]
+        .as_str()
+        .unwrap_or("");
+    assert!(
+        diff.contains("@@"),
+        "unified diff payload should include hunks"
+    );
 
-    send_json(&mut writer, &serde_json::json!({"op":"quit"})).await;
-    let mut saw_quit = false;
-    for _ in 0..20 {
-        let msg = read_json(&mut reader).await;
-        if msg["action"] == "quit" {
-            saw_quit = true;
-            break;
-        }
-    }
-    assert!(saw_quit, "expected quit response");
+    send_json_line(
+        &mut writer,
+        &serde_json::json!({"op":"quit","request_id":"r-quit"}),
+    )
+    .await;
+    let quit = read_response_for_request_id(&mut reader, "r-quit").await;
+    assert_eq!(quit["action"], "quit", "expected quit response");
 
     let _ = child.wait();
 }
@@ -1386,7 +1410,7 @@ async fn interactive_mode_json_screen_delta_formats() {
 #[tokio::test]
 async fn interactive_mode_watchpoint_event_burst_cursor_delta_hit() {
     use std::process::Stdio;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+    use tokio::io::BufReader as TokioBufReader;
 
     let mut child = std::process::Command::new(bmux_binary())
         .args([
@@ -1432,40 +1456,15 @@ async fn interactive_mode_watchpoint_event_burst_cursor_delta_hit() {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = TokioBufReader::new(reader);
 
-    async fn send_json(
-        writer: &mut (impl tokio::io::AsyncWrite + Unpin),
-        payload: &serde_json::Value,
-    ) {
-        writer
-            .write_all(format!("{}\n", payload).as_bytes())
-            .await
-            .expect("failed to write json command");
-        writer.flush().await.expect("failed to flush");
-    }
-
-    async fn read_json(reader: &mut (impl AsyncBufReadExt + Unpin)) -> serde_json::Value {
-        let mut line = String::new();
-        let read = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            reader.read_line(&mut line),
-        )
-        .await
-        .expect("timed out waiting for response line")
-        .expect("failed to read response line");
-        assert!(read > 0, "unexpected EOF while waiting for response line");
-        serde_json::from_str(line.trim())
-            .unwrap_or_else(|e| panic!("failed to parse json line: {e}\nline: {line}"))
-    }
-
-    send_json(
+    send_json_line(
         &mut writer,
         &serde_json::json!({"op":"command","request_id":"wp-new","dsl":"new-session"}),
     )
     .await;
-    let new_session = read_json(&mut reader).await;
+    let new_session = read_response_for_request_id(&mut reader, "wp-new").await;
     assert_eq!(new_session["action"], "new-session");
 
-    send_json(
+    send_json_line(
         &mut writer,
         &serde_json::json!({
             "op":"subscribe",
@@ -1475,10 +1474,10 @@ async fn interactive_mode_watchpoint_event_burst_cursor_delta_hit() {
         }),
     )
     .await;
-    let subscribed = read_json(&mut reader).await;
+    let subscribed = read_response_for_request_id(&mut reader, "wp-sub").await;
     assert_eq!(subscribed["action"], "subscribe");
 
-    send_json(
+    send_json_line(
         &mut writer,
         &serde_json::json!({
             "op":"set_watchpoint",
@@ -1492,49 +1491,41 @@ async fn interactive_mode_watchpoint_event_burst_cursor_delta_hit() {
         }),
     )
     .await;
-    let set_resp = read_json(&mut reader).await;
+    let set_resp = read_response_for_request_id(&mut reader, "wp-set").await;
     assert_eq!(set_resp["action"], "set_watchpoint");
 
-    send_json(
+    send_json_line(
         &mut writer,
         &serde_json::json!({"op":"command","request_id":"wp-keys","dsl":"send-keys keys='echo watchpoint_cursor_marker\\r'"}),
     )
     .await;
+    let key_resp = read_response_for_request_id(&mut reader, "wp-keys").await;
+    assert_eq!(key_resp["status"], "ok");
 
-    let mut saw_hit = false;
-    for _ in 0..30 {
-        let msg = read_json(&mut reader).await;
-        if msg["event_type"] == "watchpoint_hit" {
-            assert_eq!(msg["watchpoint_hit"]["id"], "cursor-delta-burst-1");
-            assert_eq!(msg["watchpoint_hit"]["kind"], "event_burst");
-            assert_eq!(msg["watchpoint_hit"]["watch_event_type"], "cursor_delta");
-            saw_hit = true;
-            break;
-        }
-    }
-    assert!(
-        saw_hit,
-        "expected watchpoint_hit event for cursor-delta-burst-1"
-    );
+    let hit = read_until_json(&mut reader, 120, "cursor_delta watchpoint hit", |msg| {
+        msg["type"] == "event"
+            && msg["event_type"] == "watchpoint_hit"
+            && msg["watchpoint_hit"]["id"] == "cursor-delta-burst-1"
+    })
+    .await;
+    assert_eq!(hit["watchpoint_hit"]["kind"], "event_burst");
+    assert_eq!(hit["watchpoint_hit"]["watch_event_type"], "cursor_delta");
 
-    send_json(
+    send_json_line(
         &mut writer,
         &serde_json::json!({"op":"clear_watchpoint","request_id":"wp-clear","id":"cursor-delta-burst-1"}),
     )
     .await;
-    let clear_resp = read_json(&mut reader).await;
+    let clear_resp = read_response_for_request_id(&mut reader, "wp-clear").await;
     assert_eq!(clear_resp["action"], "clear_watchpoint");
 
-    send_json(&mut writer, &serde_json::json!({"op":"quit"})).await;
-    let mut saw_quit = false;
-    for _ in 0..20 {
-        let msg = read_json(&mut reader).await;
-        if msg["action"] == "quit" {
-            saw_quit = true;
-            break;
-        }
-    }
-    assert!(saw_quit, "expected quit response");
+    send_json_line(
+        &mut writer,
+        &serde_json::json!({"op":"quit","request_id":"wp-quit"}),
+    )
+    .await;
+    let quit = read_response_for_request_id(&mut reader, "wp-quit").await;
+    assert_eq!(quit["action"], "quit", "expected quit response");
 
     let _ = child.wait();
 }
@@ -1542,7 +1533,7 @@ async fn interactive_mode_watchpoint_event_burst_cursor_delta_hit() {
 #[tokio::test]
 async fn interactive_mode_watchpoint_event_burst_screen_delta_hit_and_blocks_recursive() {
     use std::process::Stdio;
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader as TokioBufReader};
+    use tokio::io::BufReader as TokioBufReader;
 
     let mut child = std::process::Command::new(bmux_binary())
         .args([
@@ -1588,40 +1579,15 @@ async fn interactive_mode_watchpoint_event_burst_screen_delta_hit_and_blocks_rec
     let (reader, mut writer) = tokio::io::split(stream);
     let mut reader = TokioBufReader::new(reader);
 
-    async fn send_json(
-        writer: &mut (impl tokio::io::AsyncWrite + Unpin),
-        payload: &serde_json::Value,
-    ) {
-        writer
-            .write_all(format!("{}\n", payload).as_bytes())
-            .await
-            .expect("failed to write json command");
-        writer.flush().await.expect("failed to flush");
-    }
-
-    async fn read_json(reader: &mut (impl AsyncBufReadExt + Unpin)) -> serde_json::Value {
-        let mut line = String::new();
-        let read = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            reader.read_line(&mut line),
-        )
-        .await
-        .expect("timed out waiting for response line")
-        .expect("failed to read response line");
-        assert!(read > 0, "unexpected EOF while waiting for response line");
-        serde_json::from_str(line.trim())
-            .unwrap_or_else(|e| panic!("failed to parse json line: {e}\nline: {line}"))
-    }
-
-    send_json(
+    send_json_line(
         &mut writer,
         &serde_json::json!({"op":"command","request_id":"burst-new","dsl":"new-session"}),
     )
     .await;
-    let new_session = read_json(&mut reader).await;
+    let new_session = read_response_for_request_id(&mut reader, "burst-new").await;
     assert_eq!(new_session["action"], "new-session");
 
-    send_json(
+    send_json_line(
         &mut writer,
         &serde_json::json!({
             "op":"subscribe",
@@ -1631,10 +1597,10 @@ async fn interactive_mode_watchpoint_event_burst_screen_delta_hit_and_blocks_rec
         }),
     )
     .await;
-    let subscribed = read_json(&mut reader).await;
+    let subscribed = read_response_for_request_id(&mut reader, "burst-sub").await;
     assert_eq!(subscribed["action"], "subscribe");
 
-    send_json(
+    send_json_line(
         &mut writer,
         &serde_json::json!({
             "op":"set_watchpoint",
@@ -1647,10 +1613,10 @@ async fn interactive_mode_watchpoint_event_burst_screen_delta_hit_and_blocks_rec
         }),
     )
     .await;
-    let invalid_watchpoint = read_json(&mut reader).await;
+    let invalid_watchpoint = read_response_for_request_id(&mut reader, "burst-set-invalid").await;
     assert_eq!(invalid_watchpoint["status"], "error");
 
-    send_json(
+    send_json_line(
         &mut writer,
         &serde_json::json!({
             "op":"set_watchpoint",
@@ -1664,50 +1630,45 @@ async fn interactive_mode_watchpoint_event_burst_screen_delta_hit_and_blocks_rec
         }),
     )
     .await;
-    let set_resp = read_json(&mut reader).await;
+    let set_resp = read_response_for_request_id(&mut reader, "burst-set").await;
     assert_eq!(set_resp["action"], "set_watchpoint");
 
-    send_json(
+    send_json_line(
         &mut writer,
         &serde_json::json!({"op":"command","request_id":"burst-keys-1","dsl":"send-keys keys='echo burst_one\\r'"}),
     )
     .await;
-    let _ = read_json(&mut reader).await;
+    let keys_1 = read_response_for_request_id(&mut reader, "burst-keys-1").await;
+    assert_eq!(keys_1["status"], "ok");
 
-    send_json(
+    send_json_line(
         &mut writer,
         &serde_json::json!({"op":"command","request_id":"burst-keys-2","dsl":"send-keys keys='echo burst_two\\r'"}),
     )
     .await;
+    let keys_2 = read_response_for_request_id(&mut reader, "burst-keys-2").await;
+    assert_eq!(keys_2["status"], "ok");
 
-    let mut saw_hit = false;
-    for _ in 0..40 {
-        let msg = read_json(&mut reader).await;
-        if msg["event_type"] == "watchpoint_hit"
+    let hit = read_until_json(&mut reader, 120, "screen_delta watchpoint hit", |msg| {
+        msg["type"] == "event"
+            && msg["event_type"] == "watchpoint_hit"
             && msg["watchpoint_hit"]["id"] == "screen-delta-burst-1"
-        {
-            assert_eq!(msg["watchpoint_hit"]["kind"], "event_burst");
-            assert_eq!(msg["watchpoint_hit"]["watch_event_type"], "screen_delta");
-            assert!(msg["watchpoint_hit"]["observed_hits"].as_u64().unwrap_or(0) >= 1);
-            saw_hit = true;
-            break;
-        }
-    }
+    })
+    .await;
+    assert_eq!(hit["watchpoint_hit"]["kind"], "event_burst");
+    assert_eq!(hit["watchpoint_hit"]["watch_event_type"], "screen_delta");
     assert!(
-        saw_hit,
-        "expected watchpoint_hit event for screen-delta-burst-1"
+        hit["watchpoint_hit"]["observed_hits"].as_u64().unwrap_or(0) >= 1,
+        "expected observed hits >= 1"
     );
 
-    send_json(&mut writer, &serde_json::json!({"op":"quit"})).await;
-    let mut saw_quit = false;
-    for _ in 0..20 {
-        let msg = read_json(&mut reader).await;
-        if msg["action"] == "quit" {
-            saw_quit = true;
-            break;
-        }
-    }
-    assert!(saw_quit, "expected quit response");
+    send_json_line(
+        &mut writer,
+        &serde_json::json!({"op":"quit","request_id":"burst-quit"}),
+    )
+    .await;
+    let quit = read_response_for_request_id(&mut reader, "burst-quit").await;
+    assert_eq!(quit["action"], "quit", "expected quit response");
 
     let _ = child.wait();
 }

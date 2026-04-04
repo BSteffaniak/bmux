@@ -27,6 +27,8 @@ use super::types::{PaneCapture, SnapshotCapture, Step};
 
 /// Default timeout for sandbox server startup.
 const SERVER_STARTUP_TIMEOUT: Duration = Duration::from_secs(15);
+/// Max bytes to drain per pane on output-available notifications.
+const INTERACTIVE_OUTPUT_MAX_BYTES: usize = 256 * 1024;
 
 /// JSON response sent back to the agent for each command.
 #[derive(Serialize)]
@@ -822,8 +824,6 @@ enum ReplLoopEvent {
     InputLine(String),
     InputEof,
     InputError(String),
-    PaneOutput(u32, String),
-    PaneOutputClosed,
     ServerEvent(bmux_client::ServerEvent),
     ServerEventClosed,
 }
@@ -851,11 +851,8 @@ async fn run_repl(
     let (reader, mut writer) = tokio::io::split(stream);
     let mut input_lines = BufReader::new(reader).lines();
 
-    // Channel for push output events (populated when subscribed).
-    let (output_tx, mut output_rx) = tokio::sync::mpsc::channel::<(u32, String)>(64);
     let (server_event_tx, mut server_event_rx) =
         tokio::sync::mpsc::channel::<bmux_client::ServerEvent>(64);
-    let mut output_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut server_event_task: Option<tokio::task::JoinHandle<()>> = None;
     let mut subscription = LiveSubscription::default();
     let mut pane_cache = std::collections::HashMap::<u32, PaneCapture>::new();
@@ -878,12 +875,6 @@ async fn run_repl(
                     Ok(Some(line)) => ReplLoopEvent::InputLine(line),
                     Ok(None) => ReplLoopEvent::InputEof,
                     Err(error) => ReplLoopEvent::InputError(error.to_string()),
-                }
-            }
-            event = output_rx.recv(), if subscription.active => {
-                match event {
-                    Some((pane_idx, data)) => ReplLoopEvent::PaneOutput(pane_idx, data),
-                    None => ReplLoopEvent::PaneOutputClosed,
                 }
             }
             event = server_event_rx.recv(), if subscription.active => {
@@ -912,8 +903,19 @@ async fn run_repl(
                 warn!("read error: {error}");
                 break;
             }
-            ReplLoopEvent::PaneOutput(pane_idx, data) => {
-                process_pane_output_event(
+            ReplLoopEvent::ServerEvent(event) => {
+                process_server_event(
+                    &mut writer,
+                    &mut sequencer,
+                    &mut event_buffer,
+                    &subscription,
+                    &mut budget_state,
+                    &mut watchpoints,
+                    &event,
+                )
+                .await?;
+
+                process_output_available_event(
                     &mut writer,
                     &mut sequencer,
                     &mut event_buffer,
@@ -925,26 +927,12 @@ async fn run_repl(
                     session_id,
                     attached,
                     &mut pane_cache,
-                    pane_idx,
-                    data,
+                    &event,
                 )
                 .await?;
                 continue;
             }
-            ReplLoopEvent::ServerEvent(event) => {
-                process_server_event(
-                    &mut writer,
-                    &mut sequencer,
-                    &mut event_buffer,
-                    &subscription,
-                    &mut budget_state,
-                    &mut watchpoints,
-                    event,
-                )
-                .await?;
-                continue;
-            }
-            ReplLoopEvent::PaneOutputClosed | ReplLoopEvent::ServerEventClosed => {
+            ReplLoopEvent::ServerEventClosed => {
                 continue;
             }
         };
@@ -992,9 +980,7 @@ async fn run_repl(
                     session_id,
                     attached,
                     &mut subscription,
-                    &mut output_task,
                     &mut server_event_task,
-                    &output_tx,
                     &server_event_tx,
                     &mut pane_cache,
                     sandbox,
@@ -1099,7 +1085,7 @@ async fn run_repl(
                     .await?;
                     continue;
                 }
-                let Some(sid) = *session_id else {
+                if session_id.is_none() {
                     let resp = InteractiveResponse::error(
                         "no session — use new-session first".to_string(),
                     );
@@ -1112,7 +1098,7 @@ async fn run_repl(
                     )
                     .await?;
                     continue;
-                };
+                }
                 if !*attached {
                     let resp = InteractiveResponse::error("not attached to a session".to_string());
                     send_response(
@@ -1125,45 +1111,59 @@ async fn run_repl(
                     .await?;
                     continue;
                 }
-                // Create a second client connection for output polling.
-                match sandbox.connect("bmux-playbook-output-stream").await {
-                    Ok(mut event_client) => {
-                        let tx = output_tx.clone();
-                        let focused = runtime_vars.focused_pane;
-                        output_task = Some(tokio::spawn(async move {
-                            output_poll_loop(&mut event_client, sid, focused, tx).await;
-                        }));
-                        subscription.active = true;
-                        subscription.event_types =
-                            ["pane_output".to_string()].into_iter().collect();
-                        let resp = InteractiveResponse::ok("subscribe");
-                        send_response(
-                            &mut writer,
-                            &mut sequencer,
-                            resp,
-                            "response",
-                            active_request_id.as_deref(),
-                        )
-                        .await?;
-                    }
-                    Err(e) => {
-                        let resp = InteractiveResponse::error(format!("subscribe failed: {e:#}"));
-                        send_response(
-                            &mut writer,
-                            &mut sequencer,
-                            resp,
-                            "error",
-                            active_request_id.as_deref(),
-                        )
-                        .await?;
+                if server_event_task.is_none() {
+                    match sandbox.connect("bmux-playbook-event-stream").await {
+                        Ok(mut event_client) => {
+                            if let Err(error) = event_client.subscribe_events().await {
+                                let resp = InteractiveResponse::error(format!(
+                                    "server event subscribe failed: {error:#}"
+                                ));
+                                send_response(
+                                    &mut writer,
+                                    &mut sequencer,
+                                    resp,
+                                    "error",
+                                    active_request_id.as_deref(),
+                                )
+                                .await?;
+                                continue;
+                            }
+                            let tx = server_event_tx.clone();
+                            server_event_task = Some(tokio::spawn(async move {
+                                server_event_poll_loop(&mut event_client, tx).await;
+                            }));
+                        }
+                        Err(error) => {
+                            let resp = InteractiveResponse::error(format!(
+                                "server event stream connection failed: {error:#}"
+                            ));
+                            send_response(
+                                &mut writer,
+                                &mut sequencer,
+                                resp,
+                                "error",
+                                active_request_id.as_deref(),
+                            )
+                            .await?;
+                            continue;
+                        }
                     }
                 }
+
+                subscription.active = true;
+                subscription.event_types = ["pane_output".to_string()].into_iter().collect();
+                let resp = InteractiveResponse::ok("subscribe");
+                send_response(
+                    &mut writer,
+                    &mut sequencer,
+                    resp,
+                    "response",
+                    active_request_id.as_deref(),
+                )
+                .await?;
                 continue;
             }
             "unsubscribe" => {
-                if let Some(task) = output_task.take() {
-                    task.abort();
-                }
                 subscription.active = false;
                 let resp = InteractiveResponse::ok("unsubscribe");
                 send_response(
@@ -1506,10 +1506,6 @@ async fn run_repl(
         }
     }
 
-    // Clean up the output polling task if still running.
-    if let Some(task) = output_task.take() {
-        task.abort();
-    }
     if let Some(task) = server_event_task.take() {
         task.abort();
     }
@@ -1664,7 +1660,7 @@ fn update_pane_cache_from_inspector(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn process_pane_output_event<W: tokio::io::AsyncWrite + Unpin>(
+async fn process_output_available_event<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     sequencer: &mut MessageSequencer,
     event_buffer: &mut EventBuffer,
@@ -1676,44 +1672,87 @@ async fn process_pane_output_event<W: tokio::io::AsyncWrite + Unpin>(
     session_id: &Option<Uuid>,
     attached: &bool,
     pane_cache: &mut std::collections::HashMap<u32, PaneCapture>,
-    pane_idx: u32,
-    data: String,
+    event: &bmux_client::ServerEvent,
 ) -> Result<()> {
-    let mut output_seq = None;
-    if subscription.wants("pane_output") && subscription.allows_pane(pane_idx) {
-        let mut push = InteractiveResponse::push_output(pane_idx, data.clone());
-        push.event_type = Some("pane_output".to_string());
-        output_seq = send_event_if_allowed(
-            writer,
-            sequencer,
-            event_buffer,
-            subscription,
-            budget_state,
-            push,
-            "pane_output",
-            Some(pane_idx),
-        )
-        .await?;
+    let bmux_client::ServerEvent::PaneOutputAvailable {
+        session_id: event_session_id,
+        ..
+    } = event
+    else {
+        return Ok(());
+    };
+
+    if !subscription.active {
+        return Ok(());
+    }
+    if !*attached {
+        return Ok(());
+    }
+    if Some(*event_session_id) != *session_id {
+        return Ok(());
     }
 
-    if subscription.wants("watchpoint_hit")
-        && !watchpoints.is_empty()
-        && subscription.allows_pane(pane_idx)
+    let drain = match inspector
+        .drain_incremental_output(client, *event_session_id, INTERACTIVE_OUTPUT_MAX_BYTES)
+        .await
     {
-        for hit in evaluate_watchpoints(
-            watchpoints,
-            "pane_output",
-            Some(pane_idx),
-            output_seq,
-            None,
-            Some(&data),
-        ) {
-            let response = InteractiveResponse::event_watchpoint_hit(hit);
-            send_response(writer, sequencer, response, "event", None).await?;
+        Ok(result) => result,
+        Err(error) => {
+            warn!("interactive output drain failed: {error:#}");
+            return Ok(());
+        }
+    };
+
+    for output in &drain.pane_outputs {
+        let pane_idx = output.pane_index;
+        if !subscription.allows_pane(pane_idx) {
+            continue;
+        }
+
+        let text = String::from_utf8_lossy(&output.data).to_string();
+        let mut output_seq = None;
+        if subscription.wants("pane_output") {
+            let mut push = InteractiveResponse::push_output(pane_idx, text.clone());
+            push.event_type = Some("pane_output".to_string());
+            output_seq = send_event_if_allowed(
+                writer,
+                sequencer,
+                event_buffer,
+                subscription,
+                budget_state,
+                push,
+                "pane_output",
+                Some(pane_idx),
+            )
+            .await?;
+        }
+
+        if subscription.wants("watchpoint_hit") && !watchpoints.is_empty() {
+            for hit in evaluate_watchpoints(
+                watchpoints,
+                "pane_output",
+                Some(pane_idx),
+                output_seq,
+                None,
+                Some(&text),
+            ) {
+                let response = InteractiveResponse::event_watchpoint_hit(hit);
+                let _ = send_event_if_allowed(
+                    writer,
+                    sequencer,
+                    event_buffer,
+                    subscription,
+                    budget_state,
+                    response,
+                    "watchpoint_hit",
+                    Some(pane_idx),
+                )
+                .await?;
+            }
         }
     }
 
-    emit_screen_events(
+    emit_screen_events_with_refresh(
         writer,
         sequencer,
         event_buffer,
@@ -1725,6 +1764,7 @@ async fn process_pane_output_event<W: tokio::io::AsyncWrite + Unpin>(
         subscription,
         pane_cache,
         watchpoints,
+        false,
     )
     .await
 }
@@ -1736,13 +1776,13 @@ async fn process_server_event<W: tokio::io::AsyncWrite + Unpin>(
     subscription: &LiveSubscription,
     budget_state: &mut EventBudgetState,
     watchpoints: &mut WatchpointRegistry,
-    event: bmux_client::ServerEvent,
+    event: &bmux_client::ServerEvent,
 ) -> Result<()> {
     let mut event_seq = None;
     if subscription.wants("server_event") {
         let payload = ServerEventPayload {
-            name: server_event_name(&event).to_string(),
-            payload: serde_json::to_value(&event)?,
+            name: server_event_name(event).to_string(),
+            payload: serde_json::to_value(event)?,
         };
         let response = InteractiveResponse::event_server_event(payload);
         event_seq = send_event_if_allowed(
@@ -1765,7 +1805,7 @@ async fn process_server_event<W: tokio::io::AsyncWrite + Unpin>(
             None,
             event_seq,
             None,
-            Some(server_event_name(&event)),
+            Some(server_event_name(event)),
         ) {
             let response = InteractiveResponse::event_watchpoint_hit(hit);
             let _ = send_event_if_allowed(
@@ -1798,6 +1838,37 @@ async fn emit_screen_events<W: tokio::io::AsyncWrite + Unpin>(
     pane_cache: &mut std::collections::HashMap<u32, PaneCapture>,
     watchpoints: &mut WatchpointRegistry,
 ) -> Result<()> {
+    emit_screen_events_with_refresh(
+        writer,
+        sequencer,
+        event_buffer,
+        budget_state,
+        client,
+        inspector,
+        session_id,
+        attached,
+        subscription,
+        pane_cache,
+        watchpoints,
+        true,
+    )
+    .await
+}
+
+async fn emit_screen_events_with_refresh<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    sequencer: &mut MessageSequencer,
+    event_buffer: &mut EventBuffer,
+    budget_state: &mut EventBudgetState,
+    client: &mut bmux_client::BmuxClient,
+    inspector: &mut ScreenInspector,
+    session_id: &Option<Uuid>,
+    attached: &bool,
+    subscription: &LiveSubscription,
+    pane_cache: &mut std::collections::HashMap<u32, PaneCapture>,
+    watchpoints: &mut WatchpointRegistry,
+    refresh_before_emit: bool,
+) -> Result<()> {
     if !subscription.active
         || (!subscription.wants("cursor_delta")
             && !subscription.wants("screen_delta")
@@ -1812,7 +1883,7 @@ async fn emit_screen_events<W: tokio::io::AsyncWrite + Unpin>(
         return Ok(());
     }
 
-    if inspector.refresh(client, sid).await.is_err() {
+    if refresh_before_emit && inspector.refresh(client, sid).await.is_err() {
         return Ok(());
     }
     let deltas = inspector.build_deltas(pane_cache, subscription.resolved_delta_format());
@@ -1931,9 +2002,7 @@ async fn handle_json_command<W: tokio::io::AsyncWrite + Unpin>(
     session_id: &mut Option<Uuid>,
     attached: &mut bool,
     subscription: &mut LiveSubscription,
-    output_task: &mut Option<tokio::task::JoinHandle<()>>,
     server_event_task: &mut Option<tokio::task::JoinHandle<()>>,
-    output_tx: &tokio::sync::mpsc::Sender<(u32, String)>,
     server_event_tx: &tokio::sync::mpsc::Sender<bmux_client::ServerEvent>,
     pane_cache: &mut std::collections::HashMap<u32, PaneCapture>,
     sandbox: &super::sandbox::SandboxServer,
@@ -1962,48 +2031,18 @@ async fn handle_json_command<W: tokio::io::AsyncWrite + Unpin>(
             Ok(true)
         }
         "subscribe" => {
-            let Some(sid) = *session_id else {
+            if session_id.is_none() {
                 let mut resp =
                     InteractiveResponse::error("no session — use new-session first".to_string());
                 resp.code = Some("invalid_state".to_string());
                 send_response(writer, sequencer, resp, "error", json.request_id.as_deref()).await?;
                 return Ok(true);
-            };
+            }
             if !*attached {
                 let mut resp = InteractiveResponse::error("not attached to a session".to_string());
                 resp.code = Some("invalid_state".to_string());
                 send_response(writer, sequencer, resp, "error", json.request_id.as_deref()).await?;
                 return Ok(true);
-            }
-            if output_task.is_none() {
-                match sandbox.connect("bmux-playbook-output-stream").await {
-                    Ok(mut event_client) => {
-                        let tx = output_tx.clone();
-                        let focused = inspector
-                            .refresh(client, sid)
-                            .await
-                            .ok()
-                            .and_then(|snapshot| {
-                                snapshot
-                                    .panes
-                                    .iter()
-                                    .find(|pane| pane.focused)
-                                    .map(|pane| pane.index)
-                            })
-                            .unwrap_or(1);
-                        *output_task = Some(tokio::spawn(async move {
-                            output_poll_loop(&mut event_client, sid, focused, tx).await;
-                        }));
-                    }
-                    Err(e) => {
-                        let mut resp =
-                            InteractiveResponse::error(format!("subscribe failed: {e:#}"));
-                        resp.code = Some("internal".to_string());
-                        send_response(writer, sequencer, resp, "error", json.request_id.as_deref())
-                            .await?;
-                        return Ok(true);
-                    }
-                }
             }
             if server_event_task.is_none() {
                 match sandbox.connect("bmux-playbook-event-stream").await {
@@ -2119,9 +2158,6 @@ async fn handle_json_command<W: tokio::io::AsyncWrite + Unpin>(
             Ok(true)
         }
         "unsubscribe" => {
-            if let Some(task) = output_task.take() {
-                task.abort();
-            }
             if let Some(task) = server_event_task.take() {
                 task.abort();
             }
@@ -2640,39 +2676,6 @@ fn simple_hash(bytes: &[u8]) -> u64 {
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     hash
-}
-
-/// Background task that polls for output from the sandbox and sends push
-/// events through the channel. Runs until the channel is closed (receiver dropped)
-/// or the task is aborted.
-async fn output_poll_loop(
-    client: &mut bmux_client::BmuxClient,
-    session_id: Uuid,
-    focused_pane_index: u32,
-    tx: tokio::sync::mpsc::Sender<(u32, String)>,
-) {
-    const MAX_OUTPUT_BYTES: usize = 64 * 1024;
-    const POLL_INTERVAL: Duration = Duration::from_millis(50);
-
-    loop {
-        match client.attach_output(session_id, MAX_OUTPUT_BYTES).await {
-            Ok(data) if !data.is_empty() => {
-                let text = String::from_utf8_lossy(&data).to_string();
-                // attach_output returns output from the focused pane.
-                if tx.send((focused_pane_index, text)).await.is_err() {
-                    break; // Receiver dropped — unsubscribed or session ended
-                }
-            }
-            Ok(_) => {
-                // No output — sleep before polling again.
-                tokio::time::sleep(POLL_INTERVAL).await;
-            }
-            Err(e) => {
-                warn!("output poll error: {e}");
-                break;
-            }
-        }
-    }
 }
 
 async fn server_event_poll_loop(
