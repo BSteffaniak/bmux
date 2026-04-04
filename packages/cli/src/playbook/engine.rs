@@ -190,11 +190,11 @@ impl VisualInteractiveState {
         let now = Instant::now();
         Ok(Self {
             terminal: VisualTerminalGuard::enter()?,
-            paused: false,
+            paused: true,
             step_once_requested: false,
             single_step_inflight: false,
             abort_requested: false,
-            status_line: "running".to_string(),
+            status_line: "paused (press n to step, c/l to run live)".to_string(),
             current_step_label: "<waiting>".to_string(),
             current_step_position: 0,
             total_steps,

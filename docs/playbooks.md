@@ -62,6 +62,9 @@ echo 'new-session\nsend-keys keys="echo hi\\r"\nwait-for pattern="hi"' | bmux pl
 Use `--interactive` from a real terminal (TTY) to enter a full-screen live tour
 that continuously renders pane output while the playbook runs.
 
+The tour starts paused so you can immediately choose step-by-step (`n`) or
+switch to live mode (`c` / `l`).
+
 - `space`: pause/resume live playback
 - `n`: single-step one playbook step (when paused)
 - `c` / `l`: return to live running mode
