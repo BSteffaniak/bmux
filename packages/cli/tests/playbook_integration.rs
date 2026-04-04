@@ -10,6 +10,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::process::Stdio;
 
 /// Path to the built `bmux` binary.
 fn bmux_binary() -> PathBuf {
@@ -53,6 +54,71 @@ fn run_playbook_fixture(name: &str) -> (serde_json::Value, bool) {
 
     let pass = json["pass"].as_bool().unwrap_or(false);
     (json, pass)
+}
+
+#[test]
+fn playbook_run_interactive_step_controls() {
+    use std::io::Write;
+
+    let fixture = fixtures_dir().join("echo_hello.dsl");
+    assert!(fixture.exists(), "fixture not found: {}", fixture.display());
+
+    let mut child = Command::new(bmux_binary())
+        .args([
+            "playbook",
+            "run",
+            "--json",
+            "--interactive",
+            fixture.to_str().expect("fixture path should be utf-8"),
+        ])
+        .env("BMUX_PLAYBOOK_ENV_MODE", "inherit")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to spawn interactive playbook run");
+
+    {
+        let mut stdin = child.stdin.take().expect("stdin should be piped");
+        stdin
+            .write_all(
+                b"n\n: send-keys keys='echo adhoc_interactive_marker\\r'\n: wait-for pattern='adhoc_interactive_marker'\ns\nc\n",
+            )
+            .expect("failed writing interactive commands");
+    }
+
+    let output = child
+        .wait_with_output()
+        .expect("failed waiting for interactive run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).unwrap_or_else(|e| {
+        panic!(
+            "failed to parse JSON output:\n  error: {e}\n  stdout: {stdout}\n  stderr: {stderr}\n  exit: {:?}",
+            output.status
+        )
+    });
+
+    assert!(
+        json["pass"].as_bool().unwrap_or(false),
+        "interactive run should pass: {json:#}"
+    );
+    let steps = json["steps"].as_array().expect("steps should be array");
+    assert!(
+        steps.iter().all(|step| step["status"] == "pass"),
+        "all scheduled steps should pass: {json:#}"
+    );
+
+    assert!(
+        stderr.contains("interactive playbook controls"),
+        "stderr should include controls help: {stderr}"
+    );
+    assert!(
+        stderr.contains("adhoc_interactive_marker"),
+        "screen output should include ad-hoc marker: {stderr}"
+    );
 }
 
 // ---------------------------------------------------------------------------

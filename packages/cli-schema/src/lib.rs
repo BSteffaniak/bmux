@@ -731,6 +731,9 @@ pub enum PlaybookCommand {
         /// Output results as JSON
         #[arg(long)]
         json: bool,
+        /// Pause at each step for interactive control
+        #[arg(long)]
+        interactive: bool,
         /// Run against the live server instead of an ephemeral sandbox
         #[arg(long)]
         target_server: bool,
@@ -1121,11 +1124,12 @@ pub enum TerminalCommand {
 mod tests {
     use super::{
         AuthCommand, Cli, Command, GatewayHostMode, HostedModeArg, KeymapCommand, LogsCommand,
-        LogsProfilesCommand, RecordingCommand, RecordingCursorBlinkMode, RecordingCursorMode,
-        RecordingCursorPaintMode, RecordingCursorProfile, RecordingCursorShape,
-        RecordingCursorTextMode, RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg,
-        RecordingRenderMode, RecordingReplayMode, RemoteCommand, RemoteCompleteCommand,
-        ServerCommand, SessionCommand, TerminalCommand, TraceFamily,
+        LogsProfilesCommand, PlaybookCommand, RecordingCommand, RecordingCursorBlinkMode,
+        RecordingCursorMode, RecordingCursorPaintMode, RecordingCursorProfile,
+        RecordingCursorShape, RecordingCursorTextMode, RecordingEventKindArg,
+        RecordingExportFormat, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
+        RemoteCommand, RemoteCompleteCommand, ServerCommand, SessionCommand, TerminalCommand,
+        TraceFamily,
     };
     use clap::Parser;
 
@@ -2518,6 +2522,28 @@ mod tests {
             command,
             RecordingCommand::Replay {
                 mode: RecordingReplayMode::Interactive,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_playbook_run_interactive_flag() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "playbook",
+            "run",
+            "fixtures/echo.dsl",
+            "--interactive",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Playbook { command }) = cli.command else {
+            panic!("expected playbook command");
+        };
+        assert!(matches!(
+            command,
+            PlaybookCommand::Run {
+                interactive: true,
                 ..
             }
         ));

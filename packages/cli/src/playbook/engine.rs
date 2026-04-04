@@ -2,6 +2,7 @@
 //!
 //! Orchestrates the full lifecycle: parse → sandbox → execute steps → report.
 
+use std::io::Write;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -15,6 +16,8 @@ use crossterm::event::{
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
+use super::RunOptions;
+use super::parse_dsl::parse_action_line;
 use super::sandbox::SandboxServer;
 use super::screen::ScreenInspector;
 use super::subst::RuntimeVars;
@@ -59,9 +62,13 @@ impl AttachInputRuntime {
 ///
 /// Handles Ctrl+C gracefully: on signal, the sandbox server is cleaned up
 /// via `SandboxServer`'s `Drop` impl.
-pub async fn run_playbook(playbook: Playbook, target_server: bool) -> Result<PlaybookResult> {
+pub async fn run_playbook(
+    playbook: Playbook,
+    target_server: bool,
+    options: RunOptions,
+) -> Result<PlaybookResult> {
     tokio::select! {
-        result = run_playbook_inner(playbook, target_server) => result,
+        result = run_playbook_inner(playbook, target_server, options) => result,
         _ = tokio::signal::ctrl_c() => {
             // The sandbox (if any) will be cleaned up by Drop when the
             // run_playbook_inner future is dropped by select!.
@@ -72,7 +79,11 @@ pub async fn run_playbook(playbook: Playbook, target_server: bool) -> Result<Pla
 }
 
 /// Core playbook execution logic.
-async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<PlaybookResult> {
+async fn run_playbook_inner(
+    playbook: Playbook,
+    target_server: bool,
+    options: RunOptions,
+) -> Result<PlaybookResult> {
     let started = Instant::now();
     let playbook_name = playbook.config.name.clone();
     let should_record = playbook.config.record;
@@ -162,8 +173,54 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
     // Execute each step
     let playbook_start = Instant::now();
     let deadline = playbook_start + playbook.config.timeout;
+    let total_steps = playbook.steps.len();
+    let mut interactive_prompt_active = options.interactive;
+    let mut interactive_abort_from_step: Option<usize> = None;
 
-    for step in &playbook.steps {
+    if options.interactive {
+        eprintln!(
+            "interactive playbook controls: n next | c continue | s screen | :<dsl> command | q quit"
+        );
+    }
+
+    for (step_position, step) in playbook.steps.iter().enumerate() {
+        if interactive_prompt_active {
+            let prompt_decision = interactive_step_prompt(
+                step,
+                step_position,
+                total_steps,
+                &mut client,
+                &mut inspector,
+                &mut session_id,
+                &mut attached,
+                &mut events_subscribed,
+                &mut attach_runtime,
+                &playbook.config.viewport.cols,
+                &playbook.config.viewport.rows,
+                &mut snapshots,
+                deadline,
+                &mut display_track,
+                &mut runtime_vars,
+            )
+            .await?;
+
+            match prompt_decision {
+                InteractivePromptDecision::RunNextStep => {}
+                InteractivePromptDecision::ContinueRemaining => {
+                    interactive_prompt_active = false;
+                }
+                InteractivePromptDecision::AbortRun => {
+                    interactive_abort_from_step = Some(step_position);
+                    error_msg = Some(format!(
+                        "interactive run aborted before step {} ({})",
+                        step.index,
+                        step.action.name()
+                    ));
+                    break;
+                }
+            }
+        }
+
         if Instant::now() > deadline {
             let elapsed = playbook_start.elapsed().as_millis();
             error_msg = Some(format!(
@@ -185,11 +242,10 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
         }
 
         let step_start = Instant::now();
-        let total_steps = playbook.steps.len();
         if playbook.config.verbose {
             eprint!(
                 "[{}/{}] {}...",
-                step.index + 1,
+                step_position + 1,
                 total_steps,
                 step.action.name()
             );
@@ -283,6 +339,22 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
         }
     }
 
+    if let Some(abort_start_index) = interactive_abort_from_step {
+        for skipped_step in playbook.steps.iter().skip(abort_start_index) {
+            step_results.push(StepResult {
+                index: skipped_step.index,
+                action: skipped_step.action.name().to_string(),
+                status: StepStatus::Skip,
+                elapsed_ms: 0,
+                detail: Some("skipped: aborted by interactive operator".to_string()),
+                expected: None,
+                actual: None,
+                failure_captures: None,
+                continue_on_error: skipped_step.continue_on_error,
+            });
+        }
+    }
+
     // Finish display track before stopping the recording.
     if let Some(ref mut dt) = display_track {
         if let Err(e) = dt.finish() {
@@ -344,6 +416,260 @@ async fn run_playbook_inner(playbook: Playbook, target_server: bool) -> Result<P
         error: error_msg,
         sandbox_root: if pass { None } else { sandbox_root },
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum InteractivePromptCommand {
+    RunNextStep,
+    ContinueRemaining,
+    AbortRun,
+    ShowScreen,
+    RunDsl(String),
+    Help,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InteractivePromptDecision {
+    RunNextStep,
+    ContinueRemaining,
+    AbortRun,
+}
+
+fn parse_interactive_prompt_command(raw: &str) -> Result<InteractivePromptCommand> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() || matches!(trimmed, "n" | "next") {
+        return Ok(InteractivePromptCommand::RunNextStep);
+    }
+    if matches!(trimmed, "c" | "continue") {
+        return Ok(InteractivePromptCommand::ContinueRemaining);
+    }
+    if matches!(trimmed, "q" | "quit" | "abort") {
+        return Ok(InteractivePromptCommand::AbortRun);
+    }
+    if matches!(trimmed, "s" | "screen") {
+        return Ok(InteractivePromptCommand::ShowScreen);
+    }
+    if matches!(trimmed, "h" | "help" | "?") {
+        return Ok(InteractivePromptCommand::Help);
+    }
+    if let Some(rest) = trimmed.strip_prefix(':') {
+        let dsl = rest.trim();
+        if dsl.is_empty() {
+            bail!("missing DSL command after ':'")
+        }
+        return Ok(InteractivePromptCommand::RunDsl(dsl.to_string()));
+    }
+
+    bail!("unknown interactive command '{trimmed}' (expected n/c/s/:<dsl>/q/help)",)
+}
+
+fn read_interactive_prompt_line() -> Result<Option<String>> {
+    let mut line = String::new();
+    let read = std::io::stdin()
+        .read_line(&mut line)
+        .context("failed reading interactive command from stdin")?;
+    if read == 0 {
+        return Ok(None);
+    }
+    Ok(Some(line))
+}
+
+fn print_interactive_prompt_help() {
+    eprintln!("interactive commands:");
+    eprintln!("  n / <enter>   run next playbook step");
+    eprintln!("  c             continue remaining steps without pausing");
+    eprintln!("  s             show current pane screen capture");
+    eprintln!("  :<dsl>        run ad-hoc DSL command in this session");
+    eprintln!("  q             abort run (remaining steps become skipped)");
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn interactive_step_prompt(
+    step: &Step,
+    step_position: usize,
+    total_steps: usize,
+    client: &mut BmuxClient,
+    inspector: &mut ScreenInspector,
+    session_id: &mut Option<Uuid>,
+    attached: &mut bool,
+    events_subscribed: &mut bool,
+    attach_runtime: &mut Option<AttachInputRuntime>,
+    viewport_cols: &u16,
+    viewport_rows: &u16,
+    snapshots: &mut Vec<SnapshotCapture>,
+    deadline: Instant,
+    display_track: &mut Option<super::display_track::PlaybookDisplayTrackWriter>,
+    runtime_vars: &mut RuntimeVars,
+) -> Result<InteractivePromptDecision> {
+    loop {
+        {
+            let mut stderr = std::io::stderr().lock();
+            writeln!(
+                stderr,
+                "[step {}/{}] {}",
+                step_position + 1,
+                total_steps,
+                step.to_dsl()
+            )
+            .context("failed writing interactive prompt")?;
+            write!(stderr, "playbook> ").context("failed writing interactive prompt")?;
+            stderr
+                .flush()
+                .context("failed flushing interactive prompt")?;
+        }
+
+        let Some(raw_line) = read_interactive_prompt_line()? else {
+            eprintln!("interactive stdin closed; aborting run");
+            return Ok(InteractivePromptDecision::AbortRun);
+        };
+
+        match parse_interactive_prompt_command(&raw_line) {
+            Ok(InteractivePromptCommand::RunNextStep) => {
+                return Ok(InteractivePromptDecision::RunNextStep);
+            }
+            Ok(InteractivePromptCommand::ContinueRemaining) => {
+                return Ok(InteractivePromptDecision::ContinueRemaining);
+            }
+            Ok(InteractivePromptCommand::AbortRun) => {
+                return Ok(InteractivePromptDecision::AbortRun);
+            }
+            Ok(InteractivePromptCommand::ShowScreen) => {
+                print_interactive_screen_snapshot(client, inspector, *session_id, *attached)
+                    .await?;
+            }
+            Ok(InteractivePromptCommand::RunDsl(dsl)) => {
+                run_interactive_dsl_command(
+                    &dsl,
+                    step.index,
+                    client,
+                    inspector,
+                    session_id,
+                    attached,
+                    events_subscribed,
+                    attach_runtime,
+                    viewport_cols,
+                    viewport_rows,
+                    snapshots,
+                    deadline,
+                    display_track,
+                    runtime_vars,
+                )
+                .await?;
+            }
+            Ok(InteractivePromptCommand::Help) => {
+                print_interactive_prompt_help();
+            }
+            Err(err) => {
+                eprintln!("interactive command error: {err}");
+            }
+        }
+    }
+}
+
+async fn print_interactive_screen_snapshot(
+    client: &mut BmuxClient,
+    inspector: &mut ScreenInspector,
+    session_id: Option<Uuid>,
+    attached: bool,
+) -> Result<()> {
+    if !attached {
+        eprintln!("screen unavailable: not attached to a session yet");
+        return Ok(());
+    }
+    let Some(sid) = session_id else {
+        eprintln!("screen unavailable: no session context");
+        return Ok(());
+    };
+
+    if let Err(err) = inspector.refresh(client, sid).await {
+        eprintln!("failed to refresh screen: {err:#}");
+        return Ok(());
+    }
+
+    let Some(panes) = inspector.capture_all_safe() else {
+        eprintln!("screen unavailable: capture failed");
+        return Ok(());
+    };
+
+    if panes.is_empty() {
+        eprintln!("screen unavailable: no panes captured");
+        return Ok(());
+    }
+
+    for pane in panes {
+        let focus_marker = if pane.focused { " (focused)" } else { "" };
+        eprintln!("--- pane {}{} ---", pane.index, focus_marker);
+        eprintln!("cursor: row={} col={}", pane.cursor_row, pane.cursor_col);
+        eprintln!("{}", pane.screen_text);
+    }
+
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_interactive_dsl_command(
+    dsl: &str,
+    step_index: usize,
+    client: &mut BmuxClient,
+    inspector: &mut ScreenInspector,
+    session_id: &mut Option<Uuid>,
+    attached: &mut bool,
+    events_subscribed: &mut bool,
+    attach_runtime: &mut Option<AttachInputRuntime>,
+    viewport_cols: &u16,
+    viewport_rows: &u16,
+    snapshots: &mut Vec<SnapshotCapture>,
+    deadline: Instant,
+    display_track: &mut Option<super::display_track::PlaybookDisplayTrackWriter>,
+    runtime_vars: &mut RuntimeVars,
+) -> Result<()> {
+    let action = match parse_action_line(dsl) {
+        Ok(action) => action,
+        Err(err) => {
+            eprintln!("interactive DSL parse failed: {err:#}");
+            return Ok(());
+        }
+    };
+
+    let action_name = action.name().to_string();
+    let command_step = Step {
+        index: step_index,
+        action,
+        continue_on_error: false,
+    };
+    let started = Instant::now();
+
+    match execute_step(
+        &command_step,
+        client,
+        inspector,
+        session_id,
+        attached,
+        events_subscribed,
+        attach_runtime,
+        viewport_cols,
+        viewport_rows,
+        snapshots,
+        deadline,
+        display_track,
+        runtime_vars,
+    )
+    .await
+    {
+        Ok(detail) => {
+            let elapsed_ms = started.elapsed().as_millis();
+            if let Some(detail) = detail {
+                eprintln!("interactive command ok: {action_name} ({elapsed_ms}ms) - {detail}");
+            } else {
+                eprintln!("interactive command ok: {action_name} ({elapsed_ms}ms)");
+            }
+        }
+        Err(err) => {
+            eprintln!("interactive command failed: {err:#}");
+        }
+    }
+
+    Ok(())
 }
 
 /// Start a recording on the server, optionally filtered to a specific session.
@@ -1320,5 +1646,55 @@ fn event_matches(event: &bmux_ipc::Event, name: &str) -> bool {
         (bmux_ipc::Event::PaneExited { .. }, "pane_exited") => true,
         (bmux_ipc::Event::PaneRestarted { .. }, "pane_restarted") => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_interactive_prompt_command_supports_shortcuts_and_defaults() {
+        assert_eq!(
+            parse_interactive_prompt_command("").expect("empty means next"),
+            InteractivePromptCommand::RunNextStep
+        );
+        assert_eq!(
+            parse_interactive_prompt_command("n").expect("n should parse"),
+            InteractivePromptCommand::RunNextStep
+        );
+        assert_eq!(
+            parse_interactive_prompt_command("c").expect("c should parse"),
+            InteractivePromptCommand::ContinueRemaining
+        );
+        assert_eq!(
+            parse_interactive_prompt_command("s").expect("s should parse"),
+            InteractivePromptCommand::ShowScreen
+        );
+        assert_eq!(
+            parse_interactive_prompt_command("q").expect("q should parse"),
+            InteractivePromptCommand::AbortRun
+        );
+    }
+
+    #[test]
+    fn parse_interactive_prompt_command_parses_inline_dsl() {
+        let command = parse_interactive_prompt_command(": send-keys keys='echo hi\\r'")
+            .expect("dsl should parse");
+        assert_eq!(
+            command,
+            InteractivePromptCommand::RunDsl("send-keys keys='echo hi\\r'".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_interactive_prompt_command_rejects_unknown_input() {
+        let error = parse_interactive_prompt_command("mystery").expect_err("should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown interactive command 'mystery'"),
+            "unexpected error: {error:#}"
+        );
     }
 }

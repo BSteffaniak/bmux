@@ -3,6 +3,7 @@ use super::*;
 pub(super) async fn run_playbook_run(
     source: &str,
     json: bool,
+    interactive: bool,
     target_server: bool,
     record: bool,
     export_gif: Option<&str>,
@@ -50,7 +51,16 @@ pub(super) async fn run_playbook_run(
     playbook.config.bundled_plugin_ids = discover_bundled_plugin_ids();
     playbook.config.verbose = verbose;
 
-    let result = crate::playbook::run(playbook, target_server).await?;
+    let result = if interactive {
+        crate::playbook::run_with_options(
+            playbook,
+            target_server,
+            crate::playbook::RunOptions { interactive: true },
+        )
+        .await?
+    } else {
+        crate::playbook::run(playbook, target_server).await?
+    };
 
     // Export GIF if requested and a recording was produced.
     if let Some(gif_path) = export_gif {

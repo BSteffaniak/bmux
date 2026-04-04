@@ -39,6 +39,7 @@ bmux playbook run <source> [flags]
 | ------------------------ | ------ | -------- | ------------------------------------------------ |
 | `<source>`               | string | required | Path to playbook file, or `-` for stdin          |
 | `--json`                 | bool   | false    | Output results as JSON to stdout                 |
+| `--interactive`          | bool   | false    | Pause before each step for interactive control   |
 | `--target-server`        | bool   | false    | Run against the live server instead of a sandbox |
 | `--record`               | bool   | false    | Record the execution (overrides playbook config) |
 | `--export-gif <path>`    | string | none     | Export recording as GIF (implies `--record`)     |
@@ -55,6 +56,17 @@ bmux playbook run <source> [flags]
 ```sh
 echo 'new-session\nsend-keys keys="echo hi\\r"\nwait-for pattern="hi"' | bmux playbook run - --json
 ```
+
+**Interactive step control:**
+
+Use `--interactive` to pause before each step. Controls are read from stdin and
+status text is printed to stderr:
+
+- `n` or Enter: run next step
+- `c`: continue remaining steps without pausing
+- `s`: print current pane screen capture
+- `:<dsl>`: execute an ad-hoc DSL action in the same session
+- `q`: abort run (remaining steps are marked skipped)
 
 ### `bmux playbook validate`
 

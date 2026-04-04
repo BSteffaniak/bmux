@@ -824,6 +824,7 @@ pub(super) async fn dispatch_built_in_command(
                     PlaybookCommand::Run {
                         source,
                         json,
+                        interactive,
                         target_server,
                         record,
                         export_gif,
@@ -838,6 +839,7 @@ pub(super) async fn dispatch_built_in_command(
             run_playbook_run(
                 source,
                 *json,
+                *interactive,
                 *target_server,
                 *record,
                 export_gif.as_deref(),

@@ -28,6 +28,12 @@ use anyhow::{Context, Result, bail};
 use self::engine::run_playbook;
 use self::types::{Playbook, PlaybookResult, Step};
 
+/// Execution options for playbook runs.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct RunOptions {
+    pub interactive: bool,
+}
+
 /// Maximum include depth to prevent circular includes.
 const MAX_INCLUDE_DEPTH: usize = 10;
 
@@ -59,7 +65,16 @@ pub fn parse_stdin() -> Result<Playbook> {
 
 /// Run a playbook and return the result.
 pub async fn run(playbook: Playbook, target_server: bool) -> Result<PlaybookResult> {
-    run_playbook(playbook, target_server).await
+    run_with_options(playbook, target_server, RunOptions::default()).await
+}
+
+/// Run a playbook with explicit execution options.
+pub async fn run_with_options(
+    playbook: Playbook,
+    target_server: bool,
+    options: RunOptions,
+) -> Result<PlaybookResult> {
+    run_playbook(playbook, target_server, options).await
 }
 
 /// Validate a playbook without executing it.
