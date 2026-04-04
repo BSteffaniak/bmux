@@ -2295,6 +2295,20 @@ impl SessionRuntimeManager {
                                 #[cfg(feature = "image-registry")]
                                 let chunk = chunk.as_slice();
 
+                                // Update DEC private mode tracking (mouse protocol
+                                // and synchronized update) BEFORE making the chunk
+                                // visible in the output buffer.  This ensures the
+                                // per-pane `sync_update_in_progress` flag is always
+                                // consistent with or ahead of the buffered data, so
+                                // a client reading from the buffer will never see
+                                // partial-update bytes without the flag being set.
+                                mouse_protocol_tracker.process(chunk);
+                                if let Ok(mut protocol) = mouse_protocol_state_for_reader.lock() {
+                                    *protocol = mouse_protocol_tracker.current_protocol();
+                                }
+                                sync_update_for_reader
+                                    .store(mouse_protocol_tracker.sync_update, Ordering::SeqCst);
+
                                 if let Ok(mut output) = reader_output.lock() {
                                     output.push_chunk(chunk);
                                 } else {
@@ -2332,12 +2346,6 @@ impl SessionRuntimeManager {
                                         },
                                     );
                                 }
-                                mouse_protocol_tracker.process(chunk);
-                                if let Ok(mut protocol) = mouse_protocol_state_for_reader.lock() {
-                                    *protocol = mouse_protocol_tracker.current_protocol();
-                                }
-                                sync_update_for_reader
-                                    .store(mouse_protocol_tracker.sync_update, Ordering::SeqCst);
                                 let reply = protocol_reply_for_chunk(
                                     &mut protocol_engine,
                                     &mut cursor_tracker,
