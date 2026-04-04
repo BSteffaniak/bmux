@@ -1252,6 +1252,12 @@ pub enum DisplayTrackEvent {
     Activity {
         kind: DisplayActivityKind,
     },
+    /// Snapshot of all visible images for a set of panes at frame time.
+    /// Used by the GIF exporter to overlay decoded images onto the
+    /// rasterized text cell grid.
+    ImageUpdate {
+        images: Vec<AttachPaneImage>,
+    },
     StreamClosed,
 }
 

@@ -781,6 +781,7 @@ fn recording_cell_metrics(events: &[DisplayTrackEnvelope]) -> Option<CellMetrics
             DisplayTrackEvent::FrameBytes { .. }
             | DisplayTrackEvent::CursorSnapshot { .. }
             | DisplayTrackEvent::Activity { .. }
+            | DisplayTrackEvent::ImageUpdate { .. }
             | DisplayTrackEvent::StreamClosed => {}
         }
     }
@@ -1643,6 +1644,7 @@ fn export_recording_gif(
         max_frames.map_or(max_timeline_frames, |limit| limit.min(max_timeline_frames));
 
     let mut event_index = 0_usize;
+    let mut active_images: Vec<bmux_ipc::AttachPaneImage> = Vec::new();
     for frame_idx in 0..target_frames {
         profiler.record_frame_considered();
         let frame_time_ns = u64::from(frame_idx).saturating_mul(frame_interval_ns);
@@ -1696,6 +1698,10 @@ fn export_recording_gif(
                     }
                 },
                 DisplayTrackEvent::StreamOpened { .. } | DisplayTrackEvent::StreamClosed => {}
+                DisplayTrackEvent::ImageUpdate { images } => {
+                    active_images = images.clone();
+                    frame_had_display_change = true;
+                }
             }
             event_index = event_index.saturating_add(1);
         }
@@ -1799,6 +1805,19 @@ fn export_recording_gif(
                 &mut bitmap_cache,
             )
         };
+
+        // Overlay decoded images onto the rasterized text frame.
+        if !active_images.is_empty() {
+            overlay_display_track_images(
+                &mut pixels,
+                u32::from(width),
+                u32::from(height),
+                u32::from(cell_w),
+                u32::from(cell_h),
+                &active_images,
+            );
+        }
+
         if cursor_visible && cursor_row < current_rows && cursor_col < current_cols {
             let (cell_fg, cell_bg) = parser
                 .screen()
@@ -3643,6 +3662,172 @@ pub(super) const fn offline_recording_status() -> RecordingStatus {
 // Display track types are defined in bmux_ipc for cross-module sharing.
 use bmux_ipc::{DisplayTrackEnvelope, DisplayTrackEvent};
 
+// ── Image overlay for GIF export ─────────────────────────────────────────────
+
+/// Decode an `AttachPaneImage` to an RGBA pixel buffer suitable for overlay.
+///
+/// Returns `(width, height, rgba_pixels)` or `None` if decoding fails or the
+/// protocol is not supported at compile time.
+fn decode_attach_image_to_rgba(image: &bmux_ipc::AttachPaneImage) -> Option<(u32, u32, Vec<u8>)> {
+    match image.protocol {
+        #[cfg(feature = "image-sixel")]
+        bmux_ipc::AttachImageProtocol::Sixel => {
+            let pb = bmux_image::codec::sixel::decode(&image.raw_data)?;
+            debug_assert!(
+                matches!(pb.format, bmux_image::PixelFormat::Rgba8),
+                "sixel decode should produce RGBA"
+            );
+            Some((pb.width, pb.height, pb.data))
+        }
+
+        #[cfg(feature = "image-kitty")]
+        bmux_ipc::AttachImageProtocol::KittyGraphics => {
+            let w = image.pixel_width;
+            let h = image.pixel_height;
+            if w == 0 || h == 0 {
+                return None;
+            }
+            let expected_rgba = (w as usize) * (h as usize) * 4;
+            let expected_rgb = (w as usize) * (h as usize) * 3;
+            if image.raw_data.len() == expected_rgba {
+                // Raw RGBA pixels
+                Some((w, h, image.raw_data.clone()))
+            } else if image.raw_data.len() == expected_rgb {
+                // Raw RGB → expand to RGBA
+                let mut rgba = Vec::with_capacity(expected_rgba);
+                for chunk in image.raw_data.chunks_exact(3) {
+                    rgba.extend_from_slice(chunk);
+                    rgba.push(255);
+                }
+                Some((w, h, rgba))
+            } else {
+                // Likely PNG-compressed — decode via tiny_skia
+                decode_png_to_rgba(&image.raw_data)
+            }
+        }
+
+        #[cfg(feature = "image-iterm2")]
+        bmux_ipc::AttachImageProtocol::ITerm2 => {
+            // iTerm2 raw_data is the decoded file bytes (PNG, JPEG, GIF, etc.).
+            // Try PNG first via tiny_skia.
+            decode_png_to_rgba(&image.raw_data)
+        }
+
+        // When a protocol feature is disabled, we can't decode.
+        #[allow(unreachable_patterns)]
+        _ => None,
+    }
+}
+
+/// Attempt to decode PNG bytes to RGBA pixels using `tiny_skia::Pixmap`.
+fn decode_png_to_rgba(data: &[u8]) -> Option<(u32, u32, Vec<u8>)> {
+    let pixmap = tiny_skia::Pixmap::decode_png(data).ok()?;
+    let w = pixmap.width();
+    let h = pixmap.height();
+    // tiny_skia stores premultiplied RGBA; we need straight RGBA for blitting.
+    let mut rgba = pixmap.take();
+    for pixel in rgba.chunks_exact_mut(4) {
+        let a = pixel[3];
+        if a > 0 && a < 255 {
+            // Un-premultiply: component = premultiplied * 255 / alpha
+            pixel[0] = ((u16::from(pixel[0]) * 255) / u16::from(a)).min(255) as u8;
+            pixel[1] = ((u16::from(pixel[1]) * 255) / u16::from(a)).min(255) as u8;
+            pixel[2] = ((u16::from(pixel[2]) * 255) / u16::from(a)).min(255) as u8;
+        }
+    }
+    Some((w, h, rgba))
+}
+
+/// Composite decoded images onto an RGBA pixel frame buffer.
+///
+/// Each image's position is in cell coordinates; we convert to pixels using
+/// the provided cell dimensions.
+fn overlay_display_track_images(
+    frame: &mut [u8],
+    frame_width: u32,
+    frame_height: u32,
+    cell_w: u32,
+    cell_h: u32,
+    images: &[bmux_ipc::AttachPaneImage],
+) {
+    for image in images {
+        let Some((img_w, img_h, rgba)) = decode_attach_image_to_rgba(image) else {
+            continue;
+        };
+        let x_px = u32::from(image.position_col) * cell_w;
+        let y_px = u32::from(image.position_row) * cell_h;
+        blit_rgba(
+            frame,
+            frame_width,
+            frame_height,
+            &rgba,
+            img_w,
+            img_h,
+            x_px,
+            y_px,
+        );
+    }
+}
+
+/// Alpha-blend `src` RGBA pixels onto `dst` RGBA frame at pixel offset (x, y).
+///
+/// Pixels outside the frame bounds are silently clipped.
+fn blit_rgba(
+    dst: &mut [u8],
+    dst_w: u32,
+    dst_h: u32,
+    src: &[u8],
+    src_w: u32,
+    src_h: u32,
+    x_off: u32,
+    y_off: u32,
+) {
+    let dst_stride = (dst_w as usize) * 4;
+    let src_stride = (src_w as usize) * 4;
+    for sy in 0..src_h {
+        let dy = y_off + sy;
+        if dy >= dst_h {
+            break;
+        }
+        let dst_row_start = (dy as usize) * dst_stride;
+        let src_row_start = (sy as usize) * src_stride;
+        for sx in 0..src_w {
+            let dx = x_off + sx;
+            if dx >= dst_w {
+                break;
+            }
+            let si = src_row_start + (sx as usize) * 4;
+            let di = dst_row_start + (dx as usize) * 4;
+            if si + 3 >= src.len() || di + 3 >= dst.len() {
+                continue;
+            }
+            let sa = src[si + 3];
+            if sa == 0 {
+                continue; // Fully transparent — skip.
+            }
+            if sa == 255 {
+                // Fully opaque — overwrite.
+                dst[di] = src[si];
+                dst[di + 1] = src[si + 1];
+                dst[di + 2] = src[si + 2];
+                dst[di + 3] = 255;
+            } else {
+                // Alpha blend: out = src * sa + dst * (1 - sa)
+                let inv_a = 255 - u16::from(sa);
+                dst[di] =
+                    ((u16::from(src[si]) * u16::from(sa) + u16::from(dst[di]) * inv_a) / 255) as u8;
+                dst[di + 1] = ((u16::from(src[si + 1]) * u16::from(sa)
+                    + u16::from(dst[di + 1]) * inv_a)
+                    / 255) as u8;
+                dst[di + 2] = ((u16::from(src[si + 2]) * u16::from(sa)
+                    + u16::from(dst[di + 2]) * inv_a)
+                    / 255) as u8;
+                dst[di + 3] = (u16::from(sa) + u16::from(dst[di + 3]) * inv_a / 255).min(255) as u8;
+            }
+        }
+    }
+}
+
 pub(super) struct DisplayCaptureWriter {
     recording_id: Uuid,
     started_at: Instant,
@@ -3747,6 +3932,18 @@ impl DisplayCaptureWriter {
 
     pub(super) fn record_stream_closed(&mut self) -> Result<()> {
         self.record(DisplayTrackEvent::StreamClosed)
+    }
+
+    /// Record a snapshot of all visible pane images at the current frame time.
+    /// The GIF exporter uses these to decode and overlay images onto the
+    /// rasterized text cell grid.
+    pub(super) fn record_images(&mut self, images: &[bmux_ipc::AttachPaneImage]) -> Result<()> {
+        if images.is_empty() {
+            return Ok(());
+        }
+        self.record(DisplayTrackEvent::ImageUpdate {
+            images: images.to_vec(),
+        })
     }
 
     pub(super) fn flush(&mut self) -> Result<()> {

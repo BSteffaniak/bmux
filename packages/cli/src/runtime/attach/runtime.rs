@@ -2498,6 +2498,29 @@ pub(crate) async fn render_attach_frame(
         if previous_cursor_state != view_state.last_cursor_state {
             let _ = capture.record_activity(bmux_ipc::DisplayActivityKind::Cursor);
         }
+        // Record structured image data for GIF export.
+        #[cfg(any(
+            feature = "image-sixel",
+            feature = "image-kitty",
+            feature = "image-iterm2"
+        ))]
+        {
+            let all_images: Vec<bmux_ipc::AttachPaneImage> = layout_state
+                .scene
+                .surfaces
+                .iter()
+                .filter_map(|surface| surface.pane_id)
+                .flat_map(|pane_id| {
+                    view_state
+                        .pane_images
+                        .get(&pane_id)
+                        .into_iter()
+                        .flatten()
+                        .cloned()
+                })
+                .collect();
+            let _ = capture.record_images(&all_images);
+        }
     }
 
     queue!(frame_bytes, EndSynchronizedUpdate).context("failed queuing end synchronized update")?;
