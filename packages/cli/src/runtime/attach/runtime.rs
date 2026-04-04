@@ -14,6 +14,111 @@ const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
 /// sleep/yield is needed between rounds.
 const ATTACH_OUTPUT_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(4);
 
+#[derive(Default)]
+pub(crate) struct DisplayCaptureFanout {
+    writers: BTreeMap<Uuid, recording::DisplayCaptureWriter>,
+}
+
+impl DisplayCaptureFanout {
+    fn open_target(&mut self, target: &bmux_ipc::RecordingCaptureTarget, client_id: Uuid) {
+        if self.writers.contains_key(&target.recording_id) {
+            return;
+        }
+        match recording::DisplayCaptureWriter::open(
+            target.recording_id,
+            Path::new(&target.path),
+            client_id,
+        ) {
+            Ok(writer) => {
+                self.writers.insert(target.recording_id, writer);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    "failed starting display capture for recording {}: {error}",
+                    target.recording_id
+                );
+            }
+        }
+    }
+
+    fn close_recording(&mut self, recording_id: Uuid) {
+        if let Some(mut writer) = self.writers.remove(&recording_id) {
+            let _ = writer.record_stream_closed();
+            let _ = writer.flush();
+        }
+    }
+
+    fn close_all(&mut self) {
+        let ids: Vec<Uuid> = self.writers.keys().copied().collect();
+        for id in ids {
+            self.close_recording(id);
+        }
+    }
+
+    fn record_resize(&mut self, cols: u16, rows: u16) {
+        let mut failed = Vec::new();
+        for (id, writer) in &mut self.writers {
+            if writer.record_resize(cols, rows).is_err() {
+                failed.push(*id);
+            }
+        }
+        for id in failed {
+            self.close_recording(id);
+        }
+    }
+
+    fn record_frame_bytes(&mut self, data: &[u8]) {
+        let mut failed = Vec::new();
+        for (id, writer) in &mut self.writers {
+            if writer.record_frame_bytes(data).is_err() {
+                failed.push(*id);
+            }
+        }
+        for id in failed {
+            self.close_recording(id);
+        }
+    }
+
+    fn record_activity(&mut self, kind: bmux_ipc::DisplayActivityKind) {
+        let mut failed = Vec::new();
+        for (id, writer) in &mut self.writers {
+            if writer.record_activity(kind).is_err() {
+                failed.push(*id);
+            }
+        }
+        for id in failed {
+            self.close_recording(id);
+        }
+    }
+
+    fn record_cursor_snapshot(
+        &mut self,
+        cursor_state: Option<crate::runtime::attach::state::AttachCursorState>,
+    ) {
+        let mut failed = Vec::new();
+        for (id, writer) in &mut self.writers {
+            if writer.record_cursor_snapshot(cursor_state).is_err() {
+                failed.push(*id);
+            }
+        }
+        for id in failed {
+            self.close_recording(id);
+        }
+    }
+
+    fn record_images(&mut self, images: &[bmux_ipc::AttachPaneImage]) {
+        let mut failed = Vec::new();
+        for (id, writer) in &mut self.writers {
+            if writer.record_images(images).is_err() {
+                failed.push(*id);
+            }
+        }
+        for id in failed {
+            self.close_recording(id);
+        }
+    }
+}
+
 fn apply_attach_output_bytes(
     view_state: &mut AttachViewState,
     pane_id: Uuid,
@@ -158,6 +263,14 @@ pub(crate) async fn run_session_attach_with_client(
         println!("attached to session: {}", attach_info.session_id);
     }
 
+    let capture_targets = match client.recording_capture_targets().await {
+        Ok(targets) => targets,
+        Err(error) => {
+            tracing::warn!("failed querying recording capture targets on attach: {error}");
+            Vec::new()
+        }
+    };
+
     // Upgrade to streaming client for event-driven operation.
     // All subsequent operations use the streaming client.
     let mut client =
@@ -171,36 +284,10 @@ pub(crate) async fn run_session_attach_with_client(
         .await
         .map_err(map_attach_client_error)?;
 
-    // Query the server for an active recording so that display capture starts
-    // automatically — handles `bmux --record` (recording already started before
-    // attach) and `bmux recording start` issued before this client attached.
-    let mut display_capture: Option<recording::DisplayCaptureWriter> =
-        match client.recording_status().await {
-            Ok(status) => {
-                if let Some(active) = status.active {
-                    match recording::DisplayCaptureWriter::open(
-                        active.id,
-                        Path::new(&active.path),
-                        self_client_id,
-                    ) {
-                        Ok(writer) => Some(writer),
-                        Err(error) => {
-                            tracing::warn!(
-                                "failed starting display capture for active recording {}: {error}",
-                                active.id
-                            );
-                            None
-                        }
-                    }
-                } else {
-                    None
-                }
-            }
-            Err(error) => {
-                tracing::warn!("failed querying recording status on attach: {error}");
-                None
-            }
-        };
+    let mut display_capture = DisplayCaptureFanout::default();
+    for target in &capture_targets {
+        display_capture.open_target(target, self_client_id);
+    }
 
     let mut view_state = AttachViewState::new(attach_info);
     view_state.mouse.config = attach_config.attach_mouse_config();
@@ -315,35 +402,17 @@ pub(crate) async fn run_session_attach_with_client(
                     ref path,
                 } = server_event
                 {
-                    // Dynamically start display capture when a recording begins.
-                    if display_capture.is_none() {
-                        match recording::DisplayCaptureWriter::open(
-                            recording_id,
-                            Path::new(path),
-                            self_client_id,
-                        ) {
-                            Ok(writer) => {
-                                display_capture = Some(writer);
-                            }
-                            Err(error) => {
-                                tracing::warn!(
-                                    "failed starting display capture for recording {recording_id}: {error}"
-                                );
-                            }
-                        }
-                    }
+                    let target = bmux_ipc::RecordingCaptureTarget {
+                        recording_id,
+                        path: path.clone(),
+                        rolling_window_secs: None,
+                    };
+                    display_capture.open_target(&target, self_client_id);
                 } else if let bmux_client::ServerEvent::RecordingStopped {
                     recording_id,
                 } = server_event
                 {
-                    // Flush and close display capture when the recording stops.
-                    if let Some(ref mut capture) = display_capture {
-                        if capture.recording_id() == recording_id {
-                            let _ = capture.record_stream_closed();
-                            let _ = capture.flush();
-                            display_capture = None;
-                        }
-                    }
+                    display_capture.close_recording(recording_id);
                 } else {
                     if let bmux_client::ServerEvent::AttachViewChanged { .. } = &server_event {
                         pane_output_pending = true;
@@ -358,7 +427,7 @@ pub(crate) async fn run_session_attach_with_client(
                         global,
                         &attach_help_lines,
                         &mut view_state,
-                        display_capture.as_mut(),
+                        &mut display_capture,
                     )
                     .await?
                     {
@@ -380,10 +449,8 @@ pub(crate) async fn run_session_attach_with_client(
                 };
                 let terminal_event = result.context("failed reading terminal event")?;
 
-                if let Event::Resize(cols, rows) = terminal_event
-                    && let Some(capture) = display_capture.as_mut()
-                {
-                    let _ = capture.record_resize(cols, rows);
+                if let Event::Resize(cols, rows) = terminal_event {
+                    display_capture.record_resize(cols, rows);
                 }
 
                 match handle_attach_loop_event(
@@ -395,7 +462,7 @@ pub(crate) async fn run_session_attach_with_client(
                     global,
                     &attach_help_lines,
                     &mut view_state,
-                    display_capture.as_mut(),
+                    &mut display_capture,
                 )
                 .await?
                 {
@@ -526,7 +593,7 @@ pub(crate) async fn run_session_attach_with_client(
                 &attach_keymap,
                 &attach_help_lines,
                 help_scroll,
-                display_capture.as_mut(),
+                &mut display_capture,
             )
             .await?;
             pane_output_pending = false;
@@ -684,7 +751,7 @@ pub(crate) async fn run_session_attach_with_client(
             &attach_keymap,
             &attach_help_lines,
             help_scroll,
-            display_capture.as_mut(),
+            &mut display_capture,
         )
         .await?;
     }
@@ -699,10 +766,7 @@ pub(crate) async fn run_session_attach_with_client(
     if let Some(message) = attach_exit_message(exit_reason) {
         println!("{message}");
     }
-    if let Some(capture) = display_capture.as_mut() {
-        let _ = capture.record_stream_closed();
-        let _ = capture.flush();
-    }
+    display_capture.close_all();
     Ok(AttachRunOutcome {
         status_code: 0,
         exit_reason,
@@ -2377,7 +2441,7 @@ pub(crate) async fn render_attach_frame(
     keymap: &crate::input::Keymap,
     help_lines: &[String],
     help_scroll: usize,
-    display_capture: Option<&mut recording::DisplayCaptureWriter>,
+    display_capture: &mut DisplayCaptureFanout,
 ) -> Result<()> {
     if view_state.dirty.status_needs_redraw {
         let now = Instant::now();
@@ -2499,43 +2563,41 @@ pub(crate) async fn render_attach_frame(
         )?;
     }
 
-    if let Some(capture) = display_capture {
-        let _ = capture.record_frame_bytes(&frame_bytes);
-        let _ = capture.record_activity(bmux_ipc::DisplayActivityKind::Output);
-        let _ = capture.record_cursor_snapshot(view_state.last_cursor_state);
-        if previous_cursor_state != view_state.last_cursor_state {
-            let _ = capture.record_activity(bmux_ipc::DisplayActivityKind::Cursor);
-        }
-        // Record structured image data for GIF export.
-        #[cfg(any(
-            feature = "image-sixel",
-            feature = "image-kitty",
-            feature = "image-iterm2"
-        ))]
-        {
-            let mut all_images: Vec<bmux_ipc::AttachPaneImage> = Vec::new();
-            for surface in &layout_state.scene.surfaces {
-                let Some(pane_id) = surface.pane_id else {
-                    continue;
-                };
-                if let Some(images) = view_state.pane_images.get(&pane_id) {
-                    for img in images {
-                        let mut adjusted = img.clone();
-                        // Offset pane-local coords by surface position + 1
-                        // for the pane border, matching the live compositor's
-                        // PaneRect translation in render_pane_images.
-                        adjusted.position_col = adjusted
-                            .position_col
-                            .saturating_add(surface.rect.x.saturating_add(1));
-                        adjusted.position_row = adjusted
-                            .position_row
-                            .saturating_add(surface.rect.y.saturating_add(1));
-                        all_images.push(adjusted);
-                    }
+    display_capture.record_frame_bytes(&frame_bytes);
+    display_capture.record_activity(bmux_ipc::DisplayActivityKind::Output);
+    display_capture.record_cursor_snapshot(view_state.last_cursor_state);
+    if previous_cursor_state != view_state.last_cursor_state {
+        display_capture.record_activity(bmux_ipc::DisplayActivityKind::Cursor);
+    }
+    // Record structured image data for GIF export.
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    {
+        let mut all_images: Vec<bmux_ipc::AttachPaneImage> = Vec::new();
+        for surface in &layout_state.scene.surfaces {
+            let Some(pane_id) = surface.pane_id else {
+                continue;
+            };
+            if let Some(images) = view_state.pane_images.get(&pane_id) {
+                for img in images {
+                    let mut adjusted = img.clone();
+                    // Offset pane-local coords by surface position + 1
+                    // for the pane border, matching the live compositor's
+                    // PaneRect translation in render_pane_images.
+                    adjusted.position_col = adjusted
+                        .position_col
+                        .saturating_add(surface.rect.x.saturating_add(1));
+                    adjusted.position_row = adjusted
+                        .position_row
+                        .saturating_add(surface.rect.y.saturating_add(1));
+                    all_images.push(adjusted);
                 }
             }
-            let _ = capture.record_images(&all_images);
         }
+        display_capture.record_images(&all_images);
     }
 
     queue!(frame_bytes, EndSynchronizedUpdate).context("failed queuing end synchronized update")?;
@@ -3396,7 +3458,7 @@ pub(crate) async fn handle_attach_loop_event(
     global: bool,
     help_lines: &[String],
     view_state: &mut AttachViewState,
-    mut display_capture: Option<&mut recording::DisplayCaptureWriter>,
+    display_capture: &mut DisplayCaptureFanout,
 ) -> Result<AttachLoopControl> {
     match event {
         AttachLoopEvent::Server(server_event) => {
@@ -3417,7 +3479,7 @@ pub(crate) async fn handle_attach_loop_event(
                 attach_input_processor,
                 help_lines,
                 view_state,
-                display_capture.as_deref_mut(),
+                display_capture,
             )
             .await
         }
@@ -3651,9 +3713,8 @@ pub(crate) async fn handle_attach_terminal_event(
     attach_input_processor: &mut InputProcessor,
     help_lines: &[String],
     view_state: &mut AttachViewState,
-    display_capture: Option<&mut recording::DisplayCaptureWriter>,
+    display_capture: &mut DisplayCaptureFanout,
 ) -> Result<AttachLoopControl> {
-    let mut display_capture = display_capture;
     if matches!(terminal_event, Event::Resize(_, _)) {
         if let Err(error) = refresh_attached_session_from_context(client, view_state).await {
             view_state.set_transient_status(
@@ -3753,10 +3814,7 @@ pub(crate) async fn handle_attach_terminal_event(
                     }
                     match client.attach_input(view_state.attached_id, bytes).await {
                         Ok(_) => {
-                            if let Some(capture) = display_capture.as_deref_mut() {
-                                let _ =
-                                    capture.record_activity(bmux_ipc::DisplayActivityKind::Input);
-                            }
+                            display_capture.record_activity(bmux_ipc::DisplayActivityKind::Input);
                         }
                         Err(error)
                             if is_attach_stream_closed_error(&error)

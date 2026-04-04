@@ -92,7 +92,10 @@ struct ServerState {
     follow_state: Mutex<FollowState>,
     context_state: Mutex<ContextState>,
     snapshot_runtime: Mutex<SnapshotRuntime>,
-    recording_runtime: Arc<Mutex<RecordingRuntime>>,
+    manual_recording_runtime: Arc<Mutex<RecordingRuntime>>,
+    rolling_recording_runtime: Arc<Mutex<Option<RecordingRuntime>>>,
+    rolling_recording_capture_input: bool,
+    rolling_recording_event_kinds: Vec<RecordingEventKind>,
     operation_lock: AsyncMutex<()>,
     event_hub: Mutex<EventHub>,
     /// Broadcast channel for pushing events to streaming clients.
@@ -961,7 +964,8 @@ struct SessionRuntimeManager {
     pane_term: String,
     protocol_profile: ProtocolProfile,
     pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
-    recording_runtime: Arc<Mutex<RecordingRuntime>>,
+    manual_recording_runtime: Arc<Mutex<RecordingRuntime>>,
+    rolling_recording_runtime: Arc<Mutex<Option<RecordingRuntime>>>,
     /// Broadcast sender for pushing pane output notifications to streaming clients.
     event_broadcast: tokio::sync::broadcast::Sender<Event>,
 }
@@ -2104,7 +2108,8 @@ impl SessionRuntimeManager {
         pane_term: String,
         protocol_profile: ProtocolProfile,
         pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
-        recording_runtime: Arc<Mutex<RecordingRuntime>>,
+        manual_recording_runtime: Arc<Mutex<RecordingRuntime>>,
+        rolling_recording_runtime: Arc<Mutex<Option<RecordingRuntime>>>,
         event_broadcast: tokio::sync::broadcast::Sender<Event>,
     ) -> Self {
         Self {
@@ -2113,7 +2118,8 @@ impl SessionRuntimeManager {
             pane_term,
             protocol_profile,
             pane_exit_tx,
-            recording_runtime,
+            manual_recording_runtime,
+            rolling_recording_runtime,
             event_broadcast,
         }
     }
@@ -2213,7 +2219,8 @@ impl SessionRuntimeManager {
         let protocol_profile = self.protocol_profile;
         let pane_id = pane_meta.id;
         let pane_exit_tx = self.pane_exit_tx.clone();
-        let recording_runtime = Arc::clone(&self.recording_runtime);
+        let manual_recording_runtime = Arc::clone(&self.manual_recording_runtime);
+        let rolling_recording_runtime = Arc::clone(&self.rolling_recording_runtime);
         let output_buffer_for_reader = Arc::clone(&output_buffer);
         let process_group_id = Arc::new(std::sync::Mutex::new(None));
         let process_group_id_for_task = Arc::clone(&process_group_id);
@@ -2452,20 +2459,19 @@ impl SessionRuntimeManager {
                                                 },
                                             );
                                         }
-                                        if let Ok(runtime) = recording_runtime.lock() {
-                                            for event in &result.events {
-                                                let payload =
-                                                    image_event_to_recording_payload(event);
-                                                let _ = runtime.record(
-                                                    RecordingEventKind::PaneImage,
-                                                    payload,
-                                                    RecordMeta {
-                                                        session_id: Some(session_id.0),
-                                                        pane_id: Some(pane_id),
-                                                        client_id: None,
-                                                    },
-                                                );
-                                            }
+                                        for event in &result.events {
+                                            let payload = image_event_to_recording_payload(event);
+                                            record_to_all_runtimes(
+                                                &manual_recording_runtime,
+                                                &rolling_recording_runtime,
+                                                RecordingEventKind::PaneImage,
+                                                payload,
+                                                RecordMeta {
+                                                    session_id: Some(session_id.0),
+                                                    pane_id: Some(pane_id),
+                                                    client_id: None,
+                                                },
+                                            );
                                         }
                                     }
                                     result.filtered
@@ -2536,19 +2542,19 @@ impl SessionRuntimeManager {
                                         },
                                     );
                                 }
-                                if let Ok(runtime) = recording_runtime.lock() {
-                                    let _ = runtime.record(
-                                        RecordingEventKind::PaneOutputRaw,
-                                        RecordingPayload::Bytes {
-                                            data: chunk.to_vec(),
-                                        },
-                                        RecordMeta {
-                                            session_id: Some(session_id.0),
-                                            pane_id: Some(pane_id),
-                                            client_id: None,
-                                        },
-                                    );
-                                }
+                                record_to_all_runtimes(
+                                    &manual_recording_runtime,
+                                    &rolling_recording_runtime,
+                                    RecordingEventKind::PaneOutputRaw,
+                                    RecordingPayload::Bytes {
+                                        data: chunk.to_vec(),
+                                    },
+                                    RecordMeta {
+                                        session_id: Some(session_id.0),
+                                        pane_id: Some(pane_id),
+                                        client_id: None,
+                                    },
+                                );
                                 let reply = protocol_reply_for_chunk(
                                     &mut protocol_engine,
                                     &mut cursor_tracker,
@@ -2582,19 +2588,19 @@ impl SessionRuntimeManager {
                                     }
                                 }
                                 if !reply.is_empty() {
-                                    if let Ok(runtime) = recording_runtime.lock() {
-                                        let _ = runtime.record(
-                                            RecordingEventKind::ProtocolReplyRaw,
-                                            RecordingPayload::Bytes {
-                                                data: reply.clone(),
-                                            },
-                                            RecordMeta {
-                                                session_id: Some(session_id.0),
-                                                pane_id: Some(pane_id),
-                                                client_id: None,
-                                            },
-                                        );
-                                    }
+                                    record_to_all_runtimes(
+                                        &manual_recording_runtime,
+                                        &rolling_recording_runtime,
+                                        RecordingEventKind::ProtocolReplyRaw,
+                                        RecordingPayload::Bytes {
+                                            data: reply.clone(),
+                                        },
+                                        RecordMeta {
+                                            session_id: Some(session_id.0),
+                                            pane_id: Some(pane_id),
+                                            client_id: None,
+                                        },
+                                    );
                                     if let Ok(mut writer) = writer_for_reader.lock() {
                                         if writer.write_all(&reply).is_err() {
                                             break;
@@ -3429,6 +3435,11 @@ impl BmuxServer {
         recordings_dir: std::path::PathBuf,
         segment_mb: usize,
         retention_days: u64,
+        recording_enabled: bool,
+        recording_capture_input: bool,
+        recording_capture_output: bool,
+        recording_capture_events: bool,
+        rolling_window_secs: u64,
     ) -> Self {
         let snapshot_runtime = match snapshot_manager {
             Some(manager) => SnapshotRuntime::with_manager(manager),
@@ -3438,14 +3449,34 @@ impl BmuxServer {
         let config = BmuxConfig::load().unwrap_or_default();
         let shell = resolve_server_shell(&config);
         let pane_term = resolve_server_pane_term(&config);
+        let rolling_recording_event_kinds = recording_event_kinds_from_flags(
+            recording_capture_input,
+            recording_capture_output,
+            recording_capture_events,
+        );
         let protocol_profile = protocol_profile_for_term(&pane_term);
         let (shutdown_tx, _) = watch::channel(false);
         let (pane_exit_tx, pane_exit_rx) = mpsc::unbounded_channel();
-        let recording_runtime = Arc::new(Mutex::new(RecordingRuntime::new(
+        let rolling_recordings_dir = recordings_dir.join(".rolling");
+        let manual_recording_runtime = Arc::new(Mutex::new(RecordingRuntime::new(
             recordings_dir,
             segment_mb,
             retention_days,
         )));
+        let rolling_recording_runtime = Arc::new(Mutex::new(
+            if recording_enabled
+                && rolling_window_secs > 0
+                && (recording_capture_output || recording_capture_events || recording_capture_input)
+            {
+                Some(RecordingRuntime::new_rolling(
+                    rolling_recordings_dir,
+                    segment_mb,
+                    rolling_window_secs,
+                ))
+            } else {
+                None
+            },
+        ));
         let (event_broadcast_tx, _) = tokio::sync::broadcast::channel::<Event>(256);
         Self {
             endpoint,
@@ -3456,14 +3487,18 @@ impl BmuxServer {
                     pane_term,
                     protocol_profile,
                     pane_exit_tx,
-                    Arc::clone(&recording_runtime),
+                    Arc::clone(&manual_recording_runtime),
+                    Arc::clone(&rolling_recording_runtime),
                     event_broadcast_tx.clone(),
                 )),
                 attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
                 follow_state: Mutex::new(FollowState::default()),
                 context_state: Mutex::new(ContextState::default()),
                 snapshot_runtime: Mutex::new(snapshot_runtime),
-                recording_runtime,
+                manual_recording_runtime,
+                rolling_recording_runtime,
+                rolling_recording_capture_input: recording_capture_input,
+                rolling_recording_event_kinds,
                 operation_lock: AsyncMutex::new(()),
                 event_hub: Mutex::new(EventHub::new(1024)),
                 event_broadcast: event_broadcast_tx,
@@ -3490,6 +3525,11 @@ impl BmuxServer {
             config.recordings_dir(&paths),
             config.recording.segment_mb,
             config.recording.retention_days,
+            config.recording.enabled,
+            config.recording.capture_input,
+            config.recording.capture_output,
+            config.recording.capture_events,
+            config.recording.rolling_window_secs,
         )
     }
 
@@ -3516,6 +3556,11 @@ impl BmuxServer {
             config.recordings_dir(paths),
             config.recording.segment_mb,
             config.recording.retention_days,
+            config.recording.enabled,
+            config.recording.capture_input,
+            config.recording.capture_output,
+            config.recording.capture_events,
+            config.recording.rolling_window_secs,
         )
     }
 
@@ -3620,6 +3665,10 @@ impl BmuxServer {
             return Err(error);
         }
 
+        if let Err(error) = ensure_rolling_recording_started(&self.state) {
+            warn!("failed to initialize rolling recording runtime: {error:#}");
+        }
+
         info!("bmux server listening on {:?}", self.endpoint);
         emit_event(&self.state, Event::ServerStarted)?;
         if let Some(tx) = ready_tx.take() {
@@ -3633,7 +3682,7 @@ impl BmuxServer {
         });
 
         // Periodic recording retention enforcement.
-        let recording_prune_runtime = Arc::clone(&self.state.recording_runtime);
+        let recording_prune_runtime = Arc::clone(&self.state.manual_recording_runtime);
         let mut prune_shutdown_rx = self.shutdown_tx.subscribe();
         let _prune_task = tokio::spawn(async move {
             // Initial prune on startup.
@@ -3923,22 +3972,22 @@ async fn handle_connection(
             exclusive,
             "server.request.start"
         );
-        if let Ok(runtime) = state.recording_runtime.lock() {
-            let _ = runtime.record(
-                RecordingEventKind::RequestStart,
-                RecordingPayload::RequestStart {
-                    request_id: envelope.request_id,
-                    request_kind: request_kind.to_string(),
-                    exclusive,
-                    request_data: request_data.clone(),
-                },
-                RecordMeta {
-                    session_id: selected_session.map(|id| id.0),
-                    pane_id: None,
-                    client_id: Some(client_id.0),
-                },
-            );
-        }
+        record_to_all_runtimes(
+            &state.manual_recording_runtime,
+            &state.rolling_recording_runtime,
+            RecordingEventKind::RequestStart,
+            RecordingPayload::RequestStart {
+                request_id: envelope.request_id,
+                request_kind: request_kind.to_string(),
+                exclusive,
+                request_data: request_data.clone(),
+            },
+            RecordMeta {
+                session_id: selected_session.map(|id| id.0),
+                pane_id: None,
+                client_id: Some(client_id.0),
+            },
+        );
 
         let response = handle_request(
             &state,
@@ -3965,24 +4014,24 @@ async fn handle_connection(
                     elapsed_ms,
                     "server.request.done"
                 );
-                if let Ok(runtime) = state.recording_runtime.lock() {
-                    let _ = runtime.record(
-                        RecordingEventKind::RequestDone,
-                        RecordingPayload::RequestDone {
-                            request_id: envelope.request_id,
-                            request_kind: request_kind.to_string(),
-                            response_kind: response_payload_kind_name(payload).to_string(),
-                            elapsed_ms: elapsed_ms.min(u128::from(u64::MAX)) as u64,
-                            request_data,
-                            response_data,
-                        },
-                        RecordMeta {
-                            session_id: selected_session.map(|id| id.0),
-                            pane_id: None,
-                            client_id: Some(client_id.0),
-                        },
-                    );
-                }
+                record_to_all_runtimes(
+                    &state.manual_recording_runtime,
+                    &state.rolling_recording_runtime,
+                    RecordingEventKind::RequestDone,
+                    RecordingPayload::RequestDone {
+                        request_id: envelope.request_id,
+                        request_kind: request_kind.to_string(),
+                        response_kind: response_payload_kind_name(payload).to_string(),
+                        elapsed_ms: elapsed_ms.min(u128::from(u64::MAX)) as u64,
+                        request_data,
+                        response_data,
+                    },
+                    RecordMeta {
+                        session_id: selected_session.map(|id| id.0),
+                        pane_id: None,
+                        client_id: Some(client_id.0),
+                    },
+                );
             }
             Response::Err(error) => {
                 warn!(
@@ -3994,23 +4043,23 @@ async fn handle_connection(
                     elapsed_ms,
                     "server.request.error"
                 );
-                if let Ok(runtime) = state.recording_runtime.lock() {
-                    let _ = runtime.record(
-                        RecordingEventKind::RequestError,
-                        RecordingPayload::RequestError {
-                            request_id: envelope.request_id,
-                            request_kind: request_kind.to_string(),
-                            error_code: error.code,
-                            message: error.message.clone(),
-                            elapsed_ms: elapsed_ms.min(u128::from(u64::MAX)) as u64,
-                        },
-                        RecordMeta {
-                            session_id: selected_session.map(|id| id.0),
-                            pane_id: None,
-                            client_id: Some(client_id.0),
-                        },
-                    );
-                }
+                record_to_all_runtimes(
+                    &state.manual_recording_runtime,
+                    &state.rolling_recording_runtime,
+                    RecordingEventKind::RequestError,
+                    RecordingPayload::RequestError {
+                        request_id: envelope.request_id,
+                        request_kind: request_kind.to_string(),
+                        error_code: error.code,
+                        message: error.message.clone(),
+                        elapsed_ms: elapsed_ms.min(u128::from(u64::MAX)) as u64,
+                    },
+                    RecordMeta {
+                        session_id: selected_session.map(|id| id.0),
+                        pane_id: None,
+                        client_id: Some(client_id.0),
+                    },
+                );
             }
         }
         match send_response_via_channel(&frame_tx, envelope.request_id, response) {
@@ -4094,38 +4143,38 @@ async fn handle_connection(
 }
 
 fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
-    if let Ok(runtime) = state.recording_runtime.lock() {
-        let session_id = match &event {
-            Event::SessionCreated { id, .. }
-            | Event::SessionRemoved { id }
-            | Event::ClientAttached { id }
-            | Event::ClientDetached { id } => Some(*id),
-            Event::FollowTargetChanged { session_id, .. }
-            | Event::AttachViewChanged { session_id, .. }
-            | Event::PaneOutputAvailable { session_id, .. }
-            | Event::PaneImageAvailable { session_id, .. }
-            | Event::PaneExited { session_id, .. }
-            | Event::PaneRestarted { session_id, .. } => Some(*session_id),
-            Event::ServerStarted
-            | Event::ServerStopping
-            | Event::FollowStarted { .. }
-            | Event::FollowStopped { .. }
-            | Event::FollowTargetGone { .. }
-            | Event::RecordingStarted { .. }
-            | Event::RecordingStopped { .. } => None,
-        };
-        let _ = runtime.record(
-            RecordingEventKind::ServerEvent,
-            RecordingPayload::ServerEvent {
-                event: event.clone(),
-            },
-            RecordMeta {
-                session_id,
-                pane_id: None,
-                client_id: None,
-            },
-        );
-    }
+    let session_id = match &event {
+        Event::SessionCreated { id, .. }
+        | Event::SessionRemoved { id }
+        | Event::ClientAttached { id }
+        | Event::ClientDetached { id } => Some(*id),
+        Event::FollowTargetChanged { session_id, .. }
+        | Event::AttachViewChanged { session_id, .. }
+        | Event::PaneOutputAvailable { session_id, .. }
+        | Event::PaneImageAvailable { session_id, .. }
+        | Event::PaneExited { session_id, .. }
+        | Event::PaneRestarted { session_id, .. } => Some(*session_id),
+        Event::ServerStarted
+        | Event::ServerStopping
+        | Event::FollowStarted { .. }
+        | Event::FollowStopped { .. }
+        | Event::FollowTargetGone { .. }
+        | Event::RecordingStarted { .. }
+        | Event::RecordingStopped { .. } => None,
+    };
+    record_to_all_runtimes(
+        &state.manual_recording_runtime,
+        &state.rolling_recording_runtime,
+        RecordingEventKind::ServerEvent,
+        RecordingPayload::ServerEvent {
+            event: event.clone(),
+        },
+        RecordMeta {
+            session_id,
+            pane_id: None,
+            client_id: None,
+        },
+    );
     // Broadcast to streaming clients (ignore errors — no receivers is fine).
     let _ = state.event_broadcast.send(event.clone());
     let mut hub = state
@@ -4627,6 +4676,40 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV4> {
         selected_contexts,
         mru_contexts,
     })
+}
+
+fn ensure_rolling_recording_started(state: &Arc<ServerState>) -> Result<()> {
+    let event_kinds = state.rolling_recording_event_kinds.clone();
+    let capture_input = state.rolling_recording_capture_input;
+
+    let mut runtime = state
+        .rolling_recording_runtime
+        .lock()
+        .map_err(|_| anyhow::anyhow!("rolling recording runtime lock poisoned"))?;
+    let Some(runtime) = runtime.as_mut() else {
+        return Ok(());
+    };
+    if runtime.status().active.is_some() {
+        return Ok(());
+    }
+
+    if let Err(error) = runtime.delete_all() {
+        warn!("failed cleaning hidden rolling recordings root: {error:#}");
+    }
+
+    let summary = runtime.start(
+        None,
+        capture_input,
+        RecordingProfile::Functional,
+        event_kinds,
+    )?;
+    info!(
+        "rolling recording started: {} path={} window_secs={}",
+        summary.id,
+        summary.path,
+        runtime.rolling_window_secs().unwrap_or(0)
+    );
+    Ok(())
 }
 
 fn restore_snapshot_if_present(state: &Arc<ServerState>) -> Result<()> {
@@ -6261,19 +6344,19 @@ async fn handle_request(
             };
             match write_result {
                 Ok((bytes, focused_pane_id)) => {
-                    if let Ok(runtime) = state.recording_runtime.lock() {
-                        let _ = runtime.record(
-                            RecordingEventKind::PaneInputRaw,
-                            RecordingPayload::Bytes {
-                                data: captured_input,
-                            },
-                            RecordMeta {
-                                session_id: Some(session_id.0),
-                                pane_id: Some(focused_pane_id),
-                                client_id: Some(client_id.0),
-                            },
-                        );
-                    }
+                    record_to_all_runtimes(
+                        &state.manual_recording_runtime,
+                        &state.rolling_recording_runtime,
+                        RecordingEventKind::PaneInputRaw,
+                        RecordingPayload::Bytes {
+                            data: captured_input,
+                        },
+                        RecordMeta {
+                            session_id: Some(session_id.0),
+                            pane_id: Some(focused_pane_id),
+                            client_id: Some(client_id.0),
+                        },
+                    );
                     Response::Ok(ResponsePayload::AttachInputAccepted { bytes })
                 }
                 Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
@@ -6666,7 +6749,7 @@ async fn handle_request(
             event_kinds,
         } => {
             let mut runtime = state
-                .recording_runtime
+                .manual_recording_runtime
                 .lock()
                 .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
             let profile = profile.unwrap_or(RecordingProfile::Functional);
@@ -6690,7 +6773,7 @@ async fn handle_request(
         }
         Request::RecordingStop { recording_id } => {
             let mut runtime = state
-                .recording_runtime
+                .manual_recording_runtime
                 .lock()
                 .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
             match runtime.stop(recording_id) {
@@ -6708,7 +6791,7 @@ async fn handle_request(
         }
         Request::RecordingStatus => {
             let runtime = state
-                .recording_runtime
+                .manual_recording_runtime
                 .lock()
                 .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
             Response::Ok(ResponsePayload::RecordingStatus {
@@ -6717,7 +6800,7 @@ async fn handle_request(
         }
         Request::RecordingList => {
             let runtime = state
-                .recording_runtime
+                .manual_recording_runtime
                 .lock()
                 .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
             match runtime.list() {
@@ -6730,7 +6813,7 @@ async fn handle_request(
         }
         Request::RecordingDelete { recording_id } => {
             let mut runtime = state
-                .recording_runtime
+                .manual_recording_runtime
                 .lock()
                 .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
             match runtime.delete(recording_id) {
@@ -6750,35 +6833,58 @@ async fn handle_request(
             name,
             payload,
         } => {
-            let runtime = state
-                .recording_runtime
-                .lock()
-                .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
-            match runtime.record(
-                RecordingEventKind::Custom,
-                RecordingPayload::Custom {
-                    source,
-                    name,
-                    payload,
-                },
-                RecordMeta {
-                    session_id,
-                    pane_id,
-                    client_id: Some(client_id.0),
-                },
-            ) {
-                Ok(accepted) => {
-                    Response::Ok(ResponsePayload::RecordingCustomEventWritten { accepted })
+            let payload = RecordingPayload::Custom {
+                source,
+                name,
+                payload,
+            };
+            let meta = RecordMeta {
+                session_id,
+                pane_id,
+                client_id: Some(client_id.0),
+            };
+
+            let mut accepted = false;
+            {
+                let runtime = state
+                    .manual_recording_runtime
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
+                match runtime.record(RecordingEventKind::Custom, payload.clone(), meta) {
+                    Ok(recorded) => accepted |= recorded,
+                    Err(error) => {
+                        return Ok(Response::Err(ErrorResponse {
+                            code: ErrorCode::Internal,
+                            message: format!("failed writing custom recording event: {error}"),
+                        }));
+                    }
                 }
-                Err(error) => Response::Err(ErrorResponse {
-                    code: ErrorCode::Internal,
-                    message: format!("failed writing custom recording event: {error}"),
-                }),
             }
+            {
+                let runtime = state
+                    .rolling_recording_runtime
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("rolling recording runtime lock poisoned"))?;
+                if let Some(runtime) = runtime.as_ref() {
+                    match runtime.record(RecordingEventKind::Custom, payload, meta) {
+                        Ok(recorded) => accepted |= recorded,
+                        Err(error) => {
+                            return Ok(Response::Err(ErrorResponse {
+                                code: ErrorCode::Internal,
+                                message: format!(
+                                    "failed writing custom recording event to rolling runtime: {error}"
+                                ),
+                            }));
+                        }
+                    }
+                }
+            }
+
+            Response::Ok(ResponsePayload::RecordingCustomEventWritten { accepted })
         }
         Request::RecordingDeleteAll => {
             let mut runtime = state
-                .recording_runtime
+                .manual_recording_runtime
                 .lock()
                 .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
             match runtime.delete_all() {
@@ -6794,7 +6900,7 @@ async fn handle_request(
         Request::RecordingPrune { older_than_days } => {
             let result = {
                 let runtime = state
-                    .recording_runtime
+                    .manual_recording_runtime
                     .lock()
                     .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
                 runtime.prune(older_than_days)
@@ -6808,6 +6914,67 @@ async fn handle_request(
                     message: format!("failed pruning recordings: {error}"),
                 }),
             }
+        }
+        Request::RecordingCut { last_seconds } => {
+            let output_root = {
+                let runtime = state
+                    .manual_recording_runtime
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
+                runtime.root_dir().to_path_buf()
+            };
+            let result = {
+                let runtime = state
+                    .rolling_recording_runtime
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("rolling recording runtime lock poisoned"))?;
+                let Some(runtime) = runtime.as_ref() else {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::InvalidRequest,
+                        message: "rolling recording is not enabled".to_string(),
+                    }));
+                };
+                runtime.cut(&output_root, last_seconds)
+            };
+            match result {
+                Ok(recording) => Response::Ok(ResponsePayload::RecordingCut { recording }),
+                Err(error) => Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: format!("failed cutting rolling recording: {error}"),
+                }),
+            }
+        }
+        Request::RecordingCaptureTargets => {
+            let mut targets = Vec::new();
+            {
+                let runtime = state
+                    .manual_recording_runtime
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
+                if let Some((recording_id, path)) = runtime.active_capture_target() {
+                    targets.push(bmux_ipc::RecordingCaptureTarget {
+                        recording_id,
+                        path: path.to_string_lossy().to_string(),
+                        rolling_window_secs: None,
+                    });
+                }
+            }
+            {
+                let runtime = state
+                    .rolling_recording_runtime
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("rolling recording runtime lock poisoned"))?;
+                if let Some(runtime) = runtime.as_ref()
+                    && let Some((recording_id, path)) = runtime.active_capture_target()
+                {
+                    targets.push(bmux_ipc::RecordingCaptureTarget {
+                        recording_id,
+                        path: path.to_string_lossy().to_string(),
+                        rolling_window_secs: runtime.rolling_window_secs(),
+                    });
+                }
+            }
+            Response::Ok(ResponsePayload::RecordingCaptureTargets { targets })
         }
         Request::PaneDirectInput {
             session_id,
@@ -6843,19 +7010,19 @@ async fn handle_request(
             };
             match write_result {
                 Ok(bytes) => {
-                    if let Ok(runtime) = state.recording_runtime.lock() {
-                        let _ = runtime.record(
-                            RecordingEventKind::PaneInputRaw,
-                            RecordingPayload::Bytes {
-                                data: captured_input,
-                            },
-                            RecordMeta {
-                                session_id: Some(session_id.0),
-                                pane_id: Some(pane_id),
-                                client_id: Some(client_id.0),
-                            },
-                        );
-                    }
+                    record_to_all_runtimes(
+                        &state.manual_recording_runtime,
+                        &state.rolling_recording_runtime,
+                        RecordingEventKind::PaneInputRaw,
+                        RecordingPayload::Bytes {
+                            data: captured_input,
+                        },
+                        RecordMeta {
+                            session_id: Some(session_id.0),
+                            pane_id: Some(pane_id),
+                            client_id: Some(client_id.0),
+                        },
+                    );
                     Response::Ok(ResponsePayload::PaneDirectInputAccepted { bytes, pane_id })
                 }
                 Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
@@ -6928,6 +7095,7 @@ const fn request_requires_exclusive(request: &Request) -> bool {
             | Request::RecordingDelete { .. }
             | Request::RecordingWriteCustomEvent { .. }
             | Request::RecordingDeleteAll
+            | Request::RecordingCut { .. }
             | Request::RecordingPrune { .. }
             | Request::Detach
     )
@@ -7003,6 +7171,8 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::RecordingDelete { .. } => "recording_delete",
         Request::RecordingWriteCustomEvent { .. } => "recording_write_custom_event",
         Request::RecordingDeleteAll => "recording_delete_all",
+        Request::RecordingCut { .. } => "recording_cut",
+        Request::RecordingCaptureTargets => "recording_capture_targets",
         Request::RecordingPrune { .. } => "recording_prune",
         Request::Detach => "detach",
         Request::SubscribeEvents => "subscribe_events",
@@ -7040,6 +7210,33 @@ fn default_recording_event_kinds(
     };
     if capture_input && profile != RecordingProfile::Visual {
         event_kinds.push(RecordingEventKind::PaneInputRaw);
+    }
+    event_kinds
+}
+
+fn recording_event_kinds_from_flags(
+    capture_input: bool,
+    capture_output: bool,
+    capture_events: bool,
+) -> Vec<RecordingEventKind> {
+    let mut event_kinds = Vec::new();
+    if capture_input {
+        event_kinds.push(RecordingEventKind::PaneInputRaw);
+    }
+    if capture_output {
+        event_kinds.push(RecordingEventKind::PaneOutputRaw);
+    }
+    if capture_events {
+        event_kinds.extend([
+            RecordingEventKind::ServerEvent,
+            RecordingEventKind::RequestStart,
+            RecordingEventKind::RequestDone,
+            RecordingEventKind::RequestError,
+            RecordingEventKind::Custom,
+        ]);
+    }
+    if event_kinds.is_empty() {
+        event_kinds.push(RecordingEventKind::PaneOutputRaw);
     }
     event_kinds
 }
@@ -7091,6 +7288,8 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::RecordingDeleted { .. } => "recording_deleted",
         ResponsePayload::RecordingCustomEventWritten { .. } => "recording_custom_event_written",
         ResponsePayload::RecordingDeleteAll { .. } => "recording_delete_all",
+        ResponsePayload::RecordingCut { .. } => "recording_cut",
+        ResponsePayload::RecordingCaptureTargets { .. } => "recording_capture_targets",
         ResponsePayload::RecordingPruned { .. } => "recording_pruned",
         ResponsePayload::Detached => "detached",
         ResponsePayload::PaneDirectInputAccepted { .. } => "pane_direct_input_accepted",
@@ -7765,6 +7964,23 @@ fn is_frame_too_large_error(err: &anyhow::Error) -> bool {
         }
     }
     false
+}
+
+fn record_to_all_runtimes(
+    manual_runtime: &Arc<Mutex<RecordingRuntime>>,
+    rolling_runtime: &Arc<Mutex<Option<RecordingRuntime>>>,
+    kind: RecordingEventKind,
+    payload: RecordingPayload,
+    meta: RecordMeta,
+) {
+    if let Ok(runtime) = manual_runtime.lock() {
+        let _ = runtime.record(kind, payload.clone(), meta);
+    }
+    if let Ok(runtime) = rolling_runtime.lock()
+        && let Some(runtime) = runtime.as_ref()
+    {
+        let _ = runtime.record(kind, payload, meta);
+    }
 }
 
 #[cfg(test)]

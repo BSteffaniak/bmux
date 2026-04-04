@@ -373,6 +373,34 @@ pub(super) async fn run_recording_delete_all(
     Ok(0)
 }
 
+pub(super) async fn run_recording_cut(
+    last_seconds: Option<u64>,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
+    cleanup_stale_pid_file().await?;
+    let mut client = connect_if_running_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-recording-cut",
+        connection_context,
+    )
+    .await?
+    .ok_or_else(|| {
+        anyhow::anyhow!(
+            "recording cut requires a running bmux server.\nRun `bmux server start --daemon` and retry."
+        )
+    })?;
+
+    let recording = client
+        .recording_cut(last_seconds)
+        .await
+        .map_err(map_cli_client_error)?;
+    println!(
+        "recording cut created: {} events={} bytes={} path={}",
+        recording.id, recording.event_count, recording.payload_bytes, recording.path
+    );
+    Ok(0)
+}
+
 pub(super) async fn run_recording_prune(
     older_than: Option<u64>,
     json: bool,
@@ -3858,7 +3886,6 @@ fn blit_rgba(
 }
 
 pub(super) struct DisplayCaptureWriter {
-    recording_id: Uuid,
     started_at: Instant,
     writer: BufWriter<std::fs::File>,
     cursor_replay_state: CursorReplayState,
@@ -3891,7 +3918,6 @@ impl DisplayCaptureWriter {
                 )
             })?;
         let mut capture = Self {
-            recording_id,
             started_at: Instant::now(),
             writer: BufWriter::new(file),
             cursor_replay_state: CursorReplayState::default(),
@@ -3919,11 +3945,6 @@ impl DisplayCaptureWriter {
             capture.record(DisplayTrackEvent::Resize { cols, rows })?;
         }
         Ok(capture)
-    }
-
-    /// Returns the recording id this writer is associated with.
-    pub(super) fn recording_id(&self) -> Uuid {
-        self.recording_id
     }
 
     pub(super) fn record_resize(&mut self, cols: u16, rows: u16) -> Result<()> {

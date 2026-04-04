@@ -13,9 +13,10 @@ use bmux_ipc::{
     CORE_PROTOCOL_CAPABILITIES, ClientSummary, ContextSelector, ContextSummary, Envelope,
     EnvelopeKind, ErrorCode, IncompatibilityReason, InvokeServiceKind, IpcEndpoint,
     NegotiatedProtocol, PaneFocusDirection, PaneLayoutNode, PaneSelector, PaneSplitDirection,
-    PaneSummary, ProtocolContract, ProtocolVersion, RecordingEventKind, RecordingProfile,
-    RecordingStatus, RecordingSummary, Request, Response, ResponsePayload, ServerSnapshotStatus,
-    SessionSelector, SessionSummary, decode, default_supported_capabilities, encode,
+    PaneSummary, ProtocolContract, ProtocolVersion, RecordingCaptureTarget, RecordingEventKind,
+    RecordingProfile, RecordingStatus, RecordingSummary, Request, Response, ResponsePayload,
+    ServerSnapshotStatus, SessionSelector, SessionSummary, decode, default_supported_capabilities,
+    encode,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -685,6 +686,34 @@ impl BmuxClient {
             ResponsePayload::RecordingDeleteAll { deleted_count } => Ok(deleted_count),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording delete-all response",
+            )),
+        }
+    }
+
+    /// Create a bounded snapshot from the active rolling recording.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn recording_cut(&mut self, last_seconds: Option<u64>) -> Result<RecordingSummary> {
+        match self.request(Request::RecordingCut { last_seconds }).await? {
+            ResponsePayload::RecordingCut { recording } => Ok(recording),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording cut response",
+            )),
+        }
+    }
+
+    /// Return active recording capture targets for display-track writing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn recording_capture_targets(&mut self) -> Result<Vec<RecordingCaptureTarget>> {
+        match self.request(Request::RecordingCaptureTargets).await? {
+            ResponsePayload::RecordingCaptureTargets { targets } => Ok(targets),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording capture targets response",
             )),
         }
     }
@@ -2228,6 +2257,24 @@ impl StreamingBmuxClient {
             _ => Err(ClientError::UnexpectedResponse("expected recording status")),
         }
     }
+
+    pub async fn recording_cut(&mut self, last_seconds: Option<u64>) -> Result<RecordingSummary> {
+        match self.request(Request::RecordingCut { last_seconds }).await? {
+            ResponsePayload::RecordingCut { recording } => Ok(recording),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording cut response",
+            )),
+        }
+    }
+
+    pub async fn recording_capture_targets(&mut self) -> Result<Vec<RecordingCaptureTarget>> {
+        match self.request(Request::RecordingCaptureTargets).await? {
+            ResponsePayload::RecordingCaptureTargets { targets } => Ok(targets),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording capture targets response",
+            )),
+        }
+    }
 }
 
 const fn request_kind_name(request: &Request) -> &'static str {
@@ -2278,6 +2325,8 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::RecordingDelete { .. } => "recording_delete",
         Request::RecordingWriteCustomEvent { .. } => "recording_write_custom_event",
         Request::RecordingDeleteAll => "recording_delete_all",
+        Request::RecordingCut { .. } => "recording_cut",
+        Request::RecordingCaptureTargets => "recording_capture_targets",
         Request::RecordingPrune { .. } => "recording_prune",
         Request::Detach => "detach",
         Request::SubscribeEvents => "subscribe_events",
@@ -2337,6 +2386,8 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::RecordingDeleted { .. } => "recording_deleted",
             ResponsePayload::RecordingCustomEventWritten { .. } => "recording_custom_event_written",
             ResponsePayload::RecordingDeleteAll { .. } => "recording_delete_all",
+            ResponsePayload::RecordingCut { .. } => "recording_cut",
+            ResponsePayload::RecordingCaptureTargets { .. } => "recording_capture_targets",
             ResponsePayload::RecordingPruned { .. } => "recording_pruned",
             ResponsePayload::Detached => "detached",
             ResponsePayload::PaneDirectInputAccepted { .. } => "pane_direct_input_accepted",

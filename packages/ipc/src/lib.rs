@@ -554,6 +554,11 @@ pub enum Request {
         payload: Vec<u8>,
     },
     RecordingDeleteAll,
+    RecordingCut {
+        #[serde(default)]
+        last_seconds: Option<u64>,
+    },
+    RecordingCaptureTargets,
     /// Prune completed recordings older than the specified retention period.
     RecordingPrune {
         /// Override retention period in days. If `None`, uses the server config.
@@ -806,6 +811,14 @@ pub enum RecordingProfile {
 pub struct RecordingStatus {
     pub active: Option<RecordingSummary>,
     pub queue_len: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingCaptureTarget {
+    pub recording_id: Uuid,
+    pub path: String,
+    #[serde(default)]
+    pub rolling_window_secs: Option<u64>,
 }
 
 /// Event kind emitted into a recording timeline.
@@ -1074,6 +1087,12 @@ pub enum ResponsePayload {
     },
     RecordingDeleteAll {
         deleted_count: usize,
+    },
+    RecordingCut {
+        recording: RecordingSummary,
+    },
+    RecordingCaptureTargets {
+        targets: Vec<RecordingCaptureTarget>,
     },
     RecordingPruned {
         deleted_count: usize,
@@ -1816,6 +1835,11 @@ mod tests {
                 payload: vec![],
             },
             Request::RecordingDeleteAll,
+            Request::RecordingCut {
+                last_seconds: Some(120),
+            },
+            Request::RecordingCut { last_seconds: None },
+            Request::RecordingCaptureTargets,
             Request::Detach,
             Request::PaneDirectInput {
                 session_id: id,
@@ -2207,6 +2231,17 @@ mod tests {
             ResponsePayload::RecordingDeleted { recording_id: id },
             ResponsePayload::RecordingCustomEventWritten { accepted: true },
             ResponsePayload::RecordingDeleteAll { deleted_count: 7 },
+            ResponsePayload::RecordingCut {
+                recording: sample_recording_summary(),
+            },
+            ResponsePayload::RecordingCaptureTargets {
+                targets: vec![RecordingCaptureTarget {
+                    recording_id: id,
+                    path: "/tmp/recordings/.rolling/active".into(),
+                    rolling_window_secs: Some(300),
+                }],
+            },
+            ResponsePayload::RecordingPruned { deleted_count: 3 },
             ResponsePayload::Detached,
             ResponsePayload::PaneDirectInputAccepted { bytes: 5, pane_id },
             ResponsePayload::ServerStopping,

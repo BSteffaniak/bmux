@@ -97,6 +97,7 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             RecordingCommand::List { .. } => BuiltInHandlerId::RecordingList,
             RecordingCommand::Delete { .. } => BuiltInHandlerId::RecordingDelete,
             RecordingCommand::DeleteAll { .. } => BuiltInHandlerId::RecordingDeleteAll,
+            RecordingCommand::Cut { .. } => BuiltInHandlerId::RecordingCut,
             RecordingCommand::Inspect { .. } => BuiltInHandlerId::RecordingInspect,
             RecordingCommand::Replay { .. } => BuiltInHandlerId::RecordingReplay,
             RecordingCommand::VerifySmoke { .. } => BuiltInHandlerId::RecordingVerifySmoke,
@@ -667,6 +668,12 @@ pub(super) async fn dispatch_built_in_command(
                 command: RecordingCommand::DeleteAll { yes },
             },
         ) => run_recording_delete_all(*yes, connection_context).await,
+        (
+            BuiltInHandlerId::RecordingCut,
+            Command::Recording {
+                command: RecordingCommand::Cut { last_seconds },
+            },
+        ) => run_recording_cut(*last_seconds, connection_context).await,
         (
             BuiltInHandlerId::RecordingInspect,
             Command::Recording {

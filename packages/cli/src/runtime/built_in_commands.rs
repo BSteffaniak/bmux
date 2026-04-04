@@ -79,6 +79,7 @@ pub enum BuiltInHandlerId {
     RecordingList,
     RecordingDelete,
     RecordingDeleteAll,
+    RecordingCut,
     RecordingInspect,
     RecordingReplay,
     RecordingVerifySmoke,
@@ -499,6 +500,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::RecordingDeleteAll,
             &["recording", "delete-all"],
             "Delete all recordings",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RecordingCut,
+            &["recording", "cut"],
+            "Snapshot active rolling recording",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::RecordingInspect,

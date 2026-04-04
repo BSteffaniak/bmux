@@ -547,6 +547,12 @@ pub enum RecordingCommand {
         #[arg(long)]
         yes: bool,
     },
+    /// Snapshot the active rolling recording without stopping it
+    Cut {
+        /// Window to snapshot, in seconds (default: full rolling window)
+        #[arg(long)]
+        last_seconds: Option<u64>,
+    },
     /// Inspect recording timeline events
     Inspect {
         /// Recording id
@@ -2572,6 +2578,33 @@ mod tests {
             panic!("expected recording command");
         };
         assert!(matches!(command, RecordingCommand::DeleteAll { yes: true }));
+    }
+
+    #[test]
+    fn parses_recording_cut_defaults() {
+        let cli = Cli::try_parse_from(["bmux", "recording", "cut"]).expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(
+            command,
+            RecordingCommand::Cut { last_seconds: None }
+        ));
+    }
+
+    #[test]
+    fn parses_recording_cut_last_seconds() {
+        let cli = Cli::try_parse_from(["bmux", "recording", "cut", "--last-seconds", "90"])
+            .expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(
+            command,
+            RecordingCommand::Cut {
+                last_seconds: Some(90)
+            }
+        ));
     }
 
     #[test]

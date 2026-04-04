@@ -1394,12 +1394,27 @@ screen content.
 
 ### Example 9: Recording conversion workflow
 
-1. Record a session:
+1. Record a session (manual start/stop):
 
    ```sh
    bmux recording start
    # ... do things in bmux ...
    bmux recording stop
+   ```
+
+   Or use a rolling capture cut without stopping the hidden rolling recorder:
+
+   ```toml
+   # ~/.config/bmux/config.toml
+   [recording]
+   rolling_window_secs = 300
+   ```
+
+   ```sh
+   # default cut window = full rolling window (300s in this example)
+   bmux recording cut
+   # optional explicit window
+   bmux recording cut --last-seconds 90
    ```
 
 2. Convert to a playbook:

@@ -1,19 +1,21 @@
 use anyhow::{Context, Result};
 use bmux_ipc::{
-    RecordingEventEnvelope, RecordingEventKind, RecordingPayload, RecordingProfile,
-    RecordingStatus, RecordingSummary,
+    DisplayTrackEnvelope, DisplayTrackEvent, RecordingEventEnvelope, RecordingEventKind,
+    RecordingPayload, RecordingProfile, RecordingStatus, RecordingSummary,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
 const MANIFEST_FILE_NAME: &str = "manifest.json";
+const DEFAULT_ROLLING_SEGMENT_MAX_AGE_SECS: u64 = 2;
 
 #[derive(Debug)]
 pub struct RecordingRuntime {
@@ -21,6 +23,8 @@ pub struct RecordingRuntime {
     active: Option<ActiveRecording>,
     segment_mb: usize,
     retention_days: u64,
+    rolling_window_secs: Option<u64>,
+    rolling_segment_max_age_secs: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -59,6 +63,23 @@ impl RecordingRuntime {
             active: None,
             segment_mb,
             retention_days,
+            rolling_window_secs: None,
+            rolling_segment_max_age_secs: None,
+        }
+    }
+
+    pub const fn new_rolling(
+        root_dir: PathBuf,
+        segment_mb: usize,
+        rolling_window_secs: u64,
+    ) -> Self {
+        Self {
+            root_dir,
+            active: None,
+            segment_mb,
+            retention_days: 0,
+            rolling_window_secs: Some(rolling_window_secs),
+            rolling_segment_max_age_secs: Some(DEFAULT_ROLLING_SEGMENT_MAX_AGE_SECS),
         }
     }
 
@@ -112,6 +133,8 @@ impl RecordingRuntime {
         let summary_for_thread = summary.clone();
         let segment_mb = self.segment_mb;
         let recording_dir = dir.clone();
+        let rolling_window_secs = self.rolling_window_secs;
+        let rolling_segment_max_age_secs = self.rolling_segment_max_age_secs;
 
         let writer = thread::Builder::new()
             .name(format!("bmux-recording-{id}"))
@@ -124,6 +147,8 @@ impl RecordingRuntime {
                     event_count_thread,
                     payload_bytes_thread,
                     segment_mb,
+                    rolling_window_secs,
+                    rolling_segment_max_age_secs,
                 )
             })
             .context("failed to spawn recording writer thread")?;
@@ -334,9 +359,100 @@ impl RecordingRuntime {
         &self.root_dir
     }
 
+    pub fn active_capture_target(&self) -> Option<(Uuid, PathBuf)> {
+        self.active
+            .as_ref()
+            .map(|active| (active.id, active.path.clone()))
+    }
+
+    pub const fn rolling_window_secs(&self) -> Option<u64> {
+        self.rolling_window_secs
+    }
+
     /// Get the configured retention days.
     pub fn retention_days(&self) -> u64 {
         self.retention_days
+    }
+
+    pub fn cut(&self, output_root: &Path, last_seconds: Option<u64>) -> Result<RecordingSummary> {
+        let active = self
+            .active
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no active recording available for cut"))?;
+        let window_secs = last_seconds.or(self.rolling_window_secs).ok_or_else(|| {
+            anyhow::anyhow!("recording cut requires rolling recording mode to be enabled")
+        })?;
+        if window_secs == 0 {
+            anyhow::bail!("recording cut window must be greater than zero seconds")
+        }
+
+        let cutoff_ms = epoch_millis_now().saturating_sub(window_secs.saturating_mul(1000));
+        let segment_names = list_segment_names(&active.path)?;
+        let mut events = Vec::new();
+        for name in &segment_names {
+            let path = active.path.join(name);
+            let mut segment_events = read_recording_events(&path)?;
+            events.append(&mut segment_events);
+        }
+
+        events.retain(|event| event.wall_epoch_ms >= cutoff_ms);
+        if events.is_empty() {
+            anyhow::bail!("rolling recording has no events in the requested window")
+        }
+
+        let first_mono_ns = events.first().map_or(0, |event| event.mono_ns);
+        for (index, event) in events.iter_mut().enumerate() {
+            event.seq = u64::try_from(index).unwrap_or(u64::MAX).saturating_add(1);
+            event.mono_ns = event.mono_ns.saturating_sub(first_mono_ns);
+        }
+
+        std::fs::create_dir_all(output_root).with_context(|| {
+            format!(
+                "failed creating recording cut output root {}",
+                output_root.display()
+            )
+        })?;
+
+        let id = Uuid::new_v4();
+        let cut_dir = output_root.join(id.to_string());
+        std::fs::create_dir_all(&cut_dir).with_context(|| {
+            format!(
+                "failed creating recording cut directory {}",
+                cut_dir.display()
+            )
+        })?;
+
+        let segments = write_recording_events_with_rotation(&cut_dir, &events, self.segment_mb)?;
+        let event_count = u64::try_from(events.len()).unwrap_or(u64::MAX);
+        let payload_bytes = events
+            .iter()
+            .map(|event| payload_size(&event.payload))
+            .sum::<u64>();
+        let summary = RecordingSummary {
+            id,
+            format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+            session_id: active.session_filter,
+            capture_input: active.capture_input,
+            profile: active.profile,
+            event_kinds: active.event_kinds.clone(),
+            started_epoch_ms: events
+                .first()
+                .map_or(epoch_millis_now(), |event| event.wall_epoch_ms),
+            ended_epoch_ms: Some(epoch_millis_now()),
+            event_count,
+            payload_bytes,
+            path: cut_dir.to_string_lossy().to_string(),
+            segments,
+            total_segment_bytes: 0,
+        };
+
+        copy_display_tracks_for_cut(&active.path, &cut_dir, window_secs)?;
+        copy_owner_client_metadata(&active.path, &cut_dir)?;
+
+        let mut finalized = summary.clone();
+        finalized.total_segment_bytes = compute_total_segment_bytes(&cut_dir, &finalized.segments);
+        write_manifest(&cut_dir.join(MANIFEST_FILE_NAME), &finalized)?;
+        Ok(finalized)
     }
 }
 
@@ -348,12 +464,19 @@ fn writer_loop(
     event_count: Arc<AtomicU64>,
     payload_bytes: Arc<AtomicU64>,
     segment_mb: usize,
+    rolling_window_secs: Option<u64>,
+    rolling_segment_max_age_secs: Option<u64>,
 ) -> Result<RecordingSummary> {
     let segment_limit_bytes = (segment_mb as u64) * 1024 * 1024;
+    let rolling_window_ms = rolling_window_secs.map(|secs| secs.saturating_mul(1000));
+    let rolling_segment_max_age_ms =
+        rolling_segment_max_age_secs.map(|secs| secs.saturating_mul(1000));
     let mut segment_index: usize = 0;
     let mut segment_bytes: u64 = 0;
+    let mut current_segment_start_wall_ms: Option<u64> = None;
+    let mut closed_segments: VecDeque<(String, u64)> = VecDeque::new();
 
-    let segment_name = format!("events_{segment_index}.bin");
+    let mut segment_name = format!("events_{segment_index}.bin");
     let segment_path = recording_dir.join(&segment_name);
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -361,51 +484,92 @@ fn writer_loop(
         .open(&segment_path)
         .with_context(|| format!("failed opening segment file {}", segment_path.display()))?;
     let mut writer = BufWriter::new(file);
-    summary.segments = vec![segment_name];
+    summary.segments = vec![segment_name.clone()];
 
-    while let Ok(event) = rx.recv() {
-        bmux_ipc::write_frame(&mut writer, &event)
-            .map_err(|e| anyhow::anyhow!("recording write_frame failed: {e}"))?;
-        let payload_sz = payload_size(&event.payload);
-        event_count.fetch_add(1, Ordering::SeqCst);
-        payload_bytes.fetch_add(payload_sz, Ordering::SeqCst);
-        segment_bytes += payload_sz;
+    loop {
+        match rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(event) => {
+                bmux_ipc::write_frame(&mut writer, &event)
+                    .map_err(|e| anyhow::anyhow!("recording write_frame failed: {e}"))?;
+                let payload_sz = payload_size(&event.payload);
+                event_count.fetch_add(1, Ordering::SeqCst);
+                payload_bytes.fetch_add(payload_sz, Ordering::SeqCst);
+                segment_bytes = segment_bytes.saturating_add(payload_sz);
 
-        // Periodic flush + manifest update.
-        if event.seq % 128 == 0 {
-            writer.flush()?;
-            summary.event_count = event_count.load(Ordering::SeqCst);
-            summary.payload_bytes = payload_bytes.load(Ordering::SeqCst);
-            summary.total_segment_bytes += 0; // updated at rotation + finalization
-            write_manifest(manifest_path, &summary)?;
-        }
+                if current_segment_start_wall_ms.is_none() {
+                    current_segment_start_wall_ms = Some(event.wall_epoch_ms);
+                }
 
-        // Segment rotation: if current segment exceeds the limit, start a new one.
-        if segment_limit_bytes > 0 && segment_bytes >= segment_limit_bytes {
-            writer.flush()?;
-            drop(writer);
+                // Periodic flush + manifest update.
+                if event.seq % 128 == 0 {
+                    writer.flush()?;
+                    summary.event_count = event_count.load(Ordering::SeqCst);
+                    summary.payload_bytes = payload_bytes.load(Ordering::SeqCst);
+                    write_manifest(manifest_path, &summary)?;
+                }
 
-            segment_index += 1;
-            segment_bytes = 0;
-            let new_segment_name = format!("events_{segment_index}.bin");
-            let new_segment_path = recording_dir.join(&new_segment_name);
-            let new_file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&new_segment_path)
-                .with_context(|| {
-                    format!(
-                        "failed opening new segment file {}",
-                        new_segment_path.display()
-                    )
-                })?;
-            writer = BufWriter::new(new_file);
-            summary.segments.push(new_segment_name);
+                let rotate_by_size =
+                    segment_limit_bytes > 0 && segment_bytes >= segment_limit_bytes;
+                let rotate_by_age = rolling_segment_max_age_ms.is_some_and(|max_age_ms| {
+                    current_segment_start_wall_ms.is_some_and(|start_ms| {
+                        event.wall_epoch_ms.saturating_sub(start_ms) >= max_age_ms
+                    })
+                });
 
-            // Update manifest with new segment list.
-            summary.event_count = event_count.load(Ordering::SeqCst);
-            summary.payload_bytes = payload_bytes.load(Ordering::SeqCst);
-            write_manifest(manifest_path, &summary)?;
+                if rotate_by_size || rotate_by_age {
+                    writer.flush()?;
+                    drop(writer);
+
+                    closed_segments.push_back((segment_name.clone(), event.wall_epoch_ms));
+
+                    segment_index = segment_index.saturating_add(1);
+                    segment_bytes = 0;
+                    current_segment_start_wall_ms = None;
+                    segment_name = format!("events_{segment_index}.bin");
+                    let new_segment_path = recording_dir.join(&segment_name);
+                    let new_file = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&new_segment_path)
+                        .with_context(|| {
+                            format!(
+                                "failed opening new segment file {}",
+                                new_segment_path.display()
+                            )
+                        })?;
+                    writer = BufWriter::new(new_file);
+                    summary.segments.push(segment_name.clone());
+
+                    if let Some(window_ms) = rolling_window_ms {
+                        prune_closed_segments(
+                            recording_dir,
+                            &mut summary,
+                            &mut closed_segments,
+                            epoch_millis_now(),
+                            window_ms,
+                        )?;
+                    }
+
+                    // Update manifest with new segment list.
+                    summary.event_count = event_count.load(Ordering::SeqCst);
+                    summary.payload_bytes = payload_bytes.load(Ordering::SeqCst);
+                    write_manifest(manifest_path, &summary)?;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                if let Some(window_ms) = rolling_window_ms {
+                    writer.flush()?;
+                    prune_closed_segments(
+                        recording_dir,
+                        &mut summary,
+                        &mut closed_segments,
+                        epoch_millis_now(),
+                        window_ms,
+                    )?;
+                    write_manifest(manifest_path, &summary)?;
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
 
@@ -419,6 +583,44 @@ fn writer_loop(
     Ok(summary)
 }
 
+fn prune_closed_segments(
+    recording_dir: &Path,
+    summary: &mut RecordingSummary,
+    closed_segments: &mut VecDeque<(String, u64)>,
+    now_ms: u64,
+    window_ms: u64,
+) -> Result<()> {
+    let cutoff_ms = now_ms.saturating_sub(window_ms);
+    let mut removed_any = false;
+
+    while let Some((name, end_ms)) = closed_segments.front().cloned() {
+        if end_ms >= cutoff_ms {
+            break;
+        }
+        let _ = closed_segments.pop_front();
+
+        let segment_path = recording_dir.join(&name);
+        if let Err(error) = std::fs::remove_file(&segment_path)
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(error).with_context(|| {
+                format!("failed removing old segment {}", segment_path.display())
+            });
+        }
+
+        if let Some(index) = summary.segments.iter().position(|segment| segment == &name) {
+            summary.segments.remove(index);
+        }
+        removed_any = true;
+    }
+
+    if removed_any {
+        summary.total_segment_bytes = compute_total_segment_bytes(recording_dir, &summary.segments);
+    }
+
+    Ok(())
+}
+
 /// Compute the total size of all segment files on disk.
 fn compute_total_segment_bytes(recording_dir: &Path, segments: &[String]) -> u64 {
     segments
@@ -429,6 +631,203 @@ fn compute_total_segment_bytes(recording_dir: &Path, segments: &[String]) -> u64
                 .unwrap_or(0)
         })
         .sum()
+}
+
+fn list_segment_names(recording_dir: &Path) -> Result<Vec<String>> {
+    let mut indexed = Vec::new();
+    for entry in std::fs::read_dir(recording_dir).with_context(|| {
+        format!(
+            "failed reading recording directory {}",
+            recording_dir.display()
+        )
+    })? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let Some(rest) = name.strip_prefix("events_") else {
+            continue;
+        };
+        let Some(index_raw) = rest.strip_suffix(".bin") else {
+            continue;
+        };
+        let Ok(index) = index_raw.parse::<u64>() else {
+            continue;
+        };
+        indexed.push((index, name));
+    }
+    indexed.sort_by_key(|(index, _)| *index);
+    Ok(indexed.into_iter().map(|(_, name)| name).collect())
+}
+
+fn read_recording_events(path: &Path) -> Result<Vec<RecordingEventEnvelope>> {
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed reading recording segment {}", path.display()))?;
+    let result = bmux_ipc::read_frames::<RecordingEventEnvelope>(&bytes).map_err(|error| {
+        anyhow::anyhow!(
+            "failed parsing recording segment {}: {error}",
+            path.display()
+        )
+    })?;
+    Ok(result.frames)
+}
+
+fn write_recording_events_with_rotation(
+    recording_dir: &Path,
+    events: &[RecordingEventEnvelope],
+    segment_mb: usize,
+) -> Result<Vec<String>> {
+    let segment_limit_bytes = (segment_mb as u64) * 1024 * 1024;
+    let mut segment_index = 0usize;
+    let mut segment_bytes = 0u64;
+    let mut segment_names = Vec::new();
+
+    let mut segment_name = format!("events_{segment_index}.bin");
+    let mut writer = BufWriter::new(
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(recording_dir.join(&segment_name))
+            .with_context(|| {
+                format!(
+                    "failed opening recording cut segment {}",
+                    recording_dir.join(&segment_name).display()
+                )
+            })?,
+    );
+    segment_names.push(segment_name.clone());
+
+    for event in events {
+        bmux_ipc::write_frame(&mut writer, event)
+            .map_err(|error| anyhow::anyhow!("recording cut write_frame failed: {error}"))?;
+        segment_bytes = segment_bytes.saturating_add(payload_size(&event.payload));
+        if segment_limit_bytes > 0 && segment_bytes >= segment_limit_bytes {
+            writer.flush()?;
+            segment_index = segment_index.saturating_add(1);
+            segment_name = format!("events_{segment_index}.bin");
+            writer = BufWriter::new(
+                std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(recording_dir.join(&segment_name))
+                    .with_context(|| {
+                        format!(
+                            "failed opening recording cut segment {}",
+                            recording_dir.join(&segment_name).display()
+                        )
+                    })?,
+            );
+            segment_names.push(segment_name.clone());
+            segment_bytes = 0;
+        }
+    }
+
+    writer.flush()?;
+    Ok(segment_names)
+}
+
+fn copy_owner_client_metadata(source_dir: &Path, dest_dir: &Path) -> Result<()> {
+    let owner_path = source_dir.join("owner-client-id.txt");
+    if !owner_path.exists() {
+        return Ok(());
+    }
+    std::fs::copy(&owner_path, dest_dir.join("owner-client-id.txt")).with_context(|| {
+        format!(
+            "failed copying owner client metadata from {}",
+            owner_path.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn copy_display_tracks_for_cut(source_dir: &Path, dest_dir: &Path, window_secs: u64) -> Result<()> {
+    if window_secs == 0 {
+        return Ok(());
+    }
+    let window_ns = window_secs.saturating_mul(1_000_000_000);
+    for entry in std::fs::read_dir(source_dir).with_context(|| {
+        format!(
+            "failed reading recording directory {}",
+            source_dir.display()
+        )
+    })? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.starts_with("display-") || !name.ends_with(".bin") {
+            continue;
+        }
+
+        let path = entry.path();
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("failed reading display track {}", path.display()))?;
+        let result = bmux_ipc::read_frames::<DisplayTrackEnvelope>(&bytes).map_err(|error| {
+            anyhow::anyhow!("failed parsing display track {}: {error}", path.display())
+        })?;
+        if result.frames.is_empty() {
+            continue;
+        }
+
+        let all_frames = result.frames;
+        let last_ns = all_frames.last().map_or(0, |frame| frame.mono_ns);
+        let cutoff_ns = last_ns.saturating_sub(window_ns);
+        let mut kept: Vec<DisplayTrackEnvelope> = all_frames
+            .iter()
+            .filter(|frame| frame.mono_ns >= cutoff_ns)
+            .cloned()
+            .collect();
+        if kept.is_empty() {
+            continue;
+        }
+
+        let first_kept_ns = kept.first().map_or(0, |frame| frame.mono_ns);
+        let mut output = Vec::new();
+        if !kept
+            .first()
+            .is_some_and(|frame| matches!(frame.event, DisplayTrackEvent::StreamOpened { .. }))
+            && let Some(opened) = all_frames
+                .iter()
+                .find(|frame| matches!(frame.event, DisplayTrackEvent::StreamOpened { .. }))
+                .cloned()
+        {
+            output.push(DisplayTrackEnvelope {
+                mono_ns: 0,
+                event: opened.event,
+            });
+        }
+        for frame in &mut kept {
+            frame.mono_ns = frame.mono_ns.saturating_sub(first_kept_ns);
+        }
+        output.extend(kept);
+
+        if output.is_empty() {
+            continue;
+        }
+
+        let mut writer = BufWriter::new(
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(dest_dir.join(&name))
+                .with_context(|| {
+                    format!(
+                        "failed opening cut display track {}",
+                        dest_dir.join(&name).display()
+                    )
+                })?,
+        );
+        for frame in &output {
+            bmux_ipc::write_frame(&mut writer, frame).map_err(|error| {
+                anyhow::anyhow!("failed writing cut display track frame: {error}")
+            })?;
+        }
+        writer.flush()?;
+    }
+    Ok(())
 }
 
 fn write_manifest(path: &Path, summary: &RecordingSummary) -> Result<()> {
@@ -541,7 +940,7 @@ mod tests {
     use bmux_ipc::{RecordingEventKind, RecordingPayload, RecordingProfile, RecordingSummary};
     use std::fs;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use uuid::Uuid;
 
     fn temp_dir() -> PathBuf {
@@ -823,5 +1222,53 @@ mod tests {
         let deleted = super::prune_old_recordings(&root, 0).unwrap();
         assert_eq!(deleted, 0);
         assert!(rec_dir.exists());
+    }
+
+    #[test]
+    fn rolling_cut_writes_completed_recording() {
+        let root = temp_dir();
+        let rolling_root = root.join(".rolling");
+        let cut_root = root.join("cuts");
+
+        let mut runtime = RecordingRuntime::new_rolling(rolling_root, 64, 300);
+        runtime
+            .start(
+                None,
+                true,
+                RecordingProfile::Functional,
+                vec![RecordingEventKind::PaneOutputRaw],
+            )
+            .expect("rolling recording should start");
+
+        runtime
+            .record(
+                RecordingEventKind::PaneOutputRaw,
+                RecordingPayload::Bytes {
+                    data: b"hello".to_vec(),
+                },
+                RecordMeta {
+                    session_id: None,
+                    pane_id: None,
+                    client_id: None,
+                },
+            )
+            .expect("rolling event should be accepted");
+
+        std::thread::sleep(Duration::from_millis(1200));
+
+        let cut = runtime
+            .cut(&cut_root, None)
+            .expect("rolling cut should succeed");
+        assert!(cut.ended_epoch_ms.is_some());
+        assert!(cut.event_count >= 1);
+        assert!(
+            cut_root
+                .join(cut.id.to_string())
+                .join("manifest.json")
+                .exists(),
+            "cut manifest should exist"
+        );
+
+        let _ = runtime.stop(None).expect("rolling recording should stop");
     }
 }

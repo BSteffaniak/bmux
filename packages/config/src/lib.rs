@@ -199,6 +199,9 @@ pub struct RecordingConfig {
     /// Retention period for completed recordings in days. Set to 0 to disable
     /// automatic pruning and keep recordings indefinitely.
     pub retention_days: u64,
+    /// Enable hidden always-on rolling capture and retain at most this many
+    /// seconds of recent events. Set to 0 to disable rolling capture.
+    pub rolling_window_secs: u64,
     /// Default settings for `recording export` rendering.
     pub export: RecordingExportConfig,
 }
@@ -213,6 +216,7 @@ impl Default for RecordingConfig {
             capture_events: true,
             segment_mb: 64,
             retention_days: 30,
+            rolling_window_secs: 0,
             export: RecordingExportConfig::default(),
         }
     }

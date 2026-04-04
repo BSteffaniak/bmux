@@ -52,6 +52,13 @@ pub(super) async fn run_recording_delete_all(
     recording::run_recording_delete_all(yes, connection_context).await
 }
 
+pub(super) async fn run_recording_cut(
+    last_seconds: Option<u64>,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
+    recording::run_recording_cut(last_seconds, connection_context).await
+}
+
 pub(super) fn run_recording_inspect(
     recording_id: &str,
     limit: usize,
@@ -274,10 +281,11 @@ struct ReplayTimeline<'a> {
 
 impl<'a> ReplayTimeline<'a> {
     fn new(events: &'a [RecordingEventEnvelope]) -> Self {
+        let last_ns = events.first().map_or(0, |event| event.mono_ns);
         Self {
             events,
             next_index: 0,
-            last_ns: 0,
+            last_ns,
         }
     }
 
@@ -1628,5 +1636,18 @@ mod tests {
         assert_eq!(timeline.last_ns, 10);
         assert_eq!(timeline.next_index, 2);
         assert!(timeline.is_finished());
+    }
+
+    #[test]
+    fn replay_timeline_starts_without_initial_delay() {
+        let events = vec![make_event(
+            RecordingEventKind::PaneOutputRaw,
+            5_000_000,
+            RecordingPayload::Bytes {
+                data: b"x".to_vec(),
+            },
+        )];
+        let timeline = ReplayTimeline::new(&events);
+        assert_eq!(timeline.next_delay(1.0), Duration::ZERO);
     }
 }
