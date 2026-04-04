@@ -1333,6 +1333,21 @@ fn image_event_to_recording_payload(event: &bmux_image::ImageEvent) -> Recording
     }
 }
 
+/// Check if a chunk contains a screen-clearing CSI sequence.
+/// Looks for `\e[2J` (erase display) or `\e[3J` (erase scrollback + display).
+#[cfg(feature = "image-registry")]
+fn chunk_contains_screen_clear(chunk: &[u8]) -> bool {
+    // Fast scan for the byte patterns.
+    for window in chunk.windows(4) {
+        if window[0] == 0x1b && window[1] == b'[' && window[3] == b'J' {
+            if window[2] == b'2' || window[2] == b'3' {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn protocol_reply_for_chunk(
     protocol_engine: &mut TerminalProtocolEngine,
     cursor_tracker: &mut PaneCursorTracker,
@@ -2150,7 +2165,21 @@ impl SessionRuntimeManager {
         let mouse_protocol_state_for_reader = Arc::clone(&mouse_protocol_state);
 
         #[cfg(feature = "image-registry")]
-        let image_registry = Arc::new(std::sync::Mutex::new(bmux_image::ImageRegistry::default()));
+        let image_registry = {
+            let img_config = bmux_config::BmuxConfig::load()
+                .unwrap_or_default()
+                .behavior
+                .images;
+            Arc::new(std::sync::Mutex::new(if img_config.enabled {
+                bmux_image::ImageRegistry::new(
+                    img_config.max_images_per_pane as usize,
+                    img_config.max_image_bytes as usize,
+                )
+            } else {
+                // Disabled: zero-capacity registry that drops everything.
+                bmux_image::ImageRegistry::new(0, 0)
+            }))
+        };
         #[cfg(feature = "image-registry")]
         let image_registry_for_reader = Arc::clone(&image_registry);
         #[cfg(feature = "image-registry")]
@@ -2341,6 +2370,16 @@ impl SessionRuntimeManager {
                                 };
                                 #[cfg(feature = "image-registry")]
                                 let chunk = chunk.as_slice();
+
+                                // Detect screen-clearing CSI sequences (\e[2J, \e[3J)
+                                // and clear the image registry when they occur.
+                                #[cfg(feature = "image-registry")]
+                                if chunk_contains_screen_clear(chunk) {
+                                    if let Ok(mut reg) = image_registry_for_reader.lock() {
+                                        reg.clear();
+                                    }
+                                    image_dirty_for_reader.store(true, Ordering::SeqCst);
+                                }
 
                                 // Update DEC private mode tracking (mouse protocol
                                 // and synchronized update) BEFORE making the chunk

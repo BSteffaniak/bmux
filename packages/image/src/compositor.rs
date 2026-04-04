@@ -20,6 +20,34 @@ pub struct PaneRect {
     pub h: u16,
 }
 
+/// Tracks kitty images already transmitted to the host terminal.
+/// This enables transmit-once-place-many: only new images are transmitted,
+/// previously transmitted images are re-placed without re-sending data.
+#[derive(Clone, Debug, Default)]
+pub struct KittyHostState {
+    /// Maps bmux-internal image ID → host-side kitty image ID.
+    pub transmitted: std::collections::HashMap<u64, u32>,
+    /// Next host-side kitty image ID to allocate.
+    next_host_id: u32,
+}
+
+impl KittyHostState {
+    /// Get or allocate a host-side kitty image ID for a bmux image.
+    fn get_or_allocate(&mut self, bmux_image_id: u64) -> (u32, bool) {
+        if let Some(&host_id) = self.transmitted.get(&bmux_image_id) {
+            (host_id, false) // Already transmitted.
+        } else {
+            self.next_host_id = self.next_host_id.wrapping_add(1);
+            if self.next_host_id == 0 {
+                self.next_host_id = 1; // kitty image_id 0 is invalid.
+            }
+            let host_id = self.next_host_id;
+            self.transmitted.insert(bmux_image_id, host_id);
+            (host_id, true) // Newly allocated, needs transmission.
+        }
+    }
+}
+
 /// Render images for a single pane as an overlay on the host terminal.
 ///
 /// Images are emitted after the cell content has been drawn.  The cursor
@@ -31,6 +59,7 @@ pub fn render_pane_images(
     pane_rect: PaneRect,
     host_caps: &HostImageCapabilities,
     decode_mode: ImageDecodeMode,
+    kitty_state: &mut KittyHostState,
 ) -> std::io::Result<()> {
     if images.is_empty() {
         return Ok(());
@@ -47,27 +76,20 @@ pub fn render_pane_images(
             continue;
         }
 
-        // Skip images that extend beyond pane boundaries for now.
-        // TODO(phase 7): implement proper cropping instead of skipping.
-        let img_bottom = image.position.row.saturating_add(image.cell_size.rows);
-        let img_right = image.position.col.saturating_add(image.cell_size.cols);
-        if img_bottom > inner_h || img_right > inner_w {
-            // Image partially outside — skip for now.
-            continue;
-        }
-
+        // Allow partially-overlapping images: the pane border will
+        // visually clip the overflow.  Only skip fully-outside images.
         let host_x = inner_x.saturating_add(image.position.col);
         let host_y = inner_y.saturating_add(image.position.row);
 
         match decode_mode {
             ImageDecodeMode::Passthrough => {
-                emit_passthrough(out, image, host_x, host_y, host_caps)?;
+                emit_passthrough(out, image, host_x, host_y, host_caps, kitty_state)?;
             }
             ImageDecodeMode::Server => {
-                emit_from_pixels(out, image, host_x, host_y, host_caps)?;
+                emit_from_pixels(out, image, host_x, host_y, host_caps, kitty_state)?;
             }
             ImageDecodeMode::Client => {
-                emit_client_decode(out, image, host_x, host_y, host_caps)?;
+                emit_client_decode(out, image, host_x, host_y, host_caps, kitty_state)?;
             }
         }
     }
@@ -82,6 +104,7 @@ fn emit_passthrough(
     host_x: u16,
     host_y: u16,
     _host_caps: &HostImageCapabilities,
+    kitty_state: &mut KittyHostState,
 ) -> std::io::Result<()> {
     let Some(raw) = &image.payload.raw else {
         return Ok(());
@@ -100,26 +123,26 @@ fn emit_passthrough(
         }
         #[cfg(feature = "kitty")]
         crate::model::ImageProtocol::KittyGraphics => {
-            // In passthrough mode, transmit + place the image directly.
-            // Use a unique placement based on the image ID.
-            let placement_id = (image.id & 0xFFFF_FFFF) as u32;
-            let image_id = placement_id; // Use same ID for simplicity.
+            // Transmit-once-place-many with globally unique host IDs.
+            let (host_image_id, needs_transmit) = kitty_state.get_or_allocate(image.id);
+            let placement_id = host_image_id;
 
-            // Transmit the image data.
-            out.write_all(b"\x1b_")?;
-            out.write_all(&crate::codec::kitty::encode_transmit(
-                image_id,
-                crate::model::KittyFormat::Png, // Assume PNG for raw passthrough.
-                raw,
-                image.pixel_size.width,
-                image.pixel_size.height,
-            ))?;
-            out.write_all(b"\x1b\\")?;
+            if needs_transmit {
+                out.write_all(b"\x1b_")?;
+                out.write_all(&crate::codec::kitty::encode_transmit(
+                    host_image_id,
+                    crate::model::KittyFormat::Png,
+                    raw,
+                    image.pixel_size.width,
+                    image.pixel_size.height,
+                ))?;
+                out.write_all(b"\x1b\\")?;
+            }
 
-            // Place the image at the cursor position (already set by MoveTo).
+            // Always re-place at the (potentially updated) position.
             out.write_all(b"\x1b_")?;
             out.write_all(&crate::codec::kitty::encode_place(
-                image_id,
+                host_image_id,
                 placement_id,
                 host_y,
                 host_x,
@@ -147,19 +170,50 @@ fn emit_from_pixels(
     host_x: u16,
     host_y: u16,
     host_caps: &HostImageCapabilities,
+    kitty_state: &mut KittyHostState,
 ) -> std::io::Result<()> {
     let Some(pixels) = &image.payload.pixels else {
-        // No decoded pixels available — fall back to passthrough if raw exists.
-        return emit_passthrough(out, image, host_x, host_y, host_caps);
+        return emit_passthrough(out, image, host_x, host_y, host_caps, kitty_state);
     };
 
     write!(out, "\x1b[{};{}H", host_y + 1, host_x + 1)?;
 
-    let _preferred = host_caps.preferred_protocol();
-
-    // TODO: encode pixels into the host's preferred protocol.
-    // For now, this is a stub that will be filled in per-protocol.
-    let _ = pixels;
+    match host_caps.preferred_protocol() {
+        #[cfg(feature = "sixel")]
+        Some(crate::model::ImageProtocol::Sixel) => {
+            if let Some(sixel_data) = crate::codec::sixel::encode(pixels) {
+                out.write_all(b"\x1bPq")?;
+                out.write_all(&sixel_data)?;
+                out.write_all(b"\x1b\\")?;
+            }
+        }
+        #[cfg(feature = "kitty")]
+        Some(crate::model::ImageProtocol::KittyGraphics) => {
+            // Encode pixels as PNG-ish kitty transmission.
+            // For now, send raw RGBA data.
+            let (host_id, needs_transmit) = kitty_state.get_or_allocate(image.id);
+            if needs_transmit {
+                out.write_all(b"\x1b_")?;
+                out.write_all(&crate::codec::kitty::encode_transmit(
+                    host_id,
+                    crate::model::KittyFormat::Rgba,
+                    &pixels.data,
+                    pixels.width,
+                    pixels.height,
+                ))?;
+                out.write_all(b"\x1b\\")?;
+            }
+            out.write_all(b"\x1b_")?;
+            out.write_all(&crate::codec::kitty::encode_place(
+                host_id, host_id, host_y, host_x,
+            ))?;
+            out.write_all(b"\x1b\\")?;
+        }
+        _ => {
+            // No supported protocol for pixel emission; fall back to passthrough.
+            return emit_passthrough(out, image, host_x, host_y, host_caps, kitty_state);
+        }
+    }
 
     Ok(())
 }
@@ -171,8 +225,9 @@ fn emit_client_decode(
     host_x: u16,
     host_y: u16,
     host_caps: &HostImageCapabilities,
+    kitty_state: &mut KittyHostState,
 ) -> std::io::Result<()> {
     // TODO: decode raw bytes to pixels, then delegate to emit_from_pixels.
     // For now, fall back to passthrough.
-    emit_passthrough(out, image, host_x, host_y, host_caps)
+    emit_passthrough(out, image, host_x, host_y, host_caps, kitty_state)
 }

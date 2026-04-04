@@ -1232,8 +1232,8 @@ impl BmuxClient {
                 rows,
                 status_top_inset,
                 status_bottom_inset,
-                cell_pixel_width: 0,
-                cell_pixel_height: 0,
+                cell_pixel_width: cell_pixel_width(),
+                cell_pixel_height: cell_pixel_height(),
             })
             .await?
         {
@@ -1847,8 +1847,8 @@ impl StreamingBmuxClient {
                 rows,
                 status_top_inset,
                 status_bottom_inset,
-                cell_pixel_width: 0,
-                cell_pixel_height: 0,
+                cell_pixel_width: cell_pixel_width(),
+                cell_pixel_height: cell_pixel_height(),
             })
             .await?
         {
@@ -2402,6 +2402,67 @@ fn load_or_create_principal_id(paths: &ConfigPaths) -> Result<Uuid> {
             source,
         }),
     }
+}
+
+/// Query the terminal's cell pixel width via `TIOCGWINSZ` ioctl.
+/// Returns 0 if unavailable.
+#[cfg(unix)]
+fn cell_pixel_width() -> u16 {
+    let (w, _) = cell_pixel_size_from_ioctl();
+    w
+}
+
+/// Query the terminal's cell pixel height via `TIOCGWINSZ` ioctl.
+/// Returns 0 if unavailable.
+#[cfg(unix)]
+fn cell_pixel_height() -> u16 {
+    let (_, h) = cell_pixel_size_from_ioctl();
+    h
+}
+
+#[cfg(unix)]
+fn cell_pixel_size_from_ioctl() -> (u16, u16) {
+    use std::os::unix::io::AsRawFd;
+
+    #[repr(C)]
+    struct Winsize {
+        ws_row: u16,
+        ws_col: u16,
+        ws_xpixel: u16,
+        ws_ypixel: u16,
+    }
+
+    #[cfg(target_os = "macos")]
+    const TIOCGWINSZ: u64 = 0x4008_7468;
+    #[cfg(target_os = "linux")]
+    const TIOCGWINSZ: u64 = 0x5413;
+
+    let fd = std::io::stdout().as_raw_fd();
+    let mut ws = std::mem::MaybeUninit::<Winsize>::uninit();
+    let ret = unsafe {
+        unsafe extern "C" {
+            fn ioctl(fd: i32, request: u64, ...) -> i32;
+        }
+        ioctl(fd, TIOCGWINSZ, ws.as_mut_ptr())
+    };
+    if ret != 0 {
+        return (0, 0);
+    }
+    let ws = unsafe { ws.assume_init() };
+    if ws.ws_col == 0 || ws.ws_row == 0 || ws.ws_xpixel == 0 || ws.ws_ypixel == 0 {
+        return (0, 0);
+    }
+    (ws.ws_xpixel / ws.ws_col, ws.ws_ypixel / ws.ws_row)
+}
+
+#[cfg(not(unix))]
+fn cell_pixel_width() -> u16 {
+    0
+}
+
+#[cfg(not(unix))]
+fn cell_pixel_height() -> u16 {
+    0
 }
 
 #[cfg(test)]

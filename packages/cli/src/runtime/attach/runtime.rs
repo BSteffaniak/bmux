@@ -249,7 +249,7 @@ pub(crate) async fn run_session_attach_with_client(
         feature = "image-iterm2"
     ))]
     {
-        let mut caps = bmux_image::host_caps::detect_from_env();
+        let mut caps = bmux_image::host_caps::detect_with_queries();
         // Query cell pixel dimensions while we're in raw mode.
         let (cpw, cph) = bmux_image::host_caps::query_cell_pixel_size();
         caps.cell_pixel_width = cpw;
@@ -466,6 +466,18 @@ pub(crate) async fn run_session_attach_with_client(
                 }
             }
             view_state.dirty.layout_needs_refresh = false;
+
+            // Reset image sequences on layout change so the next fetch
+            // gets a full snapshot from the server (handles zoom/unzoom).
+            #[cfg(any(
+                feature = "image-sixel",
+                feature = "image-kitty",
+                feature = "image-iterm2"
+            ))]
+            {
+                view_state.image_sequences.clear();
+                view_state.kitty_host_state.transmitted.clear();
+            }
         }
 
         let Some(layout_state) = view_state.cached_layout_state.clone() else {
@@ -2411,13 +2423,31 @@ pub(crate) async fn render_attach_frame(
                         w: surface.rect.w,
                         h: surface.rect.h,
                     };
-                    let decode_mode = bmux_image::config::ImageDecodeMode::Passthrough;
+                    let decode_mode = {
+                        let cfg = bmux_config::BmuxConfig::load()
+                            .unwrap_or_default()
+                            .behavior
+                            .images
+                            .decode_mode;
+                        match cfg {
+                            bmux_config::ImageDecodeMode::Server => {
+                                bmux_image::config::ImageDecodeMode::Server
+                            }
+                            bmux_config::ImageDecodeMode::Client => {
+                                bmux_image::config::ImageDecodeMode::Client
+                            }
+                            bmux_config::ImageDecodeMode::Passthrough => {
+                                bmux_image::config::ImageDecodeMode::Passthrough
+                            }
+                        }
+                    };
                     let _ = bmux_image::compositor::render_pane_images(
                         &mut frame_bytes,
                         &pane_images,
                         pane_rect,
                         &view_state.host_image_caps,
                         decode_mode,
+                        &mut view_state.kitty_host_state,
                     );
                 }
             }

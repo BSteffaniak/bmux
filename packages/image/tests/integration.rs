@@ -217,6 +217,7 @@ mod pipeline {
             h: 24,
         };
 
+        let mut kitty_state = bmux_image::compositor::KittyHostState::default();
         let mut output = Vec::new();
         render_pane_images(
             &mut output,
@@ -224,6 +225,7 @@ mod pipeline {
             rect,
             &host_caps,
             ImageDecodeMode::Passthrough,
+            &mut kitty_state,
         )
         .unwrap();
 

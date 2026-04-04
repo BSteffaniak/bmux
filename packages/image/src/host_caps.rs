@@ -97,16 +97,119 @@ pub fn detect_from_env() -> HostImageCapabilities {
         caps.sixel = true;
     }
 
-    // -- DA-based sixel detection (attribute 4) ---------------------------
-    // TODO(phase 3): Send DA1 query, parse response for attribute 4.
-    // This requires async I/O with the host terminal and a timeout,
-    // which is better done during the attach handshake.
+    // Alacritty supports sixel since 0.14
+    if term_program == "Alacritty" || term.starts_with("alacritty") {
+        caps.sixel = true;
+    }
 
-    // -- Kitty graphics query ---------------------------------------------
-    // TODO(phase 3): Send `\e_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\e\` and
-    // check for an `OK` response.
+    // Windows Terminal
+    if term_program == "Windows_Terminal" {
+        caps.sixel = true;
+    }
 
     caps
+}
+
+/// Enhanced detection that sends terminal queries.
+///
+/// Must be called while the terminal is in raw mode.  Falls back to
+/// `detect_from_env()` results if queries time out.
+#[cfg(unix)]
+pub fn detect_with_queries() -> HostImageCapabilities {
+    use std::io::{Read, Write};
+    use std::os::unix::io::AsRawFd;
+    use std::time::{Duration, Instant};
+
+    let mut caps = detect_from_env();
+
+    // Send DA1 query (Primary Device Attributes) to detect sixel.
+    // Response: ESC [ ? <attrs> c  where attrs include "4" for sixel.
+    let mut stdout = std::io::stdout();
+    if stdout.write_all(b"\x1b[c").is_err() || stdout.flush().is_err() {
+        return caps;
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let stdin_fd = std::io::stdin().as_raw_fd();
+    let mut response = Vec::new();
+
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let millis = remaining.as_millis().min(100) as i32;
+
+        let mut pollfd = PollFd {
+            fd: stdin_fd,
+            events: 1, // POLLIN
+            revents: 0,
+        };
+        let ret = unsafe { poll(&mut pollfd, 1, millis) };
+        if ret <= 0 {
+            break;
+        }
+
+        let mut buf = [0u8; 256];
+        let stdin = std::io::stdin();
+        let mut handle = stdin.lock();
+        match handle.read(&mut buf) {
+            Ok(n) if n > 0 => {
+                response.extend_from_slice(&buf[..n]);
+                // DA1 response ends with 'c'.
+                if response.iter().any(|&b| b == b'c') {
+                    break;
+                }
+            }
+            _ => break,
+        }
+    }
+
+    // Parse DA1 response for sixel attribute (4).
+    if let Some(da_response) = parse_da1_response(&response) {
+        if da_response.contains(&4) {
+            caps.sixel = true;
+        }
+    }
+
+    caps
+}
+
+/// Non-unix stub for query-based detection.
+#[cfg(not(unix))]
+pub fn detect_with_queries() -> HostImageCapabilities {
+    detect_from_env()
+}
+
+/// Parse a DA1 response (`ESC [ ? <attrs> c`) into a list of attribute numbers.
+fn parse_da1_response(response: &[u8]) -> Option<Vec<u32>> {
+    // Find ESC [ ? ... c
+    let esc_pos = response.iter().position(|&b| b == 0x1b)?;
+    let rest = &response[esc_pos..];
+    if rest.len() < 4 || rest[1] != b'[' || rest[2] != b'?' {
+        return None;
+    }
+    let c_pos = rest[3..].iter().position(|&b| b == b'c')?;
+    let params = &rest[3..3 + c_pos];
+    let params_str = std::str::from_utf8(params).ok()?;
+    let attrs: Vec<u32> = params_str
+        .split(';')
+        .filter_map(|s| s.parse().ok())
+        .collect();
+    Some(attrs)
+}
+
+#[cfg(unix)]
+#[repr(C)]
+struct PollFd {
+    fd: i32,
+    events: i16,
+    revents: i16,
+}
+
+#[cfg(unix)]
+unsafe fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32 {
+    unsafe extern "C" {
+        fn poll(fds: *mut PollFd, nfds: u64, timeout: i32) -> i32;
+    }
+    unsafe { poll(fds, nfds, timeout) }
 }
 
 /// Query the host terminal for cell pixel dimensions.
