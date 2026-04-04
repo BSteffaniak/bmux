@@ -100,8 +100,31 @@ fn emit_passthrough(
         }
         #[cfg(feature = "kitty")]
         crate::model::ImageProtocol::KittyGraphics => {
-            // TODO: Re-emit kitty placement with translated coordinates.
-            let _ = raw;
+            // In passthrough mode, transmit + place the image directly.
+            // Use a unique placement based on the image ID.
+            let placement_id = (image.id & 0xFFFF_FFFF) as u32;
+            let image_id = placement_id; // Use same ID for simplicity.
+
+            // Transmit the image data.
+            out.write_all(b"\x1b_")?;
+            out.write_all(&crate::codec::kitty::encode_transmit(
+                image_id,
+                crate::model::KittyFormat::Png, // Assume PNG for raw passthrough.
+                raw,
+                image.pixel_size.width,
+                image.pixel_size.height,
+            ))?;
+            out.write_all(b"\x1b\\")?;
+
+            // Place the image at the cursor position (already set by MoveTo).
+            out.write_all(b"\x1b_")?;
+            out.write_all(&crate::codec::kitty::encode_place(
+                image_id,
+                placement_id,
+                host_y,
+                host_x,
+            ))?;
+            out.write_all(b"\x1b\\")?;
         }
         #[cfg(feature = "iterm2")]
         crate::model::ImageProtocol::ITerm2 => {

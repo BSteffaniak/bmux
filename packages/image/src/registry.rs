@@ -9,6 +9,22 @@ use crate::model::{
     ImageProtocol, PaneImage,
 };
 
+/// A change log entry for delta tracking.
+#[derive(Clone, Debug)]
+enum ChangeLogEntry {
+    Added { sequence: u64, image: PaneImage },
+    Removed { sequence: u64, image_id: u64 },
+}
+
+/// Accumulator for kitty chunked transmissions.
+#[cfg(feature = "kitty")]
+struct KittyChunkAccumulator {
+    format: crate::model::KittyFormat,
+    data: Vec<u8>,
+    width: u32,
+    height: u32,
+}
+
 /// Per-pane image storage with scroll tracking and delta queries.
 pub struct ImageRegistry {
     images: Vec<PaneImage>,
@@ -19,12 +35,19 @@ pub struct ImageRegistry {
     max_images: usize,
     /// Maximum bytes of image payload per pane (0 = unlimited).
     max_bytes: usize,
+    /// Change log for delta tracking: (sequence, event).
+    change_log: Vec<ChangeLogEntry>,
+    /// Maximum change log entries before compaction.
+    max_change_log: usize,
 
     // Kitty-specific state
     #[cfg(feature = "kitty")]
     kitty_transmitted: std::collections::BTreeMap<u32, crate::model::KittyTransmittedImage>,
     #[cfg(feature = "kitty")]
     kitty_placements: Vec<crate::model::KittyPlacement>,
+    /// Accumulator for kitty chunked transmissions.
+    #[cfg(feature = "kitty")]
+    kitty_pending_chunks: std::collections::BTreeMap<u32, KittyChunkAccumulator>,
 }
 
 impl ImageRegistry {
@@ -36,10 +59,14 @@ impl ImageRegistry {
             sequence: 0,
             max_images,
             max_bytes,
+            change_log: Vec::new(),
+            max_change_log: 1000,
             #[cfg(feature = "kitty")]
             kitty_transmitted: std::collections::BTreeMap::new(),
             #[cfg(feature = "kitty")]
             kitty_placements: Vec::new(),
+            #[cfg(feature = "kitty")]
+            kitty_pending_chunks: std::collections::BTreeMap::new(),
         }
     }
 
@@ -115,30 +142,53 @@ impl ImageRegistry {
         self.next_id += 1;
         self.sequence += 1;
 
-        self.images.push(PaneImage {
+        let image = PaneImage {
             id,
             protocol,
             payload,
             position,
             cell_size,
             pixel_size,
-        });
+        };
 
+        self.change_log.push(ChangeLogEntry::Added {
+            sequence: self.sequence,
+            image: image.clone(),
+        });
+        self.images.push(image);
+        self.compact_change_log();
         self.enforce_limits();
     }
 
     /// Remove images exceeding the per-pane limits (oldest first).
     fn enforce_limits(&mut self) {
         while self.images.len() > self.max_images {
-            self.images.remove(0);
+            let removed = self.images.remove(0);
             self.sequence += 1;
+            self.change_log.push(ChangeLogEntry::Removed {
+                sequence: self.sequence,
+                image_id: removed.id,
+            });
         }
 
         if self.max_bytes > 0 {
             while self.total_bytes() > self.max_bytes && !self.images.is_empty() {
-                self.images.remove(0);
+                let removed = self.images.remove(0);
                 self.sequence += 1;
+                self.change_log.push(ChangeLogEntry::Removed {
+                    sequence: self.sequence,
+                    image_id: removed.id,
+                });
             }
+        }
+    }
+
+    /// Compact the change log if it exceeds the maximum size.
+    fn compact_change_log(&mut self) {
+        if self.change_log.len() > self.max_change_log {
+            // Drop the oldest half.
+            let keep = self.max_change_log / 2;
+            self.change_log.drain(..self.change_log.len() - keep);
         }
     }
 
@@ -158,15 +208,19 @@ impl ImageRegistry {
     /// Images that scroll entirely above the viewport are removed.
     pub fn scroll_up(&mut self, lines: u16) {
         self.sequence += 1;
+        let seq = self.sequence;
+        let change_log = &mut self.change_log;
         self.images.retain_mut(|img| {
             if img.position.row < lines {
-                // Image scrolled above the visible area.
-                // Keep if part of the image is still visible.
                 if img.position.row + img.cell_size.rows > lines {
                     img.position.row = 0;
                     img.cell_size.rows -= lines - img.position.row;
                     true
                 } else {
+                    change_log.push(ChangeLogEntry::Removed {
+                        sequence: seq,
+                        image_id: img.id,
+                    });
                     false
                 }
             } else {
@@ -192,8 +246,35 @@ impl ImageRegistry {
 
     /// Compute a delta since the given sequence number.
     pub fn delta_since(&self, since_sequence: u64) -> ImageDelta {
-        if since_sequence == 0 {
-            // Full snapshot.
+        if since_sequence == 0 || since_sequence >= self.sequence {
+            // Either first request (full snapshot) or already up to date.
+            if since_sequence == 0 {
+                return ImageDelta {
+                    added: self.images.clone(),
+                    removed: Vec::new(),
+                    sequence: self.sequence,
+                };
+            }
+            return ImageDelta {
+                added: Vec::new(),
+                removed: Vec::new(),
+                sequence: self.sequence,
+            };
+        }
+
+        // Check if the change log covers the requested range.
+        let oldest_log_seq = self
+            .change_log
+            .first()
+            .map(|e| match e {
+                ChangeLogEntry::Added { sequence, .. }
+                | ChangeLogEntry::Removed { sequence, .. } => *sequence,
+            })
+            .unwrap_or(0);
+
+        if since_sequence < oldest_log_seq {
+            // Change log was compacted past the client's sequence.
+            // Fall back to full snapshot.
             return ImageDelta {
                 added: self.images.clone(),
                 removed: Vec::new(),
@@ -201,12 +282,26 @@ impl ImageRegistry {
             };
         }
 
-        // For now, always send a full snapshot.  A proper delta tracker
-        // would record removed IDs and only send new images.
-        // TODO: implement proper delta tracking with a change log.
+        // Build delta from the change log.
+        let mut added = Vec::new();
+        let mut removed = Vec::new();
+        for entry in &self.change_log {
+            match entry {
+                ChangeLogEntry::Added { sequence, image } if *sequence > since_sequence => {
+                    added.push(image.clone());
+                }
+                ChangeLogEntry::Removed {
+                    sequence, image_id, ..
+                } if *sequence > since_sequence => {
+                    removed.push(*image_id);
+                }
+                _ => {}
+            }
+        }
+
         ImageDelta {
-            added: self.images.clone(),
-            removed: Vec::new(),
+            added,
+            removed,
             sequence: self.sequence,
         }
     }
@@ -218,12 +313,20 @@ impl ImageRegistry {
 
     /// Remove all images (e.g., on screen clear).
     pub fn clear(&mut self) {
-        self.images.clear();
         self.sequence += 1;
+        for img in &self.images {
+            self.change_log.push(ChangeLogEntry::Removed {
+                sequence: self.sequence,
+                image_id: img.id,
+            });
+        }
+        self.images.clear();
+        self.compact_change_log();
         #[cfg(feature = "kitty")]
         {
             self.kitty_transmitted.clear();
             self.kitty_placements.clear();
+            self.kitty_pending_chunks.clear();
         }
     }
 
@@ -246,12 +349,20 @@ impl ImageRegistry {
                 height,
                 more_chunks: false,
             } => {
+                // Check if this is the final chunk of a multi-chunk transmission.
+                let final_data = if let Some(mut acc) = self.kitty_pending_chunks.remove(&image_id)
+                {
+                    acc.data.extend_from_slice(&data);
+                    acc.data
+                } else {
+                    data
+                };
                 self.kitty_transmitted.insert(
                     image_id,
                     KittyTransmittedImage {
                         image_id,
                         format,
-                        data,
+                        data: final_data,
                         width,
                         height,
                     },
@@ -259,10 +370,24 @@ impl ImageRegistry {
                 self.sequence += 1;
             }
             KittyCommand::Transmit {
-                more_chunks: true, ..
+                image_id,
+                format,
+                data,
+                width,
+                height,
+                more_chunks: true,
             } => {
-                // TODO: handle chunked transmission — accumulate data until
-                // the final chunk (more_chunks=false) arrives.
+                // Accumulate chunks until the final chunk arrives.
+                let acc = self
+                    .kitty_pending_chunks
+                    .entry(image_id)
+                    .or_insert_with(|| KittyChunkAccumulator {
+                        format,
+                        data: Vec::new(),
+                        width,
+                        height,
+                    });
+                acc.data.extend_from_slice(&data);
             }
             KittyCommand::Place(placement) => {
                 // If we have the transmitted image, create a PaneImage.

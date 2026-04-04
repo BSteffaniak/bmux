@@ -444,6 +444,8 @@ pub struct BehaviorConfig {
     pub pane_restore_method: PaneRestoreMethod,
     /// Mouse interaction settings for attach mode (focus/scroll gestures).
     pub mouse: MouseBehaviorConfig,
+    /// Terminal image protocol settings (Sixel, Kitty graphics, iTerm2).
+    pub images: ImageBehaviorConfig,
 }
 
 impl Default for BehaviorConfig {
@@ -465,6 +467,7 @@ impl Default for BehaviorConfig {
             kitty_keyboard: true,
             pane_restore_method: PaneRestoreMethod::Snapshot,
             mouse: MouseBehaviorConfig::default(),
+            images: ImageBehaviorConfig::default(),
         }
     }
 }
@@ -516,6 +519,52 @@ impl Default for MouseBehaviorConfig {
             gesture_actions: BTreeMap::new(),
         }
     }
+}
+
+/// Terminal image protocol behavior.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ConfigDoc)]
+#[config_doc(section = "behavior.images")]
+#[serde(default)]
+pub struct ImageBehaviorConfig {
+    /// Master switch for image protocol support.
+    pub enabled: bool,
+    /// How image decoding is distributed between server and client.
+    pub decode_mode: ImageDecodeMode,
+    /// Maximum image payload size in bytes per image.
+    pub max_image_bytes: u64,
+    /// Maximum number of images kept per pane.
+    pub max_images_per_pane: u32,
+}
+
+impl Default for ImageBehaviorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            decode_mode: ImageDecodeMode::Passthrough,
+            max_image_bytes: 10 * 1024 * 1024, // 10 MiB
+            max_images_per_pane: 100,
+        }
+    }
+}
+
+impl ImageBehaviorConfig {
+    /// Config doc support — empty since this is a nested struct, not an enum.
+    pub const fn config_doc_values() -> &'static [&'static str] {
+        &[]
+    }
+}
+
+/// How image decoding is distributed between server and client.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageDecodeMode {
+    /// Server decodes images to pixel buffers; client encodes for host protocol.
+    Server,
+    /// Server sends raw protocol bytes; client decodes + re-encodes.
+    Client,
+    /// Raw bytes forwarded with coordinate translation (same-protocol only).
+    #[default]
+    Passthrough,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]

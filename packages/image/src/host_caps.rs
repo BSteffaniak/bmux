@@ -19,6 +19,9 @@ pub struct HostImageCapabilities {
     pub max_pixel_width: Option<u32>,
     /// Maximum image height in pixels (if reported by the terminal).
     pub max_pixel_height: Option<u32>,
+    /// Cell dimensions in pixels (width, height). (0, 0) = unknown.
+    pub cell_pixel_width: u16,
+    pub cell_pixel_height: u16,
 }
 
 impl HostImageCapabilities {
@@ -104,6 +107,69 @@ pub fn detect_from_env() -> HostImageCapabilities {
     // check for an `OK` response.
 
     caps
+}
+
+/// Query the host terminal for cell pixel dimensions.
+///
+/// Uses the `TIOCGWINSZ` ioctl which reports both character and pixel
+/// dimensions of the terminal window.  Divides pixel size by character
+/// size to get cell dimensions.  Returns `(width, height)` or `(0, 0)`
+/// if the query fails.
+#[cfg(unix)]
+pub fn query_cell_pixel_size() -> (u16, u16) {
+    use std::mem::MaybeUninit;
+    use std::os::unix::io::AsRawFd;
+
+    let fd = std::io::stdout().as_raw_fd();
+    let mut ws = MaybeUninit::<Winsize>::uninit();
+
+    // TIOCGWINSZ = 0x5413 on Linux, 0x40087468 on macOS.
+    // The libc constants handle this portably.
+    let ret = unsafe { ioctl_tiocgwinsz(fd, ws.as_mut_ptr()) };
+    if ret != 0 {
+        return (0, 0);
+    }
+
+    let ws = unsafe { ws.assume_init() };
+    if ws.ws_col == 0 || ws.ws_row == 0 {
+        return (0, 0);
+    }
+    if ws.ws_xpixel == 0 || ws.ws_ypixel == 0 {
+        return (0, 0);
+    }
+
+    let cell_w = ws.ws_xpixel / ws.ws_col;
+    let cell_h = ws.ws_ypixel / ws.ws_row;
+    (cell_w, cell_h)
+}
+
+#[cfg(unix)]
+#[repr(C)]
+struct Winsize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+}
+
+#[cfg(target_os = "macos")]
+const TIOCGWINSZ: u64 = 0x4008_7468;
+
+#[cfg(target_os = "linux")]
+const TIOCGWINSZ: u64 = 0x5413;
+
+#[cfg(unix)]
+unsafe fn ioctl_tiocgwinsz(fd: i32, ws: *mut Winsize) -> i32 {
+    unsafe extern "C" {
+        fn ioctl(fd: i32, request: u64, ...) -> i32;
+    }
+    unsafe { ioctl(fd, TIOCGWINSZ, ws) }
+}
+
+/// Non-unix stub.
+#[cfg(not(unix))]
+pub fn query_cell_pixel_size() -> (u16, u16) {
+    (0, 0)
 }
 
 #[cfg(test)]

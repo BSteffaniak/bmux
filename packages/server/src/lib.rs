@@ -1025,6 +1025,12 @@ struct PaneRuntimeHandle {
     mouse_protocol_state: Arc<std::sync::Mutex<AttachMouseProtocolState>>,
     #[cfg(feature = "image-registry")]
     image_registry: Arc<std::sync::Mutex<bmux_image::ImageRegistry>>,
+    /// Cell pixel dimensions reported by the client (width, height).
+    #[cfg(feature = "image-registry")]
+    cell_pixel_size: Arc<std::sync::Mutex<(u16, u16)>>,
+    /// Set to `true` when the image registry has new content.
+    #[cfg(feature = "image-registry")]
+    image_dirty: Arc<AtomicBool>,
 }
 
 enum PaneRuntimeCommand {
@@ -1274,7 +1280,34 @@ fn image_event_to_recording_payload(event: &bmux_image::ImageEvent) -> Recording
         },
         #[cfg(feature = "image-registry")]
         bmux_image::ImageEvent::KittyCommand(cmd) => {
-            let _ = cmd;
+            // Serialize the kitty command as raw APC bytes for recording.
+            let mut apc_body = Vec::new();
+            match cmd {
+                bmux_image::KittyCommand::Transmit {
+                    image_id,
+                    data,
+                    width,
+                    height,
+                    ..
+                } => {
+                    apc_body = bmux_image::codec::kitty::encode_transmit(
+                        *image_id,
+                        bmux_image::KittyFormat::Rgba,
+                        data,
+                        *width,
+                        *height,
+                    );
+                }
+                bmux_image::KittyCommand::Place(placement) => {
+                    apc_body = bmux_image::codec::kitty::encode_place(
+                        placement.image_id,
+                        placement.placement_id,
+                        placement.position.row,
+                        placement.position.col,
+                    );
+                }
+                _ => {}
+            }
             RecordingPayload::Image {
                 protocol: 1,
                 position_row: 0,
@@ -1283,7 +1316,7 @@ fn image_event_to_recording_payload(event: &bmux_image::ImageEvent) -> Recording
                 cell_cols: 0,
                 pixel_width: 0,
                 pixel_height: 0,
-                data: Vec::new(),
+                data: apc_body,
             }
         }
         #[cfg(feature = "image-registry")]
@@ -2120,6 +2153,14 @@ impl SessionRuntimeManager {
         let image_registry = Arc::new(std::sync::Mutex::new(bmux_image::ImageRegistry::default()));
         #[cfg(feature = "image-registry")]
         let image_registry_for_reader = Arc::clone(&image_registry);
+        #[cfg(feature = "image-registry")]
+        let cell_pixel_size = Arc::new(std::sync::Mutex::new((0u16, 0u16)));
+        #[cfg(feature = "image-registry")]
+        let cell_pixel_size_for_reader = Arc::clone(&cell_pixel_size);
+        #[cfg(feature = "image-registry")]
+        let image_dirty = Arc::new(AtomicBool::new(false));
+        #[cfg(feature = "image-registry")]
+        let image_dirty_for_reader = Arc::clone(&image_dirty);
 
         let task = tokio::spawn(async move {
             let pty_system = native_pty_system();
@@ -2267,12 +2308,18 @@ impl SessionRuntimeManager {
                                     let cursor_pos = cursor_tracker.cursor_position();
                                     let result = image_interceptor.process(chunk, cursor_pos);
                                     if !result.events.is_empty() {
+                                        let (cpw, cph) = cell_pixel_size_for_reader
+                                            .lock()
+                                            .map(|s| *s)
+                                            .unwrap_or((8, 16));
+                                        let cpw = if cpw == 0 { 8 } else { cpw };
+                                        let cph = if cph == 0 { 16 } else { cph };
                                         if let Ok(mut reg) = image_registry_for_reader.lock() {
                                             for event in &result.events {
-                                                // TODO(step 7): get cell pixel size from client.
-                                                reg.handle_event(event.clone(), 8, 16);
+                                                reg.handle_event(event.clone(), cpw, cph);
                                             }
                                         }
+                                        image_dirty_for_reader.store(true, Ordering::SeqCst);
                                         // Record image events to the recording timeline.
                                         if let Ok(runtime) = recording_runtime.lock() {
                                             for event in &result.events {
@@ -2451,6 +2498,10 @@ impl SessionRuntimeManager {
             mouse_protocol_state,
             #[cfg(feature = "image-registry")]
             image_registry,
+            #[cfg(feature = "image-registry")]
+            cell_pixel_size,
+            #[cfg(feature = "image-registry")]
+            image_dirty,
         })
     }
 
@@ -2988,6 +3039,8 @@ impl SessionRuntimeManager {
         rows: u16,
         status_top_inset: u16,
         status_bottom_inset: u16,
+        cell_pixel_width: u16,
+        cell_pixel_height: u16,
     ) -> Result<(u16, u16, u16, u16), SessionRuntimeError> {
         let runtime = self
             .runtimes
@@ -3018,6 +3071,19 @@ impl SessionRuntimeManager {
             status_bottom_inset,
         });
         resize_session_ptys(runtime, cols, rows, status_top_inset, status_bottom_inset);
+
+        // Update cell pixel dimensions for image placement sizing.
+        #[cfg(feature = "image-registry")]
+        if cell_pixel_width > 0 && cell_pixel_height > 0 {
+            for pane in runtime.panes.values() {
+                if let Ok(mut size) = pane.cell_pixel_size.lock() {
+                    *size = (cell_pixel_width, cell_pixel_height);
+                }
+            }
+        }
+        #[cfg(not(feature = "image-registry"))]
+        let _ = (cell_pixel_width, cell_pixel_height);
+
         Ok((cols, rows, status_top_inset, status_bottom_inset))
     }
 
@@ -6050,8 +6116,8 @@ async fn handle_request(
             rows,
             status_top_inset,
             status_bottom_inset,
-            cell_pixel_width: _cell_pixel_width,
-            cell_pixel_height: _cell_pixel_height,
+            cell_pixel_width,
+            cell_pixel_height,
         } => {
             let session_id = SessionId(session_id);
             if !ensure_attach_session_exists(state, session_id).await? {
@@ -6073,6 +6139,8 @@ async fn handle_request(
                     rows,
                     status_top_inset,
                     status_bottom_inset,
+                    cell_pixel_width,
+                    cell_pixel_height,
                 )
             };
 

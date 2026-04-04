@@ -249,7 +249,12 @@ pub(crate) async fn run_session_attach_with_client(
         feature = "image-iterm2"
     ))]
     {
-        view_state.host_image_caps = bmux_image::host_caps::detect_from_env();
+        let mut caps = bmux_image::host_caps::detect_from_env();
+        // Query cell pixel dimensions while we're in raw mode.
+        let (cpw, cph) = bmux_image::host_caps::query_cell_pixel_size();
+        caps.cell_pixel_width = cpw;
+        caps.cell_pixel_height = cph;
+        view_state.host_image_caps = caps;
     }
 
     // Async terminal event stream — replaces spawn_blocking + poll(15ms).
