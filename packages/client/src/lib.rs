@@ -704,6 +704,34 @@ impl BmuxClient {
         }
     }
 
+    /// Start hidden rolling recording on a running server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn recording_rolling_start(&mut self) -> Result<RecordingSummary> {
+        match self.request(Request::RecordingRollingStart).await? {
+            ResponsePayload::RecordingStarted { recording } => Ok(recording),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording started response",
+            )),
+        }
+    }
+
+    /// Stop hidden rolling recording on a running server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn recording_rolling_stop(&mut self) -> Result<Uuid> {
+        match self.request(Request::RecordingRollingStop).await? {
+            ResponsePayload::RecordingStopped { recording_id } => Ok(recording_id),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording stopped response",
+            )),
+        }
+    }
+
     /// Return active recording capture targets for display-track writing.
     ///
     /// # Errors
@@ -2267,6 +2295,24 @@ impl StreamingBmuxClient {
         }
     }
 
+    pub async fn recording_rolling_start(&mut self) -> Result<RecordingSummary> {
+        match self.request(Request::RecordingRollingStart).await? {
+            ResponsePayload::RecordingStarted { recording } => Ok(recording),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording started response",
+            )),
+        }
+    }
+
+    pub async fn recording_rolling_stop(&mut self) -> Result<Uuid> {
+        match self.request(Request::RecordingRollingStop).await? {
+            ResponsePayload::RecordingStopped { recording_id } => Ok(recording_id),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording stopped response",
+            )),
+        }
+    }
+
     pub async fn recording_capture_targets(&mut self) -> Result<Vec<RecordingCaptureTarget>> {
         match self.request(Request::RecordingCaptureTargets).await? {
             ResponsePayload::RecordingCaptureTargets { targets } => Ok(targets),
@@ -2326,6 +2372,8 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::RecordingWriteCustomEvent { .. } => "recording_write_custom_event",
         Request::RecordingDeleteAll => "recording_delete_all",
         Request::RecordingCut { .. } => "recording_cut",
+        Request::RecordingRollingStart => "recording_rolling_start",
+        Request::RecordingRollingStop => "recording_rolling_stop",
         Request::RecordingCaptureTargets => "recording_capture_targets",
         Request::RecordingPrune { .. } => "recording_prune",
         Request::Detach => "detach",

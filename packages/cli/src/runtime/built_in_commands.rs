@@ -49,6 +49,9 @@ pub enum BuiltInHandlerId {
     ServerSave,
     ServerRestore,
     ServerStop,
+    ServerRecording,
+    ServerRecordingStart,
+    ServerRecordingStop,
     ServerGateway,
     ServerBridge,
     Logs,
@@ -350,6 +353,21 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::ServerStop,
             &["server", "stop"],
             "Stop the server",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::ServerRecording,
+            &["server", "recording"],
+            "Control hidden rolling recording",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::ServerRecordingStart,
+            &["server", "recording", "start"],
+            "Start hidden rolling recording",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::ServerRecordingStop,
+            &["server", "recording", "stop"],
+            "Stop hidden rolling recording",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::ServerGateway,

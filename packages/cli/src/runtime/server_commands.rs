@@ -352,6 +352,45 @@ pub(super) async fn run_server_stop(connection_context: ConnectionContext<'_>) -
     Ok(1)
 }
 
+pub(super) async fn run_server_recording_start(
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
+    cleanup_stale_pid_file().await?;
+    let mut client = connect_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-server-recording-start",
+        connection_context,
+    )
+    .await?;
+    let recording = client
+        .recording_rolling_start()
+        .await
+        .map_err(map_cli_client_error)?;
+    println!(
+        "server rolling recording started: {} path={}",
+        recording.id, recording.path
+    );
+    Ok(0)
+}
+
+pub(super) async fn run_server_recording_stop(
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
+    cleanup_stale_pid_file().await?;
+    let mut client = connect_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-server-recording-stop",
+        connection_context,
+    )
+    .await?;
+    let recording_id = client
+        .recording_rolling_stop()
+        .await
+        .map_err(map_cli_client_error)?;
+    println!("server rolling recording stopped: {recording_id}");
+    Ok(0)
+}
+
 const BRIDGE_PREFLIGHT_TOKEN: &str = "BMUX_BRIDGE_READY";
 
 pub(super) async fn run_server_bridge(stdio: bool, preflight: bool) -> Result<u8> {

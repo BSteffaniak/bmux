@@ -558,6 +558,8 @@ pub enum Request {
         #[serde(default)]
         last_seconds: Option<u64>,
     },
+    RecordingRollingStart,
+    RecordingRollingStop,
     RecordingCaptureTargets,
     /// Prune completed recordings older than the specified retention period.
     RecordingPrune {
@@ -1839,6 +1841,8 @@ mod tests {
                 last_seconds: Some(120),
             },
             Request::RecordingCut { last_seconds: None },
+            Request::RecordingRollingStart,
+            Request::RecordingRollingStop,
             Request::RecordingCaptureTargets,
             Request::Detach,
             Request::PaneDirectInput {

@@ -63,6 +63,10 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             ServerCommand::Save => BuiltInHandlerId::ServerSave,
             ServerCommand::Restore { .. } => BuiltInHandlerId::ServerRestore,
             ServerCommand::Stop => BuiltInHandlerId::ServerStop,
+            ServerCommand::Recording { command } => match command {
+                ServerRecordingCommand::Start => BuiltInHandlerId::ServerRecordingStart,
+                ServerRecordingCommand::Stop => BuiltInHandlerId::ServerRecordingStop,
+            },
             ServerCommand::Gateway { .. } => BuiltInHandlerId::ServerGateway,
             ServerCommand::Bridge { .. } => BuiltInHandlerId::ServerBridge,
         },
@@ -418,9 +422,27 @@ pub(super) async fn dispatch_built_in_command(
                     ServerCommand::Start {
                         daemon,
                         foreground_internal,
+                        rolling_recording,
+                        no_rolling_recording,
+                        rolling_window_secs,
                     },
             },
-        ) => run_server_start(*daemon, *foreground_internal).await,
+        ) => {
+            let rolling_enabled_override = if *rolling_recording {
+                Some(true)
+            } else if *no_rolling_recording {
+                Some(false)
+            } else {
+                None
+            };
+            run_server_start(
+                *daemon,
+                *foreground_internal,
+                rolling_enabled_override,
+                *rolling_window_secs,
+            )
+            .await
+        }
         (
             BuiltInHandlerId::ServerStatus,
             Command::Server {
@@ -451,6 +473,24 @@ pub(super) async fn dispatch_built_in_command(
                 command: ServerCommand::Stop,
             },
         ) => run_server_stop(connection_context).await,
+        (
+            BuiltInHandlerId::ServerRecordingStart,
+            Command::Server {
+                command:
+                    ServerCommand::Recording {
+                        command: ServerRecordingCommand::Start,
+                    },
+            },
+        ) => run_server_recording_start(connection_context).await,
+        (
+            BuiltInHandlerId::ServerRecordingStop,
+            Command::Server {
+                command:
+                    ServerCommand::Recording {
+                        command: ServerRecordingCommand::Stop,
+                    },
+            },
+        ) => run_server_recording_stop(connection_context).await,
         (
             BuiltInHandlerId::ServerGateway,
             Command::Server {

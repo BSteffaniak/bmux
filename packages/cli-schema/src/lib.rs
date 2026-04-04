@@ -899,6 +899,15 @@ pub enum ServerCommand {
         /// Internal flag used by daemon launcher
         #[arg(long, hide = true)]
         foreground_internal: bool,
+        /// Enable hidden rolling recording on server boot for this run
+        #[arg(long, conflicts_with = "no_rolling_recording")]
+        rolling_recording: bool,
+        /// Disable hidden rolling recording on server boot for this run
+        #[arg(long, conflicts_with = "rolling_recording")]
+        no_rolling_recording: bool,
+        /// Override rolling recording window in seconds for this run
+        #[arg(long, value_name = "SECONDS", conflicts_with = "no_rolling_recording")]
+        rolling_window_secs: Option<u64>,
     },
     /// Check server status
     Status {
@@ -925,6 +934,11 @@ pub enum ServerCommand {
     },
     /// Request graceful server shutdown
     Stop,
+    /// Control hidden rolling recording on a running server
+    Recording {
+        #[command(subcommand)]
+        command: ServerRecordingCommand,
+    },
     /// Run a TLS gateway that exposes bmux over TCP/TLS
     Gateway {
         /// Listen address (host:port)
@@ -965,6 +979,14 @@ pub enum ServerCommand {
 pub enum GatewayHostMode {
     Iroh,
     Ssh,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServerRecordingCommand {
+    /// Start hidden rolling recording
+    Start,
+    /// Stop hidden rolling recording
+    Stop,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1134,8 +1156,8 @@ mod tests {
         RecordingCursorMode, RecordingCursorPaintMode, RecordingCursorProfile,
         RecordingCursorShape, RecordingCursorTextMode, RecordingEventKindArg,
         RecordingExportFormat, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
-        RemoteCommand, RemoteCompleteCommand, ServerCommand, SessionCommand, TerminalCommand,
-        TraceFamily,
+        RemoteCommand, RemoteCompleteCommand, ServerCommand, ServerRecordingCommand,
+        SessionCommand, TerminalCommand, TraceFamily,
     };
     use clap::Parser;
 
@@ -1473,7 +1495,10 @@ mod tests {
             command,
             ServerCommand::Start {
                 daemon: false,
-                foreground_internal: false
+                foreground_internal: false,
+                rolling_recording: false,
+                no_rolling_recording: false,
+                rolling_window_secs: None,
             }
         ));
     }
@@ -1560,9 +1585,82 @@ mod tests {
             command,
             ServerCommand::Start {
                 daemon: true,
-                foreground_internal: false
+                foreground_internal: false,
+                rolling_recording: false,
+                no_rolling_recording: false,
+                rolling_window_secs: None,
             }
         ));
+    }
+
+    #[test]
+    fn parses_server_start_with_rolling_recording_flag() {
+        let cli = Cli::try_parse_from(["bmux", "server", "start", "--rolling-recording"])
+            .expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Start {
+                daemon: false,
+                foreground_internal: false,
+                rolling_recording: true,
+                no_rolling_recording: false,
+                rolling_window_secs: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_server_start_with_no_rolling_recording_flag() {
+        let cli = Cli::try_parse_from(["bmux", "server", "start", "--no-rolling-recording"])
+            .expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Start {
+                daemon: false,
+                foreground_internal: false,
+                rolling_recording: false,
+                no_rolling_recording: true,
+                rolling_window_secs: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_server_start_with_rolling_window_override() {
+        let cli = Cli::try_parse_from(["bmux", "server", "start", "--rolling-window-secs", "180"])
+            .expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Start {
+                daemon: false,
+                foreground_internal: false,
+                rolling_recording: false,
+                no_rolling_recording: false,
+                rolling_window_secs: Some(180),
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_conflicting_server_start_rolling_flags() {
+        let error = Cli::try_parse_from([
+            "bmux",
+            "server",
+            "start",
+            "--rolling-recording",
+            "--no-rolling-recording",
+        ])
+        .expect_err("conflicting flags should fail");
+        assert!(error.to_string().contains("cannot be used"));
     }
 
     #[test]
@@ -1658,6 +1756,36 @@ mod tests {
             panic!("expected server subcommand");
         };
         assert!(matches!(command, ServerCommand::Stop));
+    }
+
+    #[test]
+    fn parses_server_recording_start_subcommand() {
+        let cli =
+            Cli::try_parse_from(["bmux", "server", "recording", "start"]).expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Recording {
+                command: ServerRecordingCommand::Start
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_server_recording_stop_subcommand() {
+        let cli =
+            Cli::try_parse_from(["bmux", "server", "recording", "stop"]).expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Recording {
+                command: ServerRecordingCommand::Stop
+            }
+        ));
     }
 
     #[test]

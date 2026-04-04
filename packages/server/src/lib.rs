@@ -19,8 +19,8 @@ use bmux_ipc::{
     EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, PaneFocusDirection,
     PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection, PaneState, PaneSummary,
     ProtocolContract, ProtocolVersion, RecordingEventKind, RecordingPayload, RecordingProfile,
-    Request, Response, ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary,
-    decode, default_supported_capabilities, encode, negotiate_protocol,
+    RecordingSummary, Request, Response, ResponsePayload, ServerSnapshotStatus, SessionSelector,
+    SessionSummary, decode, default_supported_capabilities, encode, negotiate_protocol,
 };
 use bmux_session::{ClientId, Session, SessionId, SessionManager};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
@@ -94,6 +94,7 @@ struct ServerState {
     snapshot_runtime: Mutex<SnapshotRuntime>,
     manual_recording_runtime: Arc<Mutex<RecordingRuntime>>,
     rolling_recording_runtime: Arc<Mutex<Option<RecordingRuntime>>>,
+    rolling_recording_auto_start: bool,
     rolling_recording_capture_input: bool,
     rolling_recording_event_kinds: Vec<RecordingEventKind>,
     operation_lock: AsyncMutex<()>,
@@ -3435,7 +3436,7 @@ impl BmuxServer {
         recordings_dir: std::path::PathBuf,
         segment_mb: usize,
         retention_days: u64,
-        recording_enabled: bool,
+        rolling_recording_auto_start: bool,
         recording_capture_input: bool,
         recording_capture_output: bool,
         recording_capture_events: bool,
@@ -3458,25 +3459,22 @@ impl BmuxServer {
         let (shutdown_tx, _) = watch::channel(false);
         let (pane_exit_tx, pane_exit_rx) = mpsc::unbounded_channel();
         let rolling_recordings_dir = recordings_dir.join(".rolling");
+        let rolling_runtime_available = rolling_window_secs > 0
+            && (recording_capture_output || recording_capture_events || recording_capture_input);
         let manual_recording_runtime = Arc::new(Mutex::new(RecordingRuntime::new(
             recordings_dir,
             segment_mb,
             retention_days,
         )));
-        let rolling_recording_runtime = Arc::new(Mutex::new(
-            if recording_enabled
-                && rolling_window_secs > 0
-                && (recording_capture_output || recording_capture_events || recording_capture_input)
-            {
-                Some(RecordingRuntime::new_rolling(
-                    rolling_recordings_dir,
-                    segment_mb,
-                    rolling_window_secs,
-                ))
-            } else {
-                None
-            },
-        ));
+        let rolling_recording_runtime = Arc::new(Mutex::new(if rolling_runtime_available {
+            Some(RecordingRuntime::new_rolling(
+                rolling_recordings_dir,
+                segment_mb,
+                rolling_window_secs,
+            ))
+        } else {
+            None
+        }));
         let (event_broadcast_tx, _) = tokio::sync::broadcast::channel::<Event>(256);
         Self {
             endpoint,
@@ -3497,6 +3495,8 @@ impl BmuxServer {
                 snapshot_runtime: Mutex::new(snapshot_runtime),
                 manual_recording_runtime,
                 rolling_recording_runtime,
+                rolling_recording_auto_start: rolling_recording_auto_start
+                    && rolling_runtime_available,
                 rolling_recording_capture_input: recording_capture_input,
                 rolling_recording_event_kinds,
                 operation_lock: AsyncMutex::new(()),
@@ -3537,6 +3537,22 @@ impl BmuxServer {
     #[must_use]
     pub fn from_config_paths(paths: &ConfigPaths) -> Self {
         let config = BmuxConfig::load_from_path(&paths.config_file()).unwrap_or_default();
+        Self::from_config_paths_with_rolling_options(
+            paths,
+            config.recording.enabled,
+            config.recording.rolling_window_secs,
+        )
+    }
+
+    /// Create a server with endpoint derived from config paths and explicit
+    /// rolling-recording boot options.
+    #[must_use]
+    pub fn from_config_paths_with_rolling_options(
+        paths: &ConfigPaths,
+        rolling_recording_auto_start: bool,
+        rolling_window_secs: u64,
+    ) -> Self {
+        let config = BmuxConfig::load_from_path(&paths.config_file()).unwrap_or_default();
         #[cfg(unix)]
         let endpoint = IpcEndpoint::unix_socket(paths.server_socket());
 
@@ -3556,11 +3572,11 @@ impl BmuxServer {
             config.recordings_dir(paths),
             config.recording.segment_mb,
             config.recording.retention_days,
-            config.recording.enabled,
+            rolling_recording_auto_start,
             config.recording.capture_input,
             config.recording.capture_output,
             config.recording.capture_events,
-            config.recording.rolling_window_secs,
+            rolling_window_secs,
         )
     }
 
@@ -4679,8 +4695,9 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV4> {
 }
 
 fn ensure_rolling_recording_started(state: &Arc<ServerState>) -> Result<()> {
-    let event_kinds = state.rolling_recording_event_kinds.clone();
-    let capture_input = state.rolling_recording_capture_input;
+    if !state.rolling_recording_auto_start {
+        return Ok(());
+    }
 
     let mut runtime = state
         .rolling_recording_runtime
@@ -4693,16 +4710,7 @@ fn ensure_rolling_recording_started(state: &Arc<ServerState>) -> Result<()> {
         return Ok(());
     }
 
-    if let Err(error) = runtime.delete_all() {
-        warn!("failed cleaning hidden rolling recordings root: {error:#}");
-    }
-
-    let summary = runtime.start(
-        None,
-        capture_input,
-        RecordingProfile::Functional,
-        event_kinds,
-    )?;
+    let summary = start_rolling_recording_runtime(state, runtime)?;
     info!(
         "rolling recording started: {} path={} window_secs={}",
         summary.id,
@@ -4710,6 +4718,22 @@ fn ensure_rolling_recording_started(state: &Arc<ServerState>) -> Result<()> {
         runtime.rolling_window_secs().unwrap_or(0)
     );
     Ok(())
+}
+
+fn start_rolling_recording_runtime(
+    state: &Arc<ServerState>,
+    runtime: &mut RecordingRuntime,
+) -> Result<RecordingSummary> {
+    if let Err(error) = runtime.delete_all() {
+        warn!("failed cleaning hidden rolling recordings root: {error:#}");
+    }
+
+    runtime.start(
+        None,
+        state.rolling_recording_capture_input,
+        RecordingProfile::Functional,
+        state.rolling_recording_event_kinds.clone(),
+    )
 }
 
 fn restore_snapshot_if_present(state: &Arc<ServerState>) -> Result<()> {
@@ -6944,6 +6968,64 @@ async fn handle_request(
                 }),
             }
         }
+        Request::RecordingRollingStart => {
+            let mut started_now = false;
+            let recording = {
+                let mut runtime = state
+                    .rolling_recording_runtime
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("rolling recording runtime lock poisoned"))?;
+                let Some(runtime) = runtime.as_mut() else {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::InvalidRequest,
+                        message: "rolling recording is not configured".to_string(),
+                    }));
+                };
+
+                if let Some(active) = runtime.status().active {
+                    active
+                } else {
+                    started_now = true;
+                    start_rolling_recording_runtime(state, runtime)?
+                }
+            };
+
+            if started_now {
+                let _ = emit_event(
+                    state,
+                    Event::RecordingStarted {
+                        recording_id: recording.id,
+                        path: recording.path.clone(),
+                    },
+                );
+            }
+
+            Response::Ok(ResponsePayload::RecordingStarted { recording })
+        }
+        Request::RecordingRollingStop => {
+            let recording_id = {
+                let mut runtime = state
+                    .rolling_recording_runtime
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("rolling recording runtime lock poisoned"))?;
+                let Some(runtime) = runtime.as_mut() else {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::InvalidRequest,
+                        message: "rolling recording is not configured".to_string(),
+                    }));
+                };
+                if runtime.status().active.is_none() {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::InvalidRequest,
+                        message: "rolling recording is not active".to_string(),
+                    }));
+                }
+                runtime.stop(None)?.id
+            };
+
+            let _ = emit_event(state, Event::RecordingStopped { recording_id });
+            Response::Ok(ResponsePayload::RecordingStopped { recording_id })
+        }
         Request::RecordingCaptureTargets => {
             let mut targets = Vec::new();
             {
@@ -7096,6 +7178,8 @@ const fn request_requires_exclusive(request: &Request) -> bool {
             | Request::RecordingWriteCustomEvent { .. }
             | Request::RecordingDeleteAll
             | Request::RecordingCut { .. }
+            | Request::RecordingRollingStart
+            | Request::RecordingRollingStop
             | Request::RecordingPrune { .. }
             | Request::Detach
     )
@@ -7172,6 +7256,8 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::RecordingWriteCustomEvent { .. } => "recording_write_custom_event",
         Request::RecordingDeleteAll => "recording_delete_all",
         Request::RecordingCut { .. } => "recording_cut",
+        Request::RecordingRollingStart => "recording_rolling_start",
+        Request::RecordingRollingStop => "recording_rolling_stop",
         Request::RecordingCaptureTargets => "recording_capture_targets",
         Request::RecordingPrune { .. } => "recording_prune",
         Request::Detach => "detach",

@@ -1407,6 +1407,7 @@ screen content.
    ```toml
    # ~/.config/bmux/config.toml
    [recording]
+   enabled = true
    rolling_window_secs = 300
    ```
 
@@ -1415,6 +1416,15 @@ screen content.
    bmux recording cut
    # optional explicit window
    bmux recording cut --last-seconds 90
+   ```
+
+   You can override rolling behavior at server boot:
+
+   ```sh
+   # force on for this boot (and optionally override window)
+   bmux server start --rolling-recording --rolling-window-secs 300
+   # force off for this boot
+   bmux server start --no-rolling-recording
    ```
 
 2. Convert to a playbook:

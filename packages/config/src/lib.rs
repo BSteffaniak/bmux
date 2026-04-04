@@ -185,8 +185,10 @@ pub struct RecordingConfig {
     /// Root directory for recording data.
     /// Relative paths are resolved against the directory containing `bmux.toml`.
     pub dir: Option<PathBuf>,
-    /// Enable the recording subsystem. When false, no recording data is captured
-    /// or written to disk regardless of other recording settings.
+    /// Enable hidden rolling recording by default when the server starts.
+    ///
+    /// Manual recordings (`bmux recording start/stop`) remain available even
+    /// when this is false.
     pub enabled: bool,
     /// Capture pane input bytes (keystrokes sent to pane processes)
     pub capture_input: bool,

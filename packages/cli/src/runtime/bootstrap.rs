@@ -122,7 +122,7 @@ pub(super) async fn ensure_server_running_for_default_attach(
         return Ok(());
     }
 
-    let _ = run_server_start(true, false).await?;
+    let _ = run_server_start(true, false, None, None).await?;
     if !server_is_running(connection_context).await? {
         anyhow::bail!("bmux server failed to start for default attach")
     }
@@ -181,7 +181,12 @@ pub(super) fn next_default_session_name(sessions: &[SessionSummary]) -> String {
     }
 }
 
-pub(super) async fn run_server_start(daemon: bool, foreground_internal: bool) -> Result<u8> {
+pub(super) async fn run_server_start(
+    daemon: bool,
+    foreground_internal: bool,
+    rolling_enabled_override: Option<bool>,
+    rolling_window_secs_override: Option<u64>,
+) -> Result<u8> {
     cleanup_stale_pid_file().await?;
     if server_is_running(ConnectionContext::default()).await? {
         println!("bmux server is already running");
@@ -189,6 +194,39 @@ pub(super) async fn run_server_start(daemon: bool, foreground_internal: bool) ->
     }
 
     let config = BmuxConfig::load()?;
+    if let Some(window_secs) = rolling_window_secs_override
+        && window_secs == 0
+    {
+        anyhow::bail!("--rolling-window-secs must be greater than 0")
+    }
+    let effective_rolling_window_secs =
+        rolling_window_secs_override.unwrap_or(config.recording.rolling_window_secs);
+    let rolling_requested = rolling_enabled_override == Some(true)
+        || rolling_window_secs_override.is_some()
+        || (rolling_enabled_override.is_none() && config.recording.enabled);
+    if rolling_requested
+        && effective_rolling_window_secs == 0
+        && (rolling_enabled_override == Some(true) || rolling_window_secs_override.is_some())
+    {
+        anyhow::bail!(
+            "rolling recording was explicitly enabled but window is 0s; set `recording.rolling_window_secs` in config or pass `--rolling-window-secs <secs>`"
+        )
+    }
+    let effective_rolling_enabled = if rolling_window_secs_override.is_some() {
+        true
+    } else {
+        rolling_enabled_override.unwrap_or(config.recording.enabled)
+    } && effective_rolling_window_secs > 0;
+    if effective_rolling_enabled {
+        if !config.recording.capture_input
+            && !config.recording.capture_output
+            && !config.recording.capture_events
+        {
+            anyhow::bail!(
+                "rolling recording is enabled but all recording capture flags are disabled; enable at least one of recording.capture_input, recording.capture_output, or recording.capture_events"
+            )
+        }
+    }
     let paths = ConfigPaths::default();
     let registry = scan_available_plugins(&config, &paths)?;
     validate_enabled_plugins(&config, &registry)?;
@@ -204,6 +242,23 @@ pub(super) async fn run_server_start(daemon: bool, foreground_internal: bool) ->
             .arg("server")
             .arg("start")
             .arg("--foreground-internal")
+            .args(
+                rolling_enabled_override
+                    .map(|enabled| {
+                        if enabled {
+                            "--rolling-recording"
+                        } else {
+                            "--no-rolling-recording"
+                        }
+                    })
+                    .into_iter(),
+            )
+            .args(
+                rolling_window_secs_override
+                    .map(|secs| ["--rolling-window-secs".to_string(), secs.to_string()])
+                    .into_iter()
+                    .flatten(),
+            )
             .env(
                 "BMUX_LOG_LEVEL",
                 match log_level {
@@ -234,7 +289,11 @@ pub(super) async fn run_server_start(daemon: bool, foreground_internal: bool) ->
     let loaded_plugins = load_enabled_plugins(&config, &registry)?;
     activate_loaded_plugins(&loaded_plugins, &config, &paths)?;
     dispatch_loaded_plugin_event(&loaded_plugins, plugin_system_event("server_starting"))?;
-    let server = BmuxServer::from_config_paths(&paths);
+    let server = BmuxServer::from_config_paths_with_rolling_options(
+        &paths,
+        effective_rolling_enabled,
+        effective_rolling_window_secs,
+    );
     register_plugin_service_handlers(&server, &config, &paths, &registry)?;
     write_server_pid_file(std::process::id())?;
     write_server_runtime_metadata(std::process::id())?;
