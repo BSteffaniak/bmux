@@ -2367,7 +2367,24 @@ impl SessionRuntimeManager {
                                                 reg.handle_event(event.clone(), cpw, cph);
                                             }
                                         }
-                                        image_dirty_for_reader.store(true, Ordering::SeqCst);
+                                        // Notify streaming clients that image state changed.
+                                        // Only emit on false→true transition to coalesce.
+                                        if image_dirty_for_reader
+                                            .compare_exchange(
+                                                false,
+                                                true,
+                                                Ordering::SeqCst,
+                                                Ordering::SeqCst,
+                                            )
+                                            .is_ok()
+                                        {
+                                            let _ = event_broadcast_for_reader.send(
+                                                Event::PaneImageAvailable {
+                                                    session_id: session_id.0,
+                                                    pane_id,
+                                                },
+                                            );
+                                        }
                                         if let Ok(runtime) = recording_runtime.lock() {
                                             for event in &result.events {
                                                 let payload =
@@ -2396,7 +2413,22 @@ impl SessionRuntimeManager {
                                     if let Ok(mut reg) = image_registry_for_reader.lock() {
                                         reg.clear();
                                     }
-                                    image_dirty_for_reader.store(true, Ordering::SeqCst);
+                                    if image_dirty_for_reader
+                                        .compare_exchange(
+                                            false,
+                                            true,
+                                            Ordering::SeqCst,
+                                            Ordering::SeqCst,
+                                        )
+                                        .is_ok()
+                                    {
+                                        let _ = event_broadcast_for_reader.send(
+                                            Event::PaneImageAvailable {
+                                                session_id: session_id.0,
+                                                pane_id,
+                                            },
+                                        );
+                                    }
                                 }
 
                                 // Update DEC private mode tracking (mouse protocol
@@ -3981,6 +4013,7 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
             Event::FollowTargetChanged { session_id, .. }
             | Event::AttachViewChanged { session_id, .. }
             | Event::PaneOutputAvailable { session_id, .. }
+            | Event::PaneImageAvailable { session_id, .. }
             | Event::PaneExited { session_id, .. }
             | Event::PaneRestarted { session_id, .. } => Some(*session_id),
             Event::ServerStarted
@@ -6447,6 +6480,16 @@ async fn handle_request(
                     .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
                 let mut result = Vec::new();
                 if let Some(runtime) = runtime_manager.runtimes.get(&session_id) {
+                    // Clear image_dirty flags so the PTY reader can re-notify
+                    // on the next image change (mirrors output_dirty pattern).
+                    for pane_id in &pane_ids {
+                        if let Some(pane) = runtime.panes.get(pane_id) {
+                            #[cfg(feature = "image-registry")]
+                            pane.image_dirty.store(false, Ordering::SeqCst);
+                            #[cfg(not(feature = "image-registry"))]
+                            let _ = pane;
+                        }
+                    }
                     for (i, pane_id) in pane_ids.iter().enumerate() {
                         let since = since_sequences.get(i).copied().unwrap_or(0);
                         if let Some(pane) = runtime.panes.get(pane_id) {

@@ -270,6 +270,12 @@ pub(crate) async fn run_session_attach_with_client(
     let mut context_refresh_interval = tokio::time::interval(ATTACH_CONTEXT_REFRESH_INTERVAL);
     context_refresh_interval.tick().await;
     let mut pane_output_pending = false;
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
+    let mut image_fetch_pending = false;
 
     loop {
         // ── Event-driven select: sleep until something happens ────────
@@ -290,6 +296,20 @@ pub(crate) async fn run_session_attach_with_client(
                 ) {
                     pane_output_pending = true;
                     // Fall through to post-event processing (no event dispatch needed).
+                } else if matches!(
+                    server_event,
+                    bmux_client::ServerEvent::PaneImageAvailable { .. }
+                ) {
+                    // Image state changed on the server — fetch deltas on the
+                    // next render cycle instead of polling every frame.
+                    #[cfg(any(
+                        feature = "image-sixel",
+                        feature = "image-kitty",
+                        feature = "image-iterm2"
+                    ))]
+                    {
+                        image_fetch_pending = true;
+                    }
                 } else if let bmux_client::ServerEvent::RecordingStarted {
                     recording_id,
                     ref path,
@@ -485,6 +505,7 @@ pub(crate) async fn run_session_attach_with_client(
             {
                 view_state.image_sequences.clear();
                 view_state.kitty_host_state.transmitted.clear();
+                image_fetch_pending = true;
             }
         }
 
@@ -605,14 +626,18 @@ pub(crate) async fn run_session_attach_with_client(
             pane_output_pending = last_round_had_data || any_sync_still_active;
         }
 
-        // Fetch image deltas for dirty panes (feature-gated).
+        // Fetch image deltas only when the server notified us that image
+        // state changed (feature-gated).
         #[cfg(any(
             feature = "image-sixel",
             feature = "image-kitty",
             feature = "image-iterm2"
         ))]
-        if view_state.host_image_caps.any_supported() && !view_state.dirty.pane_dirty_ids.is_empty()
+        if image_fetch_pending
+            && view_state.host_image_caps.any_supported()
+            && !view_state.dirty.pane_dirty_ids.is_empty()
         {
+            image_fetch_pending = false;
             let dirty_panes: Vec<Uuid> = view_state.dirty.pane_dirty_ids.iter().copied().collect();
             let sequences: Vec<u64> = dirty_panes
                 .iter()

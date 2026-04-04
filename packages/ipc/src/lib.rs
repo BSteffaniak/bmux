@@ -1160,6 +1160,13 @@ pub enum Event {
         session_id: Uuid,
         pane_id: Uuid,
     },
+    /// Notification that pane image state has changed (new images placed,
+    /// images removed, or positions shifted).  Streaming clients use this
+    /// to fetch image deltas on demand instead of polling every frame.
+    PaneImageAvailable {
+        session_id: Uuid,
+        pane_id: Uuid,
+    },
     PaneExited {
         session_id: Uuid,
         pane_id: Uuid,
