@@ -495,7 +495,7 @@ pub struct BehaviorConfig {
     pub mouse: MouseBehaviorConfig,
     /// Terminal image protocol settings (Sixel, Kitty graphics, iTerm2).
     pub images: ImageBehaviorConfig,
-    /// IPC compression settings (payload, frame, and transport layers).
+    /// IPC compression settings (image payloads and remote connections).
     pub compression: CompressionConfig,
 }
 

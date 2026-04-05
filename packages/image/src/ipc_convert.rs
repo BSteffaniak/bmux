@@ -261,4 +261,38 @@ mod tests {
         );
         assert_eq!(ipc.raw_data, raw);
     }
+
+    #[cfg(feature = "compression-zstd")]
+    #[test]
+    fn explicit_codec_used_when_provided() {
+        let raw = vec![b'#'; 8192];
+        let img = make_pane_image(raw.clone(), ImageProtocol::Sixel);
+        let codec = bmux_ipc::compression::ZstdCodec::with_level(5);
+        let ipc = super::pane_image_to_ipc(&img, Some(&codec));
+        assert_eq!(
+            ipc.compression,
+            bmux_ipc::compression::CompressionId::Zstd,
+            "explicit zstd codec should be used"
+        );
+        assert!(ipc.raw_data.len() < raw.len());
+        // Verify roundtrip decompression.
+        let roundtripped = PaneImage::from(&ipc);
+        assert_eq!(roundtripped.payload.raw.as_deref(), Some(raw.as_slice()));
+    }
+
+    #[cfg(feature = "compression-lz4")]
+    #[test]
+    fn explicit_lz4_codec_roundtrips() {
+        let raw = vec![b'Q'; 8192];
+        let img = make_pane_image(raw.clone(), ImageProtocol::Sixel);
+        let codec = bmux_ipc::compression::Lz4Codec::new();
+        let ipc = super::pane_image_to_ipc(&img, Some(&codec));
+        assert_eq!(
+            ipc.compression,
+            bmux_ipc::compression::CompressionId::Lz4,
+            "explicit lz4 codec should be used"
+        );
+        let roundtripped = PaneImage::from(&ipc);
+        assert_eq!(roundtripped.payload.raw.as_deref(), Some(raw.as_slice()));
+    }
 }

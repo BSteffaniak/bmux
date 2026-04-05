@@ -166,8 +166,8 @@ pub fn default_supported_capabilities() -> Vec<String> {
     // because frame compression requires both the server reader and the
     // client writer to switch to the compressed format simultaneously.
     // The non-streaming BmuxClient path (used by playbooks and the CLI)
-    // does not support frame compression.  Frame compression is opt-in
-    // via behavior.compression.frame config.
+    // does not support frame compression.  Frame compression is internal
+    // infrastructure that may be exposed via an advanced config in the future.
     #[cfg(feature = "compression-zstd")]
     {
         caps.push(CAPABILITY_COMPRESSION_PAYLOAD_ZSTD.to_string());
