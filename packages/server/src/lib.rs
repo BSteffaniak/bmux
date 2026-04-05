@@ -110,6 +110,9 @@ struct ServerState {
     pane_exit_rx: AsyncMutex<mpsc::UnboundedReceiver<PaneExitEvent>>,
     service_registry: Mutex<ServiceRegistry>,
     service_resolver: Mutex<Option<Arc<ServiceResolverHandler>>>,
+    /// Resolved image payload compression codec from config.
+    /// Stored here so `handle_connection` can pass it to `delta.to_ipc()`.
+    payload_codec: Option<Arc<dyn bmux_ipc::compression::CompressionCodec>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3467,6 +3470,14 @@ impl BmuxServer {
         let shell = resolve_server_shell(&config);
         let pane_term = resolve_server_pane_term(&config);
         let protocol_profile = protocol_profile_for_term(&pane_term);
+
+        // Resolve image payload compression codec from config.
+        let payload_codec: Option<Arc<dyn bmux_ipc::compression::CompressionCodec>> =
+            if config.behavior.compression.enabled {
+                resolve_payload_codec_from_config(&config.behavior.compression)
+            } else {
+                None
+            };
         let (shutdown_tx, _) = watch::channel(false);
         let (pane_exit_tx, pane_exit_rx) = mpsc::unbounded_channel();
         let rolling_recordings_dir = recordings_dir.join(".rolling");
@@ -3519,6 +3530,7 @@ impl BmuxServer {
                 pane_exit_rx: AsyncMutex::new(pane_exit_rx),
                 service_registry: Mutex::new(ServiceRegistry::default()),
                 service_resolver: Mutex::new(None),
+                payload_codec,
             }),
             shutdown_tx,
         }
@@ -6861,7 +6873,7 @@ async fn handle_request(
                             #[cfg(feature = "image-registry")]
                             if let Ok(reg) = pane.image_registry.lock() {
                                 let delta = reg.delta_since(since);
-                                result.push(delta.to_ipc(*pane_id, None));
+                                result.push(delta.to_ipc(*pane_id, state.payload_codec.as_deref()));
                             }
                             #[cfg(not(feature = "image-registry"))]
                             {
@@ -8547,6 +8559,53 @@ fn resolve_frame_codec_from_capabilities(
         compression::resolve_codec(compression::CompressionId::Zstd).map(std::sync::Arc::from)
     } else {
         None
+    }
+}
+
+/// Resolve a payload compression codec from the user's compression config.
+fn resolve_payload_codec_from_config(
+    config: &bmux_config::CompressionConfig,
+) -> Option<std::sync::Arc<dyn bmux_ipc::compression::CompressionCodec>> {
+    use bmux_ipc::compression;
+    match config.images {
+        bmux_config::CompressionMode::None => None,
+        bmux_config::CompressionMode::Auto => {
+            // Prefer zstd for image payloads, fall back to lz4.
+            #[cfg(feature = "compression")]
+            {
+                compression::default_payload_codec().map(|codec| {
+                    // Apply user-configured level if zstd.
+                    let boxed: Box<dyn compression::CompressionCodec> =
+                        if codec.id() == compression::CompressionId::Zstd {
+                            Box::new(compression::ZstdCodec::with_level(config.level))
+                        } else {
+                            codec
+                        };
+                    std::sync::Arc::from(boxed)
+                })
+            }
+            #[cfg(not(feature = "compression"))]
+            None
+        }
+        bmux_config::CompressionMode::Zstd => {
+            #[cfg(feature = "compression")]
+            {
+                Some(std::sync::Arc::new(compression::ZstdCodec::with_level(
+                    config.level,
+                )))
+            }
+            #[cfg(not(feature = "compression"))]
+            None
+        }
+        bmux_config::CompressionMode::Lz4 => {
+            #[cfg(feature = "compression")]
+            {
+                compression::resolve_codec(compression::CompressionId::Lz4)
+                    .map(std::sync::Arc::from)
+            }
+            #[cfg(not(feature = "compression"))]
+            None
+        }
     }
 }
 

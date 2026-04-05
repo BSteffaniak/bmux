@@ -835,13 +835,14 @@ async fn handle_gateway_connection(
         .await
         .context("failed connecting local IPC endpoint for TLS gateway")?;
 
-    // Optionally wrap the TLS side with transport-level compression (Layer 3).
+    // Optionally wrap the TLS side with transport-level compression.
     // The local IPC side is never compressed (Unix socket, negligible latency).
     let config = bmux_config::BmuxConfig::load().unwrap_or_default();
-    let use_transport_compression = matches!(
-        config.behavior.compression.transport,
-        bmux_config::CompressionMode::Auto | bmux_config::CompressionMode::Zstd
-    );
+    let use_transport_compression = config.behavior.compression.enabled
+        && matches!(
+            config.behavior.compression.remote,
+            bmux_config::CompressionMode::Auto | bmux_config::CompressionMode::Zstd
+        );
 
     let (mut ipc_read, mut ipc_write) = tokio::io::split(ipc_stream);
 

@@ -621,39 +621,41 @@ pub enum ImageDecodeMode {
 
 /// IPC compression settings.
 ///
-/// Controls three independent compression layers:
-/// - **payload**: Per-image payload compression (zstd/lz4 on raw image data).
-/// - **frame**: Per-IPC-frame compression (lz4/zstd on entire serialized messages).
-/// - **transport**: Stream-level compression for remote connections (zstd streaming).
+/// Controls two user-facing compression layers:
+/// - **images**: Per-image payload compression (zstd/lz4 on raw image data
+///   before IPC transport).
+/// - **remote**: Stream-level compression for remote connections (TLS gateway,
+///   Iroh P2P).  Local Unix socket connections are never compressed.
 ///
-/// Default is `auto` for payload and transport, `none` for frame.
+/// Default is `enabled = true`, `images = auto`, `remote = auto`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ConfigDoc)]
 #[config_doc(section = "behavior.compression")]
 #[serde(default)]
 pub struct CompressionConfig {
-    /// Per-image payload compression.  Applied to image raw_data before IPC
-    /// serialization.  `auto` selects zstd if available.
-    pub payload: CompressionMode,
-    /// Minimum payload size in bytes before compression is attempted.
-    pub payload_threshold: usize,
-    /// Per-IPC-frame compression.  Applied to entire serialized frame payloads.
-    /// Leave `none` when transport compression is active to avoid double work.
-    pub frame: CompressionMode,
-    /// Minimum frame payload size before compression is attempted.
-    pub frame_threshold: usize,
-    /// Stream-level transport compression for remote connections (TLS, Iroh).
-    /// `auto` selects zstd streaming for remote, none for local.
-    pub transport: CompressionMode,
+    /// Master switch for all compression.  When false, no compression is
+    /// applied anywhere.
+    pub enabled: bool,
+    /// Compress image payloads (Sixel, Kitty graphics, iTerm2) before IPC
+    /// transport.  Typical reduction: 5-15x for sixel text, 3-20x for kitty
+    /// raw pixels.  `auto` selects zstd when available.
+    pub images: CompressionMode,
+    /// Compress remote connections (TLS gateway, Iroh P2P).  Local Unix
+    /// socket connections are never compressed.  `auto` selects zstd
+    /// streaming for remote connections.
+    pub remote: CompressionMode,
+    /// Compression level (1-19 for zstd, ignored for lz4).  Lower values
+    /// are faster, higher values produce smaller output.  Default balances
+    /// ratio and speed for image data.
+    pub level: i32,
 }
 
 impl Default for CompressionConfig {
     fn default() -> Self {
         Self {
-            payload: CompressionMode::Auto,
-            payload_threshold: 4096,
-            frame: CompressionMode::None,
-            frame_threshold: 256,
-            transport: CompressionMode::Auto,
+            enabled: true,
+            images: CompressionMode::Auto,
+            remote: CompressionMode::Auto,
+            level: 3,
         }
     }
 }

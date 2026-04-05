@@ -127,6 +127,15 @@ impl ZstdCodec {
             frame_level,
         }
     }
+
+    /// Create with a single level used for bulk payloads (images).
+    /// Frame-level compression always uses level 1 for low latency.
+    pub fn with_level(level: i32) -> Self {
+        Self {
+            bulk_level: level,
+            frame_level: 1,
+        }
+    }
 }
 
 #[cfg(feature = "compression-zstd")]
