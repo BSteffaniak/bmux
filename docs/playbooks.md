@@ -1400,6 +1400,10 @@ screen content.
    bmux recording start
    # ... do things in bmux ...
    bmux recording stop
+
+   # inspect manual recording storage and defaults
+   bmux recording path
+   bmux recording status
    ```
 
    Or use a rolling capture cut without stopping the hidden rolling recorder:

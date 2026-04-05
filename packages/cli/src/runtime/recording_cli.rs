@@ -31,6 +31,10 @@ pub(super) async fn run_recording_status(
     recording::run_recording_status(as_json, connection_context).await
 }
 
+pub(super) fn run_recording_path(as_json: bool) -> Result<u8> {
+    recording::run_recording_path(as_json)
+}
+
 pub(super) async fn run_recording_list(
     as_json: bool,
     connection_context: ConnectionContext<'_>,

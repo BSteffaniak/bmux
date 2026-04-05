@@ -101,6 +101,7 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             RecordingCommand::Start { .. } => BuiltInHandlerId::RecordingStart,
             RecordingCommand::Stop { .. } => BuiltInHandlerId::RecordingStop,
             RecordingCommand::Status { .. } => BuiltInHandlerId::RecordingStatus,
+            RecordingCommand::Path { .. } => BuiltInHandlerId::RecordingPath,
             RecordingCommand::List { .. } => BuiltInHandlerId::RecordingList,
             RecordingCommand::Delete { .. } => BuiltInHandlerId::RecordingDelete,
             RecordingCommand::DeleteAll { .. } => BuiltInHandlerId::RecordingDeleteAll,
@@ -809,6 +810,12 @@ pub(super) async fn dispatch_built_in_command(
                 command: RecordingCommand::Status { json },
             },
         ) => run_recording_status(*json, connection_context).await,
+        (
+            BuiltInHandlerId::RecordingPath,
+            Command::Recording {
+                command: RecordingCommand::Path { json },
+            },
+        ) => run_recording_path(*json),
         (
             BuiltInHandlerId::RecordingList,
             Command::Recording {

@@ -524,8 +524,14 @@ pub enum RecordingCommand {
         /// Recording id to stop (defaults to active)
         recording_id: Option<String>,
     },
-    /// Show active recording status
+    /// Show recording status, config defaults, and storage usage
     Status {
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print recordings storage root path
+    Path {
         /// Print output as JSON
         #[arg(long)]
         json: bool,
@@ -3010,6 +3016,44 @@ mod tests {
             } if id == "550e8400-e29b-41d4-a716-446655440000"
                 && event_kind.is_empty()
         ));
+    }
+
+    #[test]
+    fn parses_recording_status_subcommand() {
+        let cli = Cli::try_parse_from(["bmux", "recording", "status"]).expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(command, RecordingCommand::Status { json: false }));
+    }
+
+    #[test]
+    fn parses_recording_status_json_flag() {
+        let cli =
+            Cli::try_parse_from(["bmux", "recording", "status", "--json"]).expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(command, RecordingCommand::Status { json: true }));
+    }
+
+    #[test]
+    fn parses_recording_path_subcommand() {
+        let cli = Cli::try_parse_from(["bmux", "recording", "path"]).expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(command, RecordingCommand::Path { json: false }));
+    }
+
+    #[test]
+    fn parses_recording_path_json_flag() {
+        let cli =
+            Cli::try_parse_from(["bmux", "recording", "path", "--json"]).expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(command, RecordingCommand::Path { json: true }));
     }
 
     #[test]

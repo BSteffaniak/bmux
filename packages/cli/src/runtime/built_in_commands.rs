@@ -82,6 +82,7 @@ pub enum BuiltInHandlerId {
     RecordingStart,
     RecordingStop,
     RecordingStatus,
+    RecordingPath,
     RecordingList,
     RecordingDelete,
     RecordingDeleteAll,
@@ -521,6 +522,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::RecordingStatus,
             &["recording", "status"],
             "Show recording status",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RecordingPath,
+            &["recording", "path"],
+            "Print recordings storage path",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::RecordingList,

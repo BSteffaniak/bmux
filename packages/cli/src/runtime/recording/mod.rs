@@ -137,14 +137,26 @@ const fn recording_event_kind_arg_to_ipc(kind: RecordingEventKindArg) -> Recordi
 
 fn default_event_kinds_from_config(capture_input: bool) -> Vec<RecordingEventKind> {
     let config = BmuxConfig::load().unwrap_or_default();
+    default_event_kinds_for_flags(
+        capture_input && config.recording.capture_input,
+        config.recording.capture_output,
+        config.recording.capture_events,
+    )
+}
+
+fn default_event_kinds_for_flags(
+    capture_input: bool,
+    capture_output: bool,
+    capture_events: bool,
+) -> Vec<RecordingEventKind> {
     let mut kinds = Vec::new();
-    if capture_input && config.recording.capture_input {
+    if capture_input {
         kinds.push(RecordingEventKind::PaneInputRaw);
     }
-    if config.recording.capture_output {
+    if capture_output {
         kinds.push(RecordingEventKind::PaneOutputRaw);
     }
-    if config.recording.capture_events {
+    if capture_events {
         kinds.extend([
             RecordingEventKind::ServerEvent,
             RecordingEventKind::RequestStart,
@@ -157,6 +169,120 @@ fn default_event_kinds_from_config(capture_input: bool) -> Vec<RecordingEventKin
         kinds.push(RecordingEventKind::PaneOutputRaw);
     }
     kinds
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct RecordingConfigStatus {
+    capture_input: bool,
+    capture_output: bool,
+    capture_events: bool,
+    default_event_kinds: Vec<RecordingEventKind>,
+    segment_mb: usize,
+    retention_days: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, Default)]
+struct RecordingStorageUsage {
+    #[serde(default)]
+    bytes: u64,
+    #[serde(default)]
+    files: u64,
+    #[serde(default)]
+    directories: u64,
+    #[serde(default)]
+    recording_dirs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct RecordingStatusView {
+    active: Option<RecordingSummary>,
+    queue_len: usize,
+    root_path: String,
+    config: RecordingConfigStatus,
+    usage: RecordingStorageUsage,
+}
+
+fn recording_config_and_root() -> (RecordingConfigStatus, PathBuf) {
+    let paths = ConfigPaths::default();
+    let (config, root) = match BmuxConfig::load_from_path(&paths.config_file()) {
+        Ok(config) => {
+            let root = config.recordings_dir(&paths);
+            (config, root)
+        }
+        Err(_) => (BmuxConfig::default(), paths.recordings_dir()),
+    };
+    let capture_input = config.recording.capture_input;
+    let capture_output = config.recording.capture_output;
+    let capture_events = config.recording.capture_events;
+    (
+        RecordingConfigStatus {
+            capture_input,
+            capture_output,
+            capture_events,
+            default_event_kinds: default_event_kinds_for_flags(
+                capture_input,
+                capture_output,
+                capture_events,
+            ),
+            segment_mb: config.recording.segment_mb,
+            retention_days: config.recording.retention_days,
+        },
+        root,
+    )
+}
+
+fn collect_recording_storage_usage(root: &Path) -> Result<RecordingStorageUsage> {
+    if !root.exists() {
+        return Ok(RecordingStorageUsage::default());
+    }
+    let mut usage = RecordingStorageUsage::default();
+    collect_recording_storage_usage_recursive(root, &mut usage, true)?;
+    Ok(usage)
+}
+
+fn collect_recording_storage_usage_recursive(
+    dir: &Path,
+    usage: &mut RecordingStorageUsage,
+    is_root: bool,
+) -> Result<()> {
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("failed reading recordings dir {}", dir.display()))?
+    {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        if file_type.is_dir() {
+            if is_root && entry.file_name() == ".rolling" {
+                continue;
+            }
+            usage.directories = usage.directories.saturating_add(1);
+            if path.join("manifest.json").exists() {
+                usage.recording_dirs = usage.recording_dirs.saturating_add(1);
+            }
+            collect_recording_storage_usage_recursive(&path, usage, false)?;
+            continue;
+        }
+        if file_type.is_file() {
+            usage.files = usage.files.saturating_add(1);
+            usage.bytes = usage.bytes.saturating_add(entry.metadata()?.len());
+        }
+    }
+    Ok(())
+}
+
+fn format_byte_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.2} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.2} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
 }
 
 pub(super) async fn run_recording_stop(
@@ -192,7 +318,7 @@ pub(super) async fn run_recording_status(
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
     cleanup_stale_pid_file().await?;
-    let status = match connect_if_running_with_context(
+    let runtime_status = match connect_if_running_with_context(
         ConnectionPolicyScope::Normal,
         "bmux-cli-recording-status",
         connection_context,
@@ -205,6 +331,16 @@ pub(super) async fn run_recording_status(
             .map_err(map_cli_client_error)?,
         None => offline_recording_status(),
     };
+    let (config, root_path) = recording_config_and_root();
+    let usage = collect_recording_storage_usage(&root_path)?;
+    let status = RecordingStatusView {
+        active: runtime_status.active,
+        queue_len: runtime_status.queue_len,
+        root_path: root_path.display().to_string(),
+        config,
+        usage,
+    };
+
     if as_json {
         println!(
             "{}",
@@ -213,7 +349,48 @@ pub(super) async fn run_recording_status(
         );
         return Ok(0);
     }
-    if let Some(active) = status.active {
+
+    println!("recordings root: {}", status.root_path);
+    println!(
+        "default capture input: {}",
+        if status.config.capture_input {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "default capture output: {}",
+        if status.config.capture_output {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "default capture events: {}",
+        if status.config.capture_events {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "default event kinds: {}",
+        status
+            .config
+            .default_event_kinds
+            .iter()
+            .map(|kind| recording_event_kind_name(*kind))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!(
+        "segment size: {} MiB retention days: {}",
+        status.config.segment_mb, status.config.retention_days
+    );
+
+    if let Some(active) = status.active.as_ref() {
         println!(
             "active recording: {} events={} bytes={} capture_input={} profile={:?} kinds={} path={}",
             active.id,
@@ -231,6 +408,31 @@ pub(super) async fn run_recording_status(
         );
     } else {
         println!("active recording: none");
+    }
+    println!("queue length: {}", status.queue_len);
+    println!(
+        "usage: bytes={} ({}) files={} dirs={} recordings={}",
+        status.usage.bytes,
+        format_byte_size(status.usage.bytes),
+        status.usage.files,
+        status.usage.directories,
+        status.usage.recording_dirs
+    );
+    Ok(0)
+}
+
+pub(super) fn run_recording_path(as_json: bool) -> Result<u8> {
+    let (_config, root_path) = recording_config_and_root();
+    let path = root_path.display().to_string();
+    if as_json {
+        let payload = serde_json::json!({ "path": path });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .context("failed encoding recording path json")?
+        );
+    } else {
+        println!("{path}");
     }
     Ok(0)
 }
@@ -3663,11 +3865,8 @@ pub(super) fn list_recordings_from_disk() -> Result<Vec<RecordingSummary>> {
 }
 
 pub(super) fn recordings_root_dir() -> PathBuf {
-    let paths = ConfigPaths::default();
-    BmuxConfig::load_from_path(&paths.config_file()).map_or_else(
-        |_| paths.recordings_dir(),
-        |config| config.recordings_dir(&paths),
-    )
+    let (_config, root) = recording_config_and_root();
+    root
 }
 
 pub(super) fn list_recordings_from_dir(recordings_root: &Path) -> Result<Vec<RecordingSummary>> {
@@ -4434,7 +4633,8 @@ mod tests {
     }
 
     use crate::runtime::recording::{
-        confirm_delete_all_recordings, delete_all_recordings_from_dir, delete_recording_dir_at,
+        collect_recording_storage_usage, confirm_delete_all_recordings,
+        default_event_kinds_for_flags, delete_all_recordings_from_dir, delete_recording_dir_at,
         list_recordings_from_dir, offline_recording_status, resolve_recording_id_prefix,
     };
     use std::fs;
@@ -4504,6 +4704,43 @@ mod tests {
         let status = offline_recording_status();
         assert!(status.active.is_none());
         assert_eq!(status.queue_len, 0);
+    }
+
+    #[test]
+    fn default_event_kinds_for_flags_falls_back_to_output() {
+        let kinds = default_event_kinds_for_flags(false, false, false);
+        assert_eq!(kinds, vec![bmux_ipc::RecordingEventKind::PaneOutputRaw]);
+    }
+
+    #[test]
+    fn collect_recording_storage_usage_skips_hidden_rolling_dir() {
+        let root = temp_dir();
+        let manual_id = Uuid::new_v4();
+        let manual_dir = root.join(manual_id.to_string());
+        fs::create_dir_all(&manual_dir).expect("manual recording dir should exist");
+        fs::write(
+            manual_dir.join("manifest.json"),
+            br#"{"summary":{"id":"00000000-0000-0000-0000-000000000000","session_id":null,"capture_input":true,"started_epoch_ms":1,"ended_epoch_ms":null,"event_count":0,"payload_bytes":0,"path":"x"}}"#,
+        )
+        .expect("manual manifest should write");
+        fs::write(manual_dir.join("events_0.bin"), b"manual-bytes")
+            .expect("manual events should write");
+
+        let rolling_dir = root.join(".rolling").join("active");
+        fs::create_dir_all(&rolling_dir).expect("rolling dir should exist");
+        fs::write(
+            rolling_dir.join("manifest.json"),
+            br#"{"summary":{"id":"00000000-0000-0000-0000-000000000000","session_id":null,"capture_input":true,"started_epoch_ms":1,"ended_epoch_ms":null,"event_count":0,"payload_bytes":0,"path":"x"}}"#,
+        )
+        .expect("rolling manifest should write");
+        fs::write(rolling_dir.join("events_0.bin"), b"rolling-bytes")
+            .expect("rolling events should write");
+
+        let usage =
+            collect_recording_storage_usage(&root).expect("usage collection should succeed");
+        assert_eq!(usage.recording_dirs, 1);
+        assert_eq!(usage.directories, 1);
+        assert_eq!(usage.files, 2);
     }
 
     #[test]
