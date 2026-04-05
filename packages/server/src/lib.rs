@@ -1225,10 +1225,18 @@ struct PaneCursorTracker {
     parser: vt100::Parser,
     rows: u16,
     cols: u16,
+    cursor_escape_state: CursorEscapeState,
     /// Cumulative number of lines that have scrolled off the top.
     /// Used by the image registry to shift image positions on scroll.
     #[cfg(feature = "image-registry")]
     total_scrollback: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CursorEscapeState {
+    Ground,
+    Esc,
+    EscBracket,
 }
 
 impl PaneCursorTracker {
@@ -1240,6 +1248,7 @@ impl PaneCursorTracker {
             parser: vt100::Parser::new(rows, cols, 1),
             rows,
             cols,
+            cursor_escape_state: CursorEscapeState::Ground,
             #[cfg(feature = "image-registry")]
             total_scrollback: 0,
         }
@@ -1256,8 +1265,51 @@ impl PaneCursorTracker {
     }
 
     fn process(&mut self, bytes: &[u8]) {
-        if !bytes.is_empty() {
-            self.parser.process(bytes);
+        if bytes.is_empty() {
+            return;
+        }
+
+        let mut normalized = Vec::with_capacity(bytes.len());
+        for byte in bytes {
+            match self.cursor_escape_state {
+                CursorEscapeState::Ground => {
+                    if *byte == 0x1b {
+                        self.cursor_escape_state = CursorEscapeState::Esc;
+                    } else {
+                        normalized.push(*byte);
+                    }
+                }
+                CursorEscapeState::Esc => {
+                    if *byte == b'[' {
+                        self.cursor_escape_state = CursorEscapeState::EscBracket;
+                    } else if *byte == 0x1b {
+                        normalized.push(0x1b);
+                        self.cursor_escape_state = CursorEscapeState::Esc;
+                    } else {
+                        normalized.extend_from_slice(&[0x1b, *byte]);
+                        self.cursor_escape_state = CursorEscapeState::Ground;
+                    }
+                }
+                CursorEscapeState::EscBracket => {
+                    match *byte {
+                        // vt100::Parser reliably restores cursor for ESC 7/8 but
+                        // can miss CSI s/u (especially when apps emit save/probe/
+                        // restore around alt-screen transitions). Normalize those
+                        // short forms to ESC 7/8 before feeding the parser.
+                        b's' => normalized.extend_from_slice(b"\x1b7"),
+                        b'u' => normalized.extend_from_slice(b"\x1b8"),
+                        _ => {
+                            normalized.extend_from_slice(b"\x1b[");
+                            normalized.push(*byte);
+                        }
+                    }
+                    self.cursor_escape_state = CursorEscapeState::Ground;
+                }
+            }
+        }
+
+        if !normalized.is_empty() {
+            self.parser.process(&normalized);
         }
     }
 
@@ -8844,6 +8896,114 @@ mod tests {
         assert!(protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"?6").is_empty());
         let dec_cpr_reply = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"n");
         assert_eq!(dec_cpr_reply, b"\x1b[?20;7R");
+    }
+
+    #[test]
+    fn protocol_reply_restores_cursor_after_csi_save_restore() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
+        let mut cursor_tracker = PaneCursorTracker::new(24, 80);
+
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[20;35H");
+        assert_eq!(
+            protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n"),
+            b"\x1b[20;35R"
+        );
+
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[s");
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[H");
+        assert_eq!(
+            protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n"),
+            b"\x1b[1;1R"
+        );
+
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[u");
+        assert_eq!(
+            protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n"),
+            b"\x1b[20;35R"
+        );
+    }
+
+    #[test]
+    fn protocol_reply_preserves_pre_alt_cursor_after_csi_save_restore_then_1049_cycle() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
+        let mut cursor_tracker = PaneCursorTracker::new(60, 120);
+
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[28;35H");
+        assert_eq!(
+            protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n"),
+            b"\x1b[28;35R"
+        );
+
+        let _ = protocol_reply_for_chunk(
+            &mut engine,
+            &mut cursor_tracker,
+            b"\x1b[s\x1b[?1016$p\x1b[H\x1b[6n\x1b[u",
+        );
+        assert_eq!(
+            protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n"),
+            b"\x1b[28;35R"
+        );
+
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[?1049h");
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[2;2H");
+        assert_eq!(
+            protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n"),
+            b"\x1b[2;2R"
+        );
+
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[?1049l");
+        assert_eq!(
+            protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n"),
+            b"\x1b[28;35R"
+        );
+    }
+
+    #[test]
+    fn protocol_reply_handles_split_csi_save_restore_across_chunks() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
+        let mut cursor_tracker = PaneCursorTracker::new(30, 120);
+
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[15;42H");
+        assert_eq!(
+            protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n"),
+            b"\x1b[15;42R"
+        );
+
+        assert!(protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b").is_empty());
+        assert!(protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"[").is_empty());
+        assert!(protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"s").is_empty());
+
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[H");
+        assert_eq!(
+            protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n"),
+            b"\x1b[1;1R"
+        );
+
+        assert!(protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b").is_empty());
+        assert!(protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"[").is_empty());
+        assert!(protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"u").is_empty());
+
+        assert_eq!(
+            protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n"),
+            b"\x1b[15;42R"
+        );
+    }
+
+    #[test]
+    fn protocol_reply_does_not_confuse_kitty_query_u_with_restore_cursor() {
+        let mut engine = TerminalProtocolEngine::new(ProtocolProfile::Xterm);
+        let mut cursor_tracker = PaneCursorTracker::new(30, 120);
+
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[9;17H");
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[s");
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[?u");
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[H");
+        let _ = protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[u");
+
+        assert_eq!(
+            protocol_reply_for_chunk(&mut engine, &mut cursor_tracker, b"\x1b[6n"),
+            b"\x1b[9;17R"
+        );
     }
 
     #[test]
