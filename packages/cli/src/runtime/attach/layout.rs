@@ -15,6 +15,7 @@ pub fn collect_pane_ids(layout: &PaneLayoutNode, out: &mut Vec<Uuid>) {
     }
 }
 
+#[allow(clippy::cast_possible_truncation)] // Product of two u16 values divided by 100 always fits in u16
 fn split_rect(rect: PaneRect, ratio_percent: u8, vertical: bool) -> (PaneRect, PaneRect) {
     if vertical {
         let split = ((u32::from(rect.w) * u32::from(ratio_percent)) / 100) as u16;

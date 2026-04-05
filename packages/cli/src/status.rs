@@ -24,6 +24,7 @@ pub struct AttachStatusLine {
     pub tab_hitboxes: Vec<AttachStatusTabHitbox>,
 }
 
+#[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
 pub fn build_attach_status_line(
     width: u16,
     config: &StatusBarConfig,
@@ -179,8 +180,9 @@ fn append_tabs(
         let token_width = display_width(&token);
         if let Some(context_id) = tab.context_id {
             hitboxes.push(AttachStatusTabHitbox {
-                start_col: col as u16,
-                end_col: col.saturating_add(token_width.saturating_sub(1)) as u16,
+                start_col: u16::try_from(col).unwrap_or(u16::MAX),
+                end_col: u16::try_from(col.saturating_add(token_width.saturating_sub(1)))
+                    .unwrap_or(u16::MAX),
                 context_id,
             });
         }
@@ -400,7 +402,7 @@ struct ResolvedStatusTheme {
 }
 
 impl ResolvedStatusTheme {
-    #[allow(clippy::similar_names)] // bg/fg pairs are intentionally parallel names
+    #[allow(clippy::similar_names, clippy::too_many_lines)] // bg/fg pairs are intentionally parallel names
     fn resolve(config: &StatusBarConfig, global_theme: &ThemeConfig) -> Self {
         let fallback_bar_bg =
             parse_hex_color(&global_theme.status.background).unwrap_or(RgbColor {
@@ -527,6 +529,7 @@ impl ResolvedStatusTheme {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stylize_status_line(
     rendered_plain: &str,
     width: u16,

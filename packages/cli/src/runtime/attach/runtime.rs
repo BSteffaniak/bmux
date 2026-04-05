@@ -139,6 +139,11 @@ impl DisplayCaptureFanout {
         }
     }
 
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
     fn record_images(&mut self, images: &[bmux_ipc::AttachPaneImage]) {
         let mut failed = Vec::new();
         for (id, writer) in &mut self.writers {
@@ -195,6 +200,7 @@ fn apply_attach_output_bytes(
     true
 }
 
+#[allow(clippy::too_many_lines)] // Core attach loop -- splitting would fragment state management
 pub async fn run_session_attach_with_client(
     mut client: BmuxClient,
     target: Option<&str>,
@@ -1095,6 +1101,7 @@ async fn enforce_hot_path_plugin_policy(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn handle_attach_plugin_command_action(
     client: &mut StreamingBmuxClient,
     plugin_id: &str,
@@ -1319,6 +1326,7 @@ pub async fn handle_attach_plugin_command_action(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn handle_attach_ui_action(
     client: &mut StreamingBmuxClient,
     action: RuntimeAction,
@@ -1883,6 +1891,7 @@ pub fn selected_attach_text(view_state: &mut AttachViewState) -> Option<String> 
     extract_attach_text(view_state, start, end)
 }
 
+#[allow(clippy::cast_possible_truncation)] // Terminal dimensions bounded by u16
 pub fn extract_attach_text(
     view_state: &mut AttachViewState,
     start: AttachScrollbackPosition,
@@ -2050,6 +2059,7 @@ pub fn relative_context_id(
         .map(|context| context.id)
 }
 
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 pub async fn build_attach_status_line_for_draw(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
@@ -2333,6 +2343,7 @@ pub fn handle_help_overlay_key_event(
     }
 }
 
+#[allow(clippy::cast_possible_truncation)] // Terminal dimensions bounded by u16
 pub fn help_overlay_surface(lines: &[String]) -> Option<bmux_ipc::AttachSurface> {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
     if cols < 20 || rows < 6 {
@@ -2373,6 +2384,7 @@ pub fn help_overlay_surface(lines: &[String]) -> Option<bmux_ipc::AttachSurface>
     })
 }
 
+#[allow(clippy::cast_possible_truncation)] // Terminal dimensions bounded by u16
 pub fn queue_attach_help_overlay(
     stdout: &mut impl Write,
     surface_meta: &bmux_ipc::AttachSurface,
@@ -2464,6 +2476,7 @@ pub fn queue_attach_help_overlay(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 pub async fn render_attach_frame(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
@@ -2999,6 +3012,7 @@ pub fn effective_attach_keybindings(config: &BmuxConfig) -> Vec<AttachKeybinding
     entries
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
     let keymap = attach_keymap_from_config(config);
     let help = key_hint_or_unbound(&keymap, &RuntimeAction::ShowHelp);
@@ -3451,6 +3465,7 @@ pub fn resize_attach_parsers_for_scene_with_size(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_attach_loop_event(
     event: AttachLoopEvent,
     client: &mut StreamingBmuxClient,
@@ -3488,6 +3503,7 @@ pub async fn handle_attach_loop_event(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn handle_attach_server_event(
     client: &mut StreamingBmuxClient,
     server_event: bmux_client::ServerEvent,
@@ -3704,6 +3720,7 @@ pub fn attach_view_event_matches_target(
     event_session_id == view_state.attached_id
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn handle_attach_terminal_event(
     client: &mut StreamingBmuxClient,
     terminal_event: Event,
@@ -3926,11 +3943,13 @@ pub async fn handle_attach_terminal_event(
     Ok(AttachLoopControl::Continue)
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn record_attach_mouse_event(mouse_event: MouseEvent, view_state: &mut AttachViewState) {
     view_state.mouse.last_position = Some((mouse_event.column, mouse_event.row));
     view_state.mouse.last_event_at = Some(Instant::now());
 }
 
+#[allow(clippy::too_many_lines)]
 pub async fn handle_attach_mouse_event(
     client: &mut StreamingBmuxClient,
     mouse_event: MouseEvent,
@@ -4374,6 +4393,7 @@ pub const fn encode_attach_mouse_modifier_bits(modifiers: KeyModifiers) -> u16 {
     cb
 }
 
+#[allow(clippy::unnecessary_wraps)] // Returns None for unrecognized mouse events in future
 pub const fn encode_attach_mouse_x10_cb(
     kind: MouseEventKind,
     modifiers: KeyModifiers,
@@ -4396,6 +4416,7 @@ pub const fn encode_attach_mouse_x10_cb(
     Some(modifier_bits + button_bits)
 }
 
+#[allow(clippy::unnecessary_wraps)] // Returns None for unrecognized mouse events in future
 pub const fn encode_attach_mouse_sgr_cb(
     kind: MouseEventKind,
     modifiers: KeyModifiers,
@@ -4704,6 +4725,7 @@ pub fn attach_event_actions(
     }
 }
 
+#[allow(clippy::unnecessary_wraps)] // Result aligns with the broader action dispatch interface
 pub fn attach_key_event_actions(
     key: &KeyEvent,
     attach_input_processor: &mut InputProcessor,

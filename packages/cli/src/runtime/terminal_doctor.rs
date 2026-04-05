@@ -58,6 +58,7 @@ pub(super) fn run_terminal_install_terminfo(yes: bool, check_only: bool) -> Resu
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn run_terminal_doctor(
     as_json: bool,
     include_trace: bool,

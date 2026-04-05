@@ -250,6 +250,7 @@ const fn command_requires_remote_server(command: Option<&Command>) -> bool {
     )
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn run_connect(
     target: Option<&str>,
     session: Option<&str>,
@@ -525,6 +526,11 @@ async fn wait_for_running_host_state(timeout: std::time::Duration) -> Result<Hos
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools
+)]
 pub(super) async fn run_host(
     listen: &str,
     name: Option<&str>,
@@ -981,6 +987,7 @@ pub(super) fn run_auth_logout() -> Result<u8> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_share(
     target: Option<&str>,
     secondary: Option<&str>,
@@ -3103,6 +3110,7 @@ fn command_needs_tty(command: Option<&Command>) -> bool {
     )
 }
 
+#[allow(clippy::cast_possible_truncation)] // Attempt count bounded to small values
 fn reconnect_backoff_ms(attempt: usize) -> u64 {
     let exponent = attempt.saturating_sub(1).min(10) as u32;
     SSH_RECONNECT_BASE_BACKOFF_MS.saturating_mul(2u64.saturating_pow(exponent))

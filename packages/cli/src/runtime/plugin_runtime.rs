@@ -118,6 +118,7 @@ declare_bundled_plugins! {
 
 /// Load a registered plugin, using the static vtable path for bundled plugins
 /// and the dynamic `dlopen` path for everything else.
+#[allow(clippy::result_large_err)] // Plugin error types carry context payloads
 pub(super) fn load_plugin(
     plugin: &bmux_plugin::RegisteredPlugin,
     host: &HostMetadata,
@@ -613,6 +614,7 @@ pub(super) fn registered_plugin_infos_from_registry(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn plugin_lifecycle_context(
     config: &BmuxConfig,
     paths: &ConfigPaths,
@@ -655,6 +657,7 @@ pub(super) fn plugin_lifecycle_context(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn plugin_command_context(
     config: &BmuxConfig,
     paths: &ConfigPaths,
@@ -860,7 +863,7 @@ pub(super) fn dispatch_loaded_plugin_event(
     event: &PluginEvent,
 ) -> Result<()> {
     for plugin in loaded_plugins {
-        let _ = plugin.dispatch_event(&event).with_context(|| {
+        let _ = plugin.dispatch_event(event).with_context(|| {
             format!(
                 "failed dispatching plugin event '{}' to '{}'",
                 event.name,
@@ -970,6 +973,7 @@ pub(super) const fn plugin_event_kind_from_server_event(
     }
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Status clamped to 0..255 before cast
 pub(super) async fn run_plugin_command(
     plugin_id: &str,
     command_name: &str,

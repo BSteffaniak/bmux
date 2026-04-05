@@ -125,6 +125,7 @@ async fn run_hosted_doctor(as_json: bool) -> Result<u8> {
 
 // ── text output ─────────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_lines)]
 async fn run_doctor_text(paths: &ConfigPaths) -> Result<bool> {
     let mut warnings = false;
 
@@ -432,6 +433,7 @@ impl DoctorPluginsCheck {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn build_doctor_report(paths: &ConfigPaths) -> DoctorReport {
     let mut has_warnings = false;
 

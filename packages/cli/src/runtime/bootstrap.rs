@@ -200,6 +200,7 @@ pub(super) fn next_default_session_name(sessions: &[SessionSummary]) -> String {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn run_server_start(
     daemon: bool,
     foreground_internal: bool,

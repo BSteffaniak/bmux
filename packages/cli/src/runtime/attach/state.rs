@@ -108,6 +108,7 @@ pub struct AttachScrollbackPosition {
     pub col: usize,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub struct AttachViewState {
     pub attached_id: Uuid,
     pub attached_context_id: Option<Uuid>,

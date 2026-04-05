@@ -4,6 +4,13 @@ use std::time::Duration;
 
 use super::{discover_bundled_plugin_ids, recording, run_recording_export};
 
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::fn_params_excessive_bools,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss
+)]
 pub(super) async fn run_playbook_run(
     source: &str,
     json: bool,
@@ -195,7 +202,7 @@ pub(super) fn run_playbook_dry_run(source: &str, json: bool) -> Result<u8> {
                 "name": config.name,
                 "viewport": format!("{}x{}", config.viewport.cols, config.viewport.rows),
                 "shell": config.shell,
-                "timeout_ms": config.timeout.as_millis() as u64,
+                "timeout_ms": u64::try_from(config.timeout.as_millis()).unwrap_or(u64::MAX),
                 "env_mode": env_mode_str,
                 "record": config.record,
             },
@@ -236,6 +243,7 @@ pub(super) fn run_playbook_dry_run(source: &str, json: bool) -> Result<u8> {
     Ok(u8::from(!valid))
 }
 
+#[allow(clippy::cast_precision_loss)] // Timing threshold u64→f64 acceptable for comparison
 pub(super) fn run_playbook_diff(
     left_path: &str,
     right_path: &str,

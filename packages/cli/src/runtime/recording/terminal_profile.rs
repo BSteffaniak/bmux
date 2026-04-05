@@ -341,6 +341,7 @@ fn parse_ghostty_cursor_text_mode(value: &str) -> Option<CursorDefaultTextMode> 
     }
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Bounds checked before cast
 fn parse_ghostty_font_size_px(value: &str) -> Option<u16> {
     let numeric = value.parse::<f32>().ok()?;
     if numeric <= 0.0 {
@@ -353,6 +354,7 @@ fn parse_ghostty_font_size_px(value: &str) -> Option<u16> {
     Some(rounded as u16)
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)] // Bounds checked before cast
 fn parse_ghostty_background_opacity_permille(value: &str) -> Option<u16> {
     let numeric = value.parse::<f32>().ok()?;
     let clamped = numeric.clamp(0.0, 1.0);

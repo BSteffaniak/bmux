@@ -114,7 +114,7 @@ pub(super) fn call_host_kernel_via_client(
     payload: &[u8],
 ) -> Result<Vec<u8>> {
     let request: bmux_ipc::Request =
-        bmux_ipc::decode(&payload).context("failed decoding kernel bridge request payload")?;
+        bmux_ipc::decode(payload).context("failed decoding kernel bridge request payload")?;
     let paths = ConfigPaths::new(
         connection.config_dir.clone().into(),
         connection.runtime_dir.clone().into(),
@@ -344,6 +344,7 @@ pub(super) const fn invoke_kind_from_service_kind(kind: ServiceKind) -> Option<I
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn register_plugin_service_handlers(
     server: &BmuxServer,
     config: &BmuxConfig,

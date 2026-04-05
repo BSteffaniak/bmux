@@ -98,6 +98,7 @@ pub(super) fn run_recording_inspect(
     recording::run_recording_inspect(recording_id, limit, kind, as_json)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_recording_replay(
     recording_id: &str,
     mode: RecordingReplayMode,
@@ -144,6 +145,12 @@ pub(super) async fn run_recording_verify_smoke(
     .await
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 pub(super) async fn run_recording_export(
     recording_id: &str,
     format: RecordingExportFormat,
@@ -323,6 +330,11 @@ impl<'a> ReplayTimeline<'a> {
         self.next_index >= self.events.len()
     }
 
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        clippy::cast_precision_loss
+    )]
     fn next_delay(&self, speed: f64) -> Duration {
         let Some(event) = self.events.get(self.next_index) else {
             return Duration::ZERO;
@@ -650,6 +662,7 @@ pub(super) async fn replay_verify(
     Ok(1)
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn verify_recording_report(
     baseline: &[RecordingEventEnvelope],
     target_bmux: Option<&str>,
@@ -981,6 +994,7 @@ pub(super) fn truncate_str(s: &str, max_len: usize) -> String {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn run_target_verify_capture(
     target_binary: &Path,
     inputs: &[ReplayInputEvent],

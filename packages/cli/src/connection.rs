@@ -657,6 +657,7 @@ pub fn current_cli_build_id() -> Result<String> {
     Ok(format!("{}-{modified}", metadata.len()))
 }
 
+#[allow(clippy::cast_possible_truncation)] // Epoch millis won't exceed u64 for billions of years
 fn current_server_runtime_metadata(pid: u32) -> Result<ServerRuntimeMetadata> {
     let executable = std::env::current_exe().context("failed resolving current executable")?;
     Ok(ServerRuntimeMetadata {

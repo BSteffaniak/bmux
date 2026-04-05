@@ -270,6 +270,7 @@ fn collect_recording_storage_usage_recursive(
     Ok(())
 }
 
+#[allow(clippy::cast_precision_loss)] // Byte size formatting; precision loss is acceptable for display
 fn format_byte_size(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = KIB * 1024;
@@ -313,6 +314,7 @@ pub(super) async fn run_recording_stop(
     Ok(0)
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn run_recording_status(
     as_json: bool,
     connection_context: ConnectionContext<'_>,
@@ -642,6 +644,7 @@ pub(super) async fn run_recording_prune(
     Ok(0)
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) fn run_recording_inspect(
     recording_id: &str,
     limit: usize,
@@ -675,6 +678,7 @@ pub(super) fn run_recording_inspect(
     Ok(0)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn run_recording_replay(
     recording_id: &str,
     mode: RecordingReplayMode,
@@ -733,7 +737,7 @@ pub(super) async fn run_recording_verify_smoke(
     Ok(u8::from(!report.pass))
 }
 
-#[allow(clippy::unused_async)] // Called in async context; may need async for future network export
+#[allow(clippy::unused_async, clippy::too_many_arguments)] // Called in async context; may need async for future network export
 pub(super) async fn run_recording_export(
     recording_id: &str,
     format: RecordingExportFormat,
@@ -1282,6 +1286,11 @@ const fn effective_cursor_shape(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn compute_cursor_visibility(
     options: &CursorExportOptions,
     replay_state: CursorReplayState,
@@ -1410,6 +1419,12 @@ fn pick_contrast_text_color(fill: (u8, u8, u8)) -> (u8, u8, u8) {
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn overlay_cursor_rgba(
     pixels: &mut [u8],
     frame_width: usize,
@@ -1586,6 +1601,13 @@ fn overlay_cursor_rgba(
     (resolved_paint_mode, resolved_text_mode, fallback_reason)
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 fn export_recording_gif(
     events: &[DisplayTrackEnvelope],
     output: &str,
@@ -2366,6 +2388,11 @@ impl ExportProfiler {
     }
 }
 
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
 fn estimate_export_progress(
     events: &[DisplayTrackEnvelope],
     speed: f64,
@@ -2435,6 +2462,7 @@ struct ExportProgress {
 }
 
 impl ExportProgress {
+    #[allow(clippy::cast_possible_truncation)]
     fn new(show_progress: bool, estimate: ExportProgressEstimate) -> Self {
         Self {
             enabled: show_progress,
@@ -2447,6 +2475,7 @@ impl ExportProgress {
         }
     }
 
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     fn update(&mut self, processed_frame_events: u32, emitted_frames: u32, force: bool) {
         if !self.enabled || self.estimate.total_frame_events == 0 {
             return;
@@ -2533,6 +2562,13 @@ fn format_duration_compact(duration: std::time::Duration) -> String {
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
 fn render_screen_rgba(
     screen: &vt100::Screen,
     rows: u16,
@@ -2713,6 +2749,7 @@ impl ResvgFrameRenderer {
         })
     }
 
+    #[allow(clippy::too_many_lines, clippy::cast_precision_loss)]
     fn render(
         &mut self,
         screen: &vt100::Screen,
@@ -2858,6 +2895,7 @@ fn resolved_cell_colors(
     (palette[usize::from(fg)], palette[usize::from(bg)])
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn dim_rgb(rgb: (u8, u8, u8)) -> (u8, u8, u8) {
     (
         (f32::from(rgb.0) * 0.72).round() as u8,
@@ -3175,6 +3213,12 @@ fn xml_escape_text(input: &str) -> String {
         .collect()
 }
 
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::cast_possible_truncation,
+    clippy::cast_precision_loss
+)]
 fn draw_bitmap_glyph_rgba(
     pixels: &mut [u8],
     width: usize,
@@ -3441,6 +3485,7 @@ impl GlyphRenderer {
         resolved
     }
 
+    #[allow(clippy::too_many_arguments, clippy::cast_precision_loss)]
     fn draw_cell(
         &mut self,
         rgba: &mut [u8],
@@ -3489,6 +3534,7 @@ impl GlyphRenderer {
     }
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn blend_channel(fg: u8, bg: u8, alpha: f32) -> u8 {
     f32::from(fg)
         .mul_add(alpha, f32::from(bg) * (1.0 - alpha))
@@ -3583,6 +3629,7 @@ fn vt100_color_to_palette_index(color: vt100::Color, foreground: bool) -> u8 {
     }
 }
 
+#[allow(clippy::cast_possible_truncation)] // Index bounded to 0..=255
 fn nearest_xterm_index(r: u8, g: u8, b: u8) -> u8 {
     let palette = xterm_256_palette();
     let mut best_index = 0_u8;
@@ -4036,6 +4083,7 @@ fn overlay_display_track_images(
     feature = "image-kitty",
     feature = "image-iterm2"
 ))]
+#[allow(clippy::cast_possible_truncation)]
 fn blit_rgba(
     dst: &mut [u8],
     dst_w: u32,
@@ -4099,6 +4147,11 @@ pub(super) struct DisplayCaptureWriter {
     /// Whether the last recorded `ImageUpdate` had any images.
     /// Used to avoid writing redundant empty `ImageUpdate` events on every
     /// frame for sessions that never use images.
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
     last_image_count: usize,
 }
 
@@ -4128,6 +4181,11 @@ impl DisplayCaptureWriter {
             started_at: Instant::now(),
             writer: BufWriter::new(file),
             cursor_replay_state: CursorReplayState::default(),
+            #[cfg(any(
+                feature = "image-sixel",
+                feature = "image-kitty",
+                feature = "image-iterm2"
+            ))]
             last_image_count: 0,
         };
         let (cell_width_px, cell_height_px, window_width_px, window_height_px) =
@@ -4203,6 +4261,11 @@ impl DisplayCaptureWriter {
     /// images (avoids ~15 bytes/frame overhead for sessions without images).
     /// An empty list IS recorded when transitioning from non-empty to empty,
     /// which signals the GIF exporter to clear stale overlays.
+    #[cfg(any(
+        feature = "image-sixel",
+        feature = "image-kitty",
+        feature = "image-iterm2"
+    ))]
     pub(super) fn record_images(&mut self, images: &[bmux_ipc::AttachPaneImage]) -> Result<()> {
         let count = images.len();
         if count == 0 && self.last_image_count == 0 {
@@ -4220,6 +4283,7 @@ impl DisplayCaptureWriter {
             .context("failed flushing display capture writer")
     }
 
+    #[allow(clippy::cast_possible_truncation)] // Epoch millis won't exceed u64
     fn record(&mut self, event: DisplayTrackEvent) -> Result<()> {
         let envelope = DisplayTrackEnvelope {
             mono_ns: self

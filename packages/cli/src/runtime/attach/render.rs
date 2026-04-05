@@ -119,6 +119,7 @@ pub fn queue_layer_fill<W: io::Write>(stdout: &mut W, surface: AttachLayerSurfac
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Default)]
+#[allow(clippy::struct_excessive_bools)]
 struct CellStyle {
     fg: vt100::Color,
     bg: vt100::Color,
@@ -247,6 +248,11 @@ pub fn visible_scene_pane_ids(scene: &AttachScene) -> Vec<Uuid> {
     pane_ids.into_iter().collect()
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines,
+    clippy::cast_possible_truncation
+)]
 pub fn render_attach_scene<W: io::Write>(
     stdout: &mut W,
     scene: &AttachScene,

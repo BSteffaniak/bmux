@@ -36,6 +36,7 @@ pub(super) struct ServerStatusJsonPayload {
     stale_warning: Option<String>,
 }
 
+#[allow(clippy::too_many_lines)]
 pub(super) async fn run_server_status(
     as_json: bool,
     connection_context: ConnectionContext<'_>,
@@ -567,6 +568,7 @@ pub(super) async fn run_server_recording_clear(
     Ok(0)
 }
 
+#[allow(clippy::cast_precision_loss)] // Byte size formatting; precision loss acceptable for display
 fn format_byte_size(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = KIB * 1024;
@@ -584,6 +586,7 @@ fn format_byte_size(bytes: u64) -> String {
 
 const BRIDGE_PREFLIGHT_TOKEN: &str = "BMUX_BRIDGE_READY";
 
+#[allow(clippy::similar_names)] // stdin/stdout are standard names
 pub(super) async fn run_server_bridge(stdio: bool, preflight: bool) -> Result<u8> {
     if !stdio {
         anyhow::bail!("server bridge currently requires --stdio");
@@ -671,6 +674,7 @@ pub(super) async fn run_server_gateway(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn run_server_gateway_iroh() -> Result<u8> {
     const BMUX_IROH_ALPN: &[u8] = b"bmux/gateway/iroh/1";
     let endpoint = Endpoint::builder(presets::N0)

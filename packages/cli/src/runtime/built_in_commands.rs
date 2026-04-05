@@ -119,6 +119,7 @@ impl BuiltInExecutionCommand {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
     vec![
         BuiltInExecutionCommand::new(

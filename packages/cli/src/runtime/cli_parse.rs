@@ -11,6 +11,7 @@ use super::{
 };
 
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub(super) enum ParsedRuntimeCli {
     BuiltIn {
         cli: Cli,
