@@ -29,6 +29,7 @@ use std::collections::BTreeMap;
 mod toml_value_option {
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
+    #[allow(clippy::ref_option)] // serde `with` modules require `&T` for the field type
     pub fn serialize<S: Serializer>(
         value: &Option<toml::Value>,
         serializer: S,
@@ -260,6 +261,8 @@ impl HostKernelBridge {
         output_capacity: usize,
         output_len: *mut usize,
     ) -> i32 {
+        #[allow(clippy::cast_possible_truncation)]
+        // pointer was stored as u64 for serialization; fits in usize on supported 64-bit targets
         let bridge: HostKernelBridgeFn = unsafe { std::mem::transmute(self.0 as usize) };
         unsafe {
             bridge(

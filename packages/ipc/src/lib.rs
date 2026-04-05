@@ -1,15 +1,12 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
-#![allow(clippy::missing_panics_doc)]
 #![allow(clippy::must_use_candidate)]
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::large_enum_variant)]
 #![allow(clippy::struct_excessive_bools)]
 #![allow(clippy::option_if_let_else)]
 #![allow(clippy::doc_markdown)]
-#![allow(clippy::unused_async)]
-#![allow(clippy::needless_pass_by_value)]
 
 //! Cross-platform IPC protocol models for bmux.
 
@@ -1487,6 +1484,11 @@ pub struct ReadFramesResult<T> {
 ///
 /// Returns all successfully-parsed frames plus the count of any trailing bytes
 /// that could not form a complete frame (indicating a truncated recording).
+///
+/// # Panics
+///
+/// Panics if the internal 4-byte length-prefix slice conversion fails, which
+/// should not occur because the slice is bounds-checked before conversion.
 ///
 /// # Errors
 ///

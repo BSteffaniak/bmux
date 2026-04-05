@@ -44,6 +44,6 @@ use bmux_ipc::{IpcEndpoint, encode, decode};
 use bmux_ipc::transport::LocalIpcListener;
 
 let endpoint = IpcEndpoint::from_session_name("my-session");
-let listener = LocalIpcListener::bind(&endpoint).await?;
+let listener = LocalIpcListener::bind(&endpoint)?;
 let stream = listener.accept().await?;
 ```

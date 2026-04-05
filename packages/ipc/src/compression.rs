@@ -118,7 +118,7 @@ impl ZstdCodec {
     ///
     /// - `bulk_level`: 3 (good ratio for image data)
     /// - `frame_level`: 1 (fastest, still worthwhile)
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self {
             bulk_level: 3,
             frame_level: 1,
@@ -126,7 +126,7 @@ impl ZstdCodec {
     }
 
     /// Create with custom levels.
-    pub fn with_levels(bulk_level: i32, frame_level: i32) -> Self {
+    pub const fn with_levels(bulk_level: i32, frame_level: i32) -> Self {
         Self {
             bulk_level,
             frame_level,
@@ -135,7 +135,7 @@ impl ZstdCodec {
 
     /// Create with a single level used for bulk payloads (images).
     /// Frame-level compression always uses level 1 for low latency.
-    pub fn with_level(level: i32) -> Self {
+    pub const fn with_level(level: i32) -> Self {
         Self {
             bulk_level: level,
             frame_level: 1,
@@ -194,7 +194,7 @@ pub struct Lz4Codec;
 
 #[cfg(feature = "compression-lz4")]
 impl Lz4Codec {
-    pub fn new() -> Self {
+    pub const fn new() -> Self {
         Self
     }
 }
@@ -302,7 +302,7 @@ pub fn default_payload_codec() -> Option<Box<dyn CompressionCodec>> {
     {
         return Some(Box::new(ZstdCodec::new()));
     }
-    #[cfg(feature = "compression-lz4")]
+    #[cfg(all(feature = "compression-lz4", not(feature = "compression-zstd")))]
     {
         return Some(Box::new(Lz4Codec::new()));
     }
@@ -318,7 +318,7 @@ pub fn default_frame_codec() -> Option<Box<dyn CompressionCodec>> {
     {
         return Some(Box::new(Lz4Codec::new()));
     }
-    #[cfg(feature = "compression-zstd")]
+    #[cfg(all(feature = "compression-zstd", not(feature = "compression-lz4")))]
     {
         return Some(Box::new(ZstdCodec::new()));
     }

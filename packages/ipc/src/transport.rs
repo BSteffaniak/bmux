@@ -86,7 +86,7 @@ impl LocalIpcListener {
     ///
     /// Returns an error when the endpoint is unsupported on this platform or
     /// the listener cannot be created.
-    pub async fn bind(endpoint: &IpcEndpoint) -> Result<Self, IpcTransportError> {
+    pub fn bind(endpoint: &IpcEndpoint) -> Result<Self, IpcTransportError> {
         #[cfg(unix)]
         {
             if let IpcEndpoint::UnixSocket(path) = endpoint {
@@ -496,9 +496,7 @@ mod tests {
         let socket_path = std::env::temp_dir().join(format!("bmux-ipc-{}.sock", Uuid::new_v4()));
         let endpoint = IpcEndpoint::unix_socket(&socket_path);
 
-        let listener = LocalIpcListener::bind(&endpoint)
-            .await
-            .expect("listener should bind");
+        let listener = LocalIpcListener::bind(&endpoint).expect("listener should bind");
 
         let server_task = tokio::spawn(async move {
             let mut server_stream = listener.accept().await.expect("accept should work");

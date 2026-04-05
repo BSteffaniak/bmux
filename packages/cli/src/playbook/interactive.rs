@@ -736,7 +736,6 @@ async fn run_interactive_session_managed(
 ) -> Result<u8> {
     // Bind the listener using the cross-platform IPC transport.
     let listener = bmux_ipc::transport::LocalIpcListener::bind(endpoint)
-        .await
         .with_context(|| format!("failed binding interactive listener on {endpoint:?}"))?;
 
     // Print ready message to stdout.

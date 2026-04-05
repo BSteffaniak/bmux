@@ -28,7 +28,8 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 pub struct CompressedStream<S> {
     inner: S,
     /// Compression level (zstd).
-    _level: i32,
+    #[cfg_attr(not(feature = "compression-zstd"), allow(dead_code))]
+    level: i32,
     // ── Write state ──────────────────────────────────────────────────────
     write_buf: Vec<u8>,
     /// Compressed bytes waiting to be written to `inner`.
@@ -69,7 +70,7 @@ impl<S> CompressedStream<S> {
     pub fn new(inner: S, level: i32) -> Self {
         Self {
             inner,
-            _level: level,
+            level,
             write_buf: Vec::with_capacity(64 * 1024),
             write_out: Vec::new(),
             write_out_pos: 0,
@@ -220,9 +221,11 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for CompressedStream<S> {
         if !this.write_buf.is_empty() && this.write_out_pos >= this.write_out.len() {
             #[cfg(feature = "compression-zstd")]
             {
-                let compressed = zstd::bulk::compress(&this.write_buf, this._level)
-                    .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+                let compressed =
+                    zstd::bulk::compress(&this.write_buf, this.level).map_err(io::Error::other)?;
+                #[allow(clippy::cast_possible_truncation)]
                 let compressed_len = compressed.len() as u32;
+                #[allow(clippy::cast_possible_truncation)]
                 let uncompressed_len = this.write_buf.len() as u32;
                 this.write_out.clear();
                 this.write_out.reserve(BLOCK_HEADER_LEN + compressed.len());

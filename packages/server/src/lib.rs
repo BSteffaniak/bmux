@@ -1,7 +1,6 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
-#![allow(clippy::cargo_common_metadata)]
 
 //! Server component for bmux terminal multiplexer.
 
@@ -3687,7 +3686,6 @@ impl BmuxServer {
         mut ready_tx: Option<oneshot::Sender<std::result::Result<(), String>>>,
     ) -> Result<()> {
         let listener = match LocalIpcListener::bind(&self.endpoint)
-            .await
             .with_context(|| format!("failed binding server endpoint {:?}", self.endpoint))
         {
             Ok(listener) => listener,

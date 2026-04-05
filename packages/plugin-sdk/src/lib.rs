@@ -7,11 +7,9 @@
 #![allow(clippy::struct_excessive_bools)]
 #![allow(clippy::option_if_let_else)]
 #![allow(clippy::doc_markdown)]
-#![allow(clippy::ref_option)]
 #![allow(clippy::redundant_closure_for_method_calls)]
 #![allow(clippy::manual_let_else)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
-#![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::result_large_err)]
 #![allow(clippy::unsafe_derive_deserialize)]
 
