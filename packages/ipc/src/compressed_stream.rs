@@ -59,7 +59,7 @@ enum ReadState {
     Header,
     /// Reading compressed block bytes.
     Block,
-    /// Decompressed data available in read_buf.
+    /// Decompressed data available in `read_buf`.
     Data,
 }
 

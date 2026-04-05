@@ -213,7 +213,7 @@ pub trait RustPlugin: Default + Send + 'static {
 
     /// Handle an inbound service call from another plugin or the host.
     ///
-    /// The default returns an "unsupported_service" error response.
+    /// The default returns an "`unsupported_service`" error response.
     fn invoke_service(&mut self, context: NativeServiceContext) -> ServiceResponse {
         ServiceResponse::error(
             "unsupported_service",
@@ -314,12 +314,10 @@ pub fn invoke_service_export<P: RustPlugin>(
     }
 
     let input = unsafe { std::slice::from_raw_parts(input_ptr, input_len) };
-    let (request_id, context) = match decode_service_envelope::<NativeServiceContext>(
-        input,
-        ServiceEnvelopeKind::Request,
-    ) {
-        Ok(value) => value,
-        Err(_) => return SERVICE_STATUS_DECODE_FAILED,
+    let Ok((request_id, context)) =
+        decode_service_envelope::<NativeServiceContext>(input, ServiceEnvelopeKind::Request)
+    else {
+        return SERVICE_STATUS_DECODE_FAILED;
     };
 
     let response = match instance.lock() {
@@ -327,11 +325,10 @@ pub fn invoke_service_export<P: RustPlugin>(
         Err(_) => return SERVICE_STATUS_PLUGIN_UNAVAILABLE,
     };
 
-    let encoded =
-        match encode_service_envelope(request_id, ServiceEnvelopeKind::Response, &response) {
-            Ok(value) => value,
-            Err(_) => return SERVICE_STATUS_ENCODE_FAILED,
-        };
+    let Ok(encoded) = encode_service_envelope(request_id, ServiceEnvelopeKind::Response, &response)
+    else {
+        return SERVICE_STATUS_ENCODE_FAILED;
+    };
 
     unsafe {
         *output_len = encoded.len();

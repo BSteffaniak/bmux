@@ -33,6 +33,7 @@ pub enum CompressionId {
 impl CompressionId {
     /// Decode a raw byte into a `CompressionId`, returning `None` for
     /// unrecognised values.
+    #[must_use]
     pub const fn from_byte(b: u8) -> Option<Self> {
         match b {
             0 => Some(Self::None),
@@ -118,6 +119,7 @@ impl ZstdCodec {
     ///
     /// - `bulk_level`: 3 (good ratio for image data)
     /// - `frame_level`: 1 (fastest, still worthwhile)
+    #[must_use]
     pub const fn new() -> Self {
         Self {
             bulk_level: 3,
@@ -126,6 +128,7 @@ impl ZstdCodec {
     }
 
     /// Create with custom levels.
+    #[must_use]
     pub const fn with_levels(bulk_level: i32, frame_level: i32) -> Self {
         Self {
             bulk_level,
@@ -135,6 +138,7 @@ impl ZstdCodec {
 
     /// Create with a single level used for bulk payloads (images).
     /// Frame-level compression always uses level 1 for low latency.
+    #[must_use]
     pub const fn with_level(level: i32) -> Self {
         Self {
             bulk_level: level,
@@ -194,6 +198,7 @@ pub struct Lz4Codec;
 
 #[cfg(feature = "compression-lz4")]
 impl Lz4Codec {
+    #[must_use]
     pub const fn new() -> Self {
         Self
     }
@@ -243,6 +248,7 @@ impl CompressionCodec for Lz4Codec {
 ///
 /// If the codec is `None`, data is below the threshold, or compression
 /// doesn't reduce size, returns the original data with `CompressionId::None`.
+#[must_use]
 pub fn compress_if_worthwhile(
     codec: Option<&dyn CompressionCodec>,
     data: &[u8],
@@ -254,10 +260,10 @@ pub fn compress_if_worthwhile(
     if data.len() < codec.threshold(hint) {
         return (data.to_vec(), CompressionId::None);
     }
-    match codec.compress(data, hint) {
-        Some(compressed) => (compressed, codec.id()),
-        None => (data.to_vec(), CompressionId::None),
-    }
+    codec.compress(data, hint).map_or_else(
+        || (data.to_vec(), CompressionId::None),
+        |compressed| (compressed, codec.id()),
+    )
 }
 
 /// Decompress `data` based on the `CompressionId`.  Returns the original
@@ -282,6 +288,7 @@ pub fn decompress_by_id(data: &[u8], id: CompressionId) -> Result<Vec<u8>, Compr
 
 /// Resolve a `CompressionId` into a boxed codec instance, or `None` if the
 /// id is `None` or the required feature is not compiled in.
+#[must_use]
 pub fn resolve_codec(id: CompressionId) -> Option<Box<dyn CompressionCodec>> {
     match id {
         CompressionId::None => None,
@@ -297,6 +304,7 @@ pub fn resolve_codec(id: CompressionId) -> Option<Box<dyn CompressionCodec>> {
 /// Return the default payload compression codec (best available).
 ///
 /// Prefers zstd (better ratio) for bulk payloads, falls back to lz4.
+#[must_use]
 pub fn default_payload_codec() -> Option<Box<dyn CompressionCodec>> {
     #[cfg(feature = "compression-zstd")]
     {
@@ -313,6 +321,7 @@ pub fn default_payload_codec() -> Option<Box<dyn CompressionCodec>> {
 /// Return the default frame compression codec (fastest available).
 ///
 /// Prefers lz4 (lower latency) for per-frame compression, falls back to zstd.
+#[must_use]
 pub fn default_frame_codec() -> Option<Box<dyn CompressionCodec>> {
     #[cfg(feature = "compression-lz4")]
     {

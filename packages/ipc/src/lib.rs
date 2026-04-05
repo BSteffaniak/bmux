@@ -1,12 +1,9 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
-#![allow(clippy::must_use_candidate)]
 #![allow(clippy::module_name_repetitions)]
 #![allow(clippy::large_enum_variant)]
 #![allow(clippy::struct_excessive_bools)]
-#![allow(clippy::option_if_let_else)]
-#![allow(clippy::doc_markdown)]
 
 //! Cross-platform IPC protocol models for bmux.
 

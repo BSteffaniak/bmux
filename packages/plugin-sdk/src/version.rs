@@ -19,11 +19,7 @@ impl ApiVersion {
         if self < minimum {
             return false;
         }
-        if let Some(maximum) = maximum {
-            self <= maximum
-        } else {
-            true
-        }
+        maximum.is_none_or(|maximum| self <= maximum)
     }
 }
 
