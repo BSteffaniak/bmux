@@ -792,7 +792,7 @@ pub(super) async fn run_recording_export(
                 anyhow::bail!(
                     "multiple display tracks found; pass --view-client with one of: {}",
                     ids.iter()
-                        .map(|id| id.to_string())
+                        .map(std::string::ToString::to_string)
                         .collect::<Vec<_>>()
                         .join(", ")
                 );
@@ -887,12 +887,11 @@ fn infer_display_track_client(recording_dir: &Path) -> InferredClient {
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name = name.to_string_lossy();
-        if let Some(rest) = name.strip_prefix("display-") {
-            if let Some(uuid_str) = rest.strip_suffix(".bin") {
-                if let Ok(id) = uuid_str.parse::<Uuid>() {
-                    found.push(id);
-                }
-            }
+        if let Some(rest) = name.strip_prefix("display-")
+            && let Some(uuid_str) = rest.strip_suffix(".bin")
+            && let Ok(id) = uuid_str.parse::<Uuid>()
+        {
+            found.push(id);
         }
     }
     match found.len() {
@@ -929,12 +928,10 @@ fn recording_terminal_profile(
             terminal_profile: Some(profile_bytes),
             ..
         } = &envelope.event
-        {
-            if let Ok(profile) =
+            && let Ok(profile) =
                 bmux_ipc::decode::<terminal_profile::DetectedTerminalProfile>(profile_bytes)
-            {
-                return Some(profile);
-            }
+        {
+            return Some(profile);
         }
     }
     None
@@ -1268,7 +1265,7 @@ fn update_cursor_replay_state(state: &mut CursorReplayState, data: &[u8]) {
     }
 }
 
-fn effective_cursor_shape(
+const fn effective_cursor_shape(
     options: &CursorExportOptions,
     replay_state: CursorReplayState,
     snapshot_shape: bmux_ipc::DisplayCursorShape,
@@ -1348,7 +1345,7 @@ fn compute_cursor_visibility(
     let period = options.blink_period_ns.max(1);
     let anchor = *blink_anchor_ns.get_or_insert(mono_ns);
     let phase_ns = mono_ns.saturating_sub(anchor);
-    let blink_on = ((phase_ns / period) % 2) == 0;
+    let blink_on = (phase_ns / period).is_multiple_of(2);
     (
         blink_on,
         blink_on,
@@ -1360,7 +1357,7 @@ fn compute_cursor_visibility(
     )
 }
 
-fn cursor_shape_name(shape: CursorVisualShape) -> &'static str {
+const fn cursor_shape_name(shape: CursorVisualShape) -> &'static str {
     match shape {
         CursorVisualShape::Block => "block",
         CursorVisualShape::Bar => "bar",
@@ -1368,7 +1365,7 @@ fn cursor_shape_name(shape: CursorVisualShape) -> &'static str {
     }
 }
 
-fn paint_mode_name(mode: BlockPaintMode) -> &'static str {
+const fn paint_mode_name(mode: BlockPaintMode) -> &'static str {
     match mode {
         BlockPaintMode::Invert => "invert",
         BlockPaintMode::Fill => "fill",
@@ -1376,7 +1373,7 @@ fn paint_mode_name(mode: BlockPaintMode) -> &'static str {
     }
 }
 
-fn text_mode_name(mode: BlockTextMode) -> &'static str {
+const fn text_mode_name(mode: BlockTextMode) -> &'static str {
     match mode {
         BlockTextMode::SwapFgBg => "swap_fg_bg",
         BlockTextMode::ForceContrast => "force_contrast",
@@ -1392,7 +1389,10 @@ fn relative_luminance(rgb: (u8, u8, u8)) -> f32 {
             ((v + 0.055) / 1.055).powf(2.4)
         }
     };
-    (0.2126 * channel(rgb.0)) + (0.7152 * channel(rgb.1)) + (0.0722 * channel(rgb.2))
+    0.0722f32.mul_add(
+        channel(rgb.2),
+        0.2126f32.mul_add(channel(rgb.0), 0.7152 * channel(rgb.1)),
+    )
 }
 
 fn contrast_ratio(a: (u8, u8, u8), b: (u8, u8, u8)) -> f32 {
@@ -1629,71 +1629,74 @@ fn export_recording_gif(
     let resolved_shape = if matches!(cursor_shape, RecordingCursorShape::Auto) {
         profile_defaults
             .and_then(|defaults| defaults.shape)
-            .map(|shape| match shape {
+            .map_or(cursor_shape, |shape| match shape {
                 terminal_profile::CursorDefaultShape::Block => RecordingCursorShape::Block,
                 terminal_profile::CursorDefaultShape::Bar => RecordingCursorShape::Bar,
                 terminal_profile::CursorDefaultShape::Underline => RecordingCursorShape::Underline,
             })
-            .unwrap_or(cursor_shape)
     } else {
         cursor_shape
     };
     let resolved_blink = if matches!(cursor_blink, RecordingCursorBlinkMode::Auto) {
         profile_defaults
             .and_then(|defaults| defaults.blink)
-            .map(|blink| match blink {
+            .map_or(cursor_blink, |blink| match blink {
                 terminal_profile::CursorDefaultBlink::On => RecordingCursorBlinkMode::On,
                 terminal_profile::CursorDefaultBlink::Off => RecordingCursorBlinkMode::Off,
             })
-            .unwrap_or(cursor_blink)
     } else {
         cursor_blink
     };
     let resolved_profile = if matches!(cursor_profile, RecordingCursorProfile::Auto) {
         profile_defaults
             .and_then(|defaults| defaults.profile)
-            .map(|profile| match profile {
+            .map_or(RecordingCursorProfile::Generic, |profile| match profile {
                 terminal_profile::CursorDefaultProfile::Ghostty => RecordingCursorProfile::Ghostty,
                 terminal_profile::CursorDefaultProfile::Generic => RecordingCursorProfile::Generic,
             })
-            .unwrap_or(RecordingCursorProfile::Generic)
     } else {
         cursor_profile
     };
     let resolved_paint_mode = if matches!(cursor_paint_mode, RecordingCursorPaintMode::Auto) {
         profile_defaults
             .and_then(|defaults| defaults.paint_mode)
-            .map(|mode| match mode {
-                terminal_profile::CursorDefaultPaintMode::Invert => {
-                    RecordingCursorPaintMode::Invert
-                }
-                terminal_profile::CursorDefaultPaintMode::Fill => RecordingCursorPaintMode::Fill,
-                terminal_profile::CursorDefaultPaintMode::Outline => {
-                    RecordingCursorPaintMode::Outline
-                }
-            })
-            .unwrap_or(match resolved_profile {
-                RecordingCursorProfile::Ghostty => RecordingCursorPaintMode::Fill,
-                _ => RecordingCursorPaintMode::Invert,
-            })
+            .map_or(
+                match resolved_profile {
+                    RecordingCursorProfile::Ghostty => RecordingCursorPaintMode::Fill,
+                    _ => RecordingCursorPaintMode::Invert,
+                },
+                |mode| match mode {
+                    terminal_profile::CursorDefaultPaintMode::Invert => {
+                        RecordingCursorPaintMode::Invert
+                    }
+                    terminal_profile::CursorDefaultPaintMode::Fill => {
+                        RecordingCursorPaintMode::Fill
+                    }
+                    terminal_profile::CursorDefaultPaintMode::Outline => {
+                        RecordingCursorPaintMode::Outline
+                    }
+                },
+            )
     } else {
         cursor_paint_mode
     };
     let resolved_text_mode = if matches!(cursor_text_mode, RecordingCursorTextMode::Auto) {
         profile_defaults
             .and_then(|defaults| defaults.text_mode)
-            .map(|mode| match mode {
-                terminal_profile::CursorDefaultTextMode::SwapFgBg => {
-                    RecordingCursorTextMode::SwapFgBg
-                }
-                terminal_profile::CursorDefaultTextMode::ForceContrast => {
-                    RecordingCursorTextMode::ForceContrast
-                }
-            })
-            .unwrap_or(match resolved_profile {
-                RecordingCursorProfile::Ghostty => RecordingCursorTextMode::SwapFgBg,
-                _ => RecordingCursorTextMode::ForceContrast,
-            })
+            .map_or(
+                match resolved_profile {
+                    RecordingCursorProfile::Ghostty => RecordingCursorTextMode::SwapFgBg,
+                    _ => RecordingCursorTextMode::ForceContrast,
+                },
+                |mode| match mode {
+                    terminal_profile::CursorDefaultTextMode::SwapFgBg => {
+                        RecordingCursorTextMode::SwapFgBg
+                    }
+                    terminal_profile::CursorDefaultTextMode::ForceContrast => {
+                        RecordingCursorTextMode::ForceContrast
+                    }
+                },
+            )
     } else {
         cursor_text_mode
     };
@@ -1924,13 +1927,13 @@ fn export_recording_gif(
                 }
                 DisplayTrackEvent::Activity { kind } => match kind {
                     bmux_ipc::DisplayActivityKind::Input => {
-                        last_input_activity_ns = Some(scaled_ns)
+                        last_input_activity_ns = Some(scaled_ns);
                     }
                     bmux_ipc::DisplayActivityKind::Output => {
-                        last_output_activity_ns = Some(scaled_ns)
+                        last_output_activity_ns = Some(scaled_ns);
                     }
                     bmux_ipc::DisplayActivityKind::Cursor => {
-                        last_cursor_activity_ns = Some(scaled_ns)
+                        last_cursor_activity_ns = Some(scaled_ns);
                     }
                 },
                 DisplayTrackEvent::StreamOpened { .. } | DisplayTrackEvent::StreamClosed => {}
@@ -2071,8 +2074,9 @@ fn export_recording_gif(
             let (cell_fg, cell_bg) = parser
                 .screen()
                 .cell(cursor_row, cursor_col)
-                .map(|cell| resolved_cell_colors(cell, &palette))
-                .unwrap_or(((255, 255, 255), (0, 0, 0)));
+                .map_or(((255, 255, 255), (0, 0, 0)), |cell| {
+                    resolved_cell_colors(cell, &palette)
+                });
             let cursor_color_rgb = cursor_options.color_override.unwrap_or(cell_fg);
             let (paint_mode_used, text_mode_used, paint_fallback_reason) = overlay_cursor_rgba(
                 &mut pixels,
@@ -2275,11 +2279,10 @@ impl ExportProfiler {
     fn new() -> Self {
         let enabled = std::env::var("BMUX_RECORDING_EXPORT_PROFILE")
             .ok()
-            .map(|value| {
+            .is_some_and(|value| {
                 let normalized = value.trim().to_ascii_lowercase();
                 matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
-            })
-            .unwrap_or(false);
+            });
         Self {
             enabled,
             started_at: Instant::now(),
@@ -2322,19 +2325,19 @@ impl ExportProfiler {
         }
     }
 
-    fn record_frame_considered(&mut self) {
+    const fn record_frame_considered(&mut self) {
         self.frames_considered = self.frames_considered.saturating_add(1);
     }
 
-    fn record_frame_emitted(&mut self) {
+    const fn record_frame_emitted(&mut self) {
         self.frames_emitted = self.frames_emitted.saturating_add(1);
     }
 
-    fn record_frame_skipped(&mut self) {
+    const fn record_frame_skipped(&mut self) {
         self.frames_skipped = self.frames_skipped.saturating_add(1);
     }
 
-    fn note_resvg_fallback(&mut self) {
+    const fn note_resvg_fallback(&mut self) {
         self.resvg_fallbacks = self.resvg_fallbacks.saturating_add(1);
     }
 
@@ -3686,14 +3689,14 @@ pub(super) fn load_recording_events(recording_id: &str) -> Result<Vec<RecordingE
         let manifest_bytes = std::fs::read(&manifest_path)
             .with_context(|| format!("failed reading manifest {}", manifest_path.display()))?;
         let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)?;
-        manifest["summary"]["segments"]
-            .as_array()
-            .map(|arr| {
+        manifest["summary"]["segments"].as_array().map_or_else(
+            || vec!["events_0.bin".to_string()],
+            |arr| {
                 arr.iter()
                     .filter_map(|v| v.as_str().map(String::from))
                     .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| vec!["events_0.bin".to_string()])
+            },
+        )
     } else {
         // Fallback: try legacy single-file format.
         vec!["events.bin".to_string()]
@@ -4172,9 +4175,8 @@ impl DisplayCaptureWriter {
         &mut self,
         cursor_state: Option<crate::runtime::attach::state::AttachCursorState>,
     ) -> Result<()> {
-        let (x, y, visible) = cursor_state
-            .map(|state| (state.x, state.y, state.visible))
-            .unwrap_or((0, 0, false));
+        let (x, y, visible) =
+            cursor_state.map_or((0, 0, false), |state| (state.x, state.y, state.visible));
         self.record(DisplayTrackEvent::CursorSnapshot {
             x,
             y,
@@ -4238,6 +4240,7 @@ fn display_track_path(recording_path: &Path, client_id: Uuid) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::wildcard_imports)]
     use super::*;
 
     fn stream_opened(

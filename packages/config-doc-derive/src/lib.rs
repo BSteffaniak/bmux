@@ -1,3 +1,6 @@
+#![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
+#![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
+#![allow(clippy::multiple_crate_versions)]
 //! Proc macros for generating configuration documentation schema.
 //!
 //! Provides two derive macros:
@@ -9,8 +12,7 @@
 //!   `config_doc_default_value()` methods using serde rename rules.
 
 use proc_macro::TokenStream;
-use proc_macro2::TokenStream as TokenStream2;
-use quote::{format_ident, quote};
+use quote::quote;
 use syn::{Attribute, Data, DeriveInput, Fields, Lit, Meta, parse_macro_input};
 
 // ── Serde rename_all support ────────────────────────────────────────────────
@@ -62,14 +64,12 @@ fn to_camel_case(s: &str, upper_first: bool) -> String {
 fn extract_doc_comment(attrs: &[Attribute]) -> String {
     let mut lines = Vec::new();
     for attr in attrs {
-        if attr.path().is_ident("doc") {
-            if let Meta::NameValue(nv) = &attr.meta {
-                if let syn::Expr::Lit(expr_lit) = &nv.value {
-                    if let Lit::Str(lit) = &expr_lit.lit {
-                        lines.push(lit.value().trim().to_string());
-                    }
-                }
-            }
+        if attr.path().is_ident("doc")
+            && let Meta::NameValue(nv) = &attr.meta
+            && let syn::Expr::Lit(expr_lit) = &nv.value
+            && let Lit::Str(lit) = &expr_lit.lit
+        {
+            lines.push(lit.value().trim().to_string());
         }
     }
     lines.join(" ")
@@ -87,14 +87,12 @@ fn extract_serde_rename_all(attrs: &[Attribute]) -> Option<String> {
             continue;
         };
         for meta in &nested {
-            if let Meta::NameValue(nv) = meta {
-                if nv.path.is_ident("rename_all") {
-                    if let syn::Expr::Lit(expr_lit) = &nv.value {
-                        if let Lit::Str(lit) = &expr_lit.lit {
-                            return Some(lit.value());
-                        }
-                    }
-                }
+            if let Meta::NameValue(nv) = meta
+                && nv.path.is_ident("rename_all")
+                && let syn::Expr::Lit(expr_lit) = &nv.value
+                && let Lit::Str(lit) = &expr_lit.lit
+            {
+                return Some(lit.value());
             }
         }
     }
@@ -113,14 +111,12 @@ fn extract_section_name(attrs: &[Attribute]) -> Option<String> {
             continue;
         };
         for meta in &nested {
-            if let Meta::NameValue(nv) = meta {
-                if nv.path.is_ident("section") {
-                    if let syn::Expr::Lit(expr_lit) = &nv.value {
-                        if let Lit::Str(lit) = &expr_lit.lit {
-                            return Some(lit.value());
-                        }
-                    }
-                }
+            if let Meta::NameValue(nv) = meta
+                && nv.path.is_ident("section")
+                && let syn::Expr::Lit(expr_lit) = &nv.value
+                && let Lit::Str(lit) = &expr_lit.lit
+            {
+                return Some(lit.value());
             }
         }
     }
@@ -140,22 +136,22 @@ fn extract_config_doc_values(attrs: &[Attribute]) -> Option<Vec<String>> {
             continue;
         };
         for meta in &nested {
-            if let Meta::List(list) = meta {
-                if list.path.is_ident("values") {
-                    let mut values = Vec::new();
-                    let Ok(inner) = list.parse_args_with(
-                        syn::punctuated::Punctuated::<Lit, syn::Token![,]>::parse_terminated,
-                    ) else {
-                        continue;
-                    };
-                    for lit in &inner {
-                        if let Lit::Str(s) = lit {
-                            values.push(s.value());
-                        }
+            if let Meta::List(list) = meta
+                && list.path.is_ident("values")
+            {
+                let mut values = Vec::new();
+                let Ok(inner) = list.parse_args_with(
+                    syn::punctuated::Punctuated::<Lit, syn::Token![,]>::parse_terminated,
+                ) else {
+                    continue;
+                };
+                for lit in &inner {
+                    if let Lit::Str(s) = lit {
+                        values.push(s.value());
                     }
-                    if !values.is_empty() {
-                        return Some(values);
-                    }
+                }
+                if !values.is_empty() {
+                    return Some(values);
                 }
             }
         }
@@ -224,7 +220,7 @@ fn is_enum_type(ty: &syn::Type) -> bool {
         && !s.starts_with("HashMap<")
 }
 
-/// Extract the type identifier for an enum type (to call ::config_doc_values()).
+/// Extract the type identifier for an enum type (to call `::config_doc_values()`).
 fn enum_type_ident(ty: &syn::Type) -> Option<proc_macro2::Ident> {
     if let syn::Type::Path(tp) = ty {
         tp.path.get_ident().cloned()
@@ -311,6 +307,7 @@ pub fn derive_config_doc_enum(input: TokenStream) -> TokenStream {
 ///
 /// **All public fields must have doc comments.** A compile error is emitted
 /// for any undocumented field.
+#[allow(clippy::too_many_lines)]
 #[proc_macro_derive(ConfigDoc, attributes(config_doc))]
 pub fn derive_config_doc(input: TokenStream) -> TokenStream {
     let input = parse_macro_input!(input as DeriveInput);
@@ -370,23 +367,26 @@ pub fn derive_config_doc(input: TokenStream) -> TokenStream {
 
         // Check for explicit #[config_doc(values("a", "b"))] on the field first,
         // then fall back to TypeName::config_doc_values() for local enums.
-        let enum_values_expr =
-            if let Some(explicit_values) = extract_config_doc_values(&field.attrs) {
+        let enum_values_expr = extract_config_doc_values(&field.attrs).map_or_else(
+            || {
+                if is_enum_type(&field.ty) {
+                    enum_type_ident(&field.ty).map_or_else(
+                        || quote! { None },
+                        |enum_ident| quote! { Some(#enum_ident::config_doc_values()) },
+                    )
+                } else {
+                    quote! { None }
+                }
+            },
+            |explicit_values| {
                 let num = explicit_values.len();
                 let lits: Vec<_> = explicit_values.iter().map(|v| quote!(#v)).collect();
                 quote! {{
                     static VALS: [&str; #num] = [#(#lits),*];
                     Some(&VALS[..])
                 }}
-            } else if is_enum_type(&field.ty) {
-                if let Some(enum_ident) = enum_type_ident(&field.ty) {
-                    quote! { Some(#enum_ident::config_doc_values()) }
-                } else {
-                    quote! { None }
-                }
-            } else {
-                quote! { None }
-            };
+            },
+        );
 
         field_doc_entries.push(quote! {
             bmux_config_doc::FieldDoc {
@@ -417,8 +417,6 @@ pub fn derive_config_doc(input: TokenStream) -> TokenStream {
             );
         });
     }
-
-    let num_fields = field_doc_entries.len();
 
     let expanded = quote! {
         impl bmux_config_doc::ConfigDocSchema for #name {

@@ -284,10 +284,10 @@ fn default_log_dir() -> PathBuf {
 }
 
 fn stable_fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325_u64;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in bytes {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     hash
 }
@@ -316,6 +316,7 @@ fn build_config_dir_candidates() -> Vec<PathBuf> {
                 candidates.push(xdg);
             }
         }
+        #[allow(clippy::needless_return)]
         return candidates;
     }
 
@@ -363,15 +364,18 @@ impl Default for ConfigPaths {
             PathBuf::from,
         );
 
-        let runtime_root = if let Some(path) = std::env::var_os("BMUX_RUNTIME_DIR") {
-            PathBuf::from(path)
-        } else if cfg!(unix) {
-            std::env::var("XDG_RUNTIME_DIR")
-                .map(PathBuf::from)
-                .map_or_else(|_| std::env::temp_dir().join("bmux"), |d| d.join("bmux"))
-        } else {
-            std::env::temp_dir().join("bmux")
-        };
+        let runtime_root = std::env::var_os("BMUX_RUNTIME_DIR").map_or_else(
+            || {
+                if cfg!(unix) {
+                    std::env::var("XDG_RUNTIME_DIR")
+                        .map(PathBuf::from)
+                        .map_or_else(|_| std::env::temp_dir().join("bmux"), |d| d.join("bmux"))
+                } else {
+                    std::env::temp_dir().join("bmux")
+                }
+            },
+            PathBuf::from,
+        );
         let runtime_dir = if runtime_name == "default" {
             runtime_root
         } else {

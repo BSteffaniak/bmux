@@ -1,4 +1,23 @@
-use super::*;
+use anyhow::{Context, Result};
+use bmux_cli_schema::{LogLevel, RecordingEventKindArg, RecordingProfileArg};
+use bmux_client::{BmuxClient, ClientError};
+use bmux_config::{BmuxConfig, ConfigPaths};
+use bmux_ipc::{RecordingEventKind, RecordingRollingStartOptions, SessionSummary};
+use bmux_server::BmuxServer;
+use std::process::{Command as ProcessCommand, Stdio};
+use tracing::{Level, warn};
+use uuid::Uuid;
+
+use super::{
+    ConnectionContext, ConnectionPolicyScope, EFFECTIVE_LOG_LEVEL, LOG_WRITER_GUARD,
+    SERVER_START_TIMEOUT, activate_loaded_plugins, append_runtime_arg, cleanup_stale_pid_file,
+    connect_with_context, deactivate_loaded_plugins, dispatch_loaded_plugin_event,
+    load_enabled_plugins, map_client_connect_error, plugin_event_bridge_loop, plugin_system_event,
+    recording, register_plugin_service_handlers, remove_server_pid_file, resolve_log_level,
+    run_server_stop, run_session_attach_with_client, scan_available_plugins, server_is_running,
+    tracing_level, try_kill_pid, validate_enabled_plugins, wait_for_server_running,
+    write_server_pid_file, write_server_runtime_metadata,
+};
 
 #[derive(Debug, Clone)]
 pub(super) struct DefaultAttachOptions {
@@ -229,12 +248,10 @@ pub(super) async fn run_server_start(
     } else {
         rolling_enabled_override.unwrap_or(config.recording.enabled)
     } && effective_rolling_settings.window_secs > 0;
-    if effective_rolling_enabled {
-        if effective_rolling_settings.event_kinds.is_empty() {
-            anyhow::bail!(
-                "rolling recording is enabled but no rolling event kinds are selected; enable rolling capture flags or pass --rolling-event-kind/--rolling-event-kind-all"
-            )
-        }
+    if effective_rolling_enabled && effective_rolling_settings.event_kinds.is_empty() {
+        anyhow::bail!(
+            "rolling recording is enabled but no rolling event kinds are selected; enable rolling capture flags or pass --rolling-event-kind/--rolling-event-kind-all"
+        )
     }
     let paths = ConfigPaths::default();
     let registry = scan_available_plugins(&config, &paths)?;
@@ -289,7 +306,7 @@ pub(super) async fn run_server_start(
         &paths,
         effective_rolling_enabled,
         effective_rolling_settings.window_secs,
-        effective_rolling_settings.event_kinds,
+        &effective_rolling_settings.event_kinds,
     );
     register_plugin_service_handlers(&server, &config, &paths, &registry)?;
     write_server_pid_file(std::process::id())?;
@@ -507,6 +524,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::wildcard_imports)]
     use crate::runtime::*;
     use bmux_cli_schema::Command;
     use bmux_client::ClientError;

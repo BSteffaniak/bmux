@@ -1,4 +1,30 @@
-use super::*;
+use anyhow::{Context, Result};
+use bmux_cli_schema::{
+    RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
+    RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode, RecordingEventKindArg,
+    RecordingExportFormat, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
+};
+use bmux_client::BmuxClient;
+use bmux_config::{
+    BmuxConfig, ConfigPaths, RecordingExportCursorBlinkMode, RecordingExportCursorMode,
+    RecordingExportCursorPaintMode, RecordingExportCursorProfile, RecordingExportCursorShape,
+    RecordingExportCursorTextMode,
+};
+use bmux_ipc::{RecordingEventEnvelope, RecordingEventKind, RecordingPayload, SessionSelector};
+use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
+use std::io::{self, IsTerminal, Write};
+use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tracing::warn;
+use uuid::Uuid;
+
+use super::{
+    ConnectionContext, VERIFY_SERVER_START_TIMEOUT_DEFAULT, bundled_plugin_roots,
+    map_cli_client_error, parse_pid_content, recording, registered_plugin_entry_exists,
+    scan_available_plugins, try_kill_pid,
+};
 
 pub(super) async fn run_recording_start(
     session_id: Option<&str>,
@@ -293,7 +319,7 @@ impl<'a> ReplayTimeline<'a> {
         }
     }
 
-    fn is_finished(&self) -> bool {
+    const fn is_finished(&self) -> bool {
         self.next_index >= self.events.len()
     }
 
@@ -439,11 +465,11 @@ fn normalize_replay_speed(speed: f64) -> f64 {
     speed.clamp(REPLAY_SPEED_MIN, REPLAY_SPEED_MAX)
 }
 
-fn replay_action_from_key_event(key: KeyEvent) -> Option<InteractiveReplayAction> {
+const fn replay_action_from_key_event(key: KeyEvent) -> Option<InteractiveReplayAction> {
     replay_action_from_key(key.code, key.modifiers, key.kind)
 }
 
-fn replay_action_from_key(
+const fn replay_action_from_key(
     code: KeyCode,
     modifiers: KeyModifiers,
     kind: KeyEventKind,
@@ -452,9 +478,7 @@ fn replay_action_from_key(
         return None;
     }
 
-    if modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(code, KeyCode::Char('c') | KeyCode::Char('d'))
-    {
+    if modifiers.contains(KeyModifiers::CONTROL) && matches!(code, KeyCode::Char('c' | 'd')) {
         return Some(InteractiveReplayAction::Quit);
     }
 
@@ -871,10 +895,10 @@ pub(super) fn extract_viewport_from_events(
             if request_data.is_empty() {
                 continue;
             }
-            if let Ok(request) = bmux_ipc::decode::<bmux_ipc::Request>(request_data) {
-                if let bmux_ipc::Request::AttachSetViewport { cols, rows, .. } = request {
-                    return Some((cols, rows));
-                }
+            if let Ok(request) = bmux_ipc::decode::<bmux_ipc::Request>(request_data)
+                && let bmux_ipc::Request::AttachSetViewport { cols, rows, .. } = request
+            {
+                return Some((cols, rows));
             }
         }
     }
@@ -892,7 +916,7 @@ pub(super) fn render_output_via_vt100(output: &[u8], cols: u16, rows: u16) -> St
         lines.push(screen.contents_between(row, 0, row, cols));
     }
     // Trim trailing empty lines.
-    while lines.last().map_or(false, |l| l.trim().is_empty()) {
+    while lines.last().is_some_and(|l| l.trim().is_empty()) {
         lines.pop();
     }
     lines.join("\n")
@@ -910,7 +934,7 @@ pub(super) fn normalize_screen_text(text: &str) -> String {
             let mut chars = trimmed.chars().peekable();
             while let Some(ch) = chars.next() {
                 if ch.is_ascii_digit() {
-                    while chars.peek().map_or(false, |c| c.is_ascii_digit()) {
+                    while chars.peek().is_some_and(char::is_ascii_digit) {
                         chars.next();
                     }
                     result.push_str("<N>");
@@ -1542,6 +1566,7 @@ pub(super) fn load_recording_events(recording_id: &str) -> Result<Vec<RecordingE
 
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::wildcard_imports)]
     use super::*;
 
     fn make_event(

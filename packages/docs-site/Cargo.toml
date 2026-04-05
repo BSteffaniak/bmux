@@ -40,7 +40,8 @@ serde_json = { workspace = true }
 switchy = { workspace = true, features = ["async", "async-tokio"] }
 
 [features]
-default = ["actix", "html", "vanilla-js", "assets", "static-routes"]
+default          = ["actix", "html", "vanilla-js", "assets", "static-routes"]
+fail-on-warnings = []
 
 actix = ["hyperchad/renderer-html-actix"]
 assets = ["hyperchad/renderer-assets"]

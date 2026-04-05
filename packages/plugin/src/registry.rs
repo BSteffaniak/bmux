@@ -149,7 +149,6 @@ impl PluginRegistry {
         Ok(())
     }
 
-    #[must_use]
     pub fn iter(&self) -> impl Iterator<Item = &RegisteredPlugin> {
         self.plugins.values()
     }
@@ -344,6 +343,12 @@ impl PluginRegistry {
         Ok(providers)
     }
 
+    /// Validate a plugin against host metadata and capabilities.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plugin is incompatible with the host or when
+    /// its native entry file is missing.
     pub fn validate_registered_plugin(
         registered_plugin: &RegisteredPlugin,
         host: &HostMetadata,
@@ -356,13 +361,12 @@ impl PluginRegistry {
                 .manifest_path
                 .parent()
                 .unwrap_or_else(|| Path::new(".")),
-        ) {
-            if !entry_path.exists() {
-                return Err(PluginError::MissingEntryFile {
-                    plugin_id: registered_plugin.declaration.id.as_str().to_string(),
-                    path: entry_path,
-                });
-            }
+        ) && !entry_path.exists()
+        {
+            return Err(PluginError::MissingEntryFile {
+                plugin_id: registered_plugin.declaration.id.as_str().to_string(),
+                path: entry_path,
+            });
         }
 
         Ok(())
@@ -372,6 +376,11 @@ impl PluginRegistry {
     /// capabilities.  This is identical to [`Self::validate_registered_plugin`]
     /// except it does **not** check for an entry file on disk (since the plugin
     /// is compiled into the binary).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the plugin is incompatible with the host or
+    /// a required capability is missing.
     pub fn validate_static_plugin(
         registered_plugin: &RegisteredPlugin,
         host: &HostMetadata,
@@ -413,6 +422,12 @@ impl PluginRegistry {
         Ok(())
     }
 
+    /// Build a map of service providers for the given plugins.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when dependency resolution fails for any of the
+    /// requested plugins.
     pub fn service_providers_for(
         &self,
         plugin_ids: &[String],

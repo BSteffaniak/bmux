@@ -1,4 +1,20 @@
-use super::*;
+use anyhow::{Context, Result};
+use bmux_client::BmuxClient;
+use bmux_config::{BmuxConfig, ConfigPaths};
+use bmux_ipc::InvokeServiceKind;
+use bmux_plugin::PluginRegistry;
+use bmux_plugin_sdk::{
+    HostConnectionInfo, HostScope, PluginCommandEffect, RegisteredService, ServiceKind,
+    ServiceRequest,
+};
+use bmux_server::{BmuxServer, ServiceInvokeContext};
+use std::cell::RefCell;
+use std::sync::OnceLock;
+use tracing::Level;
+
+use super::{
+    effective_enabled_plugins, load_plugin, plugin_host_metadata, resolve_plugin_search_paths,
+};
 
 thread_local! {
     static SERVICE_KERNEL_CONTEXT: RefCell<Option<ServiceInvokeContext>> = const { RefCell::new(None) };

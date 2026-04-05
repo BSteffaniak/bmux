@@ -1,5 +1,5 @@
-use super::*;
 use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(super) struct DetectedTerminalProfile {
@@ -411,8 +411,8 @@ fn trim_config_value(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::wildcard_imports)]
     use super::*;
-
     #[test]
     fn parse_ghostty_font_families_handles_repeat_and_reset() {
         let parsed = parse_ghostty_config_profile(

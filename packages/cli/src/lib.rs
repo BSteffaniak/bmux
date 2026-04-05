@@ -11,7 +11,7 @@ pub use bmux_event::{Event, EventDispatcher, ModalSystem, Mode};
 pub use bmux_session::{SessionId, SessionInfo, SessionManager};
 pub use bmux_terminal::{TerminalInstance, TerminalManager};
 
-mod input;
+pub mod input;
 
 /// Playbook system for headless scripted bmux execution.
 pub mod playbook;

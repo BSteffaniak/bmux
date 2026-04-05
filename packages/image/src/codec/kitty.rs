@@ -35,10 +35,7 @@ pub fn parse_command(body: &[u8], cursor_pos: ImagePosition) -> Option<KittyComm
         }
     }
 
-    let action = params
-        .get("a")
-        .map(|s| s.as_bytes().first().copied())
-        .flatten();
+    let action = params.get("a").and_then(|s| s.as_bytes().first().copied());
 
     match action {
         // Transmit (default if no action specified, or a=t, a=T)
@@ -220,7 +217,7 @@ pub fn base64_decode(input: &[u8]) -> Vec<u8> {
 /// Simple base64 encoder (standard alphabet with padding).
 pub fn base64_encode(input: &[u8]) -> String {
     const CHARS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity((input.len() + 2) / 3 * 4);
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
         let b0 = chunk[0] as u32;
         let b1 = chunk.get(1).copied().unwrap_or(0) as u32;

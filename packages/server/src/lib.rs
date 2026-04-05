@@ -111,6 +111,7 @@ struct ServerState {
     service_resolver: Mutex<Option<Arc<ServiceResolverHandler>>>,
     /// Resolved image payload compression codec from config.
     /// Stored here so `handle_connection` can pass it to `delta.to_ipc()`.
+    #[cfg(feature = "image-registry")]
     payload_codec: Option<Arc<dyn bmux_ipc::compression::CompressionCodec>>,
 }
 
@@ -121,7 +122,7 @@ pub struct RollingRecordingSettings {
 }
 
 impl RollingRecordingSettings {
-    fn is_available(&self) -> bool {
+    const fn is_available(&self) -> bool {
         self.window_secs > 0 && !self.event_kinds.is_empty()
     }
 
@@ -193,9 +194,14 @@ impl ServiceInvokeContext {
         .await?;
         selection.0 = selected_session;
         selection.1 = attached_stream_session;
+        drop(selection);
         Ok(response)
     }
 
+    /// Execute a raw request payload.
+    ///
+    /// # Errors
+    /// Returns an error if decoding, handling, or encoding fails.
     pub async fn execute_raw(&self, request_payload: Vec<u8>) -> Result<Vec<u8>> {
         let request: Request =
             decode(&request_payload).context("failed decoding kernel bridge request payload")?;
@@ -343,6 +349,7 @@ impl AttachTokenManager {
 
         let attach_token = Uuid::new_v4();
         let expires_at = Instant::now() + self.ttl;
+        #[allow(clippy::cast_possible_truncation)]
         let expires_at_epoch_ms = epoch_millis_now().saturating_add(self.ttl.as_millis() as u64);
         self.tokens.insert(
             attach_token,
@@ -396,6 +403,7 @@ impl AttachTokenManager {
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn epoch_millis_now() -> u64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -409,6 +417,7 @@ struct FollowEntry {
     global: bool,
 }
 
+#[allow(clippy::struct_field_names)]
 #[derive(Debug, Clone, Copy)]
 struct FollowTargetUpdate {
     follower_client_id: ClientId,
@@ -438,6 +447,7 @@ impl FollowState {
         self.selected_sessions.remove(&client_id);
         self.follows.remove(&client_id);
 
+        #[allow(clippy::needless_collect)]
         let impacted_followers = self
             .follows
             .iter()
@@ -796,7 +806,7 @@ impl ContextState {
         }
 
         if let Some(client_id) = preferred_client
-            && self.selected_by_client.get(&client_id).is_none()
+            && !self.selected_by_client.contains_key(&client_id)
             && let Some(next_id) = replacement
         {
             self.selected_by_client.insert(client_id, next_id);
@@ -870,11 +880,11 @@ fn create_session_runtime(state: &Arc<ServerState>, name: Option<String>) -> Res
         .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
     if let Err(error) = runtime_manager.start_runtime(session_id) {
         drop(runtime_manager);
-        let mut rollback_manager = state
+        let _ = state
             .session_manager
             .lock()
-            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-        let _ = rollback_manager.remove_session(&session_id);
+            .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?
+            .remove_session(&session_id);
         anyhow::bail!("failed creating session runtime: {error:#}");
     }
     drop(runtime_manager);
@@ -903,6 +913,8 @@ fn resolve_server_shell(config: &BmuxConfig) -> String {
 }
 
 fn resolve_server_pane_term(config: &BmuxConfig) -> String {
+    const FALLBACKS: &[&str] = &["xterm-256color", "screen-256color"];
+
     let configured = config.behavior.pane_term.trim();
     let candidate = if configured.is_empty() {
         "bmux-256color"
@@ -915,7 +927,6 @@ fn resolve_server_pane_term(config: &BmuxConfig) -> String {
     }
 
     // Configured TERM not found in terminfo; try fallback chain.
-    const FALLBACKS: &[&str] = &["xterm-256color", "screen-256color"];
     for fallback in FALLBACKS {
         if *fallback != candidate && check_terminfo_available(fallback) {
             warn!(
@@ -957,7 +968,10 @@ async fn shutdown_pane_handle(mut pane: PaneRuntimeHandle) {
         let _ = stop_tx.send(());
     }
 
-    if let Ok(_) = tokio::time::timeout(Duration::from_millis(250), &mut pane.task).await {
+    if tokio::time::timeout(Duration::from_millis(250), &mut pane.task)
+        .await
+        .is_ok()
+    {
     } else {
         pane.task.abort();
         let _ = pane.task.await;
@@ -973,7 +987,7 @@ fn push_pane_runtime_notice(
     }
 }
 
-fn format_pane_exit_reason(status: portable_pty::ExitStatus) -> String {
+fn format_pane_exit_reason(status: &portable_pty::ExitStatus) -> String {
     if let Some(signal) = status.signal() {
         return format!("process terminated by signal {signal}");
     }
@@ -1011,6 +1025,7 @@ struct AttachViewport {
     status_bottom_inset: u16,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FloatingSurfaceRuntime {
     id: Uuid,
@@ -1071,6 +1086,7 @@ enum MouseTrackerParseState {
     Csi,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
 struct PaneMouseProtocolTracker {
     parse_state: MouseTrackerParseState,
@@ -1143,7 +1159,7 @@ impl PaneMouseProtocolTracker {
         }
     }
 
-    fn current_protocol(&self) -> AttachMouseProtocolState {
+    const fn current_protocol(&self) -> AttachMouseProtocolState {
         let mode = if self.any_motion_mode {
             AttachMouseProtocolMode::AnyMotion
         } else if self.button_motion_mode {
@@ -1207,7 +1223,7 @@ impl PaneMouseProtocolTracker {
         }
     }
 
-    fn apply_private_mode(&mut self, mode: u16, enable: bool) {
+    const fn apply_private_mode(&mut self, mode: u16, enable: bool) {
         match mode {
             9 => self.x10_mode = enable,
             1000 => self.press_release_mode = enable,
@@ -1321,9 +1337,10 @@ impl PaneCursorTracker {
     /// Returns the number of lines that scrolled since last drain.
     #[cfg(feature = "image-registry")]
     fn drain_scroll_delta(&mut self) -> u16 {
+        #[allow(clippy::cast_possible_truncation)]
         let scrollback = self.parser.screen().scrollback() as u16;
         if scrollback > 0 {
-            self.total_scrollback += scrollback as u64;
+            self.total_scrollback += u64::from(scrollback);
             // Reset scrollback to 0 so we can detect the next scroll.
             self.parser.screen_mut().set_scrollback(0);
             scrollback
@@ -1417,10 +1434,12 @@ fn image_event_to_recording_payload(event: &bmux_image::ImageEvent) -> Recording
 fn chunk_contains_screen_clear(chunk: &[u8]) -> bool {
     // Fast scan for the byte patterns.
     for window in chunk.windows(4) {
-        if window[0] == 0x1b && window[1] == b'[' && window[3] == b'J' {
-            if window[2] == b'2' || window[2] == b'3' {
-                return true;
-            }
+        if window[0] == 0x1b
+            && window[1] == b'['
+            && window[3] == b'J'
+            && (window[2] == b'2' || window[2] == b'3')
+        {
+            return true;
         }
     }
     false
@@ -1595,14 +1614,16 @@ impl OutputFanoutBuffer {
         let end = self.end_offset();
         let cursor = self.cursors.entry(client_id).or_insert(end);
 
-        let mut stream_gap = false;
-        if *cursor < self.start_offset {
+        let stream_gap = if *cursor < self.start_offset {
             *cursor = self.start_offset;
-            stream_gap = true;
-        }
+            true
+        } else {
+            false
+        };
 
         let stream_start = *cursor;
 
+        #[allow(clippy::cast_possible_truncation)]
         let available = end.saturating_sub(*cursor) as usize;
         if available == 0 {
             return OutputRead {
@@ -1614,6 +1635,7 @@ impl OutputFanoutBuffer {
         }
 
         let to_read = available.min(limit);
+        #[allow(clippy::cast_possible_truncation)]
         let start_index = (*cursor - self.start_offset) as usize;
         let bytes = self
             .data
@@ -1737,7 +1759,7 @@ impl PaneLayoutNode {
                 first.replace_leaf_with_split(target, direction, ratio, new_pane_id)
                     || second.replace_leaf_with_split(target, direction, ratio, new_pane_id)
             }
-            _ => false,
+            Self::Leaf { .. } => false,
         }
     }
 
@@ -1823,6 +1845,7 @@ fn ipc_layout_from_runtime(node: &PaneLayoutNode) -> IpcPaneLayoutNode {
             second,
         } => {
             let percent = (ratio * 100.0).round();
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             let ratio_percent = percent.clamp(10.0, 90.0) as u8;
             IpcPaneLayoutNode::Split {
                 direction: *direction,
@@ -1874,6 +1897,7 @@ fn validate_runtime_layout_matches_panes(
     Ok(())
 }
 
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
 fn split_layout_rect(rect: LayoutRect, ratio: f32, vertical: bool) -> (LayoutRect, LayoutRect) {
     let ratio = ratio.clamp(0.1, 0.9);
     if vertical {
@@ -1976,51 +2000,51 @@ fn build_attach_scene(
     let scene_root = scene_root_from_viewport(viewport);
 
     // When a pane is zoomed, produce a single-pane scene that fills the viewport.
-    if let Some(zoomed_id) = runtime.zoomed_pane_id {
-        if runtime.panes.contains_key(&zoomed_id) {
-            let zoomed_surface = AttachSurface {
-                id: zoomed_id,
-                kind: AttachSurfaceKind::Pane,
-                layer: AttachLayer::Pane,
-                z: 0,
-                rect: attach_rect_from_layout_rect(scene_root),
-                opaque: true,
-                visible: true,
-                accepts_input: true,
-                cursor_owner: true,
-                pane_id: Some(zoomed_id),
-            };
+    if let Some(zoomed_id) = runtime.zoomed_pane_id
+        && runtime.panes.contains_key(&zoomed_id)
+    {
+        let zoomed_surface = AttachSurface {
+            id: zoomed_id,
+            kind: AttachSurfaceKind::Pane,
+            layer: AttachLayer::Pane,
+            z: 0,
+            rect: attach_rect_from_layout_rect(scene_root),
+            opaque: true,
+            visible: true,
+            accepts_input: true,
+            cursor_owner: true,
+            pane_id: Some(zoomed_id),
+        };
 
-            let mut surfaces = vec![zoomed_surface];
+        let mut surfaces = vec![zoomed_surface];
 
-            // Floating surfaces still render on top of the zoomed pane.
-            surfaces.extend(
-                runtime
-                    .floating_surfaces
-                    .iter()
-                    .filter(|surface| runtime.panes.contains_key(&surface.pane_id))
-                    .map(|surface| AttachSurface {
-                        id: surface.id,
-                        kind: AttachSurfaceKind::FloatingPane,
-                        layer: AttachLayer::FloatingPane,
-                        z: surface.z,
-                        rect: attach_rect_from_layout_rect(surface.rect),
-                        opaque: surface.opaque,
-                        visible: surface.visible,
-                        accepts_input: surface.accepts_input,
-                        cursor_owner: surface.cursor_owner,
-                        pane_id: Some(surface.pane_id),
-                    }),
-            );
+        // Floating surfaces still render on top of the zoomed pane.
+        surfaces.extend(
+            runtime
+                .floating_surfaces
+                .iter()
+                .filter(|surface| runtime.panes.contains_key(&surface.pane_id))
+                .map(|surface| AttachSurface {
+                    id: surface.id,
+                    kind: AttachSurfaceKind::FloatingPane,
+                    layer: AttachLayer::FloatingPane,
+                    z: surface.z,
+                    rect: attach_rect_from_layout_rect(surface.rect),
+                    opaque: surface.opaque,
+                    visible: surface.visible,
+                    accepts_input: surface.accepts_input,
+                    cursor_owner: surface.cursor_owner,
+                    pane_id: Some(surface.pane_id),
+                }),
+        );
 
-            return AttachScene {
-                session_id: session_id.0,
-                focus: AttachFocusTarget::Pane { pane_id: zoomed_id },
-                surfaces,
-            };
-        }
-        // Zoomed pane was removed; fall through to normal rendering.
+        return AttachScene {
+            session_id: session_id.0,
+            focus: AttachFocusTarget::Pane { pane_id: zoomed_id },
+            surfaces,
+        };
     }
+    // Zoomed pane was removed; fall through to normal rendering.
 
     let mut rects = BTreeMap::new();
     collect_layout_rects(&runtime.layout_root, scene_root, &mut rects);
@@ -2036,6 +2060,7 @@ fn build_attach_scene(
                 id: pane_id,
                 kind: AttachSurfaceKind::Pane,
                 layer: AttachLayer::Pane,
+                #[allow(clippy::cast_possible_truncation, clippy::cast_possible_wrap)]
                 z: index as i32,
                 rect: attach_rect_from_layout_rect(rect),
                 opaque: true,
@@ -2082,7 +2107,7 @@ fn pane_pty_size(layout_rect: LayoutRect) -> (u16, u16) {
 }
 
 fn resize_session_ptys(
-    runtime: &mut SessionRuntimeHandle,
+    runtime: &SessionRuntimeHandle,
     cols: u16,
     rows: u16,
     status_top_inset: u16,
@@ -2099,11 +2124,11 @@ fn resize_session_ptys(
 
     // When zoomed, only resize the zoomed pane to fill the viewport.
     if let Some(zoomed_id) = runtime.zoomed_pane_id {
-        if let Some(pane) = runtime.panes.get(&zoomed_id) {
-            if !pane.exited.load(Ordering::SeqCst) {
-                let (zoom_rows, zoom_cols) = pane_pty_size(root);
-                pane.resize_pty(zoom_rows, zoom_cols);
-            }
+        if let Some(pane) = runtime.panes.get(&zoomed_id)
+            && !pane.exited.load(Ordering::SeqCst)
+        {
+            let (zoom_rows, zoom_cols) = pane_pty_size(root);
+            pane.resize_pty(zoom_rows, zoom_cols);
         }
         return;
     }
@@ -2177,7 +2202,7 @@ fn runtime_layout_from_snapshot(node: &PaneLayoutNodeSnapshotV2) -> PaneLayoutNo
 }
 
 impl SessionRuntimeManager {
-    fn new(
+    const fn new(
         shell: String,
         pane_term: String,
         protocol_profile: ProtocolProfile,
@@ -2209,7 +2234,7 @@ impl SessionRuntimeManager {
             name: Some("pane-1".to_string()),
             shell: self.shell.clone(),
         };
-        let first_pane = self.spawn_pane_runtime(session_id, pane_meta)?;
+        let first_pane = self.spawn_pane_runtime(session_id, pane_meta);
         let mut panes = BTreeMap::new();
         panes.insert(first_pane_id, first_pane);
 
@@ -2234,7 +2259,7 @@ impl SessionRuntimeManager {
     fn restore_runtime(
         &mut self,
         session_id: SessionId,
-        panes: Vec<PaneRuntimeMeta>,
+        panes: &[PaneRuntimeMeta],
         layout_root: Option<PaneLayoutNode>,
         focused_pane_id: Uuid,
         floating_surfaces: Vec<FloatingSurfaceRuntime>,
@@ -2251,13 +2276,13 @@ impl SessionRuntimeManager {
         }
 
         let mut runtime_panes = BTreeMap::new();
-        for pane_meta in &panes {
-            let pane = self.spawn_pane_runtime(session_id, pane_meta.clone())?;
+        for pane_meta in panes {
+            let pane = self.spawn_pane_runtime(session_id, pane_meta.clone());
             runtime_panes.insert(pane_meta.id, pane);
         }
 
         let runtime_layout_root = layout_root
-            .unwrap_or_else(|| layout_from_panes(&panes).expect("restored runtime has panes"));
+            .unwrap_or_else(|| layout_from_panes(panes).expect("restored runtime has panes"));
         validate_runtime_layout_matches_panes(&runtime_layout_root, &runtime_panes)?;
 
         self.runtimes.insert(
@@ -2277,11 +2302,12 @@ impl SessionRuntimeManager {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn spawn_pane_runtime(
         &self,
         session_id: SessionId,
         pane_meta: PaneRuntimeMeta,
-    ) -> Result<PaneRuntimeHandle> {
+    ) -> PaneRuntimeHandle {
         let (stop_tx, mut stop_rx) = oneshot::channel();
         let (input_tx, mut input_rx) = mpsc::unbounded_channel::<PaneRuntimeCommand>();
         let output_buffer = Arc::new(std::sync::Mutex::new(OutputFanoutBuffer::new(
@@ -2319,6 +2345,7 @@ impl SessionRuntimeManager {
                 .behavior
                 .images;
             Arc::new(std::sync::Mutex::new(if img_config.enabled {
+                #[allow(clippy::cast_possible_truncation)]
                 bmux_image::ImageRegistry::new(
                     img_config.max_images_per_pane as usize,
                     img_config.max_image_bytes as usize,
@@ -2341,14 +2368,12 @@ impl SessionRuntimeManager {
 
         let task = tokio::spawn(async move {
             let pty_system = native_pty_system();
-            let pty_pair = if let Ok(pair) = pty_system.openpty(PtySize {
+            let Ok(pty_pair) = pty_system.openpty(PtySize {
                 rows: 24,
                 cols: 80,
                 pixel_width: 0,
                 pixel_height: 0,
-            }) {
-                pair
-            } else {
+            }) else {
                 if let Ok(mut reason) = exit_reason_for_task.lock() {
                     *reason = Some("failed to allocate PTY".to_string());
                 }
@@ -2362,9 +2387,7 @@ impl SessionRuntimeManager {
 
             let mut command = CommandBuilder::new(&shell);
             command.env("TERM", &pane_term);
-            let mut child = if let Ok(child) = pty_pair.slave.spawn_command(command) {
-                child
-            } else {
+            let Ok(mut child) = pty_pair.slave.spawn_command(command) else {
                 if let Ok(mut reason) = exit_reason_for_task.lock() {
                     *reason = Some(format!("failed to spawn shell '{shell}'"));
                 }
@@ -2385,9 +2408,7 @@ impl SessionRuntimeManager {
 
             let master = pty_pair.master;
 
-            let mut reader = if let Ok(reader) = master.try_clone_reader() {
-                reader
-            } else {
+            let Ok(mut reader) = master.try_clone_reader() else {
                 if let Ok(mut reason) = exit_reason_for_task.lock() {
                     *reason = Some("failed to open PTY reader".to_string());
                 }
@@ -2399,9 +2420,7 @@ impl SessionRuntimeManager {
                 exited_for_task.store(true, Ordering::SeqCst);
                 return;
             };
-            let writer = if let Ok(writer) = master.take_writer() {
-                writer
-            } else {
+            let Ok(writer) = master.take_writer() else {
                 if let Ok(mut reason) = exit_reason_for_task.lock() {
                     *reason = Some("failed to open PTY writer".to_string());
                 }
@@ -2428,7 +2447,7 @@ impl SessionRuntimeManager {
                         && reason.is_none()
                     {
                         *reason = Some(match wait_result {
-                            Ok(status) => format_pane_exit_reason(status),
+                            Ok(status) => format_pane_exit_reason(&status),
                             Err(error) => format!("process wait failed: {error}"),
                         });
                     }
@@ -2467,7 +2486,7 @@ impl SessionRuntimeManager {
 
                     loop {
                         match reader.read(&mut buffer) {
-                            Ok(0) => break,
+                            Ok(0) | Err(_) => break,
                             Ok(bytes_read) => {
                                 let chunk = &buffer[..bytes_read];
                                 if let Ok((rows, cols)) =
@@ -2685,7 +2704,6 @@ impl SessionRuntimeManager {
                                     }
                                 }
                             }
-                            Err(_) => break,
                         }
                     }
                 })
@@ -2736,7 +2754,7 @@ impl SessionRuntimeManager {
             exited_for_task.store(true, Ordering::SeqCst);
         });
 
-        Ok(PaneRuntimeHandle {
+        PaneRuntimeHandle {
             meta: pane_meta,
             process_group_id,
             exit_reason,
@@ -2755,7 +2773,7 @@ impl SessionRuntimeManager {
             cell_pixel_size,
             #[cfg(feature = "image-registry")]
             image_dirty,
-        })
+        }
     }
 
     fn split_pane(
@@ -2774,7 +2792,7 @@ impl SessionRuntimeManager {
                 .get_mut(&session_id)
                 .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
             let target_pane_id =
-                resolve_pane_id_from_selector(session, target.unwrap_or(PaneSelector::Active))
+                resolve_pane_id_from_selector(session, &target.unwrap_or(PaneSelector::Active))
                     .ok_or_else(|| anyhow::anyhow!("target pane not found"))?;
             let focused = session
                 .panes
@@ -2798,7 +2816,7 @@ impl SessionRuntimeManager {
             name: next_pane_name,
             shell,
         };
-        let handle = self.spawn_pane_runtime(session_id, pane_meta)?;
+        let handle = self.spawn_pane_runtime(session_id, pane_meta);
         for client_id in client_ids {
             if let Ok(mut output) = handle.output_buffer.lock() {
                 output.register_client_at_tail(client_id);
@@ -2857,7 +2875,7 @@ impl SessionRuntimeManager {
         Ok(self.runtimes[&session_id].focused_pane_id)
     }
 
-    fn focus_pane_target(&mut self, session_id: SessionId, target: PaneSelector) -> Result<Uuid> {
+    fn focus_pane_target(&mut self, session_id: SessionId, target: &PaneSelector) -> Result<Uuid> {
         let session = self
             .runtimes
             .get_mut(&session_id)
@@ -2889,7 +2907,7 @@ impl SessionRuntimeManager {
                 .get_mut(&session_id)
                 .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
             let pane_id =
-                resolve_pane_id_from_selector(session, target.unwrap_or(PaneSelector::Active))
+                resolve_pane_id_from_selector(session, &target.unwrap_or(PaneSelector::Active))
                     .ok_or_else(|| anyhow::anyhow!("target pane not found"))?;
             (pane_id, session.panes.len() == 1)
         };
@@ -2935,7 +2953,7 @@ impl SessionRuntimeManager {
                 .get(&session_id)
                 .ok_or_else(|| anyhow::anyhow!("runtime not found for session {}", session_id.0))?;
             let pane_id =
-                resolve_pane_id_from_selector(session, target.unwrap_or(PaneSelector::Active))
+                resolve_pane_id_from_selector(session, &target.unwrap_or(PaneSelector::Active))
                     .ok_or_else(|| anyhow::anyhow!("target pane not found"))?;
             let pane = session
                 .panes
@@ -2962,7 +2980,7 @@ impl SessionRuntimeManager {
             shutdown_pane_handle(old_pane).await;
         });
 
-        let new_pane = self.spawn_pane_runtime(session_id, pane_meta.clone())?;
+        let new_pane = self.spawn_pane_runtime(session_id, pane_meta.clone());
         let client_ids = {
             let session = self
                 .runtimes
@@ -3002,7 +3020,7 @@ impl SessionRuntimeManager {
         // Auto-unzoom on layout mutation.
         session.zoomed_pane_id = None;
         let pane_id =
-            resolve_pane_id_from_selector(session, target.unwrap_or(PaneSelector::Active))
+            resolve_pane_id_from_selector(session, &target.unwrap_or(PaneSelector::Active))
                 .ok_or_else(|| anyhow::anyhow!("target pane not found"))?;
         let step = f32::from(delta) * 0.05;
         let _ = session.layout_root.adjust_focused_ratio(pane_id, step);
@@ -3033,6 +3051,7 @@ impl SessionRuntimeManager {
         }
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn list_panes(&self, session_id: SessionId) -> Result<Vec<PaneSummary>> {
         let session = self
             .runtimes
@@ -3057,6 +3076,7 @@ impl SessionRuntimeManager {
         Ok(panes)
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn attach_layout_state(
         &self,
         session_id: SessionId,
@@ -3095,6 +3115,7 @@ impl SessionRuntimeManager {
         })
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn attach_snapshot_state(
         &self,
         session_id: SessionId,
@@ -3290,6 +3311,7 @@ impl SessionRuntimeManager {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn set_attach_viewport(
         &mut self,
         session_id: SessionId,
@@ -3465,16 +3487,16 @@ impl SessionRuntimeManager {
 
 fn resolve_pane_id_from_selector(
     runtime: &SessionRuntimeHandle,
-    selector: PaneSelector,
+    selector: &PaneSelector,
 ) -> Option<Uuid> {
     match selector {
         PaneSelector::Active => runtime
             .panes
             .contains_key(&runtime.focused_pane_id)
             .then_some(runtime.focused_pane_id),
-        PaneSelector::ById(id) => runtime.panes.contains_key(&id).then_some(id),
+        PaneSelector::ById(id) => runtime.panes.contains_key(id).then_some(*id),
         PaneSelector::ByIndex(index) => {
-            if index == 0 {
+            if *index == 0 {
                 return None;
             }
             let mut pane_ids = Vec::new();
@@ -3502,6 +3524,7 @@ fn pane_state_reason_for_handle(pane: &PaneRuntimeHandle) -> Option<String> {
 }
 
 impl BmuxServer {
+    #[allow(clippy::too_many_arguments)]
     fn new_with_snapshot(
         endpoint: IpcEndpoint,
         snapshot_manager: Option<SnapshotManager>,
@@ -3512,10 +3535,8 @@ impl BmuxServer {
         rolling_recording_auto_start: bool,
         rolling_recording_defaults: RollingRecordingSettings,
     ) -> Self {
-        let snapshot_runtime = match snapshot_manager {
-            Some(manager) => SnapshotRuntime::with_manager(manager),
-            None => SnapshotRuntime::disabled(),
-        };
+        let snapshot_runtime =
+            snapshot_manager.map_or_else(SnapshotRuntime::disabled, SnapshotRuntime::with_manager);
 
         let config = BmuxConfig::load().unwrap_or_default();
         let shell = resolve_server_shell(&config);
@@ -3523,6 +3544,7 @@ impl BmuxServer {
         let protocol_profile = protocol_profile_for_term(&pane_term);
 
         // Resolve image payload compression codec from config.
+        #[cfg(feature = "image-registry")]
         let payload_codec: Option<Arc<dyn bmux_ipc::compression::CompressionCodec>> =
             if config.behavior.compression.enabled {
                 resolve_payload_codec_from_config(&config.behavior.compression)
@@ -3581,6 +3603,7 @@ impl BmuxServer {
                 pane_exit_rx: AsyncMutex::new(pane_exit_rx),
                 service_registry: Mutex::new(ServiceRegistry::default()),
                 service_resolver: Mutex::new(None),
+                #[cfg(feature = "image-registry")]
                 payload_codec,
             }),
             shutdown_tx,
@@ -3614,7 +3637,7 @@ impl BmuxServer {
             paths,
             config.recording.enabled,
             rolling_defaults.window_secs,
-            rolling_defaults.event_kinds,
+            &rolling_defaults.event_kinds,
         )
     }
 
@@ -3625,7 +3648,7 @@ impl BmuxServer {
         paths: &ConfigPaths,
         rolling_recording_auto_start: bool,
         rolling_window_secs: u64,
-        rolling_event_kinds: Vec<RecordingEventKind>,
+        rolling_event_kinds: &[RecordingEventKind],
     ) -> Self {
         let config = BmuxConfig::load_from_path(&paths.config_file()).unwrap_or_default();
         #[cfg(unix)]
@@ -3642,7 +3665,7 @@ impl BmuxServer {
             });
         let rolling_defaults = RollingRecordingSettings {
             window_secs: rolling_window_secs,
-            event_kinds: normalize_recording_event_kinds(&rolling_event_kinds),
+            event_kinds: normalize_recording_event_kinds(rolling_event_kinds),
         };
         Self::new_with_snapshot(
             endpoint,
@@ -3665,6 +3688,9 @@ impl BmuxServer {
     /// Register a generic service invocation handler.
     ///
     /// Handlers are matched by exact `(capability, kind, interface_id, operation)`.
+    ///
+    /// # Errors
+    /// Returns an error if the service registry lock is poisoned.
     pub fn register_service_handler<F, Fut>(
         &self,
         capability: impl Into<String>,
@@ -3686,17 +3712,20 @@ impl BmuxServer {
         let wrapped: Arc<ServiceInvokeHandler> =
             Arc::new(move |route, context, payload| Box::pin(handler(route, context, payload)));
 
-        let mut registry = self
-            .state
+        self.state
             .service_registry
             .lock()
-            .map_err(|_| anyhow::anyhow!("service registry lock poisoned"))?;
-        registry.handlers.insert(route, wrapped);
+            .map_err(|_| anyhow::anyhow!("service registry lock poisoned"))?
+            .handlers
+            .insert(route, wrapped);
         Ok(())
     }
 
     /// Register a generic fallback resolver for service routes that are not
     /// explicitly present in the service registry.
+    ///
+    /// # Errors
+    /// Returns an error if the service resolver lock is poisoned.
     pub fn set_service_resolver<F, Fut>(&self, resolver: F) -> Result<()>
     where
         F: Fn(ServiceRoute, Vec<u8>) -> Fut + Send + Sync + 'static,
@@ -3704,12 +3733,11 @@ impl BmuxServer {
     {
         let wrapped: Arc<ServiceResolverHandler> =
             Arc::new(move |route, payload| Box::pin(resolver(route, payload)));
-        let mut slot = self
+        *self
             .state
             .service_resolver
             .lock()
-            .map_err(|_| anyhow::anyhow!("service resolver lock poisoned"))?;
-        *slot = Some(wrapped);
+            .map_err(|_| anyhow::anyhow!("service resolver lock poisoned"))? = Some(wrapped);
         Ok(())
     }
 
@@ -3733,6 +3761,7 @@ impl BmuxServer {
         self.run_impl(None).await
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn run_impl(
         &self,
         mut ready_tx: Option<oneshot::Sender<std::result::Result<(), String>>>,
@@ -3853,11 +3882,10 @@ impl BmuxServer {
         let _ = maybe_flush_snapshot(&self.state, true);
         let _ = pane_exit_task.await;
 
-        let removed_runtimes = if let Ok(mut runtime_manager) = self.state.session_runtimes.lock() {
-            runtime_manager.remove_all_runtimes()
-        } else {
-            Vec::new()
-        };
+        let removed_runtimes = self.state.session_runtimes.lock().map_or_else(
+            |_| Vec::new(),
+            |mut runtime_manager| runtime_manager.remove_all_runtimes(),
+        );
         for removed_runtime in removed_runtimes {
             if removed_runtime.had_attached_clients {
                 let _ = emit_event(
@@ -3891,6 +3919,7 @@ impl BmuxServer {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_connection(
     state: Arc<ServerState>,
     shutdown_tx: watch::Sender<bool>,
@@ -4128,6 +4157,7 @@ async fn handle_connection(
                         request_id: envelope.request_id,
                         request_kind: request_kind.to_string(),
                         response_kind: response_payload_kind_name(payload).to_string(),
+                        #[allow(clippy::cast_possible_truncation)]
                         elapsed_ms: elapsed_ms.min(u128::from(u64::MAX)) as u64,
                         request_data,
                         response_data,
@@ -4158,6 +4188,7 @@ async fn handle_connection(
                         request_kind: request_kind.to_string(),
                         error_code: error.code,
                         message: error.message.clone(),
+                        #[allow(clippy::cast_possible_truncation)]
                         elapsed_ms: elapsed_ms.min(u128::from(u64::MAX)) as u64,
                     },
                     RecordMeta {
@@ -4171,7 +4202,7 @@ async fn handle_connection(
         match send_response_via_channel(
             &frame_tx,
             envelope.request_id,
-            response,
+            &response,
             negotiated_frame_codec.as_deref(),
         ) {
             Ok(()) => {}
@@ -4301,11 +4332,11 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
     );
     // Broadcast to streaming clients (ignore errors — no receivers is fine).
     let _ = state.event_broadcast.send(event.clone());
-    let mut hub = state
+    state
         .event_hub
         .lock()
-        .map_err(|_| anyhow::anyhow!("event hub lock poisoned"))?;
-    hub.emit(event);
+        .map_err(|_| anyhow::anyhow!("event hub lock poisoned"))?
+        .emit(event);
     Ok(())
 }
 
@@ -4322,11 +4353,12 @@ fn emit_attach_view_changed(
         return Ok(());
     }
     let revision = {
-        let mut runtime_manager = state
+        let Some(revision) = state
             .session_runtimes
             .lock()
-            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-        let Some(revision) = runtime_manager.bump_attach_view_revision(session_id) else {
+            .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?
+            .bump_attach_view_revision(session_id)
+        else {
             return Ok(());
         };
         revision
@@ -4380,11 +4412,11 @@ fn emit_attach_view_changed_for_layout(
 }
 
 fn unsubscribe_events(state: &Arc<ServerState>, client_id: ClientId) -> Result<()> {
-    let mut hub = state
+    state
         .event_hub
         .lock()
-        .map_err(|_| anyhow::anyhow!("event hub lock poisoned"))?;
-    hub.unsubscribe(client_id);
+        .map_err(|_| anyhow::anyhow!("event hub lock poisoned"))?
+        .unsubscribe(client_id);
     Ok(())
 }
 
@@ -4442,6 +4474,7 @@ fn reconcile_selected_session_membership(
     {
         session.add_client(client_id);
     }
+    drop(manager);
 
     Ok(())
 }
@@ -4521,6 +4554,7 @@ fn clear_selected_session_for_all(
     for client_id in affected_clients {
         let _ = follow_state.sync_followers_from_leader(client_id, None, None);
     }
+    drop(follow_state);
 
     Ok(())
 }
@@ -4534,6 +4568,7 @@ fn mark_snapshot_dirty(state: &Arc<ServerState>) -> Result<()> {
         runtime.dirty = true;
         runtime.last_marked_at = Some(Instant::now());
     }
+    drop(runtime);
     Ok(())
 }
 
@@ -4613,6 +4648,7 @@ fn snapshot_status(state: &Arc<ServerState>) -> Result<ServerSnapshotStatus> {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV4> {
     let sessions = {
         let manager = state
@@ -4743,6 +4779,7 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV4> {
                 session_id: selected.map(|session| session.0),
             })
             .collect::<Vec<_>>();
+        drop(follow_state);
 
         (follows, selected_sessions)
     };
@@ -4783,6 +4820,7 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV4> {
             .iter()
             .copied()
             .collect::<Vec<_>>();
+        drop(context_state);
         (
             contexts,
             context_session_bindings,
@@ -4895,7 +4933,7 @@ fn rolling_status_snapshot(state: &Arc<ServerState>) -> Result<RecordingRollingS
             available = true;
             rolling_window_secs = runtime.rolling_window_secs();
             if let Some(summary) = runtime.status().active {
-                event_kinds = summary.event_kinds.clone();
+                event_kinds.clone_from(&summary.event_kinds);
                 active = Some(summary);
             }
         }
@@ -4920,18 +4958,18 @@ fn ensure_rolling_recording_started(state: &Arc<ServerState>) -> Result<()> {
         return Ok(());
     }
 
-    let mut runtime = state
+    let mut guard = state
         .rolling_recording_runtime
         .lock()
         .map_err(|_| anyhow::anyhow!("rolling recording runtime lock poisoned"))?;
-    if runtime.is_none() {
-        *runtime = Some(RecordingRuntime::new_rolling(
+    if guard.is_none() {
+        *guard = Some(RecordingRuntime::new_rolling(
             state.rolling_recordings_dir.clone(),
             state.rolling_recording_segment_mb,
             state.rolling_recording_defaults.window_secs,
         ));
     }
-    let runtime = runtime
+    let runtime = guard
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("rolling recording runtime missing after init"))?;
     if runtime.status().active.is_some() {
@@ -4940,11 +4978,11 @@ fn ensure_rolling_recording_started(state: &Arc<ServerState>) -> Result<()> {
 
     let summary =
         start_rolling_recording_runtime(state, runtime, &state.rolling_recording_defaults)?;
+    let window_secs = runtime.rolling_window_secs().unwrap_or(0);
+    drop(guard);
     info!(
         "rolling recording started: {} path={} window_secs={}",
-        summary.id,
-        summary.path,
-        runtime.rolling_window_secs().unwrap_or(0)
+        summary.id, summary.path, window_secs
     );
     Ok(())
 }
@@ -5015,6 +5053,7 @@ fn restore_snapshot_if_present(state: &Arc<ServerState>) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV4) -> Result<RestoreSummary> {
     let mut summary = RestoreSummary::default();
 
@@ -5084,7 +5123,7 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV4) -> Resu
 
             if let Err(error) = runtime_manager.restore_runtime(
                 session_id,
-                runtime_panes,
+                &runtime_panes,
                 session_snapshot
                     .layout_root
                     .as_ref()
@@ -5102,6 +5141,8 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV4) -> Resu
 
             summary.sessions += 1;
         }
+        drop(session_manager);
+        drop(runtime_manager);
     }
 
     let (selected_contexts, context_for_session) = {
@@ -5257,6 +5298,7 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV4) -> Resu
             );
             summary.follows += 1;
         }
+        drop(follow_state);
     }
 
     Ok(summary)
@@ -5304,11 +5346,7 @@ async fn restore_snapshot_replace(
     apply_snapshot_state(state, &snapshot)
 }
 
-async fn reap_exited_pane(
-    state: &Arc<ServerState>,
-    session_id: SessionId,
-    pane_id: Uuid,
-) -> Result<()> {
+fn reap_exited_pane(state: &Arc<ServerState>, session_id: SessionId, pane_id: Uuid) -> Result<()> {
     let state_reason = {
         let runtime_manager = state
             .session_runtimes
@@ -5353,7 +5391,7 @@ async fn process_pane_exit_events(state: Arc<ServerState>, mut shutdown_rx: watc
                 let Some(event) = maybe_event else {
                     break;
                 };
-                if let Err(error) = reap_exited_pane(&state, event.session_id, event.pane_id).await {
+                if let Err(error) = reap_exited_pane(&state, event.session_id, event.pane_id) {
                     warn!("failed reaping exited pane {} in session {}: {error:#}", event.pane_id, event.session_id.0);
                 }
             }
@@ -5386,6 +5424,7 @@ async fn ensure_attach_session_exists(
                 )
             })?;
         }
+        drop(runtime_manager);
         return Ok(true);
     }
 
@@ -5405,6 +5444,7 @@ async fn ensure_attach_session_exists(
     Ok(false)
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_request(
     state: &Arc<ServerState>,
     shutdown_tx: &watch::Sender<bool>,
@@ -5614,6 +5654,7 @@ async fn handle_request(
                     Ok(()) => Ok(()),
                     Err(message) => {
                         let _ = context_state.remove_context_by_id(context.id, Some(client_id));
+                        drop(context_state);
                         Err(message.to_string())
                     }
                 }
@@ -5653,18 +5694,22 @@ async fn handle_request(
                 .session_manager
                 .lock()
                 .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            let session_id =
-                match resolve_session_request_session_id(&manager, &session, selected_session) {
-                    Ok(session_id) => session_id,
-                    Err(response) => return Ok(Response::Err(response)),
-                };
+            let session_id = match resolve_session_request_session_id(
+                &manager,
+                session.as_ref(),
+                selected_session.as_ref(),
+            ) {
+                Ok(session_id) => session_id,
+                Err(response) => return Ok(Response::Err(response)),
+            };
             drop(manager);
 
-            let runtime_manager = state
+            let pane_result = state
                 .session_runtimes
                 .lock()
-                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-            let panes = match runtime_manager.list_panes(session_id) {
+                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?
+                .list_panes(session_id);
+            let panes = match pane_result {
                 Ok(panes) => panes,
                 Err(error) => {
                     return Ok(Response::Err(ErrorResponse {
@@ -5686,7 +5731,11 @@ async fn handle_request(
                     .session_manager
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                match resolve_session_request_session_id(&manager, &session, selected_session) {
+                match resolve_session_request_session_id(
+                    &manager,
+                    session.as_ref(),
+                    selected_session.as_ref(),
+                ) {
                     Ok(session_id) => session_id,
                     Err(response) => return Ok(Response::Err(response)),
                 }
@@ -5733,7 +5782,11 @@ async fn handle_request(
                     .session_manager
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                match resolve_session_request_session_id(&manager, &session, selected_session) {
+                match resolve_session_request_session_id(
+                    &manager,
+                    session.as_ref(),
+                    selected_session.as_ref(),
+                ) {
                     Ok(session_id) => session_id,
                     Err(response) => return Ok(Response::Err(response)),
                 }
@@ -5761,9 +5814,11 @@ async fn handle_request(
                         message: "focus-pane cannot use target and direction together".to_string(),
                     }));
                 }
-                (Some(target), None) => runtime_manager.focus_pane_target(session_id, target),
+                (Some(target), None) => runtime_manager.focus_pane_target(session_id, &target),
                 (None, Some(direction)) => runtime_manager.focus_pane(session_id, direction),
-                (None, None) => runtime_manager.focus_pane_target(session_id, PaneSelector::Active),
+                (None, None) => {
+                    runtime_manager.focus_pane_target(session_id, &PaneSelector::Active)
+                }
             };
             let pane_id = match pane_id {
                 Ok(id) => id,
@@ -5791,7 +5846,11 @@ async fn handle_request(
                     .session_manager
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                match resolve_session_request_session_id(&manager, &session, selected_session) {
+                match resolve_session_request_session_id(
+                    &manager,
+                    session.as_ref(),
+                    selected_session.as_ref(),
+                ) {
                     Ok(session_id) => session_id,
                     Err(response) => return Ok(Response::Err(response)),
                 }
@@ -5830,7 +5889,11 @@ async fn handle_request(
                     .session_manager
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                match resolve_session_request_session_id(&manager, &session, selected_session) {
+                match resolve_session_request_session_id(
+                    &manager,
+                    session.as_ref(),
+                    selected_session.as_ref(),
+                ) {
                     Ok(session_id) => session_id,
                     Err(response) => return Ok(Response::Err(response)),
                 }
@@ -5848,16 +5911,12 @@ async fn handle_request(
                 return Ok(Response::Err(response));
             }
 
-            let (closed_pane_id, removed_session) = {
-                let mut runtime_manager = state
-                    .session_runtimes
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                let (closed_pane_id, removed_session) = runtime_manager
-                    .close_pane(session_id, target)
-                    .map_err(|error| anyhow::anyhow!("failed closing pane: {error:#}"))?;
-                (closed_pane_id, removed_session)
-            };
+            let (closed_pane_id, removed_session) = state
+                .session_runtimes
+                .lock()
+                .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?
+                .close_pane(session_id, target)
+                .map_err(|error| anyhow::anyhow!("failed closing pane: {error:#}"))?;
 
             let mut session_closed = false;
             if let Some(removed_session) = removed_session {
@@ -5918,7 +5977,11 @@ async fn handle_request(
                     .session_manager
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                match resolve_session_request_session_id(&manager, &session, selected_session) {
+                match resolve_session_request_session_id(
+                    &manager,
+                    session.as_ref(),
+                    selected_session.as_ref(),
+                ) {
                     Ok(session_id) => session_id,
                     Err(response) => return Ok(Response::Err(response)),
                 }
@@ -5965,7 +6028,11 @@ async fn handle_request(
                     .session_manager
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-                match resolve_session_request_session_id(&manager, &session, selected_session) {
+                match resolve_session_request_session_id(
+                    &manager,
+                    session.as_ref(),
+                    selected_session.as_ref(),
+                ) {
                     Ok(session_id) => session_id,
                     Err(response) => return Ok(Response::Err(response)),
                 }
@@ -6004,11 +6071,10 @@ async fn handle_request(
             })
         }
         Request::ListSessions => {
-            let manager = state
+            let sessions = state
                 .session_manager
                 .lock()
-                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?;
-            let sessions = manager
+                .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?
                 .list_sessions()
                 .into_iter()
                 .map(|session| SessionSummary {
@@ -6046,12 +6112,17 @@ async fn handle_request(
                 }
             };
 
-            let mut context_state = state
-                .context_state
-                .lock()
-                .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
-            let context = context_state.create(client_id, name, attributes);
-            if let Err(message) = context_state.bind_session(context.id, session_id) {
+            let (context, bind_result) = {
+                let mut context_state = state
+                    .context_state
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
+                let context = context_state.create(client_id, name, attributes);
+                let bind_result = context_state.bind_session(context.id, session_id);
+                drop(context_state);
+                (context, bind_result)
+            };
+            if let Err(message) = bind_result {
                 return Ok(Response::Err(ErrorResponse {
                     code: ErrorCode::Internal,
                     message: message.to_string(),
@@ -6060,11 +6131,11 @@ async fn handle_request(
             Response::Ok(ResponsePayload::ContextCreated { context })
         }
         Request::ListContexts => {
-            let context_state = state
+            let contexts = state
                 .context_state
                 .lock()
-                .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
-            let contexts = context_state.list();
+                .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?
+                .list();
             Response::Ok(ResponsePayload::ContextList { contexts })
         }
         Request::SelectContext { selector } => {
@@ -6076,6 +6147,7 @@ async fn handle_request(
                 match context_state.select_for_client(client_id, &selector) {
                     Ok(context) => {
                         let session_id = context_state.current_session_for_client(client_id);
+                        drop(context_state);
                         Ok((context, session_id))
                     }
                     Err(message) => Err(message),
@@ -6164,11 +6236,11 @@ async fn handle_request(
             }
         }
         Request::CurrentContext => {
-            let context_state = state
+            let context = state
                 .context_state
                 .lock()
-                .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
-            let context = context_state.current_for_client(client_id);
+                .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?
+                .current_for_client(client_id);
             Response::Ok(ResponsePayload::CurrentContext { context })
         }
         Request::KillSession {
@@ -6384,11 +6456,11 @@ async fn handle_request(
                 persist_selected_session(state, client_id, *selected_session)?;
                 drop(manager);
 
-                let mut attach_tokens = state
+                let mut grant = state
                     .attach_tokens
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
-                let mut grant = attach_tokens.issue(next_session_id);
+                    .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?
+                    .issue(next_session_id);
                 // Prefer the context that maps to the target session so that
                 // the client's first `refresh_attached_session_from_context`
                 // does not resolve a stale MRU context belonging to a
@@ -6428,6 +6500,7 @@ async fn handle_request(
                         message: "context has no attached runtime".to_string(),
                     }));
                 };
+                drop(context_state);
 
                 (context.id, session_id)
             };
@@ -6449,11 +6522,11 @@ async fn handle_request(
                 persist_selected_session(state, client_id, *selected_session)?;
                 drop(manager);
 
-                let mut attach_tokens = state
+                let mut grant = state
                     .attach_tokens
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?;
-                let mut grant = attach_tokens.issue(next_session_id);
+                    .map_err(|_| anyhow::anyhow!("attach token manager lock poisoned"))?
+                    .issue(next_session_id);
                 grant.context_id = Some(selected_context_id);
                 Response::Ok(ResponsePayload::Attached { grant })
             } else {
@@ -6540,17 +6613,15 @@ async fn handle_request(
                                 can_write,
                             })
                         }
-                        Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
-                            code: ErrorCode::NotFound,
-                            message: format!("session runtime not found: {}", session_id.0),
-                        }),
+                        Err(SessionRuntimeError::NotFound | SessionRuntimeError::Closed) => {
+                            Response::Err(ErrorResponse {
+                                code: ErrorCode::NotFound,
+                                message: format!("session runtime not found: {}", session_id.0),
+                            })
+                        }
                         Err(SessionRuntimeError::NotAttached) => Response::Err(ErrorResponse {
                             code: ErrorCode::Internal,
                             message: "failed opening attach stream".to_string(),
-                        }),
-                        Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
-                            code: ErrorCode::NotFound,
-                            message: format!("session runtime not found: {}", session_id.0),
                         }),
                     }
                 }
@@ -6785,18 +6856,19 @@ async fn handle_request(
                 // cursors to the buffer end and clear output_dirty so the
                 // PTY reader can re-notify on new output.  Mirrors the
                 // cleanup in AttachPaneOutputBatch.
-                if let Ok(ref snapshot) = result {
-                    if let Some(runtime) = runtime_manager.runtimes.get(&session_id) {
-                        for chunk in &snapshot.chunks {
-                            if let Some(pane) = runtime.panes.get(&chunk.pane_id) {
-                                pane.output_dirty.store(false, Ordering::SeqCst);
-                                if let Ok(mut output) = pane.output_buffer.lock() {
-                                    output.advance_client_to_end(client_id);
-                                }
+                if let Ok(ref snapshot) = result
+                    && let Some(runtime) = runtime_manager.runtimes.get(&session_id)
+                {
+                    for chunk in &snapshot.chunks {
+                        if let Some(pane) = runtime.panes.get(&chunk.pane_id) {
+                            pane.output_dirty.store(false, Ordering::SeqCst);
+                            if let Ok(mut output) = pane.output_buffer.lock() {
+                                output.advance_client_to_end(client_id);
                             }
                         }
                     }
                 }
+                drop(runtime_manager);
                 result
             };
 
@@ -6857,16 +6929,14 @@ async fn handle_request(
                 // Re-check output_dirty: if the PTY reader pushed new data
                 // between the clear above and this check, the client should
                 // keep draining instead of proceeding to render.
-                let still_pending = runtime_manager
-                    .runtimes
-                    .get(&session_id)
-                    .map_or(false, |rt| {
-                        pane_ids.iter().any(|pane_id| {
-                            rt.panes
-                                .get(pane_id)
-                                .map_or(false, |p| p.output_dirty.load(Ordering::SeqCst))
-                        })
-                    });
+                let still_pending = runtime_manager.runtimes.get(&session_id).is_some_and(|rt| {
+                    pane_ids.iter().any(|pane_id| {
+                        rt.panes
+                            .get(pane_id)
+                            .is_some_and(|p| p.output_dirty.load(Ordering::SeqCst))
+                    })
+                });
+                drop(runtime_manager);
                 (chunks, still_pending)
             };
             match chunks {
@@ -6938,6 +7008,7 @@ async fn handle_request(
                         }
                     }
                 }
+                drop(runtime_manager);
                 result
             };
             Response::Ok(ResponsePayload::AttachPaneImages { deltas })
@@ -6956,11 +7027,11 @@ async fn handle_request(
             drop(manager);
 
             if let Some(current_stream_session) = attached_stream_session.take() {
-                let mut runtime_manager = state
+                state
                     .session_runtimes
                     .lock()
-                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                runtime_manager.end_attach(current_stream_session, client_id);
+                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?
+                    .end_attach(current_stream_session, client_id);
                 emit_event(
                     state,
                     Event::ClientDetached {
@@ -6972,11 +7043,11 @@ async fn handle_request(
             Response::Ok(ResponsePayload::Detached)
         }
         Request::SubscribeEvents => {
-            let mut hub = state
+            state
                 .event_hub
                 .lock()
-                .map_err(|_| anyhow::anyhow!("event hub lock poisoned"))?;
-            hub.subscribe(client_id);
+                .map_err(|_| anyhow::anyhow!("event hub lock poisoned"))?
+                .subscribe(client_id);
             Response::Ok(ResponsePayload::EventsSubscribed)
         }
         Request::PollEvents { max_events } => {
@@ -6984,13 +7055,15 @@ async fn handle_request(
                 .event_hub
                 .lock()
                 .map_err(|_| anyhow::anyhow!("event hub lock poisoned"))?;
-            match hub.poll(client_id, max_events) {
-                Some(events) => Response::Ok(ResponsePayload::EventBatch { events }),
-                None => Response::Err(ErrorResponse {
-                    code: ErrorCode::InvalidRequest,
-                    message: "event subscription not found for client".to_string(),
-                }),
-            }
+            hub.poll(client_id, max_events).map_or_else(
+                || {
+                    Response::Err(ErrorResponse {
+                        code: ErrorCode::InvalidRequest,
+                        message: "event subscription not found for client".to_string(),
+                    })
+                },
+                |events| Response::Ok(ResponsePayload::EventBatch { events }),
+            )
         }
         // EnableEventPush is handled in handle_connection after the response
         // is sent — the actual push task spawning happens there. Here we just
@@ -7170,25 +7243,26 @@ async fn handle_request(
             }
         }
         Request::RecordingCut { last_seconds } => {
-            let output_root = {
-                let runtime = state
-                    .manual_recording_runtime
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?;
-                runtime.root_dir().to_path_buf()
-            };
+            let output_root = state
+                .manual_recording_runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?
+                .root_dir()
+                .to_path_buf();
             let result = {
-                let runtime = state
+                let guard = state
                     .rolling_recording_runtime
                     .lock()
                     .map_err(|_| anyhow::anyhow!("rolling recording runtime lock poisoned"))?;
-                let Some(runtime) = runtime.as_ref() else {
+                let Some(rt) = guard.as_ref() else {
                     return Ok(Response::Err(ErrorResponse {
                         code: ErrorCode::InvalidRequest,
                         message: "rolling recording is not enabled".to_string(),
                     }));
                 };
-                runtime.cut(&output_root, last_seconds)
+                let result = rt.cut(&output_root, last_seconds);
+                drop(guard);
+                result
             };
             match result {
                 Ok(recording) => Response::Ok(ResponsePayload::RecordingCut { recording }),
@@ -7215,20 +7289,27 @@ async fn handle_request(
             }
             let options_empty = rolling_start_options_is_empty(&options);
             let mut started_now = false;
-            let recording = {
-                let mut runtime = state
+            // Ensure the rolling runtime Option is initialized before taking the inner &mut.
+            {
+                let mut guard = state
                     .rolling_recording_runtime
                     .lock()
                     .map_err(|_| anyhow::anyhow!("rolling recording runtime lock poisoned"))?;
-                if runtime.is_none() {
-                    *runtime = Some(RecordingRuntime::new_rolling(
+                if guard.is_none() {
+                    *guard = Some(RecordingRuntime::new_rolling(
                         state.rolling_recordings_dir.clone(),
                         state.rolling_recording_segment_mb,
                         resolved_settings.window_secs,
                     ));
                 }
-
-                let runtime = runtime.as_mut().ok_or_else(|| {
+                drop(guard);
+            }
+            let recording = {
+                let mut guard = state
+                    .rolling_recording_runtime
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("rolling recording runtime lock poisoned"))?;
+                let runtime = guard.as_mut().ok_or_else(|| {
                     anyhow::anyhow!("rolling recording runtime missing after init")
                 })?;
                 if let Some(active) = runtime.status().active {
@@ -7250,7 +7331,10 @@ async fn handle_request(
                         );
                     }
                     started_now = true;
-                    start_rolling_recording_runtime(state, runtime, &resolved_settings)?
+                    let result =
+                        start_rolling_recording_runtime(state, runtime, &resolved_settings)?;
+                    drop(guard);
+                    result
                 }
             };
 
@@ -7268,23 +7352,25 @@ async fn handle_request(
         }
         Request::RecordingRollingStop => {
             let recording_id = {
-                let mut runtime = state
+                let mut guard = state
                     .rolling_recording_runtime
                     .lock()
                     .map_err(|_| anyhow::anyhow!("rolling recording runtime lock poisoned"))?;
-                let Some(runtime) = runtime.as_mut() else {
+                let Some(rt) = guard.as_mut() else {
                     return Ok(Response::Err(ErrorResponse {
                         code: ErrorCode::InvalidRequest,
                         message: "rolling recording is not configured".to_string(),
                     }));
                 };
-                if runtime.status().active.is_none() {
+                if rt.status().active.is_none() {
                     return Ok(Response::Err(ErrorResponse {
                         code: ErrorCode::InvalidRequest,
                         message: "rolling recording is not active".to_string(),
                     }));
                 }
-                runtime.stop(None)?.id
+                let id = rt.stop(None)?.id;
+                drop(guard);
+                id
             };
 
             let _ = emit_event(state, Event::RecordingStopped { recording_id });
@@ -7343,13 +7429,14 @@ async fn handle_request(
                 }));
             }
 
+            #[allow(clippy::useless_let_if_seq)]
             let mut restarted = false;
+            #[allow(clippy::useless_let_if_seq)]
             let mut restarted_recording = None;
 
             if restart_if_active && was_active {
-                let settings = restart_settings
-                    .clone()
-                    .unwrap_or_else(|| state.rolling_recording_defaults.clone());
+                let settings =
+                    restart_settings.unwrap_or_else(|| state.rolling_recording_defaults.clone());
                 if !settings.is_available() {
                     return Ok(Response::Err(ErrorResponse {
                         code: ErrorCode::InvalidRequest,
@@ -7359,18 +7446,24 @@ async fn handle_request(
                 }
 
                 let recording = {
-                    let mut runtime = state
+                    // Ensure the rolling runtime Option is initialized.
+                    {
+                        let mut guard = state.rolling_recording_runtime.lock().map_err(|_| {
+                            anyhow::anyhow!("rolling recording runtime lock poisoned")
+                        })?;
+                        if guard.is_none() {
+                            *guard = Some(RecordingRuntime::new_rolling(
+                                root.clone(),
+                                state.rolling_recording_segment_mb,
+                                settings.window_secs,
+                            ));
+                        }
+                    }
+                    let mut guard = state
                         .rolling_recording_runtime
                         .lock()
                         .map_err(|_| anyhow::anyhow!("rolling recording runtime lock poisoned"))?;
-                    if runtime.is_none() {
-                        *runtime = Some(RecordingRuntime::new_rolling(
-                            root.clone(),
-                            state.rolling_recording_segment_mb,
-                            settings.window_secs,
-                        ));
-                    }
-                    let runtime = runtime.as_mut().ok_or_else(|| {
+                    let runtime = guard.as_mut().ok_or_else(|| {
                         anyhow::anyhow!("rolling recording runtime missing after init")
                     })?;
                     if runtime.rolling_window_secs() != Some(settings.window_secs) {
@@ -7380,7 +7473,9 @@ async fn handle_request(
                             settings.window_secs,
                         );
                     }
-                    start_rolling_recording_runtime(state, runtime, &settings)?
+                    let result = start_rolling_recording_runtime(state, runtime, &settings)?;
+                    drop(guard);
+                    result
                 };
 
                 restarted = true;
@@ -7512,7 +7607,7 @@ async fn handle_request(
                 }),
                 Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
-                    message: format!("pane is closed: {}", pane_id),
+                    message: format!("pane is closed: {pane_id}"),
                 }),
             }
         }
@@ -7719,6 +7814,7 @@ fn normalize_recording_event_kinds(event_kinds: &[RecordingEventKind]) -> Vec<Re
     normalized
 }
 
+#[allow(clippy::fn_params_excessive_bools)]
 fn recording_event_kinds_from_flags(
     capture_input: bool,
     capture_output: bool,
@@ -7818,43 +7914,49 @@ fn set_event_kind_enabled(
     }
 }
 
+#[must_use]
 pub fn apply_rolling_start_options(
     base: &RollingRecordingSettings,
     options: &RecordingRollingStartOptions,
 ) -> RollingRecordingSettings {
-    let event_kinds = if let Some(event_kinds) = options.event_kinds.as_deref() {
-        normalize_recording_event_kinds(event_kinds)
-    } else {
-        let mut event_kinds = base.event_kinds.clone();
-        if let Some(enabled) = options.capture_input {
-            set_event_kind_enabled(&mut event_kinds, RecordingEventKind::PaneInputRaw, enabled);
-        }
-        if let Some(enabled) = options.capture_output {
-            set_event_kind_enabled(&mut event_kinds, RecordingEventKind::PaneOutputRaw, enabled);
-        }
-        if let Some(enabled) = options.capture_protocol_replies {
-            set_event_kind_enabled(
-                &mut event_kinds,
-                RecordingEventKind::ProtocolReplyRaw,
-                enabled,
-            );
-        }
-        if let Some(enabled) = options.capture_images {
-            set_event_kind_enabled(&mut event_kinds, RecordingEventKind::PaneImage, enabled);
-        }
-        if let Some(enabled) = options.capture_events {
-            for kind in [
-                RecordingEventKind::ServerEvent,
-                RecordingEventKind::RequestStart,
-                RecordingEventKind::RequestDone,
-                RecordingEventKind::RequestError,
-                RecordingEventKind::Custom,
-            ] {
-                set_event_kind_enabled(&mut event_kinds, kind, enabled);
+    let event_kinds = options.event_kinds.as_deref().map_or_else(
+        || {
+            let mut event_kinds = base.event_kinds.clone();
+            if let Some(enabled) = options.capture_input {
+                set_event_kind_enabled(&mut event_kinds, RecordingEventKind::PaneInputRaw, enabled);
             }
-        }
-        normalize_recording_event_kinds(&event_kinds)
-    };
+            if let Some(enabled) = options.capture_output {
+                set_event_kind_enabled(
+                    &mut event_kinds,
+                    RecordingEventKind::PaneOutputRaw,
+                    enabled,
+                );
+            }
+            if let Some(enabled) = options.capture_protocol_replies {
+                set_event_kind_enabled(
+                    &mut event_kinds,
+                    RecordingEventKind::ProtocolReplyRaw,
+                    enabled,
+                );
+            }
+            if let Some(enabled) = options.capture_images {
+                set_event_kind_enabled(&mut event_kinds, RecordingEventKind::PaneImage, enabled);
+            }
+            if let Some(enabled) = options.capture_events {
+                for kind in [
+                    RecordingEventKind::ServerEvent,
+                    RecordingEventKind::RequestStart,
+                    RecordingEventKind::RequestDone,
+                    RecordingEventKind::RequestError,
+                    RecordingEventKind::Custom,
+                ] {
+                    set_event_kind_enabled(&mut event_kinds, kind, enabled);
+                }
+            }
+            normalize_recording_event_kinds(&event_kinds)
+        },
+        normalize_recording_event_kinds,
+    );
 
     RollingRecordingSettings {
         window_secs: options.window_secs.unwrap_or(base.window_secs),
@@ -8021,6 +8123,10 @@ fn resolve_session_id(manager: &SessionManager, selector: &SessionSelector) -> O
     }
 }
 
+/// Kill sessions offline (without a running server) via the snapshot file.
+///
+/// # Errors
+/// Returns an error if the snapshot cannot be read or written.
 pub fn offline_kill_sessions(target: OfflineSessionKillTarget) -> Result<OfflineSessionKillReport> {
     let paths = ConfigPaths::default();
     let snapshot_manager = SnapshotManager::from_paths(&paths);
@@ -8316,8 +8422,8 @@ fn session_not_found_message(selector: &SessionSelector) -> String {
 
 fn resolve_session_request_session_id(
     manager: &SessionManager,
-    selector: &Option<SessionSelector>,
-    selected_session: &Option<SessionId>,
+    selector: Option<&SessionSelector>,
+    selected_session: Option<&SessionId>,
 ) -> std::result::Result<SessionId, ErrorResponse> {
     if let Some(selector) = selector {
         return resolve_session_id(manager, selector).ok_or_else(|| ErrorResponse {
@@ -8567,16 +8673,16 @@ fn send_error_via_channel(
     frame_codec: Option<&dyn bmux_ipc::compression::CompressionCodec>,
 ) -> Result<()> {
     let response = Response::Err(ErrorResponse { code, message });
-    send_response_via_channel(frame_tx, request_id, response, frame_codec)
+    send_response_via_channel(frame_tx, request_id, &response, frame_codec)
 }
 
 fn send_response_via_channel(
     frame_tx: &mpsc::UnboundedSender<Vec<u8>>,
     request_id: u64,
-    response: Response,
+    response: &Response,
     frame_codec: Option<&dyn bmux_ipc::compression::CompressionCodec>,
 ) -> Result<()> {
-    let payload = encode(&response).context("failed encoding response payload")?;
+    let payload = encode(response).context("failed encoding response payload")?;
     let envelope = Envelope::new(request_id, EnvelopeKind::Response, payload);
     let frame = if frame_codec.is_some() {
         bmux_ipc::frame::encode_frame_compressed(&envelope, frame_codec)
@@ -8613,9 +8719,11 @@ fn resolve_frame_codec_from_capabilities(
 }
 
 /// Resolve a payload compression codec from the user's compression config.
+#[cfg(feature = "image-registry")]
 fn resolve_payload_codec_from_config(
     config: &bmux_config::CompressionConfig,
 ) -> Option<std::sync::Arc<dyn bmux_ipc::compression::CompressionCodec>> {
+    #[cfg(feature = "compression")]
     use bmux_ipc::compression;
     match config.images {
         bmux_config::CompressionMode::None => None,
@@ -9179,7 +9287,6 @@ mod tests {
         }
 
         reap_exited_pane(&server.state, SessionId(session_id), target_pane_id)
-            .await
             .expect("reap should succeed");
 
         let list_exited = execute_request(

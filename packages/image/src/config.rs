@@ -3,21 +3,16 @@
 use serde::{Deserialize, Serialize};
 
 /// How image decoding is distributed between server and client.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ImageDecodeMode {
     /// Server decodes images to pixel buffers; client encodes for host protocol.
+    #[default]
     Server,
     /// Server sends raw protocol bytes; client decodes + re-encodes.
     Client,
     /// Raw bytes forwarded with coordinate translation (same-protocol only).
     Passthrough,
-}
-
-impl Default for ImageDecodeMode {
-    fn default() -> Self {
-        Self::Server
-    }
 }
 
 /// Top-level image configuration.

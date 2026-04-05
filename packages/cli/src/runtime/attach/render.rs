@@ -21,13 +21,13 @@ pub enum AttachLayer {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttachLayerSurface {
-    pub(crate) rect: PaneRect,
-    pub(crate) layer: AttachLayer,
-    pub(crate) opaque: bool,
+    pub rect: PaneRect,
+    pub layer: AttachLayer,
+    pub opaque: bool,
 }
 
 impl AttachLayerSurface {
-    pub(crate) const fn new(rect: PaneRect, layer: AttachLayer, opaque: bool) -> Self {
+    pub const fn new(rect: PaneRect, layer: AttachLayer, opaque: bool) -> Self {
         Self {
             rect,
             layer,
@@ -331,7 +331,7 @@ pub fn render_attach_scene<W: io::Write>(
         // screen area has already been cleared and must be repopulated.
         let sync_deferred = pane_buffers
             .get(&pane_id)
-            .map_or(false, |b| b.sync_update_in_progress && !full_pane_redraw);
+            .is_some_and(|b| b.sync_update_in_progress && !full_pane_redraw);
 
         let focus = surface.cursor_owner
             || focused_surface_id == Some(surface.id)
@@ -498,7 +498,7 @@ pub fn render_attach_scene<W: io::Write>(
                 // Row-level diff: skip emitting if the rendered string
                 // matches the previous frame's cached version for this row.
                 let cached = entry.prev_rows.get(row);
-                if cached.map_or(true, |c| *c != line) {
+                if cached.is_none_or(|c| *c != line) {
                     queue!(stdout, MoveTo(rect.x.saturating_add(1), y), Print(&line))
                         .context("failed drawing pane content")?;
                     if row < entry.prev_rows.len() {

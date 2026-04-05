@@ -1,4 +1,15 @@
-use super::*;
+use anyhow::{Context, Result};
+use bmux_cli_schema::TraceFamily;
+use bmux_config::{BmuxConfig, ConfigPaths, ResolvedTimeout, TerminfoAutoInstall};
+use std::io::{self, IsTerminal};
+use std::process::Command as ProcessCommand;
+
+use super::attach::runtime::{describe_timeout, effective_attach_keybindings};
+use super::{
+    ProtocolDirection, ProtocolProfile, ProtocolTraceEvent, TerminalProfile,
+    effective_enabled_plugins, primary_da_for_profile, protocol_profile_name,
+    scan_available_plugins, secondary_da_for_profile, supported_query_names,
+};
 
 pub(super) fn run_terminal_install_terminfo(yes: bool, check_only: bool) -> Result<u8> {
     let configured = BmuxConfig::load().map_or_else(
@@ -659,6 +670,7 @@ pub(super) fn run_keymap_doctor(as_json: bool) -> Result<u8> {
 }
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::wildcard_imports)]
     use crate::runtime::*;
 
     #[test]

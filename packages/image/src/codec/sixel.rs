@@ -50,7 +50,7 @@ pub fn estimate_pixel_size(data: &[u8]) -> ImagePixelSize {
                     i += 1;
                 }
                 // The next byte is the sixel character to repeat.
-                if i < data.len() && data[i] >= 0x3F && data[i] <= 0x7E {
+                if i < data.len() && (0x3F..=0x7E).contains(&data[i]) {
                     current_x += count;
                     if current_x > max_x {
                         max_x = current_x;
@@ -154,7 +154,7 @@ pub fn decode(data: &[u8]) -> Option<PixelBuffer> {
                         .saturating_add((data[i] - b'0') as usize);
                     i += 1;
                 }
-                if i < data.len() && data[i] >= 0x3F && data[i] <= 0x7E {
+                if i < data.len() && (0x3F..=0x7E).contains(&data[i]) {
                     let bits = data[i] - 0x3F;
                     for _ in 0..count {
                         paint_sixel_column(
@@ -286,7 +286,7 @@ pub fn encode(pixels: &PixelBuffer) -> Option<Vec<u8>> {
     }
 
     // Encode pixel data in sixel bands (6 rows per band).
-    let num_bands = (height + 5) / 6;
+    let num_bands = height.div_ceil(6);
     for band in 0..num_bands {
         let band_y = band * 6;
 

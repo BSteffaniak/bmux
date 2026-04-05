@@ -23,7 +23,8 @@ pub struct RuntimeVars {
 }
 
 impl RuntimeVars {
-    pub fn new(static_vars: BTreeMap<String, String>) -> Self {
+    #[must_use]
+    pub const fn new(static_vars: BTreeMap<String, String>) -> Self {
         Self {
             static_vars,
             session_id: None,
@@ -36,7 +37,7 @@ impl RuntimeVars {
     /// Resolve all `${NAME}` references in a template string.
     ///
     /// Resolution order:
-    /// 1. Runtime variables (SESSION_ID, SESSION_NAME, PANE_COUNT, FOCUSED_PANE)
+    /// 1. Runtime variables (`SESSION_ID`, `SESSION_NAME`, `PANE_COUNT`, `FOCUSED_PANE`)
     /// 2. Static variables (`@var` directives)
     /// 3. Environment variables
     /// 4. Unresolved references are left as-is (with a warning)
@@ -75,7 +76,7 @@ impl RuntimeVars {
                     } else {
                         tracing::warn!("unresolved variable reference: ${{{var_name}}}");
                         // Leave unresolved
-                        result.push_str(&template[i..i + 2 + close + 1]);
+                        result.push_str(&template[i..=(i + 2 + close)]);
                     }
                     i += 2 + close + 1;
                     continue;
@@ -90,6 +91,7 @@ impl RuntimeVars {
 
     /// Resolve a string only if it contains `${`.
     /// Returns the original string unchanged if no substitution markers are present.
+    #[must_use]
     pub fn resolve_opt(&self, value: &str) -> String {
         if value.contains("${") {
             self.resolve(value)
@@ -100,11 +102,12 @@ impl RuntimeVars {
 
     /// Resolve bytes (for send-keys): substitute in the string representation,
     /// then re-encode. Only works if the bytes are valid UTF-8 containing `${`.
+    #[must_use]
     pub fn resolve_bytes(&self, bytes: &[u8]) -> Vec<u8> {
-        if let Ok(s) = std::str::from_utf8(bytes) {
-            if s.contains("${") {
-                return self.resolve(s).into_bytes();
-            }
+        if let Ok(s) = std::str::from_utf8(bytes)
+            && s.contains("${")
+        {
+            return self.resolve(s).into_bytes();
         }
         bytes.to_vec()
     }

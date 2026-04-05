@@ -1,6 +1,6 @@
 //! Config string parsing for key chords and strokes.
 //!
-//! Parses human-readable key binding strings like "ctrl+a", "shift+arrow_up",
+//! Parses human-readable key binding strings like "ctrl+a", "`shift+arrow_up`",
 //! or "ctrl+a d" into `bmux_keyboard` types.
 
 use anyhow::{Result, anyhow, bail};
@@ -18,7 +18,7 @@ pub(super) fn parse_chord(value: &str) -> Result<Vec<KeyStroke>> {
     parts.into_iter().map(parse_stroke).collect()
 }
 
-/// Parse a single key stroke string like "ctrl+a" or "shift+arrow_up".
+/// Parse a single key stroke string like "ctrl+a" or "`shift+arrow_up`".
 pub(super) fn parse_stroke(value: &str) -> Result<KeyStroke> {
     let lowered = value.trim().to_ascii_lowercase();
     if lowered.is_empty() {

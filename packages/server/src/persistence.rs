@@ -59,6 +59,7 @@ pub struct SessionSnapshotV3 {
     pub floating_surfaces: Vec<FloatingSurfaceSnapshotV3>,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FloatingSurfaceSnapshotV3 {
     pub id: Uuid,
@@ -187,6 +188,7 @@ impl SnapshotManager {
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| SnapshotError::Validation("snapshot missing version".to_string()))?;
 
+        #[allow(clippy::cast_possible_truncation)]
         match version as u32 {
             SNAPSHOT_VERSION_V4 => {
                 let envelope: SnapshotEnvelopeV4 = serde_json::from_value(value)?;
@@ -225,10 +227,10 @@ impl SnapshotManager {
         }
 
         let mut temp_path = self.path.clone();
-        let temp_name = match self.path.file_name() {
-            Some(name) => format!("{}.tmp", name.to_string_lossy()),
-            None => "server-snapshot.tmp".to_string(),
-        };
+        let temp_name = self.path.file_name().map_or_else(
+            || "server-snapshot.tmp".to_string(),
+            |name| format!("{}.tmp", name.to_string_lossy()),
+        );
         temp_path.set_file_name(temp_name);
 
         let mut temp_file = std::fs::OpenOptions::new()
@@ -254,10 +256,10 @@ impl SnapshotManager {
 
     pub(crate) fn cleanup_temp_file(&self) -> Result<(), SnapshotError> {
         let mut temp_path = self.path.clone();
-        let temp_name = match self.path.file_name() {
-            Some(name) => format!("{}.tmp", name.to_string_lossy()),
-            None => "server-snapshot.tmp".to_string(),
-        };
+        let temp_name = self.path.file_name().map_or_else(
+            || "server-snapshot.tmp".to_string(),
+            |name| format!("{}.tmp", name.to_string_lossy()),
+        );
         temp_path.set_file_name(temp_name);
         if temp_path.exists() {
             std::fs::remove_file(temp_path)?;
@@ -277,10 +279,10 @@ fn snapshot_checksum_v4(snapshot: &SnapshotV4) -> Result<u64, serde_json::Error>
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf29ce484222325u64;
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
     for byte in bytes {
         hash ^= u64::from(*byte);
-        hash = hash.wrapping_mul(0x100000001b3);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     hash
 }

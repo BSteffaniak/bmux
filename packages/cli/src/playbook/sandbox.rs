@@ -4,6 +4,7 @@
 //! the duration of a playbook run. This is extracted from (and mirrors) the
 //! recording-verify sandbox pattern in `runtime/mod.rs`.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -49,6 +50,9 @@ impl SandboxServer {
     ///   when `None`.
     /// - `bundled_plugin_ids`: pre-computed list of bundled plugin IDs for the
     ///   disable list. Pass an empty vec if plugin discovery is unavailable.
+    /// # Errors
+    ///
+    /// Returns an error if the sandbox server fails to start.
     pub async fn start(
         shell: Option<&str>,
         plugin_config: &PluginConfig,
@@ -86,6 +90,9 @@ impl SandboxServer {
     }
 
     /// Connect a new `BmuxClient` to this sandbox server.
+    /// # Errors
+    ///
+    /// Returns an error if the connection to the sandbox server fails.
     pub async fn connect(&self, label: &str) -> Result<BmuxClient> {
         BmuxClient::connect_with_paths(self.paths(), label)
             .await
@@ -93,18 +100,23 @@ impl SandboxServer {
     }
 
     /// Return the `ConfigPaths` for this sandbox.
-    pub fn paths(&self) -> &ConfigPaths {
+    #[must_use]
+    pub const fn paths(&self) -> &ConfigPaths {
         match &self.handle {
             ServerHandle::Foreground { paths, .. } | ServerHandle::Daemon { paths, .. } => paths,
         }
     }
 
     /// Return the root temp directory for this sandbox.
+    #[must_use]
     pub fn root_dir(&self) -> &Path {
         &self.root_dir
     }
 
     /// Gracefully shut down the sandbox server and optionally clean up temp dirs.
+    /// # Errors
+    ///
+    /// Returns an error if the sandbox server fails to shut down cleanly.
     pub async fn shutdown(mut self, retain_on_failure: bool) -> Result<()> {
         self.cleaned_up = true;
         let result = self.stop_server().await;
@@ -233,20 +245,20 @@ fn apply_sandbox_env(
     // In Clean mode, PATH/USER/SHELL must be explicitly inherited because
     // env_clear() removed them. In Inherit mode they're already present.
     if env_mode == super::types::SandboxEnvMode::Clean {
-        if !env.contains_key("PATH") {
-            if let Ok(path) = std::env::var("PATH") {
-                cmd.env("PATH", path);
-            }
+        if !env.contains_key("PATH")
+            && let Ok(path) = std::env::var("PATH")
+        {
+            cmd.env("PATH", path);
         }
-        if !env.contains_key("USER") {
-            if let Ok(user) = std::env::var("USER") {
-                cmd.env("USER", user);
-            }
+        if !env.contains_key("USER")
+            && let Ok(user) = std::env::var("USER")
+        {
+            cmd.env("USER", user);
         }
-        if !env.contains_key("SHELL") {
-            if let Ok(shell) = std::env::var("SHELL") {
-                cmd.env("SHELL", shell);
-            }
+        if !env.contains_key("SHELL")
+            && let Ok(shell) = std::env::var("SHELL")
+        {
+            cmd.env("SHELL", shell);
         }
     }
 
@@ -274,7 +286,7 @@ fn write_sandbox_config(
 
     // Shell override
     if let Some(shell) = shell {
-        toml.push_str(&format!("[general]\ndefault_shell = '{shell}'\n\n"));
+        let _ = write!(toml, "[general]\ndefault_shell = '{shell}'\n\n");
     }
 
     // Plugin configuration — build disabled list
@@ -285,11 +297,11 @@ fn write_sandbox_config(
         toml.push_str("[plugins]\n");
         if !disabled.is_empty() {
             let quoted: Vec<String> = disabled.iter().map(|id| format!("'{id}'")).collect();
-            toml.push_str(&format!("disabled = [{}]\n", quoted.join(", ")));
+            let _ = writeln!(toml, "disabled = [{}]", quoted.join(", "));
         }
         if !enabled.is_empty() {
             let quoted: Vec<String> = enabled.iter().map(|id| format!("'{id}'")).collect();
-            toml.push_str(&format!("enabled = [{}]\n", quoted.join(", ")));
+            let _ = writeln!(toml, "enabled = [{}]", quoted.join(", "));
         }
     }
 
@@ -465,10 +477,10 @@ async fn wait_for_server_ready(
         match BmuxClient::connect_with_paths(paths, "bmux-playbook-sandbox-ready").await {
             Ok(_) => return Ok(()),
             Err(_) if start.elapsed() < timeout => {
-                if let Some(ref mut child) = child {
-                    if let Some(status) = child.try_wait()? {
-                        anyhow::bail!("sandbox server exited before ready (status: {status})");
-                    }
+                if let Some(ref mut child) = child
+                    && let Some(status) = child.try_wait()?
+                {
+                    anyhow::bail!("sandbox server exited before ready (status: {status})");
                 }
                 tokio::time::sleep(poll_delay).await;
                 poll_delay = (poll_delay * 2).min(Duration::from_millis(250));
@@ -557,7 +569,7 @@ fn read_log_excerpt(path: &Path) -> String {
 }
 
 impl ServerHandle {
-    fn child_mut(&mut self) -> Option<&mut std::process::Child> {
+    const fn child_mut(&mut self) -> Option<&mut std::process::Child> {
         match self {
             Self::Foreground { child, .. } => Some(child),
             Self::Daemon { .. } => None,
@@ -581,6 +593,9 @@ pub struct CleanupEntry {
 /// 1. Directory name starts with `bpb-`
 /// 2. Directory is older than 5 minutes (to avoid touching active sandboxes)
 /// 3. The `server.pid` file inside contains a PID of a dead process
+/// # Errors
+///
+/// Returns an error if the temp directory cannot be read.
 pub fn cleanup_orphaned_sandboxes(dry_run: bool) -> anyhow::Result<(usize, Vec<CleanupEntry>)> {
     let temp_dir = std::env::temp_dir();
     let mut scanned = 0;
@@ -588,16 +603,12 @@ pub fn cleanup_orphaned_sandboxes(dry_run: bool) -> anyhow::Result<(usize, Vec<C
     let now = SystemTime::now();
     let min_age = std::time::Duration::from_secs(300); // 5 minutes
 
-    let dir_entries = match std::fs::read_dir(&temp_dir) {
-        Ok(entries) => entries,
-        Err(_) => return Ok((0, entries)),
+    let Ok(dir_entries) = std::fs::read_dir(&temp_dir) else {
+        return Ok((0, entries));
     };
 
     for entry in dir_entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let Ok(entry) = entry else { continue };
 
         let name = entry.file_name();
         let name_str = name.to_string_lossy();
@@ -640,23 +651,17 @@ pub fn cleanup_orphaned_sandboxes(dry_run: bool) -> anyhow::Result<(usize, Vec<C
         } else if pid_file.exists() {
             // No socket but PID file exists -- check if process is running.
             // Use `kill -0` via std::process::Command as a portable check.
-            match std::fs::read_to_string(&pid_file) {
-                Ok(contents) => {
-                    if let Ok(pid) = contents.trim().parse::<u32>() {
-                        // `kill -0 <pid>` exits 0 if process exists, non-zero otherwise.
-                        std::process::Command::new("kill")
-                            .args(["-0", &pid.to_string()])
-                            .stdout(std::process::Stdio::null())
-                            .stderr(std::process::Stdio::null())
-                            .status()
-                            .map(|s| s.success())
-                            .unwrap_or(false)
-                    } else {
-                        false
-                    }
-                }
-                Err(_) => false,
-            }
+            std::fs::read_to_string(&pid_file).is_ok_and(|contents| {
+                contents.trim().parse::<u32>().is_ok_and(|pid| {
+                    // `kill -0 <pid>` exits 0 if process exists, non-zero otherwise.
+                    std::process::Command::new("kill")
+                        .args(["-0", &pid.to_string()])
+                        .stdout(std::process::Stdio::null())
+                        .stderr(std::process::Stdio::null())
+                        .status()
+                        .is_ok_and(|s| s.success())
+                })
+            })
         } else {
             false // No PID file, no socket -- server is gone.
         };

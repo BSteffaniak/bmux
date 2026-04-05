@@ -39,3 +39,6 @@ hyperchad_renderer           = { workspace = true }
 hyperchad_template           = { workspace = true }
 hyperchad_transformer        = { workspace = true }
 hyperchad_transformer_models = { workspace = true }
+
+[features]
+fail-on-warnings = []

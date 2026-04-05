@@ -191,10 +191,12 @@ pub enum RecordingEventKindConfig {
 }
 
 /// Session recording for terminal replay, debugging, and playbook generation.
+///
 /// Records pane I/O and lifecycle events to disk.
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "recording")]
 #[serde(default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct RecordingConfig {
     /// Root directory for recording data.
     /// Relative paths are resolved against the directory containing `bmux.toml`.
@@ -528,6 +530,7 @@ impl Default for BehaviorConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ConfigDoc)]
 #[config_doc(section = "behavior.mouse")]
 #[serde(default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct MouseBehaviorConfig {
     /// Master toggle for mouse handling in attach mode.
     pub enabled: bool,
@@ -609,6 +612,7 @@ impl Default for ImageBehaviorConfig {
 
 impl ImageBehaviorConfig {
     /// Config doc support — empty since this is a nested struct, not an enum.
+    #[must_use]
     pub const fn config_doc_values() -> &'static [&'static str] {
         &[]
     }
@@ -675,6 +679,7 @@ impl Default for CompressionConfig {
 
 impl CompressionConfig {
     /// Config doc support.
+    #[must_use]
     pub const fn config_doc_values() -> &'static [&'static str] {
         &[]
     }
@@ -730,10 +735,10 @@ impl MouseBehaviorConfig {
     #[must_use]
     pub const fn effective_wheel_propagation(&self) -> MouseWheelPropagation {
         match (self.wheel_propagation, self.scroll_scrollback) {
-            (MouseWheelPropagation::ScrollbackOnly, false)
-            | (MouseWheelPropagation::ForwardAndScrollback, false) => {
-                MouseWheelPropagation::ForwardOnly
-            }
+            (
+                MouseWheelPropagation::ScrollbackOnly | MouseWheelPropagation::ForwardAndScrollback,
+                false,
+            ) => MouseWheelPropagation::ForwardOnly,
             (other, _) => other,
         }
     }
@@ -857,10 +862,11 @@ pub struct RequiredPathClaim {
 }
 
 /// Content and layout of the status bar displayed at the top or bottom
-/// of the terminal
+/// of the terminal.
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "status_bar")]
 #[serde(default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct StatusBarConfig {
     /// Enable status bar rendering in attach UI.
     pub enabled: bool,
@@ -996,6 +1002,7 @@ impl Default for StatusBarLayoutConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[serde(default)]
+#[allow(clippy::struct_excessive_bools)]
 pub struct StatusBarStyleConfig {
     /// Separator character set for tabs and modules.
     pub separator_set: StatusSeparatorSet,
@@ -1365,6 +1372,7 @@ impl BmuxConfig {
         Ok(())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn sanitize_invalid_values(&mut self) -> Vec<String> {
         let general_defaults = GeneralConfig::default();
         let keybind_defaults = KeyBindingConfig::default();
@@ -1389,7 +1397,7 @@ impl BmuxConfig {
         }
 
         if self.keybindings.prefix.trim().is_empty() {
-            self.keybindings.prefix = keybind_defaults.prefix.clone();
+            self.keybindings.prefix.clone_from(&keybind_defaults.prefix);
             repaired_fields.push(format!(
                 "keybindings.prefix=<empty> -> {}",
                 keybind_defaults.prefix
@@ -1398,7 +1406,9 @@ impl BmuxConfig {
 
         if let Err(error) = self.keybindings.resolve_timeout() {
             self.keybindings.timeout_ms = keybind_defaults.timeout_ms;
-            self.keybindings.timeout_profile = keybind_defaults.timeout_profile.clone();
+            self.keybindings
+                .timeout_profile
+                .clone_from(&keybind_defaults.timeout_profile);
             self.keybindings.timeout_profiles = keybind_defaults.timeout_profiles;
             repaired_fields.push(format!(
                 "keybindings timeout settings -> indefinite ({error})"

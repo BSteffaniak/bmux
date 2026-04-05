@@ -50,7 +50,6 @@ impl Mode {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub enum KeyCode {
     // Letter keys
     Char(char),
@@ -92,7 +91,6 @@ pub struct KeyModifiers {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub struct KeyEvent {
     pub code: KeyCode,
     pub modifiers: KeyModifiers,
@@ -139,7 +137,6 @@ impl KeyEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub enum MouseButton {
     Left,
     Right,
@@ -148,7 +145,6 @@ pub enum MouseButton {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub enum MouseEventType {
     Down,
     Up,
@@ -161,7 +157,6 @@ pub enum MouseEventType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub struct MouseEvent {
     pub event_type: MouseEventType,
     pub button: Option<MouseButton>,
@@ -176,7 +171,6 @@ pub struct MouseEvent {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub enum SessionEvent {
     Created {
         session_id: SessionId,
@@ -202,7 +196,6 @@ pub enum SessionEvent {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub enum PaneEvent {
     Created {
         pane_id: PaneId,
@@ -245,7 +238,6 @@ pub enum PaneEvent {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub enum ClientEvent {
     Connected {
         client_id: ClientId,
@@ -280,7 +272,6 @@ pub enum ClientEvent {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub enum InputEvent {
     Key {
         client_id: ClientId,
@@ -302,7 +293,6 @@ pub enum InputEvent {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub enum SystemEvent {
     ServerStarted,
     ServerStopping,
@@ -319,7 +309,6 @@ pub enum SystemEvent {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub enum Event {
     Session(SessionEvent),
     Pane(PaneEvent),

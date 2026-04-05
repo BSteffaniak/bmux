@@ -6,65 +6,24 @@ use crate::connection::{
     write_server_runtime_metadata,
 };
 use crate::input::{InputProcessor, Keymap, RuntimeAction};
-use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 use anyhow::{Context, Result};
 use bmux_cli_schema::{
-    AuthCommand, Cli, Command, ConfigCommand, KeymapCommand, LogLevel, LogsCommand,
-    LogsProfilesCommand, PlaybookCommand, RecordingCommand, RecordingCursorBlinkMode,
-    RecordingCursorMode, RecordingCursorPaintMode, RecordingCursorProfile, RecordingCursorShape,
-    RecordingCursorTextMode, RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg,
-    RecordingRenderMode, RecordingReplayMode, RemoteCommand, RemoteCompleteCommand, ServerCommand,
-    ServerRecordingCommand, SessionCommand, TerminalCommand, TraceFamily,
+    RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
+    RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode, RecordingEventKindArg,
+    RecordingExportFormat, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
 };
-use bmux_client::{
-    AttachLayoutState, AttachSnapshotState, BmuxClient, ClientError, StreamingBmuxClient,
-};
-use bmux_config::{
-    BmuxConfig, ConfigPaths, PaneRestoreMethod, RecordingExportCursorBlinkMode,
-    RecordingExportCursorMode, RecordingExportCursorPaintMode, RecordingExportCursorProfile,
-    RecordingExportCursorShape, RecordingExportCursorTextMode, ResolvedTimeout, StatusPosition,
-    TerminfoAutoInstall,
-};
-use bmux_ipc::{
-    AttachRect, AttachViewComponent, ContextSelector, ContextSummary, InvokeServiceKind,
-    PaneFocusDirection, PaneSelector, PaneSplitDirection, RecordingEventEnvelope,
-    RecordingEventKind, RecordingPayload, RecordingRollingStartOptions, RecordingStatus,
-    RecordingSummary, SessionSelector, SessionSummary,
-};
-use bmux_keybind::action_to_config_name;
-use bmux_plugin::{
-    PluginManifest, PluginRegistry, load_registered_plugin as load_native_registered_plugin,
-};
-use bmux_plugin_sdk::{
-    CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
-    HostScope, NativeCommandContext, NativeLifecycleContext, PluginCommandEffect,
-    PluginCommandOutcome, PluginEvent, PluginEventKind, RegisteredService, ServiceKind,
-    ServiceRequest,
-};
-use bmux_server::{BmuxServer, OfflineSessionKillTarget, offline_kill_sessions};
-use clap::{CommandFactory, FromArgMatches};
-use crossterm::cursor::{Hide, MoveTo, SavePosition, Show};
-use crossterm::event::{
-    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-    MouseButton, MouseEvent, MouseEventKind,
-};
-use crossterm::queue;
-use crossterm::style::Print;
+use bmux_client::BmuxClient;
+use bmux_config::{BmuxConfig, ConfigPaths};
+use bmux_ipc::{RecordingEventEnvelope, RecordingEventKind, RecordingStatus, RecordingSummary};
+use bmux_server::offline_kill_sessions;
+use clap::CommandFactory;
 use crossterm::terminal;
-use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
-use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use gif::{Encoder as GifEncoder, Frame as GifFrame, Repeat};
-use std::cell::RefCell;
-use std::io::{self, BufWriter, IsTerminal, Read, Seek, Write};
+use std::io::{self, BufWriter, IsTerminal, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::OnceLock;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use time::{Duration as TimeDuration, OffsetDateTime, format_description::well_known::Rfc3339};
-use tracing::{Level, debug, trace, warn};
+use std::process::Command as ProcessCommand;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
-
-use bmux_server::ServiceInvokeContext;
 
 mod attach;
 mod bootstrap;
@@ -99,38 +58,133 @@ use self::logs_watch::{
     active_log_file_path, run_logs_profiles_delete, run_logs_profiles_list,
     run_logs_profiles_rename, run_logs_profiles_show, run_logs_watch,
 };
-use attach::cursor::apply_attach_cursor_state;
-use attach::events::{AttachLoopControl, AttachLoopEvent};
-use attach::render::{
-    AttachLayer, AttachLayerSurface, append_pane_output, opaque_row_text, queue_layer_fill,
-    render_attach_scene, visible_scene_pane_ids,
-};
-use attach::runtime::*;
+use attach::runtime::run_session_attach_with_client;
 use attach::state::{
     AttachEventAction, AttachExitReason, AttachScrollbackCursor, AttachScrollbackPosition,
     AttachUiMode, AttachViewState, PaneRect,
 };
-use bootstrap::*;
+use bootstrap::{
+    DefaultAttachOptions, init_logging, map_attach_client_error, map_cli_client_error,
+    run_default_server_attach, run_server_start, run_session_attach,
+};
 use built_in_commands::{BuiltInHandlerId, built_in_command_by_handler};
-use cli_parse::*;
-use config_cli::*;
-use dispatch::*;
-use doctor_cli::*;
-use logs_cli::*;
-use playbook_cli::*;
-use plugin_commands::PluginCommandRegistry;
-use plugin_kernel::*;
-use plugin_runtime::*;
-use recording_cli::*;
-use remote_cli::*;
-use server_commands::*;
-use server_runtime::*;
-use session_cli::*;
-use session_follow::*;
-use terminal_doctor::*;
+use cli_parse::{
+    ParsedRuntimeCli, parse_runtime_cli, resolve_log_level, tracing_level,
+    validate_record_bootstrap_flags,
+};
+use config_cli::{run_config_get, run_config_path, run_config_set, run_config_show};
+use dispatch::run_command;
+use doctor_cli::run_doctor;
+use logs_cli::{run_logs_level, run_logs_path, run_logs_tail};
+use playbook_cli::{
+    run_playbook_cleanup, run_playbook_diff, run_playbook_dry_run, run_playbook_from_recording,
+    run_playbook_interactive, run_playbook_run, run_playbook_validate,
+};
+use plugin_kernel::{
+    EFFECTIVE_LOG_LEVEL, LOG_WRITER_GUARD, available_capability_providers,
+    available_service_descriptors, begin_host_kernel_effect_capture, core_provided_capabilities,
+    enter_host_kernel_connection, finish_host_kernel_effect_capture, host_kernel_bridge,
+    register_plugin_service_handlers, service_descriptors_from_declarations,
+};
+use plugin_runtime::{
+    activate_loaded_plugins, bundled_plugin_root as bundled_plugin_roots,
+    deactivate_loaded_plugins, discover_bundled_plugin_ids, dispatch_loaded_plugin_event,
+    effective_enabled_plugins, load_enabled_plugins, load_plugin, plugin_command_policy_hints,
+    plugin_event_bridge_loop, plugin_host_metadata, plugin_system_event,
+    registered_plugin_entry_exists, resolve_plugin_search_paths, run_external_plugin_command,
+    run_plugin_command, run_plugin_keybinding_command, scan_available_plugins,
+    validate_enabled_plugins,
+};
+use recording_cli::{
+    recording_event_kind_name, replay_interactive, replay_verify, replay_watch, run_recording_cut,
+    run_recording_delete, run_recording_delete_all, run_recording_export, run_recording_inspect,
+    run_recording_list, run_recording_path, run_recording_replay, run_recording_start,
+    run_recording_status, run_recording_stop, run_recording_verify_smoke, verify_recording_report,
+};
+use remote_cli::{
+    run_auth_login, run_auth_logout, run_auth_status, run_connect, run_host, run_hosts, run_join,
+    run_remote_complete_sessions, run_remote_complete_targets, run_remote_doctor, run_remote_init,
+    run_remote_install_server, run_remote_list, run_remote_test, run_remote_upgrade, run_setup,
+    run_share, run_target_proxy_from_current_argv, run_unshare, should_proxy_to_target,
+};
+use server_commands::{
+    run_server_bridge, run_server_gateway, run_server_recording_clear, run_server_recording_path,
+    run_server_recording_start, run_server_recording_status, run_server_recording_stop,
+    run_server_restore, run_server_save, run_server_status, run_server_stop,
+    run_server_whoami_principal, server_event_name,
+};
+use server_runtime::{
+    cleanup_stale_pid_file, fetch_server_status, is_pid_running, parse_pid_content,
+    read_server_pid_file, remove_server_pid_file, server_is_running, try_kill_pid,
+    wait_for_process_exit, wait_for_server_running, wait_until_server_stopped,
+    write_server_pid_file,
+};
+use session_cli::{
+    attach_quit_failure_status, run_client_list, run_session_kill, run_session_kill_all,
+    run_session_list, run_session_new,
+};
+use session_follow::{
+    parse_session_selector, parse_uuid_value, run_follow, run_session_detach, run_unfollow,
+};
+use terminal_doctor::{
+    check_terminfo_available, merged_runtime_keybindings, resolve_pane_term, run_keymap_doctor,
+    run_terminal_doctor, run_terminal_install_terminfo, terminal_profile_name,
+};
 use terminal_protocol::{
     ProtocolDirection, ProtocolProfile, ProtocolTraceEvent, primary_da_for_profile,
     protocol_profile_name, secondary_da_for_profile, supported_query_names,
+};
+
+// Re-exports for test visibility: submodule items that test code accesses via
+// `crate::runtime::ItemName`. These are `use` (not `pub use`) so they're only
+// visible within the runtime module tree.
+#[cfg(test)]
+use attach::render::append_pane_output;
+#[cfg(test)]
+use attach::runtime::{
+    AttachKeybindingScope, AttachPaneMouseProtocol, ClosePaneConfirmationAction,
+    adjust_attach_scrollback_offset, adjust_help_overlay_scroll,
+    adjust_scrollback_cursor_component, apply_attach_view_change_components, attach_event_actions,
+    attach_exit_message, attach_key_event_actions, attach_keymap_from_config,
+    attach_layout_requires_snapshot_hydration, attach_mode_hint,
+    attach_mouse_forward_bytes_for_target, attach_pane_mouse_protocol, attach_scene_pane_at,
+    attach_scrollback_hint, begin_attach_selection, build_attach_help_lines,
+    cancel_close_pane_confirmation, clear_attach_selection, confirm_attach_scrollback,
+    describe_timeout, effective_attach_keybindings, encode_attach_mouse_for_protocol,
+    encode_attach_mouse_sgr, enter_attach_scrollback, filtered_attach_keybindings,
+    focused_attach_pane_id, handle_attach_mouse_scrollback, handle_help_overlay_key_event,
+    initial_attach_status, mouse_protocol_mode_reports_event,
+    move_attach_scrollback_cursor_horizontal, move_attach_scrollback_cursor_vertical,
+    plugin_fallback_new_context_id, plugin_fallback_retarget_context_id,
+    process_close_pane_confirmation, record_attach_mouse_event, relative_session_id,
+    resize_attach_parsers_for_scene_with_size, resolve_mouse_gesture_action, selected_attach_text,
+    should_forward_click_like_mouse,
+};
+#[cfg(test)]
+use bmux_cli_schema::TraceFamily;
+#[cfg(test)]
+use bmux_plugin_sdk::PluginCommandEffect;
+#[cfg(test)]
+use cli_parse::parse_runtime_cli_with_registry;
+#[cfg(test)]
+use dispatch::built_in_handler_for_command;
+#[cfg(test)]
+use logs_cli::{line_matches_since, parse_since_duration};
+#[cfg(test)]
+use plugin_kernel::maybe_record_host_kernel_effect;
+#[cfg(test)]
+use plugin_runtime::{
+    bundled_plugin_root, format_plugin_argument_validation_error, format_plugin_command_run_error,
+    format_plugin_not_enabled_message, format_plugin_not_found_message, plugin_command_context,
+    plugin_event_from_server_event, plugin_lifecycle_context, unknown_external_command_message,
+    validate_configured_plugins,
+};
+#[cfg(test)]
+use session_cli::format_destructive_op_error;
+#[cfg(test)]
+use terminal_doctor::{
+    filter_trace_events, profile_for_term, protocol_profile_for_terminal_profile,
+    resolve_pane_term_with_checker,
 };
 
 const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(200);
@@ -148,7 +202,7 @@ const ATTACH_TRANSIENT_STATUS_TTL: Duration = Duration::from_millis(1800);
 const ATTACH_WELCOME_STATUS_TTL: Duration = Duration::from_millis(2600);
 const HELP_OVERLAY_SURFACE_ID: Uuid = Uuid::from_u128(1);
 
-pub(super) fn active_runtime_name() -> String {
+pub fn active_runtime_name() -> String {
     std::env::var("BMUX_RUNTIME_NAME")
         .ok()
         .map(|value| value.trim().to_string())
@@ -156,7 +210,7 @@ pub(super) fn active_runtime_name() -> String {
         .unwrap_or_else(|| "default".to_string())
 }
 
-pub(super) fn append_runtime_arg(command: &mut ProcessCommand) {
+pub fn append_runtime_arg(command: &mut ProcessCommand) {
     command.arg("--runtime").arg(active_runtime_name());
 }
 

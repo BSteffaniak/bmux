@@ -154,7 +154,7 @@ pub fn detect_with_queries() -> HostImageCapabilities {
             Ok(n) if n > 0 => {
                 response.extend_from_slice(&buf[..n]);
                 // DA1 response ends with 'c'.
-                if response.iter().any(|&b| b == b'c') {
+                if response.contains(&b'c') {
                     break;
                 }
             }
@@ -163,10 +163,10 @@ pub fn detect_with_queries() -> HostImageCapabilities {
     }
 
     // Parse DA1 response for sixel attribute (4).
-    if let Some(da_response) = parse_da1_response(&response) {
-        if da_response.contains(&4) {
-            caps.sixel = true;
-        }
+    if let Some(da_response) = parse_da1_response(&response)
+        && da_response.contains(&4)
+    {
+        caps.sixel = true;
     }
 
     caps

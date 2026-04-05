@@ -26,6 +26,11 @@ impl PlaybookDisplayTrackWriter {
     /// Create a new display track writer in the given recording directory.
     ///
     /// Writes `owner-client-id.txt` and the initial `stream_opened` + `resize` events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the recording directory cannot be created or files
+    /// cannot be written.
     pub fn new(
         recording_dir: &Path,
         client_id: Uuid,
@@ -76,6 +81,10 @@ impl PlaybookDisplayTrackWriter {
     }
 
     /// Record terminal output bytes (a frame of data).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing to the display track file fails.
     pub fn record_frame_bytes(&mut self, data: &[u8]) -> Result<()> {
         if data.is_empty() {
             return Ok(());
@@ -92,16 +101,29 @@ impl PlaybookDisplayTrackWriter {
     }
 
     /// Record a viewport resize.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing to the display track file fails.
     pub fn record_resize(&mut self, cols: u16, rows: u16) -> Result<()> {
         self.parser.screen_mut().set_size(rows.max(1), cols.max(1));
         self.record(DisplayTrackEvent::Resize { cols, rows })
     }
 
+    /// Record an activity event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing to the display track file fails.
     pub fn record_activity(&mut self, kind: DisplayActivityKind) -> Result<()> {
         self.record(DisplayTrackEvent::Activity { kind })
     }
 
     /// Record the stream closed event and flush.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if flushing the display track writer fails.
     pub fn finish(&mut self) -> Result<()> {
         self.record(DisplayTrackEvent::StreamClosed)?;
         self.writer
@@ -109,13 +131,14 @@ impl PlaybookDisplayTrackWriter {
             .context("failed flushing display track writer")
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn record(&mut self, event: DisplayTrackEvent) -> Result<()> {
         let envelope = DisplayTrackEnvelope {
             mono_ns: self
                 .started_at
                 .elapsed()
                 .as_nanos()
-                .min(u128::from(u64::MAX)) as u64,
+                .min(u128::from(u64::MAX)) as u64, // safe: clamped to u64::MAX
             event,
         };
         bmux_ipc::write_frame(&mut self.writer, &envelope)

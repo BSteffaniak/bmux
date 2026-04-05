@@ -65,6 +65,7 @@ pub struct InterceptResult {
 pub struct ImageInterceptor {
     state: State,
     buf: Vec<u8>,
+    #[allow(dead_code)]
     capture_position: ImagePosition,
     /// Byte offset in the filtered output when the current image's ESC was seen.
     capture_filtered_offset: usize,
@@ -100,6 +101,7 @@ impl ImageInterceptor {
     /// `event.set_position(pos)` before passing to the registry.
     pub fn process(&mut self, input: &[u8]) -> InterceptResult {
         let mut filtered = Vec::with_capacity(input.len());
+        #[allow(unused_mut)]
         let mut events = Vec::new();
 
         for &byte in input {
@@ -158,10 +160,10 @@ impl ImageInterceptor {
                 State::DcsEntry => {
                     // Accumulate DCS parameter/intermediate bytes until the
                     // final byte.  Sixel's final byte is 'q'.
-                    if byte >= 0x30 && byte <= 0x3F {
+                    if (0x30..=0x3F).contains(&byte) {
                         // Parameter byte (0-9, ;, etc.)
                         self.dcs_intermediates.push(byte);
-                    } else if byte >= 0x20 && byte <= 0x2F {
+                    } else if (0x20..=0x2F).contains(&byte) {
                         // Intermediate byte
                         self.dcs_intermediates.push(byte);
                     } else if byte == b'q' {

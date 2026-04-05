@@ -1,6 +1,7 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
+#![cfg_attr(feature = "static-bundled", allow(dead_code))]
 
 use bmux_cli_output::{Table, TableColumn, write_table};
 use bmux_plugin::ServiceCaller;
@@ -126,9 +127,7 @@ fn run_permissions_grant(context: &NativeCommandContext) -> i32 {
         eprintln!("example.native permissions-grant requires --client <uuid>");
         return EXIT_USAGE;
     };
-    let client_id = if let Ok(value) = uuid::Uuid::parse_str(&client_id) {
-        value
-    } else {
+    let Ok(client_id) = uuid::Uuid::parse_str(&client_id) else {
         eprintln!("example.native permissions-grant received invalid client id");
         return EXIT_USAGE;
     };
@@ -189,9 +188,7 @@ fn run_permissions_revoke(context: &NativeCommandContext) -> i32 {
         eprintln!("example.native permissions-revoke requires --client <uuid>");
         return EXIT_USAGE;
     };
-    let client_id = if let Ok(value) = uuid::Uuid::parse_str(&client_id) {
-        value
-    } else {
+    let Ok(client_id) = uuid::Uuid::parse_str(&client_id) else {
         eprintln!("example.native permissions-revoke received invalid client id");
         return EXIT_USAGE;
     };

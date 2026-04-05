@@ -6,6 +6,7 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::time::Duration;
 use uuid::Uuid;
 
@@ -64,6 +65,7 @@ impl PlaybookConfig {
     ///
     /// Priority: playbook config (if explicitly set) → `BMUX_PLAYBOOK_ENV_MODE`
     /// env var (if set) → `Inherit`.
+    #[must_use]
     pub fn effective_env_mode(&self) -> SandboxEnvMode {
         effective_env_mode_from(
             self.env_mode,
@@ -81,7 +83,6 @@ fn effective_env_mode_from(
     }
     match env_mode {
         Some("clean") => SandboxEnvMode::Clean,
-        Some("inherit") => SandboxEnvMode::Inherit,
         _ => SandboxEnvMode::Inherit,
     }
 }
@@ -137,6 +138,8 @@ pub struct Step {
 
 impl Step {
     /// Serialize the step to a DSL line, including the `!continue` suffix if set.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn to_dsl(&self) -> String {
         let line = self.action.to_dsl();
         if self.continue_on_error {
@@ -353,7 +356,8 @@ pub struct PaneCapture {
 
 impl Action {
     /// Return the action name for display / reporting.
-    pub fn name(&self) -> &'static str {
+    #[must_use]
+    pub const fn name(&self) -> &'static str {
         match self {
             Self::NewSession { .. } => "new-session",
             Self::KillSession { .. } => "kill-session",
@@ -379,14 +383,16 @@ impl Action {
     }
 
     /// Serialize the action back to a DSL line for round-trip display.
+    #[must_use]
+    #[allow(clippy::too_many_lines)]
     pub fn to_dsl(&self) -> String {
         use super::from_recording::{bytes_to_c_escaped, escape_single_quote};
 
         match self {
-            Self::NewSession { name } => match name {
-                Some(n) => format!("new-session name='{}'", escape_single_quote(n)),
-                None => "new-session".to_string(),
-            },
+            Self::NewSession { name } => name.as_ref().map_or_else(
+                || "new-session".to_string(),
+                |n| format!("new-session name='{}'", escape_single_quote(n)),
+            ),
             Self::KillSession { name } => {
                 format!("kill-session name='{}'", escape_single_quote(name))
             }
@@ -395,25 +401,28 @@ impl Action {
                     SplitDirection::Vertical => "vertical",
                     SplitDirection::Horizontal => "horizontal",
                 };
-                match ratio {
-                    Some(r) => format!("split-pane direction={dir} ratio={r}"),
-                    None => format!("split-pane direction={dir}"),
-                }
+                ratio.map_or_else(
+                    || format!("split-pane direction={dir}"),
+                    |r| format!("split-pane direction={dir} ratio={r}"),
+                )
             }
             Self::FocusPane { target } => format!("focus-pane target={target}"),
-            Self::ClosePane { target } => match target {
-                Some(t) => format!("close-pane target={t}"),
-                None => "close-pane".to_string(),
-            },
+            Self::ClosePane { target } => target.map_or_else(
+                || "close-pane".to_string(),
+                |t| format!("close-pane target={t}"),
+            ),
             Self::SendKeys { keys, pane } => {
                 let escaped = bytes_to_c_escaped(keys);
-                match pane {
-                    Some(p) => format!("send-keys keys='{escaped}' pane={p}"),
-                    None => format!("send-keys keys='{escaped}'"),
-                }
+                pane.map_or_else(
+                    || format!("send-keys keys='{escaped}'"),
+                    |p| format!("send-keys keys='{escaped}' pane={p}"),
+                )
             }
             Self::SendBytes { hex } => {
-                let hex_str: String = hex.iter().map(|b| format!("{b:02x}")).collect();
+                let mut hex_str = String::with_capacity(hex.len() * 2);
+                for b in hex {
+                    let _ = write!(hex_str, "{b:02x}");
+                }
                 format!("send-bytes hex={hex_str}")
             }
             Self::WaitFor {
@@ -425,14 +434,14 @@ impl Action {
                 let escaped = escape_single_quote(pattern);
                 let mut line = format!("wait-for pattern='{escaped}'");
                 if let Some(p) = pane {
-                    line.push_str(&format!(" pane={p}"));
+                    let _ = write!(line, " pane={p}");
                 }
                 let ms = timeout.as_millis();
                 if ms != 5000 {
-                    line.push_str(&format!(" timeout={ms}"));
+                    let _ = write!(line, " timeout={ms}");
                 }
                 if *retry > 1 {
-                    line.push_str(&format!(" retry={retry}"));
+                    let _ = write!(line, " retry={retry}");
                 }
                 line
             }
@@ -448,16 +457,16 @@ impl Action {
             } => {
                 let mut line = "assert-screen".to_string();
                 if let Some(p) = pane {
-                    line.push_str(&format!(" pane={p}"));
+                    let _ = write!(line, " pane={p}");
                 }
                 if let Some(c) = contains {
-                    line.push_str(&format!(" contains='{}'", escape_single_quote(c)));
+                    let _ = write!(line, " contains='{}'", escape_single_quote(c));
                 }
                 if let Some(nc) = not_contains {
-                    line.push_str(&format!(" not_contains='{}'", escape_single_quote(nc)));
+                    let _ = write!(line, " not_contains='{}'", escape_single_quote(nc));
                 }
                 if let Some(m) = matches {
-                    line.push_str(&format!(" matches='{}'", escape_single_quote(m)));
+                    let _ = write!(line, " matches='{}'", escape_single_quote(m));
                 }
                 line
             }
@@ -467,7 +476,7 @@ impl Action {
             Self::AssertCursor { pane, row, col } => {
                 let mut line = format!("assert-cursor row={row} col={col}");
                 if let Some(p) = pane {
-                    line.push_str(&format!(" pane={p}"));
+                    let _ = write!(line, " pane={p}");
                 }
                 line
             }
@@ -481,10 +490,10 @@ impl Action {
             Self::WaitForEvent { event, timeout } => {
                 let escaped = escape_single_quote(event);
                 let ms = timeout.as_millis();
-                if ms != 5000 {
-                    format!("wait-for-event event='{escaped}' timeout={ms}")
-                } else {
+                if ms == 5000 {
                     format!("wait-for-event event='{escaped}'")
+                } else {
+                    format!("wait-for-event event='{escaped}' timeout={ms}")
                 }
             }
             Self::InvokeService {
@@ -505,7 +514,7 @@ impl Action {
                     escape_single_quote(operation),
                 );
                 if !payload.is_empty() {
-                    line.push_str(&format!(" payload='{}'", escape_single_quote(payload)));
+                    let _ = write!(line, " payload='{}'", escape_single_quote(payload));
                 }
                 line
             }

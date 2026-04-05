@@ -13,6 +13,9 @@ use super::types::{
 ///
 /// Returns the playbook and a list of include paths that the caller
 /// is responsible for resolving and merging.
+/// # Errors
+///
+/// Returns an error if the TOML input is malformed or contains invalid fields.
 pub fn parse_toml(input: &str) -> Result<(Playbook, Vec<(usize, String)>)> {
     let raw: RawPlaybook = toml::from_str(input).context("invalid playbook TOML")?;
     let includes: Vec<(usize, String)> = raw
@@ -49,16 +52,13 @@ fn parse_config(raw: Option<RawPlaybookConfig>) -> Result<PlaybookConfig> {
         return Ok(PlaybookConfig::default());
     };
 
-    let viewport = match raw.viewport {
-        Some(v) => {
-            let defaults = Viewport::default();
-            Viewport {
-                cols: v.cols.unwrap_or(defaults.cols),
-                rows: v.rows.unwrap_or(defaults.rows),
-            }
+    let viewport = raw.viewport.map_or_else(Viewport::default, |v| {
+        let defaults = Viewport::default();
+        Viewport {
+            cols: v.cols.unwrap_or(defaults.cols),
+            rows: v.rows.unwrap_or(defaults.rows),
         }
-        None => Viewport::default(),
-    };
+    });
 
     let timeout = raw
         .timeout_ms
@@ -96,6 +96,7 @@ fn parse_config(raw: Option<RawPlaybookConfig>) -> Result<PlaybookConfig> {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 fn parse_step_action(step: RawStep) -> Result<Action> {
     match step.action.as_str() {
         "new-session" => Ok(Action::NewSession { name: step.name }),
@@ -105,8 +106,8 @@ fn parse_step_action(step: RawStep) -> Result<Action> {
         }
         "split-pane" => {
             let direction = match step.direction.as_deref() {
-                Some("vertical") | Some("v") | None => SplitDirection::Vertical,
-                Some("horizontal") | Some("h") => SplitDirection::Horizontal,
+                Some("vertical" | "v") | None => SplitDirection::Vertical,
+                Some("horizontal" | "h") => SplitDirection::Horizontal,
                 Some(other) => bail!("invalid split direction: {other}"),
             };
             Ok(Action::SplitPane {
@@ -207,8 +208,8 @@ fn parse_step_action(step: RawStep) -> Result<Action> {
                 .capability
                 .context("invoke-service requires 'capability'")?;
             let kind = match step.kind.as_deref() {
-                Some("query") | Some("q") => ServiceKind::Query,
-                Some("command") | Some("cmd") | None => ServiceKind::Command,
+                Some("query" | "q") => ServiceKind::Query,
+                Some("command" | "cmd") | None => ServiceKind::Command,
                 Some(other) => bail!("invalid service kind: {other}"),
             };
             let interface_id = step
@@ -234,7 +235,7 @@ fn parse_step_action(step: RawStep) -> Result<Action> {
 
 fn decode_hex(hex: &str) -> Result<Vec<u8>> {
     let hex = hex.trim();
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         bail!("hex string must have even length");
     }
     (0..hex.len())

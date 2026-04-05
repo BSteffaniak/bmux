@@ -6,6 +6,7 @@
 //! parser model used by mature multiplexers.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 
 use anyhow::{Context, Result, bail};
 use bmux_client::{AttachLayoutState, AttachSnapshotState, BmuxClient};
@@ -123,7 +124,8 @@ pub struct PaneDeltaResult {
 }
 
 impl ScreenInspector {
-    pub fn new(viewport_cols: u16, viewport_rows: u16) -> Self {
+    #[must_use]
+    pub const fn new(viewport_cols: u16, viewport_rows: u16) -> Self {
         Self {
             panes: Vec::new(),
             pane_states: BTreeMap::new(),
@@ -144,6 +146,9 @@ impl ScreenInspector {
     }
 
     /// Synchronize layout/output and update parsed pane state.
+    /// # Errors
+    ///
+    /// Returns an error if the server request fails.
     pub async fn refresh(
         &mut self,
         client: &mut BmuxClient,
@@ -156,6 +161,9 @@ impl ScreenInspector {
     }
 
     /// Drain one incremental pane-output batch and update parser state.
+    /// # Errors
+    ///
+    /// Returns an error if reading pane output fails.
     pub async fn drain_incremental_output(
         &mut self,
         client: &mut BmuxClient,
@@ -369,11 +377,11 @@ impl ScreenInspector {
                 continue;
             }
 
-            if let Some(expected) = state.expected_stream_start {
-                if stream_start != expected {
-                    needs_resync = true;
-                    continue;
-                }
+            if let Some(expected) = state.expected_stream_start
+                && stream_start != expected
+            {
+                needs_resync = true;
+                continue;
             }
 
             if pane_id == layout.focused_pane_id && !data.is_empty() {
@@ -429,6 +437,7 @@ impl ScreenInspector {
     }
 
     /// Get the full screen text of a specific pane (by index).
+    #[must_use]
     pub fn pane_text(&self, pane_index: u32) -> Option<String> {
         self.panes
             .iter()
@@ -437,6 +446,7 @@ impl ScreenInspector {
     }
 
     /// Get cursor position for a pane (by index). Returns (row, col).
+    #[must_use]
     pub fn pane_cursor(&self, pane_index: u32) -> Option<(u16, u16)> {
         self.panes
             .iter()
@@ -445,6 +455,7 @@ impl ScreenInspector {
     }
 
     /// Capture the state of all panes for a snapshot.
+    #[must_use]
     pub fn capture_all(&self) -> Vec<PaneCapture> {
         self.panes
             .iter()
@@ -460,6 +471,7 @@ impl ScreenInspector {
 
     /// Capture all panes, returning `None` if no panes are available.
     /// Safe to call even when the inspector has not been refreshed.
+    #[must_use]
     pub fn capture_all_safe(&self) -> Option<Vec<PaneCapture>> {
         if self.panes.is_empty() {
             None
@@ -469,6 +481,8 @@ impl ScreenInspector {
     }
 
     /// Build cursor and screen deltas against a previous pane cache.
+    #[must_use]
+    #[allow(clippy::cast_possible_truncation)]
     pub fn build_deltas(
         &self,
         previous: &std::collections::HashMap<u32, PaneCapture>,
@@ -490,12 +504,16 @@ impl ScreenInspector {
     }
 
     /// Check if a pane's screen text contains a substring.
+    #[must_use]
     pub fn pane_contains(&self, pane_index: u32, needle: &str) -> bool {
         self.pane_text(pane_index)
             .is_some_and(|text| text.contains(needle))
     }
 
     /// Check if a pane's screen text matches a regex.
+    /// # Errors
+    ///
+    /// Returns an error if the regex pattern is invalid.
     pub fn pane_matches(&self, pane_index: u32, pattern: &str) -> Result<bool> {
         let re = Regex::new(pattern).with_context(|| format!("invalid regex: {pattern}"))?;
         Ok(self.pane_matches_compiled(pane_index, &re))
@@ -503,12 +521,16 @@ impl ScreenInspector {
 
     /// Check if a pane's screen text matches a pre-compiled regex.
     /// Use this in hot loops (e.g. `wait-for` polling) to avoid recompiling.
+    #[must_use]
     pub fn pane_matches_compiled(&self, pane_index: u32, re: &Regex) -> bool {
         self.pane_text(pane_index)
             .is_some_and(|text| re.is_match(&text))
     }
 
     /// Resolve which pane index to inspect. If `pane` is `None`, uses the focused pane.
+    /// # Errors
+    ///
+    /// Returns an error if the pane index is out of range.
     pub fn resolve_pane_index(
         &self,
         pane: Option<u32>,
@@ -624,6 +646,7 @@ fn build_screen_delta(
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn line_ops_delta(previous_text: &str, current_text: &str) -> Vec<ScreenLineOp> {
     let previous_lines = previous_text.lines().collect::<Vec<_>>();
     let current_lines = current_text.lines().collect::<Vec<_>>();
@@ -657,9 +680,9 @@ fn unified_diff(previous_text: &str, current_text: &str) -> Option<String> {
         if prev == curr {
             continue;
         }
-        output.push_str(&format!("@@ -{},1 +{},1 @@\n", row + 1, row + 1));
-        output.push_str(&format!("-{prev}\n"));
-        output.push_str(&format!("+{curr}\n"));
+        let _ = writeln!(output, "@@ -{},1 +{},1 @@", row + 1, row + 1);
+        let _ = writeln!(output, "-{prev}");
+        let _ = writeln!(output, "+{curr}");
     }
     if output.is_empty() {
         None

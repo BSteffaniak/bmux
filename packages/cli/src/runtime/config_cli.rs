@@ -1,4 +1,5 @@
-use super::*;
+use anyhow::{Context, Result};
+use bmux_config::{BmuxConfig, ConfigPaths};
 
 pub(super) fn run_config_path(as_json: bool) -> Result<u8> {
     let paths = ConfigPaths::default();
@@ -159,10 +160,10 @@ fn parse_cli_value(raw: &str) -> toml_edit::Value {
     if let Ok(i) = raw.parse::<i64>() {
         return toml_edit::value(i).into_value().unwrap();
     }
-    if let Ok(f) = raw.parse::<f64>() {
-        if raw.contains('.') {
-            return toml_edit::value(f).into_value().unwrap();
-        }
+    if let Ok(f) = raw.parse::<f64>()
+        && raw.contains('.')
+    {
+        return toml_edit::value(f).into_value().unwrap();
     }
     toml_edit::value(raw).into_value().unwrap()
 }
@@ -198,8 +199,8 @@ fn set_dotted_key(
 
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::wildcard_imports)]
     use super::*;
-
     #[test]
     fn resolve_dotted_key_traverses_nested_tables() {
         let input: toml::Value = toml::from_str(

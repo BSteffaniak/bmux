@@ -1,4 +1,13 @@
-use super::*;
+use anyhow::{Context, Result};
+use bmux_config::{BmuxConfig, ConfigPaths};
+use bmux_plugin::PluginRegistry;
+use std::path::PathBuf;
+
+use super::{
+    ConnectionContext, check_terminfo_available, current_cli_build_id, effective_enabled_plugins,
+    fetch_server_status, plugin_host_metadata, read_server_runtime_metadata, resolve_pane_term,
+    scan_available_plugins, terminal_profile_name,
+};
 
 pub(super) async fn run_doctor(as_json: bool, hosted: bool) -> Result<u8> {
     if hosted {
@@ -19,7 +28,7 @@ pub(super) async fn run_doctor(as_json: bool, hosted: bool) -> Result<u8> {
         run_doctor_text(&paths).await?
     };
 
-    Ok(if has_warnings { 1 } else { 0 })
+    Ok(u8::from(has_warnings))
 }
 
 async fn run_hosted_doctor(as_json: bool) -> Result<u8> {
@@ -117,7 +126,7 @@ async fn run_hosted_doctor(as_json: bool) -> Result<u8> {
     }
 
     let has_failures = lines.iter().any(|(_, ok, _, _)| !*ok);
-    Ok(if has_failures { 1 } else { 0 })
+    Ok(u8::from(has_failures))
 }
 
 // ── text output ─────────────────────────────────────────────────────────
@@ -195,16 +204,15 @@ async fn run_doctor_text(paths: &ConfigPaths) -> Result<bool> {
             );
 
             // Check for stale build
-            if let Ok(Some(meta)) = &meta {
-                if let Ok(cli_build_id) = current_cli_build_id() {
-                    if meta.build_id != cli_build_id {
-                        print_warn(
-                            "server",
-                            "stale build detected (server build differs from CLI)",
-                        );
-                        warnings = true;
-                    }
-                }
+            if let Ok(Some(meta)) = &meta
+                && let Ok(cli_build_id) = current_cli_build_id()
+                && meta.build_id != cli_build_id
+            {
+                print_warn(
+                    "server",
+                    "stale build detected (server build differs from CLI)",
+                );
+                warnings = true;
             }
         }
         _ => {
@@ -506,8 +514,8 @@ async fn build_doctor_report(paths: &ConfigPaths) -> DoctorReport {
     }
 
     // Terminal
-    let config_ref = config.as_ref().cloned().unwrap_or_default();
-    let configured_term = config_ref.behavior.pane_term.clone();
+    let config_ref = config.clone().unwrap_or_default();
+    let configured_term = config_ref.behavior.pane_term;
     let resolution = resolve_pane_term(&configured_term);
     let profile_name = terminal_profile_name(resolution.profile).to_string();
     if !resolution.warnings.is_empty() {
@@ -523,7 +531,7 @@ async fn build_doctor_report(paths: &ConfigPaths) -> DoctorReport {
                 let incompatible: Vec<String> = enabled
                     .iter()
                     .filter(|id| {
-                        registry.get(id).map_or(false, |p| {
+                        registry.get(id).is_some_and(|p| {
                             !PluginRegistry::compatibility_report(p, &host).is_loadable()
                         })
                     })

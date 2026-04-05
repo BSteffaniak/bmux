@@ -99,15 +99,15 @@ pub fn estimate_pixel_size(image_data: &[u8]) -> Option<ImagePixelSize> {
             }
             let marker = image_data[i + 1];
             // SOF markers: C0-C3, C5-C7, C9-CB, CD-CF
-            if matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF) {
-                if i + 9 < image_data.len() {
-                    let height = u16::from_be_bytes([image_data[i + 5], image_data[i + 6]]);
-                    let width = u16::from_be_bytes([image_data[i + 7], image_data[i + 8]]);
-                    return Some(ImagePixelSize {
-                        width: width as u32,
-                        height: height as u32,
-                    });
-                }
+            if matches!(marker, 0xC0..=0xC3 | 0xC5..=0xC7 | 0xC9..=0xCB | 0xCD..=0xCF)
+                && i + 9 < image_data.len()
+            {
+                let height = u16::from_be_bytes([image_data[i + 5], image_data[i + 6]]);
+                let width = u16::from_be_bytes([image_data[i + 7], image_data[i + 8]]);
+                return Some(ImagePixelSize {
+                    width: width as u32,
+                    height: height as u32,
+                });
             }
             // Skip to next marker.
             if i + 3 < image_data.len() {

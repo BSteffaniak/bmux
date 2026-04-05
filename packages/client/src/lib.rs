@@ -171,7 +171,7 @@ impl ClientStream {
 
 impl BmuxClient {
     #[must_use]
-    pub fn negotiated_protocol(&self) -> Option<&NegotiatedProtocol> {
+    pub const fn negotiated_protocol(&self) -> Option<&NegotiatedProtocol> {
         self.negotiated_protocol.as_ref()
     }
 
@@ -940,6 +940,11 @@ impl BmuxClient {
         }
     }
 
+    /// Split the focused pane in the given direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the split or transport fails.
     pub async fn split_pane(
         &mut self,
         session: Option<SessionSelector>,
@@ -959,6 +964,11 @@ impl BmuxClient {
         }
     }
 
+    /// Split a specific target pane in the given direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the split or transport fails.
     pub async fn split_pane_target(
         &mut self,
         session: Option<SessionSelector>,
@@ -979,6 +989,11 @@ impl BmuxClient {
         }
     }
 
+    /// Move focus to an adjacent pane in the given direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the focus change or transport fails.
     pub async fn focus_pane(
         &mut self,
         session: Option<SessionSelector>,
@@ -997,6 +1012,11 @@ impl BmuxClient {
         }
     }
 
+    /// Focus a specific target pane by selector.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the focus change or transport fails.
     pub async fn focus_pane_target(
         &mut self,
         session: Option<SessionSelector>,
@@ -1015,6 +1035,11 @@ impl BmuxClient {
         }
     }
 
+    /// Resize the focused pane by the given delta.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the resize or transport fails.
     pub async fn resize_pane(
         &mut self,
         session: Option<SessionSelector>,
@@ -1033,6 +1058,11 @@ impl BmuxClient {
         }
     }
 
+    /// Resize a specific target pane by the given delta.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the resize or transport fails.
     pub async fn resize_pane_target(
         &mut self,
         session: Option<SessionSelector>,
@@ -1052,6 +1082,11 @@ impl BmuxClient {
         }
     }
 
+    /// Close the focused pane.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the close or transport fails.
     pub async fn close_pane(&mut self, session: Option<SessionSelector>) -> Result<()> {
         match self
             .request(Request::ClosePane {
@@ -1065,6 +1100,11 @@ impl BmuxClient {
         }
     }
 
+    /// Close a specific target pane.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the close or transport fails.
     pub async fn close_pane_target(
         &mut self,
         session: Option<SessionSelector>,
@@ -1082,6 +1122,11 @@ impl BmuxClient {
         }
     }
 
+    /// Restart the focused pane's process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the restart or transport fails.
     pub async fn restart_pane(&mut self, session: Option<SessionSelector>) -> Result<Uuid> {
         match self
             .request(Request::RestartPane {
@@ -1095,6 +1140,11 @@ impl BmuxClient {
         }
     }
 
+    /// Restart a specific target pane's process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the restart or transport fails.
     pub async fn restart_pane_target(
         &mut self,
         session: Option<SessionSelector>,
@@ -1112,6 +1162,11 @@ impl BmuxClient {
         }
     }
 
+    /// Toggle zoom on the focused pane.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the zoom or transport fails.
     pub async fn zoom_pane(&mut self, session: Option<SessionSelector>) -> Result<(Uuid, bool)> {
         match self.request(Request::ZoomPane { session }).await? {
             ResponsePayload::PaneZoomed {
@@ -1121,6 +1176,11 @@ impl BmuxClient {
         }
     }
 
+    /// List panes in the given session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn list_panes(
         &mut self,
         session: Option<SessionSelector>,
@@ -1361,6 +1421,11 @@ impl BmuxClient {
         }
     }
 
+    /// Fetch current layout state for an attached session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn attach_layout(&mut self, session_id: Uuid) -> Result<AttachLayoutState> {
         match self.request(Request::AttachLayout { session_id }).await? {
             ResponsePayload::AttachLayout {
@@ -1386,6 +1451,11 @@ impl BmuxClient {
         }
     }
 
+    /// Fetch output from multiple panes in a single batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn attach_pane_output_batch(
         &mut self,
         session_id: Uuid,
@@ -1413,6 +1483,11 @@ impl BmuxClient {
         }
     }
 
+    /// Fetch image deltas for multiple panes since given sequence numbers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn attach_pane_images(
         &mut self,
         session_id: Uuid,
@@ -1434,6 +1509,11 @@ impl BmuxClient {
         }
     }
 
+    /// Fetch a full session snapshot including layout, output, and mouse state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn attach_snapshot(
         &mut self,
         session_id: Uuid,
@@ -1579,11 +1659,11 @@ impl StreamingBmuxClient {
         let (mut reader, mut writer) = local_stream.into_split();
 
         // Enable frame compression if negotiated.
-        if let Some(ref negotiated) = negotiated_protocol {
-            if let Some(codec) = resolve_frame_codec_from_capabilities(&negotiated.capabilities) {
-                writer.enable_frame_compression(codec);
-                reader.enable_frame_compression();
-            }
+        if let Some(ref negotiated) = negotiated_protocol
+            && let Some(codec) = resolve_frame_codec_from_capabilities(&negotiated.capabilities)
+        {
+            writer.enable_frame_compression(codec);
+            reader.enable_frame_compression();
         }
 
         let pending: PendingMap = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
@@ -1612,21 +1692,18 @@ impl StreamingBmuxClient {
         event_tx: tokio::sync::mpsc::UnboundedSender<ServerEvent>,
     ) {
         loop {
-            let envelope = match reader.recv_envelope().await {
-                Ok(envelope) => envelope,
-                Err(_) => {
-                    // Connection closed or error — wake all pending requests.
-                    let mut map = pending.lock().await;
-                    for (_, tx) in std::mem::take(&mut *map) {
-                        let _ = tx.send(Err(ClientError::Transport(IpcTransportError::Io(
-                            std::io::Error::new(
-                                std::io::ErrorKind::UnexpectedEof,
-                                "server connection closed",
-                            ),
-                        ))));
-                    }
-                    return;
+            let Ok(envelope) = reader.recv_envelope().await else {
+                // Connection closed or error — wake all pending requests.
+                let pending_requests = std::mem::take(&mut *pending.lock().await);
+                for (_, tx) in pending_requests {
+                    let _ = tx.send(Err(ClientError::Transport(IpcTransportError::Io(
+                        std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "server connection closed",
+                        ),
+                    ))));
                 }
+                return;
             };
 
             match envelope.kind {
@@ -1664,7 +1741,9 @@ impl StreamingBmuxClient {
     }
 
     /// Borrow the event receiver for use in `tokio::select!`.
-    pub fn event_receiver(&mut self) -> &mut tokio::sync::mpsc::UnboundedReceiver<ServerEvent> {
+    pub const fn event_receiver(
+        &mut self,
+    ) -> &mut tokio::sync::mpsc::UnboundedReceiver<ServerEvent> {
         &mut self.event_rx
     }
 
@@ -1675,6 +1754,10 @@ impl StreamingBmuxClient {
     }
 
     /// Execute a request and return the full response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if transport, serialization, or timeout occurs.
     pub async fn request_raw(&mut self, request: Request) -> Result<Response> {
         let request_id = self.take_request_id();
         let request_kind = request_kind_name(&request);
@@ -1699,8 +1782,7 @@ impl StreamingBmuxClient {
             .await
             .map_err(|_| ClientError::Timeout(self.timeout))?
         {
-            let mut map = self.pending.lock().await;
-            map.remove(&request_id);
+            self.pending.lock().await.remove(&request_id);
             return Err(ClientError::Transport(e));
         }
 
@@ -1747,6 +1829,10 @@ impl StreamingBmuxClient {
     ///
     /// After this call, the server will push `Event` frames asynchronously.
     /// Events are received via [`event_receiver`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn enable_event_push(&mut self) -> Result<()> {
         match self.request(Request::EnableEventPush).await? {
             ResponsePayload::EventPushEnabled => Ok(()),
@@ -1758,6 +1844,11 @@ impl StreamingBmuxClient {
 
     // ── Delegated request methods ────────────────────────────────────────
 
+    /// Ping the server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn ping(&mut self) -> Result<()> {
         match self.request(Request::Ping).await? {
             ResponsePayload::Pong => Ok(()),
@@ -1765,6 +1856,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Return the server-assigned client UUID for this connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn whoami(&mut self) -> Result<Uuid> {
         match self.request(Request::WhoAmI).await? {
             ResponsePayload::ClientIdentity { id } => Ok(id),
@@ -1772,6 +1868,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Return principal identity information for this client and server control principal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn whoami_principal(&mut self) -> Result<PrincipalIdentityInfo> {
         match self.request(Request::WhoAmIPrincipal).await? {
             ResponsePayload::PrincipalIdentity {
@@ -1789,6 +1890,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Subscribe this client to server lifecycle events.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn subscribe_events(&mut self) -> Result<()> {
         match self.request(Request::SubscribeEvents).await? {
             ResponsePayload::EventsSubscribed => Ok(()),
@@ -1798,6 +1904,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Poll server lifecycle events for this client subscription.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn poll_events(&mut self, max_events: usize) -> Result<Vec<ServerEvent>> {
         match self.request(Request::PollEvents { max_events }).await? {
             ResponsePayload::EventBatch { events } => Ok(events),
@@ -1807,6 +1918,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// List sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn list_sessions(&mut self) -> Result<Vec<SessionSummary>> {
         match self.request(Request::ListSessions).await? {
             ResponsePayload::SessionList { sessions } => Ok(sessions),
@@ -1814,6 +1930,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// List currently connected clients.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn list_clients(&mut self) -> Result<Vec<ClientSummary>> {
         match self.request(Request::ListClients).await? {
             ResponsePayload::ClientList { clients } => Ok(clients),
@@ -1821,6 +1942,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Create a new generic runtime context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn create_context(
         &mut self,
         name: Option<String>,
@@ -1835,6 +1961,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// List generic runtime contexts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn list_contexts(&mut self) -> Result<Vec<ContextSummary>> {
         match self.request(Request::ListContexts).await? {
             ResponsePayload::ContextList { contexts } => Ok(contexts),
@@ -1842,6 +1973,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Select an active runtime context for this client.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn select_context(&mut self, selector: ContextSelector) -> Result<ContextSummary> {
         match self.request(Request::SelectContext { selector }).await? {
             ResponsePayload::ContextSelected { context } => Ok(context),
@@ -1849,6 +1985,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Return currently active context for this client when available.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn current_context(&mut self) -> Result<Option<ContextSummary>> {
         match self.request(Request::CurrentContext).await? {
             ResponsePayload::CurrentContext { context } => Ok(context),
@@ -1856,10 +1997,20 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Kill a session selected by name or UUID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn kill_session(&mut self, selector: SessionSelector) -> Result<Uuid> {
         self.kill_session_with_options(selector, false).await
     }
 
+    /// Kill a session selected by name or UUID with explicit force-local option.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn kill_session_with_options(
         &mut self,
         selector: SessionSelector,
@@ -1877,6 +2028,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Follow another client's active session focus.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn follow_client(&mut self, target_client_id: Uuid, global: bool) -> Result<()> {
         match self
             .request(Request::FollowClient {
@@ -1890,6 +2046,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Stop following any current follow target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn unfollow(&mut self) -> Result<()> {
         match self.request(Request::Unfollow).await? {
             ResponsePayload::FollowStopped { .. } => Ok(()),
@@ -1897,6 +2058,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Request attach grant token for a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn attach_grant(&mut self, selector: SessionSelector) -> Result<AttachGrant> {
         match self.request(Request::Attach { selector }).await? {
             ResponsePayload::Attached { grant } => Ok(grant),
@@ -1906,6 +2072,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Request attach grant token for a context selected by name or UUID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn attach_context_grant(&mut self, selector: ContextSelector) -> Result<AttachGrant> {
         match self.request(Request::AttachContext { selector }).await? {
             ResponsePayload::Attached { grant } => Ok(grant),
@@ -1915,6 +2086,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Validate and consume attach grant token and return attach metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn open_attach_stream_info(&mut self, grant: &AttachGrant) -> Result<AttachOpenInfo> {
         match self
             .request(Request::AttachOpen {
@@ -1938,6 +2114,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Update attached viewport dimensions and status insets for pane PTY sizing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn attach_set_viewport_with_insets(
         &mut self,
         session_id: Uuid,
@@ -1965,6 +2146,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Send bytes to an attached session runtime.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn attach_input(&mut self, session_id: Uuid, data: Vec<u8>) -> Result<()> {
         match self
             .request(Request::AttachInput { session_id, data })
@@ -1977,6 +2163,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Fetch current layout state for an attached session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn attach_layout(&mut self, session_id: Uuid) -> Result<AttachLayoutState> {
         match self.request(Request::AttachLayout { session_id }).await? {
             ResponsePayload::AttachLayout {
@@ -2002,6 +2193,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Fetch output from multiple panes in a single batch.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn attach_pane_output_batch(
         &mut self,
         session_id: Uuid,
@@ -2029,6 +2225,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Fetch image deltas for multiple panes since given sequence numbers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn attach_pane_images(
         &mut self,
         session_id: Uuid,
@@ -2050,6 +2251,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Fetch a full session snapshot including layout, output, and mouse state.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn attach_snapshot(
         &mut self,
         session_id: Uuid,
@@ -2089,6 +2295,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Split the focused pane in the given direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the split or transport fails.
     pub async fn split_pane(
         &mut self,
         session: Option<SessionSelector>,
@@ -2108,6 +2319,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Split a specific target pane in the given direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the split or transport fails.
     pub async fn split_pane_target(
         &mut self,
         session: Option<SessionSelector>,
@@ -2128,6 +2344,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Move focus to an adjacent pane in the given direction.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the focus change or transport fails.
     pub async fn focus_pane(
         &mut self,
         session: Option<SessionSelector>,
@@ -2146,6 +2367,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Focus a specific target pane by selector.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the focus change or transport fails.
     pub async fn focus_pane_target(
         &mut self,
         session: Option<SessionSelector>,
@@ -2164,6 +2390,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Resize the focused pane by the given delta.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the resize or transport fails.
     pub async fn resize_pane(
         &mut self,
         session: Option<SessionSelector>,
@@ -2182,6 +2413,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Close the focused pane.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the close or transport fails.
     pub async fn close_pane(&mut self, session: Option<SessionSelector>) -> Result<()> {
         match self
             .request(Request::ClosePane {
@@ -2195,6 +2431,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Restart the focused pane's process.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the restart or transport fails.
     pub async fn restart_pane(&mut self, session: Option<SessionSelector>) -> Result<Uuid> {
         match self
             .request(Request::RestartPane {
@@ -2208,6 +2449,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Toggle zoom on the focused pane.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the server rejects the zoom or transport fails.
     pub async fn zoom_pane(&mut self, session: Option<SessionSelector>) -> Result<(Uuid, bool)> {
         match self.request(Request::ZoomPane { session }).await? {
             ResponsePayload::PaneZoomed {
@@ -2217,6 +2463,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Detach from currently attached session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn detach(&mut self) -> Result<()> {
         match self.request(Request::Detach).await? {
             ResponsePayload::Detached => Ok(()),
@@ -2224,6 +2475,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Invoke a generic service request over IPC.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the request fails transport/protocol validation.
     pub async fn invoke_service_raw(
         &mut self,
         capability: impl Into<String>,
@@ -2247,6 +2503,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Send bytes directly to a specific pane by ID, bypassing focus routing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn pane_direct_input(
         &mut self,
         session_id: Uuid,
@@ -2268,6 +2529,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Start a new recording session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn recording_start(
         &mut self,
         session_id: Option<Uuid>,
@@ -2291,6 +2557,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Stop an active recording session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn recording_stop(&mut self, recording_id: Option<Uuid>) -> Result<Uuid> {
         match self
             .request(Request::RecordingStop { recording_id })
@@ -2303,6 +2574,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Write a custom event into the active recording.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn recording_write_custom_event(
         &mut self,
         session_id: Option<Uuid>,
@@ -2328,6 +2604,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Query recording runtime status.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn recording_status(&mut self) -> Result<RecordingStatus> {
         match self.request(Request::RecordingStatus).await? {
             ResponsePayload::RecordingStatus { status } => Ok(status),
@@ -2335,6 +2616,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Create a bounded snapshot from the active rolling recording.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn recording_cut(&mut self, last_seconds: Option<u64>) -> Result<RecordingSummary> {
         match self.request(Request::RecordingCut { last_seconds }).await? {
             ResponsePayload::RecordingCut { recording } => Ok(recording),
@@ -2344,6 +2630,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Start hidden rolling recording on a running server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn recording_rolling_start(
         &mut self,
         options: RecordingRollingStartOptions,
@@ -2359,6 +2650,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Stop hidden rolling recording on a running server.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn recording_rolling_stop(&mut self) -> Result<Uuid> {
         match self.request(Request::RecordingRollingStop).await? {
             ResponsePayload::RecordingStopped { recording_id } => Ok(recording_id),
@@ -2368,6 +2664,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Fetch hidden rolling recording status and usage details.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn recording_rolling_status(&mut self) -> Result<RecordingRollingStatus> {
         match self.request(Request::RecordingRollingStatus).await? {
             ResponsePayload::RecordingRollingStatus { status } => Ok(status),
@@ -2377,6 +2678,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Clear hidden rolling recording data and optionally restart when active.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn recording_rolling_clear(
         &mut self,
         restart_if_active: bool,
@@ -2392,6 +2698,11 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Return active recording capture targets for display-track writing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
     pub async fn recording_capture_targets(&mut self) -> Result<Vec<RecordingCaptureTarget>> {
         match self.request(Request::RecordingCaptureTargets).await? {
             ResponsePayload::RecordingCaptureTargets { targets } => Ok(targets),
@@ -2564,7 +2875,7 @@ fn endpoint_from_paths(paths: &ConfigPaths) -> IpcEndpoint {
     }
 }
 
-fn should_fallback_to_legacy_hello(error: &ClientError) -> bool {
+const fn should_fallback_to_legacy_hello(error: &ClientError) -> bool {
     matches!(
         error,
         ClientError::ServerError {
@@ -2629,6 +2940,7 @@ fn cell_pixel_size_from_ioctl() -> (u16, u16) {
     use std::os::unix::io::AsRawFd;
 
     #[repr(C)]
+    #[allow(clippy::struct_field_names)]
     struct Winsize {
         ws_row: u16,
         ws_col: u16,

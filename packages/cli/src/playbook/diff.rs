@@ -6,6 +6,8 @@
 //!
 //! See `docs/playbooks.md` for the full reference.
 
+use std::fmt::Write;
+
 use serde::Serialize;
 use similar::TextDiff;
 
@@ -114,6 +116,12 @@ pub struct TimingRegression {
 // ---------------------------------------------------------------------------
 
 /// Compare two playbook results and produce a structured diff report.
+#[must_use]
+#[allow(
+    clippy::too_many_lines,
+    clippy::cast_possible_wrap,
+    clippy::cast_precision_loss
+)]
 pub fn diff_results(
     left: &PlaybookResult,
     right: &PlaybookResult,
@@ -181,10 +189,10 @@ pub fn diff_results(
 
                 // Include details when something changed.
                 if status_changed || detail_changed {
-                    diff.left_detail = ls.detail.clone();
-                    diff.right_detail = rs.detail.clone();
-                    diff.right_expected = rs.expected.clone();
-                    diff.right_actual = rs.actual.clone();
+                    diff.left_detail.clone_from(&ls.detail);
+                    diff.right_detail.clone_from(&rs.detail);
+                    diff.right_expected.clone_from(&rs.expected);
+                    diff.right_actual.clone_from(&rs.actual);
                 }
 
                 step_diffs.push(diff);
@@ -471,7 +479,7 @@ fn unified_text_diff(left: &str, right: &str) -> String {
     output.push_str("+++ right\n");
 
     for hunk in diff.unified_diff().context_radius(2).iter_hunks() {
-        output.push_str(&format!("{hunk}"));
+        let _ = write!(output, "{hunk}");
     }
 
     output
@@ -482,23 +490,24 @@ fn unified_text_diff(left: &str, right: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// Format a diff report as human-readable text.
+#[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn format_diff_report(report: &DiffReport, left_name: &str, right_name: &str) -> String {
     let mut out = String::new();
     let s = &report.summary;
 
-    out.push_str(&format!("playbook diff: {left_name} → {right_name}\n\n"));
+    let _ = writeln!(out, "playbook diff: {left_name} → {right_name}\n");
 
     // Outcome
     let left_status = if s.left_pass { "PASS" } else { "FAIL" };
     let right_status = if s.right_pass { "PASS" } else { "FAIL" };
     let changed = if s.outcome_changed { " (CHANGED)" } else { "" };
-    out.push_str(&format!(
-        "  outcome: {left_status} → {right_status}{changed}\n"
-    ));
-    out.push_str(&format!(
-        "  total time: {}ms → {}ms ({:+}ms, {:+.1}%)\n",
+    let _ = writeln!(out, "  outcome: {left_status} → {right_status}{changed}");
+    let _ = writeln!(
+        out,
+        "  total time: {}ms → {}ms ({:+}ms, {:+.1}%)",
         s.left_total_ms, s.right_total_ms, s.timing_delta_ms, s.timing_delta_pct
-    ));
+    );
     out.push('\n');
 
     // Steps
@@ -518,13 +527,14 @@ pub fn format_diff_report(report: &DiffReport, left_name: &str, right_name: &str
         } else {
             String::new()
         };
-        out.push_str(&format!(
-            "    [{icon}] {:>2}. {:<24} {ls} → {rs}  {}ms → {}ms{timing_warn}\n",
+        let _ = writeln!(
+            out,
+            "    [{icon}] {:>2}. {:<24} {ls} → {rs}  {}ms → {}ms{timing_warn}",
             sd.index, sd.action, sd.left_ms, sd.right_ms
-        ));
+        );
         if sd.status_changed {
             if let Some(ref expected) = sd.right_expected {
-                out.push_str(&format!("         expected: '{expected}'\n"));
+                let _ = writeln!(out, "         expected: '{expected}'");
             }
             if let Some(ref actual) = sd.right_actual {
                 let truncated = if actual.len() > 120 {
@@ -532,7 +542,7 @@ pub fn format_diff_report(report: &DiffReport, left_name: &str, right_name: &str
                 } else {
                     actual.clone()
                 };
-                out.push_str(&format!("         actual:   '{truncated}'\n"));
+                let _ = writeln!(out, "         actual:   '{truncated}'");
             }
         }
     }
@@ -548,10 +558,10 @@ pub fn format_diff_report(report: &DiffReport, left_name: &str, right_name: &str
         for sd in changed_snapshots {
             for pd in &sd.pane_diffs {
                 if pd.text_changed {
-                    out.push_str(&format!("    {} pane={}: CHANGED\n", sd.id, pd.pane_index));
+                    let _ = writeln!(out, "    {} pane={}: CHANGED", sd.id, pd.pane_index);
                     if let Some(ref udiff) = pd.unified_diff {
                         for line in udiff.lines() {
-                            out.push_str(&format!("      {line}\n"));
+                            let _ = writeln!(out, "      {line}");
                         }
                     }
                 }
@@ -565,13 +575,14 @@ pub fn format_diff_report(report: &DiffReport, left_name: &str, right_name: &str
         for fcd in &report.failure_capture_diffs {
             for pd in &fcd.pane_diffs {
                 if pd.text_changed {
-                    out.push_str(&format!(
-                        "    step {} ({}) pane={}: CHANGED\n",
+                    let _ = writeln!(
+                        out,
+                        "    step {} ({}) pane={}: CHANGED",
                         fcd.step_index, fcd.action, pd.pane_index
-                    ));
+                    );
                     if let Some(ref udiff) = pd.unified_diff {
                         for line in udiff.lines() {
-                            out.push_str(&format!("      {line}\n"));
+                            let _ = writeln!(out, "      {line}");
                         }
                     }
                 }
@@ -581,22 +592,24 @@ pub fn format_diff_report(report: &DiffReport, left_name: &str, right_name: &str
 
     // Timing regressions
     if !report.timing_regressions.is_empty() {
-        out.push_str(&format!(
-            "\n  timing regressions (>{:.0}%):\n",
+        let _ = writeln!(
+            out,
+            "\n  timing regressions (>{:.0}%):",
             report.timing_threshold_pct
-        ));
+        );
         for tr in &report.timing_regressions {
-            out.push_str(&format!(
-                "    {}. {}: {}ms → {}ms ({:+.0}%)\n",
+            let _ = writeln!(
+                out,
+                "    {}. {}: {}ms → {}ms ({:+.0}%)",
                 tr.index, tr.action, tr.left_ms, tr.right_ms, tr.delta_pct
-            ));
+            );
         }
     }
 
     out
 }
 
-fn format_status(status: StepStatus) -> &'static str {
+const fn format_status(status: StepStatus) -> &'static str {
     match status {
         StepStatus::Pass => "pass",
         StepStatus::Fail => "FAIL",

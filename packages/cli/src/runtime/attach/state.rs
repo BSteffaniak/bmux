@@ -37,10 +37,10 @@ pub enum AttachExitReason {
 
 #[derive(Debug, Clone)]
 pub struct AttachDirtyFlags {
-    pub(crate) status_needs_redraw: bool,
-    pub(crate) layout_needs_refresh: bool,
-    pub(crate) pane_dirty_ids: BTreeSet<Uuid>,
-    pub(crate) full_pane_redraw: bool,
+    pub status_needs_redraw: bool,
+    pub layout_needs_refresh: bool,
+    pub pane_dirty_ids: BTreeSet<Uuid>,
+    pub full_pane_redraw: bool,
 }
 
 impl Default for AttachDirtyFlags {
@@ -56,33 +56,33 @@ impl Default for AttachDirtyFlags {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PaneRect {
-    pub(crate) x: u16,
-    pub(crate) y: u16,
-    pub(crate) w: u16,
-    pub(crate) h: u16,
+    pub x: u16,
+    pub y: u16,
+    pub w: u16,
+    pub h: u16,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct AttachCursorState {
-    pub(crate) x: u16,
-    pub(crate) y: u16,
-    pub(crate) visible: bool,
+    pub x: u16,
+    pub y: u16,
+    pub visible: bool,
 }
 
 pub struct PaneRenderBuffer {
-    pub(crate) parser: vt100::Parser,
-    pub(crate) last_alternate_screen: bool,
+    pub parser: vt100::Parser,
+    pub last_alternate_screen: bool,
     /// Cached rendered row strings from the previous frame.  When a row's
     /// string matches the cached version we skip emitting it, avoiding
     /// unnecessary terminal I/O for unchanged content.
-    pub(crate) prev_rows: Vec<String>,
+    pub prev_rows: Vec<String>,
     /// True while the inner application is inside a DEC mode 2026
     /// synchronized update.  Populated from the server's per-pane
     /// `sync_update_active` flag (tracked by the PTY reader's byte-by-
     /// byte CSI parser, so no cross-chunk splitting issues).  When set,
     /// the renderer defers drawing this pane's content so the user never
     /// sees a partially-updated screen.
-    pub(crate) sync_update_in_progress: bool,
+    pub sync_update_in_progress: bool,
 }
 
 impl Default for PaneRenderBuffer {
@@ -98,42 +98,42 @@ impl Default for PaneRenderBuffer {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AttachScrollbackCursor {
-    pub(crate) row: usize,
-    pub(crate) col: usize,
+    pub row: usize,
+    pub col: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct AttachScrollbackPosition {
-    pub(crate) row: usize,
-    pub(crate) col: usize,
+    pub row: usize,
+    pub col: usize,
 }
 
 pub struct AttachViewState {
-    pub(crate) attached_id: Uuid,
-    pub(crate) attached_context_id: Option<Uuid>,
-    pub(crate) can_write: bool,
-    pub(crate) ui_mode: AttachUiMode,
-    pub(crate) scrollback_active: bool,
-    pub(crate) scrollback_offset: usize,
-    pub(crate) scrollback_cursor: Option<AttachScrollbackCursor>,
-    pub(crate) selection_anchor: Option<AttachScrollbackPosition>,
-    pub(crate) quit_confirmation_pending: bool,
-    pub(crate) close_pane_confirmation_pending: Option<Uuid>,
-    pub(crate) help_overlay_open: bool,
-    pub(crate) help_overlay_scroll: usize,
-    pub(crate) transient_status: Option<String>,
-    pub(crate) transient_status_until: Option<Instant>,
-    pub(crate) last_context_refresh_at: Option<Instant>,
-    pub(crate) cached_tab_order: Vec<Uuid>,
-    pub(crate) pane_buffers: BTreeMap<Uuid, PaneRenderBuffer>,
-    pub(crate) pane_mouse_protocol_hints: BTreeMap<Uuid, AttachMouseProtocolState>,
-    pub(crate) status_position: StatusPosition,
-    pub(crate) cached_status_line: Option<AttachStatusLine>,
-    pub(crate) cached_layout_state: Option<AttachLayoutState>,
-    pub(crate) last_cursor_state: Option<AttachCursorState>,
-    pub(crate) force_cursor_move_next_frame: bool,
-    pub(crate) mouse: AttachMouseState,
-    pub(crate) dirty: AttachDirtyFlags,
+    pub attached_id: Uuid,
+    pub attached_context_id: Option<Uuid>,
+    pub can_write: bool,
+    pub ui_mode: AttachUiMode,
+    pub scrollback_active: bool,
+    pub scrollback_offset: usize,
+    pub scrollback_cursor: Option<AttachScrollbackCursor>,
+    pub selection_anchor: Option<AttachScrollbackPosition>,
+    pub quit_confirmation_pending: bool,
+    pub close_pane_confirmation_pending: Option<Uuid>,
+    pub help_overlay_open: bool,
+    pub help_overlay_scroll: usize,
+    pub transient_status: Option<String>,
+    pub transient_status_until: Option<Instant>,
+    pub last_context_refresh_at: Option<Instant>,
+    pub cached_tab_order: Vec<Uuid>,
+    pub pane_buffers: BTreeMap<Uuid, PaneRenderBuffer>,
+    pub pane_mouse_protocol_hints: BTreeMap<Uuid, AttachMouseProtocolState>,
+    pub status_position: StatusPosition,
+    pub cached_status_line: Option<AttachStatusLine>,
+    pub cached_layout_state: Option<AttachLayoutState>,
+    pub last_cursor_state: Option<AttachCursorState>,
+    pub force_cursor_move_next_frame: bool,
+    pub mouse: AttachMouseState,
+    pub dirty: AttachDirtyFlags,
 
     // -- Image protocol support (feature-gated) --
     /// Per-pane image cache received from the server.
@@ -142,49 +142,49 @@ pub struct AttachViewState {
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    pub(crate) pane_images: BTreeMap<Uuid, Vec<bmux_ipc::AttachPaneImage>>,
+    pub pane_images: BTreeMap<Uuid, Vec<bmux_ipc::AttachPaneImage>>,
     /// Per-pane last-seen image sequence numbers for delta queries.
     #[cfg(any(
         feature = "image-sixel",
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    pub(crate) image_sequences: BTreeMap<Uuid, u64>,
+    pub image_sequences: BTreeMap<Uuid, u64>,
     /// Detected host terminal image capabilities.
     #[cfg(any(
         feature = "image-sixel",
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    pub(crate) host_image_caps: bmux_image::HostImageCapabilities,
+    pub host_image_caps: bmux_image::HostImageCapabilities,
     #[cfg(any(
         feature = "image-sixel",
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    pub(crate) kitty_host_state: bmux_image::compositor::KittyHostState,
+    pub kitty_host_state: bmux_image::compositor::KittyHostState,
     /// Cached image decode mode from config (read once at attach time).
     #[cfg(any(
         feature = "image-sixel",
         feature = "image-kitty",
         feature = "image-iterm2"
     ))]
-    pub(crate) image_decode_mode: bmux_image::config::ImageDecodeMode,
+    pub image_decode_mode: bmux_image::config::ImageDecodeMode,
 }
 
 #[derive(Debug, Clone, Default)]
 #[allow(dead_code)]
 pub struct AttachMouseState {
-    pub(crate) config: MouseBehaviorConfig,
-    pub(crate) last_position: Option<(u16, u16)>,
-    pub(crate) last_event_at: Option<Instant>,
-    pub(crate) hover_started_at: Option<Instant>,
-    pub(crate) hovered_pane_id: Option<Uuid>,
-    pub(crate) last_focused_pane_id: Option<Uuid>,
+    pub config: MouseBehaviorConfig,
+    pub last_position: Option<(u16, u16)>,
+    pub last_event_at: Option<Instant>,
+    pub hover_started_at: Option<Instant>,
+    pub hovered_pane_id: Option<Uuid>,
+    pub last_focused_pane_id: Option<Uuid>,
 }
 
 impl AttachViewState {
-    pub(crate) fn new(attach_info: bmux_client::AttachOpenInfo) -> Self {
+    pub fn new(attach_info: bmux_client::AttachOpenInfo) -> Self {
         Self {
             attached_id: attach_info.session_id,
             attached_context_id: attach_info.context_id,
@@ -247,7 +247,7 @@ impl AttachViewState {
         }
     }
 
-    pub(crate) fn set_transient_status(
+    pub fn set_transient_status(
         &mut self,
         message: impl Into<String>,
         now: Instant,
@@ -258,7 +258,7 @@ impl AttachViewState {
         self.dirty.status_needs_redraw = true;
     }
 
-    pub(crate) fn clear_expired_transient_status(&mut self, now: Instant) -> bool {
+    pub fn clear_expired_transient_status(&mut self, now: Instant) -> bool {
         let Some(until) = self.transient_status_until else {
             return false;
         };
@@ -271,7 +271,7 @@ impl AttachViewState {
         true
     }
 
-    pub(crate) fn transient_status_text(&self, now: Instant) -> Option<&str> {
+    pub fn transient_status_text(&self, now: Instant) -> Option<&str> {
         if self
             .transient_status_until
             .is_some_and(|until| now >= until)
@@ -281,14 +281,14 @@ impl AttachViewState {
         self.transient_status.as_deref()
     }
 
-    pub(crate) const fn exit_scrollback(&mut self) {
+    pub const fn exit_scrollback(&mut self) {
         self.scrollback_active = false;
         self.scrollback_offset = 0;
         self.scrollback_cursor = None;
         self.selection_anchor = None;
     }
 
-    pub(crate) const fn selection_active(&self) -> bool {
+    pub const fn selection_active(&self) -> bool {
         self.selection_anchor.is_some()
     }
 }

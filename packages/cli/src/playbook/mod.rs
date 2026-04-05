@@ -20,6 +20,7 @@ pub mod subst;
 pub mod types;
 
 use std::collections::BTreeSet;
+use std::fmt::Write as _;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -39,6 +40,9 @@ const MAX_INCLUDE_DEPTH: usize = 10;
 
 /// Parse a playbook from a file path. Detects format by extension.
 /// Resolves `@include` / `include = [...]` directives recursively.
+/// # Errors
+///
+/// Returns an error if the file cannot be read or parsed.
 pub fn parse_file(path: &Path) -> Result<Playbook> {
     let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
     let mut seen = BTreeSet::new();
@@ -47,6 +51,9 @@ pub fn parse_file(path: &Path) -> Result<Playbook> {
 }
 
 /// Parse a playbook from stdin. Includes are resolved relative to CWD.
+/// # Errors
+///
+/// Returns an error if stdin cannot be read or parsed.
 pub fn parse_stdin() -> Result<Playbook> {
     let mut content = String::new();
     std::io::stdin()
@@ -64,11 +71,17 @@ pub fn parse_stdin() -> Result<Playbook> {
 }
 
 /// Run a playbook and return the result.
+/// # Errors
+///
+/// Returns an error if the playbook execution fails.
 pub async fn run(playbook: Playbook, target_server: bool) -> Result<PlaybookResult> {
     run_with_options(playbook, target_server, RunOptions::default()).await
 }
 
 /// Run a playbook with explicit execution options.
+/// # Errors
+///
+/// Returns an error if the playbook execution fails.
 pub async fn run_with_options(
     playbook: Playbook,
     target_server: bool,
@@ -81,6 +94,7 @@ pub async fn run_with_options(
 ///
 /// If `target_server` is true, the first-step `new-session` check is skipped
 /// since the user may be targeting an existing session on a live server.
+#[must_use]
 pub fn validate(playbook: &Playbook, target_server: bool) -> Vec<String> {
     let mut errors = Vec::new();
 
@@ -91,12 +105,12 @@ pub fn validate(playbook: &Playbook, target_server: bool) -> Vec<String> {
     // Check that the first meaningful action is new-session (unless targeting live server)
     if !target_server {
         let first_action = playbook.steps.first().map(|s| &s.action);
-        if let Some(action) = first_action {
-            if !matches!(action, types::Action::NewSession { .. }) {
-                errors.push(
-                    "first step should be 'new-session' (no session exists at start)".to_string(),
-                );
-            }
+        if let Some(action) = first_action
+            && !matches!(action, types::Action::NewSession { .. })
+        {
+            errors.push(
+                "first step should be 'new-session' (no session exists at start)".to_string(),
+            );
         }
     }
 
@@ -134,14 +148,15 @@ pub fn validate(playbook: &Playbook, target_server: bool) -> Vec<String> {
                     ));
                 }
             }
-            types::Action::AssertScreen { matches, .. } => {
-                if let Some(pattern) = matches {
-                    if let Err(e) = regex::Regex::new(pattern) {
-                        errors.push(format!(
-                            "step {}: invalid regex pattern '{}': {}",
-                            step.index, pattern, e
-                        ));
-                    }
+            types::Action::AssertScreen {
+                matches: Some(pattern),
+                ..
+            } => {
+                if let Err(e) = regex::Regex::new(pattern) {
+                    errors.push(format!(
+                        "step {}: invalid regex pattern '{}': {}",
+                        step.index, pattern, e
+                    ));
                 }
             }
 
@@ -193,15 +208,17 @@ pub fn validate(playbook: &Playbook, target_server: bool) -> Vec<String> {
 }
 
 /// Format a `PlaybookResult` as human-readable output.
+#[must_use]
 pub fn format_result(result: &PlaybookResult) -> String {
     let mut out = String::new();
 
     let name = result.playbook_name.as_deref().unwrap_or("<unnamed>");
     let status = if result.pass { "PASS" } else { "FAIL" };
-    out.push_str(&format!(
-        "playbook: {name} — {status} ({} ms)\n",
+    let _ = writeln!(
+        out,
+        "playbook: {name} — {status} ({} ms)",
         result.total_elapsed_ms
-    ));
+    );
     out.push('\n');
 
     for step in &result.steps {
@@ -211,29 +228,30 @@ pub fn format_result(result: &PlaybookResult) -> String {
             (types::StepStatus::Fail, false) => "x",
             (types::StepStatus::Skip, _) => "-",
         };
-        out.push_str(&format!(
+        let _ = write!(
+            out,
             "  [{icon}] step {}: {} ({} ms)",
             step.index, step.action, step.elapsed_ms
-        ));
+        );
         if let Some(detail) = &step.detail {
-            out.push_str(&format!(" — {detail}"));
+            let _ = write!(out, " — {detail}");
         }
         out.push('\n');
     }
 
     if !result.snapshots.is_empty() {
-        out.push_str(&format!("\nsnapshots: {}\n", result.snapshots.len()));
+        let _ = writeln!(out, "\nsnapshots: {}", result.snapshots.len());
         for snap in &result.snapshots {
-            out.push_str(&format!("  - {} ({} panes)\n", snap.id, snap.panes.len()));
+            let _ = writeln!(out, "  - {} ({} panes)", snap.id, snap.panes.len());
         }
     }
 
     if let Some(rid) = &result.recording_id {
-        out.push_str(&format!("\nrecording: {rid}\n"));
+        let _ = writeln!(out, "\nrecording: {rid}");
     }
 
     if let Some(err) = &result.error {
-        out.push_str(&format!("\nerror: {err}\n"));
+        let _ = writeln!(out, "\nerror: {err}");
     }
 
     out
@@ -265,6 +283,7 @@ fn parse_file_recursive(
     Ok(playbook)
 }
 
+#[allow(clippy::similar_names)]
 fn resolve_includes(
     playbook: &mut Playbook,
     includes: &[(usize, String)],

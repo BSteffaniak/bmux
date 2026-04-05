@@ -21,9 +21,9 @@ use parse::{parse_chord, parse_stroke};
 // ============================================================================
 
 #[derive(Debug, Clone)]
-struct KeyBinding {
-    chord: Vec<KeyStroke>,
-    action: RuntimeAction,
+pub struct KeyBinding {
+    pub chord: Vec<KeyStroke>,
+    pub action: RuntimeAction,
 }
 
 #[derive(Debug, Clone)]
@@ -36,20 +36,20 @@ pub struct Keymap {
 
 #[derive(Debug, Clone)]
 pub struct DoctorBinding {
-    pub(crate) chord: String,
-    pub(crate) action: String,
+    pub chord: String,
+    pub action: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct KeymapDoctorReport {
-    pub(crate) global: Vec<DoctorBinding>,
-    pub(crate) runtime: Vec<DoctorBinding>,
-    pub(crate) scroll: Vec<DoctorBinding>,
-    pub(crate) overlaps: Vec<String>,
+    pub global: Vec<DoctorBinding>,
+    pub runtime: Vec<DoctorBinding>,
+    pub scroll: Vec<DoctorBinding>,
+    pub overlaps: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct DecodedStroke {
+pub struct DecodedStroke {
     stroke: KeyStroke,
     raw: Vec<u8>,
 }
@@ -227,7 +227,8 @@ impl Keymap {
         has_any_prefix(&self.scroll_bindings, strokes)
     }
 
-    pub(crate) fn doctor_lines(&self) -> Vec<String> {
+    #[must_use]
+    pub fn doctor_lines(&self) -> Vec<String> {
         let report = self.doctor_report();
         let mut lines = Vec::new();
 
@@ -270,7 +271,8 @@ impl Keymap {
         lines
     }
 
-    pub(crate) fn doctor_report(&self) -> KeymapDoctorReport {
+    #[must_use]
+    pub fn doctor_report(&self) -> KeymapDoctorReport {
         let global = self
             .global_bindings
             .iter()
@@ -306,7 +308,8 @@ impl Keymap {
         }
     }
 
-    pub(crate) fn primary_binding_for_action(&self, action: &RuntimeAction) -> Option<String> {
+    #[must_use]
+    pub fn primary_binding_for_action(&self, action: &RuntimeAction) -> Option<String> {
         primary_binding_for_sets(
             action,
             [
@@ -316,14 +319,13 @@ impl Keymap {
         )
     }
 
-    pub(crate) fn primary_scroll_binding_for_action(
-        &self,
-        action: &RuntimeAction,
-    ) -> Option<String> {
+    #[must_use]
+    pub fn primary_scroll_binding_for_action(&self, action: &RuntimeAction) -> Option<String> {
         primary_binding_for_sets(action, [(0_u8, &self.scroll_bindings)])
     }
 
-    fn overlap_warnings(&self) -> Vec<String> {
+    #[must_use]
+    pub fn overlap_warnings(&self) -> Vec<String> {
         let mut warnings = Vec::new();
 
         warnings.extend(find_overlaps(&self.runtime_bindings, "runtime"));
@@ -405,13 +407,14 @@ impl InputProcessor {
         actions
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     pub(crate) fn process_terminal_event(&mut self, event: Event) -> Vec<RuntimeAction> {
         let mut actions = Vec::new();
         if self.pending_timed_out() {
             self.resolve_pending(&mut actions, true);
         }
 
-        let Some(input_event) = crossterm_event_to_input_event(event, self.enhanced) else {
+        let Some(input_event) = crossterm_event_to_input_event(&event, self.enhanced) else {
             return actions;
         };
         actions.extend(self.process_input_events(std::iter::once(input_event)));
@@ -570,11 +573,22 @@ impl InputProcessor {
 // Public helpers
 // ============================================================================
 
+/// Parse a runtime action name string into a [`RuntimeAction`].
+///
+/// # Errors
+///
+/// Returns an error if the action name is not recognized.
 pub fn parse_runtime_action_name(value: &str) -> Result<RuntimeAction> {
     parse_action(value)
 }
 
-pub(crate) fn parse_key_chord(value: &str) -> Result<Vec<KeyStroke>> {
+/// Parse a key chord string into a sequence of keystrokes.
+///
+/// # Errors
+///
+/// Returns an error if the chord string contains an unrecognized key name or
+/// invalid modifier syntax.
+pub fn parse_key_chord(value: &str) -> Result<Vec<KeyStroke>> {
     parse_chord(value)
 }
 
@@ -608,9 +622,10 @@ fn find_exact(bindings: &[KeyBinding], strokes: &[KeyStroke]) -> Option<RuntimeA
         .map(|binding| binding.action.clone())
 }
 
-fn primary_binding_for_sets<const N: usize>(
+#[must_use]
+pub fn primary_binding_for_sets<const N: usize>(
     action: &RuntimeAction,
-    binding_sets: [(u8, &Vec<KeyBinding>); N],
+    binding_sets: [(u8, &[KeyBinding]); N],
 ) -> Option<String> {
     let mut best: Option<(usize, u8, String)> = None;
 
@@ -643,7 +658,8 @@ fn has_longer_prefix(bindings: &[KeyBinding], strokes: &[KeyStroke]) -> bool {
         .any(|binding| binding.chord.len() > strokes.len() && binding.chord.starts_with(strokes))
 }
 
-fn find_overlaps(bindings: &[KeyBinding], label: &str) -> Vec<String> {
+#[must_use]
+pub fn find_overlaps(bindings: &[KeyBinding], label: &str) -> Vec<String> {
     let mut warnings = Vec::new();
     for i in 0..bindings.len() {
         for j in (i + 1)..bindings.len() {
@@ -673,14 +689,16 @@ fn find_overlaps(bindings: &[KeyBinding], label: &str) -> Vec<String> {
 /// This normalizes aliases (e.g. `"left"` -> `"arrow_left"`, `"esc"` -> `"escape"`)
 /// so that two strings representing the same keystroke produce the same canonical key.
 /// Returns the original string unchanged if parsing fails.
-pub(crate) fn canonical_chord_key(chord_str: &str) -> String {
-    match parse_chord(chord_str) {
-        Ok(strokes) => chord_to_string(&strokes),
-        Err(_) => chord_str.to_string(),
-    }
+#[must_use]
+pub fn canonical_chord_key(chord_str: &str) -> String {
+    parse_chord(chord_str).map_or_else(
+        |_| chord_str.to_string(),
+        |strokes| chord_to_string(&strokes),
+    )
 }
 
-fn chord_to_string(chord: &[KeyStroke]) -> String {
+#[must_use]
+pub fn chord_to_string(chord: &[KeyStroke]) -> String {
     chord
         .iter()
         .map(stroke_to_string)
@@ -688,7 +706,8 @@ fn chord_to_string(chord: &[KeyStroke]) -> String {
         .join(" ")
 }
 
-fn display_chord(chord: &[KeyStroke]) -> String {
+#[must_use]
+pub fn display_chord(chord: &[KeyStroke]) -> String {
     chord
         .iter()
         .map(display_stroke)
@@ -696,7 +715,8 @@ fn display_chord(chord: &[KeyStroke]) -> String {
         .join(" ")
 }
 
-fn display_stroke(stroke: &KeyStroke) -> String {
+#[must_use]
+pub fn display_stroke(stroke: &KeyStroke) -> String {
     let uppercase_shift_char = matches!(stroke.key, KeyCode::Char(c) if c.is_ascii_alphabetic())
         && stroke.modifiers.shift
         && !stroke.modifiers.ctrl
@@ -747,7 +767,8 @@ fn display_stroke(stroke: &KeyStroke) -> String {
     parts.join("-")
 }
 
-fn stroke_to_string(stroke: &KeyStroke) -> String {
+#[must_use]
+pub fn stroke_to_string(stroke: &KeyStroke) -> String {
     let mut parts = Vec::new();
     if stroke.modifiers.ctrl {
         parts.push("ctrl".to_string());

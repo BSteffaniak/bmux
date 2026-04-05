@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
+
 //! bmux documentation website.
 //!
 //! Uses the HyperChad framework to serve the bmux documentation as a web

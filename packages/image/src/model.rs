@@ -249,10 +249,13 @@ impl ImageEvent {
                 filtered_byte_offset,
                 ..
             } => *filtered_byte_offset,
+            #[allow(unreachable_patterns)]
+            _ => unreachable!(),
         }
     }
 
     /// Set the image position (used by the caller after resolving cursor pos).
+    #[allow(unused_variables)]
     pub fn set_position(&mut self, pos: ImagePosition) {
         match self {
             #[cfg(feature = "sixel")]
@@ -261,6 +264,8 @@ impl ImageEvent {
             Self::KittyCommand { .. } => {}
             #[cfg(feature = "iterm2")]
             Self::ITerm2Image { position, .. } => *position = pos,
+            #[allow(unreachable_patterns)]
+            _ => unreachable!(),
         }
     }
 }

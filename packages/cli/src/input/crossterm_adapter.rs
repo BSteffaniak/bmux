@@ -13,9 +13,9 @@ use crossterm::event::{
 use super::{DecodedStroke, InputEvent};
 
 /// Convert a crossterm [`Event`] into an [`InputEvent`], if applicable.
-pub(super) fn crossterm_event_to_input_event(event: Event, enhanced: bool) -> Option<InputEvent> {
+pub(super) fn crossterm_event_to_input_event(event: &Event, enhanced: bool) -> Option<InputEvent> {
     match event {
-        Event::Key(key) => key_event_to_input_event(&key, enhanced),
+        Event::Key(key) => key_event_to_input_event(key, enhanced),
         _ => None,
     }
 }
@@ -35,7 +35,7 @@ fn key_event_to_input_event(key: &CrosstermKeyEvent, enhanced: bool) -> Option<I
 }
 
 /// Convert a crossterm `KeyEvent` into a `bmux_keyboard::KeyStroke`.
-pub(crate) const fn key_event_to_stroke(key: &CrosstermKeyEvent) -> Option<KeyStroke> {
+pub const fn key_event_to_stroke(key: &CrosstermKeyEvent) -> Option<KeyStroke> {
     let modifiers = key.modifiers;
     let ctrl = modifiers.contains(KeyModifiers::CONTROL);
     let alt = modifiers.contains(KeyModifiers::ALT);

@@ -18,8 +18,12 @@ use super::types::{Action, Playbook, PlaybookConfig, ServiceKind, SplitDirection
 /// - Starting with `@`: config directive
 /// - Otherwise: an action line with `key=value` arguments
 ///
-/// Returns the playbook and a list of (step_index, include_path) pairs from
+/// Returns the playbook and a list of (`step_index`, `include_path`) pairs from
 /// `@include` directives that the caller is responsible for resolving.
+///
+/// # Errors
+///
+/// Returns an error if parsing any line fails.
 pub fn parse_dsl(input: &str) -> Result<(Playbook, Vec<(usize, String)>)> {
     let mut config = PlaybookConfig::default();
     let mut steps = Vec::new();
@@ -39,11 +43,9 @@ pub fn parse_dsl(input: &str) -> Result<(Playbook, Vec<(usize, String)>)> {
                 .with_context(|| format!("line {line_ctx}: invalid config directive"))?;
         } else {
             // Check for !continue suffix (must be preceded by whitespace).
-            let (action_line, continue_on_error) = if line.ends_with(" !continue") {
-                (line[..line.len() - " !continue".len()].trim(), true)
-            } else {
-                (line, false)
-            };
+            let (action_line, continue_on_error) = line
+                .strip_suffix(" !continue")
+                .map_or((line, false), |stripped| (stripped.trim(), true));
             let action = parse_action_line(action_line)
                 .with_context(|| format!("line {line_ctx}: invalid action"))?;
             steps.push(Step {
@@ -154,7 +156,14 @@ fn parse_config_directive(
     Ok(())
 }
 
-pub(crate) fn parse_action_line(line: &str) -> Result<Action> {
+/// Parse a single DSL action line into an [`Action`].
+///
+/// # Errors
+///
+/// Returns an error if the action name is unrecognized, required arguments are
+/// missing, or argument values fail to parse.
+#[allow(clippy::too_many_lines)]
+pub fn parse_action_line(line: &str) -> Result<Action> {
     let (action_name, rest) = split_first_token(line);
     let args = parse_kv_args(rest)?;
 
@@ -168,10 +177,9 @@ pub(crate) fn parse_action_line(line: &str) -> Result<Action> {
         }
         "split-pane" => {
             let direction = match args.get("direction").map(String::as_str) {
-                Some("vertical") | Some("v") => SplitDirection::Vertical,
-                Some("horizontal") | Some("h") => SplitDirection::Horizontal,
+                Some("vertical" | "v") | None => SplitDirection::Vertical,
+                Some("horizontal" | "h") => SplitDirection::Horizontal,
                 Some(other) => bail!("invalid split direction: {other}"),
-                None => SplitDirection::Vertical,
             };
             let ratio = args
                 .get("ratio")
@@ -322,8 +330,8 @@ pub(crate) fn parse_action_line(line: &str) -> Result<Action> {
         "invoke-service" => {
             let capability = require_arg(&args, "capability", "invoke-service")?;
             let kind = match args.get("kind").map(String::as_str) {
-                Some("query") | Some("q") => ServiceKind::Query,
-                Some("command") | Some("cmd") | None => ServiceKind::Command,
+                Some("query" | "q") => ServiceKind::Query,
+                Some("command" | "cmd") | None => ServiceKind::Command,
                 Some(other) => {
                     bail!("invalid service kind: {other} (expected 'query' or 'command')")
                 }
@@ -353,10 +361,8 @@ fn require_arg(args: &BTreeMap<String, String>, key: &str, action: &str) -> Resu
 
 /// Split on the first whitespace to get the action name and remaining text.
 fn split_first_token(s: &str) -> (&str, &str) {
-    match s.find(char::is_whitespace) {
-        Some(pos) => (&s[..pos], s[pos..].trim_start()),
-        None => (s, ""),
-    }
+    s.find(char::is_whitespace)
+        .map_or((s, ""), |pos| (&s[..pos], s[pos..].trim_start()))
 }
 
 /// Parse `key=value key2='val with spaces'` argument pairs.
@@ -392,10 +398,10 @@ fn parse_value(input: &str) -> Result<(String, &str)> {
         parse_quoted_value(input, first as char)
     } else {
         // Bare value: up to next whitespace
-        match input.find(char::is_whitespace) {
-            Some(pos) => Ok((input[..pos].to_string(), &input[pos..])),
-            None => Ok((input.to_string(), "")),
-        }
+        input.find(char::is_whitespace).map_or_else(
+            || Ok((input.to_string(), "")),
+            |pos| Ok((input[..pos].to_string(), &input[pos..])),
+        )
     }
 }
 
@@ -443,6 +449,9 @@ fn parse_quoted_value(input: &str, quote: char) -> Result<(String, &str)> {
 }
 
 /// Decode C-style escape sequences in a string value into raw bytes.
+/// # Errors
+///
+/// Returns an error if the input contains invalid escape sequences.
 pub fn decode_c_escapes(input: &str) -> Result<Vec<u8>> {
     let bytes = input.as_bytes();
     let mut result = Vec::with_capacity(bytes.len());
@@ -487,7 +496,7 @@ pub fn decode_c_escapes(input: &str) -> Result<Vec<u8>> {
 /// Decode hex string to bytes (e.g. "1b5b41" -> [0x1b, 0x5b, 0x41]).
 fn decode_hex(hex: &str) -> Result<Vec<u8>> {
     let hex = hex.trim();
-    if hex.len() % 2 != 0 {
+    if !hex.len().is_multiple_of(2) {
         bail!("hex string must have even length");
     }
     (0..hex.len())

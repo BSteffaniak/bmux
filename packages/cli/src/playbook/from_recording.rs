@@ -22,6 +22,7 @@
 //!    barrier. Distinctive content lines become `assert-screen contains=` checks.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use anyhow::Result;
 use bmux_ipc::{
@@ -61,7 +62,7 @@ struct RecordingStateTracker {
 }
 
 impl RecordingStateTracker {
-    fn new() -> Self {
+    const fn new() -> Self {
         Self {
             pane_uuid_to_index: BTreeMap::new(),
             focused_pane_id: None,
@@ -85,7 +86,7 @@ impl RecordingStateTracker {
     }
 
     /// Set the focused pane.
-    fn set_focus(&mut self, pane_id: Uuid) {
+    const fn set_focus(&mut self, pane_id: Uuid) {
         self.focused_pane_id = Some(pane_id);
     }
 
@@ -102,23 +103,15 @@ impl RecordingStateTracker {
     }
 
     /// Update state from a decoded Request.
-    fn process_request(&mut self, request: &Request) {
-        match request {
-            Request::AttachSetViewport { cols, rows, .. } => {
-                self.viewport = (*cols, *rows);
-            }
-            _ => {}
+    const fn process_request(&mut self, request: &Request) {
+        if let Request::AttachSetViewport { cols, rows, .. } = request {
+            self.viewport = (*cols, *rows);
         }
     }
 
-    /// Update state from a decoded ResponsePayload.
+    /// Update state from a decoded `ResponsePayload`.
     fn process_response(&mut self, response: &ResponsePayload) {
         match response {
-            ResponsePayload::SessionCreated { .. } => {
-                // Session just created — the first pane is auto-created by the
-                // engine, but its UUID comes from the first snapshot or server
-                // event. We handle it via PaneSplit/snapshot.
-            }
             ResponsePayload::PaneSplit { id, .. } => {
                 self.add_pane(*id);
             }
@@ -169,6 +162,11 @@ struct PaneOutputAccumulator {
 // ---------------------------------------------------------------------------
 
 /// Convert a list of recording events into a DSL playbook string with assertions.
+///
+/// # Errors
+///
+/// Returns an error if event decoding fails or the recording is malformed.
+#[allow(clippy::too_many_lines, clippy::similar_names)]
 pub fn events_to_playbook(events: &[RecordingEventEnvelope]) -> Result<String> {
     let mut lines: Vec<String> = Vec::new();
     lines.push("# Auto-generated from recording".to_string());
@@ -201,15 +199,15 @@ pub fn events_to_playbook(events: &[RecordingEventEnvelope]) -> Result<String> {
             },
         ) = (&event.kind, &event.payload)
         {
-            if !request_data.is_empty() {
-                if let Ok(request) = bmux_ipc::decode::<Request>(request_data) {
-                    state.process_request(&request);
-                }
+            if !request_data.is_empty()
+                && let Ok(request) = bmux_ipc::decode::<Request>(request_data)
+            {
+                state.process_request(&request);
             }
-            if !response_data.is_empty() {
-                if let Ok(response) = bmux_ipc::decode::<ResponsePayload>(response_data) {
-                    state.process_response(&response);
-                }
+            if !response_data.is_empty()
+                && let Ok(response) = bmux_ipc::decode::<ResponsePayload>(response_data)
+            {
+                state.process_response(&response);
             }
         }
 
@@ -299,13 +297,17 @@ pub fn events_to_playbook(events: &[RecordingEventEnvelope]) -> Result<String> {
             }
             if let Ok(request) = bmux_ipc::decode::<Request>(request_data) {
                 // Emit viewport directive on first AttachSetViewport.
-                if let Request::AttachSetViewport { cols, rows, .. } = &request {
-                    if !viewport_set {
-                        // Insert viewport as the first directive after the header.
-                        let insert_pos = lines.iter().position(|l| l.is_empty()).unwrap_or(1) + 1;
-                        lines.insert(insert_pos, format!("@viewport cols={cols} rows={rows}"));
-                        viewport_set = true;
-                    }
+                if let Request::AttachSetViewport { cols, rows, .. } = &request
+                    && !viewport_set
+                {
+                    // Insert viewport as the first directive after the header.
+                    let insert_pos = lines
+                        .iter()
+                        .position(std::string::String::is_empty)
+                        .unwrap_or(1)
+                        + 1;
+                    lines.insert(insert_pos, format!("@viewport cols={cols} rows={rows}"));
+                    viewport_set = true;
                 }
 
                 match request_to_dsl(&request, &mut has_session, request_kind, &state, event) {
@@ -361,7 +363,7 @@ fn flush_input(
         let focused_idx = state.focused_pane_index();
         // Only add pane arg if target differs from the currently focused pane
         // and there are multiple panes.
-        if state.pane_uuid_to_index.len() > 1 && focused_idx.map_or(true, |fi| fi != target_idx) {
+        if state.pane_uuid_to_index.len() > 1 && (focused_idx != Some(target_idx)) {
             Some(target_idx)
         } else {
             None
@@ -469,7 +471,7 @@ fn make_robust_pattern(line: &str) -> String {
     while let Some(ch) = chars.next() {
         if ch.is_ascii_digit() {
             // Collapse consecutive digits into \d+
-            while chars.peek().map_or(false, |c| c.is_ascii_digit()) {
+            while chars.peek().is_some_and(char::is_ascii_digit) {
                 chars.next();
             }
             result.push_str("\\d+");
@@ -485,7 +487,7 @@ fn make_robust_pattern(line: &str) -> String {
 }
 
 /// Check if a character is a regex metacharacter that needs escaping.
-fn is_regex_meta(ch: char) -> bool {
+const fn is_regex_meta(ch: char) -> bool {
     matches!(
         ch,
         '.' | '*' | '+' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '|' | '^' | '$' | '\\'
@@ -505,7 +507,7 @@ pub(super) fn escape_single_quote(s: &str) -> String {
 enum RequestDslResult {
     /// A complete DSL line to emit.
     Line(String),
-    /// Input bytes to coalesce with subsequent AttachInput events.
+    /// Input bytes to coalesce with subsequent `AttachInput` events.
     /// Second element is the pane UUID the input was sent to (if known).
     CoalesceInput(Vec<u8>, Option<Uuid>),
     /// Skip this request (non-structural).
@@ -523,10 +525,10 @@ fn request_to_dsl(
     match request {
         Request::NewSession { name } => {
             *has_session = true;
-            RequestDslResult::Line(match name {
-                Some(n) => format!("new-session name='{n}'"),
-                None => "new-session".to_string(),
-            })
+            RequestDslResult::Line(name.as_ref().map_or_else(
+                || "new-session".to_string(),
+                |n| format!("new-session name='{n}'"),
+            ))
         }
         Request::SplitPane { direction, .. } => {
             let dir = match direction {
@@ -548,7 +550,9 @@ fn request_to_dsl(
             bmux_ipc::SessionSelector::ByName(name) => {
                 RequestDslResult::Line(format!("kill-session name='{name}'"))
             }
-            _ => RequestDslResult::Line("# kill-session (by id, manual edit needed)".to_string()),
+            bmux_ipc::SessionSelector::ById(_) => {
+                RequestDslResult::Line("# kill-session (by id, manual edit needed)".to_string())
+            }
         },
         Request::AttachSetViewport { cols, rows, .. } => {
             RequestDslResult::Line(format!("resize-viewport cols={cols} rows={rows}"))
@@ -572,6 +576,8 @@ fn request_to_dsl(
             RequestDslResult::CoalesceInput(data.clone(), Some(*pane_id))
         }
         // Skip high-frequency / non-structural requests.
+        // Recording-related requests aren't playbook actions.
+        // Attach lifecycle is handled implicitly by the playbook engine.
         Request::AttachOutput { .. }
         | Request::AttachSnapshot { .. }
         | Request::AttachLayout { .. }
@@ -584,17 +590,15 @@ fn request_to_dsl(
         | Request::ListPanes { .. }
         | Request::ListClients
         | Request::SubscribeEvents
-        | Request::PollEvents { .. } => RequestDslResult::Skip,
-        // Recording-related requests aren't playbook actions.
-        Request::RecordingStart { .. }
+        | Request::PollEvents { .. }
+        | Request::RecordingStart { .. }
         | Request::RecordingStop { .. }
         | Request::RecordingStatus
         | Request::RecordingList
         | Request::RecordingDelete { .. }
         | Request::RecordingDeleteAll
-        | Request::RecordingWriteCustomEvent { .. } => RequestDslResult::Skip,
-        // Attach lifecycle is handled implicitly by the playbook engine.
-        Request::Attach { .. }
+        | Request::RecordingWriteCustomEvent { .. }
+        | Request::Attach { .. }
         | Request::AttachContext { .. }
         | Request::AttachOpen { .. }
         | Request::Detach => RequestDslResult::Skip,
@@ -620,11 +624,13 @@ pub(super) fn bytes_to_c_escaped(data: &[u8]) -> String {
             0x1b => result.push_str("\\e"),
             0x01..=0x1a => {
                 // Ctrl+A through Ctrl+Z
-                result.push_str(&format!("\\x{byte:02x}"));
+                let _ = write!(result, "\\x{byte:02x}");
             }
             0x7f => result.push_str("\\x7f"),
             0x20..=0x7e => result.push(byte as char),
-            _ => result.push_str(&format!("\\x{byte:02x}")),
+            _ => {
+                let _ = write!(result, "\\x{byte:02x}");
+            }
         }
     }
     result

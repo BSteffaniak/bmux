@@ -1,5 +1,19 @@
-use super::*;
-use anyhow::Context;
+use anyhow::{Context, Result};
+use bmux_cli_schema::{Cli, Command, ServerCommand, SessionCommand};
+use bmux_client::BmuxClient;
+use bmux_config::{BmuxConfig, ConfigPaths};
+use bmux_ipc::{RecordingRollingStartOptions, SessionSummary};
+use std::io::{self, IsTerminal, Read, Write};
+use std::path::PathBuf;
+use std::process::{Command as ProcessCommand, Stdio};
+use std::time::{Duration, Instant};
+use uuid::Uuid;
+
+use super::{
+    AttachExitReason, ConnectionContext, ConnectionPolicyScope, active_runtime_name,
+    append_runtime_arg, connect, connect_with_context, expand_bmux_target_if_needed,
+    map_cli_client_error, run_server_start, run_session_attach, run_session_attach_with_client,
+};
 use bmux_cli_schema::HostedModeArg;
 use bmux_config::{ConnectionTargetConfig, ConnectionTransport, HostedMode, RemoteServerStartMode};
 use bmux_ipc::IpcEndpoint;
@@ -224,7 +238,7 @@ pub(super) async fn run_target_proxy_from_current_argv(cli: &Cli) -> Result<u8> 
     }
 }
 
-fn command_requires_remote_server(command: Option<&Command>) -> bool {
+const fn command_requires_remote_server(command: Option<&Command>) -> bool {
     !matches!(
         command,
         Some(Command::Server {
@@ -595,8 +609,7 @@ pub(super) async fn run_host(
 
     let join_link = resolved_share
         .as_ref()
-        .map(|value| format!("bmux://{value}"))
-        .unwrap_or_else(|| target.clone());
+        .map_or_else(|| target.clone(), |value| format!("bmux://{value}"));
 
     let host_name = name
         .map(ToString::to_string)
@@ -780,8 +793,7 @@ fn normalize_relay_url_for_display(raw: &str) -> String {
     let tail = &raw[authority_start..];
     let suffix_start = tail
         .find(['/', '?', '#'])
-        .map(|value| authority_start + value)
-        .unwrap_or(raw.len());
+        .map_or(raw.len(), |value| authority_start + value);
     let authority = &raw[authority_start..suffix_start];
     let suffix = &raw[suffix_start..];
     let normalized_authority = normalize_url_authority_host(authority);
@@ -819,7 +831,7 @@ fn normalize_url_authority_host(authority: &str) -> String {
     }
 }
 
-fn resolve_hosted_mode(config: &BmuxConfig, mode: Option<HostedModeArg>) -> HostedMode {
+const fn resolve_hosted_mode(config: &BmuxConfig, mode: Option<HostedModeArg>) -> HostedMode {
     match mode {
         Some(HostedModeArg::P2p) => HostedMode::P2p,
         Some(HostedModeArg::ControlPlane) => HostedMode::ControlPlane,
@@ -1003,9 +1015,10 @@ pub(super) async fn run_share(
             .cloned()
             .unwrap_or_else(|| "local".to_string())
     };
-    let slug = name
-        .map(ToString::to_string)
-        .unwrap_or_else(|| format!("share-{}", Uuid::new_v4().simple()));
+    let slug = name.map_or_else(
+        || format!("share-{}", Uuid::new_v4().simple()),
+        ToString::to_string,
+    );
 
     let control_plane_url = control_plane_url(&config);
     let auth_state = load_auth_state_optional(&ConfigPaths::default())?.ok_or_else(|| {
@@ -1030,7 +1043,7 @@ pub(super) async fn run_share(
         .insert(slug.clone(), resolved_target.clone());
     config.save()?;
     let link_name = created.name.clone().unwrap_or(slug);
-    let invite_url = created.url.clone();
+    let invite_url = created.url;
     println!("Share link: bmux://{link_name}");
     if let Some(url) = invite_url.as_deref() {
         println!("Invite URL: {url}");
@@ -1222,8 +1235,7 @@ fn invite_requires_confirmation(metadata: Option<&InviteMetadata>) -> bool {
     let is_control = meta
         .role
         .as_deref()
-        .map(|value| value.eq_ignore_ascii_case("control"))
-        .unwrap_or(false);
+        .is_some_and(|value| value.eq_ignore_ascii_case("control"));
     let owner_is_unknown = meta
         .owner
         .as_deref()
@@ -1285,7 +1297,7 @@ fn json_string(payload: &serde_json::Value, keys: &[&str]) -> Option<String> {
 
 fn json_bool(payload: &serde_json::Value, keys: &[&str]) -> Option<bool> {
     keys.iter()
-        .find_map(|key| payload.get(*key).and_then(|value| value.as_bool()))
+        .find_map(|key| payload.get(*key).and_then(serde_json::Value::as_bool))
 }
 
 fn control_plane_url(config: &BmuxConfig) -> String {
@@ -1346,7 +1358,7 @@ fn current_unix_timestamp() -> i64 {
         .unwrap_or(0)
 }
 
-fn build_create_share_request(
+const fn build_create_share_request(
     name: String,
     target: String,
     role: String,
@@ -1536,7 +1548,7 @@ fn local_ipc_endpoint_label(paths: &ConfigPaths) -> String {
     }
 }
 
-fn hosted_mode_to_cli_value(mode: HostedMode) -> &'static str {
+const fn hosted_mode_to_cli_value(mode: HostedMode) -> &'static str {
     match mode {
         HostedMode::P2p => "p2p",
         HostedMode::ControlPlane => "control-plane",
@@ -1546,12 +1558,12 @@ fn hosted_mode_to_cli_value(mode: HostedMode) -> &'static str {
 fn is_process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        return std::process::Command::new("kill")
+        std::process::Command::new("kill")
             .args(["-0", &pid.to_string()])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
-            .is_ok_and(|status| status.success());
+            .is_ok_and(|status| status.success())
     }
     #[cfg(windows)]
     {
@@ -1743,10 +1755,10 @@ fn extract_target_from_text(value: &str) -> Option<String> {
 fn open_browser(url: &str) -> bool {
     #[cfg(target_os = "macos")]
     {
-        return std::process::Command::new("open")
+        std::process::Command::new("open")
             .arg(url)
             .status()
-            .is_ok_and(|status| status.success());
+            .is_ok_and(|status| status.success())
     }
     #[cfg(target_os = "windows")]
     {
@@ -1938,8 +1950,7 @@ async fn run_iroh_attach_with_reconnect(
         }
         if !reconnect_forever && attempt >= SSH_RECONNECT_MAX_ATTEMPTS {
             println!(
-                "remote iroh connection closed; giving up after {} reconnect attempts",
-                SSH_RECONNECT_MAX_ATTEMPTS
+                "remote iroh connection closed; giving up after {SSH_RECONNECT_MAX_ATTEMPTS} reconnect attempts"
             );
             return Ok(1);
         }
@@ -1972,8 +1983,7 @@ async fn run_tls_attach_with_reconnect(
         }
         if !reconnect_forever && attempt >= SSH_RECONNECT_MAX_ATTEMPTS {
             println!(
-                "remote TLS connection closed; giving up after {} reconnect attempts",
-                SSH_RECONNECT_MAX_ATTEMPTS
+                "remote TLS connection closed; giving up after {SSH_RECONNECT_MAX_ATTEMPTS} reconnect attempts"
             );
             return Ok(1);
         }
@@ -2006,8 +2016,7 @@ async fn run_remote_attach_with_reconnect(
         }
         if !reconnect_forever && attempt >= SSH_RECONNECT_MAX_ATTEMPTS {
             println!(
-                "remote connection closed; giving up after {} reconnect attempts",
-                SSH_RECONNECT_MAX_ATTEMPTS
+                "remote connection closed; giving up after {SSH_RECONNECT_MAX_ATTEMPTS} reconnect attempts"
             );
             return Ok(1);
         }
@@ -2420,8 +2429,7 @@ async fn resolve_remote_attach_session(
 ) -> Result<Option<String>> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         anyhow::bail!(
-            "session argument is required in non-interactive mode.\nList sessions: bmux --target {} list-sessions",
-            target_label
+            "session argument is required in non-interactive mode.\nList sessions: bmux --target {target_label} list-sessions"
         );
     }
     let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
@@ -2909,7 +2917,7 @@ fn run_ssh_bmux_command_inner(
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             if print_stdout && !stdout.trim().is_empty() {
-                print!("{}", stdout);
+                print!("{stdout}");
             }
             return Ok(0);
         }
@@ -3087,10 +3095,12 @@ fn command_needs_tty(command: Option<&Command>) -> bool {
     }
     matches!(
         command,
-        Some(Command::Attach { .. })
-            | Some(Command::Session {
-                command: SessionCommand::Attach { .. }
-            })
+        Some(
+            Command::Attach { .. }
+                | Command::Session {
+                    command: SessionCommand::Attach { .. }
+                }
+        )
     )
 }
 
@@ -3377,6 +3387,7 @@ fn parse_host_port_with_default(value: &str, default_port: u16) -> Result<(Strin
 
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::wildcard_imports)]
     use super::*;
     use serial_test::serial;
     use std::ffi::OsString;

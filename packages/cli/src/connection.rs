@@ -21,11 +21,11 @@ struct AuthState {
 }
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct ServerRuntimeMetadata {
-    pub(crate) pid: u32,
-    pub(crate) version: String,
-    pub(crate) build_id: String,
-    pub(crate) executable_path: String,
-    pub(crate) started_at_epoch_ms: u64,
+    pub pid: u32,
+    pub version: String,
+    pub build_id: String,
+    pub executable_path: String,
+    pub started_at_epoch_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -276,10 +276,7 @@ async fn resolve_active_target(context: ConnectionContext<'_>) -> Result<ActiveT
     resolve_target_reference(&config, &expanded)
 }
 
-pub(crate) async fn expand_bmux_target_if_needed(
-    config: &BmuxConfig,
-    target: &str,
-) -> Result<String> {
+pub async fn expand_bmux_target_if_needed(config: &BmuxConfig, target: &str) -> Result<String> {
     let Some(name) = target.strip_prefix("bmux://") else {
         return Ok(target.to_string());
     };
@@ -379,8 +376,7 @@ fn resolve_named_target(name: &str, target: &ConnectionTargetConfig) -> Result<A
         }
         ConnectionTransport::Ssh => {
             anyhow::bail!(
-                "SSH targets require CLI target proxying; run command with --target {}",
-                name
+                "SSH targets require CLI target proxying; run command with --target {name}"
             )
         }
         ConnectionTransport::Iroh => {
@@ -542,19 +538,19 @@ pub fn map_client_connect_error(error: ClientError) -> anyhow::Error {
         );
     }
 
-    if let ClientError::Transport(bmux_ipc::transport::IpcTransportError::Io(io_error)) = &error {
-        if io_error.kind() == std::io::ErrorKind::UnexpectedEof {
-            let paths = ConfigPaths::default();
-            let runtime = std::env::var("BMUX_RUNTIME_NAME")
-                .ok()
-                .map(|value| value.trim().to_string())
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "default".to_string());
-            return anyhow::anyhow!(
-                "bmux error: server connection lost unexpectedly.\nThe server may have crashed or been stopped, or a hosted bridge could not reach its local IPC endpoint.\nLocal CLI runtime: {runtime}\nLocal CLI IPC endpoint: {}\nCheck `bmux --runtime {runtime} server status` on this machine and host logs on the remote machine.",
-                local_ipc_endpoint_label_for_error(&paths)
-            );
-        }
+    if let ClientError::Transport(bmux_ipc::transport::IpcTransportError::Io(io_error)) = &error
+        && io_error.kind() == std::io::ErrorKind::UnexpectedEof
+    {
+        let paths = ConfigPaths::default();
+        let runtime = std::env::var("BMUX_RUNTIME_NAME")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .unwrap_or_else(|| "default".to_string());
+        return anyhow::anyhow!(
+            "bmux error: server connection lost unexpectedly.\nThe server may have crashed or been stopped, or a hosted bridge could not reach its local IPC endpoint.\nLocal CLI runtime: {runtime}\nLocal CLI IPC endpoint: {}\nCheck `bmux --runtime {runtime} server status` on this machine and host logs on the remote machine.",
+            local_ipc_endpoint_label_for_error(&paths)
+        );
     }
 
     anyhow::Error::from(error)

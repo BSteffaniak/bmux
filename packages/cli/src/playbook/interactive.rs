@@ -488,7 +488,7 @@ impl Default for LiveSubscription {
     fn default() -> Self {
         Self {
             active: false,
-            event_types: ["pane_output".to_string()].into_iter().collect(),
+            event_types: std::iter::once("pane_output".to_string()).collect(),
             pane_indexes: None,
             format_preference: DeltaFormatPreference::Auto,
             prefer_machine_readable: false,
@@ -511,7 +511,7 @@ impl LiveSubscription {
             .is_none_or(|panes| panes.contains(&pane_index))
     }
 
-    fn resolved_delta_format(&self) -> ScreenDeltaFormat {
+    const fn resolved_delta_format(&self) -> ScreenDeltaFormat {
         match self.format_preference {
             DeltaFormatPreference::LineOps => ScreenDeltaFormat::LineOps,
             DeltaFormatPreference::UnifiedDiff => ScreenDeltaFormat::UnifiedDiff,
@@ -597,6 +597,7 @@ impl MessageSequencer {
         }
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     fn stamp(
         &mut self,
         response: &mut InteractiveResponse,
@@ -606,7 +607,7 @@ impl MessageSequencer {
         self.seq = self.seq.saturating_add(1);
         response.message_type = Some(message_type.to_string());
         response.seq = Some(self.seq);
-        response.mono_ns = Some(self.started.elapsed().as_nanos().min(u64::MAX as u128) as u64);
+        response.mono_ns = Some(self.started.elapsed().as_nanos().min(u128::from(u64::MAX)) as u64);
         response.request_id = request_id.map(std::string::ToString::to_string);
         self.seq
     }
@@ -651,7 +652,7 @@ impl WatchpointRegistry {
         before != self.event_burst.len()
     }
 
-    fn is_empty(&self) -> bool {
+    const fn is_empty(&self) -> bool {
         self.event_burst.is_empty()
     }
 }
@@ -668,6 +669,9 @@ struct ReadyMessage {
 ///
 /// Handles Ctrl+C gracefully: on signal, the sandbox server is cleaned up
 /// via `SandboxServer`'s `Drop` impl.
+/// # Errors
+///
+/// Returns an error if the interactive session fails.
 pub async fn run_interactive(
     socket_override: Option<&str>,
     record: bool,
@@ -829,6 +833,7 @@ enum ReplLoopEvent {
 
 /// The core read-eval-respond loop.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines, clippy::useless_let_if_seq)]
 async fn run_repl(
     stream: impl tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     client: &mut bmux_client::BmuxClient,
@@ -862,7 +867,7 @@ async fn run_repl(
 
     loop {
         let loop_event = tokio::select! {
-            _ = async {
+            () = async {
                 if let Some(dl) = deadline {
                     tokio::time::sleep_until(tokio::time::Instant::from_std(dl)).await;
                 } else {
@@ -877,10 +882,7 @@ async fn run_repl(
                 }
             }
             event = server_event_rx.recv(), if subscription.active => {
-                match event {
-                    Some(server_event) => ReplLoopEvent::ServerEvent(server_event),
-                    None => ReplLoopEvent::ServerEventClosed,
-                }
+                event.map_or(ReplLoopEvent::ServerEventClosed, ReplLoopEvent::ServerEvent)
             }
         };
 
@@ -976,8 +978,8 @@ async fn run_repl(
                     &mut event_buffer,
                     client,
                     inspector,
-                    session_id,
-                    attached,
+                    &*session_id,
+                    &*attached,
                     &mut subscription,
                     &mut server_event_task,
                     &server_event_tx,
@@ -1150,7 +1152,7 @@ async fn run_repl(
                 }
 
                 subscription.active = true;
-                subscription.event_types = ["pane_output".to_string()].into_iter().collect();
+                subscription.event_types = std::iter::once("pane_output".to_string()).collect();
                 let resp = InteractiveResponse::ok("subscribe");
                 send_response(
                     &mut writer,
@@ -1319,6 +1321,7 @@ async fn run_repl(
         )
         .await;
 
+        #[allow(clippy::cast_possible_truncation)]
         let elapsed_ms = step_start.elapsed().as_millis() as u64;
 
         match result {
@@ -1338,10 +1341,10 @@ async fn run_repl(
                     InteractiveResponse::ok_with_detail(&action_name, elapsed_ms, detail);
 
                 // For snapshot actions, include the snapshot data in the response.
-                if action_name == "snapshot" {
-                    if let Some(snap) = snapshots.last() {
-                        resp.snapshot = Some(snap.clone());
-                    }
+                if action_name == "snapshot"
+                    && let Some(snap) = snapshots.last()
+                {
+                    resp.snapshot = Some(snap.clone());
                 }
 
                 update_pane_cache_from_inspector(inspector, &mut pane_cache);
@@ -1513,6 +1516,7 @@ async fn run_repl(
 }
 
 /// Handle the `screen` special command — return all pane screen text.
+#[allow(clippy::ref_option)]
 async fn handle_screen_command(
     client: &mut bmux_client::BmuxClient,
     inspector: &mut ScreenInspector,
@@ -1537,6 +1541,7 @@ async fn handle_screen_command(
 }
 
 /// Handle the `status` special command — return session/pane metadata.
+#[allow(clippy::ref_option)]
 async fn handle_status_command(
     client: &mut bmux_client::BmuxClient,
     inspector: &mut ScreenInspector,
@@ -1552,6 +1557,7 @@ async fn handle_status_command(
 
     match inspector.refresh(client, sid).await {
         Ok(snapshot) => {
+            #[allow(clippy::cast_possible_truncation)]
             let pane_count = snapshot.panes.len() as u32;
             let focused = snapshot.panes.iter().find(|p| p.focused).map(|p| p.index);
             let mut resp = InteractiveResponse::ok("status");
@@ -1629,6 +1635,7 @@ async fn send_response_buffered<W: tokio::io::AsyncWrite + Unpin>(
     Ok(seq)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn send_event_if_allowed<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     sequencer: &mut MessageSequencer,
@@ -1659,6 +1666,7 @@ fn update_pane_cache_from_inspector(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::ref_option, clippy::useless_let_if_seq)]
 async fn process_output_available_event<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     sequencer: &mut MessageSequencer,
@@ -1768,6 +1776,7 @@ async fn process_output_available_event<W: tokio::io::AsyncWrite + Unpin>(
     .await
 }
 
+#[allow(clippy::useless_let_if_seq)]
 async fn process_server_event<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     sequencer: &mut MessageSequencer,
@@ -1824,6 +1833,7 @@ async fn process_server_event<W: tokio::io::AsyncWrite + Unpin>(
     Ok(())
 }
 
+#[allow(clippy::ref_option, clippy::too_many_arguments)]
 async fn emit_screen_events<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     sequencer: &mut MessageSequencer,
@@ -1854,6 +1864,12 @@ async fn emit_screen_events<W: tokio::io::AsyncWrite + Unpin>(
     .await
 }
 
+#[allow(
+    clippy::too_many_lines,
+    clippy::too_many_arguments,
+    clippy::ref_option,
+    clippy::useless_let_if_seq
+)]
 async fn emit_screen_events_with_refresh<W: tokio::io::AsyncWrite + Unpin>(
     writer: &mut W,
     sequencer: &mut MessageSequencer,
@@ -1991,6 +2007,7 @@ async fn emit_screen_events_with_refresh<W: tokio::io::AsyncWrite + Unpin>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines, clippy::ref_option)]
 async fn handle_json_command<W: tokio::io::AsyncWrite + Unpin>(
     json: InteractiveJsonRequest,
     writer: &mut W,
@@ -1998,8 +2015,8 @@ async fn handle_json_command<W: tokio::io::AsyncWrite + Unpin>(
     event_buffer: &mut EventBuffer,
     client: &mut bmux_client::BmuxClient,
     inspector: &mut ScreenInspector,
-    session_id: &mut Option<Uuid>,
-    attached: &mut bool,
+    session_id: &Option<Uuid>,
+    attached: &bool,
     subscription: &mut LiveSubscription,
     server_event_task: &mut Option<tokio::task::JoinHandle<()>>,
     server_event_tx: &tokio::sync::mpsc::Sender<bmux_client::ServerEvent>,
@@ -2452,6 +2469,7 @@ fn parse_delta_preference(value: Option<&str>) -> Result<DeltaFormatPreference> 
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn evaluate_watchpoints(
     watchpoints: &mut WatchpointRegistry,
     event_type: &str,
@@ -2497,6 +2515,7 @@ fn evaluate_watchpoints(
             history.pop_front();
         }
         if history.len() >= usize::from(watchpoint.min_hits) {
+            #[allow(clippy::cast_possible_truncation)]
             let observed_hits = history.len() as u16;
             let peak_distance = history
                 .iter()
@@ -2559,7 +2578,7 @@ fn pane_input_from_action(action: &super::types::Action) -> Option<PaneInputEven
     }
 }
 
-fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
+const fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
     match event {
         bmux_client::ServerEvent::ServerStarted => "server_started",
         bmux_client::ServerEvent::ServerStopping => "server_stopping",

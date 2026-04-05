@@ -1,8 +1,20 @@
-use super::*;
+use anyhow::{Context, Result};
 use bmux_cli_schema::GatewayHostMode;
-use bmux_ipc::IpcEndpoint;
+use bmux_config::ConfigPaths;
 use bmux_ipc::transport::LocalIpcStream;
+use bmux_ipc::{IpcEndpoint, RecordingRollingStartOptions};
 use iroh::{Endpoint, endpoint::presets};
+use std::process::{Command as ProcessCommand, Stdio};
+use uuid::Uuid;
+
+use super::{
+    ConnectionContext, ConnectionPolicyScope, SERVER_STATUS_TIMEOUT, SERVER_STOP_TIMEOUT,
+    ServerRuntimeMetadata, active_runtime_name, cleanup_stale_pid_file, connect_raw_with_context,
+    connect_with_context, current_cli_build_id, fetch_server_status, is_pid_running,
+    map_cli_client_error, read_server_pid_file, read_server_runtime_metadata,
+    recording_event_kind_name, remove_server_pid_file, try_kill_pid, wait_for_process_exit,
+    wait_until_server_stopped,
+};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls_pemfile::{certs, pkcs8_private_keys};
 use std::sync::Arc;
@@ -640,10 +652,7 @@ pub(super) async fn run_server_gateway(
     println!("bmux TLS gateway listening on {listen}");
     if host {
         let tunnel_target = format!("80:127.0.0.1:{}", parse_listen_port(listen)?);
-        println!(
-            "starting hosted reverse tunnel via '{}' (target: {})",
-            host_relay, tunnel_target
-        );
+        println!("starting hosted reverse tunnel via '{host_relay}' (target: {tunnel_target})");
         spawn_reverse_tunnel(host_relay, &tunnel_target)?;
         println!(
             "when tunnel is ready, your public URL will be shown by ssh output. use that URL with 'bmux connect <url>'"
@@ -673,7 +682,10 @@ async fn run_server_gateway_iroh() -> Result<u8> {
     endpoint.online().await;
     let addr = endpoint.addr();
     let endpoint_id = endpoint.id();
-    let relay = addr.relay_urls().next().map(|value| value.to_string());
+    let relay = addr
+        .relay_urls()
+        .next()
+        .map(std::string::ToString::to_string);
     let url = relay.as_ref().map_or_else(
         || format!("iroh://{endpoint_id}"),
         |relay| format!("iroh://{endpoint_id}?relay={relay}"),

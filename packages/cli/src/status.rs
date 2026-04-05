@@ -6,22 +6,22 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use uuid::Uuid;
 
 pub struct AttachTab {
-    pub(crate) label: String,
-    pub(crate) active: bool,
-    pub(crate) context_id: Option<Uuid>,
+    pub label: String,
+    pub active: bool,
+    pub context_id: Option<Uuid>,
 }
 
 #[derive(Clone, Debug)]
 pub struct AttachStatusTabHitbox {
-    pub(crate) start_col: u16,
-    pub(crate) end_col: u16,
-    pub(crate) context_id: Uuid,
+    pub start_col: u16,
+    pub end_col: u16,
+    pub context_id: Uuid,
 }
 
 #[derive(Clone, Debug)]
 pub struct AttachStatusLine {
-    pub(crate) rendered: String,
-    pub(crate) tab_hitboxes: Vec<AttachStatusTabHitbox>,
+    pub rendered: String,
+    pub tab_hitboxes: Vec<AttachStatusTabHitbox>,
 }
 
 pub fn build_attach_status_line(
@@ -560,14 +560,13 @@ fn stylize_status_line(
         let kind = tabs
             .iter()
             .find(|tab| tab.context_id == Some(hitbox.context_id))
-            .map(|tab| {
+            .map_or(SegmentKind::InactiveTab, |tab| {
                 if tab.active {
                     SegmentKind::ActiveTab
                 } else {
                     SegmentKind::InactiveTab
                 }
-            })
-            .unwrap_or(SegmentKind::InactiveTab);
+            });
         let start = usize::from(hitbox.start_col).min(width.saturating_sub(1));
         let end = usize::from(hitbox.end_col).min(width.saturating_sub(1));
         for col in start..=end {
@@ -599,7 +598,7 @@ fn stylize_status_line(
     rendered
 }
 
-fn style_for_segment(
+const fn style_for_segment(
     segment: SegmentKind,
     _config: &StatusBarConfig,
     theme: &ResolvedStatusTheme,

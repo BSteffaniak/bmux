@@ -11,6 +11,7 @@ use crate::model::{
 
 /// A change log entry for delta tracking.
 #[derive(Clone, Debug)]
+#[allow(dead_code)]
 enum ChangeLogEntry {
     Added { sequence: u64, image: PaneImage },
     Removed { sequence: u64, image_id: u64 },
@@ -19,13 +20,11 @@ enum ChangeLogEntry {
 /// Accumulator for kitty chunked transmissions.
 #[cfg(feature = "kitty")]
 struct KittyChunkAccumulator {
-    format: crate::model::KittyFormat,
     data: Vec<u8>,
-    width: u32,
-    height: u32,
 }
 
 /// Per-pane image storage with scroll tracking and delta queries.
+#[allow(dead_code)]
 pub struct ImageRegistry {
     images: Vec<PaneImage>,
     next_id: u64,
@@ -74,6 +73,7 @@ impl ImageRegistry {
     ///
     /// `cell_width` and `cell_height` are the pane's cell dimensions in
     /// pixels, used to compute `cell_size` from pixel dimensions.
+    #[allow(unused_variables)]
     pub fn handle_event(
         &mut self,
         event: ImageEvent,
@@ -131,6 +131,7 @@ impl ImageRegistry {
     }
 
     /// Insert a new image into the registry.
+    #[allow(dead_code)]
     fn add_image(
         &mut self,
         protocol: ImageProtocol,
@@ -162,6 +163,7 @@ impl ImageRegistry {
     }
 
     /// Remove images exceeding the per-pane limits (oldest first).
+    #[allow(dead_code)]
     fn enforce_limits(&mut self) {
         while self.images.len() > self.max_images {
             let removed = self.images.remove(0);
@@ -193,6 +195,7 @@ impl ImageRegistry {
         }
     }
 
+    #[allow(dead_code)]
     fn total_bytes(&self) -> usize {
         self.images
             .iter()
@@ -373,22 +376,17 @@ impl ImageRegistry {
             }
             KittyCommand::Transmit {
                 image_id,
-                format,
+                format: _,
                 data,
-                width,
-                height,
+                width: _,
+                height: _,
                 more_chunks: true,
             } => {
                 // Accumulate chunks until the final chunk arrives.
                 let acc = self
                     .kitty_pending_chunks
                     .entry(image_id)
-                    .or_insert_with(|| KittyChunkAccumulator {
-                        format,
-                        data: Vec::new(),
-                        width,
-                        height,
-                    });
+                    .or_insert_with(|| KittyChunkAccumulator { data: Vec::new() });
                 acc.data.extend_from_slice(&data);
             }
             KittyCommand::Place(placement) => {
@@ -449,6 +447,7 @@ impl Default for ImageRegistry {
 }
 
 /// Convert pixel dimensions to cell dimensions.
+#[allow(dead_code)]
 fn pixel_size_to_cells(
     pixel_size: ImagePixelSize,
     cell_pixel_width: u16,
@@ -458,9 +457,8 @@ fn pixel_size_to_cells(
         return ImageCellSize { rows: 1, cols: 1 };
     }
     ImageCellSize {
-        rows: ((pixel_size.height as u16).saturating_add(cell_pixel_height - 1))
-            / cell_pixel_height,
-        cols: ((pixel_size.width as u16).saturating_add(cell_pixel_width - 1)) / cell_pixel_width,
+        rows: (pixel_size.height as u16).div_ceil(cell_pixel_height),
+        cols: (pixel_size.width as u16).div_ceil(cell_pixel_width),
     }
 }
 

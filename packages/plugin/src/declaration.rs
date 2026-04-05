@@ -25,6 +25,13 @@ impl PluginOwnedPath {
 pub struct PluginId(String);
 
 impl PluginId {
+    /// Create a new plugin identifier.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the value is not a valid plugin identifier (must
+    /// start with a lowercase ASCII letter and contain only lowercase ASCII
+    /// letters, digits, hyphens, underscores, and dots).
     pub fn new(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
         if is_valid_plugin_id(&value) {
@@ -259,10 +266,16 @@ impl Default for PluginLifecycle {
 pub trait NativePlugin: Send + Sync {
     fn declaration(&self) -> &PluginDeclaration;
 
+    /// # Errors
+    ///
+    /// Returns an error if the context setup fails.
     fn activate(&mut self, _context: &mut PluginContext<'_>) -> Result<()> {
         Ok(())
     }
 
+    /// # Errors
+    ///
+    /// Returns an error if the cleanup fails.
     fn deactivate(&mut self, _context: &mut PluginContext<'_>) -> Result<()> {
         Ok(())
     }

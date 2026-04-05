@@ -13,6 +13,9 @@ version     = { workspace = true }
 [lib]
 proc-macro = true
 
+[features]
+fail-on-warnings = []
+
 [dependencies]
 proc-macro2 = { workspace = true, features = ["proc-macro"] }
 quote = { workspace = true, features = ["proc-macro"] }

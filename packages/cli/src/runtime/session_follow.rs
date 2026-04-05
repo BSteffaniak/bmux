@@ -1,4 +1,8 @@
-use super::*;
+use anyhow::{Context, Result};
+use bmux_ipc::SessionSelector;
+use uuid::Uuid;
+
+use super::{ConnectionContext, ConnectionPolicyScope, connect_with_context, map_cli_client_error};
 
 pub(super) async fn run_session_detach(connection_context: ConnectionContext<'_>) -> Result<u8> {
     let mut client = connect_with_context(

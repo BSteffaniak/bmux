@@ -1,4 +1,24 @@
-use super::*;
+use anyhow::{Context, Result};
+use bmux_config::{BmuxConfig, ConfigPaths};
+use bmux_plugin::{
+    PluginManifest, PluginRegistry, load_registered_plugin as load_native_registered_plugin,
+};
+use bmux_plugin_sdk::{
+    CURRENT_PLUGIN_ABI_VERSION, CURRENT_PLUGIN_API_VERSION, HostConnectionInfo, HostMetadata,
+    HostScope, NativeCommandContext, NativeLifecycleContext, PluginCommandEffect,
+    PluginCommandOutcome, PluginEvent, PluginEventKind, RegisteredService,
+};
+use std::path::PathBuf;
+use std::time::Duration;
+use tracing::{debug, warn};
+
+use super::{
+    available_capability_providers, available_service_descriptors,
+    begin_host_kernel_effect_capture, connect_raw, core_provided_capabilities,
+    enter_host_kernel_connection, finish_host_kernel_effect_capture, host_kernel_bridge,
+    map_cli_client_error, plugin_commands::PluginCommandRegistry, plugin_host, server_event_name,
+    service_descriptors_from_declarations,
+};
 
 pub(super) fn plugin_host_metadata() -> HostMetadata {
     HostMetadata {
@@ -115,10 +135,7 @@ pub(super) fn load_plugin(
     }
 }
 
-pub(crate) fn scan_available_plugins(
-    config: &BmuxConfig,
-    paths: &ConfigPaths,
-) -> Result<PluginRegistry> {
+pub fn scan_available_plugins(config: &BmuxConfig, paths: &ConfigPaths) -> Result<PluginRegistry> {
     let workspace_bundled_root = workspace_bundled_plugin_root();
     let search_paths = resolve_plugin_search_paths(config, paths)?;
     let reports = bmux_plugin::discover_plugin_manifests_in_roots(&search_paths)?;
@@ -135,20 +152,17 @@ pub(crate) fn scan_available_plugins(
                         manifest_path
                             .parent()
                             .unwrap_or_else(|| std::path::Path::new(".")),
-                    ) {
-                        if !entry_path.exists()
-                            && workspace_bundled_root
-                                .as_ref()
-                                .is_some_and(|root| report.search_root == *root)
-                            && let Ok(executable) = std::env::current_exe()
-                            && let Some(executable_dir) = executable.parent()
-                        {
-                            if let Some(entry) = manifest.entry.as_ref() {
-                                let executable_candidate = executable_dir.join(entry);
-                                if executable_candidate.exists() {
-                                    manifest.entry = Some(executable_candidate);
-                                }
-                            }
+                    ) && !entry_path.exists()
+                        && workspace_bundled_root
+                            .as_ref()
+                            .is_some_and(|root| report.search_root == *root)
+                        && let Ok(executable) = std::env::current_exe()
+                        && let Some(executable_dir) = executable.parent()
+                        && let Some(entry) = manifest.entry.as_ref()
+                    {
+                        let executable_candidate = executable_dir.join(entry);
+                        if executable_candidate.exists() {
+                            manifest.entry = Some(executable_candidate);
                         }
                     }
                     if let Err(error) = registry.register_manifest_from_root(
@@ -234,7 +248,7 @@ pub(super) fn workspace_bundled_plugin_root() -> Option<PathBuf> {
     plugins.exists().then_some(plugins)
 }
 
-pub(crate) fn bundled_plugin_roots() -> Vec<PathBuf> {
+pub fn bundled_plugin_roots() -> Vec<PathBuf> {
     let mut roots = Vec::new();
     let mut seen = std::collections::BTreeSet::new();
     if let Some(root) = bundled_plugin_root()
@@ -250,7 +264,7 @@ pub(crate) fn bundled_plugin_roots() -> Vec<PathBuf> {
     roots
 }
 
-pub(crate) fn registered_plugin_entry_exists(plugin: &bmux_plugin::RegisteredPlugin) -> bool {
+pub fn registered_plugin_entry_exists(plugin: &bmux_plugin::RegisteredPlugin) -> bool {
     plugin
         .manifest
         .resolve_entry_path(
@@ -264,7 +278,7 @@ pub(crate) fn registered_plugin_entry_exists(plugin: &bmux_plugin::RegisteredPlu
 
 /// Discover bundled plugin IDs using the same dynamic discovery as the runtime.
 /// Returns an empty vec on failure (non-fatal).
-pub(crate) fn discover_bundled_plugin_ids() -> Vec<String> {
+pub fn discover_bundled_plugin_ids() -> Vec<String> {
     let config = BmuxConfig::default();
     let paths = bmux_config::ConfigPaths::default();
     let roots = bundled_plugin_roots();
@@ -430,18 +444,14 @@ fn validate_required_namespace_claim(
         .owner_for_namespace(namespace)
         .ok_or_else(|| {
             anyhow::anyhow!(
-                "required namespace claim '{}' is not owned by any enabled plugin",
-                namespace
+                "required namespace claim '{namespace}' is not owned by any enabled plugin"
             )
         })?;
     if let Some(expected_owner) = claim.owner.as_deref()
         && owner != expected_owner
     {
         anyhow::bail!(
-            "required namespace claim '{}' must be owned by plugin '{}' (actual owner '{}')",
-            namespace,
-            expected_owner,
-            owner
+            "required namespace claim '{namespace}' must be owned by plugin '{expected_owner}' (actual owner '{owner}')"
         );
     }
     Ok(())
@@ -1009,11 +1019,7 @@ pub(super) fn plugin_command_policy_hints(
         .iter()
         .find(|entry| entry.name == command_name)
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "plugin '{}' does not declare command '{}'",
-                plugin_id,
-                command_name
-            )
+            anyhow::anyhow!("plugin '{plugin_id}' does not declare command '{command_name}'")
         })?;
 
     Ok(PluginCommandPolicyHints {
@@ -1200,6 +1206,7 @@ mod tests {
         dir
     }
 
+    #[allow(clippy::wildcard_imports)]
     use crate::runtime::*;
     use bmux_cli_schema::Command;
     use bmux_client::ClientError;

@@ -50,7 +50,7 @@ enum PlaybookInteractiveMode {
     Visual,
 }
 
-fn resolve_interactive_mode(
+const fn resolve_interactive_mode(
     interactive_requested: bool,
     stdin_is_tty: bool,
     stdout_is_tty: bool,
@@ -92,16 +92,13 @@ impl std::fmt::Display for InteractiveAbort {
 
 impl std::error::Error for InteractiveAbort {}
 
-fn parse_visual_control_action(key: KeyEvent) -> Option<VisualControlAction> {
+const fn parse_visual_control_action(key: KeyEvent) -> Option<VisualControlAction> {
     if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
         return None;
     }
 
     if key.modifiers.contains(KeyModifiers::CONTROL)
-        && matches!(
-            key.code,
-            CrosstermKeyCode::Char('c') | CrosstermKeyCode::Char('d')
-        )
+        && matches!(key.code, CrosstermKeyCode::Char('c' | 'd'))
     {
         return Some(VisualControlAction::Abort);
     }
@@ -109,14 +106,10 @@ fn parse_visual_control_action(key: KeyEvent) -> Option<VisualControlAction> {
     match key.code {
         CrosstermKeyCode::Char(' ') => Some(VisualControlAction::TogglePause),
         CrosstermKeyCode::Char('n') => Some(VisualControlAction::StepOnce),
-        CrosstermKeyCode::Char('c') | CrosstermKeyCode::Char('l') => {
-            Some(VisualControlAction::ContinueLive)
-        }
+        CrosstermKeyCode::Char('c' | 'l') => Some(VisualControlAction::ContinueLive),
         CrosstermKeyCode::Char('q') | CrosstermKeyCode::Esc => Some(VisualControlAction::Abort),
         CrosstermKeyCode::Char(':') => Some(VisualControlAction::PromptDsl),
-        CrosstermKeyCode::Char('?') | CrosstermKeyCode::Char('h') => {
-            Some(VisualControlAction::Help)
-        }
+        CrosstermKeyCode::Char('?' | 'h') => Some(VisualControlAction::Help),
         _ => None,
     }
 }
@@ -169,6 +162,7 @@ impl Drop for VisualTerminalGuard {
     }
 }
 
+#[allow(clippy::struct_excessive_bools)]
 pub(super) struct VisualInteractiveState {
     terminal: VisualTerminalGuard,
     paused: bool,
@@ -200,8 +194,8 @@ impl VisualInteractiveState {
             total_steps,
             last_step_line: String::new(),
             started_at: now,
-            last_render_at: now - VISUAL_RENDER_INTERVAL,
-            last_refresh_at: now - VISUAL_REFRESH_INTERVAL,
+            last_render_at: now.checked_sub(VISUAL_RENDER_INTERVAL).unwrap_or(now),
+            last_refresh_at: now.checked_sub(VISUAL_REFRESH_INTERVAL).unwrap_or(now),
         })
     }
 
@@ -253,21 +247,21 @@ impl VisualInteractiveState {
     }
 
     fn force_render(&mut self) {
-        self.last_render_at = Instant::now() - VISUAL_RENDER_INTERVAL;
+        let now = Instant::now();
+        self.last_render_at = now.checked_sub(VISUAL_RENDER_INTERVAL).unwrap_or(now);
     }
 
-    fn parse_next_control_action(&mut self) -> Result<Option<VisualControlAction>> {
+    #[allow(clippy::unused_self)]
+    fn parse_next_control_action(&self) -> Result<Option<VisualControlAction>> {
         loop {
             if !crossterm::event::poll(Duration::ZERO).context("failed polling visual controls")? {
                 return Ok(None);
             }
-            match crossterm::event::read().context("failed reading visual control event")? {
-                crossterm::event::Event::Key(key) => {
-                    if let Some(action) = parse_visual_control_action(key) {
-                        return Ok(Some(action));
-                    }
-                }
-                _ => {}
+            if let crossterm::event::Event::Key(key) =
+                crossterm::event::read().context("failed reading visual control event")?
+                && let Some(action) = parse_visual_control_action(key)
+            {
+                return Ok(Some(action));
             }
         }
     }
@@ -351,9 +345,7 @@ impl VisualInteractiveState {
         })();
 
         let resume_result = self.terminal.resume_after_line_input();
-        if let Err(error) = resume_result {
-            return Err(error);
-        }
+        resume_result?;
 
         self.force_render();
         read_result
@@ -369,12 +361,11 @@ impl VisualInteractiveState {
     ) -> Result<()> {
         let now = Instant::now();
         if force || now.duration_since(self.last_refresh_at) >= VISUAL_REFRESH_INTERVAL {
-            if attached {
-                if let Some(sid) = session_id {
-                    if let Err(error) = inspector.refresh(client, sid).await {
-                        self.status_line = format!("screen refresh failed: {error:#}");
-                    }
-                }
+            if attached
+                && let Some(sid) = session_id
+                && let Err(error) = inspector.refresh(client, sid).await
+            {
+                self.status_line = format!("screen refresh failed: {error:#}");
             }
             self.last_refresh_at = now;
         }
@@ -388,7 +379,7 @@ impl VisualInteractiveState {
     }
 
     fn render(
-        &mut self,
+        &self,
         inspector: &ScreenInspector,
         attached: bool,
         session_id: Option<Uuid>,
@@ -432,9 +423,7 @@ impl VisualInteractiveState {
             &format!(
                 "status: {} | session: {}",
                 self.status_line,
-                session_id
-                    .map(|id| id.to_string())
-                    .unwrap_or_else(|| "none".to_string())
+                session_id.map_or_else(|| "none".to_string(), |id| id.to_string())
             ),
             cols_usize,
         ));
@@ -469,7 +458,7 @@ impl VisualInteractiveState {
                     if lines.len() >= rows_usize {
                         break;
                     }
-                    lines.push("".to_string());
+                    lines.push(String::new());
                 }
             }
         } else {
@@ -539,6 +528,10 @@ impl AttachInputRuntime {
 ///
 /// Handles Ctrl+C gracefully: on signal, the sandbox server is cleaned up
 /// via `SandboxServer`'s `Drop` impl.
+///
+/// # Errors
+///
+/// Returns an error if the playbook execution fails (server startup, IPC, etc.).
 pub async fn run_playbook(
     playbook: Playbook,
     target_server: bool,
@@ -556,6 +549,7 @@ pub async fn run_playbook(
 }
 
 /// Core playbook execution logic.
+#[allow(clippy::too_many_lines)]
 async fn run_playbook_inner(
     playbook: Playbook,
     target_server: bool,
@@ -620,10 +614,7 @@ async fn run_playbook_inner(
                 // Create display track writer for GIF export.
                 if let Some(ref sb) = sandbox {
                     let rec_dir = sb.paths().recordings_dir().join(rid.to_string());
-                    let client_id = match client.whoami().await {
-                        Ok(id) => id,
-                        Err(_) => Uuid::new_v4(),
-                    };
+                    let client_id = client.whoami().await.unwrap_or_else(|_| Uuid::new_v4());
                     match super::display_track::PlaybookDisplayTrackWriter::new(
                         &rec_dir,
                         client_id,
@@ -797,6 +788,7 @@ async fn run_playbook_inner(
         )
         .await;
 
+        #[allow(clippy::cast_possible_truncation)]
         let elapsed_ms = step_start.elapsed().as_millis() as u64;
 
         match result {
@@ -873,11 +865,10 @@ async fn run_playbook_inner(
                 );
 
                 // Try to extract structured failure info if the error is a StepFailure.
-                let (msg, expected, actual) = if let Some(sf) = err.downcast_ref::<StepFailure>() {
-                    (sf.message.clone(), sf.expected.clone(), sf.actual.clone())
-                } else {
-                    (format!("{err:#}"), None, None)
-                };
+                let (msg, expected, actual) = err.downcast_ref::<StepFailure>().map_or_else(
+                    || (format!("{err:#}"), None, None),
+                    |sf| (sf.message.clone(), sf.expected.clone(), sf.actual.clone()),
+                );
 
                 // Auto-capture all pane states at the time of failure.
                 let failure_captures = if attached {
@@ -946,10 +937,10 @@ async fn run_playbook_inner(
     }
 
     // Finish display track before stopping the recording.
-    if let Some(ref mut dt) = display_track {
-        if let Err(e) = dt.finish() {
-            warn!("failed to finish display track: {e:#}");
-        }
+    if let Some(ref mut dt) = display_track
+        && let Err(e) = dt.finish()
+    {
+        warn!("failed to finish display track: {e:#}");
     }
 
     // Copy recording dir to user recordings dir before sandbox shutdown.
@@ -980,6 +971,7 @@ async fn run_playbook_inner(
         }
     }
 
+    #[allow(clippy::cast_possible_truncation)]
     let total_elapsed_ms = started.elapsed().as_millis() as u64;
     let pass = error_msg.is_none() && !step_results.iter().any(|s| s.status == StepStatus::Fail);
 
@@ -989,10 +981,10 @@ async fn run_playbook_inner(
         .map(|sb| sb.root_dir().to_string_lossy().to_string());
 
     // Shutdown sandbox if we created one.
-    if let Some(sb) = sandbox {
-        if let Err(e) = sb.shutdown(!pass).await {
-            warn!("sandbox shutdown error: {e:#}");
-        }
+    if let Some(sb) = sandbox
+        && let Err(e) = sb.shutdown(!pass).await
+    {
+        warn!("sandbox shutdown error: {e:#}");
     }
 
     Ok(PlaybookResult {
@@ -1130,15 +1122,18 @@ async fn run_visual_dsl_command(
     {
         Ok(detail) => {
             let elapsed_ms = started.elapsed().as_millis();
-            if let Some(detail) = detail {
-                Ok(format!(
-                    "interactive command ok: {action_name} ({elapsed_ms}ms) - {detail}"
-                ))
-            } else {
-                Ok(format!(
-                    "interactive command ok: {action_name} ({elapsed_ms}ms)"
-                ))
-            }
+            detail.map_or_else(
+                || {
+                    Ok(format!(
+                        "interactive command ok: {action_name} ({elapsed_ms}ms)"
+                    ))
+                },
+                |detail| {
+                    Ok(format!(
+                        "interactive command ok: {action_name} ({elapsed_ms}ms) - {detail}"
+                    ))
+                },
+            )
         }
         Err(err) => {
             if err.downcast_ref::<InteractiveAbort>().is_some() {
@@ -1480,6 +1475,7 @@ pub(super) async fn start_recording(
 
 /// Execute a single step.
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines, clippy::cast_possible_truncation)]
 pub(super) async fn execute_step(
     step: &Step,
     client: &mut BmuxClient,
@@ -1674,17 +1670,14 @@ pub(super) async fn execute_step(
                     .pane_direct_input(sid, pane_id, resolved_keys.clone())
                     .await
                     .map_err(|e| anyhow::anyhow!("send-keys to pane {target_index} failed: {e}"))?;
-                if let Some(dt) = display_track.as_mut() {
-                    let _ = dt.record_activity(bmux_ipc::DisplayActivityKind::Input);
-                }
             } else {
                 client
                     .attach_input(sid, resolved_keys)
                     .await
                     .map_err(|e| anyhow::anyhow!("send-keys failed: {e}"))?;
-                if let Some(dt) = display_track.as_mut() {
-                    let _ = dt.record_activity(bmux_ipc::DisplayActivityKind::Input);
-                }
+            }
+            if let Some(dt) = display_track.as_mut() {
+                let _ = dt.record_activity(bmux_ipc::DisplayActivityKind::Input);
             }
             Ok(None)
         }
@@ -1943,6 +1936,7 @@ pub(super) async fn execute_step(
             require_attached(*attached)?;
 
             let snapshot = inspector.refresh(client, sid).await?;
+            #[allow(clippy::cast_possible_truncation)]
             let actual_count = snapshot.panes.len() as u32;
 
             if actual_count != *pane_count {
@@ -2165,6 +2159,7 @@ pub(super) async fn execute_step(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(clippy::cast_possible_truncation)]
 async fn execute_attach_chord(
     chord: &str,
     client: &mut BmuxClient,
@@ -2188,7 +2183,7 @@ async fn execute_attach_chord(
     let strokes = crate::input::parse_key_chord(chord)
         .map_err(|e| anyhow::anyhow!("invalid attach key chord '{chord}': {e}"))?;
     for stroke in &strokes {
-        let event = crossterm_event_from_stroke(*stroke)?;
+        let event = crossterm_event_from_stroke(*stroke);
         let actions = runtime.processor.process_terminal_event(event);
         apply_attach_runtime_actions(actions, client, sid, runtime).await?;
     }
@@ -2208,6 +2203,7 @@ async fn execute_attach_chord(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn apply_attach_runtime_actions(
     actions: Vec<crate::input::RuntimeAction>,
     client: &mut BmuxClient,
@@ -2409,7 +2405,7 @@ async fn apply_attach_runtime_actions(
     Ok(())
 }
 
-fn crossterm_event_from_stroke(stroke: KeyStroke) -> Result<CrosstermEvent> {
+fn crossterm_event_from_stroke(stroke: KeyStroke) -> CrosstermEvent {
     let key_code = match stroke.key {
         BmuxKeyCode::Char(c) => CrosstermKeyCode::Char(c),
         BmuxKeyCode::Enter => CrosstermKeyCode::Enter,
@@ -2444,12 +2440,12 @@ fn crossterm_event_from_stroke(stroke: KeyStroke) -> Result<CrosstermEvent> {
         modifiers |= KeyModifiers::SUPER;
     }
 
-    Ok(CrosstermEvent::Key(KeyEvent {
+    CrosstermEvent::Key(KeyEvent {
         code: key_code,
         modifiers,
         kind: KeyEventKind::Press,
         state: KeyEventState::NONE,
-    }))
+    })
 }
 
 pub(super) fn require_session(session_id: Option<Uuid>) -> Result<Uuid> {
@@ -2494,6 +2490,7 @@ pub(super) async fn drain_output_until_idle(
 }
 
 /// Same as `drain_output_until_idle` but with a configurable idle threshold.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn drain_output_with_threshold(
     client: &mut BmuxClient,
     inspector: &mut ScreenInspector,
@@ -2522,10 +2519,10 @@ pub(super) async fn drain_output_with_threshold(
             .await
             .map_err(|e| anyhow::anyhow!("drain output failed: {e}"))?;
 
-        if !drain.focused_output.is_empty() {
-            if let Some(ref mut dt) = *display_track {
-                let _ = dt.record_frame_bytes(&drain.focused_output);
-            }
+        if !drain.focused_output.is_empty()
+            && let Some(ref mut dt) = *display_track
+        {
+            let _ = dt.record_frame_bytes(&drain.focused_output);
         }
 
         if drain.had_activity {
@@ -2572,20 +2569,29 @@ fn copy_dir_recursive(src: &std::path::Path, dst: &std::path::Path) -> Result<()
 
 /// Match a server event against a user-specified event name string.
 fn event_matches(event: &bmux_ipc::Event, name: &str) -> bool {
-    match (event, name) {
-        (bmux_ipc::Event::ServerStarted, "server_started") => true,
-        (bmux_ipc::Event::ServerStopping, "server_stopping") => true,
-        (bmux_ipc::Event::SessionCreated { .. }, "session_created") => true,
-        (bmux_ipc::Event::SessionRemoved { .. }, "session_removed") => true,
-        (bmux_ipc::Event::ClientAttached { .. }, "client_attached") => true,
-        (bmux_ipc::Event::ClientDetached { .. }, "client_detached") => true,
-        (bmux_ipc::Event::AttachViewChanged { .. }, "attach_view_changed") => true,
-        (bmux_ipc::Event::PaneOutputAvailable { .. }, "pane_output_available") => true,
-        (bmux_ipc::Event::PaneImageAvailable { .. }, "pane_image_available") => true,
-        (bmux_ipc::Event::PaneExited { .. }, "pane_exited") => true,
-        (bmux_ipc::Event::PaneRestarted { .. }, "pane_restarted") => true,
-        _ => false,
-    }
+    matches!(
+        (event, name),
+        (bmux_ipc::Event::ServerStarted, "server_started")
+            | (bmux_ipc::Event::ServerStopping, "server_stopping")
+            | (bmux_ipc::Event::SessionCreated { .. }, "session_created")
+            | (bmux_ipc::Event::SessionRemoved { .. }, "session_removed")
+            | (bmux_ipc::Event::ClientAttached { .. }, "client_attached")
+            | (bmux_ipc::Event::ClientDetached { .. }, "client_detached")
+            | (
+                bmux_ipc::Event::AttachViewChanged { .. },
+                "attach_view_changed"
+            )
+            | (
+                bmux_ipc::Event::PaneOutputAvailable { .. },
+                "pane_output_available"
+            )
+            | (
+                bmux_ipc::Event::PaneImageAvailable { .. },
+                "pane_image_available"
+            )
+            | (bmux_ipc::Event::PaneExited { .. }, "pane_exited")
+            | (bmux_ipc::Event::PaneRestarted { .. }, "pane_restarted")
+    )
 }
 
 #[cfg(test)]

@@ -23,6 +23,12 @@ use serde::{Serialize, de::DeserializeOwned};
 /// [`HostRuntimeApi`] is a blanket impl over `ServiceCaller`, providing
 /// ergonomic methods like `session_list()`.
 pub trait ServiceCaller {
+    /// Dispatch a raw service call with a binary payload.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the capability is not accessible, the service
+    /// is not registered, or the provider returns a transport-level error.
     fn call_service_raw(
         &self,
         capability: &str,
@@ -32,6 +38,13 @@ pub trait ServiceCaller {
         payload: Vec<u8>,
     ) -> Result<Vec<u8>>;
 
+    /// Dispatch a typed service call, serializing the request and
+    /// deserializing the response.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the capability is not accessible, the service
+    /// is not registered, or the provider returns a transport-level error.
     fn call_service<Request, Response>(
         &self,
         capability: &str,
@@ -51,6 +64,11 @@ pub trait ServiceCaller {
 }
 
 pub trait HostRuntimeApi: ServiceCaller {
+    /// List all sessions.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
     fn session_list(&self) -> Result<SessionListResponse> {
         self.call_service(
             "bmux.sessions.read",
@@ -61,6 +79,11 @@ pub trait HostRuntimeApi: ServiceCaller {
         )
     }
 
+    /// Create a new session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
     fn session_create(&self, request: &SessionCreateRequest) -> Result<SessionCreateResponse> {
         self.call_service(
             "bmux.sessions.write",
@@ -71,6 +94,11 @@ pub trait HostRuntimeApi: ServiceCaller {
         )
     }
 
+    /// Kill a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
     fn session_kill(&self, request: &SessionKillRequest) -> Result<SessionKillResponse> {
         self.call_service(
             "bmux.sessions.write",
@@ -81,6 +109,11 @@ pub trait HostRuntimeApi: ServiceCaller {
         )
     }
 
+    /// Select (attach to) a session.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
     fn session_select(&self, request: &SessionSelectRequest) -> Result<SessionSelectResponse> {
         self.call_service(
             "bmux.sessions.write",
@@ -91,6 +124,11 @@ pub trait HostRuntimeApi: ServiceCaller {
         )
     }
 
+    /// Get the current client identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
     fn current_client(&self) -> Result<CurrentClientResponse> {
         self.call_service(
             "bmux.clients.read",
@@ -101,6 +139,11 @@ pub trait HostRuntimeApi: ServiceCaller {
         )
     }
 
+    /// List all contexts.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
     fn context_list(&self) -> Result<ContextListResponse> {
         self.call_service(
             "bmux.contexts.read",
@@ -111,6 +154,11 @@ pub trait HostRuntimeApi: ServiceCaller {
         )
     }
 
+    /// Get the current context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
     fn context_current(&self) -> Result<ContextCurrentResponse> {
         self.call_service(
             "bmux.contexts.read",
@@ -121,6 +169,11 @@ pub trait HostRuntimeApi: ServiceCaller {
         )
     }
 
+    /// Create a new context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
     fn context_create(&self, request: &ContextCreateRequest) -> Result<ContextCreateResponse> {
         self.call_service(
             "bmux.contexts.write",
@@ -131,6 +184,11 @@ pub trait HostRuntimeApi: ServiceCaller {
         )
     }
 
+    /// Select (switch to) a context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
     fn context_select(&self, request: &ContextSelectRequest) -> Result<ContextSelectResponse> {
         self.call_service(
             "bmux.contexts.write",
@@ -141,6 +199,11 @@ pub trait HostRuntimeApi: ServiceCaller {
         )
     }
 
+    /// Close a context.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
     fn context_close(&self, request: &ContextCloseRequest) -> Result<ContextCloseResponse> {
         self.call_service(
             "bmux.contexts.write",
@@ -151,6 +214,11 @@ pub trait HostRuntimeApi: ServiceCaller {
         )
     }
 
+    /// List panes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
     fn pane_list(&self, request: &PaneListRequest) -> Result<PaneListResponse> {
         self.call_service(
             "bmux.panes.read",
@@ -161,6 +229,11 @@ pub trait HostRuntimeApi: ServiceCaller {
         )
     }
 
+    /// Split a pane.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
     fn pane_split(&self, request: &PaneSplitRequest) -> Result<PaneSplitResponse> {
         self.call_service(
             "bmux.panes.write",
@@ -171,6 +244,11 @@ pub trait HostRuntimeApi: ServiceCaller {
         )
     }
 
+    /// Focus a pane.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
     fn pane_focus(&self, request: &PaneFocusRequest) -> Result<PaneFocusResponse> {
         self.call_service(
             "bmux.panes.write",
@@ -181,6 +259,11 @@ pub trait HostRuntimeApi: ServiceCaller {
         )
     }
 
+    /// Resize a pane.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
     fn pane_resize(&self, request: &PaneResizeRequest) -> Result<PaneResizeResponse> {
         self.call_service(
             "bmux.panes.write",
@@ -191,6 +274,11 @@ pub trait HostRuntimeApi: ServiceCaller {
         )
     }
 
+    /// Close a pane.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
     fn pane_close(&self, request: &PaneCloseRequest) -> Result<PaneCloseResponse> {
         self.call_service(
             "bmux.panes.write",
@@ -201,6 +289,11 @@ pub trait HostRuntimeApi: ServiceCaller {
         )
     }
 
+    /// Get a value from plugin storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
     fn storage_get(&self, request: &StorageGetRequest) -> Result<StorageGetResponse> {
         self.call_service(
             "bmux.storage",
@@ -211,6 +304,11 @@ pub trait HostRuntimeApi: ServiceCaller {
         )
     }
 
+    /// Set a value in plugin storage.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
     fn storage_set(&self, request: &StorageSetRequest) -> Result<()> {
         self.call_service(
             "bmux.storage",
@@ -221,6 +319,11 @@ pub trait HostRuntimeApi: ServiceCaller {
         )
     }
 
+    /// Write a log message.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
     fn log_write(&self, request: &LogWriteRequest) -> Result<()> {
         self.call_service(
             "bmux.logs.write",
@@ -231,6 +334,11 @@ pub trait HostRuntimeApi: ServiceCaller {
         )
     }
 
+    /// Write a custom recording event.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the service call fails.
     fn recording_write_event(
         &self,
         request: &RecordingWriteEventRequest,

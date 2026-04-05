@@ -1,4 +1,8 @@
-use super::*;
+use anyhow::{Context, Result};
+use bmux_cli_schema::{RecordingExportFormat, RecordingRenderMode};
+use std::time::Duration;
+
+use super::{discover_bundled_plugin_ids, recording, run_recording_export};
 
 pub(super) async fn run_playbook_run(
     source: &str,
@@ -124,7 +128,7 @@ pub(super) async fn run_playbook_run(
         print!("{}", crate::playbook::format_result(&result));
     }
 
-    Ok(if result.pass { 0 } else { 1 })
+    Ok(u8::from(!result.pass))
 }
 
 pub(super) fn run_playbook_validate(source: &str, json: bool) -> Result<u8> {
@@ -152,7 +156,7 @@ pub(super) fn run_playbook_validate(source: &str, json: bool) -> Result<u8> {
         }
     }
 
-    Ok(if errors.is_empty() { 0 } else { 1 })
+    Ok(u8::from(!errors.is_empty()))
 }
 
 pub(super) fn run_playbook_dry_run(source: &str, json: bool) -> Result<u8> {
@@ -229,7 +233,7 @@ pub(super) fn run_playbook_dry_run(source: &str, json: bool) -> Result<u8> {
         }
     }
 
-    Ok(if valid { 0 } else { 1 })
+    Ok(u8::from(!valid))
 }
 
 pub(super) fn run_playbook_diff(
@@ -270,7 +274,7 @@ pub(super) fn run_playbook_diff(
         || report.summary.steps_changed > 0
         || report.summary.snapshots_changed > 0
         || !report.timing_regressions.is_empty();
-    Ok(if has_changes { 1 } else { 0 })
+    Ok(u8::from(has_changes))
 }
 
 pub(super) fn run_playbook_cleanup(dry_run: bool, json: bool) -> Result<u8> {

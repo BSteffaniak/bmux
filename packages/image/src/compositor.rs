@@ -28,11 +28,13 @@ pub struct KittyHostState {
     /// Maps bmux-internal image ID → host-side kitty image ID.
     pub transmitted: std::collections::HashMap<u64, u32>,
     /// Next host-side kitty image ID to allocate.
+    #[cfg(feature = "kitty")]
     next_host_id: u32,
 }
 
 impl KittyHostState {
     /// Get or allocate a host-side kitty image ID for a bmux image.
+    #[cfg(feature = "kitty")]
     fn get_or_allocate(&mut self, bmux_image_id: u64) -> (u32, bool) {
         if let Some(&host_id) = self.transmitted.get(&bmux_image_id) {
             (host_id, false) // Already transmitted.
@@ -98,6 +100,7 @@ pub fn render_pane_images(
 }
 
 /// Passthrough mode: re-emit raw protocol bytes at translated coordinates.
+#[allow(unused_variables)]
 fn emit_passthrough(
     out: &mut impl Write,
     image: &PaneImage,
@@ -164,6 +167,7 @@ fn emit_passthrough(
 }
 
 /// Server-decode mode: encode decoded pixels for the host's preferred protocol.
+#[allow(unused_variables, unreachable_code)]
 fn emit_from_pixels(
     out: &mut impl Write,
     image: &PaneImage,

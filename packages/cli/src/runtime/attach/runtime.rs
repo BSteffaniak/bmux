@@ -1,7 +1,55 @@
-use super::super::*;
+use anyhow::{Context, Result};
+use bmux_client::{AttachLayoutState, AttachSnapshotState, ClientError, StreamingBmuxClient};
+use bmux_config::{BmuxConfig, ConfigPaths, PaneRestoreMethod, ResolvedTimeout, StatusPosition};
+use bmux_ipc::{
+    AttachRect, AttachViewComponent, ContextSelector, ContextSummary, InvokeServiceKind,
+    PaneFocusDirection, PaneSelector, PaneSplitDirection, SessionSelector, SessionSummary,
+};
+use bmux_keybind::action_to_config_name;
+use bmux_plugin_sdk::{
+    HostScope, PluginCommandEffect, PluginCommandOutcome, ServiceKind, ServiceRequest,
+};
+use crossterm::cursor::{Hide, MoveTo, SavePosition, Show};
+use crossterm::event::{
+    DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    MouseButton, MouseEvent, MouseEventKind,
+};
+use crossterm::queue;
+use crossterm::style::Print;
+use crossterm::terminal;
+use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchronizedUpdate};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::io::{self, Write};
+use std::path::Path;
+use std::time::{Duration, Instant};
+use tracing::{debug, trace, warn};
+use uuid::Uuid;
+
+use super::super::{
+    ATTACH_SCROLLBACK_UNAVAILABLE_STATUS, ATTACH_SELECTION_CLEARED_STATUS,
+    ATTACH_SELECTION_COPIED_STATUS, ATTACH_SELECTION_EMPTY_STATUS, ATTACH_SELECTION_STARTED_STATUS,
+    ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE, ATTACH_TRANSIENT_STATUS_TTL, ATTACH_WELCOME_STATUS_TTL,
+    BmuxClient, HELP_OVERLAY_SURFACE_ID, InputProcessor, Keymap, RuntimeAction, attach,
+    attach_quit_failure_status, available_capability_providers, available_service_descriptors,
+    effective_enabled_plugins, enter_host_kernel_connection, host_kernel_bridge, load_plugin,
+    map_attach_client_error, merged_runtime_keybindings, parse_session_selector, parse_uuid_value,
+    plugin_command_policy_hints, plugin_host_metadata, recording, resolve_plugin_search_paths,
+    run_plugin_keybinding_command, scan_available_plugins,
+};
+use super::cursor::apply_attach_cursor_state;
+use super::events::{AttachLoopControl, AttachLoopEvent};
+use super::render::{
+    AttachLayer, AttachLayerSurface, append_pane_output, opaque_row_text, queue_layer_fill,
+    render_attach_scene, visible_scene_pane_ids,
+};
+use super::state::{
+    AttachEventAction, AttachExitReason, AttachScrollbackCursor, AttachScrollbackPosition,
+    AttachUiMode, AttachViewState, PaneRect,
+};
+use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 
 const ATTACH_CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
@@ -15,7 +63,7 @@ const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
 const ATTACH_OUTPUT_DRAIN_TIME_BUDGET: Duration = Duration::from_millis(4);
 
 #[derive(Default)]
-pub(crate) struct DisplayCaptureFanout {
+pub struct DisplayCaptureFanout {
     writers: BTreeMap<Uuid, recording::DisplayCaptureWriter>,
 }
 
@@ -150,7 +198,7 @@ fn apply_attach_output_bytes(
     true
 }
 
-pub(crate) async fn run_session_attach_with_client(
+pub async fn run_session_attach_with_client(
     mut client: BmuxClient,
     target: Option<&str>,
     follow: Option<&str>,
@@ -478,8 +526,8 @@ pub(crate) async fn run_session_attach_with_client(
             _ = context_refresh_interval.tick() => {
                 let now = Instant::now();
                 let _ = view_state.clear_expired_transient_status(now);
-                if should_refresh_attached_session(&view_state, now) {
-                    if let Err(error) =
+                if should_refresh_attached_session(&view_state, now)
+                    && let Err(error) =
                         refresh_attached_session_from_context(&mut client, &mut view_state).await
                     {
                         view_state.set_transient_status(
@@ -491,7 +539,6 @@ pub(crate) async fn run_session_attach_with_client(
                             ATTACH_TRANSIENT_STATUS_TTL,
                         );
                     }
-                }
             }
         }
 
@@ -783,12 +830,12 @@ pub(crate) async fn run_session_attach_with_client(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AttachRunOutcome {
-    pub(crate) status_code: u8,
-    pub(crate) exit_reason: AttachExitReason,
+pub struct AttachRunOutcome {
+    pub status_code: u8,
+    pub exit_reason: AttachExitReason,
 }
 
-pub(crate) async fn handle_attach_runtime_action(
+pub async fn handle_attach_runtime_action(
     client: &mut StreamingBmuxClient,
     action: RuntimeAction,
     view_state: &mut AttachViewState,
@@ -827,7 +874,7 @@ pub(crate) async fn handle_attach_runtime_action(
     Ok(())
 }
 
-pub(crate) async fn apply_plugin_command_outcome(
+pub async fn apply_plugin_command_outcome(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     outcome: PluginCommandOutcome,
@@ -856,7 +903,7 @@ pub(crate) async fn apply_plugin_command_outcome(
     Ok(applied)
 }
 
-pub(crate) async fn retarget_attach_to_context(
+pub async fn retarget_attach_to_context(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     context_id: Uuid,
@@ -900,7 +947,7 @@ pub(crate) async fn retarget_attach_to_context(
     Ok(())
 }
 
-pub(crate) fn plugin_fallback_retarget_context_id(
+pub fn plugin_fallback_retarget_context_id(
     before_context_id: Option<Uuid>,
     after_context_id: Option<Uuid>,
     attached_context_id: Option<Uuid>,
@@ -913,7 +960,7 @@ pub(crate) fn plugin_fallback_retarget_context_id(
         .filter(|after| Some(*after) != before_context_id && Some(*after) != attached_context_id)
 }
 
-pub(crate) fn plugin_fallback_new_context_id(
+pub fn plugin_fallback_new_context_id(
     before_context_ids: Option<&std::collections::BTreeSet<Uuid>>,
     after_context_ids: Option<&std::collections::BTreeSet<Uuid>>,
     attached_context_id: Option<Uuid>,
@@ -1051,7 +1098,7 @@ async fn enforce_hot_path_plugin_policy(
     }
 }
 
-pub(crate) async fn handle_attach_plugin_command_action(
+pub async fn handle_attach_plugin_command_action(
     client: &mut StreamingBmuxClient,
     plugin_id: &str,
     command_name: &str,
@@ -1275,7 +1322,7 @@ pub(crate) async fn handle_attach_plugin_command_action(
     Ok(())
 }
 
-pub(crate) async fn handle_attach_ui_action(
+pub async fn handle_attach_ui_action(
     client: &mut StreamingBmuxClient,
     action: RuntimeAction,
     view_state: &mut AttachViewState,
@@ -1537,7 +1584,7 @@ pub(crate) async fn handle_attach_ui_action(
     Ok(())
 }
 
-pub(crate) fn enter_attach_scrollback(view_state: &mut AttachViewState) -> bool {
+pub fn enter_attach_scrollback(view_state: &mut AttachViewState) -> bool {
     let Some((inner_w, inner_h)) = focused_attach_pane_inner_size(view_state) else {
         return false;
     };
@@ -1555,7 +1602,7 @@ pub(crate) fn enter_attach_scrollback(view_state: &mut AttachViewState) -> bool 
     true
 }
 
-pub(crate) fn begin_attach_selection(view_state: &mut AttachViewState) -> bool {
+pub fn begin_attach_selection(view_state: &mut AttachViewState) -> bool {
     if !view_state.scrollback_active {
         return false;
     }
@@ -1564,13 +1611,13 @@ pub(crate) fn begin_attach_selection(view_state: &mut AttachViewState) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ClosePaneConfirmationAction {
+pub enum ClosePaneConfirmationAction {
     NoFocusedPane,
     Armed,
     Confirmed,
 }
 
-pub(crate) fn process_close_pane_confirmation(
+pub fn process_close_pane_confirmation(
     view_state: &mut AttachViewState,
     focused_pane_id: Option<Uuid>,
 ) -> ClosePaneConfirmationAction {
@@ -1586,11 +1633,11 @@ pub(crate) fn process_close_pane_confirmation(
     }
 }
 
-pub(crate) fn cancel_close_pane_confirmation(view_state: &mut AttachViewState) -> bool {
+pub const fn cancel_close_pane_confirmation(view_state: &mut AttachViewState) -> bool {
     view_state.close_pane_confirmation_pending.take().is_some()
 }
 
-pub(crate) fn clear_attach_selection(view_state: &mut AttachViewState, show_status: bool) {
+pub fn clear_attach_selection(view_state: &mut AttachViewState, show_status: bool) {
     view_state.selection_anchor = None;
     if show_status {
         view_state.set_transient_status(
@@ -1601,7 +1648,7 @@ pub(crate) fn clear_attach_selection(view_state: &mut AttachViewState, show_stat
     }
 }
 
-pub(crate) fn attach_scrollback_cursor_absolute_position(
+pub fn attach_scrollback_cursor_absolute_position(
     view_state: &AttachViewState,
 ) -> Option<AttachScrollbackPosition> {
     let cursor = view_state.scrollback_cursor?;
@@ -1611,7 +1658,7 @@ pub(crate) fn attach_scrollback_cursor_absolute_position(
     })
 }
 
-pub(crate) fn attach_selection_bounds(
+pub fn attach_selection_bounds(
     view_state: &AttachViewState,
 ) -> Option<(AttachScrollbackPosition, AttachScrollbackPosition)> {
     let anchor = view_state.selection_anchor?;
@@ -1623,7 +1670,7 @@ pub(crate) fn attach_selection_bounds(
     })
 }
 
-pub(crate) fn step_attach_scrollback(view_state: &mut AttachViewState, delta: isize) {
+pub fn step_attach_scrollback(view_state: &mut AttachViewState, delta: isize) {
     if !view_state.scrollback_active {
         return;
     }
@@ -1633,10 +1680,7 @@ pub(crate) fn step_attach_scrollback(view_state: &mut AttachViewState, delta: is
     clamp_attach_scrollback_cursor(view_state);
 }
 
-pub(crate) fn move_attach_scrollback_cursor_horizontal(
-    view_state: &mut AttachViewState,
-    delta: isize,
-) {
+pub fn move_attach_scrollback_cursor_horizontal(view_state: &mut AttachViewState, delta: isize) {
     if !view_state.scrollback_active {
         return;
     }
@@ -1649,10 +1693,7 @@ pub(crate) fn move_attach_scrollback_cursor_horizontal(
     cursor.col = adjust_scrollback_cursor_component(cursor.col, delta, inner_w.saturating_sub(1));
 }
 
-pub(crate) fn move_attach_scrollback_cursor_vertical(
-    view_state: &mut AttachViewState,
-    delta: isize,
-) {
+pub fn move_attach_scrollback_cursor_vertical(view_state: &mut AttachViewState, delta: isize) {
     if !view_state.scrollback_active || delta == 0 {
         return;
     }
@@ -1685,11 +1726,7 @@ pub(crate) fn move_attach_scrollback_cursor_vertical(
     clamp_attach_scrollback_cursor(view_state);
 }
 
-pub(crate) fn adjust_scrollback_cursor_component(
-    current: usize,
-    delta: isize,
-    max_value: usize,
-) -> usize {
+pub fn adjust_scrollback_cursor_component(current: usize, delta: isize, max_value: usize) -> usize {
     if delta < 0 {
         current.saturating_sub(delta.unsigned_abs())
     } else {
@@ -1697,7 +1734,7 @@ pub(crate) fn adjust_scrollback_cursor_component(
     }
 }
 
-pub(crate) fn copy_attach_selection(view_state: &mut AttachViewState, exit_after_copy: bool) {
+pub fn copy_attach_selection(view_state: &mut AttachViewState, exit_after_copy: bool) {
     let Some(text) = selected_attach_text(view_state) else {
         if exit_after_copy {
             view_state.exit_scrollback();
@@ -1732,16 +1769,16 @@ pub(crate) fn copy_attach_selection(view_state: &mut AttachViewState, exit_after
     }
 }
 
-pub(crate) fn confirm_attach_scrollback(view_state: &mut AttachViewState) {
+pub fn confirm_attach_scrollback(view_state: &mut AttachViewState) {
     copy_attach_selection(view_state, true);
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub(crate) struct ClipboardWriteRequest {
+pub struct ClipboardWriteRequest {
     text: String,
 }
 
-pub(crate) fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
+pub fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
     let config = BmuxConfig::load()?;
     let paths = ConfigPaths::default();
     let registry = scan_available_plugins(&config, &paths)?;
@@ -1833,7 +1870,7 @@ pub(crate) fn copy_text_with_clipboard_plugin(text: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn format_clipboard_service_error(error: &anyhow::Error) -> String {
+pub fn format_clipboard_service_error(error: &anyhow::Error) -> String {
     let message = error.to_string();
     if message.contains("clipboard backend unavailable") {
         return "clipboard backend unavailable".to_string();
@@ -1844,12 +1881,12 @@ pub(crate) fn format_clipboard_service_error(error: &anyhow::Error) -> String {
     format!("clipboard copy failed: {message}")
 }
 
-pub(crate) fn selected_attach_text(view_state: &mut AttachViewState) -> Option<String> {
+pub fn selected_attach_text(view_state: &mut AttachViewState) -> Option<String> {
     let (start, end) = attach_selection_bounds(view_state)?;
     extract_attach_text(view_state, start, end)
 }
 
-pub(crate) fn extract_attach_text(
+pub fn extract_attach_text(
     view_state: &mut AttachViewState,
     start: AttachScrollbackPosition,
     end: AttachScrollbackPosition,
@@ -1870,11 +1907,7 @@ pub(crate) fn extract_attach_text(
     Some(text)
 }
 
-pub(crate) fn adjust_attach_scrollback_offset(
-    current: usize,
-    delta: isize,
-    max_offset: usize,
-) -> usize {
+pub fn adjust_attach_scrollback_offset(current: usize, delta: isize, max_offset: usize) -> usize {
     if delta < 0 {
         current.saturating_add(delta.unsigned_abs()).min(max_offset)
     } else {
@@ -1882,7 +1915,7 @@ pub(crate) fn adjust_attach_scrollback_offset(
     }
 }
 
-pub(crate) fn max_attach_scrollback(view_state: &mut AttachViewState) -> usize {
+pub fn max_attach_scrollback(view_state: &mut AttachViewState) -> usize {
     let Some(buffer) = focused_attach_pane_buffer(view_state) else {
         return 0;
     };
@@ -1893,7 +1926,7 @@ pub(crate) fn max_attach_scrollback(view_state: &mut AttachViewState) -> usize {
     max_offset
 }
 
-pub(crate) fn clamp_attach_scrollback_cursor(view_state: &mut AttachViewState) {
+pub fn clamp_attach_scrollback_cursor(view_state: &mut AttachViewState) {
     let Some((inner_w, inner_h)) = focused_attach_pane_inner_size(view_state) else {
         view_state.scrollback_cursor = None;
         return;
@@ -1905,24 +1938,22 @@ pub(crate) fn clamp_attach_scrollback_cursor(view_state: &mut AttachViewState) {
     cursor.col = cursor.col.min(inner_w.saturating_sub(1));
 }
 
-pub(crate) fn attach_scrollback_page_size(view_state: &AttachViewState) -> usize {
+pub fn attach_scrollback_page_size(view_state: &AttachViewState) -> usize {
     focused_attach_pane_inner_size(view_state).map_or(10, |(_, inner_h)| inner_h)
 }
 
-pub(crate) fn focused_attach_pane_buffer(
+pub fn focused_attach_pane_buffer(
     view_state: &mut AttachViewState,
 ) -> Option<&mut attach::state::PaneRenderBuffer> {
     let focused_pane_id = focused_attach_pane_id(view_state)?;
     view_state.pane_buffers.get_mut(&focused_pane_id)
 }
 
-pub(crate) fn focused_attach_pane_id(view_state: &AttachViewState) -> Option<Uuid> {
+pub fn focused_attach_pane_id(view_state: &AttachViewState) -> Option<Uuid> {
     Some(view_state.cached_layout_state.as_ref()?.focused_pane_id)
 }
 
-pub(crate) fn focused_attach_pane_inner_size(
-    view_state: &AttachViewState,
-) -> Option<(usize, usize)> {
+pub fn focused_attach_pane_inner_size(view_state: &AttachViewState) -> Option<(usize, usize)> {
     let layout_state = view_state.cached_layout_state.as_ref()?;
     layout_state
         .scene
@@ -1937,7 +1968,7 @@ pub(crate) fn focused_attach_pane_inner_size(
         })
 }
 
-pub(crate) async fn switch_attach_session_relative(
+pub async fn switch_attach_session_relative(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     step: isize,
@@ -1974,7 +2005,7 @@ pub(crate) async fn switch_attach_session_relative(
     Ok(())
 }
 
-pub(crate) fn relative_session_id(
+pub fn relative_session_id(
     sessions: &[SessionSummary],
     current_session_id: Uuid,
     step: isize,
@@ -1998,7 +2029,7 @@ pub(crate) fn relative_session_id(
         .map(|session| session.id)
 }
 
-pub(crate) fn relative_context_id(
+pub fn relative_context_id(
     contexts: &[ContextSummary],
     current_context_id: Uuid,
     step: isize,
@@ -2022,7 +2053,7 @@ pub(crate) fn relative_context_id(
         .map(|context| context.id)
 }
 
-pub(crate) async fn build_attach_status_line_for_draw(
+pub async fn build_attach_status_line_for_draw(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     status_config: &bmux_config::StatusBarConfig,
@@ -2108,7 +2139,7 @@ pub(crate) async fn build_attach_status_line_for_draw(
     Ok(status_line)
 }
 
-pub(crate) fn attach_mode_hint(_ui_mode: AttachUiMode, keymap: &Keymap) -> String {
+pub fn attach_mode_hint(_ui_mode: AttachUiMode, keymap: &Keymap) -> String {
     let detach = key_hint_or_unbound(keymap, RuntimeAction::Detach);
     let quit = key_hint_or_unbound(keymap, RuntimeAction::Quit);
     let help = key_hint_or_unbound(keymap, RuntimeAction::ShowHelp);
@@ -2120,7 +2151,7 @@ pub(crate) fn attach_mode_hint(_ui_mode: AttachUiMode, keymap: &Keymap) -> Strin
     )
 }
 
-pub(crate) fn initial_attach_status(keymap: &Keymap, can_write: bool) -> String {
+pub fn initial_attach_status(keymap: &Keymap, can_write: bool) -> String {
     let help = key_hint_or_unbound(keymap, RuntimeAction::ShowHelp);
     if can_write {
         format!("{help} help | typing goes to pane")
@@ -2129,14 +2160,14 @@ pub(crate) fn initial_attach_status(keymap: &Keymap, can_write: bool) -> String 
     }
 }
 
-pub(crate) const fn attach_exit_message(reason: AttachExitReason) -> Option<&'static str> {
+pub const fn attach_exit_message(reason: AttachExitReason) -> Option<&'static str> {
     match reason {
         AttachExitReason::Detached | AttachExitReason::Quit => None,
         AttachExitReason::StreamClosed => Some("attach ended unexpectedly: server stream closed"),
     }
 }
 
-pub(crate) fn attach_scrollback_hint(keymap: &Keymap) -> String {
+pub fn attach_scrollback_hint(keymap: &Keymap) -> String {
     let exit = scroll_key_hint_or_unbound(keymap, RuntimeAction::ExitScrollMode);
     let confirm = scroll_key_hint_or_unbound(keymap, RuntimeAction::ConfirmScrollback);
     let left = scroll_key_hint_or_unbound(keymap, RuntimeAction::MoveCursorLeft);
@@ -2154,19 +2185,19 @@ pub(crate) fn attach_scrollback_hint(keymap: &Keymap) -> String {
     )
 }
 
-pub(crate) fn scroll_key_hint_or_unbound(keymap: &Keymap, action: RuntimeAction) -> String {
+pub fn scroll_key_hint_or_unbound(keymap: &Keymap, action: RuntimeAction) -> String {
     keymap
         .primary_scroll_binding_for_action(&action)
         .unwrap_or_else(|| "unbound".to_string())
 }
 
-pub(crate) fn key_hint_or_unbound(keymap: &Keymap, action: RuntimeAction) -> String {
+pub fn key_hint_or_unbound(keymap: &Keymap, action: RuntimeAction) -> String {
     keymap
         .primary_binding_for_action(&action)
         .unwrap_or_else(|| "unbound".to_string())
 }
 
-pub(crate) const fn status_insets_for_position(status_position: StatusPosition) -> (u16, u16) {
+pub const fn status_insets_for_position(status_position: StatusPosition) -> (u16, u16) {
     match status_position {
         StatusPosition::Top => (1, 0),
         StatusPosition::Bottom => (0, 1),
@@ -2174,10 +2205,7 @@ pub(crate) const fn status_insets_for_position(status_position: StatusPosition) 
     }
 }
 
-pub(crate) const fn status_row_for_position(
-    status_position: StatusPosition,
-    rows: u16,
-) -> Option<u16> {
+pub const fn status_row_for_position(status_position: StatusPosition, rows: u16) -> Option<u16> {
     if rows == 0 {
         return None;
     }
@@ -2188,7 +2216,7 @@ pub(crate) const fn status_row_for_position(
     }
 }
 
-pub(crate) fn queue_attach_status_line(
+pub fn queue_attach_status_line(
     stdout: &mut impl Write,
     status_line: &AttachStatusLine,
     status_position: StatusPosition,
@@ -2204,7 +2232,7 @@ pub(crate) fn queue_attach_status_line(
         .context("failed queuing attach status line")
 }
 
-pub(crate) fn help_overlay_visible_rows(lines: &[String]) -> usize {
+pub fn help_overlay_visible_rows(lines: &[String]) -> usize {
     let (_cols, rows) = terminal::size().unwrap_or((0, 0));
     let max_content_rows = (rows as usize).saturating_sub(6);
     let content_rows = lines.len().min(max_content_rows);
@@ -2212,7 +2240,7 @@ pub(crate) fn help_overlay_visible_rows(lines: &[String]) -> usize {
     height.saturating_sub(4).max(1)
 }
 
-pub(crate) fn adjust_help_overlay_scroll(
+pub fn adjust_help_overlay_scroll(
     current: usize,
     delta: isize,
     total_lines: usize,
@@ -2230,11 +2258,11 @@ pub(crate) fn adjust_help_overlay_scroll(
     next.min(max_scroll)
 }
 
-pub(crate) const fn help_overlay_accepts_key_kind(kind: KeyEventKind) -> bool {
+pub const fn help_overlay_accepts_key_kind(kind: KeyEventKind) -> bool {
     matches!(kind, KeyEventKind::Press | KeyEventKind::Repeat)
 }
 
-pub(crate) fn handle_help_overlay_key_event(
+pub fn handle_help_overlay_key_event(
     key: &KeyEvent,
     help_lines: &[String],
     view_state: &mut AttachViewState,
@@ -2308,7 +2336,7 @@ pub(crate) fn handle_help_overlay_key_event(
     }
 }
 
-pub(crate) fn help_overlay_surface(lines: &[String]) -> Option<bmux_ipc::AttachSurface> {
+pub fn help_overlay_surface(lines: &[String]) -> Option<bmux_ipc::AttachSurface> {
     let (cols, rows) = terminal::size().unwrap_or((0, 0));
     if cols < 20 || rows < 6 {
         return None;
@@ -2348,7 +2376,7 @@ pub(crate) fn help_overlay_surface(lines: &[String]) -> Option<bmux_ipc::AttachS
     })
 }
 
-pub(crate) fn queue_attach_help_overlay(
+pub fn queue_attach_help_overlay(
     stdout: &mut impl Write,
     surface_meta: &bmux_ipc::AttachSurface,
     lines: &[String],
@@ -2439,7 +2467,7 @@ pub(crate) fn queue_attach_help_overlay(
     Ok(())
 }
 
-pub(crate) async fn render_attach_frame(
+pub async fn render_attach_frame(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     layout_state: &AttachLayoutState,
@@ -2621,7 +2649,7 @@ pub(crate) async fn render_attach_frame(
     Ok(())
 }
 
-pub(crate) async fn build_attach_tabs(
+pub async fn build_attach_tabs(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     status_config: &bmux_config::StatusBarConfig,
@@ -2689,7 +2717,7 @@ pub(crate) async fn build_attach_tabs(
     Ok(tabs)
 }
 
-pub(crate) fn stabilize_tab_order(
+pub fn stabilize_tab_order(
     contexts: Vec<ContextSummary>,
     cached_tab_order: &mut Vec<Uuid>,
 ) -> Vec<ContextSummary> {
@@ -2711,7 +2739,7 @@ pub(crate) fn stabilize_tab_order(
         .collect()
 }
 
-pub(crate) async fn resolve_attach_context_label(
+pub async fn resolve_attach_context_label(
     client: &mut StreamingBmuxClient,
     context_id: Option<Uuid>,
     session_id: Uuid,
@@ -2735,7 +2763,7 @@ pub(crate) async fn resolve_attach_context_label(
     Ok("terminal".to_string())
 }
 
-pub(crate) fn context_summary_label(context: &ContextSummary) -> String {
+pub fn context_summary_label(context: &ContextSummary) -> String {
     context
         .name
         .as_deref()
@@ -2746,7 +2774,7 @@ pub(crate) fn context_summary_label(context: &ContextSummary) -> String {
         )
 }
 
-pub(crate) async fn resolve_attach_session_label(
+pub async fn resolve_attach_session_label(
     client: &mut StreamingBmuxClient,
     session_id: Uuid,
 ) -> std::result::Result<String, ClientError> {
@@ -2754,7 +2782,7 @@ pub(crate) async fn resolve_attach_session_label(
     Ok(label)
 }
 
-pub(crate) async fn resolve_attach_session_label_and_count(
+pub async fn resolve_attach_session_label_and_count(
     client: &mut StreamingBmuxClient,
     session_id: Uuid,
 ) -> std::result::Result<(String, usize), ClientError> {
@@ -2770,14 +2798,14 @@ pub(crate) async fn resolve_attach_session_label_and_count(
     Ok((label, count))
 }
 
-pub(crate) fn session_summary_label(session: &bmux_ipc::SessionSummary) -> String {
+pub fn session_summary_label(session: &bmux_ipc::SessionSummary) -> String {
     session
         .name
         .clone()
         .unwrap_or_else(|| format!("session-{}", short_uuid(session.id)))
 }
 
-pub(crate) async fn attach_context_status(
+pub async fn attach_context_status(
     client: &mut StreamingBmuxClient,
     context_id: Option<Uuid>,
     session_id: Uuid,
@@ -2789,7 +2817,7 @@ pub(crate) async fn attach_context_status(
     ))
 }
 
-pub(crate) fn set_attach_context_status(
+pub fn set_attach_context_status(
     view_state: &mut AttachViewState,
     status: String,
     now: Instant,
@@ -2798,11 +2826,11 @@ pub(crate) fn set_attach_context_status(
     view_state.set_transient_status(status, now, ttl);
 }
 
-pub(crate) fn short_uuid(id: Uuid) -> String {
+pub fn short_uuid(id: Uuid) -> String {
     id.to_string().chars().take(8).collect()
 }
 
-pub(crate) async fn resolve_follow_target_context(
+pub async fn resolve_follow_target_context(
     client: &mut StreamingBmuxClient,
     leader_client_id: Uuid,
 ) -> std::result::Result<Uuid, ClientError> {
@@ -2833,7 +2861,7 @@ pub(crate) async fn resolve_follow_target_context(
     ))
 }
 
-pub(crate) async fn open_attach_for_session(
+pub async fn open_attach_for_session(
     client: &mut StreamingBmuxClient,
     session_id: Uuid,
 ) -> std::result::Result<bmux_client::AttachOpenInfo, ClientError> {
@@ -2843,7 +2871,7 @@ pub(crate) async fn open_attach_for_session(
     client.open_attach_stream_info(&grant).await
 }
 
-pub(crate) async fn open_attach_for_context(
+pub async fn open_attach_for_context(
     client: &mut StreamingBmuxClient,
     context_id: Uuid,
 ) -> std::result::Result<bmux_client::AttachOpenInfo, ClientError> {
@@ -2853,7 +2881,7 @@ pub(crate) async fn open_attach_for_context(
     client.open_attach_stream_info(&grant).await
 }
 
-pub(crate) async fn attached_session_selector(
+pub async fn attached_session_selector(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
 ) -> std::result::Result<SessionSelector, ClientError> {
@@ -2861,7 +2889,7 @@ pub(crate) async fn attached_session_selector(
     Ok(SessionSelector::ById(view_state.attached_id))
 }
 
-pub(crate) async fn refresh_attached_session_from_context(
+pub async fn refresh_attached_session_from_context(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
 ) -> std::result::Result<(), ClientError> {
@@ -2877,7 +2905,10 @@ pub(crate) async fn refresh_attached_session_from_context(
             .await?;
         let previous_session_id = view_state.attached_id;
 
-        if grant.session_id != previous_session_id {
+        if grant.session_id == previous_session_id {
+            view_state.attached_id = grant.session_id;
+            view_state.attached_context_id = grant.context_id.or(Some(context_id));
+        } else {
             // The context now maps to a different session (e.g. after
             // snapshot restore or context reassignment).  We must open a
             // new attach stream so the server registers this client in the
@@ -2886,9 +2917,6 @@ pub(crate) async fn refresh_attached_session_from_context(
             // fail with "client is not attached to session runtime".
             let attach_info = client.open_attach_stream_info(&grant).await?;
             view_state.attached_id = attach_info.session_id;
-            view_state.attached_context_id = grant.context_id.or(Some(context_id));
-        } else {
-            view_state.attached_id = grant.session_id;
             view_state.attached_context_id = grant.context_id.or(Some(context_id));
         }
 
@@ -2904,13 +2932,13 @@ pub(crate) async fn refresh_attached_session_from_context(
     Ok(())
 }
 
-pub(crate) fn should_refresh_attached_session(view_state: &AttachViewState, now: Instant) -> bool {
+pub fn should_refresh_attached_session(view_state: &AttachViewState, now: Instant) -> bool {
     view_state
         .last_context_refresh_at
         .is_none_or(|last| now.duration_since(last) >= ATTACH_CONTEXT_REFRESH_INTERVAL)
 }
 
-pub(crate) fn attach_keymap_from_config(config: &BmuxConfig) -> crate::input::Keymap {
+pub fn attach_keymap_from_config(config: &BmuxConfig) -> crate::input::Keymap {
     let (runtime_bindings, global_bindings, scroll_bindings) = filtered_attach_keybindings(config);
     let timeout_ms = config
         .keybindings
@@ -2932,7 +2960,7 @@ pub(crate) fn attach_keymap_from_config(config: &BmuxConfig) -> crate::input::Ke
     }
 }
 
-pub(crate) fn filtered_attach_keybindings(
+pub fn filtered_attach_keybindings(
     config: &BmuxConfig,
 ) -> (
     std::collections::BTreeMap<String, String>,
@@ -2949,13 +2977,13 @@ pub(crate) fn filtered_attach_keybindings(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AttachKeybindingScope {
+pub enum AttachKeybindingScope {
     Runtime,
     Global,
 }
 
 impl AttachKeybindingScope {
-    pub(crate) const fn as_str(self) -> &'static str {
+    pub const fn as_str(self) -> &'static str {
         match self {
             Self::Runtime => "runtime",
             Self::Global => "global",
@@ -2964,14 +2992,14 @@ impl AttachKeybindingScope {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AttachKeybindingEntry {
-    pub(crate) scope: AttachKeybindingScope,
-    pub(crate) chord: String,
-    pub(crate) action: RuntimeAction,
-    pub(crate) action_name: String,
+pub struct AttachKeybindingEntry {
+    pub scope: AttachKeybindingScope,
+    pub chord: String,
+    pub action: RuntimeAction,
+    pub action_name: String,
 }
 
-pub(crate) fn effective_attach_keybindings(config: &BmuxConfig) -> Vec<AttachKeybindingEntry> {
+pub fn effective_attach_keybindings(config: &BmuxConfig) -> Vec<AttachKeybindingEntry> {
     let (runtime, global, _) = filtered_attach_keybindings(config);
     let mut entries = Vec::new();
 
@@ -3005,7 +3033,7 @@ pub(crate) fn effective_attach_keybindings(config: &BmuxConfig) -> Vec<AttachKey
     entries
 }
 
-pub(crate) fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
+pub fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
     let keymap = attach_keymap_from_config(config);
     let help = key_hint_or_unbound(&keymap, RuntimeAction::ShowHelp);
     let detach = key_hint_or_unbound(&keymap, RuntimeAction::Detach);
@@ -3114,7 +3142,7 @@ pub(crate) fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
     lines
 }
 
-pub(crate) fn normalize_attach_keybindings(
+pub fn normalize_attach_keybindings(
     bindings: std::collections::BTreeMap<String, String>,
     scope: &str,
 ) -> std::collections::BTreeMap<String, String> {
@@ -3137,14 +3165,14 @@ pub(crate) fn normalize_attach_keybindings(
         .collect()
 }
 
-pub(crate) fn inject_attach_global_defaults(
+pub const fn inject_attach_global_defaults(
     _global: &mut std::collections::BTreeMap<String, String>,
 ) {
     // Global defaults are now provided by KeyBindingConfig::default_global_runtime_bindings().
     // This function is retained as a hook for future attach-specific global defaults.
 }
 
-pub(crate) const fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
+pub const fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
     matches!(
         action,
         RuntimeAction::Detach
@@ -3199,7 +3227,7 @@ pub(crate) const fn is_attach_runtime_action(action: &RuntimeAction) -> bool {
     )
 }
 
-pub(crate) fn default_attach_keymap() -> crate::input::Keymap {
+pub fn default_attach_keymap() -> crate::input::Keymap {
     let defaults = BmuxConfig::default();
     let (runtime_bindings, global_bindings, scroll_bindings) =
         filtered_attach_keybindings(&defaults);
@@ -3218,7 +3246,7 @@ pub(crate) fn default_attach_keymap() -> crate::input::Keymap {
     .expect("default attach keymap must be valid")
 }
 
-pub(crate) fn describe_timeout(timeout: &ResolvedTimeout) -> String {
+pub fn describe_timeout(timeout: &ResolvedTimeout) -> String {
     match timeout {
         ResolvedTimeout::Indefinite => "indefinite".to_string(),
         ResolvedTimeout::Exact(ms) => format!("exact ({ms}ms)"),
@@ -3226,7 +3254,7 @@ pub(crate) fn describe_timeout(timeout: &ResolvedTimeout) -> String {
     }
 }
 
-pub(crate) struct RawModeGuard {
+pub struct RawModeGuard {
     keyboard_enhanced: bool,
     mouse_capture_enabled: bool,
 }
@@ -3290,7 +3318,7 @@ impl Drop for RawModeGuard {
     }
 }
 
-pub(crate) async fn update_attach_viewport(
+pub async fn update_attach_viewport(
     client: &mut StreamingBmuxClient,
     session_id: Uuid,
     status_position: StatusPosition,
@@ -3312,7 +3340,7 @@ pub(crate) async fn update_attach_viewport(
     Ok(())
 }
 
-pub(crate) async fn hydrate_attach_state_from_snapshot(
+pub async fn hydrate_attach_state_from_snapshot(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
 ) -> std::result::Result<(), ClientError> {
@@ -3395,13 +3423,13 @@ pub(crate) async fn hydrate_attach_state_from_snapshot(
     Ok(())
 }
 
-pub(crate) fn attach_layout_pane_id_set(
+pub fn attach_layout_pane_id_set(
     layout_state: &AttachLayoutState,
 ) -> std::collections::BTreeSet<Uuid> {
     layout_state.panes.iter().map(|pane| pane.id).collect()
 }
 
-pub(crate) fn attach_layout_requires_snapshot_hydration(
+pub fn attach_layout_requires_snapshot_hydration(
     previous: &AttachLayoutState,
     next: &AttachLayoutState,
 ) -> bool {
@@ -3414,7 +3442,7 @@ pub(crate) fn attach_layout_requires_snapshot_hydration(
     attach_layout_pane_id_set(previous) != attach_layout_pane_id_set(next)
 }
 
-pub(crate) fn resize_attach_parsers_for_scene(
+pub fn resize_attach_parsers_for_scene(
     pane_buffers: &mut std::collections::BTreeMap<Uuid, attach::state::PaneRenderBuffer>,
     scene: &bmux_ipc::AttachScene,
 ) {
@@ -3422,7 +3450,7 @@ pub(crate) fn resize_attach_parsers_for_scene(
     resize_attach_parsers_for_scene_with_size(pane_buffers, scene, cols, rows);
 }
 
-pub(crate) fn resize_attach_parsers_for_scene_with_size(
+pub fn resize_attach_parsers_for_scene_with_size(
     pane_buffers: &mut std::collections::BTreeMap<Uuid, attach::state::PaneRenderBuffer>,
     scene: &bmux_ipc::AttachScene,
     cols: u16,
@@ -3458,7 +3486,7 @@ pub(crate) fn resize_attach_parsers_for_scene_with_size(
     }
 }
 
-pub(crate) async fn handle_attach_loop_event(
+pub async fn handle_attach_loop_event(
     event: AttachLoopEvent,
     client: &mut StreamingBmuxClient,
     attach_input_processor: &mut InputProcessor,
@@ -3495,7 +3523,7 @@ pub(crate) async fn handle_attach_loop_event(
     }
 }
 
-pub(crate) async fn handle_attach_server_event(
+pub async fn handle_attach_server_event(
     client: &mut StreamingBmuxClient,
     server_event: bmux_client::ServerEvent,
     follow_target_id: Option<Uuid>,
@@ -3614,7 +3642,7 @@ pub(crate) async fn handle_attach_server_event(
     Ok(AttachLoopControl::Continue)
 }
 
-pub(crate) fn apply_attach_view_change_components(
+pub fn apply_attach_view_change_components(
     components: &[AttachViewComponent],
     view_state: &mut AttachViewState,
 ) {
@@ -3644,7 +3672,7 @@ pub(crate) fn apply_attach_view_change_components(
     }
 }
 
-pub(crate) async fn recover_attach_after_session_removed(
+pub async fn recover_attach_after_session_removed(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
 ) -> std::result::Result<bool, ClientError> {
@@ -3705,7 +3733,7 @@ pub(crate) async fn recover_attach_after_session_removed(
     Ok(false)
 }
 
-pub(crate) fn attach_view_event_matches_target(
+pub fn attach_view_event_matches_target(
     view_state: &AttachViewState,
     event_context_id: Option<Uuid>,
     event_session_id: Uuid,
@@ -3716,7 +3744,7 @@ pub(crate) fn attach_view_event_matches_target(
     event_session_id == view_state.attached_id
 }
 
-pub(crate) async fn handle_attach_terminal_event(
+pub async fn handle_attach_terminal_event(
     client: &mut StreamingBmuxClient,
     terminal_event: Event,
     attach_input_processor: &mut InputProcessor,
@@ -3822,7 +3850,7 @@ pub(crate) async fn handle_attach_terminal_event(
                         );
                     }
                     match client.attach_input(view_state.attached_id, bytes).await {
-                        Ok(_) => {
+                        Ok(()) => {
                             display_capture.record_activity(bmux_ipc::DisplayActivityKind::Input);
                         }
                         Err(error)
@@ -3938,12 +3966,12 @@ pub(crate) async fn handle_attach_terminal_event(
     Ok(AttachLoopControl::Continue)
 }
 
-pub(crate) fn record_attach_mouse_event(mouse_event: MouseEvent, view_state: &mut AttachViewState) {
+pub fn record_attach_mouse_event(mouse_event: MouseEvent, view_state: &mut AttachViewState) {
     view_state.mouse.last_position = Some((mouse_event.column, mouse_event.row));
     view_state.mouse.last_event_at = Some(Instant::now());
 }
 
-pub(crate) async fn handle_attach_mouse_event(
+pub async fn handle_attach_mouse_event(
     client: &mut StreamingBmuxClient,
     mouse_event: MouseEvent,
     view_state: &mut AttachViewState,
@@ -4135,7 +4163,7 @@ pub(crate) async fn handle_attach_mouse_event(
     Ok(())
 }
 
-pub(crate) fn should_forward_click_like_mouse(view_state: &AttachViewState) -> bool {
+pub const fn should_forward_click_like_mouse(view_state: &AttachViewState) -> bool {
     !matches!(
         view_state.mouse.config.effective_click_propagation(),
         bmux_config::MouseClickPropagation::FocusOnly
@@ -4143,12 +4171,12 @@ pub(crate) fn should_forward_click_like_mouse(view_state: &AttachViewState) -> b
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct AttachPaneMouseProtocol {
-    pub(crate) mode: vt100::MouseProtocolMode,
-    pub(crate) encoding: vt100::MouseProtocolEncoding,
+pub struct AttachPaneMouseProtocol {
+    pub mode: vt100::MouseProtocolMode,
+    pub encoding: vt100::MouseProtocolEncoding,
 }
 
-pub(crate) const fn mouse_protocol_mode_to_ipc(
+pub const fn mouse_protocol_mode_to_ipc(
     mode: vt100::MouseProtocolMode,
 ) -> bmux_ipc::AttachMouseProtocolMode {
     match mode {
@@ -4160,7 +4188,7 @@ pub(crate) const fn mouse_protocol_mode_to_ipc(
     }
 }
 
-pub(crate) const fn mouse_protocol_encoding_to_ipc(
+pub const fn mouse_protocol_encoding_to_ipc(
     encoding: vt100::MouseProtocolEncoding,
 ) -> bmux_ipc::AttachMouseProtocolEncoding {
     match encoding {
@@ -4170,7 +4198,7 @@ pub(crate) const fn mouse_protocol_encoding_to_ipc(
     }
 }
 
-pub(crate) const fn mouse_protocol_mode_from_ipc(
+pub const fn mouse_protocol_mode_from_ipc(
     mode: bmux_ipc::AttachMouseProtocolMode,
 ) -> vt100::MouseProtocolMode {
     match mode {
@@ -4182,7 +4210,7 @@ pub(crate) const fn mouse_protocol_mode_from_ipc(
     }
 }
 
-pub(crate) const fn mouse_protocol_encoding_from_ipc(
+pub const fn mouse_protocol_encoding_from_ipc(
     encoding: bmux_ipc::AttachMouseProtocolEncoding,
 ) -> vt100::MouseProtocolEncoding {
     match encoding {
@@ -4192,7 +4220,7 @@ pub(crate) const fn mouse_protocol_encoding_from_ipc(
     }
 }
 
-pub(crate) fn attach_pane_mouse_protocol(
+pub fn attach_pane_mouse_protocol(
     view_state: &AttachViewState,
     pane_id: Uuid,
 ) -> Option<AttachPaneMouseProtocol> {
@@ -4225,7 +4253,7 @@ pub(crate) fn attach_pane_mouse_protocol(
     }
 }
 
-pub(crate) fn mouse_protocol_mode_reports_event(
+pub const fn mouse_protocol_mode_reports_event(
     mode: vt100::MouseProtocolMode,
     kind: MouseEventKind,
 ) -> bool {
@@ -4272,7 +4300,7 @@ pub(crate) fn mouse_protocol_mode_reports_event(
     }
 }
 
-pub(crate) fn encode_attach_mouse_for_protocol(
+pub fn encode_attach_mouse_for_protocol(
     mouse_event: MouseEvent,
     protocol: AttachPaneMouseProtocol,
 ) -> Option<Vec<u8>> {
@@ -4287,7 +4315,7 @@ pub(crate) fn encode_attach_mouse_for_protocol(
     }
 }
 
-pub(crate) async fn maybe_forward_attach_mouse_event(
+pub async fn maybe_forward_attach_mouse_event(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     mouse_event: MouseEvent,
@@ -4314,11 +4342,11 @@ pub(crate) async fn maybe_forward_attach_mouse_event(
         return Ok(false);
     };
 
-    let _ = client.attach_input(view_state.attached_id, bytes).await?;
+    let () = client.attach_input(view_state.attached_id, bytes).await?;
     Ok(true)
 }
 
-pub(crate) fn attach_mouse_forward_bytes_for_target(
+pub fn attach_mouse_forward_bytes_for_target(
     view_state: &AttachViewState,
     mouse_event: MouseEvent,
     target_pane: Option<Uuid>,
@@ -4332,17 +4360,14 @@ pub(crate) fn attach_mouse_forward_bytes_for_target(
     encode_attach_mouse_for_protocol(mouse_event, protocol)
 }
 
-pub(crate) fn encode_attach_mouse_sgr(mouse_event: MouseEvent) -> Option<Vec<u8>> {
+pub fn encode_attach_mouse_sgr(mouse_event: MouseEvent) -> Option<Vec<u8>> {
     let (cb, suffix) = encode_attach_mouse_sgr_cb(mouse_event.kind, mouse_event.modifiers)?;
     let x = mouse_event.column.saturating_add(1);
     let y = mouse_event.row.saturating_add(1);
     Some(format!("\x1b[<{cb};{x};{y}{suffix}").into_bytes())
 }
 
-pub(crate) fn encode_attach_mouse_x10(
-    mouse_event: MouseEvent,
-    utf8_coordinates: bool,
-) -> Option<Vec<u8>> {
+pub fn encode_attach_mouse_x10(mouse_event: MouseEvent, utf8_coordinates: bool) -> Option<Vec<u8>> {
     let cb = encode_attach_mouse_x10_cb(mouse_event.kind, mouse_event.modifiers)?;
     let x = mouse_event.column.saturating_add(1);
     let y = mouse_event.row.saturating_add(1);
@@ -4366,7 +4391,7 @@ pub(crate) fn encode_attach_mouse_x10(
     Some(bytes)
 }
 
-pub(crate) fn encode_utf8_mouse_component(bytes: &mut Vec<u8>, value: u16) -> Option<()> {
+pub fn encode_utf8_mouse_component(bytes: &mut Vec<u8>, value: u16) -> Option<()> {
     let codepoint = char::from_u32(u32::from(value))?;
     let mut buffer = [0_u8; 4];
     let encoded = codepoint.encode_utf8(&mut buffer);
@@ -4374,7 +4399,7 @@ pub(crate) fn encode_utf8_mouse_component(bytes: &mut Vec<u8>, value: u16) -> Op
     Some(())
 }
 
-pub(crate) fn encode_attach_mouse_modifier_bits(modifiers: KeyModifiers) -> u16 {
+pub const fn encode_attach_mouse_modifier_bits(modifiers: KeyModifiers) -> u16 {
     let mut cb: u16 = if modifiers.contains(KeyModifiers::SHIFT) {
         4
     } else {
@@ -4389,7 +4414,7 @@ pub(crate) fn encode_attach_mouse_modifier_bits(modifiers: KeyModifiers) -> u16 
     cb
 }
 
-pub(crate) fn encode_attach_mouse_x10_cb(
+pub const fn encode_attach_mouse_x10_cb(
     kind: MouseEventKind,
     modifiers: KeyModifiers,
 ) -> Option<u16> {
@@ -4398,9 +4423,7 @@ pub(crate) fn encode_attach_mouse_x10_cb(
         MouseEventKind::Down(MouseButton::Left) => 0,
         MouseEventKind::Down(MouseButton::Middle) => 1,
         MouseEventKind::Down(MouseButton::Right) => 2,
-        MouseEventKind::Up(MouseButton::Left)
-        | MouseEventKind::Up(MouseButton::Middle)
-        | MouseEventKind::Up(MouseButton::Right) => 3,
+        MouseEventKind::Up(MouseButton::Left | MouseButton::Middle | MouseButton::Right) => 3,
         MouseEventKind::Drag(MouseButton::Left) => 32,
         MouseEventKind::Drag(MouseButton::Middle) => 33,
         MouseEventKind::Drag(MouseButton::Right) => 34,
@@ -4413,7 +4436,7 @@ pub(crate) fn encode_attach_mouse_x10_cb(
     Some(modifier_bits + button_bits)
 }
 
-pub(crate) fn encode_attach_mouse_sgr_cb(
+pub const fn encode_attach_mouse_sgr_cb(
     kind: MouseEventKind,
     modifiers: KeyModifiers,
 ) -> Option<(u16, char)> {
@@ -4437,7 +4460,7 @@ pub(crate) fn encode_attach_mouse_sgr_cb(
     }
 }
 
-pub(crate) async fn handle_attach_status_tab_click(
+pub async fn handle_attach_status_tab_click(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     mouse_event: MouseEvent,
@@ -4491,7 +4514,7 @@ pub(crate) async fn handle_attach_status_tab_click(
     Ok(true)
 }
 
-pub(crate) const fn status_row_matches_mouse(status_row: u16, mouse_row: u16, rows: u16) -> bool {
+pub const fn status_row_matches_mouse(status_row: u16, mouse_row: u16, rows: u16) -> bool {
     if mouse_row == status_row {
         return true;
     }
@@ -4501,7 +4524,7 @@ pub(crate) const fn status_row_matches_mouse(status_row: u16, mouse_row: u16, ro
     rows > 0 && mouse_row == rows && status_row == rows.saturating_sub(1)
 }
 
-pub(crate) async fn handle_attach_mouse_gesture_action(
+pub async fn handle_attach_mouse_gesture_action(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     gesture: &str,
@@ -4562,7 +4585,7 @@ pub(crate) async fn handle_attach_mouse_gesture_action(
     }
 }
 
-pub(crate) fn resolve_mouse_gesture_action(
+pub fn resolve_mouse_gesture_action(
     view_state: &AttachViewState,
     gesture: &str,
 ) -> Option<AttachEventAction> {
@@ -4581,7 +4604,7 @@ pub(crate) fn resolve_mouse_gesture_action(
     }
 }
 
-pub(crate) fn handle_attach_mouse_scrollback(
+pub fn handle_attach_mouse_scrollback(
     view_state: &mut AttachViewState,
     kind: MouseEventKind,
 ) -> bool {
@@ -4619,7 +4642,7 @@ pub(crate) fn handle_attach_mouse_scrollback(
     }
 }
 
-pub(crate) async fn focus_attach_pane(
+pub async fn focus_attach_pane(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     pane_id: Uuid,
@@ -4654,11 +4677,7 @@ pub(crate) async fn focus_attach_pane(
     Ok(())
 }
 
-pub(crate) fn attach_scene_pane_at(
-    view_state: &AttachViewState,
-    column: u16,
-    row: u16,
-) -> Option<Uuid> {
+pub fn attach_scene_pane_at(view_state: &AttachViewState, column: u16, row: u16) -> Option<Uuid> {
     let layout_state = view_state.cached_layout_state.as_ref()?;
     let mut best: Option<(bmux_ipc::AttachLayer, i32, usize, Uuid)> = None;
     for (index, surface) in layout_state.scene.surfaces.iter().enumerate() {
@@ -4679,7 +4698,7 @@ pub(crate) fn attach_scene_pane_at(
     best.map(|(_, _, _, pane_id)| pane_id)
 }
 
-pub(crate) fn attach_rect_contains_point(rect: AttachRect, column: u16, row: u16) -> bool {
+pub const fn attach_rect_contains_point(rect: AttachRect, column: u16, row: u16) -> bool {
     if rect.w == 0 || rect.h == 0 {
         return false;
     }
@@ -4688,7 +4707,7 @@ pub(crate) fn attach_rect_contains_point(rect: AttachRect, column: u16, row: u16
     column >= rect.x && column <= max_x && row >= rect.y && row <= max_y
 }
 
-pub(crate) fn restore_terminal_after_attach_ui() -> Result<()> {
+pub fn restore_terminal_after_attach_ui() -> Result<()> {
     let mut stdout = io::stdout();
     // Safety net: restore terminal input flags in case the drop guard didn't run.
     #[cfg(feature = "kitty-keyboard")]
@@ -4708,7 +4727,7 @@ pub(crate) fn restore_terminal_after_attach_ui() -> Result<()> {
         .context("failed flushing terminal restoration")
 }
 
-pub(crate) fn attach_event_actions(
+pub fn attach_event_actions(
     event: &Event,
     attach_input_processor: &mut InputProcessor,
     ui_mode: AttachUiMode,
@@ -4723,7 +4742,7 @@ pub(crate) fn attach_event_actions(
     }
 }
 
-pub(crate) fn attach_key_event_actions(
+pub fn attach_key_event_actions(
     key: &KeyEvent,
     attach_input_processor: &mut InputProcessor,
     _ui_mode: AttachUiMode,
@@ -4741,7 +4760,7 @@ pub(crate) fn attach_key_event_actions(
         .collect())
 }
 
-pub(crate) fn runtime_action_to_attach_event_action(action: RuntimeAction) -> AttachEventAction {
+pub fn runtime_action_to_attach_event_action(action: RuntimeAction) -> AttachEventAction {
     match action {
         RuntimeAction::Detach => AttachEventAction::Detach,
         RuntimeAction::ForwardToPane(bytes) => AttachEventAction::Send(bytes),
@@ -4809,7 +4828,7 @@ pub(crate) fn runtime_action_to_attach_event_action(action: RuntimeAction) -> At
     }
 }
 
-pub(crate) fn is_attach_stream_closed_error(error: &ClientError) -> bool {
+pub fn is_attach_stream_closed_error(error: &ClientError) -> bool {
     matches!(
         error,
         ClientError::ServerError { code: bmux_ipc::ErrorCode::NotFound, message }
@@ -4817,7 +4836,7 @@ pub(crate) fn is_attach_stream_closed_error(error: &ClientError) -> bool {
     )
 }
 
-pub(crate) fn is_attach_not_attached_runtime_error(error: &ClientError) -> bool {
+pub fn is_attach_not_attached_runtime_error(error: &ClientError) -> bool {
     matches!(
         error,
         ClientError::ServerError { message, .. }
@@ -4825,7 +4844,7 @@ pub(crate) fn is_attach_not_attached_runtime_error(error: &ClientError) -> bool 
     )
 }
 
-pub(crate) fn is_attach_active_pane_closed_error(error: &ClientError) -> bool {
+pub fn is_attach_active_pane_closed_error(error: &ClientError) -> bool {
     matches!(
         error,
         ClientError::ServerError { message, .. }
@@ -4836,6 +4855,7 @@ pub(crate) fn is_attach_active_pane_closed_error(error: &ClientError) -> bool {
 mod tests {
     use crate::input::InputProcessor;
     use crate::runtime::attach::state::AttachViewState;
+    #[allow(clippy::wildcard_imports)]
     use crate::runtime::*;
     use bmux_client::{AttachLayoutState, AttachOpenInfo};
     use bmux_config::{BmuxConfig, MouseClickPropagation, MouseWheelPropagation};

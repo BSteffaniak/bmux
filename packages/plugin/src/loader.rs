@@ -102,13 +102,14 @@ struct CorePluginSettingsResponse {
     settings: Option<toml::Value>,
 }
 
+#[allow(clippy::ref_option)]
 fn serialize_toml_option<S: serde::Serializer>(
     value: &Option<toml::Value>,
     serializer: S,
 ) -> std::result::Result<S::Ok, S::Error> {
     let text: Option<String> = value
         .as_ref()
-        .map(|v| serde_json::to_string(v))
+        .map(serde_json::to_string)
         .transpose()
         .map_err(serde::ser::Error::custom)?;
     text.serialize(serializer)
@@ -229,6 +230,8 @@ impl ServiceCaller for NativeServiceContext {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_lines)]
 fn call_service_raw(
     caller_plugin_id: &str,
     required_capabilities: &[String],
@@ -277,9 +280,9 @@ fn call_service_raw(
         return handle_core_service_call(
             caller_plugin_id,
             connection,
-            service,
+            &service,
             operation,
-            payload,
+            &payload,
             host_kernel_bridge,
             plugin_settings_map,
         );
@@ -365,23 +368,24 @@ fn call_service_raw(
     Ok(response.payload)
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_core_service_call(
     caller_plugin_id: &str,
     connection: &HostConnectionInfo,
-    service: RegisteredService,
+    service: &RegisteredService,
     operation: &str,
-    payload: Vec<u8>,
+    payload: &[u8],
     host_kernel_bridge: Option<HostKernelBridge>,
     plugin_settings_map: &BTreeMap<String, toml::Value>,
 ) -> Result<Vec<u8>> {
     match (service.interface_id.as_str(), operation) {
         ("config-query/v1", "plugin_settings") => {
-            let request: CorePluginSettingsRequest = decode_service_message(&payload)?;
+            let request: CorePluginSettingsRequest = decode_service_message(payload)?;
             let settings = plugin_settings_map.get(&request.plugin_id).cloned();
             encode_service_message(&CorePluginSettingsResponse { settings })
         }
         ("storage-query/v1", "get") => {
-            let request: CoreStorageGetRequest = decode_service_message(&payload)?;
+            let request: CoreStorageGetRequest = decode_service_message(payload)?;
             validate_storage_key(&request.key)?;
             let path = storage_file_path(connection, caller_plugin_id, &request.key);
             let value = match fs::read(path) {
@@ -396,7 +400,7 @@ fn handle_core_service_call(
             encode_service_message(&CoreStorageGetResponse { value })
         }
         ("storage-command/v1", "set") => {
-            let request: CoreStorageSetRequest = decode_service_message(&payload)?;
+            let request: CoreStorageSetRequest = decode_service_message(payload)?;
             validate_storage_key(&request.key)?;
             let path = storage_file_path(connection, caller_plugin_id, &request.key);
             if let Some(parent) = path.parent() {
@@ -410,12 +414,12 @@ fn handle_core_service_call(
             encode_service_message(&())
         }
         ("logging-command/v1", "write") => {
-            let request: bmux_plugin_sdk::LogWriteRequest = decode_service_message(&payload)?;
+            let request: bmux_plugin_sdk::LogWriteRequest = decode_service_message(payload)?;
             emit_plugin_log(caller_plugin_id, &request)?;
             encode_service_message(&())
         }
         ("recording-command/v1", "write_event") => {
-            let request: RecordingWriteEventRequest = decode_service_message(&payload)?;
+            let request: RecordingWriteEventRequest = decode_service_message(payload)?;
             let response = execute_kernel_request(
                 host_kernel_bridge,
                 IpcRequest::RecordingWriteCustomEvent {
@@ -456,14 +460,13 @@ fn handle_core_service_call(
             }
         }
         ("client-query/v1", "current") => {
-            let client_id = match execute_kernel_request(host_kernel_bridge, IpcRequest::WhoAmI)? {
-                IpcResponsePayload::ClientIdentity { id } => id,
-                _ => {
-                    return Err(PluginError::ServiceProtocol {
-                        details: "unexpected response payload for client-query/v1:current whoami"
-                            .to_string(),
-                    });
-                }
+            let IpcResponsePayload::ClientIdentity { id: client_id } =
+                execute_kernel_request(host_kernel_bridge, IpcRequest::WhoAmI)?
+            else {
+                return Err(PluginError::ServiceProtocol {
+                    details: "unexpected response payload for client-query/v1:current whoami"
+                        .to_string(),
+                });
             };
             let response = execute_kernel_request(host_kernel_bridge, IpcRequest::ListClients)?;
             match response {
@@ -524,7 +527,7 @@ fn handle_core_service_call(
             }
         }
         ("context-command/v1", "create") => {
-            let request: ContextCreateRequest = decode_service_message(&payload)?;
+            let request: ContextCreateRequest = decode_service_message(payload)?;
             let response = execute_kernel_request(
                 host_kernel_bridge,
                 IpcRequest::CreateContext {
@@ -552,7 +555,7 @@ fn handle_core_service_call(
             }
         }
         ("context-command/v1", "select") => {
-            let request: ContextSelectRequest = decode_service_message(&payload)?;
+            let request: ContextSelectRequest = decode_service_message(payload)?;
             let response = execute_kernel_request(
                 host_kernel_bridge,
                 IpcRequest::SelectContext {
@@ -579,7 +582,7 @@ fn handle_core_service_call(
             }
         }
         ("context-command/v1", "close") => {
-            let request: ContextCloseRequest = decode_service_message(&payload)?;
+            let request: ContextCloseRequest = decode_service_message(payload)?;
             let response = execute_kernel_request(
                 host_kernel_bridge,
                 IpcRequest::CloseContext {
@@ -597,7 +600,7 @@ fn handle_core_service_call(
             }
         }
         ("session-command/v1", "new") => {
-            let request: SessionCreateRequest = decode_service_message(&payload)?;
+            let request: SessionCreateRequest = decode_service_message(payload)?;
             let response = execute_kernel_request(
                 host_kernel_bridge,
                 IpcRequest::NewSession { name: request.name },
@@ -612,7 +615,7 @@ fn handle_core_service_call(
             }
         }
         ("session-command/v1", "kill") => {
-            let request: SessionKillRequest = decode_service_message(&payload)?;
+            let request: SessionKillRequest = decode_service_message(payload)?;
             let response = execute_kernel_request(
                 host_kernel_bridge,
                 IpcRequest::KillSession {
@@ -630,7 +633,7 @@ fn handle_core_service_call(
             }
         }
         ("session-command/v1", "select") => {
-            let request: SessionSelectRequest = decode_service_message(&payload)?;
+            let request: SessionSelectRequest = decode_service_message(payload)?;
             let response = execute_kernel_request(
                 host_kernel_bridge,
                 IpcRequest::Attach {
@@ -652,7 +655,7 @@ fn handle_core_service_call(
             }
         }
         ("pane-query/v1", "list") => {
-            let request: PaneListRequest = decode_service_message(&payload)?;
+            let request: PaneListRequest = decode_service_message(payload)?;
             let response = execute_kernel_request(
                 host_kernel_bridge,
                 IpcRequest::ListPanes {
@@ -678,7 +681,7 @@ fn handle_core_service_call(
             }
         }
         ("pane-command/v1", "split") => {
-            let request: PaneSplitRequest = decode_service_message(&payload)?;
+            let request: PaneSplitRequest = decode_service_message(payload)?;
             let response = execute_kernel_request(
                 host_kernel_bridge,
                 IpcRequest::SplitPane {
@@ -698,7 +701,7 @@ fn handle_core_service_call(
             }
         }
         ("pane-command/v1", "focus") => {
-            let request: PaneFocusRequest = decode_service_message(&payload)?;
+            let request: PaneFocusRequest = decode_service_message(payload)?;
             let response = execute_kernel_request(
                 host_kernel_bridge,
                 IpcRequest::FocusPane {
@@ -717,7 +720,7 @@ fn handle_core_service_call(
             }
         }
         ("pane-command/v1", "resize") => {
-            let request: PaneResizeRequest = decode_service_message(&payload)?;
+            let request: PaneResizeRequest = decode_service_message(payload)?;
             let response = execute_kernel_request(
                 host_kernel_bridge,
                 IpcRequest::ResizePane {
@@ -736,7 +739,7 @@ fn handle_core_service_call(
             }
         }
         ("pane-command/v1", "close") => {
-            let request: PaneCloseRequest = decode_service_message(&payload)?;
+            let request: PaneCloseRequest = decode_service_message(payload)?;
             let response = execute_kernel_request(
                 host_kernel_bridge,
                 IpcRequest::ClosePane {
@@ -841,6 +844,7 @@ fn context_selector_to_ipc(selector: HostContextSelector) -> IpcContextSelector 
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 const fn pane_selector_to_ipc(selector: HostPaneSelector) -> IpcPaneSelector {
     match selector {
         HostPaneSelector::ById(id) => IpcPaneSelector::ById(id),
@@ -863,6 +867,7 @@ const fn pane_focus_direction_to_ipc(direction: HostPaneFocusDirection) -> IpcPa
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn execute_kernel_request(
     host_kernel_bridge: Option<HostKernelBridge>,
     request: IpcRequest,
@@ -1000,6 +1005,10 @@ impl LoadedPlugin {
     /// Returns an error when the plugin does not declare the command, the
     /// command symbol cannot be loaded, or any command input contains an
     /// interior NUL byte.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the native command context fails to serialize to JSON.
     pub fn run_command_with_context_and_outcome(
         &self,
         command_name: &str,
@@ -1129,6 +1138,10 @@ impl LoadedPlugin {
     ///
     /// Returns an error when the event symbol cannot be loaded or the event
     /// payload cannot be encoded.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the plugin event payload fails to serialize to JSON.
     pub fn dispatch_event(&self, event: &PluginEvent) -> Result<Option<i32>> {
         if !self.receives_event(event) {
             return Ok(None);
@@ -1163,6 +1176,11 @@ impl LoadedPlugin {
     ///
     /// Returns an error when the service symbol cannot be loaded, the service
     /// payload cannot be encoded, or the plugin returns invalid transport data.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the resolved dynamic library symbol is unexpectedly `None`
+    /// for a `Dynamic` backend (should not happen in practice).
     pub fn invoke_service(&self, context: &NativeServiceContext) -> Result<ServiceResponse> {
         let payload = encode_service_envelope(0, ServiceEnvelopeKind::Request, context)?;
 

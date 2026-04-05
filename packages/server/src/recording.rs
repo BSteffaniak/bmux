@@ -57,6 +57,7 @@ struct Manifest {
 }
 
 impl RecordingRuntime {
+    #[must_use]
     pub const fn new(root_dir: PathBuf, segment_mb: usize, retention_days: u64) -> Self {
         Self {
             root_dir,
@@ -68,6 +69,7 @@ impl RecordingRuntime {
         }
     }
 
+    #[must_use]
     pub const fn new_rolling(
         root_dir: PathBuf,
         segment_mb: usize,
@@ -83,6 +85,11 @@ impl RecordingRuntime {
         }
     }
 
+    /// Start a new recording session.
+    ///
+    /// # Errors
+    /// Returns an error if a recording is already active or if the recording
+    /// directory cannot be created.
     pub fn start(
         &mut self,
         session_filter: Option<Uuid>,
@@ -140,12 +147,12 @@ impl RecordingRuntime {
             .name(format!("bmux-recording-{id}"))
             .spawn(move || {
                 writer_loop(
-                    rx,
+                    &rx,
                     &recording_dir,
                     &manifest_path,
                     summary_for_thread,
-                    event_count_thread,
-                    payload_bytes_thread,
+                    &event_count_thread,
+                    &payload_bytes_thread,
                     segment_mb,
                     rolling_window_secs,
                     rolling_segment_max_age_secs,
@@ -172,6 +179,10 @@ impl RecordingRuntime {
         Ok(summary)
     }
 
+    /// Stop the active recording.
+    ///
+    /// # Errors
+    /// Returns an error if no recording is active or the writer thread panicked.
     pub fn stop(&mut self, recording_id: Option<Uuid>) -> Result<RecordingSummary> {
         let Some(mut active) = self.active.take() else {
             anyhow::bail!("no active recording")
@@ -215,6 +226,10 @@ impl RecordingRuntime {
         }
     }
 
+    /// List all known recordings.
+    ///
+    /// # Errors
+    /// Returns an error if the recording directory cannot be read.
     pub fn list(&self) -> Result<Vec<RecordingSummary>> {
         let mut recordings = Vec::new();
         if self.root_dir.exists() {
@@ -243,6 +258,10 @@ impl RecordingRuntime {
         Ok(recordings)
     }
 
+    /// Delete a specific recording by ID.
+    ///
+    /// # Errors
+    /// Returns an error if the recording is not found or cannot be removed.
     pub fn delete(&mut self, recording_id: Uuid) -> Result<RecordingSummary> {
         if self
             .active
@@ -269,6 +288,10 @@ impl RecordingRuntime {
         Ok(summary)
     }
 
+    /// Delete all recordings.
+    ///
+    /// # Errors
+    /// Returns an error if the recording directory cannot be read or entries removed.
     pub fn delete_all(&mut self) -> Result<usize> {
         if self.active.is_some() {
             let _ = self.stop(None)?;
@@ -300,6 +323,10 @@ impl RecordingRuntime {
         Ok(deleted)
     }
 
+    /// Record a single event into the active recording.
+    ///
+    /// # Errors
+    /// Returns an error if the recording writer is not accepting events.
     pub fn record(
         &self,
         kind: RecordingEventKind,
@@ -332,6 +359,7 @@ impl RecordingRuntime {
         let seq = active.seq.fetch_add(1, Ordering::SeqCst).saturating_add(1);
         let envelope = RecordingEventEnvelope {
             seq,
+            #[allow(clippy::cast_possible_truncation)]
             mono_ns: elapsed.as_nanos().min(u128::from(u64::MAX)) as u64,
             wall_epoch_ms: epoch_millis_now(),
             session_id: meta.session_id,
@@ -349,6 +377,9 @@ impl RecordingRuntime {
 
     /// Prune completed recordings older than the specified retention period.
     /// Returns the number of recordings deleted.
+    ///
+    /// # Errors
+    /// Returns an error if the recordings directory cannot be read.
     pub fn prune(&self, older_than_days: Option<u64>) -> Result<usize> {
         let retention = older_than_days.unwrap_or(self.retention_days);
         prune_old_recordings(&self.root_dir, retention)
@@ -370,10 +401,15 @@ impl RecordingRuntime {
     }
 
     /// Get the configured retention days.
-    pub fn retention_days(&self) -> u64 {
+    pub const fn retention_days(&self) -> u64 {
         self.retention_days
     }
 
+    /// Cut a snapshot of the rolling recording for the given time window.
+    ///
+    /// # Errors
+    /// Returns an error if no recording is active, the window is invalid,
+    /// or file I/O fails.
     pub fn cut(&self, output_root: &Path, last_seconds: Option<u64>) -> Result<RecordingSummary> {
         let active = self
             .active
@@ -437,7 +473,7 @@ impl RecordingRuntime {
             event_kinds: active.event_kinds.clone(),
             started_epoch_ms: events
                 .first()
-                .map_or(epoch_millis_now(), |event| event.wall_epoch_ms),
+                .map_or_else(epoch_millis_now, |event| event.wall_epoch_ms),
             ended_epoch_ms: Some(epoch_millis_now()),
             event_count,
             payload_bytes,
@@ -449,20 +485,21 @@ impl RecordingRuntime {
         copy_display_tracks_for_cut(&active.path, &cut_dir, window_secs)?;
         copy_owner_client_metadata(&active.path, &cut_dir)?;
 
-        let mut finalized = summary.clone();
+        let mut finalized = summary;
         finalized.total_segment_bytes = compute_total_segment_bytes(&cut_dir, &finalized.segments);
         write_manifest(&cut_dir.join(MANIFEST_FILE_NAME), &finalized)?;
         Ok(finalized)
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn writer_loop(
-    rx: mpsc::Receiver<RecordingEventEnvelope>,
+    rx: &mpsc::Receiver<RecordingEventEnvelope>,
     recording_dir: &Path,
     manifest_path: &Path,
     mut summary: RecordingSummary,
-    event_count: Arc<AtomicU64>,
-    payload_bytes: Arc<AtomicU64>,
+    event_count: &Arc<AtomicU64>,
+    payload_bytes: &Arc<AtomicU64>,
     segment_mb: usize,
     rolling_window_secs: Option<u64>,
     rolling_segment_max_age_secs: Option<u64>,
@@ -757,7 +794,11 @@ fn copy_display_tracks_for_cut(source_dir: &Path, dest_dir: &Path, window_secs: 
             continue;
         }
         let name = entry.file_name().to_string_lossy().to_string();
-        if !name.starts_with("display-") || !name.ends_with(".bin") {
+        if !name.starts_with("display-")
+            || !std::path::Path::new(&name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("bin"))
+        {
             continue;
         }
 
@@ -852,9 +893,12 @@ fn read_manifest(path: &Path) -> Result<RecordingSummary> {
 /// not the actual serialized frame size (which includes the 4-byte length prefix
 /// and codec envelope overhead). Treat `payload_bytes` in the manifest as
 /// an approximate content-size metric, not an exact file-size measurement.
+#[allow(clippy::missing_const_for_fn, clippy::cast_possible_truncation)]
 fn payload_size(payload: &RecordingPayload) -> u64 {
     match payload {
-        RecordingPayload::Bytes { data } => data.len() as u64,
+        RecordingPayload::Bytes { data } | RecordingPayload::Image { data, .. } => {
+            data.len() as u64
+        }
         RecordingPayload::ServerEvent { .. } => {
             // Estimate: server events are typically small (< 256 bytes).
             // Avoid re-serializing just to measure size.
@@ -876,10 +920,10 @@ fn payload_size(payload: &RecordingPayload) -> u64 {
             name,
             payload,
         } => (source.len() + name.len() + payload.len()) as u64,
-        RecordingPayload::Image { data, .. } => data.len() as u64,
     }
 }
 
+#[allow(clippy::cast_possible_truncation)]
 fn epoch_millis_now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -889,6 +933,9 @@ fn epoch_millis_now() -> u64 {
 /// Prune completed recordings older than `retention_days`.
 /// Returns the number of recordings deleted. If `retention_days` is 0, returns 0
 /// (0 means keep forever).
+///
+/// # Errors
+/// Returns an error if the recordings directory cannot be read.
 pub fn prune_old_recordings(root_dir: &Path, retention_days: u64) -> Result<usize> {
     if retention_days == 0 {
         return Ok(0);
@@ -904,10 +951,7 @@ pub fn prune_old_recordings(root_dir: &Path, retention_days: u64) -> Result<usiz
         .with_context(|| format!("failed reading recordings dir {}", root_dir.display()))?;
 
     for entry in entries {
-        let entry = match entry {
-            Ok(e) => e,
-            Err(_) => continue,
-        };
+        let Ok(entry) = entry else { continue };
         if !entry.path().is_dir() {
             continue;
         }
@@ -915,18 +959,17 @@ pub fn prune_old_recordings(root_dir: &Path, retention_days: u64) -> Result<usiz
         if !manifest_path.exists() {
             continue;
         }
-        let summary = match read_manifest(&manifest_path) {
-            Ok(s) => s,
-            Err(_) => continue, // skip unreadable manifests
+        let Ok(summary) = read_manifest(&manifest_path) else {
+            continue;
         };
         // Only prune completed recordings (has ended_epoch_ms).
-        if let Some(ended_ms) = summary.ended_epoch_ms {
-            if ended_ms < cutoff_ms {
-                if let Err(e) = std::fs::remove_dir_all(entry.path()) {
-                    tracing::warn!("failed to prune recording {}: {e}", entry.path().display());
-                } else {
-                    deleted += 1;
-                }
+        if let Some(ended_ms) = summary.ended_epoch_ms
+            && ended_ms < cutoff_ms
+        {
+            if let Err(e) = std::fs::remove_dir_all(entry.path()) {
+                tracing::warn!("failed to prune recording {}: {e}", entry.path().display());
+            } else {
+                deleted += 1;
             }
         }
     }

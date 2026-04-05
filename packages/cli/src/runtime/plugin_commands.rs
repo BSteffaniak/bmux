@@ -460,8 +460,7 @@ fn register_plugin_ownership(
             && existing != &plugin_id
         {
             bail!(
-                "plugin '{plugin_id}' ownership conflict: namespace '{}' already owned by plugin '{existing}'",
-                namespace
+                "plugin '{plugin_id}' ownership conflict: namespace '{namespace}' already owned by plugin '{existing}'"
             );
         }
         owned_namespaces.insert(namespace.clone(), plugin_id.clone());

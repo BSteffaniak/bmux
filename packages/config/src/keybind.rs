@@ -16,9 +16,11 @@ const PROFILE_FAST: &str = "fast";
 const PROFILE_TRADITIONAL: &str = "traditional";
 const PROFILE_SLOW: &str = "slow";
 
-/// Keyboard shortcuts organized by scope. Prefix-chord bindings (runtime)
-/// require pressing the prefix key first. Modal bindings (normal, insert,
-/// visual, command) are active only in their respective interaction modes.
+/// Keyboard shortcuts organized by scope.
+///
+/// Prefix-chord bindings (runtime) require pressing the prefix key first.
+/// Modal bindings (normal, insert, visual, command) are active only in
+/// their respective interaction modes.
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[config_doc(section = "keybindings")]
 #[serde(default)]
@@ -27,11 +29,11 @@ pub struct KeyBindingConfig {
     /// bindings require pressing this key first.
     pub prefix: String,
     /// Exact timeout in milliseconds for multi-stroke chord resolution.
-    /// Takes precedence over timeout_profile. Valid range: 50-5000.
+    /// Takes precedence over `timeout_profile`. Valid range: 50-5000.
     pub timeout_ms: Option<u64>,
     /// Named timeout profile for multi-stroke chord resolution. Built-in
     /// profiles: fast (200ms), traditional (400ms), slow (800ms). Ignored
-    /// when timeout_ms is set.
+    /// when `timeout_ms` is set.
     pub timeout_profile: Option<String>,
     /// Override values for built-in timeout profiles or define custom ones.
     /// Keys are profile names, values are timeout in milliseconds.
@@ -260,7 +262,13 @@ impl KeyBindingConfig {
         profiles
     }
 
-    #[must_use]
+    /// Resolve the effective timeout for multi-stroke chord resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `timeout_ms` is out of range, `timeout_profile`
+    /// references an unknown or empty profile, or a custom profile value is
+    /// out of range.
     pub fn resolve_timeout(&self) -> Result<ResolvedTimeout, String> {
         if let Some(timeout_ms) = self.timeout_ms {
             validate_timeout_value(timeout_ms, "keybindings.timeout_ms")?;

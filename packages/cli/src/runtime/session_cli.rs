@@ -1,4 +1,13 @@
-use super::*;
+use anyhow::{Context, Result};
+use bmux_client::{BmuxClient, ClientError};
+use bmux_ipc::SessionSelector;
+use bmux_server::OfflineSessionKillTarget;
+
+use super::attach::runtime::{session_summary_label, short_uuid};
+use super::{
+    ConnectionContext, ConnectionPolicyScope, connect_if_running_with_context,
+    connect_with_context, map_cli_client_error, offline_kill_sessions, parse_session_selector,
+};
 
 pub(super) async fn run_session_new(
     name: Option<String>,
@@ -283,25 +292,24 @@ pub(super) async fn run_session_kill(
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
     let selector = parse_session_selector(target);
-    let mut client = match connect_if_running_with_context(
+    let mut client = if let Some(client) = connect_if_running_with_context(
         ConnectionPolicyScope::Normal,
         "bmux-cli-kill-session",
         connection_context,
     )
     .await?
     {
-        Some(client) => client,
-        None => {
-            let report = offline_kill_sessions(OfflineSessionKillTarget::One(selector.clone()))?;
-            let Some(killed_id) = report.removed_session_ids.first().copied() else {
-                anyhow::bail!("{}", session_not_found_message_for_selector(&selector));
-            };
-            println!("killed session: {killed_id}");
-            println!(
-                "bmux server is not running; pruned session from snapshot for next startup (live pane processes may still be running)"
-            );
-            return Ok(0);
-        }
+        client
+    } else {
+        let report = offline_kill_sessions(OfflineSessionKillTarget::One(selector.clone()))?;
+        let Some(killed_id) = report.removed_session_ids.first().copied() else {
+            anyhow::bail!("{}", session_not_found_message_for_selector(&selector));
+        };
+        println!("killed session: {killed_id}");
+        println!(
+            "bmux server is not running; pruned session from snapshot for next startup (live pane processes may still be running)"
+        );
+        return Ok(0);
     };
 
     let _ = kill_preflight_identity(&mut client, force_local).await?;
@@ -319,30 +327,29 @@ pub(super) async fn run_session_kill_all(
     force_local: bool,
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
-    let mut client = match connect_if_running_with_context(
+    let mut client = if let Some(client) = connect_if_running_with_context(
         ConnectionPolicyScope::Normal,
         "bmux-cli-kill-all-sessions",
         connection_context,
     )
     .await?
     {
-        Some(client) => client,
-        None => {
-            let report = offline_kill_sessions(OfflineSessionKillTarget::All)?;
-            let killed_count = report.removed_session_ids.len();
-            if killed_count == 0 {
-                println!("no sessions");
-                return Ok(0);
-            }
-            for session_id in report.removed_session_ids {
-                println!("killed session: {session_id}");
-            }
-            println!("kill-all-sessions complete: killed {killed_count}, failed 0");
-            println!(
-                "bmux server is not running; pruned sessions from snapshot for next startup (live pane processes may still be running)"
-            );
+        client
+    } else {
+        let report = offline_kill_sessions(OfflineSessionKillTarget::All)?;
+        let killed_count = report.removed_session_ids.len();
+        if killed_count == 0 {
+            println!("no sessions");
             return Ok(0);
         }
+        for session_id in report.removed_session_ids {
+            println!("killed session: {session_id}");
+        }
+        println!("kill-all-sessions complete: killed {killed_count}, failed 0");
+        println!(
+            "bmux server is not running; pruned sessions from snapshot for next startup (live pane processes may still be running)"
+        );
+        return Ok(0);
     };
 
     let _ = print_bulk_kill_preflight(&mut client, "sessions", force_local).await?;

@@ -51,6 +51,7 @@ pub fn apply_attach_cursor_state(
 
 #[cfg(test)]
 mod tests {
+    #[allow(clippy::wildcard_imports)]
     use super::*;
 
     #[test]
