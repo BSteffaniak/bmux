@@ -901,12 +901,9 @@ pub(super) async fn plugin_event_bridge_loop(
     };
 
     // Upgrade to streaming client for server-push event delivery.
-    let mut streaming_client = match bmux_client::StreamingBmuxClient::from_client(client) {
-        Ok(sc) => sc,
-        Err(_) => {
-            // Fallback: if upgrade fails (e.g., bridge stream), just return.
-            return Ok(());
-        }
+    let Ok(mut streaming_client) = bmux_client::StreamingBmuxClient::from_client(client) else {
+        // Fallback: if upgrade fails (e.g., bridge stream), just return.
+        return Ok(());
     };
     streaming_client
         .subscribe_events()

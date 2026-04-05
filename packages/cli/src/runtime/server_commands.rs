@@ -292,15 +292,14 @@ pub(super) async fn latest_server_event_name(
     )
     .await;
 
-    let mut client = match connect {
-        Ok(Ok(client)) => client,
-        Ok(Err(_)) | Err(_) => return Ok(None),
+    let Ok(Ok(mut client)) = connect else {
+        return Ok(None);
     };
 
     let _ = tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.subscribe_events()).await;
-    let events = match tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.poll_events(1)).await {
-        Ok(Ok(events)) => events,
-        Ok(Err(_)) | Err(_) => return Ok(None),
+    let Ok(Ok(events)) = tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.poll_events(1)).await
+    else {
+        return Ok(None);
     };
     Ok(events.last().map(server_event_name))
 }

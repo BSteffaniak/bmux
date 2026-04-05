@@ -452,13 +452,13 @@ pub(super) async fn run_session_attach(
 
 pub(super) fn map_attach_client_error(error: ClientError) -> anyhow::Error {
     match error {
-        ClientError::ServerError { code, message } => match code {
-            bmux_ipc::ErrorCode::AlreadyExists => {
+        ClientError::ServerError { code, message } => {
+            if matches!(code, bmux_ipc::ErrorCode::AlreadyExists) {
                 anyhow::anyhow!("attach failed: session already has an active attached client")
+            } else {
+                anyhow::anyhow!("attach failed: {message}")
             }
-            bmux_ipc::ErrorCode::NotFound => anyhow::anyhow!("attach failed: {message}"),
-            _ => anyhow::anyhow!("attach failed: {message}"),
-        },
+        }
         other => map_client_connect_error(other),
     }
 }

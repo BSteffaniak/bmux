@@ -292,15 +292,13 @@ pub(super) async fn run_session_kill(
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
     let selector = parse_session_selector(target);
-    let mut client = if let Some(client) = connect_if_running_with_context(
+    let Some(mut client) = connect_if_running_with_context(
         ConnectionPolicyScope::Normal,
         "bmux-cli-kill-session",
         connection_context,
     )
     .await?
-    {
-        client
-    } else {
+    else {
         let report = offline_kill_sessions(OfflineSessionKillTarget::One(selector.clone()))?;
         let Some(killed_id) = report.removed_session_ids.first().copied() else {
             anyhow::bail!("{}", session_not_found_message_for_selector(&selector));
@@ -327,15 +325,13 @@ pub(super) async fn run_session_kill_all(
     force_local: bool,
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
-    let mut client = if let Some(client) = connect_if_running_with_context(
+    let Some(mut client) = connect_if_running_with_context(
         ConnectionPolicyScope::Normal,
         "bmux-cli-kill-all-sessions",
         connection_context,
     )
     .await?
-    {
-        client
-    } else {
+    else {
         let report = offline_kill_sessions(OfflineSessionKillTarget::All)?;
         let killed_count = report.removed_session_ids.len();
         if killed_count == 0 {

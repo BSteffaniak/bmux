@@ -29,9 +29,8 @@ pub(super) async fn fetch_server_status(
     )
     .await;
 
-    let mut client = match connect {
-        Ok(Ok(client)) => client,
-        Ok(Err(_)) | Err(_) => return Ok(None),
+    let Ok(Ok(mut client)) = connect else {
+        return Ok(None);
     };
 
     match tokio::time::timeout(SERVER_STATUS_TIMEOUT, client.server_status()).await {

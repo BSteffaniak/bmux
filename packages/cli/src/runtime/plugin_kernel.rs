@@ -166,12 +166,11 @@ pub(super) unsafe extern "C" fn host_kernel_bridge(
                 handle.block_on(async { context.execute_raw(request.payload).await })
             })
         } else {
-            let runtime = match tokio::runtime::Builder::new_current_thread()
+            let Ok(runtime) = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-            {
-                Ok(runtime) => runtime,
-                Err(_) => return 5,
+            else {
+                return 5;
             };
             runtime.block_on(async { context.execute_raw(request.payload).await })
         }
@@ -186,9 +185,8 @@ pub(super) unsafe extern "C" fn host_kernel_bridge(
         Err(_) => return 5,
     };
 
-    let encoded = match bmux_plugin_sdk::encode_service_message(&response) {
-        Ok(value) => value,
-        Err(_) => return 5,
+    let Ok(encoded) = bmux_plugin_sdk::encode_service_message(&response) else {
+        return 5;
     };
 
     unsafe {

@@ -879,9 +879,8 @@ enum InferredClient {
 /// `display-{uuid}.bin` files. If exactly one exists, return its client id so
 /// the export can proceed without requiring `--view-client`.
 fn infer_display_track_client(recording_dir: &Path) -> InferredClient {
-    let entries = match std::fs::read_dir(recording_dir) {
-        Ok(entries) => entries,
-        Err(_) => return InferredClient::None,
+    let Ok(entries) = std::fs::read_dir(recording_dir) else {
+        return InferredClient::None;
     };
     let mut found: Vec<Uuid> = Vec::new();
     for entry in entries.flatten() {

@@ -240,16 +240,17 @@ struct StatusRenderStyle {
 impl StatusRenderStyle {
     fn from_config(config: &StatusBarConfig) -> Self {
         let use_ascii = config.style.force_ascii;
-        let separators =
-            if use_ascii || matches!(config.style.separator_set, StatusSeparatorSet::Ascii) {
-                ("|", "|", "<", ">")
-            } else if matches!(config.style.separator_set, StatusSeparatorSet::Plain) {
-                ("|", "|", "<", ">")
-            } else if config.style.prefer_unicode {
-                ("", "", "◀", "▶")
-            } else {
-                ("|", "|", "<", ">")
-            };
+        let separators = if use_ascii
+            || matches!(
+                config.style.separator_set,
+                StatusSeparatorSet::Ascii | StatusSeparatorSet::Plain
+            ) {
+            ("|", "|", "<", ">")
+        } else if config.style.prefer_unicode {
+            ("", "", "◀", "▶")
+        } else {
+            ("|", "|", "<", ">")
+        };
         let gap = " ".repeat(match config.layout.density {
             StatusDensity::Compact => 0,
             StatusDensity::Cozy => config.layout.tab_gap.max(1),
@@ -399,6 +400,7 @@ struct ResolvedStatusTheme {
 }
 
 impl ResolvedStatusTheme {
+    #[allow(clippy::similar_names)] // bg/fg pairs are intentionally parallel names
     fn resolve(config: &StatusBarConfig, global_theme: &ThemeConfig) -> Self {
         let fallback_bar_bg =
             parse_hex_color(&global_theme.status.background).unwrap_or(RgbColor {
@@ -453,7 +455,7 @@ impl ResolvedStatusTheme {
             .tab_inactive_bg
             .as_deref()
             .and_then(parse_hex_color)
-            .unwrap_or(adjust_rgb(bar_bg, 18));
+            .unwrap_or_else(|| adjust_rgb(bar_bg, 18));
         let inactive_fg = config
             .theme
             .tab_inactive_fg
@@ -465,7 +467,7 @@ impl ResolvedStatusTheme {
             .module_bg
             .as_deref()
             .and_then(parse_hex_color)
-            .unwrap_or(adjust_rgb(bar_bg, 10));
+            .unwrap_or_else(|| adjust_rgb(bar_bg, 10));
         let module_fg = config
             .theme
             .module_fg
@@ -477,7 +479,7 @@ impl ResolvedStatusTheme {
             .overflow_bg
             .as_deref()
             .and_then(parse_hex_color)
-            .unwrap_or(adjust_rgb(bar_bg, 26));
+            .unwrap_or_else(|| adjust_rgb(bar_bg, 26));
         let overflow_fg = config
             .theme
             .overflow_fg
@@ -542,8 +544,8 @@ fn stylize_status_line(
 
     let mut segments = vec![SegmentKind::Base; width];
     if let Some(start) = right_start_col {
-        for col in start.min(width)..width {
-            segments[col] = SegmentKind::Module;
+        for segment in &mut segments[start.min(width)..width] {
+            *segment = SegmentKind::Module;
         }
     }
 
@@ -551,8 +553,8 @@ fn stylize_status_line(
         if *start >= width {
             continue;
         }
-        for col in *start..=(*end).min(width.saturating_sub(1)) {
-            segments[col] = SegmentKind::Overflow;
+        for segment in &mut segments[*start..=(*end).min(width.saturating_sub(1))] {
+            *segment = SegmentKind::Overflow;
         }
     }
 
@@ -569,8 +571,8 @@ fn stylize_status_line(
             });
         let start = usize::from(hitbox.start_col).min(width.saturating_sub(1));
         let end = usize::from(hitbox.end_col).min(width.saturating_sub(1));
-        for col in start..=end {
-            segments[col] = kind;
+        for segment in &mut segments[start..=end] {
+            *segment = kind;
         }
     }
 
