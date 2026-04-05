@@ -2730,6 +2730,7 @@ fn build_tls_connector(target: &TlsTarget) -> Result<TlsConnector> {
     Ok(TlsConnector::from(Arc::new(config)))
 }
 
+#[allow(clippy::unused_async)] // Async signature for caller consistency in async dispatch chain
 async fn ensure_remote_server_ready(target: &SshTarget) -> Result<()> {
     let status = run_ssh_bmux_command_silent(
         target,
@@ -2786,6 +2787,7 @@ async fn ensure_remote_server_ready(target: &SshTarget) -> Result<()> {
     }
 }
 
+#[allow(clippy::unused_async)] // Async signature for caller consistency in async dispatch chain
 async fn ensure_remote_bridge_stdio_clean(target: &SshTarget) -> Result<()> {
     let output = run_ssh_bmux_command_capture(
         target,

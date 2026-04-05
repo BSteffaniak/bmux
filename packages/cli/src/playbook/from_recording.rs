@@ -24,7 +24,6 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use anyhow::Result;
 use bmux_ipc::{
     PaneSplitDirection, RecordingEventEnvelope, RecordingEventKind, RecordingPayload, Request,
     ResponsePayload,
@@ -163,11 +162,8 @@ struct PaneOutputAccumulator {
 
 /// Convert a list of recording events into a DSL playbook string with assertions.
 ///
-/// # Errors
-///
-/// Returns an error if event decoding fails or the recording is malformed.
 #[allow(clippy::too_many_lines, clippy::similar_names)]
-pub fn events_to_playbook(events: &[RecordingEventEnvelope]) -> Result<String> {
+pub fn events_to_playbook(events: &[RecordingEventEnvelope]) -> String {
     let mut lines: Vec<String> = Vec::new();
     lines.push("# Auto-generated from recording".to_string());
     lines.push(String::new());
@@ -341,7 +337,7 @@ pub fn events_to_playbook(events: &[RecordingEventEnvelope]) -> Result<String> {
 
     lines.push(String::new());
 
-    Ok(lines.join("\n"))
+    lines.join("\n")
 }
 
 // ---------------------------------------------------------------------------
@@ -842,7 +838,7 @@ mod tests {
             ),
         ];
 
-        let dsl = events_to_playbook(&events).unwrap();
+        let dsl = events_to_playbook(&events);
 
         assert!(
             dsl.contains("new-session"),
@@ -949,7 +945,7 @@ mod tests {
             ),
         ];
 
-        let dsl = events_to_playbook(&events).unwrap();
+        let dsl = events_to_playbook(&events);
 
         // The input to pane1 should have pane targeting
         assert!(dsl.contains("send-keys"), "should have send-keys: {dsl}");
@@ -999,7 +995,7 @@ mod tests {
             ),
         ];
 
-        let dsl = events_to_playbook(&events).unwrap();
+        let dsl = events_to_playbook(&events);
 
         assert!(
             dsl.contains("@viewport cols=120 rows=40"),

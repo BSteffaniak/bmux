@@ -712,8 +712,7 @@ async fn recording_to_playbook_end_to_end() {
     ];
 
     // Step 1: Convert recording events → DSL string.
-    let dsl = bmux_cli::playbook::from_recording::events_to_playbook(&events)
-        .expect("events_to_playbook should succeed");
+    let dsl = bmux_cli::playbook::from_recording::events_to_playbook(&events);
 
     // Sanity check: the DSL should contain key elements.
     assert!(

@@ -351,7 +351,7 @@ pub(super) fn run_playbook_from_recording(recording_id: &str, output: Option<&st
     let recordings = recording::list_recordings_from_dir(&recording::recordings_root_dir())?;
     let resolved_id = recording::resolve_recording_id_prefix(recording_id, &recordings)?;
     let events = recording::load_recording_events(&resolved_id.to_string())?;
-    let playbook_dsl = crate::playbook::from_recording::events_to_playbook(&events)?;
+    let playbook_dsl = crate::playbook::from_recording::events_to_playbook(&events);
 
     if let Some(path) = output {
         std::fs::write(path, &playbook_dsl)

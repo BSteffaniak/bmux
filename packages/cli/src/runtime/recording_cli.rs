@@ -199,7 +199,7 @@ pub(super) async fn run_recording_export(
         RecordingExportCursorBlinkMode::Off => RecordingCursorBlinkMode::Off,
     });
     let resolved_cursor_blink_period_ms =
-        cursor_blink_period_ms.unwrap_or(export_defaults.cursor_blink_period_ms.max(1));
+        cursor_blink_period_ms.unwrap_or_else(|| export_defaults.cursor_blink_period_ms.max(1));
     let resolved_cursor_color = cursor_color
         .map(str::to_string)
         .or_else(|| {
@@ -234,9 +234,9 @@ pub(super) async fn run_recording_export(
             RecordingExportCursorTextMode::ForceContrast => RecordingCursorTextMode::ForceContrast,
         });
     let resolved_cursor_bar_width_pct =
-        cursor_bar_width_pct.unwrap_or(export_defaults.cursor_bar_width_pct.clamp(1, 100));
+        cursor_bar_width_pct.unwrap_or_else(|| export_defaults.cursor_bar_width_pct.clamp(1, 100));
     let resolved_cursor_underline_height_pct = cursor_underline_height_pct
-        .unwrap_or(export_defaults.cursor_underline_height_pct.clamp(1, 100));
+        .unwrap_or_else(|| export_defaults.cursor_underline_height_pct.clamp(1, 100));
 
     recording::run_recording_export(
         recording_id,

@@ -733,6 +733,7 @@ pub(super) async fn run_recording_verify_smoke(
     Ok(u8::from(!report.pass))
 }
 
+#[allow(clippy::unused_async)] // Called in async context; may need async for future network export
 pub(super) async fn run_recording_export(
     recording_id: &str,
     format: RecordingExportFormat,
@@ -959,18 +960,18 @@ fn resolve_export_cell_metrics(
     }
 
     let (size_width, size_height) = cell_size.unwrap_or((0, 0));
-    let cli_width = cell_width.or((size_width > 0).then_some(size_width));
-    let cli_height = cell_height.or((size_height > 0).then_some(size_height));
+    let cli_width = cell_width.or_else(|| (size_width > 0).then_some(size_width));
+    let cli_height = cell_height.or_else(|| (size_height > 0).then_some(size_height));
 
     let recorded = recording_cell_metrics(events);
     let current = current_terminal_cell_metrics();
     let width = cli_width
-        .or(recorded.map(|value| value.width))
-        .or(current.map(|value| value.width))
+        .or_else(|| recorded.map(|value| value.width))
+        .or_else(|| current.map(|value| value.width))
         .unwrap_or(8);
     let height = cli_height
-        .or(recorded.map(|value| value.height))
-        .or(current.map(|value| value.height))
+        .or_else(|| recorded.map(|value| value.height))
+        .or_else(|| current.map(|value| value.height))
         .unwrap_or(16);
     Ok(CellMetrics { width, height })
 }
@@ -2670,10 +2671,10 @@ impl ResvgFrameRenderer {
         let font_size = options
             .font_size_px
             .or_else(|| metrics.as_ref().map(|value| value.font_size_px))
-            .unwrap_or((f32::from(cell_h) * 0.9).max(8.0));
+            .unwrap_or_else(|| (f32::from(cell_h) * 0.9).max(8.0));
         let top_to_baseline = metrics
             .as_ref()
-            .map_or(f32::from(cell_h) * 0.8, |value| value.top_to_baseline_px);
+            .map_or_else(|| f32::from(cell_h) * 0.8, |value| value.top_to_baseline_px);
         let font_family_attr = svg_font_family_list(&families);
 
         let mut options_usvg = usvg::Options::default();
@@ -3401,7 +3402,9 @@ impl GlyphRenderer {
     fn new(cell_w: u16, cell_h: u16, options: &RenderOptions) -> Option<Self> {
         let fonts = load_monospace_fonts(options);
         let font = fonts.first()?;
-        let base_font_size = options.font_size_px.unwrap_or(f32::from(cell_h).max(8.0));
+        let base_font_size = options
+            .font_size_px
+            .unwrap_or_else(|| f32::from(cell_h).max(8.0));
         let base_scale = PxScale {
             x: base_font_size,
             y: base_font_size,
