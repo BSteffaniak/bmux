@@ -5,9 +5,9 @@ use hyperchad::markdown::markdown_to_container;
 use hyperchad::template::Containers;
 
 use bmux_config::{
-    AppearanceConfig, BehaviorConfig, ConfigDocSchema, GeneralConfig, KeyBindingConfig,
-    MouseBehaviorConfig, MultiClientConfig, PluginConfig, RecordingConfig, RecordingExportConfig,
-    StatusBarConfig,
+    AppearanceConfig, BehaviorConfig, CompressionConfig, ConfigDocSchema, GeneralConfig,
+    ImageBehaviorConfig, KeyBindingConfig, MouseBehaviorConfig, MultiClientConfig, PluginConfig,
+    RecordingConfig, RecordingExportConfig, StatusBarConfig,
 };
 use std::collections::BTreeMap;
 
@@ -59,6 +59,15 @@ pub fn playbooks() -> Containers {
         "/docs/playbooks",
         "Playbooks",
         &md(include_str!("../../../../../docs/playbooks.md")),
+    )
+}
+
+#[must_use]
+pub fn images() -> Containers {
+    layout::docs_layout(
+        "/docs/images",
+        "Images & Compression",
+        &md(include_str!("../../../../../docs/images.md")),
     )
 }
 
@@ -275,16 +284,55 @@ fn render_section<T: ConfigDocSchema>() -> String {
 fn render_behavior_section() -> String {
     let mut defaults = BehaviorConfig::default_values();
     let mouse_defaults = MouseBehaviorConfig::default_values();
+    let images_defaults = ImageBehaviorConfig::default_values();
+    let compression_defaults = CompressionConfig::default_values();
 
     let mut fields = BehaviorConfig::field_docs()
         .into_iter()
-        .filter(|field| field.toml_key != "mouse")
+        .filter(|field| {
+            field.toml_key != "mouse"
+                && field.toml_key != "images"
+                && field.toml_key != "compression"
+        })
         .map(RenderField::from)
         .collect::<Vec<_>>();
 
+    // Inline MouseBehaviorConfig sub-fields with "mouse." prefix.
     for field in MouseBehaviorConfig::field_docs() {
         let dotted_key = format!("mouse.{}", field.toml_key);
         if let Some(default) = mouse_defaults.get(field.toml_key) {
+            defaults.insert(dotted_key.clone(), default.clone());
+        }
+        fields.push(RenderField {
+            toml_key: dotted_key,
+            type_display: field.type_display.to_string(),
+            description: field.description.to_string(),
+            enum_values: field
+                .enum_values
+                .map(|values| values.iter().map(|value| (*value).to_string()).collect()),
+        });
+    }
+
+    // Inline ImageBehaviorConfig sub-fields with "images." prefix.
+    for field in ImageBehaviorConfig::field_docs() {
+        let dotted_key = format!("images.{}", field.toml_key);
+        if let Some(default) = images_defaults.get(field.toml_key) {
+            defaults.insert(dotted_key.clone(), default.clone());
+        }
+        fields.push(RenderField {
+            toml_key: dotted_key,
+            type_display: field.type_display.to_string(),
+            description: field.description.to_string(),
+            enum_values: field
+                .enum_values
+                .map(|values| values.iter().map(|value| (*value).to_string()).collect()),
+        });
+    }
+
+    // Inline CompressionConfig sub-fields with "compression." prefix.
+    for field in CompressionConfig::field_docs() {
+        let dotted_key = format!("compression.{}", field.toml_key);
+        if let Some(default) = compression_defaults.get(field.toml_key) {
             defaults.insert(dotted_key.clone(), default.clone());
         }
         fields.push(RenderField {

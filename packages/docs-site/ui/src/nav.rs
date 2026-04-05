@@ -43,6 +43,10 @@ pub static SECTIONS: &[NavSection] = &[
                 href: "/docs/playbooks",
             },
             NavItem {
+                label: "Images & Compression",
+                href: "/docs/images",
+            },
+            NavItem {
                 label: "Configuration",
                 href: "/docs/config",
             },

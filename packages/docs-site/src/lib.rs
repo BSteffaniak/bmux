@@ -43,6 +43,9 @@ pub static ROUTER: LazyLock<Router> = LazyLock::new(|| {
         .with_static_route(&["/docs/playbooks"], |_| async {
             bmux_docs_site_ui::pages::docs::playbooks()
         })
+        .with_static_route(&["/docs/images"], |_| async {
+            bmux_docs_site_ui::pages::docs::images()
+        })
         .with_static_route(&["/docs/config"], |_| async {
             bmux_docs_site_ui::pages::docs::config()
         })

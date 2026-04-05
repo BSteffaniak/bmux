@@ -578,13 +578,21 @@ impl Default for MouseBehaviorConfig {
 #[config_doc(section = "behavior.images")]
 #[serde(default)]
 pub struct ImageBehaviorConfig {
-    /// Master switch for image protocol support.
+    /// Master switch for Sixel, Kitty graphics, and iTerm2 inline image
+    /// support.  When false, image escape sequences are passed through to
+    /// the host terminal without interception or registry tracking.
     pub enabled: bool,
     /// How image decoding is distributed between server and client.
+    /// PASSTHROUGH forwards raw protocol bytes with coordinate translation
+    /// (fastest, requires same protocol support on the host terminal).
+    /// SERVER decodes images to pixel buffers on the server side.
+    /// CLIENT sends raw bytes for the client to decode and re-encode.
     pub decode_mode: ImageDecodeMode,
-    /// Maximum image payload size in bytes per image.
+    /// Maximum image payload size in bytes per image.  Images exceeding
+    /// this limit are silently discarded to prevent memory exhaustion.
     pub max_image_bytes: u64,
-    /// Maximum number of images kept per pane.
+    /// Maximum number of images kept in the registry per pane.  When this
+    /// limit is reached, the oldest images are evicted (FIFO).
     pub max_images_per_pane: u32,
 }
 
@@ -632,20 +640,25 @@ pub enum ImageDecodeMode {
 #[config_doc(section = "behavior.compression")]
 #[serde(default)]
 pub struct CompressionConfig {
-    /// Master switch for all compression.  When false, no compression is
-    /// applied anywhere.
+    /// Master switch for all compression.  When false, image payloads are
+    /// sent uncompressed and remote connections are not wrapped in streaming
+    /// compression.
     pub enabled: bool,
     /// Compress image payloads (Sixel, Kitty graphics, iTerm2) before IPC
     /// transport.  Typical reduction: 5-15x for sixel text, 3-20x for kitty
-    /// raw pixels.  `auto` selects zstd when available.
+    /// raw pixels.  Pre-compressed formats (e.g. kitty PNG) are automatically
+    /// detected and skipped.  `auto` selects zstd when available.
     pub images: CompressionMode,
-    /// Compress remote connections (TLS gateway, Iroh P2P).  Local Unix
-    /// socket connections are never compressed.  `auto` selects zstd
-    /// streaming for remote connections.
+    /// Compress remote connections (TLS gateway, Iroh P2P) with streaming
+    /// compression.  Local Unix socket connections are never compressed.
+    /// Both the client and the server gateway must use the same setting;
+    /// a mismatch will cause the connection to fail.  If SSH is already
+    /// compressing the tunnel, set this to `none` to avoid double work.
     pub remote: CompressionMode,
-    /// Compression level (1-19 for zstd, ignored for lz4).  Lower values
-    /// are faster, higher values produce smaller output.  Default balances
-    /// ratio and speed for image data.
+    /// Zstd compression level for image payloads (1-19, ignored for lz4).
+    /// Level 1 is fastest (~500 MB/s), level 3 (default) balances speed and
+    /// ratio, level 9+ gives diminishing returns.  Remote streaming always
+    /// uses level 1 internally for low latency regardless of this setting.
     pub level: i32,
 }
 
