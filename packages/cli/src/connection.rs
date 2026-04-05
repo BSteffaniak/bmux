@@ -967,7 +967,7 @@ mod tests {
             .await
             .expect("bind mock control plane");
         let address = listener.local_addr().expect("listener addr");
-        let control_plane_url = format!("http://{}", address);
+        let control_plane_url = format!("http://{address}");
         let _control_plane_guard = EnvVarGuard::set("BMUX_CONTROL_PLANE_URL", &control_plane_url);
 
         let (request_tx, request_rx) = oneshot::channel::<String>();

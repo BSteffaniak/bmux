@@ -514,7 +514,7 @@ mod tests {
 
     #[test]
     fn parse_simple_playbook() {
-        let input = r#"
+        let input = r"
 # A simple test playbook
 @viewport cols=120 rows=50
 @timeout 10000
@@ -525,7 +525,7 @@ send-keys keys='echo hello\r'
 wait-for pattern='hello' timeout=3000
 sleep ms=100
 snapshot id=final
-"#;
+";
         let (playbook, _includes) = parse_dsl(input).unwrap();
         assert_eq!(playbook.config.name.as_deref(), Some("test-playbook"));
         assert_eq!(playbook.config.viewport.cols, 120);

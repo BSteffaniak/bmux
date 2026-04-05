@@ -758,7 +758,7 @@ mod tests {
         bmux_ipc::encode(req).unwrap_or_default()
     }
 
-    /// Helper: encode a ResponsePayload as binary bytes.
+    /// Helper: encode a `ResponsePayload` as binary bytes.
     fn encode_response(resp: &bmux_ipc::ResponsePayload) -> Vec<u8> {
         bmux_ipc::encode(resp).unwrap_or_default()
     }

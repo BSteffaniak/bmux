@@ -541,16 +541,13 @@ fn scan_plugins_with_bundled_entry_fallback(
 
             if let Some(entry_path) = manifest
                 .resolve_entry_path(manifest_path.parent().unwrap_or_else(|| Path::new(".")))
+                && !entry_path.exists()
+                && let (Some(entry), Some(executable_dir)) =
+                    (manifest.entry.as_ref(), executable_dir.as_ref())
             {
-                if !entry_path.exists() {
-                    if let (Some(entry), Some(executable_dir)) =
-                        (manifest.entry.as_ref(), executable_dir.as_ref())
-                    {
-                        let candidate = executable_dir.join(entry);
-                        if candidate.exists() {
-                            manifest.entry = Some(candidate);
-                        }
-                    }
+                let candidate = executable_dir.join(entry);
+                if candidate.exists() {
+                    manifest.entry = Some(candidate);
                 }
             }
 

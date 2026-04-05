@@ -1765,6 +1765,7 @@ mod tests {
     // ── Level 1A: Exhaustive Request variant round-trips ─────────────────────
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn request_all_variants_roundtrip() {
         let id = Uuid::from_u128(1);
         let id2 = Uuid::from_u128(2);
@@ -2111,6 +2112,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn response_payload_all_variants_roundtrip() {
         let id = Uuid::from_u128(1);
         let id2 = Uuid::from_u128(2);

@@ -16,6 +16,8 @@ serde    = { workspace = true, features = ["derive", "std"] }
 uuid     = { workspace = true, features = ["std"] }
 
 [features]
+compression-lz4  = ["bmux_ipc/compression-lz4"]
+compression-zstd = ["bmux_ipc/compression-zstd"]
 default          = []
 fail-on-warnings = ["bmux_ipc/fail-on-warnings"]
 iterm2           = []

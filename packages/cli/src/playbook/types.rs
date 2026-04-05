@@ -635,7 +635,7 @@ mod tests {
         });
         match parsed {
             Action::SplitPane { direction, .. } => {
-                assert_eq!(direction, SplitDirection::Horizontal)
+                assert_eq!(direction, SplitDirection::Horizontal);
             }
             other => panic!("expected SplitPane, got {other:?}"),
         }

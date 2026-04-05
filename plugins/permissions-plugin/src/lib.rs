@@ -197,7 +197,7 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
                 .as_deref()
                 .map(parse_iterations)
                 .transpose()?
-                .unwrap_or(if watch { 0 } else { 1 });
+                .unwrap_or(usize::from(!watch));
 
             watch_hot_path_policy_decision(
                 context,

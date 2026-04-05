@@ -20,10 +20,11 @@ use crate::types::KeyStroke;
 #[must_use]
 pub fn encode_key(stroke: &KeyStroke, enhanced: bool) -> Option<Vec<u8>> {
     #[cfg(feature = "csi-u")]
-    if enhanced && needs_enhanced_encoding(stroke) {
-        if let Some(encoded) = csi_u::encode(stroke) {
-            return Some(encoded);
-        }
+    if enhanced
+        && needs_enhanced_encoding(stroke)
+        && let Some(encoded) = csi_u::encode(stroke)
+    {
+        return Some(encoded);
     }
 
     let _ = enhanced; // suppress unused warning when csi-u is disabled
@@ -35,7 +36,7 @@ pub fn encode_key(stroke: &KeyStroke, enhanced: bool) -> Option<Vec<u8>> {
 /// Returns true when the key has modifiers that legacy encoding would silently
 /// lose.
 #[cfg(feature = "csi-u")]
-fn needs_enhanced_encoding(stroke: &KeyStroke) -> bool {
+const fn needs_enhanced_encoding(stroke: &KeyStroke) -> bool {
     let mods = stroke.modifiers;
     if mods.is_empty() {
         return false;
@@ -57,16 +58,14 @@ fn needs_enhanced_encoding(stroke: &KeyStroke) -> bool {
             mods.ctrl || mods.alt || mods.super_key
         }
 
-        // Navigation: legacy has no modifier encoding at all.
+        // Navigation + F-keys: legacy has no modifier encoding at all.
         KeyCode::Home
         | KeyCode::End
         | KeyCode::PageUp
         | KeyCode::PageDown
         | KeyCode::Insert
-        | KeyCode::Delete => true,
-
-        // F-keys: legacy has no modifier encoding.
-        KeyCode::F(_) => true,
+        | KeyCode::Delete
+        | KeyCode::F(_) => true,
     }
 }
 

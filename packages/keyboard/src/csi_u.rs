@@ -64,20 +64,11 @@ pub const fn keycode_to_codepoint(key: KeyCode) -> Option<u32> {
         KeyCode::Backspace => Some(127),
         KeyCode::Escape => Some(27),
         KeyCode::Space => Some(32),
-        // Delete, Insert use legacy tilde encoding with modifier parameters.
-        KeyCode::Delete | KeyCode::Insert => None,
-        KeyCode::F(n) => {
-            // F1-F4 don't have stable CSI u codepoints in all implementations.
-            // F5+ use legacy encoding. For consistency, map F-keys to their
-            // unicode codepoints from the kitty spec.
-            match n {
-                1..=4 => None,  // Use legacy SS3 encoding
-                5..=12 => None, // Use legacy CSI ~ encoding
-                _ => None,
-            }
-        }
-        // These use legacy CSI encoding with modifier parameters instead.
-        KeyCode::Up
+        // These keys use legacy encoding (tilde, SS3, or CSI with modifier params).
+        KeyCode::Delete
+        | KeyCode::Insert
+        | KeyCode::F(_)
+        | KeyCode::Up
         | KeyCode::Down
         | KeyCode::Left
         | KeyCode::Right
@@ -97,7 +88,7 @@ pub const fn codepoint_to_keycode(cp: u32) -> Option<KeyCode> {
         127 => Some(KeyCode::Backspace),
         27 => Some(KeyCode::Escape),
         32 => Some(KeyCode::Space),
-        cp if cp > 0 && cp < 0x110000 => {
+        cp if cp > 0 && cp < 0x0011_0000 => {
             // Safety: we check the range is valid for char
             match char::from_u32(cp) {
                 Some(c) => Some(KeyCode::Char(c)),
@@ -177,13 +168,10 @@ fn encode_modified_fkey(n: u8, modifier: u8) -> Option<Vec<u8>> {
         _ => return None,
     };
 
-    if let Some(fb) = final_byte {
-        // F1-F4 with modifiers: ESC [ 1 ; <mod> <P|Q|R|S>
-        Some(format!("\x1b[1;{modifier}{}", fb as char).into_bytes())
-    } else {
-        // F5-F12: ESC [ <number> ; <mod> ~
-        Some(format!("\x1b[{number};{modifier}~").into_bytes())
-    }
+    Some(final_byte.map_or_else(
+        || format!("\x1b[{number};{modifier}~").into_bytes(),
+        |fb| format!("\x1b[1;{modifier}{}", fb as char).into_bytes(),
+    ))
 }
 
 /// Decode result from [`decode`].
@@ -299,7 +287,7 @@ pub fn decode(bytes: &[u8]) -> Option<DecodeResult> {
     None
 }
 
-fn tilde_number_to_keycode(number: u32) -> Option<KeyCode> {
+const fn tilde_number_to_keycode(number: u32) -> Option<KeyCode> {
     match number {
         2 => Some(KeyCode::Insert),
         3 => Some(KeyCode::Delete),
@@ -321,9 +309,8 @@ fn parse_params(bytes: &[u8]) -> Vec<u32> {
     if bytes.is_empty() {
         return Vec::new();
     }
-    let s = match std::str::from_utf8(bytes) {
-        Ok(s) => s,
-        Err(_) => return Vec::new(),
+    let Ok(s) = std::str::from_utf8(bytes) else {
+        return Vec::new();
     };
     s.split(';')
         .filter_map(|part| {

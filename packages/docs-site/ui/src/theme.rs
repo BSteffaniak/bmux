@@ -40,17 +40,17 @@ fn remap_color(color: &Color) -> Option<Color> {
 /// to dark-theme equivalents.
 pub fn apply_dark_theme(container: &mut Container) {
     // Remap background
-    if let Some(ref bg) = container.background {
-        if let Some(replacement) = remap_color(bg) {
-            container.background = Some(replacement);
-        }
+    if let Some(ref bg) = container.background
+        && let Some(replacement) = remap_color(bg)
+    {
+        container.background = Some(replacement);
     }
 
     // Remap text color
-    if let Some(ref c) = container.color {
-        if let Some(replacement) = remap_color(c) {
-            container.color = Some(replacement);
-        }
+    if let Some(ref c) = container.color
+        && let Some(replacement) = remap_color(c)
+    {
+        container.color = Some(replacement);
     }
 
     // Recurse into children

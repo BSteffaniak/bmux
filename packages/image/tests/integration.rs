@@ -83,7 +83,7 @@ mod pipeline {
         let mut registry = ImageRegistry::new(2, 0);
 
         // Add 3 images (limit is 2, so first one gets evicted).
-        for i in 0..3 {
+        for _i in 0..3 {
             let input = b"\x1bPq~\x1b\\";
             let mut interceptor = ImageInterceptor::new();
             let result = interceptor.process(input);

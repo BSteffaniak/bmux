@@ -517,7 +517,7 @@ mod tests {
 
     #[test]
     fn hash_fnv1a_known_vector() {
-        assert_eq!(stable_fnv1a64(b"bmux"), 0xbb09969bbc2c17fd);
+        assert_eq!(stable_fnv1a64(b"bmux"), 0xbb09_969b_bc2c_17fd);
     }
 
     // -- resolve_first_existing (the old directory-level helper, kept for unit coverage) --
@@ -529,7 +529,7 @@ mod tests {
         let primary = tmp.join("primary");
         let fallback = tmp.join("fallback");
 
-        let result = resolve_first_existing(&[primary.clone(), fallback.clone()]);
+        let result = resolve_first_existing(&[primary.clone(), fallback]);
         assert_eq!(result, primary);
 
         let _ = std::fs::remove_dir_all(&tmp);

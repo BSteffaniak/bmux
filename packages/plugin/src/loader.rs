@@ -1650,6 +1650,7 @@ mod tests {
         0
     }
 
+    #[allow(clippy::too_many_lines)]
     unsafe extern "C" fn test_host_kernel_bridge(
         input_ptr: *const u8,
         input_len: usize,
@@ -1831,15 +1832,13 @@ mod tests {
                 message: "unsupported kernel request in test bridge".to_string(),
             }),
         };
-        let encoded_kernel_response = match bmux_ipc::encode(&kernel_response) {
-            Ok(payload) => payload,
-            Err(_) => return 1,
+        let Ok(encoded_kernel_response) = bmux_ipc::encode(&kernel_response) else {
+            return 1;
         };
-        let output_message = match encode_service_message(&super::HostKernelBridgeResponse {
+        let Ok(output_message) = encode_service_message(&super::HostKernelBridgeResponse {
             payload: encoded_kernel_response,
-        }) {
-            Ok(message) => message,
-            Err(_) => return 1,
+        }) else {
+            return 1;
         };
 
         let required_len = output_message.len();
@@ -2284,13 +2283,12 @@ minimum = "1.0"
             .expect("core session query should succeed");
         assert_eq!(response.sessions.len(), 1);
 
-        let requests = KERNEL_REQUESTS
+        let last_is_list_sessions = KERNEL_REQUESTS
             .lock()
-            .expect("kernel request log lock should succeed");
-        assert!(matches!(
-            requests.last(),
-            Some(bmux_ipc::Request::ListSessions)
-        ));
+            .expect("kernel request log lock should succeed")
+            .last()
+            .is_some_and(|r| matches!(r, bmux_ipc::Request::ListSessions));
+        assert!(last_is_list_sessions);
     }
 
     #[test]
@@ -2348,13 +2346,12 @@ minimum = "1.0"
             )
             .expect("core pane command should succeed");
 
-        let requests = KERNEL_REQUESTS
+        let last_is_split = KERNEL_REQUESTS
             .lock()
-            .expect("kernel request log lock should succeed");
-        assert!(matches!(
-            requests.last(),
-            Some(bmux_ipc::Request::SplitPane { .. })
-        ));
+            .expect("kernel request log lock should succeed")
+            .last()
+            .is_some_and(|r| matches!(r, bmux_ipc::Request::SplitPane { .. }));
+        assert!(last_is_split);
     }
 
     #[test]
@@ -2410,13 +2407,12 @@ minimum = "1.0"
             )
             .expect("core session command should succeed");
 
-        let requests = KERNEL_REQUESTS
+        let last_is_new_session = KERNEL_REQUESTS
             .lock()
-            .expect("kernel request log lock should succeed");
-        assert!(matches!(
-            requests.last(),
-            Some(bmux_ipc::Request::NewSession { .. })
-        ));
+            .expect("kernel request log lock should succeed")
+            .last()
+            .is_some_and(|r| matches!(r, bmux_ipc::Request::NewSession { .. }));
+        assert!(last_is_new_session);
     }
 
     #[test]
@@ -2480,19 +2476,21 @@ minimum = "1.0"
             ))
         );
 
-        let requests = KERNEL_REQUESTS
-            .lock()
-            .expect("kernel request log lock should succeed");
-        assert!(
-            requests
-                .iter()
-                .any(|request| matches!(request, bmux_ipc::Request::WhoAmI))
-        );
-        assert!(
-            requests
-                .iter()
-                .any(|request| matches!(request, bmux_ipc::Request::ListClients))
-        );
+        let (has_whoami, has_list_clients) = {
+            let requests = KERNEL_REQUESTS
+                .lock()
+                .expect("kernel request log lock should succeed");
+            (
+                requests
+                    .iter()
+                    .any(|r| matches!(r, bmux_ipc::Request::WhoAmI)),
+                requests
+                    .iter()
+                    .any(|r| matches!(r, bmux_ipc::Request::ListClients)),
+            )
+        };
+        assert!(has_whoami);
+        assert!(has_list_clients);
     }
 
     #[test]
@@ -2613,17 +2611,19 @@ minimum = "1.0"
         assert_eq!(response.session_id, target_session_id);
         assert_eq!(response.expires_at_epoch_ms, 42);
 
-        let requests = KERNEL_REQUESTS
+        let has_attach = KERNEL_REQUESTS
             .lock()
-            .expect("kernel request log lock should succeed");
-        assert!(requests.iter().any(|request| {
-            matches!(
-                request,
-                bmux_ipc::Request::Attach {
-                    selector: bmux_ipc::SessionSelector::ById(id)
-                } if *id == target_session_id
-            )
-        }));
+            .expect("kernel request log lock should succeed")
+            .iter()
+            .any(|request| {
+                matches!(
+                    request,
+                    bmux_ipc::Request::Attach {
+                        selector: bmux_ipc::SessionSelector::ById(id)
+                    } if *id == target_session_id
+                )
+            });
+        assert!(has_attach);
     }
 
     #[test]
@@ -2733,13 +2733,12 @@ minimum = "1.0"
             .expect("core pane query should succeed");
         assert_eq!(response.panes.len(), 1);
 
-        let requests = KERNEL_REQUESTS
+        let last_is_list_panes = KERNEL_REQUESTS
             .lock()
-            .expect("kernel request log lock should succeed");
-        assert!(matches!(
-            requests.last(),
-            Some(bmux_ipc::Request::ListPanes { .. })
-        ));
+            .expect("kernel request log lock should succeed")
+            .last()
+            .is_some_and(|r| matches!(r, bmux_ipc::Request::ListPanes { .. }));
+        assert!(last_is_list_panes);
     }
 
     #[test]
@@ -2824,24 +2823,25 @@ minimum = "1.0"
             )
             .expect("close command should succeed");
 
-        let requests = KERNEL_REQUESTS
-            .lock()
-            .expect("kernel request log lock should succeed");
-        assert!(
-            requests
-                .iter()
-                .any(|request| matches!(request, bmux_ipc::Request::FocusPane { .. }))
-        );
-        assert!(
-            requests
-                .iter()
-                .any(|request| matches!(request, bmux_ipc::Request::ResizePane { .. }))
-        );
-        assert!(
-            requests
-                .iter()
-                .any(|request| matches!(request, bmux_ipc::Request::ClosePane { .. }))
-        );
+        let (has_focus, has_resize, has_close) = {
+            let requests = KERNEL_REQUESTS
+                .lock()
+                .expect("kernel request log lock should succeed");
+            (
+                requests
+                    .iter()
+                    .any(|r| matches!(r, bmux_ipc::Request::FocusPane { .. })),
+                requests
+                    .iter()
+                    .any(|r| matches!(r, bmux_ipc::Request::ResizePane { .. })),
+                requests
+                    .iter()
+                    .any(|r| matches!(r, bmux_ipc::Request::ClosePane { .. })),
+            )
+        };
+        assert!(has_focus);
+        assert!(has_resize);
+        assert!(has_close);
     }
 
     #[test]

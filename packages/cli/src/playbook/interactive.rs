@@ -2600,47 +2600,6 @@ const fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn event_burst_regex_predicate_filters_pane_output() {
-        let mut watchpoints = WatchpointRegistry::default();
-        watchpoints.upsert_event_burst(EventBurstWatchpoint {
-            id: "pane-output-regex".to_string(),
-            event_type: "pane_output".to_string(),
-            pane_index: Some(1),
-            min_hits: 1,
-            window_ms: 500,
-            contains_regex_raw: Some("match_me_[0-9]+".to_string()),
-            contains_regex: Some(Regex::new("match_me_[0-9]+$").expect("valid regex")),
-        });
-
-        let no_match_hits = evaluate_watchpoints(
-            &mut watchpoints,
-            "pane_output",
-            Some(1),
-            Some(1),
-            None,
-            Some("no_match_here"),
-        );
-        assert!(no_match_hits.is_empty());
-
-        let match_hits = evaluate_watchpoints(
-            &mut watchpoints,
-            "pane_output",
-            Some(1),
-            Some(2),
-            None,
-            Some("match_me_123"),
-        );
-        assert_eq!(match_hits.len(), 1);
-        assert_eq!(match_hits[0].kind, "event_burst");
-        assert_eq!(match_hits[0].watch_event_type, "pane_output");
-    }
-}
-
 // ── Endpoint selection ────────────────────────────────────────────────────────
 
 /// Create a cross-platform IPC endpoint for the interactive session.
@@ -2718,5 +2677,46 @@ async fn server_event_poll_loop(
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn event_burst_regex_predicate_filters_pane_output() {
+        let mut watchpoints = WatchpointRegistry::default();
+        watchpoints.upsert_event_burst(EventBurstWatchpoint {
+            id: "pane-output-regex".to_string(),
+            event_type: "pane_output".to_string(),
+            pane_index: Some(1),
+            min_hits: 1,
+            window_ms: 500,
+            contains_regex_raw: Some("match_me_[0-9]+".to_string()),
+            contains_regex: Some(Regex::new("match_me_[0-9]+$").expect("valid regex")),
+        });
+
+        let no_match_hits = evaluate_watchpoints(
+            &mut watchpoints,
+            "pane_output",
+            Some(1),
+            Some(1),
+            None,
+            Some("no_match_here"),
+        );
+        assert!(no_match_hits.is_empty());
+
+        let match_hits = evaluate_watchpoints(
+            &mut watchpoints,
+            "pane_output",
+            Some(1),
+            Some(2),
+            None,
+            Some("match_me_123"),
+        );
+        assert_eq!(match_hits.len(), 1);
+        assert_eq!(match_hits[0].kind, "event_burst");
+        assert_eq!(match_hits[0].watch_event_type, "pane_output");
     }
 }

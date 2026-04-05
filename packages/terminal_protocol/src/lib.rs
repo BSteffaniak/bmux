@@ -167,24 +167,23 @@ impl TerminalProtocolEngine {
                     if byte.is_ascii_alphabetic() {
                         // First try kitty keyboard protocol sequences (state-changing).
                         #[cfg(feature = "kitty-keyboard")]
-                        if *byte == b'u' {
-                            if let Some((name, reply)) =
+                        if *byte == b'u'
+                            && let Some((name, reply)) =
                                 self.handle_kitty_keyboard_csi(&self.csi_buffer.clone())
-                            {
-                                self.trace_event(
-                                    "csi",
-                                    name,
-                                    ProtocolDirection::Query,
-                                    &self.csi_buffer,
-                                );
-                                if !reply.is_empty() {
-                                    self.trace_event("csi", name, ProtocolDirection::Reply, &reply);
-                                    replies.extend_from_slice(&reply);
-                                }
-                                self.state = ParseState::Ground;
-                                self.csi_buffer.clear();
-                                continue;
+                        {
+                            self.trace_event(
+                                "csi",
+                                name,
+                                ProtocolDirection::Query,
+                                &self.csi_buffer,
+                            );
+                            if !reply.is_empty() {
+                                self.trace_event("csi", name, ProtocolDirection::Reply, &reply);
+                                replies.extend_from_slice(&reply);
                             }
+                            self.state = ParseState::Ground;
+                            self.csi_buffer.clear();
+                            continue;
                         }
 
                         if let Some((name, reply)) =

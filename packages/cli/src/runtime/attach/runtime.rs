@@ -786,10 +786,7 @@ pub async fn run_session_attach_with_client(
                             .insert(delta.pane_id, delta.sequence);
                         // Apply delta incrementally: remove deleted images,
                         // then append newly added ones.
-                        let images = view_state
-                            .pane_images
-                            .entry(delta.pane_id)
-                            .or_insert_with(Vec::new);
+                        let images = view_state.pane_images.entry(delta.pane_id).or_default();
                         if !delta.removed.is_empty() {
                             images.retain(|img| !delta.removed.contains(&img.id));
                         }
@@ -2552,26 +2549,26 @@ pub async fn render_attach_frame(
             let Some(pane_id) = surface.pane_id else {
                 continue;
             };
-            if let Some(images) = view_state.pane_images.get(&pane_id) {
-                if !images.is_empty() {
-                    let pane_images: Vec<bmux_image::PaneImage> =
-                        images.iter().map(bmux_image::PaneImage::from).collect();
-                    let pane_rect = bmux_image::compositor::PaneRect {
-                        x: surface.rect.x,
-                        y: surface.rect.y,
-                        w: surface.rect.w,
-                        h: surface.rect.h,
-                    };
-                    let decode_mode = view_state.image_decode_mode;
-                    let _ = bmux_image::compositor::render_pane_images(
-                        &mut frame_bytes,
-                        &pane_images,
-                        pane_rect,
-                        &view_state.host_image_caps,
-                        decode_mode,
-                        &mut view_state.kitty_host_state,
-                    );
-                }
+            if let Some(images) = view_state.pane_images.get(&pane_id)
+                && !images.is_empty()
+            {
+                let pane_images: Vec<bmux_image::PaneImage> =
+                    images.iter().map(bmux_image::PaneImage::from).collect();
+                let pane_rect = bmux_image::compositor::PaneRect {
+                    x: surface.rect.x,
+                    y: surface.rect.y,
+                    w: surface.rect.w,
+                    h: surface.rect.h,
+                };
+                let decode_mode = view_state.image_decode_mode;
+                let _ = bmux_image::compositor::render_pane_images(
+                    &mut frame_bytes,
+                    &pane_images,
+                    pane_rect,
+                    &view_state.host_image_caps,
+                    decode_mode,
+                    &mut view_state.kitty_host_state,
+                );
             }
         }
     }
@@ -4815,32 +4812,17 @@ mod tests {
     use crate::input::InputProcessor;
     use crate::runtime::attach::render::append_pane_output;
     use crate::runtime::attach::state::{
-        AttachCursorState, AttachEventAction, AttachScrollbackCursor, AttachScrollbackPosition,
-        AttachUiMode, AttachViewState, PaneRenderBuffer,
+        AttachEventAction, AttachScrollbackCursor, AttachScrollbackPosition, AttachUiMode,
+        AttachViewState, PaneRenderBuffer,
     };
-    use crate::runtime::cli_parse::parse_runtime_cli_with_registry;
-    use crate::runtime::dispatch::built_in_handler_for_command;
-    use crate::runtime::logs_cli::{line_matches_since, parse_since_duration};
-    use crate::runtime::plugin_kernel::maybe_record_host_kernel_effect;
-    use crate::runtime::plugin_runtime::{
-        bundled_plugin_root, format_plugin_argument_validation_error,
-        format_plugin_command_run_error, format_plugin_not_enabled_message,
-        format_plugin_not_found_message, plugin_command_context, plugin_event_from_server_event,
-        plugin_lifecycle_context, unknown_external_command_message, validate_configured_plugins,
-    };
-    use crate::runtime::session_cli::format_destructive_op_error;
-    use crate::runtime::terminal_doctor::{
-        filter_trace_events, profile_for_term, protocol_profile_for_terminal_profile,
-        resolve_pane_term_with_checker,
-    };
-    use bmux_cli_schema::TraceFamily;
+
     use bmux_client::{AttachLayoutState, AttachOpenInfo};
     use bmux_config::{BmuxConfig, MouseClickPropagation, MouseWheelPropagation};
     use bmux_ipc::{
         AttachFocusTarget, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
         AttachViewComponent, PaneLayoutNode, PaneState, PaneSummary, SessionSummary,
     };
-    use bmux_plugin_sdk::PluginCommandEffect;
+
     use crossterm::event::{
         Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
         KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -5196,10 +5178,7 @@ mod tests {
     #[test]
     fn attach_layout_requires_snapshot_hydration_ignores_focus_only_scene_change() {
         let view_state = attach_view_state_with_scrollback_fixture();
-        let previous = view_state
-            .cached_layout_state
-            .clone()
-            .expect("layout state");
+        let previous = view_state.cached_layout_state.expect("layout state");
         let mut next = previous.clone();
         next.scene.surfaces[0].cursor_owner = false;
 
@@ -5210,10 +5189,7 @@ mod tests {
     #[test]
     fn attach_layout_requires_snapshot_hydration_on_layout_tree_change() {
         let view_state = attach_view_state_with_scrollback_fixture();
-        let previous = view_state
-            .cached_layout_state
-            .clone()
-            .expect("layout state");
+        let previous = view_state.cached_layout_state.expect("layout state");
         let existing_pane = previous.panes[0].id;
         let new_pane = Uuid::new_v4();
         let mut next = previous.clone();

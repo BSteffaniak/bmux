@@ -357,7 +357,7 @@ mod tests {
 
     #[test]
     fn decode_rejects_oversized_payload_len() {
-        let oversized = (MAX_FRAME_PAYLOAD_SIZE + 1) as u32;
+        let oversized = u32::try_from(MAX_FRAME_PAYLOAD_SIZE + 1).expect("fits in u32");
         let mut buffer = oversized.to_le_bytes().to_vec();
         buffer.extend_from_slice(&[1, 2, 3]);
 
@@ -424,7 +424,7 @@ mod tests {
     fn compressed_frame_rejects_unknown_compression_id() {
         // Build a valid-looking frame with an invalid compression byte.
         let payload = encode(&Request::Ping).expect("request should encode");
-        let total_len = (1 + payload.len()) as u32;
+        let total_len = u32::try_from(1 + payload.len()).expect("fits in u32");
         let mut frame = total_len.to_le_bytes().to_vec();
         frame.push(0xFF); // unknown compression id
         frame.extend_from_slice(&payload);

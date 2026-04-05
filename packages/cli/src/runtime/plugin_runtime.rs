@@ -1210,19 +1210,15 @@ mod tests {
     #[allow(clippy::wildcard_imports)]
     use super::*;
     use crate::runtime::attach::runtime::{
-        attach_scene_pane_at, describe_timeout, effective_attach_keybindings,
         plugin_fallback_new_context_id, plugin_fallback_retarget_context_id,
     };
     use crate::runtime::built_in_commands::BuiltInHandlerId;
     use crate::runtime::cli_parse::{ParsedRuntimeCli, parse_runtime_cli_with_registry};
     use crate::runtime::dispatch::built_in_handler_for_command;
-    use crate::runtime::logs_cli::{line_matches_since, parse_since_duration};
+
     use crate::runtime::plugin_kernel::maybe_record_host_kernel_effect;
     use crate::runtime::session_cli::format_destructive_op_error;
-    use crate::runtime::terminal_doctor::{
-        filter_trace_events, merged_runtime_keybindings, profile_for_term,
-        protocol_profile_for_terminal_profile, resolve_pane_term_with_checker,
-    };
+    use crate::runtime::terminal_doctor::{filter_trace_events, merged_runtime_keybindings};
     use crate::runtime::terminal_protocol::{ProtocolDirection, ProtocolTraceEvent};
     use bmux_cli_schema::{Command, TraceFamily};
     use bmux_client::ClientError;

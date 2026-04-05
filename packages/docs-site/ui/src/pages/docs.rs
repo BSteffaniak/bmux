@@ -146,15 +146,14 @@ fn extract_section(markdown: &str, start_heading: &str, end_prefix: Option<&str>
             start_idx = Some(i + 1);
             continue;
         }
-        if let Some(start) = start_idx {
-            if i > start {
-                if let Some(prefix) = end_prefix {
-                    if line.starts_with(prefix) && *line != start_heading {
-                        end_idx = i;
-                        break;
-                    }
-                }
-            }
+        if let Some(start) = start_idx
+            && i > start
+            && let Some(prefix) = end_prefix
+            && line.starts_with(prefix)
+            && *line != start_heading
+        {
+            end_idx = i;
+            break;
         }
     }
 
@@ -569,7 +568,7 @@ fn render_command(doc: &mut String, cmd: &clap::Command, path: &[&str], depth: u
 
             // Show value name for non-bool flags
             let num_vals = flag.get_num_args();
-            if num_vals.map_or(false, |r| r.min_values() > 0 || r.max_values() > 0) {
+            if num_vals.is_some_and(|r| r.min_values() > 0 || r.max_values() > 0) {
                 let val_names = flag.get_value_names().unwrap_or_default();
                 if !val_names.is_empty() {
                     let names = val_names
