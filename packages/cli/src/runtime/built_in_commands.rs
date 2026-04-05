@@ -1,5 +1,3 @@
-use std::collections::BTreeSet;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltInHandlerId {
     Setup,
@@ -118,10 +116,6 @@ impl BuiltInExecutionCommand {
             aliases: Vec::new(),
             summary,
         }
-    }
-
-    pub fn all_paths(&self) -> impl Iterator<Item = &Vec<String>> {
-        std::iter::once(&self.canonical_path).chain(self.aliases.iter())
     }
 }
 
@@ -616,14 +610,6 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
     ]
 }
 
-pub fn reserved_built_in_paths() -> BTreeSet<Vec<String>> {
-    built_in_execution_commands()
-        .into_iter()
-        .filter(|command| !matches!(command.handler, BuiltInHandlerId::Session))
-        .flat_map(|command| command.all_paths().cloned().collect::<Vec<_>>())
-        .collect()
-}
-
 pub fn built_in_command_by_handler(handler: BuiltInHandlerId) -> BuiltInExecutionCommand {
     built_in_execution_commands()
         .into_iter()
@@ -633,10 +619,26 @@ pub fn built_in_command_by_handler(handler: BuiltInHandlerId) -> BuiltInExecutio
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use super::{
-        BuiltInHandlerId, built_in_command_by_handler, built_in_execution_commands,
-        reserved_built_in_paths,
+        BuiltInExecutionCommand, BuiltInHandlerId, built_in_command_by_handler,
+        built_in_execution_commands,
     };
+
+    impl BuiltInExecutionCommand {
+        fn all_paths(&self) -> impl Iterator<Item = &Vec<String>> {
+            std::iter::once(&self.canonical_path).chain(self.aliases.iter())
+        }
+    }
+
+    fn reserved_built_in_paths() -> BTreeSet<Vec<String>> {
+        built_in_execution_commands()
+            .into_iter()
+            .filter(|command| !matches!(command.handler, BuiltInHandlerId::Session))
+            .flat_map(|command| command.all_paths().cloned().collect::<Vec<_>>())
+            .collect()
+    }
 
     #[test]
     fn reserved_paths_include_current_static_commands() {

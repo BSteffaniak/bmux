@@ -3,7 +3,7 @@ use bmux_cli_schema::{Cli, Command, ServerCommand, SessionCommand};
 use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::{RecordingRollingStartOptions, SessionSummary};
-use std::io::{self, IsTerminal, Read, Write};
+use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::process::{Command as ProcessCommand, Stdio};
 use std::time::{Duration, Instant};

@@ -16,7 +16,6 @@ use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, ConfigPaths};
 use bmux_ipc::{RecordingEventEnvelope, RecordingEventKind, RecordingStatus, RecordingSummary};
 use bmux_server::offline_kill_sessions;
-use clap::CommandFactory;
 use crossterm::terminal;
 use gif::{Encoder as GifEncoder, Frame as GifFrame, Repeat};
 use std::io::{self, BufWriter, IsTerminal, Write};

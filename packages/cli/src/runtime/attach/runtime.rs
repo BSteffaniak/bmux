@@ -139,10 +139,10 @@ impl DisplayCaptureFanout {
         }
     }
 
-    fn record_cursor_snapshot(&mut self, cursor_state: Option<super::state::AttachCursorState>) {
+    fn record_images(&mut self, images: &[bmux_ipc::AttachPaneImage]) {
         let mut failed = Vec::new();
         for (id, writer) in &mut self.writers {
-            if writer.record_cursor_snapshot(cursor_state).is_err() {
+            if writer.record_images(images).is_err() {
                 failed.push(*id);
             }
         }
@@ -151,10 +151,10 @@ impl DisplayCaptureFanout {
         }
     }
 
-    fn record_images(&mut self, images: &[bmux_ipc::AttachPaneImage]) {
+    fn record_cursor_snapshot(&mut self, cursor_state: Option<super::state::AttachCursorState>) {
         let mut failed = Vec::new();
         for (id, writer) in &mut self.writers {
-            if writer.record_images(images).is_err() {
+            if writer.record_cursor_snapshot(cursor_state).is_err() {
                 failed.push(*id);
             }
         }
@@ -2825,37 +2825,6 @@ pub fn set_attach_context_status(
 
 pub fn short_uuid(id: Uuid) -> String {
     id.to_string().chars().take(8).collect()
-}
-
-pub async fn resolve_follow_target_context(
-    client: &mut StreamingBmuxClient,
-    leader_client_id: Uuid,
-) -> std::result::Result<Uuid, ClientError> {
-    let clients = client.list_clients().await?;
-    let leader = clients
-        .into_iter()
-        .find(|entry| entry.id == leader_client_id)
-        .ok_or(ClientError::UnexpectedResponse("follow target not found"))?;
-
-    if let Some(context_id) = leader.selected_context_id {
-        return Ok(context_id);
-    }
-
-    if let Some(session_id) = leader.selected_session_id {
-        let contexts = client.list_contexts().await?;
-        if let Some(context) = contexts.into_iter().find(|context| {
-            context
-                .attributes
-                .get("bmux.session_id")
-                .is_some_and(|value| value == &session_id.to_string())
-        }) {
-            return Ok(context.id);
-        }
-    }
-
-    Err(ClientError::UnexpectedResponse(
-        "follow target has no selected context",
-    ))
 }
 
 pub async fn open_attach_for_session(

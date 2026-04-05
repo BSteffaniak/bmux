@@ -66,13 +66,6 @@ pub async fn connect_with_context(
     connect_for_active_target(client_name, context).await
 }
 
-pub async fn connect_if_running(
-    scope: ConnectionPolicyScope,
-    client_name: &'static str,
-) -> Result<Option<BmuxClient>> {
-    connect_if_running_with_context(scope, client_name, ConnectionContext::default()).await
-}
-
 pub async fn connect_if_running_with_context(
     scope: ConnectionPolicyScope,
     client_name: &'static str,
