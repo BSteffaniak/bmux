@@ -1,9 +1,12 @@
 [package]
 authors     = { workspace = true }
+categories  = ["development-tools"]
 description = "Proc macros for generating config documentation schema from bmux config types"
 edition     = { workspace = true }
+keywords    = ["bmux", "config", "derive", "documentation"]
 license     = { workspace = true }
 name        = "bmux_config_doc_derive"
+readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 

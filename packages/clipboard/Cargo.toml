@@ -6,6 +6,7 @@ edition     = { workspace = true }
 keywords    = ["bmux", "clipboard", "terminal"]
 license     = { workspace = true }
 name        = "bmux_clipboard"
+readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 

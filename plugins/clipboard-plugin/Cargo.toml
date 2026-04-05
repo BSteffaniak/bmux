@@ -1,10 +1,13 @@
 [package]
 authors     = { workspace = true }
+categories  = ["development-tools"]
 description = "Shipped clipboard plugin for bmux"
 edition     = { workspace = true }
+keywords    = ["bmux", "clipboard", "plugin"]
 license     = { workspace = true }
 name        = "bmux_clipboard_plugin"
 publish     = false
+readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 

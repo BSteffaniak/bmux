@@ -1,9 +1,12 @@
 [package]
 authors     = { workspace = true }
+categories  = ["development-tools"]
 description = "Bundled and preset font handling for bmux renderers"
 edition     = { workspace = true }
+keywords    = ["bmux", "fonts", "nerd-fonts", "terminal"]
 license     = { workspace = true }
 name        = "bmux_fonts"
+readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 

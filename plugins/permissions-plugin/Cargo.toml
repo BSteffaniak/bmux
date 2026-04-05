@@ -1,10 +1,13 @@
 [package]
 authors     = { workspace = true }
+categories  = ["development-tools"]
 description = "Shipped permissions plugin for bmux"
 edition     = { workspace = true }
+keywords    = ["bmux", "permissions", "plugin"]
 license     = { workspace = true }
 name        = "bmux_permissions_plugin"
 publish     = false
+readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 

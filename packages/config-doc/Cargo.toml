@@ -1,9 +1,12 @@
 [package]
 authors     = { workspace = true }
+categories  = ["development-tools"]
 description = "Types and trait for bmux configuration documentation schema"
 edition     = { workspace = true }
+keywords    = ["bmux", "config", "documentation", "schema"]
 license     = { workspace = true }
 name        = "bmux_config_doc"
+readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 

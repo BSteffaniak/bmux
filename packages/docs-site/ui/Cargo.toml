@@ -1,9 +1,12 @@
 [package]
 authors     = { workspace = true }
+categories  = ["web-programming"]
 description = "bmux documentation website UI components"
 edition     = { workspace = true }
+keywords    = ["bmux", "documentation", "ui"]
 license     = { workspace = true }
 name        = "bmux_docs_site_ui"
+readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 

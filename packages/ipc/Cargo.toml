@@ -6,6 +6,7 @@ edition     = { workspace = true }
 keywords    = ["bmux", "ipc", "multiplexer", "protocol", "terminal"]
 license     = { workspace = true }
 name        = "bmux_ipc"
+readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 

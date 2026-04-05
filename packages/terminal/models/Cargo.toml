@@ -6,6 +6,7 @@ edition     = { workspace = true }
 keywords    = ["models", "multiplexer", "pane", "terminal", "window"]
 license     = { workspace = true }
 name        = "bmux_terminal_models"
+readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 

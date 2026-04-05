@@ -1,10 +1,13 @@
 [package]
 authors     = { workspace = true }
+categories  = ["development-tools"]
 description = "Example native bmux plugin"
 edition     = { workspace = true }
+keywords    = ["bmux", "example", "native", "plugin"]
 license     = { workspace = true }
 name        = "bmux_example_native_plugin"
 publish     = false
+readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 

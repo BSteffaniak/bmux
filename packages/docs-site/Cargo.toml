@@ -1,10 +1,13 @@
 [package]
 authors     = { workspace = true }
 build       = "build.rs"
+categories  = ["web-programming"]
 description = "bmux documentation website"
 edition     = { workspace = true }
+keywords    = ["bmux", "documentation", "site"]
 license     = { workspace = true }
 name        = "bmux-docs-site"
+readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 

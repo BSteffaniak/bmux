@@ -6,6 +6,7 @@ edition     = { workspace = true }
 keywords    = ["bmux", "keybind", "modal", "terminal"]
 license     = { workspace = true }
 name        = "bmux_keybind"
+readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }
 
