@@ -221,21 +221,20 @@ pub(super) fn parse_pid_content(content: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     #[allow(clippy::wildcard_imports)]
-    use crate::runtime::*;
+    use super::*;
+    use crate::runtime::attach::runtime::describe_timeout;
+    use crate::runtime::server_commands::server_event_name;
     use bmux_config::ResolvedTimeout;
 
     #[test]
     fn describe_timeout_formats_resolved_timeout_states() {
+        assert_eq!(describe_timeout(&ResolvedTimeout::Indefinite), "indefinite");
         assert_eq!(
-            crate::runtime::describe_timeout(&ResolvedTimeout::Indefinite),
-            "indefinite"
-        );
-        assert_eq!(
-            crate::runtime::describe_timeout(&ResolvedTimeout::Exact(275)),
+            describe_timeout(&ResolvedTimeout::Exact(275)),
             "exact (275ms)"
         );
         assert_eq!(
-            crate::runtime::describe_timeout(&ResolvedTimeout::Profile {
+            describe_timeout(&ResolvedTimeout::Profile {
                 name: "traditional".to_string(),
                 ms: 450,
             }),
@@ -258,11 +257,11 @@ mod tests {
     #[test]
     fn server_event_name_maps_known_variants() {
         assert_eq!(
-            crate::runtime::server_event_name(&bmux_client::ServerEvent::ServerStarted),
+            server_event_name(&bmux_client::ServerEvent::ServerStarted),
             "server_started"
         );
         assert_eq!(
-            crate::runtime::server_event_name(&bmux_client::ServerEvent::ClientDetached {
+            server_event_name(&bmux_client::ServerEvent::ClientDetached {
                 id: uuid::Uuid::new_v4()
             }),
             "client_detached"

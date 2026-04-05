@@ -49,20 +49,12 @@ mod session_follow;
 mod terminal_doctor;
 mod terminal_protocol;
 
-#[cfg(test)]
-pub use self::logs_watch::{
-    LogFilterCaseMode, LogFilterKind, LogFilterRule, compile_filter_regex, line_visible_in_watch,
-    logs_watch_filter_rule_to_state, logs_watch_filter_state_to_rule, normalize_logs_watch_profile,
-};
 use self::logs_watch::{
     active_log_file_path, run_logs_profiles_delete, run_logs_profiles_list,
     run_logs_profiles_rename, run_logs_profiles_show, run_logs_watch,
 };
 use attach::runtime::run_session_attach_with_client;
-use attach::state::{
-    AttachEventAction, AttachExitReason, AttachScrollbackCursor, AttachScrollbackPosition,
-    AttachUiMode, AttachViewState, PaneRect,
-};
+use attach::state::AttachExitReason;
 use bootstrap::{
     DefaultAttachOptions, init_logging, map_attach_client_error, map_cli_client_error,
     run_default_server_attach, run_server_start, run_session_attach,
@@ -133,58 +125,6 @@ use terminal_doctor::{
 use terminal_protocol::{
     ProtocolDirection, ProtocolProfile, ProtocolTraceEvent, primary_da_for_profile,
     protocol_profile_name, secondary_da_for_profile, supported_query_names,
-};
-
-// Re-exports for test visibility: submodule items that test code accesses via
-// `crate::runtime::ItemName`. These are `use` (not `pub use`) so they're only
-// visible within the runtime module tree.
-#[cfg(test)]
-use attach::render::append_pane_output;
-#[cfg(test)]
-use attach::runtime::{
-    AttachKeybindingScope, AttachPaneMouseProtocol, ClosePaneConfirmationAction,
-    adjust_attach_scrollback_offset, adjust_help_overlay_scroll,
-    adjust_scrollback_cursor_component, apply_attach_view_change_components, attach_event_actions,
-    attach_exit_message, attach_key_event_actions, attach_keymap_from_config,
-    attach_layout_requires_snapshot_hydration, attach_mode_hint,
-    attach_mouse_forward_bytes_for_target, attach_pane_mouse_protocol, attach_scene_pane_at,
-    attach_scrollback_hint, begin_attach_selection, build_attach_help_lines,
-    cancel_close_pane_confirmation, clear_attach_selection, confirm_attach_scrollback,
-    describe_timeout, effective_attach_keybindings, encode_attach_mouse_for_protocol,
-    encode_attach_mouse_sgr, enter_attach_scrollback, filtered_attach_keybindings,
-    focused_attach_pane_id, handle_attach_mouse_scrollback, handle_help_overlay_key_event,
-    initial_attach_status, mouse_protocol_mode_reports_event,
-    move_attach_scrollback_cursor_horizontal, move_attach_scrollback_cursor_vertical,
-    plugin_fallback_new_context_id, plugin_fallback_retarget_context_id,
-    process_close_pane_confirmation, record_attach_mouse_event, relative_session_id,
-    resize_attach_parsers_for_scene_with_size, resolve_mouse_gesture_action, selected_attach_text,
-    should_forward_click_like_mouse,
-};
-#[cfg(test)]
-use bmux_cli_schema::TraceFamily;
-#[cfg(test)]
-use bmux_plugin_sdk::PluginCommandEffect;
-#[cfg(test)]
-use cli_parse::parse_runtime_cli_with_registry;
-#[cfg(test)]
-use dispatch::built_in_handler_for_command;
-#[cfg(test)]
-use logs_cli::{line_matches_since, parse_since_duration};
-#[cfg(test)]
-use plugin_kernel::maybe_record_host_kernel_effect;
-#[cfg(test)]
-use plugin_runtime::{
-    bundled_plugin_root, format_plugin_argument_validation_error, format_plugin_command_run_error,
-    format_plugin_not_enabled_message, format_plugin_not_found_message, plugin_command_context,
-    plugin_event_from_server_event, plugin_lifecycle_context, unknown_external_command_message,
-    validate_configured_plugins,
-};
-#[cfg(test)]
-use session_cli::format_destructive_op_error;
-#[cfg(test)]
-use terminal_doctor::{
-    filter_trace_events, profile_for_term, protocol_profile_for_terminal_profile,
-    resolve_pane_term_with_checker,
 };
 
 const SERVER_POLL_INTERVAL: Duration = Duration::from_millis(200);

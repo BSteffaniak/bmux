@@ -71,7 +71,7 @@ macro_rules! declare_bundled_plugins {
         manifest = $manifest:expr,
         plugin_type = $ty:ty;
     )*) => {
-        #[allow(unused_variables)]
+        #[allow(unused_variables, clippy::missing_const_for_fn)]
         fn register_static_bundled_plugins(registry: &mut PluginRegistry) {
             $(
                 #[cfg(feature = $feature)]
@@ -81,7 +81,7 @@ macro_rules! declare_bundled_plugins {
             )*
         }
 
-        #[allow(unused_variables)]
+        #[allow(unused_variables, clippy::missing_const_for_fn)]
         fn static_bundled_vtable(plugin_id: &str) -> Option<bmux_plugin_sdk::StaticPluginVtable> {
             $(
                 #[cfg(feature = $feature)]
@@ -1207,12 +1207,28 @@ mod tests {
     }
 
     #[allow(clippy::wildcard_imports)]
-    use crate::runtime::*;
-    use bmux_cli_schema::Command;
+    use super::*;
+    use crate::runtime::attach::runtime::{
+        attach_scene_pane_at, describe_timeout, effective_attach_keybindings,
+        plugin_fallback_new_context_id, plugin_fallback_retarget_context_id,
+    };
+    use crate::runtime::built_in_commands::BuiltInHandlerId;
+    use crate::runtime::cli_parse::{ParsedRuntimeCli, parse_runtime_cli_with_registry};
+    use crate::runtime::dispatch::built_in_handler_for_command;
+    use crate::runtime::logs_cli::{line_matches_since, parse_since_duration};
+    use crate::runtime::plugin_kernel::maybe_record_host_kernel_effect;
+    use crate::runtime::session_cli::format_destructive_op_error;
+    use crate::runtime::terminal_doctor::{
+        filter_trace_events, merged_runtime_keybindings, profile_for_term,
+        protocol_profile_for_terminal_profile, resolve_pane_term_with_checker,
+    };
+    use crate::runtime::terminal_protocol::{ProtocolDirection, ProtocolTraceEvent};
+    use bmux_cli_schema::{Command, TraceFamily};
     use bmux_client::ClientError;
     use bmux_config::{BmuxConfig, ConfigPaths};
     use bmux_ipc::ErrorCode;
     use bmux_plugin::{PluginManifest, PluginRegistry};
+    use bmux_plugin_sdk::PluginCommandEffect;
     use std::ffi::OsString;
     use std::fs;
     use uuid::Uuid;
@@ -1246,7 +1262,7 @@ mod tests {
         let mut config = BmuxConfig::default();
         config.plugins.enabled.push("example.plugin".to_string());
 
-        assert!(crate::runtime::validate_enabled_plugins(&config, &registry).is_ok());
+        assert!(validate_enabled_plugins(&config, &registry).is_ok());
     }
 
     #[test]
@@ -1279,7 +1295,7 @@ mod tests {
                 owner: None,
             });
 
-        let error = crate::runtime::validate_enabled_plugins(&config, &registry)
+        let error = validate_enabled_plugins(&config, &registry)
             .expect_err("required namespace claim should fail when unowned");
         assert!(
             error
@@ -1317,7 +1333,7 @@ mod tests {
                 owner: Some("third.party".to_string()),
             });
 
-        let error = crate::runtime::validate_enabled_plugins(&config, &registry)
+        let error = validate_enabled_plugins(&config, &registry)
             .expect_err("owner mismatch should fail startup validation");
         assert!(
             error
@@ -1328,7 +1344,7 @@ mod tests {
 
     #[test]
     fn effective_enabled_plugins_includes_bundled_plugins_by_default() {
-        let Some(bundled_root) = crate::runtime::bundled_plugin_root() else {
+        let Some(bundled_root) = bundled_plugin_root() else {
             return;
         };
         let dir = temp_dir();
@@ -1343,13 +1359,13 @@ mod tests {
             .expect("bundled plugin should register");
 
         let config = BmuxConfig::default();
-        let enabled = crate::runtime::effective_enabled_plugins(&config, &registry);
+        let enabled = effective_enabled_plugins(&config, &registry);
         assert!(enabled.iter().any(|plugin_id| plugin_id == "bmux.windows"));
     }
 
     #[test]
     fn effective_enabled_plugins_include_windows_and_permissions_by_default() {
-        let Some(bundled_root) = crate::runtime::bundled_plugin_root() else {
+        let Some(bundled_root) = bundled_plugin_root() else {
             return;
         };
         let dir = temp_dir();
@@ -1373,7 +1389,7 @@ mod tests {
             .expect("permissions plugin should register");
 
         let config = BmuxConfig::default();
-        let enabled = crate::runtime::effective_enabled_plugins(&config, &registry);
+        let enabled = effective_enabled_plugins(&config, &registry);
         assert!(enabled.iter().any(|plugin_id| plugin_id == "bmux.windows"));
         assert!(
             enabled
@@ -1384,7 +1400,7 @@ mod tests {
 
     #[test]
     fn effective_enabled_plugins_honors_disabled_overrides() {
-        let Some(bundled_root) = crate::runtime::bundled_plugin_root() else {
+        let Some(bundled_root) = bundled_plugin_root() else {
             return;
         };
         let dir = temp_dir();
@@ -1400,13 +1416,13 @@ mod tests {
 
         let mut config = BmuxConfig::default();
         config.plugins.disabled.push("bmux.windows".to_string());
-        let enabled = crate::runtime::effective_enabled_plugins(&config, &registry);
+        let enabled = effective_enabled_plugins(&config, &registry);
         assert!(!enabled.iter().any(|plugin_id| plugin_id == "bmux.windows"));
     }
 
     #[test]
     fn effective_enabled_plugins_skips_bundled_plugins_with_missing_entry() {
-        let Some(bundled_root) = crate::runtime::bundled_plugin_root() else {
+        let Some(bundled_root) = bundled_plugin_root() else {
             return;
         };
         let dir = temp_dir();
@@ -1420,7 +1436,7 @@ mod tests {
             .expect("bundled plugin should register");
 
         let config = BmuxConfig::default();
-        let enabled = crate::runtime::effective_enabled_plugins(&config, &registry);
+        let enabled = effective_enabled_plugins(&config, &registry);
         assert!(!enabled.iter().any(|plugin_id| plugin_id == "bmux.windows"));
     }
 
@@ -1458,7 +1474,7 @@ mod tests {
         config.plugins.enabled.push("provider.plugin".to_string());
         config.plugins.enabled.push("consumer.plugin".to_string());
 
-        assert!(crate::runtime::validate_enabled_plugins(&config, &registry).is_ok());
+        assert!(validate_enabled_plugins(&config, &registry).is_ok());
     }
 
     #[test]
@@ -1466,7 +1482,7 @@ mod tests {
         let mut config = BmuxConfig::default();
         config.plugins.enabled.push("missing.plugin".to_string());
 
-        let error = crate::runtime::validate_enabled_plugins(&config, &PluginRegistry::new())
+        let error = validate_enabled_plugins(&config, &PluginRegistry::new())
             .expect_err("validation should fail");
         assert!(error.to_string().contains("missing.plugin"));
     }
@@ -1492,7 +1508,7 @@ mod tests {
             dir.join("state"),
         );
 
-        assert!(crate::runtime::validate_configured_plugins(&config, &paths).is_ok());
+        assert!(validate_configured_plugins(&config, &paths).is_ok());
     }
 
     #[test]
@@ -1524,10 +1540,10 @@ mod tests {
             OsString::from("dev"),
         ];
 
-        let parsed = crate::runtime::parse_runtime_cli_with_registry(&argv, &config, &registry)
+        let parsed = parse_runtime_cli_with_registry(&argv, &config, &registry)
             .expect("runtime CLI should parse plugin alias under session namespace");
         match parsed {
-            crate::runtime::ParsedRuntimeCli::Plugin {
+            ParsedRuntimeCli::Plugin {
                 plugin_id,
                 command_name,
                 arguments,
@@ -1568,10 +1584,10 @@ mod tests {
             OsString::from("list"),
         ];
 
-        let parsed = crate::runtime::parse_runtime_cli_with_registry(&argv, &config, &registry)
+        let parsed = parse_runtime_cli_with_registry(&argv, &config, &registry)
             .expect("runtime CLI should parse plugin-owned plugin namespace command");
         match parsed {
-            crate::runtime::ParsedRuntimeCli::Plugin {
+            ParsedRuntimeCli::Plugin {
                 plugin_id,
                 command_name,
                 arguments,
@@ -1587,7 +1603,7 @@ mod tests {
 
     #[test]
     fn runtime_cli_parses_bundled_plugin_command_without_explicit_enable() {
-        let Some(bundled_root) = crate::runtime::bundled_plugin_root() else {
+        let Some(bundled_root) = bundled_plugin_root() else {
             return;
         };
         let dir = temp_dir();
@@ -1607,10 +1623,10 @@ mod tests {
 
         let config = BmuxConfig::default();
         let argv = vec![OsString::from("bmux"), OsString::from("new-window")];
-        let parsed = crate::runtime::parse_runtime_cli_with_registry(&argv, &config, &registry)
+        let parsed = parse_runtime_cli_with_registry(&argv, &config, &registry)
             .expect("runtime CLI should parse bundled plugin command");
         match parsed {
-            crate::runtime::ParsedRuntimeCli::Plugin { plugin_id, .. } => {
+            ParsedRuntimeCli::Plugin { plugin_id, .. } => {
                 assert_eq!(plugin_id, "bmux.windows");
             }
             other => panic!("expected plugin runtime parse, got {other:?}"),
@@ -1627,11 +1643,11 @@ mod tests {
             OsString::from("dev"),
         ];
 
-        let parsed = crate::runtime::parse_runtime_cli_with_registry(&argv, &config, &registry)
+        let parsed = parse_runtime_cli_with_registry(&argv, &config, &registry)
             .expect("runtime CLI should parse built-in attach command");
 
         match parsed {
-            crate::runtime::ParsedRuntimeCli::BuiltIn { cli, .. } => {
+            ParsedRuntimeCli::BuiltIn { cli, .. } => {
                 assert!(matches!(
                     cli.command,
                     Some(Command::Attach {
@@ -1697,11 +1713,11 @@ mod tests {
             dependencies: Vec::new(),
             lifecycle: bmux_plugin::PluginLifecycle::default(),
         };
-        let context = crate::runtime::plugin_lifecycle_context(
+        let context = plugin_lifecycle_context(
             &config,
             &paths,
             &declaration,
-            crate::runtime::service_descriptors_from_declarations([&declaration]),
+            service_descriptors_from_declarations([&declaration]),
             vec![
                 "bmux.commands".to_string(),
                 "example.provider.write".to_string(),
@@ -1865,13 +1881,13 @@ mod tests {
             lifecycle: bmux_plugin::PluginLifecycle::default(),
         };
 
-        let context = crate::runtime::plugin_command_context(
+        let context = plugin_command_context(
             &config,
             &paths,
             &declaration,
             "run-action",
             &["--name".to_string(), "editor".to_string()],
-            crate::runtime::service_descriptors_from_declarations([&declaration]),
+            service_descriptors_from_declarations([&declaration]),
             vec![
                 "bmux.commands".to_string(),
                 "example.base.read".to_string(),
@@ -1973,7 +1989,7 @@ mod tests {
 
     #[test]
     fn plugin_system_event_uses_system_kind_and_name() {
-        let event = crate::runtime::plugin_system_event("server_started");
+        let event = plugin_system_event("server_started");
         assert_eq!(event.kind, bmux_plugin_sdk::PluginEventKind::System);
         assert_eq!(event.name, "server_started");
         assert_eq!(
@@ -1988,12 +2004,10 @@ mod tests {
     #[test]
     fn plugin_event_from_server_event_maps_kind_and_payload() {
         let session_id = Uuid::from_u128(1);
-        let event = crate::runtime::plugin_event_from_server_event(
-            &bmux_client::ServerEvent::SessionCreated {
-                id: session_id,
-                name: Some("editor".to_string()),
-            },
-        )
+        let event = plugin_event_from_server_event(&bmux_client::ServerEvent::SessionCreated {
+            id: session_id,
+            name: Some("editor".to_string()),
+        })
         .expect("plugin event should build");
         let session_id_text = session_id.to_string();
         assert_eq!(event.kind, bmux_plugin_sdk::PluginEventKind::Session);
@@ -2008,8 +2022,8 @@ mod tests {
             force_local: false,
         };
         assert_eq!(
-            crate::runtime::built_in_handler_for_command(&command),
-            crate::runtime::BuiltInHandlerId::KillSession
+            built_in_handler_for_command(&command),
+            BuiltInHandlerId::KillSession
         );
     }
 
@@ -2080,7 +2094,7 @@ mod tests {
 
     #[test]
     fn destructive_op_error_formats_session_policy_guidance() {
-        let message = crate::runtime::format_destructive_op_error(
+        let message = format_destructive_op_error(
             "session",
             ClientError::ServerError {
                 code: ErrorCode::InvalidRequest,
@@ -2094,7 +2108,7 @@ mod tests {
 
     #[test]
     fn destructive_op_error_formats_force_local_guidance() {
-        let message = crate::runtime::format_destructive_op_error(
+        let message = format_destructive_op_error(
             "window",
             ClientError::ServerError {
                 code: ErrorCode::InvalidRequest,
@@ -2110,8 +2124,7 @@ mod tests {
     #[test]
     fn format_plugin_command_run_error_adds_policy_hint_when_denied() {
         let error = anyhow::anyhow!("session policy denied for this operation");
-        let message =
-            crate::runtime::format_plugin_command_run_error("bmux.windows", "kill", &error);
+        let message = format_plugin_command_run_error("bmux.windows", "kill", &error);
         assert!(message.contains("failed running plugin command 'bmux.windows:kill'"));
         assert!(message.contains("operation denied by an active policy provider"));
         assert!(message.contains("authorized principal"));
@@ -2120,25 +2133,22 @@ mod tests {
     #[test]
     fn format_plugin_command_run_error_keeps_generic_failures_without_hint() {
         let error = anyhow::anyhow!("unsupported service operation");
-        let message =
-            crate::runtime::format_plugin_command_run_error("bmux.permissions", "grant", &error);
+        let message = format_plugin_command_run_error("bmux.permissions", "grant", &error);
         assert!(message.contains("failed running plugin command 'bmux.permissions:grant'"));
         assert!(!message.contains("operation denied by session policy"));
     }
 
     #[test]
     fn unknown_external_command_message_points_to_plugin_list_help() {
-        let message = crate::runtime::unknown_external_command_message(&[
-            "session".to_string(),
-            "roles".to_string(),
-        ]);
+        let message =
+            unknown_external_command_message(&["session".to_string(), "roles".to_string()]);
         assert!(message.contains("unknown command 'session roles'"));
         assert!(message.contains("bmux plugin list"));
     }
 
     #[test]
     fn format_plugin_not_found_message_lists_available_plugins() {
-        let message = crate::runtime::format_plugin_not_found_message(
+        let message = format_plugin_not_found_message(
             "missing.plugin",
             &["bmux.windows".to_string(), "bmux.permissions".to_string()],
         );
@@ -2149,13 +2159,13 @@ mod tests {
     #[test]
     fn format_plugin_not_found_message_handles_empty_registry() {
         let empty: [&str; 0] = [];
-        let message = crate::runtime::format_plugin_not_found_message("missing.plugin", &empty);
+        let message = format_plugin_not_found_message("missing.plugin", &empty);
         assert_eq!(message, "plugin 'missing.plugin' was not found");
     }
 
     #[test]
     fn format_plugin_not_enabled_message_points_to_plugins_enabled() {
-        let message = crate::runtime::format_plugin_not_enabled_message("bmux.windows");
+        let message = format_plugin_not_enabled_message("bmux.windows");
         assert!(message.contains("plugin 'bmux.windows' is not enabled"));
         assert!(message.contains("plugins.disabled"));
         assert!(message.contains("plugins.enabled"));
@@ -2164,7 +2174,7 @@ mod tests {
     #[test]
     fn format_plugin_argument_validation_error_adds_help_hint_for_missing_required() {
         let error = anyhow::anyhow!("missing required option '--session'");
-        let message = crate::runtime::format_plugin_argument_validation_error(
+        let message = format_plugin_argument_validation_error(
             &["session".to_string(), "roles".to_string()],
             &error,
         );
@@ -2176,7 +2186,7 @@ mod tests {
     #[test]
     fn format_plugin_argument_validation_error_keeps_non_required_errors_without_hint() {
         let error = anyhow::anyhow!("unknown option '--wat'");
-        let message = crate::runtime::format_plugin_argument_validation_error(
+        let message = format_plugin_argument_validation_error(
             &["session".to_string(), "roles".to_string()],
             &error,
         );
@@ -2192,7 +2202,7 @@ mod tests {
         let attached = Some(Uuid::from_u128(1));
 
         assert_eq!(
-            crate::runtime::plugin_fallback_retarget_context_id(before, after, attached, false),
+            plugin_fallback_retarget_context_id(before, after, attached, false),
             after
         );
     }
@@ -2204,7 +2214,7 @@ mod tests {
         let attached = Some(Uuid::from_u128(2));
 
         assert_eq!(
-            crate::runtime::plugin_fallback_retarget_context_id(before, after, attached, true),
+            plugin_fallback_retarget_context_id(before, after, attached, true),
             None
         );
     }
@@ -2219,7 +2229,7 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
 
         assert_eq!(
-            crate::runtime::plugin_fallback_new_context_id(
+            plugin_fallback_new_context_id(
                 Some(&before),
                 Some(&after),
                 Some(Uuid::from_u128(1)),
@@ -2240,7 +2250,7 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
 
         assert_eq!(
-            crate::runtime::plugin_fallback_new_context_id(
+            plugin_fallback_new_context_id(
                 Some(&before),
                 Some(&after),
                 Some(Uuid::from_u128(1)),
@@ -2261,7 +2271,7 @@ mod tests {
             .collect::<std::collections::BTreeSet<_>>();
 
         assert_eq!(
-            crate::runtime::plugin_fallback_new_context_id(
+            plugin_fallback_new_context_id(
                 Some(&before),
                 Some(&after),
                 Some(Uuid::from_u128(1)),
@@ -2274,9 +2284,9 @@ mod tests {
 
     #[test]
     fn host_kernel_effect_capture_records_select_context_from_select_response() {
-        crate::runtime::begin_host_kernel_effect_capture();
+        begin_host_kernel_effect_capture();
         let context_id = Uuid::from_u128(42);
-        crate::runtime::maybe_record_host_kernel_effect(
+        maybe_record_host_kernel_effect(
             &bmux_ipc::Request::SelectContext {
                 selector: bmux_ipc::ContextSelector::ById(context_id),
             },
@@ -2288,7 +2298,7 @@ mod tests {
                 },
             }),
         );
-        let captured = crate::runtime::finish_host_kernel_effect_capture();
+        let captured = finish_host_kernel_effect_capture();
         assert_eq!(
             captured,
             vec![PluginCommandEffect::SelectContext { context_id }]
@@ -2297,14 +2307,14 @@ mod tests {
 
     #[test]
     fn host_kernel_effect_capture_ignores_non_context_responses() {
-        crate::runtime::begin_host_kernel_effect_capture();
-        crate::runtime::maybe_record_host_kernel_effect(
+        begin_host_kernel_effect_capture();
+        maybe_record_host_kernel_effect(
             &bmux_ipc::Request::ListSessions,
             &bmux_ipc::Response::Ok(bmux_ipc::ResponsePayload::SessionList {
                 sessions: Vec::new(),
             }),
         );
-        let captured = crate::runtime::finish_host_kernel_effect_capture();
+        let captured = finish_host_kernel_effect_capture();
         assert!(captured.is_empty());
     }
 }

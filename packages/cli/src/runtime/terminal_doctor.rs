@@ -671,7 +671,7 @@ pub(super) fn run_keymap_doctor(as_json: bool) -> Result<u8> {
 #[cfg(test)]
 mod tests {
     #[allow(clippy::wildcard_imports)]
-    use crate::runtime::*;
+    use super::*;
 
     #[test]
     fn pane_term_profile_mapping_is_stable() {
@@ -740,19 +740,19 @@ mod tests {
     fn protocol_profile_mapping_is_stable() {
         assert_eq!(
             protocol_profile_for_terminal_profile(TerminalProfile::Bmux256Color),
-            crate::runtime::ProtocolProfile::Bmux
+            ProtocolProfile::Bmux
         );
         assert_eq!(
             protocol_profile_for_terminal_profile(TerminalProfile::Xterm256Color),
-            crate::runtime::ProtocolProfile::Xterm
+            ProtocolProfile::Xterm
         );
         assert_eq!(
             protocol_profile_for_terminal_profile(TerminalProfile::Screen256Color),
-            crate::runtime::ProtocolProfile::Screen
+            ProtocolProfile::Screen
         );
         assert_eq!(
             protocol_profile_for_terminal_profile(TerminalProfile::Conservative),
-            crate::runtime::ProtocolProfile::Conservative
+            ProtocolProfile::Conservative
         );
     }
 }

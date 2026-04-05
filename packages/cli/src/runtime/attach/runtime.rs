@@ -139,10 +139,7 @@ impl DisplayCaptureFanout {
         }
     }
 
-    fn record_cursor_snapshot(
-        &mut self,
-        cursor_state: Option<crate::runtime::attach::state::AttachCursorState>,
-    ) {
+    fn record_cursor_snapshot(&mut self, cursor_state: Option<super::state::AttachCursorState>) {
         let mut failed = Vec::new();
         for (id, writer) in &mut self.writers {
             if writer.record_cursor_snapshot(cursor_state).is_err() {
@@ -4853,16 +4850,37 @@ pub fn is_attach_active_pane_closed_error(error: &ClientError) -> bool {
 }
 #[cfg(test)]
 mod tests {
-    use crate::input::InputProcessor;
-    use crate::runtime::attach::state::AttachViewState;
     #[allow(clippy::wildcard_imports)]
-    use crate::runtime::*;
+    use super::*;
+    use crate::input::InputProcessor;
+    use crate::runtime::attach::render::append_pane_output;
+    use crate::runtime::attach::state::{
+        AttachCursorState, AttachEventAction, AttachScrollbackCursor, AttachScrollbackPosition,
+        AttachUiMode, AttachViewState, PaneRenderBuffer,
+    };
+    use crate::runtime::cli_parse::parse_runtime_cli_with_registry;
+    use crate::runtime::dispatch::built_in_handler_for_command;
+    use crate::runtime::logs_cli::{line_matches_since, parse_since_duration};
+    use crate::runtime::plugin_kernel::maybe_record_host_kernel_effect;
+    use crate::runtime::plugin_runtime::{
+        bundled_plugin_root, format_plugin_argument_validation_error,
+        format_plugin_command_run_error, format_plugin_not_enabled_message,
+        format_plugin_not_found_message, plugin_command_context, plugin_event_from_server_event,
+        plugin_lifecycle_context, unknown_external_command_message, validate_configured_plugins,
+    };
+    use crate::runtime::session_cli::format_destructive_op_error;
+    use crate::runtime::terminal_doctor::{
+        filter_trace_events, profile_for_term, protocol_profile_for_terminal_profile,
+        resolve_pane_term_with_checker,
+    };
+    use bmux_cli_schema::TraceFamily;
     use bmux_client::{AttachLayoutState, AttachOpenInfo};
     use bmux_config::{BmuxConfig, MouseClickPropagation, MouseWheelPropagation};
     use bmux_ipc::{
         AttachFocusTarget, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
         AttachViewComponent, PaneLayoutNode, PaneState, PaneSummary, SessionSummary,
     };
+    use bmux_plugin_sdk::PluginCommandEffect;
     use crossterm::event::{
         Event as CrosstermEvent, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent,
         KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseButton, MouseEvent,
@@ -4915,14 +4933,15 @@ mod tests {
             },
             zoomed: false,
         });
-        let buffer = view_state.pane_buffers.entry(pane_id).or_insert_with(|| {
-            crate::runtime::attach::state::PaneRenderBuffer {
+        let buffer = view_state
+            .pane_buffers
+            .entry(pane_id)
+            .or_insert_with(|| PaneRenderBuffer {
                 parser: vt100::Parser::new(4, 20, 4_096),
                 last_alternate_screen: false,
                 prev_rows: Vec::new(),
                 sync_update_in_progress: false,
-            }
-        });
+            });
         append_pane_output(buffer, b"one\r\n  four\r\n     five\r\n  six\r\n\x1b[4;3H");
         view_state
     }
@@ -5005,72 +5024,65 @@ mod tests {
     fn attach_key_event_action_detaches_on_prefix_d() {
         let mut processor =
             InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
-        let _ = crate::runtime::attach_key_event_actions(
+        let _ = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('a'),
                 KeyModifiers::CONTROL,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
 
-        let actions = crate::runtime::attach_key_event_actions(
+        let actions = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('d'),
                 KeyModifiers::NONE,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         assert_eq!(actions.len(), 1);
-        assert!(matches!(
-            actions[0],
-            crate::runtime::AttachEventAction::Detach
-        ));
+        assert!(matches!(actions[0], AttachEventAction::Detach));
     }
 
     #[test]
     fn attach_key_event_action_ctrl_d_forwards_to_pane() {
         let mut processor =
             InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
-        let actions = crate::runtime::attach_key_event_actions(
+        let actions = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('d'),
                 KeyModifiers::CONTROL,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         assert_eq!(actions.len(), 1);
-        assert!(
-            matches!(actions[0], crate::runtime::AttachEventAction::Send(ref bytes) if bytes == &[0x04])
-        );
+        assert!(matches!(actions[0], AttachEventAction::Send(ref bytes) if bytes == &[0x04]));
     }
 
     #[test]
     fn attach_key_event_action_encodes_char_input() {
         let mut processor =
             InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
-        let actions = crate::runtime::attach_key_event_actions(
+        let actions = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('x'),
                 KeyModifiers::NONE,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         assert_eq!(actions.len(), 1);
-        assert!(
-            matches!(actions[0], crate::runtime::AttachEventAction::Send(ref bytes) if bytes == b"x")
-        );
+        assert!(matches!(actions[0], AttachEventAction::Send(ref bytes) if bytes == b"x"));
     }
 
     #[test]
@@ -5084,16 +5096,12 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
 
-        let actions = crate::runtime::attach_event_actions(
-            &event,
-            &mut processor,
-            crate::runtime::AttachUiMode::Normal,
-        )
-        .expect("mouse event should map");
+        let actions = attach_event_actions(&event, &mut processor, AttachUiMode::Normal)
+            .expect("mouse event should map");
 
         assert!(matches!(
             actions.first(),
-            Some(crate::runtime::AttachEventAction::Mouse(mouse)) if mouse.column == 12 && mouse.row == 8
+            Some(AttachEventAction::Mouse(mouse)) if mouse.column == 12 && mouse.row == 8
         ));
     }
 
@@ -5111,7 +5119,7 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
 
-        crate::runtime::record_attach_mouse_event(event, &mut view_state);
+        record_attach_mouse_event(event, &mut view_state);
 
         assert_eq!(view_state.mouse.last_position, Some((3, 4)));
         assert!(view_state.mouse.last_event_at.is_some());
@@ -5119,7 +5127,7 @@ mod tests {
 
     #[test]
     fn encode_attach_mouse_sgr_encodes_button_down() {
-        let encoded = crate::runtime::encode_attach_mouse_sgr(MouseEvent {
+        let encoded = encode_attach_mouse_sgr(MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
             column: 2,
             row: 4,
@@ -5132,7 +5140,7 @@ mod tests {
 
     #[test]
     fn encode_attach_mouse_sgr_encodes_release_with_modifier_bits() {
-        let encoded = crate::runtime::encode_attach_mouse_sgr(MouseEvent {
+        let encoded = encode_attach_mouse_sgr(MouseEvent {
             kind: MouseEventKind::Up(MouseButton::Right),
             column: 0,
             row: 0,
@@ -5145,14 +5153,14 @@ mod tests {
 
     #[test]
     fn encode_attach_mouse_sgr_encodes_scroll_and_move_events() {
-        let scroll = crate::runtime::encode_attach_mouse_sgr(MouseEvent {
+        let scroll = encode_attach_mouse_sgr(MouseEvent {
             kind: MouseEventKind::ScrollDown,
             column: 10,
             row: 1,
             modifiers: KeyModifiers::SHIFT,
         })
         .expect("scroll should encode");
-        let moved = crate::runtime::encode_attach_mouse_sgr(MouseEvent {
+        let moved = encode_attach_mouse_sgr(MouseEvent {
             kind: MouseEventKind::Moved,
             column: 10,
             row: 1,
@@ -5169,9 +5177,7 @@ mod tests {
         let mut view_state = attach_view_state_with_scrollback_fixture();
         view_state.mouse.config.click_propagation = MouseClickPropagation::FocusOnly;
 
-        assert!(!crate::runtime::should_forward_click_like_mouse(
-            &view_state
-        ));
+        assert!(!should_forward_click_like_mouse(&view_state));
     }
 
     #[test]
@@ -5179,7 +5185,7 @@ mod tests {
         let mut view_state = attach_view_state_with_scrollback_fixture();
         view_state.mouse.config.click_propagation = MouseClickPropagation::FocusAndForward;
 
-        assert!(crate::runtime::should_forward_click_like_mouse(&view_state));
+        assert!(should_forward_click_like_mouse(&view_state));
     }
 
     #[test]
@@ -5197,15 +5203,14 @@ mod tests {
     #[test]
     fn attach_pane_mouse_protocol_reads_parser_state() {
         let mut view_state = attach_view_state_with_scrollback_fixture();
-        let pane_id = crate::runtime::focused_attach_pane_id(&view_state).expect("focused pane id");
+        let pane_id = focused_attach_pane_id(&view_state).expect("focused pane id");
         let buffer = view_state
             .pane_buffers
             .get_mut(&pane_id)
             .expect("pane render buffer");
         append_pane_output(buffer, b"\x1b[?1000h\x1b[?1006h");
 
-        let protocol = crate::runtime::attach_pane_mouse_protocol(&view_state, pane_id)
-            .expect("pane protocol");
+        let protocol = attach_pane_mouse_protocol(&view_state, pane_id).expect("pane protocol");
         assert_eq!(protocol.mode, vt100::MouseProtocolMode::PressRelease);
         assert_eq!(protocol.encoding, vt100::MouseProtocolEncoding::Sgr);
     }
@@ -5213,7 +5218,7 @@ mod tests {
     #[test]
     fn attach_pane_mouse_protocol_uses_snapshot_hint_when_parser_mode_is_none() {
         let mut view_state = attach_view_state_with_scrollback_fixture();
-        let pane_id = crate::runtime::focused_attach_pane_id(&view_state).expect("focused pane id");
+        let pane_id = focused_attach_pane_id(&view_state).expect("focused pane id");
 
         view_state.pane_mouse_protocol_hints.insert(
             pane_id,
@@ -5223,8 +5228,7 @@ mod tests {
             },
         );
 
-        let protocol = crate::runtime::attach_pane_mouse_protocol(&view_state, pane_id)
-            .expect("pane protocol");
+        let protocol = attach_pane_mouse_protocol(&view_state, pane_id).expect("pane protocol");
         assert_eq!(protocol.mode, vt100::MouseProtocolMode::AnyMotion);
         assert_eq!(protocol.encoding, vt100::MouseProtocolEncoding::Sgr);
     }
@@ -5240,9 +5244,7 @@ mod tests {
         next.scene.surfaces[0].cursor_owner = false;
 
         assert_ne!(previous.scene, next.scene);
-        assert!(!crate::runtime::attach_layout_requires_snapshot_hydration(
-            &previous, &next
-        ));
+        assert!(!attach_layout_requires_snapshot_hydration(&previous, &next));
     }
 
     #[test]
@@ -5272,21 +5274,19 @@ mod tests {
             second: Box::new(PaneLayoutNode::Leaf { pane_id: new_pane }),
         };
 
-        assert!(crate::runtime::attach_layout_requires_snapshot_hydration(
-            &previous, &next
-        ));
+        assert!(attach_layout_requires_snapshot_hydration(&previous, &next));
     }
 
     #[test]
     fn encode_attach_mouse_for_protocol_skips_when_mode_is_disabled() {
-        let encoded = crate::runtime::encode_attach_mouse_for_protocol(
+        let encoded = encode_attach_mouse_for_protocol(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: 1,
                 row: 1,
                 modifiers: KeyModifiers::NONE,
             },
-            crate::runtime::AttachPaneMouseProtocol {
+            AttachPaneMouseProtocol {
                 mode: vt100::MouseProtocolMode::None,
                 encoding: vt100::MouseProtocolEncoding::Sgr,
             },
@@ -5296,11 +5296,11 @@ mod tests {
 
     #[test]
     fn mouse_protocol_mode_reports_event_rejects_move_without_any_motion_mode() {
-        assert!(!crate::runtime::mouse_protocol_mode_reports_event(
+        assert!(!mouse_protocol_mode_reports_event(
             vt100::MouseProtocolMode::PressRelease,
             MouseEventKind::Moved,
         ));
-        assert!(crate::runtime::mouse_protocol_mode_reports_event(
+        assert!(mouse_protocol_mode_reports_event(
             vt100::MouseProtocolMode::AnyMotion,
             MouseEventKind::Moved,
         ));
@@ -5308,11 +5308,11 @@ mod tests {
 
     #[test]
     fn mouse_protocol_mode_reports_event_rejects_release_in_press_mode() {
-        assert!(!crate::runtime::mouse_protocol_mode_reports_event(
+        assert!(!mouse_protocol_mode_reports_event(
             vt100::MouseProtocolMode::Press,
             MouseEventKind::Up(MouseButton::Left),
         ));
-        assert!(crate::runtime::mouse_protocol_mode_reports_event(
+        assert!(mouse_protocol_mode_reports_event(
             vt100::MouseProtocolMode::Press,
             MouseEventKind::Down(MouseButton::Left),
         ));
@@ -5320,14 +5320,14 @@ mod tests {
 
     #[test]
     fn encode_attach_mouse_default_uses_csi_m_sequence() {
-        let encoded = crate::runtime::encode_attach_mouse_for_protocol(
+        let encoded = encode_attach_mouse_for_protocol(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: 0,
                 row: 0,
                 modifiers: KeyModifiers::NONE,
             },
-            crate::runtime::AttachPaneMouseProtocol {
+            AttachPaneMouseProtocol {
                 mode: vt100::MouseProtocolMode::PressRelease,
                 encoding: vt100::MouseProtocolEncoding::Default,
             },
@@ -5339,14 +5339,14 @@ mod tests {
 
     #[test]
     fn encode_attach_mouse_default_rejects_wide_coordinates() {
-        let encoded = crate::runtime::encode_attach_mouse_for_protocol(
+        let encoded = encode_attach_mouse_for_protocol(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: 223,
                 row: 0,
                 modifiers: KeyModifiers::NONE,
             },
-            crate::runtime::AttachPaneMouseProtocol {
+            AttachPaneMouseProtocol {
                 mode: vt100::MouseProtocolMode::PressRelease,
                 encoding: vt100::MouseProtocolEncoding::Default,
             },
@@ -5357,14 +5357,14 @@ mod tests {
 
     #[test]
     fn encode_attach_mouse_utf8_supports_wide_coordinates() {
-        let encoded = crate::runtime::encode_attach_mouse_for_protocol(
+        let encoded = encode_attach_mouse_for_protocol(
             MouseEvent {
                 kind: MouseEventKind::Down(MouseButton::Left),
                 column: 223,
                 row: 0,
                 modifiers: KeyModifiers::NONE,
             },
-            crate::runtime::AttachPaneMouseProtocol {
+            AttachPaneMouseProtocol {
                 mode: vt100::MouseProtocolMode::PressRelease,
                 encoding: vt100::MouseProtocolEncoding::Utf8,
             },
@@ -5386,26 +5386,21 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
 
-        let actions = crate::runtime::attach_event_actions(
-            &event,
-            &mut processor,
-            crate::runtime::AttachUiMode::Normal,
-        )
-        .expect("mouse event should map through attach loop");
+        let actions = attach_event_actions(&event, &mut processor, AttachUiMode::Normal)
+            .expect("mouse event should map through attach loop");
         let mouse_event = match actions.as_slice() {
-            [crate::runtime::AttachEventAction::Mouse(mouse)] => *mouse,
+            [AttachEventAction::Mouse(mouse)] => *mouse,
             _ => panic!("unexpected attach actions for mouse event"),
         };
 
-        let target_pane =
-            crate::runtime::attach_scene_pane_at(&view_state, mouse_event.column, mouse_event.row);
+        let target_pane = attach_scene_pane_at(&view_state, mouse_event.column, mouse_event.row);
         let focused_pane = view_state
             .cached_layout_state
             .as_ref()
             .map(|layout| layout.focused_pane_id);
         let in_focused_pane = target_pane.is_some() && target_pane == focused_pane;
 
-        let forwarded = crate::runtime::attach_mouse_forward_bytes_for_target(
+        let forwarded = attach_mouse_forward_bytes_for_target(
             &view_state,
             mouse_event,
             target_pane,
@@ -5416,14 +5411,14 @@ mod tests {
             "mouse move should not forward when pane mouse mode is disabled"
         );
 
-        let pane_id = crate::runtime::focused_attach_pane_id(&view_state).expect("focused pane id");
+        let pane_id = focused_attach_pane_id(&view_state).expect("focused pane id");
         let buffer = view_state
             .pane_buffers
             .get_mut(&pane_id)
             .expect("pane render buffer");
         append_pane_output(buffer, b"\x1b[?1003h\x1b[?1006h");
 
-        let forwarded = crate::runtime::attach_mouse_forward_bytes_for_target(
+        let forwarded = attach_mouse_forward_bytes_for_target(
             &view_state,
             mouse_event,
             target_pane,
@@ -5445,10 +5440,10 @@ mod tests {
             "plugin:bmux.windows:new-window".to_string(),
         );
 
-        let resolved = crate::runtime::resolve_mouse_gesture_action(&view_state, "click_left");
+        let resolved = resolve_mouse_gesture_action(&view_state, "click_left");
         assert!(matches!(
             resolved,
-            Some(crate::runtime::AttachEventAction::PluginCommand {
+            Some(AttachEventAction::PluginCommand {
                 plugin_id,
                 command_name,
                 args,
@@ -5519,18 +5514,12 @@ mod tests {
             zoomed: false,
         });
 
+        assert_eq!(attach_scene_pane_at(&view_state, 4, 4), Some(floating_pane));
         assert_eq!(
-            crate::runtime::attach_scene_pane_at(&view_state, 4, 4),
-            Some(floating_pane)
-        );
-        assert_eq!(
-            crate::runtime::attach_scene_pane_at(&view_state, 1, 1),
+            attach_scene_pane_at(&view_state, 1, 1),
             Some(background_pane)
         );
-        assert_eq!(
-            crate::runtime::attach_scene_pane_at(&view_state, 30, 30),
-            None
-        );
+        assert_eq!(attach_scene_pane_at(&view_state, 30, 30), None);
     }
 
     #[test]
@@ -5538,189 +5527,187 @@ mod tests {
         let mut processor =
             InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
 
-        let prefix = crate::runtime::attach_key_event_actions(
+        let prefix = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('a'),
                 KeyModifiers::CONTROL,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         assert!(prefix.is_empty());
 
-        let new_window = crate::runtime::attach_key_event_actions(
+        let new_window = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('c'),
                 KeyModifiers::NONE,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         assert!(matches!(
             new_window.first(),
-            Some(crate::runtime::AttachEventAction::PluginCommand { plugin_id, command_name, args })
+            Some(AttachEventAction::PluginCommand { plugin_id, command_name, args })
                 if plugin_id == "bmux.windows" && command_name == "new-window" && args.is_empty()
         ));
 
-        let _ = crate::runtime::attach_key_event_actions(
+        let _ = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('a'),
                 KeyModifiers::CONTROL,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
-        let next_window = crate::runtime::attach_key_event_actions(
+        let next_window = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('n'),
                 KeyModifiers::NONE,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         assert!(matches!(
             next_window.first(),
-            Some(crate::runtime::AttachEventAction::PluginCommand { plugin_id, command_name, args })
+            Some(AttachEventAction::PluginCommand { plugin_id, command_name, args })
                 if plugin_id == "bmux.windows" && command_name == "next-window" && args.is_empty()
         ));
 
-        let _ = crate::runtime::attach_key_event_actions(
+        let _ = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('a'),
                 KeyModifiers::CONTROL,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
-        let previous_window = crate::runtime::attach_key_event_actions(
+        let previous_window = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('p'),
                 KeyModifiers::NONE,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         assert!(matches!(
             previous_window.first(),
-            Some(crate::runtime::AttachEventAction::PluginCommand { plugin_id, command_name, args })
+            Some(AttachEventAction::PluginCommand { plugin_id, command_name, args })
                 if plugin_id == "bmux.windows" && command_name == "prev-window" && args.is_empty()
         ));
 
-        let _ = crate::runtime::attach_key_event_actions(
+        let _ = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('a'),
                 KeyModifiers::CONTROL,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
-        let last_window = crate::runtime::attach_key_event_actions(
+        let last_window = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('w'),
                 KeyModifiers::NONE,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         assert!(matches!(
             last_window.first(),
-            Some(crate::runtime::AttachEventAction::PluginCommand { plugin_id, command_name, args })
+            Some(AttachEventAction::PluginCommand { plugin_id, command_name, args })
                 if plugin_id == "bmux.windows" && command_name == "last-window" && args.is_empty()
         ));
 
-        let _ = crate::runtime::attach_key_event_actions(
+        let _ = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('a'),
                 KeyModifiers::CONTROL,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
-        let split_vertical = crate::runtime::attach_key_event_actions(
+        let split_vertical = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('%'),
                 KeyModifiers::NONE,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         assert!(matches!(
             split_vertical.first(),
-            Some(crate::runtime::AttachEventAction::Ui(
+            Some(AttachEventAction::Ui(
                 crate::input::RuntimeAction::SplitFocusedVertical
             ))
         ));
 
-        let _ = crate::runtime::attach_key_event_actions(
+        let _ = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('a'),
                 KeyModifiers::CONTROL,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
-        let quit = crate::runtime::attach_key_event_actions(
+        let quit = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('q'),
                 KeyModifiers::NONE,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         assert!(matches!(
             quit.first(),
-            Some(crate::runtime::AttachEventAction::Ui(
-                crate::input::RuntimeAction::Quit
-            ))
+            Some(AttachEventAction::Ui(crate::input::RuntimeAction::Quit))
         ));
 
-        let _ = crate::runtime::attach_key_event_actions(
+        let _ = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('a'),
                 KeyModifiers::CONTROL,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
-        let new_session = crate::runtime::attach_key_event_actions(
+        let new_session = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('C'),
                 KeyModifiers::SHIFT,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         assert!(matches!(
             new_session.first(),
-            Some(crate::runtime::AttachEventAction::Runtime(
+            Some(AttachEventAction::Runtime(
                 crate::input::RuntimeAction::NewSession
             ))
         ));
@@ -5730,20 +5717,20 @@ mod tests {
     fn attach_key_event_action_routes_ctrl_t_as_focus_prev_pane_by_default() {
         let mut processor =
             InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
-        let actions = crate::runtime::attach_key_event_actions(
+        let actions = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('t'),
                 KeyModifiers::CONTROL,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
 
         assert!(matches!(
             actions.first(),
-            Some(crate::runtime::AttachEventAction::Ui(
+            Some(AttachEventAction::Ui(
                 crate::input::RuntimeAction::FocusPrev
             ))
         ));
@@ -5754,19 +5741,19 @@ mod tests {
         let mut processor =
             InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
 
-        let normal_actions = crate::runtime::attach_key_event_actions(
+        let normal_actions = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('h'),
                 KeyModifiers::NONE,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         assert!(matches!(
             normal_actions.first(),
-            Some(crate::runtime::AttachEventAction::Send(bytes)) if bytes.as_slice() == b"h"
+            Some(AttachEventAction::Send(bytes)) if bytes.as_slice() == b"h"
         ));
 
         let _ = processor;
@@ -5781,20 +5768,20 @@ mod tests {
         );
         let mut processor = InputProcessor::new(attach_keymap_from_config(&config), false);
 
-        let actions = crate::runtime::attach_key_event_actions(
+        let actions = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('1'),
                 KeyModifiers::ALT,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         assert!(
             matches!(
                 actions.first(),
-                Some(crate::runtime::AttachEventAction::PluginCommand {
+                Some(AttachEventAction::PluginCommand {
                     plugin_id,
                     command_name,
                     args,
@@ -5811,30 +5798,30 @@ mod tests {
         let mut processor =
             InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
 
-        let _ = crate::runtime::attach_key_event_actions(
+        let _ = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('a'),
                 KeyModifiers::CONTROL,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
-        let actions = crate::runtime::attach_key_event_actions(
+        let actions = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('['),
                 KeyModifiers::NONE,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
 
         assert!(matches!(
             actions.first(),
-            Some(crate::runtime::AttachEventAction::Ui(
+            Some(AttachEventAction::Ui(
                 crate::input::RuntimeAction::EnterScrollMode
             ))
         ));
@@ -5845,19 +5832,19 @@ mod tests {
         let mut processor =
             InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
 
-        let actions = crate::runtime::attach_key_event_actions(
+        let actions = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('h'),
                 KeyModifiers::ALT,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         assert!(matches!(
             actions.first(),
-            Some(crate::runtime::AttachEventAction::Ui(
+            Some(AttachEventAction::Ui(
                 crate::input::RuntimeAction::FocusLeft
             ))
         ));
@@ -5868,19 +5855,19 @@ mod tests {
         let mut processor =
             InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);
 
-        let normal_actions = crate::runtime::attach_key_event_actions(
+        let normal_actions = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('n'),
                 KeyModifiers::NONE,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
         assert!(matches!(
             normal_actions.first(),
-            Some(crate::runtime::AttachEventAction::Send(bytes)) if bytes.as_slice() == b"n"
+            Some(AttachEventAction::Send(bytes)) if bytes.as_slice() == b"n"
         ));
     }
 
@@ -5893,20 +5880,20 @@ mod tests {
             .insert("ctrl+t".to_string(), "new_session".to_string());
 
         let mut processor = InputProcessor::new(attach_keymap_from_config(&config), false);
-        let actions = crate::runtime::attach_key_event_actions(
+        let actions = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('t'),
                 KeyModifiers::CONTROL,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
 
         assert!(matches!(
             actions.first(),
-            Some(crate::runtime::AttachEventAction::Runtime(
+            Some(AttachEventAction::Runtime(
                 crate::input::RuntimeAction::NewSession
             ))
         ));
@@ -5925,7 +5912,7 @@ mod tests {
             .insert("z".to_string(), "detach".to_string());
 
         let keymap = attach_keymap_from_config(&config);
-        let hint = crate::runtime::attach_mode_hint(crate::runtime::AttachUiMode::Normal, &keymap);
+        let hint = attach_mode_hint(AttachUiMode::Normal, &keymap);
         assert!(hint.contains("Ctrl-A z detach"));
         assert!(hint.contains("Ctrl-A d quit"));
     }
@@ -5947,7 +5934,7 @@ mod tests {
             .insert("q".to_string(), "quit".to_string());
 
         let keymap = attach_keymap_from_config(&config);
-        let hint = crate::runtime::attach_mode_hint(crate::runtime::AttachUiMode::Normal, &keymap);
+        let hint = attach_mode_hint(AttachUiMode::Normal, &keymap);
         assert!(hint.contains("Ctrl-A d quit") || hint.contains("q quit"));
         assert!(hint.contains("detach"));
     }
@@ -5970,82 +5957,70 @@ mod tests {
         ];
 
         assert_eq!(
-            crate::runtime::relative_session_id(&sessions, session_a, -1),
+            relative_session_id(&sessions, session_a, -1),
             Some(session_b)
         );
         assert_eq!(
-            crate::runtime::relative_session_id(&sessions, session_a, 1),
+            relative_session_id(&sessions, session_a, 1),
             Some(session_b)
         );
         assert_eq!(
-            crate::runtime::relative_session_id(&sessions, session_b, 1),
+            relative_session_id(&sessions, session_b, 1),
             Some(session_a)
         );
     }
 
     #[test]
     fn adjust_attach_scrollback_offset_clamps_within_bounds() {
-        assert_eq!(crate::runtime::adjust_attach_scrollback_offset(0, -1, 4), 1);
-        assert_eq!(
-            crate::runtime::adjust_attach_scrollback_offset(3, -10, 4),
-            4
-        );
-        assert_eq!(crate::runtime::adjust_attach_scrollback_offset(4, 1, 4), 3);
-        assert_eq!(crate::runtime::adjust_attach_scrollback_offset(1, 50, 4), 0);
+        assert_eq!(adjust_attach_scrollback_offset(0, -1, 4), 1);
+        assert_eq!(adjust_attach_scrollback_offset(3, -10, 4), 4);
+        assert_eq!(adjust_attach_scrollback_offset(4, 1, 4), 3);
+        assert_eq!(adjust_attach_scrollback_offset(1, 50, 4), 0);
     }
 
     #[test]
     fn adjust_scrollback_cursor_component_clamps_within_bounds() {
-        assert_eq!(
-            crate::runtime::adjust_scrollback_cursor_component(0, -1, 5),
-            0
-        );
-        assert_eq!(
-            crate::runtime::adjust_scrollback_cursor_component(2, -1, 5),
-            1
-        );
-        assert_eq!(
-            crate::runtime::adjust_scrollback_cursor_component(2, 10, 5),
-            5
-        );
+        assert_eq!(adjust_scrollback_cursor_component(0, -1, 5), 0);
+        assert_eq!(adjust_scrollback_cursor_component(2, -1, 5), 1);
+        assert_eq!(adjust_scrollback_cursor_component(2, 10, 5), 5);
     }
 
     #[test]
     fn enter_attach_scrollback_initializes_cursor_from_live_position() {
         let mut view_state = attach_view_state_with_scrollback_fixture();
 
-        assert!(crate::runtime::enter_attach_scrollback(&mut view_state));
+        assert!(enter_attach_scrollback(&mut view_state));
         assert!(view_state.scrollback_active);
         assert_eq!(view_state.scrollback_offset, 0);
         assert_eq!(
             view_state.scrollback_cursor,
-            Some(crate::runtime::attach::state::AttachScrollbackCursor { row: 3, col: 2 })
+            Some(AttachScrollbackCursor { row: 3, col: 2 })
         );
     }
 
     #[test]
     fn move_attach_scrollback_cursor_vertical_scrolls_at_viewport_edges() {
         let mut view_state = attach_view_state_with_scrollback_fixture();
-        assert!(crate::runtime::enter_attach_scrollback(&mut view_state));
+        assert!(enter_attach_scrollback(&mut view_state));
 
-        crate::runtime::move_attach_scrollback_cursor_vertical(&mut view_state, -1);
+        move_attach_scrollback_cursor_vertical(&mut view_state, -1);
         assert_eq!(
             view_state.scrollback_cursor,
-            Some(crate::runtime::attach::state::AttachScrollbackCursor { row: 2, col: 2 })
+            Some(AttachScrollbackCursor { row: 2, col: 2 })
         );
         assert_eq!(view_state.scrollback_offset, 0);
 
-        crate::runtime::move_attach_scrollback_cursor_vertical(&mut view_state, -3);
+        move_attach_scrollback_cursor_vertical(&mut view_state, -3);
         assert_eq!(
             view_state.scrollback_cursor,
-            Some(crate::runtime::attach::state::AttachScrollbackCursor { row: 0, col: 2 })
+            Some(AttachScrollbackCursor { row: 0, col: 2 })
         );
         assert_eq!(view_state.scrollback_offset, 1);
 
-        crate::runtime::move_attach_scrollback_cursor_vertical(&mut view_state, 1);
+        move_attach_scrollback_cursor_vertical(&mut view_state, 1);
         assert_eq!(
             view_state.scrollback_cursor,
-            Some(crate::runtime::attach::state::AttachScrollbackCursor { row: 1, col: 2 })
+            Some(AttachScrollbackCursor { row: 1, col: 2 })
         );
         assert_eq!(view_state.scrollback_offset, 1);
     }
@@ -6053,56 +6028,54 @@ mod tests {
     #[test]
     fn move_attach_scrollback_cursor_horizontal_updates_column() {
         let mut view_state = attach_view_state_with_scrollback_fixture();
-        assert!(crate::runtime::enter_attach_scrollback(&mut view_state));
+        assert!(enter_attach_scrollback(&mut view_state));
 
-        crate::runtime::move_attach_scrollback_cursor_horizontal(&mut view_state, 3);
+        move_attach_scrollback_cursor_horizontal(&mut view_state, 3);
         assert_eq!(
             view_state.scrollback_cursor,
-            Some(crate::runtime::attach::state::AttachScrollbackCursor { row: 3, col: 5 })
+            Some(AttachScrollbackCursor { row: 3, col: 5 })
         );
 
-        crate::runtime::move_attach_scrollback_cursor_horizontal(&mut view_state, -10);
+        move_attach_scrollback_cursor_horizontal(&mut view_state, -10);
         assert_eq!(
             view_state.scrollback_cursor,
-            Some(crate::runtime::attach::state::AttachScrollbackCursor { row: 3, col: 0 })
+            Some(AttachScrollbackCursor { row: 3, col: 0 })
         );
     }
 
     #[test]
     fn begin_attach_selection_uses_absolute_cursor_position() {
         let mut view_state = attach_view_state_with_scrollback_fixture();
-        assert!(crate::runtime::enter_attach_scrollback(&mut view_state));
+        assert!(enter_attach_scrollback(&mut view_state));
         view_state.scrollback_offset = 2;
 
-        assert!(crate::runtime::begin_attach_selection(&mut view_state));
+        assert!(begin_attach_selection(&mut view_state));
         assert_eq!(
             view_state.selection_anchor,
-            Some(crate::runtime::attach::state::AttachScrollbackPosition { row: 5, col: 2 })
+            Some(AttachScrollbackPosition { row: 5, col: 2 })
         );
     }
 
     #[test]
     fn clear_attach_selection_removes_anchor() {
         let mut view_state = attach_view_state_with_scrollback_fixture();
-        assert!(crate::runtime::enter_attach_scrollback(&mut view_state));
-        assert!(crate::runtime::begin_attach_selection(&mut view_state));
+        assert!(enter_attach_scrollback(&mut view_state));
+        assert!(begin_attach_selection(&mut view_state));
 
-        crate::runtime::clear_attach_selection(&mut view_state, false);
+        clear_attach_selection(&mut view_state, false);
         assert_eq!(view_state.selection_anchor, None);
     }
 
     #[test]
     fn selected_attach_text_extracts_multiline_range() {
         let mut view_state = attach_view_state_with_scrollback_fixture();
-        assert!(crate::runtime::enter_attach_scrollback(&mut view_state));
-        view_state.selection_anchor =
-            Some(crate::runtime::attach::state::AttachScrollbackPosition { row: 2, col: 2 });
-        view_state.scrollback_cursor =
-            Some(crate::runtime::attach::state::AttachScrollbackCursor { row: 3, col: 8 });
+        assert!(enter_attach_scrollback(&mut view_state));
+        view_state.selection_anchor = Some(AttachScrollbackPosition { row: 2, col: 2 });
+        view_state.scrollback_cursor = Some(AttachScrollbackCursor { row: 3, col: 8 });
         view_state.scrollback_offset = 0;
 
         assert_eq!(
-            crate::runtime::selected_attach_text(&mut view_state),
+            selected_attach_text(&mut view_state),
             Some("e\n  four".to_string())
         );
     }
@@ -6110,9 +6083,9 @@ mod tests {
     #[test]
     fn confirm_attach_scrollback_exits_when_no_selection() {
         let mut view_state = attach_view_state_with_scrollback_fixture();
-        assert!(crate::runtime::enter_attach_scrollback(&mut view_state));
+        assert!(enter_attach_scrollback(&mut view_state));
 
-        crate::runtime::confirm_attach_scrollback(&mut view_state);
+        confirm_attach_scrollback(&mut view_state);
         assert!(!view_state.scrollback_active);
     }
 
@@ -6122,7 +6095,7 @@ mod tests {
         view_state.mouse.config.scroll_lines_per_tick = 1;
         view_state.mouse.config.scroll_scrollback = true;
 
-        assert!(crate::runtime::handle_attach_mouse_scrollback(
+        assert!(handle_attach_mouse_scrollback(
             &mut view_state,
             MouseEventKind::ScrollUp,
         ));
@@ -6136,10 +6109,10 @@ mod tests {
         view_state.mouse.config.scroll_lines_per_tick = 1;
         view_state.mouse.config.scroll_scrollback = true;
         view_state.mouse.config.exit_scrollback_on_bottom = true;
-        assert!(crate::runtime::enter_attach_scrollback(&mut view_state));
+        assert!(enter_attach_scrollback(&mut view_state));
         view_state.scrollback_offset = 1;
 
-        assert!(crate::runtime::handle_attach_mouse_scrollback(
+        assert!(handle_attach_mouse_scrollback(
             &mut view_state,
             MouseEventKind::ScrollDown,
         ));
@@ -6150,7 +6123,7 @@ mod tests {
     #[test]
     fn attach_scrollback_hint_uses_default_bindings() {
         let keymap = attach_keymap_from_config(&BmuxConfig::default());
-        let hint = crate::runtime::attach_scrollback_hint(&keymap);
+        let hint = attach_scrollback_hint(&keymap);
 
         assert!(hint.contains("select"));
         assert!(hint.contains("copy"));
@@ -6161,80 +6134,77 @@ mod tests {
 
     #[test]
     fn attach_keybindings_keep_focus_next_pane_binding() {
-        let (runtime, _global, _scroll) =
-            crate::runtime::filtered_attach_keybindings(&BmuxConfig::default());
+        let (runtime, _global, _scroll) = filtered_attach_keybindings(&BmuxConfig::default());
         assert_eq!(runtime.get("o"), Some(&"focus_next_pane".to_string()));
     }
 
     #[test]
     fn attach_key_event_action_maps_show_help_to_ui() {
         let config = BmuxConfig::default();
-        let keymap = crate::runtime::attach_keymap_from_config(&config);
+        let keymap = attach_keymap_from_config(&config);
         let mut processor = InputProcessor::new(keymap, false);
 
-        let _ = crate::runtime::attach_key_event_actions(
+        let _ = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('a'),
                 KeyModifiers::CONTROL,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
 
-        let help_question = crate::runtime::attach_key_event_actions(
+        let help_question = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('?'),
                 KeyModifiers::NONE,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
 
-        let _ = crate::runtime::attach_key_event_actions(
+        let _ = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('a'),
                 KeyModifiers::CONTROL,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
 
-        let help_shift_slash = crate::runtime::attach_key_event_actions(
+        let help_shift_slash = attach_key_event_actions(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Char('/'),
                 KeyModifiers::SHIFT,
                 CrosstermKeyEventKind::Press,
             ),
             &mut processor,
-            crate::runtime::AttachUiMode::Normal,
+            AttachUiMode::Normal,
         )
         .expect("attach key action should parse");
 
         assert!(matches!(
             help_question.first().or_else(|| help_shift_slash.first()),
-            Some(crate::runtime::AttachEventAction::Ui(
-                crate::input::RuntimeAction::ShowHelp
-            ))
+            Some(AttachEventAction::Ui(crate::input::RuntimeAction::ShowHelp))
         ));
     }
 
     #[test]
     fn effective_attach_keybindings_include_scope_and_canonical_action_names() {
-        let entries = crate::runtime::effective_attach_keybindings(&BmuxConfig::default());
+        let entries = effective_attach_keybindings(&BmuxConfig::default());
         assert!(entries.iter().any(|entry| {
-            entry.scope == crate::runtime::AttachKeybindingScope::Runtime
+            entry.scope == AttachKeybindingScope::Runtime
                 && entry.chord == "o"
                 && entry.action_name == "focus_next_pane"
                 && entry.action == crate::input::RuntimeAction::FocusNext
         }));
         assert!(entries.iter().any(|entry| {
-            entry.scope == crate::runtime::AttachKeybindingScope::Global
+            entry.scope == AttachKeybindingScope::Global
                 && entry.chord == "alt+h"
                 && entry.action_name == "focus_left_pane"
                 && entry.action == crate::input::RuntimeAction::FocusLeft
@@ -6243,19 +6213,16 @@ mod tests {
 
     #[test]
     fn adjust_help_overlay_scroll_clamps_to_bounds() {
-        assert_eq!(crate::runtime::adjust_help_overlay_scroll(0, -10, 20, 5), 0);
-        assert_eq!(crate::runtime::adjust_help_overlay_scroll(0, 3, 20, 5), 3);
-        assert_eq!(
-            crate::runtime::adjust_help_overlay_scroll(17, 10, 20, 5),
-            15
-        );
-        assert_eq!(crate::runtime::adjust_help_overlay_scroll(4, -2, 20, 5), 2);
-        assert_eq!(crate::runtime::adjust_help_overlay_scroll(0, 4, 0, 5), 0);
+        assert_eq!(adjust_help_overlay_scroll(0, -10, 20, 5), 0);
+        assert_eq!(adjust_help_overlay_scroll(0, 3, 20, 5), 3);
+        assert_eq!(adjust_help_overlay_scroll(17, 10, 20, 5), 15);
+        assert_eq!(adjust_help_overlay_scroll(4, -2, 20, 5), 2);
+        assert_eq!(adjust_help_overlay_scroll(0, 4, 0, 5), 0);
     }
 
     #[test]
     fn help_overlay_repeat_navigation_is_handled() {
-        let mut view_state = crate::runtime::AttachViewState::new(bmux_client::AttachOpenInfo {
+        let mut view_state = AttachViewState::new(bmux_client::AttachOpenInfo {
             context_id: None,
             session_id: uuid::Uuid::new_v4(),
             can_write: true,
@@ -6265,7 +6232,7 @@ mod tests {
             .map(|idx| format!("line {idx}"))
             .collect::<Vec<_>>();
 
-        let handled = crate::runtime::handle_help_overlay_key_event(
+        let handled = handle_help_overlay_key_event(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Down,
                 KeyModifiers::NONE,
@@ -6280,7 +6247,7 @@ mod tests {
 
     #[test]
     fn help_overlay_release_is_ignored() {
-        let mut view_state = crate::runtime::AttachViewState::new(bmux_client::AttachOpenInfo {
+        let mut view_state = AttachViewState::new(bmux_client::AttachOpenInfo {
             context_id: None,
             session_id: uuid::Uuid::new_v4(),
             can_write: true,
@@ -6291,7 +6258,7 @@ mod tests {
             .map(|idx| format!("line {idx}"))
             .collect::<Vec<_>>();
 
-        let handled = crate::runtime::handle_help_overlay_key_event(
+        let handled = handle_help_overlay_key_event(
             &CrosstermKeyEvent::new_with_kind(
                 CrosstermKeyCode::Down,
                 KeyModifiers::NONE,
@@ -6306,7 +6273,7 @@ mod tests {
 
     #[test]
     fn build_attach_help_lines_groups_entries_by_category() {
-        let lines = crate::runtime::build_attach_help_lines(&BmuxConfig::default());
+        let lines = build_attach_help_lines(&BmuxConfig::default());
         assert_eq!(lines.first().map(String::as_str), Some("Attach Help"));
         assert!(lines[1].contains("Normal mode sends typing to the pane"));
         assert!(
@@ -6368,16 +6335,10 @@ mod tests {
 
     #[test]
     fn attach_exit_message_suppresses_normal_detach_and_formats_stream_close() {
+        assert_eq!(attach_exit_message(AttachExitReason::Detached), None);
+        assert_eq!(attach_exit_message(AttachExitReason::Quit), None);
         assert_eq!(
-            crate::runtime::attach_exit_message(crate::runtime::AttachExitReason::Detached),
-            None
-        );
-        assert_eq!(
-            crate::runtime::attach_exit_message(crate::runtime::AttachExitReason::Quit),
-            None
-        );
-        assert_eq!(
-            crate::runtime::attach_exit_message(crate::runtime::AttachExitReason::StreamClosed),
+            attach_exit_message(AttachExitReason::StreamClosed),
             Some("attach ended unexpectedly: server stream closed")
         );
     }
@@ -6407,22 +6368,14 @@ mod tests {
             }],
         };
         let mut pane_buffers = BTreeMap::new();
-        pane_buffers.insert(
-            pane_id,
-            crate::runtime::attach::state::PaneRenderBuffer::default(),
-        );
+        pane_buffers.insert(pane_id, PaneRenderBuffer::default());
 
-        crate::runtime::resize_attach_parsers_for_scene_with_size(
-            &mut pane_buffers,
-            &scene,
-            120,
-            50,
-        );
+        resize_attach_parsers_for_scene_with_size(&mut pane_buffers, &scene, 120, 50);
 
         let buffer = pane_buffers
             .get_mut(&pane_id)
             .expect("pane buffer should exist");
-        crate::runtime::append_pane_output(&mut *buffer, b"\x1b[999;999H");
+        append_pane_output(&mut *buffer, b"\x1b[999;999H");
         let (row, col) = buffer.parser.screen().cursor_position();
 
         assert_eq!(row, 46, "cursor row should clamp to pane inner height");

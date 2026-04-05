@@ -160,37 +160,43 @@ pub(super) fn line_matches_since(line: &str, cutoff: Option<OffsetDateTime>) -> 
 }
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::runtime::logs_watch::{
+        LogFilterCaseMode, LogFilterKind, LogFilterRule, compile_filter_regex,
+        line_visible_in_watch, logs_watch_filter_rule_to_state, logs_watch_filter_state_to_rule,
+        normalize_logs_watch_profile,
+    };
+
     #[test]
     fn parse_since_duration_accepts_supported_units() {
         assert_eq!(
-            crate::runtime::parse_since_duration("45s").expect("seconds should parse"),
+            parse_since_duration("45s").expect("seconds should parse"),
             time::Duration::seconds(45)
         );
         assert_eq!(
-            crate::runtime::parse_since_duration("10m").expect("minutes should parse"),
+            parse_since_duration("10m").expect("minutes should parse"),
             time::Duration::minutes(10)
         );
         assert_eq!(
-            crate::runtime::parse_since_duration("2h").expect("hours should parse"),
+            parse_since_duration("2h").expect("hours should parse"),
             time::Duration::hours(2)
         );
         assert_eq!(
-            crate::runtime::parse_since_duration("1d").expect("days should parse"),
+            parse_since_duration("1d").expect("days should parse"),
             time::Duration::days(1)
         );
         assert_eq!(
-            crate::runtime::parse_since_duration("30")
-                .expect("plain values should default to seconds"),
+            parse_since_duration("30").expect("plain values should default to seconds"),
             time::Duration::seconds(30)
         );
     }
 
     #[test]
     fn parse_since_duration_rejects_invalid_values() {
-        assert!(crate::runtime::parse_since_duration("").is_err());
-        assert!(crate::runtime::parse_since_duration("abc").is_err());
-        assert!(crate::runtime::parse_since_duration("5w").is_err());
-        assert!(crate::runtime::parse_since_duration("-1m").is_err());
+        assert!(parse_since_duration("").is_err());
+        assert!(parse_since_duration("abc").is_err());
+        assert!(parse_since_duration("5w").is_err());
+        assert!(parse_since_duration("-1m").is_err());
     }
 
     #[test]
@@ -200,32 +206,23 @@ mod tests {
             &time::format_description::well_known::Rfc3339,
         )
         .expect("cutoff should parse");
-        assert!(crate::runtime::line_matches_since(
+        assert!(line_matches_since(
             "2026-03-15T10:30:00Z INFO bmux started",
             Some(cutoff)
         ));
-        assert!(!crate::runtime::line_matches_since(
+        assert!(!line_matches_since(
             "2026-03-15T09:30:00Z INFO bmux started",
             Some(cutoff)
         ));
-        assert!(!crate::runtime::line_matches_since(
-            "INFO missing timestamp",
-            Some(cutoff)
-        ));
+        assert!(!line_matches_since("INFO missing timestamp", Some(cutoff)));
     }
 
     #[test]
     fn compile_filter_regex_supports_case_modes() {
-        let sensitive = crate::runtime::compile_filter_regex(
-            "error",
-            crate::runtime::LogFilterCaseMode::Sensitive,
-        )
-        .expect("sensitive regex should compile");
-        let insensitive = crate::runtime::compile_filter_regex(
-            "error",
-            crate::runtime::LogFilterCaseMode::Insensitive,
-        )
-        .expect("insensitive regex should compile");
+        let sensitive = compile_filter_regex("error", LogFilterCaseMode::Sensitive)
+            .expect("sensitive regex should compile");
+        let insensitive = compile_filter_regex("error", LogFilterCaseMode::Insensitive)
+            .expect("insensitive regex should compile");
 
         assert!(sensitive.is_match("error line"));
         assert!(!sensitive.is_match("ERROR line"));
@@ -235,43 +232,39 @@ mod tests {
     #[test]
     fn line_visible_in_watch_respects_include_and_exclude_rules() {
         let filters = vec![
-            crate::runtime::LogFilterRule::new(
-                crate::runtime::LogFilterKind::Include,
+            LogFilterRule::new(
+                LogFilterKind::Include,
                 "server".to_string(),
-                crate::runtime::LogFilterCaseMode::Sensitive,
+                LogFilterCaseMode::Sensitive,
             ),
-            crate::runtime::LogFilterRule::new(
-                crate::runtime::LogFilterKind::Exclude,
+            LogFilterRule::new(
+                LogFilterKind::Exclude,
                 "listening".to_string(),
-                crate::runtime::LogFilterCaseMode::Sensitive,
+                LogFilterCaseMode::Sensitive,
             ),
         ];
 
-        assert!(!crate::runtime::line_visible_in_watch(
+        assert!(!line_visible_in_watch(
             "INFO bmux server listening",
             &filters,
             None
         ));
-        assert!(crate::runtime::line_visible_in_watch(
+        assert!(line_visible_in_watch(
             "INFO bmux server started",
             &filters,
             None
         ));
-        assert!(!crate::runtime::line_visible_in_watch(
-            "INFO unrelated",
-            &filters,
-            None
-        ));
+        assert!(!line_visible_in_watch("INFO unrelated", &filters, None));
     }
 
     #[test]
     fn line_visible_in_watch_supports_quick_filter() {
-        assert!(crate::runtime::line_visible_in_watch(
+        assert!(line_visible_in_watch(
             "INFO subsystem ready",
             &[],
             Some("subsystem")
         ));
-        assert!(!crate::runtime::line_visible_in_watch(
+        assert!(!line_visible_in_watch(
             "INFO subsystem ready",
             &[],
             Some("error")
@@ -281,36 +274,32 @@ mod tests {
     #[test]
     fn normalize_logs_watch_profile_defaults_and_validates() {
         assert_eq!(
-            crate::runtime::normalize_logs_watch_profile(None)
-                .expect("default profile should resolve"),
+            normalize_logs_watch_profile(None).expect("default profile should resolve"),
             "default"
         );
         assert_eq!(
-            crate::runtime::normalize_logs_watch_profile(Some("incident_db"))
+            normalize_logs_watch_profile(Some("incident_db"))
                 .expect("valid profile should resolve"),
             "incident_db"
         );
-        assert!(crate::runtime::normalize_logs_watch_profile(Some("bad name")).is_err());
-        assert!(crate::runtime::normalize_logs_watch_profile(Some("")).is_err());
+        assert!(normalize_logs_watch_profile(Some("bad name")).is_err());
+        assert!(normalize_logs_watch_profile(Some("")).is_err());
     }
 
     #[test]
     fn logs_watch_filter_state_roundtrip_preserves_case_and_enabled() {
-        let mut rule = crate::runtime::LogFilterRule::new(
-            crate::runtime::LogFilterKind::Exclude,
+        let mut rule = LogFilterRule::new(
+            LogFilterKind::Exclude,
             "server listening".to_string(),
-            crate::runtime::LogFilterCaseMode::Insensitive,
+            LogFilterCaseMode::Insensitive,
         );
         rule.enabled = false;
-        let state = crate::runtime::logs_watch_filter_rule_to_state(&rule);
-        let roundtrip = crate::runtime::logs_watch_filter_state_to_rule(state);
-        assert!(matches!(
-            roundtrip.kind,
-            crate::runtime::LogFilterKind::Exclude
-        ));
+        let state = logs_watch_filter_rule_to_state(&rule);
+        let roundtrip = logs_watch_filter_state_to_rule(state);
+        assert!(matches!(roundtrip.kind, LogFilterKind::Exclude));
         assert!(matches!(
             roundtrip.case_mode,
-            crate::runtime::LogFilterCaseMode::Insensitive
+            LogFilterCaseMode::Insensitive
         ));
         assert!(!roundtrip.enabled);
         assert_eq!(roundtrip.pattern, "server listening");

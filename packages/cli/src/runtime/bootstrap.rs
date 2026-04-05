@@ -525,7 +525,10 @@ mod tests {
     }
 
     #[allow(clippy::wildcard_imports)]
-    use crate::runtime::*;
+    use super::*;
+    use crate::runtime::attach::runtime::{attach_keymap_from_config, initial_attach_status};
+    use crate::runtime::cli_parse::validate_record_bootstrap_flags;
+    use crate::runtime::session_cli::attach_quit_failure_status;
     use bmux_cli_schema::Command;
     use bmux_client::ClientError;
     use bmux_config::BmuxConfig;
@@ -535,15 +538,14 @@ mod tests {
     #[test]
     fn validate_record_bootstrap_flags_accepts_plain_defaults() {
         let cli = empty_cli();
-        assert!(crate::runtime::validate_record_bootstrap_flags(&cli).is_ok());
+        assert!(validate_record_bootstrap_flags(&cli).is_ok());
     }
 
     #[test]
     fn validate_record_bootstrap_flags_rejects_orphaned_record_flags() {
         let mut cli = empty_cli();
         cli.no_capture_input = true;
-        let error = crate::runtime::validate_record_bootstrap_flags(&cli)
-            .expect_err("validation should fail");
+        let error = validate_record_bootstrap_flags(&cli).expect_err("validation should fail");
         assert!(
             error
                 .to_string()
@@ -557,8 +559,7 @@ mod tests {
         let mut cli = empty_cli();
         cli.record = true;
         cli.command = Some(Command::ListSessions { json: false });
-        let error = crate::runtime::validate_record_bootstrap_flags(&cli)
-            .expect_err("validation should fail");
+        let error = validate_record_bootstrap_flags(&cli).expect_err("validation should fail");
         assert!(
             error
                 .to_string()
@@ -606,7 +607,7 @@ mod tests {
 
     #[test]
     fn attach_quit_failure_status_is_actionable_for_policy_errors() {
-        let status = crate::runtime::attach_quit_failure_status(&ClientError::ServerError {
+        let status = attach_quit_failure_status(&ClientError::ServerError {
             code: ErrorCode::InvalidRequest,
             message: "session policy denied for this operation".to_string(),
         });
@@ -617,7 +618,7 @@ mod tests {
     #[test]
     fn initial_attach_status_mentions_help_and_typing() {
         let keymap = attach_keymap_from_config(&BmuxConfig::default());
-        let status = crate::runtime::initial_attach_status(&keymap, true);
+        let status = initial_attach_status(&keymap, true);
         assert!(status.contains("help"));
         assert!(status.contains("typing goes to pane"));
     }
