@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+pub mod compression;
 pub mod frame;
 pub mod transport;
 
@@ -667,8 +668,12 @@ pub enum AttachImageProtocol {
 pub struct AttachPaneImage {
     pub id: u64,
     pub protocol: AttachImageProtocol,
-    /// Raw protocol bytes (sixel body, kitty payload, iTerm2 data).
+    /// Raw protocol bytes (sixel body, kitty payload, iTerm2 data),
+    /// potentially compressed according to `compression`.
     pub raw_data: Vec<u8>,
+    /// Compression algorithm applied to `raw_data`.  `None` means the data
+    /// is uncompressed.  The receiver must decompress before use.
+    pub compression: compression::CompressionId,
     pub position_row: u16,
     pub position_col: u16,
     pub cell_rows: u16,
@@ -772,7 +777,7 @@ pub struct RecordingSummary {
 }
 
 /// Current recording format version.
-pub const RECORDING_FORMAT_VERSION: u32 = 5;
+pub const RECORDING_FORMAT_VERSION: u32 = 6;
 
 const fn recording_format_version_default() -> u32 {
     1 // pre-versioning recordings are treated as version 1
@@ -2582,6 +2587,7 @@ mod tests {
                     id: 42,
                     protocol: AttachImageProtocol::Sixel,
                     raw_data: vec![0x1b, 0x50, 0x71],
+                    compression: compression::CompressionId::None,
                     position_row: 3,
                     position_col: 5,
                     cell_rows: 10,

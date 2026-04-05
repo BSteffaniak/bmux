@@ -47,5 +47,8 @@ image-registry = [
     "bmux_image/iterm2",
 ]
 
+# IPC compression support
+compression = ["bmux_ipc/compression"]
+
 # Serialization features
 serde = []

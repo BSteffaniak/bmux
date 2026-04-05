@@ -143,6 +143,7 @@ image = { version = "0.25", default-features = false, features = [
 iroh = { version = "0.97.0", default-features = true }
 libloading = { version = "0.8.9", default-features = false }
 log = { version = "0.4.29", default-features = false }
+lz4_flex = { version = "0.11", default-features = false }
 portable-pty = { version = "0.9.0" }
 proc-macro2 = { version = "1.0.106", default-features = false }
 qrcode = { version = "0.14.1", default-features = false }
@@ -186,6 +187,7 @@ ttf-parser = { version = "0.25.1", default-features = true }
 unicode-width = { version = "0.2.2", default-features = false }
 uuid = { version = "1.21.0", default-features = false }
 vt100 = { version = "0.16.2", default-features = false }
+zstd = { version = "0.13", default-features = false }
 
 # Dev/test dependencies
 serial_test = { version = "3.4.0" }

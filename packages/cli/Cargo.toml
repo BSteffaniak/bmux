@@ -99,6 +99,7 @@ vt100 = { workspace = true }
 default = [
     "bundled-fonts",
     "bundled-plugins",
+    "compression",
     "kitty-keyboard",
     "image-protocols",
 ]
@@ -128,6 +129,9 @@ bundled-plugin-windows     = ["dep:bmux_windows_plugin"]
 
 # Optional features
 bundled-fonts = ["bmux_fonts/bundled-nerd-fonts"]
+
+# IPC compression support
+compression = ["bmux_ipc/compression", "bmux_server/compression"]
 
 # Serialization features
 serde = ["bmux_event/serde", "bmux_session/serde", "bmux_terminal/serde"]

@@ -3721,10 +3721,14 @@ use bmux_ipc::{DisplayTrackEnvelope, DisplayTrackEvent};
     feature = "image-iterm2"
 ))]
 fn decode_attach_image_to_rgba(image: &bmux_ipc::AttachPaneImage) -> Option<(u32, u32, Vec<u8>)> {
+    // Decompress raw_data if it was compressed during IPC transport.
+    let raw_data =
+        bmux_ipc::compression::decompress_by_id(&image.raw_data, image.compression).ok()?;
+
     match image.protocol {
         #[cfg(feature = "image-sixel")]
         bmux_ipc::AttachImageProtocol::Sixel => {
-            let pb = bmux_image::codec::sixel::decode(&image.raw_data)?;
+            let pb = bmux_image::codec::sixel::decode(&raw_data)?;
             debug_assert!(
                 matches!(pb.format, bmux_image::PixelFormat::Rgba8),
                 "sixel decode should produce RGBA"
@@ -3741,20 +3745,20 @@ fn decode_attach_image_to_rgba(image: &bmux_ipc::AttachPaneImage) -> Option<(u32
             }
             let expected_rgba = (w as usize) * (h as usize) * 4;
             let expected_rgb = (w as usize) * (h as usize) * 3;
-            if image.raw_data.len() == expected_rgba {
+            if raw_data.len() == expected_rgba {
                 // Raw RGBA pixels
-                Some((w, h, image.raw_data.clone()))
-            } else if image.raw_data.len() == expected_rgb {
+                Some((w, h, raw_data))
+            } else if raw_data.len() == expected_rgb {
                 // Raw RGB → expand to RGBA
                 let mut rgba = Vec::with_capacity(expected_rgba);
-                for chunk in image.raw_data.chunks_exact(3) {
+                for chunk in raw_data.chunks_exact(3) {
                     rgba.extend_from_slice(chunk);
                     rgba.push(255);
                 }
                 Some((w, h, rgba))
             } else {
                 // Likely PNG-compressed — decode via image crate
-                decode_image_bytes_to_rgba(&image.raw_data)
+                decode_image_bytes_to_rgba(&raw_data)
             }
         }
 
@@ -3763,7 +3767,7 @@ fn decode_attach_image_to_rgba(image: &bmux_ipc::AttachPaneImage) -> Option<(u32
             // iTerm2 raw_data is the OSC body (params + base64-encoded file).
             // Parse the body to extract decoded image file bytes, then decode
             // the image format (PNG, JPEG, GIF, etc.) to RGBA pixels.
-            let (_params, file_bytes) = bmux_image::codec::iterm2::parse_body(&image.raw_data)?;
+            let (_params, file_bytes) = bmux_image::codec::iterm2::parse_body(&raw_data)?;
             decode_image_bytes_to_rgba(&file_bytes)
         }
 

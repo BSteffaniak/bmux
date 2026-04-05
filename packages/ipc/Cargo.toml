@@ -11,10 +11,12 @@ version     = { workspace = true }
 
 [dependencies]
 bmux_codec = { workspace = true }
+lz4_flex   = { workspace = true, optional = true }
 serde      = { workspace = true, features = ["derive", "std"] }
 thiserror  = { workspace = true }
 tokio      = { workspace = true, features = ["io-util", "macros", "net", "rt"] }
 uuid       = { workspace = true, features = ["serde", "std", "v4"] }
+zstd       = { workspace = true, optional = true }
 
 [features]
 # Default features
@@ -22,3 +24,8 @@ default = []
 
 # Development features
 fail-on-warnings = []
+
+# Compression support (optional, feature-gated)
+compression      = ["compression-zstd", "compression-lz4"]
+compression-lz4  = ["dep:lz4_flex"]
+compression-zstd = ["dep:zstd"]
