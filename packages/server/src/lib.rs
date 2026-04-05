@@ -19,8 +19,9 @@ use bmux_ipc::{
     EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, PaneFocusDirection,
     PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection, PaneState, PaneSummary,
     ProtocolContract, ProtocolVersion, RecordingEventKind, RecordingPayload, RecordingProfile,
-    RecordingSummary, Request, Response, ResponsePayload, ServerSnapshotStatus, SessionSelector,
-    SessionSummary, decode, default_supported_capabilities, encode, negotiate_protocol,
+    RecordingRollingStartOptions, RecordingSummary, Request, Response, ResponsePayload,
+    ServerSnapshotStatus, SessionSelector, SessionSummary, decode, default_supported_capabilities,
+    encode, negotiate_protocol,
 };
 use bmux_session::{ClientId, Session, SessionId, SessionManager};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
@@ -95,8 +96,9 @@ struct ServerState {
     manual_recording_runtime: Arc<Mutex<RecordingRuntime>>,
     rolling_recording_runtime: Arc<Mutex<Option<RecordingRuntime>>>,
     rolling_recording_auto_start: bool,
-    rolling_recording_capture_input: bool,
-    rolling_recording_event_kinds: Vec<RecordingEventKind>,
+    rolling_recording_defaults: RollingRecordingSettings,
+    rolling_recordings_dir: std::path::PathBuf,
+    rolling_recording_segment_mb: usize,
     operation_lock: AsyncMutex<()>,
     event_hub: Mutex<EventHub>,
     /// Broadcast channel for pushing events to streaming clients.
@@ -107,6 +109,22 @@ struct ServerState {
     pane_exit_rx: AsyncMutex<mpsc::UnboundedReceiver<PaneExitEvent>>,
     service_registry: Mutex<ServiceRegistry>,
     service_resolver: Mutex<Option<Arc<ServiceResolverHandler>>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollingRecordingSettings {
+    pub window_secs: u64,
+    pub event_kinds: Vec<RecordingEventKind>,
+}
+
+impl RollingRecordingSettings {
+    fn is_available(&self) -> bool {
+        self.window_secs > 0 && !self.event_kinds.is_empty()
+    }
+
+    fn capture_input(&self) -> bool {
+        self.event_kinds.contains(&RecordingEventKind::PaneInputRaw)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -3437,10 +3455,7 @@ impl BmuxServer {
         segment_mb: usize,
         retention_days: u64,
         rolling_recording_auto_start: bool,
-        recording_capture_input: bool,
-        recording_capture_output: bool,
-        recording_capture_events: bool,
-        rolling_window_secs: u64,
+        rolling_recording_defaults: RollingRecordingSettings,
     ) -> Self {
         let snapshot_runtime = match snapshot_manager {
             Some(manager) => SnapshotRuntime::with_manager(manager),
@@ -3450,17 +3465,11 @@ impl BmuxServer {
         let config = BmuxConfig::load().unwrap_or_default();
         let shell = resolve_server_shell(&config);
         let pane_term = resolve_server_pane_term(&config);
-        let rolling_recording_event_kinds = recording_event_kinds_from_flags(
-            recording_capture_input,
-            recording_capture_output,
-            recording_capture_events,
-        );
         let protocol_profile = protocol_profile_for_term(&pane_term);
         let (shutdown_tx, _) = watch::channel(false);
         let (pane_exit_tx, pane_exit_rx) = mpsc::unbounded_channel();
         let rolling_recordings_dir = recordings_dir.join(".rolling");
-        let rolling_runtime_available = rolling_window_secs > 0
-            && (recording_capture_output || recording_capture_events || recording_capture_input);
+        let rolling_runtime_available = rolling_recording_defaults.is_available();
         let manual_recording_runtime = Arc::new(Mutex::new(RecordingRuntime::new(
             recordings_dir,
             segment_mb,
@@ -3468,9 +3477,9 @@ impl BmuxServer {
         )));
         let rolling_recording_runtime = Arc::new(Mutex::new(if rolling_runtime_available {
             Some(RecordingRuntime::new_rolling(
-                rolling_recordings_dir,
+                rolling_recordings_dir.clone(),
                 segment_mb,
-                rolling_window_secs,
+                rolling_recording_defaults.window_secs,
             ))
         } else {
             None
@@ -3497,8 +3506,9 @@ impl BmuxServer {
                 rolling_recording_runtime,
                 rolling_recording_auto_start: rolling_recording_auto_start
                     && rolling_runtime_available,
-                rolling_recording_capture_input: recording_capture_input,
-                rolling_recording_event_kinds,
+                rolling_recording_defaults,
+                rolling_recordings_dir,
+                rolling_recording_segment_mb: segment_mb,
                 operation_lock: AsyncMutex::new(()),
                 event_hub: Mutex::new(EventHub::new(1024)),
                 event_broadcast: event_broadcast_tx,
@@ -3518,6 +3528,7 @@ impl BmuxServer {
     pub fn new(endpoint: IpcEndpoint) -> Self {
         let paths = ConfigPaths::default();
         let config = BmuxConfig::load_from_path(&paths.config_file()).unwrap_or_default();
+        let rolling_defaults = rolling_recording_settings_from_config(&config);
         Self::new_with_snapshot(
             endpoint,
             None,
@@ -3526,10 +3537,7 @@ impl BmuxServer {
             config.recording.segment_mb,
             config.recording.retention_days,
             config.recording.enabled,
-            config.recording.capture_input,
-            config.recording.capture_output,
-            config.recording.capture_events,
-            config.recording.rolling_window_secs,
+            rolling_defaults,
         )
     }
 
@@ -3537,10 +3545,12 @@ impl BmuxServer {
     #[must_use]
     pub fn from_config_paths(paths: &ConfigPaths) -> Self {
         let config = BmuxConfig::load_from_path(&paths.config_file()).unwrap_or_default();
+        let rolling_defaults = rolling_recording_settings_from_config(&config);
         Self::from_config_paths_with_rolling_options(
             paths,
             config.recording.enabled,
-            config.recording.rolling_window_secs,
+            rolling_defaults.window_secs,
+            rolling_defaults.event_kinds,
         )
     }
 
@@ -3551,6 +3561,7 @@ impl BmuxServer {
         paths: &ConfigPaths,
         rolling_recording_auto_start: bool,
         rolling_window_secs: u64,
+        rolling_event_kinds: Vec<RecordingEventKind>,
     ) -> Self {
         let config = BmuxConfig::load_from_path(&paths.config_file()).unwrap_or_default();
         #[cfg(unix)]
@@ -3565,6 +3576,10 @@ impl BmuxServer {
                 warn!("failed loading server control principal id: {error}");
                 Uuid::new_v4()
             });
+        let rolling_defaults = RollingRecordingSettings {
+            window_secs: rolling_window_secs,
+            event_kinds: normalize_recording_event_kinds(&rolling_event_kinds),
+        };
         Self::new_with_snapshot(
             endpoint,
             Some(snapshot_manager),
@@ -3573,10 +3588,7 @@ impl BmuxServer {
             config.recording.segment_mb,
             config.recording.retention_days,
             rolling_recording_auto_start,
-            config.recording.capture_input,
-            config.recording.capture_output,
-            config.recording.capture_events,
-            rolling_window_secs,
+            rolling_defaults,
         )
     }
 
@@ -4698,19 +4710,30 @@ fn ensure_rolling_recording_started(state: &Arc<ServerState>) -> Result<()> {
     if !state.rolling_recording_auto_start {
         return Ok(());
     }
+    if !state.rolling_recording_defaults.is_available() {
+        return Ok(());
+    }
 
     let mut runtime = state
         .rolling_recording_runtime
         .lock()
         .map_err(|_| anyhow::anyhow!("rolling recording runtime lock poisoned"))?;
-    let Some(runtime) = runtime.as_mut() else {
-        return Ok(());
-    };
+    if runtime.is_none() {
+        *runtime = Some(RecordingRuntime::new_rolling(
+            state.rolling_recordings_dir.clone(),
+            state.rolling_recording_segment_mb,
+            state.rolling_recording_defaults.window_secs,
+        ));
+    }
+    let runtime = runtime
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("rolling recording runtime missing after init"))?;
     if runtime.status().active.is_some() {
         return Ok(());
     }
 
-    let summary = start_rolling_recording_runtime(state, runtime)?;
+    let summary =
+        start_rolling_recording_runtime(state, runtime, &state.rolling_recording_defaults)?;
     info!(
         "rolling recording started: {} path={} window_secs={}",
         summary.id,
@@ -4721,8 +4744,9 @@ fn ensure_rolling_recording_started(state: &Arc<ServerState>) -> Result<()> {
 }
 
 fn start_rolling_recording_runtime(
-    state: &Arc<ServerState>,
+    _state: &Arc<ServerState>,
     runtime: &mut RecordingRuntime,
+    settings: &RollingRecordingSettings,
 ) -> Result<RecordingSummary> {
     if let Err(error) = runtime.delete_all() {
         warn!("failed cleaning hidden rolling recordings root: {error:#}");
@@ -4730,9 +4754,9 @@ fn start_rolling_recording_runtime(
 
     runtime.start(
         None,
-        state.rolling_recording_capture_input,
+        settings.capture_input(),
         RecordingProfile::Functional,
-        state.rolling_recording_event_kinds.clone(),
+        settings.event_kinds.clone(),
     )
 }
 
@@ -6968,25 +6992,59 @@ async fn handle_request(
                 }),
             }
         }
-        Request::RecordingRollingStart => {
+        Request::RecordingRollingStart { options } => {
+            if matches!(options.window_secs, Some(0)) {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "rolling window must be greater than 0 seconds".to_string(),
+                }));
+            }
+            let resolved_settings =
+                apply_rolling_start_options(&state.rolling_recording_defaults, &options);
+            if !resolved_settings.is_available() {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "rolling recording requires a non-zero window and at least one enabled event kind".to_string(),
+                }));
+            }
+            let options_empty = rolling_start_options_is_empty(&options);
             let mut started_now = false;
             let recording = {
                 let mut runtime = state
                     .rolling_recording_runtime
                     .lock()
                     .map_err(|_| anyhow::anyhow!("rolling recording runtime lock poisoned"))?;
-                let Some(runtime) = runtime.as_mut() else {
-                    return Ok(Response::Err(ErrorResponse {
-                        code: ErrorCode::InvalidRequest,
-                        message: "rolling recording is not configured".to_string(),
-                    }));
-                };
+                if runtime.is_none() {
+                    *runtime = Some(RecordingRuntime::new_rolling(
+                        state.rolling_recordings_dir.clone(),
+                        state.rolling_recording_segment_mb,
+                        resolved_settings.window_secs,
+                    ));
+                }
 
+                let runtime = runtime.as_mut().ok_or_else(|| {
+                    anyhow::anyhow!("rolling recording runtime missing after init")
+                })?;
                 if let Some(active) = runtime.status().active {
+                    if !options_empty {
+                        return Ok(Response::Err(ErrorResponse {
+                            code: ErrorCode::InvalidRequest,
+                            message:
+                                "rolling recording is already active; stop it before applying overrides"
+                                    .to_string(),
+                        }));
+                    }
                     active
                 } else {
+                    if runtime.rolling_window_secs() != Some(resolved_settings.window_secs) {
+                        *runtime = RecordingRuntime::new_rolling(
+                            state.rolling_recordings_dir.clone(),
+                            state.rolling_recording_segment_mb,
+                            resolved_settings.window_secs,
+                        );
+                    }
                     started_now = true;
-                    start_rolling_recording_runtime(state, runtime)?
+                    start_rolling_recording_runtime(state, runtime, &resolved_settings)?
                 }
             };
 
@@ -7178,7 +7236,7 @@ const fn request_requires_exclusive(request: &Request) -> bool {
             | Request::RecordingWriteCustomEvent { .. }
             | Request::RecordingDeleteAll
             | Request::RecordingCut { .. }
-            | Request::RecordingRollingStart
+            | Request::RecordingRollingStart { .. }
             | Request::RecordingRollingStop
             | Request::RecordingPrune { .. }
             | Request::Detach
@@ -7256,7 +7314,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::RecordingWriteCustomEvent { .. } => "recording_write_custom_event",
         Request::RecordingDeleteAll => "recording_delete_all",
         Request::RecordingCut { .. } => "recording_cut",
-        Request::RecordingRollingStart => "recording_rolling_start",
+        Request::RecordingRollingStart { .. } => "recording_rolling_start",
         Request::RecordingRollingStop => "recording_rolling_stop",
         Request::RecordingCaptureTargets => "recording_capture_targets",
         Request::RecordingPrune { .. } => "recording_prune",
@@ -7300,10 +7358,36 @@ fn default_recording_event_kinds(
     event_kinds
 }
 
+fn all_recording_event_kinds() -> Vec<RecordingEventKind> {
+    vec![
+        RecordingEventKind::PaneInputRaw,
+        RecordingEventKind::PaneOutputRaw,
+        RecordingEventKind::ProtocolReplyRaw,
+        RecordingEventKind::PaneImage,
+        RecordingEventKind::ServerEvent,
+        RecordingEventKind::RequestStart,
+        RecordingEventKind::RequestDone,
+        RecordingEventKind::RequestError,
+        RecordingEventKind::Custom,
+    ]
+}
+
+fn normalize_recording_event_kinds(event_kinds: &[RecordingEventKind]) -> Vec<RecordingEventKind> {
+    let mut normalized = Vec::new();
+    for kind in all_recording_event_kinds() {
+        if event_kinds.contains(&kind) {
+            normalized.push(kind);
+        }
+    }
+    normalized
+}
+
 fn recording_event_kinds_from_flags(
     capture_input: bool,
     capture_output: bool,
     capture_events: bool,
+    capture_protocol_replies: bool,
+    capture_images: bool,
 ) -> Vec<RecordingEventKind> {
     let mut event_kinds = Vec::new();
     if capture_input {
@@ -7311,6 +7395,12 @@ fn recording_event_kinds_from_flags(
     }
     if capture_output {
         event_kinds.push(RecordingEventKind::PaneOutputRaw);
+    }
+    if capture_protocol_replies {
+        event_kinds.push(RecordingEventKind::ProtocolReplyRaw);
+    }
+    if capture_images {
+        event_kinds.push(RecordingEventKind::PaneImage);
     }
     if capture_events {
         event_kinds.extend([
@@ -7321,10 +7411,128 @@ fn recording_event_kinds_from_flags(
             RecordingEventKind::Custom,
         ]);
     }
-    if event_kinds.is_empty() {
-        event_kinds.push(RecordingEventKind::PaneOutputRaw);
+    normalize_recording_event_kinds(&event_kinds)
+}
+
+const fn recording_event_kind_from_config(
+    kind: bmux_config::RecordingEventKindConfig,
+) -> RecordingEventKind {
+    match kind {
+        bmux_config::RecordingEventKindConfig::PaneInputRaw => RecordingEventKind::PaneInputRaw,
+        bmux_config::RecordingEventKindConfig::PaneOutputRaw => RecordingEventKind::PaneOutputRaw,
+        bmux_config::RecordingEventKindConfig::ProtocolReplyRaw => {
+            RecordingEventKind::ProtocolReplyRaw
+        }
+        bmux_config::RecordingEventKindConfig::PaneImage => RecordingEventKind::PaneImage,
+        bmux_config::RecordingEventKindConfig::ServerEvent => RecordingEventKind::ServerEvent,
+        bmux_config::RecordingEventKindConfig::RequestStart => RecordingEventKind::RequestStart,
+        bmux_config::RecordingEventKindConfig::RequestDone => RecordingEventKind::RequestDone,
+        bmux_config::RecordingEventKindConfig::RequestError => RecordingEventKind::RequestError,
+        bmux_config::RecordingEventKindConfig::Custom => RecordingEventKind::Custom,
     }
-    event_kinds
+}
+
+pub fn rolling_recording_settings_from_config(config: &BmuxConfig) -> RollingRecordingSettings {
+    let event_kinds = if config.recording.rolling_event_kinds.is_empty() {
+        recording_event_kinds_from_flags(
+            config
+                .recording
+                .rolling_capture_input
+                .unwrap_or(config.recording.capture_input),
+            config
+                .recording
+                .rolling_capture_output
+                .unwrap_or(config.recording.capture_output),
+            config
+                .recording
+                .rolling_capture_events
+                .unwrap_or(config.recording.capture_events),
+            config
+                .recording
+                .rolling_capture_protocol_replies
+                .unwrap_or(false),
+            config.recording.rolling_capture_images.unwrap_or(false),
+        )
+    } else {
+        normalize_recording_event_kinds(
+            &config
+                .recording
+                .rolling_event_kinds
+                .iter()
+                .copied()
+                .map(recording_event_kind_from_config)
+                .collect::<Vec<_>>(),
+        )
+    };
+    RollingRecordingSettings {
+        window_secs: config.recording.rolling_window_secs,
+        event_kinds,
+    }
+}
+
+fn set_event_kind_enabled(
+    event_kinds: &mut Vec<RecordingEventKind>,
+    kind: RecordingEventKind,
+    enabled: bool,
+) {
+    event_kinds.retain(|current| *current != kind);
+    if enabled {
+        event_kinds.push(kind);
+    }
+}
+
+pub fn apply_rolling_start_options(
+    base: &RollingRecordingSettings,
+    options: &RecordingRollingStartOptions,
+) -> RollingRecordingSettings {
+    let event_kinds = if let Some(event_kinds) = options.event_kinds.as_deref() {
+        normalize_recording_event_kinds(event_kinds)
+    } else {
+        let mut event_kinds = base.event_kinds.clone();
+        if let Some(enabled) = options.capture_input {
+            set_event_kind_enabled(&mut event_kinds, RecordingEventKind::PaneInputRaw, enabled);
+        }
+        if let Some(enabled) = options.capture_output {
+            set_event_kind_enabled(&mut event_kinds, RecordingEventKind::PaneOutputRaw, enabled);
+        }
+        if let Some(enabled) = options.capture_protocol_replies {
+            set_event_kind_enabled(
+                &mut event_kinds,
+                RecordingEventKind::ProtocolReplyRaw,
+                enabled,
+            );
+        }
+        if let Some(enabled) = options.capture_images {
+            set_event_kind_enabled(&mut event_kinds, RecordingEventKind::PaneImage, enabled);
+        }
+        if let Some(enabled) = options.capture_events {
+            for kind in [
+                RecordingEventKind::ServerEvent,
+                RecordingEventKind::RequestStart,
+                RecordingEventKind::RequestDone,
+                RecordingEventKind::RequestError,
+                RecordingEventKind::Custom,
+            ] {
+                set_event_kind_enabled(&mut event_kinds, kind, enabled);
+            }
+        }
+        normalize_recording_event_kinds(&event_kinds)
+    };
+
+    RollingRecordingSettings {
+        window_secs: options.window_secs.unwrap_or(base.window_secs),
+        event_kinds,
+    }
+}
+
+const fn rolling_start_options_is_empty(options: &RecordingRollingStartOptions) -> bool {
+    options.window_secs.is_none()
+        && options.event_kinds.is_none()
+        && options.capture_input.is_none()
+        && options.capture_output.is_none()
+        && options.capture_events.is_none()
+        && options.capture_protocol_replies.is_none()
+        && options.capture_images.is_none()
 }
 
 const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {

@@ -28,8 +28,8 @@ use bmux_config::{
 use bmux_ipc::{
     AttachRect, AttachViewComponent, ContextSelector, ContextSummary, InvokeServiceKind,
     PaneFocusDirection, PaneSelector, PaneSplitDirection, RecordingEventEnvelope,
-    RecordingEventKind, RecordingPayload, RecordingStatus, RecordingSummary, SessionSelector,
-    SessionSummary,
+    RecordingEventKind, RecordingPayload, RecordingRollingStartOptions, RecordingStatus,
+    RecordingSummary, SessionSelector, SessionSummary,
 };
 use bmux_keybind::action_to_config_name;
 use bmux_plugin::{

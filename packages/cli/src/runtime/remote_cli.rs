@@ -1460,7 +1460,8 @@ async fn ensure_local_ipc_backend_ready(paths: &ConfigPaths, mode: HostedMode) -
             "local IPC backend unavailable for runtime '{}'; attempting to start bmux server...",
             active_runtime_name()
         );
-        let _ = run_server_start(true, false, None, None).await?;
+        let _ =
+            run_server_start(true, false, None, RecordingRollingStartOptions::default()).await?;
         if wait_for_local_ipc_ready(&endpoint, Duration::from_secs(3)).await {
             return Ok(());
         }
@@ -3586,6 +3587,18 @@ mod tests {
                 rolling_recording: false,
                 no_rolling_recording: false,
                 rolling_window_secs: None,
+                rolling_event_kind_all: false,
+                rolling_event_kind: Vec::new(),
+                rolling_capture_input: false,
+                no_rolling_capture_input: false,
+                rolling_capture_output: false,
+                no_rolling_capture_output: false,
+                rolling_capture_events: false,
+                no_rolling_capture_events: false,
+                rolling_capture_protocol_replies: false,
+                no_rolling_capture_protocol_replies: false,
+                rolling_capture_images: false,
+                no_rolling_capture_images: false,
             },
         };
         assert!(!command_requires_remote_server(Some(&command)));

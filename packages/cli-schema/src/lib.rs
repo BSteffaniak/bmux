@@ -903,11 +903,65 @@ pub enum ServerCommand {
         #[arg(long, conflicts_with = "no_rolling_recording")]
         rolling_recording: bool,
         /// Disable hidden rolling recording on server boot for this run
-        #[arg(long, conflicts_with = "rolling_recording")]
+        #[arg(
+            long,
+            conflicts_with = "rolling_recording",
+            conflicts_with_all = [
+                "rolling_window_secs",
+                "rolling_event_kind_all",
+                "rolling_event_kind",
+                "rolling_capture_input",
+                "no_rolling_capture_input",
+                "rolling_capture_output",
+                "no_rolling_capture_output",
+                "rolling_capture_events",
+                "no_rolling_capture_events",
+                "rolling_capture_protocol_replies",
+                "no_rolling_capture_protocol_replies",
+                "rolling_capture_images",
+                "no_rolling_capture_images"
+            ]
+        )]
         no_rolling_recording: bool,
         /// Override rolling recording window in seconds for this run
         #[arg(long, value_name = "SECONDS", conflicts_with = "no_rolling_recording")]
         rolling_window_secs: Option<u64>,
+        /// Enable all supported rolling event kinds
+        #[arg(long, conflicts_with = "rolling_event_kind")]
+        rolling_event_kind_all: bool,
+        /// Explicit rolling event kind allowlist (repeatable)
+        #[arg(long, value_enum, conflicts_with = "rolling_event_kind_all")]
+        rolling_event_kind: Vec<RecordingEventKindArg>,
+        /// Override rolling capture of pane input bytes for this run
+        #[arg(long, conflicts_with = "no_rolling_capture_input")]
+        rolling_capture_input: bool,
+        /// Disable rolling capture of pane input bytes for this run
+        #[arg(long, conflicts_with = "rolling_capture_input")]
+        no_rolling_capture_input: bool,
+        /// Override rolling capture of pane output bytes for this run
+        #[arg(long, conflicts_with = "no_rolling_capture_output")]
+        rolling_capture_output: bool,
+        /// Disable rolling capture of pane output bytes for this run
+        #[arg(long, conflicts_with = "rolling_capture_output")]
+        no_rolling_capture_output: bool,
+        /// Override rolling capture of lifecycle/request/custom events for this run
+        #[arg(long, conflicts_with = "no_rolling_capture_events")]
+        rolling_capture_events: bool,
+        /// Disable rolling capture of lifecycle/request/custom events for this run
+        #[arg(long, conflicts_with = "rolling_capture_events")]
+        no_rolling_capture_events: bool,
+        /// Override rolling capture of protocol reply bytes for this run
+        #[arg(long, conflicts_with = "no_rolling_capture_protocol_replies")]
+        rolling_capture_protocol_replies: bool,
+        /// Disable rolling capture of protocol reply bytes for this run
+        #[arg(long, conflicts_with = "rolling_capture_protocol_replies")]
+        no_rolling_capture_protocol_replies: bool,
+        /// Override rolling capture of extracted pane images for this run
+        #[arg(long, conflicts_with = "no_rolling_capture_images")]
+        rolling_capture_images: bool,
+        /// Disable rolling capture of extracted pane images for this run
+        #[arg(long, conflicts_with = "rolling_capture_images")]
+        no_rolling_capture_images: bool,
     },
     /// Check server status
     Status {
@@ -984,7 +1038,47 @@ pub enum GatewayHostMode {
 #[derive(Debug, Subcommand)]
 pub enum ServerRecordingCommand {
     /// Start hidden rolling recording
-    Start,
+    Start {
+        /// Override rolling recording window in seconds
+        #[arg(long, value_name = "SECONDS")]
+        rolling_window_secs: Option<u64>,
+        /// Enable all supported rolling event kinds
+        #[arg(long, conflicts_with = "rolling_event_kind")]
+        rolling_event_kind_all: bool,
+        /// Explicit rolling event kind allowlist (repeatable)
+        #[arg(long, value_enum, conflicts_with = "rolling_event_kind_all")]
+        rolling_event_kind: Vec<RecordingEventKindArg>,
+        /// Override rolling capture of pane input bytes
+        #[arg(long, conflicts_with = "no_rolling_capture_input")]
+        rolling_capture_input: bool,
+        /// Disable rolling capture of pane input bytes
+        #[arg(long, conflicts_with = "rolling_capture_input")]
+        no_rolling_capture_input: bool,
+        /// Override rolling capture of pane output bytes
+        #[arg(long, conflicts_with = "no_rolling_capture_output")]
+        rolling_capture_output: bool,
+        /// Disable rolling capture of pane output bytes
+        #[arg(long, conflicts_with = "rolling_capture_output")]
+        no_rolling_capture_output: bool,
+        /// Override rolling capture of lifecycle/request/custom events
+        #[arg(long, conflicts_with = "no_rolling_capture_events")]
+        rolling_capture_events: bool,
+        /// Disable rolling capture of lifecycle/request/custom events
+        #[arg(long, conflicts_with = "rolling_capture_events")]
+        no_rolling_capture_events: bool,
+        /// Override rolling capture of protocol reply bytes
+        #[arg(long, conflicts_with = "no_rolling_capture_protocol_replies")]
+        rolling_capture_protocol_replies: bool,
+        /// Disable rolling capture of protocol reply bytes
+        #[arg(long, conflicts_with = "rolling_capture_protocol_replies")]
+        no_rolling_capture_protocol_replies: bool,
+        /// Override rolling capture of extracted pane images
+        #[arg(long, conflicts_with = "no_rolling_capture_images")]
+        rolling_capture_images: bool,
+        /// Disable rolling capture of extracted pane images
+        #[arg(long, conflicts_with = "rolling_capture_images")]
+        no_rolling_capture_images: bool,
+    },
     /// Stop hidden rolling recording
     Stop,
 }
@@ -1499,22 +1593,34 @@ mod tests {
                 rolling_recording: false,
                 no_rolling_recording: false,
                 rolling_window_secs: None,
-            }
+                rolling_event_kind_all: false,
+                rolling_event_kind,
+                rolling_capture_input: false,
+                no_rolling_capture_input: false,
+                rolling_capture_output: false,
+                no_rolling_capture_output: false,
+                rolling_capture_events: false,
+                no_rolling_capture_events: false,
+                rolling_capture_protocol_replies: false,
+                no_rolling_capture_protocol_replies: false,
+                rolling_capture_images: false,
+                no_rolling_capture_images: false,
+            } if rolling_event_kind.is_empty()
         ));
     }
 
     #[test]
-    fn parses_server_gateway_command() {
+    fn parses_server_start_with_rolling_kind_and_category_overrides() {
         let cli = Cli::try_parse_from([
             "bmux",
             "server",
-            "gateway",
-            "--listen",
-            "0.0.0.0:7443",
-            "--cert-file",
-            "cert.pem",
-            "--key-file",
-            "key.pem",
+            "start",
+            "--rolling-event-kind",
+            "protocol-reply-raw",
+            "--rolling-event-kind",
+            "pane-image",
+            "--rolling-capture-input",
+            "--no-rolling-capture-events",
         ])
         .expect("valid CLI args");
         let Some(Command::Server { command }) = cli.command else {
@@ -1522,33 +1628,72 @@ mod tests {
         };
         assert!(matches!(
             command,
-            ServerCommand::Gateway {
-                listen,
-                host,
-                host_mode,
-                host_relay,
-                quick,
-                cert_file,
-                key_file,
-            } if listen == "0.0.0.0:7443"
-                && !host
-                && host_mode == GatewayHostMode::Iroh
-                && host_relay == "nokey@localhost.run"
-                && !quick
-                && cert_file.as_deref() == Some("cert.pem")
-                && key_file.as_deref() == Some("key.pem")
+            ServerCommand::Start {
+                rolling_event_kind,
+                rolling_capture_input: true,
+                no_rolling_capture_events: true,
+                ..
+            } if rolling_event_kind == vec![
+                RecordingEventKindArg::ProtocolReplyRaw,
+                RecordingEventKindArg::PaneImage,
+            ]
         ));
     }
 
     #[test]
-    fn parses_server_gateway_quick_mode() {
+    fn rejects_conflicting_server_start_rolling_capture_flags() {
+        let error = Cli::try_parse_from([
+            "bmux",
+            "server",
+            "start",
+            "--rolling-capture-output",
+            "--no-rolling-capture-output",
+        ])
+        .expect_err("conflicting rolling capture flags should fail");
+        assert!(error.to_string().contains("cannot be used"));
+    }
+
+    #[test]
+    fn rejects_conflicting_server_start_rolling_kind_flags() {
+        let error = Cli::try_parse_from([
+            "bmux",
+            "server",
+            "start",
+            "--rolling-event-kind-all",
+            "--rolling-event-kind",
+            "pane-output-raw",
+        ])
+        .expect_err("conflicting rolling kind flags should fail");
+        assert!(error.to_string().contains("cannot be used"));
+    }
+
+    #[test]
+    fn parses_server_start_with_rolling_event_kind_all_flag() {
+        let cli = Cli::try_parse_from(["bmux", "server", "start", "--rolling-event-kind-all"])
+            .expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Start {
+                rolling_event_kind_all: true,
+                rolling_event_kind,
+                ..
+            } if rolling_event_kind.is_empty()
+        ));
+    }
+
+    #[test]
+    fn parses_server_start_with_rolling_window_and_kinds() {
         let cli = Cli::try_parse_from([
             "bmux",
             "server",
-            "gateway",
-            "--listen",
-            "0.0.0.0:7443",
-            "--quick",
+            "start",
+            "--rolling-window-secs",
+            "180",
+            "--rolling-event-kind",
+            "pane-output-raw",
         ])
         .expect("valid CLI args");
         let Some(Command::Server { command }) = cli.command else {
@@ -1556,22 +1701,39 @@ mod tests {
         };
         assert!(matches!(
             command,
-            ServerCommand::Gateway {
-                listen,
-                host,
-                host_mode,
-                host_relay,
-                quick,
-                cert_file,
-                key_file,
-            } if listen == "0.0.0.0:7443"
-                && !host
-                && host_mode == GatewayHostMode::Iroh
-                && host_relay == "nokey@localhost.run"
-                && quick
-                && cert_file.is_none()
-                && key_file.is_none()
+            ServerCommand::Start {
+                rolling_window_secs: Some(180),
+                rolling_event_kind,
+                ..
+            } if rolling_event_kind == vec![RecordingEventKindArg::PaneOutputRaw]
         ));
+    }
+
+    #[test]
+    fn rejects_server_start_no_rolling_with_window_override() {
+        let error = Cli::try_parse_from([
+            "bmux",
+            "server",
+            "start",
+            "--no-rolling-recording",
+            "--rolling-window-secs",
+            "90",
+        ])
+        .expect_err("conflicting flags should fail");
+        assert!(error.to_string().contains("cannot be used"));
+    }
+
+    #[test]
+    fn rejects_server_start_no_rolling_with_capture_override() {
+        let error = Cli::try_parse_from([
+            "bmux",
+            "server",
+            "start",
+            "--no-rolling-recording",
+            "--rolling-capture-output",
+        ])
+        .expect_err("conflicting flags should fail");
+        assert!(error.to_string().contains("cannot be used"));
     }
 
     #[test]
@@ -1589,6 +1751,7 @@ mod tests {
                 rolling_recording: false,
                 no_rolling_recording: false,
                 rolling_window_secs: None,
+                ..
             }
         ));
     }
@@ -1603,11 +1766,9 @@ mod tests {
         assert!(matches!(
             command,
             ServerCommand::Start {
-                daemon: false,
-                foreground_internal: false,
                 rolling_recording: true,
                 no_rolling_recording: false,
-                rolling_window_secs: None,
+                ..
             }
         ));
     }
@@ -1622,11 +1783,9 @@ mod tests {
         assert!(matches!(
             command,
             ServerCommand::Start {
-                daemon: false,
-                foreground_internal: false,
                 rolling_recording: false,
                 no_rolling_recording: true,
-                rolling_window_secs: None,
+                ..
             }
         ));
     }
@@ -1641,11 +1800,8 @@ mod tests {
         assert!(matches!(
             command,
             ServerCommand::Start {
-                daemon: false,
-                foreground_internal: false,
-                rolling_recording: false,
-                no_rolling_recording: false,
                 rolling_window_secs: Some(180),
+                ..
             }
         ));
     }
@@ -1768,8 +1924,54 @@ mod tests {
         assert!(matches!(
             command,
             ServerCommand::Recording {
-                command: ServerRecordingCommand::Start
-            }
+                command:
+                    ServerRecordingCommand::Start {
+                        rolling_window_secs: None,
+                        rolling_event_kind_all: false,
+                        rolling_event_kind,
+                        rolling_capture_input: false,
+                        no_rolling_capture_input: false,
+                        rolling_capture_output: false,
+                        no_rolling_capture_output: false,
+                        rolling_capture_events: false,
+                        no_rolling_capture_events: false,
+                        rolling_capture_protocol_replies: false,
+                        no_rolling_capture_protocol_replies: false,
+                        rolling_capture_images: false,
+                        no_rolling_capture_images: false,
+                    }
+            } if rolling_event_kind.is_empty()
+        ));
+    }
+
+    #[test]
+    fn parses_server_recording_start_with_overrides() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "server",
+            "recording",
+            "start",
+            "--rolling-window-secs",
+            "75",
+            "--rolling-event-kind",
+            "protocol-reply-raw",
+            "--rolling-capture-images",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Recording {
+                command:
+                    ServerRecordingCommand::Start {
+                        rolling_window_secs: Some(75),
+                        rolling_event_kind,
+                        rolling_capture_images: true,
+                        ..
+                    }
+            } if rolling_event_kind == vec![RecordingEventKindArg::ProtocolReplyRaw]
         ));
     }
 
@@ -1785,6 +1987,77 @@ mod tests {
             ServerCommand::Recording {
                 command: ServerRecordingCommand::Stop
             }
+        ));
+    }
+
+    #[test]
+    fn parses_server_gateway_command() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "server",
+            "gateway",
+            "--listen",
+            "0.0.0.0:7443",
+            "--cert-file",
+            "cert.pem",
+            "--key-file",
+            "key.pem",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Gateway {
+                listen,
+                host,
+                host_mode,
+                host_relay,
+                quick,
+                cert_file,
+                key_file,
+            } if listen == "0.0.0.0:7443"
+                && !host
+                && host_mode == GatewayHostMode::Iroh
+                && host_relay == "nokey@localhost.run"
+                && !quick
+                && cert_file.as_deref() == Some("cert.pem")
+                && key_file.as_deref() == Some("key.pem")
+        ));
+    }
+
+    #[test]
+    fn parses_server_gateway_quick_mode() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "server",
+            "gateway",
+            "--listen",
+            "0.0.0.0:7443",
+            "--quick",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Gateway {
+                listen,
+                host,
+                host_mode,
+                host_relay,
+                quick,
+                cert_file,
+                key_file,
+            } if listen == "0.0.0.0:7443"
+                && !host
+                && host_mode == GatewayHostMode::Iroh
+                && host_relay == "nokey@localhost.run"
+                && quick
+                && cert_file.is_none()
+                && key_file.is_none()
         ));
     }
 

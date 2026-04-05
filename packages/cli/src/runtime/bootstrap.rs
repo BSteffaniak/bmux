@@ -122,7 +122,7 @@ pub(super) async fn ensure_server_running_for_default_attach(
         return Ok(());
     }
 
-    let _ = run_server_start(true, false, None, None).await?;
+    let _ = run_server_start(true, false, None, RecordingRollingStartOptions::default()).await?;
     if !server_is_running(connection_context).await? {
         anyhow::bail!("bmux server failed to start for default attach")
     }
@@ -185,7 +185,7 @@ pub(super) async fn run_server_start(
     daemon: bool,
     foreground_internal: bool,
     rolling_enabled_override: Option<bool>,
-    rolling_window_secs_override: Option<u64>,
+    rolling_options: RecordingRollingStartOptions,
 ) -> Result<u8> {
     cleanup_stale_pid_file().await?;
     if server_is_running(ConnectionContext::default()).await? {
@@ -194,36 +194,45 @@ pub(super) async fn run_server_start(
     }
 
     let config = BmuxConfig::load()?;
-    if let Some(window_secs) = rolling_window_secs_override
+    if let Some(window_secs) = rolling_options.window_secs
         && window_secs == 0
     {
         anyhow::bail!("--rolling-window-secs must be greater than 0")
     }
-    let effective_rolling_window_secs =
-        rolling_window_secs_override.unwrap_or(config.recording.rolling_window_secs);
+    let base_rolling_settings = bmux_server::rolling_recording_settings_from_config(&config);
+    let effective_rolling_settings =
+        bmux_server::apply_rolling_start_options(&base_rolling_settings, &rolling_options);
+    let explicit_rolling_event_selection = rolling_options.event_kinds.is_some()
+        || rolling_options.capture_input.is_some()
+        || rolling_options.capture_output.is_some()
+        || rolling_options.capture_events.is_some()
+        || rolling_options.capture_protocol_replies.is_some()
+        || rolling_options.capture_images.is_some();
     let rolling_requested = rolling_enabled_override == Some(true)
-        || rolling_window_secs_override.is_some()
+        || rolling_options.window_secs.is_some()
+        || explicit_rolling_event_selection
         || (rolling_enabled_override.is_none() && config.recording.enabled);
     if rolling_requested
-        && effective_rolling_window_secs == 0
-        && (rolling_enabled_override == Some(true) || rolling_window_secs_override.is_some())
+        && effective_rolling_settings.window_secs == 0
+        && (rolling_enabled_override == Some(true)
+            || rolling_options.window_secs.is_some()
+            || explicit_rolling_event_selection)
     {
         anyhow::bail!(
             "rolling recording was explicitly enabled but window is 0s; set `recording.rolling_window_secs` in config or pass `--rolling-window-secs <secs>`"
         )
     }
-    let effective_rolling_enabled = if rolling_window_secs_override.is_some() {
+    let effective_rolling_enabled = if rolling_enabled_override == Some(false) {
+        false
+    } else if rolling_options.window_secs.is_some() || explicit_rolling_event_selection {
         true
     } else {
         rolling_enabled_override.unwrap_or(config.recording.enabled)
-    } && effective_rolling_window_secs > 0;
+    } && effective_rolling_settings.window_secs > 0;
     if effective_rolling_enabled {
-        if !config.recording.capture_input
-            && !config.recording.capture_output
-            && !config.recording.capture_events
-        {
+        if effective_rolling_settings.event_kinds.is_empty() {
             anyhow::bail!(
-                "rolling recording is enabled but all recording capture flags are disabled; enable at least one of recording.capture_input, recording.capture_output, or recording.capture_events"
+                "rolling recording is enabled but no rolling event kinds are selected; enable rolling capture flags or pass --rolling-event-kind/--rolling-event-kind-all"
             )
         }
     }
@@ -242,23 +251,10 @@ pub(super) async fn run_server_start(
             .arg("server")
             .arg("start")
             .arg("--foreground-internal")
-            .args(
-                rolling_enabled_override
-                    .map(|enabled| {
-                        if enabled {
-                            "--rolling-recording"
-                        } else {
-                            "--no-rolling-recording"
-                        }
-                    })
-                    .into_iter(),
-            )
-            .args(
-                rolling_window_secs_override
-                    .map(|secs| ["--rolling-window-secs".to_string(), secs.to_string()])
-                    .into_iter()
-                    .flatten(),
-            )
+            .args(rolling_start_override_args(
+                rolling_enabled_override,
+                &rolling_options,
+            ))
             .env(
                 "BMUX_LOG_LEVEL",
                 match log_level {
@@ -292,7 +288,8 @@ pub(super) async fn run_server_start(
     let server = BmuxServer::from_config_paths_with_rolling_options(
         &paths,
         effective_rolling_enabled,
-        effective_rolling_window_secs,
+        effective_rolling_settings.window_secs,
+        effective_rolling_settings.event_kinds,
     );
     register_plugin_service_handlers(&server, &config, &paths, &registry)?;
     write_server_pid_file(std::process::id())?;
@@ -328,6 +325,95 @@ pub(super) async fn run_server_start(
     let _ = remove_server_pid_file();
     run_result?;
     Ok(0)
+}
+
+fn rolling_start_override_args(
+    rolling_enabled_override: Option<bool>,
+    options: &RecordingRollingStartOptions,
+) -> Vec<String> {
+    let mut args = Vec::new();
+
+    if let Some(enabled) = rolling_enabled_override {
+        args.push(if enabled {
+            "--rolling-recording".to_string()
+        } else {
+            "--no-rolling-recording".to_string()
+        });
+    }
+
+    if let Some(window_secs) = options.window_secs {
+        args.push("--rolling-window-secs".to_string());
+        args.push(window_secs.to_string());
+    }
+
+    if let Some(event_kinds) = options.event_kinds.as_deref() {
+        for kind in event_kinds {
+            args.push("--rolling-event-kind".to_string());
+            args.push(recording_event_kind_flag_value(*kind).to_string());
+        }
+    }
+
+    push_bool_override_flag(
+        &mut args,
+        options.capture_input,
+        "--rolling-capture-input",
+        "--no-rolling-capture-input",
+    );
+    push_bool_override_flag(
+        &mut args,
+        options.capture_output,
+        "--rolling-capture-output",
+        "--no-rolling-capture-output",
+    );
+    push_bool_override_flag(
+        &mut args,
+        options.capture_events,
+        "--rolling-capture-events",
+        "--no-rolling-capture-events",
+    );
+    push_bool_override_flag(
+        &mut args,
+        options.capture_protocol_replies,
+        "--rolling-capture-protocol-replies",
+        "--no-rolling-capture-protocol-replies",
+    );
+    push_bool_override_flag(
+        &mut args,
+        options.capture_images,
+        "--rolling-capture-images",
+        "--no-rolling-capture-images",
+    );
+
+    args
+}
+
+fn push_bool_override_flag(
+    args: &mut Vec<String>,
+    value: Option<bool>,
+    positive: &str,
+    negative: &str,
+) {
+    if let Some(value) = value {
+        args.push(if value {
+            positive.to_string()
+        } else {
+            negative.to_string()
+        });
+    }
+}
+
+const fn recording_event_kind_flag_value(kind: RecordingEventKind) -> &'static str {
+    match kind {
+        RecordingEventKind::PaneInputRaw => "pane-input-raw",
+        RecordingEventKind::PaneOutputRaw => "pane-output-raw",
+        RecordingEventKind::ProtocolReplyRaw => "protocol-reply-raw",
+        RecordingEventKind::PaneImage => "pane-image",
+        RecordingEventKind::ServerEvent => "server-event",
+        RecordingEventKind::RequestStart => "request-start",
+        RecordingEventKind::RequestDone => "request-done",
+        RecordingEventKind::RequestError => "request-error",
+        RecordingEventKind::Custom => "custom",
+    }
 }
 
 pub(super) async fn run_session_attach(

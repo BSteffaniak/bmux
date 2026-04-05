@@ -580,7 +580,10 @@ pub enum Request {
         #[serde(default)]
         last_seconds: Option<u64>,
     },
-    RecordingRollingStart,
+    RecordingRollingStart {
+        #[serde(default)]
+        options: RecordingRollingStartOptions,
+    },
     RecordingRollingStop,
     RecordingCaptureTargets,
     /// Prune completed recordings older than the specified retention period.
@@ -847,6 +850,24 @@ pub struct RecordingCaptureTarget {
     pub path: String,
     #[serde(default)]
     pub rolling_window_secs: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RecordingRollingStartOptions {
+    #[serde(default)]
+    pub window_secs: Option<u64>,
+    #[serde(default)]
+    pub event_kinds: Option<Vec<RecordingEventKind>>,
+    #[serde(default)]
+    pub capture_input: Option<bool>,
+    #[serde(default)]
+    pub capture_output: Option<bool>,
+    #[serde(default)]
+    pub capture_events: Option<bool>,
+    #[serde(default)]
+    pub capture_protocol_replies: Option<bool>,
+    #[serde(default)]
+    pub capture_images: Option<bool>,
 }
 
 /// Event kind emitted into a recording timeline.
@@ -1867,7 +1888,23 @@ mod tests {
                 last_seconds: Some(120),
             },
             Request::RecordingCut { last_seconds: None },
-            Request::RecordingRollingStart,
+            Request::RecordingRollingStart {
+                options: RecordingRollingStartOptions::default(),
+            },
+            Request::RecordingRollingStart {
+                options: RecordingRollingStartOptions {
+                    window_secs: Some(90),
+                    event_kinds: Some(vec![
+                        RecordingEventKind::PaneOutputRaw,
+                        RecordingEventKind::ProtocolReplyRaw,
+                    ]),
+                    capture_input: Some(false),
+                    capture_output: Some(true),
+                    capture_events: Some(false),
+                    capture_protocol_replies: Some(true),
+                    capture_images: Some(false),
+                },
+            },
             Request::RecordingRollingStop,
             Request::RecordingCaptureTargets,
             Request::Detach,

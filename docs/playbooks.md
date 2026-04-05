@@ -1409,6 +1409,16 @@ screen content.
    [recording]
    enabled = true
    rolling_window_secs = 300
+
+   # rolling capture categories (optional)
+   rolling_capture_input = true
+   rolling_capture_output = true
+   rolling_capture_events = true
+   rolling_capture_protocol_replies = false
+   rolling_capture_images = false
+
+   # or explicit allowlist (takes precedence over categories when non-empty)
+   # rolling_event_kinds = ["pane_output_raw", "protocol_reply_raw", "pane_image"]
    ```
 
    ```sh
@@ -1423,8 +1433,20 @@ screen content.
    ```sh
    # force on for this boot (and optionally override window)
    bmux server start --rolling-recording --rolling-window-secs 300
+
+   # choose exact kinds for this boot
+   bmux server start --rolling-window-secs 300 --rolling-event-kind-all
+   bmux server start --rolling-window-secs 300 --rolling-event-kind pane-output-raw --rolling-event-kind protocol-reply-raw
+
+   # category overrides for this boot
+   bmux server start --rolling-capture-input --no-rolling-capture-events --rolling-capture-protocol-replies
+
    # force off for this boot
    bmux server start --no-rolling-recording
+
+   # kill switch on a running server (and restart with runtime overrides)
+   bmux server recording stop
+   bmux server recording start --rolling-window-secs 120 --rolling-event-kind-all
    ```
 
 2. Convert to a playbook:

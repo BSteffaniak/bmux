@@ -176,6 +176,20 @@ pub enum RemoteServerStartMode {
     RequireRunning,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingEventKindConfig {
+    PaneInputRaw,
+    PaneOutputRaw,
+    ProtocolReplyRaw,
+    PaneImage,
+    ServerEvent,
+    RequestStart,
+    RequestDone,
+    RequestError,
+    Custom,
+}
+
 /// Session recording for terminal replay, debugging, and playbook generation.
 /// Records pane I/O and lifecycle events to disk.
 #[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
@@ -196,6 +210,29 @@ pub struct RecordingConfig {
     pub capture_output: bool,
     /// Capture lifecycle and server events (pane creation, resize, close, etc.)
     pub capture_events: bool,
+    /// Override rolling capture of pane input bytes.
+    ///
+    /// `None` falls back to `recording.capture_input`.
+    pub rolling_capture_input: Option<bool>,
+    /// Override rolling capture of pane output bytes.
+    ///
+    /// `None` falls back to `recording.capture_output`.
+    pub rolling_capture_output: Option<bool>,
+    /// Override rolling capture of lifecycle/request/custom events.
+    ///
+    /// `None` falls back to `recording.capture_events`.
+    pub rolling_capture_events: Option<bool>,
+    /// Enable rolling capture of protocol reply bytes.
+    ///
+    /// `None` defaults to `false`.
+    pub rolling_capture_protocol_replies: Option<bool>,
+    /// Enable rolling capture of extracted pane image payloads.
+    ///
+    /// `None` defaults to `false`.
+    pub rolling_capture_images: Option<bool>,
+    /// Explicit rolling event-kind allowlist. When non-empty, this takes
+    /// precedence over rolling capture category booleans.
+    pub rolling_event_kinds: Vec<RecordingEventKindConfig>,
     /// Rotate recording segments at approximately this size in MB
     pub segment_mb: usize,
     /// Retention period for completed recordings in days. Set to 0 to disable
@@ -216,6 +253,12 @@ impl Default for RecordingConfig {
             capture_input: true,
             capture_output: true,
             capture_events: true,
+            rolling_capture_input: None,
+            rolling_capture_output: None,
+            rolling_capture_events: None,
+            rolling_capture_protocol_replies: None,
+            rolling_capture_images: None,
+            rolling_event_kinds: Vec::new(),
             segment_mb: 64,
             retention_days: 30,
             rolling_window_secs: 0,

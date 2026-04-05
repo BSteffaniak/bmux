@@ -14,9 +14,9 @@ use bmux_ipc::{
     EnvelopeKind, ErrorCode, IncompatibilityReason, InvokeServiceKind, IpcEndpoint,
     NegotiatedProtocol, PaneFocusDirection, PaneLayoutNode, PaneSelector, PaneSplitDirection,
     PaneSummary, ProtocolContract, ProtocolVersion, RecordingCaptureTarget, RecordingEventKind,
-    RecordingProfile, RecordingStatus, RecordingSummary, Request, Response, ResponsePayload,
-    ServerSnapshotStatus, SessionSelector, SessionSummary, decode, default_supported_capabilities,
-    encode,
+    RecordingProfile, RecordingRollingStartOptions, RecordingStatus, RecordingSummary, Request,
+    Response, ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary, decode,
+    default_supported_capabilities, encode,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -709,8 +709,14 @@ impl BmuxClient {
     /// # Errors
     ///
     /// Returns an error if request or response validation fails.
-    pub async fn recording_rolling_start(&mut self) -> Result<RecordingSummary> {
-        match self.request(Request::RecordingRollingStart).await? {
+    pub async fn recording_rolling_start(
+        &mut self,
+        options: RecordingRollingStartOptions,
+    ) -> Result<RecordingSummary> {
+        match self
+            .request(Request::RecordingRollingStart { options })
+            .await?
+        {
             ResponsePayload::RecordingStarted { recording } => Ok(recording),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording started response",
@@ -2295,8 +2301,14 @@ impl StreamingBmuxClient {
         }
     }
 
-    pub async fn recording_rolling_start(&mut self) -> Result<RecordingSummary> {
-        match self.request(Request::RecordingRollingStart).await? {
+    pub async fn recording_rolling_start(
+        &mut self,
+        options: RecordingRollingStartOptions,
+    ) -> Result<RecordingSummary> {
+        match self
+            .request(Request::RecordingRollingStart { options })
+            .await?
+        {
             ResponsePayload::RecordingStarted { recording } => Ok(recording),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording started response",
@@ -2372,7 +2384,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::RecordingWriteCustomEvent { .. } => "recording_write_custom_event",
         Request::RecordingDeleteAll => "recording_delete_all",
         Request::RecordingCut { .. } => "recording_cut",
-        Request::RecordingRollingStart => "recording_rolling_start",
+        Request::RecordingRollingStart { .. } => "recording_rolling_start",
         Request::RecordingRollingStop => "recording_rolling_stop",
         Request::RecordingCaptureTargets => "recording_capture_targets",
         Request::RecordingPrune { .. } => "recording_prune",

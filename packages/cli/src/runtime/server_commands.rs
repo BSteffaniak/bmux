@@ -353,6 +353,7 @@ pub(super) async fn run_server_stop(connection_context: ConnectionContext<'_>) -
 }
 
 pub(super) async fn run_server_recording_start(
+    options: RecordingRollingStartOptions,
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
     cleanup_stale_pid_file().await?;
@@ -363,7 +364,7 @@ pub(super) async fn run_server_recording_start(
     )
     .await?;
     let recording = client
-        .recording_rolling_start()
+        .recording_rolling_start(options)
         .await
         .map_err(map_cli_client_error)?;
     println!(

@@ -64,7 +64,7 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             ServerCommand::Restore { .. } => BuiltInHandlerId::ServerRestore,
             ServerCommand::Stop => BuiltInHandlerId::ServerStop,
             ServerCommand::Recording { command } => match command {
-                ServerRecordingCommand::Start => BuiltInHandlerId::ServerRecordingStart,
+                ServerRecordingCommand::Start { .. } => BuiltInHandlerId::ServerRecordingStart,
                 ServerRecordingCommand::Stop => BuiltInHandlerId::ServerRecordingStop,
             },
             ServerCommand::Gateway { .. } => BuiltInHandlerId::ServerGateway,
@@ -425,6 +425,18 @@ pub(super) async fn dispatch_built_in_command(
                         rolling_recording,
                         no_rolling_recording,
                         rolling_window_secs,
+                        rolling_event_kind_all,
+                        rolling_event_kind,
+                        rolling_capture_input,
+                        no_rolling_capture_input,
+                        rolling_capture_output,
+                        no_rolling_capture_output,
+                        rolling_capture_events,
+                        no_rolling_capture_events,
+                        rolling_capture_protocol_replies,
+                        no_rolling_capture_protocol_replies,
+                        rolling_capture_images,
+                        no_rolling_capture_images,
                     },
             },
         ) => {
@@ -435,11 +447,35 @@ pub(super) async fn dispatch_built_in_command(
             } else {
                 None
             };
+            let rolling_options = RecordingRollingStartOptions {
+                window_secs: *rolling_window_secs,
+                event_kinds: if *rolling_event_kind_all {
+                    Some(all_recording_event_kinds())
+                } else if rolling_event_kind.is_empty() {
+                    None
+                } else {
+                    Some(
+                        rolling_event_kind
+                            .iter()
+                            .copied()
+                            .map(recording_event_kind_arg_to_ipc)
+                            .collect(),
+                    )
+                },
+                capture_input: bool_override(*rolling_capture_input, *no_rolling_capture_input),
+                capture_output: bool_override(*rolling_capture_output, *no_rolling_capture_output),
+                capture_events: bool_override(*rolling_capture_events, *no_rolling_capture_events),
+                capture_protocol_replies: bool_override(
+                    *rolling_capture_protocol_replies,
+                    *no_rolling_capture_protocol_replies,
+                ),
+                capture_images: bool_override(*rolling_capture_images, *no_rolling_capture_images),
+            };
             run_server_start(
                 *daemon,
                 *foreground_internal,
                 rolling_enabled_override,
-                *rolling_window_secs,
+                rolling_options,
             )
             .await
         }
@@ -478,10 +514,63 @@ pub(super) async fn dispatch_built_in_command(
             Command::Server {
                 command:
                     ServerCommand::Recording {
-                        command: ServerRecordingCommand::Start,
+                        command:
+                            ServerRecordingCommand::Start {
+                                rolling_window_secs,
+                                rolling_event_kind_all,
+                                rolling_event_kind,
+                                rolling_capture_input,
+                                no_rolling_capture_input,
+                                rolling_capture_output,
+                                no_rolling_capture_output,
+                                rolling_capture_events,
+                                no_rolling_capture_events,
+                                rolling_capture_protocol_replies,
+                                no_rolling_capture_protocol_replies,
+                                rolling_capture_images,
+                                no_rolling_capture_images,
+                            },
                     },
             },
-        ) => run_server_recording_start(connection_context).await,
+        ) => {
+            run_server_recording_start(
+                RecordingRollingStartOptions {
+                    window_secs: *rolling_window_secs,
+                    event_kinds: if *rolling_event_kind_all {
+                        Some(all_recording_event_kinds())
+                    } else if rolling_event_kind.is_empty() {
+                        None
+                    } else {
+                        Some(
+                            rolling_event_kind
+                                .iter()
+                                .copied()
+                                .map(recording_event_kind_arg_to_ipc)
+                                .collect(),
+                        )
+                    },
+                    capture_input: bool_override(*rolling_capture_input, *no_rolling_capture_input),
+                    capture_output: bool_override(
+                        *rolling_capture_output,
+                        *no_rolling_capture_output,
+                    ),
+                    capture_events: bool_override(
+                        *rolling_capture_events,
+                        *no_rolling_capture_events,
+                    ),
+                    capture_protocol_replies: bool_override(
+                        *rolling_capture_protocol_replies,
+                        *no_rolling_capture_protocol_replies,
+                    ),
+                    capture_images: bool_override(
+                        *rolling_capture_images,
+                        *no_rolling_capture_images,
+                    ),
+                },
+                connection_context,
+            )
+            .await
+        }
         (
             BuiltInHandlerId::ServerRecordingStop,
             Command::Server {
@@ -961,5 +1050,43 @@ pub(super) async fn dispatch_built_in_command(
             },
         ) => run_playbook_cleanup(*dry_run, *json),
         _ => unreachable!("built-in command handler and command variant should stay in sync"),
+    }
+}
+
+fn bool_override(positive: bool, negative: bool) -> Option<bool> {
+    if positive {
+        Some(true)
+    } else if negative {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn all_recording_event_kinds() -> Vec<RecordingEventKind> {
+    vec![
+        RecordingEventKind::PaneInputRaw,
+        RecordingEventKind::PaneOutputRaw,
+        RecordingEventKind::ProtocolReplyRaw,
+        RecordingEventKind::PaneImage,
+        RecordingEventKind::ServerEvent,
+        RecordingEventKind::RequestStart,
+        RecordingEventKind::RequestDone,
+        RecordingEventKind::RequestError,
+        RecordingEventKind::Custom,
+    ]
+}
+
+const fn recording_event_kind_arg_to_ipc(kind: RecordingEventKindArg) -> RecordingEventKind {
+    match kind {
+        RecordingEventKindArg::PaneInputRaw => RecordingEventKind::PaneInputRaw,
+        RecordingEventKindArg::PaneOutputRaw => RecordingEventKind::PaneOutputRaw,
+        RecordingEventKindArg::ProtocolReplyRaw => RecordingEventKind::ProtocolReplyRaw,
+        RecordingEventKindArg::PaneImage => RecordingEventKind::PaneImage,
+        RecordingEventKindArg::ServerEvent => RecordingEventKind::ServerEvent,
+        RecordingEventKindArg::RequestStart => RecordingEventKind::RequestStart,
+        RecordingEventKindArg::RequestDone => RecordingEventKind::RequestDone,
+        RecordingEventKindArg::RequestError => RecordingEventKind::RequestError,
+        RecordingEventKindArg::Custom => RecordingEventKind::Custom,
     }
 }
