@@ -1,8 +1,12 @@
-use crate::frame::{FrameDecodeError, FrameEncodeError, decode_frame_exact, encode_frame};
+use crate::frame::{
+    FrameDecodeError, FrameEncodeError, decode_frame_compressed, decode_frame_exact, encode_frame,
+    encode_frame_compressed,
+};
 use crate::{Envelope, IpcEndpoint};
 use std::io;
 use std::path::Path;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use thiserror::Error;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -133,6 +137,8 @@ impl LocalIpcListener {
 /// Write half of a split [`LocalIpcStream`].
 pub struct IpcStreamWriter {
     inner: tokio::io::WriteHalf<LocalIpcStream>,
+    /// Optional frame compression codec, activated after capability negotiation.
+    frame_codec: Option<Arc<dyn crate::compression::CompressionCodec>>,
 }
 
 impl std::fmt::Debug for IpcStreamWriter {
@@ -144,6 +150,9 @@ impl std::fmt::Debug for IpcStreamWriter {
 /// Read half of a split [`LocalIpcStream`].
 pub struct IpcStreamReader {
     inner: tokio::io::ReadHalf<LocalIpcStream>,
+    /// Whether to expect the compressed frame format (1-byte compression id
+    /// prefix).  Activated after capability negotiation.
+    compressed_frames: bool,
 }
 
 impl std::fmt::Debug for IpcStreamReader {
@@ -155,11 +164,18 @@ impl std::fmt::Debug for IpcStreamReader {
 impl IpcStreamWriter {
     /// Send a single framed envelope.
     ///
+    /// Uses compressed frame format if a frame codec has been set via
+    /// [`enable_frame_compression`](Self::enable_frame_compression).
+    ///
     /// # Errors
     ///
     /// Returns an error if frame encoding or socket writes fail.
     pub async fn send_envelope(&mut self, envelope: &Envelope) -> Result<(), IpcTransportError> {
-        let frame = encode_frame(envelope)?;
+        let frame = if self.frame_codec.is_some() {
+            encode_frame_compressed(envelope, self.frame_codec.as_deref())?
+        } else {
+            encode_frame(envelope)?
+        };
         write_frame(&mut self.inner, &frame).await
     }
 
@@ -171,16 +187,36 @@ impl IpcStreamWriter {
     pub async fn write_raw_frame(&mut self, frame: &[u8]) -> Result<(), IpcTransportError> {
         write_frame(&mut self.inner, frame).await
     }
+
+    /// Enable frame-level compression for all subsequent `send_envelope` calls.
+    pub fn enable_frame_compression(
+        &mut self,
+        codec: Arc<dyn crate::compression::CompressionCodec>,
+    ) {
+        self.frame_codec = Some(codec);
+    }
 }
 
 impl IpcStreamReader {
     /// Receive a single framed envelope.
     ///
+    /// Uses compressed frame format if compression was enabled via
+    /// [`enable_frame_compression`](Self::enable_frame_compression).
+    ///
     /// # Errors
     ///
     /// Returns an error if frame reads fail or the frame is invalid.
     pub async fn recv_envelope(&mut self) -> Result<Envelope, IpcTransportError> {
-        read_frame(&mut self.inner).await
+        if self.compressed_frames {
+            read_frame_compressed(&mut self.inner).await
+        } else {
+            read_frame(&mut self.inner).await
+        }
+    }
+
+    /// Enable compressed frame format for all subsequent `recv_envelope` calls.
+    pub fn enable_frame_compression(&mut self) {
+        self.compressed_frames = true;
     }
 }
 
@@ -194,8 +230,14 @@ impl LocalIpcStream {
     pub fn into_split(self) -> (IpcStreamReader, IpcStreamWriter) {
         let (read_half, write_half) = tokio::io::split(self);
         (
-            IpcStreamReader { inner: read_half },
-            IpcStreamWriter { inner: write_half },
+            IpcStreamReader {
+                inner: read_half,
+                compressed_frames: false,
+            },
+            IpcStreamWriter {
+                inner: write_half,
+                frame_codec: None,
+            },
         )
     }
 
@@ -366,6 +408,23 @@ where
     frame.resize(4 + payload_len, 0);
     stream.read_exact(&mut frame[4..]).await?;
     let envelope = decode_frame_exact(&frame)?;
+    Ok(envelope)
+}
+
+/// Read one frame using the compressed frame format (1-byte compression id
+/// prefix after the length).
+async fn read_frame_compressed<T>(stream: &mut T) -> Result<Envelope, IpcTransportError>
+where
+    T: AsyncRead + Unpin,
+{
+    let mut len_bytes = [0_u8; 4];
+    stream.read_exact(&mut len_bytes).await?;
+    let total_len = u32::from_le_bytes(len_bytes) as usize;
+    let mut frame = Vec::with_capacity(4 + total_len);
+    frame.extend_from_slice(&len_bytes);
+    frame.resize(4 + total_len, 0);
+    stream.read_exact(&mut frame[4..]).await?;
+    let envelope = decode_frame_compressed(&frame)?;
     Ok(envelope)
 }
 

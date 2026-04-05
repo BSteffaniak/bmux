@@ -452,6 +452,8 @@ pub struct BehaviorConfig {
     pub mouse: MouseBehaviorConfig,
     /// Terminal image protocol settings (Sixel, Kitty graphics, iTerm2).
     pub images: ImageBehaviorConfig,
+    /// IPC compression settings (payload, frame, and transport layers).
+    pub compression: CompressionConfig,
 }
 
 impl Default for BehaviorConfig {
@@ -474,6 +476,7 @@ impl Default for BehaviorConfig {
             pane_restore_method: PaneRestoreMethod::Snapshot,
             mouse: MouseBehaviorConfig::default(),
             images: ImageBehaviorConfig::default(),
+            compression: CompressionConfig::default(),
         }
     }
 }
@@ -571,6 +574,67 @@ pub enum ImageDecodeMode {
     /// Raw bytes forwarded with coordinate translation (same-protocol only).
     #[default]
     Passthrough,
+}
+
+/// IPC compression settings.
+///
+/// Controls three independent compression layers:
+/// - **payload**: Per-image payload compression (zstd/lz4 on raw image data).
+/// - **frame**: Per-IPC-frame compression (lz4/zstd on entire serialized messages).
+/// - **transport**: Stream-level compression for remote connections (zstd streaming).
+///
+/// Default is `auto` for payload and transport, `none` for frame.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, ConfigDoc)]
+#[config_doc(section = "behavior.compression")]
+#[serde(default)]
+pub struct CompressionConfig {
+    /// Per-image payload compression.  Applied to image raw_data before IPC
+    /// serialization.  `auto` selects zstd if available.
+    pub payload: CompressionMode,
+    /// Minimum payload size in bytes before compression is attempted.
+    pub payload_threshold: usize,
+    /// Per-IPC-frame compression.  Applied to entire serialized frame payloads.
+    /// Leave `none` when transport compression is active to avoid double work.
+    pub frame: CompressionMode,
+    /// Minimum frame payload size before compression is attempted.
+    pub frame_threshold: usize,
+    /// Stream-level transport compression for remote connections (TLS, Iroh).
+    /// `auto` selects zstd streaming for remote, none for local.
+    pub transport: CompressionMode,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            payload: CompressionMode::Auto,
+            payload_threshold: 4096,
+            frame: CompressionMode::None,
+            frame_threshold: 256,
+            transport: CompressionMode::Auto,
+        }
+    }
+}
+
+impl CompressionConfig {
+    /// Config doc support.
+    pub const fn config_doc_values() -> &'static [&'static str] {
+        &[]
+    }
+}
+
+/// Compression algorithm selection.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum CompressionMode {
+    /// No compression.
+    None,
+    /// Select the best available algorithm automatically.
+    #[default]
+    Auto,
+    /// Use zstd compression.
+    Zstd,
+    /// Use lz4 compression.
+    Lz4,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]

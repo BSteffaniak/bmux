@@ -9,6 +9,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
+pub mod compressed_stream;
 pub mod compression;
 pub mod frame;
 pub mod transport;
@@ -78,6 +79,13 @@ pub const CORE_PROTOCOL_CAPABILITIES: &[&str] = &[
     CORE_CAPABILITY_DETACH,
 ];
 
+// Compression capability strings (non-core, optional).
+pub const CAPABILITY_COMPRESSION_PAYLOAD_ZSTD: &str = "compression.payload.zstd";
+pub const CAPABILITY_COMPRESSION_PAYLOAD_LZ4: &str = "compression.payload.lz4";
+pub const CAPABILITY_COMPRESSION_FRAME_ZSTD: &str = "compression.frame.zstd";
+pub const CAPABILITY_COMPRESSION_FRAME_LZ4: &str = "compression.frame.lz4";
+pub const CAPABILITY_COMPRESSION_TRANSPORT_ZSTD: &str = "compression.transport.zstd";
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ProtocolRevisionRange {
     pub min: u32,
@@ -144,7 +152,7 @@ pub enum IncompatibilityReason {
 
 #[must_use]
 pub fn default_supported_capabilities() -> Vec<String> {
-    vec![
+    let mut caps = vec![
         CORE_CAPABILITY_SESSION.to_string(),
         CORE_CAPABILITY_ATTACH.to_string(),
         CORE_CAPABILITY_PANE_IO.to_string(),
@@ -152,7 +160,20 @@ pub fn default_supported_capabilities() -> Vec<String> {
         "feature.contexts".to_string(),
         "feature.attach_snapshot".to_string(),
         "feature.recording.v4".to_string(),
-    ]
+    ];
+    // Advertise compression capabilities when compiled in.
+    #[cfg(feature = "compression-zstd")]
+    {
+        caps.push(CAPABILITY_COMPRESSION_PAYLOAD_ZSTD.to_string());
+        caps.push(CAPABILITY_COMPRESSION_FRAME_ZSTD.to_string());
+        caps.push(CAPABILITY_COMPRESSION_TRANSPORT_ZSTD.to_string());
+    }
+    #[cfg(feature = "compression-lz4")]
+    {
+        caps.push(CAPABILITY_COMPRESSION_PAYLOAD_LZ4.to_string());
+        caps.push(CAPABILITY_COMPRESSION_FRAME_LZ4.to_string());
+    }
+    caps
 }
 
 pub fn negotiate_protocol(
