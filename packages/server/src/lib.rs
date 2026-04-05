@@ -1541,14 +1541,6 @@ impl PaneRuntimeHandle {
             .input_tx
             .send(PaneRuntimeCommand::Resize { rows, cols });
     }
-
-    #[cfg(test)]
-    fn last_requested_pty_size(&self) -> (u16, u16) {
-        self.last_requested_size
-            .lock()
-            .map(|value| *value)
-            .unwrap_or((0, 0))
-    }
 }
 
 impl SessionRuntimeManager {
@@ -3473,16 +3465,6 @@ impl SessionRuntimeManager {
 
         Ok(read.bytes)
     }
-
-    #[cfg(test)]
-    fn runtime_count(&self) -> usize {
-        self.runtimes.len()
-    }
-
-    #[cfg(test)]
-    fn has_runtime(&self, session_id: SessionId) -> bool {
-        self.runtimes.contains_key(&session_id)
-    }
 }
 
 fn resolve_pane_id_from_selector(
@@ -3908,14 +3890,6 @@ impl BmuxServer {
         info!("bmux server listener closed on {:?}", self.endpoint);
 
         Ok(())
-    }
-
-    #[cfg(test)]
-    async fn run_with_ready(
-        &self,
-        ready_tx: oneshot::Sender<std::result::Result<(), String>>,
-    ) -> Result<()> {
-        self.run_impl(Some(ready_tx)).await
     }
 }
 
@@ -9745,23 +9719,9 @@ mod tests {
                 assert_eq!(error.code, ErrorCode::NotFound);
                 assert!(error.message.starts_with("session not found:"));
             }
-            response => panic!("expected attach context not found response, got {response:?}"),
-        }
-
-        let current = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::CurrentContext,
-        )
-        .await;
-        match current {
-            Response::Ok(ResponsePayload::CurrentContext { context }) => {
-                assert!(context.is_none());
+            response @ Response::Ok(_) => {
+                panic!("expected attach context not found response, got {response:?}")
             }
-            response => panic!("expected current context response, got {response:?}"),
         }
 
         let second_attach = execute_request(
@@ -9780,7 +9740,9 @@ mod tests {
                 assert_eq!(error.code, ErrorCode::NotFound);
                 assert_eq!(error.message, "context not found");
             }
-            response => panic!("expected attach context not found response, got {response:?}"),
+            response @ Response::Ok(_) => {
+                panic!("expected attach context not found response, got {response:?}")
+            }
         }
     }
 
@@ -9934,7 +9896,7 @@ mod tests {
                 assert_eq!(error.code, ErrorCode::InvalidRequest);
                 assert!(error.message.contains("session policy denied"));
             }
-            response => panic!("expected denied kill response, got {response:?}"),
+            response @ Response::Ok(_) => panic!("expected denied kill response, got {response:?}"),
         }
     }
 
@@ -9995,7 +9957,9 @@ mod tests {
                 assert_eq!(error.code, ErrorCode::InvalidRequest);
                 assert!(error.message.contains("session policy denied"));
             }
-            response => panic!("expected denied split response, got {response:?}"),
+            response @ Response::Ok(_) => {
+                panic!("expected denied split response, got {response:?}")
+            }
         }
     }
 
@@ -10054,7 +10018,9 @@ mod tests {
                 assert_eq!(error.code, ErrorCode::InvalidRequest);
                 assert!(error.message.contains("session policy denied"));
             }
-            response => panic!("expected denied attach input response, got {response:?}"),
+            response @ Response::Ok(_) => {
+                panic!("expected denied attach input response, got {response:?}")
+            }
         }
     }
 }

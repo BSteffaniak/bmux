@@ -642,10 +642,10 @@ mod tests {
         }]);
         let snapshot_bytes = serde_json::to_vec(&payload["snapshot"]).expect("snapshot bytes");
         let checksum = {
-            let mut hash = 0xcbf29ce484222325u64;
+            let mut hash = 0xcbf2_9ce4_8422_2325_u64;
             for byte in snapshot_bytes {
                 hash ^= u64::from(byte);
-                hash = hash.wrapping_mul(0x100000001b3);
+                hash = hash.wrapping_mul(0x0100_0000_01b3);
             }
             hash
         };
@@ -695,10 +695,10 @@ mod tests {
         };
 
         let snapshot_bytes = serde_json::to_vec(&snapshot).expect("snapshot bytes");
-        let mut hash = 0xcbf29ce484222325u64;
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
         for byte in snapshot_bytes {
             hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x100000001b3);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
         }
         let legacy_payload = serde_json::json!({
             "version": 3,
