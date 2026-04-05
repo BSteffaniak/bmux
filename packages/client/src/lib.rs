@@ -1530,7 +1530,7 @@ impl StreamingBmuxClient {
             timeout,
             next_request_id,
             principal_id,
-            negotiated_protocol: _,
+            negotiated_protocol,
         } = client;
 
         let local_stream = match stream {
@@ -1542,7 +1542,16 @@ impl StreamingBmuxClient {
             }
         };
 
-        let (reader, writer) = local_stream.into_split();
+        let (mut reader, mut writer) = local_stream.into_split();
+
+        // Enable frame compression if negotiated.
+        if let Some(ref negotiated) = negotiated_protocol {
+            if let Some(codec) = resolve_frame_codec_from_capabilities(&negotiated.capabilities) {
+                writer.enable_frame_compression(codec);
+                reader.enable_frame_compression();
+            }
+        }
+
         let pending: PendingMap = Arc::new(tokio::sync::Mutex::new(BTreeMap::new()));
         let (event_tx, event_rx) = tokio::sync::mpsc::unbounded_channel();
 
@@ -2456,6 +2465,28 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::EventPushEnabled => "event_push_enabled",
         },
         Response::Err(_) => "error",
+    }
+}
+
+/// Resolve a frame compression codec from negotiated capability strings.
+///
+/// Prefers lz4 for frames (fastest), falls back to zstd.
+fn resolve_frame_codec_from_capabilities(
+    capabilities: &[String],
+) -> Option<Arc<dyn bmux_ipc::compression::CompressionCodec>> {
+    use bmux_ipc::compression;
+    if capabilities
+        .iter()
+        .any(|c| c == bmux_ipc::CAPABILITY_COMPRESSION_FRAME_LZ4)
+    {
+        compression::resolve_codec(compression::CompressionId::Lz4).map(Arc::from)
+    } else if capabilities
+        .iter()
+        .any(|c| c == bmux_ipc::CAPABILITY_COMPRESSION_FRAME_ZSTD)
+    {
+        compression::resolve_codec(compression::CompressionId::Zstd).map(Arc::from)
+    } else {
+        None
     }
 }
 

@@ -3837,6 +3837,9 @@ async fn handle_connection(
     let client_principal_id: Uuid;
     let mut selected_session: Option<SessionId> = None;
     let mut attached_stream_session: Option<SessionId> = None;
+    let mut negotiated_frame_codec: Option<
+        std::sync::Arc<dyn bmux_ipc::compression::CompressionCodec>,
+    > = None;
 
     // ── Handshake (serial, before split) ─────────────────────────────────
 
@@ -3894,6 +3897,9 @@ async fn handle_connection(
                         negotiated.revision,
                         negotiated.capabilities.join(",")
                     );
+                    // Resolve frame compression codec from negotiated capabilities.
+                    negotiated_frame_codec =
+                        resolve_frame_codec_from_capabilities(&negotiated.capabilities);
                     send_ok(
                         &mut stream,
                         first_envelope.request_id,
@@ -3943,6 +3949,14 @@ async fn handle_connection(
 
     let (mut reader, mut writer) = stream.into_split();
 
+    // Enable frame compression if negotiated.
+    if negotiated_frame_codec.is_some() {
+        reader.enable_frame_compression();
+        // The writer is used via write_raw_frame with pre-encoded frames,
+        // so we don't set a codec on it — compression happens at the
+        // encode_frame_compressed call site in send_response_via_channel.
+    }
+
     // Channel-based writer: all outgoing frames (responses + pushed events)
     // are sent through this channel to a single writer task. This eliminates
     // mutex contention between the request loop and the event push task.
@@ -3978,6 +3992,7 @@ async fn handle_connection(
                     envelope.request_id,
                     ErrorCode::InvalidRequest,
                     format!("failed parsing request: {error:#}"),
+                    negotiated_frame_codec.as_deref(),
                 )?;
                 continue;
             }
@@ -4090,7 +4105,12 @@ async fn handle_connection(
                 );
             }
         }
-        match send_response_via_channel(&frame_tx, envelope.request_id, response) {
+        match send_response_via_channel(
+            &frame_tx,
+            envelope.request_id,
+            response,
+            negotiated_frame_codec.as_deref(),
+        ) {
             Ok(()) => {}
             Err(err) if is_frame_too_large_error(&err) => {
                 warn!(
@@ -4103,6 +4123,7 @@ async fn handle_connection(
                     envelope.request_id,
                     ErrorCode::Internal,
                     "response too large".to_string(),
+                    negotiated_frame_codec.as_deref(),
                 )?;
             }
             Err(err) => return Err(err),
@@ -4114,6 +4135,7 @@ async fn handle_connection(
         if is_enable_push && event_push_task.is_none() {
             let mut event_rx = state.event_broadcast.subscribe();
             let push_frame_tx = frame_tx.clone();
+            let push_frame_codec = negotiated_frame_codec.clone();
             event_push_task = Some(tokio::spawn(async move {
                 loop {
                     match event_rx.recv().await {
@@ -4122,8 +4144,19 @@ async fn handle_connection(
                                 continue;
                             };
                             let envelope = Envelope::new(0, EnvelopeKind::Event, payload);
-                            let Ok(frame) = bmux_ipc::frame::encode_frame(&envelope) else {
-                                continue;
+                            let frame = if push_frame_codec.is_some() {
+                                let Ok(f) = bmux_ipc::frame::encode_frame_compressed(
+                                    &envelope,
+                                    push_frame_codec.as_deref(),
+                                ) else {
+                                    continue;
+                                };
+                                f
+                            } else {
+                                let Ok(f) = bmux_ipc::frame::encode_frame(&envelope) else {
+                                    continue;
+                                };
+                                f
                             };
                             if push_frame_tx.send(frame).is_err() {
                                 return; // writer dropped (client disconnected)
@@ -6717,7 +6750,7 @@ async fn handle_request(
                             #[cfg(feature = "image-registry")]
                             if let Ok(reg) = pane.image_registry.lock() {
                                 let delta = reg.delta_since(since);
-                                result.push(delta.to_ipc(*pane_id));
+                                result.push(delta.to_ipc(*pane_id, None));
                             }
                             #[cfg(not(feature = "image-registry"))]
                             {
@@ -8225,24 +8258,52 @@ fn send_error_via_channel(
     request_id: u64,
     code: ErrorCode,
     message: String,
+    frame_codec: Option<&dyn bmux_ipc::compression::CompressionCodec>,
 ) -> Result<()> {
     let response = Response::Err(ErrorResponse { code, message });
-    send_response_via_channel(frame_tx, request_id, response)
+    send_response_via_channel(frame_tx, request_id, response, frame_codec)
 }
 
 fn send_response_via_channel(
     frame_tx: &mpsc::UnboundedSender<Vec<u8>>,
     request_id: u64,
     response: Response,
+    frame_codec: Option<&dyn bmux_ipc::compression::CompressionCodec>,
 ) -> Result<()> {
     let payload = encode(&response).context("failed encoding response payload")?;
     let envelope = Envelope::new(request_id, EnvelopeKind::Response, payload);
-    let frame =
-        bmux_ipc::frame::encode_frame(&envelope).context("failed encoding response frame")?;
+    let frame = if frame_codec.is_some() {
+        bmux_ipc::frame::encode_frame_compressed(&envelope, frame_codec)
+            .context("failed encoding compressed response frame")?
+    } else {
+        bmux_ipc::frame::encode_frame(&envelope).context("failed encoding response frame")?
+    };
     frame_tx
         .send(frame)
         .map_err(|_| anyhow::anyhow!("writer channel closed"))?;
     Ok(())
+}
+
+/// Resolve a frame compression codec from negotiated capability strings.
+///
+/// Prefers lz4 for frames (fastest), falls back to zstd.
+fn resolve_frame_codec_from_capabilities(
+    capabilities: &[String],
+) -> Option<std::sync::Arc<dyn bmux_ipc::compression::CompressionCodec>> {
+    use bmux_ipc::compression;
+    if capabilities
+        .iter()
+        .any(|c| c == bmux_ipc::CAPABILITY_COMPRESSION_FRAME_LZ4)
+    {
+        compression::resolve_codec(compression::CompressionId::Lz4).map(std::sync::Arc::from)
+    } else if capabilities
+        .iter()
+        .any(|c| c == bmux_ipc::CAPABILITY_COMPRESSION_FRAME_ZSTD)
+    {
+        compression::resolve_codec(compression::CompressionId::Zstd).map(std::sync::Arc::from)
+    } else {
+        None
+    }
 }
 
 /// Returns `true` when `err` was caused by the IPC frame payload exceeding the

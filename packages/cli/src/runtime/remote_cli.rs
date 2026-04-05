@@ -2561,14 +2561,24 @@ async fn connect_tls_bridge(target: &TlsTarget, client_name: &str) -> Result<Bmu
         .with_context(|| format!("TLS handshake failed for target '{}'", target.label))?;
     let timeout = Duration::from_millis(target.connect_timeout_ms.max(1));
     let principal_id = load_or_create_local_principal_id(&ConfigPaths::default())?;
-    BmuxClient::connect_with_bridge_stream(
-        ErasedIpcStream::new(Box::new(tls_stream)),
-        timeout,
-        client_name.to_string(),
-        principal_id,
-    )
-    .await
-    .map_err(map_cli_client_error)
+
+    // Optionally wrap the TLS stream with transport-level compression (Layer 3).
+    let config = BmuxConfig::load().unwrap_or_default();
+    let use_transport_compression = matches!(
+        config.behavior.compression.transport,
+        bmux_config::CompressionMode::Auto | bmux_config::CompressionMode::Zstd
+    );
+    let erased = if use_transport_compression {
+        ErasedIpcStream::new(Box::new(
+            bmux_ipc::compressed_stream::CompressedStream::new(tls_stream, 1),
+        ))
+    } else {
+        ErasedIpcStream::new(Box::new(tls_stream))
+    };
+
+    BmuxClient::connect_with_bridge_stream(erased, timeout, client_name.to_string(), principal_id)
+        .await
+        .map_err(map_cli_client_error)
 }
 
 async fn connect_iroh_bridge(target: &IrohTarget, client_name: &str) -> Result<BmuxClient> {
@@ -2619,14 +2629,24 @@ async fn connect_iroh_bridge(target: &IrohTarget, client_name: &str) -> Result<B
     });
     let timeout = Duration::from_millis(target.connect_timeout_ms.max(1));
     let principal_id = load_or_create_local_principal_id(&ConfigPaths::default())?;
-    BmuxClient::connect_with_bridge_stream(
-        ErasedIpcStream::new(Box::new(client_stream)),
-        timeout,
-        client_name.to_string(),
-        principal_id,
-    )
-    .await
-    .map_err(map_cli_client_error)
+
+    // Optionally wrap the iroh duplex stream with transport-level compression.
+    let config = BmuxConfig::load().unwrap_or_default();
+    let use_transport_compression = matches!(
+        config.behavior.compression.transport,
+        bmux_config::CompressionMode::Auto | bmux_config::CompressionMode::Zstd
+    );
+    let erased = if use_transport_compression {
+        ErasedIpcStream::new(Box::new(
+            bmux_ipc::compressed_stream::CompressedStream::new(client_stream, 1),
+        ))
+    } else {
+        ErasedIpcStream::new(Box::new(client_stream))
+    };
+
+    BmuxClient::connect_with_bridge_stream(erased, timeout, client_name.to_string(), principal_id)
+        .await
+        .map_err(map_cli_client_error)
 }
 
 fn build_tls_connector(target: &TlsTarget) -> Result<TlsConnector> {

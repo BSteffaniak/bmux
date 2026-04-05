@@ -655,25 +655,59 @@ async fn handle_gateway_connection(
     let ipc_stream = LocalIpcStream::connect(&endpoint)
         .await
         .context("failed connecting local IPC endpoint for TLS gateway")?;
-    let (mut tls_read, mut tls_write) = tokio::io::split(tls_stream);
+
+    // Optionally wrap the TLS side with transport-level compression (Layer 3).
+    // The local IPC side is never compressed (Unix socket, negligible latency).
+    let config = bmux_config::BmuxConfig::load().unwrap_or_default();
+    let use_transport_compression = matches!(
+        config.behavior.compression.transport,
+        bmux_config::CompressionMode::Auto | bmux_config::CompressionMode::Zstd
+    );
+
     let (mut ipc_read, mut ipc_write) = tokio::io::split(ipc_stream);
 
-    let inbound = tokio::spawn(async move {
-        tokio::io::copy(&mut tls_read, &mut ipc_write).await?;
-        ipc_write.shutdown().await?;
-        Ok::<(), std::io::Error>(())
-    });
-    let outbound = tokio::spawn(async move {
-        tokio::io::copy(&mut ipc_read, &mut tls_write).await?;
-        tls_write.shutdown().await?;
-        Ok::<(), std::io::Error>(())
-    });
+    if use_transport_compression {
+        let compressed = bmux_ipc::compressed_stream::CompressedStream::new(tls_stream, 1);
+        let (mut tls_read, mut tls_write) = tokio::io::split(compressed);
 
-    let inbound_result: std::io::Result<()> = inbound.await.context("TLS inbound task failed")?;
-    let outbound_result: std::io::Result<()> =
-        outbound.await.context("TLS outbound task failed")?;
-    inbound_result.context("TLS inbound copy failed")?;
-    outbound_result.context("TLS outbound copy failed")?;
+        let inbound = tokio::spawn(async move {
+            tokio::io::copy(&mut tls_read, &mut ipc_write).await?;
+            ipc_write.shutdown().await?;
+            Ok::<(), std::io::Error>(())
+        });
+        let outbound = tokio::spawn(async move {
+            tokio::io::copy(&mut ipc_read, &mut tls_write).await?;
+            tls_write.shutdown().await?;
+            Ok::<(), std::io::Error>(())
+        });
+
+        let inbound_result: std::io::Result<()> =
+            inbound.await.context("TLS inbound task failed")?;
+        let outbound_result: std::io::Result<()> =
+            outbound.await.context("TLS outbound task failed")?;
+        inbound_result.context("TLS inbound copy failed")?;
+        outbound_result.context("TLS outbound copy failed")?;
+    } else {
+        let (mut tls_read, mut tls_write) = tokio::io::split(tls_stream);
+
+        let inbound = tokio::spawn(async move {
+            tokio::io::copy(&mut tls_read, &mut ipc_write).await?;
+            ipc_write.shutdown().await?;
+            Ok::<(), std::io::Error>(())
+        });
+        let outbound = tokio::spawn(async move {
+            tokio::io::copy(&mut ipc_read, &mut tls_write).await?;
+            tls_write.shutdown().await?;
+            Ok::<(), std::io::Error>(())
+        });
+
+        let inbound_result: std::io::Result<()> =
+            inbound.await.context("TLS inbound task failed")?;
+        let outbound_result: std::io::Result<()> =
+            outbound.await.context("TLS outbound task failed")?;
+        inbound_result.context("TLS inbound copy failed")?;
+        outbound_result.context("TLS outbound copy failed")?;
+    }
     Ok(())
 }
 

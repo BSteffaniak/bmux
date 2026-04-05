@@ -44,6 +44,10 @@ impl<T> AsyncReadWrite for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
 /// Framed IPC stream backed by an erased async duplex transport.
 pub struct ErasedIpcStream {
     inner: Box<dyn AsyncReadWrite>,
+    /// Optional frame compression codec (Layer 2).
+    frame_codec: Option<Arc<dyn crate::compression::CompressionCodec>>,
+    /// Whether to expect the compressed frame format on reads.
+    compressed_frames: bool,
 }
 
 impl std::fmt::Debug for ErasedIpcStream {
@@ -309,16 +313,41 @@ impl LocalIpcStream {
 impl ErasedIpcStream {
     #[must_use]
     pub fn new(inner: Box<dyn AsyncReadWrite>) -> Self {
-        Self { inner }
+        Self {
+            inner,
+            frame_codec: None,
+            compressed_frames: false,
+        }
     }
 
     pub async fn send_envelope(&mut self, envelope: &Envelope) -> Result<(), IpcTransportError> {
-        let frame = encode_frame(envelope)?;
+        let frame = if self.frame_codec.is_some() {
+            encode_frame_compressed(envelope, self.frame_codec.as_deref())?
+        } else {
+            encode_frame(envelope)?
+        };
         write_frame(&mut self.inner, &frame).await
     }
 
     pub async fn recv_envelope(&mut self) -> Result<Envelope, IpcTransportError> {
-        read_frame(&mut self.inner).await
+        if self.compressed_frames {
+            read_frame_compressed(&mut self.inner).await
+        } else {
+            read_frame(&mut self.inner).await
+        }
+    }
+
+    /// Enable frame-level compression for all subsequent sends.
+    pub fn enable_frame_compression(
+        &mut self,
+        codec: Arc<dyn crate::compression::CompressionCodec>,
+    ) {
+        self.frame_codec = Some(codec);
+    }
+
+    /// Enable compressed frame format for all subsequent receives.
+    pub fn enable_frame_decompression(&mut self) {
+        self.compressed_frames = true;
     }
 }
 
