@@ -25,39 +25,39 @@ fn md(markdown: &str) -> Containers {
 
 #[must_use]
 pub fn overview() -> Containers {
-    layout::docs_layout(
-        "/docs",
-        "Overview",
-        &md(include_str!("../../../../../README.md")),
-    )
+    layout::docs_layout("/docs", None, &md(include_str!("../../../../../README.md")))
 }
 
 #[must_use]
 pub fn installation() -> Containers {
     let readme = include_str!("../../../../../README.md");
     let content = extract_section(readme, "## Installation", Some("## "));
-    layout::docs_layout("/docs/installation", "Installation", &md(&content))
+    layout::docs_layout("/docs/installation", Some("Installation"), &md(&content))
 }
 
 #[must_use]
 pub fn quickstart() -> Containers {
     let readme = include_str!("../../../../../README.md");
     let content = extract_section(readme, "## Current CLI Workflow", Some("## "));
-    layout::docs_layout("/docs/quickstart", "Quick Start", &md(&content))
+    layout::docs_layout("/docs/quickstart", Some("Quick Start"), &md(&content))
 }
 
 // ── Reference ───────────────────────────────────────────────────────────────
 
 #[must_use]
 pub fn cli() -> Containers {
-    layout::docs_layout("/docs/cli", "CLI Reference", &md(&generate_cli_reference()))
+    layout::docs_layout(
+        "/docs/cli",
+        Some("CLI Reference"),
+        &md(&generate_cli_reference()),
+    )
 }
 
 #[must_use]
 pub fn playbooks() -> Containers {
     layout::docs_layout(
         "/docs/playbooks",
-        "Playbooks",
+        None,
         &md(include_str!("../../../../../docs/playbooks.md")),
     )
 }
@@ -66,7 +66,7 @@ pub fn playbooks() -> Containers {
 pub fn images() -> Containers {
     layout::docs_layout(
         "/docs/images",
-        "Images & Compression",
+        None,
         &md(include_str!("../../../../../docs/images.md")),
     )
 }
@@ -75,7 +75,7 @@ pub fn images() -> Containers {
 pub fn config() -> Containers {
     layout::docs_layout(
         "/docs/config",
-        "Configuration",
+        Some("Configuration"),
         &md(&generate_config_reference()),
     )
 }
@@ -86,7 +86,7 @@ pub fn config() -> Containers {
 pub fn plugins() -> Containers {
     layout::docs_layout(
         "/docs/plugins",
-        "Plugin Architecture",
+        None,
         &md(include_str!("../../../../../docs/plugins.md")),
     )
 }
@@ -95,7 +95,7 @@ pub fn plugins() -> Containers {
 pub fn plugin_sdk() -> Containers {
     layout::docs_layout(
         "/docs/plugin-sdk",
-        "Plugin SDK",
+        None,
         &md(include_str!("../../../../../packages/plugin-sdk/README.md")),
     )
 }
@@ -104,7 +104,7 @@ pub fn plugin_sdk() -> Containers {
 pub fn plugin_example() -> Containers {
     layout::docs_layout(
         "/docs/plugin-example",
-        "Example Plugin",
+        None,
         &md(include_str!(
             "../../../../../examples/native-plugin/README.md"
         )),
@@ -117,7 +117,7 @@ pub fn plugin_example() -> Containers {
 pub fn testing() -> Containers {
     layout::docs_layout(
         "/docs/testing",
-        "Testing",
+        None,
         &md(include_str!("../../../../../TESTING.md")),
     )
 }
@@ -128,8 +128,8 @@ pub fn testing() -> Containers {
 pub fn not_found() -> Containers {
     layout::docs_layout(
         "/not-found",
-        "404",
-        &md("# Page not found\n\nThe page you are looking for does not exist."),
+        Some("404"),
+        &md("The page you are looking for does not exist."),
     )
 }
 

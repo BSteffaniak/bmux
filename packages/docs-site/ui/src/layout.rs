@@ -282,7 +282,7 @@ fn sidebar_item(label: &str, href: &str, active: bool) -> Container {
 
 /// Full docs page layout with sidebar and content area.
 #[must_use]
-pub fn docs_layout(current_path: &str, title: &str, content: &Containers) -> Containers {
+pub fn docs_layout(current_path: &str, title: Option<&str>, content: &Containers) -> Containers {
     page(&container! {
         div
             direction=(
@@ -306,16 +306,22 @@ pub fn docs_layout(current_path: &str, title: &str, content: &Containers) -> Con
                     padding=(if_responsive("tablet").then::<i32>(24).or_else(48))
                     max-width=900
                 {
-                    h1
-                        color=(text_primary())
-                        font-size=(if_responsive("mobile").then::<i32>(24).or_else(32))
-                        font-family=(MONO_FONT)
-                        margin-bottom=24
-                        padding-bottom=16
-                        border-bottom="1, #21262d"
-                    {
-                        (title)
-                    }
+                    (if let Some(t) = title {
+                        container! {
+                            h1
+                                color=(text_primary())
+                                font-size=(if_responsive("mobile").then::<i32>(24).or_else(32))
+                                font-family=(MONO_FONT)
+                                margin-bottom=24
+                                padding-bottom=16
+                                border-bottom="1, #21262d"
+                            {
+                                (t)
+                            }
+                        }
+                    } else {
+                        container! { div {} }
+                    })
                     // Content wrapper with overflow-x for wide code blocks / tables
                     div
                         color=(text_secondary())
