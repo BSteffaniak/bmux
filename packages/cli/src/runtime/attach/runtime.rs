@@ -377,6 +377,9 @@ pub async fn run_session_attach_with_client(
     .context("failed to enable raw mode for attach")?;
     let mut attach_input_processor =
         InputProcessor::new(attach_keymap.clone(), raw_mode_guard.keyboard_enhanced);
+    // Default exit reason; always overwritten before the loop breaks, but the
+    // compiler cannot prove this through the tokio::select! macro expansion.
+    #[allow(unused_assignments)]
     let mut exit_reason = AttachExitReason::Detached;
 
     // Detect host terminal image capabilities (Sixel, Kitty graphics, iTerm2)
@@ -702,7 +705,10 @@ pub async fn run_session_attach_with_client(
                         if is_attach_stream_closed_error(&error)
                             || is_attach_not_attached_runtime_error(&error) =>
                     {
-                        exit_reason = AttachExitReason::StreamClosed;
+                        #[allow(unused_assignments)] // Read after breaking inner drain loop
+                        {
+                            exit_reason = AttachExitReason::StreamClosed;
+                        }
                         last_round_had_data = false;
                         break;
                     }
@@ -1109,10 +1115,10 @@ pub async fn handle_attach_plugin_command_action(
     args: &[String],
     view_state: &mut AttachViewState,
 ) -> std::result::Result<(), ClientError> {
-    let before_context_id = match client.current_context().await {
-        Ok(context) => context.map(|entry| entry.id),
-        Err(_) => None,
-    };
+    let before_context_id = client
+        .current_context()
+        .await
+        .map_or(None, |context| context.map(|entry| entry.id));
     let before_context_ids = client.list_contexts().await.ok().map(|contexts| {
         contexts
             .into_iter()
@@ -1206,10 +1212,10 @@ pub async fn handle_attach_plugin_command_action(
                     }
                 };
 
-            let after_context_id = match client.current_context().await {
-                Ok(context) => context.map(|entry| entry.id),
-                Err(_) => None,
-            };
+            let after_context_id = client
+                .current_context()
+                .await
+                .map_or(None, |context| context.map(|entry| entry.id));
             let after_context_ids = client.list_contexts().await.ok().map(|contexts| {
                 contexts
                     .into_iter()
@@ -1455,37 +1461,18 @@ pub async fn handle_attach_ui_action(
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
         }
-        RuntimeAction::WindowPrev | RuntimeAction::WindowNext => {
-            view_state.exit_scrollback();
-        }
-        RuntimeAction::WindowGoto1 => {
-            view_state.exit_scrollback();
-        }
-        RuntimeAction::WindowGoto2 => {
-            view_state.exit_scrollback();
-        }
-        RuntimeAction::WindowGoto3 => {
-            view_state.exit_scrollback();
-        }
-        RuntimeAction::WindowGoto4 => {
-            view_state.exit_scrollback();
-        }
-        RuntimeAction::WindowGoto5 => {
-            view_state.exit_scrollback();
-        }
-        RuntimeAction::WindowGoto6 => {
-            view_state.exit_scrollback();
-        }
-        RuntimeAction::WindowGoto7 => {
-            view_state.exit_scrollback();
-        }
-        RuntimeAction::WindowGoto8 => {
-            view_state.exit_scrollback();
-        }
-        RuntimeAction::WindowGoto9 => {
-            view_state.exit_scrollback();
-        }
-        RuntimeAction::WindowClose => {
+        RuntimeAction::WindowPrev
+        | RuntimeAction::WindowNext
+        | RuntimeAction::WindowGoto1
+        | RuntimeAction::WindowGoto2
+        | RuntimeAction::WindowGoto3
+        | RuntimeAction::WindowGoto4
+        | RuntimeAction::WindowGoto5
+        | RuntimeAction::WindowGoto6
+        | RuntimeAction::WindowGoto7
+        | RuntimeAction::WindowGoto8
+        | RuntimeAction::WindowGoto9
+        | RuntimeAction::WindowClose => {
             view_state.exit_scrollback();
         }
         RuntimeAction::SplitFocusedVertical => {
@@ -2886,7 +2873,6 @@ pub async fn refresh_attached_session_from_context(
 
         if grant.session_id == previous_session_id {
             view_state.attached_id = grant.session_id;
-            view_state.attached_context_id = grant.context_id.or(Some(context_id));
         } else {
             // The context now maps to a different session (e.g. after
             // snapshot restore or context reassignment).  We must open a
@@ -2896,8 +2882,8 @@ pub async fn refresh_attached_session_from_context(
             // fail with "client is not attached to session runtime".
             let attach_info = client.open_attach_stream_info(&grant).await?;
             view_state.attached_id = attach_info.session_id;
-            view_state.attached_context_id = grant.context_id.or(Some(context_id));
         }
+        view_state.attached_context_id = grant.context_id.or(Some(context_id));
 
         view_state.last_context_refresh_at = Some(Instant::now());
         trace!(
@@ -3034,18 +3020,6 @@ pub fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
             | RuntimeAction::SessionNext
             | RuntimeAction::Detach
             | RuntimeAction::Quit => "Session",
-            RuntimeAction::NewWindow
-            | RuntimeAction::WindowPrev
-            | RuntimeAction::WindowNext
-            | RuntimeAction::WindowGoto1
-            | RuntimeAction::WindowGoto2
-            | RuntimeAction::WindowGoto3
-            | RuntimeAction::WindowGoto4
-            | RuntimeAction::WindowGoto5
-            | RuntimeAction::WindowGoto6
-            | RuntimeAction::WindowGoto7
-            | RuntimeAction::WindowGoto8
-            | RuntimeAction::WindowGoto9 => "Other",
             RuntimeAction::SplitFocusedVertical
             | RuntimeAction::SplitFocusedHorizontal
             | RuntimeAction::FocusNext
@@ -3598,11 +3572,10 @@ pub async fn handle_attach_server_event(
             pane_id,
             reason,
         } if session_id == view_state.attached_id => {
-            let message = if let Some(reason) = reason {
-                format!("pane {} exited: {}", short_uuid(pane_id), reason)
-            } else {
-                format!("pane {} exited", short_uuid(pane_id))
-            };
+            let message = reason.map_or_else(
+                || format!("pane {} exited", short_uuid(pane_id)),
+                |reason| format!("pane {} exited: {reason}", short_uuid(pane_id)),
+            );
             view_state.set_transient_status(message, Instant::now(), ATTACH_TRANSIENT_STATUS_TTL);
             view_state.dirty.status_needs_redraw = true;
         }

@@ -321,12 +321,10 @@ impl StatusRenderStyle {
 }
 
 fn append_segment(out: &mut String, separator: &str, value: &str) {
-    if out.is_empty() {
-        out.push_str(value);
-    } else {
+    if !out.is_empty() {
         out.push_str(separator);
-        out.push_str(value);
     }
+    out.push_str(value);
 }
 
 struct ComposedStatusLine {
@@ -645,7 +643,9 @@ fn parse_hex_color(value: &str) -> Option<RgbColor> {
 }
 
 fn adjust_rgb(value: RgbColor, delta: i16) -> RgbColor {
-    let adjust = |channel: u8| -> u8 { (i16::from(channel) + delta).clamp(0, 255) as u8 };
+    let adjust = |channel: u8| -> u8 {
+        u8::try_from((i16::from(channel) + delta).clamp(0, 255)).unwrap_or(0)
+    };
     RgbColor {
         r: adjust(value.r),
         g: adjust(value.g),

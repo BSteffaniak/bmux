@@ -297,7 +297,7 @@ fn insert_plugin_path(root: &mut Command, path: &[String], schema: &PluginComman
 
     if path.len() == 1 {
         let updated = std::mem::replace(root, Command::new("bmux-temp-root")).subcommand(
-            build_plugin_leaf_command(path.last().expect("leaf exists"), schema)?,
+            build_plugin_leaf_command(path.last().expect("leaf exists"), schema),
         );
         *root = updated;
         return Ok(());
@@ -318,7 +318,7 @@ fn insert_plugin_path(root: &mut Command, path: &[String], schema: &PluginComman
     })?;
     if tail.len() == 1 {
         let updated = std::mem::replace(child, Command::new("bmux-temp-child")).subcommand(
-            build_plugin_leaf_command(tail.last().expect("leaf exists"), schema)?,
+            build_plugin_leaf_command(tail.last().expect("leaf exists"), schema),
         );
         *child = updated;
         return Ok(());
@@ -333,7 +333,7 @@ fn build_plugin_namespace_command(name: &str) -> Command {
         .arg_required_else_help(true)
 }
 
-fn build_plugin_leaf_command(name: &str, schema: &PluginCommand) -> Result<Command> {
+fn build_plugin_leaf_command(name: &str, schema: &PluginCommand) -> Command {
     let mut command = Command::new(leak_string(name))
         .about(leak_string(&schema.summary))
         .disable_help_subcommand(true);
@@ -343,7 +343,7 @@ fn build_plugin_leaf_command(name: &str, schema: &PluginCommand) -> Result<Comma
     for argument in &schema.arguments {
         command = command.arg(build_clap_arg(argument));
     }
-    Ok(command)
+    command
 }
 
 fn build_clap_arg(argument: &PluginCommandArgument) -> Arg {

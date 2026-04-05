@@ -468,10 +468,10 @@ fn format_setup_check_not_ready_lines(
         reasons.push("not signed in".to_string());
     }
     if !host_alive {
-        reasons.push(match host_state {
-            Some(state) => format!("host state is stale (pid {})", state.pid),
-            None => "host is offline".to_string(),
-        });
+        reasons.push(host_state.map_or_else(
+            || "host is offline".to_string(),
+            |state| format!("host state is stale (pid {})", state.pid),
+        ));
     }
 
     let reason_text = if reasons.is_empty() {

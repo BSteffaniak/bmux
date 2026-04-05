@@ -154,7 +154,11 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
     }
 }
 
-#[allow(clippy::match_same_arms, clippy::too_many_lines)] // Short aliases and full subcommand forms dispatch to the same function by design
+#[allow(
+    clippy::match_same_arms,
+    clippy::too_many_lines,
+    clippy::large_stack_frames
+)] // Short aliases and full subcommand forms dispatch to the same function by design
 pub(super) async fn dispatch_built_in_command(
     command: &Command,
     connection_context: ConnectionContext<'_>,

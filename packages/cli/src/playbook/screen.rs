@@ -531,6 +531,7 @@ impl ScreenInspector {
     /// # Errors
     ///
     /// Returns an error if the pane index is out of range.
+    #[allow(clippy::unused_self)] // Method on inspector for API consistency; may use self in future
     pub fn resolve_pane_index(
         &self,
         pane: Option<u32>,

@@ -596,7 +596,8 @@ pub struct CleanupEntry {
 /// # Errors
 ///
 /// Returns an error if the temp directory cannot be read.
-pub fn cleanup_orphaned_sandboxes(dry_run: bool) -> anyhow::Result<(usize, Vec<CleanupEntry>)> {
+#[must_use]
+pub fn cleanup_orphaned_sandboxes(dry_run: bool) -> (usize, Vec<CleanupEntry>) {
     let temp_dir = std::env::temp_dir();
     let mut scanned = 0;
     let mut entries = Vec::new();
@@ -604,7 +605,7 @@ pub fn cleanup_orphaned_sandboxes(dry_run: bool) -> anyhow::Result<(usize, Vec<C
     let min_age = std::time::Duration::from_secs(300); // 5 minutes
 
     let Ok(dir_entries) = std::fs::read_dir(&temp_dir) else {
-        return Ok((0, entries));
+        return (0, entries);
     };
 
     for entry in dir_entries {
@@ -684,5 +685,5 @@ pub fn cleanup_orphaned_sandboxes(dry_run: bool) -> anyhow::Result<(usize, Vec<C
         });
     }
 
-    Ok((scanned, entries))
+    (scanned, entries)
 }

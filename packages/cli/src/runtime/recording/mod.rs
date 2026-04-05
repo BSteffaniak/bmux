@@ -204,13 +204,13 @@ struct RecordingStatusView {
 
 fn recording_config_and_root() -> (RecordingConfigStatus, PathBuf) {
     let paths = ConfigPaths::default();
-    let (config, root) = match BmuxConfig::load_from_path(&paths.config_file()) {
-        Ok(config) => {
+    let (config, root) = BmuxConfig::load_from_path(&paths.config_file()).map_or_else(
+        |_| (BmuxConfig::default(), paths.recordings_dir()),
+        |config| {
             let root = config.recordings_dir(&paths);
             (config, root)
-        }
-        Err(_) => (BmuxConfig::default(), paths.recordings_dir()),
-    };
+        },
+    );
     let capture_input = config.recording.capture_input;
     let capture_output = config.recording.capture_output;
     let capture_events = config.recording.capture_events;
@@ -1743,23 +1743,24 @@ fn export_recording_gif(
         .or_else(|| profile_defaults.and_then(|defaults| defaults.solid_after_cursor_ms))
         .unwrap_or(500);
     let color_input = cursor_color.trim();
-    let (resolved_color_label, resolved_color_override) = if color_input.is_empty()
-        || color_input.eq_ignore_ascii_case("auto")
-    {
-        if let Some(profile_color) = profile_defaults.and_then(|defaults| defaults.color.as_deref())
-        {
-            let parsed = parse_cursor_color(profile_color).ok().flatten();
-            if parsed.is_some() {
-                (profile_color.to_string(), parsed)
-            } else {
-                ("auto".to_string(), None)
-            }
+    let (resolved_color_label, resolved_color_override) =
+        if color_input.is_empty() || color_input.eq_ignore_ascii_case("auto") {
+            profile_defaults
+                .and_then(|defaults| defaults.color.as_deref())
+                .map_or_else(
+                    || ("auto".to_string(), None),
+                    |profile_color| {
+                        let parsed = parse_cursor_color(profile_color).ok().flatten();
+                        if parsed.is_some() {
+                            (profile_color.to_string(), parsed)
+                        } else {
+                            ("auto".to_string(), None)
+                        }
+                    },
+                )
         } else {
-            ("auto".to_string(), None)
-        }
-    } else {
-        (color_input.to_string(), parse_cursor_color(color_input)?)
-    };
+            (color_input.to_string(), parse_cursor_color(color_input)?)
+        };
 
     let cursor_options = CursorExportOptions {
         mode: cursor_mode,
@@ -2712,12 +2713,15 @@ impl ResvgFrameRenderer {
             .map_or_else(|| f32::from(cell_h) * 0.8, |value| value.top_to_baseline_px);
         let font_family_attr = svg_font_family_list(&families);
 
-        let mut options_usvg = usvg::Options::default();
-        options_usvg.font_family = families
+        let font_family = families
             .first()
             .cloned()
             .unwrap_or_else(|| "monospace".to_string());
-        options_usvg.font_size = font_size;
+        let mut options_usvg = usvg::Options {
+            font_family,
+            font_size,
+            ..usvg::Options::default()
+        };
         let fontdb = options_usvg.fontdb_mut();
         let _ = bmux_fonts::register_preset_fonts(fontdb, preset);
         fontdb.load_system_fonts();
@@ -2838,7 +2842,7 @@ impl ResvgFrameRenderer {
                 let x0 = usize::from(run.start_col).saturating_mul(self.cell_width_px);
                 let y0 = usize::from(row).saturating_mul(self.cell_height_px);
                 let text_y = y0 as f32 + self.top_to_baseline;
-                let style_attrs = svg_style_attrs(&run.style);
+                let style_attrs = svg_style_attrs(run.style);
                 let text_length = usize::from(run.cell_count).saturating_mul(self.cell_width_px);
                 write!(
                     &mut self.svg,
@@ -2920,7 +2924,7 @@ fn composite_with_backdrop(
     )
 }
 
-fn svg_style_attrs(style: &TextStyle) -> String {
+fn svg_style_attrs(style: TextStyle) -> String {
     let mut attrs = String::new();
     if style.bold {
         attrs.push_str(" font-weight=\"700\"");

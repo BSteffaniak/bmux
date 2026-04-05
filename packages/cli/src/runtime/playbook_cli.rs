@@ -286,7 +286,7 @@ pub(super) fn run_playbook_diff(
 }
 
 pub(super) fn run_playbook_cleanup(dry_run: bool, json: bool) -> Result<u8> {
-    let (scanned, entries) = crate::playbook::sandbox::cleanup_orphaned_sandboxes(dry_run)?;
+    let (scanned, entries) = crate::playbook::sandbox::cleanup_orphaned_sandboxes(dry_run);
     let orphaned = entries.len();
 
     if json {
