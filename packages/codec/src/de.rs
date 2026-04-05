@@ -102,7 +102,7 @@ pub fn from_bytes<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<T, Error
     Ok(value)
 }
 
-impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
+impl<'de> de::Deserializer<'de> for &mut Deserializer<'de> {
     type Error = Error;
 
     fn deserialize_any<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, Error> {
@@ -289,7 +289,7 @@ impl<'de, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
 
 // ── Enum access ──────────────────────────────────────────────────────────────
 
-impl<'de, 'a> de::EnumAccess<'de> for &'a mut Deserializer<'de> {
+impl<'de> de::EnumAccess<'de> for &mut Deserializer<'de> {
     type Error = Error;
     type Variant = Self;
 
@@ -302,7 +302,7 @@ impl<'de, 'a> de::EnumAccess<'de> for &'a mut Deserializer<'de> {
     }
 }
 
-impl<'de, 'a> de::VariantAccess<'de> for &'a mut Deserializer<'de> {
+impl<'de> de::VariantAccess<'de> for &mut Deserializer<'de> {
     type Error = Error;
 
     fn unit_variant(self) -> Result<(), Error> {

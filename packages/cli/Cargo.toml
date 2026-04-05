@@ -105,7 +105,25 @@ default = [
 ]
 
 # Development features
-fail-on-warnings = []
+fail-on-warnings = [
+    "bmux_client/fail-on-warnings",
+    "bmux_clipboard_plugin?/fail-on-warnings",
+    "bmux_config/fail-on-warnings",
+    "bmux_event/fail-on-warnings",
+    "bmux_image?/fail-on-warnings",
+    "bmux_ipc/fail-on-warnings",
+    "bmux_keybind/fail-on-warnings",
+    "bmux_keyboard/fail-on-warnings",
+    "bmux_permissions_plugin?/fail-on-warnings",
+    "bmux_plugin/fail-on-warnings",
+    "bmux_plugin_cli_plugin?/fail-on-warnings",
+    "bmux_plugin_sdk/fail-on-warnings",
+    "bmux_server/fail-on-warnings",
+    "bmux_session/fail-on-warnings",
+    "bmux_terminal/fail-on-warnings",
+    "bmux_terminal_protocol/fail-on-warnings",
+    "bmux_windows_plugin?/fail-on-warnings",
+]
 
 # Kitty keyboard protocol support (CSI u encoding/decoding + inner program negotiation)
 kitty-keyboard = [
@@ -128,13 +146,20 @@ bundled-plugin-permissions = ["dep:bmux_permissions_plugin"]
 bundled-plugin-windows     = ["dep:bmux_windows_plugin"]
 
 # Optional features
-bundled-fonts = ["bmux_fonts/bundled-nerd-fonts"]
+bundled-fonts = ["bmux_fonts/bundled-fonts", "bmux_fonts/bundled-nerd-fonts"]
 
 # IPC compression support
 compression = ["bmux_ipc/compression", "bmux_server/compression"]
 
 # Serialization features
-serde = ["bmux_event/serde", "bmux_session/serde", "bmux_terminal/serde"]
+serde = [
+    "bmux_client/serde",
+    "bmux_event/serde",
+    "bmux_keyboard/serde",
+    "bmux_server/serde",
+    "bmux_session/serde",
+    "bmux_terminal/serde",
+]
 
 # Terminal image protocol support
 image-iterm2 = [

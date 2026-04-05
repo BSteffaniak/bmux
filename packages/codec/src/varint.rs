@@ -1,7 +1,7 @@
-/// LEB128 variable-length integer encoding/decoding.
-///
-/// Uses unsigned LEB128 for unsigned types and ZigZag + LEB128 for signed types,
-/// producing compact representations for small values.
+//! LEB128 variable-length integer encoding/decoding.
+//!
+//! Uses unsigned LEB128 for unsigned types and ZigZag + LEB128 for signed types,
+//! producing compact representations for small values.
 
 /// Encode a `u64` as unsigned LEB128 into the output buffer.
 pub fn encode_u64(output: &mut Vec<u8>, mut value: u64) {

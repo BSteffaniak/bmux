@@ -32,7 +32,7 @@ pub fn to_vec<T: Serialize>(value: &T) -> Result<Vec<u8>, Error> {
     Ok(serializer.into_vec())
 }
 
-impl<'a> ser::Serializer for &'a mut Serializer {
+impl ser::Serializer for &mut Serializer {
     type Ok = ();
     type Error = Error;
 

@@ -33,7 +33,7 @@ pub enum CompressionId {
 impl CompressionId {
     /// Decode a raw byte into a `CompressionId`, returning `None` for
     /// unrecognised values.
-    pub fn from_byte(b: u8) -> Option<Self> {
+    pub const fn from_byte(b: u8) -> Option<Self> {
         match b {
             0 => Some(Self::None),
             1 => Some(Self::Zstd),

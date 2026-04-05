@@ -1,6 +1,7 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
+#![allow(clippy::cargo_common_metadata)]
 
 use bmux_session_models::{LayoutError, PaneId};
 #[cfg(feature = "serde")]
@@ -13,7 +14,6 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub struct PaneSize {
     pub width: u16,
     pub height: u16,
@@ -47,7 +47,6 @@ impl Default for PaneSize {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub enum SplitDirection {
     Horizontal,
     Vertical,
@@ -55,7 +54,6 @@ pub enum SplitDirection {
 
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub enum PaneLayout {
     Single(PaneId),
     HSplit {
@@ -127,7 +125,6 @@ impl PaneLayout {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub struct Pane {
     pub id: PaneId,
     pub size: PaneSize,
@@ -205,7 +202,6 @@ impl Pane {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub struct PaneGroup {
     pub id: PaneId,
     pub name: Option<String>,
@@ -385,7 +381,6 @@ impl PaneGroup {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub struct PaneGroupInfo {
     pub id: PaneId,
     pub name: Option<String>,

@@ -37,7 +37,16 @@ vt100        = { workspace = true }
 default = []
 
 # Development features
-fail-on-warnings = []
+fail-on-warnings = [
+    "bmux_codec/fail-on-warnings",
+    "bmux_config/fail-on-warnings",
+    "bmux_event/fail-on-warnings",
+    "bmux_image?/fail-on-warnings",
+    "bmux_ipc/fail-on-warnings",
+    "bmux_session/fail-on-warnings",
+    "bmux_terminal/fail-on-warnings",
+    "bmux_terminal_protocol/fail-on-warnings",
+]
 
 # Terminal image protocol support (feature-gated, optional)
 image-registry = [
@@ -51,4 +60,4 @@ image-registry = [
 compression = ["bmux_ipc/compression"]
 
 # Serialization features
-serde = []
+serde = ["bmux_event/serde", "bmux_session/serde", "bmux_terminal/serde"]

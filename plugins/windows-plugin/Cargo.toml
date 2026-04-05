@@ -24,5 +24,12 @@ tokio           = { workspace = true, features = ["rt-multi-thread"] }
 uuid            = { workspace = true, features = ["std"] }
 
 [features]
-fail-on-warnings = []
-static-bundled   = []
+fail-on-warnings = [
+    "bmux_cli_output/fail-on-warnings",
+    "bmux_client/fail-on-warnings",
+    "bmux_config/fail-on-warnings",
+    "bmux_ipc/fail-on-warnings",
+    "bmux_plugin/fail-on-warnings",
+    "bmux_plugin_sdk/fail-on-warnings",
+]
+static-bundled = []

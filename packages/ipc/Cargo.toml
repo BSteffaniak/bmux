@@ -23,7 +23,7 @@ zstd       = { workspace = true, optional = true }
 default = []
 
 # Development features
-fail-on-warnings = []
+fail-on-warnings = ["bmux_codec/fail-on-warnings"]
 
 # Compression support (optional, feature-gated)
 compression      = ["compression-zstd", "compression-lz4"]

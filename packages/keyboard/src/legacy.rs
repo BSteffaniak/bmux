@@ -78,10 +78,10 @@ pub fn encode(stroke: &KeyStroke) -> Option<Vec<u8>> {
             out.push(b' ');
             Some(out)
         }
-        KeyCode::Up => arrow_encoding(shift, b'A'),
-        KeyCode::Down => arrow_encoding(shift, b'B'),
-        KeyCode::Right => arrow_encoding(shift, b'C'),
-        KeyCode::Left => arrow_encoding(shift, b'D'),
+        KeyCode::Up => Some(arrow_encoding(shift, b'A')),
+        KeyCode::Down => Some(arrow_encoding(shift, b'B')),
+        KeyCode::Right => Some(arrow_encoding(shift, b'C')),
+        KeyCode::Left => Some(arrow_encoding(shift, b'D')),
         KeyCode::Home => Some(vec![0x1b, b'[', b'H']),
         KeyCode::End => Some(vec![0x1b, b'[', b'F']),
         KeyCode::PageUp => Some(vec![0x1b, b'[', b'5', b'~']),
@@ -98,12 +98,12 @@ pub fn encode(stroke: &KeyStroke) -> Option<Vec<u8>> {
     }
 }
 
-fn arrow_encoding(shift: bool, letter: u8) -> Option<Vec<u8>> {
-    Some(if shift {
+fn arrow_encoding(shift: bool, letter: u8) -> Vec<u8> {
+    if shift {
         vec![0x1b, b'[', b'1', b';', b'2', letter]
     } else {
         vec![0x1b, b'[', letter]
-    })
+    }
 }
 
 /// Decode a single non-escape byte into a [`KeyStroke`].

@@ -30,4 +30,7 @@ tracing   = { workspace = true, features = ["std"] }
 default = []
 
 # Development features
-fail-on-warnings = []
+fail-on-warnings = [
+    "bmux_event/fail-on-warnings",
+    "bmux_keybind/fail-on-warnings",
+]

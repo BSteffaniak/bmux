@@ -1,6 +1,9 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
+#![allow(clippy::cargo_common_metadata)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::option_if_let_else)]
 
 use std::env;
 use std::ffi::OsString;
@@ -159,20 +162,21 @@ fn windows_path_exts() -> Vec<OsString> {
     if !cfg!(windows) {
         return Vec::new();
     }
-    env::var_os("PATHEXT")
-        .map(|raw| {
+    env::var_os("PATHEXT").map_or_else(
+        || {
+            [".COM", ".EXE", ".BAT", ".CMD"]
+                .iter()
+                .map(OsString::from)
+                .collect()
+        },
+        |raw| {
             raw.to_string_lossy()
                 .split(';')
                 .filter(|value| !value.is_empty())
                 .map(OsString::from)
                 .collect()
-        })
-        .unwrap_or_else(|| {
-            [".COM", ".EXE", ".BAT", ".CMD"]
-                .iter()
-                .map(OsString::from)
-                .collect()
-        })
+        },
+    )
 }
 
 fn is_file(path: &Path) -> bool {

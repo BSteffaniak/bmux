@@ -36,7 +36,19 @@ bmux_server = { workspace = true }
 default = ["serde"]
 
 # Development features
-fail-on-warnings = []
+fail-on-warnings = [
+    "bmux_codec/fail-on-warnings",
+    "bmux_config/fail-on-warnings",
+    "bmux_event/fail-on-warnings",
+    "bmux_ipc/fail-on-warnings",
+    "bmux_session/fail-on-warnings",
+    "bmux_terminal/fail-on-warnings",
+]
 
 # Serialization features
-serde = ["bmux_session/serde", "bmux_terminal/serde", "dep:serde"]
+serde = [
+    "bmux_event/serde",
+    "bmux_session/serde",
+    "bmux_terminal/serde",
+    "dep:serde",
+]

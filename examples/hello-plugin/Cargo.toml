@@ -15,5 +15,5 @@ crate-type = ["cdylib", "rlib"]
 bmux_plugin_sdk = { workspace = true }
 
 [features]
-fail-on-warnings = []
+fail-on-warnings = ["bmux_plugin_sdk/fail-on-warnings"]
 static-bundled   = []

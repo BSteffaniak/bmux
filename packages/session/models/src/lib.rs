@@ -15,7 +15,6 @@ use uuid::Uuid;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub struct SessionId(pub Uuid);
 
 impl SessionId {
@@ -39,7 +38,6 @@ impl std::fmt::Display for SessionId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub struct PaneId(pub Uuid);
 
 impl PaneId {
@@ -63,7 +61,6 @@ impl std::fmt::Display for PaneId {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub struct ClientId(pub Uuid);
 
 impl ClientId {
@@ -143,7 +140,6 @@ pub enum ClientError {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub struct Session {
     pub id: SessionId,
     pub name: Option<String>,
@@ -195,7 +191,6 @@ impl Session {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub struct SessionInfo {
     pub id: SessionId,
     pub name: Option<String>,
@@ -222,7 +217,6 @@ impl From<&Session> for SessionInfo {
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
-
 pub struct ClientInfo {
     pub id: ClientId,
     pub session_id: Option<SessionId>,

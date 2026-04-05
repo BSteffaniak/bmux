@@ -149,6 +149,11 @@ pub fn action_to_config_name(action: &RuntimeAction) -> String {
     }
 }
 
+/// Parse a string action name into a `RuntimeAction`.
+///
+/// # Errors
+///
+/// Returns an error if the action name is not recognized.
 pub fn parse_action(value: &str) -> Result<RuntimeAction> {
     let normalized = value.trim().to_ascii_lowercase();
     if let Some(plugin_action) = parse_plugin_action(&normalized) {
@@ -215,13 +220,10 @@ pub fn parse_action(value: &str) -> Result<RuntimeAction> {
 
 fn parse_plugin_action(value: &str) -> Option<Result<RuntimeAction>> {
     let rest = value.strip_prefix("plugin:")?;
-    let (plugin_id, remainder) = match rest.split_once(':') {
-        Some(parts) => parts,
-        None => {
-            return Some(Err(anyhow::anyhow!(
-                "invalid plugin keymap action '{value}' (expected plugin:<plugin-id>:<command>)"
-            )));
-        }
+    let Some((plugin_id, remainder)) = rest.split_once(':') else {
+        return Some(Err(anyhow::anyhow!(
+            "invalid plugin keymap action '{value}' (expected plugin:<plugin-id>:<command>)"
+        )));
     };
     if plugin_id.trim().is_empty() || remainder.trim().is_empty() {
         return Some(Err(anyhow::anyhow!(

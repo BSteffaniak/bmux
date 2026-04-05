@@ -219,7 +219,7 @@ impl IpcStreamReader {
     }
 
     /// Enable compressed frame format for all subsequent `recv_envelope` calls.
-    pub fn enable_frame_compression(&mut self) {
+    pub const fn enable_frame_compression(&mut self) {
         self.compressed_frames = true;
     }
 }
@@ -346,7 +346,7 @@ impl ErasedIpcStream {
     }
 
     /// Enable compressed frame format for all subsequent receives.
-    pub fn enable_frame_decompression(&mut self) {
+    pub const fn enable_frame_decompression(&mut self) {
         self.compressed_frames = true;
     }
 }

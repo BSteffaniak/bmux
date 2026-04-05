@@ -16,7 +16,7 @@ uuid     = { workspace = true, features = ["std"] }
 
 [features]
 default          = []
-fail-on-warnings = []
+fail-on-warnings = ["bmux_ipc/fail-on-warnings"]
 iterm2           = []
 kitty            = []
 sixel            = []

@@ -35,7 +35,7 @@ mod toml_value_option {
     ) -> Result<S::Ok, S::Error> {
         let text: Option<String> = value
             .as_ref()
-            .map(|v| serde_json::to_string(v))
+            .map(serde_json::to_string)
             .transpose()
             .map_err(serde::ser::Error::custom)?;
         text.serialize(serializer)

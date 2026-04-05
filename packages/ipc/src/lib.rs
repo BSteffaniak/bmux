@@ -1,6 +1,17 @@
 #![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
+#![allow(clippy::cargo_common_metadata)]
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::must_use_candidate)]
+#![allow(clippy::module_name_repetitions)]
+#![allow(clippy::large_enum_variant)]
+#![allow(clippy::struct_excessive_bools)]
+#![allow(clippy::option_if_let_else)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::unused_async)]
+#![allow(clippy::needless_pass_by_value)]
 
 //! Cross-platform IPC protocol models for bmux.
 
@@ -116,7 +127,7 @@ pub struct ProtocolContract {
 
 impl ProtocolContract {
     #[must_use]
-    pub fn current(capabilities: Vec<String>) -> Self {
+    pub const fn current(capabilities: Vec<String>) -> Self {
         Self {
             wire_epoch: CURRENT_WIRE_EPOCH,
             revisions: ProtocolRevisionRange::current(),
@@ -152,6 +163,7 @@ pub enum IncompatibilityReason {
 
 #[must_use]
 pub fn default_supported_capabilities() -> Vec<String> {
+    #[allow(unused_mut)]
     let mut caps = vec![
         CORE_CAPABILITY_SESSION.to_string(),
         CORE_CAPABILITY_ATTACH.to_string(),
@@ -1476,7 +1488,7 @@ pub fn read_frames<T: DeserializeOwned>(
             break;
         }
         let value: T = bmux_codec::from_bytes(&data[offset..offset + len])
-            .map_err(|e| format!("codec deserialize failed at offset {}: {e}", offset))?;
+            .map_err(|e| format!("codec deserialize failed at offset {offset}: {e}"))?;
         results.push(value);
         offset += len;
     }
