@@ -36,6 +36,14 @@ impl fmt::Display for ApiVersion {
 impl FromStr for ApiVersion {
     type Err = String;
 
+    /// Parse an `ApiVersion` from a string in `"major.minor"` or `"major"` format.
+    ///
+    /// When the minor component is omitted it defaults to `0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns a descriptive error string if the input is empty, contains
+    /// non-numeric components, or has more than two dot-separated parts.
     fn from_str(value: &str) -> Result<Self, Self::Err> {
         let value = value.trim();
         if value.is_empty() {

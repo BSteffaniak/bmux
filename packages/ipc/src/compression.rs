@@ -75,6 +75,11 @@ pub trait CompressionCodec: Send + Sync {
     fn compress(&self, input: &[u8], hint: CompressionHint) -> Option<Vec<u8>>;
 
     /// Decompress `input`, returning the original bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompressionError::DecompressFailed`] if the input is not
+    /// valid compressed data for this codec.
     fn decompress(&self, input: &[u8]) -> Result<Vec<u8>, CompressionError>;
 
     /// Minimum input size worth compressing for the given hint.
@@ -257,6 +262,12 @@ pub fn compress_if_worthwhile(
 
 /// Decompress `data` based on the `CompressionId`.  Returns the original
 /// bytes if `id` is `None`.
+///
+/// # Errors
+///
+/// Returns [`CompressionError::DecompressFailed`] if the codec fails to
+/// decompress the data, or [`CompressionError::UnknownCodec`] if the
+/// compression feature for the given `id` is not compiled in.
 pub fn decompress_by_id(data: &[u8], id: CompressionId) -> Result<Vec<u8>, CompressionError> {
     match id {
         CompressionId::None => Ok(data.to_vec()),

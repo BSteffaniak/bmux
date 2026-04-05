@@ -320,6 +320,14 @@ impl ErasedIpcStream {
         }
     }
 
+    /// Send a single framed envelope over the erased transport.
+    ///
+    /// Uses compressed frame format if a frame codec has been set via
+    /// [`enable_frame_compression`](Self::enable_frame_compression).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if frame encoding or socket writes fail.
     pub async fn send_envelope(&mut self, envelope: &Envelope) -> Result<(), IpcTransportError> {
         let frame = if self.frame_codec.is_some() {
             encode_frame_compressed(envelope, self.frame_codec.as_deref())?
@@ -329,6 +337,14 @@ impl ErasedIpcStream {
         write_frame(&mut self.inner, &frame).await
     }
 
+    /// Receive a single framed envelope from the erased transport.
+    ///
+    /// Uses compressed frame format if decompression was enabled via
+    /// [`enable_frame_decompression`](Self::enable_frame_decompression).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if frame reads fail or the frame is invalid.
     pub async fn recv_envelope(&mut self) -> Result<Envelope, IpcTransportError> {
         if self.compressed_frames {
             read_frame_compressed(&mut self.inner).await

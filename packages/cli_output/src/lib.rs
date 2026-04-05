@@ -2,8 +2,6 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 #![allow(clippy::cargo_common_metadata)]
-#![allow(clippy::missing_errors_doc)]
-
 use std::fmt;
 use std::io;
 
@@ -80,6 +78,14 @@ impl Table {
     }
 }
 
+/// Write a formatted table to the given writer.
+///
+/// Each row is written as a single line with columns padded to their computed
+/// widths according to the alignment specified in each [`TableColumn`].
+///
+/// # Errors
+///
+/// Returns an [`io::Error`] if any write to `out` fails.
 pub fn write_table<W>(out: &mut W, table: &Table) -> io::Result<()>
 where
     W: io::Write,
@@ -90,6 +96,14 @@ where
     })
 }
 
+/// Write a formatted table using the [`fmt::Write`] trait.
+///
+/// Behaves like [`write_table`] but targets any `fmt::Write` destination
+/// (e.g. a `String`).
+///
+/// # Errors
+///
+/// Returns [`fmt::Error`] if any write to `out` fails.
 pub fn write_table_fmt<W>(out: &mut W, table: &Table) -> fmt::Result
 where
     W: fmt::Write,

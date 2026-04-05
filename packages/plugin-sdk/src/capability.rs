@@ -6,6 +6,15 @@ use std::fmt;
 pub struct HostScope(String);
 
 impl HostScope {
+    /// Create a new host scope from a capability identifier string.
+    ///
+    /// The value must be a non-empty ASCII lowercase string that may contain
+    /// digits, hyphens, underscores, and dots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginError::InvalidCapabilityId`] if the value does not
+    /// conform to the capability identifier format.
     pub fn new(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
         if is_valid_capability_id(&value) {
@@ -39,6 +48,15 @@ impl fmt::Display for HostScope {
 pub struct PluginFeature(String);
 
 impl PluginFeature {
+    /// Create a new plugin feature from an identifier string.
+    ///
+    /// The value must be a non-empty ASCII lowercase string that may contain
+    /// digits, hyphens, underscores, and dots.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginError::InvalidPluginFeature`] if the value does not
+    /// conform to the capability identifier format.
     pub fn new(value: impl Into<String>) -> Result<Self> {
         let value = value.into();
         if is_valid_capability_id(&value) {

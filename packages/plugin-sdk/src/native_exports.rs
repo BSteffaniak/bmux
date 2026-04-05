@@ -170,6 +170,10 @@ pub trait RustPlugin: Default + Send + 'static {
     /// Handle a CLI command declared in the plugin manifest.
     ///
     /// The default returns `Err(PluginCommandError::unknown_command(""))`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginCommandError`] when the command fails or is unrecognised.
     fn run_command(&mut self, _context: NativeCommandContext) -> Result<i32, PluginCommandError> {
         Err(PluginCommandError::unknown_command(""))
     }
@@ -177,6 +181,10 @@ pub trait RustPlugin: Default + Send + 'static {
     /// Called when the plugin is activated by the host.
     ///
     /// The default returns `Ok(EXIT_OK)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginCommandError`] if activation fails.
     fn activate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
         Ok(EXIT_OK)
     }
@@ -184,6 +192,10 @@ pub trait RustPlugin: Default + Send + 'static {
     /// Called when the plugin is deactivated by the host.
     ///
     /// The default returns `Ok(EXIT_OK)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginCommandError`] if deactivation fails.
     fn deactivate(&mut self, _context: NativeLifecycleContext) -> Result<i32, PluginCommandError> {
         Ok(EXIT_OK)
     }
@@ -191,6 +203,10 @@ pub trait RustPlugin: Default + Send + 'static {
     /// Called when a subscribed event fires.
     ///
     /// The default returns `Ok(EXIT_OK)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginCommandError`] if event handling fails.
     fn handle_event(&mut self, _event: PluginEvent) -> Result<i32, PluginCommandError> {
         Ok(EXIT_OK)
     }

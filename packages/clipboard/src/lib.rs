@@ -2,7 +2,6 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 #![allow(clippy::cargo_common_metadata)]
-#![allow(clippy::missing_errors_doc)]
 #![allow(clippy::option_if_let_else)]
 
 use std::env;
@@ -31,6 +30,12 @@ pub struct Clipboard {
 }
 
 impl Clipboard {
+    /// Create a new clipboard handle by detecting the platform clipboard backend.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClipboardError::BackendUnavailable`] if no supported clipboard
+    /// command is found on the current platform.
     pub fn new() -> Result<Self, ClipboardError> {
         Self::for_os(env::consts::OS, command_exists)
     }
@@ -44,6 +49,16 @@ impl Clipboard {
             .ok_or_else(|| ClipboardError::BackendUnavailable { os: os.to_string() })
     }
 
+    /// Copy text to the system clipboard.
+    ///
+    /// Spawns the platform clipboard command, writes `text` to its stdin,
+    /// and waits for it to exit.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ClipboardError::BackendFailed`] if the clipboard command
+    /// cannot be spawned, stdin writing fails, or the command exits with a
+    /// non-zero status.
     pub fn copy_text(&self, text: &str) -> Result<(), ClipboardError> {
         let mut child = Command::new(self.command.program)
             .args(self.command.args)
@@ -88,6 +103,15 @@ impl Clipboard {
     }
 }
 
+/// Copy text to the system clipboard using a one-shot clipboard handle.
+///
+/// Convenience wrapper that creates a [`Clipboard`] and copies `text` in
+/// a single call.
+///
+/// # Errors
+///
+/// Returns [`ClipboardError::BackendUnavailable`] if no clipboard backend
+/// is found, or [`ClipboardError::BackendFailed`] if the copy command fails.
 pub fn copy_text(text: &str) -> Result<(), ClipboardError> {
     Clipboard::new()?.copy_text(text)
 }

@@ -32,6 +32,16 @@ pub trait PluginHost: Send + Sync {
 
     fn available_services(&self) -> &[RegisteredService];
 
+    /// Resolve a registered service by capability, kind, and interface ID.
+    ///
+    /// The default implementation checks that the plugin has access to the
+    /// requested capability, then searches the available service list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginError::CapabilityAccessDenied`] if the plugin does not
+    /// hold the requested capability, or [`PluginError::ServiceProtocol`] if
+    /// no matching service registration is found.
     fn resolve_service(
         &self,
         capability: &HostScope,

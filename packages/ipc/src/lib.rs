@@ -2,7 +2,6 @@
 #![warn(clippy::all, clippy::pedantic, clippy::nursery, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions)]
 #![allow(clippy::cargo_common_metadata)]
-#![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::must_use_candidate)]
 #![allow(clippy::module_name_repetitions)]
@@ -192,6 +191,18 @@ pub fn default_supported_capabilities() -> Vec<String> {
     caps
 }
 
+/// Negotiate a protocol agreement between a client and server contract.
+///
+/// Compares wire epochs, finds the highest common protocol revision, intersects
+/// capability sets, and verifies that all `core_required` capabilities are
+/// present in the intersection.
+///
+/// # Errors
+///
+/// Returns [`IncompatibilityReason::WireEpochMismatch`] if the wire epochs
+/// differ, [`IncompatibilityReason::NoCommonRevision`] if the revision ranges
+/// do not overlap, or [`IncompatibilityReason::MissingCoreCapabilities`] if
+/// any required core capability is absent from the negotiated set.
 pub fn negotiate_protocol(
     client: &ProtocolContract,
     server: &ProtocolContract,
@@ -1448,7 +1459,10 @@ pub struct DisplayTrackEnvelope {
 ///
 /// Format: `[u32 little-endian length][codec bytes]`
 ///
-/// Returns an error if the serialized payload exceeds `u32::MAX` bytes.
+/// # Errors
+///
+/// Returns an error if codec serialization fails, the serialized payload
+/// exceeds `u32::MAX` bytes, or writing to the underlying writer fails.
 pub fn write_frame<W: std::io::Write, T: Serialize>(
     writer: &mut W,
     value: &T,
@@ -1474,6 +1488,11 @@ pub struct ReadFramesResult<T> {
 ///
 /// Returns all successfully-parsed frames plus the count of any trailing bytes
 /// that could not form a complete frame (indicating a truncated recording).
+///
+/// # Errors
+///
+/// Returns an error if codec deserialization fails for any complete frame in
+/// the buffer.
 pub fn read_frames<T: DeserializeOwned>(
     data: &[u8],
 ) -> Result<ReadFramesResult<T>, Box<dyn std::error::Error>> {

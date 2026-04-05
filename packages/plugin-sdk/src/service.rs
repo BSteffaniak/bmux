@@ -18,6 +18,12 @@ pub struct PluginService {
 }
 
 impl PluginService {
+    /// Validate that this service definition has a non-empty interface ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`PluginError::InvalidServiceInterfaceId`] if the interface ID
+    /// is empty or contains only whitespace.
     pub fn validate(&self, plugin_id: &str) -> Result<()> {
         if self.interface_id.trim().is_empty() {
             return Err(PluginError::InvalidServiceInterfaceId {
@@ -158,6 +164,11 @@ impl ServiceResponse {
     }
 }
 
+/// Serialize a service message using the bmux binary codec.
+///
+/// # Errors
+///
+/// Returns [`PluginError::ServiceProtocol`] if serialization fails.
 pub fn encode_service_message<T>(message: &T) -> Result<Vec<u8>>
 where
     T: Serialize,
@@ -167,6 +178,11 @@ where
     })
 }
 
+/// Deserialize a service message from binary codec bytes.
+///
+/// # Errors
+///
+/// Returns [`PluginError::ServiceProtocol`] if deserialization fails.
 pub fn decode_service_message<T>(payload: &[u8]) -> Result<T>
 where
     T: DeserializeOwned,
@@ -176,6 +192,14 @@ where
     })
 }
 
+/// Encode a typed message into a service envelope with the given request ID and kind.
+///
+/// Serializes both the inner message and the outer envelope using the binary codec.
+///
+/// # Errors
+///
+/// Returns [`PluginError::ServiceProtocol`] if serialization of the message
+/// or the envelope fails.
 pub fn encode_service_envelope<T>(
     request_id: u64,
     kind: ServiceEnvelopeKind,
@@ -191,6 +215,16 @@ where
     ))
 }
 
+/// Decode a service envelope and extract the typed payload.
+///
+/// Validates the protocol version and envelope kind before deserializing
+/// the inner payload.
+///
+/// # Errors
+///
+/// Returns [`PluginError::ServiceProtocol`] if the envelope cannot be
+/// deserialized, the protocol version is unsupported, the envelope kind
+/// does not match `expected_kind`, or the inner payload fails to deserialize.
 pub fn decode_service_envelope<T>(
     payload: &[u8],
     expected_kind: ServiceEnvelopeKind,

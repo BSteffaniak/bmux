@@ -274,6 +274,11 @@ pub fn decode_frame_compressed(frame: &[u8]) -> Result<Envelope, FrameDecodeErro
 /// Try to decode one compressed frame from a mutable input buffer.
 ///
 /// Returns `Ok(None)` when the buffer does not yet contain a complete frame.
+///
+/// # Errors
+///
+/// Returns an error for oversized, unknown compression, decompression failure,
+/// or deserialization failures.
 pub fn try_decode_frame_compressed(
     buffer: &mut Vec<u8>,
 ) -> Result<Option<Envelope>, FrameDecodeError> {
