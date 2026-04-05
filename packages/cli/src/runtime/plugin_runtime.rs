@@ -857,7 +857,7 @@ pub(super) fn deactivate_loaded_plugins(
 
 pub(super) fn dispatch_loaded_plugin_event(
     loaded_plugins: &[bmux_plugin::LoadedPlugin],
-    event: PluginEvent,
+    event: &PluginEvent,
 ) -> Result<()> {
     for plugin in loaded_plugins {
         let _ = plugin.dispatch_event(&event).with_context(|| {
@@ -929,7 +929,7 @@ pub(super) async fn plugin_event_bridge_loop(
                 if matches!(event, bmux_client::ServerEvent::PaneOutputAvailable { .. }) {
                     continue;
                 }
-                dispatch_loaded_plugin_event(loaded_plugins, plugin_event_from_server_event(&event)?)?;
+                dispatch_loaded_plugin_event(loaded_plugins, &plugin_event_from_server_event(&event)?)?;
             }
         }
     }

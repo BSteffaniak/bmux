@@ -771,14 +771,14 @@ fn format_setup_summary_lines(
     join_target: &str,
     include_auth_line: bool,
 ) -> Vec<String> {
-    let share_line = share_link.unwrap_or("unavailable");
+    let share_url = share_link.unwrap_or("unavailable");
     let mut lines = Vec::new();
     if include_auth_line {
         let account = account_name.unwrap_or("unknown");
         lines.push(format!("Signed in as {account}"));
     }
     lines.push(format!("Host online: {host_name}"));
-    lines.push(format!("Share link: {share_line}"));
+    lines.push(format!("Share link: {share_url}"));
     lines.push(format!(
         "Join from another machine: bmux join {join_target}"
     ));

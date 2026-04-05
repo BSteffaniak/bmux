@@ -599,17 +599,17 @@ pub(super) async fn run_server_bridge(stdio: bool, preflight: bool) -> Result<u8
     let stream = LocalIpcStream::connect(&endpoint)
         .await
         .context("failed connecting local IPC endpoint for bridge")?;
-    let (mut stream_read, mut stream_write) = tokio::io::split(stream);
+    let (mut ipc_reader, mut ipc_writer) = tokio::io::split(stream);
     let mut stdin = tokio::io::stdin();
     let mut stdout = tokio::io::stdout();
 
     let to_server = tokio::spawn(async move {
-        tokio::io::copy(&mut stdin, &mut stream_write).await?;
-        stream_write.shutdown().await?;
+        tokio::io::copy(&mut stdin, &mut ipc_writer).await?;
+        ipc_writer.shutdown().await?;
         Ok::<(), std::io::Error>(())
     });
     let from_server = tokio::spawn(async move {
-        tokio::io::copy(&mut stream_read, &mut stdout).await?;
+        tokio::io::copy(&mut ipc_reader, &mut stdout).await?;
         stdout.flush().await?;
         Ok::<(), std::io::Error>(())
     });

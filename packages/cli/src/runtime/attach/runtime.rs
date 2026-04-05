@@ -2137,19 +2137,19 @@ pub async fn build_attach_status_line_for_draw(
 }
 
 pub fn attach_mode_hint(_ui_mode: AttachUiMode, keymap: &Keymap) -> String {
-    let detach = key_hint_or_unbound(keymap, RuntimeAction::Detach);
-    let quit = key_hint_or_unbound(keymap, RuntimeAction::Quit);
-    let help = key_hint_or_unbound(keymap, RuntimeAction::ShowHelp);
-    let restart = key_hint_or_unbound(keymap, RuntimeAction::RestartFocusedPane);
-    let prev = key_hint_or_unbound(keymap, RuntimeAction::SessionPrev);
-    let next = key_hint_or_unbound(keymap, RuntimeAction::SessionNext);
+    let detach = key_hint_or_unbound(keymap, &RuntimeAction::Detach);
+    let quit = key_hint_or_unbound(keymap, &RuntimeAction::Quit);
+    let help = key_hint_or_unbound(keymap, &RuntimeAction::ShowHelp);
+    let restart = key_hint_or_unbound(keymap, &RuntimeAction::RestartFocusedPane);
+    let prev = key_hint_or_unbound(keymap, &RuntimeAction::SessionPrev);
+    let next = key_hint_or_unbound(keymap, &RuntimeAction::SessionNext);
     format!(
         "{prev}/{next} tabs | {detach} detach | {restart} restart pane | {quit} quit | {help} help"
     )
 }
 
 pub fn initial_attach_status(keymap: &Keymap, can_write: bool) -> String {
-    let help = key_hint_or_unbound(keymap, RuntimeAction::ShowHelp);
+    let help = key_hint_or_unbound(keymap, &RuntimeAction::ShowHelp);
     if can_write {
         format!("{help} help | typing goes to pane")
     } else {
@@ -2165,32 +2165,32 @@ pub const fn attach_exit_message(reason: AttachExitReason) -> Option<&'static st
 }
 
 pub fn attach_scrollback_hint(keymap: &Keymap) -> String {
-    let exit = scroll_key_hint_or_unbound(keymap, RuntimeAction::ExitScrollMode);
-    let confirm = scroll_key_hint_or_unbound(keymap, RuntimeAction::ConfirmScrollback);
-    let left = scroll_key_hint_or_unbound(keymap, RuntimeAction::MoveCursorLeft);
-    let right = scroll_key_hint_or_unbound(keymap, RuntimeAction::MoveCursorRight);
-    let up = scroll_key_hint_or_unbound(keymap, RuntimeAction::MoveCursorUp);
-    let down = scroll_key_hint_or_unbound(keymap, RuntimeAction::MoveCursorDown);
-    let page_up = scroll_key_hint_or_unbound(keymap, RuntimeAction::ScrollUpPage);
-    let page_down = scroll_key_hint_or_unbound(keymap, RuntimeAction::ScrollDownPage);
-    let top = scroll_key_hint_or_unbound(keymap, RuntimeAction::ScrollTop);
-    let bottom = scroll_key_hint_or_unbound(keymap, RuntimeAction::ScrollBottom);
-    let select = scroll_key_hint_or_unbound(keymap, RuntimeAction::BeginSelection);
-    let copy = scroll_key_hint_or_unbound(keymap, RuntimeAction::CopyScrollback);
+    let exit = scroll_key_hint_or_unbound(keymap, &RuntimeAction::ExitScrollMode);
+    let confirm = scroll_key_hint_or_unbound(keymap, &RuntimeAction::ConfirmScrollback);
+    let left = scroll_key_hint_or_unbound(keymap, &RuntimeAction::MoveCursorLeft);
+    let right = scroll_key_hint_or_unbound(keymap, &RuntimeAction::MoveCursorRight);
+    let up = scroll_key_hint_or_unbound(keymap, &RuntimeAction::MoveCursorUp);
+    let down = scroll_key_hint_or_unbound(keymap, &RuntimeAction::MoveCursorDown);
+    let page_up = scroll_key_hint_or_unbound(keymap, &RuntimeAction::ScrollUpPage);
+    let page_down = scroll_key_hint_or_unbound(keymap, &RuntimeAction::ScrollDownPage);
+    let top = scroll_key_hint_or_unbound(keymap, &RuntimeAction::ScrollTop);
+    let bottom = scroll_key_hint_or_unbound(keymap, &RuntimeAction::ScrollBottom);
+    let select = scroll_key_hint_or_unbound(keymap, &RuntimeAction::BeginSelection);
+    let copy = scroll_key_hint_or_unbound(keymap, &RuntimeAction::CopyScrollback);
     format!(
         "{up}/{down} line | {left}/{right} col | {page_up}/{page_down} page | {top}/{bottom} top/bottom | {select} select | {copy} copy | {confirm} copy+exit | {exit} cancel/exit scroll"
     )
 }
 
-pub fn scroll_key_hint_or_unbound(keymap: &Keymap, action: RuntimeAction) -> String {
+pub fn scroll_key_hint_or_unbound(keymap: &Keymap, action: &RuntimeAction) -> String {
     keymap
-        .primary_scroll_binding_for_action(&action)
+        .primary_scroll_binding_for_action(action)
         .unwrap_or_else(|| "unbound".to_string())
 }
 
-pub fn key_hint_or_unbound(keymap: &Keymap, action: RuntimeAction) -> String {
+pub fn key_hint_or_unbound(keymap: &Keymap, action: &RuntimeAction) -> String {
     keymap
-        .primary_binding_for_action(&action)
+        .primary_binding_for_action(action)
         .unwrap_or_else(|| "unbound".to_string())
 }
 
@@ -3001,11 +3001,11 @@ pub fn effective_attach_keybindings(config: &BmuxConfig) -> Vec<AttachKeybinding
 
 pub fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
     let keymap = attach_keymap_from_config(config);
-    let help = key_hint_or_unbound(&keymap, RuntimeAction::ShowHelp);
-    let detach = key_hint_or_unbound(&keymap, RuntimeAction::Detach);
-    let scroll = key_hint_or_unbound(&keymap, RuntimeAction::EnterScrollMode);
-    let close = key_hint_or_unbound(&keymap, RuntimeAction::CloseFocusedPane);
-    let restart = key_hint_or_unbound(&keymap, RuntimeAction::RestartFocusedPane);
+    let help = key_hint_or_unbound(&keymap, &RuntimeAction::ShowHelp);
+    let detach = key_hint_or_unbound(&keymap, &RuntimeAction::Detach);
+    let scroll = key_hint_or_unbound(&keymap, &RuntimeAction::EnterScrollMode);
+    let close = key_hint_or_unbound(&keymap, &RuntimeAction::CloseFocusedPane);
+    let restart = key_hint_or_unbound(&keymap, &RuntimeAction::RestartFocusedPane);
     let mut groups: Vec<(&str, Vec<AttachKeybindingEntry>)> = vec![
         ("Session", Vec::new()),
         ("Pane", Vec::new()),

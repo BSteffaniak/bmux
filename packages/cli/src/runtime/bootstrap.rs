@@ -301,7 +301,7 @@ pub(super) async fn run_server_start(
 
     let loaded_plugins = load_enabled_plugins(&config, &registry)?;
     activate_loaded_plugins(&loaded_plugins, &config, &paths)?;
-    dispatch_loaded_plugin_event(&loaded_plugins, plugin_system_event("server_starting"))?;
+    dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_starting"))?;
     let server = BmuxServer::from_config_paths_with_rolling_options(
         &paths,
         effective_rolling_enabled,
@@ -311,7 +311,7 @@ pub(super) async fn run_server_start(
     register_plugin_service_handlers(&server, &config, &paths, &registry)?;
     write_server_pid_file(std::process::id())?;
     write_server_runtime_metadata(std::process::id())?;
-    dispatch_loaded_plugin_event(&loaded_plugins, plugin_system_event("server_started"))?;
+    dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_started"))?;
     let run_result = if loaded_plugins.is_empty() {
         server.run().await
     } else {
@@ -332,7 +332,7 @@ pub(super) async fn run_server_start(
         }
     };
     if let Err(error) =
-        dispatch_loaded_plugin_event(&loaded_plugins, plugin_system_event("server_stopping"))
+        dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_stopping"))
     {
         warn!("failed delivering server_stopping plugin event: {error}");
     }

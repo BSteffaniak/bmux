@@ -2549,7 +2549,7 @@ fn render_screen_rgba(
     let height = usize::from(max_rows.saturating_mul(cell_h));
     let mut pixels = vec![0_u8; width.saturating_mul(height).saturating_mul(4)];
     let cw = usize::from(cell_w);
-    let cell_h_usize = usize::from(cell_h);
+    let cell_height_px = usize::from(cell_h);
 
     for row in 0..rows {
         for col in 0..cols {
@@ -2564,8 +2564,8 @@ fn render_screen_rgba(
             let (fg_r, fg_g, fg_b) = palette[usize::from(fg)];
             let (bg_r, bg_g, bg_b) = palette[usize::from(bg)];
             let x0 = usize::from(col).saturating_mul(cw);
-            let y0 = usize::from(row).saturating_mul(cell_h_usize);
-            for py in 0..cell_h_usize {
+            let y0 = usize::from(row).saturating_mul(cell_height_px);
+            for py in 0..cell_height_px {
                 let y = y0 + py;
                 if y >= height {
                     continue;
@@ -2593,9 +2593,8 @@ fn render_screen_rgba(
                 continue;
             }
 
-            let mut drawn_with_font = false;
-            if let Some(renderer) = glyph_renderer.as_deref_mut() {
-                drawn_with_font = renderer.draw_cell(
+            let drawn_with_font = glyph_renderer.as_deref_mut().is_some_and(|renderer| {
+                renderer.draw_cell(
                     &mut pixels,
                     width,
                     height,
@@ -2604,8 +2603,8 @@ fn render_screen_rgba(
                     glyph_char,
                     (fg_r, fg_g, fg_b),
                     (bg_r, bg_g, bg_b),
-                );
-            }
+                )
+            });
             if !drawn_with_font {
                 draw_bitmap_glyph_rgba(
                     &mut pixels,
@@ -2614,7 +2613,7 @@ fn render_screen_rgba(
                     x0,
                     y0,
                     cw,
-                    cell_h_usize,
+                    cell_height_px,
                     glyph_char,
                     (fg_r, fg_g, fg_b),
                     bitmap_cache,
@@ -2631,8 +2630,8 @@ struct ResvgFrameRenderer {
     height: usize,
     width_u32: u32,
     height_u32: u32,
-    cell_w_usize: usize,
-    cell_h_usize: usize,
+    cell_width_px: usize,
+    cell_height_px: usize,
     background_opacity: f32,
     backdrop_rgb: (u8, u8, u8),
     top_to_baseline: f32,
@@ -2654,8 +2653,8 @@ impl ResvgFrameRenderer {
         let height = usize::from(max_rows.saturating_mul(cell_h));
         let width_u32 = u32::try_from(width).context("render width exceeds u32")?;
         let height_u32 = u32::try_from(height).context("render height exceeds u32")?;
-        let cell_w_usize = usize::from(cell_w);
-        let cell_h_usize = usize::from(cell_h);
+        let cell_width_px = usize::from(cell_w);
+        let cell_height_px = usize::from(cell_h);
         let preset = font_preset_for_options(options);
 
         let mut families = if options.font_families.is_empty() {
@@ -2702,8 +2701,8 @@ impl ResvgFrameRenderer {
             height,
             width_u32,
             height_u32,
-            cell_w_usize,
-            cell_h_usize,
+            cell_width_px,
+            cell_height_px,
             background_opacity: options.background_opacity,
             backdrop_rgb: options.backdrop_rgb,
             top_to_baseline,
@@ -2749,12 +2748,12 @@ impl ResvgFrameRenderer {
                 }
                 let bg_rgb =
                     composite_with_backdrop(bg_rgb, self.background_opacity, self.backdrop_rgb);
-                let x0 = usize::from(col).saturating_mul(self.cell_w_usize);
-                let y0 = usize::from(row).saturating_mul(self.cell_h_usize);
+                let x0 = usize::from(col).saturating_mul(self.cell_width_px);
+                let y0 = usize::from(row).saturating_mul(self.cell_height_px);
                 write!(
                     &mut self.svg,
                     "<rect x=\"{}\" y=\"{}\" width=\"{}\" height=\"{}\" fill=\"rgb({},{},{})\"/>",
-                    x0, y0, self.cell_w_usize, self.cell_h_usize, bg_rgb.0, bg_rgb.1, bg_rgb.2
+                    x0, y0, self.cell_width_px, self.cell_height_px, bg_rgb.0, bg_rgb.1, bg_rgb.2
                 )
                 .expect("svg write cannot fail");
 
@@ -2799,11 +2798,11 @@ impl ResvgFrameRenderer {
                 row_runs.push(run);
             }
             for run in row_runs {
-                let x0 = usize::from(run.start_col).saturating_mul(self.cell_w_usize);
-                let y0 = usize::from(row).saturating_mul(self.cell_h_usize);
+                let x0 = usize::from(run.start_col).saturating_mul(self.cell_width_px);
+                let y0 = usize::from(row).saturating_mul(self.cell_height_px);
                 let text_y = y0 as f32 + self.top_to_baseline;
                 let style_attrs = svg_style_attrs(&run.style);
-                let text_length = usize::from(run.cell_count).saturating_mul(self.cell_w_usize);
+                let text_length = usize::from(run.cell_count).saturating_mul(self.cell_width_px);
                 write!(
                     &mut self.svg,
                     "<text x=\"{}\" y=\"{:.3}\" fill=\"rgb({},{},{})\" xml:space=\"preserve\" textLength=\"{}\" lengthAdjust=\"spacingAndGlyphs\"{}>{}</text>",

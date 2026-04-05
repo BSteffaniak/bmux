@@ -111,7 +111,7 @@ pub(super) fn maybe_record_host_kernel_effect(
 
 pub(super) fn call_host_kernel_via_client(
     connection: &HostConnectionInfo,
-    payload: Vec<u8>,
+    payload: &[u8],
 ) -> Result<Vec<u8>> {
     let request: bmux_ipc::Request =
         bmux_ipc::decode(&payload).context("failed decoding kernel bridge request payload")?;
@@ -176,7 +176,7 @@ pub(super) unsafe extern "C" fn host_kernel_bridge(
             runtime.block_on(async { context.execute_raw(request.payload).await })
         }
     } else if let Some(connection) = HOST_KERNEL_CONNECTION.with(|slot| slot.borrow().clone()) {
-        call_host_kernel_via_client(&connection, request.payload)
+        call_host_kernel_via_client(&connection, &request.payload)
     } else {
         return 5;
     };
