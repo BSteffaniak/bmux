@@ -174,7 +174,7 @@ impl PluginCommandRegistry {
         let mut clap_command =
             Command::new(leak_string(&command.name)).disable_help_subcommand(true);
         for argument in &command.arguments {
-            clap_command = clap_command.arg(build_clap_arg(argument)?);
+            clap_command = clap_command.arg(build_clap_arg(argument));
         }
         let mut argv = Vec::with_capacity(arguments.len() + 1);
         argv.push(command.name.clone());
@@ -341,12 +341,12 @@ fn build_plugin_leaf_command(name: &str, schema: &PluginCommand) -> Result<Comma
         command = command.long_about(leak_string(description));
     }
     for argument in &schema.arguments {
-        command = command.arg(build_clap_arg(argument)?);
+        command = command.arg(build_clap_arg(argument));
     }
     Ok(command)
 }
 
-fn build_clap_arg(argument: &PluginCommandArgument) -> Result<Arg> {
+fn build_clap_arg(argument: &PluginCommandArgument) -> Arg {
     let mut arg = Arg::new(leak_string(&argument.name)).required(argument.required);
     if let Some(position) = argument.position {
         arg = arg.index(position + 1);
@@ -392,7 +392,7 @@ fn build_clap_arg(argument: &PluginCommandArgument) -> Result<Arg> {
         | PluginCommandArgumentKind::Boolean
         | PluginCommandArgumentKind::Path => {}
     }
-    Ok(arg)
+    arg
 }
 
 fn leak_string(value: &str) -> &'static str {
@@ -445,6 +445,7 @@ fn clap_path_exists(root: &Command, path: &[String]) -> bool {
     true
 }
 
+#[allow(clippy::suspicious_operation_groupings)] // Intentional: checks two distinct slices aren't equal AND one is a prefix
 fn is_prefix_collision(left: &[String], right: &[String]) -> bool {
     left != right && (left.starts_with(right) || right.starts_with(left))
 }

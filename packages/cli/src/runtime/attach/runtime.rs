@@ -1367,11 +1367,14 @@ pub async fn handle_attach_ui_action(
         RuntimeAction::ScrollUpPage => {
             step_attach_scrollback(
                 view_state,
-                -(attach_scrollback_page_size(view_state) as isize),
+                -(attach_scrollback_page_size(view_state).cast_signed()),
             );
         }
         RuntimeAction::ScrollDownPage => {
-            step_attach_scrollback(view_state, attach_scrollback_page_size(view_state) as isize);
+            step_attach_scrollback(
+                view_state,
+                attach_scrollback_page_size(view_state).cast_signed(),
+            );
         }
         RuntimeAction::ScrollTop => {
             if view_state.scrollback_active {
@@ -1444,10 +1447,7 @@ pub async fn handle_attach_ui_action(
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
         }
-        RuntimeAction::WindowPrev => {
-            view_state.exit_scrollback();
-        }
-        RuntimeAction::WindowNext => {
+        RuntimeAction::WindowPrev | RuntimeAction::WindowNext => {
             view_state.exit_scrollback();
         }
         RuntimeAction::WindowGoto1 => {
@@ -1711,7 +1711,7 @@ pub fn move_attach_scrollback_cursor_vertical(view_state: &mut AttachViewState, 
             }
         }
     } else {
-        for _ in 0..(delta as usize) {
+        for _ in 0..(delta.cast_unsigned()) {
             if cursor.row + 1 < inner_h {
                 cursor.row += 1;
             } else if view_state.scrollback_offset > 0 {
@@ -1727,7 +1727,7 @@ pub fn adjust_scrollback_cursor_component(current: usize, delta: isize, max_valu
     if delta < 0 {
         current.saturating_sub(delta.unsigned_abs())
     } else {
-        current.saturating_add(delta as usize).min(max_value)
+        current.saturating_add(delta.cast_unsigned()).min(max_value)
     }
 }
 
@@ -1908,7 +1908,7 @@ pub fn adjust_attach_scrollback_offset(current: usize, delta: isize, max_offset:
     if delta < 0 {
         current.saturating_add(delta.unsigned_abs()).min(max_offset)
     } else {
-        current.saturating_sub(delta as usize)
+        current.saturating_sub(delta.cast_unsigned())
     }
 }
 
@@ -2015,14 +2015,14 @@ pub fn relative_session_id(
         .iter()
         .position(|session| session.id == current_session_id)
         .unwrap_or(0);
-    let len = sessions.len() as isize;
-    let mut target_index = current_index as isize + step;
+    let len = sessions.len().cast_signed();
+    let mut target_index = current_index.cast_signed() + step;
     while target_index < 0 {
         target_index += len;
     }
     target_index %= len;
     sessions
-        .get(target_index as usize)
+        .get(target_index.cast_unsigned())
         .map(|session| session.id)
 }
 
@@ -2039,14 +2039,14 @@ pub fn relative_context_id(
         .iter()
         .position(|context| context.id == current_context_id)
         .unwrap_or(0);
-    let len = contexts.len() as isize;
-    let mut target_index = current_index as isize + step;
+    let len = contexts.len().cast_signed();
+    let mut target_index = current_index.cast_signed() + step;
     while target_index < 0 {
         target_index += len;
     }
     target_index %= len;
     contexts
-        .get(target_index as usize)
+        .get(target_index.cast_unsigned())
         .map(|context| context.id)
 }
 
@@ -2250,7 +2250,7 @@ pub fn adjust_help_overlay_scroll(
     let next = if delta.is_negative() {
         current.saturating_sub(delta.unsigned_abs())
     } else {
-        current.saturating_add(delta as usize)
+        current.saturating_add(delta.cast_unsigned())
     };
     next.min(max_scroll)
 }
@@ -2297,7 +2297,7 @@ pub fn handle_help_overlay_key_event(
             true
         }
         KeyCode::PageUp => {
-            let page = help_overlay_visible_rows(help_lines) as isize;
+            let page = help_overlay_visible_rows(help_lines).cast_signed();
             view_state.help_overlay_scroll = adjust_help_overlay_scroll(
                 view_state.help_overlay_scroll,
                 -page,
@@ -2308,7 +2308,7 @@ pub fn handle_help_overlay_key_event(
             true
         }
         KeyCode::PageDown => {
-            let page = help_overlay_visible_rows(help_lines) as isize;
+            let page = help_overlay_visible_rows(help_lines).cast_signed();
             view_state.help_overlay_scroll = adjust_help_overlay_scroll(
                 view_state.help_overlay_scroll,
                 page,
@@ -3031,8 +3031,7 @@ pub fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
             | RuntimeAction::WindowGoto6
             | RuntimeAction::WindowGoto7
             | RuntimeAction::WindowGoto8
-            | RuntimeAction::WindowGoto9
-            | RuntimeAction::WindowClose => "Other",
+            | RuntimeAction::WindowGoto9 => "Other",
             RuntimeAction::SplitFocusedVertical
             | RuntimeAction::SplitFocusedHorizontal
             | RuntimeAction::FocusNext
@@ -3617,7 +3616,7 @@ pub fn apply_attach_view_change_components(
     // without re-sorting or undoing prior effects.
     for component in components {
         match component {
-            AttachViewComponent::Scene => {
+            AttachViewComponent::Scene | AttachViewComponent::Layout => {
                 view_state.dirty.layout_needs_refresh = true;
                 view_state.dirty.full_pane_redraw = true;
                 view_state.dirty.status_needs_redraw = true;
@@ -3625,11 +3624,6 @@ pub fn apply_attach_view_change_components(
             AttachViewComponent::SurfaceContent => {
                 view_state.dirty.layout_needs_refresh = true;
                 view_state.dirty.full_pane_redraw = true;
-            }
-            AttachViewComponent::Layout => {
-                view_state.dirty.layout_needs_refresh = true;
-                view_state.dirty.full_pane_redraw = true;
-                view_state.dirty.status_needs_redraw = true;
             }
             AttachViewComponent::Status => {
                 view_state.dirty.status_needs_redraw = true;
@@ -4578,6 +4572,8 @@ pub fn handle_attach_mouse_scrollback(
         return false;
     }
 
+    #[allow(clippy::cast_possible_wrap)]
+    // scroll_lines_per_tick is a small u16, always fits in isize
     let lines = view_state.mouse.config.scroll_lines_per_tick.max(1) as isize;
     match kind {
         MouseEventKind::ScrollUp => {

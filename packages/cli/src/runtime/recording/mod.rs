@@ -1423,8 +1423,8 @@ fn overlay_cursor_rgba(
     text_mode: BlockTextMode,
     bar_width_pct: u8,
     underline_height_pct: u8,
-    cell_fg: (u8, u8, u8),
-    cell_bg: (u8, u8, u8),
+    cell_foreground: (u8, u8, u8),
+    cell_background: (u8, u8, u8),
     color: (u8, u8, u8),
 ) -> (BlockPaintMode, BlockTextMode, Option<&'static str>) {
     if frame_width == 0 || frame_height == 0 || cell_w == 0 || cell_h == 0 {
@@ -1462,14 +1462,14 @@ fn overlay_cursor_rgba(
             BlockPaintMode::Fill => {
                 let mut effective_text_mode = text_mode;
                 if matches!(text_mode, BlockTextMode::SwapFgBg)
-                    && contrast_ratio(cell_bg, color) < 2.0
+                    && contrast_ratio(cell_background, color) < 2.0
                 {
                     effective_text_mode = BlockTextMode::ForceContrast;
                     fallback_reason = Some("swap_fg_bg_low_contrast");
                 }
                 resolved_text_mode = effective_text_mode;
                 let fill_text = match effective_text_mode {
-                    BlockTextMode::SwapFgBg => cell_bg,
+                    BlockTextMode::SwapFgBg => cell_background,
                     BlockTextMode::ForceContrast => pick_contrast_text_color(color),
                 };
                 for py in 0..cell_h {
@@ -1582,7 +1582,7 @@ fn overlay_cursor_rgba(
             }
         }
     }
-    let _ = cell_fg;
+    let _ = cell_foreground;
     (resolved_paint_mode, resolved_text_mode, fallback_reason)
 }
 
@@ -2071,13 +2071,13 @@ fn export_recording_gif(
         }
 
         if cursor_visible && cursor_row < current_rows && cursor_col < current_cols {
-            let (cell_fg, cell_bg) = parser
+            let (cell_foreground, cell_background) = parser
                 .screen()
                 .cell(cursor_row, cursor_col)
                 .map_or(((255, 255, 255), (0, 0, 0)), |cell| {
                     resolved_cell_colors(cell, &palette)
                 });
-            let cursor_color_rgb = cursor_options.color_override.unwrap_or(cell_fg);
+            let cursor_color_rgb = cursor_options.color_override.unwrap_or(cell_foreground);
             let (paint_mode_used, text_mode_used, paint_fallback_reason) = overlay_cursor_rgba(
                 &mut pixels,
                 usize::from(width),
@@ -2102,8 +2102,8 @@ fn export_recording_gif(
                 },
                 cursor_options.bar_width_pct,
                 cursor_options.underline_height_pct,
-                cell_fg,
-                cell_bg,
+                cell_foreground,
+                cell_background,
                 cursor_color_rgb,
             );
             if let Some(frames) = cursor_frames.as_mut() {
@@ -3592,7 +3592,7 @@ fn nearest_xterm_index(r: u8, g: u8, b: u8) -> u8 {
         let dr = i32::from(*pr) - i32::from(r);
         let dg = i32::from(*pg) - i32::from(g);
         let db = i32::from(*pb) - i32::from(b);
-        let distance = (dr * dr + dg * dg + db * db) as u32;
+        let distance = (dr * dr + dg * dg + db * db).cast_unsigned();
         if distance < best_distance {
             best_distance = distance;
             best_index = index as u8;

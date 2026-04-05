@@ -64,13 +64,7 @@ async fn run_hosted_doctor(as_json: bool) -> Result<u8> {
 
     let host_state_path = paths.runtime_dir.join("host-state.json");
     let host_runtime_ok = host_state_path.exists();
-    let share_lookup_ok = if config.connections.share_links.is_empty() {
-        false
-    } else if auth_token.is_none() {
-        true
-    } else {
-        true
-    };
+    let share_lookup_ok = !config.connections.share_links.is_empty();
 
     let lines = vec![
         (
@@ -191,12 +185,12 @@ async fn run_doctor_text(paths: &ConfigPaths) -> Result<bool> {
                 .as_ref()
                 .ok()
                 .and_then(|m| m.as_ref())
-                .map_or("unknown".to_string(), |m| m.version.clone());
+                .map_or_else(|| "unknown".to_string(), |m| m.version.clone());
             let pid_str = meta
                 .as_ref()
                 .ok()
                 .and_then(|m| m.as_ref())
-                .map_or("?".to_string(), |m| m.pid.to_string());
+                .map_or_else(|| "?".to_string(), |m| m.pid.to_string());
 
             print_ok(
                 "server",
@@ -523,6 +517,8 @@ async fn build_doctor_report(paths: &ConfigPaths) -> DoctorReport {
     }
 
     // Plugins
+    #[allow(clippy::option_if_let_else)]
+    // Nested match with side effects reads better than map_or_else
     let (plugin_enabled, plugin_incompatible, plugin_scan_error) = match &config {
         Some(cfg) => match scan_available_plugins(cfg, paths) {
             Ok(registry) => {

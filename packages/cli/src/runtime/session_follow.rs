@@ -53,10 +53,10 @@ pub(super) async fn run_unfollow(connection_context: ConnectionContext<'_>) -> R
 }
 
 pub(super) fn parse_session_selector(target: &str) -> SessionSelector {
-    match Uuid::parse_str(target) {
-        Ok(id) => SessionSelector::ById(id),
-        Err(_) => SessionSelector::ByName(target.to_string()),
-    }
+    Uuid::parse_str(target).map_or_else(
+        |_| SessionSelector::ByName(target.to_string()),
+        SessionSelector::ById,
+    )
 }
 
 pub(super) fn parse_uuid_value(value: &str, label: &str) -> Result<Uuid> {

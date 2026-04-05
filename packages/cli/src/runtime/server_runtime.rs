@@ -118,12 +118,13 @@ pub(super) fn read_server_pid_file() -> Result<Option<u32>> {
         }
     };
 
-    if let Some(pid) = parse_pid_content(&content) {
-        Ok(Some(pid))
-    } else {
-        let _ = remove_server_pid_file();
-        Ok(None)
-    }
+    parse_pid_content(&content).map_or_else(
+        || {
+            let _ = remove_server_pid_file();
+            Ok(None)
+        },
+        |pid| Ok(Some(pid)),
+    )
 }
 
 pub(super) fn remove_server_pid_file() -> Result<()> {

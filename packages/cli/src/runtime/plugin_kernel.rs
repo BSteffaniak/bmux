@@ -84,6 +84,7 @@ pub(super) fn finish_host_kernel_effect_capture() -> Vec<PluginCommandEffect> {
         .unwrap_or_default()
 }
 
+#[allow(clippy::match_same_arms)] // CreateContext and SelectContext both produce SelectContext effect; different patterns, same intent
 pub(super) fn maybe_record_host_kernel_effect(
     request: &bmux_ipc::Request,
     response: &bmux_ipc::Response,

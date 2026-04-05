@@ -387,16 +387,16 @@ pub fn render_attach_scene<W: io::Write>(
             }
         }
 
-        let inner_w_u16 = rect.w.saturating_sub(2);
-        let inner_h_u16 = rect.h.saturating_sub(2);
-        let inner_w = usize::from(inner_w_u16);
-        let inner_h = usize::from(inner_h_u16);
+        let inner_width = rect.w.saturating_sub(2);
+        let inner_height = rect.h.saturating_sub(2);
+        let inner_w = usize::from(inner_width);
+        let inner_h = usize::from(inner_height);
         if let Some(entry) = pane_buffers.get_mut(&pane_id) {
             let (old_rows, old_cols) = entry.parser.screen().size();
             entry
                 .parser
                 .screen_mut()
-                .set_size(inner_h_u16.max(1), inner_w_u16.max(1));
+                .set_size(inner_height.max(1), inner_width.max(1));
             // Invalidate the row cache when the pane dimensions change, since
             // the row strings are no longer comparable at a different size.
             let (new_rows, new_cols) = entry.parser.screen().size();
@@ -425,8 +425,8 @@ pub fn render_attach_scene<W: io::Write>(
                 } else {
                     let (cursor_row, cursor_col) = screen.cursor_position();
                     (
-                        cursor_row.min(inner_h_u16.saturating_sub(1)),
-                        cursor_col.min(inner_w_u16.saturating_sub(1)),
+                        cursor_row.min(inner_height.saturating_sub(1)),
+                        cursor_col.min(inner_width.saturating_sub(1)),
                     )
                 };
                 cursor_state = Some(AttachCursorState {
@@ -444,7 +444,7 @@ pub fn render_attach_scene<W: io::Write>(
                 let mut current = CellStyle::default();
                 let mut used_cols = 0usize;
                 let mut col = 0u16;
-                while col < inner_w_u16 {
+                while col < inner_width {
                     if let Some(cell) = screen.cell(row as u16, col) {
                         let absolute_row = scrollback_offset.saturating_add(row);
                         let style = if cell_selected(selection, absolute_row, usize::from(col)) {

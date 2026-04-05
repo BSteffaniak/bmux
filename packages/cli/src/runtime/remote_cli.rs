@@ -1354,7 +1354,7 @@ fn clear_host_runtime_state(paths: &ConfigPaths) -> Result<()> {
 fn current_unix_timestamp() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|value| value.as_secs() as i64)
+        .map(|value| value.as_secs().cast_signed())
         .unwrap_or(0)
 }
 
@@ -2317,10 +2317,7 @@ pub(super) async fn run_remote_upgrade(target: Option<&str>) -> Result<u8> {
                 println!("remote upgrade completed for '{}'", ssh_target.label);
                 return Ok(0);
             }
-            ResolvedTarget::Tls(_) => {
-                anyhow::bail!("remote upgrade currently supports SSH targets only");
-            }
-            ResolvedTarget::Iroh(_) => {
+            ResolvedTarget::Tls(_) | ResolvedTarget::Iroh(_) => {
                 anyhow::bail!("remote upgrade currently supports SSH targets only");
             }
             ResolvedTarget::Local => {

@@ -202,8 +202,9 @@ pub(super) fn format_destructive_op_error(
         DestructiveOpErrorKind::ForceLocalUnauthorized =>
             "`--force-local` is only available to the server control principal. Check `bmux server whoami-principal`."
                 .to_string(),
-        DestructiveOpErrorKind::NotFound => map_cli_client_error(error).to_string(),
-        DestructiveOpErrorKind::Other => map_cli_client_error(error).to_string(),
+        DestructiveOpErrorKind::NotFound | DestructiveOpErrorKind::Other => {
+            map_cli_client_error(error).to_string()
+        }
     }
 }
 
