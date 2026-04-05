@@ -19,7 +19,8 @@ use bmux_ipc::{
     EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, PaneFocusDirection,
     PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection, PaneState, PaneSummary,
     ProtocolContract, ProtocolVersion, RecordingEventKind, RecordingPayload, RecordingProfile,
-    RecordingRollingStartOptions, RecordingSummary, Request, Response, ResponsePayload,
+    RecordingRollingClearReport, RecordingRollingStartOptions, RecordingRollingStatus,
+    RecordingRollingUsage, RecordingSummary, Request, Response, ResponsePayload,
     ServerSnapshotStatus, SessionSelector, SessionSummary, decode, default_supported_capabilities,
     encode, negotiate_protocol,
 };
@@ -4739,6 +4740,116 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV4> {
     })
 }
 
+#[derive(Default)]
+struct RollingUsageCounters {
+    bytes: u64,
+    files: u64,
+    directories: u64,
+}
+
+fn collect_rolling_usage(root: &std::path::Path) -> Result<RecordingRollingUsage> {
+    let mut counters = RollingUsageCounters::default();
+    if root.exists() {
+        collect_rolling_usage_recursive(root, &mut counters)?;
+    }
+    Ok(RecordingRollingUsage {
+        bytes: counters.bytes,
+        files: counters.files,
+        directories: counters.directories,
+        recording_dirs: count_rolling_recording_dirs(root)?,
+    })
+}
+
+fn collect_rolling_usage_recursive(
+    path: &std::path::Path,
+    counters: &mut RollingUsageCounters,
+) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let metadata = std::fs::metadata(path)
+        .with_context(|| format!("failed reading metadata for {}", path.display()))?;
+    if metadata.is_file() {
+        counters.files = counters.files.saturating_add(1);
+        counters.bytes = counters.bytes.saturating_add(metadata.len());
+        return Ok(());
+    }
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+
+    counters.directories = counters.directories.saturating_add(1);
+    for entry in std::fs::read_dir(path)
+        .with_context(|| format!("failed reading rolling directory {}", path.display()))?
+    {
+        let entry = entry?;
+        collect_rolling_usage_recursive(&entry.path(), counters)?;
+    }
+    Ok(())
+}
+
+fn count_rolling_recording_dirs(root: &std::path::Path) -> Result<u64> {
+    if !root.exists() {
+        return Ok(0);
+    }
+    let mut count = 0_u64;
+    for entry in std::fs::read_dir(root)
+        .with_context(|| format!("failed reading rolling directory {}", root.display()))?
+    {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        if entry.path().join("manifest.json").exists() {
+            count = count.saturating_add(1);
+        }
+    }
+    Ok(count)
+}
+
+fn clear_rolling_root(root: &std::path::Path) -> Result<()> {
+    if root.exists() {
+        std::fs::remove_dir_all(root)
+            .with_context(|| format!("failed clearing rolling directory {}", root.display()))?;
+    }
+    std::fs::create_dir_all(root)
+        .with_context(|| format!("failed creating rolling directory {}", root.display()))?;
+    Ok(())
+}
+
+fn rolling_status_snapshot(state: &Arc<ServerState>) -> Result<RecordingRollingStatus> {
+    let mut available = state.rolling_recording_defaults.is_available();
+    let mut active = None;
+    let mut rolling_window_secs = (state.rolling_recording_defaults.window_secs > 0)
+        .then_some(state.rolling_recording_defaults.window_secs);
+    let mut event_kinds = state.rolling_recording_defaults.event_kinds.clone();
+
+    {
+        let runtime = state
+            .rolling_recording_runtime
+            .lock()
+            .map_err(|_| anyhow::anyhow!("rolling recording runtime lock poisoned"))?;
+        if let Some(runtime) = runtime.as_ref() {
+            available = true;
+            rolling_window_secs = runtime.rolling_window_secs();
+            if let Some(summary) = runtime.status().active {
+                event_kinds = summary.event_kinds.clone();
+                active = Some(summary);
+            }
+        }
+    }
+
+    Ok(RecordingRollingStatus {
+        root_path: state.rolling_recordings_dir.to_string_lossy().to_string(),
+        auto_start: state.rolling_recording_auto_start,
+        available,
+        active,
+        rolling_window_secs,
+        event_kinds: normalize_recording_event_kinds(&event_kinds),
+        usage: collect_rolling_usage(&state.rolling_recordings_dir)?,
+    })
+}
+
 fn ensure_rolling_recording_started(state: &Arc<ServerState>) -> Result<()> {
     if !state.rolling_recording_auto_start {
         return Ok(());
@@ -7117,6 +7228,134 @@ async fn handle_request(
             let _ = emit_event(state, Event::RecordingStopped { recording_id });
             Response::Ok(ResponsePayload::RecordingStopped { recording_id })
         }
+        Request::RecordingRollingStatus => match rolling_status_snapshot(state) {
+            Ok(status) => Response::Ok(ResponsePayload::RecordingRollingStatus { status }),
+            Err(error) => Response::Err(ErrorResponse {
+                code: ErrorCode::Internal,
+                message: format!("failed reading rolling recording status: {error}"),
+            }),
+        },
+        Request::RecordingRollingClear { restart_if_active } => {
+            let root = state.rolling_recordings_dir.clone();
+            let usage_before = match collect_rolling_usage(&root) {
+                Ok(usage) => usage,
+                Err(error) => {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::Internal,
+                        message: format!("failed reading rolling recording usage: {error}"),
+                    }));
+                }
+            };
+
+            let mut was_active = false;
+            let mut stopped_recording_id = None;
+            let mut restart_settings = None;
+
+            {
+                let mut runtime = state
+                    .rolling_recording_runtime
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("rolling recording runtime lock poisoned"))?;
+                if let Some(runtime) = runtime.as_mut()
+                    && let Some(active) = runtime.status().active
+                {
+                    was_active = true;
+                    restart_settings = Some(RollingRecordingSettings {
+                        window_secs: runtime
+                            .rolling_window_secs()
+                            .unwrap_or(state.rolling_recording_defaults.window_secs),
+                        event_kinds: active.event_kinds,
+                    });
+                    stopped_recording_id = Some(runtime.stop(None)?.id);
+                }
+            }
+
+            if let Some(recording_id) = stopped_recording_id {
+                let _ = emit_event(state, Event::RecordingStopped { recording_id });
+            }
+
+            if let Err(error) = clear_rolling_root(&root) {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::Internal,
+                    message: format!("failed clearing rolling recordings: {error}"),
+                }));
+            }
+
+            let mut restarted = false;
+            let mut restarted_recording = None;
+
+            if restart_if_active && was_active {
+                let settings = restart_settings
+                    .clone()
+                    .unwrap_or_else(|| state.rolling_recording_defaults.clone());
+                if !settings.is_available() {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::InvalidRequest,
+                        message: "cannot restart rolling recording after clear: no valid settings"
+                            .to_string(),
+                    }));
+                }
+
+                let recording = {
+                    let mut runtime = state
+                        .rolling_recording_runtime
+                        .lock()
+                        .map_err(|_| anyhow::anyhow!("rolling recording runtime lock poisoned"))?;
+                    if runtime.is_none() {
+                        *runtime = Some(RecordingRuntime::new_rolling(
+                            root.clone(),
+                            state.rolling_recording_segment_mb,
+                            settings.window_secs,
+                        ));
+                    }
+                    let runtime = runtime.as_mut().ok_or_else(|| {
+                        anyhow::anyhow!("rolling recording runtime missing after init")
+                    })?;
+                    if runtime.rolling_window_secs() != Some(settings.window_secs) {
+                        *runtime = RecordingRuntime::new_rolling(
+                            root.clone(),
+                            state.rolling_recording_segment_mb,
+                            settings.window_secs,
+                        );
+                    }
+                    start_rolling_recording_runtime(state, runtime, &settings)?
+                };
+
+                restarted = true;
+                let _ = emit_event(
+                    state,
+                    Event::RecordingStarted {
+                        recording_id: recording.id,
+                        path: recording.path.clone(),
+                    },
+                );
+                restarted_recording = Some(recording);
+            }
+
+            let usage_after = match collect_rolling_usage(&root) {
+                Ok(usage) => usage,
+                Err(error) => {
+                    return Ok(Response::Err(ErrorResponse {
+                        code: ErrorCode::Internal,
+                        message: format!(
+                            "failed reading rolling recording usage after clear: {error}"
+                        ),
+                    }));
+                }
+            };
+
+            Response::Ok(ResponsePayload::RecordingRollingCleared {
+                report: RecordingRollingClearReport {
+                    root_path: root.to_string_lossy().to_string(),
+                    was_active,
+                    restarted,
+                    stopped_recording_id,
+                    restarted_recording,
+                    usage_before,
+                    usage_after,
+                },
+            })
+        }
         Request::RecordingCaptureTargets => {
             let mut targets = Vec::new();
             {
@@ -7271,6 +7510,7 @@ const fn request_requires_exclusive(request: &Request) -> bool {
             | Request::RecordingCut { .. }
             | Request::RecordingRollingStart { .. }
             | Request::RecordingRollingStop
+            | Request::RecordingRollingClear { .. }
             | Request::RecordingPrune { .. }
             | Request::Detach
     )
@@ -7349,6 +7589,8 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::RecordingCut { .. } => "recording_cut",
         Request::RecordingRollingStart { .. } => "recording_rolling_start",
         Request::RecordingRollingStop => "recording_rolling_stop",
+        Request::RecordingRollingStatus => "recording_rolling_status",
+        Request::RecordingRollingClear { .. } => "recording_rolling_clear",
         Request::RecordingCaptureTargets => "recording_capture_targets",
         Request::RecordingPrune { .. } => "recording_prune",
         Request::Detach => "detach",
@@ -7617,6 +7859,8 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::RecordingDeleteAll { .. } => "recording_delete_all",
         ResponsePayload::RecordingCut { .. } => "recording_cut",
         ResponsePayload::RecordingCaptureTargets { .. } => "recording_capture_targets",
+        ResponsePayload::RecordingRollingStatus { .. } => "recording_rolling_status",
+        ResponsePayload::RecordingRollingCleared { .. } => "recording_rolling_cleared",
         ResponsePayload::RecordingPruned { .. } => "recording_pruned",
         ResponsePayload::Detached => "detached",
         ResponsePayload::PaneDirectInputAccepted { .. } => "pane_direct_input_accepted",

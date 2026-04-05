@@ -52,6 +52,9 @@ pub enum BuiltInHandlerId {
     ServerRecording,
     ServerRecordingStart,
     ServerRecordingStop,
+    ServerRecordingStatus,
+    ServerRecordingPath,
+    ServerRecordingClear,
     ServerGateway,
     ServerBridge,
     Logs,
@@ -368,6 +371,21 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::ServerRecordingStop,
             &["server", "recording", "stop"],
             "Stop hidden rolling recording",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::ServerRecordingStatus,
+            &["server", "recording", "status"],
+            "Show hidden rolling recording status",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::ServerRecordingPath,
+            &["server", "recording", "path"],
+            "Show hidden rolling recording path",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::ServerRecordingClear,
+            &["server", "recording", "clear"],
+            "Clear hidden rolling recording data",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::ServerGateway,

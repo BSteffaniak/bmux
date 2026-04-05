@@ -392,6 +392,185 @@ pub(super) async fn run_server_recording_stop(
     Ok(0)
 }
 
+async fn fetch_server_recording_rolling_status(
+    connection_context: ConnectionContext<'_>,
+) -> Result<bmux_ipc::RecordingRollingStatus> {
+    cleanup_stale_pid_file().await?;
+    let mut client = connect_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-server-recording-status",
+        connection_context,
+    )
+    .await?;
+    client
+        .recording_rolling_status()
+        .await
+        .map_err(map_cli_client_error)
+}
+
+pub(super) async fn run_server_recording_status(
+    json: bool,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
+    let status = fetch_server_recording_rolling_status(connection_context).await?;
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&status)
+                .context("failed encoding server recording status json")?
+        );
+        return Ok(0);
+    }
+
+    println!("rolling root: {}", status.root_path);
+    println!(
+        "auto-start: {}",
+        if status.auto_start {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
+        "configured: {}",
+        if status.available { "yes" } else { "no" }
+    );
+    match status.rolling_window_secs {
+        Some(window_secs) => println!("window seconds: {window_secs}"),
+        None => println!("window seconds: unset"),
+    }
+    if status.event_kinds.is_empty() {
+        println!("event kinds: none");
+    } else {
+        println!(
+            "event kinds: {}",
+            status
+                .event_kinds
+                .iter()
+                .map(|kind| recording_event_kind_name(*kind))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if let Some(active) = status.active {
+        println!(
+            "active: {} events={} bytes={} ({}) path={}",
+            active.id,
+            active.event_count,
+            active.payload_bytes,
+            format_byte_size(active.payload_bytes),
+            active.path
+        );
+    } else {
+        println!("active: none");
+    }
+    println!(
+        "usage: bytes={} ({}) files={} dirs={} recordings={}",
+        status.usage.bytes,
+        format_byte_size(status.usage.bytes),
+        status.usage.files,
+        status.usage.directories,
+        status.usage.recording_dirs
+    );
+    Ok(0)
+}
+
+pub(super) async fn run_server_recording_path(
+    json: bool,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
+    let status = fetch_server_recording_rolling_status(connection_context).await?;
+    if json {
+        let payload = serde_json::json!({ "path": status.root_path });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&payload)
+                .context("failed encoding server recording path json")?
+        );
+    } else {
+        println!("{}", status.root_path);
+    }
+    Ok(0)
+}
+
+pub(super) async fn run_server_recording_clear(
+    json: bool,
+    no_restart: bool,
+    connection_context: ConnectionContext<'_>,
+) -> Result<u8> {
+    cleanup_stale_pid_file().await?;
+    let mut client = connect_with_context(
+        ConnectionPolicyScope::Normal,
+        "bmux-cli-server-recording-clear",
+        connection_context,
+    )
+    .await?;
+    let report = client
+        .recording_rolling_clear(!no_restart)
+        .await
+        .map_err(map_cli_client_error)?;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .context("failed encoding server recording clear json")?
+        );
+        return Ok(0);
+    }
+
+    println!("rolling root: {}", report.root_path);
+    println!(
+        "usage before: bytes={} ({}) files={} dirs={} recordings={}",
+        report.usage_before.bytes,
+        format_byte_size(report.usage_before.bytes),
+        report.usage_before.files,
+        report.usage_before.directories,
+        report.usage_before.recording_dirs
+    );
+    println!(
+        "usage after: bytes={} ({}) files={} dirs={} recordings={}",
+        report.usage_after.bytes,
+        format_byte_size(report.usage_after.bytes),
+        report.usage_after.files,
+        report.usage_after.directories,
+        report.usage_after.recording_dirs
+    );
+    if report.was_active {
+        println!("was active: yes");
+        if let Some(recording_id) = report.stopped_recording_id {
+            println!("stopped recording: {recording_id}");
+        }
+    } else {
+        println!("was active: no");
+    }
+    if report.restarted {
+        if let Some(recording) = report.restarted_recording {
+            println!("restarted: yes id={} path={}", recording.id, recording.path);
+        } else {
+            println!("restarted: yes");
+        }
+    } else {
+        println!("restarted: no");
+    }
+    Ok(0)
+}
+
+fn format_byte_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    const GIB: u64 = MIB * 1024;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.2} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.2} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 const BRIDGE_PREFLIGHT_TOKEN: &str = "BMUX_BRIDGE_READY";
 
 pub(super) async fn run_server_bridge(stdio: bool, preflight: bool) -> Result<u8> {

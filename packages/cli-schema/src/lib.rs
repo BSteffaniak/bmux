@@ -1081,6 +1081,27 @@ pub enum ServerRecordingCommand {
     },
     /// Stop hidden rolling recording
     Stop,
+    /// Show hidden rolling recording status and disk usage
+    Status {
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print hidden rolling recording storage path
+    Path {
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Clear hidden rolling recording data
+    Clear {
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+        /// Do not restart rolling recording when it was active
+        #[arg(long)]
+        no_restart: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1986,6 +2007,109 @@ mod tests {
             command,
             ServerCommand::Recording {
                 command: ServerRecordingCommand::Stop
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_server_recording_status_subcommand() {
+        let cli =
+            Cli::try_parse_from(["bmux", "server", "recording", "status"]).expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Recording {
+                command: ServerRecordingCommand::Status { json: false }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_server_recording_status_json_flag() {
+        let cli = Cli::try_parse_from(["bmux", "server", "recording", "status", "--json"])
+            .expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Recording {
+                command: ServerRecordingCommand::Status { json: true }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_server_recording_path_subcommand() {
+        let cli =
+            Cli::try_parse_from(["bmux", "server", "recording", "path"]).expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Recording {
+                command: ServerRecordingCommand::Path { json: false }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_server_recording_path_json_flag() {
+        let cli = Cli::try_parse_from(["bmux", "server", "recording", "path", "--json"])
+            .expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Recording {
+                command: ServerRecordingCommand::Path { json: true }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_server_recording_clear_subcommand() {
+        let cli =
+            Cli::try_parse_from(["bmux", "server", "recording", "clear"]).expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Recording {
+                command: ServerRecordingCommand::Clear {
+                    json: false,
+                    no_restart: false,
+                }
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_server_recording_clear_flags() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "server",
+            "recording",
+            "clear",
+            "--json",
+            "--no-restart",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Recording {
+                command: ServerRecordingCommand::Clear {
+                    json: true,
+                    no_restart: true,
+                }
             }
         ));
     }

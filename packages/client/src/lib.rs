@@ -14,9 +14,10 @@ use bmux_ipc::{
     EnvelopeKind, ErrorCode, IncompatibilityReason, InvokeServiceKind, IpcEndpoint,
     NegotiatedProtocol, PaneFocusDirection, PaneLayoutNode, PaneSelector, PaneSplitDirection,
     PaneSummary, ProtocolContract, ProtocolVersion, RecordingCaptureTarget, RecordingEventKind,
-    RecordingProfile, RecordingRollingStartOptions, RecordingStatus, RecordingSummary, Request,
-    Response, ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary, decode,
-    default_supported_capabilities, encode,
+    RecordingProfile, RecordingRollingClearReport, RecordingRollingStartOptions,
+    RecordingRollingStatus, RecordingStatus, RecordingSummary, Request, Response, ResponsePayload,
+    ServerSnapshotStatus, SessionSelector, SessionSummary, decode, default_supported_capabilities,
+    encode,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -734,6 +735,40 @@ impl BmuxClient {
             ResponsePayload::RecordingStopped { recording_id } => Ok(recording_id),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording stopped response",
+            )),
+        }
+    }
+
+    /// Fetch hidden rolling recording status and usage details.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn recording_rolling_status(&mut self) -> Result<RecordingRollingStatus> {
+        match self.request(Request::RecordingRollingStatus).await? {
+            ResponsePayload::RecordingRollingStatus { status } => Ok(status),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording rolling status response",
+            )),
+        }
+    }
+
+    /// Clear hidden rolling recording data and optionally restart when active.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn recording_rolling_clear(
+        &mut self,
+        restart_if_active: bool,
+    ) -> Result<RecordingRollingClearReport> {
+        match self
+            .request(Request::RecordingRollingClear { restart_if_active })
+            .await?
+        {
+            ResponsePayload::RecordingRollingCleared { report } => Ok(report),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording rolling cleared response",
             )),
         }
     }
@@ -2334,6 +2369,30 @@ impl StreamingBmuxClient {
         }
     }
 
+    pub async fn recording_rolling_status(&mut self) -> Result<RecordingRollingStatus> {
+        match self.request(Request::RecordingRollingStatus).await? {
+            ResponsePayload::RecordingRollingStatus { status } => Ok(status),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording rolling status response",
+            )),
+        }
+    }
+
+    pub async fn recording_rolling_clear(
+        &mut self,
+        restart_if_active: bool,
+    ) -> Result<RecordingRollingClearReport> {
+        match self
+            .request(Request::RecordingRollingClear { restart_if_active })
+            .await?
+        {
+            ResponsePayload::RecordingRollingCleared { report } => Ok(report),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording rolling cleared response",
+            )),
+        }
+    }
+
     pub async fn recording_capture_targets(&mut self) -> Result<Vec<RecordingCaptureTarget>> {
         match self.request(Request::RecordingCaptureTargets).await? {
             ResponsePayload::RecordingCaptureTargets { targets } => Ok(targets),
@@ -2395,6 +2454,8 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::RecordingCut { .. } => "recording_cut",
         Request::RecordingRollingStart { .. } => "recording_rolling_start",
         Request::RecordingRollingStop => "recording_rolling_stop",
+        Request::RecordingRollingStatus => "recording_rolling_status",
+        Request::RecordingRollingClear { .. } => "recording_rolling_clear",
         Request::RecordingCaptureTargets => "recording_capture_targets",
         Request::RecordingPrune { .. } => "recording_prune",
         Request::Detach => "detach",
@@ -2457,6 +2518,8 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::RecordingDeleteAll { .. } => "recording_delete_all",
             ResponsePayload::RecordingCut { .. } => "recording_cut",
             ResponsePayload::RecordingCaptureTargets { .. } => "recording_capture_targets",
+            ResponsePayload::RecordingRollingStatus { .. } => "recording_rolling_status",
+            ResponsePayload::RecordingRollingCleared { .. } => "recording_rolling_cleared",
             ResponsePayload::RecordingPruned { .. } => "recording_pruned",
             ResponsePayload::Detached => "detached",
             ResponsePayload::PaneDirectInputAccepted { .. } => "pane_direct_input_accepted",

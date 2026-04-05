@@ -1447,6 +1447,15 @@ screen content.
    # kill switch on a running server (and restart with runtime overrides)
    bmux server recording stop
    bmux server recording start --rolling-window-secs 120 --rolling-event-kind-all
+
+   # inspect rolling storage path + status/usage
+   bmux server recording path
+   bmux server recording status
+
+   # clear rolling data (default: restart if active)
+   bmux server recording clear
+   # clear and keep rolling stopped
+   bmux server recording clear --no-restart
    ```
 
 2. Convert to a playbook:

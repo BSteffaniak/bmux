@@ -589,6 +589,10 @@ pub enum Request {
         options: RecordingRollingStartOptions,
     },
     RecordingRollingStop,
+    RecordingRollingStatus,
+    RecordingRollingClear {
+        restart_if_active: bool,
+    },
     RecordingCaptureTargets,
     /// Prune completed recordings older than the specified retention period.
     RecordingPrune {
@@ -874,6 +878,52 @@ pub struct RecordingRollingStartOptions {
     pub capture_images: Option<bool>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct RecordingRollingUsage {
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(default)]
+    pub files: u64,
+    #[serde(default)]
+    pub directories: u64,
+    #[serde(default)]
+    pub recording_dirs: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingRollingStatus {
+    pub root_path: String,
+    #[serde(default)]
+    pub auto_start: bool,
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub active: Option<RecordingSummary>,
+    #[serde(default)]
+    pub rolling_window_secs: Option<u64>,
+    #[serde(default)]
+    pub event_kinds: Vec<RecordingEventKind>,
+    #[serde(default)]
+    pub usage: RecordingRollingUsage,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RecordingRollingClearReport {
+    pub root_path: String,
+    #[serde(default)]
+    pub was_active: bool,
+    #[serde(default)]
+    pub restarted: bool,
+    #[serde(default)]
+    pub stopped_recording_id: Option<Uuid>,
+    #[serde(default)]
+    pub restarted_recording: Option<RecordingSummary>,
+    #[serde(default)]
+    pub usage_before: RecordingRollingUsage,
+    #[serde(default)]
+    pub usage_after: RecordingRollingUsage,
+}
+
 /// Event kind emitted into a recording timeline.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1146,6 +1196,12 @@ pub enum ResponsePayload {
     },
     RecordingCaptureTargets {
         targets: Vec<RecordingCaptureTarget>,
+    },
+    RecordingRollingStatus {
+        status: RecordingRollingStatus,
+    },
+    RecordingRollingCleared {
+        report: RecordingRollingClearReport,
     },
     RecordingPruned {
         deleted_count: usize,
@@ -1910,6 +1966,13 @@ mod tests {
                 },
             },
             Request::RecordingRollingStop,
+            Request::RecordingRollingStatus,
+            Request::RecordingRollingClear {
+                restart_if_active: true,
+            },
+            Request::RecordingRollingClear {
+                restart_if_active: false,
+            },
             Request::RecordingCaptureTargets,
             Request::Detach,
             Request::PaneDirectInput {
@@ -2311,6 +2374,47 @@ mod tests {
                     path: "/tmp/recordings/.rolling/active".into(),
                     rolling_window_secs: Some(300),
                 }],
+            },
+            ResponsePayload::RecordingRollingStatus {
+                status: RecordingRollingStatus {
+                    root_path: "/tmp/recordings/.rolling".into(),
+                    auto_start: true,
+                    available: true,
+                    active: Some(sample_recording_summary()),
+                    rolling_window_secs: Some(300),
+                    event_kinds: vec![
+                        RecordingEventKind::PaneOutputRaw,
+                        RecordingEventKind::ProtocolReplyRaw,
+                        RecordingEventKind::ServerEvent,
+                    ],
+                    usage: RecordingRollingUsage {
+                        bytes: 2048,
+                        files: 7,
+                        directories: 3,
+                        recording_dirs: 2,
+                    },
+                },
+            },
+            ResponsePayload::RecordingRollingCleared {
+                report: RecordingRollingClearReport {
+                    root_path: "/tmp/recordings/.rolling".into(),
+                    was_active: true,
+                    restarted: true,
+                    stopped_recording_id: Some(id),
+                    restarted_recording: Some(sample_recording_summary()),
+                    usage_before: RecordingRollingUsage {
+                        bytes: 8192,
+                        files: 17,
+                        directories: 5,
+                        recording_dirs: 4,
+                    },
+                    usage_after: RecordingRollingUsage {
+                        bytes: 1024,
+                        files: 4,
+                        directories: 2,
+                        recording_dirs: 1,
+                    },
+                },
             },
             ResponsePayload::RecordingPruned { deleted_count: 3 },
             ResponsePayload::Detached,

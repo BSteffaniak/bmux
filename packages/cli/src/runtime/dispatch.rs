@@ -66,6 +66,9 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             ServerCommand::Recording { command } => match command {
                 ServerRecordingCommand::Start { .. } => BuiltInHandlerId::ServerRecordingStart,
                 ServerRecordingCommand::Stop => BuiltInHandlerId::ServerRecordingStop,
+                ServerRecordingCommand::Status { .. } => BuiltInHandlerId::ServerRecordingStatus,
+                ServerRecordingCommand::Path { .. } => BuiltInHandlerId::ServerRecordingPath,
+                ServerRecordingCommand::Clear { .. } => BuiltInHandlerId::ServerRecordingClear,
             },
             ServerCommand::Gateway { .. } => BuiltInHandlerId::ServerGateway,
             ServerCommand::Bridge { .. } => BuiltInHandlerId::ServerBridge,
@@ -580,6 +583,33 @@ pub(super) async fn dispatch_built_in_command(
                     },
             },
         ) => run_server_recording_stop(connection_context).await,
+        (
+            BuiltInHandlerId::ServerRecordingStatus,
+            Command::Server {
+                command:
+                    ServerCommand::Recording {
+                        command: ServerRecordingCommand::Status { json },
+                    },
+            },
+        ) => run_server_recording_status(*json, connection_context).await,
+        (
+            BuiltInHandlerId::ServerRecordingPath,
+            Command::Server {
+                command:
+                    ServerCommand::Recording {
+                        command: ServerRecordingCommand::Path { json },
+                    },
+            },
+        ) => run_server_recording_path(*json, connection_context).await,
+        (
+            BuiltInHandlerId::ServerRecordingClear,
+            Command::Server {
+                command:
+                    ServerCommand::Recording {
+                        command: ServerRecordingCommand::Clear { json, no_restart },
+                    },
+            },
+        ) => run_server_recording_clear(*json, *no_restart, connection_context).await,
         (
             BuiltInHandlerId::ServerGateway,
             Command::Server {
