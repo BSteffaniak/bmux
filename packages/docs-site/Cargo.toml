@@ -41,7 +41,7 @@ switchy = { workspace = true, features = ["async", "async-tokio"] }
 
 [features]
 default          = ["actix", "html", "vanilla-js", "assets", "static-routes"]
-fail-on-warnings = []
+fail-on-warnings = ["bmux_docs_site_ui/fail-on-warnings"]
 
 actix = ["hyperchad/renderer-html-actix"]
 assets = ["hyperchad/renderer-assets"]

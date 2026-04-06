@@ -364,7 +364,7 @@ impl Event {
 
 #[cfg(feature = "keyboard")]
 mod keyboard_conversions {
-    use super::*;
+    use super::{KeyCode, KeyEvent, KeyModifiers};
     use bmux_keyboard::types as kb;
 
     impl From<kb::KeyCode> for KeyCode {
