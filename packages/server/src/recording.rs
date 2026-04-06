@@ -802,6 +802,86 @@ fn copy_owner_client_metadata(source_dir: &Path, dest_dir: &Path) -> Result<()> 
     Ok(())
 }
 
+fn push_cut_stream_opened_baseline(
+    output: &mut Vec<DisplayTrackEnvelope>,
+    all_frames: &[DisplayTrackEnvelope],
+    kept_first: Option<&DisplayTrackEnvelope>,
+) {
+    if kept_first.is_some_and(|frame| matches!(frame.event, DisplayTrackEvent::StreamOpened { .. }))
+    {
+        return;
+    }
+    if let Some(opened) = all_frames
+        .iter()
+        .find(|frame| matches!(frame.event, DisplayTrackEvent::StreamOpened { .. }))
+        .cloned()
+    {
+        output.push(DisplayTrackEnvelope {
+            mono_ns: 0,
+            event: opened.event,
+        });
+    }
+}
+
+fn push_cut_resize_baseline_if_missing(
+    output: &mut Vec<DisplayTrackEnvelope>,
+    all_frames: &[DisplayTrackEnvelope],
+    first_kept_ns: u64,
+    kept_has_resize: bool,
+) {
+    if kept_has_resize {
+        return;
+    }
+    if let Some(resize) = all_frames
+        .iter()
+        .rev()
+        .find(|frame| {
+            frame.mono_ns <= first_kept_ns
+                && matches!(frame.event, DisplayTrackEvent::Resize { .. })
+        })
+        .cloned()
+    {
+        output.push(DisplayTrackEnvelope {
+            mono_ns: 0,
+            event: resize.event,
+        });
+    }
+}
+
+fn cut_display_track_frames(
+    all_frames: &[DisplayTrackEnvelope],
+    window_ns: u64,
+) -> Vec<DisplayTrackEnvelope> {
+    if all_frames.is_empty() {
+        return Vec::new();
+    }
+
+    let last_ns = all_frames.last().map_or(0, |frame| frame.mono_ns);
+    let cutoff_ns = last_ns.saturating_sub(window_ns);
+    let mut kept: Vec<DisplayTrackEnvelope> = all_frames
+        .iter()
+        .filter(|frame| frame.mono_ns >= cutoff_ns)
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        return Vec::new();
+    }
+
+    let first_kept_ns = kept.first().map_or(0, |frame| frame.mono_ns);
+    let kept_has_resize = kept
+        .iter()
+        .any(|frame| matches!(frame.event, DisplayTrackEvent::Resize { .. }));
+    let mut output = Vec::new();
+    push_cut_stream_opened_baseline(&mut output, all_frames, kept.first());
+    push_cut_resize_baseline_if_missing(&mut output, all_frames, first_kept_ns, kept_has_resize);
+
+    for frame in &mut kept {
+        frame.mono_ns = frame.mono_ns.saturating_sub(first_kept_ns);
+    }
+    output.extend(kept);
+    output
+}
+
 fn copy_display_tracks_for_cut(source_dir: &Path, dest_dir: &Path, window_secs: u64) -> Result<()> {
     if window_secs == 0 {
         return Ok(());
@@ -832,41 +912,7 @@ fn copy_display_tracks_for_cut(source_dir: &Path, dest_dir: &Path, window_secs: 
         let result = bmux_ipc::read_frames::<DisplayTrackEnvelope>(&bytes).map_err(|error| {
             anyhow::anyhow!("failed parsing display track {}: {error}", path.display())
         })?;
-        if result.frames.is_empty() {
-            continue;
-        }
-
-        let all_frames = result.frames;
-        let last_ns = all_frames.last().map_or(0, |frame| frame.mono_ns);
-        let cutoff_ns = last_ns.saturating_sub(window_ns);
-        let mut kept: Vec<DisplayTrackEnvelope> = all_frames
-            .iter()
-            .filter(|frame| frame.mono_ns >= cutoff_ns)
-            .cloned()
-            .collect();
-        if kept.is_empty() {
-            continue;
-        }
-
-        let first_kept_ns = kept.first().map_or(0, |frame| frame.mono_ns);
-        let mut output = Vec::new();
-        if !kept
-            .first()
-            .is_some_and(|frame| matches!(frame.event, DisplayTrackEvent::StreamOpened { .. }))
-            && let Some(opened) = all_frames
-                .iter()
-                .find(|frame| matches!(frame.event, DisplayTrackEvent::StreamOpened { .. }))
-                .cloned()
-        {
-            output.push(DisplayTrackEnvelope {
-                mono_ns: 0,
-                event: opened.event,
-            });
-        }
-        for frame in &mut kept {
-            frame.mono_ns = frame.mono_ns.saturating_sub(first_kept_ns);
-        }
-        output.extend(kept);
+        let output = cut_display_track_frames(&result.frames, window_ns);
 
         if output.is_empty() {
             continue;
@@ -1004,8 +1050,12 @@ pub fn prune_old_recordings(root_dir: &Path, retention_days: u64) -> Result<usiz
 #[cfg(test)]
 mod tests {
     use super::{Manifest, RecordMeta, RecordingRuntime};
-    use bmux_ipc::{RecordingEventKind, RecordingPayload, RecordingProfile, RecordingSummary};
+    use bmux_ipc::{
+        DisplayCursorShape, DisplayTrackEnvelope, DisplayTrackEvent, RecordingEventKind,
+        RecordingPayload, RecordingProfile, RecordingSummary,
+    };
     use std::fs;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use uuid::Uuid;
@@ -1018,6 +1068,56 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("bmux-recording-test-{nanos}"));
         fs::create_dir_all(&dir).expect("temp dir should be created");
         dir
+    }
+
+    fn write_display_track(path: &Path, frames: &[DisplayTrackEnvelope]) {
+        let mut bytes = Vec::new();
+        for frame in frames {
+            bmux_ipc::write_frame(&mut bytes, frame).expect("display frame should encode");
+        }
+        fs::write(path, bytes).expect("display track should write");
+    }
+
+    fn read_display_track(path: &Path) -> Vec<DisplayTrackEnvelope> {
+        let bytes = fs::read(path).expect("display track should read");
+        bmux_ipc::read_frames::<DisplayTrackEnvelope>(&bytes)
+            .expect("display track should decode")
+            .frames
+    }
+
+    fn stream_opened_frame(mono_ns: u64) -> DisplayTrackEnvelope {
+        DisplayTrackEnvelope {
+            mono_ns,
+            event: DisplayTrackEvent::StreamOpened {
+                client_id: Uuid::nil(),
+                recording_id: Uuid::nil(),
+                cell_width_px: Some(16),
+                cell_height_px: Some(35),
+                window_width_px: Some(3440),
+                window_height_px: Some(2150),
+                terminal_profile: None,
+            },
+        }
+    }
+
+    fn resize_frame(mono_ns: u64, cols: u16, rows: u16) -> DisplayTrackEnvelope {
+        DisplayTrackEnvelope {
+            mono_ns,
+            event: DisplayTrackEvent::Resize { cols, rows },
+        }
+    }
+
+    fn cursor_snapshot_frame(mono_ns: u64, x: u16, y: u16) -> DisplayTrackEnvelope {
+        DisplayTrackEnvelope {
+            mono_ns,
+            event: DisplayTrackEvent::CursorSnapshot {
+                x,
+                y,
+                visible: true,
+                shape: DisplayCursorShape::Block,
+                blink_enabled: true,
+            },
+        }
     }
 
     #[test]
@@ -1325,6 +1425,94 @@ mod tests {
         let deleted = super::prune_old_recordings(&root, 0).unwrap();
         assert_eq!(deleted, 0);
         assert!(rec_dir.exists());
+    }
+
+    #[test]
+    fn copy_display_tracks_for_cut_injects_baseline_resize_when_window_has_none() {
+        let root = temp_dir();
+        let source_dir = root.join("source");
+        let cut_dir = root.join("cut");
+        fs::create_dir_all(&source_dir).expect("source dir should exist");
+        fs::create_dir_all(&cut_dir).expect("cut dir should exist");
+
+        let client_id = Uuid::new_v4();
+        let display_name = format!("display-{client_id}.bin");
+        write_display_track(
+            &source_dir.join(&display_name),
+            &[
+                stream_opened_frame(0),
+                resize_frame(1_000, 215, 61),
+                DisplayTrackEnvelope {
+                    mono_ns: 30_000_000_000,
+                    event: DisplayTrackEvent::FrameBytes { data: vec![b'x'] },
+                },
+                cursor_snapshot_frame(39_000_000_000, 213, 57),
+                DisplayTrackEnvelope {
+                    mono_ns: 40_000_000_000,
+                    event: DisplayTrackEvent::StreamClosed,
+                },
+            ],
+        );
+
+        super::copy_display_tracks_for_cut(&source_dir, &cut_dir, 10)
+            .expect("display track copy should succeed");
+
+        let cut_frames = read_display_track(&cut_dir.join(display_name));
+        assert!(
+            matches!(cut_frames.first(), Some(frame) if matches!(frame.event, DisplayTrackEvent::StreamOpened { .. })),
+            "cut track should start with stream_opened"
+        );
+        assert!(
+            matches!(cut_frames.get(1), Some(frame) if matches!(frame.event, DisplayTrackEvent::Resize { cols: 215, rows: 61 })),
+            "cut track should include injected baseline resize"
+        );
+        let resize_count = cut_frames
+            .iter()
+            .filter(|frame| matches!(frame.event, DisplayTrackEvent::Resize { .. }))
+            .count();
+        assert_eq!(resize_count, 1);
+    }
+
+    #[test]
+    fn copy_display_tracks_for_cut_does_not_duplicate_resize_when_window_has_one() {
+        let root = temp_dir();
+        let source_dir = root.join("source");
+        let cut_dir = root.join("cut");
+        fs::create_dir_all(&source_dir).expect("source dir should exist");
+        fs::create_dir_all(&cut_dir).expect("cut dir should exist");
+
+        let client_id = Uuid::new_v4();
+        let display_name = format!("display-{client_id}.bin");
+        write_display_track(
+            &source_dir.join(&display_name),
+            &[
+                stream_opened_frame(0),
+                resize_frame(1_000, 215, 61),
+                DisplayTrackEnvelope {
+                    mono_ns: 30_000_000_000,
+                    event: DisplayTrackEvent::FrameBytes { data: vec![b'x'] },
+                },
+                resize_frame(39_500_000_000, 120, 40),
+                cursor_snapshot_frame(39_700_000_000, 118, 38),
+                DisplayTrackEnvelope {
+                    mono_ns: 40_000_000_000,
+                    event: DisplayTrackEvent::StreamClosed,
+                },
+            ],
+        );
+
+        super::copy_display_tracks_for_cut(&source_dir, &cut_dir, 10)
+            .expect("display track copy should succeed");
+
+        let cut_frames = read_display_track(&cut_dir.join(display_name));
+        let resize_values: Vec<(u16, u16)> = cut_frames
+            .iter()
+            .filter_map(|frame| match frame.event {
+                DisplayTrackEvent::Resize { cols, rows } => Some((cols, rows)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resize_values, vec![(120, 40)]);
     }
 
     #[test]

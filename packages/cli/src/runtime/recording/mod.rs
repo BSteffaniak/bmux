@@ -1102,6 +1102,9 @@ struct CellMetrics {
     height: u16,
 }
 
+const DEFAULT_EXPORT_COLS: u16 = 80;
+const DEFAULT_EXPORT_ROWS: u16 = 24;
+
 fn resolve_export_cell_metrics(
     events: &[DisplayTrackEnvelope],
     cell_size: Option<(u16, u16)>,
@@ -1234,6 +1237,84 @@ fn capture_stream_open_metrics() -> (Option<u16>, Option<u16>, Option<u16>, Opti
         window_width_px,
         window_height_px,
     )
+}
+
+fn infer_export_terminal_bounds(events: &[DisplayTrackEnvelope]) -> (u16, u16) {
+    let mut resize_bounds = None::<(u16, u16)>;
+    let mut stream_bounds = None::<(u16, u16)>;
+    let mut cursor_cols = 0_u16;
+    let mut cursor_rows = 0_u16;
+
+    for envelope in events {
+        match envelope.event {
+            DisplayTrackEvent::Resize { cols, rows } => {
+                let cols = cols.max(1);
+                let rows = rows.max(1);
+                resize_bounds = Some(match resize_bounds {
+                    Some((current_cols, current_rows)) => {
+                        (current_cols.max(cols), current_rows.max(rows))
+                    }
+                    None => (cols, rows),
+                });
+            }
+            DisplayTrackEvent::StreamOpened {
+                cell_width_px,
+                cell_height_px,
+                window_width_px,
+                window_height_px,
+                ..
+            } => {
+                if let (
+                    Some(cell_width),
+                    Some(cell_height),
+                    Some(window_width),
+                    Some(window_height),
+                ) = (
+                    cell_width_px,
+                    cell_height_px,
+                    window_width_px,
+                    window_height_px,
+                ) && cell_width > 0
+                    && cell_height > 0
+                {
+                    let cols = (window_width / cell_width).max(1);
+                    let rows = (window_height / cell_height).max(1);
+                    stream_bounds = Some(match stream_bounds {
+                        Some((current_cols, current_rows)) => {
+                            (current_cols.max(cols), current_rows.max(rows))
+                        }
+                        None => (cols, rows),
+                    });
+                }
+            }
+            DisplayTrackEvent::CursorSnapshot { x, y, .. } => {
+                cursor_cols = cursor_cols.max(x.saturating_add(1));
+                cursor_rows = cursor_rows.max(y.saturating_add(1));
+            }
+            DisplayTrackEvent::FrameBytes { .. }
+            | DisplayTrackEvent::Activity { .. }
+            | DisplayTrackEvent::ImageUpdate { .. }
+            | DisplayTrackEvent::StreamClosed => {}
+        }
+    }
+
+    if let Some((cols, rows)) = resize_bounds {
+        return (cols, rows);
+    }
+
+    let mut cols = DEFAULT_EXPORT_COLS;
+    let mut rows = DEFAULT_EXPORT_ROWS;
+    if let Some((stream_cols, stream_rows)) = stream_bounds {
+        cols = cols.max(stream_cols);
+        rows = rows.max(stream_rows);
+    }
+    if cursor_cols > 0 {
+        cols = cols.max(cursor_cols);
+    }
+    if cursor_rows > 0 {
+        rows = rows.max(cursor_rows);
+    }
+    (cols, rows)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1934,14 +2015,7 @@ fn export_recording_gif(
         color_override: resolved_color_override,
     };
 
-    let mut max_cols = 80_u16;
-    let mut max_rows = 24_u16;
-    for event in events {
-        if let DisplayTrackEvent::Resize { cols, rows } = event.event {
-            max_cols = max_cols.max(cols.max(1));
-            max_rows = max_rows.max(rows.max(1));
-        }
-    }
+    let (max_cols, max_rows) = infer_export_terminal_bounds(events);
 
     let cell_metrics = resolve_export_cell_metrics(events, cell_size, cell_width, cell_height)?;
     let cell_w = cell_metrics.width;
@@ -4538,6 +4612,19 @@ mod tests {
         }
     }
 
+    fn cursor_snapshot(mono_ns: u64, x: u16, y: u16) -> DisplayTrackEnvelope {
+        DisplayTrackEnvelope {
+            mono_ns,
+            event: DisplayTrackEvent::CursorSnapshot {
+                x,
+                y,
+                visible: true,
+                shape: bmux_ipc::DisplayCursorShape::Block,
+                blink_enabled: true,
+            },
+        }
+    }
+
     #[test]
     fn display_track_envelope_round_trips_through_codec() {
         let envelope = DisplayTrackEnvelope {
@@ -4597,6 +4684,40 @@ mod tests {
             resolve_export_cell_metrics(&events, None, None, None).expect("metrics should resolve");
         assert_eq!(resolved.width, 10);
         assert_eq!(resolved.height, 20);
+    }
+
+    #[test]
+    fn infer_export_terminal_bounds_prefers_resize_events() {
+        let events = vec![
+            stream_opened(Some(16), Some(35), Some(3440), Some(2150)),
+            DisplayTrackEnvelope {
+                mono_ns: 2,
+                event: DisplayTrackEvent::Resize {
+                    cols: 120,
+                    rows: 40,
+                },
+            },
+            cursor_snapshot(3, 213, 57),
+        ];
+        assert_eq!(infer_export_terminal_bounds(&events), (120, 40));
+    }
+
+    #[test]
+    fn infer_export_terminal_bounds_falls_back_to_stream_metrics_without_resize() {
+        let events = vec![
+            stream_opened(Some(16), Some(35), Some(3440), Some(2150)),
+            frame_bytes(2),
+        ];
+        assert_eq!(infer_export_terminal_bounds(&events), (215, 61));
+    }
+
+    #[test]
+    fn infer_export_terminal_bounds_uses_cursor_when_resize_and_stream_grid_missing() {
+        let events = vec![
+            stream_opened(None, None, Some(3440), Some(2150)),
+            cursor_snapshot(2, 189, 28),
+        ];
+        assert_eq!(infer_export_terminal_bounds(&events), (190, 29));
     }
 
     #[test]
