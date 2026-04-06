@@ -65,6 +65,24 @@ Key rules when fixing clippy issues:
 - Never use `cargo clippy --fix` without verifying it compiles and tests pass afterward -- auto-fixes can break code in macro contexts and async functions.
 - Wildcard imports (`use something::*`) are not allowed in production code. They are acceptable in `#[cfg(test)] mod tests` blocks with `use super::*`.
 
+## Cargo Machete (REQUIRED)
+
+For any code change anywhere in the repo, run:
+
+- `cargo machete --with-metadata`
+
+This must report zero unused dependencies. Treat any finding as blocking.
+
+Key rules when addressing unused dependency findings:
+
+- Remove the dependency from `Cargo.toml` if it has no source code references.
+- Also remove any feature propagation entries (e.g., `"dep_name/fail-on-warnings"`) for removed deps.
+- If a dependency is only used for feature propagation (not imported in source code), remove both the dep and propagation -- transitive deps handle their own features.
+- Use `[package.metadata.cargo-machete] ignored = [...]` only for genuine false positives:
+  - Dependencies used via proc macro code generation (e.g., `container!` generating `::crate_name::Type` paths).
+  - Dev-dependencies that cargo-machete cannot trace into test code.
+  - A comment in the `ignored` list explains why the ignore is needed.
+
 ## Plugin Changes (REQUIRED)
 
 If a change touches `plugins/**`, rebuild bundled plugins before finishing:
@@ -116,6 +134,7 @@ In addition, for any non-doc code change, always run:
 
 - `cargo nextest run --no-fail-fast`
 - `cargo clippy --all-targets -- -D warnings`
+- `cargo machete --with-metadata`
 
 ## Completion Reporting Format
 
@@ -125,6 +144,7 @@ Agents should report test execution in final response using this format:
 - `cargo check -p bmux_cli` - PASS/FAIL
 - `cargo nextest run --no-fail-fast` - PASS/FAIL
 - `cargo clippy --all-targets -- -D warnings` - PASS/FAIL
+- `cargo machete --with-metadata` - PASS/FAIL
 - `./scripts/smoke-pty-runtime.sh` - PASS/FAIL
 - `./scripts/compat-matrix.sh` - PASS/FAIL (if required)
 - `bmux plugin rebuild` - PASS/FAIL (if required)
