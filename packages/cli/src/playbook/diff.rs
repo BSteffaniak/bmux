@@ -479,7 +479,7 @@ fn unified_text_diff(left: &str, right: &str) -> String {
     output.push_str("+++ right\n");
 
     for hunk in diff.unified_diff().context_radius(2).iter_hunks() {
-        let _ = write!(output, "{hunk}");
+        write!(output, "{hunk}").unwrap();
     }
 
     output

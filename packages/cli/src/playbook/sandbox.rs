@@ -286,7 +286,7 @@ fn write_sandbox_config(
 
     // Shell override
     if let Some(shell) = shell {
-        let _ = write!(toml, "[general]\ndefault_shell = '{shell}'\n\n");
+        write!(toml, "[general]\ndefault_shell = '{shell}'\n\n").unwrap();
     }
 
     // Plugin configuration — build disabled list

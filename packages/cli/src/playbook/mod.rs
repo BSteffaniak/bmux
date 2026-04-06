@@ -228,13 +228,14 @@ pub fn format_result(result: &PlaybookResult) -> String {
             (types::StepStatus::Fail, false) => "x",
             (types::StepStatus::Skip, _) => "-",
         };
-        let _ = write!(
+        write!(
             out,
             "  [{icon}] step {}: {} ({} ms)",
             step.index, step.action, step.elapsed_ms
-        );
+        )
+        .unwrap();
         if let Some(detail) = &step.detail {
-            let _ = write!(out, " — {detail}");
+            write!(out, " — {detail}").unwrap();
         }
         out.push('\n');
     }

@@ -620,12 +620,12 @@ pub(super) fn bytes_to_c_escaped(data: &[u8]) -> String {
             0x1b => result.push_str("\\e"),
             0x01..=0x1a => {
                 // Ctrl+A through Ctrl+Z
-                let _ = write!(result, "\\x{byte:02x}");
+                write!(result, "\\x{byte:02x}").unwrap();
             }
             0x7f => result.push_str("\\x7f"),
             0x20..=0x7e => result.push(byte as char),
             _ => {
-                let _ = write!(result, "\\x{byte:02x}");
+                write!(result, "\\x{byte:02x}").unwrap();
             }
         }
     }

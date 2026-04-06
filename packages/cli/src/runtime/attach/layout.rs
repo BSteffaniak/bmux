@@ -1,10 +1,9 @@
-#![allow(dead_code)]
-
 use super::state::PaneRect;
 use bmux_ipc::{PaneLayoutNode, PaneSplitDirection};
 use std::collections::BTreeMap;
 use uuid::Uuid;
 
+#[allow(dead_code)] // Will be used when multi-pane layout is wired into the attach runtime
 pub fn collect_pane_ids(layout: &PaneLayoutNode, out: &mut Vec<Uuid>) {
     match layout {
         PaneLayoutNode::Leaf { pane_id } => out.push(*pane_id),
@@ -56,6 +55,7 @@ fn split_rect(rect: PaneRect, ratio_percent: u8, vertical: bool) -> (PaneRect, P
     }
 }
 
+#[allow(dead_code)] // Will be used when multi-pane layout is wired into the attach runtime
 pub fn collect_layout_rects(
     layout: &PaneLayoutNode,
     rect: PaneRect,

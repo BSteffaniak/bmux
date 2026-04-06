@@ -421,7 +421,7 @@ impl Action {
             Self::SendBytes { hex } => {
                 let mut hex_str = String::with_capacity(hex.len() * 2);
                 for b in hex {
-                    let _ = write!(hex_str, "{b:02x}");
+                    write!(hex_str, "{b:02x}").unwrap();
                 }
                 format!("send-bytes hex={hex_str}")
             }
@@ -434,14 +434,14 @@ impl Action {
                 let escaped = escape_single_quote(pattern);
                 let mut line = format!("wait-for pattern='{escaped}'");
                 if let Some(p) = pane {
-                    let _ = write!(line, " pane={p}");
+                    write!(line, " pane={p}").unwrap();
                 }
                 let ms = timeout.as_millis();
                 if ms != 5000 {
-                    let _ = write!(line, " timeout={ms}");
+                    write!(line, " timeout={ms}").unwrap();
                 }
                 if *retry > 1 {
-                    let _ = write!(line, " retry={retry}");
+                    write!(line, " retry={retry}").unwrap();
                 }
                 line
             }
@@ -457,16 +457,16 @@ impl Action {
             } => {
                 let mut line = "assert-screen".to_string();
                 if let Some(p) = pane {
-                    let _ = write!(line, " pane={p}");
+                    write!(line, " pane={p}").unwrap();
                 }
                 if let Some(c) = contains {
-                    let _ = write!(line, " contains='{}'", escape_single_quote(c));
+                    write!(line, " contains='{}'", escape_single_quote(c)).unwrap();
                 }
                 if let Some(nc) = not_contains {
-                    let _ = write!(line, " not_contains='{}'", escape_single_quote(nc));
+                    write!(line, " not_contains='{}'", escape_single_quote(nc)).unwrap();
                 }
                 if let Some(m) = matches {
-                    let _ = write!(line, " matches='{}'", escape_single_quote(m));
+                    write!(line, " matches='{}'", escape_single_quote(m)).unwrap();
                 }
                 line
             }
@@ -476,7 +476,7 @@ impl Action {
             Self::AssertCursor { pane, row, col } => {
                 let mut line = format!("assert-cursor row={row} col={col}");
                 if let Some(p) = pane {
-                    let _ = write!(line, " pane={p}");
+                    write!(line, " pane={p}").unwrap();
                 }
                 line
             }
@@ -514,7 +514,7 @@ impl Action {
                     escape_single_quote(operation),
                 );
                 if !payload.is_empty() {
-                    let _ = write!(line, " payload='{}'", escape_single_quote(payload));
+                    write!(line, " payload='{}'", escape_single_quote(payload)).unwrap();
                 }
                 line
             }
