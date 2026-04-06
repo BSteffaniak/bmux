@@ -49,6 +49,8 @@ bmux playbook run <source> [flags]
 | `--var KEY=VALUE`        | string | none     | Define a variable (repeatable, overrides `@var`) |
 | `--verbose` / `-v`       | bool   | false    | Print step-by-step progress to stderr            |
 
+Note: global recording auto-export settings (`recording.auto_export` or `--recording-auto-export`) do not auto-export playbook recordings. Use `--export-gif <path>` for playbook runs.
+
 **Exit codes:** `0` = all steps passed, `1` = one or more steps failed or error.
 
 **Stdin example:**

@@ -194,6 +194,22 @@ pub struct Cli {
     #[arg(long)]
     pub stop_server_on_exit: bool,
 
+    /// Override recordings root directory for this invocation
+    #[arg(long, global = true, value_name = "PATH")]
+    pub recordings_dir: Option<String>,
+
+    /// Enable automatic GIF export after user-initiated recording stop/cut
+    #[arg(long, global = true, conflicts_with = "no_recording_auto_export")]
+    pub recording_auto_export: bool,
+
+    /// Disable automatic GIF export after user-initiated recording stop/cut
+    #[arg(long, global = true, conflicts_with = "recording_auto_export")]
+    pub no_recording_auto_export: bool,
+
+    /// Override directory for auto-exported recording GIFs
+    #[arg(long, global = true, value_name = "PATH")]
+    pub recording_auto_export_dir: Option<String>,
+
     /// Execute command against a configured target (local or remote)
     #[arg(long, global = true)]
     pub target: Option<String>,
@@ -3494,6 +3510,61 @@ mod tests {
         assert_eq!(cli.recording_id_file.as_deref(), Some("/tmp/rec.id"));
         assert!(cli.stop_server_on_exit);
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn parses_recording_override_flags_top_level() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "--recordings-dir",
+            "/tmp/recordings",
+            "--recording-auto-export",
+            "--recording-auto-export-dir",
+            "/tmp/exports",
+        ])
+        .expect("valid CLI args");
+        assert_eq!(cli.recordings_dir.as_deref(), Some("/tmp/recordings"));
+        assert!(cli.recording_auto_export);
+        assert!(!cli.no_recording_auto_export);
+        assert_eq!(
+            cli.recording_auto_export_dir.as_deref(),
+            Some("/tmp/exports")
+        );
+    }
+
+    #[test]
+    fn parses_recording_override_flags_for_subcommands() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "recording",
+            "status",
+            "--recordings-dir",
+            "./recordings",
+            "--no-recording-auto-export",
+            "--recording-auto-export-dir",
+            "./exports",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(command, RecordingCommand::Status { json: false }));
+        assert_eq!(cli.recordings_dir.as_deref(), Some("./recordings"));
+        assert!(!cli.recording_auto_export);
+        assert!(cli.no_recording_auto_export);
+        assert_eq!(cli.recording_auto_export_dir.as_deref(), Some("./exports"));
+    }
+
+    #[test]
+    fn rejects_conflicting_recording_auto_export_flags() {
+        let error = Cli::try_parse_from([
+            "bmux",
+            "--recording-auto-export",
+            "--no-recording-auto-export",
+        ])
+        .expect_err("conflicting flags should fail");
+        let text = error.to_string();
+        assert!(text.contains("recording-auto-export"));
     }
 
     #[test]

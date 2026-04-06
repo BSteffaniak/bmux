@@ -14,6 +14,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use thiserror::Error;
 
+pub const RECORDINGS_DIR_OVERRIDE_ENV: &str = "BMUX_RECORDINGS_DIR";
+
 pub mod keybind;
 pub mod paths;
 pub mod theme;
@@ -243,6 +245,13 @@ pub struct RecordingConfig {
     /// Enable hidden always-on rolling capture and retain at most this many
     /// seconds of recent events. Set to 0 to disable rolling capture.
     pub rolling_window_secs: u64,
+    /// Automatically export stopped/cut user-initiated recordings as GIF.
+    pub auto_export: bool,
+    /// Directory for auto-exported GIFs.
+    ///
+    /// Relative paths are resolved against the directory containing `bmux.toml`.
+    /// When unset, GIFs are written next to the recording directory.
+    pub auto_export_dir: Option<PathBuf>,
     /// Default settings for `recording export` rendering.
     pub export: RecordingExportConfig,
 }
@@ -264,6 +273,8 @@ impl Default for RecordingConfig {
             segment_mb: 64,
             retention_days: 30,
             rolling_window_secs: 0,
+            auto_export: false,
+            auto_export_dir: None,
             export: RecordingExportConfig::default(),
         }
     }
@@ -1140,6 +1151,32 @@ pub enum BellAction {
 }
 
 impl BmuxConfig {
+    fn resolve_relative_to_config_dir(paths: &ConfigPaths, value: &std::path::Path) -> PathBuf {
+        if value.is_absolute() {
+            return value.to_path_buf();
+        }
+        let base = paths
+            .config_file()
+            .parent()
+            .map_or_else(|| paths.config_dir.clone(), std::path::Path::to_path_buf);
+        base.join(value)
+    }
+
+    fn env_path_override(name: &str) -> Option<PathBuf> {
+        let raw = std::env::var_os(name)?;
+        if raw.is_empty() {
+            return None;
+        }
+        let path = PathBuf::from(raw);
+        if path.is_absolute() {
+            return Some(path);
+        }
+        match std::env::current_dir() {
+            Ok(cwd) => Some(cwd.join(path)),
+            Err(_) => Some(path),
+        }
+    }
+
     #[must_use]
     pub fn attach_mouse_config(&self) -> MouseBehaviorConfig {
         let defaults = MouseBehaviorConfig::default();
@@ -1159,17 +1196,22 @@ impl BmuxConfig {
     /// directory that contains the active `bmux.toml`.
     #[must_use]
     pub fn recordings_dir(&self, paths: &ConfigPaths) -> PathBuf {
-        match &self.recording.dir {
-            Some(dir) if dir.is_absolute() => dir.clone(),
-            Some(dir) => {
-                let base = paths
-                    .config_file()
-                    .parent()
-                    .map_or_else(|| paths.config_dir.clone(), std::path::Path::to_path_buf);
-                base.join(dir)
-            }
-            None => paths.recordings_dir(),
+        if let Some(override_path) = Self::env_path_override(RECORDINGS_DIR_OVERRIDE_ENV) {
+            return override_path;
         }
+        self.recording.dir.as_deref().map_or_else(
+            || paths.recordings_dir(),
+            |dir| Self::resolve_relative_to_config_dir(paths, dir),
+        )
+    }
+
+    /// Resolve `recording.auto_export_dir` if configured.
+    #[must_use]
+    pub fn recording_auto_export_dir(&self, paths: &ConfigPaths) -> Option<PathBuf> {
+        self.recording
+            .auto_export_dir
+            .as_deref()
+            .map(|path| Self::resolve_relative_to_config_dir(paths, path))
     }
 
     /// Load configuration from default location
@@ -1941,6 +1983,67 @@ timeout_profile = "missing"
         assert_eq!(
             config.recording.dir,
             Some(std::path::PathBuf::from("recordings/custom"))
+        );
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn recording_auto_export_defaults_disabled_without_custom_dir() {
+        let config = BmuxConfig::default();
+        assert!(!config.recording.auto_export);
+        assert!(config.recording.auto_export_dir.is_none());
+    }
+
+    #[test]
+    fn recording_auto_export_dir_uses_absolute_override() {
+        let paths = ConfigPaths::new(
+            std::path::PathBuf::from("/config"),
+            std::path::PathBuf::from("/runtime"),
+            std::path::PathBuf::from("/data"),
+            std::path::PathBuf::from("/state"),
+        );
+        let mut config = BmuxConfig::default();
+        config.recording.auto_export_dir = Some(std::path::PathBuf::from("/exports/gif"));
+
+        assert_eq!(
+            config.recording_auto_export_dir(&paths),
+            Some(std::path::PathBuf::from("/exports/gif"))
+        );
+    }
+
+    #[test]
+    fn recording_auto_export_dir_resolves_relative_to_config_file_directory() {
+        let paths = ConfigPaths::new(
+            std::path::PathBuf::from("/cfg-root"),
+            std::path::PathBuf::from("/runtime"),
+            std::path::PathBuf::from("/data"),
+            std::path::PathBuf::from("/state"),
+        );
+        let mut config = BmuxConfig::default();
+        config.recording.auto_export_dir = Some(std::path::PathBuf::from("exports/gif"));
+
+        assert_eq!(
+            config.recording_auto_export_dir(&paths),
+            Some(std::path::PathBuf::from("/cfg-root/exports/gif"))
+        );
+    }
+
+    #[test]
+    fn load_parses_recording_auto_export_settings() {
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        std::fs::write(
+            &path,
+            "[recording]\nauto_export = true\nauto_export_dir = 'exports/gif'\n",
+        )
+        .expect("failed writing config fixture");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert!(config.recording.auto_export);
+        assert_eq!(
+            config.recording.auto_export_dir,
+            Some(std::path::PathBuf::from("exports/gif"))
         );
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");

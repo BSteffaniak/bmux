@@ -119,8 +119,11 @@ pub(super) async fn run_default_server_attach(
                 recording.payload_bytes,
                 recording.path
             );
+            let recording_path = std::path::PathBuf::from(&recording.path);
+            recording::maybe_auto_export_recording(stopped_id, Some(&recording_path)).await;
         } else {
             println!("recording stopped: {stopped_id}");
+            recording::maybe_auto_export_recording(stopped_id, None).await;
         }
     }
 
@@ -525,6 +528,10 @@ mod tests {
             record_name: None,
             record_event_kind: Vec::new(),
             stop_server_on_exit: false,
+            recordings_dir: None,
+            recording_auto_export: false,
+            no_recording_auto_export: false,
+            recording_auto_export_dir: None,
             target: None,
             runtime: None,
             core_builtins_only: false,

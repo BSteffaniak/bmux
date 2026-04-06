@@ -1,3 +1,6 @@
+use super::cli_parse::{
+    RECORDING_AUTO_EXPORT_DIR_OVERRIDE_ENV, RECORDING_AUTO_EXPORT_OVERRIDE_ENV,
+};
 use super::{
     BmuxConfig, BufWriter, ConfigPaths, ConnectionContext, ConnectionPolicyScope, Context,
     GifEncoder, GifFrame, Instant, IsTerminal, Path, PathBuf, RecordingCursorBlinkMode,
@@ -217,6 +220,134 @@ struct RecordingStatusView {
     usage: RecordingStorageUsage,
 }
 
+#[derive(Debug, Clone)]
+struct RecordingAutoExportSettings {
+    enabled: bool,
+    output_dir: Option<PathBuf>,
+}
+
+fn parse_bool_env_flag(raw: &str) -> Option<bool> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn env_path_override(name: &str) -> Option<PathBuf> {
+    let raw = std::env::var_os(name)?;
+    if raw.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(raw);
+    if path.is_absolute() {
+        return Some(path);
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => Some(cwd.join(path)),
+        Err(_) => Some(path),
+    }
+}
+
+fn recording_auto_export_settings() -> RecordingAutoExportSettings {
+    let paths = ConfigPaths::default();
+    let config = BmuxConfig::load_from_path(&paths.config_file()).unwrap_or_default();
+    let enabled = std::env::var(RECORDING_AUTO_EXPORT_OVERRIDE_ENV)
+        .ok()
+        .map_or(config.recording.auto_export, |raw| {
+            parse_bool_env_flag(&raw).unwrap_or_else(|| {
+                tracing::warn!(
+                    "ignoring invalid {} value {:?}",
+                    RECORDING_AUTO_EXPORT_OVERRIDE_ENV,
+                    raw
+                );
+                config.recording.auto_export
+            })
+        });
+    let output_dir = env_path_override(RECORDING_AUTO_EXPORT_DIR_OVERRIDE_ENV)
+        .or_else(|| config.recording_auto_export_dir(&paths));
+    RecordingAutoExportSettings {
+        enabled,
+        output_dir,
+    }
+}
+
+fn auto_export_default_dir(recording_dir: &Path) -> PathBuf {
+    recording_dir
+        .parent()
+        .map_or_else(|| recording_dir.to_path_buf(), std::path::Path::to_path_buf)
+}
+
+fn auto_export_filename_stem(timestamp: time::OffsetDateTime) -> String {
+    let hour = timestamp.hour();
+    let (hour12, meridiem) = match hour {
+        0 => (12_u8, "AM"),
+        1..=11 => (hour, "AM"),
+        12 => (12_u8, "PM"),
+        _ => (hour - 12, "PM"),
+    };
+    format!(
+        "Recording {:04}-{:02}-{:02} at {}.{:02}.{:02} {meridiem}",
+        timestamp.year(),
+        u8::from(timestamp.month()),
+        timestamp.day(),
+        hour12,
+        timestamp.minute(),
+        timestamp.second(),
+    )
+}
+
+fn unique_auto_export_path(output_dir: &Path, stem: &str) -> PathBuf {
+    let mut candidate = output_dir.join(format!("{stem}.gif"));
+    if !candidate.exists() {
+        return candidate;
+    }
+    let mut suffix = 2_u32;
+    loop {
+        candidate = output_dir.join(format!("{stem} {suffix}.gif"));
+        if !candidate.exists() {
+            return candidate;
+        }
+        suffix = suffix.saturating_add(1);
+    }
+}
+
+fn auto_export_output_path(recording_dir: &Path, explicit_output_dir: Option<&Path>) -> PathBuf {
+    let output_dir = explicit_output_dir.map_or_else(
+        || auto_export_default_dir(recording_dir),
+        std::path::Path::to_path_buf,
+    );
+    unique_auto_export_path(
+        &output_dir,
+        &auto_export_filename_stem(time::OffsetDateTime::now_utc()),
+    )
+}
+
+pub(super) async fn maybe_auto_export_recording(recording_id: Uuid, recording_path: Option<&Path>) {
+    let settings = recording_auto_export_settings();
+    if !settings.enabled {
+        return;
+    }
+
+    let recording_dir = recording_path.map_or_else(
+        || recordings_root_dir().join(recording_id.to_string()),
+        std::path::Path::to_path_buf,
+    );
+    let output_path = auto_export_output_path(&recording_dir, settings.output_dir.as_deref());
+    let output = output_path.to_string_lossy().into_owned();
+    let recording_id_string = recording_id.to_string();
+    if let Err(error) =
+        super::recording_cli::run_recording_auto_export_gif(&recording_id_string, &output).await
+    {
+        eprintln!(
+            "bmux warning: recording auto-export failed for {} (output={}): {}",
+            recording_id,
+            output_path.display(),
+            error
+        );
+    }
+}
+
 fn recording_config_and_root() -> (RecordingConfigStatus, PathBuf) {
     let paths = ConfigPaths::default();
     let (config, root) = BmuxConfig::load_from_path(&paths.config_file()).map_or_else(
@@ -326,6 +457,7 @@ pub(super) async fn run_recording_stop(
         .await
         .map_err(map_cli_client_error)?;
     println!("recording stopped: {stopped_id}");
+    maybe_auto_export_recording(stopped_id, None).await;
     Ok(0)
 }
 
@@ -622,6 +754,8 @@ pub(super) async fn run_recording_cut(
         "recording cut created: {} name={} events={} bytes={} path={}",
         recording.id, name_display, recording.event_count, recording.payload_bytes, recording.path
     );
+    let recording_path = PathBuf::from(&recording.path);
+    maybe_auto_export_recording(recording.id, Some(&recording_path)).await;
     Ok(0)
 }
 
@@ -4771,12 +4905,42 @@ mod tests {
     }
 
     use crate::runtime::recording::{
-        collect_recording_storage_usage, confirm_delete_all_recordings,
-        default_event_kinds_for_flags, delete_all_recordings_from_dir, delete_recording_dir_at,
-        list_recordings_from_dir, offline_recording_status, resolve_recording_id_prefix,
+        auto_export_default_dir, auto_export_filename_stem, collect_recording_storage_usage,
+        confirm_delete_all_recordings, default_event_kinds_for_flags,
+        delete_all_recordings_from_dir, delete_recording_dir_at, list_recordings_from_dir,
+        offline_recording_status, resolve_recording_id_prefix, unique_auto_export_path,
     };
     use std::fs;
     use uuid::Uuid;
+
+    #[test]
+    fn auto_export_filename_stem_uses_macos_like_timestamp() {
+        let timestamp =
+            time::OffsetDateTime::from_unix_timestamp(0).expect("timestamp should parse");
+        assert_eq!(
+            auto_export_filename_stem(timestamp),
+            "Recording 1970-01-01 at 12.00.00 AM"
+        );
+    }
+
+    #[test]
+    fn auto_export_default_dir_uses_recording_parent_directory() {
+        let recording_dir = std::path::PathBuf::from("/tmp/bmux/recordings/demo");
+        assert_eq!(
+            auto_export_default_dir(&recording_dir),
+            std::path::PathBuf::from("/tmp/bmux/recordings")
+        );
+    }
+
+    #[test]
+    fn unique_auto_export_path_adds_numeric_suffix_when_needed() {
+        let root = temp_dir();
+        let stem = "Recording 2026-04-05 at 1.02.03 PM";
+        fs::write(root.join(format!("{stem}.gif")), b"gif").expect("seed gif should write");
+
+        let output = unique_auto_export_path(&root, stem);
+        assert_eq!(output, root.join(format!("{stem} 2.gif")));
+    }
 
     #[test]
     fn list_recordings_from_dir_returns_empty_when_missing() {

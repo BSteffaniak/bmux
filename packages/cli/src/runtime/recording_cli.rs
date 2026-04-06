@@ -285,6 +285,44 @@ pub(super) async fn run_recording_export(
     .await
 }
 
+pub(super) async fn run_recording_auto_export_gif(recording_id: &str, output: &str) -> Result<u8> {
+    run_recording_export(
+        recording_id,
+        RecordingExportFormat::Gif,
+        output,
+        None,
+        1.0,
+        12,
+        None,
+        None,
+        RecordingRenderMode::Font,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        &[],
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        false,
+    )
+    .await
+}
+
 const REPLAY_SPEED_MIN: f64 = 0.125;
 const REPLAY_SPEED_MAX: f64 = 32.0;
 

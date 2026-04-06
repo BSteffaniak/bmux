@@ -1,9 +1,12 @@
 use anyhow::{Context, Result};
 use bmux_cli_schema::{Cli, LogLevel};
-use bmux_config::{BmuxConfig, ConfigPaths};
+use bmux_config::{BmuxConfig, ConfigPaths, RECORDINGS_DIR_OVERRIDE_ENV};
 use bmux_plugin::PluginRegistry;
 use clap::{CommandFactory, FromArgMatches};
 use tracing::Level;
+
+pub(super) const RECORDING_AUTO_EXPORT_OVERRIDE_ENV: &str = "BMUX_RECORDING_AUTO_EXPORT";
+pub(super) const RECORDING_AUTO_EXPORT_DIR_OVERRIDE_ENV: &str = "BMUX_RECORDING_AUTO_EXPORT_DIR";
 
 use super::{
     effective_enabled_plugins, plugin_commands, plugin_commands::PluginCommandRegistry,
@@ -48,7 +51,8 @@ fn apply_runtime_override_from_raw_args(argv: &[std::ffi::OsString]) -> Result<(
             let runtime = validate_runtime_name(value)?;
             // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
             unsafe { std::env::set_var("BMUX_RUNTIME_NAME", runtime) };
-            return Ok(());
+            index += 1;
+            continue;
         }
         if arg == "--runtime" {
             let Some(value) = argv.get(index + 1) else {
@@ -57,11 +61,75 @@ fn apply_runtime_override_from_raw_args(argv: &[std::ffi::OsString]) -> Result<(
             let runtime = validate_runtime_name(&value.to_string_lossy())?;
             // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
             unsafe { std::env::set_var("BMUX_RUNTIME_NAME", runtime) };
-            return Ok(());
+            index += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--recordings-dir=") {
+            let path = resolve_cli_path_override(value, "--recordings-dir")?;
+            // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
+            unsafe { std::env::set_var(RECORDINGS_DIR_OVERRIDE_ENV, path) };
+            index += 1;
+            continue;
+        }
+        if arg == "--recordings-dir" {
+            let Some(value) = argv.get(index + 1) else {
+                anyhow::bail!("--recordings-dir requires a value")
+            };
+            let path = resolve_cli_path_override(&value.to_string_lossy(), "--recordings-dir")?;
+            // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
+            unsafe { std::env::set_var(RECORDINGS_DIR_OVERRIDE_ENV, path) };
+            index += 2;
+            continue;
+        }
+        if arg == "--recording-auto-export" {
+            // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
+            unsafe { std::env::set_var(RECORDING_AUTO_EXPORT_OVERRIDE_ENV, "1") };
+            index += 1;
+            continue;
+        }
+        if arg == "--no-recording-auto-export" {
+            // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
+            unsafe { std::env::set_var(RECORDING_AUTO_EXPORT_OVERRIDE_ENV, "0") };
+            index += 1;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--recording-auto-export-dir=") {
+            let path = resolve_cli_path_override(value, "--recording-auto-export-dir")?;
+            // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
+            unsafe { std::env::set_var(RECORDING_AUTO_EXPORT_DIR_OVERRIDE_ENV, path) };
+            index += 1;
+            continue;
+        }
+        if arg == "--recording-auto-export-dir" {
+            let Some(value) = argv.get(index + 1) else {
+                anyhow::bail!("--recording-auto-export-dir requires a value")
+            };
+            let path =
+                resolve_cli_path_override(&value.to_string_lossy(), "--recording-auto-export-dir")?;
+            // SAFETY: this runs during CLI bootstrap before background tasks/threads are spawned.
+            unsafe { std::env::set_var(RECORDING_AUTO_EXPORT_DIR_OVERRIDE_ENV, path) };
+            index += 2;
+            continue;
         }
         index += 1;
     }
     Ok(())
+}
+
+fn resolve_cli_path_override(value: &str, flag: &str) -> Result<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("{flag} requires a non-empty path")
+    }
+    let path = std::path::PathBuf::from(trimmed);
+    let resolved = if path.is_absolute() {
+        path
+    } else {
+        std::env::current_dir()
+            .with_context(|| format!("failed resolving relative path for {flag}"))?
+            .join(path)
+    };
+    Ok(resolved.to_string_lossy().into_owned())
 }
 
 fn validate_runtime_name(value: &str) -> Result<String> {

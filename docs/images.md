@@ -80,6 +80,32 @@ bmux recording list              # find your recording id/name
 bmux recording export --format gif <recording-id-or-name>
 ```
 
+### Optional auto-export for user-initiated recordings
+
+You can have bmux auto-export a GIF when you run user-initiated recording stop/cut flows (`bmux --record`, `bmux recording stop`, `bmux recording cut`).
+
+```toml
+[recording]
+# Auto-export GIF after user-initiated stop/cut.
+auto_export = true
+
+# Optional dedicated output directory for auto-exported GIFs.
+# Relative paths resolve from the directory that contains bmux.toml.
+# If unset, bmux writes GIFs next to the recording directory.
+auto_export_dir = "recordings/gif"
+```
+
+CLI overrides for a single invocation:
+
+```bash
+bmux recording stop \
+  --recordings-dir /tmp/bmux-recordings \
+  --recording-auto-export \
+  --recording-auto-export-dir /tmp/bmux-gifs
+```
+
+If auto-export cannot run (for example no display track data is present), bmux still completes the recording command and prints a warning.
+
 Supported decode formats in GIF export:
 - **Sixel**: Full native decode to RGBA pixels
 - **Kitty**: Raw RGB/RGBA pixels and PNG-compressed payloads
