@@ -848,6 +848,31 @@ fn push_cut_resize_baseline_if_missing(
     }
 }
 
+fn push_cut_cursor_snapshot_baseline_if_missing(
+    output: &mut Vec<DisplayTrackEnvelope>,
+    all_frames: &[DisplayTrackEnvelope],
+    first_kept_ns: u64,
+    kept_has_cursor_snapshot: bool,
+) {
+    if kept_has_cursor_snapshot {
+        return;
+    }
+    if let Some(snapshot) = all_frames
+        .iter()
+        .rev()
+        .find(|frame| {
+            frame.mono_ns <= first_kept_ns
+                && matches!(frame.event, DisplayTrackEvent::CursorSnapshot { .. })
+        })
+        .cloned()
+    {
+        output.push(DisplayTrackEnvelope {
+            mono_ns: 0,
+            event: snapshot.event,
+        });
+    }
+}
+
 fn cut_display_track_frames(
     all_frames: &[DisplayTrackEnvelope],
     window_ns: u64,
@@ -871,9 +896,18 @@ fn cut_display_track_frames(
     let kept_has_resize = kept
         .iter()
         .any(|frame| matches!(frame.event, DisplayTrackEvent::Resize { .. }));
+    let kept_has_cursor_snapshot = kept
+        .iter()
+        .any(|frame| matches!(frame.event, DisplayTrackEvent::CursorSnapshot { .. }));
     let mut output = Vec::new();
     push_cut_stream_opened_baseline(&mut output, all_frames, kept.first());
     push_cut_resize_baseline_if_missing(&mut output, all_frames, first_kept_ns, kept_has_resize);
+    push_cut_cursor_snapshot_baseline_if_missing(
+        &mut output,
+        all_frames,
+        first_kept_ns,
+        kept_has_cursor_snapshot,
+    );
 
     for frame in &mut kept {
         frame.mono_ns = frame.mono_ns.saturating_sub(first_kept_ns);
