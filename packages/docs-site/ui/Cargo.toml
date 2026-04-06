@@ -41,7 +41,10 @@ hyperchad_transformer        = { workspace = true }
 hyperchad_transformer_models = { workspace = true }
 
 [features]
-fail-on-warnings = ["bmux_config/fail-on-warnings"]
+fail-on-warnings = [
+    "bmux_cli_schema/fail-on-warnings",
+    "bmux_config/fail-on-warnings",
+]
 
 [package.metadata.cargo-machete]
 ignored = [

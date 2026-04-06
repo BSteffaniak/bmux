@@ -6,7 +6,6 @@ use bmux_ipc::{AttachFocusTarget, AttachScene, AttachSurfaceKind, PaneState, Pan
 use crossterm::cursor::MoveTo;
 use crossterm::queue;
 use crossterm::style::Print;
-use crossterm::terminal;
 use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use unicode_width::UnicodeWidthStr;
@@ -267,8 +266,9 @@ pub fn render_attach_scene<W: io::Write>(
     scrollback_cursor: Option<AttachScrollbackCursor>,
     selection_anchor: Option<AttachScrollbackPosition>,
     zoomed: bool,
+    terminal_size: (u16, u16),
 ) -> Result<Option<AttachCursorState>> {
-    let (cols, rows) = terminal::size().unwrap_or((0, 0));
+    let (cols, rows) = terminal_size;
     if cols == 0 || rows <= status_top_inset.saturating_add(status_bottom_inset) {
         return Ok(None);
     }
@@ -676,6 +676,7 @@ mod tests {
             Some(AttachScrollbackCursor { row: 0, col: 0 }),
             None,
             false,
+            (80, 24),
         )
         .expect("render should succeed");
 
@@ -729,6 +730,7 @@ mod tests {
             Some(AttachScrollbackCursor { row: 0, col: 4 }),
             Some(AttachScrollbackPosition { row: 0, col: 1 }),
             false,
+            (80, 24),
         )
         .expect("render should succeed");
 
@@ -785,6 +787,7 @@ mod tests {
             None,
             None,
             false,
+            (80, 24),
         )
         .expect("render should succeed");
 
@@ -848,6 +851,7 @@ mod tests {
             None,
             None,
             false,
+            (80, 24),
         )
         .expect("initial render should succeed");
         assert!(!output1.is_empty(), "initial render should produce output");
@@ -875,6 +879,7 @@ mod tests {
             None,
             None,
             false,
+            (80, 24),
         )
         .expect("deferred render should succeed");
 
@@ -906,6 +911,7 @@ mod tests {
             None,
             None,
             false,
+            (80, 24),
         )
         .expect("completed render should succeed");
 
@@ -962,6 +968,7 @@ mod tests {
             None,
             None,
             false,
+            (80, 24),
         )
         .expect("full redraw should succeed despite sync flag");
 

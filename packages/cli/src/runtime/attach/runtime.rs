@@ -2535,6 +2535,7 @@ pub async fn render_attach_frame(
         view_state.scrollback_cursor,
         view_state.selection_anchor,
         layout_state.zoomed,
+        terminal::size().unwrap_or((0, 0)),
     )?;
 
     // Image overlay: render terminal images (Sixel, Kitty, iTerm2) on top
@@ -5459,6 +5460,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "bundled-plugin-windows")]
     #[allow(clippy::too_many_lines)]
     fn attach_key_event_action_maps_prefixed_runtime_defaults() {
         let mut processor =

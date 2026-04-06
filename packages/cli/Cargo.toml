@@ -106,6 +106,7 @@ default = [
 
 # Development features
 fail-on-warnings = [
+    "bmux_cli_schema/fail-on-warnings",
     "bmux_client/fail-on-warnings",
     "bmux_clipboard_plugin?/fail-on-warnings",
     "bmux_config/fail-on-warnings",

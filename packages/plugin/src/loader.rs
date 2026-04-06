@@ -1596,14 +1596,15 @@ mod tests {
         encode_service_envelope, encode_service_message,
     };
     use libloading::Library;
+    use std::cell::{Cell, RefCell};
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::c_char;
     use std::ptr;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
 
-    static KERNEL_REQUESTS: Mutex<Vec<bmux_ipc::Request>> = Mutex::new(Vec::new());
-    static OMIT_CURRENT_CLIENT_FROM_LIST: AtomicBool = AtomicBool::new(false);
+    thread_local! {
+        static KERNEL_REQUESTS: RefCell<Vec<bmux_ipc::Request>> = const { RefCell::new(Vec::new()) };
+        static OMIT_CURRENT_CLIENT_FROM_LIST: Cell<bool> = const { Cell::new(false) };
+    }
 
     const TEST_MANIFEST_TEXT: &str = concat!(
         "id = \"test.plugin\"\n",
@@ -1668,10 +1669,7 @@ mod tests {
             Err(_) => return 1,
         };
 
-        KERNEL_REQUESTS
-            .lock()
-            .expect("kernel request log lock should succeed")
-            .push(kernel_request.clone());
+        KERNEL_REQUESTS.with(|log| log.borrow_mut().push(kernel_request.clone()));
 
         let kernel_response = match kernel_request {
             bmux_ipc::Request::NewSession { name: Some(name) } if name == "deny" => {
@@ -1706,7 +1704,7 @@ mod tests {
                 })
             }
             bmux_ipc::Request::ListClients => {
-                let clients = if OMIT_CURRENT_CLIENT_FROM_LIST.load(Ordering::SeqCst) {
+                let clients = if OMIT_CURRENT_CLIENT_FROM_LIST.with(Cell::get) {
                     vec![bmux_ipc::ClientSummary {
                         id: uuid::Uuid::from_u128(0xaaaaaaaa_aaaa_aaaa_aaaa_aaaaaaaaaaaa),
                         selected_context_id: None,
@@ -2233,10 +2231,7 @@ minimum = "1.0"
 
     #[test]
     fn command_context_calls_core_session_query_via_kernel_bridge() {
-        KERNEL_REQUESTS
-            .lock()
-            .expect("kernel request log lock should succeed")
-            .clear();
+        KERNEL_REQUESTS.with(|log| log.borrow_mut().clear());
 
         let context = super::NativeCommandContext {
             plugin_id: "caller.plugin".to_string(),
@@ -2283,20 +2278,17 @@ minimum = "1.0"
             .expect("core session query should succeed");
         assert_eq!(response.sessions.len(), 1);
 
-        let last_is_list_sessions = KERNEL_REQUESTS
-            .lock()
-            .expect("kernel request log lock should succeed")
-            .last()
-            .is_some_and(|r| matches!(r, bmux_ipc::Request::ListSessions));
+        let last_is_list_sessions = KERNEL_REQUESTS.with(|log| {
+            log.borrow()
+                .last()
+                .is_some_and(|r| matches!(r, bmux_ipc::Request::ListSessions))
+        });
         assert!(last_is_list_sessions);
     }
 
     #[test]
     fn command_context_calls_core_pane_command_via_kernel_bridge() {
-        KERNEL_REQUESTS
-            .lock()
-            .expect("kernel request log lock should succeed")
-            .clear();
+        KERNEL_REQUESTS.with(|log| log.borrow_mut().clear());
 
         let context = super::NativeCommandContext {
             plugin_id: "caller.plugin".to_string(),
@@ -2346,20 +2338,17 @@ minimum = "1.0"
             )
             .expect("core pane command should succeed");
 
-        let last_is_split = KERNEL_REQUESTS
-            .lock()
-            .expect("kernel request log lock should succeed")
-            .last()
-            .is_some_and(|r| matches!(r, bmux_ipc::Request::SplitPane { .. }));
+        let last_is_split = KERNEL_REQUESTS.with(|log| {
+            log.borrow()
+                .last()
+                .is_some_and(|r| matches!(r, bmux_ipc::Request::SplitPane { .. }))
+        });
         assert!(last_is_split);
     }
 
     #[test]
     fn command_context_calls_core_session_command_via_kernel_bridge() {
-        KERNEL_REQUESTS
-            .lock()
-            .expect("kernel request log lock should succeed")
-            .clear();
+        KERNEL_REQUESTS.with(|log| log.borrow_mut().clear());
 
         let context = super::NativeCommandContext {
             plugin_id: "caller.plugin".to_string(),
@@ -2407,20 +2396,17 @@ minimum = "1.0"
             )
             .expect("core session command should succeed");
 
-        let last_is_new_session = KERNEL_REQUESTS
-            .lock()
-            .expect("kernel request log lock should succeed")
-            .last()
-            .is_some_and(|r| matches!(r, bmux_ipc::Request::NewSession { .. }));
+        let last_is_new_session = KERNEL_REQUESTS.with(|log| {
+            log.borrow()
+                .last()
+                .is_some_and(|r| matches!(r, bmux_ipc::Request::NewSession { .. }))
+        });
         assert!(last_is_new_session);
     }
 
     #[test]
     fn command_context_calls_core_client_query_via_kernel_bridge() {
-        KERNEL_REQUESTS
-            .lock()
-            .expect("kernel request log lock should succeed")
-            .clear();
+        KERNEL_REQUESTS.with(|log| log.borrow_mut().clear());
 
         let context = super::NativeCommandContext {
             plugin_id: "caller.plugin".to_string(),
@@ -2476,10 +2462,8 @@ minimum = "1.0"
             ))
         );
 
-        let (has_whoami, has_list_clients) = {
-            let requests = KERNEL_REQUESTS
-                .lock()
-                .expect("kernel request log lock should succeed");
+        let (has_whoami, has_list_clients) = KERNEL_REQUESTS.with(|log| {
+            let requests = log.borrow();
             (
                 requests
                     .iter()
@@ -2488,18 +2472,15 @@ minimum = "1.0"
                     .iter()
                     .any(|r| matches!(r, bmux_ipc::Request::ListClients)),
             )
-        };
+        });
         assert!(has_whoami);
         assert!(has_list_clients);
     }
 
     #[test]
     fn command_context_current_client_tolerates_missing_list_clients_entry() {
-        KERNEL_REQUESTS
-            .lock()
-            .expect("kernel request log lock should succeed")
-            .clear();
-        OMIT_CURRENT_CLIENT_FROM_LIST.store(true, Ordering::SeqCst);
+        KERNEL_REQUESTS.with(|log| log.borrow_mut().clear());
+        OMIT_CURRENT_CLIENT_FROM_LIST.with(|c| c.set(true));
 
         let context = super::NativeCommandContext {
             plugin_id: "caller.plugin".to_string(),
@@ -2552,15 +2533,12 @@ minimum = "1.0"
         assert_eq!(response.following_client_id, None);
         assert!(!response.following_global);
 
-        OMIT_CURRENT_CLIENT_FROM_LIST.store(false, Ordering::SeqCst);
+        OMIT_CURRENT_CLIENT_FROM_LIST.with(|c| c.set(false));
     }
 
     #[test]
     fn command_context_calls_core_session_select_via_kernel_bridge() {
-        KERNEL_REQUESTS
-            .lock()
-            .expect("kernel request log lock should succeed")
-            .clear();
+        KERNEL_REQUESTS.with(|log| log.borrow_mut().clear());
 
         let target_session_id = uuid::Uuid::new_v4();
         let context = super::NativeCommandContext {
@@ -2611,18 +2589,16 @@ minimum = "1.0"
         assert_eq!(response.session_id, target_session_id);
         assert_eq!(response.expires_at_epoch_ms, 42);
 
-        let has_attach = KERNEL_REQUESTS
-            .lock()
-            .expect("kernel request log lock should succeed")
-            .iter()
-            .any(|request| {
+        let has_attach = KERNEL_REQUESTS.with(|log| {
+            log.borrow().iter().any(|request| {
                 matches!(
                     request,
                     bmux_ipc::Request::Attach {
                         selector: bmux_ipc::SessionSelector::ById(id)
                     } if *id == target_session_id
                 )
-            });
+            })
+        });
         assert!(has_attach);
     }
 
@@ -2683,10 +2659,7 @@ minimum = "1.0"
 
     #[test]
     fn command_context_calls_core_pane_query_via_kernel_bridge() {
-        KERNEL_REQUESTS
-            .lock()
-            .expect("kernel request log lock should succeed")
-            .clear();
+        KERNEL_REQUESTS.with(|log| log.borrow_mut().clear());
 
         let context = super::NativeCommandContext {
             plugin_id: "caller.plugin".to_string(),
@@ -2733,20 +2706,17 @@ minimum = "1.0"
             .expect("core pane query should succeed");
         assert_eq!(response.panes.len(), 1);
 
-        let last_is_list_panes = KERNEL_REQUESTS
-            .lock()
-            .expect("kernel request log lock should succeed")
-            .last()
-            .is_some_and(|r| matches!(r, bmux_ipc::Request::ListPanes { .. }));
+        let last_is_list_panes = KERNEL_REQUESTS.with(|log| {
+            log.borrow()
+                .last()
+                .is_some_and(|r| matches!(r, bmux_ipc::Request::ListPanes { .. }))
+        });
         assert!(last_is_list_panes);
     }
 
     #[test]
     fn command_context_calls_focus_resize_close_via_kernel_bridge() {
-        KERNEL_REQUESTS
-            .lock()
-            .expect("kernel request log lock should succeed")
-            .clear();
+        KERNEL_REQUESTS.with(|log| log.borrow_mut().clear());
 
         let context = super::NativeCommandContext {
             plugin_id: "caller.plugin".to_string(),
@@ -2823,10 +2793,8 @@ minimum = "1.0"
             )
             .expect("close command should succeed");
 
-        let (has_focus, has_resize, has_close) = {
-            let requests = KERNEL_REQUESTS
-                .lock()
-                .expect("kernel request log lock should succeed");
+        let (has_focus, has_resize, has_close) = KERNEL_REQUESTS.with(|log| {
+            let requests = log.borrow();
             (
                 requests
                     .iter()
@@ -2838,7 +2806,7 @@ minimum = "1.0"
                     .iter()
                     .any(|r| matches!(r, bmux_ipc::Request::ClosePane { .. })),
             )
-        };
+        });
         assert!(has_focus);
         assert!(has_resize);
         assert!(has_close);
