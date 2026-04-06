@@ -152,6 +152,19 @@ impl std::fmt::Debug for IpcStreamWriter {
     }
 }
 
+/// Write half of a split [`ErasedIpcStream`].
+pub struct ErasedIpcStreamWriter {
+    inner: tokio::io::WriteHalf<Box<dyn AsyncReadWrite>>,
+    /// Optional frame compression codec, activated after capability negotiation.
+    frame_codec: Option<Arc<dyn crate::compression::CompressionCodec>>,
+}
+
+impl std::fmt::Debug for ErasedIpcStreamWriter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ErasedIpcStreamWriter(..)")
+    }
+}
+
 /// Read half of a split [`LocalIpcStream`].
 pub struct IpcStreamReader {
     inner: tokio::io::ReadHalf<LocalIpcStream>,
@@ -163,6 +176,20 @@ pub struct IpcStreamReader {
 impl std::fmt::Debug for IpcStreamReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str("IpcStreamReader(..)")
+    }
+}
+
+/// Read half of a split [`ErasedIpcStream`].
+pub struct ErasedIpcStreamReader {
+    inner: tokio::io::ReadHalf<Box<dyn AsyncReadWrite>>,
+    /// Whether to expect the compressed frame format (1-byte compression id
+    /// prefix). Activated after capability negotiation.
+    compressed_frames: bool,
+}
+
+impl std::fmt::Debug for ErasedIpcStreamReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ErasedIpcStreamReader(..)")
     }
 }
 
@@ -202,7 +229,57 @@ impl IpcStreamWriter {
     }
 }
 
+impl ErasedIpcStreamWriter {
+    /// Send a single framed envelope.
+    ///
+    /// Uses compressed frame format if a frame codec has been set via
+    /// [`enable_frame_compression`](Self::enable_frame_compression).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if frame encoding or socket writes fail.
+    pub async fn send_envelope(&mut self, envelope: &Envelope) -> Result<(), IpcTransportError> {
+        let frame = if self.frame_codec.is_some() {
+            encode_frame_compressed(envelope, self.frame_codec.as_deref())?
+        } else {
+            encode_frame(envelope)?
+        };
+        write_frame(&mut self.inner, &frame).await
+    }
+
+    /// Enable frame-level compression for all subsequent `send_envelope` calls.
+    pub fn enable_frame_compression(
+        &mut self,
+        codec: Arc<dyn crate::compression::CompressionCodec>,
+    ) {
+        self.frame_codec = Some(codec);
+    }
+}
+
 impl IpcStreamReader {
+    /// Receive a single framed envelope.
+    ///
+    /// Uses compressed frame format if compression was enabled via
+    /// [`enable_frame_compression`](Self::enable_frame_compression).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if frame reads fail or the frame is invalid.
+    pub async fn recv_envelope(&mut self) -> Result<Envelope, IpcTransportError> {
+        if self.compressed_frames {
+            read_frame_compressed(&mut self.inner).await
+        } else {
+            read_frame(&mut self.inner).await
+        }
+    }
+
+    /// Enable compressed frame format for all subsequent `recv_envelope` calls.
+    pub const fn enable_frame_compression(&mut self) {
+        self.compressed_frames = true;
+    }
+}
+
+impl ErasedIpcStreamReader {
     /// Receive a single framed envelope.
     ///
     /// Uses compressed frame format if compression was enabled via
@@ -369,6 +446,22 @@ impl ErasedIpcStream {
     /// Enable compressed frame format for all subsequent receives.
     pub const fn enable_frame_decompression(&mut self) {
         self.compressed_frames = true;
+    }
+
+    /// Split this stream into independent read and write halves.
+    #[must_use]
+    pub fn into_split(self) -> (ErasedIpcStreamReader, ErasedIpcStreamWriter) {
+        let (read_half, write_half) = tokio::io::split(self.inner);
+        (
+            ErasedIpcStreamReader {
+                inner: read_half,
+                compressed_frames: self.compressed_frames,
+            },
+            ErasedIpcStreamWriter {
+                inner: write_half,
+                frame_codec: self.frame_codec,
+            },
+        )
     }
 }
 

@@ -6,7 +6,10 @@
 
 use bmux_config::{BmuxConfig, ConfigPaths};
 pub use bmux_ipc::Event as ServerEvent;
-use bmux_ipc::transport::{ErasedIpcStream, IpcStreamWriter, IpcTransportError, LocalIpcStream};
+use bmux_ipc::transport::{
+    ErasedIpcStream, ErasedIpcStreamReader, ErasedIpcStreamWriter, IpcStreamReader,
+    IpcStreamWriter, IpcTransportError, LocalIpcStream,
+};
 use bmux_ipc::{
     AttachGrant, AttachPaneChunk, AttachPaneImageDelta, AttachPaneMouseProtocol, AttachScene,
     CORE_PROTOCOL_CAPABILITIES, ClientSummary, ContextSelector, ContextSummary, Envelope,
@@ -1628,7 +1631,7 @@ type PendingMap =
 /// delivery.
 #[derive(Debug)]
 pub struct StreamingBmuxClient {
-    writer: IpcStreamWriter,
+    writer: StreamingClientWriter,
     timeout: Duration,
     next_request_id: u64,
     principal_id: Uuid,
@@ -1637,16 +1640,57 @@ pub struct StreamingBmuxClient {
     _reader_task: tokio::task::JoinHandle<()>,
 }
 
+#[derive(Debug)]
+enum StreamingClientWriter {
+    Local(IpcStreamWriter),
+    Bridge(ErasedIpcStreamWriter),
+}
+
+impl StreamingClientWriter {
+    async fn send_envelope(
+        &mut self,
+        envelope: &Envelope,
+    ) -> std::result::Result<(), IpcTransportError> {
+        match self {
+            Self::Local(writer) => writer.send_envelope(envelope).await,
+            Self::Bridge(writer) => writer.send_envelope(envelope).await,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum StreamingClientReader {
+    Local(IpcStreamReader),
+    Bridge(ErasedIpcStreamReader),
+}
+
+impl StreamingClientReader {
+    async fn recv_envelope(&mut self) -> std::result::Result<Envelope, IpcTransportError> {
+        match self {
+            Self::Local(reader) => reader.recv_envelope().await,
+            Self::Bridge(reader) => reader.recv_envelope().await,
+        }
+    }
+
+    const fn enable_frame_compression(&mut self) {
+        match self {
+            Self::Local(reader) => reader.enable_frame_compression(),
+            Self::Bridge(reader) => reader.enable_frame_compression(),
+        }
+    }
+}
+
 impl StreamingBmuxClient {
     /// Upgrade an existing [`BmuxClient`] (already handshaken) into a streaming
     /// client. The `BmuxClient` is consumed; its socket is split and a reader
     /// task is spawned on the current tokio runtime.
     ///
-    /// Only `Local` (Unix socket) streams can be upgraded.
+    /// Supports both local IPC sockets and bridge streams.
     ///
     /// # Errors
     ///
-    /// Returns an error if the client uses a bridge stream.
+    /// Returns an error if request/response frame processing cannot be
+    /// initialized for the provided client stream.
     pub fn from_client(client: BmuxClient) -> Result<Self> {
         let BmuxClient {
             stream,
@@ -1656,22 +1700,35 @@ impl StreamingBmuxClient {
             negotiated_protocol,
         } = client;
 
-        let local_stream = match stream {
-            ClientStream::Local(s) => s,
-            ClientStream::Bridge(_) => {
-                return Err(ClientError::UnexpectedResponse(
-                    "streaming client requires a local IPC stream, not a bridge stream",
-                ));
+        let (mut reader, mut writer) = match stream {
+            ClientStream::Local(local_stream) => {
+                let (reader, writer) = local_stream.into_split();
+                (
+                    StreamingClientReader::Local(reader),
+                    StreamingClientWriter::Local(writer),
+                )
+            }
+            ClientStream::Bridge(bridge_stream) => {
+                let (reader, writer) = bridge_stream.into_split();
+                (
+                    StreamingClientReader::Bridge(reader),
+                    StreamingClientWriter::Bridge(writer),
+                )
             }
         };
-
-        let (mut reader, mut writer) = local_stream.into_split();
 
         // Enable frame compression if negotiated.
         if let Some(ref negotiated) = negotiated_protocol
             && let Some(codec) = resolve_frame_codec_from_capabilities(&negotiated.capabilities)
         {
-            writer.enable_frame_compression(codec);
+            match &mut writer {
+                StreamingClientWriter::Local(writer) => {
+                    writer.enable_frame_compression(codec.clone());
+                }
+                StreamingClientWriter::Bridge(writer) => {
+                    writer.enable_frame_compression(codec.clone());
+                }
+            }
             reader.enable_frame_compression();
         }
 
@@ -1696,7 +1753,7 @@ impl StreamingBmuxClient {
 
     /// Background reader loop that demuxes incoming envelopes.
     async fn reader_loop(
-        mut reader: bmux_ipc::transport::IpcStreamReader,
+        mut reader: StreamingClientReader,
         pending: PendingMap,
         event_tx: tokio::sync::mpsc::UnboundedSender<ServerEvent>,
     ) {
@@ -3047,10 +3104,15 @@ fn cell_pixel_height() -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ConfigPaths, load_or_create_principal_id};
+    use super::{
+        BmuxClient, ClientStream, ConfigPaths, StreamingBmuxClient, load_or_create_principal_id,
+    };
+    use bmux_ipc::transport::ErasedIpcStream;
     use std::fs;
     use std::path::PathBuf;
+    use std::time::Duration;
     use std::time::{SystemTime, UNIX_EPOCH};
+    use uuid::Uuid;
 
     fn temp_dir() -> PathBuf {
         let nanos = SystemTime::now()
@@ -3092,5 +3154,22 @@ mod tests {
         fs::write(&path, "not-a-uuid").expect("principal file should be written");
         let error = load_or_create_principal_id(&paths).expect_err("invalid principal should fail");
         assert!(error.to_string().contains("invalid principal id"));
+    }
+
+    #[tokio::test]
+    async fn streaming_client_upgrade_accepts_bridge_stream() {
+        let (bridge_stream, _peer_stream) = tokio::io::duplex(8 * 1024);
+        let principal_id = Uuid::new_v4();
+        let client = BmuxClient {
+            stream: ClientStream::Bridge(ErasedIpcStream::new(Box::new(bridge_stream))),
+            timeout: Duration::from_millis(500),
+            next_request_id: 1,
+            principal_id,
+            negotiated_protocol: None,
+        };
+
+        let streaming =
+            StreamingBmuxClient::from_client(client).expect("bridge stream upgrade should work");
+        assert_eq!(streaming.principal_id(), principal_id);
     }
 }
