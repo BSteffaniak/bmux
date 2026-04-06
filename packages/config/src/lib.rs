@@ -112,10 +112,13 @@ pub struct ConnectionTargetConfig {
     /// SSH port override.
     pub port: Option<u16>,
     /// Private key file path.
+    /// Supports `~`, `$VAR`, and `${VAR}` interpolation.
     pub identity_file: Option<PathBuf>,
     /// Known hosts file path.
+    /// Supports `~`, `$VAR`, and `${VAR}` interpolation.
     pub known_hosts_file: Option<PathBuf>,
     /// Optional CA certificate bundle used for TLS transport.
+    /// Supports `~`, `$VAR`, and `${VAR}` interpolation.
     pub ca_file: Option<PathBuf>,
     /// Optional TLS server name override (defaults to host).
     pub server_name: Option<String>,
@@ -201,6 +204,7 @@ pub enum RecordingEventKindConfig {
 #[allow(clippy::struct_excessive_bools)]
 pub struct RecordingConfig {
     /// Root directory for recording data.
+    /// Supports `~`, `$VAR`, and `${VAR}` interpolation.
     /// Relative paths are resolved against the directory containing `bmux.toml`.
     pub dir: Option<PathBuf>,
     /// Enable hidden rolling recording by default when the server starts.
@@ -249,6 +253,7 @@ pub struct RecordingConfig {
     pub auto_export: bool,
     /// Directory for auto-exported GIFs.
     ///
+    /// Supports `~`, `$VAR`, and `${VAR}` interpolation.
     /// Relative paths are resolved against the directory containing `bmux.toml`.
     /// When unset, GIFs are written next to the recording directory.
     pub auto_export_dir: Option<PathBuf>,
@@ -819,7 +824,8 @@ pub struct PluginConfig {
     /// both bundled defaults and the enabled list.
     pub disabled: Vec<String>,
     /// Additional directories to scan for plugin binaries beyond the default
-    /// plugin search path
+    /// plugin search path.
+    /// Supports `~`, `$VAR`, and `${VAR}` interpolation.
     pub search_paths: Vec<PathBuf>,
     /// Per-plugin settings keyed by plugin ID. Each plugin defines its own
     /// accepted keys and values.
@@ -1151,6 +1157,196 @@ pub enum BellAction {
 }
 
 impl BmuxConfig {
+    const fn is_env_var_start(ch: char) -> bool {
+        ch == '_' || ch.is_ascii_alphabetic()
+    }
+
+    const fn is_env_var_continue(ch: char) -> bool {
+        ch == '_' || ch.is_ascii_alphanumeric()
+    }
+
+    fn is_valid_env_var_name(name: &str) -> bool {
+        let mut chars = name.chars();
+        match chars.next() {
+            Some(first) if Self::is_env_var_start(first) => chars.all(Self::is_env_var_continue),
+            _ => false,
+        }
+    }
+
+    fn expand_home_prefix(input: &str) -> (String, bool) {
+        let Some(rest) = input.strip_prefix('~') else {
+            return (input.to_string(), false);
+        };
+        if !(rest.is_empty() || rest.starts_with('/') || rest.starts_with('\\')) {
+            return (input.to_string(), false);
+        }
+        let Some(home) = dirs::home_dir() else {
+            return (input.to_string(), true);
+        };
+        let mut expanded = home.to_string_lossy().into_owned();
+        expanded.push_str(rest);
+        (expanded, false)
+    }
+
+    fn expand_env_tokens(input: &str) -> (String, Vec<String>) {
+        let chars: Vec<char> = input.chars().collect();
+        let mut output = String::with_capacity(input.len());
+        let mut unresolved = Vec::new();
+        let mut index = 0usize;
+
+        while let Some(ch) = chars.get(index).copied() {
+            if ch != '$' {
+                output.push(ch);
+                index += 1;
+                continue;
+            }
+
+            let Some(next) = chars.get(index + 1).copied() else {
+                output.push('$');
+                index += 1;
+                continue;
+            };
+
+            if next == '$' {
+                output.push('$');
+                index += 2;
+                continue;
+            }
+
+            if next == '{' {
+                let mut end = index + 2;
+                while end < chars.len() && chars[end] != '}' {
+                    end += 1;
+                }
+                if end >= chars.len() {
+                    output.push('$');
+                    index += 1;
+                    continue;
+                }
+
+                let name: String = chars[(index + 2)..end].iter().collect();
+                if Self::is_valid_env_var_name(&name) {
+                    if let Some(value) = std::env::var_os(&name) {
+                        output.push_str(&value.to_string_lossy());
+                    } else {
+                        output.push_str("${");
+                        output.push_str(&name);
+                        output.push('}');
+                        if !unresolved.contains(&name) {
+                            unresolved.push(name);
+                        }
+                    }
+                } else {
+                    output.push_str("${");
+                    output.push_str(&name);
+                    output.push('}');
+                }
+                index = end + 1;
+                continue;
+            }
+
+            if Self::is_env_var_start(next) {
+                let mut end = index + 2;
+                while end < chars.len() && Self::is_env_var_continue(chars[end]) {
+                    end += 1;
+                }
+
+                let name: String = chars[(index + 1)..end].iter().collect();
+                if let Some(value) = std::env::var_os(&name) {
+                    output.push_str(&value.to_string_lossy());
+                } else {
+                    output.push('$');
+                    output.push_str(&name);
+                    if !unresolved.contains(&name) {
+                        unresolved.push(name);
+                    }
+                }
+                index = end;
+                continue;
+            }
+
+            output.push('$');
+            index += 1;
+        }
+
+        (output, unresolved)
+    }
+
+    fn interpolate_path_tokens(value: &std::path::Path, field: &str) -> (PathBuf, Vec<String>) {
+        let input = value.to_string_lossy().into_owned();
+        let (home_expanded, home_unresolved) = Self::expand_home_prefix(&input);
+        let (expanded, unresolved_vars) = Self::expand_env_tokens(&home_expanded);
+
+        let mut warnings = Vec::new();
+        if home_unresolved {
+            warnings.push(format!(
+                "could not expand ~ in {field}; home directory is unavailable, keeping literal path"
+            ));
+        }
+        for var in unresolved_vars {
+            warnings.push(format!(
+                "unresolved env var {var} in {field}; keeping literal token"
+            ));
+        }
+        (PathBuf::from(expanded), warnings)
+    }
+
+    fn interpolate_optional_path_field(
+        value: &mut Option<PathBuf>,
+        field: &str,
+        warnings: &mut Vec<String>,
+    ) {
+        if let Some(path) = value {
+            let (expanded, field_warnings) = Self::interpolate_path_tokens(path.as_path(), field);
+            *path = expanded;
+            warnings.extend(field_warnings);
+        }
+    }
+
+    fn interpolate_path_fields(&mut self) -> Vec<String> {
+        let mut warnings = Vec::new();
+
+        Self::interpolate_optional_path_field(
+            &mut self.recording.dir,
+            "recording.dir",
+            &mut warnings,
+        );
+        Self::interpolate_optional_path_field(
+            &mut self.recording.auto_export_dir,
+            "recording.auto_export_dir",
+            &mut warnings,
+        );
+
+        for (name, target) in &mut self.connections.targets {
+            let identity_field = format!("connections.targets.{name}.identity_file");
+            Self::interpolate_optional_path_field(
+                &mut target.identity_file,
+                &identity_field,
+                &mut warnings,
+            );
+
+            let known_hosts_field = format!("connections.targets.{name}.known_hosts_file");
+            Self::interpolate_optional_path_field(
+                &mut target.known_hosts_file,
+                &known_hosts_field,
+                &mut warnings,
+            );
+
+            let ca_field = format!("connections.targets.{name}.ca_file");
+            Self::interpolate_optional_path_field(&mut target.ca_file, &ca_field, &mut warnings);
+        }
+
+        for (index, search_path) in self.plugins.search_paths.iter_mut().enumerate() {
+            let field = format!("plugins.search_paths[{index}]");
+            let (expanded, field_warnings) =
+                Self::interpolate_path_tokens(search_path.as_path(), &field);
+            *search_path = expanded;
+            warnings.extend(field_warnings);
+        }
+
+        warnings
+    }
+
     fn resolve_relative_to_config_dir(paths: &ConfigPaths, value: &std::path::Path) -> PathBuf {
         if value.is_absolute() {
             return value.to_path_buf();
@@ -1279,6 +1475,11 @@ impl BmuxConfig {
         let mut config: Self = toml::from_str(&contents).map_err(|e| ConfigError::ParseError {
             error: e.to_string(),
         })?;
+
+        let interpolation_warnings = config.interpolate_path_fields();
+        for warning in interpolation_warnings {
+            eprintln!("bmux warning: {warning}");
+        }
 
         let repaired_fields = config.sanitize_invalid_values();
         if !repaired_fields.is_empty() {
@@ -1695,6 +1896,68 @@ mod tests {
     }
 
     #[test]
+    fn load_expands_connection_target_path_fields() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        std::fs::write(
+            &path,
+            "[connections.targets.prod]\ntransport = 'ssh'\nidentity_file = '$HOME/.ssh/id_ed25519'\nknown_hosts_file = '${HOME}/.ssh/known_hosts'\nca_file = '~/certs/prod-ca.pem'\n",
+        )
+        .expect("write temp config");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        let prod = config
+            .connections
+            .targets
+            .get("prod")
+            .expect("prod target missing");
+        assert_eq!(
+            prod.identity_file,
+            Some(home.join(".ssh").join("id_ed25519"))
+        );
+        assert_eq!(
+            prod.known_hosts_file,
+            Some(home.join(".ssh").join("known_hosts"))
+        );
+        assert_eq!(prod.ca_file, Some(home.join("certs").join("prod-ca.pem")));
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn load_expands_plugin_search_paths() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        std::fs::write(
+            &path,
+            "[plugins]\nsearch_paths = ['$HOME/.local/share/bmux/plugins', '~/bmux/plugins']\n",
+        )
+        .expect("write temp config");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(
+            config.plugins.search_paths,
+            vec![
+                home.join(".local")
+                    .join("share")
+                    .join("bmux")
+                    .join("plugins"),
+                home.join("bmux").join("plugins"),
+            ]
+        );
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
     fn load_repairs_zero_general_limits_without_persisting() {
         let path = temp_config_path();
         let dir = path.parent().expect("temp dir").to_path_buf();
@@ -1986,6 +2249,57 @@ timeout_profile = "missing"
         );
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn load_expands_recording_path_fields() {
+        let Some(home) = dirs::home_dir() else {
+            return;
+        };
+
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        std::fs::write(
+            &path,
+            "[recording]\ndir = '~/bmux-recordings'\nauto_export = true\nauto_export_dir = '${HOME}/bmux-gifs'\n",
+        )
+        .expect("failed writing config fixture");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(config.recording.dir, Some(home.join("bmux-recordings")));
+        assert_eq!(
+            config.recording.auto_export_dir,
+            Some(home.join("bmux-gifs"))
+        );
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn interpolate_path_tokens_keeps_unresolved_vars_literal_and_reports_warning() {
+        let mut suffix = 0usize;
+        let missing = loop {
+            let candidate = format!("BMUX_CONFIG_TEST_MISSING_{}_{}", std::process::id(), suffix);
+            if std::env::var_os(&candidate).is_none() {
+                break candidate;
+            }
+            suffix += 1;
+        };
+        let raw = format!("${missing}/dir");
+        let (expanded, warnings) =
+            BmuxConfig::interpolate_path_tokens(std::path::Path::new(&raw), "recording.dir");
+
+        assert_eq!(expanded, std::path::PathBuf::from(raw));
+        assert!(warnings.iter().any(|warning| warning.contains(&missing)));
+    }
+
+    #[test]
+    fn interpolate_path_tokens_supports_escaped_dollar() {
+        let (expanded, warnings) =
+            BmuxConfig::interpolate_path_tokens(std::path::Path::new("$$HOME/cache"), "field");
+
+        assert_eq!(expanded, std::path::PathBuf::from("$HOME/cache"));
+        assert!(warnings.is_empty());
     }
 
     #[test]

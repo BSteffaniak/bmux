@@ -90,6 +90,7 @@ You can have bmux auto-export a GIF when you run user-initiated recording stop/c
 auto_export = true
 
 # Optional dedicated output directory for auto-exported GIFs.
+# Supports ~, $VAR, and ${VAR} interpolation.
 # Relative paths resolve from the directory that contains bmux.toml.
 # If unset, bmux writes GIFs next to the recording directory.
 auto_export_dir = "recordings/gif"
