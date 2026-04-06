@@ -172,8 +172,79 @@ pub fn detect_with_queries() -> HostImageCapabilities {
     caps
 }
 
-/// Non-unix stub for query-based detection.
-#[cfg(not(unix))]
+/// Enhanced detection that sends terminal queries.
+///
+/// Must be called while the terminal is in raw mode.  Falls back to
+/// `detect_from_env()` results if queries time out.
+///
+/// On Windows, uses `WaitForSingleObject` + `ReadFile` on the console
+/// input handle to read the DA1 response with a timeout.
+#[cfg(windows)]
+pub fn detect_with_queries() -> HostImageCapabilities {
+    use std::io::Write;
+    use std::time::{Duration, Instant};
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::ReadFile;
+    use windows_sys::Win32::System::Console::{GetStdHandle, STD_INPUT_HANDLE};
+    use windows_sys::Win32::System::Threading::WaitForSingleObject;
+
+    let mut caps = detect_from_env();
+
+    let mut stdout = std::io::stdout();
+    if stdout.write_all(b"\x1b[c").is_err() || stdout.flush().is_err() {
+        return caps;
+    }
+
+    let stdin_handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    if stdin_handle == INVALID_HANDLE_VALUE {
+        return caps;
+    }
+
+    let deadline = Instant::now() + Duration::from_millis(100);
+    let mut response = Vec::new();
+
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let millis = remaining.as_millis().min(100) as u32;
+
+        // Wait for input to be available on the console handle.
+        let wait_result = unsafe { WaitForSingleObject(stdin_handle, millis) };
+        // WAIT_OBJECT_0 == 0
+        if wait_result != 0 {
+            break;
+        }
+
+        let mut buf = [0u8; 256];
+        let mut bytes_read: u32 = 0;
+        let ok = unsafe {
+            ReadFile(
+                stdin_handle,
+                buf.as_mut_ptr().cast(),
+                buf.len() as u32,
+                &mut bytes_read,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 || bytes_read == 0 {
+            break;
+        }
+        response.extend_from_slice(&buf[..bytes_read as usize]);
+        if response.contains(&b'c') {
+            break;
+        }
+    }
+
+    if let Some(da_response) = parse_da1_response(&response)
+        && da_response.contains(&4)
+    {
+        caps.sixel = true;
+    }
+
+    caps
+}
+
+/// Fallback for platforms that are neither Unix nor Windows.
+#[cfg(not(any(unix, windows)))]
 pub fn detect_with_queries() -> HostImageCapabilities {
     detect_from_env()
 }
@@ -269,8 +340,44 @@ unsafe fn ioctl_tiocgwinsz(fd: i32, ws: *mut Winsize) -> i32 {
     unsafe { ioctl(fd, TIOCGWINSZ, ws) }
 }
 
-/// Non-unix stub.
-#[cfg(not(unix))]
+/// Query cell pixel dimensions via the Win32 Console API.
+///
+/// Uses `GetCurrentConsoleFontEx` to read the font cell size in pixels.
+/// Returns `(width, height)` or `(0, 0)` if the query fails (e.g. when
+/// running under a non-console host or when ConPTY doesn't report accurate
+/// font metrics).
+#[cfg(windows)]
+pub fn query_cell_pixel_size() -> (u16, u16) {
+    use windows_sys::Win32::Foundation::{FALSE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_FONT_INFOEX, GetCurrentConsoleFontEx, GetStdHandle, STD_OUTPUT_HANDLE,
+    };
+
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if handle == INVALID_HANDLE_VALUE {
+            return (0, 0);
+        }
+
+        let mut font_info: CONSOLE_FONT_INFOEX = std::mem::zeroed();
+        font_info.cbSize = std::mem::size_of::<CONSOLE_FONT_INFOEX>() as u32;
+
+        if GetCurrentConsoleFontEx(handle, FALSE, &mut font_info) == 0 {
+            return (0, 0);
+        }
+
+        let w = font_info.dwFontSize.X;
+        let h = font_info.dwFontSize.Y;
+        if w <= 0 || h <= 0 {
+            return (0, 0);
+        }
+
+        (w as u16, h as u16)
+    }
+}
+
+/// Fallback for platforms that are neither Unix nor Windows.
+#[cfg(not(any(unix, windows)))]
 pub fn query_cell_pixel_size() -> (u16, u16) {
     (0, 0)
 }

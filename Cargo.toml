@@ -187,6 +187,7 @@ ttf-parser = { version = "0.25.1", default-features = true }
 unicode-width = { version = "0.2.2", default-features = false }
 uuid = { version = "1.21.0", default-features = false }
 vt100 = { version = "0.16.2", default-features = false }
+windows-sys = { version = "0.61.2" }
 zstd = { version = "0.13", default-features = false }
 
 # Dev/test dependencies

@@ -22,6 +22,12 @@ tokio      = { workspace = true, features = ["time", "sync", "rt"] }
 tracing    = { workspace = true }
 uuid       = { workspace = true, features = ["std"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_System_Console",
+    "Win32_Foundation",
+] }
+
 [dev-dependencies]
 bmux_server = { workspace = true }
 

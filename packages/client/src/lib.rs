@@ -2989,12 +2989,58 @@ fn cell_pixel_size_from_ioctl() -> (u16, u16) {
     (ws.ws_xpixel / ws.ws_col, ws.ws_ypixel / ws.ws_row)
 }
 
-#[cfg(not(unix))]
+/// Query the terminal's cell pixel width via `GetCurrentConsoleFontEx`.
+/// Returns 0 if unavailable.
+#[cfg(windows)]
+fn cell_pixel_width() -> u16 {
+    let (w, _) = cell_pixel_size_from_console();
+    w
+}
+
+/// Query the terminal's cell pixel height via `GetCurrentConsoleFontEx`.
+/// Returns 0 if unavailable.
+#[cfg(windows)]
+fn cell_pixel_height() -> u16 {
+    let (_, h) = cell_pixel_size_from_console();
+    h
+}
+
+#[cfg(windows)]
+fn cell_pixel_size_from_console() -> (u16, u16) {
+    use windows_sys::Win32::Foundation::FALSE;
+    use windows_sys::Win32::System::Console::{
+        CONSOLE_FONT_INFOEX, GetCurrentConsoleFontEx, GetStdHandle, STD_OUTPUT_HANDLE,
+    };
+
+    unsafe {
+        let handle = GetStdHandle(STD_OUTPUT_HANDLE);
+        if handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            return (0, 0);
+        }
+
+        let mut font_info: CONSOLE_FONT_INFOEX = std::mem::zeroed();
+        font_info.cbSize = std::mem::size_of::<CONSOLE_FONT_INFOEX>() as u32;
+
+        if GetCurrentConsoleFontEx(handle, FALSE, &mut font_info) == 0 {
+            return (0, 0);
+        }
+
+        let w = font_info.dwFontSize.X;
+        let h = font_info.dwFontSize.Y;
+        if w <= 0 || h <= 0 {
+            return (0, 0);
+        }
+
+        (w as u16, h as u16)
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 fn cell_pixel_width() -> u16 {
     0
 }
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn cell_pixel_height() -> u16 {
     0
 }

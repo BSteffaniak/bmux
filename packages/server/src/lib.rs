@@ -8323,7 +8323,51 @@ fn terminate_process_group(process_group_id: i32) -> bool {
     sent_term
 }
 
-#[cfg(not(unix))]
+/// On Windows there are no POSIX process groups, but `taskkill /T` kills an
+/// entire process tree rooted at a PID.  We use the PID that
+/// `resolve_process_group_id_for_pid` stored (it returns the PID itself on
+/// Windows) as the tree-kill target.
+#[cfg(windows)]
+fn terminate_process_group(process_group_id: i32) -> bool {
+    if process_group_id <= 0 {
+        return false;
+    }
+    let pid = process_group_id.to_string();
+
+    // Graceful tree kill first.
+    let sent_term = std::process::Command::new("taskkill")
+        .args(["/PID", &pid, "/T"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+
+    std::thread::sleep(Duration::from_millis(120));
+
+    // Check if the process is still alive.
+    let still_alive = std::process::Command::new("tasklist")
+        .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+        .output()
+        .map(|o| o.status.success() && String::from_utf8_lossy(&o.stdout).contains(&pid))
+        .unwrap_or(false);
+
+    if still_alive {
+        // Force-kill the process tree.
+        return std::process::Command::new("taskkill")
+            .args(["/PID", &pid, "/T", "/F"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+            || sent_term;
+    }
+
+    sent_term
+}
+
+#[cfg(not(any(unix, windows)))]
 fn terminate_process_group(_process_group_id: i32) -> bool {
     false
 }
@@ -8345,7 +8389,15 @@ fn resolve_process_group_id_for_pid(pid: u32) -> Option<i32> {
     (parsed > 0).then_some(parsed)
 }
 
-#[cfg(not(unix))]
+/// On Windows there are no POSIX process groups. Return the PID itself so
+/// that `terminate_process_group` can use it as the `taskkill /T` target for
+/// process-tree termination.
+#[cfg(windows)]
+fn resolve_process_group_id_for_pid(pid: u32) -> Option<i32> {
+    i32::try_from(pid).ok().filter(|&id| id > 0)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn resolve_process_group_id_for_pid(_pid: u32) -> Option<i32> {
     None
 }

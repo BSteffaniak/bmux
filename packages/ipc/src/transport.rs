@@ -538,6 +538,51 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_transport_roundtrip_between_client_and_server() {
+        let pipe_name = format!(r"\\.\pipe\bmux-ipc-{}", Uuid::new_v4());
+        let endpoint = IpcEndpoint::windows_named_pipe(&pipe_name);
+
+        let listener = LocalIpcListener::bind(&endpoint).expect("listener should bind");
+
+        let server_task = tokio::spawn(async move {
+            let mut server_stream = listener.accept().await.expect("accept should work");
+            let envelope = server_stream
+                .recv_envelope()
+                .await
+                .expect("receive should work");
+            assert_eq!(envelope.kind, EnvelopeKind::Request);
+            let request: Request = decode(&envelope.payload).expect("payload should decode");
+            assert_eq!(request, Request::Ping);
+
+            let reply_payload = encode(&Request::ServerStatus).expect("reply payload encode");
+            let reply = Envelope::new(envelope.request_id, EnvelopeKind::Response, reply_payload);
+            server_stream
+                .send_envelope(&reply)
+                .await
+                .expect("send reply should work");
+        });
+
+        let mut client_stream = LocalIpcStream::connect(&endpoint)
+            .await
+            .expect("client should connect");
+        let request_payload = encode(&Request::Ping).expect("request payload encode");
+        let request = Envelope::new(5, EnvelopeKind::Request, request_payload);
+        client_stream
+            .send_envelope(&request)
+            .await
+            .expect("send request should work");
+        let response = client_stream
+            .recv_envelope()
+            .await
+            .expect("receive response should work");
+        assert_eq!(response.request_id, 5);
+        assert_eq!(response.kind, EnvelopeKind::Response);
+
+        server_task.await.expect("server task should finish");
+    }
+
     #[tokio::test]
     async fn connect_rejects_wrong_transport_for_platform() {
         #[cfg(unix)]

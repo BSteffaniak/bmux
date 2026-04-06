@@ -560,6 +560,43 @@ fn try_kill_pid(pid: u32) -> Result<bool> {
     }
 }
 
+/// Check if a process with the given PID is still alive.
+///
+/// On Unix uses `kill -0`; on Windows uses `tasklist /FI`.
+fn is_pid_alive(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+
+    #[cfg(windows)]
+    {
+        std::process::Command::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/NH"])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .output()
+            .is_ok_and(|o| {
+                o.status.success() && String::from_utf8_lossy(&o.stdout).contains(&pid.to_string())
+            })
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 fn read_log_excerpt(path: &Path) -> String {
     std::fs::read_to_string(path)
         .ok()
@@ -651,18 +688,8 @@ pub fn cleanup_orphaned_sandboxes(dry_run: bool) -> (usize, Vec<CleanupEntry>) {
             }
         } else if pid_file.exists() {
             // No socket but PID file exists -- check if process is running.
-            // Use `kill -0` via std::process::Command as a portable check.
-            std::fs::read_to_string(&pid_file).is_ok_and(|contents| {
-                contents.trim().parse::<u32>().is_ok_and(|pid| {
-                    // `kill -0 <pid>` exits 0 if process exists, non-zero otherwise.
-                    std::process::Command::new("kill")
-                        .args(["-0", &pid.to_string()])
-                        .stdout(std::process::Stdio::null())
-                        .stderr(std::process::Stdio::null())
-                        .status()
-                        .is_ok_and(|s| s.success())
-                })
-            })
+            std::fs::read_to_string(&pid_file)
+                .is_ok_and(|contents| contents.trim().parse::<u32>().is_ok_and(is_pid_alive))
         } else {
             false // No PID file, no socket -- server is gone.
         };
