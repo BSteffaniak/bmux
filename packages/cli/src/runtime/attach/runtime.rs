@@ -528,7 +528,7 @@ pub async fn run_session_attach_with_client(
                 }
             }
 
-            // Periodic context refresh (safety net, 2s interval).
+            // Periodic context refresh (safety net, 250ms interval).
             _ = context_refresh_interval.tick() => {
                 let now = Instant::now();
                 let _ = view_state.clear_expired_transient_status(now);
@@ -3701,7 +3701,9 @@ pub async fn handle_attach_terminal_event(
     display_capture: &mut DisplayCaptureFanout,
 ) -> Result<AttachLoopControl> {
     if matches!(terminal_event, Event::Resize(_, _)) {
-        if let Err(error) = refresh_attached_session_from_context(client, view_state).await {
+        if should_refresh_attached_session(view_state, Instant::now())
+            && let Err(error) = refresh_attached_session_from_context(client, view_state).await
+        {
             view_state.set_transient_status(
                 format!(
                     "context refresh delayed: {}",
@@ -3785,8 +3787,9 @@ pub async fn handle_attach_terminal_event(
                     continue;
                 }
                 if view_state.can_write {
-                    if let Err(error) =
-                        refresh_attached_session_from_context(client, view_state).await
+                    if should_refresh_attached_session(view_state, Instant::now())
+                        && let Err(error) =
+                            refresh_attached_session_from_context(client, view_state).await
                     {
                         view_state.set_transient_status(
                             format!(
@@ -4605,7 +4608,9 @@ pub async fn focus_attach_pane(
         return Ok(());
     }
 
-    if let Err(error) = refresh_attached_session_from_context(client, view_state).await {
+    if should_refresh_attached_session(view_state, Instant::now())
+        && let Err(error) = refresh_attached_session_from_context(client, view_state).await
+    {
         view_state.set_transient_status(
             format!(
                 "context refresh delayed: {}",

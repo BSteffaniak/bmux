@@ -285,8 +285,10 @@ pub(super) async fn run_connect(
                 ConnectionContext::new(Some("local")),
             )
             .await?;
-            if status == 0 {
-                remember_recent_selection("local", target_session.as_deref())?;
+            if status == 0
+                && let Err(error) = remember_recent_selection("local", target_session.as_deref())
+            {
+                tracing::warn!("failed to save recent selection: {error}");
             }
             Ok(status)
         }
@@ -308,8 +310,11 @@ pub(super) async fn run_connect(
                 reconnect_forever,
             )
             .await?;
-            if status == 0 {
-                remember_recent_selection(&ssh_target.label, target_session.as_deref())?;
+            if status == 0
+                && let Err(error) =
+                    remember_recent_selection(&ssh_target.label, target_session.as_deref())
+            {
+                tracing::warn!("failed to save recent selection: {error}");
             }
             Ok(status)
         }
@@ -331,8 +336,11 @@ pub(super) async fn run_connect(
                 reconnect_forever,
             )
             .await?;
-            if status == 0 {
-                remember_recent_selection(&tls_target.label, target_session.as_deref())?;
+            if status == 0
+                && let Err(error) =
+                    remember_recent_selection(&tls_target.label, target_session.as_deref())
+            {
+                tracing::warn!("failed to save recent selection: {error}");
             }
             Ok(status)
         }
@@ -355,8 +363,11 @@ pub(super) async fn run_connect(
                 reconnect_forever,
             )
             .await?;
-            if status == 0 {
-                remember_recent_selection(&iroh_target.label, target_session.as_deref())?;
+            if status == 0
+                && let Err(error) =
+                    remember_recent_selection(&iroh_target.label, target_session.as_deref())
+            {
+                tracing::warn!("failed to save recent selection: {error}");
             }
             Ok(status)
         }
