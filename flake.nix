@@ -20,7 +20,16 @@
     flake-utils.lib.eachDefaultSystem (
       system:
       let
-        pkgs = import nixpkgs { inherit system; };
+        pkgs = import nixpkgs {
+          inherit system;
+          config = {
+            allowUnfreePredicate =
+              pkg:
+              builtins.elem (nixpkgs.lib.getName pkg) [
+                "codeql"
+              ];
+          };
+        };
         cargoMachete = pkgs.rustPlatform.buildRustPackage {
           pname = "cargo-machete";
           version = "ignored-dirs";
@@ -44,6 +53,7 @@
             pkg-config
             openssl
             fish
+            codeql
           ];
 
           shellHook = ''
@@ -55,6 +65,7 @@
             echo "  - cargo-deny ($(cargo deny --version))"
             echo "  - cargo-machete ($(cargo machete --version))"
             echo "  - markdownlint ($(markdownlint --version))"
+            echo "  - codeql ($(codeql --version | head -1))"
             echo ""
             echo "Run 'markdownlint *.md **/*.md' to lint all markdown files"
             echo "Run 'markdownlint --fix *.md **/*.md' to auto-fix markdown issues"
