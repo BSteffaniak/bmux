@@ -101,6 +101,11 @@ for lang in "${LANGUAGES[@]}"; do
     echo "done (${elapsed}s)"
   fi
 
+  # Download the query pack if not already cached.
+  echo -n "Ensuring query pack for ${lang} is available... "
+  codeql pack download "codeql/${lang}-queries" --verbosity=progress 2>&1
+  echo "done"
+
   # Build analyze command.
   analyze_args=(
     "$db_path"
