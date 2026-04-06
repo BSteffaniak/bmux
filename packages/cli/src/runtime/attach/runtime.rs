@@ -2884,6 +2884,19 @@ pub async fn refresh_attached_session_from_context(
             // fail with "client is not attached to session runtime".
             let attach_info = client.open_attach_stream_info(&grant).await?;
             view_state.attached_id = attach_info.session_id;
+            view_state.can_write = attach_info.can_write;
+
+            // Fully hydrate the new session: set the viewport so the
+            // server knows our terminal size, then fetch a snapshot.  The
+            // snapshot clears the server-side `output_dirty` flag for each
+            // pane, which allows the PTY reader to emit fresh
+            // `PaneOutputAvailable` events for subsequent output.  Without
+            // this, the flag stays permanently `true` (set when the pane
+            // first produced output before any client consumed it) and no
+            // events are ever broadcast — making the session appear frozen.
+            update_attach_viewport(client, view_state.attached_id, view_state.status_position)
+                .await?;
+            hydrate_attach_state_from_snapshot(client, view_state).await?;
         }
         view_state.attached_context_id = grant.context_id.or(Some(context_id));
 
