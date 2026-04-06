@@ -12,17 +12,11 @@ version     = { workspace = true }
 
 [dependencies]
 # Internal bmux packages
-bmux_config   = { workspace = true }
-bmux_event    = { workspace = true }
-bmux_ipc      = { workspace = true }
-bmux_session  = { workspace = true }
-bmux_terminal = { workspace = true }
+bmux_config = { workspace = true }
+bmux_ipc    = { workspace = true }
 
 # External dependencies
-anyhow     = { workspace = true }
 bmux_codec = { workspace = true }
-crossterm  = { workspace = true }
-serde      = { workspace = true, features = ["derive"], optional = true }
 thiserror  = { workspace = true }
 tokio      = { workspace = true, features = ["time", "sync", "rt"] }
 tracing    = { workspace = true }
@@ -40,16 +34,11 @@ default = ["serde"]
 fail-on-warnings = [
     "bmux_codec/fail-on-warnings",
     "bmux_config/fail-on-warnings",
-    "bmux_event/fail-on-warnings",
     "bmux_ipc/fail-on-warnings",
-    "bmux_session/fail-on-warnings",
-    "bmux_terminal/fail-on-warnings",
 ]
 
 # Serialization features
-serde = [
-    "bmux_event/serde",
-    "bmux_session/serde",
-    "bmux_terminal/serde",
-    "dep:serde",
-]
+serde = []
+
+[package.metadata.cargo-machete]
+ignored = ["bmux_server"] # dev-dependency used in integration tests

@@ -15,11 +15,8 @@ version     = { workspace = true }
 bmux_session_models = { workspace = true }
 
 # External dependencies
-anyhow    = { workspace = true, features = ["std"] }
-serde     = { workspace = true, features = ["derive"], optional = true }
-thiserror = { workspace = true }
-tokio     = { workspace = true, features = ["rt", "sync"] }
-tracing   = { workspace = true, features = ["std"] }
+anyhow  = { workspace = true, features = ["std"] }
+tracing = { workspace = true, features = ["std"] }
 
 
 [features]
@@ -30,4 +27,4 @@ default = ["serde"]
 fail-on-warnings = ["bmux_session_models/fail-on-warnings"]
 
 # Serialization features
-serde = ["bmux_session_models/serde", "dep:serde"]
+serde = ["bmux_session_models/serde"]

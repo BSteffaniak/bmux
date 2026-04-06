@@ -42,3 +42,11 @@ hyperchad_transformer_models = { workspace = true }
 
 [features]
 fail-on-warnings = []
+
+[package.metadata.cargo-machete]
+ignored = [
+    "bmux_config_doc",              # Used via ConfigDocSchema trait derives in bmux_config types
+    "hyperchad_renderer",           # Proc macro (container!) generates absolute ::hyperchad_renderer paths
+    "hyperchad_transformer",        # Proc macro (container!) generates absolute ::hyperchad_transformer paths
+    "hyperchad_transformer_models", # Proc macro (container!) generates absolute ::hyperchad_transformer_models paths
+]

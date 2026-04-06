@@ -62,7 +62,6 @@ moosicbox_log_watch = { workspace = true, features = [
     "tui",
     "persistence-json",
 ] }
-portable-pty = { workspace = true }
 qrcode = { workspace = true }
 rcgen = { workspace = true }
 regex = { workspace = true }

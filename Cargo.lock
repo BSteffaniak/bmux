@@ -866,7 +866,6 @@ dependencies = [
  "iroh",
  "moosicbox_log_runtime",
  "moosicbox_log_watch",
- "portable-pty",
  "qrcode",
  "rcgen",
  "regex",
@@ -906,16 +905,10 @@ dependencies = [
 name = "bmux_client"
 version = "0.0.1-alpha.0"
 dependencies = [
- "anyhow",
  "bmux_codec",
  "bmux_config",
- "bmux_event",
  "bmux_ipc",
  "bmux_server",
- "bmux_session",
- "bmux_terminal",
- "crossterm",
- "serde",
  "thiserror 2.0.18",
  "tokio",
  "tracing",
@@ -926,7 +919,6 @@ dependencies = [
 name = "bmux_clipboard"
 version = "0.0.1-alpha.0"
 dependencies = [
- "anyhow",
  "thiserror 2.0.18",
 ]
 
@@ -952,7 +944,6 @@ dependencies = [
 name = "bmux_config"
 version = "0.0.1-alpha.0"
 dependencies = [
- "anyhow",
  "bmux_config_doc",
  "bmux_config_doc_derive",
  "bmux_event",
@@ -961,7 +952,6 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "toml",
- "tracing",
 ]
 
 [[package]]
@@ -999,9 +989,6 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "anyhow",
  "bmux_event_models",
- "bmux_session",
- "serde",
- "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -1021,15 +1008,9 @@ name = "bmux_example_native_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_cli_output",
- "bmux_client",
- "bmux_config",
- "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "serde",
- "serde_json",
- "tokio",
- "toml",
  "uuid",
 ]
 
@@ -1088,15 +1069,11 @@ dependencies = [
 name = "bmux_permissions_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
- "bmux_cli_output",
- "bmux_client",
- "bmux_config",
  "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "serde",
  "serde_json",
- "tokio",
  "uuid",
 ]
 
@@ -1104,14 +1081,12 @@ dependencies = [
 name = "bmux_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
- "bmux_codec",
  "bmux_ipc",
  "bmux_plugin_sdk",
  "libloading",
  "semver",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "toml",
  "tracing",
  "uuid",
@@ -1132,7 +1107,6 @@ name = "bmux_plugin_sdk"
 version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_codec",
- "semver",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
@@ -1147,11 +1121,9 @@ dependencies = [
  "anyhow",
  "bmux_codec",
  "bmux_config",
- "bmux_event",
  "bmux_image",
  "bmux_ipc",
  "bmux_session",
- "bmux_terminal",
  "bmux_terminal_protocol",
  "portable-pty",
  "serde",
@@ -1169,9 +1141,6 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "anyhow",
  "bmux_session_models",
- "serde",
- "thiserror 2.0.18",
- "tokio",
  "tracing",
 ]
 
@@ -1189,13 +1158,8 @@ name = "bmux_terminal"
 version = "0.0.1-alpha.0"
 dependencies = [
  "anyhow",
- "bmux_event",
  "bmux_session",
  "bmux_terminal_models",
- "crossterm",
- "serde",
- "thiserror 2.0.18",
- "tokio",
  "tracing",
 ]
 
@@ -1205,7 +1169,6 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "bmux_session_models",
  "serde",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -1219,15 +1182,11 @@ dependencies = [
 name = "bmux_windows_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
- "bmux_cli_output",
- "bmux_client",
- "bmux_config",
  "bmux_ipc",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "serde",
  "serde_json",
- "tokio",
  "uuid",
 ]
 

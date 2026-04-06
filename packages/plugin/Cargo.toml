@@ -15,13 +15,11 @@ version     = { workspace = true }
 bmux_plugin_sdk = { workspace = true }
 
 # External dependencies (host-side only)
-bmux_codec = { workspace = true }
 bmux_ipc   = { workspace = true }
 libloading = { workspace = true }
 semver     = { workspace = true }
 serde      = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
-thiserror  = { workspace = true }
 toml       = { workspace = true, features = ["parse"] }
 tracing    = { workspace = true, features = ["std"] }
 uuid       = { workspace = true, features = ["serde", "std"] }
@@ -33,7 +31,6 @@ default = []
 
 # Development features
 fail-on-warnings = [
-    "bmux_codec/fail-on-warnings",
     "bmux_ipc/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
 ]

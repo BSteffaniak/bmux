@@ -12,17 +12,12 @@ version     = { workspace = true }
 
 [dependencies]
 # Internal bmux packages
-bmux_event           = { workspace = true }
 bmux_session         = { workspace = true }
 bmux_terminal_models = { workspace = true }
 
 # External dependencies
-anyhow    = { workspace = true, features = ["std"] }
-crossterm = { workspace = true }
-serde     = { workspace = true, features = ["derive"], optional = true }
-thiserror = { workspace = true }
-tokio     = { workspace = true, features = ["rt", "sync"] }
-tracing   = { workspace = true, features = ["std"] }
+anyhow  = { workspace = true, features = ["std"] }
+tracing = { workspace = true, features = ["std"] }
 
 
 [features]
@@ -31,15 +26,9 @@ default = ["serde"]
 
 # Development features
 fail-on-warnings = [
-    "bmux_event/fail-on-warnings",
     "bmux_session/fail-on-warnings",
     "bmux_terminal_models/fail-on-warnings",
 ]
 
 # Serialization features
-serde = [
-    "bmux_event/serde",
-    "bmux_session/serde",
-    "bmux_terminal_models/serde",
-    "dep:serde",
-]
+serde = ["bmux_session/serde", "bmux_terminal_models/serde"]

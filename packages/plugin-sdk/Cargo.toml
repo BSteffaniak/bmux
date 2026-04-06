@@ -12,7 +12,6 @@ version     = { workspace = true }
 
 [dependencies]
 bmux_codec = { workspace = true }
-semver     = { workspace = true }
 serde      = { workspace = true, features = ["derive", "std"] }
 serde_json = { workspace = true }
 thiserror  = { workspace = true }

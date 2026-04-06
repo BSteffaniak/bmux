@@ -18,12 +18,10 @@ bmux_event             = { workspace = true, features = ["serde"] }
 bmux_keybind           = { workspace = true }
 
 # External dependencies
-anyhow    = { workspace = true, features = ["std"] }
 dirs      = { workspace = true }
 serde     = { workspace = true, features = ["derive"] }
 thiserror = { workspace = true }
 toml      = { workspace = true, features = ["display", "parse"] }
-tracing   = { workspace = true, features = ["std"] }
 
 
 [features]
