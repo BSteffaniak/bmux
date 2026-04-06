@@ -49,7 +49,7 @@ pub fn parse_body(body: &[u8]) -> Option<(ITerm2Params, Vec<u8>)> {
                 "name" => {
                     // Name is base64-encoded.
                     params.name = Some(
-                        String::from_utf8(crate::codec::kitty::base64_decode(value.as_bytes()))
+                        String::from_utf8(crate::codec::base64::base64_decode(value.as_bytes()))
                             .unwrap_or_default(),
                     );
                 }
@@ -61,7 +61,7 @@ pub fn parse_body(body: &[u8]) -> Option<(ITerm2Params, Vec<u8>)> {
     }
 
     // Decode the base64 image data.
-    let image_data = crate::codec::kitty::base64_decode(b64_data);
+    let image_data = crate::codec::base64::base64_decode(b64_data);
 
     Some((params, image_data))
 }
@@ -124,7 +124,7 @@ pub fn estimate_pixel_size(image_data: &[u8]) -> Option<ImagePixelSize> {
 
 /// Encode an image file as an iTerm2 OSC 1337 body (between "1337;File=" and ST).
 pub fn encode_body(image_data: &[u8], inline: bool) -> Vec<u8> {
-    let b64 = crate::codec::kitty::base64_encode(image_data);
+    let b64 = crate::codec::base64::base64_encode(image_data);
     let mut body = Vec::new();
     if inline {
         body.extend_from_slice(b"inline=1:");

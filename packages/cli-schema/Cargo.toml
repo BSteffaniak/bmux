@@ -12,3 +12,6 @@ version     = { workspace = true }
 
 [dependencies]
 clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
+
+[features]
+fail-on-warnings = []

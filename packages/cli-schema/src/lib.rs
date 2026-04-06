@@ -1,3 +1,5 @@
+#![cfg_attr(feature = "fail-on-warnings", deny(warnings))]
+
 //! CLI argument definitions for bmux.
 //!
 //! This crate contains the clap derive structs and enums that define bmux's

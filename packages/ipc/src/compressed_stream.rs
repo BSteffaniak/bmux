@@ -286,6 +286,7 @@ impl<S: Unpin> Unpin for CompressedStream<S> {}
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "compression-zstd")]
     use super::*;
 
     #[cfg(feature = "compression-zstd")]

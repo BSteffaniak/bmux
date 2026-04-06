@@ -11,6 +11,7 @@ use crate::model::{
 
 /// A change log entry for delta tracking.
 #[derive(Clone, Debug)]
+#[allow(dead_code)] // Used when multiple image features are enabled; dead in single-feature combos
 enum ChangeLogEntry {
     Added { sequence: u64, image: PaneImage },
     Removed { sequence: u64, image_id: u64 },
@@ -23,6 +24,7 @@ struct KittyChunkAccumulator {
 }
 
 /// Per-pane image storage with scroll tracking and delta queries.
+#[allow(dead_code)] // Fields used when image features are enabled; dead in minimal feature combos
 pub struct ImageRegistry {
     images: Vec<PaneImage>,
     next_id: u64,
@@ -129,6 +131,7 @@ impl ImageRegistry {
     }
 
     /// Insert a new image into the registry.
+    #[allow(dead_code)] // Called from feature-gated image processing paths
     fn add_image(
         &mut self,
         protocol: ImageProtocol,
@@ -160,6 +163,7 @@ impl ImageRegistry {
     }
 
     /// Remove images exceeding the per-pane limits (oldest first).
+    #[allow(dead_code)] // Called from add_image which is feature-gated
     fn enforce_limits(&mut self) {
         while self.images.len() > self.max_images {
             let removed = self.images.remove(0);
@@ -191,6 +195,7 @@ impl ImageRegistry {
         }
     }
 
+    #[allow(dead_code)] // Called from enforce_limits which is feature-gated
     fn total_bytes(&self) -> usize {
         self.images
             .iter()
@@ -442,6 +447,7 @@ impl Default for ImageRegistry {
 }
 
 /// Convert pixel dimensions to cell dimensions.
+#[allow(dead_code)] // Called from feature-gated image processing paths
 fn pixel_size_to_cells(
     pixel_size: ImagePixelSize,
     cell_pixel_width: u16,
