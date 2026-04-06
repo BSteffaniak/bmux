@@ -1,0 +1,4 @@
+name: "bmux CodeQL config"
+
+queries:
+  - uses: security-extended
