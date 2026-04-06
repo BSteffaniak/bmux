@@ -236,10 +236,10 @@ fn default_state_dir() -> PathBuf {
 
     #[cfg(target_os = "windows")]
     {
-        return dirs::data_local_dir().map_or_else(
+        dirs::data_local_dir().map_or_else(
             || PathBuf::from(".").join("bmux").join("state"),
             |base| base.join("bmux").join("State"),
-        );
+        )
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
@@ -271,10 +271,10 @@ fn default_log_dir() -> PathBuf {
 
     #[cfg(target_os = "windows")]
     {
-        return dirs::data_local_dir().map_or_else(
+        dirs::data_local_dir().map_or_else(
             || PathBuf::from(".").join("bmux").join("logs"),
             |base| base.join("bmux").join("Logs"),
-        );
+        )
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]

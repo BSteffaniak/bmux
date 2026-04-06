@@ -4,6 +4,7 @@ use crate::frame::{
 };
 use crate::{Envelope, IpcEndpoint};
 use std::io;
+#[cfg(unix)]
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -251,6 +252,10 @@ impl LocalIpcStream {
     ///
     /// Returns an error when the endpoint is unsupported on this platform or
     /// the connection fails.
+    // The Windows named-pipe path (`ClientOptions::open`) is synchronous, so
+    // this function contains no `.await` on that platform.  It must remain
+    // `async` for the cross-platform public API.
+    #[allow(clippy::unused_async)]
     pub async fn connect(endpoint: &IpcEndpoint) -> Result<Self, IpcTransportError> {
         #[cfg(unix)]
         {
