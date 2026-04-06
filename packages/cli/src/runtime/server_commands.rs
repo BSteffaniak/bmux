@@ -379,9 +379,10 @@ pub(super) async fn run_server_recording_start(
         .recording_rolling_start(options)
         .await
         .map_err(map_cli_client_error)?;
+    let name_display = recording.name.as_deref().unwrap_or("-");
     println!(
-        "server rolling recording started: {} path={}",
-        recording.id, recording.path
+        "server rolling recording started: {} name={} path={}",
+        recording.id, name_display, recording.path
     );
     Ok(0)
 }
@@ -466,8 +467,9 @@ pub(super) async fn run_server_recording_status(
     }
     if let Some(active) = status.active {
         println!(
-            "active: {} events={} bytes={} ({}) path={}",
+            "active: {} name={} events={} bytes={} ({}) path={}",
             active.id,
+            active.name.as_deref().unwrap_or("-"),
             active.event_count,
             active.payload_bytes,
             format_byte_size(active.payload_bytes),
@@ -558,7 +560,12 @@ pub(super) async fn run_server_recording_clear(
     }
     if report.restarted {
         if let Some(recording) = report.restarted_recording {
-            println!("restarted: yes id={} path={}", recording.id, recording.path);
+            println!(
+                "restarted: yes id={} name={} path={}",
+                recording.id,
+                recording.name.as_deref().unwrap_or("-"),
+                recording.path
+            );
         } else {
             println!("restarted: yes");
         }

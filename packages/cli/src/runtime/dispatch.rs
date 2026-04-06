@@ -487,6 +487,7 @@ pub(super) async fn dispatch_built_in_command(
             };
             let rolling_options = RecordingRollingStartOptions {
                 window_secs: *rolling_window_secs,
+                name: None,
                 event_kinds: if *rolling_event_kind_all {
                     Some(all_recording_event_kinds())
                 } else if rolling_event_kind.is_empty() {
@@ -555,6 +556,7 @@ pub(super) async fn dispatch_built_in_command(
                         command:
                             ServerRecordingCommand::Start {
                                 rolling_window_secs,
+                                name,
                                 rolling_event_kind_all,
                                 rolling_event_kind,
                                 rolling_capture_input,
@@ -574,6 +576,7 @@ pub(super) async fn dispatch_built_in_command(
             run_server_recording_start(
                 RecordingRollingStartOptions {
                     window_secs: *rolling_window_secs,
+                    name: name.clone(),
                     event_kinds: if *rolling_event_kind_all {
                         Some(all_recording_event_kinds())
                     } else if rolling_event_kind.is_empty() {
@@ -818,6 +821,7 @@ pub(super) async fn dispatch_built_in_command(
                     RecordingCommand::Start {
                         session_id,
                         no_capture_input,
+                        name,
                         profile,
                         event_kind,
                     },
@@ -826,6 +830,7 @@ pub(super) async fn dispatch_built_in_command(
             run_recording_start(
                 session_id.as_deref(),
                 !*no_capture_input,
+                name.as_deref(),
                 *profile,
                 event_kind,
                 connection_context,
@@ -871,9 +876,9 @@ pub(super) async fn dispatch_built_in_command(
         (
             BuiltInHandlerId::RecordingCut,
             Command::Recording {
-                command: RecordingCommand::Cut { last_seconds },
+                command: RecordingCommand::Cut { last_seconds, name },
             },
-        ) => run_recording_cut(*last_seconds, connection_context).await,
+        ) => run_recording_cut(*last_seconds, name.as_deref(), connection_context).await,
         (
             BuiltInHandlerId::RecordingInspect,
             Command::Recording {

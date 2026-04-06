@@ -1465,6 +1465,7 @@ pub(super) async fn start_recording(
     let summary = client
         .recording_start(
             session_id, true, // capture_input
+            None, // name
             None, // profile: server default (Functional)
             None, // event_kinds: server default
         )

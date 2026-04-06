@@ -225,6 +225,9 @@ pub(super) fn validate_record_bootstrap_flags(cli: &Cli) -> Result<()> {
         if cli.record_profile.is_some() {
             anyhow::bail!("--record-profile requires --record")
         }
+        if cli.record_name.is_some() {
+            anyhow::bail!("--record-name requires --record")
+        }
         if !cli.record_event_kind.is_empty() {
             anyhow::bail!("--record-event-kind requires --record")
         }
@@ -240,6 +243,9 @@ pub(super) fn validate_record_bootstrap_flags(cli: &Cli) -> Result<()> {
         }
         if cli.record_profile.is_some() {
             anyhow::bail!("--record-profile requires --record")
+        }
+        if cli.record_name.is_some() {
+            anyhow::bail!("--record-name requires --record")
         }
         if !cli.record_event_kind.is_empty() {
             anyhow::bail!("--record-event-kind requires --record")

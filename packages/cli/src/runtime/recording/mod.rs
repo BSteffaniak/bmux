@@ -19,10 +19,12 @@ mod terminal_profile;
 pub(super) async fn run_recording_start(
     session_id: Option<&str>,
     capture_input: bool,
+    name: Option<&str>,
     profile: Option<RecordingProfileArg>,
     event_kinds: &[RecordingEventKindArg],
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
+    let name = normalize_recording_name(name)?;
     cleanup_stale_pid_file().await?;
     let mut client = connect_if_running_with_context(
         ConnectionPolicyScope::Normal,
@@ -48,12 +50,14 @@ pub(super) async fn run_recording_start(
         Some(default_event_kinds_from_config(capture_input))
     };
     let summary = client
-        .recording_start(session_id, capture_input, profile, event_kinds)
+        .recording_start(session_id, capture_input, name, profile, event_kinds)
         .await
         .map_err(map_cli_client_error)?;
+    let name_display = summary.name.as_deref().unwrap_or("-");
     println!(
-        "recording started: {} (capture_input={} profile={:?} kinds={})",
+        "recording started: {} name={} (capture_input={} profile={:?} kinds={})",
         summary.id,
+        name_display,
         summary.capture_input,
         summary.profile,
         summary
@@ -169,6 +173,17 @@ fn default_event_kinds_for_flags(
         kinds.push(RecordingEventKind::PaneOutputRaw);
     }
     kinds
+}
+
+fn normalize_recording_name(name: Option<&str>) -> Result<Option<String>> {
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("recording name cannot be empty")
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -394,8 +409,9 @@ pub(super) async fn run_recording_status(
 
     if let Some(active) = status.active.as_ref() {
         println!(
-            "active recording: {} events={} bytes={} capture_input={} profile={:?} kinds={} path={}",
+            "active recording: {} name={} events={} bytes={} capture_input={} profile={:?} kinds={} path={}",
             active.id,
+            active.name.as_deref().unwrap_or("-"),
             active.event_count,
             active.payload_bytes,
             active.capture_input,
@@ -467,8 +483,9 @@ pub(super) async fn run_recording_list(
     }
     for recording in recordings {
         println!(
-            "{} started={} ended={} events={} bytes={} capture_input={} profile={:?} kinds={} path={}",
+            "{} name={} started={} ended={} events={} bytes={} capture_input={} profile={:?} kinds={} path={}",
             recording.id,
+            recording.name.as_deref().unwrap_or("-"),
             recording.started_epoch_ms,
             recording
                 .ended_epoch_ms
@@ -579,8 +596,10 @@ pub(super) async fn run_recording_delete_all(
 
 pub(super) async fn run_recording_cut(
     last_seconds: Option<u64>,
+    name: Option<&str>,
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
+    let name = normalize_recording_name(name)?;
     cleanup_stale_pid_file().await?;
     let mut client = connect_if_running_with_context(
         ConnectionPolicyScope::Normal,
@@ -595,12 +614,13 @@ pub(super) async fn run_recording_cut(
     })?;
 
     let recording = client
-        .recording_cut(last_seconds)
+        .recording_cut(last_seconds, name)
         .await
         .map_err(map_cli_client_error)?;
+    let name_display = recording.name.as_deref().unwrap_or("-");
     println!(
-        "recording cut created: {} events={} bytes={} path={}",
-        recording.id, recording.event_count, recording.payload_bytes, recording.path
+        "recording cut created: {} name={} events={} bytes={} path={}",
+        recording.id, name_display, recording.event_count, recording.payload_bytes, recording.path
     );
     Ok(0)
 }
@@ -772,7 +792,8 @@ pub(super) async fn run_recording_export(
     export_metadata: Option<&str>,
     show_progress: bool,
 ) -> Result<u8> {
-    let recording_id = parse_uuid_value(recording_id, "recording id")?;
+    let recordings = list_recordings_from_disk()?;
+    let recording_id = resolve_recording_id_prefix(recording_id, &recordings)?;
     let recording_dir = recordings_root_dir().join(recording_id.to_string());
     if !recording_dir.exists() {
         anyhow::bail!("recording not found: {recording_id}")
@@ -3732,7 +3753,8 @@ pub(super) fn recording_event_kind_name(kind: RecordingEventKind) -> String {
 }
 
 pub(super) fn load_recording_events(recording_id: &str) -> Result<Vec<RecordingEventEnvelope>> {
-    let id = Uuid::parse_str(recording_id).context("invalid recording id")?;
+    let recordings = list_recordings_from_disk()?;
+    let id = resolve_recording_id_prefix(recording_id, &recordings)?;
     let recording_dir = recordings_root_dir().join(id.to_string());
     let manifest_path = recording_dir.join("manifest.json");
 
@@ -3793,41 +3815,84 @@ pub(super) fn resolve_recording_id_prefix(
     value: &str,
     recordings: &[RecordingSummary],
 ) -> Result<Uuid> {
-    if let Ok(id) = Uuid::parse_str(value) {
-        if recordings.iter().any(|recording| recording.id == id) {
-            return Ok(id);
+    let query = value.trim();
+    if query.is_empty() {
+        anyhow::bail!("recording id/name cannot be empty");
+    }
+
+    if let Ok(id) = Uuid::parse_str(query)
+        && recordings.iter().any(|recording| recording.id == id)
+    {
+        return Ok(id);
+    }
+
+    let exact_name_matches = recordings
+        .iter()
+        .filter_map(|recording| {
+            recording
+                .name
+                .as_deref()
+                .is_some_and(|name| name.eq_ignore_ascii_case(query))
+                .then_some(recording.id)
+        })
+        .collect::<Vec<_>>();
+
+    match exact_name_matches.as_slice() {
+        [id] => return Ok(*id),
+        [] => {}
+        _ => {
+            let mut options = exact_name_matches
+                .iter()
+                .filter_map(|id| recordings.iter().find(|recording| recording.id == *id))
+                .map(recording_selection_label)
+                .collect::<Vec<_>>();
+            options.sort();
+            anyhow::bail!(
+                "recording name '{query}' is ambiguous; matches: {}",
+                options.join(", ")
+            )
         }
-        anyhow::bail!("recording not found: {id}");
     }
 
-    let normalized = value.trim().to_ascii_lowercase();
-    if normalized.is_empty() {
-        anyhow::bail!("recording id/prefix cannot be empty");
-    }
-
+    let normalized = query.to_ascii_lowercase();
+    let mut seen = HashSet::new();
     let matches = recordings
         .iter()
         .filter_map(|recording| {
-            let id = recording.id.to_string();
-            id.starts_with(&normalized).then_some(recording.id)
+            let id_match = recording.id.to_string().starts_with(&normalized);
+            let name_match = recording
+                .name
+                .as_ref()
+                .is_some_and(|name| name.to_ascii_lowercase().starts_with(&normalized));
+            (id_match || name_match)
+                .then_some(recording.id)
+                .filter(|id| seen.insert(*id))
         })
         .collect::<Vec<_>>();
 
     match matches.as_slice() {
         [id] => Ok(*id),
-        [] => anyhow::bail!("no recording matches prefix '{value}'"),
+        [] => anyhow::bail!("no recording matches id/name '{value}'"),
         _ => {
             let mut options = matches
                 .iter()
-                .map(std::string::ToString::to_string)
+                .filter_map(|id| recordings.iter().find(|recording| recording.id == *id))
+                .map(recording_selection_label)
                 .collect::<Vec<_>>();
             options.sort();
             anyhow::bail!(
-                "recording prefix '{value}' is ambiguous; matches: {}",
+                "recording id/name '{value}' is ambiguous; matches: {}",
                 options.join(", ")
             )
         }
     }
+}
+
+fn recording_selection_label(recording: &RecordingSummary) -> String {
+    recording.name.as_ref().map_or_else(
+        || recording.id.to_string(),
+        |name| format!("{} (name={name})", recording.id),
+    )
 }
 
 pub(super) fn delete_recording_dir(recording_id: Uuid) -> Result<()> {
@@ -4825,6 +4890,7 @@ mod tests {
         let recordings = vec![
             RecordingSummary {
                 id: other,
+                name: None,
                 format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
                 session_id: None,
                 capture_input: true,
@@ -4840,6 +4906,7 @@ mod tests {
             },
             RecordingSummary {
                 id: exact,
+                name: None,
                 format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
                 session_id: None,
                 capture_input: true,
@@ -4870,6 +4937,7 @@ mod tests {
         let recordings = vec![
             RecordingSummary {
                 id: first,
+                name: None,
                 format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
                 session_id: None,
                 capture_input: true,
@@ -4885,6 +4953,7 @@ mod tests {
             },
             RecordingSummary {
                 id: second,
+                name: None,
                 format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
                 session_id: None,
                 capture_input: true,
@@ -4902,6 +4971,78 @@ mod tests {
 
         let error = resolve_recording_id_prefix("550e8400", &recordings)
             .expect_err("ambiguous prefix should fail");
+        assert!(error.to_string().contains("ambiguous"));
+    }
+
+    #[test]
+    fn resolve_recording_id_prefix_accepts_exact_name() {
+        let named = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
+            .expect("named uuid should parse");
+        let recordings = vec![RecordingSummary {
+            id: named,
+            name: Some("startup regression".to_string()),
+            format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+            session_id: None,
+            capture_input: true,
+            profile: bmux_ipc::RecordingProfile::Functional,
+            event_kinds: vec![bmux_ipc::RecordingEventKind::PaneOutputRaw],
+            started_epoch_ms: 1,
+            ended_epoch_ms: Some(2),
+            event_count: 0,
+            payload_bytes: 0,
+            path: "/tmp/named".to_string(),
+            segments: vec!["events_0.bin".to_string()],
+            total_segment_bytes: 0,
+        }];
+
+        let resolved = resolve_recording_id_prefix("startup regression", &recordings)
+            .expect("exact recording name should resolve");
+        assert_eq!(resolved, named);
+    }
+
+    #[test]
+    fn resolve_recording_id_prefix_rejects_ambiguous_name_prefix() {
+        let first = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440000")
+            .expect("first uuid should parse");
+        let second = Uuid::parse_str("550e8400-e29b-41d4-a716-446655440001")
+            .expect("second uuid should parse");
+        let recordings = vec![
+            RecordingSummary {
+                id: first,
+                name: Some("bug repro startup".to_string()),
+                format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+                session_id: None,
+                capture_input: true,
+                profile: bmux_ipc::RecordingProfile::Functional,
+                event_kinds: vec![bmux_ipc::RecordingEventKind::PaneOutputRaw],
+                started_epoch_ms: 1,
+                ended_epoch_ms: None,
+                event_count: 0,
+                payload_bytes: 0,
+                path: "/tmp/first".to_string(),
+                segments: vec!["events_0.bin".to_string()],
+                total_segment_bytes: 0,
+            },
+            RecordingSummary {
+                id: second,
+                name: Some("bug repro render".to_string()),
+                format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+                session_id: None,
+                capture_input: true,
+                profile: bmux_ipc::RecordingProfile::Functional,
+                event_kinds: vec![bmux_ipc::RecordingEventKind::PaneOutputRaw],
+                started_epoch_ms: 2,
+                ended_epoch_ms: None,
+                event_count: 0,
+                payload_bytes: 0,
+                path: "/tmp/second".to_string(),
+                segments: vec!["events_0.bin".to_string()],
+                total_segment_bytes: 0,
+            },
+        ];
+
+        let error = resolve_recording_id_prefix("bug repro", &recordings)
+            .expect_err("ambiguous name prefix should fail");
         assert!(error.to_string().contains("ambiguous"));
     }
 

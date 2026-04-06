@@ -153,6 +153,14 @@ fn parse_runtime_name(value: &str) -> Result<String, String> {
     Err("runtime name can only include letters, numbers, '-', '_' or '.'".to_string())
 }
 
+fn parse_recording_name(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("recording name cannot be empty".to_string());
+    }
+    Ok(trimmed.to_string())
+}
+
 #[derive(Debug, Parser)]
 #[command(author, version, about, long_about = None)]
 #[command(name = "bmux")]
@@ -173,6 +181,10 @@ pub struct Cli {
     /// Recording profile when using --record
     #[arg(long, value_enum)]
     pub record_profile: Option<RecordingProfileArg>,
+
+    /// Recording name when using --record
+    #[arg(long, value_parser = parse_recording_name)]
+    pub record_name: Option<String>,
 
     /// Explicit event kind allowlist when using --record (repeatable)
     #[arg(long, value_enum)]
@@ -512,6 +524,9 @@ pub enum RecordingCommand {
         /// Do not capture pane input bytes
         #[arg(long)]
         no_capture_input: bool,
+        /// Optional human-readable recording name
+        #[arg(long, value_parser = parse_recording_name)]
+        name: Option<String>,
         /// Recording profile to use
         #[arg(long, value_enum)]
         profile: Option<RecordingProfileArg>,
@@ -544,7 +559,7 @@ pub enum RecordingCommand {
     },
     /// Delete one recording by id or unique id prefix
     Delete {
-        /// Recording UUID or unique UUID prefix
+        /// Recording id/name or unique id/name prefix
         recording_id: String,
     },
     /// Delete all recordings
@@ -558,10 +573,13 @@ pub enum RecordingCommand {
         /// Window to snapshot, in seconds (default: full rolling window)
         #[arg(long)]
         last_seconds: Option<u64>,
+        /// Optional human-readable recording name
+        #[arg(long, value_parser = parse_recording_name)]
+        name: Option<String>,
     },
     /// Inspect recording timeline events
     Inspect {
-        /// Recording id
+        /// Recording id/name or unique id/name prefix
         recording_id: String,
         /// Limit number of events
         #[arg(long, default_value_t = 200)]
@@ -575,7 +593,7 @@ pub enum RecordingCommand {
     },
     /// Replay a recording timeline
     Replay {
-        /// Recording id
+        /// Recording id/name or unique id/name prefix
         recording_id: String,
         /// Replay mode
         #[arg(long, value_enum, default_value_t = RecordingReplayMode::Watch)]
@@ -604,7 +622,7 @@ pub enum RecordingCommand {
     },
     /// Run machine-readable verify smoke report
     VerifySmoke {
-        /// Recording id
+        /// Recording id/name or unique id/name prefix
         recording_id: String,
         /// Optional target bmux binary for verify
         #[arg(long)]
@@ -627,7 +645,7 @@ pub enum RecordingCommand {
     },
     /// Export a recording as media
     Export {
-        /// Recording id
+        /// Recording id/name or unique id/name prefix
         recording_id: String,
         /// Export format
         #[arg(long, value_enum, default_value_t = RecordingExportFormat::Gif)]
@@ -799,7 +817,7 @@ pub enum PlaybookCommand {
     },
     /// Generate a playbook stub from an existing recording
     FromRecording {
-        /// Recording ID (or prefix)
+        /// Recording id/name or unique id/name prefix
         recording_id: String,
         /// Output file path (default: stdout)
         #[arg(long, short)]
@@ -1048,6 +1066,9 @@ pub enum ServerRecordingCommand {
         /// Override rolling recording window in seconds
         #[arg(long, value_name = "SECONDS")]
         rolling_window_secs: Option<u64>,
+        /// Optional human-readable recording name
+        #[arg(long, value_parser = parse_recording_name)]
+        name: Option<String>,
         /// Enable all supported rolling event kinds
         #[arg(long, conflicts_with = "rolling_event_kind")]
         rolling_event_kind_all: bool,
@@ -1954,6 +1975,7 @@ mod tests {
                 command:
                     ServerRecordingCommand::Start {
                         rolling_window_secs: None,
+                        name: None,
                         rolling_event_kind_all: false,
                         rolling_event_kind,
                         rolling_capture_input: false,
@@ -1999,6 +2021,31 @@ mod tests {
                         ..
                     }
             } if rolling_event_kind == vec![RecordingEventKindArg::ProtocolReplyRaw]
+        ));
+    }
+
+    #[test]
+    fn parses_server_recording_start_with_name() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "server",
+            "recording",
+            "start",
+            "--name",
+            "rolling-debug-window",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Recording {
+                command: ServerRecordingCommand::Start {
+                    name: Some(ref name),
+                    ..
+                }
+            } if name == "rolling-debug-window"
         ));
     }
 
@@ -2985,6 +3032,7 @@ mod tests {
             RecordingCommand::Start {
                 session_id: None,
                 no_capture_input: false,
+                name: None,
                 profile: None,
                 event_kind,
             }
@@ -3011,10 +3059,28 @@ mod tests {
             RecordingCommand::Start {
                 session_id: Some(ref id),
                 no_capture_input: true,
+                name: None,
                 profile: None,
                 event_kind,
             } if id == "550e8400-e29b-41d4-a716-446655440000"
                 && event_kind.is_empty()
+        ));
+    }
+
+    #[test]
+    fn parses_recording_start_with_name() {
+        let cli =
+            Cli::try_parse_from(["bmux", "recording", "start", "--name", "startup-regression"])
+                .expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(
+            command,
+            RecordingCommand::Start {
+                name: Some(ref name),
+                ..
+            } if name == "startup-regression"
         ));
     }
 
@@ -3157,7 +3223,10 @@ mod tests {
         };
         assert!(matches!(
             command,
-            RecordingCommand::Cut { last_seconds: None }
+            RecordingCommand::Cut {
+                last_seconds: None,
+                name: None,
+            }
         ));
     }
 
@@ -3171,8 +3240,25 @@ mod tests {
         assert!(matches!(
             command,
             RecordingCommand::Cut {
-                last_seconds: Some(90)
+                last_seconds: Some(90),
+                name: None,
             }
+        ));
+    }
+
+    #[test]
+    fn parses_recording_cut_with_name() {
+        let cli = Cli::try_parse_from(["bmux", "recording", "cut", "--name", "look-at-this-one"])
+            .expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(
+            command,
+            RecordingCommand::Cut {
+                name: Some(ref name),
+                ..
+            } if name == "look-at-this-one"
         ));
     }
 
@@ -3388,6 +3474,8 @@ mod tests {
             "--no-capture-input",
             "--record-profile",
             "visual",
+            "--record-name",
+            "demo-repro",
             "--record-event-kind",
             "pane-output-raw",
             "--recording-id-file",
@@ -3398,6 +3486,7 @@ mod tests {
         assert!(cli.record);
         assert!(cli.no_capture_input);
         assert_eq!(cli.record_profile, Some(RecordingProfileArg::Visual));
+        assert_eq!(cli.record_name.as_deref(), Some("demo-repro"));
         assert_eq!(
             cli.record_event_kind,
             vec![RecordingEventKindArg::PaneOutputRaw]

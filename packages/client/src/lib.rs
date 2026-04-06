@@ -599,6 +599,7 @@ impl BmuxClient {
         &mut self,
         session_id: Option<Uuid>,
         capture_input: bool,
+        name: Option<String>,
         profile: Option<RecordingProfile>,
         event_kinds: Option<Vec<RecordingEventKind>>,
     ) -> Result<RecordingSummary> {
@@ -606,6 +607,7 @@ impl BmuxClient {
             .request(Request::RecordingStart {
                 session_id,
                 capture_input,
+                name,
                 profile,
                 event_kinds,
             })
@@ -695,8 +697,15 @@ impl BmuxClient {
     /// # Errors
     ///
     /// Returns an error if request or response validation fails.
-    pub async fn recording_cut(&mut self, last_seconds: Option<u64>) -> Result<RecordingSummary> {
-        match self.request(Request::RecordingCut { last_seconds }).await? {
+    pub async fn recording_cut(
+        &mut self,
+        last_seconds: Option<u64>,
+        name: Option<String>,
+    ) -> Result<RecordingSummary> {
+        match self
+            .request(Request::RecordingCut { last_seconds, name })
+            .await?
+        {
             ResponsePayload::RecordingCut { recording } => Ok(recording),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording cut response",
@@ -2538,6 +2547,7 @@ impl StreamingBmuxClient {
         &mut self,
         session_id: Option<Uuid>,
         capture_input: bool,
+        name: Option<String>,
         profile: Option<RecordingProfile>,
         event_kinds: Option<Vec<RecordingEventKind>>,
     ) -> Result<RecordingSummary> {
@@ -2545,6 +2555,7 @@ impl StreamingBmuxClient {
             .request(Request::RecordingStart {
                 session_id,
                 capture_input,
+                name,
                 profile,
                 event_kinds,
             })
@@ -2621,8 +2632,15 @@ impl StreamingBmuxClient {
     /// # Errors
     ///
     /// Returns an error if request or response validation fails.
-    pub async fn recording_cut(&mut self, last_seconds: Option<u64>) -> Result<RecordingSummary> {
-        match self.request(Request::RecordingCut { last_seconds }).await? {
+    pub async fn recording_cut(
+        &mut self,
+        last_seconds: Option<u64>,
+        name: Option<String>,
+    ) -> Result<RecordingSummary> {
+        match self
+            .request(Request::RecordingCut { last_seconds, name })
+            .await?
+        {
             ResponsePayload::RecordingCut { recording } => Ok(recording),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected recording cut response",

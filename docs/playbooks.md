@@ -203,7 +203,7 @@ See [Interactive Mode Protocol](#interactive-mode-protocol) for the wire format.
 Generate a playbook from an existing recording.
 
 ```
-bmux playbook from-recording <recording-id> [--output <path>]
+bmux playbook from-recording <recording-id-or-name> [--output <path>]
 ```
 
 If `--output` is omitted, writes to stdout. The generated playbook includes
@@ -1397,7 +1397,7 @@ screen content.
 1. Record a session (manual start/stop):
 
    ```sh
-   bmux recording start
+   bmux recording start --name startup-repro
    # ... do things in bmux ...
    bmux recording stop
 
@@ -1427,7 +1427,7 @@ screen content.
 
    ```sh
    # default cut window = full rolling window (300s in this example)
-   bmux recording cut
+   bmux recording cut --name startup-snapshot
    # optional explicit window
    bmux recording cut --last-seconds 90
    ```
@@ -1465,7 +1465,7 @@ screen content.
 2. Convert to a playbook:
 
    ```sh
-   bmux playbook from-recording <recording-id> --output repro.dsl
+   bmux playbook from-recording <recording-id-or-name> --output repro.dsl
    ```
 
 3. Review and edit the generated playbook. The auto-generated `wait-for`

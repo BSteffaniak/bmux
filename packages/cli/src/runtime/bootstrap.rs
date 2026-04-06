@@ -24,6 +24,7 @@ pub(super) struct DefaultAttachOptions {
     pub(super) record: bool,
     pub(super) capture_input: bool,
     pub(super) profile: Option<RecordingProfileArg>,
+    pub(super) name: Option<String>,
     pub(super) event_kinds: Vec<RecordingEventKindArg>,
     pub(super) recording_id_file: Option<String>,
     pub(super) stop_server_on_exit: bool,
@@ -50,6 +51,7 @@ pub(super) async fn run_default_server_attach(
             .recording_start(
                 None,
                 options.capture_input,
+                options.name.clone(),
                 recording::recording_profile_arg_to_ipc(options.profile),
                 recording::resolve_event_kind_override(
                     options.profile,
@@ -60,9 +62,10 @@ pub(super) async fn run_default_server_attach(
             .await
             .map_err(map_cli_client_error)?;
         active_recording_id = Some(started.id);
+        let name_display = started.name.as_deref().unwrap_or("-");
         println!(
-            "recording started: {} (capture_input={})",
-            started.id, started.capture_input
+            "recording started: {} name={} (capture_input={})",
+            started.id, name_display, started.capture_input
         );
         if let Some(path) = options.recording_id_file.as_deref() {
             std::fs::write(path, format!("{}\n", started.id))
@@ -107,9 +110,14 @@ pub(super) async fn run_default_server_attach(
             .into_iter()
             .find(|summary| summary.id == stopped_id);
         if let Some(recording) = recording {
+            let name_display = recording.name.as_deref().unwrap_or("-");
             println!(
-                "recording stopped: {} events={} bytes={} path={}",
-                recording.id, recording.event_count, recording.payload_bytes, recording.path
+                "recording stopped: {} name={} events={} bytes={} path={}",
+                recording.id,
+                name_display,
+                recording.event_count,
+                recording.payload_bytes,
+                recording.path
             );
         } else {
             println!("recording stopped: {stopped_id}");
@@ -514,6 +522,7 @@ mod tests {
             no_capture_input: false,
             recording_id_file: None,
             record_profile: None,
+            record_name: None,
             record_event_kind: Vec::new(),
             stop_server_on_exit: false,
             target: None,
@@ -551,6 +560,16 @@ mod tests {
             error
                 .to_string()
                 .contains("--no-capture-input requires --record"),
+            "unexpected error: {error}"
+        );
+
+        let mut cli = empty_cli();
+        cli.record_name = Some("demo".to_string());
+        let error = validate_record_bootstrap_flags(&cli).expect_err("validation should fail");
+        assert!(
+            error
+                .to_string()
+                .contains("--record-name requires --record"),
             "unexpected error: {error}"
         );
     }

@@ -183,6 +183,7 @@ pub async fn run() -> Result<u8> {
                 record: cli.record,
                 capture_input: !cli.no_capture_input,
                 profile: cli.record_profile,
+                name: cli.record_name.clone(),
                 event_kinds: cli.record_event_kind.clone(),
                 recording_id_file: cli.recording_id_file.clone(),
                 stop_server_on_exit: cli.stop_server_on_exit,

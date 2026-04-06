@@ -29,6 +29,7 @@ use super::{
 pub(super) async fn run_recording_start(
     session_id: Option<&str>,
     capture_input: bool,
+    name: Option<&str>,
     profile: Option<RecordingProfileArg>,
     event_kinds: &[RecordingEventKindArg],
     connection_context: ConnectionContext<'_>,
@@ -36,6 +37,7 @@ pub(super) async fn run_recording_start(
     recording::run_recording_start(
         session_id,
         capture_input,
+        name,
         profile,
         event_kinds,
         connection_context,
@@ -84,9 +86,10 @@ pub(super) async fn run_recording_delete_all(
 
 pub(super) async fn run_recording_cut(
     last_seconds: Option<u64>,
+    name: Option<&str>,
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
-    recording::run_recording_cut(last_seconds, connection_context).await
+    recording::run_recording_cut(last_seconds, name, connection_context).await
 }
 
 pub(super) fn run_recording_inspect(

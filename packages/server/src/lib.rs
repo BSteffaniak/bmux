@@ -4951,7 +4951,7 @@ fn ensure_rolling_recording_started(state: &Arc<ServerState>) -> Result<()> {
     }
 
     let summary =
-        start_rolling_recording_runtime(state, runtime, &state.rolling_recording_defaults)?;
+        start_rolling_recording_runtime(state, runtime, &state.rolling_recording_defaults, None)?;
     let window_secs = runtime.rolling_window_secs().unwrap_or(0);
     drop(guard);
     info!(
@@ -4965,6 +4965,7 @@ fn start_rolling_recording_runtime(
     _state: &Arc<ServerState>,
     runtime: &mut RecordingRuntime,
     settings: &RollingRecordingSettings,
+    name: Option<String>,
 ) -> Result<RecordingSummary> {
     if let Err(error) = runtime.delete_all() {
         warn!("failed cleaning hidden rolling recordings root: {error:#}");
@@ -4973,6 +4974,7 @@ fn start_rolling_recording_runtime(
     runtime.start(
         None,
         settings.capture_input(),
+        name,
         RecordingProfile::Functional,
         settings.event_kinds.clone(),
     )
@@ -7046,6 +7048,7 @@ async fn handle_request(
         Request::RecordingStart {
             session_id,
             capture_input,
+            name,
             profile,
             event_kinds,
         } => {
@@ -7056,7 +7059,7 @@ async fn handle_request(
             let profile = profile.unwrap_or(RecordingProfile::Functional);
             let event_kinds = event_kinds
                 .unwrap_or_else(|| default_recording_event_kinds(profile, capture_input));
-            match runtime.start(session_id, capture_input, profile, event_kinds) {
+            match runtime.start(session_id, capture_input, name, profile, event_kinds) {
                 Ok(recording) => {
                     let event = Event::RecordingStarted {
                         recording_id: recording.id,
@@ -7216,7 +7219,7 @@ async fn handle_request(
                 }),
             }
         }
-        Request::RecordingCut { last_seconds } => {
+        Request::RecordingCut { last_seconds, name } => {
             let output_root = state
                 .manual_recording_runtime
                 .lock()
@@ -7234,7 +7237,7 @@ async fn handle_request(
                         message: "rolling recording is not enabled".to_string(),
                     }));
                 };
-                let result = rt.cut(&output_root, last_seconds);
+                let result = rt.cut(&output_root, last_seconds, name);
                 drop(guard);
                 result
             };
@@ -7305,8 +7308,12 @@ async fn handle_request(
                         );
                     }
                     started_now = true;
-                    let result =
-                        start_rolling_recording_runtime(state, runtime, &resolved_settings)?;
+                    let result = start_rolling_recording_runtime(
+                        state,
+                        runtime,
+                        &resolved_settings,
+                        options.name,
+                    )?;
                     drop(guard);
                     result
                 }
@@ -7372,6 +7379,7 @@ async fn handle_request(
             let mut was_active = false;
             let mut stopped_recording_id = None;
             let mut restart_settings = None;
+            let mut restart_name = None;
 
             {
                 let mut runtime = state
@@ -7382,6 +7390,7 @@ async fn handle_request(
                     && let Some(active) = runtime.status().active
                 {
                     was_active = true;
+                    restart_name = active.name;
                     restart_settings = Some(RollingRecordingSettings {
                         window_secs: runtime
                             .rolling_window_secs()
@@ -7447,7 +7456,8 @@ async fn handle_request(
                             settings.window_secs,
                         );
                     }
-                    let result = start_rolling_recording_runtime(state, runtime, &settings)?;
+                    let result =
+                        start_rolling_recording_runtime(state, runtime, &settings, restart_name)?;
                     drop(guard);
                     result
                 };
@@ -7940,6 +7950,7 @@ pub fn apply_rolling_start_options(
 
 const fn rolling_start_options_is_empty(options: &RecordingRollingStartOptions) -> bool {
     options.window_secs.is_none()
+        && options.name.is_none()
         && options.event_kinds.is_none()
         && options.capture_input.is_none()
         && options.capture_output.is_none()

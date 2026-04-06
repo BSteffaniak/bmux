@@ -30,6 +30,7 @@ pub struct RecordingRuntime {
 #[derive(Debug)]
 struct ActiveRecording {
     id: Uuid,
+    name: Option<String>,
     session_filter: Option<Uuid>,
     capture_input: bool,
     profile: RecordingProfile,
@@ -94,6 +95,7 @@ impl RecordingRuntime {
         &mut self,
         session_filter: Option<Uuid>,
         capture_input: bool,
+        name: Option<String>,
         profile: RecordingProfile,
         event_kinds: Vec<RecordingEventKind>,
     ) -> Result<RecordingSummary> {
@@ -109,6 +111,7 @@ impl RecordingRuntime {
         })?;
 
         let id = Uuid::new_v4();
+        let name = normalize_recording_name(name)?;
         let started_epoch_ms = epoch_millis_now();
         let dir = self.root_dir.join(id.to_string());
         std::fs::create_dir_all(&dir)
@@ -117,6 +120,7 @@ impl RecordingRuntime {
         let manifest_path = dir.join(MANIFEST_FILE_NAME);
         let summary = RecordingSummary {
             id,
+            name: name.clone(),
             format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
             session_id: session_filter,
             capture_input,
@@ -162,6 +166,7 @@ impl RecordingRuntime {
 
         self.active = Some(ActiveRecording {
             id,
+            name,
             session_filter,
             capture_input,
             profile,
@@ -207,6 +212,7 @@ impl RecordingRuntime {
     pub fn status(&self) -> RecordingStatus {
         let active = self.active.as_ref().map(|active| RecordingSummary {
             id: active.id,
+            name: active.name.clone(),
             format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
             session_id: active.session_filter,
             capture_input: active.capture_input,
@@ -410,11 +416,17 @@ impl RecordingRuntime {
     /// # Errors
     /// Returns an error if no recording is active, the window is invalid,
     /// or file I/O fails.
-    pub fn cut(&self, output_root: &Path, last_seconds: Option<u64>) -> Result<RecordingSummary> {
+    pub fn cut(
+        &self,
+        output_root: &Path,
+        last_seconds: Option<u64>,
+        name: Option<String>,
+    ) -> Result<RecordingSummary> {
         let active = self
             .active
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no active recording available for cut"))?;
+        let name = normalize_recording_name(name)?.or_else(|| active.name.clone());
         let window_secs = last_seconds.or(self.rolling_window_secs).ok_or_else(|| {
             anyhow::anyhow!("recording cut requires rolling recording mode to be enabled")
         })?;
@@ -466,6 +478,7 @@ impl RecordingRuntime {
             .sum::<u64>();
         let summary = RecordingSummary {
             id,
+            name,
             format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
             session_id: active.session_filter,
             capture_input: active.capture_input,
@@ -490,6 +503,17 @@ impl RecordingRuntime {
         write_manifest(&cut_dir.join(MANIFEST_FILE_NAME), &finalized)?;
         Ok(finalized)
     }
+}
+
+fn normalize_recording_name(name: Option<String>) -> Result<Option<String>> {
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        anyhow::bail!("recording name cannot be empty")
+    }
+    Ok(Some(trimmed.to_string()))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1004,6 +1028,7 @@ mod tests {
             .start(
                 None,
                 true,
+                None,
                 RecordingProfile::Functional,
                 vec![RecordingEventKind::PaneOutputRaw],
             )
@@ -1034,6 +1059,32 @@ mod tests {
     }
 
     #[test]
+    fn start_with_name_persists_name() {
+        let root = temp_dir();
+        let mut runtime = RecordingRuntime::new(root.clone(), 64, 30);
+        let summary = runtime
+            .start(
+                None,
+                true,
+                Some("startup-regression".to_string()),
+                RecordingProfile::Functional,
+                vec![RecordingEventKind::PaneOutputRaw],
+            )
+            .expect("recording should start");
+        let stopped = runtime
+            .stop(Some(summary.id))
+            .expect("recording should stop");
+        assert_eq!(stopped.name.as_deref(), Some("startup-regression"));
+        let manifest_summary = super::read_manifest(
+            &root
+                .join(summary.id.to_string())
+                .join(super::MANIFEST_FILE_NAME),
+        )
+        .expect("manifest should parse");
+        assert_eq!(manifest_summary.name.as_deref(), Some("startup-regression"));
+    }
+
+    #[test]
     fn no_capture_input_suppresses_input_events() {
         let root = temp_dir();
         let mut runtime = RecordingRuntime::new(root, 64, 30);
@@ -1041,6 +1092,7 @@ mod tests {
             .start(
                 None,
                 false,
+                None,
                 RecordingProfile::Functional,
                 vec![RecordingEventKind::PaneInputRaw],
             )
@@ -1070,6 +1122,7 @@ mod tests {
             .start(
                 None,
                 true,
+                None,
                 RecordingProfile::Functional,
                 vec![RecordingEventKind::PaneOutputRaw],
             )
@@ -1091,6 +1144,7 @@ mod tests {
             .start(
                 None,
                 true,
+                None,
                 RecordingProfile::Functional,
                 vec![RecordingEventKind::PaneOutputRaw],
             )
@@ -1099,6 +1153,7 @@ mod tests {
             .start(
                 None,
                 true,
+                None,
                 RecordingProfile::Functional,
                 vec![RecordingEventKind::PaneOutputRaw],
             )
@@ -1112,6 +1167,7 @@ mod tests {
             .start(
                 None,
                 true,
+                None,
                 RecordingProfile::Functional,
                 vec![RecordingEventKind::PaneOutputRaw],
             )
@@ -1132,6 +1188,7 @@ mod tests {
             .start(
                 None,
                 true,
+                None,
                 RecordingProfile::Full,
                 vec![RecordingEventKind::PaneOutputRaw],
             )
@@ -1174,6 +1231,7 @@ mod tests {
         std::fs::create_dir_all(&rec_dir).unwrap();
         let summary = RecordingSummary {
             id: rec_id,
+            name: None,
             format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
             session_id: None,
             capture_input: true,
@@ -1208,6 +1266,7 @@ mod tests {
         std::fs::create_dir_all(&rec_dir).unwrap();
         let summary = RecordingSummary {
             id: rec_id,
+            name: None,
             format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
             session_id: None,
             capture_input: true,
@@ -1242,6 +1301,7 @@ mod tests {
         std::fs::create_dir_all(&rec_dir).unwrap();
         let summary = RecordingSummary {
             id: rec_id,
+            name: None,
             format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
             session_id: None,
             capture_input: true,
@@ -1278,6 +1338,7 @@ mod tests {
             .start(
                 None,
                 true,
+                None,
                 RecordingProfile::Functional,
                 vec![RecordingEventKind::PaneOutputRaw],
             )
@@ -1300,7 +1361,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(1200));
 
         let cut = runtime
-            .cut(&cut_root, None)
+            .cut(&cut_root, None, None)
             .expect("rolling cut should succeed");
         assert!(cut.ended_epoch_ms.is_some());
         assert!(cut.event_count >= 1);
@@ -1311,6 +1372,45 @@ mod tests {
                 .exists(),
             "cut manifest should exist"
         );
+
+        let _ = runtime.stop(None).expect("rolling recording should stop");
+    }
+
+    #[test]
+    fn rolling_cut_with_name_persists_name() {
+        let root = temp_dir();
+        let rolling_root = root.join(".rolling");
+        let cut_root = root.join("cuts");
+
+        let mut runtime = RecordingRuntime::new_rolling(rolling_root, 64, 300);
+        runtime
+            .start(
+                None,
+                true,
+                None,
+                RecordingProfile::Functional,
+                vec![RecordingEventKind::PaneOutputRaw],
+            )
+            .expect("rolling recording should start");
+        runtime
+            .record(
+                RecordingEventKind::PaneOutputRaw,
+                RecordingPayload::Bytes {
+                    data: b"hello".to_vec(),
+                },
+                RecordMeta {
+                    session_id: None,
+                    pane_id: None,
+                    client_id: None,
+                },
+            )
+            .expect("rolling event should be accepted");
+        std::thread::sleep(Duration::from_millis(1200));
+
+        let cut = runtime
+            .cut(&cut_root, None, Some("look-at-this-one".to_string()))
+            .expect("rolling cut should succeed");
+        assert_eq!(cut.name.as_deref(), Some("look-at-this-one"));
 
         let _ = runtime.stop(None).expect("rolling recording should stop");
     }

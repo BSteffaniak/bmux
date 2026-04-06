@@ -572,6 +572,8 @@ pub enum Request {
         session_id: Option<Uuid>,
         capture_input: bool,
         #[serde(default)]
+        name: Option<String>,
+        #[serde(default)]
         profile: Option<RecordingProfile>,
         #[serde(default)]
         event_kinds: Option<Vec<RecordingEventKind>>,
@@ -599,6 +601,8 @@ pub enum Request {
     RecordingCut {
         #[serde(default)]
         last_seconds: Option<u64>,
+        #[serde(default)]
+        name: Option<String>,
     },
     RecordingRollingStart {
         #[serde(default)]
@@ -800,6 +804,8 @@ pub struct ServerSnapshotStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RecordingSummary {
     pub id: Uuid,
+    #[serde(default)]
+    pub name: Option<String>,
     /// Recording format version. Absent in recordings created before versioning was added.
     #[serde(default = "recording_format_version_default")]
     pub format_version: u32,
@@ -880,6 +886,8 @@ pub struct RecordingCaptureTarget {
 pub struct RecordingRollingStartOptions {
     #[serde(default)]
     pub window_secs: Option<u64>,
+    #[serde(default)]
+    pub name: Option<String>,
     #[serde(default)]
     pub event_kinds: Option<Vec<RecordingEventKind>>,
     #[serde(default)]
@@ -1940,6 +1948,7 @@ mod tests {
             Request::RecordingStart {
                 session_id: Some(id),
                 capture_input: true,
+                name: Some("manual-demo".into()),
                 profile: Some(RecordingProfile::Visual),
                 event_kinds: Some(vec![
                     RecordingEventKind::PaneOutputRaw,
@@ -1949,6 +1958,7 @@ mod tests {
             Request::RecordingStart {
                 session_id: None,
                 capture_input: false,
+                name: None,
                 profile: None,
                 event_kinds: None,
             },
@@ -1976,14 +1986,19 @@ mod tests {
             Request::RecordingDeleteAll,
             Request::RecordingCut {
                 last_seconds: Some(120),
+                name: Some("cut-demo".into()),
             },
-            Request::RecordingCut { last_seconds: None },
+            Request::RecordingCut {
+                last_seconds: None,
+                name: None,
+            },
             Request::RecordingRollingStart {
                 options: RecordingRollingStartOptions::default(),
             },
             Request::RecordingRollingStart {
                 options: RecordingRollingStartOptions {
                     window_secs: Some(90),
+                    name: Some("rolling-demo".into()),
                     event_kinds: Some(vec![
                         RecordingEventKind::PaneOutputRaw,
                         RecordingEventKind::ProtocolReplyRaw,
@@ -2026,6 +2041,7 @@ mod tests {
     fn sample_recording_summary() -> RecordingSummary {
         RecordingSummary {
             id: Uuid::from_u128(100),
+            name: Some("demo-recording".into()),
             format_version: RECORDING_FORMAT_VERSION,
             session_id: Some(Uuid::from_u128(1)),
             capture_input: true,

@@ -70,14 +70,14 @@ To record and export:
 
 ```bash
 # Start a recording
-bmux recording start
+bmux recording start --name image-demo
 
 # Display some images in your session...
 
 # Stop and export
 bmux recording stop
-bmux recording list              # find your recording ID
-bmux recording export --format gif <recording-id>
+bmux recording list              # find your recording id/name
+bmux recording export --format gif <recording-id-or-name>
 ```
 
 Supported decode formats in GIF export:
