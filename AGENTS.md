@@ -47,6 +47,24 @@ In addition, for any code change anywhere in the repo, run:
 
 This is required. Treat failures as blocking, and do not finish with known flaky/failing tests.
 
+## Clippy (REQUIRED)
+
+For any code change anywhere in the repo, run:
+
+- `cargo clippy --all-targets -- -D warnings`
+
+This must produce zero errors and zero warnings. Treat any warning as blocking.
+
+Key rules when fixing clippy issues:
+
+- Fix the root cause. Do not add crate-level `#![allow(clippy::...)]` to suppress warnings.
+- Item-level `#[allow(clippy::...)]` is acceptable only when:
+  - The lint is a genuine false positive for that specific item (e.g., `too_many_lines` on a state machine function that would be less readable if split).
+  - The lint cannot be satisfied without breaking the API or reducing clarity (e.g., `cast_possible_truncation` on a bounded numeric conversion in rendering code).
+  - A comment explains why the allow is needed.
+- Never use `cargo clippy --fix` without verifying it compiles and tests pass afterward -- auto-fixes can break code in macro contexts and async functions.
+- Wildcard imports (`use something::*`) are not allowed in production code. They are acceptable in `#[cfg(test)] mod tests` blocks with `use super::*`.
+
 ## Plugin Changes (REQUIRED)
 
 If a change touches `plugins/**`, rebuild bundled plugins before finishing:
@@ -94,6 +112,11 @@ This includes edits under:
 - Docs-only changes
   - No mandatory runtime commands.
 
+In addition, for any non-doc code change, always run:
+
+- `cargo nextest run --no-fail-fast`
+- `cargo clippy --all-targets -- -D warnings`
+
 ## Completion Reporting Format
 
 Agents should report test execution in final response using this format:
@@ -101,6 +124,7 @@ Agents should report test execution in final response using this format:
 - `cargo test -p bmux_cli` - PASS/FAIL
 - `cargo check -p bmux_cli` - PASS/FAIL
 - `cargo nextest run --no-fail-fast` - PASS/FAIL
+- `cargo clippy --all-targets -- -D warnings` - PASS/FAIL
 - `./scripts/smoke-pty-runtime.sh` - PASS/FAIL
 - `./scripts/compat-matrix.sh` - PASS/FAIL (if required)
 - `bmux plugin rebuild` - PASS/FAIL (if required)
