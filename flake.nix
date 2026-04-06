@@ -4,6 +4,10 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
     flake-utils.url = "github:numtide/flake-utils";
+    cargoMacheteSrc = {
+      url = "github:BSteffaniak/cargo-machete/ignored-dirs";
+      flake = false;
+    };
   };
 
   outputs =
@@ -11,11 +15,21 @@
       self,
       nixpkgs,
       flake-utils,
+      cargoMacheteSrc,
     }:
     flake-utils.lib.eachDefaultSystem (
       system:
       let
         pkgs = import nixpkgs { inherit system; };
+        cargoMachete = pkgs.rustPlatform.buildRustPackage {
+          pname = "cargo-machete";
+          version = "ignored-dirs";
+          src = cargoMacheteSrc;
+          cargoLock = {
+            lockFile = "${cargoMacheteSrc}/Cargo.lock";
+          };
+          doCheck = false;
+        };
       in
       {
         devShells.default = pkgs.mkShell {
@@ -24,6 +38,8 @@
             cargo
             rustfmt
             clippy
+            cargo-deny
+            cargoMachete
             nodePackages.markdownlint-cli
             pkg-config
             openssl
@@ -36,6 +52,8 @@
             echo "  - cargo ($(cargo --version))"
             echo "  - rustc ($(rustc --version))"
             echo "  - clippy ($(cargo clippy --version))"
+            echo "  - cargo-deny ($(cargo deny --version))"
+            echo "  - cargo-machete ($(cargo machete --version))"
             echo "  - markdownlint ($(markdownlint --version))"
             echo ""
             echo "Run 'markdownlint *.md **/*.md' to lint all markdown files"

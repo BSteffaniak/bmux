@@ -1,5 +1,22 @@
 {
   "nodes": {
+    "cargoMacheteSrc": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1751732367,
+        "narHash": "sha256-Gk25/ZzJxgPThCpai3/8eJQ7JP5Hz45E0Wi4T4w7PAs=",
+        "owner": "BSteffaniak",
+        "repo": "cargo-machete",
+        "rev": "87dd88aa744c5950fe155666ced33766ad62a338",
+        "type": "github"
+      },
+      "original": {
+        "owner": "BSteffaniak",
+        "ref": "ignored-dirs",
+        "repo": "cargo-machete",
+        "type": "github"
+      }
+    },
     "flake-utils": {
       "inputs": {
         "systems": "systems"
@@ -36,6 +53,7 @@
     },
     "root": {
       "inputs": {
+        "cargoMacheteSrc": "cargoMacheteSrc",
         "flake-utils": "flake-utils",
         "nixpkgs": "nixpkgs"
       }
