@@ -1,5 +1,5 @@
 [parallelization]
-chunked = 5
+chunked = 3
 
 [[config]]
 os = "ubuntu"
