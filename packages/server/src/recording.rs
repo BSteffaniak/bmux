@@ -1154,6 +1154,266 @@ mod tests {
         }
     }
 
+    fn frame_bytes_frame(mono_ns: u64) -> DisplayTrackEnvelope {
+        DisplayTrackEnvelope {
+            mono_ns,
+            event: DisplayTrackEvent::FrameBytes { data: vec![b'x'] },
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // cut_display_track_frames unit tests
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn cut_empty_input_returns_empty() {
+        let result = super::cut_display_track_frames(&[], 10_000_000_000);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn cut_all_frames_within_window() {
+        let frames = vec![
+            stream_opened_frame(0),
+            resize_frame(1_000, 80, 24),
+            cursor_snapshot_frame(2_000, 0, 0),
+            frame_bytes_frame(3_000),
+        ];
+        // Window of 1 second easily covers all frames (max mono_ns = 3_000 ns).
+        let result = super::cut_display_track_frames(&frames, 1_000_000_000);
+        assert_eq!(result.len(), 4);
+        // StreamOpened should be first, no extra baselines injected.
+        assert!(matches!(
+            result[0].event,
+            DisplayTrackEvent::StreamOpened { .. }
+        ));
+        assert!(matches!(
+            result[1].event,
+            DisplayTrackEvent::Resize { cols: 80, rows: 24 }
+        ));
+        assert!(matches!(
+            result[2].event,
+            DisplayTrackEvent::CursorSnapshot { x: 0, y: 0, .. }
+        ));
+        assert!(matches!(
+            result[3].event,
+            DisplayTrackEvent::FrameBytes { .. }
+        ));
+    }
+
+    #[test]
+    fn cut_zero_window_keeps_only_last_frame_with_baselines() {
+        let frames = vec![
+            stream_opened_frame(0),
+            resize_frame(1_000, 80, 24),
+            cursor_snapshot_frame(2_000, 5, 3),
+            frame_bytes_frame(3_000),
+        ];
+        // Window of 0 ns: cutoff == last_ns, so only the frame at last_ns
+        // passes the >= filter, plus injected baselines.
+        let result = super::cut_display_track_frames(&frames, 0);
+        assert!(
+            matches!(result[0].event, DisplayTrackEvent::StreamOpened { .. }),
+            "should inject StreamOpened baseline"
+        );
+        assert!(
+            matches!(
+                result[1].event,
+                DisplayTrackEvent::Resize { cols: 80, rows: 24 }
+            ),
+            "should inject Resize baseline"
+        );
+        assert!(
+            matches!(
+                result[2].event,
+                DisplayTrackEvent::CursorSnapshot { x: 5, y: 3, .. }
+            ),
+            "should inject CursorSnapshot baseline"
+        );
+        assert!(
+            matches!(result[3].event, DisplayTrackEvent::FrameBytes { .. }),
+            "should keep the last frame"
+        );
+        assert_eq!(result.len(), 4);
+    }
+
+    #[test]
+    fn cut_injects_stream_opened_baseline() {
+        // StreamOpened at t=0, frame data at t=30s and t=40s.
+        // A 15-second window keeps only the t=40s frame; StreamOpened should
+        // be injected as a baseline.
+        let frames = vec![
+            stream_opened_frame(0),
+            resize_frame(1_000, 80, 24),
+            cursor_snapshot_frame(2_000, 5, 10),
+            frame_bytes_frame(30_000_000_000),
+            frame_bytes_frame(40_000_000_000),
+        ];
+        let result = super::cut_display_track_frames(&frames, 15_000_000_000);
+        assert!(
+            matches!(result.first(), Some(f) if matches!(f.event, DisplayTrackEvent::StreamOpened { .. })),
+            "cut should start with injected StreamOpened baseline"
+        );
+        // The injected baseline should have mono_ns = 0.
+        assert_eq!(result[0].mono_ns, 0);
+    }
+
+    #[test]
+    fn cut_preserves_stream_opened_when_inside_window() {
+        // All events within a tiny time range; window covers everything.
+        let frames = vec![
+            stream_opened_frame(100),
+            resize_frame(200, 80, 24),
+            cursor_snapshot_frame(300, 0, 0),
+            frame_bytes_frame(400),
+        ];
+        let result = super::cut_display_track_frames(&frames, 1_000_000_000);
+        // Should have exactly one StreamOpened (the original, not a duplicate).
+        let opened_count = result
+            .iter()
+            .filter(|f| matches!(f.event, DisplayTrackEvent::StreamOpened { .. }))
+            .count();
+        assert_eq!(opened_count, 1);
+    }
+
+    #[test]
+    fn cut_injects_resize_baseline_when_missing() {
+        // Resize at t=1_000 (before window), frames at t=30s and t=40s.
+        // 15-second window keeps t=30s+ frames; Resize should be injected.
+        let frames = vec![
+            stream_opened_frame(0),
+            resize_frame(1_000, 120, 40),
+            cursor_snapshot_frame(2_000, 10, 5),
+            frame_bytes_frame(30_000_000_000),
+            frame_bytes_frame(40_000_000_000),
+        ];
+        let result = super::cut_display_track_frames(&frames, 15_000_000_000);
+        let resizes: Vec<(u16, u16)> = result
+            .iter()
+            .filter_map(|f| match f.event {
+                DisplayTrackEvent::Resize { cols, rows } => Some((cols, rows)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(resizes, vec![(120, 40)], "should inject pre-window resize");
+        // Injected baseline should have mono_ns = 0.
+        let resize_frame = result
+            .iter()
+            .find(|f| matches!(f.event, DisplayTrackEvent::Resize { .. }))
+            .unwrap();
+        assert_eq!(resize_frame.mono_ns, 0);
+    }
+
+    #[test]
+    fn cut_does_not_inject_resize_when_present() {
+        // Resize at t=35s is inside the 15-second window (cutoff = 25s).
+        let frames = vec![
+            stream_opened_frame(0),
+            resize_frame(1_000, 80, 24),
+            cursor_snapshot_frame(2_000, 0, 0),
+            frame_bytes_frame(30_000_000_000),
+            resize_frame(35_000_000_000, 120, 40),
+            cursor_snapshot_frame(35_000_000_001, 5, 3),
+            frame_bytes_frame(40_000_000_000),
+        ];
+        let result = super::cut_display_track_frames(&frames, 15_000_000_000);
+        let resizes: Vec<(u16, u16)> = result
+            .iter()
+            .filter_map(|f| match f.event {
+                DisplayTrackEvent::Resize { cols, rows } => Some((cols, rows)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            resizes,
+            vec![(120, 40)],
+            "only the in-window resize should be present"
+        );
+    }
+
+    #[test]
+    fn cut_injects_cursor_snapshot_baseline_when_missing() {
+        // CursorSnapshot at t=2_000 (before window), frames at t=30s and t=40s.
+        // 15-second window keeps t=30s+ frames; CursorSnapshot should be injected.
+        let frames = vec![
+            stream_opened_frame(0),
+            resize_frame(1_000, 80, 24),
+            cursor_snapshot_frame(2_000, 42, 13),
+            frame_bytes_frame(30_000_000_000),
+            frame_bytes_frame(40_000_000_000),
+        ];
+        let result = super::cut_display_track_frames(&frames, 15_000_000_000);
+        let snapshots: Vec<(u16, u16)> = result
+            .iter()
+            .filter_map(|f| match f.event {
+                DisplayTrackEvent::CursorSnapshot { x, y, .. } => Some((x, y)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            snapshots,
+            vec![(42, 13)],
+            "should inject pre-window cursor snapshot"
+        );
+        // Injected baseline should have mono_ns = 0.
+        let snapshot_frame = result
+            .iter()
+            .find(|f| matches!(f.event, DisplayTrackEvent::CursorSnapshot { .. }))
+            .unwrap();
+        assert_eq!(snapshot_frame.mono_ns, 0);
+    }
+
+    #[test]
+    fn cut_does_not_inject_cursor_snapshot_when_present() {
+        // CursorSnapshot at t=35s is inside the 15-second window.
+        let frames = vec![
+            stream_opened_frame(0),
+            resize_frame(1_000, 80, 24),
+            cursor_snapshot_frame(2_000, 0, 0),
+            frame_bytes_frame(30_000_000_000),
+            cursor_snapshot_frame(35_000_000_000, 77, 22),
+            frame_bytes_frame(40_000_000_000),
+        ];
+        let result = super::cut_display_track_frames(&frames, 15_000_000_000);
+        let snapshots: Vec<(u16, u16)> = result
+            .iter()
+            .filter_map(|f| match f.event {
+                DisplayTrackEvent::CursorSnapshot { x, y, .. } => Some((x, y)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            snapshots,
+            vec![(77, 22)],
+            "only the in-window cursor snapshot should be present"
+        );
+    }
+
+    #[test]
+    fn cut_rebases_mono_ns_to_zero() {
+        // Events at t=20s, t=30s, t=40s.  15-second window (cutoff=25s)
+        // keeps t=30s and t=40s.  After rebasing, they should be at 0 and 10s.
+        let frames = vec![
+            stream_opened_frame(0),
+            resize_frame(1_000, 80, 24),
+            cursor_snapshot_frame(2_000, 0, 0),
+            frame_bytes_frame(20_000_000_000),
+            frame_bytes_frame(30_000_000_000),
+            frame_bytes_frame(40_000_000_000),
+        ];
+        let result = super::cut_display_track_frames(&frames, 15_000_000_000);
+        // Baselines are injected at mono_ns = 0.
+        // Kept frames should be rebased: first_kept_ns = 30_000_000_000.
+        let kept_timestamps: Vec<u64> = result.iter().map(|f| f.mono_ns).collect();
+        // StreamOpened baseline, Resize baseline, CursorSnapshot baseline, then
+        // two rebased FrameBytes at 0 and 10_000_000_000.
+        assert_eq!(
+            kept_timestamps,
+            vec![0, 0, 0, 0, 10_000_000_000],
+            "kept frames should be rebased relative to first_kept_ns"
+        );
+    }
+
     #[test]
     fn start_record_stop_persists_manifest() {
         let root = temp_dir();
