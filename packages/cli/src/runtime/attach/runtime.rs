@@ -51,7 +51,7 @@ use super::state::{
 };
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 
-const ATTACH_CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+const ATTACH_CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
 const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
 /// Maximum wall-clock time the drain loop may spend waiting for an in-
@@ -528,7 +528,11 @@ pub async fn run_session_attach_with_client(
                 }
             }
 
-            // Periodic context refresh (safety net, 250ms interval).
+            // Periodic context refresh — safety net for rare context-session
+            // reassignment (e.g. snapshot restore).  Session removal is
+            // handled event-driven via SessionRemoved, so this only needs to
+            // catch the edge case where a context is rebound to a different
+            // session without the old session being removed.
             _ = context_refresh_interval.tick() => {
                 let now = Instant::now();
                 let _ = view_state.clear_expired_transient_status(now);

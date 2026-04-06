@@ -479,7 +479,7 @@ pub(super) fn map_cli_client_error(error: ClientError) -> anyhow::Error {
     map_client_connect_error(error)
 }
 
-pub(super) fn init_logging(verbose: bool, cli_level: Option<LogLevel>) {
+pub(super) fn init_logging(verbose: bool, cli_level: Option<LogLevel>, file_only: bool) {
     let level = resolve_log_level(
         verbose,
         cli_level,
@@ -507,6 +507,14 @@ pub(super) fn init_logging(verbose: bool, cli_level: Option<LogLevel>) {
         log_config.sinks.file = Some(moosicbox_log_runtime::init::FileSinkConfig {
             mode: moosicbox_log_runtime::init::FileMode::Exact("bmux.log"),
         });
+        // Commands that enter raw terminal mode (attach, connect, join, etc.)
+        // must not write tracing output to stderr — it would corrupt the TUI.
+        // All log output is still captured in the log file at
+        // ~/Library/Logs/bmux/bmux.log (macOS) or ~/.local/state/bmux/logs/
+        // (Linux).  Non-raw-mode commands keep stderr for interactive debugging.
+        if file_only {
+            log_config.sinks.stderr = false;
+        }
         match moosicbox_log_runtime::init::init(log_config) {
             Ok(handle) => {
                 let _ = LOG_WRITER_GUARD.set(handle);

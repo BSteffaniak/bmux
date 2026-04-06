@@ -161,6 +161,38 @@ enum TerminalProfile {
     Conservative,
 }
 
+/// Returns `true` for commands that enter raw terminal mode (TUI attach
+/// sessions).  When `command` is `None` the default attach path is taken,
+/// which always enters raw mode.
+const fn command_enters_raw_mode(command: Option<&bmux_cli_schema::Command>) -> bool {
+    use bmux_cli_schema::{
+        Command, LogsCommand, PlaybookCommand, RecordingCommand, SessionCommand,
+    };
+    let Some(cmd) = command else {
+        // Default path (no subcommand) = attach to server.
+        return true;
+    };
+    matches!(
+        cmd,
+        Command::Attach { .. }
+            | Command::Connect { .. }
+            | Command::Join { .. }
+            | Command::Host { .. }
+            | Command::Session {
+                command: SessionCommand::Attach { .. }
+            }
+            | Command::Recording {
+                command: RecordingCommand::Replay { .. }
+            }
+            | Command::Playbook {
+                command: PlaybookCommand::Run { .. } | PlaybookCommand::Interactive { .. }
+            }
+            | Command::Logs {
+                command: LogsCommand::Watch { .. }
+            }
+    )
+}
+
 pub async fn run() -> Result<u8> {
     match parse_runtime_cli()? {
         ParsedRuntimeCli::BuiltIn {
@@ -168,7 +200,8 @@ pub async fn run() -> Result<u8> {
             log_level,
             verbose,
         } => {
-            init_logging(verbose, Some(log_level));
+            let file_only = command_enters_raw_mode(cli.command.as_ref());
+            init_logging(verbose, Some(log_level), file_only);
             validate_record_bootstrap_flags(&cli)?;
             let connection_context = ConnectionContext::new(cli.target.as_deref());
             if should_proxy_to_target(&cli).await? {
@@ -196,7 +229,7 @@ pub async fn run() -> Result<u8> {
             command_name,
             arguments,
         } => {
-            init_logging(false, Some(log_level));
+            init_logging(false, Some(log_level), false);
             run_plugin_command(&plugin_id, &command_name, &arguments).await
         }
         ParsedRuntimeCli::ImmediateExit {
