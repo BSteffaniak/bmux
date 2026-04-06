@@ -701,9 +701,7 @@ mod tests {
     #[test]
     fn pane_term_falls_back_to_xterm_then_screen() {
         let resolved = resolve_pane_term_with_checker("bmux-256color", |term| match term {
-            "bmux-256color" => Some(false),
-            "xterm-256color" => Some(true),
-            "screen-256color" => Some(true),
+            "xterm-256color" | "screen-256color" => Some(true),
             _ => Some(false),
         });
 
@@ -714,8 +712,6 @@ mod tests {
     #[test]
     fn pane_term_uses_screen_when_xterm_unavailable() {
         let resolved = resolve_pane_term_with_checker("bmux-256color", |term| match term {
-            "bmux-256color" => Some(false),
-            "xterm-256color" => Some(false),
             "screen-256color" => Some(true),
             _ => Some(false),
         });

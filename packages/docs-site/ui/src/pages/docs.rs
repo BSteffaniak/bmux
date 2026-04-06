@@ -439,7 +439,7 @@ fn render_section_with_fields(
             }
         } else {
             match raw_default {
-                Some(v) if v.is_empty() => "*(empty)*".to_string(),
+                Some("") => "*(empty)*".to_string(),
                 Some(v) => format!("`{v}`"),
                 None => "—".to_string(),
             }

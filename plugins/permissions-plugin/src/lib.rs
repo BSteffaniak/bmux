@@ -30,7 +30,7 @@ impl RustPlugin for PermissionsPlugin {
                 Ok(CommandAckResponse { ok: true })
             },
             "permission-command/v1", "revoke" => |req: RevokeRequest, ctx| {
-                revoke_entry(ctx, req)
+                revoke_entry(ctx, &req)
                     .map_err(|e| ServiceResponse::error("revoke_failed", e))?;
                 Ok(CommandAckResponse { ok: true })
             },
@@ -52,7 +52,7 @@ impl RustPlugin for PermissionsPlugin {
                 Ok(CommandAckResponse { ok: true })
             },
             "session-policy-command/v1", "revoke-hot-path-override" => |req: RevokeHotPathOverrideRequest, ctx| {
-                revoke_hot_path_override(ctx, req)
+                revoke_hot_path_override(ctx, &req)
                     .map_err(|e| ServiceResponse::error("revoke_hot_path_override_failed", e))?;
                 Ok(CommandAckResponse { ok: true })
             },
@@ -60,6 +60,7 @@ impl RustPlugin for PermissionsPlugin {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
     match context.command.as_str() {
         "permissions" => {
@@ -111,7 +112,7 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
                 session: required_option_value(&context.arguments, "session")?,
                 client: required_option_value(&context.arguments, "client")?,
             };
-            revoke_entry(context, request)?;
+            revoke_entry(context, &request)?;
             println!("revoked permission");
             Ok(())
         }
@@ -137,7 +138,7 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
                 session: option_value(&context.arguments, "session"),
                 context: option_value(&context.arguments, "context"),
             };
-            revoke_hot_path_override(context, request)?;
+            revoke_hot_path_override(context, &request)?;
             println!("revoked hot-path override");
             Ok(())
         }
@@ -197,7 +198,7 @@ fn handle_command(context: &NativeCommandContext) -> Result<(), String> {
                 .as_deref()
                 .map(parse_iterations)
                 .transpose()?
-                .unwrap_or(usize::from(!watch));
+                .unwrap_or_else(|| usize::from(!watch));
 
             watch_hot_path_policy_decision(
                 context,
@@ -281,7 +282,7 @@ fn grant_entry(caller: &impl HostRuntimeApi, request: GrantRequest) -> Result<()
     save_state(caller, &state)
 }
 
-fn revoke_entry(caller: &impl HostRuntimeApi, request: RevokeRequest) -> Result<(), String> {
+fn revoke_entry(caller: &impl HostRuntimeApi, request: &RevokeRequest) -> Result<(), String> {
     let session_id = resolve_session_id(caller, &request.session)?;
     let mut state = load_state(caller)?;
     if let Some(entries) = state.by_session_id.get_mut(&session_id) {
@@ -309,13 +310,13 @@ fn evaluate_policy(
         .into_iter()
         .find(|entry| entry.client_id == client_key);
 
-    let decision = match entry.as_ref().map(|entry| entry.role.as_str()) {
-        None => SessionPolicyCheckResponse {
+    let decision = entry.as_ref().map(|entry| entry.role.as_str()).map_or(
+        SessionPolicyCheckResponse {
             allowed: true,
             reason: None,
         },
-        Some(role) => evaluate_role_action(role, request.action.as_str()),
-    };
+        |role| evaluate_role_action(role, request.action.as_str()),
+    );
     Ok(decision)
 }
 
@@ -432,7 +433,7 @@ fn grant_hot_path_override(
 
 fn revoke_hot_path_override(
     caller: &impl HostRuntimeApi,
-    request: RevokeHotPathOverrideRequest,
+    request: &RevokeHotPathOverrideRequest,
 ) -> Result<(), String> {
     validate_hot_path_override_fields(
         &request.plugin_id,
@@ -760,6 +761,7 @@ enum PolicyActionKind {
     Unknown,
 }
 
+#[allow(clippy::match_same_arms)] // Role/action matrix intentionally lists each combination explicitly
 fn evaluate_role_action(role: &str, action: &str) -> SessionPolicyCheckResponse {
     let action_kind = classify_action(action);
     match (role, action_kind) {
@@ -816,10 +818,10 @@ fn load_state(caller: &impl HostRuntimeApi) -> Result<StoredPermissions, String>
             key: PERMISSIONS_STORAGE_KEY.to_string(),
         })
         .map_err(|error| error.to_string())?;
-    match response.value {
-        Some(value) => decode_service_message(&value).map_err(|error| error.to_string()),
-        None => Ok(StoredPermissions::with_default()),
-    }
+    response.value.map_or_else(
+        || Ok(StoredPermissions::with_default()),
+        |value| decode_service_message(&value).map_err(|error| error.to_string()),
+    )
 }
 
 fn save_state(caller: &impl HostRuntimeApi, state: &StoredPermissions) -> Result<(), String> {
@@ -1045,7 +1047,7 @@ mod tests {
         HostMetadata, HostScope, NativeServiceContext, ProviderId, RegisteredService, ServiceKind,
         ServiceRequest, SessionListResponse, SessionSummary,
     };
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
     struct MockHost {
@@ -1064,7 +1066,7 @@ mod tests {
                     client_count: 1,
                 }],
                 contexts: vec![ContextSummary {
-                    id: Uuid::from_u128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbbbbbbbbbb),
+                    id: Uuid::from_u128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb),
                     name: Some("default".to_string()),
                     attributes: BTreeMap::new(),
                 }],
@@ -1076,7 +1078,7 @@ mod tests {
         fn with_sessions(sessions: Vec<SessionSummary>) -> Self {
             Self {
                 contexts: vec![ContextSummary {
-                    id: Uuid::from_u128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbbbbbbbbbb),
+                    id: Uuid::from_u128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb),
                     name: Some("default".to_string()),
                     attributes: BTreeMap::new(),
                 }],
@@ -1093,7 +1095,7 @@ mod tests {
             Self {
                 sessions,
                 contexts: vec![ContextSummary {
-                    id: Uuid::from_u128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbbbbbbbbbb),
+                    id: Uuid::from_u128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb),
                     name: Some("default".to_string()),
                     attributes: BTreeMap::new(),
                 }],
@@ -1216,13 +1218,11 @@ mod tests {
             }),
         };
 
-        let encoded = match bmux_ipc::encode(&response) {
-            Ok(encoded) => encoded,
-            Err(_) => return 1,
+        let Ok(encoded) = bmux_ipc::encode(&response) else {
+            return 1;
         };
-        let output = match encode_service_message(&BridgeResponse { payload: encoded }) {
-            Ok(output) => output,
-            Err(_) => return 1,
+        let Ok(output) = encode_service_message(&BridgeResponse { payload: encoded }) else {
+            return 1;
         };
 
         if output.len() > output_capacity {
@@ -1249,7 +1249,7 @@ mod tests {
         payload: Vec<u8>,
         capability: &str,
         kind: ServiceKind,
-        data_dir: &PathBuf,
+        data_dir: &Path,
     ) -> NativeServiceContext {
         let host_services = vec![
             RegisteredService {
@@ -1658,7 +1658,7 @@ mod tests {
         .expect("grant should succeed");
         revoke_entry(
             &host,
-            RevokeRequest {
+            &RevokeRequest {
                 session: "alpha".to_string(),
                 client: client_id.to_string(),
             },
@@ -2029,7 +2029,7 @@ mod tests {
     #[test]
     fn hot_path_execution_denies_interpreter_without_override() {
         let session_id = Uuid::new_v4();
-        let context_id = Uuid::from_u128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbbbbbbbbbb);
+        let context_id = Uuid::from_u128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb);
         let host = MockHost::with_session(session_id, "alpha");
         let decision = evaluate_policy(
             &host,
@@ -2051,7 +2051,7 @@ mod tests {
     #[test]
     fn hot_path_execution_allows_with_scoped_override() {
         let session_id = Uuid::new_v4();
-        let context_id = Uuid::from_u128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbbbbbbbbbb);
+        let context_id = Uuid::from_u128(0xbbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb_bbbb);
         let host = MockHost::with_session(session_id, "alpha");
         grant_hot_path_override(
             &host,

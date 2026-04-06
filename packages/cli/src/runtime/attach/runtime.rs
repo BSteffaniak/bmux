@@ -5459,6 +5459,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn attach_key_event_action_maps_prefixed_runtime_defaults() {
         let mut processor =
             InputProcessor::new(attach_keymap_from_config(&BmuxConfig::default()), false);

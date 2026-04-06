@@ -1601,6 +1601,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)] // Test assertions with exact expected values
     fn replay_speed_normalization_clamps_invalid_values() {
         assert_eq!(normalize_replay_speed(0.0), 1.0);
         assert_eq!(normalize_replay_speed(-4.0), 1.0);

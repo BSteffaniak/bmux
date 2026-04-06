@@ -9182,6 +9182,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::too_many_lines, clippy::significant_drop_tightening)]
     async fn exited_pane_keeps_layout_and_restart_reuses_same_pane_id() {
         let server = BmuxServer::new(test_endpoint());
         let client_id = ClientId::new();

@@ -226,6 +226,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::approx_constant)] // 3.14 is a test value, not an approximation of PI
     fn parse_cli_value_detects_types() {
         assert!(parse_cli_value("true").as_bool().unwrap());
         assert!(!parse_cli_value("false").as_bool().unwrap());

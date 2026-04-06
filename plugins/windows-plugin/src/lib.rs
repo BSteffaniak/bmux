@@ -57,6 +57,7 @@ impl RustPlugin for WindowsPlugin {
     }
 }
 
+#[allow(clippy::too_many_lines)]
 fn handle_command(
     plugin: &mut WindowsPlugin,
     context: &NativeCommandContext,
@@ -300,6 +301,7 @@ fn kill_all_windows(
     Ok(WindowCommandAck { ok: true, id: None })
 }
 
+#[allow(clippy::needless_pass_by_value)] // Plugin command dispatch passes owned selector from deserialized request
 fn switch_window(
     caller: &impl HostRuntimeApi,
     selector: ContextSelector,
@@ -334,6 +336,7 @@ fn switch_window(
     })
 }
 
+#[allow(clippy::needless_pass_by_value)] // Plugin command dispatch passes owned direction from deserialized request
 fn cycle_window(
     caller: &impl HostRuntimeApi,
     direction: WindowCycleDirection,
@@ -532,6 +535,7 @@ fn set_stored_context_id(
 }
 
 #[cfg(test)]
+#[allow(clippy::needless_pass_by_value)] // Test helper; owned selector from deserialized request
 fn resolve_session_id(
     caller: &impl HostRuntimeApi,
     selector: ContextSelector,
@@ -642,6 +646,7 @@ mod tests {
         payload: Vec<u8>,
     }
 
+    #[allow(clippy::too_many_lines)]
     unsafe extern "C" fn service_test_kernel_bridge(
         input_ptr: *const u8,
         input_len: usize,
@@ -743,13 +748,11 @@ mod tests {
             }),
         };
 
-        let encoded = match bmux_ipc::encode(&response) {
-            Ok(encoded) => encoded,
-            Err(_) => return 1,
+        let Ok(encoded) = bmux_ipc::encode(&response) else {
+            return 1;
         };
-        let output = match encode_service_message(&BridgeResponse { payload: encoded }) {
-            Ok(output) => output,
-            Err(_) => return 1,
+        let Ok(output) = encode_service_message(&BridgeResponse { payload: encoded }) else {
+            return 1;
         };
 
         if output.len() > output_capacity {
@@ -920,6 +923,7 @@ mod tests {
     }
 
     impl ServiceCaller for MockHost {
+        #[allow(clippy::too_many_lines)]
         fn call_service_raw(
             &self,
             _capability: &str,
@@ -1124,7 +1128,11 @@ mod tests {
         let ack = create_window(&host, Some("dev".to_string())).expect("create should succeed");
         assert!(ack.ok);
         assert!(ack.id.is_some());
-        let creates = host.creates.lock().expect("create log lock should succeed");
+        let creates: Vec<_> = host
+            .creates
+            .lock()
+            .expect("create log lock should succeed")
+            .clone();
         assert_eq!(creates.as_slice(), &[Some("dev".to_string())]);
     }
 
@@ -1133,9 +1141,12 @@ mod tests {
         let host = MockHost::with_sessions(sample_sessions());
         let ack = kill_all_windows(&host, true).expect("kill all should succeed");
         assert!(ack.ok);
-        let kills = host.kills.lock().expect("kill log lock should succeed");
-        assert_eq!(kills.len(), 2);
-        assert!(kills.iter().all(|request| request.force));
+        let (kill_count, all_force) = {
+            let kills = host.kills.lock().expect("kill log lock should succeed");
+            (kills.len(), kills.iter().all(|request| request.force))
+        };
+        assert_eq!(kill_count, 2);
+        assert!(all_force);
     }
 
     #[test]
@@ -1153,10 +1164,19 @@ mod tests {
         let target_text = target.to_string();
         assert_eq!(ack.id.as_deref(), Some(target_text.as_str()));
 
-        let kills = host.kills.lock().expect("kill log lock should succeed");
-        assert_eq!(kills.len(), 1);
-        assert!(matches!(kills[0].selector, SessionSelector::ById(id) if id == target));
-        assert!(kills[0].force);
+        let (kill_count, first_matches_target, first_force) = {
+            let kills = host.kills.lock().expect("kill log lock should succeed");
+            (
+                kills.len(),
+                kills.first().is_some_and(
+                    |k| matches!(k.selector, SessionSelector::ById(id) if id == target),
+                ),
+                kills.first().is_some_and(|k| k.force),
+            )
+        };
+        assert_eq!(kill_count, 1);
+        assert!(first_matches_target);
+        assert!(first_force);
     }
 
     #[test]
@@ -1189,7 +1209,11 @@ mod tests {
         let target_text = target_id.to_string();
         assert_eq!(ack.id.as_deref(), Some(target_text.as_str()));
 
-        let selects = host.selects.lock().expect("select log lock should succeed");
+        let selects: Vec<_> = host
+            .selects
+            .lock()
+            .expect("select log lock should succeed")
+            .clone();
         assert_eq!(selects.as_slice(), &[target_id]);
     }
 
@@ -1540,15 +1564,24 @@ mod tests {
         assert_eq!(ack.id.as_deref(), Some(first_text.as_str()));
 
         // Verify that a context select was issued (switch to fallback window)
-        let selects = host.selects.lock().expect("select log lock should succeed");
-        assert!(
-            !selects.is_empty(),
-            "should have switched to a fallback window"
-        );
+        let has_selects = !host
+            .selects
+            .lock()
+            .expect("select log lock should succeed")
+            .is_empty();
+        assert!(has_selects, "should have switched to a fallback window");
 
         // Verify that the current window was closed
-        let kills = host.kills.lock().expect("kill log lock should succeed");
-        assert_eq!(kills.len(), 1);
-        assert!(matches!(kills[0].selector, SessionSelector::ById(id) if id == first_id));
+        let (kill_count, first_kill_matches) = {
+            let kills = host.kills.lock().expect("kill log lock should succeed");
+            (
+                kills.len(),
+                kills.first().is_some_and(
+                    |k| matches!(k.selector, SessionSelector::ById(id) if id == first_id),
+                ),
+            )
+        };
+        assert_eq!(kill_count, 1);
+        assert!(first_kill_matches);
     }
 }

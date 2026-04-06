@@ -1659,6 +1659,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn plugin_lifecycle_context_uses_plugin_specific_settings() {
         let mut config = BmuxConfig::default();
         config
@@ -1819,6 +1820,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn plugin_command_context_includes_capability_sets() {
         let config = BmuxConfig::default();
         let paths = ConfigPaths::new(
@@ -2217,6 +2219,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::iter_on_single_items)]
     fn plugin_fallback_new_context_id_returns_single_new_context() {
         let before = [Uuid::from_u128(1)]
             .into_iter()
@@ -2238,6 +2241,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::iter_on_single_items)]
     fn plugin_fallback_new_context_id_prefers_after_context_when_multiple_new() {
         let before = [Uuid::from_u128(1)]
             .into_iter()
@@ -2259,6 +2263,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::iter_on_single_items)]
     fn plugin_fallback_new_context_id_ignores_when_outcome_applied() {
         let before = [Uuid::from_u128(1)]
             .into_iter()

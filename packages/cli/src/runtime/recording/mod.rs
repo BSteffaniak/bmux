@@ -1967,7 +1967,7 @@ fn export_recording_gif(
                         feature = "image-iterm2"
                     ))]
                     {
-                        active_images = images.clone();
+                        active_images.clone_from(images);
                     }
                     let _ = images; // suppress unused warning when no image features
                     frame_had_display_change = true;
@@ -4087,7 +4087,7 @@ fn overlay_display_track_images(
     feature = "image-kitty",
     feature = "image-iterm2"
 ))]
-#[allow(clippy::cast_possible_truncation)]
+#[allow(clippy::cast_possible_truncation, clippy::too_many_arguments)]
 fn blit_rgba(
     dst: &mut [u8],
     dst_w: u32,
@@ -4401,6 +4401,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::float_cmp)] // Test assertions with exact expected values
     fn build_render_options_uses_terminal_profile_defaults() {
         let profile = terminal_profile::DetectedTerminalProfile {
             terminal_id: "ghostty".to_string(),
