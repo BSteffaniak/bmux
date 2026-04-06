@@ -6,7 +6,7 @@ description = "bmux documentation website"
 edition     = { workspace = true }
 keywords    = ["bmux", "documentation", "site"]
 license     = { workspace = true }
-name        = "bmux-docs-site"
+name        = "bmux_docs_site"
 readme      = "README.md"
 repository  = { workspace = true }
 version     = { workspace = true }

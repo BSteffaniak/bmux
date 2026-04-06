@@ -30,7 +30,7 @@ jobs:
               uses: dtolnay/rust-toolchain@stable
 
             - name: Generate static site
-              run: cargo run --release -p bmux-docs-site -- gen --output dist
+              run: cargo run --release -p bmux_docs_site -- gen --output dist
 
             - name: Deploy to Cloudflare Pages
               uses: cloudflare/wrangler-action@v3
