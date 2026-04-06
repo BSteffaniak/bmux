@@ -437,6 +437,22 @@ pub async fn run_session_attach_with_client(
                 ) {
                     pane_output_pending = true;
                     // Fall through to post-event processing (no event dispatch needed).
+                } else if let bmux_client::ServerEvent::PaneOutput {
+                    pane_id,
+                    ref data,
+                    ..
+                } = server_event
+                {
+                    // Inline output push — apply directly without a fetch
+                    // round-trip.  The server already read from our per-client
+                    // cursor and cleared output_dirty.
+                    let mut render = false;
+                    apply_attach_output_bytes(
+                        &mut view_state,
+                        pane_id,
+                        data,
+                        &mut render,
+                    );
                 } else if matches!(
                     server_event,
                     bmux_client::ServerEvent::PaneImageAvailable { .. }
@@ -3817,25 +3833,22 @@ pub async fn handle_attach_terminal_event(
                             ATTACH_TRANSIENT_STATUS_TTL,
                         );
                     }
-                    match client.attach_input(view_state.attached_id, bytes).await {
-                        Ok(()) => {
-                            display_capture.record_activity(bmux_ipc::DisplayActivityKind::Input);
-                        }
-                        Err(error)
-                            if is_attach_stream_closed_error(&error)
-                                || is_attach_not_attached_runtime_error(&error) =>
-                        {
-                            return Ok(AttachLoopControl::Break(AttachExitReason::StreamClosed));
-                        }
-                        Err(error) if is_attach_active_pane_closed_error(&error) => {
-                            view_state.set_transient_status(
-                                "focused pane process exited; use restart pane or close pane",
-                                Instant::now(),
-                                ATTACH_TRANSIENT_STATUS_TTL,
-                            );
-                        }
-                        Err(error) => return Err(map_attach_client_error(error)),
+                    // Fire-and-forget: send input without waiting for the
+                    // round-trip acknowledgement.  Critical failures
+                    // (session removed, pane exited) are detected via
+                    // server-pushed events rather than per-keystroke
+                    // responses.  Only transport-level send failures are
+                    // treated as fatal here.
+                    if let Err(error) = client
+                        .send_one_way(bmux_ipc::Request::AttachInput {
+                            session_id: view_state.attached_id,
+                            data: bytes,
+                        })
+                        .await
+                    {
+                        return Err(map_attach_client_error(error));
                     }
+                    display_capture.record_activity(bmux_ipc::DisplayActivityKind::Input);
                 }
             }
             AttachEventAction::Runtime(action) => {
@@ -4818,14 +4831,6 @@ pub fn is_attach_not_attached_runtime_error(error: &ClientError) -> bool {
         error,
         ClientError::ServerError { message, .. }
             if message.contains("not attached to session runtime")
-    )
-}
-
-pub fn is_attach_active_pane_closed_error(error: &ClientError) -> bool {
-    matches!(
-        error,
-        ClientError::ServerError { message, .. }
-            if message.contains("active pane is closed")
     )
 }
 #[cfg(test)]

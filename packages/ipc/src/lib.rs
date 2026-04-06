@@ -1326,6 +1326,16 @@ pub enum Event {
         session_id: Uuid,
         pane_id: Uuid,
     },
+    /// Inline pane output pushed by the server.  Carries the actual output
+    /// bytes so the client does not need a round-trip fetch.  The event push
+    /// task reads from the per-client output cursor and includes the data
+    /// directly, eliminating the `AttachPaneOutputBatch` request-response
+    /// for the normal streaming path.
+    PaneOutput {
+        session_id: Uuid,
+        pane_id: Uuid,
+        data: Vec<u8>,
+    },
     /// Notification that pane image state has changed (new images placed,
     /// images removed, or positions shifted).  Streaming clients use this
     /// to fetch image deltas on demand instead of polling every frame.

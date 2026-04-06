@@ -2586,6 +2586,7 @@ fn event_matches(event: &bmux_ipc::Event, name: &str) -> bool {
                 bmux_ipc::Event::PaneOutputAvailable { .. },
                 "pane_output_available"
             )
+            | (bmux_ipc::Event::PaneOutput { .. }, "pane_output")
             | (
                 bmux_ipc::Event::PaneImageAvailable { .. },
                 "pane_image_available"

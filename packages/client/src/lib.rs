@@ -1785,7 +1785,10 @@ impl StreamingBmuxClient {
                             }
                         }
                     } else {
-                        warn!(
+                        // Expected when the caller used send_one_way() — the
+                        // server still sends a response but we have no pending
+                        // entry.  Log at trace to avoid noise.
+                        trace!(
                             request_id = envelope.request_id,
                             "streaming client received response for unknown request id"
                         );
@@ -1887,6 +1890,34 @@ impl StreamingBmuxClient {
         let request_id = self.next_request_id;
         self.next_request_id = self.next_request_id.wrapping_add(1).max(1);
         request_id
+    }
+
+    /// Send a request without waiting for a response.
+    ///
+    /// The server may still send a response, but the client will silently
+    /// discard it.  Use this for latency-sensitive operations where the
+    /// response carries no essential information (e.g. `AttachInput` where
+    /// the normal response is just `AttachInputAccepted`).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the frame cannot be written to the transport.
+    pub async fn send_one_way(&mut self, request: Request) -> Result<()> {
+        let request_id = self.take_request_id();
+        let request_kind = request_kind_name(&request);
+        trace!(
+            request_id,
+            request = request_kind,
+            "streaming_ipc.one_way.send"
+        );
+        let payload = encode(&request)?;
+        let envelope = Envelope::new(request_id, EnvelopeKind::Request, payload);
+        // Deliberately do NOT register in self.pending — the response (if
+        // any) will be silently dropped by the reader task.
+        self.writer
+            .send_envelope(&envelope)
+            .await
+            .map_err(ClientError::Transport)
     }
 
     // ── Event push control ───────────────────────────────────────────────

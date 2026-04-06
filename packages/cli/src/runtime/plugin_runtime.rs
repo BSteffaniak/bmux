@@ -929,7 +929,11 @@ pub(super) async fn plugin_event_bridge_loop(
                     return Ok(()); // server disconnected
                 };
                 // Skip high-frequency pane output notifications for plugins.
-                if matches!(event, bmux_client::ServerEvent::PaneOutputAvailable { .. }) {
+                if matches!(
+                    event,
+                    bmux_client::ServerEvent::PaneOutputAvailable { .. }
+                        | bmux_client::ServerEvent::PaneOutput { .. }
+                ) {
                     continue;
                 }
                 dispatch_loaded_plugin_event(loaded_plugins, &plugin_event_from_server_event(&event)?)?;
@@ -965,6 +969,7 @@ pub(super) const fn plugin_event_kind_from_server_event(
         | bmux_client::ServerEvent::ClientDetached { .. } => PluginEventKind::Client,
         bmux_client::ServerEvent::AttachViewChanged { .. }
         | bmux_client::ServerEvent::PaneOutputAvailable { .. }
+        | bmux_client::ServerEvent::PaneOutput { .. }
         | bmux_client::ServerEvent::PaneImageAvailable { .. }
         | bmux_client::ServerEvent::PaneExited { .. }
         | bmux_client::ServerEvent::PaneRestarted { .. } => PluginEventKind::Pane,

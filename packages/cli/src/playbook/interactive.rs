@@ -2592,6 +2592,7 @@ const fn server_event_name(event: &bmux_client::ServerEvent) -> &'static str {
         bmux_client::ServerEvent::FollowTargetChanged { .. } => "follow_target_changed",
         bmux_client::ServerEvent::AttachViewChanged { .. } => "attach_view_changed",
         bmux_client::ServerEvent::PaneOutputAvailable { .. } => "pane_output_available",
+        bmux_client::ServerEvent::PaneOutput { .. } => "pane_output",
         bmux_client::ServerEvent::PaneImageAvailable { .. } => "pane_image_available",
         bmux_client::ServerEvent::PaneExited { .. } => "pane_exited",
         bmux_client::ServerEvent::PaneRestarted { .. } => "pane_restarted",

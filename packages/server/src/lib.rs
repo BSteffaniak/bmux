@@ -4199,15 +4199,67 @@ async fn handle_connection(
 
         // After responding to EnableEventPush, spawn the event push task.
         // It receives events from the broadcast channel and forwards them
-        // as serialized frames through the writer channel — no mutex needed.
+        // as serialized frames through the writer channel.
+        //
+        // For `PaneOutputAvailable` events, the task reads the actual output
+        // data from the per-client cursor in the pane's OutputFanoutBuffer
+        // and sends it inline as a `PaneOutput` event.  This eliminates the
+        // round-trip `AttachPaneOutputBatch` request the client would
+        // otherwise need, reducing output latency to a single one-way push.
         if is_enable_push && event_push_task.is_none() {
             let mut event_rx = state.event_broadcast.subscribe();
             let push_frame_tx = frame_tx.clone();
             let push_frame_codec = negotiated_frame_codec.clone();
+            let push_state = Arc::clone(&state);
+            let push_client_id = client_id;
             event_push_task = Some(tokio::spawn(async move {
                 loop {
                     match event_rx.recv().await {
                         Ok(event) => {
+                            // For pane output notifications, read the actual
+                            // data from the buffer and send it inline.
+                            let event = match event {
+                                Event::PaneOutputAvailable {
+                                    session_id,
+                                    pane_id,
+                                } => {
+                                    let data = {
+                                        let Ok(runtime_mgr) = push_state.session_runtimes.lock()
+                                        else {
+                                            continue;
+                                        };
+                                        let Some(runtime) =
+                                            runtime_mgr.runtimes.get(&SessionId(session_id))
+                                        else {
+                                            continue;
+                                        };
+                                        // Only read output for panes in
+                                        // sessions this client is attached to.
+                                        if !runtime.attached_clients.contains(&push_client_id) {
+                                            continue;
+                                        }
+                                        let Some(pane) = runtime.panes.get(&pane_id) else {
+                                            continue;
+                                        };
+                                        pane.output_dirty
+                                            .store(false, std::sync::atomic::Ordering::SeqCst);
+                                        let Ok(mut buf) = pane.output_buffer.lock() else {
+                                            continue;
+                                        };
+                                        buf.read_for_client(push_client_id, RESPONSE_OUTPUT_BUDGET)
+                                    };
+                                    if data.bytes.is_empty() {
+                                        continue;
+                                    }
+                                    Event::PaneOutput {
+                                        session_id,
+                                        pane_id,
+                                        data: data.bytes,
+                                    }
+                                }
+                                other => other,
+                            };
+
                             let Ok(payload) = encode(&event) else {
                                 continue;
                             };
@@ -4280,6 +4332,7 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
         Event::FollowTargetChanged { session_id, .. }
         | Event::AttachViewChanged { session_id, .. }
         | Event::PaneOutputAvailable { session_id, .. }
+        | Event::PaneOutput { session_id, .. }
         | Event::PaneImageAvailable { session_id, .. }
         | Event::PaneExited { session_id, .. }
         | Event::PaneRestarted { session_id, .. } => Some(*session_id),
