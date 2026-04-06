@@ -1102,9 +1102,6 @@ struct CellMetrics {
     height: u16,
 }
 
-const DEFAULT_EXPORT_COLS: u16 = 80;
-const DEFAULT_EXPORT_ROWS: u16 = 24;
-
 fn resolve_export_cell_metrics(
     events: &[DisplayTrackEnvelope],
     cell_size: Option<(u16, u16)>,
@@ -1239,7 +1236,7 @@ fn capture_stream_open_metrics() -> (Option<u16>, Option<u16>, Option<u16>, Opti
     )
 }
 
-fn infer_export_terminal_bounds(events: &[DisplayTrackEnvelope]) -> (u16, u16) {
+fn infer_export_terminal_bounds(events: &[DisplayTrackEnvelope]) -> Result<(u16, u16)> {
     let mut resize_bounds = None::<(u16, u16)>;
     let mut stream_bounds = None::<(u16, u16)>;
     let mut cursor_cols = 0_u16;
@@ -1299,22 +1296,16 @@ fn infer_export_terminal_bounds(events: &[DisplayTrackEnvelope]) -> (u16, u16) {
     }
 
     if let Some((cols, rows)) = resize_bounds {
-        return (cols, rows);
+        return Ok((cols, rows));
     }
 
-    let mut cols = DEFAULT_EXPORT_COLS;
-    let mut rows = DEFAULT_EXPORT_ROWS;
     if let Some((stream_cols, stream_rows)) = stream_bounds {
-        cols = cols.max(stream_cols);
-        rows = rows.max(stream_rows);
+        return Ok((stream_cols.max(cursor_cols), stream_rows.max(cursor_rows)));
     }
-    if cursor_cols > 0 {
-        cols = cols.max(cursor_cols);
-    }
-    if cursor_rows > 0 {
-        rows = rows.max(cursor_rows);
-    }
-    (cols, rows)
+
+    anyhow::bail!(
+        "recording export cannot infer terminal bounds: display track is missing resize events and stream-opened grid metrics"
+    )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2015,7 +2006,7 @@ fn export_recording_gif(
         color_override: resolved_color_override,
     };
 
-    let (max_cols, max_rows) = infer_export_terminal_bounds(events);
+    let (max_cols, max_rows) = infer_export_terminal_bounds(events)?;
 
     let cell_metrics = resolve_export_cell_metrics(events, cell_size, cell_width, cell_height)?;
     let cell_w = cell_metrics.width;
@@ -4699,7 +4690,7 @@ mod tests {
             },
             cursor_snapshot(3, 213, 57),
         ];
-        assert_eq!(infer_export_terminal_bounds(&events), (120, 40));
+        assert_eq!(infer_export_terminal_bounds(&events).unwrap(), (120, 40));
     }
 
     #[test]
@@ -4708,16 +4699,29 @@ mod tests {
             stream_opened(Some(16), Some(35), Some(3440), Some(2150)),
             frame_bytes(2),
         ];
-        assert_eq!(infer_export_terminal_bounds(&events), (215, 61));
+        assert_eq!(infer_export_terminal_bounds(&events).unwrap(), (215, 61));
     }
 
     #[test]
-    fn infer_export_terminal_bounds_uses_cursor_when_resize_and_stream_grid_missing() {
+    fn infer_export_terminal_bounds_expands_stream_bounds_with_cursor_extent() {
+        let events = vec![
+            stream_opened(Some(10), Some(25), Some(800), Some(600)),
+            cursor_snapshot(2, 100, 30),
+        ];
+        assert_eq!(infer_export_terminal_bounds(&events).unwrap(), (101, 31));
+    }
+
+    #[test]
+    fn infer_export_terminal_bounds_errors_when_resize_and_stream_grid_missing() {
         let events = vec![
             stream_opened(None, None, Some(3440), Some(2150)),
             cursor_snapshot(2, 189, 28),
         ];
-        assert_eq!(infer_export_terminal_bounds(&events), (190, 29));
+        let err = infer_export_terminal_bounds(&events).expect_err("missing bounds should fail");
+        assert!(
+            err.to_string().contains("cannot infer terminal bounds"),
+            "error should explain why export cannot proceed"
+        );
     }
 
     #[test]
