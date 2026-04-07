@@ -3,14 +3,22 @@
 #![allow(clippy::multiple_crate_versions)]
 #![cfg_attr(feature = "static-bundled", allow(dead_code))]
 
+use bmux_cli::attach::{
+    self as attach_prompt, PromptOption, PromptRequest, PromptResponse, PromptSubmitError,
+    PromptValue,
+};
 use bmux_cli_output::{Table, TableColumn, write_table};
 use bmux_plugin::ServiceCaller;
 use bmux_plugin_sdk::EXIT_USAGE;
 use bmux_plugin_sdk::prelude::*;
 use serde::{Deserialize, Serialize};
+use std::time::{Duration, Instant};
 
 #[derive(Default)]
 struct ExamplePlugin;
+
+const PROMPT_HOST_WAIT_TIMEOUT: Duration = Duration::from_secs(8);
+const PROMPT_HOST_WAIT_POLL: Duration = Duration::from_millis(75);
 
 impl RustPlugin for ExamplePlugin {
     fn run_command(&mut self, context: NativeCommandContext) -> Result<i32, PluginCommandError> {
@@ -23,6 +31,7 @@ impl RustPlugin for ExamplePlugin {
             "settings-show" => Ok(run_settings_show(&context)),
             "storage-put" => Ok(run_storage_put(&context)),
             "storage-get" => Ok(run_storage_get(&context)),
+            "prompt-showcase" => Ok(run_prompt_showcase_command()),
             "hello" => {
                 if context.arguments.is_empty() {
                     println!("example.native: hello from bmux plugin");
@@ -403,6 +412,180 @@ fn run_storage_get(context: &NativeCommandContext) -> i32 {
     EXIT_OK
 }
 
+fn run_prompt_showcase_command() -> i32 {
+    spawn_prompt_showcase_task();
+    println!("example.native: prompt showcase task started");
+    EXIT_OK
+}
+
+fn spawn_prompt_showcase_task() {
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        std::mem::drop(handle.spawn(async {
+            print_prompt_showcase_result(run_prompt_showcase_sequence().await);
+        }));
+        return;
+    }
+
+    std::mem::drop(std::thread::spawn(|| {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build();
+        match runtime {
+            Ok(runtime) => {
+                let result = runtime.block_on(run_prompt_showcase_sequence());
+                print_prompt_showcase_result(result);
+            }
+            Err(error) => {
+                eprintln!("example.native: failed starting prompt showcase runtime: {error}");
+            }
+        }
+    }));
+}
+
+/// Run the plugin-provided prompt showcase sequence.
+///
+/// # Errors
+/// Returns an error string when the attach prompt host is unavailable,
+/// disconnects, or prompt delivery fails.
+pub async fn run_prompt_showcase_sequence() -> std::result::Result<Vec<String>, String> {
+    let mut lines = Vec::new();
+
+    let confirm = request_prompt_with_retry(|| {
+        PromptRequest::confirm("Plugin Prompt Showcase")
+            .message("These prompts are requested from example.native plugin code.")
+            .submit_label("Continue")
+            .cancel_label("Stop")
+            .confirm_default(true)
+            .confirm_labels("Continue", "Stop")
+    })
+    .await?;
+    lines.push(format_prompt_result_line("confirm", &confirm));
+
+    if !prompt_response_is_confirmed(&confirm) {
+        lines.push("showcase cancelled before running remaining prompt types".to_string());
+        return Ok(lines);
+    }
+
+    let text_input = request_prompt_with_retry(|| {
+        PromptRequest::text_input("Plugin Label")
+            .message("Enter a short label for this plugin-driven prompt run.")
+            .input_placeholder("plugin-demo")
+            .input_required(true)
+            .submit_label("Save")
+            .cancel_label("Skip")
+    })
+    .await?;
+    lines.push(format_prompt_result_line("text_input", &text_input));
+
+    let single_select = request_prompt_with_retry(|| {
+        PromptRequest::single_select(
+            "Plugin Theme",
+            vec![
+                PromptOption::new("classic", "Classic"),
+                PromptOption::new("compact", "Compact"),
+                PromptOption::new("focus", "Focus"),
+            ],
+        )
+        .message("Pick a display mode for this plugin demo.")
+        .single_default_index(0)
+        .submit_label("Select")
+        .cancel_label("Skip")
+    })
+    .await?;
+    lines.push(format_prompt_result_line("single_select", &single_select));
+
+    let multi_toggle = request_prompt_with_retry(|| {
+        PromptRequest::multi_toggle(
+            "Plugin Flags",
+            vec![
+                PromptOption::new("clipboard", "Clipboard sync"),
+                PromptOption::new("activity", "Activity hints"),
+                PromptOption::new("notifications", "Notifications"),
+                PromptOption::new("autofocus", "Auto focus new panes"),
+            ],
+        )
+        .message("Toggle one or more plugin-managed flags.")
+        .multi_defaults(vec![0, 1])
+        .multi_min_selected(1)
+        .submit_label("Apply")
+        .cancel_label("Skip")
+    })
+    .await?;
+    lines.push(format_prompt_result_line("multi_toggle", &multi_toggle));
+
+    let done = request_prompt_with_retry(|| {
+        PromptRequest::confirm("Plugin Showcase Complete")
+            .message("Plugin-provided prompts are complete. Press Ctrl+b then d to detach.")
+            .submit_label("Done")
+            .cancel_label("Repeat")
+            .confirm_default(true)
+            .confirm_labels("Done", "Repeat")
+    })
+    .await?;
+    lines.push(format_prompt_result_line("completion", &done));
+
+    Ok(lines)
+}
+
+async fn request_prompt_with_retry<F>(build: F) -> std::result::Result<PromptResponse, String>
+where
+    F: Fn() -> PromptRequest,
+{
+    let started = Instant::now();
+
+    loop {
+        match attach_prompt::request_prompt(build()).await {
+            Ok(response) => return Ok(response),
+            Err(PromptSubmitError::HostUnavailable)
+                if started.elapsed() < PROMPT_HOST_WAIT_TIMEOUT =>
+            {
+                tokio::time::sleep(PROMPT_HOST_WAIT_POLL).await;
+            }
+            Err(PromptSubmitError::HostUnavailable) => {
+                return Err("prompt host did not become available in time".to_string());
+            }
+            Err(PromptSubmitError::HostDisconnected) => {
+                return Err("prompt host disconnected while running plugin showcase".to_string());
+            }
+        }
+    }
+}
+
+const fn prompt_response_is_confirmed(response: &PromptResponse) -> bool {
+    matches!(
+        response,
+        PromptResponse::Submitted(PromptValue::Confirm(true))
+    )
+}
+
+fn format_prompt_result_line(label: &str, response: &PromptResponse) -> String {
+    let value = match response {
+        PromptResponse::Submitted(PromptValue::Confirm(value)) => format!("confirm={value}"),
+        PromptResponse::Submitted(PromptValue::Text(value)) => format!("text={value}"),
+        PromptResponse::Submitted(PromptValue::Single(value)) => format!("single={value}"),
+        PromptResponse::Submitted(PromptValue::Multi(values)) => {
+            format!("multi={}", values.join(", "))
+        }
+        PromptResponse::Cancelled => "cancelled".to_string(),
+        PromptResponse::RejectedBusy => "rejected_busy".to_string(),
+    };
+    format!("{label}: {value}")
+}
+
+fn print_prompt_showcase_result(result: std::result::Result<Vec<String>, String>) {
+    match result {
+        Ok(lines) => {
+            println!("example.native: prompt showcase completed");
+            for line in lines {
+                println!("example.native: {line}");
+            }
+        }
+        Err(error) => {
+            eprintln!("example.native: prompt showcase failed: {error}");
+        }
+    }
+}
+
 fn write_stdout_table(table: &Table) -> std::io::Result<()> {
     let mut stdout = std::io::stdout().lock();
     write_table(&mut stdout, table)
@@ -536,7 +719,7 @@ mod tests {
         let manifest = bmux_plugin::PluginManifest::from_toml_str(include_str!("../plugin.toml"))
             .expect("manifest should parse");
         assert_eq!(manifest.id, "example.native");
-        assert_eq!(manifest.commands.len(), 9);
+        assert_eq!(manifest.commands.len(), 10);
         let declaration = manifest.to_declaration().expect("manifest should validate");
         assert_eq!(declaration.id.as_str(), "example.native");
     }

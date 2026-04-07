@@ -1009,10 +1009,12 @@ dependencies = [
 name = "bmux_example_native_plugin"
 version = "0.0.1-alpha.0"
 dependencies = [
+ "bmux_cli",
  "bmux_cli_output",
  "bmux_plugin",
  "bmux_plugin_sdk",
  "serde",
+ "tokio",
  "uuid",
 ]
 
@@ -1115,6 +1117,17 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "uuid",
+]
+
+[[package]]
+name = "bmux_prompt_plugin_showcase"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "anyhow",
+ "bmux_cli",
+ "bmux_example_native_plugin",
+ "bmux_sandbox_harness",
+ "tokio",
 ]
 
 [[package]]

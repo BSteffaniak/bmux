@@ -32,6 +32,11 @@ value_name          = "MESSAGE"
 
 [[commands]]
 expose_in_cli = true
+name          = "prompt-showcase"
+summary       = "Queue plugin-provided attach prompts (requires active attach host)"
+
+[[commands]]
+expose_in_cli = true
 name          = "permissions-list"
 summary       = "List session permissions through bmux provider service"
 

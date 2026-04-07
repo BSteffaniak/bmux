@@ -204,6 +204,12 @@ Role policy: `owner` controls session and window mutations plus role changes, `w
   cargo run -p bmux_prompt_showcase
   ```
 
+- Plugin-provided prompt showcase (reuses `example.native` prompt sequence):
+
+  ```bash
+  cargo run -p bmux_prompt_plugin_showcase
+  ```
+
 - Native plugin example:
 
   ```bash

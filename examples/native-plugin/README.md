@@ -52,3 +52,14 @@ bmux plugin run example.native permissions-list my-session
 ```
 
 Start the server and the plugin will also log activation plus matching events such as `server_started` and `window_created`.
+
+## Plugin Prompt Demo
+
+The plugin includes a `prompt-showcase` command that queues modal prompts
+through the attach prompt host.
+
+This is easiest to exercise with the in-repo sandbox example:
+
+```bash
+cargo run -p bmux_prompt_plugin_showcase
+```
