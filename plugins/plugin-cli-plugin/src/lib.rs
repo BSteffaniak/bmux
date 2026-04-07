@@ -41,11 +41,13 @@ impl RustPlugin for PluginCliPlugin {
             "recording-start" => run_core_proxy_command(&context, &["recording", "start"]),
             "recording-stop" => run_core_proxy_command(&context, &["recording", "stop"]),
             "recording-status" => run_core_proxy_command(&context, &["recording", "status"]),
+            "recording-path" => run_core_proxy_command(&context, &["recording", "path"]),
             "recording-list" => run_core_proxy_command(&context, &["recording", "list"]),
             "recording-delete" => run_core_proxy_command(&context, &["recording", "delete"]),
             "recording-delete-all" => {
                 run_core_proxy_command(&context, &["recording", "delete-all"])
             }
+            "recording-cut" => run_core_proxy_command(&context, &["recording", "cut"]),
             "recording-inspect" => run_core_proxy_command(&context, &["recording", "inspect"]),
             "recording-replay" => run_core_proxy_command(&context, &["recording", "replay"]),
             "recording-verify-smoke" => {

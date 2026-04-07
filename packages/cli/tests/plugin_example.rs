@@ -49,6 +49,19 @@ fn bundled_plugin_manifests_include_core_shipped_plugins() {
 }
 
 #[test]
+fn bundled_plugin_cli_manifest_includes_recording_cut_and_path() {
+    let plugin_cli = bundled_manifest("bmux.plugin_cli");
+    let commands = plugin_cli
+        .commands
+        .iter()
+        .map(|command| command.name.as_str())
+        .collect::<Vec<_>>();
+
+    assert!(commands.contains(&"recording-cut"));
+    assert!(commands.contains(&"recording-path"));
+}
+
+#[test]
 fn bundled_windows_manifest_requires_generic_runtime_capabilities() {
     let windows = bundled_manifest("bmux.windows");
 

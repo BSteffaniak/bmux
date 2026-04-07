@@ -65,6 +65,10 @@ owns_paths = [
     ],
     [
         "recording",
+        "path",
+    ],
+    [
+        "recording",
         "list",
     ],
     [
@@ -74,6 +78,10 @@ owns_paths = [
     [
         "recording",
         "delete-all",
+    ],
+    [
+        "recording",
+        "cut",
     ],
     [
         "recording",
@@ -391,6 +399,21 @@ value_name          = "ARGS"
 
 [[commands]]
 expose_in_cli = true
+name          = "recording-path"
+path          = ["recording", "path"]
+summary       = "Core recording path command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
 name          = "recording-list"
 path          = ["recording", "list"]
 summary       = "Core recording list command proxy"
@@ -424,6 +447,21 @@ expose_in_cli = true
 name          = "recording-delete-all"
 path          = ["recording", "delete-all"]
 summary       = "Core recording delete-all command proxy"
+
+[[commands.arguments]]
+allow_hyphen_values = true
+kind                = "string"
+multiple            = true
+name                = "args"
+position            = 0
+trailing_var_arg    = true
+value_name          = "ARGS"
+
+[[commands]]
+expose_in_cli = true
+name          = "recording-cut"
+path          = ["recording", "cut"]
+summary       = "Core recording cut command proxy"
 
 [[commands.arguments]]
 allow_hyphen_values = true
