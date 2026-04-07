@@ -10,9 +10,10 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 use super::{
-    AttachExitReason, ConnectionContext, ConnectionPolicyScope, active_runtime_name,
-    append_runtime_arg, connect, connect_with_context, expand_bmux_target_if_needed,
-    map_cli_client_error, run_server_start, run_session_attach, run_session_attach_with_client,
+    AttachExitReason, ConnectionContext, ConnectionPolicyScope, KernelClientFactory,
+    active_runtime_name, append_runtime_arg, connect, connect_with_context,
+    expand_bmux_target_if_needed, map_cli_client_error, run_server_start, run_session_attach,
+    run_session_attach_with_client,
 };
 use bmux_cli_schema::HostedModeArg;
 use bmux_config::{ConnectionTargetConfig, ConnectionTransport, HostedMode, RemoteServerStartMode};
@@ -345,7 +346,7 @@ pub(super) async fn run_connect(
             Ok(status)
         }
         ResolvedTarget::Iroh(iroh_target) => {
-            let mut client =
+            let (mut client, iroh_connection) =
                 connect_iroh_bridge(&iroh_target, "bmux-cli-connect-remote-iroh").await?;
             let target_session = if follow.is_some() {
                 None
@@ -356,6 +357,7 @@ pub(super) async fn run_connect(
             };
             let status = run_iroh_attach_with_reconnect(
                 client,
+                iroh_connection,
                 &iroh_target,
                 target_session.as_deref(),
                 follow,
@@ -708,66 +710,22 @@ pub(super) async fn run_host(
                 let conn = accepting
                     .await
                     .context("failed accepting iroh connection")?;
-                let (mut send, mut recv) = conn
-                    .accept_bi()
-                    .await
-                    .context("failed accepting iroh stream")?;
-                let endpoint = local_ipc_endpoint_from_paths(&bridge_paths);
-                let ipc_stream = LocalIpcStream::connect(&endpoint)
-                    .await
-                    .context("failed connecting local IPC endpoint for iroh gateway")?;
-                let (mut ipc_read, mut ipc_write) = tokio::io::split(ipc_stream);
 
-                // Optionally wrap the Iroh side with transport compression.
-                let config = BmuxConfig::load().unwrap_or_default();
-                let use_compression = config.behavior.compression.enabled
-                    && matches!(
-                        config.behavior.compression.remote,
-                        bmux_config::CompressionMode::Auto | bmux_config::CompressionMode::Zstd
-                    );
-
-                if use_compression {
-                    let compressed = bmux_ipc::compressed_stream::CompressedStream::new(
-                        tokio::io::join(recv, send),
-                        1,
-                    );
-                    let (mut iroh_read, mut iroh_write) = tokio::io::split(compressed);
-
-                    let inbound = tokio::spawn(async move {
-                        tokio::io::copy(&mut iroh_read, &mut ipc_write).await?;
-                        ipc_write.shutdown().await?;
-                        Ok::<(), std::io::Error>(())
+                // Accept multiple bi-streams per connection.  The first stream is
+                // the primary attach session; additional streams are opened by the
+                // client-side kernel bridge for plugin-to-server IPC calls.
+                loop {
+                    let Ok((send, recv)) = conn.accept_bi().await else {
+                        break; // connection closed
+                    };
+                    let stream_paths = bridge_paths.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) =
+                            proxy_iroh_stream_to_local_ipc(send, recv, &stream_paths).await
+                        {
+                            tracing::debug!(?error, "iroh stream proxy failed");
+                        }
                     });
-                    let outbound = tokio::spawn(async move {
-                        tokio::io::copy(&mut ipc_read, &mut iroh_write).await?;
-                        iroh_write.shutdown().await?;
-                        Ok::<(), std::io::Error>(())
-                    });
-
-                    let inbound_result: std::io::Result<()> =
-                        inbound.await.context("iroh inbound task failed")?;
-                    let outbound_result: std::io::Result<()> =
-                        outbound.await.context("iroh outbound task failed")?;
-                    inbound_result.context("iroh inbound copy failed")?;
-                    outbound_result.context("iroh outbound copy failed")?;
-                } else {
-                    let inbound = tokio::spawn(async move {
-                        tokio::io::copy(&mut recv, &mut ipc_write).await?;
-                        ipc_write.shutdown().await?;
-                        Ok::<(), std::io::Error>(())
-                    });
-                    let outbound = tokio::spawn(async move {
-                        tokio::io::copy(&mut ipc_read, &mut send).await?;
-                        send.finish()?;
-                        Ok::<(), anyhow::Error>(())
-                    });
-
-                    let inbound_result: std::io::Result<()> =
-                        inbound.await.context("iroh inbound task failed")?;
-                    let outbound_result: anyhow::Result<()> =
-                        outbound.await.context("iroh outbound task failed")?;
-                    inbound_result.context("iroh inbound copy failed")?;
-                    outbound_result.context("iroh outbound copy failed")?;
                 }
                 Ok(())
             }
@@ -779,6 +737,77 @@ pub(super) async fn run_host(
     }
     let _ = clear_host_runtime_state(&ConfigPaths::default());
     Ok(0)
+}
+
+/// Proxy a single iroh QUIC bi-stream to/from a local IPC connection.
+///
+/// Used by the iroh gateway to bridge each bi-stream (primary attach session or
+/// kernel bridge side-channel) to an independent local IPC session with the bmux
+/// server.
+async fn proxy_iroh_stream_to_local_ipc(
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+    paths: &ConfigPaths,
+) -> Result<()> {
+    let endpoint = local_ipc_endpoint_from_paths(paths);
+    let ipc_stream = LocalIpcStream::connect(&endpoint)
+        .await
+        .context("failed connecting local IPC endpoint for iroh stream proxy")?;
+    let (mut ipc_read, mut ipc_write) = tokio::io::split(ipc_stream);
+
+    let config = BmuxConfig::load().unwrap_or_default();
+    let use_compression = config.behavior.compression.enabled
+        && matches!(
+            config.behavior.compression.remote,
+            bmux_config::CompressionMode::Auto | bmux_config::CompressionMode::Zstd
+        );
+
+    if use_compression {
+        let compressed =
+            bmux_ipc::compressed_stream::CompressedStream::new(tokio::io::join(recv, send), 1);
+        let (mut iroh_read, mut iroh_write) = tokio::io::split(compressed);
+
+        let inbound = tokio::spawn(async move {
+            tokio::io::copy(&mut iroh_read, &mut ipc_write).await?;
+            ipc_write.shutdown().await?;
+            Ok::<(), std::io::Error>(())
+        });
+        let outbound = tokio::spawn(async move {
+            tokio::io::copy(&mut ipc_read, &mut iroh_write).await?;
+            iroh_write.shutdown().await?;
+            Ok::<(), std::io::Error>(())
+        });
+
+        inbound
+            .await
+            .context("iroh inbound task failed")?
+            .context("iroh inbound copy failed")?;
+        outbound
+            .await
+            .context("iroh outbound task failed")?
+            .context("iroh outbound copy failed")?;
+    } else {
+        let inbound = tokio::spawn(async move {
+            tokio::io::copy(&mut recv, &mut ipc_write).await?;
+            ipc_write.shutdown().await?;
+            Ok::<(), std::io::Error>(())
+        });
+        let outbound = tokio::spawn(async move {
+            tokio::io::copy(&mut ipc_read, &mut send).await?;
+            send.finish()?;
+            Ok::<(), anyhow::Error>(())
+        });
+
+        inbound
+            .await
+            .context("iroh inbound task failed")?
+            .context("iroh inbound copy failed")?;
+        outbound
+            .await
+            .context("iroh outbound task failed")?
+            .context("iroh outbound copy failed")?;
+    }
+    Ok(())
 }
 
 fn format_setup_summary_lines(
@@ -1954,6 +1983,7 @@ async fn delete_share_link(control_plane_url: &str, token: &str, name: &str) -> 
 
 async fn run_iroh_attach_with_reconnect(
     mut client: BmuxClient,
+    mut iroh_connection: iroh::endpoint::Connection,
     target: &IrohTarget,
     session: Option<&str>,
     follow: Option<&str>,
@@ -1962,7 +1992,9 @@ async fn run_iroh_attach_with_reconnect(
 ) -> Result<u8> {
     let mut attempt = 0usize;
     loop {
-        let outcome = run_session_attach_with_client(client, session, follow, global).await?;
+        let factory = build_iroh_kernel_client_factory(iroh_connection.clone(), target);
+        let outcome =
+            run_session_attach_with_client(client, session, follow, global, Some(factory)).await?;
         if outcome.exit_reason != AttachExitReason::StreamClosed {
             return Ok(outcome.status_code);
         }
@@ -1981,7 +2013,10 @@ async fn run_iroh_attach_with_reconnect(
             backoff.as_millis()
         );
         tokio::time::sleep(backoff).await;
-        client = connect_iroh_bridge(target, "bmux-cli-connect-remote-iroh-reconnect").await?;
+        let (new_client, new_connection) =
+            connect_iroh_bridge(target, "bmux-cli-connect-remote-iroh-reconnect").await?;
+        client = new_client;
+        iroh_connection = new_connection;
     }
 }
 
@@ -1995,7 +2030,7 @@ async fn run_tls_attach_with_reconnect(
 ) -> Result<u8> {
     let mut attempt = 0usize;
     loop {
-        let outcome = run_session_attach_with_client(client, session, follow, global).await?;
+        let outcome = run_session_attach_with_client(client, session, follow, global, None).await?;
         if outcome.exit_reason != AttachExitReason::StreamClosed {
             return Ok(outcome.status_code);
         }
@@ -2028,7 +2063,7 @@ async fn run_remote_attach_with_reconnect(
 ) -> Result<u8> {
     let mut attempt = 0usize;
     loop {
-        let outcome = run_session_attach_with_client(client, session, follow, global).await?;
+        let outcome = run_session_attach_with_client(client, session, follow, global, None).await?;
         if outcome.exit_reason != AttachExitReason::StreamClosed {
             return Ok(outcome.status_code);
         }
@@ -2147,7 +2182,8 @@ pub(super) async fn run_remote_test(target: &str) -> Result<u8> {
             Ok(0)
         }
         ResolvedTarget::Iroh(iroh_target) => {
-            let mut client = connect_iroh_bridge(&iroh_target, "bmux-cli-remote-test-iroh").await?;
+            let (mut client, _) =
+                connect_iroh_bridge(&iroh_target, "bmux-cli-remote-test-iroh").await?;
             client.ping().await.map_err(map_cli_client_error)?;
             println!("target '{}' OK (iroh)", iroh_target.label);
             Ok(0)
@@ -2223,7 +2259,7 @@ pub(super) async fn run_remote_doctor(target: &str, fix: bool) -> Result<u8> {
             Ok(0)
         }
         ResolvedTarget::Iroh(iroh_target) => {
-            let mut client =
+            let (mut client, _) =
                 connect_iroh_bridge(&iroh_target, "bmux-cli-remote-doctor-iroh").await?;
             client.ping().await.map_err(map_cli_client_error)?;
             print_doctor_step_ok("iroh", "connectivity and ping succeeded");
@@ -2402,7 +2438,9 @@ pub(super) async fn run_remote_complete_sessions(target: &str) -> Result<u8> {
             connect_tls_bridge(&tls_target, "bmux-cli-complete-sessions-tls").await?
         }
         ResolvedTarget::Iroh(iroh_target) => {
-            connect_iroh_bridge(&iroh_target, "bmux-cli-complete-sessions-iroh").await?
+            connect_iroh_bridge(&iroh_target, "bmux-cli-complete-sessions-iroh")
+                .await?
+                .0
         }
     };
     let sessions = client.list_sessions().await.map_err(map_cli_client_error)?;
@@ -2639,7 +2677,10 @@ async fn connect_tls_bridge(target: &TlsTarget, client_name: &str) -> Result<Bmu
         .map_err(map_cli_client_error)
 }
 
-async fn connect_iroh_bridge(target: &IrohTarget, client_name: &str) -> Result<BmuxClient> {
+async fn connect_iroh_bridge(
+    target: &IrohTarget,
+    client_name: &str,
+) -> Result<(BmuxClient, iroh::endpoint::Connection)> {
     let endpoint = Endpoint::builder(presets::N0)
         .alpns(vec![BMUX_IROH_ALPN.to_vec()])
         .bind()
@@ -2671,6 +2712,10 @@ async fn connect_iroh_bridge(target: &IrohTarget, client_name: &str) -> Result<B
         .context("failed opening iroh bi-directional stream")?;
     let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
     let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge_stream);
+    // Clone the connection before moving the stream halves into copy tasks.
+    // The clone keeps the underlying QUIC connection alive for the kernel bridge
+    // to open additional bi-streams for plugin-to-server calls.
+    let retained_connection = connection.clone();
     tokio::spawn(async move {
         if let Err(error) = tokio::io::copy(&mut recv, &mut bridge_write).await {
             tracing::debug!(?error, "iroh bridge recv->client copy failed");
@@ -2703,9 +2748,74 @@ async fn connect_iroh_bridge(target: &IrohTarget, client_name: &str) -> Result<B
         ErasedIpcStream::new(Box::new(client_stream))
     };
 
-    BmuxClient::connect_with_bridge_stream(erased, timeout, client_name.to_string(), principal_id)
-        .await
-        .map_err(map_cli_client_error)
+    let client = BmuxClient::connect_with_bridge_stream(
+        erased,
+        timeout,
+        client_name.to_string(),
+        principal_id,
+    )
+    .await
+    .map_err(map_cli_client_error)?;
+    Ok((client, retained_connection))
+}
+
+/// Build a [`KernelClientFactory`] that opens new QUIC bi-streams on `connection`
+/// for each kernel bridge invocation.  Each call produces a fresh, independently-
+/// handshaked [`BmuxClient`] whose lifetime is a single IPC request/response pair.
+fn build_iroh_kernel_client_factory(
+    connection: iroh::endpoint::Connection,
+    target: &IrohTarget,
+) -> KernelClientFactory {
+    let timeout = Duration::from_millis(target.connect_timeout_ms.max(1));
+    let principal_id = load_or_create_local_principal_id(&ConfigPaths::default())
+        .unwrap_or_else(|_| Uuid::new_v4());
+    let config = BmuxConfig::load().unwrap_or_default();
+    let use_compression = config.behavior.compression.enabled
+        && matches!(
+            config.behavior.compression.remote,
+            bmux_config::CompressionMode::Auto | bmux_config::CompressionMode::Zstd
+        );
+
+    Arc::new(move || {
+        let conn = connection.clone();
+        let timeout = timeout;
+        let principal_id = principal_id;
+        Box::pin(async move {
+            let (mut send, mut recv) = conn
+                .open_bi()
+                .await
+                .context("failed opening iroh kernel bridge bi-stream")?;
+            let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
+            let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge_stream);
+            tokio::spawn(async move {
+                if let Err(error) = tokio::io::copy(&mut recv, &mut bridge_write).await {
+                    tracing::debug!(?error, "iroh kernel bridge recv->client copy failed");
+                }
+                let _ = bridge_write.shutdown().await;
+            });
+            tokio::spawn(async move {
+                if let Err(error) = tokio::io::copy(&mut bridge_read, &mut send).await {
+                    tracing::debug!(?error, "iroh kernel bridge client->send copy failed");
+                }
+                let _ = send.finish();
+            });
+            let erased = if use_compression {
+                ErasedIpcStream::new(Box::new(
+                    bmux_ipc::compressed_stream::CompressedStream::new(client_stream, 1),
+                ))
+            } else {
+                ErasedIpcStream::new(Box::new(client_stream))
+            };
+            BmuxClient::connect_with_bridge_stream(
+                erased,
+                timeout,
+                "bmux-cli-iroh-kernel-bridge".to_string(),
+                principal_id,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+        }) as Pin<Box<dyn std::future::Future<Output = Result<BmuxClient>> + Send>>
+    })
 }
 
 fn build_tls_connector(target: &TlsTarget) -> Result<TlsConnector> {

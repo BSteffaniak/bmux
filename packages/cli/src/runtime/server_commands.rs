@@ -721,70 +721,23 @@ async fn run_server_gateway_iroh() -> Result<u8> {
                 let conn = accepting
                     .await
                     .context("failed accepting iroh connection")?;
-                let (mut send, mut recv) = conn
-                    .accept_bi()
-                    .await
-                    .context("failed accepting iroh stream")?;
-                let endpoint = local_endpoint_from_paths(&ConfigPaths::default());
-                let ipc_stream = LocalIpcStream::connect(&endpoint)
-                    .await
-                    .context("failed connecting local IPC endpoint for iroh gateway")?;
-                let (mut ipc_read, mut ipc_write) = tokio::io::split(ipc_stream);
 
-                // Optionally wrap the Iroh side with transport compression.
-                // The local IPC side is never compressed.
-                let config = bmux_config::BmuxConfig::load().unwrap_or_default();
-                let use_compression = config.behavior.compression.enabled
-                    && matches!(
-                        config.behavior.compression.remote,
-                        bmux_config::CompressionMode::Auto | bmux_config::CompressionMode::Zstd
-                    );
-
-                if use_compression {
-                    let (iroh_read, iroh_write) = {
-                        let compressed = bmux_ipc::compressed_stream::CompressedStream::new(
-                            tokio::io::join(recv, send),
-                            1,
-                        );
-                        tokio::io::split(compressed)
+                // Accept multiple bi-streams per connection.  The first stream is
+                // the primary attach session; additional streams are opened by the
+                // client-side kernel bridge for plugin-to-server IPC calls.
+                let paths = ConfigPaths::default();
+                loop {
+                    let Ok((send, recv)) = conn.accept_bi().await else {
+                        break; // connection closed
                     };
-                    let (mut iroh_read, mut iroh_write) = (iroh_read, iroh_write);
-
-                    let inbound = tokio::spawn(async move {
-                        tokio::io::copy(&mut iroh_read, &mut ipc_write).await?;
-                        ipc_write.shutdown().await?;
-                        Ok::<(), std::io::Error>(())
+                    let stream_paths = paths.clone();
+                    tokio::spawn(async move {
+                        if let Err(error) =
+                            proxy_gateway_iroh_stream(send, recv, &stream_paths).await
+                        {
+                            tracing::debug!(?error, "iroh gateway stream proxy failed");
+                        }
                     });
-                    let outbound = tokio::spawn(async move {
-                        tokio::io::copy(&mut ipc_read, &mut iroh_write).await?;
-                        iroh_write.shutdown().await?;
-                        Ok::<(), std::io::Error>(())
-                    });
-
-                    let inbound_result: std::io::Result<()> =
-                        inbound.await.context("iroh inbound task failed")?;
-                    let outbound_result: std::io::Result<()> =
-                        outbound.await.context("iroh outbound task failed")?;
-                    inbound_result.context("iroh inbound copy failed")?;
-                    outbound_result.context("iroh outbound copy failed")?;
-                } else {
-                    let inbound = tokio::spawn(async move {
-                        tokio::io::copy(&mut recv, &mut ipc_write).await?;
-                        ipc_write.shutdown().await?;
-                        Ok::<(), std::io::Error>(())
-                    });
-                    let outbound = tokio::spawn(async move {
-                        tokio::io::copy(&mut ipc_read, &mut send).await?;
-                        send.finish()?;
-                        Ok::<(), anyhow::Error>(())
-                    });
-
-                    let inbound_result: std::io::Result<()> =
-                        inbound.await.context("iroh inbound task failed")?;
-                    let outbound_result: anyhow::Result<()> =
-                        outbound.await.context("iroh outbound task failed")?;
-                    inbound_result.context("iroh inbound copy failed")?;
-                    outbound_result.context("iroh outbound copy failed")?;
                 }
                 Ok(())
             }
@@ -795,6 +748,73 @@ async fn run_server_gateway_iroh() -> Result<u8> {
         });
     }
     Ok(0)
+}
+
+/// Proxy a single iroh QUIC bi-stream to/from a local IPC connection.
+async fn proxy_gateway_iroh_stream(
+    mut send: iroh::endpoint::SendStream,
+    mut recv: iroh::endpoint::RecvStream,
+    paths: &ConfigPaths,
+) -> Result<()> {
+    let endpoint = local_endpoint_from_paths(paths);
+    let ipc_stream = LocalIpcStream::connect(&endpoint)
+        .await
+        .context("failed connecting local IPC endpoint for iroh gateway stream")?;
+    let (mut ipc_read, mut ipc_write) = tokio::io::split(ipc_stream);
+
+    let config = bmux_config::BmuxConfig::load().unwrap_or_default();
+    let use_compression = config.behavior.compression.enabled
+        && matches!(
+            config.behavior.compression.remote,
+            bmux_config::CompressionMode::Auto | bmux_config::CompressionMode::Zstd
+        );
+
+    if use_compression {
+        let compressed =
+            bmux_ipc::compressed_stream::CompressedStream::new(tokio::io::join(recv, send), 1);
+        let (mut iroh_read, mut iroh_write) = tokio::io::split(compressed);
+
+        let inbound = tokio::spawn(async move {
+            tokio::io::copy(&mut iroh_read, &mut ipc_write).await?;
+            ipc_write.shutdown().await?;
+            Ok::<(), std::io::Error>(())
+        });
+        let outbound = tokio::spawn(async move {
+            tokio::io::copy(&mut ipc_read, &mut iroh_write).await?;
+            iroh_write.shutdown().await?;
+            Ok::<(), std::io::Error>(())
+        });
+
+        inbound
+            .await
+            .context("iroh inbound task failed")?
+            .context("iroh inbound copy failed")?;
+        outbound
+            .await
+            .context("iroh outbound task failed")?
+            .context("iroh outbound copy failed")?;
+    } else {
+        let inbound = tokio::spawn(async move {
+            tokio::io::copy(&mut recv, &mut ipc_write).await?;
+            ipc_write.shutdown().await?;
+            Ok::<(), std::io::Error>(())
+        });
+        let outbound = tokio::spawn(async move {
+            tokio::io::copy(&mut ipc_read, &mut send).await?;
+            send.finish()?;
+            Ok::<(), anyhow::Error>(())
+        });
+
+        inbound
+            .await
+            .context("iroh inbound task failed")?
+            .context("iroh inbound copy failed")?;
+        outbound
+            .await
+            .context("iroh outbound task failed")?
+            .context("iroh outbound copy failed")?;
+    }
+    Ok(())
 }
 
 fn parse_listen_port(listen: &str) -> Result<u16> {

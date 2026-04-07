@@ -9,8 +9,19 @@ use bmux_plugin_sdk::{
 };
 use bmux_server::{BmuxServer, ServiceInvokeContext};
 use std::cell::RefCell;
-use std::sync::OnceLock;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::{Arc, OnceLock};
 use tracing::Level;
+
+/// A factory that produces a connected [`BmuxClient`] on demand.
+///
+/// Used by the kernel bridge to reach the bmux server when the normal local-IPC
+/// path is not viable (e.g. iroh remote connections where the server lives on a
+/// different host).  Each invocation should return a fresh, independently-usable
+/// client -- callers will run one request and drop it.
+pub(super) type KernelClientFactory =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = Result<BmuxClient>> + Send>> + Send + Sync>;
 
 use super::{
     effective_enabled_plugins, load_plugin, plugin_host_metadata, resolve_plugin_search_paths,
@@ -19,11 +30,13 @@ use super::{
 thread_local! {
     static SERVICE_KERNEL_CONTEXT: RefCell<Option<ServiceInvokeContext>> = const { RefCell::new(None) };
     static HOST_KERNEL_CONNECTION: RefCell<Option<HostConnectionInfo>> = const { RefCell::new(None) };
+    static HOST_KERNEL_CLIENT_FACTORY: RefCell<Option<KernelClientFactory>> = const { RefCell::new(None) };
     static HOST_KERNEL_EFFECT_CAPTURE: RefCell<Option<Vec<PluginCommandEffect>>> = const { RefCell::new(None) };
 }
 
 pub(super) struct ServiceKernelContextGuard;
 pub(super) struct HostKernelConnectionGuard;
+pub(super) struct HostKernelClientFactoryGuard;
 
 pub(super) static EFFECTIVE_LOG_LEVEL: OnceLock<Level> = OnceLock::new();
 
@@ -46,6 +59,14 @@ impl Drop for HostKernelConnectionGuard {
     }
 }
 
+impl Drop for HostKernelClientFactoryGuard {
+    fn drop(&mut self) {
+        HOST_KERNEL_CLIENT_FACTORY.with(|slot| {
+            *slot.borrow_mut() = None;
+        });
+    }
+}
+
 pub(super) fn enter_service_kernel_context(
     context: ServiceInvokeContext,
 ) -> ServiceKernelContextGuard {
@@ -62,6 +83,15 @@ pub(super) fn enter_host_kernel_connection(
         *slot.borrow_mut() = Some(connection);
     });
     HostKernelConnectionGuard
+}
+
+pub(super) fn enter_host_kernel_client_factory(
+    factory: KernelClientFactory,
+) -> HostKernelClientFactoryGuard {
+    HOST_KERNEL_CLIENT_FACTORY.with(|slot| {
+        *slot.borrow_mut() = Some(factory);
+    });
+    HostKernelClientFactoryGuard
 }
 
 pub(super) fn begin_host_kernel_effect_capture() {
@@ -143,6 +173,41 @@ pub(super) fn call_host_kernel_via_client(
     bmux_ipc::encode(&response).context("failed encoding kernel bridge response payload")
 }
 
+fn call_host_kernel_via_factory(factory: &KernelClientFactory, payload: &[u8]) -> Result<Vec<u8>> {
+    let request: bmux_ipc::Request =
+        bmux_ipc::decode(payload).context("failed decoding kernel bridge request payload")?;
+    let factory = Arc::clone(factory);
+    let response: bmux_ipc::Response = if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        tokio::task::block_in_place(|| {
+            handle.block_on(async {
+                let mut client = factory()
+                    .await
+                    .context("remote kernel bridge client factory failed")?;
+                client
+                    .request_raw(request.clone())
+                    .await
+                    .context("remote kernel bridge request failed")
+            })
+        })
+    } else {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("failed creating kernel bridge runtime")?;
+        runtime.block_on(async {
+            let mut client = factory()
+                .await
+                .context("remote kernel bridge client factory failed")?;
+            client
+                .request_raw(request.clone())
+                .await
+                .context("remote kernel bridge request failed")
+        })
+    }?;
+    maybe_record_host_kernel_effect(&request, &response);
+    bmux_ipc::encode(&response).context("failed encoding kernel bridge response payload")
+}
+
 pub(super) unsafe extern "C" fn host_kernel_bridge(
     input_ptr: *const u8,
     input_len: usize,
@@ -175,6 +240,8 @@ pub(super) unsafe extern "C" fn host_kernel_bridge(
             };
             runtime.block_on(async { context.execute_raw(request.payload).await })
         }
+    } else if let Some(factory) = HOST_KERNEL_CLIENT_FACTORY.with(|slot| slot.borrow().clone()) {
+        call_host_kernel_via_factory(&factory, &request.payload)
     } else if let Some(connection) = HOST_KERNEL_CONNECTION.with(|slot| slot.borrow().clone()) {
         call_host_kernel_via_client(&connection, &request.payload)
     } else {

@@ -74,10 +74,11 @@ use playbook_cli::{
     run_playbook_interactive, run_playbook_run, run_playbook_validate,
 };
 use plugin_kernel::{
-    EFFECTIVE_LOG_LEVEL, LOG_WRITER_GUARD, available_capability_providers,
+    EFFECTIVE_LOG_LEVEL, KernelClientFactory, LOG_WRITER_GUARD, available_capability_providers,
     available_service_descriptors, begin_host_kernel_effect_capture, core_provided_capabilities,
-    enter_host_kernel_connection, finish_host_kernel_effect_capture, host_kernel_bridge,
-    register_plugin_service_handlers, service_descriptors_from_declarations,
+    enter_host_kernel_client_factory, enter_host_kernel_connection,
+    finish_host_kernel_effect_capture, host_kernel_bridge, register_plugin_service_handlers,
+    service_descriptors_from_declarations,
 };
 use plugin_runtime::{
     activate_loaded_plugins, bundled_plugin_root as bundled_plugin_roots,
@@ -165,7 +166,7 @@ pub async fn run_attach_with_client(
     follow: Option<&str>,
     global: bool,
 ) -> Result<AttachRunOutcome> {
-    run_session_attach_with_client(client, target, follow, global).await
+    run_session_attach_with_client(client, target, follow, global, None).await
 }
 
 pub fn submit_prompt_request(

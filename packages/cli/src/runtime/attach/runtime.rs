@@ -33,12 +33,12 @@ use super::super::{
     ATTACH_SCROLLBACK_UNAVAILABLE_STATUS, ATTACH_SELECTION_CLEARED_STATUS,
     ATTACH_SELECTION_COPIED_STATUS, ATTACH_SELECTION_EMPTY_STATUS, ATTACH_SELECTION_STARTED_STATUS,
     ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE, ATTACH_TRANSIENT_STATUS_TTL, ATTACH_WELCOME_STATUS_TTL,
-    BmuxClient, HELP_OVERLAY_SURFACE_ID, InputProcessor, Keymap, RuntimeAction, attach,
-    attach_quit_failure_status, available_capability_providers, available_service_descriptors,
-    effective_enabled_plugins, enter_host_kernel_connection, host_kernel_bridge, load_plugin,
-    map_attach_client_error, merged_runtime_keybindings, parse_session_selector, parse_uuid_value,
-    plugin_command_policy_hints, plugin_host_metadata, recording, resolve_plugin_search_paths,
-    run_plugin_keybinding_command, scan_available_plugins,
+    BmuxClient, HELP_OVERLAY_SURFACE_ID, InputProcessor, KernelClientFactory, Keymap,
+    RuntimeAction, attach, attach_quit_failure_status, available_capability_providers,
+    available_service_descriptors, effective_enabled_plugins, enter_host_kernel_connection,
+    host_kernel_bridge, load_plugin, map_attach_client_error, merged_runtime_keybindings,
+    parse_session_selector, parse_uuid_value, plugin_command_policy_hints, plugin_host_metadata,
+    recording, resolve_plugin_search_paths, run_plugin_keybinding_command, scan_available_plugins,
 };
 use super::cursor::apply_attach_cursor_state;
 use super::events::{AttachLoopControl, AttachLoopEvent};
@@ -211,6 +211,7 @@ pub async fn run_session_attach_with_client(
     target: Option<&str>,
     follow: Option<&str>,
     global: bool,
+    kernel_client_factory: Option<KernelClientFactory>,
 ) -> Result<AttachRunOutcome> {
     if target.is_none() && follow.is_none() {
         anyhow::bail!("attach requires a session target or --follow <client-uuid>");
@@ -505,6 +506,7 @@ pub async fn run_session_attach_with_client(
                         &attach_help_lines,
                         &mut view_state,
                         &mut display_capture,
+                        kernel_client_factory.as_ref(),
                     )
                     .await?
                     {
@@ -540,6 +542,7 @@ pub async fn run_session_attach_with_client(
                     &attach_help_lines,
                     &mut view_state,
                     &mut display_capture,
+                    kernel_client_factory.as_ref(),
                 )
                 .await?
                 {
@@ -1148,6 +1151,7 @@ pub async fn handle_attach_plugin_command_action(
     command_name: &str,
     args: &[String],
     view_state: &mut AttachViewState,
+    kernel_client_factory: Option<&KernelClientFactory>,
 ) -> std::result::Result<(), ClientError> {
     let before_context_id = client
         .current_context()
@@ -1194,7 +1198,7 @@ pub async fn handle_attach_plugin_command_action(
         );
         return Ok(());
     }
-    match run_plugin_keybinding_command(plugin_id, command_name, args) {
+    match run_plugin_keybinding_command(plugin_id, command_name, args, kernel_client_factory) {
         Err(error) => {
             warn!(
                 plugin_id = %plugin_id,
@@ -3499,6 +3503,7 @@ pub async fn handle_attach_loop_event(
     help_lines: &[String],
     view_state: &mut AttachViewState,
     display_capture: &mut DisplayCaptureFanout,
+    kernel_client_factory: Option<&KernelClientFactory>,
 ) -> Result<AttachLoopControl> {
     match event {
         AttachLoopEvent::Server(server_event) => {
@@ -3520,6 +3525,7 @@ pub async fn handle_attach_loop_event(
                 help_lines,
                 view_state,
                 display_capture,
+                kernel_client_factory,
             )
             .await
         }
@@ -3750,6 +3756,7 @@ pub async fn handle_attach_terminal_event(
     help_lines: &[String],
     view_state: &mut AttachViewState,
     display_capture: &mut DisplayCaptureFanout,
+    kernel_client_factory: Option<&KernelClientFactory>,
 ) -> Result<AttachLoopControl> {
     if matches!(terminal_event, Event::Resize(_, _)) {
         if should_refresh_attached_session(view_state, Instant::now())
@@ -3869,6 +3876,7 @@ pub async fn handle_attach_terminal_event(
                     &command_name,
                     &args,
                     view_state,
+                    kernel_client_factory,
                 )
                 .await
                 {
@@ -3881,7 +3889,13 @@ pub async fn handle_attach_terminal_event(
                 attach_input_processor.set_scroll_mode(view_state.scrollback_active);
             }
             AttachEventAction::Mouse(mouse_event) => {
-                if let Err(error) = handle_attach_mouse_event(client, mouse_event, view_state).await
+                if let Err(error) = handle_attach_mouse_event(
+                    client,
+                    mouse_event,
+                    view_state,
+                    kernel_client_factory,
+                )
+                .await
                 {
                     view_state.set_transient_status(
                         format!("mouse action failed: {}", map_attach_client_error(error)),
@@ -4019,6 +4033,7 @@ pub async fn handle_attach_mouse_event(
     client: &mut StreamingBmuxClient,
     mouse_event: MouseEvent,
     view_state: &mut AttachViewState,
+    kernel_client_factory: Option<&KernelClientFactory>,
 ) -> std::result::Result<(), ClientError> {
     record_attach_mouse_event(mouse_event, view_state);
 
@@ -4047,12 +4062,24 @@ pub async fn handle_attach_mouse_event(
     let in_focused_pane = target_pane.is_some() && target_pane == focused_pane;
 
     if matches!(mouse_event.kind, MouseEventKind::ScrollUp)
-        && handle_attach_mouse_gesture_action(client, view_state, "scroll_up").await?
+        && handle_attach_mouse_gesture_action(
+            client,
+            view_state,
+            "scroll_up",
+            kernel_client_factory,
+        )
+        .await?
     {
         return Ok(());
     }
     if matches!(mouse_event.kind, MouseEventKind::ScrollDown)
-        && handle_attach_mouse_gesture_action(client, view_state, "scroll_down").await?
+        && handle_attach_mouse_gesture_action(
+            client,
+            view_state,
+            "scroll_down",
+            kernel_client_factory,
+        )
+        .await?
     {
         return Ok(());
     }
@@ -4099,7 +4126,14 @@ pub async fn handle_attach_mouse_event(
             let target = target_pane;
             view_state.mouse.hovered_pane_id = target;
             view_state.mouse.hover_started_at = Some(Instant::now());
-            if !handle_attach_mouse_gesture_action(client, view_state, "click_left").await? {
+            if !handle_attach_mouse_gesture_action(
+                client,
+                view_state,
+                "click_left",
+                kernel_client_factory,
+            )
+            .await?
+            {
                 match view_state.mouse.config.effective_click_propagation() {
                     bmux_config::MouseClickPropagation::FocusOnly => {
                         if let Some(pane_id) = target {
@@ -4181,8 +4215,13 @@ pub async fn handle_attach_mouse_event(
                 if now.duration_since(hover_started_at)
                     >= Duration::from_millis(view_state.mouse.config.hover_delay_ms)
                 {
-                    if !handle_attach_mouse_gesture_action(client, view_state, "hover_focus")
-                        .await?
+                    if !handle_attach_mouse_gesture_action(
+                        client,
+                        view_state,
+                        "hover_focus",
+                        kernel_client_factory,
+                    )
+                    .await?
                     {
                         focus_attach_pane(client, view_state, pane_id).await?;
                     }
@@ -4574,6 +4613,7 @@ pub async fn handle_attach_mouse_gesture_action(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     gesture: &str,
+    kernel_client_factory: Option<&KernelClientFactory>,
 ) -> std::result::Result<bool, ClientError> {
     let Some(attach_action) = resolve_mouse_gesture_action(view_state, gesture) else {
         return Ok(false);
@@ -4591,6 +4631,7 @@ pub async fn handle_attach_mouse_gesture_action(
                 &command_name,
                 &args,
                 view_state,
+                kernel_client_factory,
             )
             .await?;
             Ok(true)

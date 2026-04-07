@@ -9,14 +9,16 @@ use bmux_plugin_sdk::{
     PluginCommandOutcome, PluginEvent, PluginEventKind, RegisteredService,
 };
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, warn};
 
 use super::{
-    available_capability_providers, available_service_descriptors,
+    KernelClientFactory, available_capability_providers, available_service_descriptors,
     begin_host_kernel_effect_capture, connect_raw, core_provided_capabilities,
-    enter_host_kernel_connection, finish_host_kernel_effect_capture, host_kernel_bridge,
-    map_cli_client_error, plugin_commands::PluginCommandRegistry, plugin_host, server_event_name,
+    enter_host_kernel_client_factory, enter_host_kernel_connection,
+    finish_host_kernel_effect_capture, host_kernel_bridge, map_cli_client_error,
+    plugin_commands::PluginCommandRegistry, plugin_host, server_event_name,
     service_descriptors_from_declarations,
 };
 
@@ -984,7 +986,7 @@ pub(super) async fn run_plugin_command(
     command_name: &str,
     args: &[String],
 ) -> Result<u8> {
-    let status = run_plugin_command_internal(plugin_id, command_name, args)?.status;
+    let status = run_plugin_command_internal(plugin_id, command_name, args, None)?.status;
     Ok(status.clamp(0, i32::from(u8::MAX)) as u8)
 }
 
@@ -992,8 +994,9 @@ pub(super) fn run_plugin_keybinding_command(
     plugin_id: &str,
     command_name: &str,
     args: &[String],
+    kernel_client_factory: Option<&KernelClientFactory>,
 ) -> Result<PluginCommandExecution> {
-    run_plugin_command_internal(plugin_id, command_name, args)
+    run_plugin_command_internal(plugin_id, command_name, args, kernel_client_factory)
 }
 
 #[derive(Debug, Clone)]
@@ -1049,6 +1052,7 @@ pub(super) fn run_plugin_command_internal(
     plugin_id: &str,
     command_name: &str,
     args: &[String],
+    kernel_client_factory: Option<&KernelClientFactory>,
 ) -> Result<PluginCommandExecution> {
     let config = BmuxConfig::load()?;
     let paths = ConfigPaths::default();
@@ -1091,6 +1095,8 @@ pub(super) fn run_plugin_command_internal(
     );
     begin_host_kernel_effect_capture();
     let _host_kernel_connection_guard = enter_host_kernel_connection(context.connection.clone());
+    let _host_kernel_factory_guard =
+        kernel_client_factory.map(|f| enter_host_kernel_client_factory(Arc::clone(f)));
     let run_result =
         loaded.run_command_with_context_and_outcome(command_name, args, Some(&context));
     let fallback_effects = finish_host_kernel_effect_capture();

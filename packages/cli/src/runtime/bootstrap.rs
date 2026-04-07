@@ -81,9 +81,10 @@ pub(super) async fn run_default_server_attach(
     .await?;
     let target = resolve_default_attach_target(&mut client).await?;
     let target = target.to_string();
-    let attach_result = run_session_attach_with_client(client, Some(target.as_str()), None, false)
-        .await
-        .map(|outcome| outcome.status_code);
+    let attach_result =
+        run_session_attach_with_client(client, Some(target.as_str()), None, false, None)
+            .await
+            .map(|outcome| outcome.status_code);
 
     if let Some(recording_id) = active_recording_id {
         let mut stop_client = connect_with_context(
@@ -457,7 +458,7 @@ pub(super) async fn run_session_attach(
         connection_context,
     )
     .await?;
-    run_session_attach_with_client(client, target, follow, global)
+    run_session_attach_with_client(client, target, follow, global, None)
         .await
         .map(|outcome| outcome.status_code)
 }
