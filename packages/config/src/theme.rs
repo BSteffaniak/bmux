@@ -2,10 +2,12 @@
 //!
 //! This module provides theme configuration management for colors and styling.
 
+use bmux_config_doc_derive::ConfigDoc;
 use serde::{Deserialize, Serialize};
 
 /// Theme configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "theme_file")]
 #[serde(default)]
 pub struct ThemeConfig {
     /// Theme name
@@ -19,13 +21,15 @@ pub struct ThemeConfig {
     /// Selection background color
     pub selection_background: String,
     /// Border colors
+    #[config_doc(nested)]
     pub border: BorderColors,
     /// Status bar colors
+    #[config_doc(nested)]
     pub status: StatusColors,
 }
 
 /// Border color configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[serde(default)]
 pub struct BorderColors {
     /// Active pane border color
@@ -35,7 +39,7 @@ pub struct BorderColors {
 }
 
 /// Status bar color configuration
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
 #[serde(default)]
 pub struct StatusColors {
     /// Status bar background

@@ -865,6 +865,7 @@ pub struct PluginConfig {
     /// accepted keys and values.
     pub settings: BTreeMap<String, toml::Value>,
     /// Command routing policy for plugin ownership and startup validation.
+    #[config_doc(nested)]
     pub routing: PluginRoutingPolicyConfig,
 }
 
@@ -924,10 +925,13 @@ pub struct StatusBarConfig {
     /// High-level status bar visual preset.
     pub preset: StatusBarPreset,
     /// Layout and spacing options.
+    #[config_doc(nested)]
     pub layout: StatusBarLayoutConfig,
     /// Separator and emphasis options.
+    #[config_doc(nested)]
     pub style: StatusBarStyleConfig,
     /// Optional status-specific color overrides.
+    #[config_doc(nested)]
     pub theme: StatusBarThemeConfig,
     /// Maximum number of tabs shown in the tab strip before overflow is collapsed.
     pub max_tabs: usize,

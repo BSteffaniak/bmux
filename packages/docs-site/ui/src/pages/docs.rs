@@ -7,6 +7,7 @@ use hyperchad::template::Containers;
 use bmux_config::{
     AppearanceConfig, BehaviorConfig, ConfigDocSchema, ConnectionsConfig, GeneralConfig,
     KeyBindingConfig, MultiClientConfig, PluginConfig, RecordingConfig, StatusBarConfig,
+    ThemeConfig,
 };
 use std::collections::BTreeMap;
 
@@ -180,6 +181,7 @@ fn generate_config_reference() -> String {
 
     doc.push_str(&render_section::<GeneralConfig>());
     doc.push_str(&render_section::<AppearanceConfig>());
+    doc.push_str(&render_theme_file_reference());
     doc.push_str(&render_section::<BehaviorConfig>());
     doc.push_str(&render_section::<MultiClientConfig>());
     doc.push_str(&render_section::<KeyBindingConfig>());
@@ -275,6 +277,26 @@ fn render_section<T: ConfigDocSchema>() -> String {
         fields,
         defaults,
     )
+}
+
+fn render_theme_file_reference() -> String {
+    let mut s = String::from(
+        "## `themes/<name>.toml`\n\n\
+         Named theme files live under the bmux config directory (for example, \
+         `~/.config/bmux/themes/solarized.toml`) and are selected via \
+         `appearance.theme = \"solarized\"`.\n\n\
+         Keys below are top-level fields in the theme file.\n\n",
+    );
+
+    let (fields, defaults) =
+        flatten_field_docs(ThemeConfig::field_docs(), ThemeConfig::default_values(), "");
+    s.push_str(&render_fields_table(
+        "theme_file",
+        "theme",
+        fields,
+        defaults,
+    ));
+    s
 }
 
 fn dotted_key(prefix: &str, key: &str) -> String {
@@ -387,6 +409,22 @@ fn render_section_with_fields(
     defaults: BTreeMap<String, String>,
 ) -> String {
     let mut s = format!("## `[{section_name}]`\n\n{section_description}\n\n",);
+    s.push_str(&render_fields_table(
+        section_name,
+        section_name,
+        fields,
+        defaults,
+    ));
+    s
+}
+
+fn render_fields_table(
+    anchor_namespace: &str,
+    default_section_name: &str,
+    fields: Vec<RenderField>,
+    defaults: BTreeMap<String, String>,
+) -> String {
+    let mut s = String::new();
 
     s.push_str("| Option | Type | Default | Description |\n");
     s.push_str("|--------|------|---------|-------------|\n");
@@ -404,7 +442,7 @@ fn render_section_with_fields(
             match raw_default {
                 Some(v) if v.is_empty() || v == "{}" => "*(empty)*".to_string(),
                 Some(v) => {
-                    let anchor_id = default_anchor_id(section_name, &field.toml_key);
+                    let anchor_id = default_anchor_id(anchor_namespace, &field.toml_key);
                     deferred_tables.push((
                         field.toml_key.clone(),
                         v.to_string(),
@@ -450,7 +488,7 @@ fn render_section_with_fields(
         s.push_str(&format!(
             "<div id=\"{anchor_id}\"></div>\n\n\
              ### {heading}\n\n\
-             ```toml\n[{section_name}.{toml_key}]\n{default_val}\n```\n\n"
+             ```toml\n[{default_section_name}.{toml_key}]\n{default_val}\n```\n\n"
         ));
     }
 
@@ -713,5 +751,19 @@ mod tests {
         assert!(doc.contains("images.decode_mode"));
         assert!(doc.contains("compression.remote"));
         assert!(doc.contains("export.cursor"));
+        assert!(doc.contains("layout.density"));
+        assert!(doc.contains("style.separator_set"));
+        assert!(doc.contains("theme.tab_active_bg"));
+        assert!(doc.contains("routing.conflict_mode"));
+        assert!(doc.contains("routing.required_paths"));
+    }
+
+    #[test]
+    fn config_reference_documents_theme_file_schema() {
+        let doc = generate_config_reference();
+
+        assert!(doc.contains("## `themes/<name>.toml`"));
+        assert!(doc.contains("border.active"));
+        assert!(doc.contains("status.mode_indicator"));
     }
 }
