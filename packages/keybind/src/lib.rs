@@ -150,14 +150,23 @@ pub fn action_to_config_name(action: &RuntimeAction) -> String {
 
 /// Parse a string action name into a `RuntimeAction`.
 ///
+/// Plugin command arguments are preserved verbatim (case-sensitive).
+/// Built-in action names and the `plugin:` prefix / plugin ID / command
+/// name are matched case-insensitively.
+///
 /// # Errors
 ///
 /// Returns an error if the action name is not recognized.
 pub fn parse_action(value: &str) -> Result<RuntimeAction> {
-    let normalized = value.trim().to_ascii_lowercase();
-    if let Some(plugin_action) = parse_plugin_action(&normalized) {
+    let trimmed = value.trim();
+    // Try plugin action first on the original string so that arguments
+    // preserve their original case (e.g. file paths, user-entered values).
+    if let Some(plugin_action) = parse_plugin_action(trimmed) {
         return plugin_action;
     }
+    // Built-in actions are single tokens — safe to lowercase for
+    // case-insensitive matching.
+    let normalized = trimmed.to_ascii_lowercase();
     match normalized.as_str() {
         "quit" | "quit_destroy" => Ok(RuntimeAction::Quit),
         "detach" => Ok(RuntimeAction::Detach),
@@ -218,7 +227,13 @@ pub fn parse_action(value: &str) -> Result<RuntimeAction> {
 }
 
 fn parse_plugin_action(value: &str) -> Option<Result<RuntimeAction>> {
-    let rest = value.strip_prefix("plugin:")?;
+    // Case-insensitive check for the "plugin:" prefix without lowercasing
+    // the entire string — arguments must preserve their original case.
+    let prefix = "plugin:";
+    if value.len() < prefix.len() || !value[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        return None;
+    }
+    let rest = &value[prefix.len()..];
     let Some((plugin_id, remainder)) = rest.split_once(':') else {
         return Some(Err(anyhow::anyhow!(
             "invalid plugin keymap action '{value}' (expected plugin:<plugin-id>:<command>)"
@@ -245,8 +260,11 @@ fn parse_plugin_action(value: &str) -> Option<Result<RuntimeAction>> {
         )));
     }
     Some(Ok(RuntimeAction::PluginCommand {
-        plugin_id: plugin_id.to_string(),
-        command_name: command_name.to_string(),
+        // Lowercase plugin ID and command name for case-insensitive matching.
+        plugin_id: plugin_id.to_ascii_lowercase(),
+        command_name: command_name.to_ascii_lowercase(),
+        // Arguments are preserved verbatim — they may contain user-provided
+        // values (file paths, names from prompt substitution, etc.).
         args,
     }))
 }
@@ -328,6 +346,50 @@ mod tests {
         assert_eq!(
             action_to_config_name(&action),
             "plugin:bmux.windows:goto-window 1"
+        );
+    }
+
+    #[test]
+    fn parse_action_preserves_plugin_argument_case() {
+        let action = parse_action("plugin:bmux.test:cmd --name MyRecording /tmp/MyFile.gif")
+            .expect("should parse");
+        assert_eq!(
+            action,
+            RuntimeAction::PluginCommand {
+                plugin_id: "bmux.test".to_string(),
+                command_name: "cmd".to_string(),
+                args: vec![
+                    "--name".to_string(),
+                    "MyRecording".to_string(),
+                    "/tmp/MyFile.gif".to_string(),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_action_lowercases_plugin_id_and_command() {
+        let action =
+            parse_action("Plugin:Bmux.Windows:New-Window").expect("mixed case should parse");
+        assert_eq!(
+            action,
+            RuntimeAction::PluginCommand {
+                plugin_id: "bmux.windows".to_string(),
+                command_name: "new-window".to_string(),
+                args: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn parse_action_is_case_insensitive_for_builtins() {
+        assert_eq!(
+            parse_action("QUIT").expect("uppercase built-in should parse"),
+            RuntimeAction::Quit
+        );
+        assert_eq!(
+            parse_action("Focus_Next_Pane").expect("mixed case built-in should parse"),
+            RuntimeAction::FocusNext
         );
     }
 }
