@@ -1118,6 +1118,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bmux_prompt_showcase"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "anyhow",
+ "bmux_cli",
+ "bmux_sandbox_harness",
+ "tokio",
+]
+
+[[package]]
 name = "bmux_sandbox_harness"
 version = "0.0.1-alpha.0"
 dependencies = [

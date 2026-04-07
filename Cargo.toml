@@ -2,6 +2,7 @@
 members = [
     "examples/hello-plugin",
     "examples/native-plugin",
+    "examples/prompt-showcase",
     "packages/bmux",
     "packages/codec",
     "packages/fonts",

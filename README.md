@@ -196,6 +196,27 @@ path = ["recording", "start"]
 
 Role policy: `owner` controls session and window mutations plus role changes, `writer` can send attach input, and `observer` is read-only.
 
+## Examples
+
+- Prompt showcase (isolated in-process sandbox + attach prompt API):
+
+  ```bash
+  cargo run -p bmux_prompt_showcase
+  ```
+
+- Native plugin example:
+
+  ```bash
+  cargo build -p bmux_example_native_plugin
+  ./scripts/install-example-plugin.sh
+  ```
+
+- Minimal hello plugin example:
+
+  ```bash
+  cargo build -p bmux_example_hello_plugin
+  ```
+
 ## Development
 
 Useful commands:
