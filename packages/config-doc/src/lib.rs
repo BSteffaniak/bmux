@@ -6,7 +6,29 @@
 
 use std::collections::BTreeMap;
 
+/// Nested schema metadata for a field that expands into dotted sub-keys.
+#[derive(Clone)]
+pub enum NestedFieldDoc {
+    /// Inline nested struct, expanded as `<parent>.<child>`.
+    Inline {
+        /// Child field docs from the nested schema.
+        fields: Vec<FieldDoc>,
+        /// Default values keyed by child field name.
+        defaults: BTreeMap<String, String>,
+    },
+    /// Map value schema, expanded as `<parent>.<key_placeholder>.<child>`.
+    Map {
+        /// Placeholder label rendered in docs for dynamic map keys.
+        key_placeholder: &'static str,
+        /// Child field docs from the map value schema.
+        value_fields: Vec<FieldDoc>,
+        /// Default values keyed by child field name.
+        value_defaults: BTreeMap<String, String>,
+    },
+}
+
 /// Metadata for a single configuration field.
+#[derive(Clone)]
 pub struct FieldDoc {
     /// TOML key name for this field.
     pub toml_key: &'static str,
@@ -16,6 +38,8 @@ pub struct FieldDoc {
     pub description: &'static str,
     /// For enum-typed fields, the list of valid TOML values.
     pub enum_values: Option<&'static [&'static str]>,
+    /// Optional nested schema metadata for dotted-key expansion.
+    pub nested: Option<NestedFieldDoc>,
 }
 
 /// Trait implemented by config structs via `#[derive(ConfigDoc)]`.

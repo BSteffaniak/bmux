@@ -83,6 +83,7 @@ pub struct ConnectionsConfig {
     /// Optional control-plane base URL for hosted auth/share resolution.
     pub control_plane_url: Option<String>,
     /// Named connection targets.
+    #[config_doc(nested, map_key = "<name>")]
     pub targets: BTreeMap<String, ConnectionTargetConfig>,
     /// Most recently used targets (newest first).
     pub recent_targets: Vec<String>,
@@ -91,21 +92,23 @@ pub struct ConnectionsConfig {
     /// User-defined share links (bmux://<name> -> target reference)
     pub share_links: BTreeMap<String, String>,
     /// Optional SSH-key allowlist and enforcement for iroh connections.
+    #[config_doc(nested)]
     pub iroh_ssh_access: IrohSshAccessConfig,
 }
 
 /// SSH-key allowlist configuration for iroh access control.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
 #[serde(default)]
 pub struct IrohSshAccessConfig {
     /// Require SSH challenge authentication on iroh connections.
     pub enabled: bool,
     /// Fingerprint -> key metadata map.
+    #[config_doc(nested, map_key = "<fingerprint>")]
     pub allowlist: BTreeMap<String, IrohSshAuthorizedKey>,
 }
 
 /// Authorized SSH public key entry.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
 #[serde(default)]
 pub struct IrohSshAuthorizedKey {
     /// Public key in OpenSSH one-line format.
@@ -114,13 +117,6 @@ pub struct IrohSshAuthorizedKey {
     pub label: Option<String>,
     /// Unix timestamp of when the key was added.
     pub added_at_unix: Option<i64>,
-}
-
-impl IrohSshAccessConfig {
-    #[must_use]
-    pub const fn config_doc_values() -> &'static [&'static str] {
-        &[]
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
@@ -292,6 +288,7 @@ pub struct RecordingConfig {
     /// When unset, GIFs are written next to the recording directory.
     pub auto_export_dir: Option<PathBuf>,
     /// Default settings for `recording export` rendering.
+    #[config_doc(nested)]
     pub export: RecordingExportConfig,
 }
 
@@ -544,10 +541,13 @@ pub struct BehaviorConfig {
     /// guaranteed accuracy. RETAIN keeps parsers in memory for instant restore.
     pub pane_restore_method: PaneRestoreMethod,
     /// Mouse interaction settings for attach mode (focus/scroll gestures).
+    #[config_doc(nested)]
     pub mouse: MouseBehaviorConfig,
     /// Terminal image protocol settings (Sixel, Kitty graphics, iTerm2).
+    #[config_doc(nested)]
     pub images: ImageBehaviorConfig,
     /// IPC compression settings (image payloads and remote connections).
+    #[config_doc(nested)]
     pub compression: CompressionConfig,
 }
 

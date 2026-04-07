@@ -5,9 +5,8 @@ use hyperchad::markdown::markdown_to_container;
 use hyperchad::template::Containers;
 
 use bmux_config::{
-    AppearanceConfig, BehaviorConfig, CompressionConfig, ConfigDocSchema, GeneralConfig,
-    ImageBehaviorConfig, KeyBindingConfig, MouseBehaviorConfig, MultiClientConfig, PluginConfig,
-    RecordingConfig, RecordingExportConfig, StatusBarConfig,
+    AppearanceConfig, BehaviorConfig, ConfigDocSchema, ConnectionsConfig, GeneralConfig,
+    KeyBindingConfig, MultiClientConfig, PluginConfig, RecordingConfig, StatusBarConfig,
 };
 use std::collections::BTreeMap;
 
@@ -181,10 +180,11 @@ fn generate_config_reference() -> String {
 
     doc.push_str(&render_section::<GeneralConfig>());
     doc.push_str(&render_section::<AppearanceConfig>());
-    doc.push_str(&render_behavior_section());
+    doc.push_str(&render_section::<BehaviorConfig>());
     doc.push_str(&render_section::<MultiClientConfig>());
     doc.push_str(&render_section::<KeyBindingConfig>());
     doc.push_str(&render_section::<PluginConfig>());
+    doc.push_str(&render_section::<ConnectionsConfig>());
     doc.push_str(&render_section::<StatusBarConfig>());
     doc.push_str("\n## Status Bar Preset Examples\n\n");
     doc.push_str("### Tab Rail (recommended)\n\n");
@@ -262,127 +262,72 @@ tab_inactive_bg = \"#2a2f45\"\n\
 module_bg = \"#343a55\"\n\
 ```\n\n",
     );
-    doc.push_str(&render_recording_section());
+    doc.push_str(&render_section::<RecordingConfig>());
 
     doc
 }
 
 fn render_section<T: ConfigDocSchema>() -> String {
-    let fields = T::field_docs()
-        .into_iter()
-        .map(RenderField::from)
-        .collect::<Vec<_>>();
+    let (fields, defaults) = flatten_field_docs(T::field_docs(), T::default_values(), "");
     render_section_with_fields(
         T::section_name(),
         T::section_description(),
         fields,
-        T::default_values(),
-    )
-}
-
-fn render_behavior_section() -> String {
-    let mut defaults = BehaviorConfig::default_values();
-    let mouse_defaults = MouseBehaviorConfig::default_values();
-    let images_defaults = ImageBehaviorConfig::default_values();
-    let compression_defaults = CompressionConfig::default_values();
-
-    let mut fields = BehaviorConfig::field_docs()
-        .into_iter()
-        .filter(|field| {
-            field.toml_key != "mouse"
-                && field.toml_key != "images"
-                && field.toml_key != "compression"
-        })
-        .map(RenderField::from)
-        .collect::<Vec<_>>();
-
-    // Inline MouseBehaviorConfig sub-fields with "mouse." prefix.
-    for field in MouseBehaviorConfig::field_docs() {
-        let dotted_key = format!("mouse.{}", field.toml_key);
-        if let Some(default) = mouse_defaults.get(field.toml_key) {
-            defaults.insert(dotted_key.clone(), default.clone());
-        }
-        fields.push(RenderField {
-            toml_key: dotted_key,
-            type_display: field.type_display.to_string(),
-            description: field.description.to_string(),
-            enum_values: field
-                .enum_values
-                .map(|values| values.iter().map(|value| (*value).to_string()).collect()),
-        });
-    }
-
-    // Inline ImageBehaviorConfig sub-fields with "images." prefix.
-    for field in ImageBehaviorConfig::field_docs() {
-        let dotted_key = format!("images.{}", field.toml_key);
-        if let Some(default) = images_defaults.get(field.toml_key) {
-            defaults.insert(dotted_key.clone(), default.clone());
-        }
-        fields.push(RenderField {
-            toml_key: dotted_key,
-            type_display: field.type_display.to_string(),
-            description: field.description.to_string(),
-            enum_values: field
-                .enum_values
-                .map(|values| values.iter().map(|value| (*value).to_string()).collect()),
-        });
-    }
-
-    // Inline CompressionConfig sub-fields with "compression." prefix.
-    for field in CompressionConfig::field_docs() {
-        let dotted_key = format!("compression.{}", field.toml_key);
-        if let Some(default) = compression_defaults.get(field.toml_key) {
-            defaults.insert(dotted_key.clone(), default.clone());
-        }
-        fields.push(RenderField {
-            toml_key: dotted_key,
-            type_display: field.type_display.to_string(),
-            description: field.description.to_string(),
-            enum_values: field
-                .enum_values
-                .map(|values| values.iter().map(|value| (*value).to_string()).collect()),
-        });
-    }
-
-    render_section_with_fields(
-        BehaviorConfig::section_name(),
-        BehaviorConfig::section_description(),
-        fields,
         defaults,
     )
 }
 
-fn render_recording_section() -> String {
-    let mut defaults = RecordingConfig::default_values();
-    let export_defaults = RecordingExportConfig::default_values();
+fn dotted_key(prefix: &str, key: &str) -> String {
+    if prefix.is_empty() {
+        key.to_string()
+    } else {
+        format!("{prefix}.{key}")
+    }
+}
 
-    let mut fields = RecordingConfig::field_docs()
-        .into_iter()
-        .filter(|field| field.toml_key != "export")
-        .map(RenderField::from)
-        .collect::<Vec<_>>();
+fn flatten_field_docs(
+    fields: Vec<bmux_config::FieldDoc>,
+    defaults: BTreeMap<String, String>,
+    prefix: &str,
+) -> (Vec<RenderField>, BTreeMap<String, String>) {
+    let mut flattened_fields = Vec::new();
+    let mut flattened_defaults = BTreeMap::new();
 
-    for field in RecordingExportConfig::field_docs() {
-        let dotted_key = format!("export.{}", field.toml_key);
-        if let Some(default) = export_defaults.get(field.toml_key) {
-            defaults.insert(dotted_key.clone(), default.clone());
+    for field in fields {
+        let full_key = dotted_key(prefix, field.toml_key);
+
+        match field.nested {
+            Some(bmux_config_doc::NestedFieldDoc::Inline {
+                fields: nested_fields,
+                defaults: nested_defaults,
+            }) => {
+                let (child_fields, child_defaults) =
+                    flatten_field_docs(nested_fields, nested_defaults, &full_key);
+                flattened_fields.extend(child_fields);
+                flattened_defaults.extend(child_defaults);
+            }
+            Some(bmux_config_doc::NestedFieldDoc::Map {
+                key_placeholder,
+                value_fields,
+                value_defaults,
+            }) => {
+                let map_prefix = dotted_key(&full_key, key_placeholder);
+                let (child_fields, child_defaults) =
+                    flatten_field_docs(value_fields, value_defaults, &map_prefix);
+                flattened_fields.extend(child_fields);
+                flattened_defaults.extend(child_defaults);
+            }
+            None => {
+                if let Some(default) = defaults.get(field.toml_key) {
+                    flattened_defaults.insert(full_key.clone(), default.clone());
+                }
+
+                flattened_fields.push(RenderField::from_field_doc(full_key, field));
+            }
         }
-        fields.push(RenderField {
-            toml_key: dotted_key,
-            type_display: field.type_display.to_string(),
-            description: field.description.to_string(),
-            enum_values: field
-                .enum_values
-                .map(|values| values.iter().map(|value| (*value).to_string()).collect()),
-        });
     }
 
-    render_section_with_fields(
-        RecordingConfig::section_name(),
-        RecordingConfig::section_description(),
-        fields,
-        defaults,
-    )
+    (flattened_fields, flattened_defaults)
 }
 
 struct RenderField {
@@ -392,10 +337,10 @@ struct RenderField {
     enum_values: Option<Vec<String>>,
 }
 
-impl From<bmux_config::FieldDoc> for RenderField {
-    fn from(value: bmux_config::FieldDoc) -> Self {
+impl RenderField {
+    fn from_field_doc(toml_key: String, value: bmux_config::FieldDoc) -> Self {
         Self {
-            toml_key: value.toml_key.to_string(),
+            toml_key,
             type_display: value.type_display.to_string(),
             description: value.description.to_string(),
             enum_values: value
@@ -403,6 +348,36 @@ impl From<bmux_config::FieldDoc> for RenderField {
                 .map(|values| values.iter().map(|v| (*v).to_string()).collect()),
         }
     }
+}
+
+fn slugify_anchor_fragment(input: &str) -> String {
+    let mut slug = String::new();
+    let mut emitted_dash = false;
+
+    for ch in input.chars() {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch.to_ascii_lowercase());
+            emitted_dash = false;
+        } else if !emitted_dash {
+            slug.push('-');
+            emitted_dash = true;
+        }
+    }
+
+    let trimmed = slug.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "default".to_string()
+    } else {
+        trimmed
+    }
+}
+
+fn default_anchor_id(section_name: &str, toml_key: &str) -> String {
+    format!(
+        "default-{}-{}",
+        slugify_anchor_fragment(section_name),
+        slugify_anchor_fragment(toml_key)
+    )
 }
 
 fn render_section_with_fields(
@@ -418,7 +393,7 @@ fn render_section_with_fields(
 
     // Collect table-typed fields with non-empty defaults for rendering after
     // the table as collapsible code blocks.
-    let mut deferred_tables: Vec<(String, String, bool)> = Vec::new();
+    let mut deferred_tables: Vec<(String, String, bool, String)> = Vec::new();
 
     for field in fields {
         let raw_default = defaults.get(&field.toml_key).map(String::as_str);
@@ -429,11 +404,14 @@ fn render_section_with_fields(
             match raw_default {
                 Some(v) if v.is_empty() || v == "{}" => "*(empty)*".to_string(),
                 Some(v) => {
-                    deferred_tables.push((field.toml_key.clone(), v.to_string(), is_table));
-                    format!(
-                        "[*(see defaults below)*](#default-{section_name}-{})",
-                        field.toml_key
-                    )
+                    let anchor_id = default_anchor_id(section_name, &field.toml_key);
+                    deferred_tables.push((
+                        field.toml_key.clone(),
+                        v.to_string(),
+                        is_table,
+                        anchor_id.clone(),
+                    ));
+                    format!("[*(see defaults below)*](#{anchor_id})")
                 }
                 None => "*(empty)*".to_string(),
             }
@@ -463,14 +441,14 @@ fn render_section_with_fields(
     s.push('\n');
 
     // Render deferred table defaults as code blocks with anchor IDs
-    for (toml_key, default_val, is_table) in &deferred_tables {
+    for (toml_key, default_val, is_table, anchor_id) in &deferred_tables {
         let heading = if *is_table {
             format!("Default `{toml_key}` bindings")
         } else {
             format!("Default `{toml_key}` value")
         };
         s.push_str(&format!(
-            "<div id=\"default-{section_name}-{toml_key}\"></div>\n\n\
+            "<div id=\"{anchor_id}\"></div>\n\n\
              ### {heading}\n\n\
              ```toml\n[{section_name}.{toml_key}]\n{default_val}\n```\n\n"
         ));
@@ -710,4 +688,30 @@ fn infer_value_type(val_name: &str) -> String {
     }
 
     "string".to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::generate_config_reference;
+
+    #[test]
+    fn config_reference_includes_connections_nested_dotted_keys() {
+        let doc = generate_config_reference();
+
+        assert!(doc.contains("## `[connections]`"));
+        assert!(doc.contains("targets.<name>.transport"));
+        assert!(doc.contains("iroh_ssh_access.enabled"));
+        assert!(doc.contains("iroh_ssh_access.allowlist.<fingerprint>.public_key"));
+        assert!(doc.contains("iroh_ssh_access.allowlist.<fingerprint>.added_at_unix"));
+    }
+
+    #[test]
+    fn config_reference_keeps_existing_nested_sections_dotted() {
+        let doc = generate_config_reference();
+
+        assert!(doc.contains("mouse.enabled"));
+        assert!(doc.contains("images.decode_mode"));
+        assert!(doc.contains("compression.remote"));
+        assert!(doc.contains("export.cursor"));
+    }
 }

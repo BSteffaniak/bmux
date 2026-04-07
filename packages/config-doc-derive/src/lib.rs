@@ -15,6 +15,12 @@ use proc_macro::TokenStream;
 use quote::quote;
 use syn::{Attribute, Data, DeriveInput, Fields, Lit, Meta, parse_macro_input};
 
+#[derive(Default)]
+struct NestedDocConfig {
+    enabled: bool,
+    map_key: Option<String>,
+}
+
 // ── Serde rename_all support ────────────────────────────────────────────────
 
 fn apply_rename_rule(name: &str, rule: &str) -> String {
@@ -157,6 +163,106 @@ fn extract_config_doc_values(attrs: &[Attribute]) -> Option<Vec<String>> {
         }
     }
     None
+}
+
+/// Extract nested schema options from `#[config_doc(...)]` field attributes.
+///
+/// Supported forms:
+/// - `#[config_doc(nested)]`
+/// - `#[config_doc(nested, map_key = "<name>")]`
+fn extract_nested_doc_config(attrs: &[Attribute]) -> syn::Result<NestedDocConfig> {
+    let mut result = NestedDocConfig::default();
+
+    for attr in attrs {
+        if !attr.path().is_ident("config_doc") {
+            continue;
+        }
+
+        let Ok(nested) = attr
+            .parse_args_with(syn::punctuated::Punctuated::<Meta, syn::Token![,]>::parse_terminated)
+        else {
+            continue;
+        };
+
+        for meta in &nested {
+            match meta {
+                Meta::Path(path) if path.is_ident("nested") => {
+                    result.enabled = true;
+                }
+                Meta::NameValue(nv) if nv.path.is_ident("map_key") => {
+                    if let syn::Expr::Lit(expr_lit) = &nv.value
+                        && let Lit::Str(lit) = &expr_lit.lit
+                    {
+                        result.map_key = Some(lit.value());
+                    } else {
+                        return Err(syn::Error::new_spanned(
+                            &nv.value,
+                            "config_doc map_key must be a string literal",
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if result.map_key.is_some() && !result.enabled {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "config_doc map_key requires config_doc(nested)",
+        ));
+    }
+
+    Ok(result)
+}
+
+fn option_inner_type(ty: &syn::Type) -> Option<&syn::Type> {
+    let syn::Type::Path(type_path) = ty else {
+        return None;
+    };
+
+    let segment = type_path.path.segments.last()?;
+    if segment.ident != "Option" {
+        return None;
+    }
+
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+
+    for arg in &args.args {
+        if let syn::GenericArgument::Type(inner) = arg {
+            return Some(inner);
+        }
+    }
+
+    None
+}
+
+fn map_value_type(ty: &syn::Type) -> Option<&syn::Type> {
+    let syn::Type::Path(type_path) = ty else {
+        return None;
+    };
+
+    let segment = type_path.path.segments.last()?;
+    if segment.ident != "BTreeMap" && segment.ident != "HashMap" {
+        return None;
+    }
+
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+
+    let mut type_args = args.args.iter().filter_map(|arg| {
+        if let syn::GenericArgument::Type(ty) = arg {
+            Some(ty)
+        } else {
+            None
+        }
+    });
+
+    let _key_ty = type_args.next()?;
+    type_args.next()
 }
 
 // ── Type display mapping ────────────────────────────────────────────────────
@@ -305,6 +411,11 @@ pub fn derive_config_doc_enum(input: TokenStream) -> TokenStream {
 /// - `field_docs()` — field metadata extracted from doc comments and types
 /// - `default_values()` — serialized from `Default::default()`
 ///
+/// Field-level options:
+/// - `#[config_doc(values("a", "b"))]` for explicit enum values.
+/// - `#[config_doc(nested)]` for inline nested schema expansion.
+/// - `#[config_doc(nested, map_key = "<name>")]` for map value schema expansion.
+///
 /// **All public fields must have doc comments.** A compile error is emitted
 /// for any undocumented field.
 #[allow(clippy::too_many_lines)]
@@ -365,28 +476,71 @@ pub fn derive_config_doc(input: TokenStream) -> TokenStream {
 
         let type_display = type_to_display(&field.ty);
 
+        let nested_doc_config = match extract_nested_doc_config(&field.attrs) {
+            Ok(cfg) => cfg,
+            Err(err) => return err.to_compile_error().into(),
+        };
+
         // Check for explicit #[config_doc(values("a", "b"))] on the field first,
         // then fall back to TypeName::config_doc_values() for local enums.
-        let enum_values_expr = extract_config_doc_values(&field.attrs).map_or_else(
-            || {
-                if is_enum_type(&field.ty) {
-                    enum_type_ident(&field.ty).map_or_else(
-                        || quote! { None },
-                        |enum_ident| quote! { Some(#enum_ident::config_doc_values()) },
-                    )
-                } else {
-                    quote! { None }
+        let enum_values_expr = if nested_doc_config.enabled {
+            quote! { None }
+        } else {
+            extract_config_doc_values(&field.attrs).map_or_else(
+                || {
+                    if is_enum_type(&field.ty) {
+                        enum_type_ident(&field.ty).map_or_else(
+                            || quote! { None },
+                            |enum_ident| quote! { Some(#enum_ident::config_doc_values()) },
+                        )
+                    } else {
+                        quote! { None }
+                    }
+                },
+                |explicit_values| {
+                    let num = explicit_values.len();
+                    let lits: Vec<_> = explicit_values.iter().map(|v| quote!(#v)).collect();
+                    quote! {{
+                        static VALS: [&str; #num] = [#(#lits),*];
+                        Some(&VALS[..])
+                    }}
+                },
+            )
+        };
+
+        let nested_expr = if nested_doc_config.enabled {
+            if let Some(value_ty) = map_value_type(&field.ty) {
+                let key_placeholder = nested_doc_config
+                    .map_key
+                    .unwrap_or_else(|| "<key>".to_string());
+                quote! {
+                    Some(bmux_config_doc::NestedFieldDoc::Map {
+                        key_placeholder: #key_placeholder,
+                        value_fields: <#value_ty as bmux_config_doc::ConfigDocSchema>::field_docs(),
+                        value_defaults: <#value_ty as bmux_config_doc::ConfigDocSchema>::default_values(),
+                    })
                 }
-            },
-            |explicit_values| {
-                let num = explicit_values.len();
-                let lits: Vec<_> = explicit_values.iter().map(|v| quote!(#v)).collect();
-                quote! {{
-                    static VALS: [&str; #num] = [#(#lits),*];
-                    Some(&VALS[..])
-                }}
-            },
-        );
+            } else {
+                if nested_doc_config.map_key.is_some() {
+                    return syn::Error::new_spanned(
+                        &field.ty,
+                        "config_doc map_key is only valid for map fields",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+
+                let nested_ty = option_inner_type(&field.ty).unwrap_or(&field.ty);
+                quote! {
+                    Some(bmux_config_doc::NestedFieldDoc::Inline {
+                        fields: <#nested_ty as bmux_config_doc::ConfigDocSchema>::field_docs(),
+                        defaults: <#nested_ty as bmux_config_doc::ConfigDocSchema>::default_values(),
+                    })
+                }
+            }
+        } else {
+            quote! { None }
+        };
 
         field_doc_entries.push(quote! {
             bmux_config_doc::FieldDoc {
@@ -394,6 +548,7 @@ pub fn derive_config_doc(input: TokenStream) -> TokenStream {
                 type_display: #type_display,
                 description: #doc_comment,
                 enum_values: #enum_values_expr,
+                nested: #nested_expr,
             }
         });
 
