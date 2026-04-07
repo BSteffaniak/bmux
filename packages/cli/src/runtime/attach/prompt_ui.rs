@@ -663,14 +663,14 @@ fn render_prompt_body(
             PromptWidgetState::Confirm { selected_yes },
         ) => {
             let yes = if *selected_yes {
-                format!("> [x] {yes_label}")
+                format!("> {yes_label}")
             } else {
-                format!("  [x] {yes_label}")
+                format!("  {yes_label}")
             };
             let no = if *selected_yes {
-                format!("  [ ] {no_label}")
+                format!("  {no_label}")
             } else {
-                format!("> [ ] {no_label}")
+                format!("> {no_label}")
             };
             let row = format!("{yes}    {no}");
             field_lines.push(opaque_row_text(
@@ -894,6 +894,7 @@ fn remove_char(input: &mut String, char_index: usize) {
 mod tests {
     use super::{
         AttachInternalPromptAction, AttachPromptState, PromptKeyDisposition, adjust_scroll,
+        render_prompt_body,
     };
     use crate::runtime::prompt::{PromptOption, PromptRequest, PromptResponse, PromptValue};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
@@ -955,6 +956,44 @@ mod tests {
         assert_eq!(
             completion.response,
             PromptResponse::Submitted(PromptValue::Text("h".to_string()))
+        );
+    }
+
+    #[test]
+    fn confirm_prompt_render_uses_caret_without_checkbox_markers() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::confirm("Prompt Showcase")
+                .confirm_default(true)
+                .confirm_labels("Continue", "Stop"),
+            AttachInternalPromptAction::QuitSession,
+        );
+
+        let active = state.active.as_mut().expect("prompt should be active");
+        let initial = render_prompt_body(active, 64, 2);
+        let initial_row = &initial.lines[0];
+        assert!(
+            initial_row.contains("> Continue"),
+            "initial row: {initial_row:?}"
+        );
+        assert!(
+            initial_row.contains("  Stop"),
+            "initial row: {initial_row:?}"
+        );
+        assert!(!initial_row.contains("[x]"));
+        assert!(!initial_row.contains("[ ]"));
+
+        let _ = state.handle_key_event(&key_event(KeyCode::Right));
+        let active = state.active.as_mut().expect("prompt should remain active");
+        let switched = render_prompt_body(active, 64, 2);
+        let switched_row = &switched.lines[0];
+        assert!(
+            switched_row.contains("  Continue"),
+            "switched row: {switched_row:?}"
+        );
+        assert!(
+            switched_row.contains("> Stop"),
+            "switched row: {switched_row:?}"
         );
     }
 
