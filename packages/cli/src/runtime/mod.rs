@@ -53,8 +53,9 @@ use self::logs_watch::{
     active_log_file_path, run_logs_profiles_delete, run_logs_profiles_list,
     run_logs_profiles_rename, run_logs_profiles_show, run_logs_watch,
 };
+pub use attach::runtime::AttachRunOutcome;
 use attach::runtime::run_session_attach_with_client;
-use attach::state::AttachExitReason;
+pub use attach::state::AttachExitReason;
 use bootstrap::{
     DefaultAttachOptions, init_logging, map_attach_client_error, map_cli_client_error,
     run_default_server_attach, run_server_start, run_session_attach,
@@ -86,6 +87,10 @@ use plugin_runtime::{
     registered_plugin_entry_exists, resolve_plugin_search_paths, run_external_plugin_command,
     run_plugin_command, run_plugin_keybinding_command, scan_available_plugins,
     validate_enabled_plugins,
+};
+pub use prompt::{
+    PromptField, PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptSubmitError,
+    PromptValue, PromptWidth,
 };
 use recording_cli::{
     recording_event_kind_name, replay_interactive, replay_verify, replay_watch, run_recording_cut,
@@ -152,6 +157,27 @@ pub fn active_runtime_name() -> String {
 
 pub fn append_runtime_arg(command: &mut ProcessCommand) {
     command.arg("--runtime").arg(active_runtime_name());
+}
+
+pub async fn run_attach_with_client(
+    client: BmuxClient,
+    target: Option<&str>,
+    follow: Option<&str>,
+    global: bool,
+) -> Result<AttachRunOutcome> {
+    run_session_attach_with_client(client, target, follow, global).await
+}
+
+pub fn submit_prompt_request(
+    request: PromptRequest,
+) -> std::result::Result<tokio::sync::oneshot::Receiver<PromptResponse>, PromptSubmitError> {
+    prompt::submit(request)
+}
+
+pub async fn request_prompt_response(
+    request: PromptRequest,
+) -> std::result::Result<PromptResponse, PromptSubmitError> {
+    prompt::request(request).await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

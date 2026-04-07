@@ -11,7 +11,20 @@ pub use bmux_event::{Event, EventDispatcher, ModalSystem, Mode};
 pub use bmux_session::{SessionId, SessionInfo, SessionManager};
 pub use bmux_terminal::{TerminalInstance, TerminalManager};
 
+mod connection;
+mod runtime;
+mod status;
+
+pub mod attach;
 pub mod input;
 
 /// Playbook system for headless scripted bmux execution.
 pub mod playbook;
+
+/// Run the bmux CLI runtime entrypoint.
+///
+/// # Errors
+/// Returns an error when CLI parsing, command execution, or runtime startup fails.
+pub async fn run_cli() -> anyhow::Result<u8> {
+    runtime::run().await
+}

@@ -1,0 +1,27 @@
+[package]
+authors     = { workspace = true }
+categories  = ["development-tools"]
+description = "Reusable sandbox harness for bmux examples and tests"
+edition     = { workspace = true }
+keywords    = ["bmux", "sandbox", "harness", "testing"]
+license     = { workspace = true }
+name        = "bmux_sandbox_harness"
+readme      = "README.md"
+repository  = { workspace = true }
+version     = { workspace = true }
+
+[dependencies]
+anyhow      = { workspace = true, features = ["std"] }
+bmux_client = { workspace = true }
+bmux_config = { workspace = true }
+bmux_server = { workspace = true }
+tokio       = { workspace = true, features = ["macros", "rt", "time"] }
+tracing     = { workspace = true, features = ["std"] }
+
+[features]
+default = []
+fail-on-warnings = [
+    "bmux_client/fail-on-warnings",
+    "bmux_config/fail-on-warnings",
+    "bmux_server/fail-on-warnings",
+]

@@ -76,6 +76,9 @@ pub use bmux_plugin as plugin;
 #[cfg(feature = "plugin_sdk")]
 pub use bmux_plugin_sdk as plugin_sdk;
 
+#[cfg(feature = "sandbox_harness")]
+pub use bmux_sandbox_harness as sandbox_harness;
+
 /// Prelude module for commonly used types across all enabled features
 pub mod prelude {
     #[cfg(feature = "session")]

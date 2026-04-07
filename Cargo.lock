@@ -814,6 +814,7 @@ dependencies = [
  "bmux_keybind",
  "bmux_plugin",
  "bmux_plugin_sdk",
+ "bmux_sandbox_harness",
  "bmux_server",
  "bmux_session",
  "bmux_terminal",
@@ -1114,6 +1115,18 @@ dependencies = [
  "thiserror 2.0.18",
  "toml",
  "uuid",
+]
+
+[[package]]
+name = "bmux_sandbox_harness"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "anyhow",
+ "bmux_client",
+ "bmux_config",
+ "bmux_server",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

@@ -18,12 +18,13 @@ bmux_session  = { workspace = true, optional = true }
 bmux_terminal = { workspace = true, optional = true }
 
 # Feature-gated packages
-bmux_cli        = { workspace = true, optional = true }
-bmux_client     = { workspace = true, optional = true }
-bmux_keybind    = { workspace = true, optional = true }
-bmux_plugin     = { workspace = true, optional = true }
-bmux_plugin_sdk = { workspace = true, optional = true }
-bmux_server     = { workspace = true, optional = true }
+bmux_cli             = { workspace = true, optional = true }
+bmux_client          = { workspace = true, optional = true }
+bmux_keybind         = { workspace = true, optional = true }
+bmux_plugin          = { workspace = true, optional = true }
+bmux_plugin_sdk      = { workspace = true, optional = true }
+bmux_sandbox_harness = { workspace = true, optional = true }
+bmux_server          = { workspace = true, optional = true }
 
 [features]
 # Default features
@@ -38,23 +39,34 @@ fail-on-warnings = [
     "bmux_keybind?/fail-on-warnings",
     "bmux_plugin?/fail-on-warnings",
     "bmux_plugin_sdk?/fail-on-warnings",
+    "bmux_sandbox_harness?/fail-on-warnings",
     "bmux_server?/fail-on-warnings",
     "bmux_session?/fail-on-warnings",
     "bmux_terminal?/fail-on-warnings",
 ]
 
 # Feature groups
-all  = ["cli", "client", "core", "keybind", "plugin", "plugin_sdk", "server"]
+all = [
+    "cli",
+    "client",
+    "core",
+    "keybind",
+    "plugin",
+    "plugin_sdk",
+    "sandbox_harness",
+    "server",
+]
 core = ["config", "event", "session", "terminal"]
 
 # Individual package features
-cli        = ["dep:bmux_cli"]
-client     = ["dep:bmux_client"]
-config     = ["dep:bmux_config"]
-event      = ["dep:bmux_event"]
-keybind    = ["dep:bmux_keybind"]
-plugin     = ["dep:bmux_plugin"]
-plugin_sdk = ["dep:bmux_plugin_sdk"]
-server     = ["dep:bmux_server"]
-session    = ["dep:bmux_session"]
-terminal   = ["dep:bmux_terminal"]
+cli             = ["dep:bmux_cli"]
+client          = ["dep:bmux_client"]
+config          = ["dep:bmux_config"]
+event           = ["dep:bmux_event"]
+keybind         = ["dep:bmux_keybind"]
+plugin          = ["dep:bmux_plugin"]
+plugin_sdk      = ["dep:bmux_plugin_sdk"]
+sandbox_harness = ["dep:bmux_sandbox_harness"]
+server          = ["dep:bmux_server"]
+session         = ["dep:bmux_session"]
+terminal        = ["dep:bmux_terminal"]
