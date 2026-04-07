@@ -112,6 +112,11 @@ declare_bundled_plugins! {
     manifest = include_str!("../../../../plugins/plugin-cli-plugin/plugin.toml"),
     plugin_type = bmux_plugin_cli_plugin::PluginCliPlugin;
 
+    feature = "bundled-plugin-prompted-actions",
+    id = "bmux.prompted_actions",
+    manifest = include_str!("../../../../plugins/prompted-actions-plugin/plugin.toml"),
+    plugin_type = bmux_prompted_actions_plugin::PromptedActionsPlugin;
+
     feature = "bundled-plugin-windows",
     id = "bmux.windows",
     manifest = include_str!("../../../../plugins/windows-plugin/plugin.toml"),

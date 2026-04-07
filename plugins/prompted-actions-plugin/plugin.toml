@@ -1,0 +1,19 @@
+execution_class   = "native_fast"
+id                = "bmux.prompted_actions"
+name              = "bmux Prompted Actions"
+owns_namespaces   = ["prompted-action"]
+provided_features = ["bmux.prompted_actions"]
+version           = "0.0.1-alpha.0"
+
+[[commands]]
+expose_in_cli = true
+name          = "run"
+path          = ["prompted-action", "run"]
+summary       = "Execute a prompted action sequence by name"
+
+[[commands.arguments]]
+kind       = "string"
+name       = "action_name"
+position   = 0
+required   = true
+value_name = "ACTION"

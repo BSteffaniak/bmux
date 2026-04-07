@@ -41,6 +41,9 @@ bmux_permissions_plugin = { workspace = true, optional = true, features = [
 bmux_plugin_cli_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
+bmux_prompted_actions_plugin = { workspace = true, optional = true, features = [
+    "static-bundled",
+] }
 bmux_windows_plugin = { workspace = true, optional = true, features = [
     "static-bundled",
 ] }
@@ -123,6 +126,7 @@ fail-on-warnings = [
     "bmux_plugin/fail-on-warnings",
     "bmux_plugin_cli_plugin?/fail-on-warnings",
     "bmux_plugin_sdk/fail-on-warnings",
+    "bmux_prompted_actions_plugin?/fail-on-warnings",
     "bmux_server/fail-on-warnings",
     "bmux_session/fail-on-warnings",
     "bmux_terminal/fail-on-warnings",
@@ -141,14 +145,16 @@ bundled-plugins = [
     "bundled-plugin-clipboard",
     "bundled-plugin-permissions",
     "bundled-plugin-cli",
+    "bundled-plugin-prompted-actions",
     "bundled-plugin-windows",
 ]
 
 # Individual plugin features for selective bundling
-bundled-plugin-cli         = ["dep:bmux_plugin_cli_plugin"]
-bundled-plugin-clipboard   = ["dep:bmux_clipboard_plugin"]
-bundled-plugin-permissions = ["dep:bmux_permissions_plugin"]
-bundled-plugin-windows     = ["dep:bmux_windows_plugin"]
+bundled-plugin-cli              = ["dep:bmux_plugin_cli_plugin"]
+bundled-plugin-clipboard        = ["dep:bmux_clipboard_plugin"]
+bundled-plugin-permissions      = ["dep:bmux_permissions_plugin"]
+bundled-plugin-prompted-actions = ["dep:bmux_prompted_actions_plugin"]
+bundled-plugin-windows          = ["dep:bmux_windows_plugin"]
 
 # Optional features
 bundled-fonts = ["bmux_fonts/bundled-fonts", "bmux_fonts/bundled-nerd-fonts"]

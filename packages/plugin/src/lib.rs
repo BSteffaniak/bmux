@@ -13,11 +13,13 @@
 //! types, macros, and everything needed to write a plugin without pulling
 //! in the host-side dependencies.
 
+pub mod action_dispatch;
 mod declaration;
 mod discovery;
 mod host_runtime;
 mod loader;
 mod manifest;
+pub mod prompt;
 mod registry;
 
 pub use declaration::{

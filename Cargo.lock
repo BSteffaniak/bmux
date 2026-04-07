@@ -958,6 +958,7 @@ dependencies = [
  "bmux_plugin",
  "bmux_plugin_cli_plugin",
  "bmux_plugin_sdk",
+ "bmux_prompted_actions_plugin",
  "bmux_server",
  "bmux_session",
  "bmux_terminal",
@@ -1214,6 +1215,8 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "serial_test",
+ "tokio",
  "toml 0.8.23",
  "tracing",
  "uuid",
@@ -1260,6 +1263,18 @@ dependencies = [
  "bmux_cli",
  "bmux_sandbox_harness",
  "tokio",
+]
+
+[[package]]
+name = "bmux_prompted_actions_plugin"
+version = "0.0.1-alpha.0"
+dependencies = [
+ "bmux_plugin",
+ "bmux_plugin_sdk",
+ "serde",
+ "tokio",
+ "toml 0.8.23",
+ "tracing",
 ]
 
 [[package]]
