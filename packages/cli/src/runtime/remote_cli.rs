@@ -1,3 +1,7 @@
+use crate::ssh_access::{
+    authenticate_client_connection, authenticate_host_connection, ensure_iroh_ssh_access_ready,
+    iroh_ssh_access_enabled, iroh_target_url, parse_iroh_target as parse_iroh_target_parts,
+};
 use anyhow::{Context, Result};
 use bmux_cli_schema::{Cli, Command, ServerCommand, SessionCommand};
 use bmux_client::BmuxClient;
@@ -73,6 +77,7 @@ struct IrohTarget {
     label: String,
     endpoint_id: String,
     relay_url: Option<String>,
+    require_ssh_auth: bool,
     connect_timeout_ms: u64,
 }
 
@@ -202,7 +207,10 @@ pub(super) async fn should_proxy_to_target(cli: &Cli) -> Result<bool> {
     let Some(command) = cli.command.as_ref() else {
         return Ok(false);
     };
-    if matches!(command, Command::Connect { .. } | Command::Remote { .. }) {
+    if matches!(
+        command,
+        Command::Connect { .. } | Command::Remote { .. } | Command::Access { .. }
+    ) {
         return Ok(false);
     }
     let config = BmuxConfig::load()?;
@@ -572,6 +580,9 @@ pub(super) async fn run_host(
         return run_host_stop();
     }
     let mut config = BmuxConfig::load()?;
+    ensure_iroh_ssh_access_ready(&config)?;
+    let require_ssh_auth = iroh_ssh_access_enabled(&config);
+    let ssh_allowlist = config.connections.iroh_ssh_access.allowlist.clone();
     let hosted_mode = resolve_hosted_mode(&config, mode);
     if restart {
         let _ = run_host_stop()?;
@@ -602,10 +613,7 @@ pub(super) async fn run_host(
         .relay_urls()
         .next()
         .map(|value| normalize_relay_url_for_display(&value.to_string()));
-    let target = relay.as_ref().map_or_else(
-        || format!("iroh://{endpoint_id}"),
-        |relay_url| format!("iroh://{endpoint_id}?relay={relay_url}"),
-    );
+    let target = iroh_target_url(&endpoint_id.to_string(), relay.as_deref(), require_ssh_auth);
 
     let resolved_share = if hosted_mode == HostedMode::ControlPlane {
         let auth_state = auth_state
@@ -687,6 +695,9 @@ pub(super) async fn run_host(
     } else {
         println!("bmux iroh gateway online");
         println!("Host online: {host_name}");
+        if require_ssh_auth {
+            println!("SSH key auth: enabled");
+        }
         if listen != "127.0.0.1:7443" {
             println!("note: --listen is ignored for iroh host mode ({listen})");
         }
@@ -708,6 +719,7 @@ pub(super) async fn run_host(
             }
         };
         let bridge_paths = bridge_paths.clone();
+        let ssh_allowlist = ssh_allowlist.clone();
         tokio::spawn(async move {
             let result: Result<()> = async {
                 let alpn = accepting.alpn().await.context("failed reading ALPN")?;
@@ -717,6 +729,12 @@ pub(super) async fn run_host(
                 let conn = accepting
                     .await
                     .context("failed accepting iroh connection")?;
+
+                if require_ssh_auth {
+                    authenticate_host_connection(&conn, &ssh_allowlist)
+                        .await
+                        .context("iroh SSH auth failed")?;
+                }
 
                 // Accept multiple bi-streams per connection.  The first stream is
                 // the primary attach session; additional streams are opened by the
@@ -2327,15 +2345,11 @@ pub(super) async fn run_remote_init(
     }
     if let Some(iroh_value) = iroh {
         target.transport = ConnectionTransport::Iroh;
-        let (endpoint_id, relay_url) =
-            if let Some((endpoint, relay)) = iroh_value.split_once("?relay=") {
-                (endpoint.to_string(), Some(relay.to_string()))
-            } else {
-                (iroh_value.to_string(), None)
-            };
-        target.endpoint_id = Some(endpoint_id.clone());
-        target.host = Some(endpoint_id);
-        target.relay_url = relay_url;
+        let parsed = parse_iroh_target_parts(iroh_value)?;
+        target.endpoint_id = Some(parsed.endpoint_id.clone());
+        target.host = Some(parsed.endpoint_id);
+        target.relay_url = parsed.relay_url;
+        target.iroh_ssh_auth = parsed.require_ssh_auth;
         target.port = None;
         target.user = None;
     }
@@ -2729,6 +2743,13 @@ async fn connect_iroh_bridge(
     .await
     .with_context(|| format!("timed out connecting iroh target '{}'", target.label))?
     .with_context(|| format!("failed connecting iroh target '{}'", target.label))?;
+
+    if target.require_ssh_auth {
+        authenticate_client_connection(&connection)
+            .await
+            .context("iroh SSH auth handshake failed")?;
+    }
+
     let (mut send, mut recv) = connection
         .open_bi()
         .await
@@ -3450,6 +3471,7 @@ fn resolve_named_target(name: &str, target: &ConnectionTargetConfig) -> Result<R
                 label: name.to_string(),
                 endpoint_id,
                 relay_url: target.relay_url.clone(),
+                require_ssh_auth: target.iroh_ssh_auth,
                 connect_timeout_ms: target.connect_timeout_ms.max(1),
             }))
         }
@@ -3547,22 +3569,12 @@ fn parse_https_target(target: &str) -> Result<ResolvedTarget> {
 }
 
 fn parse_iroh_target(target: &str) -> Result<ResolvedTarget> {
-    let raw = target
-        .trim()
-        .strip_prefix("iroh://")
-        .ok_or_else(|| anyhow::anyhow!("iroh target must start with iroh://"))?;
-    let (endpoint_id, relay_url) = if let Some((endpoint, relay)) = raw.split_once("?relay=") {
-        (endpoint.to_string(), Some(relay.to_string()))
-    } else {
-        (raw.to_string(), None)
-    };
-    if endpoint_id.trim().is_empty() {
-        anyhow::bail!("iroh target must include an endpoint id");
-    }
+    let parsed = parse_iroh_target_parts(target)?;
     Ok(ResolvedTarget::Iroh(IrohTarget {
         label: target.to_string(),
-        endpoint_id,
-        relay_url,
+        endpoint_id: parsed.endpoint_id,
+        relay_url: parsed.relay_url,
+        require_ssh_auth: parsed.require_ssh_auth,
         connect_timeout_ms: 8_000,
     }))
 }

@@ -288,6 +288,11 @@ pub enum Command {
         #[command(subcommand)]
         command: AuthCommand,
     },
+    /// SSH-key access controls for iroh hosting
+    Access {
+        #[command(subcommand)]
+        command: AccessCommand,
+    },
     /// Share helpers for hosted links
     Share {
         /// Target/link to share
@@ -461,6 +466,63 @@ pub enum AuthCommand {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum AccessCommand {
+    /// Show iroh SSH access status
+    Status,
+    /// Initialize iroh SSH access and enable it immediately
+    Init {
+        /// Add all currently loaded SSH agent keys
+        #[arg(long)]
+        agent: bool,
+        /// Add a public key from file (repeatable)
+        #[arg(long, value_name = "PATH")]
+        key_file: Vec<String>,
+        /// Add a public key line directly (repeatable)
+        #[arg(long, value_name = "KEY")]
+        public_key: Vec<String>,
+        /// Import public keys from a GitHub username (repeatable)
+        #[arg(long, value_name = "USER")]
+        github_user: Vec<String>,
+        /// Skip interactive confirmation prompts
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Add SSH keys to iroh allowlist
+    Add {
+        /// Add all currently loaded SSH agent keys
+        #[arg(long)]
+        agent: bool,
+        /// Add a public key from file (repeatable)
+        #[arg(long, value_name = "PATH")]
+        key_file: Vec<String>,
+        /// Add a public key line directly (repeatable)
+        #[arg(long, value_name = "KEY")]
+        public_key: Vec<String>,
+        /// Import public keys from a GitHub username (repeatable)
+        #[arg(long, value_name = "USER")]
+        github_user: Vec<String>,
+    },
+    /// List currently authorized SSH keys
+    List {
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Remove an SSH key from the allowlist
+    Remove {
+        /// Key fingerprint to remove
+        fingerprint: String,
+        /// Skip interactive confirmation prompts
+        #[arg(long)]
+        yes: bool,
+    },
+    /// Enable iroh SSH access enforcement
+    Enable,
+    /// Disable iroh SSH access enforcement
+    Disable,
+}
+
+#[derive(Debug, Subcommand)]
 pub enum RemoteCommand {
     /// List configured connection targets
     List {
@@ -491,7 +553,7 @@ pub enum RemoteCommand {
         /// Configure as a TLS target (host[:port])
         #[arg(long, conflicts_with_all = ["ssh", "iroh"])]
         tls: Option<String>,
-        /// Configure as an iroh target (endpoint_id[?relay=https://...])
+        /// Configure as an iroh target (endpoint_id[?relay=https://...][&auth=ssh])
         #[arg(long, conflicts_with_all = ["ssh", "tls"])]
         iroh: Option<String>,
         /// SSH username override
@@ -1311,13 +1373,13 @@ pub enum TerminalCommand {
 #[cfg(test)]
 mod tests {
     use super::{
-        AuthCommand, Cli, Command, GatewayHostMode, HostedModeArg, KeymapCommand, LogsCommand,
-        LogsProfilesCommand, PlaybookCommand, RecordingCommand, RecordingCursorBlinkMode,
-        RecordingCursorMode, RecordingCursorPaintMode, RecordingCursorProfile,
-        RecordingCursorShape, RecordingCursorTextMode, RecordingEventKindArg,
-        RecordingExportFormat, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
-        RemoteCommand, RemoteCompleteCommand, ServerCommand, ServerRecordingCommand,
-        SessionCommand, TerminalCommand, TraceFamily,
+        AccessCommand, AuthCommand, Cli, Command, GatewayHostMode, HostedModeArg, KeymapCommand,
+        LogsCommand, LogsProfilesCommand, PlaybookCommand, RecordingCommand,
+        RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
+        RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode,
+        RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg, RecordingRenderMode,
+        RecordingReplayMode, RemoteCommand, RemoteCompleteCommand, ServerCommand,
+        ServerRecordingCommand, SessionCommand, TerminalCommand, TraceFamily,
     };
     use clap::Parser;
 
@@ -1526,6 +1588,67 @@ mod tests {
             panic!("expected auth command");
         };
         assert!(matches!(command, AuthCommand::Logout));
+    }
+
+    #[test]
+    fn parses_access_status_command() {
+        let cli = Cli::try_parse_from(["bmux", "access", "status"]).expect("valid CLI args");
+        let Some(Command::Access { command }) = cli.command else {
+            panic!("expected access command");
+        };
+        assert!(matches!(command, AccessCommand::Status));
+    }
+
+    #[test]
+    fn parses_access_init_agent_yes_flags() {
+        let cli = Cli::try_parse_from(["bmux", "access", "init", "--agent", "--yes"])
+            .expect("valid CLI args");
+        let Some(Command::Access { command }) = cli.command else {
+            panic!("expected access command");
+        };
+        assert!(matches!(
+            command,
+            AccessCommand::Init {
+                agent: true,
+                yes: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_access_add_key_file() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "access",
+            "add",
+            "--key-file",
+            "~/.ssh/id_ed25519.pub",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Access { command }) = cli.command else {
+            panic!("expected access command");
+        };
+        let AccessCommand::Add { key_file, .. } = command else {
+            panic!("expected access add command");
+        };
+        assert_eq!(key_file, vec!["~/.ssh/id_ed25519.pub".to_string()]);
+    }
+
+    #[test]
+    fn parses_access_remove_with_yes_flag() {
+        let cli = Cli::try_parse_from(["bmux", "access", "remove", "abc123", "--yes"])
+            .expect("valid CLI args");
+        let Some(Command::Access { command }) = cli.command else {
+            panic!("expected access command");
+        };
+        assert!(matches!(
+            command,
+            AccessCommand::Remove {
+                fingerprint,
+                yes: true
+            } if fingerprint == "abc123"
+        ));
     }
 
     #[test]

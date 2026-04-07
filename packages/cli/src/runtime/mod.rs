@@ -24,6 +24,7 @@ use std::process::Command as ProcessCommand;
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+mod access_cli;
 mod attach;
 mod bootstrap;
 mod built_in_commands;
@@ -52,6 +53,10 @@ mod terminal_protocol;
 use self::logs_watch::{
     active_log_file_path, run_logs_profiles_delete, run_logs_profiles_list,
     run_logs_profiles_rename, run_logs_profiles_show, run_logs_watch,
+};
+use access_cli::{
+    run_access_add, run_access_disable, run_access_enable, run_access_init, run_access_list,
+    run_access_remove, run_access_status,
 };
 pub use attach::runtime::AttachRunOutcome;
 use attach::runtime::run_session_attach_with_client;

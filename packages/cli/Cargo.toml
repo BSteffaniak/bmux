@@ -51,10 +51,14 @@ anyhow = { workspace = true, features = ["std"] }
 bmux_image = { workspace = true, optional = true }
 clap = { workspace = true, features = ["derive", "help", "std", "usage"] }
 crossterm = { workspace = true, features = ["events", "event-stream"] }
+dirs = { workspace = true }
 font8x8 = { workspace = true }
 fontdb = { workspace = true }
 futures = { workspace = true }
 gif = { workspace = true }
+git_sshripped_recipient = { workspace = true }
+git_sshripped_ssh_agent = { workspace = true }
+git_sshripped_ssh_identity = { workspace = true }
 image = { workspace = true, optional = true }
 iroh = { workspace = true }
 moosicbox_log_runtime = { workspace = true, features = ["file"] }

@@ -127,6 +127,10 @@ switchy = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", p
 moosicbox_log_runtime = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "moosicbox_log_runtime", default-features = false }
 moosicbox_log_watch   = { git = "https://github.com/MoosicBox/MoosicBox", branch = "master", package = "moosicbox_log_watch", default-features = false }
 
+git_sshripped_recipient    = { git = "https://github.com/BSteffaniak/git-ssh-crypt", branch = "master", package = "git_sshripped_recipient", default-features = false }
+git_sshripped_ssh_agent    = { git = "https://github.com/BSteffaniak/git-ssh-crypt", branch = "master", package = "git_sshripped_ssh_agent", default-features = false }
+git_sshripped_ssh_identity = { git = "https://github.com/BSteffaniak/git-ssh-crypt", branch = "master", package = "git_sshripped_ssh_identity", default-features = false }
+
 # External dependencies
 ab_glyph = { version = "0.2.32" }
 anyhow = { version = "1.0.98", default-features = false }
@@ -202,3 +206,8 @@ serial_test = { version = "3.4.0" }
 # [patch."https://github.com/MoosicBox/MoosicBox"]
 # moosicbox_log_runtime = { path = "../MoosicBox/packages/log_runtime" }
 # moosicbox_log_watch   = { path = "../MoosicBox/packages/log_watch" }
+
+[patch."https://github.com/BSteffaniak/git-ssh-crypt"]
+git_sshripped_recipient    = { path = "../git-ssh-crypt/packages/recipient" }
+git_sshripped_ssh_agent    = { path = "../git-ssh-crypt/packages/ssh_agent" }
+git_sshripped_ssh_identity = { path = "../git-ssh-crypt/packages/ssh_identity" }

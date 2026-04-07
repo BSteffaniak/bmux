@@ -1,3 +1,6 @@
+use crate::ssh_access::{
+    authenticate_client_connection, parse_iroh_target as parse_iroh_target_parts,
+};
 use anyhow::{Context, Result};
 use bmux_client::{BmuxClient, ClientError};
 use bmux_config::{
@@ -120,6 +123,7 @@ struct IrohTarget {
     label: String,
     endpoint_id: String,
     relay_url: Option<String>,
+    require_ssh_auth: bool,
     connect_timeout_ms: u64,
 }
 
@@ -192,6 +196,13 @@ async fn connect_iroh_target(target: &IrohTarget, client_name: &'static str) -> 
     .await
     .with_context(|| format!("iroh target '{}' connect timed out", target.label))?
     .with_context(|| format!("iroh target unreachable: {}", target.label))?;
+
+    if target.require_ssh_auth {
+        authenticate_client_connection(&connection)
+            .await
+            .context("iroh SSH auth handshake failed")?;
+    }
+
     let (mut send, mut recv) = connection
         .open_bi()
         .await
@@ -384,6 +395,7 @@ fn resolve_named_target(name: &str, target: &ConnectionTargetConfig) -> Result<A
                 label: name.to_string(),
                 endpoint_id,
                 relay_url: target.relay_url.clone(),
+                require_ssh_auth: target.iroh_ssh_auth,
                 connect_timeout_ms: target.connect_timeout_ms.max(1),
             }))
         }
@@ -450,21 +462,12 @@ fn parse_https_target(target: &str) -> Result<ActiveTarget> {
 }
 
 fn parse_iroh_target(target: &str) -> Result<ActiveTarget> {
-    let raw = target
-        .strip_prefix("iroh://")
-        .ok_or_else(|| anyhow::anyhow!("iroh target must start with iroh://"))?;
-    let (endpoint_id, relay_url) = if let Some((endpoint, relay)) = raw.split_once("?relay=") {
-        (endpoint.to_string(), Some(relay.to_string()))
-    } else {
-        (raw.to_string(), None)
-    };
-    if endpoint_id.trim().is_empty() {
-        anyhow::bail!("iroh target must include an endpoint id");
-    }
+    let parsed = parse_iroh_target_parts(target)?;
     Ok(ActiveTarget::Iroh(IrohTarget {
         label: target.to_string(),
-        endpoint_id,
-        relay_url,
+        endpoint_id: parsed.endpoint_id,
+        relay_url: parsed.relay_url,
+        require_ssh_auth: parsed.require_ssh_auth,
         connect_timeout_ms: 8_000,
     }))
 }

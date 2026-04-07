@@ -8,6 +8,7 @@ pub enum BuiltInHandlerId {
     AuthLogin,
     AuthStatus,
     AuthLogout,
+    Access,
     Share,
     Unshare,
     Connect,
@@ -157,6 +158,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::AuthLogout,
             &["auth", "logout"],
             "Remove local login credentials",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::Access,
+            &["access"],
+            "Manage iroh SSH access keys",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Share,

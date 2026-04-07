@@ -13,6 +13,7 @@ pub use bmux_terminal::{TerminalInstance, TerminalManager};
 
 mod connection;
 mod runtime;
+mod ssh_access;
 mod status;
 
 pub mod attach;

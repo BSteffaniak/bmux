@@ -90,6 +90,37 @@ pub struct ConnectionsConfig {
     pub recent_sessions: BTreeMap<String, Vec<String>>,
     /// User-defined share links (bmux://<name> -> target reference)
     pub share_links: BTreeMap<String, String>,
+    /// Optional SSH-key allowlist and enforcement for iroh connections.
+    pub iroh_ssh_access: IrohSshAccessConfig,
+}
+
+/// SSH-key allowlist configuration for iroh access control.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct IrohSshAccessConfig {
+    /// Require SSH challenge authentication on iroh connections.
+    pub enabled: bool,
+    /// Fingerprint -> key metadata map.
+    pub allowlist: BTreeMap<String, IrohSshAuthorizedKey>,
+}
+
+/// Authorized SSH public key entry.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct IrohSshAuthorizedKey {
+    /// Public key in OpenSSH one-line format.
+    pub public_key: String,
+    /// Optional descriptive label (for display and management UX).
+    pub label: Option<String>,
+    /// Unix timestamp of when the key was added.
+    pub added_at_unix: Option<i64>,
+}
+
+impl IrohSshAccessConfig {
+    #[must_use]
+    pub const fn config_doc_values() -> &'static [&'static str] {
+        &[]
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
@@ -126,6 +157,8 @@ pub struct ConnectionTargetConfig {
     pub endpoint_id: Option<String>,
     /// Optional Iroh relay URL for hosted transport.
     pub relay_url: Option<String>,
+    /// Require SSH auth handshake when connecting to this iroh target.
+    pub iroh_ssh_auth: bool,
     /// Require strict host key checking.
     pub strict_host_key_checking: bool,
     /// SSH jump host (`ProxyJump`) value.
@@ -153,6 +186,7 @@ impl Default for ConnectionTargetConfig {
             server_name: None,
             endpoint_id: None,
             relay_url: None,
+            iroh_ssh_auth: false,
             strict_host_key_checking: true,
             jump: None,
             remote_bmux_path: "bmux".to_string(),

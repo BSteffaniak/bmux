@@ -1,3 +1,7 @@
+use crate::ssh_access::{
+    authenticate_host_connection, ensure_iroh_ssh_access_ready, iroh_ssh_access_enabled,
+    iroh_target_url,
+};
 use anyhow::{Context, Result};
 use bmux_cli_schema::GatewayHostMode;
 use bmux_config::ConfigPaths;
@@ -685,6 +689,11 @@ pub(super) async fn run_server_gateway(
 #[allow(clippy::too_many_lines)]
 async fn run_server_gateway_iroh() -> Result<u8> {
     const BMUX_IROH_ALPN: &[u8] = b"bmux/gateway/iroh/1";
+    let config = bmux_config::BmuxConfig::load().context("failed loading bmux config")?;
+    ensure_iroh_ssh_access_ready(&config)?;
+    let require_ssh_auth = iroh_ssh_access_enabled(&config);
+    let ssh_allowlist = config.connections.iroh_ssh_access.allowlist.clone();
+
     let endpoint = Endpoint::builder(presets::N0)
         .alpns(vec![BMUX_IROH_ALPN.to_vec()])
         .bind()
@@ -697,12 +706,12 @@ async fn run_server_gateway_iroh() -> Result<u8> {
         .relay_urls()
         .next()
         .map(std::string::ToString::to_string);
-    let url = relay.as_ref().map_or_else(
-        || format!("iroh://{endpoint_id}"),
-        |relay| format!("iroh://{endpoint_id}?relay={relay}"),
-    );
+    let url = iroh_target_url(&endpoint_id.to_string(), relay.as_deref(), require_ssh_auth);
     println!("bmux iroh gateway online");
     println!("connect URL: {url}");
+    if require_ssh_auth {
+        println!("ssh key auth: enabled");
+    }
 
     while let Some(incoming) = endpoint.accept().await {
         let mut accepting = match incoming.accept() {
@@ -712,6 +721,7 @@ async fn run_server_gateway_iroh() -> Result<u8> {
                 continue;
             }
         };
+        let ssh_allowlist = ssh_allowlist.clone();
         tokio::spawn(async move {
             let result: Result<()> = async {
                 let alpn = accepting.alpn().await.context("failed reading ALPN")?;
@@ -721,6 +731,12 @@ async fn run_server_gateway_iroh() -> Result<u8> {
                 let conn = accepting
                     .await
                     .context("failed accepting iroh connection")?;
+
+                if require_ssh_auth {
+                    authenticate_host_connection(&conn, &ssh_allowlist)
+                        .await
+                        .context("iroh SSH auth failed")?;
+                }
 
                 // Accept multiple bi-streams per connection.  The first stream is
                 // the primary attach session; additional streams are opened by the
