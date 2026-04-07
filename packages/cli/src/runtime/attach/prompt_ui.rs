@@ -67,6 +67,8 @@ enum PromptWidgetState {
 struct ActivePrompt {
     envelope: AttachPromptEnvelope,
     state: PromptWidgetState,
+    message_wrap_width: Option<usize>,
+    message_wrapped_lines: Vec<String>,
 }
 
 impl ActivePrompt {
@@ -113,7 +115,12 @@ impl ActivePrompt {
                 }
             }
         };
-        Self { envelope, state }
+        Self {
+            envelope,
+            state,
+            message_wrap_width: None,
+            message_wrapped_lines: Vec::new(),
+        }
     }
 }
 
@@ -643,11 +650,15 @@ fn render_prompt_body(
     let mut lines = Vec::new();
 
     if let Some(message) = &active.envelope.request.message {
-        let wrapped = wrap_lines(message, text_width);
+        if active.message_wrap_width != Some(text_width) {
+            active.message_wrapped_lines = wrap_lines(message, text_width);
+            active.message_wrap_width = Some(text_width);
+        }
         lines.extend(
-            wrapped
-                .into_iter()
-                .map(|line| opaque_row_text(&line, text_width)),
+            active
+                .message_wrapped_lines
+                .iter()
+                .map(|line| opaque_row_text(line, text_width)),
         );
     }
 

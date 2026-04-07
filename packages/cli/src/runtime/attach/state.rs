@@ -37,10 +37,12 @@ pub enum AttachExitReason {
     Quit,
 }
 
+#[allow(clippy::struct_excessive_bools)] // Dirty flags are independent repaint/fetch toggles.
 #[derive(Debug, Clone)]
 pub struct AttachDirtyFlags {
     pub status_needs_redraw: bool,
     pub layout_needs_refresh: bool,
+    pub overlay_needs_redraw: bool,
     pub pane_dirty_ids: BTreeSet<Uuid>,
     pub full_pane_redraw: bool,
 }
@@ -50,6 +52,7 @@ impl Default for AttachDirtyFlags {
         Self {
             status_needs_redraw: true,
             layout_needs_refresh: true,
+            overlay_needs_redraw: false,
             pane_dirty_ids: BTreeSet::new(),
             full_pane_redraw: true,
         }

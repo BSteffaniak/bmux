@@ -555,7 +555,7 @@ pub async fn run_session_attach_with_client(
                 if let Some(prompt_request) = prompt_request {
                     view_state.prompt.enqueue_external(prompt_request);
                     view_state.dirty.status_needs_redraw = true;
-                    view_state.dirty.full_pane_redraw = true;
+                    view_state.dirty.overlay_needs_redraw = true;
                 }
             }
 
@@ -589,6 +589,7 @@ pub async fn run_session_attach_with_client(
 
         let mut frame_needs_render = view_state.dirty.status_needs_redraw
             || view_state.dirty.full_pane_redraw
+            || view_state.dirty.overlay_needs_redraw
             || !view_state.dirty.pane_dirty_ids.is_empty();
 
         let mut scene_hydrated = false;
@@ -691,9 +692,10 @@ pub async fn run_session_attach_with_client(
 
         resize_attach_parsers_for_scene(&mut view_state.pane_buffers, &layout_state.scene);
 
-        // Only fetch pane output when the server notified us there's new data,
-        // or when dirty flags indicate we need a redraw.
-        if pane_output_pending || frame_needs_render {
+        // Only fetch pane output when new pane bytes are pending or there are
+        // dirty panes that need fresh output (e.g. visible scene change).
+        // Overlay/status-only redraws should not trigger pane-output IPC.
+        if pane_output_pending || !view_state.dirty.pane_dirty_ids.is_empty() {
             let pane_ids = visible_scene_pane_ids(&layout_state.scene);
             let active_pane_ids = attach_layout_pane_id_set(&layout_state);
             view_state
@@ -2296,7 +2298,7 @@ pub fn handle_help_overlay_key_event(
                 help_lines.len(),
                 help_overlay_visible_rows(help_lines),
             );
-            view_state.dirty.full_pane_redraw = true;
+            view_state.dirty.overlay_needs_redraw = true;
             true
         }
         KeyCode::Down | KeyCode::Char('j') => {
@@ -2306,7 +2308,7 @@ pub fn handle_help_overlay_key_event(
                 help_lines.len(),
                 help_overlay_visible_rows(help_lines),
             );
-            view_state.dirty.full_pane_redraw = true;
+            view_state.dirty.overlay_needs_redraw = true;
             true
         }
         KeyCode::PageUp => {
@@ -2317,7 +2319,7 @@ pub fn handle_help_overlay_key_event(
                 help_lines.len(),
                 help_overlay_visible_rows(help_lines),
             );
-            view_state.dirty.full_pane_redraw = true;
+            view_state.dirty.overlay_needs_redraw = true;
             true
         }
         KeyCode::PageDown => {
@@ -2328,18 +2330,18 @@ pub fn handle_help_overlay_key_event(
                 help_lines.len(),
                 help_overlay_visible_rows(help_lines),
             );
-            view_state.dirty.full_pane_redraw = true;
+            view_state.dirty.overlay_needs_redraw = true;
             true
         }
         KeyCode::Home => {
             view_state.help_overlay_scroll = 0;
-            view_state.dirty.full_pane_redraw = true;
+            view_state.dirty.overlay_needs_redraw = true;
             true
         }
         KeyCode::End => {
             let visible = help_overlay_visible_rows(help_lines);
             view_state.help_overlay_scroll = help_lines.len().saturating_sub(visible);
-            view_state.dirty.full_pane_redraw = true;
+            view_state.dirty.overlay_needs_redraw = true;
             true
         }
         _ => false,
@@ -2541,22 +2543,28 @@ pub async fn render_attach_frame(
     }
     let (status_top_inset, status_bottom_inset) =
         status_insets_for_position(view_state.status_position);
-    let cursor_state = render_attach_scene(
-        &mut frame_bytes,
-        &layout_state.scene,
-        &layout_state.panes,
-        &mut view_state.pane_buffers,
-        &view_state.dirty.pane_dirty_ids,
-        view_state.dirty.full_pane_redraw,
-        status_top_inset,
-        status_bottom_inset,
-        view_state.scrollback_active,
-        view_state.scrollback_offset,
-        view_state.scrollback_cursor,
-        view_state.selection_anchor,
-        layout_state.zoomed,
-        terminal::size().unwrap_or((0, 0)),
-    )?;
+    let render_scene =
+        view_state.dirty.full_pane_redraw || !view_state.dirty.pane_dirty_ids.is_empty();
+    let cursor_state = if render_scene {
+        render_attach_scene(
+            &mut frame_bytes,
+            &layout_state.scene,
+            &layout_state.panes,
+            &mut view_state.pane_buffers,
+            &view_state.dirty.pane_dirty_ids,
+            view_state.dirty.full_pane_redraw,
+            status_top_inset,
+            status_bottom_inset,
+            view_state.scrollback_active,
+            view_state.scrollback_offset,
+            view_state.scrollback_cursor,
+            view_state.selection_anchor,
+            layout_state.zoomed,
+            terminal::size().unwrap_or((0, 0)),
+        )?
+    } else {
+        view_state.last_cursor_state
+    };
 
     // Image overlay: render terminal images (Sixel, Kitty, iTerm2) on top
     // of the cell content, translated to host terminal coordinates.
@@ -2669,6 +2677,7 @@ pub async fn render_attach_frame(
         .context("failed writing attach frame")?;
     stdout.flush().context("failed flushing attach frame")?;
     view_state.dirty.full_pane_redraw = false;
+    view_state.dirty.overlay_needs_redraw = false;
     view_state.dirty.pane_dirty_ids.clear();
     Ok(())
 }
@@ -3770,8 +3779,7 @@ pub async fn handle_attach_terminal_event(
                         }
                     }
                     PromptKeyDisposition::Consumed => {
-                        view_state.dirty.status_needs_redraw = true;
-                        view_state.dirty.full_pane_redraw = true;
+                        view_state.dirty.overlay_needs_redraw = true;
                     }
                     PromptKeyDisposition::NotActive => {}
                 }
@@ -3886,11 +3894,13 @@ pub async fn handle_attach_terminal_event(
             AttachEventAction::Ui(action) => {
                 if matches!(action, RuntimeAction::ShowHelp) {
                     view_state.help_overlay_open = !view_state.help_overlay_open;
-                    if !view_state.help_overlay_open {
+                    if view_state.help_overlay_open {
+                        view_state.dirty.overlay_needs_redraw = true;
+                    } else {
                         view_state.help_overlay_scroll = 0;
+                        view_state.dirty.full_pane_redraw = true;
                     }
                     view_state.dirty.status_needs_redraw = true;
-                    view_state.dirty.full_pane_redraw = true;
                     continue;
                 }
                 if view_state.help_overlay_open {
@@ -3904,8 +3914,14 @@ pub async fn handle_attach_terminal_event(
                     }
                     continue;
                 }
+                let prompt_only_action = matches!(
+                    action,
+                    RuntimeAction::Quit | RuntimeAction::CloseFocusedPane
+                );
                 if let Err(error) = handle_attach_ui_action(client, action, view_state).await {
                     println!("attach action failed: {}", map_attach_client_error(error));
+                } else if prompt_only_action && view_state.prompt.is_active() {
+                    view_state.dirty.overlay_needs_redraw = true;
                 } else {
                     view_state.dirty.layout_needs_refresh = true;
                     view_state.dirty.full_pane_redraw = true;
@@ -6239,6 +6255,8 @@ mod tests {
             can_write: true,
         });
         view_state.help_overlay_open = true;
+        view_state.dirty.full_pane_redraw = false;
+        view_state.dirty.overlay_needs_redraw = false;
         let lines = (0..200)
             .map(|idx| format!("line {idx}"))
             .collect::<Vec<_>>();
@@ -6254,6 +6272,8 @@ mod tests {
         );
         assert!(handled);
         assert!(view_state.help_overlay_scroll > 0);
+        assert!(view_state.dirty.overlay_needs_redraw);
+        assert!(!view_state.dirty.full_pane_redraw);
     }
 
     #[test]
@@ -6280,6 +6300,36 @@ mod tests {
         );
         assert!(!handled);
         assert_eq!(view_state.help_overlay_scroll, 5);
+    }
+
+    #[test]
+    fn help_overlay_close_marks_full_redraw() {
+        let mut view_state = AttachViewState::new(bmux_client::AttachOpenInfo {
+            context_id: None,
+            session_id: uuid::Uuid::new_v4(),
+            can_write: true,
+        });
+        view_state.help_overlay_open = true;
+        view_state.help_overlay_scroll = 3;
+        view_state.dirty.status_needs_redraw = false;
+        view_state.dirty.full_pane_redraw = false;
+        view_state.dirty.overlay_needs_redraw = false;
+
+        let handled = handle_help_overlay_key_event(
+            &CrosstermKeyEvent::new_with_kind(
+                CrosstermKeyCode::Esc,
+                KeyModifiers::NONE,
+                CrosstermKeyEventKind::Press,
+            ),
+            &[],
+            &mut view_state,
+        );
+
+        assert!(handled);
+        assert!(!view_state.help_overlay_open);
+        assert_eq!(view_state.help_overlay_scroll, 0);
+        assert!(view_state.dirty.status_needs_redraw);
+        assert!(view_state.dirty.full_pane_redraw);
     }
 
     #[test]
