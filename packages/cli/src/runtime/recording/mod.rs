@@ -1496,6 +1496,30 @@ fn update_cursor_replay_state(state: &mut CursorReplayState, data: &[u8]) {
     }
 }
 
+const fn display_cursor_shape_from_visual(
+    shape: CursorVisualShape,
+) -> bmux_ipc::DisplayCursorShape {
+    match shape {
+        CursorVisualShape::Block => bmux_ipc::DisplayCursorShape::Block,
+        CursorVisualShape::Bar => bmux_ipc::DisplayCursorShape::Bar,
+        CursorVisualShape::Underline => bmux_ipc::DisplayCursorShape::Underline,
+    }
+}
+
+fn cursor_snapshot_from_parser_fallback(
+    parser: &vt100::Parser,
+    replay_state: CursorReplayState,
+) -> RecordedCursorSnapshot {
+    let (y, x) = parser.screen().cursor_position();
+    RecordedCursorSnapshot {
+        x,
+        y,
+        visible: !parser.screen().hide_cursor(),
+        shape: display_cursor_shape_from_visual(replay_state.shape),
+        blink_enabled: replay_state.blink_enabled,
+    }
+}
+
 const fn effective_cursor_shape(
     options: &CursorExportOptions,
     replay_state: CursorReplayState,
@@ -2081,6 +2105,7 @@ fn export_recording_gif(
     let mut last_input_activity_ns = None::<u64>;
     let mut last_output_activity_ns = None::<u64>;
     let mut last_cursor_activity_ns = None::<u64>;
+    let mut warned_cursor_snapshot_fallback = false;
     let mut previous_visual_state = None::<FrameVisualState>;
     let start_mono_ns = events.iter().map(|event| event.mono_ns).min().unwrap_or(0);
     let frame_cutoff_ns = max_frames.map(|limit| {
@@ -2202,12 +2227,21 @@ fn export_recording_gif(
             continue;
         }
 
-        let snapshot = snapshot_cursor_state.ok_or_else(|| {
-            anyhow::anyhow!(
-                "display track is missing cursor snapshots; re-record with format {}",
-                bmux_ipc::RECORDING_FORMAT_VERSION
-            )
-        })?;
+        let (snapshot, cursor_source) = snapshot_cursor_state.map_or_else(
+            || {
+                if !warned_cursor_snapshot_fallback {
+                    tracing::warn!(
+                        "recording export: display track missing initial cursor snapshot; using parser cursor fallback until snapshots appear"
+                    );
+                    warned_cursor_snapshot_fallback = true;
+                }
+                (
+                    cursor_snapshot_from_parser_fallback(&parser, cursor_state),
+                    "parser_fallback",
+                )
+            },
+            |snapshot| (snapshot, "snapshot"),
+        );
         let cursor_row = snapshot.y;
         let cursor_col = snapshot.x;
         let parser_cursor_visible = snapshot.visible;
@@ -2357,7 +2391,7 @@ fn export_recording_gif(
                     visible: cursor_visible,
                     shape: cursor_shape_name(shape),
                     blink_on,
-                    cursor_source: "snapshot",
+                    cursor_source,
                     visible_reason,
                     paint_mode_used: paint_mode_name(paint_mode_used),
                     text_mode_used: text_mode_name(text_mode_used),
@@ -2375,7 +2409,7 @@ fn export_recording_gif(
                 visible: cursor_visible,
                 shape: cursor_shape_name(shape),
                 blink_on,
-                cursor_source: "snapshot",
+                cursor_source,
                 visible_reason,
                 paint_mode_used: paint_mode_name(match cursor_options.paint_mode {
                     RecordingCursorPaintMode::Auto | RecordingCursorPaintMode::Invert => {
@@ -4508,11 +4542,7 @@ impl DisplayCaptureWriter {
             x,
             y,
             visible,
-            shape: match self.cursor_replay_state.shape {
-                CursorVisualShape::Block => bmux_ipc::DisplayCursorShape::Block,
-                CursorVisualShape::Bar => bmux_ipc::DisplayCursorShape::Bar,
-                CursorVisualShape::Underline => bmux_ipc::DisplayCursorShape::Underline,
-            },
+            shape: display_cursor_shape_from_visual(self.cursor_replay_state.shape),
             blink_enabled: self.cursor_replay_state.blink_enabled,
         })
     }
@@ -5017,6 +5047,40 @@ mod tests {
         update_cursor_replay_state(&mut state, b"\x1b[3 q");
         assert!(matches!(state.shape, CursorVisualShape::Underline));
         assert!(state.blink_enabled);
+    }
+
+    #[test]
+    fn display_cursor_shape_from_visual_maps_shapes() {
+        assert_eq!(
+            display_cursor_shape_from_visual(CursorVisualShape::Block),
+            bmux_ipc::DisplayCursorShape::Block
+        );
+        assert_eq!(
+            display_cursor_shape_from_visual(CursorVisualShape::Bar),
+            bmux_ipc::DisplayCursorShape::Bar
+        );
+        assert_eq!(
+            display_cursor_shape_from_visual(CursorVisualShape::Underline),
+            bmux_ipc::DisplayCursorShape::Underline
+        );
+    }
+
+    #[test]
+    fn cursor_snapshot_from_parser_fallback_uses_parser_cursor_state() {
+        let mut parser = vt100::Parser::new(24, 80, 1024);
+        parser.process(b"\x1b[6;11H");
+        let snapshot = cursor_snapshot_from_parser_fallback(
+            &parser,
+            CursorReplayState {
+                shape: CursorVisualShape::Bar,
+                blink_enabled: false,
+            },
+        );
+        assert_eq!(snapshot.x, 10);
+        assert_eq!(snapshot.y, 5);
+        assert!(snapshot.visible);
+        assert_eq!(snapshot.shape, bmux_ipc::DisplayCursorShape::Bar);
+        assert!(!snapshot.blink_enabled);
     }
 
     fn temp_dir() -> std::path::PathBuf {

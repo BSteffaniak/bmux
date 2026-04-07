@@ -848,27 +848,43 @@ fn push_cut_resize_baseline_if_missing(
     }
 }
 
-fn push_cut_cursor_snapshot_baseline_if_missing(
+fn push_cut_cursor_snapshot_baseline_if_needed(
     output: &mut Vec<DisplayTrackEnvelope>,
     all_frames: &[DisplayTrackEnvelope],
-    first_kept_ns: u64,
-    kept_has_cursor_snapshot: bool,
+    kept: &[DisplayTrackEnvelope],
 ) {
-    if kept_has_cursor_snapshot {
+    let Some(first_kept_frame_bytes_ns) = kept.iter().find_map(|frame| {
+        matches!(frame.event, DisplayTrackEvent::FrameBytes { .. }).then_some(frame.mono_ns)
+    }) else {
+        return;
+    };
+
+    let first_kept_cursor_snapshot_ns = kept.iter().find_map(|frame| {
+        matches!(frame.event, DisplayTrackEvent::CursorSnapshot { .. }).then_some(frame.mono_ns)
+    });
+
+    if first_kept_cursor_snapshot_ns
+        .is_some_and(|snapshot_ns| snapshot_ns <= first_kept_frame_bytes_ns)
+    {
         return;
     }
-    if let Some(snapshot) = all_frames
+
+    let baseline_snapshot = all_frames
         .iter()
         .rev()
         .find(|frame| {
-            frame.mono_ns <= first_kept_ns
+            frame.mono_ns <= first_kept_frame_bytes_ns
                 && matches!(frame.event, DisplayTrackEvent::CursorSnapshot { .. })
         })
-        .cloned()
-    {
+        .or_else(|| {
+            kept.iter()
+                .find(|frame| matches!(frame.event, DisplayTrackEvent::CursorSnapshot { .. }))
+        });
+
+    if let Some(snapshot) = baseline_snapshot {
         output.push(DisplayTrackEnvelope {
             mono_ns: 0,
-            event: snapshot.event,
+            event: snapshot.event.clone(),
         });
     }
 }
@@ -896,18 +912,10 @@ fn cut_display_track_frames(
     let kept_has_resize = kept
         .iter()
         .any(|frame| matches!(frame.event, DisplayTrackEvent::Resize { .. }));
-    let kept_has_cursor_snapshot = kept
-        .iter()
-        .any(|frame| matches!(frame.event, DisplayTrackEvent::CursorSnapshot { .. }));
     let mut output = Vec::new();
     push_cut_stream_opened_baseline(&mut output, all_frames, kept.first());
     push_cut_resize_baseline_if_missing(&mut output, all_frames, first_kept_ns, kept_has_resize);
-    push_cut_cursor_snapshot_baseline_if_missing(
-        &mut output,
-        all_frames,
-        first_kept_ns,
-        kept_has_cursor_snapshot,
-    );
+    push_cut_cursor_snapshot_baseline_if_needed(&mut output, all_frames, &kept);
 
     for frame in &mut kept {
         frame.mono_ns = frame.mono_ns.saturating_sub(first_kept_ns);
@@ -1364,14 +1372,15 @@ mod tests {
     }
 
     #[test]
-    fn cut_does_not_inject_cursor_snapshot_when_present() {
-        // CursorSnapshot at t=35s is inside the 15-second window.
+    fn cut_does_not_inject_cursor_snapshot_when_present_before_first_frame() {
+        // CursorSnapshot at t=35s is inside the 15-second window and appears
+        // before the first FrameBytes at t=35s+1ns.
         let frames = vec![
             stream_opened_frame(0),
             resize_frame(1_000, 80, 24),
             cursor_snapshot_frame(2_000, 0, 0),
-            frame_bytes_frame(30_000_000_000),
             cursor_snapshot_frame(35_000_000_000, 77, 22),
+            frame_bytes_frame(35_000_000_001),
             frame_bytes_frame(40_000_000_000),
         ];
         let result = super::cut_display_track_frames(&frames, 15_000_000_000);
@@ -1387,6 +1396,69 @@ mod tests {
             vec![(77, 22)],
             "only the in-window cursor snapshot should be present"
         );
+    }
+
+    #[test]
+    fn cut_injects_cursor_snapshot_when_first_snapshot_is_after_first_frame() {
+        // CursorSnapshot at t=30s+10us is inside the window but occurs after
+        // the first FrameBytes at t=30s, so inject a baseline snapshot.
+        let frames = vec![
+            stream_opened_frame(0),
+            resize_frame(1_000, 80, 24),
+            cursor_snapshot_frame(2_000, 5, 3),
+            frame_bytes_frame(30_000_000_000),
+            cursor_snapshot_frame(30_000_010_000, 77, 22),
+            frame_bytes_frame(40_000_000_000),
+        ];
+        let result = super::cut_display_track_frames(&frames, 15_000_000_000);
+        let snapshots: Vec<(u16, u16)> = result
+            .iter()
+            .filter_map(|f| match f.event {
+                DisplayTrackEvent::CursorSnapshot { x, y, .. } => Some((x, y)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            snapshots,
+            vec![(5, 3), (77, 22)],
+            "should prepend baseline snapshot before first frame"
+        );
+        let first_snapshot = result
+            .iter()
+            .find(|f| matches!(f.event, DisplayTrackEvent::CursorSnapshot { .. }))
+            .expect("snapshot should exist");
+        assert_eq!(first_snapshot.mono_ns, 0);
+    }
+
+    #[test]
+    fn cut_injects_cursor_snapshot_from_earliest_kept_when_no_prior_snapshot_exists() {
+        // No CursorSnapshot exists at or before the first in-window frame.
+        // Fallback should use the earliest kept snapshot and rebase it to 0.
+        let frames = vec![
+            stream_opened_frame(0),
+            resize_frame(1_000, 80, 24),
+            frame_bytes_frame(30_000_000_000),
+            cursor_snapshot_frame(35_000_000_000, 77, 22),
+            frame_bytes_frame(40_000_000_000),
+        ];
+        let result = super::cut_display_track_frames(&frames, 15_000_000_000);
+        let snapshots: Vec<(u16, u16)> = result
+            .iter()
+            .filter_map(|f| match f.event {
+                DisplayTrackEvent::CursorSnapshot { x, y, .. } => Some((x, y)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            snapshots,
+            vec![(77, 22), (77, 22)],
+            "should inject fallback snapshot and keep original in-window snapshot"
+        );
+        let first_snapshot = result
+            .iter()
+            .find(|f| matches!(f.event, DisplayTrackEvent::CursorSnapshot { .. }))
+            .expect("snapshot should exist");
+        assert_eq!(first_snapshot.mono_ns, 0);
     }
 
     #[test]
