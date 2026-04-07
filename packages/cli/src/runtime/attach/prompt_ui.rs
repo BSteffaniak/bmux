@@ -895,7 +895,7 @@ mod tests {
     use super::{
         AttachInternalPromptAction, AttachPromptState, PromptKeyDisposition, adjust_scroll,
     };
-    use crate::runtime::prompt::{PromptRequest, PromptResponse, PromptValue};
+    use crate::runtime::prompt::{PromptOption, PromptRequest, PromptResponse, PromptValue};
     use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers};
     use uuid::Uuid;
 
@@ -955,6 +955,66 @@ mod tests {
         assert_eq!(
             completion.response,
             PromptResponse::Submitted(PromptValue::Text("h".to_string()))
+        );
+    }
+
+    #[test]
+    fn single_select_prompt_moves_with_arrow_keys() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::single_select(
+                "Layout",
+                vec![
+                    PromptOption::new("tall", "Tall"),
+                    PromptOption::new("wide", "Wide"),
+                    PromptOption::new("grid", "Grid"),
+                ],
+            ),
+            AttachInternalPromptAction::ClosePane {
+                pane_id: Uuid::new_v4(),
+            },
+        );
+
+        let _ = state.handle_key_event(&key_event(KeyCode::Down));
+        let outcome = state.handle_key_event(&key_event(KeyCode::Enter));
+
+        let PromptKeyDisposition::Completed(completion) = outcome else {
+            panic!("expected prompt completion");
+        };
+        assert_eq!(
+            completion.response,
+            PromptResponse::Submitted(PromptValue::Single("wide".to_string()))
+        );
+    }
+
+    #[test]
+    fn multi_toggle_prompt_moves_with_arrow_keys_and_toggles_selection() {
+        let mut state = AttachPromptState::default();
+        state.enqueue_internal(
+            PromptRequest::multi_toggle(
+                "Features",
+                vec![
+                    PromptOption::new("line-numbers", "Line numbers"),
+                    PromptOption::new("timestamps", "Timestamps"),
+                    PromptOption::new("soft-wrap", "Soft wrap"),
+                ],
+            )
+            .multi_min_selected(1),
+            AttachInternalPromptAction::ClosePane {
+                pane_id: Uuid::new_v4(),
+            },
+        );
+
+        let _ = state.handle_key_event(&key_event(KeyCode::Down));
+        let _ = state.handle_key_event(&key_event(KeyCode::Char(' ')));
+        let outcome = state.handle_key_event(&key_event(KeyCode::Enter));
+
+        let PromptKeyDisposition::Completed(completion) = outcome else {
+            panic!("expected prompt completion");
+        };
+        assert_eq!(
+            completion.response,
+            PromptResponse::Submitted(PromptValue::Multi(vec!["timestamps".to_string()]))
         );
     }
 }

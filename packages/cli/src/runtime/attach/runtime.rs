@@ -3769,7 +3769,11 @@ pub async fn handle_attach_terminal_event(
                             return Ok(control);
                         }
                     }
-                    PromptKeyDisposition::Consumed | PromptKeyDisposition::NotActive => {}
+                    PromptKeyDisposition::Consumed => {
+                        view_state.dirty.status_needs_redraw = true;
+                        view_state.dirty.full_pane_redraw = true;
+                    }
+                    PromptKeyDisposition::NotActive => {}
                 }
                 return Ok(AttachLoopControl::Continue);
             }
