@@ -4,6 +4,55 @@
 
 use std::path::PathBuf;
 
+/// Generated docs metadata for path/environment overrides.
+pub struct EnvOverrideDoc {
+    /// Environment variable name.
+    pub variable: &'static str,
+    /// Config or runtime area affected by the override.
+    pub scope: &'static str,
+    /// Human-readable behavior summary.
+    pub description: &'static str,
+}
+
+/// Path and runtime environment overrides recognized by bmux.
+pub static ENV_OVERRIDE_DOCS: &[EnvOverrideDoc] = &[
+    EnvOverrideDoc {
+        variable: "BMUX_CONFIG_DIR",
+        scope: "config",
+        description: "Overrides the config directory root and disables fallback candidate chaining.",
+    },
+    EnvOverrideDoc {
+        variable: "BMUX_RUNTIME_DIR",
+        scope: "runtime",
+        description: "Overrides the runtime root used for sockets and temp runtime artifacts.",
+    },
+    EnvOverrideDoc {
+        variable: "BMUX_RUNTIME_NAME",
+        scope: "runtime",
+        description: "Selects the runtime instance name; non-default values use runtime subdirectories.",
+    },
+    EnvOverrideDoc {
+        variable: "BMUX_DATA_DIR",
+        scope: "data",
+        description: "Overrides the persistent data directory (plugins and runtime identity files).",
+    },
+    EnvOverrideDoc {
+        variable: "BMUX_STATE_DIR",
+        scope: "state",
+        description: "Overrides the persistent state directory (recordings, traces, and runtime layout state).",
+    },
+    EnvOverrideDoc {
+        variable: "BMUX_LOG_DIR",
+        scope: "logs",
+        description: "Overrides the log directory used by bmux file logging.",
+    },
+    EnvOverrideDoc {
+        variable: crate::RECORDINGS_DIR_OVERRIDE_ENV,
+        scope: "recordings",
+        description: "Overrides recording storage root for recording CLI/runtime resolution.",
+    },
+];
+
 /// Configuration paths for bmux
 #[derive(Debug, Clone)]
 pub struct ConfigPaths {

@@ -25,6 +25,15 @@ pub enum NestedFieldDoc {
         /// Default values keyed by child field name.
         value_defaults: BTreeMap<String, String>,
     },
+    /// List item schema, expanded as `<parent>.<index_placeholder>.<child>`.
+    List {
+        /// Placeholder label rendered in docs for dynamic list indexes.
+        index_placeholder: &'static str,
+        /// Child field docs from the list item schema.
+        item_fields: Vec<FieldDoc>,
+        /// Default values keyed by list item field name.
+        item_defaults: BTreeMap<String, String>,
+    },
 }
 
 /// Metadata for a single configuration field.

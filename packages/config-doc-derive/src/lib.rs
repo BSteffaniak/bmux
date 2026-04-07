@@ -19,6 +19,7 @@ use syn::{Attribute, Data, DeriveInput, Fields, Lit, Meta, parse_macro_input};
 struct NestedDocConfig {
     enabled: bool,
     map_key: Option<String>,
+    list_index: Option<String>,
 }
 
 // ── Serde rename_all support ────────────────────────────────────────────────
@@ -170,6 +171,7 @@ fn extract_config_doc_values(attrs: &[Attribute]) -> Option<Vec<String>> {
 /// Supported forms:
 /// - `#[config_doc(nested)]`
 /// - `#[config_doc(nested, map_key = "<name>")]`
+/// - `#[config_doc(nested, list_index = "<index>")]`
 fn extract_nested_doc_config(attrs: &[Attribute]) -> syn::Result<NestedDocConfig> {
     let mut result = NestedDocConfig::default();
 
@@ -201,15 +203,34 @@ fn extract_nested_doc_config(attrs: &[Attribute]) -> syn::Result<NestedDocConfig
                         ));
                     }
                 }
+                Meta::NameValue(nv) if nv.path.is_ident("list_index") => {
+                    if let syn::Expr::Lit(expr_lit) = &nv.value
+                        && let Lit::Str(lit) = &expr_lit.lit
+                    {
+                        result.list_index = Some(lit.value());
+                    } else {
+                        return Err(syn::Error::new_spanned(
+                            &nv.value,
+                            "config_doc list_index must be a string literal",
+                        ));
+                    }
+                }
                 _ => {}
             }
         }
     }
 
-    if result.map_key.is_some() && !result.enabled {
+    if (result.map_key.is_some() || result.list_index.is_some()) && !result.enabled {
         return Err(syn::Error::new(
             proc_macro2::Span::call_site(),
-            "config_doc map_key requires config_doc(nested)",
+            "config_doc map_key/list_index requires config_doc(nested)",
+        ));
+    }
+
+    if result.map_key.is_some() && result.list_index.is_some() {
+        return Err(syn::Error::new(
+            proc_macro2::Span::call_site(),
+            "config_doc map_key and list_index cannot be combined on the same field",
         ));
     }
 
@@ -265,11 +286,46 @@ fn map_value_type(ty: &syn::Type) -> Option<&syn::Type> {
     type_args.next()
 }
 
+fn vec_item_type(ty: &syn::Type) -> Option<&syn::Type> {
+    let syn::Type::Path(type_path) = ty else {
+        return None;
+    };
+
+    let segment = type_path.path.segments.last()?;
+    if segment.ident != "Vec" {
+        return None;
+    }
+
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+
+    for arg in &args.args {
+        if let syn::GenericArgument::Type(inner) = arg {
+            return Some(inner);
+        }
+    }
+
+    None
+}
+
 // ── Type display mapping ────────────────────────────────────────────────────
+
+fn scalar_type_display(name: &str) -> Option<&'static str> {
+    match name {
+        "bool" => Some("bool"),
+        "String" => Some("string"),
+        "PathBuf" => Some("path"),
+        "usize" | "u64" | "u32" | "u16" | "u8" | "i64" | "i32" | "i16" | "i8" => Some("integer"),
+        "f64" | "f32" => Some("number"),
+        _ => None,
+    }
+}
 
 /// Map a Rust type to a human-readable display name for docs.
 fn type_to_display(ty: &syn::Type) -> String {
     let s = quote!(#ty).to_string().replace(' ', "");
+
     match s.as_str() {
         "bool" => "bool".to_string(),
         "String" => "string".to_string(),
@@ -279,21 +335,12 @@ fn type_to_display(ty: &syn::Type) -> String {
         "f64" | "f32" => "number".to_string(),
         _ if s.starts_with("Option<") => {
             let inner = &s[7..s.len() - 1];
-            let inner_display = match inner {
-                "String" => "string",
-                "PathBuf" => "path",
-                "u64" | "usize" => "integer",
-                _ => inner,
-            };
+            let inner_display = scalar_type_display(inner).unwrap_or("string");
             format!("{inner_display} (optional)")
         }
         _ if s.starts_with("Vec<") => {
             let inner = &s[4..s.len() - 1];
-            let inner_display = match inner {
-                "String" => "string",
-                "PathBuf" => "path",
-                _ => inner,
-            };
+            let inner_display = scalar_type_display(inner).unwrap_or("string");
             format!("list of {inner_display}s")
         }
         _ if s.starts_with("BTreeMap<") || s.starts_with("HashMap<") => "table".to_string(),
@@ -415,6 +462,7 @@ pub fn derive_config_doc_enum(input: TokenStream) -> TokenStream {
 /// - `#[config_doc(values("a", "b"))]` for explicit enum values.
 /// - `#[config_doc(nested)]` for inline nested schema expansion.
 /// - `#[config_doc(nested, map_key = "<name>")]` for map value schema expansion.
+/// - `#[config_doc(nested, list_index = "<index>")]` for list item schema expansion.
 ///
 /// **All public fields must have doc comments.** A compile error is emitted
 /// for any undocumented field.
@@ -493,6 +541,15 @@ pub fn derive_config_doc(input: TokenStream) -> TokenStream {
                             || quote! { None },
                             |enum_ident| quote! { Some(#enum_ident::config_doc_values()) },
                         )
+                    } else if let Some(item_ty) = vec_item_type(&field.ty) {
+                        if is_enum_type(item_ty) {
+                            enum_type_ident(item_ty).map_or_else(
+                                || quote! { None },
+                                |enum_ident| quote! { Some(#enum_ident::config_doc_values()) },
+                            )
+                        } else {
+                            quote! { None }
+                        }
                     } else {
                         quote! { None }
                     }
@@ -510,6 +567,14 @@ pub fn derive_config_doc(input: TokenStream) -> TokenStream {
 
         let nested_expr = if nested_doc_config.enabled {
             if let Some(value_ty) = map_value_type(&field.ty) {
+                if nested_doc_config.list_index.is_some() {
+                    return syn::Error::new_spanned(
+                        &field.ty,
+                        "config_doc list_index is only valid for list fields",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
                 let key_placeholder = nested_doc_config
                     .map_key
                     .unwrap_or_else(|| "<key>".to_string());
@@ -520,11 +585,30 @@ pub fn derive_config_doc(input: TokenStream) -> TokenStream {
                         value_defaults: <#value_ty as bmux_config_doc::ConfigDocSchema>::default_values(),
                     })
                 }
-            } else {
+            } else if let Some(item_ty) = vec_item_type(&field.ty) {
                 if nested_doc_config.map_key.is_some() {
                     return syn::Error::new_spanned(
                         &field.ty,
                         "config_doc map_key is only valid for map fields",
+                    )
+                    .to_compile_error()
+                    .into();
+                }
+                let index_placeholder = nested_doc_config
+                    .list_index
+                    .unwrap_or_else(|| "<index>".to_string());
+                quote! {
+                    Some(bmux_config_doc::NestedFieldDoc::List {
+                        index_placeholder: #index_placeholder,
+                        item_fields: <#item_ty as bmux_config_doc::ConfigDocSchema>::field_docs(),
+                        item_defaults: <#item_ty as bmux_config_doc::ConfigDocSchema>::default_values(),
+                    })
+                }
+            } else {
+                if nested_doc_config.map_key.is_some() || nested_doc_config.list_index.is_some() {
+                    return syn::Error::new_spanned(
+                        &field.ty,
+                        "config_doc map_key/list_index is only valid for map/list fields",
                     )
                     .to_compile_error()
                     .into();

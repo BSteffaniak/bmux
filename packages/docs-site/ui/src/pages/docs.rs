@@ -1,14 +1,11 @@
 //! Doc page functions — one per route, embedding markdown via `include_str!`.
 
 use clap::CommandFactory;
+use clap::builder::ValueHint;
 use hyperchad::markdown::markdown_to_container;
 use hyperchad::template::Containers;
 
-use bmux_config::{
-    AppearanceConfig, BehaviorConfig, ConfigDocSchema, ConnectionsConfig, GeneralConfig,
-    KeyBindingConfig, MultiClientConfig, PluginConfig, RecordingConfig, StatusBarConfig,
-    ThemeConfig,
-};
+use bmux_config::{BmuxConfig, ConfigDocSchema, ENV_OVERRIDE_DOCS, ThemeConfig};
 use std::collections::BTreeMap;
 
 use crate::layout;
@@ -174,23 +171,102 @@ fn generate_config_reference() -> String {
         "bmux is configured via a `bmux.toml` file. If no config file exists, \
          bmux uses sensible defaults for all options.\n\n\
          ## Config File Location\n\n\
-         bmux looks for `bmux.toml` in the standard XDG config directory:\n\n\
-         ```\n~/.config/bmux/bmux.toml\n```\n\n\
+         bmux resolves `bmux.toml` from the configured config directory candidate \
+         chain. Use the path/env override table below to pin exact locations.\n\n\
          ---\n\n",
     );
 
-    doc.push_str(&render_section::<GeneralConfig>());
-    doc.push_str(&render_section::<AppearanceConfig>());
-    doc.push_str(&render_theme_file_reference());
-    doc.push_str(&render_section::<BehaviorConfig>());
-    doc.push_str(&render_section::<MultiClientConfig>());
-    doc.push_str(&render_section::<KeyBindingConfig>());
-    doc.push_str(&render_section::<PluginConfig>());
-    doc.push_str(&render_section::<ConnectionsConfig>());
-    doc.push_str(&render_section::<StatusBarConfig>());
-    doc.push_str("\n## Status Bar Preset Examples\n\n");
-    doc.push_str("### Tab Rail (recommended)\n\n");
-    doc.push_str(
+    doc.push_str(&render_path_env_overrides_section());
+
+    for section in root_config_sections() {
+        doc.push_str(&render_section_with_fields(
+            &section.section_name,
+            &section.section_description,
+            section.fields,
+            section.defaults,
+        ));
+
+        if section.section_name == "appearance" {
+            doc.push_str(&render_theme_file_reference());
+        }
+
+        if section.section_name == "status_bar" {
+            doc.push_str(&render_status_preset_examples());
+        }
+    }
+
+    doc
+}
+
+struct RootConfigSection {
+    section_name: String,
+    section_description: String,
+    fields: Vec<RenderField>,
+    defaults: BTreeMap<String, String>,
+}
+
+fn root_config_sections() -> Vec<RootConfigSection> {
+    let mut sections = Vec::new();
+
+    for field in BmuxConfig::field_docs() {
+        if let Some(bmux_config_doc::NestedFieldDoc::Inline { fields, defaults }) = field.nested {
+            let (flattened_fields, flattened_defaults) = flatten_field_docs(fields, defaults, "");
+            sections.push(RootConfigSection {
+                section_name: field.toml_key.to_string(),
+                section_description: field.description.to_string(),
+                fields: flattened_fields,
+                defaults: flattened_defaults,
+            });
+        }
+    }
+
+    sections
+}
+
+fn render_theme_file_reference() -> String {
+    let mut s = String::from(
+        "## `themes/<name>.toml`\n\n\
+         Named theme files live under the bmux config directory (for example, \
+         `~/.config/bmux/themes/solarized.toml`) and are selected via \
+         `appearance.theme = \"solarized\"`.\n\n\
+         Keys below are top-level fields in the theme file.\n\n",
+    );
+
+    let (fields, defaults) =
+        flatten_field_docs(ThemeConfig::field_docs(), ThemeConfig::default_values(), "");
+    s.push_str(&render_fields_table(
+        "theme_file",
+        "theme",
+        fields,
+        defaults,
+    ));
+    s
+}
+
+fn render_path_env_overrides_section() -> String {
+    let mut s = String::from(
+        "## Path & Env Overrides\n\n\
+         bmux supports environment-variable overrides for config/runtime/data \
+         directories and recording storage.\n\n",
+    );
+
+    s.push_str("| Variable | Scope | Behavior |\n");
+    s.push_str("|----------|-------|----------|\n");
+    for override_doc in ENV_OVERRIDE_DOCS {
+        let variable = format!("`{}`", escape_markdown_table_cell(override_doc.variable));
+        let scope = escape_markdown_table_cell(override_doc.scope);
+        let behavior = escape_markdown_table_cell(override_doc.description);
+        s.push_str(&format!("| {variable} | {scope} | {behavior} |\n"));
+    }
+    s.push_str("\n---\n\n");
+
+    s
+}
+
+fn render_status_preset_examples() -> String {
+    let mut s = String::from("## Status Bar Preset Examples\n\n");
+    s.push_str("### Tab Rail (recommended)\n\n");
+    s.push_str(
         "```toml\n\
 [status_bar]\n\
 enabled = true\n\
@@ -224,8 +300,8 @@ bold_active = true\n\
 underline_active = false\n\
 ```\n\n",
     );
-    doc.push_str("### Minimal\n\n");
-    doc.push_str(
+    s.push_str("### Minimal\n\n");
+    s.push_str(
         "```toml\n\
 [status_bar]\n\
 enabled = true\n\
@@ -253,8 +329,8 @@ bold_active = false\n\
 underline_active = false\n\
 ```\n\n",
     );
-    doc.push_str("### Status Theme Override (partial)\n\n");
-    doc.push_str(
+    s.push_str("### Status Theme Override (partial)\n\n");
+    s.push_str(
         "```toml\n\
 [status_bar.theme]\n\
 # Unset fields inherit from the global appearance theme defaults\n\
@@ -264,38 +340,6 @@ tab_inactive_bg = \"#2a2f45\"\n\
 module_bg = \"#343a55\"\n\
 ```\n\n",
     );
-    doc.push_str(&render_section::<RecordingConfig>());
-
-    doc
-}
-
-fn render_section<T: ConfigDocSchema>() -> String {
-    let (fields, defaults) = flatten_field_docs(T::field_docs(), T::default_values(), "");
-    render_section_with_fields(
-        T::section_name(),
-        T::section_description(),
-        fields,
-        defaults,
-    )
-}
-
-fn render_theme_file_reference() -> String {
-    let mut s = String::from(
-        "## `themes/<name>.toml`\n\n\
-         Named theme files live under the bmux config directory (for example, \
-         `~/.config/bmux/themes/solarized.toml`) and are selected via \
-         `appearance.theme = \"solarized\"`.\n\n\
-         Keys below are top-level fields in the theme file.\n\n",
-    );
-
-    let (fields, defaults) =
-        flatten_field_docs(ThemeConfig::field_docs(), ThemeConfig::default_values(), "");
-    s.push_str(&render_fields_table(
-        "theme_file",
-        "theme",
-        fields,
-        defaults,
-    ));
     s
 }
 
@@ -336,6 +380,17 @@ fn flatten_field_docs(
                 let map_prefix = dotted_key(&full_key, key_placeholder);
                 let (child_fields, child_defaults) =
                     flatten_field_docs(value_fields, value_defaults, &map_prefix);
+                flattened_fields.extend(child_fields);
+                flattened_defaults.extend(child_defaults);
+            }
+            Some(bmux_config_doc::NestedFieldDoc::List {
+                index_placeholder,
+                item_fields,
+                item_defaults,
+            }) => {
+                let list_prefix = dotted_key(&full_key, index_placeholder);
+                let (child_fields, child_defaults) =
+                    flatten_field_docs(item_fields, item_defaults, &list_prefix);
                 flattened_fields.extend(child_fields);
                 flattened_defaults.extend(child_defaults);
             }
@@ -402,6 +457,17 @@ fn default_anchor_id(section_name: &str, toml_key: &str) -> String {
     )
 }
 
+fn escape_markdown_table_cell(input: &str) -> String {
+    input
+        .replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace('\n', "<br>")
+}
+
+fn escape_inline_code(input: &str) -> String {
+    input.replace('`', "\\`")
+}
+
 fn render_section_with_fields(
     section_name: &str,
     section_description: &str,
@@ -456,7 +522,7 @@ fn render_fields_table(
         } else {
             match raw_default {
                 Some("") => "*(empty)*".to_string(),
-                Some(v) => format!("`{v}`"),
+                Some(v) => format!("`{}`", escape_inline_code(v)),
                 None => "—".to_string(),
             }
         };
@@ -470,9 +536,18 @@ fn render_fields_table(
             Some(_) => field.type_display.to_string(),
         };
 
+        let escaped_option = escape_markdown_table_cell(&field.toml_key);
+        let escaped_type = escape_markdown_table_cell(&type_info);
+        let escaped_default = if default_val.starts_with("[*(see defaults below)*](#") {
+            default_val
+        } else {
+            escape_markdown_table_cell(&default_val)
+        };
+        let escaped_description = escape_markdown_table_cell(&field.description);
+
         s.push_str(&format!(
             "| `{}` | {} | {} | {} |\n",
-            field.toml_key, type_info, default_val, field.description
+            escaped_option, escaped_type, escaped_default, escaped_description
         ));
     }
 
@@ -485,10 +560,15 @@ fn render_fields_table(
         } else {
             format!("Default `{toml_key}` value")
         };
+        let body = if *is_table {
+            format!("[{default_section_name}.{toml_key}]\n{default_val}")
+        } else {
+            format!("[{default_section_name}]\n{toml_key} = {default_val}")
+        };
         s.push_str(&format!(
             "<div id=\"{anchor_id}\"></div>\n\n\
              ### {heading}\n\n\
-             ```toml\n[{default_section_name}.{toml_key}]\n{default_val}\n```\n\n"
+             ```toml\n{body}\n```\n\n"
         ));
     }
 
@@ -598,42 +678,23 @@ fn render_command(doc: &mut String, cmd: &clap::Command, path: &[&str], depth: u
 
             let desc = flag.get_help().map(|h| h.to_string()).unwrap_or_default();
 
-            // Determine the Values column content:
-            // - ValueEnum args: show the valid choices
-            // - Boolean flags: show "boolean"
-            // - Otherwise: infer type from value name heuristic
-            let possible: Vec<String> = flag
-                .get_possible_values()
-                .iter()
-                .filter(|v| !v.is_hide_set())
-                .map(|v| v.get_name().to_string())
-                .collect();
+            // Determine values/types from clap metadata first, then value-name heuristics.
+            let possible = arg_possible_values(flag);
+            let repeatable = arg_is_repeatable(flag);
 
-            let is_bool_values = possible.is_empty()
-                || possible == ["true", "false"]
-                || possible == ["false", "true"];
-
-            let values_display = if !is_bool_values {
-                // Real ValueEnum — show the choices
+            let values_display = if !is_bool_possible_values(&possible) {
                 possible
                     .iter()
-                    .map(|v| format!("`{v}`"))
+                    .map(|v| format!("`{}`", escape_inline_code(v)))
                     .collect::<Vec<_>>()
                     .join(", ")
-            } else if matches!(
-                flag.get_action(),
-                clap::ArgAction::SetTrue | clap::ArgAction::SetFalse | clap::ArgAction::Count
-            ) {
-                // Boolean flag (SetTrue/SetFalse) or count flag (-vvv)
-                "boolean".to_string()
             } else {
-                // Takes a value — infer type from value name
-                let val_name = flag
-                    .get_value_names()
-                    .and_then(|n| n.first())
-                    .map(|n| n.as_str().to_lowercase())
-                    .unwrap_or_default();
-                infer_value_type(&val_name)
+                infer_arg_value_type(flag)
+            };
+            let values_display = if repeatable {
+                format!("{values_display} (repeatable)")
+            } else {
+                values_display
             };
 
             let default = flag
@@ -643,7 +704,7 @@ fn render_command(doc: &mut String, cmd: &clap::Command, path: &[&str], depth: u
                 .collect::<Vec<_>>()
                 .join(", ");
             let default_display = if !default.is_empty() {
-                format!("`{default}`")
+                format!("`{}`", escape_inline_code(&default))
             } else if matches!(flag.get_action(), clap::ArgAction::SetTrue) {
                 "`false`".to_string()
             } else if matches!(flag.get_action(), clap::ArgAction::SetFalse) {
@@ -652,8 +713,13 @@ fn render_command(doc: &mut String, cmd: &clap::Command, path: &[&str], depth: u
                 String::new()
             };
 
+            let escaped_flag = escape_markdown_table_cell(&flag_str);
+            let escaped_desc = escape_markdown_table_cell(&desc);
+            let escaped_values = escape_markdown_table_cell(&values_display);
+            let escaped_default = escape_markdown_table_cell(&default_display);
+
             doc.push_str(&format!(
-                "| `{flag_str}` | {desc} | {values_display} | {default_display} |\n"
+                "| `{escaped_flag}` | {escaped_desc} | {escaped_values} | {escaped_default} |\n"
             ));
         }
         doc.push('\n');
@@ -682,8 +748,62 @@ fn render_command(doc: &mut String, cmd: &clap::Command, path: &[&str], depth: u
     }
 }
 
+fn arg_possible_values(flag: &clap::Arg) -> Vec<String> {
+    flag.get_possible_values()
+        .iter()
+        .filter(|v| !v.is_hide_set())
+        .map(|v| v.get_name().to_string())
+        .collect()
+}
+
+fn is_bool_possible_values(possible: &[String]) -> bool {
+    possible.is_empty() || possible == ["true", "false"] || possible == ["false", "true"]
+}
+
+fn arg_is_repeatable(flag: &clap::Arg) -> bool {
+    matches!(flag.get_action(), clap::ArgAction::Append)
+        || flag
+            .get_num_args()
+            .is_some_and(|range| range.max_values() > 1 || range.min_values() > 1)
+}
+
+/// Infer a human-readable type name from clap arg metadata, falling back to
+/// value-name heuristics when clap metadata is non-specific.
+fn infer_arg_value_type(flag: &clap::Arg) -> String {
+    match flag.get_action() {
+        clap::ArgAction::SetTrue | clap::ArgAction::SetFalse => return "boolean".to_string(),
+        clap::ArgAction::Count => return "integer".to_string(),
+        _ => {}
+    }
+
+    match flag.get_value_hint() {
+        ValueHint::AnyPath
+        | ValueHint::FilePath
+        | ValueHint::DirPath
+        | ValueHint::ExecutablePath => return "path".to_string(),
+        ValueHint::CommandString
+        | ValueHint::CommandName
+        | ValueHint::CommandWithArguments
+        | ValueHint::Username
+        | ValueHint::Hostname
+        | ValueHint::Url
+        | ValueHint::EmailAddress
+        | ValueHint::Other => return "string".to_string(),
+        ValueHint::Unknown => {}
+        _ => {}
+    }
+
+    let val_name = flag
+        .get_value_names()
+        .and_then(|names| names.first())
+        .map(|name| name.as_str().to_lowercase())
+        .unwrap_or_default();
+
+    infer_value_type_from_name(&val_name)
+}
+
 /// Infer a human-readable type name from a clap value name.
-fn infer_value_type(val_name: &str) -> String {
+fn infer_value_type_from_name(val_name: &str) -> String {
     // Integer-like value names
     if matches!(
         val_name,
@@ -693,6 +813,7 @@ fn infer_value_type(val_name: &str) -> String {
             | "n"
             | "days"
             | "secs"
+            | "seconds"
             | "ms"
             | "timeout"
             | "threshold"
@@ -730,7 +851,8 @@ fn infer_value_type(val_name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::generate_config_reference;
+    use super::{generate_cli_reference, generate_config_reference};
+    use bmux_config::{BmuxConfig, ConfigDocSchema};
 
     #[test]
     fn config_reference_includes_connections_nested_dotted_keys() {
@@ -755,7 +877,10 @@ mod tests {
         assert!(doc.contains("style.separator_set"));
         assert!(doc.contains("theme.tab_active_bg"));
         assert!(doc.contains("routing.conflict_mode"));
-        assert!(doc.contains("routing.required_paths"));
+        assert!(doc.contains("routing.required_paths.<index>.path"));
+        assert!(doc.contains("routing.required_namespaces.<index>.namespace"));
+        assert!(doc.contains("rolling_event_kinds"));
+        assert!(doc.contains("pane_input_raw"));
     }
 
     #[test]
@@ -765,5 +890,46 @@ mod tests {
         assert!(doc.contains("## `themes/<name>.toml`"));
         assert!(doc.contains("border.active"));
         assert!(doc.contains("status.mode_indicator"));
+    }
+
+    #[test]
+    fn config_reference_renders_all_root_sections() {
+        let doc = generate_config_reference();
+
+        for field in BmuxConfig::field_docs() {
+            let heading = format!("## `[{}]`", field.toml_key);
+            assert!(doc.contains(&heading), "missing section heading: {heading}");
+        }
+    }
+
+    #[test]
+    fn config_reference_documents_env_overrides() {
+        let doc = generate_config_reference();
+
+        assert!(doc.contains("## Path & Env Overrides"));
+        assert!(doc.contains("BMUX_CONFIG_DIR"));
+        assert!(doc.contains("BMUX_RUNTIME_NAME"));
+        assert!(doc.contains("BMUX_RECORDINGS_DIR"));
+    }
+
+    #[test]
+    fn cli_reference_hides_internal_flags_and_renders_enums_types_and_repeatability() {
+        let doc = generate_cli_reference();
+
+        assert!(!doc.contains("core-builtins-only"));
+        assert!(doc.contains("--record-profile"));
+        assert!(doc.contains("`full`, `functional`, `visual`"));
+
+        let recordings_dir_line = doc
+            .lines()
+            .find(|line| line.contains("--recordings-dir"))
+            .expect("missing --recordings-dir line");
+        assert!(recordings_dir_line.contains("path"));
+
+        let record_event_kind_line = doc
+            .lines()
+            .find(|line| line.contains("--record-event-kind"))
+            .expect("missing --record-event-kind line");
+        assert!(record_event_kind_line.contains("repeatable"));
     }
 }

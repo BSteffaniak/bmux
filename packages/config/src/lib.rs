@@ -22,7 +22,7 @@ pub mod theme;
 
 pub use bmux_config_doc::{ConfigDocSchema, FieldDoc};
 pub use keybind::{KeyBindingConfig, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS, ResolvedTimeout};
-pub use paths::ConfigPaths;
+pub use paths::{ConfigPaths, ENV_OVERRIDE_DOCS, EnvOverrideDoc};
 pub use theme::ThemeConfig;
 
 /// Configuration error types
@@ -47,26 +47,35 @@ pub enum ConfigError {
 pub type Result<T> = std::result::Result<T, ConfigError>;
 
 /// Root configuration structure for bmux, deserialized from `bmux.toml`
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, ConfigDoc)]
 #[serde(default)]
 pub struct BmuxConfig {
     /// Core session defaults: shell, scrollback depth, and server connection settings
+    #[config_doc(nested)]
     pub general: GeneralConfig,
     /// Visual styling: color theme, pane borders, status bar placement, and window titles
+    #[config_doc(nested)]
     pub appearance: AppearanceConfig,
     /// Runtime behavior toggles for terminal protocol handling, layout persistence, and build compatibility
+    #[config_doc(nested)]
     pub behavior: BehaviorConfig,
     /// Settings for multiple clients attached to the same session
+    #[config_doc(nested)]
     pub multi_client: MultiClientConfig,
     /// Keyboard shortcuts organized by scope and interaction mode
+    #[config_doc(nested)]
     pub keybindings: KeyBindingConfig,
     /// Plugin discovery, enablement, and per-plugin settings
+    #[config_doc(nested)]
     pub plugins: PluginConfig,
     /// Local and remote connection target profiles
+    #[config_doc(nested)]
     pub connections: ConnectionsConfig,
     /// Content and layout of the status bar displayed at the top or bottom of the terminal
+    #[config_doc(nested)]
     pub status_bar: StatusBarConfig,
     /// Session recording for terminal replay, debugging, and playbook generation
+    #[config_doc(nested)]
     pub recording: RecordingConfig,
 }
 
@@ -876,8 +885,10 @@ pub struct PluginRoutingPolicyConfig {
     /// Conflict behavior when multiple plugins claim overlapping command ownership.
     pub conflict_mode: PluginRoutingConflictMode,
     /// Required namespace claims that must be satisfied at startup.
+    #[config_doc(nested, list_index = "<index>")]
     pub required_namespaces: Vec<RequiredNamespaceClaim>,
     /// Required path claims that must be satisfied at startup.
+    #[config_doc(nested, list_index = "<index>")]
     pub required_paths: Vec<RequiredPathClaim>,
 }
 
