@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+use super::prompt_ui::AttachPromptState;
+
 pub enum AttachEventAction {
     Send(Vec<u8>),
     Runtime(RuntimeAction),
@@ -118,10 +120,9 @@ pub struct AttachViewState {
     pub scrollback_offset: usize,
     pub scrollback_cursor: Option<AttachScrollbackCursor>,
     pub selection_anchor: Option<AttachScrollbackPosition>,
-    pub quit_confirmation_pending: bool,
-    pub close_pane_confirmation_pending: Option<Uuid>,
     pub help_overlay_open: bool,
     pub help_overlay_scroll: usize,
+    pub prompt: AttachPromptState,
     pub transient_status: Option<String>,
     pub transient_status_until: Option<Instant>,
     pub last_context_refresh_at: Option<Instant>,
@@ -195,10 +196,9 @@ impl AttachViewState {
             scrollback_offset: 0,
             scrollback_cursor: None,
             selection_anchor: None,
-            quit_confirmation_pending: false,
-            close_pane_confirmation_pending: None,
             help_overlay_open: false,
             help_overlay_scroll: 0,
+            prompt: AttachPromptState::default(),
             transient_status: None,
             transient_status_until: None,
             last_context_refresh_at: None,

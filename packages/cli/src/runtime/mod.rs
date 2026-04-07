@@ -38,6 +38,7 @@ mod plugin_commands;
 mod plugin_host;
 mod plugin_kernel;
 mod plugin_runtime;
+mod prompt;
 mod recording;
 mod recording_cli;
 mod remote_cli;

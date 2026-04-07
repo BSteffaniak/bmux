@@ -28,6 +28,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, trace, warn};
 use uuid::Uuid;
 
+use super::super::prompt::{self, PromptRequest, PromptResponse, PromptValue};
 use super::super::{
     ATTACH_SCROLLBACK_UNAVAILABLE_STATUS, ATTACH_SELECTION_CLEARED_STATUS,
     ATTACH_SELECTION_COPIED_STATUS, ATTACH_SELECTION_EMPTY_STATUS, ATTACH_SELECTION_STARTED_STATUS,
@@ -41,6 +42,10 @@ use super::super::{
 };
 use super::cursor::apply_attach_cursor_state;
 use super::events::{AttachLoopControl, AttachLoopEvent};
+use super::prompt_ui::{
+    AttachInternalPromptAction, AttachPromptCompletion, AttachPromptOrigin, PromptKeyDisposition,
+    prompt_accepts_key_kind,
+};
 use super::render::{
     AttachLayer, AttachLayerSurface, append_pane_output, opaque_row_text, queue_layer_fill,
     render_attach_scene, visible_scene_pane_ids,
@@ -377,6 +382,8 @@ pub async fn run_session_attach_with_client(
     .context("failed to enable raw mode for attach")?;
     let mut attach_input_processor =
         InputProcessor::new(attach_keymap.clone(), raw_mode_guard.keyboard_enhanced);
+    let (prompt_host_tx, mut prompt_host_rx) = tokio::sync::mpsc::unbounded_channel();
+    let _prompt_host_guard = prompt::register_host(prompt_host_tx);
     // Default exit reason; always overwritten before the loop breaks, but the
     // compiler cannot prove this through the tokio::select! macro expansion.
     #[allow(unused_assignments)]
@@ -541,6 +548,14 @@ pub async fn run_session_attach_with_client(
                         exit_reason = reason;
                         break;
                     }
+                }
+            }
+
+            prompt_request = prompt_host_rx.recv() => {
+                if let Some(prompt_request) = prompt_request {
+                    view_state.prompt.enqueue_external(prompt_request);
+                    view_state.dirty.status_needs_redraw = true;
+                    view_state.dirty.full_pane_redraw = true;
                 }
             }
 
@@ -1363,15 +1378,6 @@ pub async fn handle_attach_ui_action(
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
         }
-        RuntimeAction::ExitMode => {
-            if cancel_close_pane_confirmation(view_state) {
-                view_state.set_transient_status(
-                    "close pane canceled",
-                    Instant::now(),
-                    ATTACH_TRANSIENT_STATUS_TTL,
-                );
-            }
-        }
         RuntimeAction::EnterScrollMode => {
             if enter_attach_scrollback(view_state) {
             } else {
@@ -1478,6 +1484,25 @@ pub async fn handle_attach_ui_action(
                 ATTACH_TRANSIENT_STATUS_TTL,
             );
         }
+        RuntimeAction::Quit => {
+            if view_state.prompt.is_busy() {
+                view_state.set_transient_status(
+                    "prompt already active",
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+                return Ok(());
+            }
+            view_state.prompt.enqueue_internal(
+                PromptRequest::confirm("Quit session and all panes?")
+                    .message("This will terminate the attached session and every pane.")
+                    .submit_label("Quit")
+                    .cancel_label("Cancel")
+                    .confirm_default(false)
+                    .policy(prompt::PromptPolicy::RejectIfBusy),
+                AttachInternalPromptAction::QuitSession,
+            );
+        }
         RuntimeAction::WindowPrev
         | RuntimeAction::WindowNext
         | RuntimeAction::WindowGoto1
@@ -1541,32 +1566,31 @@ pub async fn handle_attach_ui_action(
             client.resize_pane(Some(selector), delta).await?;
         }
         RuntimeAction::CloseFocusedPane => {
-            match process_close_pane_confirmation(view_state, focused_attach_pane_id(view_state)) {
-                ClosePaneConfirmationAction::NoFocusedPane => {
-                    view_state.set_transient_status(
-                        "no focused pane",
-                        Instant::now(),
-                        ATTACH_TRANSIENT_STATUS_TTL,
-                    );
-                    return Ok(());
-                }
-                ClosePaneConfirmationAction::Armed => {
-                    view_state.set_transient_status(
-                        "press close pane again to confirm; Esc to cancel",
-                        Instant::now(),
-                        ATTACH_TRANSIENT_STATUS_TTL,
-                    );
-                }
-                ClosePaneConfirmationAction::Confirmed => {
-                    let selector = attached_session_selector(client, view_state).await?;
-                    client.close_pane(Some(selector)).await?;
-                    view_state.set_transient_status(
-                        "pane closed",
-                        Instant::now(),
-                        ATTACH_TRANSIENT_STATUS_TTL,
-                    );
-                }
+            let Some(pane_id) = focused_attach_pane_id(view_state) else {
+                view_state.set_transient_status(
+                    "no focused pane",
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+                return Ok(());
+            };
+            if view_state.prompt.is_busy() {
+                view_state.set_transient_status(
+                    "prompt already active",
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+                return Ok(());
             }
+            view_state.prompt.enqueue_internal(
+                PromptRequest::confirm("Close focused pane?")
+                    .message("This will stop the pane process.")
+                    .submit_label("Close")
+                    .cancel_label("Cancel")
+                    .confirm_default(false)
+                    .policy(prompt::PromptPolicy::RejectIfBusy),
+                AttachInternalPromptAction::ClosePane { pane_id },
+            );
         }
         RuntimeAction::ZoomPane => {
             let selector = attached_session_selector(client, view_state).await?;
@@ -1580,7 +1604,6 @@ pub async fn handle_attach_ui_action(
         RuntimeAction::RestartFocusedPane => {
             let selector = attached_session_selector(client, view_state).await?;
             let _ = client.restart_pane(Some(selector)).await?;
-            view_state.close_pane_confirmation_pending = None;
             view_state.set_transient_status(
                 "pane restarted",
                 Instant::now(),
@@ -1617,33 +1640,6 @@ pub fn begin_attach_selection(view_state: &mut AttachViewState) -> bool {
     }
     view_state.selection_anchor = attach_scrollback_cursor_absolute_position(view_state);
     view_state.selection_anchor.is_some()
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClosePaneConfirmationAction {
-    NoFocusedPane,
-    Armed,
-    Confirmed,
-}
-
-pub fn process_close_pane_confirmation(
-    view_state: &mut AttachViewState,
-    focused_pane_id: Option<Uuid>,
-) -> ClosePaneConfirmationAction {
-    let Some(focused_pane_id) = focused_pane_id else {
-        return ClosePaneConfirmationAction::NoFocusedPane;
-    };
-    if view_state.close_pane_confirmation_pending == Some(focused_pane_id) {
-        view_state.close_pane_confirmation_pending = None;
-        ClosePaneConfirmationAction::Confirmed
-    } else {
-        view_state.close_pane_confirmation_pending = Some(focused_pane_id);
-        ClosePaneConfirmationAction::Armed
-    }
-}
-
-pub const fn cancel_close_pane_confirmation(view_state: &mut AttachViewState) -> bool {
-    view_state.close_pane_confirmation_pending.take().is_some()
 }
 
 pub fn clear_attach_selection(view_state: &mut AttachViewState, show_status: bool) {
@@ -2076,7 +2072,8 @@ pub async fn build_attach_status_line_for_draw(
     scrollback_active: bool,
     follow_target_id: Option<Uuid>,
     follow_global: bool,
-    quit_confirmation_pending: bool,
+    prompt_active: bool,
+    prompt_hint: Option<&str>,
     help_overlay_open: bool,
     transient_status: Option<&str>,
     keymap: &Keymap,
@@ -2104,6 +2101,8 @@ pub async fn build_attach_status_line_for_draw(
         .is_some_and(|s| s.zoomed);
     let mode_label = if help_overlay_open {
         "HELP"
+    } else if prompt_active {
+        "PROMPT"
     } else if scrollback_active {
         "SCROLL"
     } else if zoomed {
@@ -2120,8 +2119,8 @@ pub async fn build_attach_status_line_for_draw(
             format!("following {}", short_uuid(id))
         }
     });
-    let hint = if quit_confirmation_pending {
-        "Quit session and all panes? [y/N]".to_string()
+    let hint = if prompt_active {
+        prompt_hint.unwrap_or("Prompt active").to_string()
     } else if help_overlay_open {
         "Help overlay open | ? toggles | Esc/Enter close".to_string()
     } else if let Some(status) = transient_status {
@@ -2510,7 +2509,8 @@ pub async fn render_attach_frame(
                 view_state.scrollback_active,
                 follow_target_id,
                 follow_global,
-                view_state.quit_confirmation_pending,
+                view_state.prompt.is_active(),
+                view_state.prompt.active_hint(),
                 view_state.help_overlay_open,
                 transient_status.as_deref(),
                 keymap,
@@ -2595,13 +2595,22 @@ pub async fn render_attach_frame(
     }
 
     let previous_cursor_state = view_state.last_cursor_state;
-    if view_state.help_overlay_open {
-        if let Some(help_surface) = help_overlay_surface(help_lines) {
-            queue_attach_help_overlay(&mut frame_bytes, &help_surface, help_lines, help_scroll)?;
-        }
+    let mut overlay_cursor_state = None;
+    if view_state.help_overlay_open
+        && let Some(help_surface) = help_overlay_surface(help_lines)
+    {
+        queue_attach_help_overlay(&mut frame_bytes, &help_surface, help_lines, help_scroll)?;
+    }
+    if view_state.prompt.is_active() {
+        overlay_cursor_state = view_state
+            .prompt
+            .queue_attach_prompt_overlay(&mut frame_bytes)?;
+    }
+
+    if view_state.help_overlay_open || view_state.prompt.is_active() {
         apply_attach_cursor_state(
             &mut frame_bytes,
-            None,
+            overlay_cursor_state,
             &mut view_state.last_cursor_state,
             false,
         )?;
@@ -3095,7 +3104,7 @@ pub fn build_attach_help_lines(config: &BmuxConfig) -> Vec<String> {
         "Normal mode sends typing to the pane. Use {scroll} for scrollback, {detach} to detach, and {help} to toggle help."
     ));
     lines.push(format!(
-        "Pane recovery: use {restart} to restart an exited pane in place; {close} requires pressing it twice on the same pane (Esc cancels)."
+        "Pane recovery: use {restart} to restart an exited pane in place; {close} opens a confirmation prompt before closing."
     ));
     lines.push(String::new());
     for (category, mut entries) in groups {
@@ -3749,56 +3758,26 @@ pub async fn handle_attach_terminal_event(
         update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
     }
 
-    let mut skip_attach_key_actions = false;
-    if view_state.quit_confirmation_pending
-        && let Event::Key(key) = &terminal_event
-        && key.kind == KeyEventKind::Press
-    {
-        match key.code {
-            KeyCode::Char('y' | 'Y') => {
-                let selector = attached_session_selector(client, view_state).await?;
-                match client.kill_session(selector).await {
-                    Ok(_) => return Ok(AttachLoopControl::Break(AttachExitReason::Quit)),
-                    Err(error) => {
-                        let status = attach_quit_failure_status(&error);
-                        view_state.set_transient_status(
-                            status,
-                            Instant::now(),
-                            ATTACH_TRANSIENT_STATUS_TTL,
-                        );
+    if view_state.prompt.is_active() {
+        match &terminal_event {
+            Event::Key(key) if prompt_accepts_key_kind(key.kind) => {
+                match view_state.prompt.handle_key_event(key) {
+                    PromptKeyDisposition::Completed(completion) => {
+                        if let Some(control) =
+                            handle_attach_prompt_completion(client, view_state, completion).await?
+                        {
+                            return Ok(control);
+                        }
                     }
+                    PromptKeyDisposition::Consumed | PromptKeyDisposition::NotActive => {}
                 }
-                view_state.quit_confirmation_pending = false;
-                view_state.dirty.status_needs_redraw = true;
-                skip_attach_key_actions = true;
+                return Ok(AttachLoopControl::Continue);
             }
-            KeyCode::Char('n' | 'N') | KeyCode::Esc | KeyCode::Enter => {
-                view_state.quit_confirmation_pending = false;
-                view_state.dirty.status_needs_redraw = true;
-                skip_attach_key_actions = true;
+            Event::Key(_) | Event::Mouse(_) | Event::Paste(_) => {
+                return Ok(AttachLoopControl::Continue);
             }
-            _ => {
-                skip_attach_key_actions = true;
-            }
+            _ => {}
         }
-    }
-
-    if skip_attach_key_actions {
-        return Ok(AttachLoopControl::Continue);
-    }
-
-    if view_state.close_pane_confirmation_pending.is_some()
-        && let Event::Key(key) = &terminal_event
-        && key.kind == KeyEventKind::Press
-        && matches!(key.code, KeyCode::Esc)
-    {
-        let _ = cancel_close_pane_confirmation(view_state);
-        view_state.set_transient_status(
-            "close pane canceled",
-            Instant::now(),
-            ATTACH_TRANSIENT_STATUS_TTL,
-        );
-        return Ok(AttachLoopControl::Continue);
     }
 
     if view_state.help_overlay_open
@@ -3816,7 +3795,7 @@ pub async fn handle_attach_terminal_event(
                 return Ok(AttachLoopControl::Break(AttachExitReason::Detached));
             }
             AttachEventAction::Send(bytes) => {
-                if view_state.help_overlay_open {
+                if view_state.help_overlay_open || view_state.prompt.is_active() {
                     continue;
                 }
                 if view_state.can_write {
@@ -3852,7 +3831,7 @@ pub async fn handle_attach_terminal_event(
                 }
             }
             AttachEventAction::Runtime(action) => {
-                if view_state.help_overlay_open {
+                if view_state.help_overlay_open || view_state.prompt.is_active() {
                     continue;
                 }
                 if let Err(error) = handle_attach_runtime_action(client, action, view_state).await {
@@ -3869,7 +3848,7 @@ pub async fn handle_attach_terminal_event(
                 command_name,
                 args,
             } => {
-                if view_state.help_overlay_open {
+                if view_state.help_overlay_open || view_state.prompt.is_active() {
                     continue;
                 }
                 if let Err(error) = handle_attach_plugin_command_action(
@@ -3921,11 +3900,6 @@ pub async fn handle_attach_terminal_event(
                     }
                     continue;
                 }
-                if matches!(action, RuntimeAction::Quit) {
-                    view_state.quit_confirmation_pending = true;
-                    view_state.dirty.status_needs_redraw = true;
-                    continue;
-                }
                 if let Err(error) = handle_attach_ui_action(client, action, view_state).await {
                     println!("attach action failed: {}", map_attach_client_error(error));
                 } else {
@@ -3947,6 +3921,73 @@ pub async fn handle_attach_terminal_event(
     Ok(AttachLoopControl::Continue)
 }
 
+pub const fn prompt_response_is_confirmed(response: &PromptResponse) -> bool {
+    matches!(
+        response,
+        PromptResponse::Submitted(PromptValue::Confirm(true))
+    )
+}
+
+pub async fn handle_attach_prompt_completion(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    completion: AttachPromptCompletion,
+) -> std::result::Result<Option<AttachLoopControl>, ClientError> {
+    match completion.origin {
+        AttachPromptOrigin::External { response_tx } => {
+            let _ = response_tx.send(completion.response);
+        }
+        AttachPromptOrigin::Internal(action) => match action {
+            AttachInternalPromptAction::QuitSession => {
+                if prompt_response_is_confirmed(&completion.response) {
+                    let selector = attached_session_selector(client, view_state).await?;
+                    match client.kill_session(selector).await {
+                        Ok(_) => return Ok(Some(AttachLoopControl::Break(AttachExitReason::Quit))),
+                        Err(error) => {
+                            let status = attach_quit_failure_status(&error);
+                            view_state.set_transient_status(
+                                status,
+                                Instant::now(),
+                                ATTACH_TRANSIENT_STATUS_TTL,
+                            );
+                        }
+                    }
+                } else {
+                    view_state.set_transient_status(
+                        "quit canceled",
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                }
+            }
+            AttachInternalPromptAction::ClosePane { pane_id } => {
+                if prompt_response_is_confirmed(&completion.response) {
+                    let selector = attached_session_selector(client, view_state).await?;
+                    let _ = client
+                        .focus_pane_target(Some(selector.clone()), PaneSelector::ById(pane_id))
+                        .await?;
+                    client.close_pane(Some(selector)).await?;
+                    view_state.set_transient_status(
+                        "pane closed",
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                } else {
+                    view_state.set_transient_status(
+                        "close pane canceled",
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                }
+            }
+        },
+    }
+
+    view_state.dirty.status_needs_redraw = true;
+    view_state.dirty.full_pane_redraw = true;
+    Ok(None)
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn record_attach_mouse_event(mouse_event: MouseEvent, view_state: &mut AttachViewState) {
     view_state.mouse.last_position = Some((mouse_event.column, mouse_event.row));
@@ -3964,7 +4005,7 @@ pub async fn handle_attach_mouse_event(
     if !view_state.mouse.config.enabled {
         return Ok(());
     }
-    if view_state.help_overlay_open || view_state.quit_confirmation_pending {
+    if view_state.help_overlay_open || view_state.prompt.is_active() {
         return Ok(());
     }
 
@@ -6250,53 +6291,11 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|line| line.contains("requires pressing it twice on the same pane"))
+                .any(|line| line.contains("opens a confirmation prompt before closing"))
         );
         assert!(lines.iter().any(|line| line == "-- Session --"));
         assert!(lines.iter().any(|line| line == "-- Pane --"));
         assert!(lines.iter().any(|line| line == "-- Mode --"));
-    }
-
-    #[test]
-    fn close_pane_confirmation_is_scoped_per_pane() {
-        let mut view_state = AttachViewState::new(AttachOpenInfo {
-            context_id: None,
-            session_id: Uuid::new_v4(),
-            can_write: true,
-        });
-        let pane_a = Uuid::new_v4();
-        let pane_b = Uuid::new_v4();
-
-        assert_eq!(
-            process_close_pane_confirmation(&mut view_state, Some(pane_a)),
-            ClosePaneConfirmationAction::Armed
-        );
-        assert_eq!(view_state.close_pane_confirmation_pending, Some(pane_a));
-
-        assert_eq!(
-            process_close_pane_confirmation(&mut view_state, Some(pane_b)),
-            ClosePaneConfirmationAction::Armed
-        );
-        assert_eq!(view_state.close_pane_confirmation_pending, Some(pane_b));
-
-        assert_eq!(
-            process_close_pane_confirmation(&mut view_state, Some(pane_b)),
-            ClosePaneConfirmationAction::Confirmed
-        );
-        assert_eq!(view_state.close_pane_confirmation_pending, None);
-    }
-
-    #[test]
-    fn cancel_close_pane_confirmation_requires_pending_state() {
-        let mut view_state = AttachViewState::new(AttachOpenInfo {
-            context_id: None,
-            session_id: Uuid::new_v4(),
-            can_write: true,
-        });
-        assert!(!cancel_close_pane_confirmation(&mut view_state));
-        view_state.close_pane_confirmation_pending = Some(Uuid::new_v4());
-        assert!(cancel_close_pane_confirmation(&mut view_state));
-        assert_eq!(view_state.close_pane_confirmation_pending, None);
     }
 
     #[test]
