@@ -294,7 +294,13 @@ pub(super) async fn run_connect(
             Ok(status)
         }
         ResolvedTarget::Ssh(ssh_target) => {
-            let mut client = connect_remote_bridge(&ssh_target, "bmux-cli-connect-remote").await?;
+            let ssh_control_path = ssh_control_path_for_session();
+            let mut client = connect_remote_bridge(
+                &ssh_target,
+                "bmux-cli-connect-remote",
+                Some(&ssh_control_path),
+            )
+            .await?;
             let target_session = if follow.is_some() {
                 None
             } else if let Some(session) = session {
@@ -304,6 +310,7 @@ pub(super) async fn run_connect(
             };
             let status = run_remote_attach_with_reconnect(
                 client,
+                ssh_control_path,
                 &ssh_target,
                 target_session.as_deref(),
                 follow,
@@ -2030,7 +2037,9 @@ async fn run_tls_attach_with_reconnect(
 ) -> Result<u8> {
     let mut attempt = 0usize;
     loop {
-        let outcome = run_session_attach_with_client(client, session, follow, global, None).await?;
+        let factory = build_tls_kernel_client_factory(target);
+        let outcome =
+            run_session_attach_with_client(client, session, follow, global, Some(factory)).await?;
         if outcome.exit_reason != AttachExitReason::StreamClosed {
             return Ok(outcome.status_code);
         }
@@ -2055,6 +2064,7 @@ async fn run_tls_attach_with_reconnect(
 
 async fn run_remote_attach_with_reconnect(
     mut client: BmuxClient,
+    mut ssh_control_path: String,
     target: &SshTarget,
     session: Option<&str>,
     follow: Option<&str>,
@@ -2063,7 +2073,9 @@ async fn run_remote_attach_with_reconnect(
 ) -> Result<u8> {
     let mut attempt = 0usize;
     loop {
-        let outcome = run_session_attach_with_client(client, session, follow, global, None).await?;
+        let factory = build_ssh_kernel_client_factory(target, ssh_control_path.clone());
+        let outcome =
+            run_session_attach_with_client(client, session, follow, global, Some(factory)).await?;
         if outcome.exit_reason != AttachExitReason::StreamClosed {
             return Ok(outcome.status_code);
         }
@@ -2090,7 +2102,14 @@ async fn run_remote_attach_with_reconnect(
             backoff.as_millis()
         );
         tokio::time::sleep(backoff).await;
-        client = connect_remote_bridge(target, "bmux-cli-connect-remote-reconnect").await?;
+        // Generate a new ControlPath for the reconnected master.
+        ssh_control_path = ssh_control_path_for_session();
+        client = connect_remote_bridge(
+            target,
+            "bmux-cli-connect-remote-reconnect",
+            Some(&ssh_control_path),
+        )
+        .await?;
     }
 }
 
@@ -2432,7 +2451,7 @@ pub(super) async fn run_remote_complete_sessions(target: &str) -> Result<u8> {
             .await?
         }
         ResolvedTarget::Ssh(ssh_target) => {
-            connect_remote_bridge(&ssh_target, "bmux-cli-complete-sessions-ssh").await?
+            connect_remote_bridge(&ssh_target, "bmux-cli-complete-sessions-ssh", None).await?
         }
         ResolvedTarget::Tls(tls_target) => {
             connect_tls_bridge(&tls_target, "bmux-cli-complete-sessions-tls").await?
@@ -2594,11 +2613,15 @@ fn push_recent(list: &mut Vec<String>, value: String) {
     }
 }
 
-async fn connect_remote_bridge(target: &SshTarget, client_name: &str) -> Result<BmuxClient> {
+async fn connect_remote_bridge(
+    target: &SshTarget,
+    client_name: &str,
+    control_path: Option<&str>,
+) -> Result<BmuxClient> {
     ensure_remote_server_ready(target).await?;
     ensure_remote_bridge_stdio_clean(target).await?;
     tracing::debug!(target = %target.label, "launching remote ssh bridge stream");
-    let mut command = build_ssh_bridge_command(target);
+    let mut command = build_ssh_bridge_command(target, control_path);
     let mut child = command
         .spawn()
         .with_context(|| format!("failed launching SSH bridge for {}", target.label))?;
@@ -2815,6 +2838,76 @@ fn build_iroh_kernel_client_factory(
             .await
             .map_err(|e| anyhow::anyhow!(e))
         }) as Pin<Box<dyn std::future::Future<Output = Result<BmuxClient>> + Send>>
+    })
+}
+
+/// Generate a unique SSH `ControlMaster` socket path for this attach session.
+fn ssh_control_path_for_session() -> String {
+    format!("/tmp/bmux-ssh-{}", Uuid::new_v4().as_simple())
+}
+
+/// Build a [`KernelClientFactory`] that spawns new SSH bridge processes for
+/// each kernel bridge invocation, reusing the master SSH connection via
+/// `ControlPath` for near-instant channel setup.
+///
+/// The `control_path` must point to the `ControlMaster` socket created by the
+/// initial `connect_remote_bridge` call.  Preflight checks are skipped since
+/// the remote server was already validated during initial connection.
+fn build_ssh_kernel_client_factory(
+    target: &SshTarget,
+    control_path: String,
+) -> KernelClientFactory {
+    let target = target.clone();
+    let principal_id = load_or_create_local_principal_id(&ConfigPaths::default())
+        .unwrap_or_else(|_| Uuid::new_v4());
+
+    Arc::new(move || {
+        let target = target.clone();
+        let control_path = control_path.clone();
+        let principal_id = principal_id;
+        Box::pin(async move {
+            let mut command = build_ssh_bridge_command(&target, Some(&control_path));
+            let mut child = command
+                .spawn()
+                .context("failed spawning SSH kernel bridge process")?;
+            let stdin = child
+                .stdin
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("failed acquiring SSH kernel bridge stdin"))?;
+            let stdout = child
+                .stdout
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("failed acquiring SSH kernel bridge stdout"))?;
+            let bridge_stream = SshBridgeStream {
+                _child: child,
+                stdin,
+                stdout,
+            };
+            let timeout = Duration::from_millis(target.connect_timeout_ms.max(1));
+            BmuxClient::connect_with_bridge_stream(
+                ErasedIpcStream::new(Box::new(bridge_stream)),
+                timeout,
+                "bmux-cli-ssh-kernel-bridge".to_string(),
+                principal_id,
+            )
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+        }) as Pin<Box<dyn std::future::Future<Output = Result<BmuxClient>> + Send>>
+    })
+}
+
+/// Build a [`KernelClientFactory`] that opens a new TCP+TLS connection for
+/// each kernel bridge invocation.
+///
+/// The TLS gateway already accepts multiple independent connections, so no
+/// server-side changes are needed.
+fn build_tls_kernel_client_factory(target: &TlsTarget) -> KernelClientFactory {
+    let target = target.clone();
+
+    Arc::new(move || {
+        let target = target.clone();
+        Box::pin(async move { connect_tls_bridge(&target, "bmux-cli-tls-kernel-bridge").await })
+            as Pin<Box<dyn std::future::Future<Output = Result<BmuxClient>> + Send>>
     })
 }
 
@@ -3107,7 +3200,7 @@ fn build_ssh_command(target: &SshTarget, args: &[OsString], force_tty: bool) -> 
     command
 }
 
-fn build_ssh_bridge_command(target: &SshTarget) -> TokioProcessCommand {
+fn build_ssh_bridge_command(target: &SshTarget, control_path: Option<&str>) -> TokioProcessCommand {
     let mut command = TokioProcessCommand::new("ssh");
     command.arg("-T");
     if let Some(port) = target.port {
@@ -3144,6 +3237,15 @@ fn build_ssh_bridge_command(target: &SshTarget) -> TokioProcessCommand {
     command.arg("ServerAliveCountMax=3");
     command.arg("-o");
     command.arg("BatchMode=yes");
+    // When a ControlPath is provided, enable SSH connection multiplexing so
+    // that kernel bridge SSH processes can piggyback on the master connection
+    // instead of performing a full handshake each time.
+    if let Some(cp) = control_path {
+        command.arg("-o");
+        command.arg("ControlMaster=auto");
+        command.arg("-o");
+        command.arg(format!("ControlPath={cp}"));
+    }
     let destination = target.user.as_ref().map_or_else(
         || target.host.clone(),
         |user| format!("{user}@{}", target.host),
