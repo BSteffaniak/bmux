@@ -25,6 +25,7 @@ use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 mod access_cli;
+mod action_dispatch;
 mod attach;
 mod bootstrap;
 mod built_in_commands;
@@ -58,6 +59,7 @@ use access_cli::{
     run_access_add, run_access_disable, run_access_enable, run_access_init, run_access_list,
     run_access_remove, run_access_status,
 };
+pub use action_dispatch::{ActionDispatchError, ActionDispatchRequest};
 pub use attach::runtime::AttachRunOutcome;
 use attach::runtime::run_session_attach_with_client;
 pub use attach::state::AttachExitReason;
@@ -96,7 +98,7 @@ use plugin_runtime::{
 };
 pub use prompt::{
     PromptField, PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptSubmitError,
-    PromptValue, PromptWidth,
+    PromptValidation, PromptValue, PromptWidth,
 };
 use recording_cli::{
     recording_event_kind_name, replay_interactive, replay_verify, replay_watch, run_recording_cut,
@@ -184,6 +186,10 @@ pub async fn request_prompt_response(
     request: PromptRequest,
 ) -> std::result::Result<PromptResponse, PromptSubmitError> {
     prompt::request(request).await
+}
+
+pub fn dispatch_action(action: impl Into<String>) -> std::result::Result<(), ActionDispatchError> {
+    action_dispatch::dispatch(action)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

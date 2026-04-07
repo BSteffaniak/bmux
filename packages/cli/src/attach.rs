@@ -3,8 +3,9 @@ use bmux_client::BmuxClient;
 use tokio::sync::oneshot;
 
 pub use crate::runtime::{
-    AttachExitReason, AttachRunOutcome, PromptField, PromptOption, PromptPolicy, PromptRequest,
-    PromptResponse, PromptSubmitError, PromptValue, PromptWidth,
+    ActionDispatchError, ActionDispatchRequest, AttachExitReason, AttachRunOutcome, PromptField,
+    PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptSubmitError, PromptValidation,
+    PromptValue, PromptWidth,
 };
 
 /// Run the attach TUI using an already-connected client.
@@ -38,4 +39,18 @@ pub async fn request_prompt(
     request: PromptRequest,
 ) -> std::result::Result<PromptResponse, PromptSubmitError> {
     crate::runtime::request_prompt_response(request).await
+}
+
+/// Dispatch a runtime action string to the attach loop.
+///
+/// The action string uses the same format as keybinding action values
+/// (e.g. `"focus_next_pane"`, `"plugin:bmux.windows:goto-window 1"`).
+///
+/// This is intended for async plugin code that has collected parameters
+/// (e.g. via prompts) and needs to execute an action with those values.
+///
+/// # Errors
+/// Returns an error if no dispatch host is registered or the channel is closed.
+pub fn dispatch_action(action: impl Into<String>) -> std::result::Result<(), ActionDispatchError> {
+    crate::runtime::dispatch_action(action)
 }

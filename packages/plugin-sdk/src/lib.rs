@@ -35,6 +35,7 @@
 //! bmux_plugin_sdk::export_plugin!(MyPlugin, include_str!("../plugin.toml"));
 //! ```
 
+pub mod action_dispatch;
 mod capability;
 mod command;
 mod context;
@@ -43,6 +44,7 @@ mod event;
 mod host;
 mod host_services;
 mod native_exports;
+pub mod prompt;
 mod service;
 mod version;
 
@@ -79,6 +81,15 @@ pub use service::{
     encode_service_envelope, encode_service_message,
 };
 pub use version::{ApiVersion, VersionRange};
+
+// Prompt types — re-exported at the crate root for convenience.
+pub use prompt::{
+    PromptField, PromptOption, PromptPolicy, PromptRequest, PromptResponse, PromptValidation,
+    PromptValue, PromptWidth,
+};
+
+// Action dispatch types.
+pub use action_dispatch::ActionDispatchRequest;
 
 /// Stable bmux plugin API version exposed by this crate.
 pub const CURRENT_PLUGIN_API_VERSION: ApiVersion = ApiVersion::new(1, 0);
@@ -205,6 +216,8 @@ macro_rules! route_command {
 /// for commands, services, lifecycle hooks, and host-runtime calls.
 pub mod prelude {
     pub use crate::{
+        // Action dispatch
+        ActionDispatchRequest,
         // Exit codes
         EXIT_ERROR,
         EXIT_OK,
@@ -218,6 +231,15 @@ pub mod prelude {
         PluginCommandError,
         // Events
         PluginEvent,
+        // Prompt types
+        PromptField,
+        PromptOption,
+        PromptPolicy,
+        PromptRequest,
+        PromptResponse,
+        PromptValidation,
+        PromptValue,
+        PromptWidth,
         // Core trait
         RustPlugin,
         // Service types

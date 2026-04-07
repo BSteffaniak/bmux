@@ -5,7 +5,7 @@ use bmux_ipc::{
     AttachRect, AttachViewComponent, ContextSelector, ContextSummary, InvokeServiceKind,
     PaneFocusDirection, PaneSelector, PaneSplitDirection, SessionSelector, SessionSummary,
 };
-use bmux_keybind::action_to_config_name;
+use bmux_keybind::{action_to_config_name, parse_action};
 use bmux_plugin_sdk::{
     HostScope, PluginCommandEffect, PluginCommandOutcome, ServiceKind, ServiceRequest,
 };
@@ -34,11 +34,12 @@ use super::super::{
     ATTACH_SELECTION_COPIED_STATUS, ATTACH_SELECTION_EMPTY_STATUS, ATTACH_SELECTION_STARTED_STATUS,
     ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE, ATTACH_TRANSIENT_STATUS_TTL, ATTACH_WELCOME_STATUS_TTL,
     BmuxClient, HELP_OVERLAY_SURFACE_ID, InputProcessor, KernelClientFactory, Keymap,
-    RuntimeAction, attach, attach_quit_failure_status, available_capability_providers,
-    available_service_descriptors, effective_enabled_plugins, enter_host_kernel_connection,
-    host_kernel_bridge, load_plugin, map_attach_client_error, merged_runtime_keybindings,
-    parse_session_selector, parse_uuid_value, plugin_command_policy_hints, plugin_host_metadata,
-    recording, resolve_plugin_search_paths, run_plugin_keybinding_command, scan_available_plugins,
+    RuntimeAction, action_dispatch, attach, attach_quit_failure_status,
+    available_capability_providers, available_service_descriptors, effective_enabled_plugins,
+    enter_host_kernel_connection, host_kernel_bridge, load_plugin, map_attach_client_error,
+    merged_runtime_keybindings, parse_session_selector, parse_uuid_value,
+    plugin_command_policy_hints, plugin_host_metadata, recording, resolve_plugin_search_paths,
+    run_plugin_keybinding_command, scan_available_plugins,
 };
 use super::cursor::apply_attach_cursor_state;
 use super::events::{AttachLoopControl, AttachLoopEvent};
@@ -385,6 +386,8 @@ pub async fn run_session_attach_with_client(
         InputProcessor::new(attach_keymap.clone(), raw_mode_guard.keyboard_enhanced);
     let (prompt_host_tx, mut prompt_host_rx) = tokio::sync::mpsc::unbounded_channel();
     let _prompt_host_guard = prompt::register_host(prompt_host_tx);
+    let (action_dispatch_tx, mut action_dispatch_rx) = tokio::sync::mpsc::unbounded_channel();
+    let _action_dispatch_guard = action_dispatch::register_host(action_dispatch_tx);
     // Default exit reason; always overwritten before the loop breaks, but the
     // compiler cannot prove this through the tokio::select! macro expansion.
     #[allow(unused_assignments)]
@@ -559,6 +562,31 @@ pub async fn run_session_attach_with_client(
                     view_state.prompt.enqueue_external(prompt_request);
                     view_state.dirty.status_needs_redraw = true;
                     view_state.dirty.overlay_needs_redraw = true;
+                }
+            }
+
+            dispatch_request = action_dispatch_rx.recv() => {
+                if let Some(dispatch_request) = dispatch_request {
+                    match handle_attach_loop_event(
+                        AttachLoopEvent::ActionDispatch(dispatch_request),
+                        &mut client,
+                        &mut attach_input_processor,
+                        follow_target_id,
+                        Some(self_client_id),
+                        global,
+                        &attach_help_lines,
+                        &mut view_state,
+                        &mut display_capture,
+                        kernel_client_factory.as_ref(),
+                    )
+                    .await?
+                    {
+                        AttachLoopControl::Continue => {}
+                        AttachLoopControl::Break(reason) => {
+                            exit_reason = reason;
+                            break;
+                        }
+                    }
                 }
             }
 
@@ -3529,6 +3557,15 @@ pub async fn handle_attach_loop_event(
             )
             .await
         }
+        AttachLoopEvent::ActionDispatch(dispatch_request) => {
+            handle_attach_action_dispatch(
+                client,
+                dispatch_request,
+                view_state,
+                kernel_client_factory,
+            )
+            .await
+        }
     }
 }
 
@@ -4020,6 +4057,117 @@ pub async fn handle_attach_prompt_completion(
     view_state.dirty.status_needs_redraw = true;
     view_state.dirty.full_pane_redraw = true;
     Ok(None)
+}
+
+/// Handle an action dispatch request from async plugin code.
+///
+/// Parses the action string into a `RuntimeAction` and routes it through
+/// the same dispatch path as keybinding-triggered actions.
+async fn handle_attach_action_dispatch(
+    client: &mut StreamingBmuxClient,
+    dispatch_request: bmux_plugin_sdk::ActionDispatchRequest,
+    view_state: &mut AttachViewState,
+    kernel_client_factory: Option<&KernelClientFactory>,
+) -> Result<AttachLoopControl> {
+    let action_str = &dispatch_request.action;
+    let action = match parse_action(action_str) {
+        Ok(action) => action,
+        Err(error) => {
+            view_state.set_transient_status(
+                format!("invalid dispatched action: {error}"),
+                Instant::now(),
+                ATTACH_TRANSIENT_STATUS_TTL,
+            );
+            return Ok(AttachLoopControl::Continue);
+        }
+    };
+
+    let event_action = runtime_action_to_attach_event_action(action);
+
+    match event_action {
+        AttachEventAction::Detach => {
+            return Ok(AttachLoopControl::Break(AttachExitReason::Detached));
+        }
+        AttachEventAction::Send(bytes) => {
+            if view_state.can_write
+                && let Err(error) = client
+                    .send_one_way(bmux_ipc::Request::AttachInput {
+                        session_id: view_state.attached_id,
+                        data: bytes,
+                    })
+                    .await
+            {
+                return Err(map_attach_client_error(error));
+            }
+        }
+        AttachEventAction::Runtime(runtime_action) => {
+            if let Err(error) =
+                handle_attach_runtime_action(client, runtime_action, view_state).await
+            {
+                view_state.set_transient_status(
+                    format!(
+                        "dispatched action failed: {}",
+                        map_attach_client_error(error)
+                    ),
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            } else {
+                view_state.dirty.status_needs_redraw = true;
+                view_state.dirty.layout_needs_refresh = true;
+                view_state.dirty.full_pane_redraw = true;
+            }
+        }
+        AttachEventAction::PluginCommand {
+            plugin_id,
+            command_name,
+            args,
+        } => {
+            if let Err(error) = handle_attach_plugin_command_action(
+                client,
+                &plugin_id,
+                &command_name,
+                &args,
+                view_state,
+                kernel_client_factory,
+            )
+            .await
+            {
+                view_state.set_transient_status(
+                    format!(
+                        "dispatched plugin action failed: {}",
+                        map_attach_client_error(error)
+                    ),
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            }
+        }
+        AttachEventAction::Ui(ui_action) => {
+            if let Err(error) = handle_attach_ui_action(client, ui_action, view_state).await {
+                view_state.set_transient_status(
+                    format!(
+                        "dispatched action failed: {}",
+                        map_attach_client_error(error)
+                    ),
+                    Instant::now(),
+                    ATTACH_TRANSIENT_STATUS_TTL,
+                );
+            } else {
+                view_state.dirty.layout_needs_refresh = true;
+                view_state.dirty.full_pane_redraw = true;
+            }
+            view_state.dirty.status_needs_redraw = true;
+        }
+        AttachEventAction::Redraw => {
+            view_state.dirty.status_needs_redraw = true;
+            view_state.dirty.layout_needs_refresh = true;
+            view_state.dirty.full_pane_redraw = true;
+        }
+        AttachEventAction::Mouse(_) | AttachEventAction::Ignore => {}
+    }
+
+    Ok(AttachLoopControl::Continue)
 }
 
 #[allow(clippy::too_many_lines)]

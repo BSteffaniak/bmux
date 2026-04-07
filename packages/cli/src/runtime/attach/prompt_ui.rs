@@ -51,6 +51,9 @@ enum PromptWidgetState {
     TextInput {
         value: String,
         cursor: usize,
+        /// Inline validation error shown when the user tries to submit
+        /// invalid input.  Cleared on the next keystroke.
+        error: Option<String>,
     },
     SingleSelect {
         selected: usize,
@@ -82,6 +85,7 @@ impl ActivePrompt {
                 PromptWidgetState::TextInput {
                     value: initial_value.clone(),
                     cursor,
+                    error: None,
                 }
             }
             PromptField::SingleSelect {
@@ -237,8 +241,13 @@ impl AttachPromptState {
                         required,
                         placeholder: _,
                         initial_value: _,
+                        validation,
                     },
-                    PromptWidgetState::TextInput { value, cursor },
+                    PromptWidgetState::TextInput {
+                        value,
+                        cursor,
+                        error,
+                    },
                 ) => match key.code {
                     KeyCode::Char(ch)
                         if !key
@@ -247,15 +256,18 @@ impl AttachPromptState {
                     {
                         insert_char(value, *cursor, ch);
                         *cursor = cursor.saturating_add(1);
+                        *error = None;
                     }
                     KeyCode::Backspace => {
                         if *cursor > 0 {
                             *cursor = cursor.saturating_sub(1);
                             remove_char(value, *cursor);
                         }
+                        *error = None;
                     }
                     KeyCode::Delete => {
                         remove_char(value, *cursor);
+                        *error = None;
                     }
                     KeyCode::Left => {
                         *cursor = cursor.saturating_sub(1);
@@ -271,6 +283,13 @@ impl AttachPromptState {
                     }
                     KeyCode::Enter => {
                         if *required && value.trim().is_empty() {
+                            *error = Some("value is required".to_string());
+                            return PromptKeyDisposition::Consumed;
+                        }
+                        if let Some(rule) = validation
+                            && let Err(msg) = run_prompt_validation(rule, value)
+                        {
+                            *error = Some(msg);
                             return PromptKeyDisposition::Consumed;
                         }
                         completion =
@@ -628,7 +647,9 @@ fn prompt_estimated_lines(request: &PromptRequest) -> usize {
         lines = lines.saturating_add(message.lines().count().max(1));
     }
     lines = lines.saturating_add(match &request.field {
-        PromptField::Confirm { .. } | PromptField::TextInput { .. } => 1,
+        PromptField::Confirm { .. } => 1,
+        // Reserve an extra line for inline validation errors.
+        PromptField::TextInput { .. } => 2,
         PromptField::SingleSelect { options, .. } | PromptField::MultiToggle { options, .. } => {
             options.len().max(1)
         }
@@ -691,7 +712,11 @@ fn render_prompt_body(
         }
         (
             PromptField::TextInput { placeholder, .. },
-            PromptWidgetState::TextInput { value, cursor: pos },
+            PromptWidgetState::TextInput {
+                value,
+                cursor: pos,
+                error,
+            },
         ) => {
             let visible_width = text_width.saturating_sub(2).max(1);
             let char_len = value.chars().count();
@@ -708,6 +733,13 @@ fn render_prompt_body(
             let row = format!("> {}", opaque_row_text(&rendered, visible_width));
             cursor = Some((lines.len(), 2 + bounded_cursor.saturating_sub(offset)));
             field_lines.push(row);
+            if let Some(err_msg) = error {
+                let err_display = format!(
+                    "! {}",
+                    truncate_chars(err_msg, text_width.saturating_sub(2))
+                );
+                field_lines.push(opaque_row_text(&err_display, text_width));
+            }
         }
         (
             PromptField::SingleSelect { options, .. },
@@ -899,6 +931,37 @@ fn remove_char(input: &mut String, char_index: usize) {
     let start = byte_index_for_char(input, char_index);
     let end = byte_index_for_char(input, char_index.saturating_add(1));
     input.replace_range(start..end, "");
+}
+
+/// Run validation for a text input value.
+///
+/// For most [`PromptValidation`] variants the SDK-level
+/// [`PromptValidation::validate`] is authoritative.  The
+/// [`PromptValidation::Regex`] variant requires the `regex` crate which
+/// the SDK intentionally does not depend on, so we handle it here.
+fn run_prompt_validation(
+    rule: &crate::runtime::prompt::PromptValidation,
+    value: &str,
+) -> Result<(), String> {
+    use crate::runtime::prompt::PromptValidation;
+
+    match rule {
+        PromptValidation::Regex { pattern, message } => {
+            regex::Regex::new(pattern).map_or_else(
+                // Invalid pattern — treat as validation error so the user
+                // (or config author) notices rather than silently accepting.
+                |_| Err(format!("invalid regex pattern: {pattern}")),
+                |re| {
+                    if re.is_match(value) {
+                        Ok(())
+                    } else {
+                        Err(message.clone())
+                    }
+                },
+            )
+        }
+        other => other.validate(value),
+    }
 }
 
 #[cfg(test)]
