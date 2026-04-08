@@ -1746,11 +1746,121 @@ impl SessionRuntimeManager {
     }
 }
 
+/// Lightweight ECMA-48 escape sequence phase tracker.
+///
+/// Classifies each byte of a terminal output stream as either part of normal
+/// ground-state text or inside an escape sequence (CSI, OSC, DCS, etc.).
+/// Used by [`OutputFanoutBuffer`] to record safe resume boundaries so that
+/// [`OutputFanoutBuffer::read_recent`] never returns bytes starting mid-sequence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EscSeqPhase {
+    /// Normal text and C0 controls — safe for a fresh parser to start here.
+    Ground,
+    /// Saw ESC (0x1B); next byte determines the sequence type.
+    Escape,
+    /// Inside a CSI sequence (ESC `[` …); ends on a final byte 0x40–0x7E.
+    Csi,
+    /// Inside an OSC string (ESC `]` …); ends on BEL (0x07) or ST (ESC `\`).
+    Osc,
+    /// Saw ESC inside an OSC body — looking for `\` to complete ST.
+    OscEsc,
+    /// Inside a DCS passthrough (ESC `P` …); ends on ST (ESC `\`).
+    Dcs,
+    /// Saw ESC inside a DCS body — looking for `\` to complete ST.
+    DcsEsc,
+    /// Inside an SOS, PM, or APC string (ESC `X`/`^`/`_` …); ends on ST.
+    Sos,
+    /// Saw ESC inside an SOS/PM/APC body — looking for `\` to complete ST.
+    SosEsc,
+}
+
+impl EscSeqPhase {
+    /// Advance the state machine by one byte, returning the new phase.
+    #[inline]
+    const fn advance(self, byte: u8) -> Self {
+        // CAN (0x18) and SUB (0x1A) abort any sequence from any state.
+        if byte == 0x18 || byte == 0x1A {
+            return Self::Ground;
+        }
+        match self {
+            Self::Ground => {
+                if byte == 0x1B {
+                    Self::Escape
+                } else {
+                    Self::Ground
+                }
+            }
+            Self::Escape => match byte {
+                b'[' => Self::Csi,
+                b']' => Self::Osc,
+                b'P' => Self::Dcs,
+                b'X' | b'^' | b'_' => Self::Sos,
+                // Intermediate bytes (0x20–0x2F) stay in Escape (ESC intermediate
+                // sequence).  ESC restarts.
+                0x1B | 0x20..=0x2F => Self::Escape,
+                // Final bytes (0x30–0x7E) complete a two-byte escape.
+                // Everything else also returns to Ground.
+                _ => Self::Ground,
+            },
+            Self::Csi => match byte {
+                // Final byte completes the CSI sequence.
+                0x40..=0x7E => Self::Ground,
+                // ESC inside CSI aborts it and starts a new escape.
+                0x1B => Self::Escape,
+                // Parameter bytes (0x30–0x3F) and intermediate bytes (0x20–0x2F)
+                // continue the sequence.  Anything else also stays in CSI (tolerant
+                // parsing, matching xterm behavior for invalid bytes).
+                _ => Self::Csi,
+            },
+            Self::Osc => match byte {
+                0x07 => Self::Ground, // BEL terminates OSC
+                0x1B => Self::OscEsc,
+                _ => Self::Osc,
+            },
+            Self::OscEsc => match byte {
+                b'\\' => Self::Ground, // ST (ESC \) terminates OSC
+                0x1B => Self::Escape,  // nested ESC aborts OSC
+                _ => Self::Osc,        // false alarm, back to body
+            },
+            Self::Dcs => match byte {
+                0x1B => Self::DcsEsc,
+                _ => Self::Dcs,
+            },
+            Self::DcsEsc => match byte {
+                b'\\' => Self::Ground,
+                0x1B => Self::Escape,
+                _ => Self::Dcs,
+            },
+            Self::Sos => match byte {
+                0x1B => Self::SosEsc,
+                _ => Self::Sos,
+            },
+            Self::SosEsc => match byte {
+                b'\\' => Self::Ground,
+                0x1B => Self::Escape,
+                _ => Self::Sos,
+            },
+        }
+    }
+
+    const fn is_ground(self) -> bool {
+        matches!(self, Self::Ground)
+    }
+}
+
 struct OutputFanoutBuffer {
     max_bytes: usize,
     start_offset: u64,
     data: VecDeque<u8>,
     cursors: BTreeMap<ClientId, u64>,
+    /// Running escape-sequence phase at the end of the buffer.
+    esc_phase: EscSeqPhase,
+    /// Escape-sequence spans: `(esc_start, safe_resume)` pairs where
+    /// `esc_start` is the offset of the ESC byte that began a sequence and
+    /// `safe_resume` is the first offset after the sequence completed
+    /// (Ground state).  An open (incomplete) span has `safe_resume == u64::MAX`.
+    /// Sorted ascending by `esc_start`.
+    esc_spans: VecDeque<(u64, u64)>,
 }
 
 struct OutputRead {
@@ -1767,6 +1877,8 @@ impl OutputFanoutBuffer {
             start_offset: 0,
             data: VecDeque::new(),
             cursors: BTreeMap::new(),
+            esc_phase: EscSeqPhase::Ground,
+            esc_spans: VecDeque::new(),
         }
     }
 
@@ -1783,15 +1895,57 @@ impl OutputFanoutBuffer {
     }
 
     fn push_chunk(&mut self, chunk: &[u8]) {
+        let base_offset = self.end_offset();
         self.data.extend(chunk.iter().copied());
+
+        // Track escape-sequence phase for every byte.  Record spans
+        // so that `first_safe_offset_at_or_after` can determine whether
+        // any position is inside an escape sequence.
+        //
+        // The ESC byte itself is a safe start — a fresh ground-state parser
+        // correctly handles it.  The unsafe region begins at the byte AFTER
+        // the ESC (e.g. the `[` in CSI, the `]` in OSC) and extends to the
+        // byte after the final/terminator byte.
+        for (i, &byte) in chunk.iter().enumerate() {
+            let prev = self.esc_phase;
+            self.esc_phase = prev.advance(byte);
+
+            if prev.is_ground() && !self.esc_phase.is_ground() {
+                // Ground → non-Ground: open a new span starting AFTER the ESC byte.
+                self.esc_spans
+                    .push_back((base_offset + i as u64 + 1, u64::MAX));
+            } else if !prev.is_ground() && self.esc_phase.is_ground() {
+                // non-Ground → Ground: close the current span.  The safe
+                // resume point is the byte after the final/terminator byte.
+                if let Some(last) = self.esc_spans.back_mut()
+                    && last.1 == u64::MAX
+                {
+                    last.1 = base_offset + i as u64 + 1;
+                }
+            }
+        }
+
         while self.data.len() > self.max_bytes {
             let _ = self.data.pop_front();
             self.start_offset = self.start_offset.saturating_add(1);
         }
 
+        // Prune spans that are entirely before start_offset.
+        while let Some(&(_, safe_resume)) = self.esc_spans.front() {
+            if safe_resume != u64::MAX && safe_resume <= self.start_offset {
+                self.esc_spans.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // Clamp client cursors that fell behind due to eviction.  Advance
+        // them to the nearest safe position so that the next
+        // `read_for_client` never returns bytes starting mid-sequence.
+        let safe_resume = self.first_safe_offset_at_or_after(self.start_offset);
         for cursor in self.cursors.values_mut() {
             if *cursor < self.start_offset {
-                *cursor = self.start_offset;
+                *cursor = safe_resume;
             }
         }
     }
@@ -1799,10 +1953,19 @@ impl OutputFanoutBuffer {
     fn read_for_client(&mut self, client_id: ClientId, max_bytes: usize) -> OutputRead {
         let limit = max_bytes.max(1);
         let end = self.end_offset();
+
+        // Pre-compute the safe resume position before borrowing cursors
+        // mutably, since first_ground_boundary_at_or_after borrows self
+        // immutably.
+        let safe_resume = self.first_safe_offset_at_or_after(self.start_offset);
+
         let cursor = self.cursors.entry(client_id).or_insert(end);
 
         let stream_gap = if *cursor < self.start_offset {
-            *cursor = self.start_offset;
+            // Bytes were evicted before the client could read them.  Advance
+            // the cursor to the nearest safe position so the client
+            // never receives bytes starting mid-escape-sequence.
+            *cursor = safe_resume;
             true
         } else {
             false
@@ -1846,13 +2009,50 @@ impl OutputFanoutBuffer {
             return Vec::new();
         }
         let to_read = self.data.len().min(max_bytes.max(1));
-        let start_index = self.data.len().saturating_sub(to_read);
-        self.data
-            .iter()
-            .skip(start_index)
-            .take(to_read)
-            .copied()
-            .collect()
+        let intended_start = self.end_offset() - to_read as u64;
+        let safe_start = self.first_safe_offset_at_or_after(intended_start);
+
+        if safe_start >= self.end_offset() {
+            return Vec::new();
+        }
+
+        #[allow(clippy::cast_possible_truncation)]
+        let start_index = (safe_start - self.start_offset) as usize;
+        self.data.iter().skip(start_index).copied().collect()
+    }
+
+    /// Return the first stream offset >= `target` where a fresh ground-state
+    /// parser can safely start consuming bytes.
+    ///
+    /// Checks the escape-sequence span list to determine whether `target`
+    /// falls inside an open span.  If so, advances to the span's
+    /// `safe_resume` offset.
+    fn first_safe_offset_at_or_after(&self, target: u64) -> u64 {
+        // Find the span that could contain `target`.  We need the latest
+        // span whose esc_start <= target.
+        //
+        // Binary search by esc_start (the first element of each tuple).
+        let idx = self
+            .esc_spans
+            .binary_search_by(|&(esc_start, _)| esc_start.cmp(&target))
+            .unwrap_or_else(|insert_point| insert_point.saturating_sub(1));
+
+        // Check a small window of spans around the search result.  Due to
+        // binary_search edge cases with saturating_sub, check idx and idx+1.
+        for check in idx..self.esc_spans.len().min(idx + 2) {
+            let (esc_start, safe_resume) = self.esc_spans[check];
+            if esc_start <= target && target < safe_resume {
+                // `target` falls inside this escape sequence.
+                if safe_resume == u64::MAX {
+                    // Sequence is still open (not yet terminated).
+                    return self.end_offset();
+                }
+                return safe_resume;
+            }
+        }
+
+        // `target` is not inside any escape sequence — it's in Ground state.
+        target
     }
 
     /// Advance an existing client's read cursor to the end of the buffer,
@@ -10768,6 +10968,339 @@ mod tests {
             response @ Response::Ok(_) => {
                 panic!("expected denied attach input response, got {response:?}")
             }
+        }
+    }
+
+    // ---- EscSeqPhase state machine tests ----
+
+    #[test]
+    fn esc_seq_phase_ground_stays_ground_for_printable() {
+        let mut phase = EscSeqPhase::Ground;
+        for &b in b"Hello, world! 123" {
+            phase = phase.advance(b);
+            assert_eq!(phase, EscSeqPhase::Ground);
+        }
+    }
+
+    #[test]
+    fn esc_seq_phase_csi_sgr_round_trip() {
+        // \x1b[38;2;10;10;10m  — a 24-bit true-color SGR sequence.
+        let seq = b"\x1b[38;2;10;10;10m";
+        let mut phase = EscSeqPhase::Ground;
+
+        phase = phase.advance(seq[0]); // ESC
+        assert_eq!(phase, EscSeqPhase::Escape);
+
+        phase = phase.advance(seq[1]); // [
+        assert_eq!(phase, EscSeqPhase::Csi);
+
+        // Parameters: 38;2;10;10;10  — all stay in CSI
+        for &b in &seq[2..seq.len() - 1] {
+            phase = phase.advance(b);
+            assert_eq!(phase, EscSeqPhase::Csi);
+        }
+
+        phase = phase.advance(seq[seq.len() - 1]); // m (final byte)
+        assert_eq!(phase, EscSeqPhase::Ground);
+    }
+
+    #[test]
+    fn esc_seq_phase_osc_bel_terminator() {
+        // \x1b]0;title\x07
+        let seq = b"\x1b]0;title\x07";
+        let mut phase = EscSeqPhase::Ground;
+
+        phase = phase.advance(0x1b); // ESC
+        phase = phase.advance(b']'); // -> Osc
+        assert_eq!(phase, EscSeqPhase::Osc);
+
+        for &b in b"0;title" {
+            phase = phase.advance(b);
+            assert_eq!(phase, EscSeqPhase::Osc);
+        }
+
+        phase = phase.advance(0x07); // BEL
+        assert_eq!(phase, EscSeqPhase::Ground);
+        let _ = seq;
+    }
+
+    #[test]
+    fn esc_seq_phase_osc_st_terminator() {
+        // \x1b]0;title\x1b\\
+        let mut phase = EscSeqPhase::Ground;
+        for &b in b"\x1b]0;title" {
+            phase = phase.advance(b);
+        }
+        assert_eq!(phase, EscSeqPhase::Osc);
+        phase = phase.advance(0x1b);
+        assert_eq!(phase, EscSeqPhase::OscEsc);
+        phase = phase.advance(b'\\');
+        assert_eq!(phase, EscSeqPhase::Ground);
+    }
+
+    #[test]
+    fn esc_seq_phase_dcs_st_terminator() {
+        // ESC P data ESC backslash
+        let mut phase = EscSeqPhase::Ground;
+        phase = phase.advance(0x1b);
+        phase = phase.advance(b'P');
+        assert_eq!(phase, EscSeqPhase::Dcs);
+        for &b in b"some;data" {
+            phase = phase.advance(b);
+            assert_eq!(phase, EscSeqPhase::Dcs);
+        }
+        phase = phase.advance(0x1b);
+        assert_eq!(phase, EscSeqPhase::DcsEsc);
+        phase = phase.advance(b'\\');
+        assert_eq!(phase, EscSeqPhase::Ground);
+    }
+
+    #[test]
+    fn esc_seq_phase_can_aborts_from_any_state() {
+        for initial in [
+            EscSeqPhase::Escape,
+            EscSeqPhase::Csi,
+            EscSeqPhase::Osc,
+            EscSeqPhase::Dcs,
+            EscSeqPhase::Sos,
+        ] {
+            assert_eq!(
+                initial.advance(0x18),
+                EscSeqPhase::Ground,
+                "CAN from {initial:?}"
+            );
+            assert_eq!(
+                initial.advance(0x1A),
+                EscSeqPhase::Ground,
+                "SUB from {initial:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn esc_seq_phase_esc_inside_csi_restarts() {
+        let mut phase = EscSeqPhase::Ground;
+        // Start a CSI
+        phase = phase.advance(0x1b);
+        phase = phase.advance(b'[');
+        assert_eq!(phase, EscSeqPhase::Csi);
+        // ESC inside CSI aborts it
+        phase = phase.advance(0x1b);
+        assert_eq!(phase, EscSeqPhase::Escape);
+        // New CSI
+        phase = phase.advance(b'[');
+        assert_eq!(phase, EscSeqPhase::Csi);
+        phase = phase.advance(b'H'); // final byte
+        assert_eq!(phase, EscSeqPhase::Ground);
+    }
+
+    #[test]
+    fn esc_seq_phase_two_byte_escape() {
+        // ESC 7 (DECSC — save cursor) is a two-byte sequence
+        let mut phase = EscSeqPhase::Ground;
+        phase = phase.advance(0x1b);
+        assert_eq!(phase, EscSeqPhase::Escape);
+        phase = phase.advance(b'7');
+        assert_eq!(phase, EscSeqPhase::Ground);
+    }
+
+    #[test]
+    fn esc_seq_phase_sos_pm_apc() {
+        for start_byte in [b'X', b'^', b'_'] {
+            let mut phase = EscSeqPhase::Ground;
+            phase = phase.advance(0x1b);
+            phase = phase.advance(start_byte);
+            assert_eq!(phase, EscSeqPhase::Sos);
+            for &b in b"body data" {
+                phase = phase.advance(b);
+                assert_eq!(phase, EscSeqPhase::Sos);
+            }
+            phase = phase.advance(0x1b);
+            assert_eq!(phase, EscSeqPhase::SosEsc);
+            phase = phase.advance(b'\\');
+            assert_eq!(phase, EscSeqPhase::Ground);
+        }
+    }
+
+    // ---- OutputFanoutBuffer boundary safety tests ----
+
+    #[test]
+    fn read_recent_pure_text_returns_full_amount() {
+        let mut buf = OutputFanoutBuffer::new(4096);
+        let text = b"Hello, world! This is plain text with no escape sequences.";
+        buf.push_chunk(text);
+        let result = buf.read_recent(text.len());
+        assert_eq!(result, text.to_vec());
+    }
+
+    #[test]
+    fn read_recent_never_starts_mid_csi() {
+        // Simulate the exact corruption scenario: 1024-byte chunks that split
+        // an SGR sequence like \x1b[48;2;10;10;10m at the boundary.
+        let mut buf = OutputFanoutBuffer::new(65536);
+
+        // Build a payload where the SGR sequence straddles a chunk boundary:
+        // First chunk ends with \x1b[48;  second chunk starts with 2;10;10;10m
+        let mut chunk1 = vec![b' '; 1020]; // padding
+        chunk1.extend_from_slice(b"\x1b[48;");
+        assert_eq!(chunk1.len(), 1025);
+
+        let mut chunk2 = Vec::new();
+        chunk2.extend_from_slice(b"2;10;10;10m");
+        chunk2.extend_from_slice(&vec![b' '; 1013]); // padding
+        assert_eq!(chunk2.len(), 1024);
+
+        buf.push_chunk(&chunk1);
+        buf.push_chunk(&chunk2);
+
+        // Request read_recent with a budget that starts mid-CSI (at the second
+        // chunk boundary, where "2;10;10;10m" lives).
+        let result = buf.read_recent(chunk2.len());
+
+        // The result must NOT start with "2;10;10;10m".  It should start at
+        // the ground boundary AFTER the 'm' — i.e. the first space.
+        assert!(
+            !result.starts_with(b"2;10;10;10m"),
+            "read_recent returned data starting mid-escape-sequence: {:?}",
+            String::from_utf8_lossy(&result[..20.min(result.len())])
+        );
+
+        // The ground boundary is one past the 'm' byte (which completes the CSI).
+        // So the result should start with spaces (the padding after the CSI).
+        if !result.is_empty() {
+            assert_eq!(result[0], b' ', "first byte should be ground-state text");
+        }
+    }
+
+    #[test]
+    fn read_recent_exact_boundary_hit() {
+        // Budget covers the full buffer — intended_start = 0 which is Ground
+        // (very start of stream, no preceding non-Ground state), so we get
+        // everything.
+        let mut buf = OutputFanoutBuffer::new(4096);
+        buf.push_chunk(b"\x1b[38;2;255;0;0mRed text here");
+
+        // The full buffer starts at offset 0 in Ground state (start of stream).
+        // ground_boundaries is empty for the region before offset 0 — but
+        // esc_phase is Ground (the CSI completed), so `first_ground_boundary_at_or_after(0)`
+        // returns 0 via the "esc_phase is Ground" fallback.  We get everything.
+        let result = buf.read_recent(4096);
+        assert_eq!(result, b"\x1b[38;2;255;0;0mRed text here");
+    }
+
+    #[test]
+    fn read_recent_entire_window_mid_sequence() {
+        // Edge case: the entire read window is inside a single long DCS.
+        let mut buf = OutputFanoutBuffer::new(4096);
+        // DCS start
+        buf.push_chunk(b"\x1bP");
+        // Large body — no ground boundary
+        buf.push_chunk(&vec![b'x'; 2000]);
+        // No ST yet
+
+        // read_recent should return empty since there's no ground boundary.
+        let result = buf.read_recent(1000);
+        assert!(
+            result.is_empty(),
+            "should return empty when entirely mid-sequence"
+        );
+    }
+
+    #[test]
+    fn read_recent_with_osc_boundary() {
+        let mut buf = OutputFanoutBuffer::new(4096);
+        // OSC terminated by BEL
+        buf.push_chunk(b"\x1b]0;My Title\x07Some text after");
+        // Full buffer starts at offset 0 which is Ground (start of stream).
+        let result = buf.read_recent(4096);
+        assert_eq!(result, b"\x1b]0;My Title\x07Some text after");
+    }
+
+    #[test]
+    fn read_recent_budget_smaller_than_buffer_skips_mid_seq_start() {
+        let mut buf = OutputFanoutBuffer::new(4096);
+        // Push text, then an SGR, then more text.
+        // "AAAA...aaaa" (30 bytes) + "\x1b[38;2;128;128;128m" (20 bytes) + "BBBBB..." (18 bytes)
+        let payload = b"AAAAAAAAAAAAAAAAAAAAAAAAAAAAaaaa\x1b[38;2;128;128;128mBBBBBBBBBBBBBBBBBB";
+        buf.push_chunk(payload);
+        let total = payload.len();
+        // SGR starts at offset 30 (ESC byte), unsafe span is [31, 50).
+        // Text 'B's start at offset 50.
+
+        // With budget=30, intended_start = total - 30.  This should land
+        // inside the escape sequence's unsafe span, so read_recent advances
+        // to the safe_resume offset (50).
+        let result = buf.read_recent(30);
+        assert_eq!(
+            result, b"BBBBBBBBBBBBBBBBBB",
+            "expected only the text after the SGR, total={total}"
+        );
+    }
+
+    // ---- read_for_client gap handling tests ----
+
+    #[test]
+    fn read_for_client_gap_advances_to_ground_boundary() {
+        let mut buf = OutputFanoutBuffer::new(64);
+        let client = ClientId(Uuid::new_v4());
+        buf.register_client_at_tail(client);
+        // Client cursor is now at end_offset = 0.
+
+        // Push a small chunk so the client cursor (0) falls behind after
+        // the next large push causes eviction.
+        buf.push_chunk(b"\x1b[31mhello");
+        // end_offset = 11, cursor still at 0.
+
+        // Large push that overflows the 64-byte buffer.  The start will
+        // contain CSI bytes that become the new buffer front.
+        let mut big_chunk = Vec::new();
+        big_chunk.extend_from_slice(b"\x1b[48;"); // CSI start (not ground)
+        big_chunk.extend_from_slice(b"2;10;10;10m"); // completes CSI
+        big_chunk.extend_from_slice(b"safe text here."); // ground state
+        big_chunk.resize(80, b' ');
+        buf.push_chunk(&big_chunk);
+
+        // After push_chunk, the buffer evicted old bytes.  The client cursor
+        // was behind start_offset and was clamped to the nearest ground
+        // boundary (which is after the "m" in "2;10;10;10m").
+
+        // Verify that the data returned does NOT start with CSI parameter
+        // bytes like "2;10;10;10m".
+        let read = buf.read_for_client(client, 1024);
+        assert!(
+            !read.bytes.starts_with(b"2;10;10;10m"),
+            "gap read returned mid-sequence data: {:?}",
+            String::from_utf8_lossy(&read.bytes[..20.min(read.bytes.len())])
+        );
+        // The first byte should be 's' from "safe text here." or a space.
+        if !read.bytes.is_empty() {
+            assert!(
+                read.bytes[0] == b's' || read.bytes[0] == b' ',
+                "expected ground-state text, got byte {}",
+                read.bytes[0]
+            );
+        }
+    }
+
+    #[test]
+    fn esc_spans_pruned_on_eviction() {
+        let mut buf = OutputFanoutBuffer::new(32);
+
+        // Push sequences that create esc_spans, then push enough to evict them.
+        buf.push_chunk(b"\x1b[mA\x1b[mB\x1b[mC"); // 3 escape sequences
+        let pre_evict_count = buf.esc_spans.len();
+        assert!(pre_evict_count >= 3);
+
+        // Push enough to evict the earlier data.
+        buf.push_chunk(&[b'X'; 40]);
+
+        // All old spans should be pruned.
+        for &(esc_start, safe_resume) in &buf.esc_spans {
+            assert!(
+                safe_resume == u64::MAX || safe_resume > buf.start_offset,
+                "stale span not pruned: ({esc_start}, {safe_resume}), start_offset={}",
+                buf.start_offset
+            );
         }
     }
 }

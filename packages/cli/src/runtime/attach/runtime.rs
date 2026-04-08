@@ -1063,6 +1063,23 @@ pub async fn run_session_attach_with_client(
                 let mut had_data = false;
                 let mut any_sync_active = false;
                 for chunk in result.chunks {
+                    if chunk.stream_gap {
+                        // Bytes were lost from the server's output buffer
+                        // (evicted before we could read them).  The client
+                        // parser's internal state is now inconsistent -- it
+                        // may be mid-escape-sequence.  Reset the parser so
+                        // the next snapshot hydration starts clean.
+                        if let Some(buffer) = view_state.pane_buffers.get_mut(&chunk.pane_id) {
+                            buffer.prev_rows.clear();
+                            buffer.parser = vt100::Parser::new(
+                                buffer.parser.screen().size().0,
+                                buffer.parser.screen().size().1,
+                                0,
+                            );
+                        }
+                        view_state.dirty.full_pane_redraw = true;
+                        frame_needs_render = true;
+                    }
                     had_data |= apply_attach_output_bytes(
                         &mut view_state,
                         chunk.pane_id,
