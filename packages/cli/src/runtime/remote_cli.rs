@@ -181,6 +181,17 @@ async fn emit_iroh_connect_perf_event(
         .await
 }
 
+async fn refresh_perf_emitter_settings_from_server(
+    perf_emitter: &mut recording::PerfEventEmitter,
+    client: &mut BmuxClient,
+) {
+    if let Ok(settings) = client.performance_status().await {
+        perf_emitter.update_settings(recording::PerfCaptureSettings::from_runtime_settings(
+            &settings,
+        ));
+    }
+}
+
 async fn emit_iroh_attach_attempt_perf_event(
     perf_emitter: &mut recording::PerfEventEmitter,
     client: &mut BmuxClient,
@@ -456,7 +467,6 @@ pub(super) async fn run_connect(
     }
 
     let config = BmuxConfig::load()?;
-    let perf_settings = recording::PerfCaptureSettings::from_config(&config);
     let selected_target = if let Some(target) = target {
         target.to_string()
     } else {
@@ -546,7 +556,9 @@ pub(super) async fn run_connect(
             Ok(status)
         }
         ResolvedTarget::Iroh(iroh_target) => {
-            let mut perf_emitter = recording::PerfEventEmitter::new(perf_settings);
+            let mut perf_emitter = recording::PerfEventEmitter::new(
+                recording::PerfCaptureSettings::from_config(&config),
+            );
             let mut connect_perf = IrohConnectPerfSummary::default();
             let (mut client, iroh_connection) = connect_iroh_bridge(
                 &iroh_target,
@@ -554,6 +566,7 @@ pub(super) async fn run_connect(
                 Some(&mut connect_perf),
             )
             .await?;
+            refresh_perf_emitter_settings_from_server(&mut perf_emitter, &mut client).await;
             emit_iroh_connect_perf_event(
                 &mut perf_emitter,
                 &mut client,
@@ -2252,6 +2265,7 @@ async fn run_iroh_attach_with_reconnect(
             Some(&mut connect_perf),
         )
         .await?;
+        refresh_perf_emitter_settings_from_server(&mut perf_emitter, &mut new_client).await;
         emit_iroh_connect_perf_event(
             &mut perf_emitter,
             &mut new_client,

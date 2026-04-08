@@ -329,6 +329,9 @@ pub(super) const fn server_event_name(event: &bmux_client::ServerEvent) -> &'sta
         bmux_client::ServerEvent::PaneRestarted { .. } => "pane_restarted",
         bmux_client::ServerEvent::RecordingStarted { .. } => "recording_started",
         bmux_client::ServerEvent::RecordingStopped { .. } => "recording_stopped",
+        bmux_client::ServerEvent::PerformanceSettingsUpdated { .. } => {
+            "performance_settings_updated"
+        }
     }
 }
 

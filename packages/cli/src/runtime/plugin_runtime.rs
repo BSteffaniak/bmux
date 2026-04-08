@@ -981,7 +981,8 @@ pub(super) const fn plugin_event_kind_from_server_event(
         | bmux_client::ServerEvent::PaneExited { .. }
         | bmux_client::ServerEvent::PaneRestarted { .. } => PluginEventKind::Pane,
         bmux_client::ServerEvent::RecordingStarted { .. }
-        | bmux_client::ServerEvent::RecordingStopped { .. } => PluginEventKind::System,
+        | bmux_client::ServerEvent::RecordingStopped { .. }
+        | bmux_client::ServerEvent::PerformanceSettingsUpdated { .. } => PluginEventKind::System,
     }
 }
 

@@ -35,6 +35,7 @@ mod dispatch;
 mod doctor_cli;
 mod logs_cli;
 mod logs_watch;
+mod perf_cli;
 mod playbook_cli;
 mod plugin_commands;
 mod plugin_host;
@@ -76,6 +77,7 @@ use config_cli::{run_config_get, run_config_path, run_config_set, run_config_sho
 use dispatch::run_command;
 use doctor_cli::run_doctor;
 use logs_cli::{run_logs_level, run_logs_path, run_logs_tail};
+use perf_cli::{run_perf_off, run_perf_on, run_perf_status};
 use playbook_cli::{
     run_playbook_cleanup, run_playbook_diff, run_playbook_dry_run, run_playbook_from_recording,
     run_playbook_interactive, run_playbook_run, run_playbook_validate,

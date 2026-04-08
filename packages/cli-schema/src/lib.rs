@@ -418,6 +418,11 @@ pub enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Runtime performance telemetry controls
+    Perf {
+        #[command(subcommand)]
+        command: PerfCommand,
+    },
     /// Run system-wide health checks
     Doctor {
         /// Print output as JSON
@@ -1350,6 +1355,38 @@ pub enum ConfigCommand {
     },
 }
 
+#[derive(Debug, Clone, Copy, clap::ValueEnum, PartialEq, Eq)]
+pub enum PerfProfileArg {
+    Basic,
+    Detailed,
+    Trace,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PerfCommand {
+    /// Show current runtime performance telemetry settings
+    Status {
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Enable runtime performance telemetry
+    On {
+        /// Capture profile level
+        #[arg(long, value_enum, default_value_t = PerfProfileArg::Detailed)]
+        profile: PerfProfileArg,
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Disable runtime performance telemetry
+    Off {
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 pub enum TerminalCommand {
     /// Show terminal capability profile used for panes
@@ -1385,8 +1422,8 @@ pub enum TerminalCommand {
 mod tests {
     use super::{
         AccessCommand, AuthCommand, Cli, Command, GatewayHostMode, HostedModeArg, KeymapCommand,
-        LogsCommand, LogsProfilesCommand, PlaybookCommand, RecordingCommand,
-        RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
+        LogsCommand, LogsProfilesCommand, PerfCommand, PerfProfileArg, PlaybookCommand,
+        RecordingCommand, RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
         RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode,
         RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg, RecordingRenderMode,
         RecordingReplayMode, RemoteCommand, RemoteCompleteCommand, ServerCommand,
@@ -1767,6 +1804,56 @@ mod tests {
             .expect_err("invalid runtime should fail");
         let text = error.to_string();
         assert!(text.contains("invalid value") || text.contains("runtime name"));
+    }
+
+    #[test]
+    fn parses_perf_status_json_flag() {
+        let cli =
+            Cli::try_parse_from(["bmux", "perf", "status", "--json"]).expect("valid CLI args");
+        let Some(Command::Perf { command }) = cli.command else {
+            panic!("expected perf subcommand");
+        };
+        assert!(matches!(command, PerfCommand::Status { json: true }));
+    }
+
+    #[test]
+    fn parses_perf_on_defaults_to_detailed_profile() {
+        let cli = Cli::try_parse_from(["bmux", "perf", "on"]).expect("valid CLI args");
+        let Some(Command::Perf { command }) = cli.command else {
+            panic!("expected perf subcommand");
+        };
+        assert!(matches!(
+            command,
+            PerfCommand::On {
+                profile: PerfProfileArg::Detailed,
+                json: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_perf_on_with_trace_profile() {
+        let cli = Cli::try_parse_from(["bmux", "perf", "on", "--profile", "trace", "--json"])
+            .expect("valid CLI args");
+        let Some(Command::Perf { command }) = cli.command else {
+            panic!("expected perf subcommand");
+        };
+        assert!(matches!(
+            command,
+            PerfCommand::On {
+                profile: PerfProfileArg::Trace,
+                json: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_perf_off_json_flag() {
+        let cli = Cli::try_parse_from(["bmux", "perf", "off", "--json"]).expect("valid CLI args");
+        let Some(Command::Perf { command }) = cli.command else {
+            panic!("expected perf subcommand");
+        };
+        assert!(matches!(command, PerfCommand::Off { json: true }));
     }
 
     #[test]

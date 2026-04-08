@@ -71,6 +71,10 @@ pub enum BuiltInHandlerId {
     ConfigShow,
     ConfigGet,
     ConfigSet,
+    Perf,
+    PerfStatus,
+    PerfOn,
+    PerfOff,
     Doctor,
     Keymap,
     KeymapDoctor,
@@ -474,6 +478,26 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::ConfigSet,
             &["config", "set"],
             "Set a configuration value",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::Perf,
+            &["perf"],
+            "Runtime performance telemetry controls",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::PerfStatus,
+            &["perf", "status"],
+            "Show runtime performance telemetry settings",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::PerfOn,
+            &["perf", "on"],
+            "Enable runtime performance telemetry",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::PerfOff,
+            &["perf", "off"],
+            "Disable runtime performance telemetry",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::Doctor,

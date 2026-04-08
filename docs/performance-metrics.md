@@ -25,6 +25,21 @@ Use either:
 `bmux recording status` warns when perf recording is enabled but defaults do not
 capture `custom` events.
 
+### Runtime toggle (no persist)
+
+You can toggle telemetry on a running server without editing config:
+
+```bash
+bmux perf status
+bmux perf on --profile detailed
+bmux perf off
+```
+
+These commands change runtime settings immediately (including already attached
+clients), but they do not modify `bmux.toml`. On server restart, settings reset
+to config defaults.
+
+
 ## Capture workflow
 
 1. Start a recording (`bmux recording start ...`).

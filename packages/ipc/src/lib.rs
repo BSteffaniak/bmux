@@ -610,6 +610,10 @@ pub enum Request {
     },
     RecordingRollingStop,
     RecordingRollingStatus,
+    PerformanceStatus,
+    PerformanceSet {
+        settings: PerformanceRuntimeSettings,
+    },
     RecordingRollingClear {
         restart_if_active: bool,
     },
@@ -838,6 +842,26 @@ pub const PERF_RECORDING_SOURCE: &str = "bmux.perf";
 
 /// Current schema version for bmux performance custom recording payloads.
 pub const PERF_RECORDING_SCHEMA_VERSION: u8 = 1;
+
+/// Runtime performance telemetry capture level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum PerformanceRecordingLevel {
+    #[default]
+    Off,
+    Basic,
+    Detailed,
+    Trace,
+}
+
+/// Mutable runtime settings used for performance telemetry capture.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerformanceRuntimeSettings {
+    pub recording_level: PerformanceRecordingLevel,
+    pub window_ms: u64,
+    pub max_events_per_sec: u32,
+    pub max_payload_bytes_per_sec: usize,
+}
 
 const fn recording_format_version_default() -> u32 {
     1 // pre-versioning recordings are treated as version 1
@@ -1230,6 +1254,12 @@ pub enum ResponsePayload {
     RecordingRollingStatus {
         status: RecordingRollingStatus,
     },
+    PerformanceStatus {
+        settings: PerformanceRuntimeSettings,
+    },
+    PerformanceUpdated {
+        settings: PerformanceRuntimeSettings,
+    },
     RecordingRollingCleared {
         report: RecordingRollingClearReport,
     },
@@ -1369,6 +1399,10 @@ pub enum Event {
     /// flush and close any in-progress display track.
     RecordingStopped {
         recording_id: Uuid,
+    },
+    /// Runtime performance telemetry settings changed.
+    PerformanceSettingsUpdated {
+        settings: PerformanceRuntimeSettings,
     },
 }
 
@@ -2028,6 +2062,10 @@ mod tests {
             },
             Request::RecordingRollingStop,
             Request::RecordingRollingStatus,
+            Request::PerformanceStatus,
+            Request::PerformanceSet {
+                settings: sample_performance_runtime_settings(),
+            },
             Request::RecordingRollingClear {
                 restart_if_active: true,
             },
@@ -2074,6 +2112,15 @@ mod tests {
             path: "/tmp/recordings/test.bmux".into(),
             segments: vec!["events_0.bin".to_string()],
             total_segment_bytes: 123_456,
+        }
+    }
+
+    const fn sample_performance_runtime_settings() -> PerformanceRuntimeSettings {
+        PerformanceRuntimeSettings {
+            recording_level: PerformanceRecordingLevel::Detailed,
+            window_ms: 1_000,
+            max_events_per_sec: 64,
+            max_payload_bytes_per_sec: 131_072,
         }
     }
 
@@ -2458,6 +2505,12 @@ mod tests {
                     },
                 },
             },
+            ResponsePayload::PerformanceStatus {
+                settings: sample_performance_runtime_settings(),
+            },
+            ResponsePayload::PerformanceUpdated {
+                settings: sample_performance_runtime_settings(),
+            },
             ResponsePayload::RecordingRollingCleared {
                 report: RecordingRollingClearReport {
                     root_path: "/tmp/recordings/.rolling".into(),
@@ -2596,6 +2649,9 @@ mod tests {
                 session_id: id,
                 pane_id: id2,
             },
+            Event::PerformanceSettingsUpdated {
+                settings: sample_performance_runtime_settings(),
+            },
         ];
 
         for (i, variant) in variants.iter().enumerate() {
@@ -2618,6 +2674,23 @@ mod tests {
         ] {
             assert_roundtrip(profile);
         }
+    }
+
+    #[test]
+    fn performance_recording_level_all_variants_roundtrip() {
+        for level in &[
+            PerformanceRecordingLevel::Off,
+            PerformanceRecordingLevel::Basic,
+            PerformanceRecordingLevel::Detailed,
+            PerformanceRecordingLevel::Trace,
+        ] {
+            assert_roundtrip(level);
+        }
+    }
+
+    #[test]
+    fn performance_runtime_settings_roundtrip() {
+        assert_roundtrip(&sample_performance_runtime_settings());
     }
 
     #[test]

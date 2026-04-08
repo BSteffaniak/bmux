@@ -8,7 +8,9 @@ mod persistence;
 pub mod recording;
 
 use anyhow::{Context, Result};
-use bmux_config::{BmuxConfig, ConfigPaths, PerformanceRecordingLevel};
+use bmux_config::{
+    BmuxConfig, ConfigPaths, PerformanceRecordingLevel as ConfigPerformanceRecordingLevel,
+};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
     AttachFocusTarget, AttachGrant, AttachLayer, AttachMouseProtocolEncoding,
@@ -17,11 +19,11 @@ use bmux_ipc::{
     CORE_PROTOCOL_CAPABILITIES, ClientSummary, ContextSelector, ContextSummary, Envelope,
     EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, PaneFocusDirection,
     PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection, PaneState, PaneSummary,
-    ProtocolContract, ProtocolVersion, RecordingEventKind, RecordingPayload, RecordingProfile,
-    RecordingRollingClearReport, RecordingRollingStartOptions, RecordingRollingStatus,
-    RecordingRollingUsage, RecordingSummary, Request, Response, ResponsePayload,
-    ServerSnapshotStatus, SessionSelector, SessionSummary, decode, default_supported_capabilities,
-    encode, negotiate_protocol,
+    PerformanceRecordingLevel, PerformanceRuntimeSettings, ProtocolContract, ProtocolVersion,
+    RecordingEventKind, RecordingPayload, RecordingProfile, RecordingRollingClearReport,
+    RecordingRollingStartOptions, RecordingRollingStatus, RecordingRollingUsage, RecordingSummary,
+    Request, Response, ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary,
+    decode, default_supported_capabilities, encode, negotiate_protocol,
 };
 use bmux_session::{ClientId, Session, SessionId, SessionManager};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
@@ -66,7 +68,7 @@ const OFFLINE_SNAPSHOT_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50)
 const OFFLINE_SNAPSHOT_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
 const EVENT_PUSH_CHANNEL_CAPACITY: usize = 256;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PerformanceCaptureSettings {
     level: PerformanceRecordingLevel,
     window_ms: u64,
@@ -74,14 +76,49 @@ struct PerformanceCaptureSettings {
     max_payload_bytes_per_sec: usize,
 }
 
+impl Default for PerformanceCaptureSettings {
+    fn default() -> Self {
+        Self::from_config(&BmuxConfig::default())
+    }
+}
+
 impl PerformanceCaptureSettings {
+    const fn from_config_level(
+        level: ConfigPerformanceRecordingLevel,
+    ) -> PerformanceRecordingLevel {
+        match level {
+            ConfigPerformanceRecordingLevel::Off => PerformanceRecordingLevel::Off,
+            ConfigPerformanceRecordingLevel::Basic => PerformanceRecordingLevel::Basic,
+            ConfigPerformanceRecordingLevel::Detailed => PerformanceRecordingLevel::Detailed,
+            ConfigPerformanceRecordingLevel::Trace => PerformanceRecordingLevel::Trace,
+        }
+    }
+
     fn from_config(config: &BmuxConfig) -> Self {
         let perf = &config.performance;
         Self {
-            level: perf.recording_level,
+            level: Self::from_config_level(perf.recording_level),
             window_ms: perf.window_ms.max(1),
             max_events_per_sec: perf.max_events_per_sec.max(1),
             max_payload_bytes_per_sec: perf.max_payload_bytes_per_sec.max(1),
+        }
+    }
+
+    fn from_runtime_settings(settings: &PerformanceRuntimeSettings) -> Self {
+        Self {
+            level: settings.recording_level,
+            window_ms: settings.window_ms.max(1),
+            max_events_per_sec: settings.max_events_per_sec.max(1),
+            max_payload_bytes_per_sec: settings.max_payload_bytes_per_sec.max(1),
+        }
+    }
+
+    const fn to_runtime_settings(self) -> PerformanceRuntimeSettings {
+        PerformanceRuntimeSettings {
+            recording_level: self.level,
+            window_ms: self.window_ms,
+            max_events_per_sec: self.max_events_per_sec,
+            max_payload_bytes_per_sec: self.max_payload_bytes_per_sec,
         }
     }
 
@@ -254,7 +291,7 @@ struct ServerState {
     rolling_recording_runtime: Arc<Mutex<Option<RecordingRuntime>>>,
     rolling_recording_auto_start: bool,
     rolling_recording_defaults: RollingRecordingSettings,
-    performance_settings: PerformanceCaptureSettings,
+    performance_settings: Arc<Mutex<PerformanceCaptureSettings>>,
     rolling_recordings_dir: std::path::PathBuf,
     rolling_recording_segment_mb: usize,
     operation_lock: AsyncMutex<()>,
@@ -3733,7 +3770,9 @@ impl BmuxServer {
                 rolling_recording_auto_start: rolling_recording_auto_start
                     && rolling_runtime_available,
                 rolling_recording_defaults,
-                performance_settings: PerformanceCaptureSettings::from_config(&config),
+                performance_settings: Arc::new(Mutex::new(
+                    PerformanceCaptureSettings::from_config(&config),
+                )),
                 rolling_recordings_dir,
                 rolling_recording_segment_mb: segment_mb,
                 operation_lock: AsyncMutex::new(()),
@@ -4373,16 +4412,34 @@ async fn handle_connection(
             let push_state = Arc::clone(&state);
             let push_client_id = client_id;
             event_push_task = Some(tokio::spawn(async move {
-                let push_perf_settings = push_state.performance_settings;
+                let push_perf_settings_state = Arc::clone(&push_state.performance_settings);
+                let mut push_perf_settings = push_perf_settings_state
+                    .lock()
+                    .map_or_else(|_| PerformanceCaptureSettings::default(), |guard| *guard);
                 let mut push_perf_rate_limiter =
                     PerformanceEventRateLimiter::new(push_perf_settings);
-                let push_perf_window = Duration::from_millis(push_perf_settings.window_ms);
+                let mut push_perf_window = Duration::from_millis(push_perf_settings.window_ms);
                 let mut push_window_started_at = Instant::now();
                 let mut push_window_sent_events = 0_u64;
                 let mut push_window_sent_bytes = 0_u64;
                 let mut push_window_lagged_events = 0_u64;
                 let mut push_window_lagged_receives = 0_u64;
                 loop {
+                    let latest_push_perf_settings = push_perf_settings_state
+                        .lock()
+                        .map_or(push_perf_settings, |guard| *guard);
+                    if latest_push_perf_settings != push_perf_settings {
+                        push_perf_settings = latest_push_perf_settings;
+                        push_perf_rate_limiter =
+                            PerformanceEventRateLimiter::new(push_perf_settings);
+                        push_perf_window = Duration::from_millis(push_perf_settings.window_ms);
+                        push_window_started_at = Instant::now();
+                        push_window_sent_events = 0;
+                        push_window_sent_bytes = 0;
+                        push_window_lagged_events = 0;
+                        push_window_lagged_receives = 0;
+                    }
+
                     match event_rx.recv().await {
                         Ok(event) => {
                             // For pane output notifications, read the actual
@@ -4588,7 +4645,8 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
         | Event::FollowStopped { .. }
         | Event::FollowTargetGone { .. }
         | Event::RecordingStarted { .. }
-        | Event::RecordingStopped { .. } => None,
+        | Event::RecordingStopped { .. }
+        | Event::PerformanceSettingsUpdated { .. } => None,
     };
     record_to_all_runtimes(
         &state.manual_recording_runtime,
@@ -7663,6 +7721,37 @@ async fn handle_request(
                 message: format!("failed reading rolling recording status: {error}"),
             }),
         },
+        Request::PerformanceStatus => {
+            let settings = state
+                .performance_settings
+                .lock()
+                .map_err(|_| anyhow::anyhow!("performance settings lock poisoned"))?
+                .to_runtime_settings();
+            Response::Ok(ResponsePayload::PerformanceStatus { settings })
+        }
+        Request::PerformanceSet { settings } => {
+            let normalized_capture_settings =
+                PerformanceCaptureSettings::from_runtime_settings(&settings);
+            let normalized_settings = normalized_capture_settings.to_runtime_settings();
+            {
+                let mut guard = state
+                    .performance_settings
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("performance settings lock poisoned"))?;
+                *guard = normalized_capture_settings;
+            }
+            if let Err(error) = emit_event(
+                state,
+                Event::PerformanceSettingsUpdated {
+                    settings: normalized_settings.clone(),
+                },
+            ) {
+                warn!("failed emitting performance settings update event: {error}");
+            }
+            Response::Ok(ResponsePayload::PerformanceUpdated {
+                settings: normalized_settings,
+            })
+        }
         Request::RecordingRollingClear { restart_if_active } => {
             let root = state.rolling_recordings_dir.clone();
             let usage_before = match collect_rolling_usage(&root) {
@@ -7950,6 +8039,7 @@ const fn request_requires_exclusive(request: &Request) -> bool {
             | Request::RecordingCut { .. }
             | Request::RecordingRollingStart { .. }
             | Request::RecordingRollingStop
+            | Request::PerformanceSet { .. }
             | Request::RecordingRollingClear { .. }
             | Request::RecordingPrune { .. }
             | Request::Detach
@@ -8030,6 +8120,8 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::RecordingRollingStart { .. } => "recording_rolling_start",
         Request::RecordingRollingStop => "recording_rolling_stop",
         Request::RecordingRollingStatus => "recording_rolling_status",
+        Request::PerformanceStatus => "performance_status",
+        Request::PerformanceSet { .. } => "performance_set",
         Request::RecordingRollingClear { .. } => "recording_rolling_clear",
         Request::RecordingCaptureTargets => "recording_capture_targets",
         Request::RecordingPrune { .. } => "recording_prune",
@@ -8308,6 +8400,8 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::RecordingCut { .. } => "recording_cut",
         ResponsePayload::RecordingCaptureTargets { .. } => "recording_capture_targets",
         ResponsePayload::RecordingRollingStatus { .. } => "recording_rolling_status",
+        ResponsePayload::PerformanceStatus { .. } => "performance_status",
+        ResponsePayload::PerformanceUpdated { .. } => "performance_updated",
         ResponsePayload::RecordingRollingCleared { .. } => "recording_rolling_cleared",
         ResponsePayload::RecordingPruned { .. } => "recording_pruned",
         ResponsePayload::Detached => "detached",

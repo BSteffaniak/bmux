@@ -283,6 +283,16 @@ impl PerfCaptureLevel {
     }
 
     #[must_use]
+    pub(super) const fn from_runtime(level: bmux_ipc::PerformanceRecordingLevel) -> Self {
+        match level {
+            bmux_ipc::PerformanceRecordingLevel::Off => Self::Off,
+            bmux_ipc::PerformanceRecordingLevel::Basic => Self::Basic,
+            bmux_ipc::PerformanceRecordingLevel::Detailed => Self::Detailed,
+            bmux_ipc::PerformanceRecordingLevel::Trace => Self::Trace,
+        }
+    }
+
+    #[must_use]
     pub(super) const fn as_str(self) -> &'static str {
         match self {
             Self::Off => "off",
@@ -312,6 +322,16 @@ impl PerfCaptureSettings {
             max_payload_bytes_per_sec: perf.max_payload_bytes_per_sec.max(1),
         }
     }
+
+    #[must_use]
+    pub(super) fn from_runtime_settings(settings: &bmux_ipc::PerformanceRuntimeSettings) -> Self {
+        Self {
+            level: PerfCaptureLevel::from_runtime(settings.recording_level),
+            window_ms: settings.window_ms.max(1),
+            max_events_per_sec: settings.max_events_per_sec.max(1),
+            max_payload_bytes_per_sec: settings.max_payload_bytes_per_sec.max(1),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -335,6 +355,15 @@ impl PerfEventEmitter {
             dropped_events_since_emit: 0,
             dropped_payload_bytes_since_emit: 0,
         }
+    }
+
+    pub(super) fn update_settings(&mut self, settings: PerfCaptureSettings) {
+        self.settings = settings;
+        self.rate_window_started_at = Instant::now();
+        self.emitted_events_in_window = 0;
+        self.emitted_payload_bytes_in_window = 0;
+        self.dropped_events_since_emit = 0;
+        self.dropped_payload_bytes_since_emit = 0;
     }
 
     #[must_use]

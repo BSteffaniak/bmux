@@ -15,11 +15,11 @@ use bmux_ipc::{
     CORE_PROTOCOL_CAPABILITIES, ClientSummary, ContextSelector, ContextSummary, Envelope,
     EnvelopeKind, ErrorCode, IncompatibilityReason, InvokeServiceKind, IpcEndpoint,
     NegotiatedProtocol, PaneFocusDirection, PaneLayoutNode, PaneSelector, PaneSplitDirection,
-    PaneSummary, ProtocolContract, ProtocolVersion, RecordingCaptureTarget, RecordingEventKind,
-    RecordingProfile, RecordingRollingClearReport, RecordingRollingStartOptions,
-    RecordingRollingStatus, RecordingStatus, RecordingSummary, Request, Response, ResponsePayload,
-    ServerSnapshotStatus, SessionSelector, SessionSummary, decode, default_supported_capabilities,
-    encode,
+    PaneSummary, PerformanceRuntimeSettings, ProtocolContract, ProtocolVersion,
+    RecordingCaptureTarget, RecordingEventKind, RecordingProfile, RecordingRollingClearReport,
+    RecordingRollingStartOptions, RecordingRollingStatus, RecordingStatus, RecordingSummary,
+    Request, Response, ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary,
+    decode, default_supported_capabilities, encode,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -1595,6 +1595,37 @@ impl BmuxClient {
         }
     }
 
+    /// Retrieve runtime performance telemetry settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn performance_status(&mut self) -> Result<PerformanceRuntimeSettings> {
+        match self.request(Request::PerformanceStatus).await? {
+            ResponsePayload::PerformanceStatus { settings } => Ok(settings),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected performance status",
+            )),
+        }
+    }
+
+    /// Update runtime performance telemetry settings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn performance_set(
+        &mut self,
+        settings: PerformanceRuntimeSettings,
+    ) -> Result<PerformanceRuntimeSettings> {
+        match self.request(Request::PerformanceSet { settings }).await? {
+            ResponsePayload::PerformanceUpdated { settings } => Ok(settings),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected performance updated",
+            )),
+        }
+    }
+
     /// Subscribe this client to server lifecycle events.
     ///
     /// # Errors
@@ -2901,6 +2932,8 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::RecordingRollingStart { .. } => "recording_rolling_start",
         Request::RecordingRollingStop => "recording_rolling_stop",
         Request::RecordingRollingStatus => "recording_rolling_status",
+        Request::PerformanceStatus => "performance_status",
+        Request::PerformanceSet { .. } => "performance_set",
         Request::RecordingRollingClear { .. } => "recording_rolling_clear",
         Request::RecordingCaptureTargets => "recording_capture_targets",
         Request::RecordingPrune { .. } => "recording_prune",
@@ -2965,6 +2998,8 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::RecordingCut { .. } => "recording_cut",
             ResponsePayload::RecordingCaptureTargets { .. } => "recording_capture_targets",
             ResponsePayload::RecordingRollingStatus { .. } => "recording_rolling_status",
+            ResponsePayload::PerformanceStatus { .. } => "performance_status",
+            ResponsePayload::PerformanceUpdated { .. } => "performance_updated",
             ResponsePayload::RecordingRollingCleared { .. } => "recording_rolling_cleared",
             ResponsePayload::RecordingPruned { .. } => "recording_pruned",
             ResponsePayload::Detached => "detached",

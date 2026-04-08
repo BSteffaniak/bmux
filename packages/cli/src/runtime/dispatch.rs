@@ -1,8 +1,9 @@
 use anyhow::Result;
 use bmux_cli_schema::{
     AccessCommand, AuthCommand, Command, ConfigCommand, KeymapCommand, LogsCommand,
-    LogsProfilesCommand, PlaybookCommand, RecordingCommand, RecordingEventKindArg, RemoteCommand,
-    RemoteCompleteCommand, ServerCommand, ServerRecordingCommand, SessionCommand, TerminalCommand,
+    LogsProfilesCommand, PerfCommand, PlaybookCommand, RecordingCommand, RecordingEventKindArg,
+    RemoteCommand, RemoteCompleteCommand, ServerCommand, ServerRecordingCommand, SessionCommand,
+    TerminalCommand,
 };
 use bmux_ipc::{RecordingEventKind, RecordingRollingStartOptions};
 
@@ -13,20 +14,21 @@ use super::{
     run_config_get, run_config_path, run_config_set, run_config_show, run_connect, run_doctor,
     run_external_plugin_command, run_follow, run_host, run_hosts, run_join, run_keymap_doctor,
     run_logs_level, run_logs_path, run_logs_profiles_delete, run_logs_profiles_list,
-    run_logs_profiles_rename, run_logs_profiles_show, run_logs_tail, run_logs_watch,
-    run_playbook_cleanup, run_playbook_diff, run_playbook_dry_run, run_playbook_from_recording,
-    run_playbook_interactive, run_playbook_run, run_playbook_validate, run_recording_analyze,
-    run_recording_cut, run_recording_delete, run_recording_delete_all, run_recording_export,
-    run_recording_inspect, run_recording_list, run_recording_path, run_recording_replay,
-    run_recording_start, run_recording_status, run_recording_stop, run_recording_verify_smoke,
-    run_remote_complete_sessions, run_remote_complete_targets, run_remote_doctor, run_remote_init,
-    run_remote_install_server, run_remote_list, run_remote_test, run_remote_upgrade,
-    run_server_bridge, run_server_gateway, run_server_recording_clear, run_server_recording_path,
-    run_server_recording_start, run_server_recording_status, run_server_recording_stop,
-    run_server_restore, run_server_save, run_server_start, run_server_status, run_server_stop,
-    run_server_whoami_principal, run_session_attach, run_session_detach, run_session_kill,
-    run_session_kill_all, run_session_list, run_session_new, run_setup, run_share,
-    run_terminal_doctor, run_terminal_install_terminfo, run_unfollow, run_unshare,
+    run_logs_profiles_rename, run_logs_profiles_show, run_logs_tail, run_logs_watch, run_perf_off,
+    run_perf_on, run_perf_status, run_playbook_cleanup, run_playbook_diff, run_playbook_dry_run,
+    run_playbook_from_recording, run_playbook_interactive, run_playbook_run, run_playbook_validate,
+    run_recording_analyze, run_recording_cut, run_recording_delete, run_recording_delete_all,
+    run_recording_export, run_recording_inspect, run_recording_list, run_recording_path,
+    run_recording_replay, run_recording_start, run_recording_status, run_recording_stop,
+    run_recording_verify_smoke, run_remote_complete_sessions, run_remote_complete_targets,
+    run_remote_doctor, run_remote_init, run_remote_install_server, run_remote_list,
+    run_remote_test, run_remote_upgrade, run_server_bridge, run_server_gateway,
+    run_server_recording_clear, run_server_recording_path, run_server_recording_start,
+    run_server_recording_status, run_server_recording_stop, run_server_restore, run_server_save,
+    run_server_start, run_server_status, run_server_stop, run_server_whoami_principal,
+    run_session_attach, run_session_detach, run_session_kill, run_session_kill_all,
+    run_session_list, run_session_new, run_setup, run_share, run_terminal_doctor,
+    run_terminal_install_terminfo, run_unfollow, run_unshare,
 };
 
 pub(super) async fn run_command(
@@ -121,6 +123,11 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             ConfigCommand::Show { .. } => BuiltInHandlerId::ConfigShow,
             ConfigCommand::Get { .. } => BuiltInHandlerId::ConfigGet,
             ConfigCommand::Set { .. } => BuiltInHandlerId::ConfigSet,
+        },
+        Command::Perf { command } => match command {
+            PerfCommand::Status { .. } => BuiltInHandlerId::PerfStatus,
+            PerfCommand::On { .. } => BuiltInHandlerId::PerfOn,
+            PerfCommand::Off { .. } => BuiltInHandlerId::PerfOff,
         },
         Command::Doctor { .. } => BuiltInHandlerId::Doctor,
         Command::Keymap { .. } => BuiltInHandlerId::KeymapDoctor,
@@ -844,6 +851,24 @@ pub(super) async fn dispatch_built_in_command(
                 command: ConfigCommand::Set { key, value },
             },
         ) => run_config_set(key, value),
+        (
+            BuiltInHandlerId::PerfStatus,
+            Command::Perf {
+                command: PerfCommand::Status { json },
+            },
+        ) => run_perf_status(*json, connection_context).await,
+        (
+            BuiltInHandlerId::PerfOn,
+            Command::Perf {
+                command: PerfCommand::On { profile, json },
+            },
+        ) => run_perf_on(*profile, *json, connection_context).await,
+        (
+            BuiltInHandlerId::PerfOff,
+            Command::Perf {
+                command: PerfCommand::Off { json },
+            },
+        ) => run_perf_off(*json, connection_context).await,
         (BuiltInHandlerId::Doctor, Command::Doctor { json, hosted }) => {
             run_doctor(*json, *hosted).await
         }

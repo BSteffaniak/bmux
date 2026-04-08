@@ -467,6 +467,11 @@ pub async fn run_session_attach_with_client(
     let mut perf_emitter = recording::PerfEventEmitter::new(
         recording::PerfCaptureSettings::from_config(&attach_config),
     );
+    if let Ok(settings) = client.performance_status().await {
+        perf_emitter.update_settings(recording::PerfCaptureSettings::from_runtime_settings(
+            &settings,
+        ));
+    }
     let mut perf_window = AttachPerfWindow::new();
     let attach_started_at = Instant::now();
     let mut rendered_frame_count = 0_u64;
@@ -729,6 +734,13 @@ pub async fn run_session_attach_with_client(
                 } = server_event
                 {
                     display_capture.close_recording(recording_id);
+                } else if let bmux_client::ServerEvent::PerformanceSettingsUpdated {
+                    ref settings,
+                } = server_event
+                {
+                    perf_emitter.update_settings(recording::PerfCaptureSettings::from_runtime_settings(
+                        settings,
+                    ));
                 } else {
                     if let bmux_client::ServerEvent::AttachViewChanged { .. } = &server_event {
                         pane_output_pending = true;
