@@ -77,6 +77,9 @@ pub struct BmuxConfig {
     /// Session recording for terminal replay, debugging, and playbook generation
     #[config_doc(nested)]
     pub recording: RecordingConfig,
+    /// Performance diagnostics capture controls and telemetry safety limits
+    #[config_doc(nested)]
+    pub performance: PerformanceConfig,
 }
 
 /// Local and remote connection target profiles used by `bmux connect` and
@@ -232,6 +235,42 @@ pub enum RecordingEventKindConfig {
     RequestDone,
     RequestError,
     Custom,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
+#[serde(rename_all = "snake_case")]
+pub enum PerformanceRecordingLevel {
+    #[default]
+    Off,
+    Basic,
+    Detailed,
+    Trace,
+}
+
+/// Performance diagnostics capture settings.
+#[derive(Debug, Clone, Serialize, Deserialize, ConfigDoc)]
+#[config_doc(section = "performance")]
+#[serde(default)]
+pub struct PerformanceConfig {
+    /// Capture verbosity for performance telemetry written into recording custom events.
+    pub recording_level: PerformanceRecordingLevel,
+    /// Aggregation window for periodic performance telemetry, in milliseconds.
+    pub window_ms: u64,
+    /// Maximum number of performance custom events emitted per second by a client/runtime.
+    pub max_events_per_sec: u32,
+    /// Maximum serialized performance payload bytes emitted per second by a client/runtime.
+    pub max_payload_bytes_per_sec: usize,
+}
+
+impl Default for PerformanceConfig {
+    fn default() -> Self {
+        Self {
+            recording_level: PerformanceRecordingLevel::Off,
+            window_ms: 1000,
+            max_events_per_sec: 32,
+            max_payload_bytes_per_sec: 64 * 1024,
+        }
+    }
 }
 
 /// Session recording for terminal replay, debugging, and playbook generation.
@@ -1647,6 +1686,27 @@ impl BmuxConfig {
             });
         }
 
+        if self.performance.window_ms == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "performance.window_ms".to_string(),
+                value: "0".to_string(),
+            });
+        }
+
+        if self.performance.max_events_per_sec == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "performance.max_events_per_sec".to_string(),
+                value: "0".to_string(),
+            });
+        }
+
+        if self.performance.max_payload_bytes_per_sec == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "performance.max_payload_bytes_per_sec".to_string(),
+                value: "0".to_string(),
+            });
+        }
+
         if self.status_bar.max_tabs == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "status_bar.max_tabs".to_string(),
@@ -1670,6 +1730,7 @@ impl BmuxConfig {
         let keybind_defaults = KeyBindingConfig::default();
         let behavior_defaults = BehaviorConfig::default();
         let recording_defaults = RecordingConfig::default();
+        let performance_defaults = PerformanceConfig::default();
         let mut repaired_fields = Vec::new();
 
         if self.general.scrollback_limit == 0 {
@@ -1776,6 +1837,31 @@ impl BmuxConfig {
             repaired_fields.push(format!(
                 "recording.export.cursor_underline_height_pct out of range -> {}",
                 self.recording.export.cursor_underline_height_pct
+            ));
+        }
+
+        if self.performance.window_ms == 0 {
+            self.performance.window_ms = performance_defaults.window_ms;
+            repaired_fields.push(format!(
+                "performance.window_ms=0 -> {}",
+                self.performance.window_ms
+            ));
+        }
+
+        if self.performance.max_events_per_sec == 0 {
+            self.performance.max_events_per_sec = performance_defaults.max_events_per_sec;
+            repaired_fields.push(format!(
+                "performance.max_events_per_sec=0 -> {}",
+                self.performance.max_events_per_sec
+            ));
+        }
+
+        if self.performance.max_payload_bytes_per_sec == 0 {
+            self.performance.max_payload_bytes_per_sec =
+                performance_defaults.max_payload_bytes_per_sec;
+            repaired_fields.push(format!(
+                "performance.max_payload_bytes_per_sec=0 -> {}",
+                self.performance.max_payload_bytes_per_sec
             ));
         }
 

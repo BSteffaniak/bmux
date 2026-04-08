@@ -15,10 +15,10 @@ use super::{
     run_logs_level, run_logs_path, run_logs_profiles_delete, run_logs_profiles_list,
     run_logs_profiles_rename, run_logs_profiles_show, run_logs_tail, run_logs_watch,
     run_playbook_cleanup, run_playbook_diff, run_playbook_dry_run, run_playbook_from_recording,
-    run_playbook_interactive, run_playbook_run, run_playbook_validate, run_recording_cut,
-    run_recording_delete, run_recording_delete_all, run_recording_export, run_recording_inspect,
-    run_recording_list, run_recording_path, run_recording_replay, run_recording_start,
-    run_recording_status, run_recording_stop, run_recording_verify_smoke,
+    run_playbook_interactive, run_playbook_run, run_playbook_validate, run_recording_analyze,
+    run_recording_cut, run_recording_delete, run_recording_delete_all, run_recording_export,
+    run_recording_inspect, run_recording_list, run_recording_path, run_recording_replay,
+    run_recording_start, run_recording_status, run_recording_stop, run_recording_verify_smoke,
     run_remote_complete_sessions, run_remote_complete_targets, run_remote_doctor, run_remote_init,
     run_remote_install_server, run_remote_list, run_remote_test, run_remote_upgrade,
     run_server_bridge, run_server_gateway, run_server_recording_clear, run_server_recording_path,
@@ -138,6 +138,7 @@ pub(super) fn built_in_handler_for_command(command: &Command) -> BuiltInHandlerI
             RecordingCommand::DeleteAll { .. } => BuiltInHandlerId::RecordingDeleteAll,
             RecordingCommand::Cut { .. } => BuiltInHandlerId::RecordingCut,
             RecordingCommand::Inspect { .. } => BuiltInHandlerId::RecordingInspect,
+            RecordingCommand::Analyze { .. } => BuiltInHandlerId::RecordingAnalyze,
             RecordingCommand::Replay { .. } => BuiltInHandlerId::RecordingReplay,
             RecordingCommand::VerifySmoke { .. } => BuiltInHandlerId::RecordingVerifySmoke,
             RecordingCommand::Export { .. } => BuiltInHandlerId::RecordingExport,
@@ -948,6 +949,17 @@ pub(super) async fn dispatch_built_in_command(
                     },
             },
         ) => run_recording_inspect(recording_id, *limit, kind.as_deref(), *json),
+        (
+            BuiltInHandlerId::RecordingAnalyze,
+            Command::Recording {
+                command:
+                    RecordingCommand::Analyze {
+                        recording_id,
+                        perf,
+                        json,
+                    },
+            },
+        ) => run_recording_analyze(recording_id, *perf, *json),
         (
             BuiltInHandlerId::RecordingReplay,
             Command::Recording {

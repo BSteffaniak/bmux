@@ -101,10 +101,11 @@ pub use prompt::{
     PromptValidation, PromptValue, PromptWidth,
 };
 use recording_cli::{
-    recording_event_kind_name, replay_interactive, replay_verify, replay_watch, run_recording_cut,
-    run_recording_delete, run_recording_delete_all, run_recording_export, run_recording_inspect,
-    run_recording_list, run_recording_path, run_recording_replay, run_recording_start,
-    run_recording_status, run_recording_stop, run_recording_verify_smoke, verify_recording_report,
+    recording_event_kind_name, replay_interactive, replay_verify, replay_watch,
+    run_recording_analyze, run_recording_cut, run_recording_delete, run_recording_delete_all,
+    run_recording_export, run_recording_inspect, run_recording_list, run_recording_path,
+    run_recording_replay, run_recording_start, run_recording_status, run_recording_stop,
+    run_recording_verify_smoke, verify_recording_report,
 };
 use remote_cli::{
     run_auth_login, run_auth_logout, run_auth_status, run_connect, run_host, run_hosts, run_join,

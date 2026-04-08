@@ -671,6 +671,17 @@ pub enum RecordingCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Analyze diagnostics and bottlenecks from a recording
+    Analyze {
+        /// Recording id/name or unique id/name prefix
+        recording_id: String,
+        /// Analyze performance telemetry (`bmux.perf` custom events)
+        #[arg(long)]
+        perf: bool,
+        /// Print output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Replay a recording timeline
     Replay {
         /// Recording id/name or unique id/name prefix

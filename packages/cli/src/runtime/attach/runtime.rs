@@ -206,6 +206,112 @@ fn apply_attach_output_bytes(
     true
 }
 
+#[derive(Debug, Clone)]
+struct AttachPerfWindow {
+    started_at: Instant,
+    drain_rounds: u64,
+    drain_ipc_calls: u64,
+    drain_bytes: u64,
+    drain_ipc_ms_sum: u64,
+    drain_ipc_ms_max: u64,
+    render_frames: u64,
+    render_ms_sum: u64,
+    render_ms_max: u64,
+}
+
+impl AttachPerfWindow {
+    fn new() -> Self {
+        Self {
+            started_at: Instant::now(),
+            drain_rounds: 0,
+            drain_ipc_calls: 0,
+            drain_bytes: 0,
+            drain_ipc_ms_sum: 0,
+            drain_ipc_ms_max: 0,
+            render_frames: 0,
+            render_ms_sum: 0,
+            render_ms_max: 0,
+        }
+    }
+
+    const fn record_drain_round(&mut self) {
+        self.drain_rounds = self.drain_rounds.saturating_add(1);
+    }
+
+    fn record_drain_ipc(&mut self, elapsed_ms: u64, bytes: usize) {
+        self.drain_ipc_calls = self.drain_ipc_calls.saturating_add(1);
+        self.drain_ipc_ms_sum = self.drain_ipc_ms_sum.saturating_add(elapsed_ms);
+        self.drain_ipc_ms_max = self.drain_ipc_ms_max.max(elapsed_ms);
+        self.drain_bytes = self
+            .drain_bytes
+            .saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX));
+    }
+
+    fn record_render_frame(&mut self, elapsed_ms: u64) {
+        self.render_frames = self.render_frames.saturating_add(1);
+        self.render_ms_sum = self.render_ms_sum.saturating_add(elapsed_ms);
+        self.render_ms_max = self.render_ms_max.max(elapsed_ms);
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+async fn maybe_emit_attach_perf_window(
+    perf_emitter: &mut recording::PerfEventEmitter,
+    client: &mut StreamingBmuxClient,
+    session_id: Uuid,
+    window: &mut AttachPerfWindow,
+) -> Result<()> {
+    if !perf_emitter.enabled() {
+        return Ok(());
+    }
+
+    let elapsed = window.started_at.elapsed();
+    if elapsed < Duration::from_millis(perf_emitter.window_ms()) {
+        return Ok(());
+    }
+
+    let detailed = perf_emitter.level_at_least(recording::PerfCaptureLevel::Detailed);
+    let mut payload = serde_json::json!({
+        "window_elapsed_ms": duration_millis_u64(elapsed),
+        "drain_rounds": window.drain_rounds,
+        "drain_ipc_calls": window.drain_ipc_calls,
+        "drain_bytes": window.drain_bytes,
+        "render_frames": window.render_frames,
+    });
+    if detailed && let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "drain_ipc_ms_sum".to_string(),
+            serde_json::Value::from(window.drain_ipc_ms_sum),
+        );
+        object.insert(
+            "drain_ipc_ms_max".to_string(),
+            serde_json::Value::from(window.drain_ipc_ms_max),
+        );
+        object.insert(
+            "render_ms_sum".to_string(),
+            serde_json::Value::from(window.render_ms_sum),
+        );
+        object.insert(
+            "render_ms_max".to_string(),
+            serde_json::Value::from(window.render_ms_max),
+        );
+    }
+
+    perf_emitter
+        .emit_with_streaming_client(client, Some(session_id), None, "attach.window", payload)
+        .await?;
+    window.reset();
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)] // Core attach loop -- splitting would fragment state management
 pub async fn run_session_attach_with_client(
     mut client: BmuxClient,
@@ -237,6 +343,10 @@ pub async fn run_session_attach_with_client(
     };
     let attach_keymap = attach_keymap_from_config(&attach_config);
     let attach_help_lines = build_attach_help_lines(&attach_config);
+    let mut perf_emitter = recording::PerfEventEmitter::new(
+        recording::PerfCaptureSettings::from_config(&attach_config),
+    );
+    let mut perf_window = AttachPerfWindow::new();
     let global_theme = match attach_config.load_theme() {
         Ok(theme) => theme,
         Err(error) => {
@@ -703,6 +813,7 @@ pub async fn run_session_attach_with_client(
 
         if scene_hydrated {
             let help_scroll = view_state.help_overlay_scroll;
+            let render_started_at = Instant::now();
             render_attach_frame(
                 &mut client,
                 &mut view_state,
@@ -715,6 +826,14 @@ pub async fn run_session_attach_with_client(
                 &attach_help_lines,
                 help_scroll,
                 &mut display_capture,
+            )
+            .await?;
+            perf_window.record_render_frame(duration_millis_u64(render_started_at.elapsed()));
+            maybe_emit_attach_perf_window(
+                &mut perf_emitter,
+                &mut client,
+                view_state.attached_id,
+                &mut perf_window,
             )
             .await?;
             pane_output_pending = false;
@@ -760,6 +879,8 @@ pub async fn run_session_attach_with_client(
             let mut last_round_had_data = false;
             let drain_start = Instant::now();
             for _round in 0..ATTACH_OUTPUT_DRAIN_MAX_ROUNDS {
+                perf_window.record_drain_round();
+                let drain_call_started_at = Instant::now();
                 let result = match client
                     .attach_pane_output_batch(
                         view_state.attached_id,
@@ -782,6 +903,11 @@ pub async fn run_session_attach_with_client(
                     }
                     Err(error) => return Err(map_attach_client_error(error)),
                 };
+                let batch_bytes: usize = result.chunks.iter().map(|chunk| chunk.data.len()).sum();
+                perf_window.record_drain_ipc(
+                    duration_millis_u64(drain_call_started_at.elapsed()),
+                    batch_bytes,
+                );
 
                 let mut had_data = false;
                 let mut any_sync_active = false;
@@ -866,10 +992,18 @@ pub async fn run_session_attach_with_client(
         }
 
         if !frame_needs_render {
+            maybe_emit_attach_perf_window(
+                &mut perf_emitter,
+                &mut client,
+                view_state.attached_id,
+                &mut perf_window,
+            )
+            .await?;
             continue;
         }
 
         let help_scroll = view_state.help_overlay_scroll;
+        let render_started_at = Instant::now();
         render_attach_frame(
             &mut client,
             &mut view_state,
@@ -882,6 +1016,14 @@ pub async fn run_session_attach_with_client(
             &attach_help_lines,
             help_scroll,
             &mut display_capture,
+        )
+        .await?;
+        perf_window.record_render_frame(duration_millis_u64(render_started_at.elapsed()));
+        maybe_emit_attach_perf_window(
+            &mut perf_emitter,
+            &mut client,
+            view_state.attached_id,
+            &mut perf_window,
         )
         .await?;
     }

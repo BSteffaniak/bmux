@@ -7,15 +7,18 @@ use super::{
     RecordingCursorMode, RecordingCursorPaintMode, RecordingCursorProfile, RecordingCursorShape,
     RecordingCursorTextMode, RecordingEventEnvelope, RecordingEventKind, RecordingEventKindArg,
     RecordingExportFormat, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
-    RecordingStatus, RecordingSummary, Repeat, Result, Uuid, Write, cleanup_stale_pid_file,
-    connect_if_running_with_context, io, map_cli_client_error, parse_uuid_value, terminal,
+    RecordingStatus, RecordingSummary, Repeat, Result, Uuid, Write, active_runtime_name,
+    cleanup_stale_pid_file, connect_if_running_with_context, io, map_cli_client_error,
+    parse_uuid_value, terminal,
 };
 use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont, point};
 use bmux_fonts::FontPreset;
+use bmux_ipc::RecordingPayload;
 use font8x8::UnicodeFonts;
 use resvg::{tiny_skia, usvg};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::Write as _;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 mod terminal_profile;
 
@@ -224,6 +227,243 @@ struct RecordingStatusView {
 struct RecordingAutoExportSettings {
     enabled: bool,
     output_dir: Option<PathBuf>,
+}
+
+const PERF_RECORDING_SOURCE: &str = "bmux.perf";
+const PERF_RECORDING_SCHEMA_VERSION: u8 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) enum PerfCaptureLevel {
+    Off,
+    Basic,
+    Detailed,
+    Trace,
+}
+
+impl PerfCaptureLevel {
+    #[must_use]
+    pub(super) const fn from_config(level: bmux_config::PerformanceRecordingLevel) -> Self {
+        match level {
+            bmux_config::PerformanceRecordingLevel::Off => Self::Off,
+            bmux_config::PerformanceRecordingLevel::Basic => Self::Basic,
+            bmux_config::PerformanceRecordingLevel::Detailed => Self::Detailed,
+            bmux_config::PerformanceRecordingLevel::Trace => Self::Trace,
+        }
+    }
+
+    #[must_use]
+    pub(super) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Basic => "basic",
+            Self::Detailed => "detailed",
+            Self::Trace => "trace",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct PerfCaptureSettings {
+    level: PerfCaptureLevel,
+    window_ms: u64,
+    max_events_per_sec: u32,
+    max_payload_bytes_per_sec: usize,
+}
+
+impl PerfCaptureSettings {
+    #[must_use]
+    pub(super) fn from_config(config: &BmuxConfig) -> Self {
+        let perf = &config.performance;
+        Self {
+            level: PerfCaptureLevel::from_config(perf.recording_level),
+            window_ms: perf.window_ms.max(1),
+            max_events_per_sec: perf.max_events_per_sec.max(1),
+            max_payload_bytes_per_sec: perf.max_payload_bytes_per_sec.max(1),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct PerfEventEmitter {
+    settings: PerfCaptureSettings,
+    rate_window_started_at: Instant,
+    emitted_events_in_window: u32,
+    emitted_payload_bytes_in_window: usize,
+    dropped_events_since_emit: u64,
+    dropped_payload_bytes_since_emit: u64,
+}
+
+impl PerfEventEmitter {
+    #[must_use]
+    pub(super) fn new(settings: PerfCaptureSettings) -> Self {
+        Self {
+            settings,
+            rate_window_started_at: Instant::now(),
+            emitted_events_in_window: 0,
+            emitted_payload_bytes_in_window: 0,
+            dropped_events_since_emit: 0,
+            dropped_payload_bytes_since_emit: 0,
+        }
+    }
+
+    #[must_use]
+    pub(super) const fn window_ms(&self) -> u64 {
+        self.settings.window_ms
+    }
+
+    #[must_use]
+    pub(super) fn level_at_least(&self, level: PerfCaptureLevel) -> bool {
+        self.settings.level >= level
+    }
+
+    #[must_use]
+    pub(super) fn enabled(&self) -> bool {
+        self.settings.level != PerfCaptureLevel::Off
+    }
+
+    fn reset_rate_window_if_needed(&mut self) {
+        if self.rate_window_started_at.elapsed() >= std::time::Duration::from_secs(1) {
+            self.rate_window_started_at = Instant::now();
+            self.emitted_events_in_window = 0;
+            self.emitted_payload_bytes_in_window = 0;
+        }
+    }
+
+    fn can_emit_payload(&mut self, payload_len: usize) -> bool {
+        if !self.enabled() {
+            return false;
+        }
+
+        self.reset_rate_window_if_needed();
+
+        let event_limit_hit = self.emitted_events_in_window >= self.settings.max_events_per_sec;
+        let payload_limit_hit = self
+            .emitted_payload_bytes_in_window
+            .saturating_add(payload_len)
+            > self.settings.max_payload_bytes_per_sec;
+        if event_limit_hit || payload_limit_hit {
+            self.dropped_events_since_emit = self.dropped_events_since_emit.saturating_add(1);
+            self.dropped_payload_bytes_since_emit = self
+                .dropped_payload_bytes_since_emit
+                .saturating_add(u64::try_from(payload_len).unwrap_or(u64::MAX));
+            return false;
+        }
+
+        self.emitted_events_in_window = self.emitted_events_in_window.saturating_add(1);
+        self.emitted_payload_bytes_in_window = self
+            .emitted_payload_bytes_in_window
+            .saturating_add(payload_len);
+        true
+    }
+
+    fn normalized_payload(&mut self, payload: serde_json::Value) -> serde_json::Value {
+        let mut object = match payload {
+            serde_json::Value::Object(map) => map,
+            other => {
+                let mut map = serde_json::Map::new();
+                map.insert("value".to_string(), other);
+                map
+            }
+        };
+        object.insert(
+            "schema_version".to_string(),
+            serde_json::Value::from(PERF_RECORDING_SCHEMA_VERSION),
+        );
+        object.insert(
+            "level".to_string(),
+            serde_json::Value::String(self.settings.level.as_str().to_string()),
+        );
+        object.insert(
+            "runtime".to_string(),
+            serde_json::Value::String(active_runtime_name()),
+        );
+        object.insert(
+            "ts_epoch_ms".to_string(),
+            serde_json::Value::from(epoch_millis_now()),
+        );
+
+        if self.dropped_events_since_emit > 0 || self.dropped_payload_bytes_since_emit > 0 {
+            object.insert(
+                "dropped_events_since_emit".to_string(),
+                serde_json::Value::from(self.dropped_events_since_emit),
+            );
+            object.insert(
+                "dropped_payload_bytes_since_emit".to_string(),
+                serde_json::Value::from(self.dropped_payload_bytes_since_emit),
+            );
+            self.dropped_events_since_emit = 0;
+            self.dropped_payload_bytes_since_emit = 0;
+        }
+
+        serde_json::Value::Object(object)
+    }
+
+    pub(super) async fn emit_with_client(
+        &mut self,
+        client: &mut bmux_client::BmuxClient,
+        session_id: Option<Uuid>,
+        pane_id: Option<Uuid>,
+        event_name: &str,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        if !self.enabled() {
+            return Ok(());
+        }
+
+        let payload = self.normalized_payload(payload);
+        let encoded = serde_json::to_vec(&payload).context("failed encoding perf payload")?;
+        if !self.can_emit_payload(encoded.len()) {
+            return Ok(());
+        }
+
+        client
+            .recording_write_custom_event(
+                session_id,
+                pane_id,
+                PERF_RECORDING_SOURCE.to_string(),
+                event_name.to_string(),
+                encoded,
+            )
+            .await
+            .map_err(map_cli_client_error)
+    }
+
+    pub(super) async fn emit_with_streaming_client(
+        &mut self,
+        client: &mut bmux_client::StreamingBmuxClient,
+        session_id: Option<Uuid>,
+        pane_id: Option<Uuid>,
+        event_name: &str,
+        payload: serde_json::Value,
+    ) -> Result<()> {
+        if !self.enabled() {
+            return Ok(());
+        }
+
+        let payload = self.normalized_payload(payload);
+        let encoded = serde_json::to_vec(&payload).context("failed encoding perf payload")?;
+        if !self.can_emit_payload(encoded.len()) {
+            return Ok(());
+        }
+
+        client
+            .recording_write_custom_event(
+                session_id,
+                pane_id,
+                PERF_RECORDING_SOURCE.to_string(),
+                event_name.to_string(),
+                encoded,
+            )
+            .await
+            .map_err(map_cli_client_error)
+    }
+}
+
+#[allow(clippy::cast_possible_truncation)]
+fn epoch_millis_now() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_millis() as u64)
 }
 
 fn parse_bool_env_flag(raw: &str) -> Option<bool> {
@@ -829,6 +1069,215 @@ pub(super) fn run_recording_inspect(
             event.seq, event.mono_ns, event.kind, event.session_id, event.pane_id, event.client_id
         );
     }
+    Ok(0)
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+struct PerfTimingSummary {
+    count: u64,
+    avg_ms: u64,
+    max_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize, Default)]
+struct PerfAnalysisReport {
+    recording_events: usize,
+    perf_events: usize,
+    malformed_payloads: usize,
+    dropped_events_reported: u64,
+    dropped_payload_bytes_reported: u64,
+    first_ts_epoch_ms: Option<u64>,
+    last_ts_epoch_ms: Option<u64>,
+    span_ms: Option<u64>,
+    by_event_name: BTreeMap<String, u64>,
+    by_level: BTreeMap<String, u64>,
+    timings_ms: BTreeMap<String, PerfTimingSummary>,
+}
+
+fn analyze_perf_events(events: &[RecordingEventEnvelope]) -> PerfAnalysisReport {
+    let mut report = PerfAnalysisReport {
+        recording_events: events.len(),
+        ..PerfAnalysisReport::default()
+    };
+
+    let mut timing_acc: HashMap<String, (u64, u64, u64)> = HashMap::new();
+
+    for event in events {
+        let RecordingPayload::Custom {
+            source,
+            name,
+            payload,
+        } = &event.payload
+        else {
+            continue;
+        };
+
+        if source != PERF_RECORDING_SOURCE {
+            continue;
+        }
+
+        report.perf_events = report.perf_events.saturating_add(1);
+        *report.by_event_name.entry(name.clone()).or_default() += 1;
+
+        let decoded: serde_json::Value = if let Ok(value) = serde_json::from_slice(payload) {
+            value
+        } else {
+            report.malformed_payloads = report.malformed_payloads.saturating_add(1);
+            continue;
+        };
+        let Some(object) = decoded.as_object() else {
+            report.malformed_payloads = report.malformed_payloads.saturating_add(1);
+            continue;
+        };
+
+        if let Some(level) = object.get("level").and_then(serde_json::Value::as_str) {
+            *report.by_level.entry(level.to_string()).or_default() += 1;
+        }
+
+        if let Some(ts_epoch_ms) = object
+            .get("ts_epoch_ms")
+            .and_then(serde_json::Value::as_u64)
+        {
+            report.first_ts_epoch_ms = Some(
+                report
+                    .first_ts_epoch_ms
+                    .map_or(ts_epoch_ms, |first| first.min(ts_epoch_ms)),
+            );
+            report.last_ts_epoch_ms = Some(
+                report
+                    .last_ts_epoch_ms
+                    .map_or(ts_epoch_ms, |last| last.max(ts_epoch_ms)),
+            );
+        }
+
+        report.dropped_events_reported = report.dropped_events_reported.saturating_add(
+            object
+                .get("dropped_events_since_emit")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0),
+        );
+        report.dropped_payload_bytes_reported =
+            report.dropped_payload_bytes_reported.saturating_add(
+                object
+                    .get("dropped_payload_bytes_since_emit")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+            );
+
+        for (field, value) in object {
+            if !field.ends_with("_ms") {
+                continue;
+            }
+            let Some(ms) = value.as_u64() else {
+                continue;
+            };
+            let (count, sum, max) = timing_acc.entry(field.clone()).or_insert((0, 0, 0));
+            *count = count.saturating_add(1);
+            *sum = sum.saturating_add(ms);
+            *max = (*max).max(ms);
+        }
+    }
+
+    if let (Some(first), Some(last)) = (report.first_ts_epoch_ms, report.last_ts_epoch_ms) {
+        report.span_ms = Some(last.saturating_sub(first));
+    }
+
+    report.timings_ms = timing_acc
+        .into_iter()
+        .map(|(field, (count, sum, max))| {
+            let avg_ms = if count == 0 { 0 } else { sum / count };
+            (
+                field,
+                PerfTimingSummary {
+                    count,
+                    avg_ms,
+                    max_ms: max,
+                },
+            )
+        })
+        .collect();
+
+    report
+}
+
+fn print_perf_analysis_text(report: &PerfAnalysisReport) {
+    if report.perf_events == 0 {
+        println!("no bmux.perf custom events found in recording");
+        return;
+    }
+
+    println!(
+        "perf events: {} / {} (malformed payloads: {})",
+        report.perf_events, report.recording_events, report.malformed_payloads
+    );
+    if let Some(span_ms) = report.span_ms {
+        println!("time span: {span_ms}ms");
+    }
+    if report.dropped_events_reported > 0 || report.dropped_payload_bytes_reported > 0 {
+        println!(
+            "reported drops: events={} payload_bytes={}",
+            report.dropped_events_reported, report.dropped_payload_bytes_reported
+        );
+    }
+
+    if !report.by_level.is_empty() {
+        let levels = report
+            .by_level
+            .iter()
+            .map(|(level, count)| format!("{level}={count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("levels: {levels}");
+    }
+
+    if !report.by_event_name.is_empty() {
+        println!("events:");
+        let mut entries = report.by_event_name.iter().collect::<Vec<_>>();
+        entries.sort_by(|(left_name, left_count), (right_name, right_count)| {
+            right_count
+                .cmp(left_count)
+                .then_with(|| left_name.cmp(right_name))
+        });
+        for (name, count) in entries.into_iter().take(12) {
+            println!("  {name}: {count}");
+        }
+    }
+
+    if !report.timings_ms.is_empty() {
+        println!("timings (ms):");
+        let mut timings = report.timings_ms.iter().collect::<Vec<_>>();
+        timings.sort_by(|(left_name, left), (right_name, right)| {
+            right
+                .avg_ms
+                .cmp(&left.avg_ms)
+                .then_with(|| left_name.cmp(right_name))
+        });
+        for (name, timing) in timings.into_iter().take(16) {
+            println!(
+                "  {name}: count={} avg={} max={}",
+                timing.count, timing.avg_ms, timing.max_ms
+            );
+        }
+    }
+}
+
+pub(super) fn run_recording_analyze(recording_id: &str, perf: bool, as_json: bool) -> Result<u8> {
+    let events = load_recording_events(recording_id)?;
+    if !perf {
+        anyhow::bail!("recording analyze currently supports only --perf")
+    }
+
+    let report = analyze_perf_events(&events);
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .context("failed encoding recording analyze json")?
+        );
+        return Ok(0);
+    }
+
+    print_perf_analysis_text(&report);
     Ok(0)
 }
 

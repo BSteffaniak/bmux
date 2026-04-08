@@ -640,6 +640,36 @@ impl BmuxClient {
         }
     }
 
+    /// Write a custom event into the active recording.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn recording_write_custom_event(
+        &mut self,
+        session_id: Option<Uuid>,
+        pane_id: Option<Uuid>,
+        source: String,
+        name: String,
+        payload: Vec<u8>,
+    ) -> Result<()> {
+        match self
+            .request(Request::RecordingWriteCustomEvent {
+                session_id,
+                pane_id,
+                source,
+                name,
+                payload,
+            })
+            .await?
+        {
+            ResponsePayload::RecordingCustomEventWritten { .. } => Ok(()),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected recording custom event written",
+            )),
+        }
+    }
+
     /// Query recording runtime status.
     ///
     /// # Errors

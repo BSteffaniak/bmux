@@ -101,6 +101,10 @@ pub(super) fn run_recording_inspect(
     recording::run_recording_inspect(recording_id, limit, kind, as_json)
 }
 
+pub(super) fn run_recording_analyze(recording_id: &str, perf: bool, as_json: bool) -> Result<u8> {
+    recording::run_recording_analyze(recording_id, perf, as_json)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn run_recording_replay(
     recording_id: &str,

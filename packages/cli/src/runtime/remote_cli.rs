@@ -16,8 +16,8 @@ use uuid::Uuid;
 use super::{
     AttachExitReason, ConnectionContext, ConnectionPolicyScope, KernelClientFactory,
     active_runtime_name, append_runtime_arg, connect, connect_with_context,
-    expand_bmux_target_if_needed, map_cli_client_error, run_server_start, run_session_attach,
-    run_session_attach_with_client,
+    expand_bmux_target_if_needed, map_cli_client_error, recording, run_server_start,
+    run_session_attach, run_session_attach_with_client,
 };
 use bmux_cli_schema::HostedModeArg;
 use bmux_config::{ConnectionTargetConfig, ConnectionTransport, HostedMode, RemoteServerStartMode};
@@ -79,6 +79,55 @@ struct IrohTarget {
     relay_url: Option<String>,
     require_ssh_auth: bool,
     connect_timeout_ms: u64,
+}
+
+#[derive(Debug, Default, Clone, Serialize)]
+struct IrohConnectPerfSummary {
+    bind_ms: u64,
+    online_ms: u64,
+    connect_ms: u64,
+    ssh_auth_ms: Option<u64>,
+    open_bi_ms: u64,
+    ipc_handshake_ms: u64,
+    total_ms: u64,
+    relay_enabled: bool,
+    ssh_auth_enabled: bool,
+    compression_enabled: bool,
+}
+
+async fn emit_iroh_connect_perf_event(
+    perf_emitter: &mut recording::PerfEventEmitter,
+    client: &mut BmuxClient,
+    target: &IrohTarget,
+    summary: &IrohConnectPerfSummary,
+    reconnect_attempt: u64,
+) -> Result<()> {
+    if !perf_emitter.level_at_least(recording::PerfCaptureLevel::Basic) {
+        return Ok(());
+    }
+
+    perf_emitter
+        .emit_with_client(
+            client,
+            None,
+            None,
+            "iroh.connect.summary",
+            serde_json::json!({
+                "target": target.label,
+                "reconnect_attempt": reconnect_attempt,
+                "bind_ms": summary.bind_ms,
+                "online_ms": summary.online_ms,
+                "connect_ms": summary.connect_ms,
+                "ssh_auth_ms": summary.ssh_auth_ms,
+                "open_bi_ms": summary.open_bi_ms,
+                "ipc_handshake_ms": summary.ipc_handshake_ms,
+                "total_ms": summary.total_ms,
+                "relay_enabled": summary.relay_enabled,
+                "ssh_auth_enabled": summary.ssh_auth_enabled,
+                "compression_enabled": summary.compression_enabled,
+            }),
+        )
+        .await
 }
 
 const SSH_RECONNECT_MAX_ATTEMPTS: usize = 4;
@@ -272,6 +321,7 @@ pub(super) async fn run_connect(
     }
 
     let config = BmuxConfig::load()?;
+    let perf_settings = recording::PerfCaptureSettings::from_config(&config);
     let selected_target = if let Some(target) = target {
         target.to_string()
     } else {
@@ -361,8 +411,22 @@ pub(super) async fn run_connect(
             Ok(status)
         }
         ResolvedTarget::Iroh(iroh_target) => {
-            let (mut client, iroh_connection) =
-                connect_iroh_bridge(&iroh_target, "bmux-cli-connect-remote-iroh").await?;
+            let mut perf_emitter = recording::PerfEventEmitter::new(perf_settings);
+            let mut connect_perf = IrohConnectPerfSummary::default();
+            let (mut client, iroh_connection) = connect_iroh_bridge(
+                &iroh_target,
+                "bmux-cli-connect-remote-iroh",
+                Some(&mut connect_perf),
+            )
+            .await?;
+            emit_iroh_connect_perf_event(
+                &mut perf_emitter,
+                &mut client,
+                &iroh_target,
+                &connect_perf,
+                0,
+            )
+            .await?;
             let target_session = if follow.is_some() {
                 None
             } else if let Some(session) = session {
@@ -378,6 +442,7 @@ pub(super) async fn run_connect(
                 follow,
                 global,
                 reconnect_forever,
+                perf_emitter,
             )
             .await?;
             if status == 0
@@ -2006,6 +2071,7 @@ async fn delete_share_link(control_plane_url: &str, token: &str, name: &str) -> 
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // keep reconnect parameters explicit at call sites
 async fn run_iroh_attach_with_reconnect(
     mut client: BmuxClient,
     mut iroh_connection: iroh::endpoint::Connection,
@@ -2014,6 +2080,7 @@ async fn run_iroh_attach_with_reconnect(
     follow: Option<&str>,
     global: bool,
     reconnect_forever: bool,
+    mut perf_emitter: recording::PerfEventEmitter,
 ) -> Result<u8> {
     let mut attempt = 0usize;
     loop {
@@ -2038,8 +2105,21 @@ async fn run_iroh_attach_with_reconnect(
             backoff.as_millis()
         );
         tokio::time::sleep(backoff).await;
-        let (new_client, new_connection) =
-            connect_iroh_bridge(target, "bmux-cli-connect-remote-iroh-reconnect").await?;
+        let mut connect_perf = IrohConnectPerfSummary::default();
+        let (mut new_client, new_connection) = connect_iroh_bridge(
+            target,
+            "bmux-cli-connect-remote-iroh-reconnect",
+            Some(&mut connect_perf),
+        )
+        .await?;
+        emit_iroh_connect_perf_event(
+            &mut perf_emitter,
+            &mut new_client,
+            target,
+            &connect_perf,
+            u64::try_from(attempt).unwrap_or(u64::MAX),
+        )
+        .await?;
         client = new_client;
         iroh_connection = new_connection;
     }
@@ -2220,7 +2300,7 @@ pub(super) async fn run_remote_test(target: &str) -> Result<u8> {
         }
         ResolvedTarget::Iroh(iroh_target) => {
             let (mut client, _) =
-                connect_iroh_bridge(&iroh_target, "bmux-cli-remote-test-iroh").await?;
+                connect_iroh_bridge(&iroh_target, "bmux-cli-remote-test-iroh", None).await?;
             client.ping().await.map_err(map_cli_client_error)?;
             println!("target '{}' OK (iroh)", iroh_target.label);
             Ok(0)
@@ -2297,7 +2377,7 @@ pub(super) async fn run_remote_doctor(target: &str, fix: bool) -> Result<u8> {
         }
         ResolvedTarget::Iroh(iroh_target) => {
             let (mut client, _) =
-                connect_iroh_bridge(&iroh_target, "bmux-cli-remote-doctor-iroh").await?;
+                connect_iroh_bridge(&iroh_target, "bmux-cli-remote-doctor-iroh", None).await?;
             client.ping().await.map_err(map_cli_client_error)?;
             print_doctor_step_ok("iroh", "connectivity and ping succeeded");
             println!("doctor result: OK ({})", iroh_target.label);
@@ -2471,7 +2551,7 @@ pub(super) async fn run_remote_complete_sessions(target: &str) -> Result<u8> {
             connect_tls_bridge(&tls_target, "bmux-cli-complete-sessions-tls").await?
         }
         ResolvedTarget::Iroh(iroh_target) => {
-            connect_iroh_bridge(&iroh_target, "bmux-cli-complete-sessions-iroh")
+            connect_iroh_bridge(&iroh_target, "bmux-cli-complete-sessions-iroh", None)
                 .await?
                 .0
         }
@@ -2714,16 +2794,33 @@ async fn connect_tls_bridge(target: &TlsTarget, client_name: &str) -> Result<Bmu
         .map_err(map_cli_client_error)
 }
 
+#[allow(clippy::too_many_lines)] // staged iroh bridge setup is clearer inline for troubleshooting
 async fn connect_iroh_bridge(
     target: &IrohTarget,
     client_name: &str,
+    perf_summary: Option<&mut IrohConnectPerfSummary>,
 ) -> Result<(BmuxClient, iroh::endpoint::Connection)> {
+    #[allow(clippy::cast_possible_truncation)]
+    fn millis(duration: Duration) -> u64 {
+        duration.as_millis().min(u128::from(u64::MAX)) as u64
+    }
+
+    let total_started_at = Instant::now();
+    let mut perf = IrohConnectPerfSummary::default();
+
+    let bind_started_at = Instant::now();
     let endpoint = Endpoint::builder(presets::N0)
         .alpns(vec![BMUX_IROH_ALPN.to_vec()])
         .bind()
         .await
         .context("failed binding iroh client endpoint")?;
+    perf.bind_ms = millis(bind_started_at.elapsed());
+
+    let online_started_at = Instant::now();
     endpoint.online().await;
+    perf.online_ms = millis(online_started_at.elapsed());
+
+    let connect_started_at = Instant::now();
     let endpoint_id: EndpointId = target
         .endpoint_id
         .parse()
@@ -2743,17 +2840,22 @@ async fn connect_iroh_bridge(
     .await
     .with_context(|| format!("timed out connecting iroh target '{}'", target.label))?
     .with_context(|| format!("failed connecting iroh target '{}'", target.label))?;
+    perf.connect_ms = millis(connect_started_at.elapsed());
 
     if target.require_ssh_auth {
+        let auth_started_at = Instant::now();
         authenticate_client_connection(&connection)
             .await
             .context("iroh SSH auth handshake failed")?;
+        perf.ssh_auth_ms = Some(millis(auth_started_at.elapsed()));
     }
 
+    let open_bi_started_at = Instant::now();
     let (mut send, mut recv) = connection
         .open_bi()
         .await
         .context("failed opening iroh bi-directional stream")?;
+    perf.open_bi_ms = millis(open_bi_started_at.elapsed());
     let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
     let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge_stream);
     // Clone the connection before moving the stream halves into copy tasks.
@@ -2792,6 +2894,7 @@ async fn connect_iroh_bridge(
         ErasedIpcStream::new(Box::new(client_stream))
     };
 
+    let ipc_handshake_started_at = Instant::now();
     let client = BmuxClient::connect_with_bridge_stream(
         erased,
         timeout,
@@ -2800,6 +2903,16 @@ async fn connect_iroh_bridge(
     )
     .await
     .map_err(map_cli_client_error)?;
+    perf.ipc_handshake_ms = millis(ipc_handshake_started_at.elapsed());
+    perf.total_ms = millis(total_started_at.elapsed());
+    perf.relay_enabled = target.relay_url.is_some();
+    perf.ssh_auth_enabled = target.require_ssh_auth;
+    perf.compression_enabled = use_transport_compression;
+
+    if let Some(summary) = perf_summary {
+        *summary = perf;
+    }
+
     Ok((client, retained_connection))
 }
 

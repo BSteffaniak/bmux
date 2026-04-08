@@ -4213,6 +4213,10 @@ async fn handle_connection(
             let push_state = Arc::clone(&state);
             let push_client_id = client_id;
             event_push_task = Some(tokio::spawn(async move {
+                let mut push_window_started_at = Instant::now();
+                let mut push_window_sent_events = 0_u64;
+                let mut push_window_sent_bytes = 0_u64;
+                let mut push_window_lagged_events = 0_u64;
                 loop {
                     match event_rx.recv().await {
                         Ok(event) => {
@@ -4278,12 +4282,55 @@ async fn handle_connection(
                                 };
                                 f
                             };
+                            let frame_len = frame.len();
                             if push_frame_tx.send(frame).is_err() {
                                 return; // writer dropped (client disconnected)
+                            }
+                            push_window_sent_events = push_window_sent_events.saturating_add(1);
+                            push_window_sent_bytes = push_window_sent_bytes
+                                .saturating_add(u64::try_from(frame_len).unwrap_or(u64::MAX));
+
+                            let elapsed = push_window_started_at.elapsed();
+                            if elapsed >= Duration::from_secs(1)
+                                && (push_window_sent_events > 0 || push_window_lagged_events > 0)
+                            {
+                                let elapsed_ms =
+                                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+                                if let Ok(payload) = serde_json::to_vec(&serde_json::json!({
+                                    "schema_version": 1,
+                                    "level": "basic",
+                                    "runtime": "server",
+                                    "ts_epoch_ms": epoch_millis_now(),
+                                    "window_elapsed_ms": elapsed_ms,
+                                    "events_pushed": push_window_sent_events,
+                                    "bytes_pushed": push_window_sent_bytes,
+                                    "lagged_events": push_window_lagged_events,
+                                })) {
+                                    record_to_all_runtimes(
+                                        &push_state.manual_recording_runtime,
+                                        &push_state.rolling_recording_runtime,
+                                        RecordingEventKind::Custom,
+                                        RecordingPayload::Custom {
+                                            source: "bmux.perf".to_string(),
+                                            name: "server.push.window".to_string(),
+                                            payload,
+                                        },
+                                        RecordMeta {
+                                            session_id: None,
+                                            pane_id: None,
+                                            client_id: Some(push_client_id.0),
+                                        },
+                                    );
+                                }
+                                push_window_started_at = Instant::now();
+                                push_window_sent_events = 0;
+                                push_window_sent_bytes = 0;
+                                push_window_lagged_events = 0;
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             warn!("event push task lagged by {n} events for client");
+                            push_window_lagged_events = push_window_lagged_events.saturating_add(n);
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             return; // server shutting down

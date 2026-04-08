@@ -87,6 +87,7 @@ pub enum BuiltInHandlerId {
     RecordingDeleteAll,
     RecordingCut,
     RecordingInspect,
+    RecordingAnalyze,
     RecordingReplay,
     RecordingVerifySmoke,
     RecordingExport,
@@ -553,6 +554,11 @@ pub fn built_in_execution_commands() -> Vec<BuiltInExecutionCommand> {
             BuiltInHandlerId::RecordingInspect,
             &["recording", "inspect"],
             "Inspect recording timeline",
+        ),
+        BuiltInExecutionCommand::new(
+            BuiltInHandlerId::RecordingAnalyze,
+            &["recording", "analyze"],
+            "Analyze recording diagnostics and bottlenecks",
         ),
         BuiltInExecutionCommand::new(
             BuiltInHandlerId::RecordingReplay,
