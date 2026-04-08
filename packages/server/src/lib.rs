@@ -8,7 +8,7 @@ mod persistence;
 pub mod recording;
 
 use anyhow::{Context, Result};
-use bmux_config::{BmuxConfig, ConfigPaths};
+use bmux_config::{BmuxConfig, ConfigPaths, PerformanceRecordingLevel};
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
     AttachFocusTarget, AttachGrant, AttachLayer, AttachMouseProtocolEncoding,
@@ -64,6 +64,163 @@ const RESPONSE_OUTPUT_BUDGET: usize =
 const SNAPSHOT_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(300);
 const OFFLINE_SNAPSHOT_LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(50);
 const OFFLINE_SNAPSHOT_LOCK_TIMEOUT: Duration = Duration::from_secs(3);
+const EVENT_PUSH_CHANNEL_CAPACITY: usize = 256;
+
+#[derive(Debug, Clone, Copy)]
+struct PerformanceCaptureSettings {
+    level: PerformanceRecordingLevel,
+    window_ms: u64,
+    max_events_per_sec: u32,
+    max_payload_bytes_per_sec: usize,
+}
+
+impl PerformanceCaptureSettings {
+    fn from_config(config: &BmuxConfig) -> Self {
+        let perf = &config.performance;
+        Self {
+            level: perf.recording_level,
+            window_ms: perf.window_ms.max(1),
+            max_events_per_sec: perf.max_events_per_sec.max(1),
+            max_payload_bytes_per_sec: perf.max_payload_bytes_per_sec.max(1),
+        }
+    }
+
+    const fn level_rank(level: PerformanceRecordingLevel) -> u8 {
+        match level {
+            PerformanceRecordingLevel::Off => 0,
+            PerformanceRecordingLevel::Basic => 1,
+            PerformanceRecordingLevel::Detailed => 2,
+            PerformanceRecordingLevel::Trace => 3,
+        }
+    }
+
+    const fn level_at_least(self, level: PerformanceRecordingLevel) -> bool {
+        Self::level_rank(self.level) >= Self::level_rank(level)
+    }
+
+    const fn enabled(self) -> bool {
+        !matches!(self.level, PerformanceRecordingLevel::Off)
+    }
+
+    const fn level_label(self) -> &'static str {
+        match self.level {
+            PerformanceRecordingLevel::Off => "off",
+            PerformanceRecordingLevel::Basic => "basic",
+            PerformanceRecordingLevel::Detailed => "detailed",
+            PerformanceRecordingLevel::Trace => "trace",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PerformanceEventRateLimiter {
+    settings: PerformanceCaptureSettings,
+    rate_window_started_at: Instant,
+    emitted_events_in_window: u32,
+    emitted_payload_bytes_in_window: usize,
+    dropped_events_since_emit: u64,
+    dropped_payload_bytes_since_emit: u64,
+}
+
+impl PerformanceEventRateLimiter {
+    fn new(settings: PerformanceCaptureSettings) -> Self {
+        Self {
+            settings,
+            rate_window_started_at: Instant::now(),
+            emitted_events_in_window: 0,
+            emitted_payload_bytes_in_window: 0,
+            dropped_events_since_emit: 0,
+            dropped_payload_bytes_since_emit: 0,
+        }
+    }
+
+    fn reset_rate_window_if_needed(&mut self) {
+        if self.rate_window_started_at.elapsed() >= Duration::from_secs(1) {
+            self.rate_window_started_at = Instant::now();
+            self.emitted_events_in_window = 0;
+            self.emitted_payload_bytes_in_window = 0;
+        }
+    }
+
+    fn can_emit_payload(&mut self, payload_len: usize) -> bool {
+        if !self.settings.enabled() {
+            return false;
+        }
+
+        self.reset_rate_window_if_needed();
+
+        let event_limit_hit = self.emitted_events_in_window >= self.settings.max_events_per_sec;
+        let payload_limit_hit = self
+            .emitted_payload_bytes_in_window
+            .saturating_add(payload_len)
+            > self.settings.max_payload_bytes_per_sec;
+        if event_limit_hit || payload_limit_hit {
+            self.dropped_events_since_emit = self.dropped_events_since_emit.saturating_add(1);
+            self.dropped_payload_bytes_since_emit = self
+                .dropped_payload_bytes_since_emit
+                .saturating_add(u64::try_from(payload_len).unwrap_or(u64::MAX));
+            return false;
+        }
+
+        self.emitted_events_in_window = self.emitted_events_in_window.saturating_add(1);
+        self.emitted_payload_bytes_in_window = self
+            .emitted_payload_bytes_in_window
+            .saturating_add(payload_len);
+        true
+    }
+
+    fn encode_payload(&mut self, payload: serde_json::Value) -> Option<Vec<u8>> {
+        if !self.settings.enabled() {
+            return None;
+        }
+
+        let mut object = match payload {
+            serde_json::Value::Object(map) => map,
+            other => {
+                let mut map = serde_json::Map::new();
+                map.insert("value".to_string(), other);
+                map
+            }
+        };
+
+        object.insert(
+            "schema_version".to_string(),
+            serde_json::Value::from(bmux_ipc::PERF_RECORDING_SCHEMA_VERSION),
+        );
+        object.insert(
+            "level".to_string(),
+            serde_json::Value::String(self.settings.level_label().to_string()),
+        );
+        object.insert(
+            "runtime".to_string(),
+            serde_json::Value::String("server".to_string()),
+        );
+        object.insert(
+            "ts_epoch_ms".to_string(),
+            serde_json::Value::from(epoch_millis_now()),
+        );
+
+        if self.dropped_events_since_emit > 0 || self.dropped_payload_bytes_since_emit > 0 {
+            object.insert(
+                "dropped_events_since_emit".to_string(),
+                serde_json::Value::from(self.dropped_events_since_emit),
+            );
+            object.insert(
+                "dropped_payload_bytes_since_emit".to_string(),
+                serde_json::Value::from(self.dropped_payload_bytes_since_emit),
+            );
+            self.dropped_events_since_emit = 0;
+            self.dropped_payload_bytes_since_emit = 0;
+        }
+
+        let encoded = serde_json::to_vec(&serde_json::Value::Object(object)).ok()?;
+        if self.can_emit_payload(encoded.len()) {
+            Some(encoded)
+        } else {
+            None
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OfflineSessionKillTarget {
@@ -97,6 +254,7 @@ struct ServerState {
     rolling_recording_runtime: Arc<Mutex<Option<RecordingRuntime>>>,
     rolling_recording_auto_start: bool,
     rolling_recording_defaults: RollingRecordingSettings,
+    performance_settings: PerformanceCaptureSettings,
     rolling_recordings_dir: std::path::PathBuf,
     rolling_recording_segment_mb: usize,
     operation_lock: AsyncMutex<()>,
@@ -3551,7 +3709,8 @@ impl BmuxServer {
         } else {
             None
         }));
-        let (event_broadcast_tx, _) = tokio::sync::broadcast::channel::<Event>(256);
+        let (event_broadcast_tx, _) =
+            tokio::sync::broadcast::channel::<Event>(EVENT_PUSH_CHANNEL_CAPACITY);
         Self {
             endpoint,
             state: Arc::new(ServerState {
@@ -3574,6 +3733,7 @@ impl BmuxServer {
                 rolling_recording_auto_start: rolling_recording_auto_start
                     && rolling_runtime_available,
                 rolling_recording_defaults,
+                performance_settings: PerformanceCaptureSettings::from_config(&config),
                 rolling_recordings_dir,
                 rolling_recording_segment_mb: segment_mb,
                 operation_lock: AsyncMutex::new(()),
@@ -4213,10 +4373,15 @@ async fn handle_connection(
             let push_state = Arc::clone(&state);
             let push_client_id = client_id;
             event_push_task = Some(tokio::spawn(async move {
+                let push_perf_settings = push_state.performance_settings;
+                let mut push_perf_rate_limiter =
+                    PerformanceEventRateLimiter::new(push_perf_settings);
+                let push_perf_window = Duration::from_millis(push_perf_settings.window_ms);
                 let mut push_window_started_at = Instant::now();
                 let mut push_window_sent_events = 0_u64;
                 let mut push_window_sent_bytes = 0_u64;
                 let mut push_window_lagged_events = 0_u64;
+                let mut push_window_lagged_receives = 0_u64;
                 loop {
                     match event_rx.recv().await {
                         Ok(event) => {
@@ -4286,51 +4451,85 @@ async fn handle_connection(
                             if push_frame_tx.send(frame).is_err() {
                                 return; // writer dropped (client disconnected)
                             }
-                            push_window_sent_events = push_window_sent_events.saturating_add(1);
-                            push_window_sent_bytes = push_window_sent_bytes
-                                .saturating_add(u64::try_from(frame_len).unwrap_or(u64::MAX));
+                            if push_perf_settings.enabled() {
+                                push_window_sent_events = push_window_sent_events.saturating_add(1);
+                                push_window_sent_bytes = push_window_sent_bytes
+                                    .saturating_add(u64::try_from(frame_len).unwrap_or(u64::MAX));
 
-                            let elapsed = push_window_started_at.elapsed();
-                            if elapsed >= Duration::from_secs(1)
-                                && (push_window_sent_events > 0 || push_window_lagged_events > 0)
-                            {
-                                let elapsed_ms =
-                                    u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-                                if let Ok(payload) = serde_json::to_vec(&serde_json::json!({
-                                    "schema_version": 1,
-                                    "level": "basic",
-                                    "runtime": "server",
-                                    "ts_epoch_ms": epoch_millis_now(),
-                                    "window_elapsed_ms": elapsed_ms,
-                                    "events_pushed": push_window_sent_events,
-                                    "bytes_pushed": push_window_sent_bytes,
-                                    "lagged_events": push_window_lagged_events,
-                                })) {
-                                    record_to_all_runtimes(
-                                        &push_state.manual_recording_runtime,
-                                        &push_state.rolling_recording_runtime,
-                                        RecordingEventKind::Custom,
-                                        RecordingPayload::Custom {
-                                            source: "bmux.perf".to_string(),
-                                            name: "server.push.window".to_string(),
-                                            payload,
-                                        },
-                                        RecordMeta {
-                                            session_id: None,
-                                            pane_id: None,
-                                            client_id: Some(push_client_id.0),
-                                        },
-                                    );
+                                let elapsed = push_window_started_at.elapsed();
+                                if push_perf_settings
+                                    .level_at_least(PerformanceRecordingLevel::Basic)
+                                    && elapsed >= push_perf_window
+                                    && (push_window_sent_events > 0
+                                        || push_window_lagged_events > 0
+                                        || push_window_lagged_receives > 0)
+                                {
+                                    let elapsed_ms =
+                                        u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+                                    let mut payload = serde_json::json!({
+                                        "window_elapsed_ms": elapsed_ms,
+                                        "events_pushed": push_window_sent_events,
+                                        "bytes_pushed": push_window_sent_bytes,
+                                        "lagged_events": push_window_lagged_events,
+                                    });
+                                    if push_perf_settings
+                                        .level_at_least(PerformanceRecordingLevel::Detailed)
+                                        && let Some(object) = payload.as_object_mut()
+                                    {
+                                        object.insert(
+                                            "lagged_receives".to_string(),
+                                            serde_json::Value::from(push_window_lagged_receives),
+                                        );
+                                    }
+                                    if push_perf_settings
+                                        .level_at_least(PerformanceRecordingLevel::Trace)
+                                        && let Some(object) = payload.as_object_mut()
+                                    {
+                                        object.insert(
+                                            "frame_compression_enabled".to_string(),
+                                            serde_json::Value::from(push_frame_codec.is_some()),
+                                        );
+                                        object.insert(
+                                            "event_push_channel_capacity".to_string(),
+                                            serde_json::Value::from(EVENT_PUSH_CHANNEL_CAPACITY),
+                                        );
+                                    }
+
+                                    if let Some(encoded_payload) =
+                                        push_perf_rate_limiter.encode_payload(payload)
+                                    {
+                                        record_to_all_runtimes(
+                                            &push_state.manual_recording_runtime,
+                                            &push_state.rolling_recording_runtime,
+                                            RecordingEventKind::Custom,
+                                            RecordingPayload::Custom {
+                                                source: bmux_ipc::PERF_RECORDING_SOURCE.to_string(),
+                                                name: "server.push.window".to_string(),
+                                                payload: encoded_payload,
+                                            },
+                                            RecordMeta {
+                                                session_id: None,
+                                                pane_id: None,
+                                                client_id: Some(push_client_id.0),
+                                            },
+                                        );
+                                    }
+                                    push_window_started_at = Instant::now();
+                                    push_window_sent_events = 0;
+                                    push_window_sent_bytes = 0;
+                                    push_window_lagged_events = 0;
+                                    push_window_lagged_receives = 0;
                                 }
-                                push_window_started_at = Instant::now();
-                                push_window_sent_events = 0;
-                                push_window_sent_bytes = 0;
-                                push_window_lagged_events = 0;
                             }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                             warn!("event push task lagged by {n} events for client");
-                            push_window_lagged_events = push_window_lagged_events.saturating_add(n);
+                            if push_perf_settings.enabled() {
+                                push_window_lagged_events =
+                                    push_window_lagged_events.saturating_add(n);
+                                push_window_lagged_receives =
+                                    push_window_lagged_receives.saturating_add(1);
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             return; // server shutting down

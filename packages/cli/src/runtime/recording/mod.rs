@@ -31,6 +31,7 @@ pub(super) async fn run_recording_start(
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
     let name = normalize_recording_name(name)?;
+    let runtime_config = BmuxConfig::load().unwrap_or_default();
     cleanup_stale_pid_file().await?;
     let mut client = connect_if_running_with_context(
         ConnectionPolicyScope::Normal,
@@ -73,6 +74,14 @@ pub(super) async fn run_recording_start(
             .collect::<Vec<_>>()
             .join(",")
     );
+    if performance_capture_enabled(runtime_config.performance.recording_level)
+        && !event_kinds_include_custom(&summary.event_kinds)
+    {
+        eprintln!(
+            "bmux warning: performance recording level '{}' is enabled, but this recording does not include `custom` events; perf telemetry will be missing",
+            performance_recording_level_label(runtime_config.performance.recording_level)
+        );
+    }
     Ok(0)
 }
 
@@ -181,6 +190,25 @@ fn default_event_kinds_for_flags(
     kinds
 }
 
+const fn performance_recording_level_label(
+    level: bmux_config::PerformanceRecordingLevel,
+) -> &'static str {
+    match level {
+        bmux_config::PerformanceRecordingLevel::Off => "off",
+        bmux_config::PerformanceRecordingLevel::Basic => "basic",
+        bmux_config::PerformanceRecordingLevel::Detailed => "detailed",
+        bmux_config::PerformanceRecordingLevel::Trace => "trace",
+    }
+}
+
+const fn performance_capture_enabled(level: bmux_config::PerformanceRecordingLevel) -> bool {
+    !matches!(level, bmux_config::PerformanceRecordingLevel::Off)
+}
+
+fn event_kinds_include_custom(kinds: &[RecordingEventKind]) -> bool {
+    kinds.contains(&RecordingEventKind::Custom)
+}
+
 fn normalize_recording_name(name: Option<&str>) -> Result<Option<String>> {
     let Some(name) = name else {
         return Ok(None);
@@ -192,12 +220,15 @@ fn normalize_recording_name(name: Option<&str>) -> Result<Option<String>> {
     Ok(Some(trimmed.to_string()))
 }
 
+#[allow(clippy::struct_excessive_bools)] // Status report intentionally surfaces independent capture toggles.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 struct RecordingConfigStatus {
     capture_input: bool,
     capture_output: bool,
     capture_events: bool,
     default_event_kinds: Vec<RecordingEventKind>,
+    performance_recording_level: bmux_config::PerformanceRecordingLevel,
+    perf_custom_events_enabled_by_default: bool,
     segment_mb: usize,
     retention_days: u64,
 }
@@ -229,8 +260,8 @@ struct RecordingAutoExportSettings {
     output_dir: Option<PathBuf>,
 }
 
-const PERF_RECORDING_SOURCE: &str = "bmux.perf";
-const PERF_RECORDING_SCHEMA_VERSION: u8 = 1;
+const PERF_RECORDING_SOURCE: &str = bmux_ipc::PERF_RECORDING_SOURCE;
+const PERF_RECORDING_SCHEMA_VERSION: u8 = bmux_ipc::PERF_RECORDING_SCHEMA_VERSION;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum PerfCaptureLevel {
@@ -600,16 +631,16 @@ fn recording_config_and_root() -> (RecordingConfigStatus, PathBuf) {
     let capture_input = config.recording.capture_input;
     let capture_output = config.recording.capture_output;
     let capture_events = config.recording.capture_events;
+    let default_event_kinds =
+        default_event_kinds_for_flags(capture_input, capture_output, capture_events);
     (
         RecordingConfigStatus {
             capture_input,
             capture_output,
             capture_events,
-            default_event_kinds: default_event_kinds_for_flags(
-                capture_input,
-                capture_output,
-                capture_events,
-            ),
+            performance_recording_level: config.performance.recording_level,
+            perf_custom_events_enabled_by_default: event_kinds_include_custom(&default_event_kinds),
+            default_event_kinds,
             segment_mb: config.recording.segment_mb,
             retention_days: config.recording.retention_days,
         },
@@ -765,6 +796,18 @@ pub(super) async fn run_recording_status(
         }
     );
     println!(
+        "performance recording level: {}",
+        performance_recording_level_label(status.config.performance_recording_level)
+    );
+    println!(
+        "default perf custom-event capture: {}",
+        if status.config.perf_custom_events_enabled_by_default {
+            "enabled"
+        } else {
+            "disabled"
+        }
+    );
+    println!(
         "default event kinds: {}",
         status
             .config
@@ -778,6 +821,13 @@ pub(super) async fn run_recording_status(
         "segment size: {} MiB retention days: {}",
         status.config.segment_mb, status.config.retention_days
     );
+    if performance_capture_enabled(status.config.performance_recording_level)
+        && !status.config.perf_custom_events_enabled_by_default
+    {
+        eprintln!(
+            "bmux warning: perf recording is enabled but default recording event kinds exclude `custom`; enable `recording.capture_events` or add `--kind custom` when starting recordings"
+        );
+    }
 
     if let Some(active) = status.active.as_ref() {
         println!(
@@ -1075,8 +1125,29 @@ pub(super) fn run_recording_inspect(
 #[derive(Debug, Clone, serde::Serialize, Default)]
 struct PerfTimingSummary {
     count: u64,
+    min_ms: u64,
+    p50_ms: u64,
+    p95_ms: u64,
+    p99_ms: u64,
     avg_ms: u64,
     max_ms: u64,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct PerfOutlierSample {
+    event_name: String,
+    metric: String,
+    value_ms: u64,
+    p95_ms: u64,
+    ts_epoch_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone)]
+struct PerfTimingSample {
+    event_name: String,
+    metric: String,
+    value_ms: u64,
+    ts_epoch_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize, Default)]
@@ -1092,15 +1163,140 @@ struct PerfAnalysisReport {
     by_event_name: BTreeMap<String, u64>,
     by_level: BTreeMap<String, u64>,
     timings_ms: BTreeMap<String, PerfTimingSummary>,
+    outlier_samples: Vec<PerfOutlierSample>,
+    connect_to_first_frame_ms: Option<u64>,
+    connect_to_interactive_ms: Option<u64>,
+    reconnect_outage_max_ms: Option<u64>,
+    hints: Vec<String>,
 }
 
-fn analyze_perf_events(events: &[RecordingEventEnvelope]) -> PerfAnalysisReport {
+fn percentile_nearest_rank(sorted_values: &[u64], percentile: u8) -> u64 {
+    if sorted_values.is_empty() {
+        return 0;
+    }
+    let clamped = usize::from(percentile.min(100));
+    let len = sorted_values.len();
+    let rank = (clamped.saturating_mul(len).saturating_add(99)) / 100;
+    let index = rank.saturating_sub(1).min(len.saturating_sub(1));
+    sorted_values[index]
+}
+
+fn timing_summary_from_values(values: &[u64]) -> PerfTimingSummary {
+    if values.is_empty() {
+        return PerfTimingSummary::default();
+    }
+
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let count = u64::try_from(sorted.len()).unwrap_or(u64::MAX);
+    let sum = sorted
+        .iter()
+        .fold(0_u128, |acc, value| acc.saturating_add(u128::from(*value)));
+    let avg_ms = u64::try_from(sum / u128::from(count.max(1))).unwrap_or(u64::MAX);
+
+    PerfTimingSummary {
+        count,
+        min_ms: sorted[0],
+        p50_ms: percentile_nearest_rank(&sorted, 50),
+        p95_ms: percentile_nearest_rank(&sorted, 95),
+        p99_ms: percentile_nearest_rank(&sorted, 99),
+        avg_ms,
+        max_ms: *sorted.last().unwrap_or(&0),
+    }
+}
+
+fn derive_perf_hints(
+    report: &PerfAnalysisReport,
+    recording_captures_custom: Option<bool>,
+) -> Vec<String> {
+    let mut hints = Vec::new();
+
+    if report.perf_events == 0 {
+        if matches!(recording_captures_custom, Some(false)) {
+            hints.push(
+                "recording did not capture `custom` events; perf telemetry requires `custom` event kind"
+                    .to_string(),
+            );
+        } else {
+            hints.push(
+                "no bmux.perf events found; set `performance.recording_level` and reproduce with recording enabled"
+                    .to_string(),
+            );
+        }
+        return hints;
+    }
+
+    if report.malformed_payloads > 0 {
+        hints.push(format!(
+            "{} perf payloads could not be parsed; check plugin/runtime payload compatibility",
+            report.malformed_payloads
+        ));
+    }
+
+    if report.dropped_events_reported > 0 || report.dropped_payload_bytes_reported > 0 {
+        hints.push(format!(
+            "perf telemetry was rate-limited (dropped events={}, dropped payload bytes={}); consider raising `performance.max_events_per_sec` or `performance.max_payload_bytes_per_sec`",
+            report.dropped_events_reported, report.dropped_payload_bytes_reported
+        ));
+    }
+
+    if let Some(connect_to_interactive_ms) = report.connect_to_interactive_ms
+        && connect_to_interactive_ms > 1500
+    {
+        hints.push(format!(
+            "connect-to-interactive took {connect_to_interactive_ms}ms; inspect iroh connect stages and attach hydration timing"
+        ));
+    }
+
+    if let Some(max_outage_ms) = report.reconnect_outage_max_ms
+        && max_outage_ms > 1000
+    {
+        hints.push(format!(
+            "max reconnect outage was {max_outage_ms}ms; investigate network stability and relay path quality"
+        ));
+    }
+
+    if let Some(render_max) = report.timings_ms.get("render_ms_max")
+        && render_max.p95_ms > 16
+    {
+        hints.push(format!(
+            "render p95 is {}ms (>16ms frame budget); local rendering may be a bottleneck",
+            render_max.p95_ms
+        ));
+    }
+
+    if let Some(drain_ipc_max) = report.timings_ms.get("drain_ipc_ms_max")
+        && drain_ipc_max.p95_ms > 20
+    {
+        hints.push(format!(
+            "drain IPC p95 is {}ms; server/client round-trip latency is likely impacting smoothness",
+            drain_ipc_max.p95_ms
+        ));
+    }
+
+    if hints.is_empty() {
+        hints.push("no obvious bottleneck stood out from captured perf telemetry".to_string());
+    }
+
+    hints
+}
+
+#[allow(clippy::too_many_lines)] // Perf analysis intentionally combines parsing, aggregation, and correlation in one pass.
+fn analyze_perf_events(
+    events: &[RecordingEventEnvelope],
+    recording_captures_custom: Option<bool>,
+) -> PerfAnalysisReport {
     let mut report = PerfAnalysisReport {
         recording_events: events.len(),
         ..PerfAnalysisReport::default()
     };
 
-    let mut timing_acc: HashMap<String, (u64, u64, u64)> = HashMap::new();
+    let mut timing_values: HashMap<String, Vec<u64>> = HashMap::new();
+    let mut timing_samples = Vec::new();
+    let mut first_connect_ts_epoch_ms = None;
+    let mut first_attach_first_frame_ts_epoch_ms = None;
+    let mut first_attach_interactive_ts_epoch_ms = None;
+    let mut reconnect_outage_max_ms = None;
 
     for event in events {
         let RecordingPayload::Custom {
@@ -1149,6 +1345,26 @@ fn analyze_perf_events(events: &[RecordingEventEnvelope]) -> PerfAnalysisReport 
                     .map_or(ts_epoch_ms, |last| last.max(ts_epoch_ms)),
             );
         }
+        let ts_epoch_ms = object
+            .get("ts_epoch_ms")
+            .and_then(serde_json::Value::as_u64);
+
+        if name == "iroh.connect.summary" && first_connect_ts_epoch_ms.is_none() {
+            first_connect_ts_epoch_ms = ts_epoch_ms;
+        }
+        if name == "attach.first_frame" && first_attach_first_frame_ts_epoch_ms.is_none() {
+            first_attach_first_frame_ts_epoch_ms = ts_epoch_ms;
+        }
+        if name == "attach.interactive.ready" && first_attach_interactive_ts_epoch_ms.is_none() {
+            first_attach_interactive_ts_epoch_ms = ts_epoch_ms;
+        }
+        if name == "iroh.reconnect.outage"
+            && let Some(outage_ms) = object.get("outage_ms").and_then(serde_json::Value::as_u64)
+        {
+            reconnect_outage_max_ms = Some(
+                reconnect_outage_max_ms.map_or(outage_ms, |current: u64| current.max(outage_ms)),
+            );
+        }
 
         report.dropped_events_reported = report.dropped_events_reported.saturating_add(
             object
@@ -1171,10 +1387,13 @@ fn analyze_perf_events(events: &[RecordingEventEnvelope]) -> PerfAnalysisReport 
             let Some(ms) = value.as_u64() else {
                 continue;
             };
-            let (count, sum, max) = timing_acc.entry(field.clone()).or_insert((0, 0, 0));
-            *count = count.saturating_add(1);
-            *sum = sum.saturating_add(ms);
-            *max = (*max).max(ms);
+            timing_values.entry(field.clone()).or_default().push(ms);
+            timing_samples.push(PerfTimingSample {
+                event_name: name.clone(),
+                metric: field.clone(),
+                value_ms: ms,
+                ts_epoch_ms,
+            });
         }
     }
 
@@ -1182,20 +1401,60 @@ fn analyze_perf_events(events: &[RecordingEventEnvelope]) -> PerfAnalysisReport 
         report.span_ms = Some(last.saturating_sub(first));
     }
 
-    report.timings_ms = timing_acc
+    report.timings_ms = timing_values
         .into_iter()
-        .map(|(field, (count, sum, max))| {
-            let avg_ms = if count == 0 { 0 } else { sum / count };
-            (
-                field,
-                PerfTimingSummary {
-                    count,
-                    avg_ms,
-                    max_ms: max,
-                },
-            )
+        .map(|(field, values)| (field, timing_summary_from_values(&values)))
+        .collect();
+
+    let p95_by_metric = report
+        .timings_ms
+        .iter()
+        .map(|(metric, summary)| (metric.clone(), summary.p95_ms))
+        .collect::<HashMap<_, _>>();
+
+    report.outlier_samples = timing_samples
+        .into_iter()
+        .filter_map(|sample| {
+            let p95_ms = p95_by_metric.get(&sample.metric).copied()?;
+            if p95_ms == 0 || sample.value_ms < p95_ms {
+                return None;
+            }
+            Some(PerfOutlierSample {
+                event_name: sample.event_name,
+                metric: sample.metric,
+                value_ms: sample.value_ms,
+                p95_ms,
+                ts_epoch_ms: sample.ts_epoch_ms,
+            })
         })
         .collect();
+    report
+        .outlier_samples
+        .sort_by(|left, right| right.value_ms.cmp(&left.value_ms));
+    report.outlier_samples.truncate(20);
+
+    if let (Some(connect_ts_epoch_ms), Some(first_frame_ts_epoch_ms)) = (
+        first_connect_ts_epoch_ms,
+        first_attach_first_frame_ts_epoch_ms,
+    ) && first_frame_ts_epoch_ms >= connect_ts_epoch_ms
+    {
+        report.connect_to_first_frame_ms = Some(first_frame_ts_epoch_ms - connect_ts_epoch_ms);
+    }
+    if let (Some(connect_ts_epoch_ms), Some(interactive_ts_epoch_ms)) = (
+        first_connect_ts_epoch_ms,
+        first_attach_interactive_ts_epoch_ms,
+    ) && interactive_ts_epoch_ms >= connect_ts_epoch_ms
+    {
+        report.connect_to_interactive_ms = Some(interactive_ts_epoch_ms - connect_ts_epoch_ms);
+    }
+    report.reconnect_outage_max_ms = reconnect_outage_max_ms.or_else(|| {
+        report
+            .timings_ms
+            .get("outage_ms")
+            .map(|timing| timing.max_ms)
+    });
+
+    report.hints = derive_perf_hints(&report, recording_captures_custom);
 
     report
 }
@@ -1248,26 +1507,84 @@ fn print_perf_analysis_text(report: &PerfAnalysisReport) {
         let mut timings = report.timings_ms.iter().collect::<Vec<_>>();
         timings.sort_by(|(left_name, left), (right_name, right)| {
             right
-                .avg_ms
-                .cmp(&left.avg_ms)
+                .p95_ms
+                .cmp(&left.p95_ms)
                 .then_with(|| left_name.cmp(right_name))
         });
         for (name, timing) in timings.into_iter().take(16) {
             println!(
-                "  {name}: count={} avg={} max={}",
-                timing.count, timing.avg_ms, timing.max_ms
+                "  {name}: count={} min={} p50={} p95={} p99={} avg={} max={}",
+                timing.count,
+                timing.min_ms,
+                timing.p50_ms,
+                timing.p95_ms,
+                timing.p99_ms,
+                timing.avg_ms,
+                timing.max_ms
             );
+        }
+    }
+
+    if let Some(connect_to_first_frame_ms) = report.connect_to_first_frame_ms {
+        println!("connect to first frame: {connect_to_first_frame_ms}ms");
+    }
+    if let Some(connect_to_interactive_ms) = report.connect_to_interactive_ms {
+        println!("connect to interactive: {connect_to_interactive_ms}ms");
+    }
+    if let Some(reconnect_outage_max_ms) = report.reconnect_outage_max_ms {
+        println!("max reconnect outage: {reconnect_outage_max_ms}ms");
+    }
+
+    if !report.outlier_samples.is_empty() {
+        println!("outliers:");
+        for outlier in report.outlier_samples.iter().take(10) {
+            if let Some(ts_epoch_ms) = outlier.ts_epoch_ms {
+                println!(
+                    "  {}: value={}ms p95={}ms ts={} event={}",
+                    outlier.metric,
+                    outlier.value_ms,
+                    outlier.p95_ms,
+                    ts_epoch_ms,
+                    outlier.event_name
+                );
+            } else {
+                println!(
+                    "  {}: value={}ms p95={}ms event={}",
+                    outlier.metric, outlier.value_ms, outlier.p95_ms, outlier.event_name
+                );
+            }
+        }
+    }
+
+    if !report.hints.is_empty() {
+        println!("hints:");
+        for hint in &report.hints {
+            println!("  - {hint}");
         }
     }
 }
 
+fn resolve_recording_summary(recording_id: &str) -> Result<RecordingSummary> {
+    let recordings = list_recordings_from_disk()?;
+    let id = resolve_recording_id_prefix(recording_id, &recordings)?;
+    recordings
+        .into_iter()
+        .find(|recording| recording.id == id)
+        .ok_or_else(|| anyhow::anyhow!("recording '{recording_id}' not found after resolving id"))
+}
+
 pub(super) fn run_recording_analyze(recording_id: &str, perf: bool, as_json: bool) -> Result<u8> {
-    let events = load_recording_events(recording_id)?;
     if !perf {
         anyhow::bail!("recording analyze currently supports only --perf")
     }
 
-    let report = analyze_perf_events(&events);
+    let recording_summary = resolve_recording_summary(recording_id)?;
+    let events = load_recording_events(recording_id)?;
+
+    let report = analyze_perf_events(
+        &events,
+        Some(event_kinds_include_custom(&recording_summary.event_kinds)),
+    );
     if as_json {
         println!(
             "{}",
@@ -5880,5 +6197,159 @@ mod tests {
         assert!(confirm_delete_all_recordings(true).expect("--yes should bypass prompt"));
         let error = confirm_delete_all_recordings(false).expect_err("non-interactive should fail");
         assert!(error.to_string().contains("requires --yes"));
+    }
+
+    fn perf_custom_event(
+        seq: u64,
+        name: &str,
+        ts_epoch_ms: u64,
+        payload: serde_json::Value,
+    ) -> RecordingEventEnvelope {
+        let mut payload_object = match payload {
+            serde_json::Value::Object(map) => map,
+            other => {
+                let mut map = serde_json::Map::new();
+                map.insert("value".to_string(), other);
+                map
+            }
+        };
+        payload_object.insert(
+            "ts_epoch_ms".to_string(),
+            serde_json::Value::from(ts_epoch_ms),
+        );
+        payload_object.insert(
+            "level".to_string(),
+            serde_json::Value::String("detailed".to_string()),
+        );
+        RecordingEventEnvelope {
+            seq,
+            mono_ns: seq.saturating_mul(1_000_000),
+            wall_epoch_ms: ts_epoch_ms,
+            session_id: None,
+            pane_id: None,
+            client_id: None,
+            kind: RecordingEventKind::Custom,
+            payload: RecordingPayload::Custom {
+                source: PERF_RECORDING_SOURCE.to_string(),
+                name: name.to_string(),
+                payload: serde_json::to_vec(&serde_json::Value::Object(payload_object))
+                    .expect("perf payload should encode"),
+            },
+        }
+    }
+
+    #[test]
+    fn perf_event_emitter_surfaces_drop_counters_on_next_payload() {
+        let settings = PerfCaptureSettings {
+            level: PerfCaptureLevel::Basic,
+            window_ms: 1_000,
+            max_events_per_sec: 1,
+            max_payload_bytes_per_sec: 4_096,
+        };
+        let mut emitter = PerfEventEmitter::new(settings);
+
+        let payload_one = emitter.normalized_payload(serde_json::json!({"sample": 1}));
+        let encoded_one = serde_json::to_vec(&payload_one).expect("payload should encode");
+        assert!(emitter.can_emit_payload(encoded_one.len()));
+
+        let payload_two = emitter.normalized_payload(serde_json::json!({"sample": 2}));
+        let encoded_two = serde_json::to_vec(&payload_two).expect("payload should encode");
+        assert!(!emitter.can_emit_payload(encoded_two.len()));
+
+        let payload_three = emitter.normalized_payload(serde_json::json!({"sample": 3}));
+        let object = payload_three
+            .as_object()
+            .expect("normalized payload should be object");
+        assert_eq!(
+            object
+                .get("dropped_events_since_emit")
+                .and_then(serde_json::Value::as_u64),
+            Some(1)
+        );
+        assert!(
+            object
+                .get("dropped_payload_bytes_since_emit")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|bytes| bytes > 0),
+            "drop payload bytes should be included after a rate-limited emit"
+        );
+    }
+
+    #[test]
+    fn analyze_perf_events_computes_percentiles_correlations_and_hints() {
+        let events = vec![
+            perf_custom_event(
+                1,
+                "iroh.connect.summary",
+                1_000,
+                serde_json::json!({"connect_ms": 120_u64, "total_ms": 300_u64}),
+            ),
+            perf_custom_event(
+                2,
+                "attach.first_frame",
+                1_300,
+                serde_json::json!({"time_to_first_frame_ms": 300_u64}),
+            ),
+            perf_custom_event(
+                3,
+                "attach.interactive.ready",
+                1_600,
+                serde_json::json!({"time_to_interactive_ms": 600_u64}),
+            ),
+            perf_custom_event(
+                4,
+                "attach.window",
+                1_700,
+                serde_json::json!({
+                    "render_ms_max": 24_u64,
+                    "drain_ipc_ms_max": 28_u64,
+                    "render_ms_avg": 12_u64,
+                    "drain_ipc_ms_avg": 8_u64,
+                    "dropped_events_since_emit": 2_u64,
+                    "dropped_payload_bytes_since_emit": 64_u64,
+                }),
+            ),
+            perf_custom_event(
+                5,
+                "iroh.reconnect.outage",
+                2_100,
+                serde_json::json!({"outage_ms": 1_800_u64}),
+            ),
+        ];
+
+        let report = analyze_perf_events(&events, Some(true));
+        assert_eq!(report.perf_events, 5);
+        assert_eq!(report.connect_to_first_frame_ms, Some(300));
+        assert_eq!(report.connect_to_interactive_ms, Some(600));
+        assert_eq!(report.reconnect_outage_max_ms, Some(1_800));
+        assert_eq!(report.dropped_events_reported, 2);
+        assert_eq!(report.dropped_payload_bytes_reported, 64);
+        assert_eq!(
+            report
+                .timings_ms
+                .get("connect_ms")
+                .map(|timing| timing.p95_ms),
+            Some(120)
+        );
+        assert!(
+            report
+                .hints
+                .iter()
+                .any(|hint| hint.contains("reconnect outage")),
+            "expected reconnect outage hint in analysis output"
+        );
+    }
+
+    #[test]
+    fn analyze_perf_events_hints_when_custom_events_were_not_captured() {
+        let report = analyze_perf_events(&[], Some(false));
+        assert_eq!(report.perf_events, 0);
+        assert!(
+            report
+                .hints
+                .iter()
+                .any(|hint| hint.contains("did not capture `custom` events")),
+            "expected missing-custom-events guidance"
+        );
     }
 }

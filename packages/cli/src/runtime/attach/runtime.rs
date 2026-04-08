@@ -210,6 +210,9 @@ fn apply_attach_output_bytes(
 struct AttachPerfWindow {
     started_at: Instant,
     drain_rounds: u64,
+    drain_rounds_with_data: u64,
+    drain_sync_active_rounds: u64,
+    drain_budget_hits: u64,
     drain_ipc_calls: u64,
     drain_bytes: u64,
     drain_ipc_ms_sum: u64,
@@ -224,6 +227,9 @@ impl AttachPerfWindow {
         Self {
             started_at: Instant::now(),
             drain_rounds: 0,
+            drain_rounds_with_data: 0,
+            drain_sync_active_rounds: 0,
+            drain_budget_hits: 0,
             drain_ipc_calls: 0,
             drain_bytes: 0,
             drain_ipc_ms_sum: 0,
@@ -236,6 +242,19 @@ impl AttachPerfWindow {
 
     const fn record_drain_round(&mut self) {
         self.drain_rounds = self.drain_rounds.saturating_add(1);
+    }
+
+    const fn record_drain_result(&mut self, had_data: bool, sync_active: bool) {
+        if had_data {
+            self.drain_rounds_with_data = self.drain_rounds_with_data.saturating_add(1);
+        }
+        if sync_active {
+            self.drain_sync_active_rounds = self.drain_sync_active_rounds.saturating_add(1);
+        }
+    }
+
+    const fn record_drain_budget_hit(&mut self) {
+        self.drain_budget_hits = self.drain_budget_hits.saturating_add(1);
     }
 
     fn record_drain_ipc(&mut self, elapsed_ms: u64, bytes: usize) {
@@ -279,6 +298,7 @@ async fn maybe_emit_attach_perf_window(
     }
 
     let detailed = perf_emitter.level_at_least(recording::PerfCaptureLevel::Detailed);
+    let trace = perf_emitter.level_at_least(recording::PerfCaptureLevel::Trace);
     let mut payload = serde_json::json!({
         "window_elapsed_ms": duration_millis_u64(elapsed),
         "drain_rounds": window.drain_rounds,
@@ -303,12 +323,113 @@ async fn maybe_emit_attach_perf_window(
             "render_ms_max".to_string(),
             serde_json::Value::from(window.render_ms_max),
         );
+        if window.drain_ipc_calls > 0 {
+            object.insert(
+                "drain_ipc_ms_avg".to_string(),
+                serde_json::Value::from(window.drain_ipc_ms_sum / window.drain_ipc_calls),
+            );
+        }
+        if window.render_frames > 0 {
+            object.insert(
+                "render_ms_avg".to_string(),
+                serde_json::Value::from(window.render_ms_sum / window.render_frames),
+            );
+        }
+    }
+    if trace && let Some(object) = payload.as_object_mut() {
+        object.insert(
+            "drain_rounds_with_data".to_string(),
+            serde_json::Value::from(window.drain_rounds_with_data),
+        );
+        object.insert(
+            "drain_sync_active_rounds".to_string(),
+            serde_json::Value::from(window.drain_sync_active_rounds),
+        );
+        object.insert(
+            "drain_budget_hits".to_string(),
+            serde_json::Value::from(window.drain_budget_hits),
+        );
     }
 
     perf_emitter
         .emit_with_streaming_client(client, Some(session_id), None, "attach.window", payload)
         .await?;
     window.reset();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)] // keep frame/attach telemetry emit context explicit
+async fn maybe_emit_attach_frame_perf(
+    perf_emitter: &mut recording::PerfEventEmitter,
+    client: &mut StreamingBmuxClient,
+    session_id: Uuid,
+    attach_started_at: Instant,
+    rendered_frame_count: u64,
+    frame_render_ms: u64,
+    scene_hydrated: bool,
+    first_frame_emitted: &mut bool,
+    interactive_ready_emitted: &mut bool,
+) -> Result<()> {
+    if !perf_emitter.enabled() {
+        return Ok(());
+    }
+
+    let since_attach_start_ms = duration_millis_u64(attach_started_at.elapsed());
+    if !*first_frame_emitted && perf_emitter.level_at_least(recording::PerfCaptureLevel::Basic) {
+        perf_emitter
+            .emit_with_streaming_client(
+                client,
+                Some(session_id),
+                None,
+                "attach.first_frame",
+                serde_json::json!({
+                    "time_to_first_frame_ms": since_attach_start_ms,
+                    "frame_render_ms": frame_render_ms,
+                    "frame_index": rendered_frame_count,
+                    "scene_hydrated": scene_hydrated,
+                }),
+            )
+            .await?;
+        *first_frame_emitted = true;
+    }
+
+    if scene_hydrated
+        && !*interactive_ready_emitted
+        && perf_emitter.level_at_least(recording::PerfCaptureLevel::Basic)
+    {
+        perf_emitter
+            .emit_with_streaming_client(
+                client,
+                Some(session_id),
+                None,
+                "attach.interactive.ready",
+                serde_json::json!({
+                    "time_to_interactive_ms": since_attach_start_ms,
+                    "frame_render_ms": frame_render_ms,
+                    "frame_index": rendered_frame_count,
+                }),
+            )
+            .await?;
+        *interactive_ready_emitted = true;
+    }
+
+    if perf_emitter.level_at_least(recording::PerfCaptureLevel::Trace) {
+        perf_emitter
+            .emit_with_streaming_client(
+                client,
+                Some(session_id),
+                None,
+                "attach.frame.trace",
+                serde_json::json!({
+                    "frame_render_ms": frame_render_ms,
+                    "frame_index": rendered_frame_count,
+                    "since_attach_start_ms": since_attach_start_ms,
+                    "scene_hydrated": scene_hydrated,
+                }),
+            )
+            .await?;
+    }
+
     Ok(())
 }
 
@@ -347,6 +468,10 @@ pub async fn run_session_attach_with_client(
         recording::PerfCaptureSettings::from_config(&attach_config),
     );
     let mut perf_window = AttachPerfWindow::new();
+    let attach_started_at = Instant::now();
+    let mut rendered_frame_count = 0_u64;
+    let mut first_frame_emitted = false;
+    let mut interactive_ready_emitted = false;
     let global_theme = match attach_config.load_theme() {
         Ok(theme) => theme,
         Err(error) => {
@@ -828,7 +953,21 @@ pub async fn run_session_attach_with_client(
                 &mut display_capture,
             )
             .await?;
-            perf_window.record_render_frame(duration_millis_u64(render_started_at.elapsed()));
+            let render_ms = duration_millis_u64(render_started_at.elapsed());
+            perf_window.record_render_frame(render_ms);
+            rendered_frame_count = rendered_frame_count.saturating_add(1);
+            maybe_emit_attach_frame_perf(
+                &mut perf_emitter,
+                &mut client,
+                view_state.attached_id,
+                attach_started_at,
+                rendered_frame_count,
+                render_ms,
+                true,
+                &mut first_frame_emitted,
+                &mut interactive_ready_emitted,
+            )
+            .await?;
             maybe_emit_attach_perf_window(
                 &mut perf_emitter,
                 &mut client,
@@ -925,6 +1064,7 @@ pub async fn run_session_attach_with_client(
                     }
                     any_sync_active |= chunk.sync_update_active;
                 }
+                perf_window.record_drain_result(had_data, any_sync_active);
                 last_round_had_data = had_data;
 
                 if !had_data {
@@ -938,6 +1078,7 @@ pub async fn run_session_attach_with_client(
                     // Each IPC round-trip gives the PTY reader thread CPU
                     // time to push pending data, so no explicit yield needed.
                     if drain_start.elapsed() >= ATTACH_OUTPUT_DRAIN_TIME_BUDGET {
+                        perf_window.record_drain_budget_hit();
                         break; // Safety valve.
                     }
                 }
@@ -1018,7 +1159,21 @@ pub async fn run_session_attach_with_client(
             &mut display_capture,
         )
         .await?;
-        perf_window.record_render_frame(duration_millis_u64(render_started_at.elapsed()));
+        let render_ms = duration_millis_u64(render_started_at.elapsed());
+        perf_window.record_render_frame(render_ms);
+        rendered_frame_count = rendered_frame_count.saturating_add(1);
+        maybe_emit_attach_frame_perf(
+            &mut perf_emitter,
+            &mut client,
+            view_state.attached_id,
+            attach_started_at,
+            rendered_frame_count,
+            render_ms,
+            false,
+            &mut first_frame_emitted,
+            &mut interactive_ready_emitted,
+        )
+        .await?;
         maybe_emit_attach_perf_window(
             &mut perf_emitter,
             &mut client,
@@ -1026,6 +1181,33 @@ pub async fn run_session_attach_with_client(
             &mut perf_window,
         )
         .await?;
+    }
+
+    if perf_emitter.level_at_least(recording::PerfCaptureLevel::Basic) {
+        let mut payload = serde_json::json!({
+            "attach_runtime_ms": duration_millis_u64(attach_started_at.elapsed()),
+            "exit_reason": attach_exit_reason_label(exit_reason),
+            "rendered_frames": rendered_frame_count,
+            "first_frame_recorded": first_frame_emitted,
+            "interactive_ready_recorded": interactive_ready_emitted,
+        });
+        if perf_emitter.level_at_least(recording::PerfCaptureLevel::Trace)
+            && let Some(object) = payload.as_object_mut()
+        {
+            object.insert(
+                "pending_output_on_exit".to_string(),
+                serde_json::Value::from(pane_output_pending),
+            );
+        }
+        perf_emitter
+            .emit_with_streaming_client(
+                &mut client,
+                Some(view_state.attached_id),
+                None,
+                "attach.exit",
+                payload,
+            )
+            .await?;
     }
 
     drop(raw_mode_guard);
@@ -2350,6 +2532,14 @@ pub const fn attach_exit_message(reason: AttachExitReason) -> Option<&'static st
     match reason {
         AttachExitReason::Detached | AttachExitReason::Quit => None,
         AttachExitReason::StreamClosed => Some("attach ended unexpectedly: server stream closed"),
+    }
+}
+
+pub const fn attach_exit_reason_label(reason: AttachExitReason) -> &'static str {
+    match reason {
+        AttachExitReason::Detached => "detached",
+        AttachExitReason::StreamClosed => "stream_closed",
+        AttachExitReason::Quit => "quit",
     }
 }
 

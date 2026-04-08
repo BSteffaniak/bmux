@@ -833,6 +833,12 @@ pub struct RecordingSummary {
 /// Current recording format version.
 pub const RECORDING_FORMAT_VERSION: u32 = 6;
 
+/// Canonical source identifier for bmux performance custom recording events.
+pub const PERF_RECORDING_SOURCE: &str = "bmux.perf";
+
+/// Current schema version for bmux performance custom recording payloads.
+pub const PERF_RECORDING_SCHEMA_VERSION: u8 = 1;
+
 const fn recording_format_version_default() -> u32 {
     1 // pre-versioning recordings are treated as version 1
 }

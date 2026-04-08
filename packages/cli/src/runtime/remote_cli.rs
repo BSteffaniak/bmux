@@ -95,6 +95,19 @@ struct IrohConnectPerfSummary {
     compression_enabled: bool,
 }
 
+#[allow(clippy::cast_possible_truncation)]
+fn duration_millis_u64(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+const fn attach_exit_reason_label(reason: AttachExitReason) -> &'static str {
+    match reason {
+        AttachExitReason::Detached => "detached",
+        AttachExitReason::StreamClosed => "stream_closed",
+        AttachExitReason::Quit => "quit",
+    }
+}
+
 async fn emit_iroh_connect_perf_event(
     perf_emitter: &mut recording::PerfEventEmitter,
     client: &mut BmuxClient,
@@ -106,27 +119,149 @@ async fn emit_iroh_connect_perf_event(
         return Ok(());
     }
 
+    let mut payload = serde_json::json!({
+        "target": target.label,
+        "reconnect_attempt": reconnect_attempt,
+        "connect_ms": summary.connect_ms,
+        "total_ms": summary.total_ms,
+    });
+    if perf_emitter.level_at_least(recording::PerfCaptureLevel::Detailed)
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert(
+            "bind_ms".to_string(),
+            serde_json::Value::from(summary.bind_ms),
+        );
+        object.insert(
+            "online_ms".to_string(),
+            serde_json::Value::from(summary.online_ms),
+        );
+        object.insert(
+            "open_bi_ms".to_string(),
+            serde_json::Value::from(summary.open_bi_ms),
+        );
+        object.insert(
+            "ipc_handshake_ms".to_string(),
+            serde_json::Value::from(summary.ipc_handshake_ms),
+        );
+        if let Some(ssh_auth_ms) = summary.ssh_auth_ms {
+            object.insert(
+                "ssh_auth_ms".to_string(),
+                serde_json::Value::from(ssh_auth_ms),
+            );
+        }
+        object.insert(
+            "relay_enabled".to_string(),
+            serde_json::Value::from(summary.relay_enabled),
+        );
+        object.insert(
+            "ssh_auth_enabled".to_string(),
+            serde_json::Value::from(summary.ssh_auth_enabled),
+        );
+        object.insert(
+            "compression_enabled".to_string(),
+            serde_json::Value::from(summary.compression_enabled),
+        );
+    }
+    if perf_emitter.level_at_least(recording::PerfCaptureLevel::Trace)
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert(
+            "connect_timeout_ms".to_string(),
+            serde_json::Value::from(target.connect_timeout_ms),
+        );
+        object.insert(
+            "endpoint_id".to_string(),
+            serde_json::Value::String(target.endpoint_id.clone()),
+        );
+    }
+
     perf_emitter
-        .emit_with_client(
-            client,
-            None,
-            None,
-            "iroh.connect.summary",
-            serde_json::json!({
-                "target": target.label,
-                "reconnect_attempt": reconnect_attempt,
-                "bind_ms": summary.bind_ms,
-                "online_ms": summary.online_ms,
-                "connect_ms": summary.connect_ms,
-                "ssh_auth_ms": summary.ssh_auth_ms,
-                "open_bi_ms": summary.open_bi_ms,
-                "ipc_handshake_ms": summary.ipc_handshake_ms,
-                "total_ms": summary.total_ms,
-                "relay_enabled": summary.relay_enabled,
-                "ssh_auth_enabled": summary.ssh_auth_enabled,
-                "compression_enabled": summary.compression_enabled,
-            }),
-        )
+        .emit_with_client(client, None, None, "iroh.connect.summary", payload)
+        .await
+}
+
+async fn emit_iroh_attach_attempt_perf_event(
+    perf_emitter: &mut recording::PerfEventEmitter,
+    client: &mut BmuxClient,
+    target: &IrohTarget,
+    attach_attempt: u64,
+    reconnect_attempt: u64,
+    attach_runtime_ms: u64,
+    exit_reason: AttachExitReason,
+) -> Result<()> {
+    if !perf_emitter.level_at_least(recording::PerfCaptureLevel::Basic) {
+        return Ok(());
+    }
+
+    let mut payload = serde_json::json!({
+        "target": target.label,
+        "attach_attempt": attach_attempt,
+        "reconnect_attempt": reconnect_attempt,
+        "attach_runtime_ms": attach_runtime_ms,
+        "exit_reason": attach_exit_reason_label(exit_reason),
+        "stream_closed": matches!(exit_reason, AttachExitReason::StreamClosed),
+    });
+    if perf_emitter.level_at_least(recording::PerfCaptureLevel::Trace)
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert(
+            "target_requires_ssh_auth".to_string(),
+            serde_json::Value::from(target.require_ssh_auth),
+        );
+        object.insert(
+            "target_uses_relay".to_string(),
+            serde_json::Value::from(target.relay_url.is_some()),
+        );
+    }
+
+    perf_emitter
+        .emit_with_client(client, None, None, "iroh.attach.attempt", payload)
+        .await
+}
+
+async fn emit_iroh_reconnect_outage_perf_event(
+    perf_emitter: &mut recording::PerfEventEmitter,
+    client: &mut BmuxClient,
+    target: &IrohTarget,
+    reconnect_attempt: u64,
+    reconnect_backoff_ms: u64,
+    outage_ms: u64,
+    connect_summary: &IrohConnectPerfSummary,
+) -> Result<()> {
+    if !perf_emitter.level_at_least(recording::PerfCaptureLevel::Basic) {
+        return Ok(());
+    }
+
+    let mut payload = serde_json::json!({
+        "target": target.label,
+        "reconnect_attempt": reconnect_attempt,
+        "reconnect_backoff_ms": reconnect_backoff_ms,
+        "outage_ms": outage_ms,
+        "reconnect_connect_total_ms": connect_summary.total_ms,
+        "reconnect_connect_ms": connect_summary.connect_ms,
+    });
+    if perf_emitter.level_at_least(recording::PerfCaptureLevel::Detailed)
+        && let Some(object) = payload.as_object_mut()
+    {
+        object.insert(
+            "reconnect_open_bi_ms".to_string(),
+            serde_json::Value::from(connect_summary.open_bi_ms),
+        );
+        object.insert(
+            "reconnect_ipc_handshake_ms".to_string(),
+            serde_json::Value::from(connect_summary.ipc_handshake_ms),
+        );
+        if let Some(auth_ms) = connect_summary.ssh_auth_ms {
+            object.insert(
+                "reconnect_ssh_auth_ms".to_string(),
+                serde_json::Value::from(auth_ms),
+            );
+        }
+    }
+
+    perf_emitter
+        .emit_with_client(client, None, None, "iroh.reconnect.outage", payload)
         .await
 }
 
@@ -2082,24 +2217,29 @@ async fn run_iroh_attach_with_reconnect(
     reconnect_forever: bool,
     mut perf_emitter: recording::PerfEventEmitter,
 ) -> Result<u8> {
-    let mut attempt = 0usize;
+    let mut reconnect_attempt = 0usize;
+    let mut attach_attempt = 0_u64;
     loop {
         let factory = build_iroh_kernel_client_factory(iroh_connection.clone(), target);
+        let attach_started_at = Instant::now();
         let outcome =
             run_session_attach_with_client(client, session, follow, global, Some(factory)).await?;
+        let attach_runtime_ms = duration_millis_u64(attach_started_at.elapsed());
         if outcome.exit_reason != AttachExitReason::StreamClosed {
             return Ok(outcome.status_code);
         }
-        if !reconnect_forever && attempt >= SSH_RECONNECT_MAX_ATTEMPTS {
+        let outage_started_at = Instant::now();
+        if !reconnect_forever && reconnect_attempt >= SSH_RECONNECT_MAX_ATTEMPTS {
             println!(
                 "remote iroh connection closed; giving up after {SSH_RECONNECT_MAX_ATTEMPTS} reconnect attempts"
             );
             return Ok(1);
         }
-        attempt = attempt.saturating_add(1);
-        let backoff = Duration::from_millis(reconnect_backoff_ms(attempt));
+        reconnect_attempt = reconnect_attempt.saturating_add(1);
+        let reconnect_backoff_ms = reconnect_backoff_ms(reconnect_attempt);
+        let backoff = Duration::from_millis(reconnect_backoff_ms);
         println!(
-            "remote iroh connection closed; reconnecting to '{}' (attempt {attempt}/{}) in {}ms...",
+            "remote iroh connection closed; reconnecting to '{}' (attempt {reconnect_attempt}/{}) in {}ms...",
             target.label,
             SSH_RECONNECT_MAX_ATTEMPTS,
             backoff.as_millis()
@@ -2117,11 +2257,32 @@ async fn run_iroh_attach_with_reconnect(
             &mut new_client,
             target,
             &connect_perf,
-            u64::try_from(attempt).unwrap_or(u64::MAX),
+            u64::try_from(reconnect_attempt).unwrap_or(u64::MAX),
+        )
+        .await?;
+        emit_iroh_reconnect_outage_perf_event(
+            &mut perf_emitter,
+            &mut new_client,
+            target,
+            u64::try_from(reconnect_attempt).unwrap_or(u64::MAX),
+            reconnect_backoff_ms,
+            duration_millis_u64(outage_started_at.elapsed()),
+            &connect_perf,
+        )
+        .await?;
+        emit_iroh_attach_attempt_perf_event(
+            &mut perf_emitter,
+            &mut new_client,
+            target,
+            attach_attempt,
+            u64::try_from(reconnect_attempt).unwrap_or(u64::MAX),
+            attach_runtime_ms,
+            outcome.exit_reason,
         )
         .await?;
         client = new_client;
         iroh_connection = new_connection;
+        attach_attempt = attach_attempt.saturating_add(1);
     }
 }
 
@@ -2800,11 +2961,6 @@ async fn connect_iroh_bridge(
     client_name: &str,
     perf_summary: Option<&mut IrohConnectPerfSummary>,
 ) -> Result<(BmuxClient, iroh::endpoint::Connection)> {
-    #[allow(clippy::cast_possible_truncation)]
-    fn millis(duration: Duration) -> u64 {
-        duration.as_millis().min(u128::from(u64::MAX)) as u64
-    }
-
     let total_started_at = Instant::now();
     let mut perf = IrohConnectPerfSummary::default();
 
@@ -2814,11 +2970,11 @@ async fn connect_iroh_bridge(
         .bind()
         .await
         .context("failed binding iroh client endpoint")?;
-    perf.bind_ms = millis(bind_started_at.elapsed());
+    perf.bind_ms = duration_millis_u64(bind_started_at.elapsed());
 
     let online_started_at = Instant::now();
     endpoint.online().await;
-    perf.online_ms = millis(online_started_at.elapsed());
+    perf.online_ms = duration_millis_u64(online_started_at.elapsed());
 
     let connect_started_at = Instant::now();
     let endpoint_id: EndpointId = target
@@ -2840,14 +2996,14 @@ async fn connect_iroh_bridge(
     .await
     .with_context(|| format!("timed out connecting iroh target '{}'", target.label))?
     .with_context(|| format!("failed connecting iroh target '{}'", target.label))?;
-    perf.connect_ms = millis(connect_started_at.elapsed());
+    perf.connect_ms = duration_millis_u64(connect_started_at.elapsed());
 
     if target.require_ssh_auth {
         let auth_started_at = Instant::now();
         authenticate_client_connection(&connection)
             .await
             .context("iroh SSH auth handshake failed")?;
-        perf.ssh_auth_ms = Some(millis(auth_started_at.elapsed()));
+        perf.ssh_auth_ms = Some(duration_millis_u64(auth_started_at.elapsed()));
     }
 
     let open_bi_started_at = Instant::now();
@@ -2855,7 +3011,7 @@ async fn connect_iroh_bridge(
         .open_bi()
         .await
         .context("failed opening iroh bi-directional stream")?;
-    perf.open_bi_ms = millis(open_bi_started_at.elapsed());
+    perf.open_bi_ms = duration_millis_u64(open_bi_started_at.elapsed());
     let (client_stream, bridge_stream) = tokio::io::duplex(64 * 1024);
     let (mut bridge_read, mut bridge_write) = tokio::io::split(bridge_stream);
     // Clone the connection before moving the stream halves into copy tasks.
@@ -2903,8 +3059,8 @@ async fn connect_iroh_bridge(
     )
     .await
     .map_err(map_cli_client_error)?;
-    perf.ipc_handshake_ms = millis(ipc_handshake_started_at.elapsed());
-    perf.total_ms = millis(total_started_at.elapsed());
+    perf.ipc_handshake_ms = duration_millis_u64(ipc_handshake_started_at.elapsed());
+    perf.total_ms = duration_millis_u64(total_started_at.elapsed());
     perf.relay_enabled = target.relay_url.is_some();
     perf.ssh_auth_enabled = target.require_ssh_auth;
     perf.compression_enabled = use_transport_compression;
