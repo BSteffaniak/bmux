@@ -177,6 +177,19 @@ impl ConfigPaths {
         self.state_dir().join("runtime").join("recordings")
     }
 
+    /// Get hidden rolling-recording root directory path scoped to this runtime.
+    ///
+    /// The runtime scope prevents one runtime instance from deleting or
+    /// truncating another runtime's rolling buffer.
+    #[must_use]
+    pub fn rolling_recordings_dir(&self) -> PathBuf {
+        let scope = format!(
+            "{:016x}",
+            stable_fnv1a64(self.runtime_dir.to_string_lossy().as_bytes())
+        );
+        self.recordings_dir().join(".rolling").join(scope)
+    }
+
     /// Get persisted terminfo prompt state file path
     #[must_use]
     pub fn terminfo_prompt_state_file(&self) -> PathBuf {
@@ -764,6 +777,48 @@ mod tests {
             None,
         );
         assert_eq!(paths.runtime_dir, PathBuf::from("/tmp/bmux-runtime-root"));
+    }
+
+    #[test]
+    fn rolling_recordings_dir_is_deterministic_for_same_runtime() {
+        let state_dir = PathBuf::from("/tmp/bmux-state-root");
+        let first = ConfigPaths::new(
+            PathBuf::from("/tmp/bmux-config-a"),
+            PathBuf::from("/tmp/bmux-runtime-a"),
+            PathBuf::from("/tmp/bmux-data-a"),
+            state_dir.clone(),
+        );
+        let second = ConfigPaths::new(
+            PathBuf::from("/tmp/bmux-config-b"),
+            PathBuf::from("/tmp/bmux-runtime-a"),
+            PathBuf::from("/tmp/bmux-data-b"),
+            state_dir,
+        );
+        assert_eq!(
+            first.rolling_recordings_dir(),
+            second.rolling_recordings_dir()
+        );
+    }
+
+    #[test]
+    fn rolling_recordings_dir_is_isolated_across_runtime_dirs() {
+        let state_dir = PathBuf::from("/tmp/bmux-state-root");
+        let left = ConfigPaths::new(
+            PathBuf::from("/tmp/bmux-config-a"),
+            PathBuf::from("/tmp/bmux-runtime-a"),
+            PathBuf::from("/tmp/bmux-data-a"),
+            state_dir.clone(),
+        );
+        let right = ConfigPaths::new(
+            PathBuf::from("/tmp/bmux-config-b"),
+            PathBuf::from("/tmp/bmux-runtime-b"),
+            PathBuf::from("/tmp/bmux-data-b"),
+            state_dir,
+        );
+        assert_ne!(
+            left.rolling_recordings_dir(),
+            right.rolling_recordings_dir()
+        );
     }
 
     #[cfg(target_os = "macos")]

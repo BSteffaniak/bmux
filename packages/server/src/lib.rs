@@ -3707,6 +3707,7 @@ impl BmuxServer {
         snapshot_manager: Option<SnapshotManager>,
         server_control_principal_id: Uuid,
         recordings_dir: std::path::PathBuf,
+        rolling_recordings_dir: std::path::PathBuf,
         segment_mb: usize,
         retention_days: u64,
         rolling_recording_auto_start: bool,
@@ -3730,7 +3731,6 @@ impl BmuxServer {
             };
         let (shutdown_tx, _) = watch::channel(false);
         let (pane_exit_tx, pane_exit_rx) = mpsc::unbounded_channel();
-        let rolling_recordings_dir = recordings_dir.join(".rolling");
         let rolling_runtime_available = rolling_recording_defaults.is_available();
         let manual_recording_runtime = Arc::new(Mutex::new(RecordingRuntime::new(
             recordings_dir,
@@ -3802,6 +3802,7 @@ impl BmuxServer {
             None,
             Uuid::new_v4(),
             config.recordings_dir(&paths),
+            paths.rolling_recordings_dir(),
             config.recording.segment_mb,
             config.recording.retention_days,
             config.recording.enabled,
@@ -3853,6 +3854,7 @@ impl BmuxServer {
             Some(snapshot_manager),
             server_control_principal_id,
             config.recordings_dir(paths),
+            paths.rolling_recordings_dir(),
             config.recording.segment_mb,
             config.recording.retention_days,
             rolling_recording_auto_start,
@@ -5335,6 +5337,39 @@ fn start_rolling_recording_runtime(
         RecordingProfile::Functional,
         settings.event_kinds.clone(),
     )
+}
+
+fn recover_rolling_runtime_after_missing_cut_path(
+    state: &Arc<ServerState>,
+    runtime: &mut RecordingRuntime,
+    active_before_cut: Option<RecordingSummary>,
+) -> Result<Option<RecordingSummary>> {
+    let window_secs = runtime
+        .rolling_window_secs()
+        .unwrap_or(state.rolling_recording_defaults.window_secs);
+    let event_kinds = active_before_cut.as_ref().map_or_else(
+        || state.rolling_recording_defaults.event_kinds.clone(),
+        |summary| summary.event_kinds.clone(),
+    );
+    let settings = RollingRecordingSettings {
+        window_secs,
+        event_kinds: normalize_recording_event_kinds(&event_kinds),
+    };
+    if !settings.is_available() {
+        return Ok(None);
+    }
+
+    if runtime.rolling_window_secs() != Some(settings.window_secs) {
+        *runtime = RecordingRuntime::new_rolling(
+            state.rolling_recordings_dir.clone(),
+            state.rolling_recording_segment_mb,
+            settings.window_secs,
+        );
+    }
+
+    let name = active_before_cut.and_then(|summary| summary.name);
+    let restarted = start_rolling_recording_runtime(state, runtime, &settings, name)?;
+    Ok(Some(restarted))
 }
 
 fn restore_snapshot_if_present(state: &Arc<ServerState>) -> Result<()> {
@@ -7583,21 +7618,60 @@ async fn handle_request(
                 .map_err(|_| anyhow::anyhow!("recording runtime lock poisoned"))?
                 .root_dir()
                 .to_path_buf();
-            let result = {
-                let guard = state
-                    .rolling_recording_runtime
-                    .lock()
-                    .map_err(|_| anyhow::anyhow!("rolling recording runtime lock poisoned"))?;
-                let Some(rt) = guard.as_ref() else {
-                    return Ok(Response::Err(ErrorResponse {
-                        code: ErrorCode::InvalidRequest,
-                        message: "rolling recording is not enabled".to_string(),
-                    }));
-                };
-                let result = rt.cut(&output_root, last_seconds, name);
-                drop(guard);
-                result
+            let mut guard = state
+                .rolling_recording_runtime
+                .lock()
+                .map_err(|_| anyhow::anyhow!("rolling recording runtime lock poisoned"))?;
+            let Some(rt) = guard.as_mut() else {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "rolling recording is not enabled".to_string(),
+                }));
             };
+            let mut restarted_rolling = None::<RecordingSummary>;
+            let active_before_cut = rt.status().active;
+            let result = match rt.cut(&output_root, last_seconds, name) {
+                Ok(recording) => Ok(recording),
+                Err(error) => {
+                    recording::cut_missing_active_recording_dir(&error).map_or_else(
+                        || Err(error),
+                        |missing_path| {
+                            let message = match recover_rolling_runtime_after_missing_cut_path(
+                                state,
+                                rt,
+                                active_before_cut,
+                            ) {
+                                Ok(Some(restarted)) => {
+                                    restarted_rolling = Some(restarted);
+                                    format!(
+                                        "rolling recording buffer at {} disappeared; rolling capture was restarted; retry recording cut",
+                                        missing_path.display()
+                                    )
+                                }
+                                Ok(None) => format!(
+                                    "rolling recording buffer at {} disappeared; rolling capture state was reset but could not be restarted automatically",
+                                    missing_path.display()
+                                ),
+                                Err(recovery_error) => format!(
+                                    "rolling recording buffer at {} disappeared; automatic recovery failed: {recovery_error:#}",
+                                    missing_path.display()
+                                ),
+                            };
+                            Err(anyhow::anyhow!(message))
+                        },
+                    )
+                }
+            };
+            drop(guard);
+            if let Some(restarted) = restarted_rolling {
+                let _ = emit_event(
+                    state,
+                    Event::RecordingStarted {
+                        recording_id: restarted.id,
+                        path: restarted.path,
+                    },
+                );
+            }
             match result {
                 Ok(recording) => Response::Ok(ResponsePayload::RecordingCut { recording }),
                 Err(error) => Response::Err(ErrorResponse {
@@ -9265,6 +9339,222 @@ mod tests {
         {
             IpcEndpoint::windows_named_pipe(PathBuf::from(r"\\.\pipe\bmux-server-policy-test"))
         }
+    }
+
+    fn test_config_paths(test_name: &str) -> (ConfigPaths, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "bmux-server-{test_name}-{}",
+            Uuid::new_v4().as_simple()
+        ));
+        let config_dir = root.join("config");
+        let runtime_dir = root.join("runtime");
+        let data_dir = root.join("data");
+        let state_dir = root.join("state");
+        std::fs::create_dir_all(&config_dir).expect("test config dir should be created");
+        std::fs::create_dir_all(&runtime_dir).expect("test runtime dir should be created");
+        std::fs::create_dir_all(&data_dir).expect("test data dir should be created");
+        std::fs::create_dir_all(&state_dir).expect("test state dir should be created");
+        (
+            ConfigPaths::new(config_dir, runtime_dir, data_dir, state_dir),
+            root,
+        )
+    }
+
+    #[test]
+    fn rolling_recordings_root_is_isolated_across_runtime_dirs() {
+        let root = std::env::temp_dir().join(format!(
+            "bmux-server-rolling-root-isolation-{}",
+            Uuid::new_v4().as_simple()
+        ));
+        let shared_config_dir = root.join("config");
+        let shared_data_dir = root.join("data");
+        let shared_state_dir = root.join("state");
+        std::fs::create_dir_all(&shared_config_dir).expect("shared config dir should be created");
+        std::fs::create_dir_all(&shared_data_dir).expect("shared data dir should be created");
+        std::fs::create_dir_all(&shared_state_dir).expect("shared state dir should be created");
+
+        let paths_left = ConfigPaths::new(
+            shared_config_dir.clone(),
+            root.join("runtime-left"),
+            shared_data_dir.clone(),
+            shared_state_dir.clone(),
+        );
+        let paths_right = ConfigPaths::new(
+            shared_config_dir,
+            root.join("runtime-right"),
+            shared_data_dir,
+            shared_state_dir,
+        );
+        let rolling_event_kinds = vec![RecordingEventKind::PaneOutputRaw];
+
+        let server_left = BmuxServer::from_config_paths_with_rolling_options(
+            &paths_left,
+            true,
+            120,
+            &rolling_event_kinds,
+        );
+        let server_right = BmuxServer::from_config_paths_with_rolling_options(
+            &paths_right,
+            true,
+            120,
+            &rolling_event_kinds,
+        );
+
+        assert_ne!(
+            server_left.state.rolling_recordings_dir, server_right.state.rolling_recordings_dir,
+            "rolling recording root should be runtime-scoped"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::too_many_lines)]
+    async fn recording_cut_recovers_when_active_rolling_directory_disappears() {
+        let (paths, root) = test_config_paths("recording-cut-recovery");
+        let rolling_event_kinds = vec![RecordingEventKind::PaneOutputRaw];
+        let server = BmuxServer::from_config_paths_with_rolling_options(
+            &paths,
+            true,
+            120,
+            &rolling_event_kinds,
+        );
+
+        let client_id = ClientId::new();
+        let principal_id = Uuid::new_v4();
+        let mut selected_session = None;
+        let mut attached_stream_session = None;
+
+        let started = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::RecordingRollingStart {
+                options: RecordingRollingStartOptions::default(),
+            },
+        )
+        .await;
+        match started {
+            Response::Ok(ResponsePayload::RecordingStarted { .. }) => {}
+            response => panic!("expected rolling start response, got {response:?}"),
+        }
+
+        let (stale_id, stale_path) = server
+            .state
+            .rolling_recording_runtime
+            .lock()
+            .expect("rolling runtime lock should succeed")
+            .as_ref()
+            .expect("rolling runtime should be initialized")
+            .active_capture_target()
+            .expect("rolling runtime should have active capture");
+        let orphaned_path = stale_path.with_extension("orphaned");
+        std::fs::rename(&stale_path, &orphaned_path)
+            .expect("active rolling recording directory should be movable");
+
+        let first_cut = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::RecordingCut {
+                last_seconds: Some(30),
+                name: None,
+            },
+        )
+        .await;
+        match first_cut {
+            Response::Err(error) => {
+                assert_eq!(error.code, ErrorCode::InvalidRequest);
+                assert!(
+                    error
+                        .message
+                        .contains("rolling capture was restarted; retry recording cut"),
+                    "expected recovery hint in cut failure, got: {}",
+                    error.message
+                );
+            }
+            response @ Response::Ok(_) => {
+                panic!("expected first cut to fail with recovery hint, got {response:?}")
+            }
+        }
+
+        let restarted_id = server
+            .state
+            .rolling_recording_runtime
+            .lock()
+            .expect("rolling runtime lock should succeed")
+            .as_ref()
+            .expect("rolling runtime should still be initialized")
+            .status()
+            .active
+            .expect("rolling runtime should be active after recovery")
+            .id;
+        assert_ne!(
+            restarted_id, stale_id,
+            "recovery should start a fresh rolling recording"
+        );
+
+        let accepted = server
+            .state
+            .rolling_recording_runtime
+            .lock()
+            .expect("rolling runtime lock should succeed")
+            .as_ref()
+            .expect("rolling runtime should remain initialized")
+            .record(
+                RecordingEventKind::PaneOutputRaw,
+                RecordingPayload::Bytes {
+                    data: b"recovered-cut-event".to_vec(),
+                },
+                RecordMeta {
+                    session_id: None,
+                    pane_id: None,
+                    client_id: None,
+                },
+            )
+            .expect("record should complete without error");
+        assert!(accepted, "rolling runtime should accept test event");
+
+        std::thread::sleep(Duration::from_millis(1200));
+
+        let second_cut = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::RecordingCut {
+                last_seconds: Some(30),
+                name: None,
+            },
+        )
+        .await;
+        match second_cut {
+            Response::Ok(ResponsePayload::RecordingCut { recording }) => {
+                assert!(recording.event_count >= 1);
+            }
+            response => panic!("expected second cut to succeed after recovery, got {response:?}"),
+        }
+
+        let stopped = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::RecordingRollingStop,
+        )
+        .await;
+        match stopped {
+            Response::Ok(ResponsePayload::RecordingStopped { .. }) => {}
+            response => panic!("expected rolling stop response, got {response:?}"),
+        }
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

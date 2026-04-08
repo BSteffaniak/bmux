@@ -57,6 +57,20 @@ struct Manifest {
     summary: RecordingSummary,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RecordingCutError {
+    #[error("active rolling recording directory is missing: {path:?}")]
+    ActiveRecordingDirectoryMissing { path: PathBuf },
+}
+
+pub(crate) fn cut_missing_active_recording_dir(error: &anyhow::Error) -> Option<PathBuf> {
+    error
+        .downcast_ref::<RecordingCutError>()
+        .map(|error| match error {
+            RecordingCutError::ActiveRecordingDirectoryMissing { path } => path.clone(),
+        })
+}
+
 impl RecordingRuntime {
     #[must_use]
     pub const fn new(root_dir: PathBuf, segment_mb: usize, retention_days: u64) -> Self {
@@ -417,7 +431,7 @@ impl RecordingRuntime {
     /// Returns an error if no recording is active, the window is invalid,
     /// or file I/O fails.
     pub fn cut(
-        &self,
+        &mut self,
         output_root: &Path,
         last_seconds: Option<u64>,
         name: Option<String>,
@@ -426,6 +440,19 @@ impl RecordingRuntime {
             .active
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("no active recording available for cut"))?;
+        if !active.path.is_dir() {
+            let stale_path = active.path.clone();
+            let stale_id = active.id;
+            if let Err(error) = self.stop(Some(stale_id)) {
+                tracing::warn!(
+                    "failed clearing stale rolling recording state for {}: {error:#}",
+                    stale_id
+                );
+            }
+            return Err(
+                RecordingCutError::ActiveRecordingDirectoryMissing { path: stale_path }.into(),
+            );
+        }
         let name = normalize_recording_name(name)?.or_else(|| active.name.clone());
         let window_secs = last_seconds.or(self.rolling_window_secs).ok_or_else(|| {
             anyhow::anyhow!("recording cut requires rolling recording mode to be enabled")
@@ -1967,5 +1994,42 @@ mod tests {
         assert_eq!(cut.name.as_deref(), Some("look-at-this-one"));
 
         let _ = runtime.stop(None).expect("rolling recording should stop");
+    }
+
+    #[test]
+    fn rolling_cut_reports_missing_active_dir_and_clears_stale_active_state() {
+        let root = temp_dir();
+        let rolling_root = root.join(".rolling");
+        let cut_root = root.join("cuts");
+
+        let mut runtime = RecordingRuntime::new_rolling(rolling_root, 64, 300);
+        runtime
+            .start(
+                None,
+                true,
+                None,
+                RecordingProfile::Functional,
+                vec![RecordingEventKind::PaneOutputRaw],
+            )
+            .expect("rolling recording should start");
+
+        let active_path = runtime
+            .active_capture_target()
+            .expect("active target should exist")
+            .1;
+        let orphaned_path = active_path.with_extension("orphaned");
+        std::fs::rename(&active_path, &orphaned_path)
+            .expect("active recording dir should be movable");
+
+        let error = runtime
+            .cut(&cut_root, None, None)
+            .expect_err("cut should fail when active dir is missing");
+        let missing_path = super::cut_missing_active_recording_dir(&error)
+            .expect("error should classify as missing active recording dir");
+        assert_eq!(missing_path, active_path);
+        assert!(
+            runtime.status().active.is_none(),
+            "cut should clear stale active runtime state"
+        );
     }
 }
