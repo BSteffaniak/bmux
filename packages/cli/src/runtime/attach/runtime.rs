@@ -206,6 +206,58 @@ fn apply_attach_output_bytes(
     true
 }
 
+#[derive(Debug, Clone, Copy)]
+struct AttachOutputChunkMeta {
+    stream_start: u64,
+    stream_end: u64,
+    stream_gap: bool,
+    sync_update_active: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttachChunkApplyOutcome {
+    Applied { had_data: bool },
+    Stale,
+    Desync,
+}
+
+fn apply_attach_output_chunk(
+    view_state: &mut AttachViewState,
+    pane_id: Uuid,
+    bytes: &[u8],
+    meta: AttachOutputChunkMeta,
+    frame_needs_render: &mut bool,
+) -> AttachChunkApplyOutcome {
+    {
+        let buffer = view_state.pane_buffers.entry(pane_id).or_default();
+
+        if meta.stream_end < meta.stream_start {
+            return AttachChunkApplyOutcome::Desync;
+        }
+
+        if meta.stream_gap {
+            return AttachChunkApplyOutcome::Desync;
+        }
+
+        if let Some(expected) = buffer.expected_stream_start {
+            if meta.stream_end <= expected {
+                return AttachChunkApplyOutcome::Stale;
+            }
+            if meta.stream_start != expected {
+                return AttachChunkApplyOutcome::Desync;
+            }
+        }
+    }
+
+    let had_data = apply_attach_output_bytes(view_state, pane_id, bytes, frame_needs_render);
+    if let Some(buffer) = view_state.pane_buffers.get_mut(&pane_id) {
+        buffer.sync_update_in_progress = meta.sync_update_active;
+        buffer.expected_stream_start = Some(meta.stream_end);
+    }
+
+    AttachChunkApplyOutcome::Applied { had_data }
+}
+
 #[derive(Debug, Clone)]
 struct AttachPerfWindow {
     started_at: Instant,
@@ -691,19 +743,41 @@ pub async fn run_session_attach_with_client(
                 } else if let bmux_client::ServerEvent::PaneOutput {
                     pane_id,
                     ref data,
+                    stream_start,
+                    stream_end,
+                    stream_gap,
+                    sync_update_active,
                     ..
                 } = server_event
                 {
-                    // Inline output push — apply directly without a fetch
-                    // round-trip.  The server already read from our per-client
-                    // cursor and cleared output_dirty.
+                    // Inline output push — apply using the same continuity
+                    // checks as batch chunks so parser state remains
+                    // deterministic even under cursor gaps or out-of-order
+                    // delivery.
                     let mut render = false;
-                    apply_attach_output_bytes(
+                    match apply_attach_output_chunk(
                         &mut view_state,
                         pane_id,
                         data,
+                        AttachOutputChunkMeta {
+                            stream_start,
+                            stream_end,
+                            stream_gap,
+                            sync_update_active,
+                        },
                         &mut render,
-                    );
+                    ) {
+                        AttachChunkApplyOutcome::Applied { .. } | AttachChunkApplyOutcome::Stale => {}
+                        AttachChunkApplyOutcome::Desync => {
+                            hydrate_attach_state_from_snapshot_mode(
+                                &mut client,
+                                &mut view_state,
+                                SnapshotHydrationMode::FullResync,
+                            )
+                            .await?;
+                            pane_output_pending = false;
+                        }
+                    }
                 } else if matches!(
                     server_event,
                     bmux_client::ServerEvent::PaneImageAvailable { .. }
@@ -1062,37 +1136,45 @@ pub async fn run_session_attach_with_client(
 
                 let mut had_data = false;
                 let mut any_sync_active = false;
+                let mut needs_resync = false;
                 for chunk in result.chunks {
-                    if chunk.stream_gap {
-                        // Bytes were lost from the server's output buffer
-                        // (evicted before we could read them).  The client
-                        // parser's internal state is now inconsistent -- it
-                        // may be mid-escape-sequence.  Reset the parser so
-                        // the next snapshot hydration starts clean.
-                        if let Some(buffer) = view_state.pane_buffers.get_mut(&chunk.pane_id) {
-                            buffer.prev_rows.clear();
-                            buffer.parser = vt100::Parser::new(
-                                buffer.parser.screen().size().0,
-                                buffer.parser.screen().size().1,
-                                0,
-                            );
-                        }
-                        view_state.dirty.full_pane_redraw = true;
-                        frame_needs_render = true;
-                    }
-                    had_data |= apply_attach_output_bytes(
+                    match apply_attach_output_chunk(
                         &mut view_state,
                         chunk.pane_id,
                         &chunk.data,
+                        AttachOutputChunkMeta {
+                            stream_start: chunk.stream_start,
+                            stream_end: chunk.stream_end,
+                            stream_gap: chunk.stream_gap,
+                            sync_update_active: chunk.sync_update_active,
+                        },
                         &mut frame_needs_render,
-                    );
-                    // Store server-side sync state on the pane buffer so the
-                    // renderer can defer drawing mid-update panes.
-                    if let Some(buffer) = view_state.pane_buffers.get_mut(&chunk.pane_id) {
-                        buffer.sync_update_in_progress = chunk.sync_update_active;
+                    ) {
+                        AttachChunkApplyOutcome::Applied {
+                            had_data: chunk_had_data,
+                        } => {
+                            had_data |= chunk_had_data;
+                            any_sync_active |= chunk.sync_update_active;
+                        }
+                        AttachChunkApplyOutcome::Stale => {}
+                        AttachChunkApplyOutcome::Desync => {
+                            needs_resync = true;
+                            break;
+                        }
                     }
-                    any_sync_active |= chunk.sync_update_active;
                 }
+
+                if needs_resync {
+                    hydrate_attach_state_from_snapshot_mode(
+                        &mut client,
+                        &mut view_state,
+                        SnapshotHydrationMode::FullResync,
+                    )
+                    .await?;
+                    last_round_had_data = false;
+                    break;
+                }
+
                 perf_window.record_drain_result(had_data, any_sync_active);
                 last_round_had_data = had_data;
 
@@ -3739,6 +3821,21 @@ pub async fn hydrate_attach_state_from_snapshot(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
 ) -> std::result::Result<(), ClientError> {
+    hydrate_attach_state_from_snapshot_mode(client, view_state, SnapshotHydrationMode::Incremental)
+        .await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SnapshotHydrationMode {
+    Incremental,
+    FullResync,
+}
+
+async fn hydrate_attach_state_from_snapshot_mode(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    mode: SnapshotHydrationMode,
+) -> std::result::Result<(), ClientError> {
     let AttachSnapshotState {
         context_id: _,
         session_id,
@@ -3757,11 +3854,12 @@ pub async fn hydrate_attach_state_from_snapshot(
         .iter()
         .map(|pane| pane.id)
         .collect::<std::collections::BTreeSet<_>>();
+    let full_resync = mode == SnapshotHydrationMode::FullResync;
     let session_changed = view_state
         .cached_layout_state
         .as_ref()
         .is_none_or(|layout| layout.session_id != session_id);
-    if session_changed {
+    if session_changed || full_resync {
         view_state.pane_buffers.clear();
         view_state.pane_mouse_protocol_hints.clear();
     } else {
@@ -3802,7 +3900,7 @@ pub async fn hydrate_attach_state_from_snapshot(
     }
     let mut frame_needs_render = false;
     for chunk in chunks {
-        if !session_changed && retained_pane_ids.contains(&chunk.pane_id) {
+        if !session_changed && !full_resync && retained_pane_ids.contains(&chunk.pane_id) {
             continue;
         }
         let _ = apply_attach_output_bytes(
@@ -3811,6 +3909,10 @@ pub async fn hydrate_attach_state_from_snapshot(
             &chunk.data,
             &mut frame_needs_render,
         );
+        if let Some(buffer) = view_state.pane_buffers.get_mut(&chunk.pane_id) {
+            buffer.sync_update_in_progress = chunk.sync_update_active;
+            buffer.expected_stream_start = Some(chunk.stream_end);
+        }
     }
     view_state.dirty.layout_needs_refresh = false;
     view_state.dirty.full_pane_redraw = true;
@@ -5522,6 +5624,7 @@ mod tests {
                 last_alternate_screen: false,
                 prev_rows: Vec::new(),
                 sync_update_in_progress: false,
+                expected_stream_start: None,
             });
         append_pane_output(buffer, b"one\r\n  four\r\n     five\r\n  six\r\n\x1b[4;3H");
         view_state
@@ -5566,6 +5669,138 @@ mod tests {
             .get(&pane_id)
             .expect("pane render buffer");
         assert!(!buffer.parser.screen().alternate_screen());
+    }
+
+    #[test]
+    fn apply_attach_output_chunk_updates_continuity_state() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        let pane_id = view_state
+            .cached_layout_state
+            .as_ref()
+            .map(|layout| layout.focused_pane_id)
+            .expect("focused pane id");
+
+        let mut frame_needs_render = false;
+        let outcome = super::apply_attach_output_chunk(
+            &mut view_state,
+            pane_id,
+            b"abc",
+            super::AttachOutputChunkMeta {
+                stream_start: 100,
+                stream_end: 103,
+                stream_gap: false,
+                sync_update_active: true,
+            },
+            &mut frame_needs_render,
+        );
+
+        assert!(matches!(
+            outcome,
+            super::AttachChunkApplyOutcome::Applied { had_data: true }
+        ));
+        assert!(frame_needs_render);
+        let buffer = view_state
+            .pane_buffers
+            .get(&pane_id)
+            .expect("pane render buffer");
+        assert_eq!(buffer.expected_stream_start, Some(103));
+        assert!(buffer.sync_update_in_progress);
+    }
+
+    #[test]
+    fn apply_attach_output_chunk_marks_gap_as_desync() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        let pane_id = view_state
+            .cached_layout_state
+            .as_ref()
+            .map(|layout| layout.focused_pane_id)
+            .expect("focused pane id");
+
+        let mut frame_needs_render = false;
+        let outcome = super::apply_attach_output_chunk(
+            &mut view_state,
+            pane_id,
+            b"",
+            super::AttachOutputChunkMeta {
+                stream_start: 50,
+                stream_end: 50,
+                stream_gap: true,
+                sync_update_active: false,
+            },
+            &mut frame_needs_render,
+        );
+
+        assert_eq!(outcome, super::AttachChunkApplyOutcome::Desync);
+        assert!(!frame_needs_render);
+    }
+
+    #[test]
+    fn apply_attach_output_chunk_ignores_stale_chunks() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        let pane_id = view_state
+            .cached_layout_state
+            .as_ref()
+            .map(|layout| layout.focused_pane_id)
+            .expect("focused pane id");
+        view_state
+            .pane_buffers
+            .get_mut(&pane_id)
+            .expect("pane render buffer")
+            .expected_stream_start = Some(80);
+
+        let mut frame_needs_render = false;
+        let outcome = super::apply_attach_output_chunk(
+            &mut view_state,
+            pane_id,
+            b"late",
+            super::AttachOutputChunkMeta {
+                stream_start: 70,
+                stream_end: 80,
+                stream_gap: false,
+                sync_update_active: false,
+            },
+            &mut frame_needs_render,
+        );
+
+        assert_eq!(outcome, super::AttachChunkApplyOutcome::Stale);
+        assert!(!frame_needs_render);
+        let buffer = view_state
+            .pane_buffers
+            .get(&pane_id)
+            .expect("pane render buffer");
+        assert_eq!(buffer.expected_stream_start, Some(80));
+    }
+
+    #[test]
+    fn apply_attach_output_chunk_detects_offset_mismatch() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        let pane_id = view_state
+            .cached_layout_state
+            .as_ref()
+            .map(|layout| layout.focused_pane_id)
+            .expect("focused pane id");
+        view_state
+            .pane_buffers
+            .get_mut(&pane_id)
+            .expect("pane render buffer")
+            .expected_stream_start = Some(80);
+
+        let mut frame_needs_render = false;
+        let outcome = super::apply_attach_output_chunk(
+            &mut view_state,
+            pane_id,
+            b"future",
+            super::AttachOutputChunkMeta {
+                stream_start: 81,
+                stream_end: 87,
+                stream_gap: false,
+                sync_update_active: false,
+            },
+            &mut frame_needs_render,
+        );
+
+        assert_eq!(outcome, super::AttachChunkApplyOutcome::Desync);
+        assert!(!frame_needs_render);
     }
 
     #[test]

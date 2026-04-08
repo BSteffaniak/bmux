@@ -1362,15 +1362,23 @@ pub enum Event {
         session_id: Uuid,
         pane_id: Uuid,
     },
-    /// Inline pane output pushed by the server.  Carries the actual output
-    /// bytes so the client does not need a round-trip fetch.  The event push
-    /// task reads from the per-client output cursor and includes the data
-    /// directly, eliminating the `AttachPaneOutputBatch` request-response
-    /// for the normal streaming path.
+    /// Inline pane output pushed by the server.  Carries full stream
+    /// continuity metadata so clients can treat it identically to
+    /// `AttachPaneOutputBatch` chunks.
     PaneOutput {
         session_id: Uuid,
         pane_id: Uuid,
         data: Vec<u8>,
+        /// Inclusive start offset (in pane output stream bytes) for `data`.
+        stream_start: u64,
+        /// Exclusive end offset (in pane output stream bytes) for `data`.
+        stream_end: u64,
+        /// True when bytes were dropped before `stream_start` for this client
+        /// (cursor fell behind ring-buffer retention and was clamped).
+        stream_gap: bool,
+        /// True when the inner application is inside a DEC mode 2026
+        /// synchronized update.
+        sync_update_active: bool,
     },
     /// Notification that pane image state has changed (new images placed,
     /// images removed, or positions shifted).  Streaming clients use this
@@ -2634,6 +2642,15 @@ mod tests {
             Event::PaneOutputAvailable {
                 session_id: id,
                 pane_id: id2,
+            },
+            Event::PaneOutput {
+                session_id: id,
+                pane_id: id2,
+                data: vec![27, 91, 51, 49, 109], // ESC[31m
+                stream_start: 128,
+                stream_end: 133,
+                stream_gap: false,
+                sync_update_active: false,
             },
             Event::PaneExited {
                 session_id: id,

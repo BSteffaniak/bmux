@@ -88,6 +88,12 @@ pub struct PaneRenderBuffer {
     /// the renderer defers drawing this pane's content so the user never
     /// sees a partially-updated screen.
     pub sync_update_in_progress: bool,
+    /// Next expected stream offset for attach output continuity checks.
+    ///
+    /// When `Some(n)`, the next chunk for this pane must start at `n` unless
+    /// `stream_gap` is explicitly reported.  `None` means no continuity
+    /// baseline is currently known (for example right after snapshot hydrate).
+    pub expected_stream_start: Option<u64>,
 }
 
 impl Default for PaneRenderBuffer {
@@ -97,6 +103,7 @@ impl Default for PaneRenderBuffer {
             last_alternate_screen: false,
             prev_rows: Vec::new(),
             sync_update_in_progress: false,
+            expected_stream_start: None,
         }
     }
 }

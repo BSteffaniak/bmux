@@ -1870,6 +1870,27 @@ struct OutputRead {
     stream_gap: bool,
 }
 
+fn pane_output_event_from_read(
+    session_id: Uuid,
+    pane_id: Uuid,
+    read: OutputRead,
+    sync_update_active: bool,
+) -> Option<Event> {
+    if read.bytes.is_empty() && !read.stream_gap {
+        return None;
+    }
+
+    Some(Event::PaneOutput {
+        session_id,
+        pane_id,
+        data: read.bytes,
+        stream_start: read.stream_start,
+        stream_end: read.stream_end,
+        stream_gap: read.stream_gap,
+        sync_update_active,
+    })
+}
+
 impl OutputFanoutBuffer {
     fn new(max_bytes: usize) -> Self {
         Self {
@@ -2004,21 +2025,42 @@ impl OutputFanoutBuffer {
         }
     }
 
+    #[cfg(test)]
     fn read_recent(&self, max_bytes: usize) -> Vec<u8> {
+        self.read_recent_with_offsets(max_bytes).bytes
+    }
+
+    fn read_recent_with_offsets(&self, max_bytes: usize) -> OutputRead {
+        let end = self.end_offset();
         if self.data.is_empty() {
-            return Vec::new();
+            return OutputRead {
+                bytes: Vec::new(),
+                stream_start: end,
+                stream_end: end,
+                stream_gap: false,
+            };
         }
         let to_read = self.data.len().min(max_bytes.max(1));
-        let intended_start = self.end_offset() - to_read as u64;
+        let intended_start = end - to_read as u64;
         let safe_start = self.first_safe_offset_at_or_after(intended_start);
 
-        if safe_start >= self.end_offset() {
-            return Vec::new();
+        if safe_start >= end {
+            return OutputRead {
+                bytes: Vec::new(),
+                stream_start: end,
+                stream_end: end,
+                stream_gap: false,
+            };
         }
 
         #[allow(clippy::cast_possible_truncation)]
         let start_index = (safe_start - self.start_offset) as usize;
-        self.data.iter().skip(start_index).copied().collect()
+        OutputRead {
+            bytes: self.data.iter().skip(start_index).copied().collect(),
+            stream_start: safe_start,
+            stream_end: end,
+            stream_gap: false,
+        }
     }
 
     /// Return the first stream offset >= `target` where a fresh ground-state
@@ -3550,19 +3592,20 @@ impl SessionRuntimeManager {
                 .unwrap_or_default();
             pane_mouse_protocols.push(AttachPaneMouseProtocol { pane_id, protocol });
             let allowed = per_pane_budget.min(budget_remaining);
-            let data = pane
+            let read = pane
                 .output_buffer
                 .lock()
                 .map_err(|_| SessionRuntimeError::Closed)?
-                .read_recent(allowed);
-            budget_remaining = budget_remaining.saturating_sub(data.len());
+                .read_recent_with_offsets(allowed);
+            budget_remaining = budget_remaining.saturating_sub(read.bytes.len());
+            let sync_update_active = pane.sync_update_in_progress.load(Ordering::SeqCst);
             chunks.push(AttachPaneChunk {
                 pane_id,
-                data,
-                stream_start: 0,
-                stream_end: 0,
-                stream_gap: false,
-                sync_update_active: false,
+                data: read.bytes,
+                stream_start: read.stream_start,
+                stream_end: read.stream_end,
+                stream_gap: read.stream_gap,
+                sync_update_active,
             });
         }
 
@@ -4651,7 +4694,7 @@ async fn handle_connection(
                                     session_id,
                                     pane_id,
                                 } => {
-                                    let data = {
+                                    let (read, sync_update_active) = {
                                         let Ok(runtime_mgr) = push_state.session_runtimes.lock()
                                         else {
                                             continue;
@@ -4674,16 +4717,23 @@ async fn handle_connection(
                                         let Ok(mut buf) = pane.output_buffer.lock() else {
                                             continue;
                                         };
-                                        buf.read_for_client(push_client_id, RESPONSE_OUTPUT_BUDGET)
+                                        let read = buf.read_for_client(
+                                            push_client_id,
+                                            RESPONSE_OUTPUT_BUDGET,
+                                        );
+                                        let sync_update_active =
+                                            pane.sync_update_in_progress.load(Ordering::SeqCst);
+                                        (read, sync_update_active)
                                     };
-                                    if data.bytes.is_empty() {
-                                        continue;
-                                    }
-                                    Event::PaneOutput {
+                                    let Some(pane_output_event) = pane_output_event_from_read(
                                         session_id,
                                         pane_id,
-                                        data: data.bytes,
-                                    }
+                                        read,
+                                        sync_update_active,
+                                    ) else {
+                                        continue;
+                                    };
+                                    pane_output_event
                                 }
                                 other => other,
                             };
@@ -11280,6 +11330,53 @@ mod tests {
                 read.bytes[0]
             );
         }
+    }
+
+    #[test]
+    fn pane_output_event_from_read_skips_empty_without_gap() {
+        let event = pane_output_event_from_read(
+            Uuid::new_v4(),
+            Uuid::new_v4(),
+            OutputRead {
+                bytes: Vec::new(),
+                stream_start: 10,
+                stream_end: 10,
+                stream_gap: false,
+            },
+            false,
+        );
+
+        assert!(event.is_none());
+    }
+
+    #[test]
+    fn pane_output_event_from_read_emits_gap_even_with_empty_bytes() {
+        let session_id = Uuid::new_v4();
+        let pane_id = Uuid::new_v4();
+        let event = pane_output_event_from_read(
+            session_id,
+            pane_id,
+            OutputRead {
+                bytes: Vec::new(),
+                stream_start: 128,
+                stream_end: 128,
+                stream_gap: true,
+            },
+            true,
+        );
+
+        assert_eq!(
+            event,
+            Some(Event::PaneOutput {
+                session_id,
+                pane_id,
+                data: Vec::new(),
+                stream_start: 128,
+                stream_end: 128,
+                stream_gap: true,
+                sync_update_active: true,
+            })
+        );
     }
 
     #[test]
