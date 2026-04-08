@@ -944,6 +944,7 @@ version = "0.0.1-alpha.0"
 dependencies = [
  "ab_glyph",
  "anyhow",
+ "bmux_cli_output",
  "bmux_cli_schema",
  "bmux_client",
  "bmux_clipboard_plugin",

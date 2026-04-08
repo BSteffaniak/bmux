@@ -12,6 +12,7 @@ use super::{
     parse_uuid_value, terminal,
 };
 use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont, point};
+use bmux_cli_output::{Table, TableAlign, TableColumn, write_table};
 use bmux_fonts::FontPreset;
 use bmux_ipc::RecordingPayload;
 use font8x8::UnicodeFonts;
@@ -732,6 +733,48 @@ fn format_byte_size(bytes: u64) -> String {
     }
 }
 
+const fn recording_status_label(ended_epoch_ms: Option<u64>) -> &'static str {
+    if ended_epoch_ms.is_some() {
+        "done"
+    } else {
+        "active"
+    }
+}
+
+fn format_recording_age(started_epoch_ms: u64, now_epoch_ms: u64) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    const WEEK: u64 = 7 * DAY;
+    const YEAR: u64 = 365 * DAY;
+
+    let elapsed_secs = now_epoch_ms.saturating_sub(started_epoch_ms) / 1_000;
+    if elapsed_secs == 0 {
+        return "now".to_string();
+    }
+
+    let (value, unit) = if elapsed_secs < MINUTE {
+        (elapsed_secs, "s")
+    } else if elapsed_secs < HOUR {
+        (elapsed_secs / MINUTE, "m")
+    } else if elapsed_secs < DAY {
+        (elapsed_secs / HOUR, "h")
+    } else if elapsed_secs < WEEK {
+        (elapsed_secs / DAY, "d")
+    } else if elapsed_secs < YEAR {
+        (elapsed_secs / WEEK, "w")
+    } else {
+        (elapsed_secs / YEAR, "y")
+    };
+
+    format!("{value}{unit} ago")
+}
+
+fn write_stdout_table(table: &Table) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    write_table(&mut stdout, table).context("failed rendering recording list table")
+}
+
 pub(super) async fn run_recording_stop(
     recording_id: Option<&str>,
     connection_context: ConnectionContext<'_>,
@@ -932,28 +975,34 @@ pub(super) async fn run_recording_list(
         );
         return Ok(0);
     }
-    for recording in recordings {
-        println!(
-            "{} name={} started={} ended={} events={} bytes={} capture_input={} profile={:?} kinds={} path={}",
-            recording.id,
-            recording.name.as_deref().unwrap_or("-"),
-            recording.started_epoch_ms,
-            recording
-                .ended_epoch_ms
-                .map_or_else(|| "active".to_string(), |value| value.to_string()),
-            recording.event_count,
-            recording.payload_bytes,
-            recording.capture_input,
-            recording.profile,
-            recording
-                .event_kinds
-                .iter()
-                .map(|kind| recording_event_kind_name(*kind))
-                .collect::<Vec<_>>()
-                .join(","),
-            recording.path
-        );
+
+    if recordings.is_empty() {
+        println!("no recordings");
+        return Ok(0);
     }
+
+    let now_epoch_ms = epoch_millis_now();
+    let mut table = Table::new(vec![
+        TableColumn::new("ID").min_width(36),
+        TableColumn::new("NAME").min_width(8),
+        TableColumn::new("STATUS").min_width(6),
+        TableColumn::new("STARTED").min_width(8),
+        TableColumn::new("EVENTS")
+            .align(TableAlign::Right)
+            .min_width(6),
+        TableColumn::new("SIZE").min_width(8),
+    ]);
+    for recording in recordings {
+        table.push_row(vec![
+            recording.id.to_string(),
+            recording.name.unwrap_or_else(|| "-".to_string()),
+            recording_status_label(recording.ended_epoch_ms).to_string(),
+            format_recording_age(recording.started_epoch_ms, now_epoch_ms),
+            recording.event_count.to_string(),
+            format_byte_size(recording.payload_bytes),
+        ]);
+    }
+    write_stdout_table(&table)?;
     Ok(0)
 }
 
@@ -5891,8 +5940,9 @@ mod tests {
     use crate::runtime::recording::{
         auto_export_default_dir, auto_export_filename_stem, collect_recording_storage_usage,
         confirm_delete_all_recordings, default_event_kinds_for_flags,
-        delete_all_recordings_from_dir, delete_recording_dir_at, list_recordings_from_dir,
-        offline_recording_status, resolve_recording_id_prefix, unique_auto_export_path,
+        delete_all_recordings_from_dir, delete_recording_dir_at, format_recording_age,
+        list_recordings_from_dir, offline_recording_status, recording_status_label,
+        resolve_recording_id_prefix, unique_auto_export_path,
     };
     use std::fs;
     use uuid::Uuid;
@@ -5996,6 +6046,23 @@ mod tests {
     fn default_event_kinds_for_flags_falls_back_to_output() {
         let kinds = default_event_kinds_for_flags(false, false, false);
         assert_eq!(kinds, vec![bmux_ipc::RecordingEventKind::PaneOutputRaw]);
+    }
+
+    #[test]
+    fn recording_status_label_reflects_active_and_done_states() {
+        assert_eq!(recording_status_label(None), "active");
+        assert_eq!(recording_status_label(Some(1)), "done");
+    }
+
+    #[test]
+    fn format_recording_age_uses_compact_units() {
+        assert_eq!(format_recording_age(1_000, 1_900), "now");
+        assert_eq!(format_recording_age(1_000, 32_000), "31s ago");
+        assert_eq!(format_recording_age(1_000, 121_000), "2m ago");
+        assert_eq!(format_recording_age(1_000, 3_601_000), "1h ago");
+        assert_eq!(format_recording_age(1_000, 172_801_000), "2d ago");
+        assert_eq!(format_recording_age(1_000, 691_201_000), "1w ago");
+        assert_eq!(format_recording_age(1_000, 31_536_001_000), "1y ago");
     }
 
     #[test]
