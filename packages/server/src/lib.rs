@@ -1807,6 +1807,7 @@ enum ShellKind {
     Bash,
     Zsh,
     Fish,
+    Nu,
     Other,
 }
 
@@ -2037,6 +2038,7 @@ fn shell_kind_for_path(shell: &str) -> ShellKind {
         "bash" => ShellKind::Bash,
         "zsh" => ShellKind::Zsh,
         "fish" => ShellKind::Fish,
+        "nu" => ShellKind::Nu,
         _ => ShellKind::Other,
     }
 }
@@ -2080,6 +2082,12 @@ fn configure_shell_integration_command(
             {
                 command.env("BMUX_ORIG_XDG_CONFIG_HOME", original_xdg_config_home);
             }
+        }
+        ShellKind::Nu => {
+            let config_path = integration_root.join("nu").join("config.nu");
+            write_shell_integration_file(&config_path, shell_integration_nu_config())?;
+            command.arg("--config");
+            command.arg(&config_path);
         }
         ShellKind::Other => {}
     }
@@ -2281,6 +2289,57 @@ if not set -q __bmux_resurrection_hook_installed
     __bmux_emit_prompt "$PWD"
   end
 end
+"#
+}
+
+#[allow(clippy::literal_string_with_formatting_args)]
+const fn shell_integration_nu_config() -> &'static str {
+    r#"const __bmux_user_config = ($nu.default-config-dir | path join "config.nu")
+source $__bmux_user_config
+
+def __bmux_hook_list [value] {
+  let kind = ($value | describe)
+  if ($kind | str starts-with "list<") {
+    $value
+  } else if $kind == "nothing" {
+    []
+  } else {
+    [$value]
+  }
+}
+
+def __bmux_emit_start [command: string, cwd: string] {
+  let command_b64 = ($command | encode base64)
+  let cwd_b64 = ($cwd | encode base64)
+  ^printf '\033]633;bmux;start;%s;%s\a' $command_b64 $cwd_b64
+}
+
+def __bmux_emit_prompt [cwd: string] {
+  let cwd_b64 = ($cwd | encode base64)
+  ^printf '\033]633;bmux;prompt;%s\a' $cwd_b64
+}
+
+let __bmux_pre_execution_hooks = (__bmux_hook_list ($env.config | get -o hooks.pre_execution))
+let __bmux_pre_prompt_hooks = (__bmux_hook_list ($env.config | get -o hooks.pre_prompt))
+
+$env.config = (
+  $env.config
+  | upsert hooks.pre_execution (
+      $__bmux_pre_execution_hooks
+      | append {||
+          let command = (commandline)
+          if (($command | str trim | str length) > 0) {
+            __bmux_emit_start $command ($env.PWD | into string)
+          }
+        }
+    )
+  | upsert hooks.pre_prompt (
+      $__bmux_pre_prompt_hooks
+      | append {||
+          __bmux_emit_prompt ($env.PWD | into string)
+        }
+    )
+)
 "#
 }
 
@@ -6082,7 +6141,7 @@ fn maybe_flush_snapshot(state: &Arc<ServerState>, force: bool) -> Result<()> {
             .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
 
         let should_flush = if force {
-            runtime.dirty
+            runtime.manager.is_some()
         } else {
             runtime.dirty
                 && runtime
@@ -6218,10 +6277,20 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV4> {
                                                 &pane.meta.shell,
                                             ) {
                                                 Some(inspection) => {
-                                                    resurrection_runtime.active_command =
-                                                        Some(inspection.command);
-                                                    resurrection_runtime.active_command_source =
-                                                        Some(PaneCommandSource::Inspection);
+                                                    if let Some(command) = inspection.command {
+                                                        resurrection_runtime.active_command =
+                                                            Some(command);
+                                                        resurrection_runtime
+                                                            .active_command_source =
+                                                            Some(PaneCommandSource::Inspection);
+                                                    } else if resurrection_runtime
+                                                        .active_command_source
+                                                        == Some(PaneCommandSource::Inspection)
+                                                    {
+                                                        resurrection_runtime.active_command = None;
+                                                        resurrection_runtime
+                                                            .active_command_source = None;
+                                                    }
                                                     if let Some(cwd) = inspection.cwd {
                                                         resurrection_runtime.last_known_cwd =
                                                             Some(cwd);
@@ -10066,8 +10135,87 @@ fn resolve_snapshot_session_id(snapshot: &SnapshotV4, selector: &SessionSelector
 
 #[derive(Debug, Clone)]
 struct ProcessInspectionResult {
-    command: String,
+    command: Option<String>,
     cwd: Option<String>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PsProcessEntry {
+    pid: u32,
+    pgid: i32,
+    state: String,
+    command: String,
+}
+
+#[cfg(unix)]
+fn parse_ps_process_entry(line: &str) -> Option<PsProcessEntry> {
+    let mut parts = line.split_whitespace();
+    let pid = parts.next()?.parse::<u32>().ok()?;
+    let process_group = parts.next()?.parse::<i32>().ok()?;
+    let state = parts.next()?.to_string();
+    let command = parts.collect::<Vec<_>>().join(" ");
+
+    Some(PsProcessEntry {
+        pid,
+        pgid: process_group,
+        state,
+        command,
+    })
+}
+
+#[cfg(unix)]
+fn inspect_process_group_entries_with_resolver<F>(
+    entries: &[PsProcessEntry],
+    process_group_id: i32,
+    shell_pid: Option<u32>,
+    shell_path: &str,
+    mut resolve_cwd: F,
+) -> Option<ProcessInspectionResult>
+where
+    F: FnMut(u32) -> Option<String>,
+{
+    if process_group_id <= 0 {
+        return None;
+    }
+
+    let mut selected_command: Option<(u32, String)> = None;
+    let mut shell_candidate_pid: Option<u32> = None;
+
+    for entry in entries {
+        if entry.pgid != process_group_id || entry.command.is_empty() || entry.state.contains('Z') {
+            continue;
+        }
+
+        if shell_pid == Some(entry.pid)
+            || process_command_looks_like_shell(&entry.command, shell_path)
+        {
+            if shell_candidate_pid.is_none_or(|best_pid| entry.pid > best_pid) {
+                shell_candidate_pid = Some(entry.pid);
+            }
+            continue;
+        }
+
+        if selected_command
+            .as_ref()
+            .is_none_or(|(best_pid, _)| entry.pid > *best_pid)
+        {
+            selected_command = Some((entry.pid, entry.command.clone()));
+        }
+    }
+
+    let cwd = selected_command
+        .as_ref()
+        .and_then(|(pid, _)| resolve_cwd(*pid))
+        .or_else(|| shell_pid.and_then(&mut resolve_cwd))
+        .or_else(|| shell_candidate_pid.and_then(&mut resolve_cwd));
+    let command = selected_command.map(|(_, command)| command);
+
+    if command.is_none() && cwd.is_none() {
+        return None;
+    }
+
+    Some(ProcessInspectionResult { command, cwd })
 }
 
 #[cfg(unix)]
@@ -10077,55 +10225,28 @@ fn inspect_process_group_command_and_cwd(
     shell_path: &str,
 ) -> Option<ProcessInspectionResult> {
     let process_group_id = process_group_id?;
-    if process_group_id <= 0 {
-        return None;
-    }
-
     let output = std::process::Command::new("ps")
+        .arg("-A")
         .arg("-o")
         .arg("pid=,pgid=,state=,command=")
-        .arg("-g")
-        .arg(process_group_id.to_string())
         .output()
         .ok()?;
     if !output.status.success() {
         return None;
     }
 
-    let mut selected: Option<(u32, String)> = None;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let mut parts = line.split_whitespace();
-        let Some(pid_raw) = parts.next() else {
-            continue;
-        };
-        let Some(_pgid_raw) = parts.next() else {
-            continue;
-        };
-        let Some(state) = parts.next() else {
-            continue;
-        };
-        let Ok(pid) = pid_raw.parse::<u32>() else {
-            continue;
-        };
-        let command = parts.collect::<Vec<_>>().join(" ");
-        if command.is_empty() || state.contains('Z') {
-            continue;
-        }
-        if shell_pid == Some(pid) || process_command_looks_like_shell(&command, shell_path) {
-            continue;
-        }
-        if selected
-            .as_ref()
-            .is_none_or(|(best_pid, _)| pid > *best_pid)
-        {
-            selected = Some((pid, command));
-        }
-    }
+    let entries = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(parse_ps_process_entry)
+        .collect::<Vec<_>>();
 
-    let (selected_pid, command) = selected?;
-    let cwd = resolve_process_working_directory(selected_pid)
-        .or_else(|| shell_pid.and_then(resolve_process_working_directory));
-    Some(ProcessInspectionResult { command, cwd })
+    inspect_process_group_entries_with_resolver(
+        &entries,
+        process_group_id,
+        shell_pid,
+        shell_path,
+        resolve_process_working_directory,
+    )
 }
 
 #[cfg(not(unix))]
@@ -10156,7 +10277,16 @@ fn process_command_looks_like_shell(command: &str, shell_path: &str) -> bool {
     name == shell_name
         || matches!(
             name.as_str(),
-            "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "mksh" | "csh" | "tcsh"
+            "sh" | "bash"
+                | "zsh"
+                | "fish"
+                | "nu"
+                | "nushell"
+                | "dash"
+                | "ksh"
+                | "mksh"
+                | "csh"
+                | "tcsh"
         )
 }
 
@@ -12548,6 +12678,75 @@ mod tests {
             phase = phase.advance(b'\\');
             assert_eq!(phase, EscSeqPhase::Ground);
         }
+    }
+
+    #[test]
+    fn shell_kind_for_path_recognizes_nushell() {
+        assert_eq!(shell_kind_for_path("nu"), ShellKind::Nu);
+        assert_eq!(shell_kind_for_path("/usr/local/bin/nu"), ShellKind::Nu);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parse_ps_process_entry_handles_command_with_spaces() {
+        let entry = parse_ps_process_entry(" 101  99 Ss opencode --model gpt-5")
+            .expect("ps line should parse");
+        assert_eq!(entry.pid, 101);
+        assert_eq!(entry.pgid, 99);
+        assert_eq!(entry.state, "Ss");
+        assert_eq!(entry.command, "opencode --model gpt-5");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspection_fallback_returns_shell_cwd_without_active_command() {
+        let entries = vec![PsProcessEntry {
+            pid: 420,
+            pgid: 77,
+            state: "Ss".to_string(),
+            command: "nu".to_string(),
+        }];
+
+        let inspection =
+            inspect_process_group_entries_with_resolver(&entries, 77, Some(420), "nu", |pid| {
+                (pid == 420).then_some("/repo".to_string())
+            })
+            .expect("inspection should include shell cwd");
+
+        assert_eq!(inspection.command, None);
+        assert_eq!(inspection.cwd.as_deref(), Some("/repo"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inspection_fallback_prefers_non_shell_process_for_command() {
+        let entries = vec![
+            PsProcessEntry {
+                pid: 120,
+                pgid: 88,
+                state: "Ss".to_string(),
+                command: "nu".to_string(),
+            },
+            PsProcessEntry {
+                pid: 121,
+                pgid: 88,
+                state: "R+".to_string(),
+                command: "opencode run".to_string(),
+            },
+        ];
+
+        let inspection =
+            inspect_process_group_entries_with_resolver(&entries, 88, Some(120), "nu", |pid| {
+                match pid {
+                    120 => Some("/home/user".to_string()),
+                    121 => Some("/work/project".to_string()),
+                    _ => None,
+                }
+            })
+            .expect("inspection should include active command");
+
+        assert_eq!(inspection.command.as_deref(), Some("opencode run"));
+        assert_eq!(inspection.cwd.as_deref(), Some("/work/project"));
     }
 
     #[test]
