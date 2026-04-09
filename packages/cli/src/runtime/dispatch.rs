@@ -941,9 +941,32 @@ pub(super) async fn dispatch_built_in_command(
         (
             BuiltInHandlerId::RecordingList,
             Command::Recording {
-                command: RecordingCommand::List { json },
+                command:
+                    RecordingCommand::List {
+                        json,
+                        limit,
+                        all,
+                        sort,
+                        order,
+                        status,
+                        query,
+                    },
             },
-        ) => run_recording_list(*json, connection_context).await,
+        ) => {
+            run_recording_list(
+                *json,
+                recording::RecordingListOptions {
+                    limit: *limit,
+                    all: *all,
+                    sort: *sort,
+                    order: *order,
+                    status: *status,
+                    query: query.as_deref(),
+                },
+                connection_context,
+            )
+            .await
+        }
         (
             BuiltInHandlerId::RecordingDelete,
             Command::Recording {

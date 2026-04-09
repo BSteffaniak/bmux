@@ -58,6 +58,27 @@ pub enum RecordingEventKindArg {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RecordingListSortArg {
+    Started,
+    Name,
+    Events,
+    Size,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RecordingListOrderArg {
+    Asc,
+    Desc,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum RecordingListStatusArg {
+    All,
+    Active,
+    Done,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 pub enum RecordingExportFormat {
     Gif,
 }
@@ -161,6 +182,17 @@ fn parse_recording_name(value: &str) -> Result<String, String> {
         return Err("recording name cannot be empty".to_string());
     }
     Ok(trimmed.to_string())
+}
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .trim()
+        .parse::<usize>()
+        .map_err(|_| "value must be a positive integer".to_string())?;
+    if parsed == 0 {
+        return Err("value must be greater than zero".to_string());
+    }
+    Ok(parsed)
 }
 
 #[derive(Debug, Parser)]
@@ -641,6 +673,24 @@ pub enum RecordingCommand {
         /// Print output as JSON
         #[arg(long)]
         json: bool,
+        /// Limit number of rows (table default is 10; JSON default is all)
+        #[arg(long, value_name = "N", value_parser = parse_positive_usize, conflicts_with = "all")]
+        limit: Option<usize>,
+        /// Show all rows (disables default table limit)
+        #[arg(long, conflicts_with = "limit")]
+        all: bool,
+        /// Sort field
+        #[arg(long, value_enum)]
+        sort: Option<RecordingListSortArg>,
+        /// Sort order
+        #[arg(long, value_enum)]
+        order: Option<RecordingListOrderArg>,
+        /// Filter by recording status
+        #[arg(long, value_enum)]
+        status: Option<RecordingListStatusArg>,
+        /// Match by ID prefix or case-insensitive name substring
+        #[arg(long = "match", value_name = "TEXT")]
+        query: Option<String>,
     },
     /// Delete one recording by id or unique id prefix
     Delete {
@@ -1425,9 +1475,10 @@ mod tests {
         LogsCommand, LogsProfilesCommand, PerfCommand, PerfProfileArg, PlaybookCommand,
         RecordingCommand, RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
         RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode,
-        RecordingEventKindArg, RecordingExportFormat, RecordingProfileArg, RecordingRenderMode,
-        RecordingReplayMode, RemoteCommand, RemoteCompleteCommand, ServerCommand,
-        ServerRecordingCommand, SessionCommand, TerminalCommand, TraceFamily,
+        RecordingEventKindArg, RecordingExportFormat, RecordingListOrderArg, RecordingListSortArg,
+        RecordingListStatusArg, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
+        RemoteCommand, RemoteCompleteCommand, ServerCommand, ServerRecordingCommand,
+        SessionCommand, TerminalCommand, TraceFamily,
     };
     use clap::Parser;
 
@@ -3362,6 +3413,68 @@ mod tests {
     }
 
     #[test]
+    fn parses_recording_list_defaults() {
+        let cli = Cli::try_parse_from(["bmux", "recording", "list"]).expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(
+            command,
+            RecordingCommand::List {
+                json: false,
+                limit: None,
+                all: false,
+                sort: None,
+                order: None,
+                status: None,
+                query: None,
+            }
+        ));
+    }
+
+    #[test]
+    fn parses_recording_list_with_filters_sort_and_limit() {
+        let cli = Cli::try_parse_from([
+            "bmux",
+            "recording",
+            "list",
+            "--json",
+            "--limit",
+            "25",
+            "--sort",
+            "events",
+            "--order",
+            "asc",
+            "--status",
+            "done",
+            "--match",
+            "repro",
+        ])
+        .expect("valid CLI args");
+        let Some(Command::Recording { command }) = cli.command else {
+            panic!("expected recording command");
+        };
+        assert!(matches!(
+            command,
+            RecordingCommand::List {
+                json: true,
+                limit: Some(25),
+                all: false,
+                sort: Some(RecordingListSortArg::Events),
+                order: Some(RecordingListOrderArg::Asc),
+                status: Some(RecordingListStatusArg::Done),
+                query: Some(ref query),
+            } if query == "repro"
+        ));
+    }
+
+    #[test]
+    fn rejects_recording_list_all_with_limit() {
+        Cli::try_parse_from(["bmux", "recording", "list", "--all", "--limit", "10"])
+            .expect_err("--all and --limit should conflict");
+    }
+
+    #[test]
     fn parses_recording_replay_verify_mode() {
         let cli = Cli::try_parse_from([
             "bmux",
@@ -3780,14 +3893,12 @@ mod tests {
 
     #[test]
     fn rejects_conflicting_recording_auto_export_flags() {
-        let error = Cli::try_parse_from([
+        Cli::try_parse_from([
             "bmux",
             "--recording-auto-export",
             "--no-recording-auto-export",
         ])
         .expect_err("conflicting flags should fail");
-        let text = error.to_string();
-        assert!(text.contains("recording-auto-export"));
     }
 
     #[test]

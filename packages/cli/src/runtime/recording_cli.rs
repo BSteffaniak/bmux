@@ -65,9 +65,10 @@ pub(super) fn run_recording_path(as_json: bool) -> Result<u8> {
 
 pub(super) async fn run_recording_list(
     as_json: bool,
+    options: recording::RecordingListOptions<'_>,
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
-    recording::run_recording_list(as_json, connection_context).await
+    recording::run_recording_list(as_json, options, connection_context).await
 }
 
 pub(super) async fn run_recording_delete(

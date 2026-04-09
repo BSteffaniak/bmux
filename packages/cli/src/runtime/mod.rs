@@ -10,7 +10,8 @@ use anyhow::{Context, Result};
 use bmux_cli_schema::{
     RecordingCursorBlinkMode, RecordingCursorMode, RecordingCursorPaintMode,
     RecordingCursorProfile, RecordingCursorShape, RecordingCursorTextMode, RecordingEventKindArg,
-    RecordingExportFormat, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
+    RecordingExportFormat, RecordingListOrderArg, RecordingListSortArg, RecordingListStatusArg,
+    RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
 };
 use bmux_client::BmuxClient;
 use bmux_config::{BmuxConfig, ConfigPaths};

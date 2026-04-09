@@ -6,10 +6,10 @@ use super::{
     GifEncoder, GifFrame, Instant, IsTerminal, Path, PathBuf, RecordingCursorBlinkMode,
     RecordingCursorMode, RecordingCursorPaintMode, RecordingCursorProfile, RecordingCursorShape,
     RecordingCursorTextMode, RecordingEventEnvelope, RecordingEventKind, RecordingEventKindArg,
-    RecordingExportFormat, RecordingProfileArg, RecordingRenderMode, RecordingReplayMode,
-    RecordingStatus, RecordingSummary, Repeat, Result, Uuid, Write, active_runtime_name,
-    cleanup_stale_pid_file, connect_if_running_with_context, io, map_cli_client_error,
-    parse_uuid_value, terminal,
+    RecordingExportFormat, RecordingListOrderArg, RecordingListSortArg, RecordingListStatusArg,
+    RecordingProfileArg, RecordingRenderMode, RecordingReplayMode, RecordingStatus,
+    RecordingSummary, Repeat, Result, Uuid, Write, active_runtime_name, cleanup_stale_pid_file,
+    connect_if_running_with_context, io, map_cli_client_error, parse_uuid_value, terminal,
 };
 use ab_glyph::{Font, FontArc, FontVec, PxScale, ScaleFont, point};
 use bmux_cli_output::{Table, TableAlign, TableColumn, write_table};
@@ -775,6 +775,134 @@ fn write_stdout_table(table: &Table) -> Result<()> {
     write_table(&mut stdout, table).context("failed rendering recording list table")
 }
 
+const RECORDING_LIST_DEFAULT_LIMIT: usize = 10;
+
+#[derive(Debug, Clone, Copy)]
+pub(super) struct RecordingListOptions<'a> {
+    pub limit: Option<usize>,
+    pub all: bool,
+    pub sort: Option<RecordingListSortArg>,
+    pub order: Option<RecordingListOrderArg>,
+    pub status: Option<RecordingListStatusArg>,
+    pub query: Option<&'a str>,
+}
+
+const fn resolve_recording_list_limit(
+    as_json: bool,
+    explicit_limit: Option<usize>,
+    all: bool,
+) -> Option<usize> {
+    if all {
+        None
+    } else if let Some(limit) = explicit_limit {
+        Some(limit)
+    } else if as_json {
+        None
+    } else {
+        Some(RECORDING_LIST_DEFAULT_LIMIT)
+    }
+}
+
+const fn default_recording_list_order(sort: RecordingListSortArg) -> RecordingListOrderArg {
+    match sort {
+        RecordingListSortArg::Started
+        | RecordingListSortArg::Events
+        | RecordingListSortArg::Size => RecordingListOrderArg::Desc,
+        RecordingListSortArg::Name => RecordingListOrderArg::Asc,
+    }
+}
+
+const fn recording_matches_status(
+    recording: &RecordingSummary,
+    status: RecordingListStatusArg,
+) -> bool {
+    match status {
+        RecordingListStatusArg::All => true,
+        RecordingListStatusArg::Active => recording.ended_epoch_ms.is_none(),
+        RecordingListStatusArg::Done => recording.ended_epoch_ms.is_some(),
+    }
+}
+
+fn recording_matches_query(recording: &RecordingSummary, query: &str) -> bool {
+    let id = recording.id.to_string();
+    if id.starts_with(query) {
+        return true;
+    }
+    recording
+        .name
+        .as_deref()
+        .is_some_and(|name| name.to_ascii_lowercase().contains(query))
+}
+
+fn filter_recordings(
+    recordings: Vec<RecordingSummary>,
+    status: RecordingListStatusArg,
+    query: Option<&str>,
+) -> Vec<RecordingSummary> {
+    let normalized_query = query
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_ascii_lowercase);
+
+    recordings
+        .into_iter()
+        .filter(|recording| {
+            recording_matches_status(recording, status)
+                && normalized_query
+                    .as_deref()
+                    .is_none_or(|value| recording_matches_query(recording, value))
+        })
+        .collect()
+}
+
+fn compare_recordings(
+    left: &RecordingSummary,
+    right: &RecordingSummary,
+    sort: RecordingListSortArg,
+) -> std::cmp::Ordering {
+    let primary = match sort {
+        RecordingListSortArg::Started => left.started_epoch_ms.cmp(&right.started_epoch_ms),
+        RecordingListSortArg::Events => left.event_count.cmp(&right.event_count),
+        RecordingListSortArg::Size => left.payload_bytes.cmp(&right.payload_bytes),
+        RecordingListSortArg::Name => {
+            let left_name = left.name.as_deref().unwrap_or("");
+            let right_name = right.name.as_deref().unwrap_or("");
+            let presence = left_name.is_empty().cmp(&right_name.is_empty());
+            if presence != std::cmp::Ordering::Equal {
+                return presence;
+            }
+            let by_name = left_name
+                .to_ascii_lowercase()
+                .cmp(&right_name.to_ascii_lowercase());
+            if by_name != std::cmp::Ordering::Equal {
+                return by_name;
+            }
+            left.started_epoch_ms.cmp(&right.started_epoch_ms)
+        }
+    };
+
+    if primary != std::cmp::Ordering::Equal {
+        return primary;
+    }
+
+    left.id.cmp(&right.id)
+}
+
+fn sort_recordings(
+    recordings: &mut [RecordingSummary],
+    sort: RecordingListSortArg,
+    order: RecordingListOrderArg,
+) {
+    recordings.sort_by(|left, right| {
+        let ordering = compare_recordings(left, right, sort);
+        if order == RecordingListOrderArg::Asc {
+            ordering
+        } else {
+            ordering.reverse()
+        }
+    });
+}
+
 pub(super) async fn run_recording_stop(
     recording_id: Option<&str>,
     connection_context: ConnectionContext<'_>,
@@ -951,6 +1079,7 @@ pub(super) fn run_recording_path(as_json: bool) -> Result<u8> {
 
 pub(super) async fn run_recording_list(
     as_json: bool,
+    options: RecordingListOptions<'_>,
     connection_context: ConnectionContext<'_>,
 ) -> Result<u8> {
     cleanup_stale_pid_file().await?;
@@ -967,6 +1096,21 @@ pub(super) async fn run_recording_list(
             .map_err(map_cli_client_error)?,
         None => list_recordings_from_disk()?,
     };
+
+    let sort = options.sort.unwrap_or(RecordingListSortArg::Started);
+    let order = options
+        .order
+        .unwrap_or_else(|| default_recording_list_order(sort));
+    let status = options.status.unwrap_or(RecordingListStatusArg::All);
+
+    let mut recordings = filter_recordings(recordings, status, options.query);
+    sort_recordings(&mut recordings, sort, order);
+
+    let total_count = recordings.len();
+    if let Some(limit) = resolve_recording_list_limit(as_json, options.limit, options.all) {
+        recordings.truncate(limit);
+    }
+
     if as_json {
         println!(
             "{}",
@@ -1003,6 +1147,13 @@ pub(super) async fn run_recording_list(
         ]);
     }
     write_stdout_table(&table)?;
+    if total_count > table.rows().len() {
+        println!(
+            "showing {} of {} recordings (use --limit N or --all)",
+            table.rows().len(),
+            total_count
+        );
+    }
     Ok(0)
 }
 
@@ -5939,13 +6090,41 @@ mod tests {
 
     use crate::runtime::recording::{
         auto_export_default_dir, auto_export_filename_stem, collect_recording_storage_usage,
-        confirm_delete_all_recordings, default_event_kinds_for_flags,
-        delete_all_recordings_from_dir, delete_recording_dir_at, format_recording_age,
-        list_recordings_from_dir, offline_recording_status, recording_status_label,
-        resolve_recording_id_prefix, unique_auto_export_path,
+        confirm_delete_all_recordings, default_event_kinds_for_flags, default_recording_list_order,
+        delete_all_recordings_from_dir, delete_recording_dir_at, filter_recordings,
+        format_recording_age, list_recordings_from_dir, offline_recording_status,
+        recording_status_label, resolve_recording_id_prefix, resolve_recording_list_limit,
+        sort_recordings, unique_auto_export_path,
     };
+    use bmux_cli_schema::{RecordingListOrderArg, RecordingListSortArg, RecordingListStatusArg};
     use std::fs;
     use uuid::Uuid;
+
+    fn recording_summary_for_list_test(
+        id: &str,
+        name: Option<&str>,
+        started_epoch_ms: u64,
+        ended_epoch_ms: Option<u64>,
+        event_count: u64,
+        payload_bytes: u64,
+    ) -> RecordingSummary {
+        RecordingSummary {
+            id: Uuid::parse_str(id).expect("test id should parse"),
+            name: name.map(str::to_string),
+            format_version: bmux_ipc::RECORDING_FORMAT_VERSION,
+            session_id: None,
+            capture_input: true,
+            profile: bmux_ipc::RecordingProfile::Functional,
+            event_kinds: vec![bmux_ipc::RecordingEventKind::PaneOutputRaw],
+            started_epoch_ms,
+            ended_epoch_ms,
+            event_count,
+            payload_bytes,
+            path: "/tmp/test-recording".to_string(),
+            segments: vec!["events_0.bin".to_string()],
+            total_segment_bytes: payload_bytes,
+        }
+    }
 
     #[test]
     fn auto_export_filename_stem_uses_macos_like_timestamp() {
@@ -6063,6 +6242,113 @@ mod tests {
         assert_eq!(format_recording_age(1_000, 172_801_000), "2d ago");
         assert_eq!(format_recording_age(1_000, 691_201_000), "1w ago");
         assert_eq!(format_recording_age(1_000, 31_536_001_000), "1y ago");
+    }
+
+    #[test]
+    fn resolve_recording_list_limit_uses_table_default_and_json_full() {
+        assert_eq!(resolve_recording_list_limit(false, None, false), Some(10));
+        assert_eq!(resolve_recording_list_limit(true, None, false), None);
+        assert_eq!(resolve_recording_list_limit(false, Some(3), false), Some(3));
+        assert_eq!(resolve_recording_list_limit(true, Some(3), false), Some(3));
+        assert_eq!(resolve_recording_list_limit(false, Some(3), true), None);
+    }
+
+    #[test]
+    fn default_recording_list_order_matches_sort_field() {
+        assert_eq!(
+            default_recording_list_order(RecordingListSortArg::Started),
+            RecordingListOrderArg::Desc
+        );
+        assert_eq!(
+            default_recording_list_order(RecordingListSortArg::Name),
+            RecordingListOrderArg::Asc
+        );
+        assert_eq!(
+            default_recording_list_order(RecordingListSortArg::Events),
+            RecordingListOrderArg::Desc
+        );
+        assert_eq!(
+            default_recording_list_order(RecordingListSortArg::Size),
+            RecordingListOrderArg::Desc
+        );
+    }
+
+    #[test]
+    fn filter_recordings_applies_status_and_case_insensitive_query() {
+        let active = recording_summary_for_list_test(
+            "550e8400-e29b-41d4-a716-446655440000",
+            Some("Startup Repro"),
+            3,
+            None,
+            12,
+            512,
+        );
+        let done = recording_summary_for_list_test(
+            "550e8400-e29b-41d4-a716-446655440001",
+            Some("Latency Sweep"),
+            2,
+            Some(9),
+            8,
+            256,
+        );
+
+        let filtered = filter_recordings(
+            vec![active.clone(), done.clone()],
+            RecordingListStatusArg::Active,
+            Some("startup"),
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, active.id);
+
+        let filtered = filter_recordings(
+            vec![active, done.clone()],
+            RecordingListStatusArg::Done,
+            Some("550e8400-e29b-41d4-a716-446655440001"),
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].id, done.id);
+    }
+
+    #[test]
+    fn sort_recordings_supports_name_events_and_size() {
+        let alpha = recording_summary_for_list_test(
+            "550e8400-e29b-41d4-a716-446655440000",
+            Some("alpha"),
+            10,
+            Some(11),
+            2,
+            100,
+        );
+        let beta = recording_summary_for_list_test(
+            "550e8400-e29b-41d4-a716-446655440001",
+            Some("beta"),
+            20,
+            Some(21),
+            9,
+            900,
+        );
+
+        let mut recordings = vec![beta.clone(), alpha.clone()];
+        sort_recordings(
+            &mut recordings,
+            RecordingListSortArg::Name,
+            RecordingListOrderArg::Asc,
+        );
+        assert_eq!(recordings[0].id, alpha.id);
+
+        sort_recordings(
+            &mut recordings,
+            RecordingListSortArg::Events,
+            RecordingListOrderArg::Desc,
+        );
+        assert_eq!(recordings[0].id, beta.id);
+
+        sort_recordings(
+            &mut recordings,
+            RecordingListSortArg::Size,
+            RecordingListOrderArg::Asc,
+        );
+        assert_eq!(recordings[0].id, alpha.id);
     }
 
     #[test]
