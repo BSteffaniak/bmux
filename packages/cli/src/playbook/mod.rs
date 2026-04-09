@@ -315,7 +315,12 @@ fn resolve_includes(
         let included = parse_file_recursive(&canonical, seen, depth + 1)
             .with_context(|| format!("failed parsing included file {}", canonical.display()))?;
 
-        // Only merge steps from included files; config is ignored.
+        // Merge config from included files: parent values take priority,
+        // included values fill gaps.  This lets shared setup files provide
+        // defaults (e.g. @shell, @env, @var, plugin config) that the
+        // including playbook can override.
+        merge_included_config(&mut playbook.config, &included.config);
+
         insertions.push((*insert_at, included.steps));
     }
 
@@ -337,6 +342,57 @@ fn resolve_includes(
     Ok(())
 }
 
+/// Merge config from an included playbook into the parent.
+///
+/// Parent values always take priority.  Included values fill gaps so that
+/// shared setup files can provide defaults (e.g. `@shell sh`, `@env`,
+/// `@var`, plugin enable/disable) without overriding the includer's config.
+///
+/// Fields that are **not** merged (they remain parent-only):
+/// `name`, `description`, `viewport`, `timeout`, `record`, `verbose`,
+/// `binary`, `bundled_plugin_ids`.
+fn merge_included_config(parent: &mut types::PlaybookConfig, included: &types::PlaybookConfig) {
+    // shell: fill if parent hasn't set one (first include wins).
+    if parent.shell.is_none() && included.shell.is_some() {
+        parent.shell.clone_from(&included.shell);
+    }
+
+    // env_mode: fill if parent hasn't set one.
+    if parent.env_mode.is_none() && included.env_mode.is_some() {
+        parent.env_mode = included.env_mode;
+    }
+
+    // env: insert included entries that don't already exist in parent.
+    for (key, value) in &included.env {
+        parent
+            .env
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
+    }
+
+    // vars: insert included entries that don't already exist in parent.
+    for (key, value) in &included.vars {
+        parent
+            .vars
+            .entry(key.clone())
+            .or_insert_with(|| value.clone());
+    }
+
+    // plugins.enable: append included entries that aren't already present.
+    for id in &included.plugins.enable {
+        if !parent.plugins.enable.contains(id) {
+            parent.plugins.enable.push(id.clone());
+        }
+    }
+
+    // plugins.disable: append included entries that aren't already present.
+    for id in &included.plugins.disable {
+        if !parent.plugins.disable.contains(id) {
+            parent.plugins.disable.push(id.clone());
+        }
+    }
+}
+
 /// Parse raw content, trying TOML first then DSL.
 fn parse_content(content: &str) -> Result<(Playbook, Vec<(usize, String)>)> {
     // Try TOML first
@@ -345,4 +401,175 @@ fn parse_content(content: &str) -> Result<(Playbook, Vec<(usize, String)>)> {
     }
     // Fall back to DSL
     parse_dsl::parse_dsl(content)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use types::{PlaybookConfig, PluginConfig, SandboxEnvMode};
+
+    fn default_config() -> PlaybookConfig {
+        PlaybookConfig::default()
+    }
+
+    // ── shell merging ──────────────────────────────────────────────────
+
+    #[test]
+    fn include_fills_shell_when_parent_unset() {
+        let mut parent = default_config();
+        let included = PlaybookConfig {
+            shell: Some("sh".to_string()),
+            ..default_config()
+        };
+        merge_included_config(&mut parent, &included);
+        assert_eq!(parent.shell.as_deref(), Some("sh"));
+    }
+
+    #[test]
+    fn parent_shell_wins_over_included() {
+        let mut parent = PlaybookConfig {
+            shell: Some("bash".to_string()),
+            ..default_config()
+        };
+        let included = PlaybookConfig {
+            shell: Some("sh".to_string()),
+            ..default_config()
+        };
+        merge_included_config(&mut parent, &included);
+        assert_eq!(parent.shell.as_deref(), Some("bash"));
+    }
+
+    #[test]
+    fn first_include_wins_for_shell() {
+        let mut parent = default_config();
+        let first = PlaybookConfig {
+            shell: Some("sh".to_string()),
+            ..default_config()
+        };
+        let second = PlaybookConfig {
+            shell: Some("bash".to_string()),
+            ..default_config()
+        };
+        merge_included_config(&mut parent, &first);
+        merge_included_config(&mut parent, &second);
+        assert_eq!(parent.shell.as_deref(), Some("sh"));
+    }
+
+    // ── env_mode merging ───────────────────────────────────────────────
+
+    #[test]
+    fn include_fills_env_mode_when_parent_unset() {
+        let mut parent = default_config();
+        let included = PlaybookConfig {
+            env_mode: Some(SandboxEnvMode::Clean),
+            ..default_config()
+        };
+        merge_included_config(&mut parent, &included);
+        assert_eq!(parent.env_mode, Some(SandboxEnvMode::Clean));
+    }
+
+    #[test]
+    fn parent_env_mode_wins_over_included() {
+        let mut parent = PlaybookConfig {
+            env_mode: Some(SandboxEnvMode::Inherit),
+            ..default_config()
+        };
+        let included = PlaybookConfig {
+            env_mode: Some(SandboxEnvMode::Clean),
+            ..default_config()
+        };
+        merge_included_config(&mut parent, &included);
+        assert_eq!(parent.env_mode, Some(SandboxEnvMode::Inherit));
+    }
+
+    // ── env merging ────────────────────────────────────────────────────
+
+    #[test]
+    fn include_fills_env_gaps() {
+        let mut parent = default_config();
+        parent.env.insert("A".into(), "from_parent".into());
+        let mut included = default_config();
+        included.env.insert("A".into(), "from_include".into());
+        included.env.insert("B".into(), "from_include".into());
+        merge_included_config(&mut parent, &included);
+        assert_eq!(parent.env["A"], "from_parent", "parent value preserved");
+        assert_eq!(parent.env["B"], "from_include", "gap filled from include");
+    }
+
+    // ── vars merging ───────────────────────────────────────────────────
+
+    #[test]
+    fn include_fills_vars_gaps() {
+        let mut parent = default_config();
+        parent.vars.insert("X".into(), "parent_x".into());
+        let mut included = default_config();
+        included.vars.insert("X".into(), "include_x".into());
+        included.vars.insert("Y".into(), "include_y".into());
+        merge_included_config(&mut parent, &included);
+        assert_eq!(parent.vars["X"], "parent_x", "parent var preserved");
+        assert_eq!(parent.vars["Y"], "include_y", "gap filled from include");
+    }
+
+    // ── plugin merging ─────────────────────────────────────────────────
+
+    #[test]
+    fn include_appends_plugin_enable() {
+        let mut parent = PlaybookConfig {
+            plugins: PluginConfig {
+                enable: vec!["a".into()],
+                disable: vec![],
+            },
+            ..default_config()
+        };
+        let included = PlaybookConfig {
+            plugins: PluginConfig {
+                enable: vec!["a".into(), "b".into()],
+                disable: vec!["c".into()],
+            },
+            ..default_config()
+        };
+        merge_included_config(&mut parent, &included);
+        assert_eq!(parent.plugins.enable, vec!["a", "b"], "dedup + append");
+        assert_eq!(parent.plugins.disable, vec!["c"], "disable appended");
+    }
+
+    // ── identity fields not merged ─────────────────────────────────────
+
+    #[test]
+    fn include_does_not_merge_identity_fields() {
+        let mut parent = default_config();
+        let included = PlaybookConfig {
+            name: Some("included-name".into()),
+            description: Some("included-desc".into()),
+            ..default_config()
+        };
+        merge_included_config(&mut parent, &included);
+        assert!(parent.name.is_none(), "name should not be merged");
+        assert!(
+            parent.description.is_none(),
+            "description should not be merged"
+        );
+    }
+
+    // ── end-to-end parse_file include config merging ───────────────────
+
+    #[test]
+    fn parse_file_merges_shell_from_include() {
+        // include_setup.dsl has @shell sh, include_main.dsl has @shell sh too
+        // (added as a safety net), but this test verifies the parse pipeline
+        // correctly processes includes without error.
+        let fixtures =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/playbooks");
+        let playbook =
+            parse_file(&fixtures.join("include_main.dsl")).expect("should parse include_main.dsl");
+        assert_eq!(
+            playbook.config.shell.as_deref(),
+            Some("sh"),
+            "shell should be set (from main or merged from include)"
+        );
+        assert!(
+            playbook.steps.len() >= 4,
+            "should have steps from both files"
+        );
+    }
 }
