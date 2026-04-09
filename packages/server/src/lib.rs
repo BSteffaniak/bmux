@@ -16,15 +16,16 @@ use bmux_ipc::{
     AttachFocusTarget, AttachGrant, AttachInputModeState, AttachLayer, AttachMouseProtocolEncoding,
     AttachMouseProtocolMode, AttachMouseProtocolState, AttachPaneChunk, AttachPaneInputMode,
     AttachPaneMouseProtocol, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
-    AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, ClientSummary, ContextSelector,
-    ContextSummary, Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint,
-    PaneFocusDirection, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection,
-    PaneState, PaneSummary, PerformanceRecordingLevel, PerformanceRuntimeSettings,
-    ProtocolContract, ProtocolVersion, RecordingEventKind, RecordingPayload, RecordingProfile,
-    RecordingRollingClearReport, RecordingRollingStartOptions, RecordingRollingStatus,
-    RecordingRollingUsage, RecordingSummary, Request, Response, ResponsePayload,
-    ServerSnapshotStatus, SessionSelector, SessionSummary, decode, default_supported_capabilities,
-    encode, negotiate_protocol,
+    AttachViewComponent, CAPABILITY_CONTROL_CATALOG_SYNC, CORE_PROTOCOL_CAPABILITIES,
+    ClientSummary, ContextSelector, ContextSessionBindingSummary, ContextSummary,
+    ControlCatalogScope, ControlCatalogSnapshot, Envelope, EnvelopeKind, ErrorCode, ErrorResponse,
+    Event, IpcEndpoint, PaneFocusDirection, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector,
+    PaneSplitDirection, PaneState, PaneSummary, PerformanceRecordingLevel,
+    PerformanceRuntimeSettings, ProtocolContract, ProtocolVersion, RecordingEventKind,
+    RecordingPayload, RecordingProfile, RecordingRollingClearReport, RecordingRollingStartOptions,
+    RecordingRollingStatus, RecordingRollingUsage, RecordingSummary, Request, Response,
+    ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary, decode,
+    default_supported_capabilities, encode, negotiate_protocol,
 };
 use bmux_session::{ClientId, Session, SessionId, SessionManager};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
@@ -40,7 +41,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::future::Future;
 use std::io::{Read, Write};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex as AsyncMutex, mpsc, oneshot, watch};
@@ -299,6 +300,8 @@ struct ServerState {
     event_hub: Mutex<EventHub>,
     /// Broadcast channel for pushing events to streaming clients.
     event_broadcast: tokio::sync::broadcast::Sender<Event>,
+    control_catalog_revision: AtomicU64,
+    client_capabilities: Mutex<BTreeMap<ClientId, BTreeSet<String>>>,
     client_principals: Mutex<BTreeMap<ClientId, Uuid>>,
     server_control_principal_id: Uuid,
     handshake_timeout: Duration,
@@ -497,18 +500,27 @@ impl EventHub {
         self.subscribers.remove(&client_id);
     }
 
-    fn poll(&mut self, client_id: ClientId, max_events: usize) -> Option<Vec<Event>> {
+    fn poll_with_filter<F>(
+        &mut self,
+        client_id: ClientId,
+        max_events: usize,
+        mut include: F,
+    ) -> Option<Vec<Event>>
+    where
+        F: FnMut(&Event) -> bool,
+    {
         let cursor = self.subscribers.get_mut(&client_id)?;
-        let start = *cursor;
+        let mut index = *cursor;
         let count = max_events.max(1);
-        let events = self
-            .events
-            .iter()
-            .skip(start)
-            .take(count)
-            .map(|record| record.event.clone())
-            .collect::<Vec<_>>();
-        *cursor = start + events.len();
+        let mut events = Vec::new();
+        while index < self.events.len() && events.len() < count {
+            let event = &self.events[index].event;
+            if include(event) {
+                events.push(event.clone());
+            }
+            index = index.saturating_add(1);
+        }
+        *cursor = index;
         Some(events)
     }
 }
@@ -4140,6 +4152,8 @@ impl BmuxServer {
                 operation_lock: AsyncMutex::new(()),
                 event_hub: Mutex::new(EventHub::new(1024)),
                 event_broadcast: event_broadcast_tx,
+                control_catalog_revision: AtomicU64::new(1),
+                client_capabilities: Mutex::new(BTreeMap::new()),
                 client_principals: Mutex::new(BTreeMap::new()),
                 server_control_principal_id,
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
@@ -4469,6 +4483,7 @@ async fn handle_connection(
     let mut negotiated_frame_codec: Option<
         std::sync::Arc<dyn bmux_ipc::compression::CompressionCodec>,
     > = None;
+    let mut negotiated_capabilities: Option<BTreeSet<String>> = None;
 
     // ── Handshake (serial, before split) ─────────────────────────────────
 
@@ -4521,6 +4536,13 @@ async fn handle_connection(
             match negotiate_protocol(&contract, &server_contract, CORE_PROTOCOL_CAPABILITIES) {
                 Ok(negotiated) => {
                     client_principal_id = principal_id;
+                    negotiated_capabilities = Some(
+                        negotiated
+                            .capabilities
+                            .iter()
+                            .cloned()
+                            .collect::<BTreeSet<_>>(),
+                    );
                     debug!(
                         "accepted client handshake (v2): {client_name} revision={} caps={}",
                         negotiated.revision,
@@ -4572,6 +4594,19 @@ async fn handle_connection(
             .lock()
             .map_err(|_| anyhow::anyhow!("client principal map lock poisoned"))?;
         principals.insert(client_id, client_principal_id);
+    }
+    let client_capabilities = negotiated_capabilities.unwrap_or_else(|| {
+        CORE_PROTOCOL_CAPABILITIES
+            .iter()
+            .map(|entry| (*entry).to_string())
+            .collect::<BTreeSet<_>>()
+    });
+    {
+        let mut capabilities = state
+            .client_capabilities
+            .lock()
+            .map_err(|_| anyhow::anyhow!("client capability map lock poisoned"))?;
+        capabilities.insert(client_id, client_capabilities.clone());
     }
 
     // ── Split stream for concurrent read/write ───────────────────────────
@@ -4775,6 +4810,7 @@ async fn handle_connection(
             let push_frame_codec = negotiated_frame_codec.clone();
             let push_state = Arc::clone(&state);
             let push_client_id = client_id;
+            let push_client_capabilities = client_capabilities.clone();
             event_push_task = Some(tokio::spawn(async move {
                 let push_perf_settings_state = Arc::clone(&push_state.performance_settings);
                 let mut push_perf_settings = push_perf_settings_state
@@ -4856,6 +4892,11 @@ async fn handle_connection(
                                 }
                                 other => other,
                             };
+
+                            if !event_supported_by_capability_set(&push_client_capabilities, &event)
+                            {
+                                continue;
+                            }
 
                             let Some(frame) =
                                 encode_event_frame(&event, push_frame_codec.as_deref())
@@ -5007,6 +5048,13 @@ async fn handle_connection(
             .map_err(|_| anyhow::anyhow!("client principal map lock poisoned"))?;
         principals.remove(&client_id);
     }
+    {
+        let mut capabilities = state
+            .client_capabilities
+            .lock()
+            .map_err(|_| anyhow::anyhow!("client capability map lock poisoned"))?;
+        capabilities.remove(&client_id);
+    }
     mark_snapshot_dirty(&state)?;
     maybe_flush_snapshot(&state, false)?;
     unsubscribe_events(&state, client_id)?;
@@ -5034,7 +5082,8 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
         | Event::FollowTargetGone { .. }
         | Event::RecordingStarted { .. }
         | Event::RecordingStopped { .. }
-        | Event::PerformanceSettingsUpdated { .. } => None,
+        | Event::PerformanceSettingsUpdated { .. }
+        | Event::ControlCatalogChanged { .. } => None,
     };
     record_to_all_runtimes(
         &state.manual_recording_runtime,
@@ -5072,6 +5121,112 @@ fn encode_event_frame(
     }
 }
 
+const fn event_required_capability(event: &Event) -> Option<&'static str> {
+    match event {
+        Event::ControlCatalogChanged { .. } => Some(CAPABILITY_CONTROL_CATALOG_SYNC),
+        _ => None,
+    }
+}
+
+fn event_supported_by_capability_set(capabilities: &BTreeSet<String>, event: &Event) -> bool {
+    event_required_capability(event)
+        .is_none_or(|required_capability| capabilities.contains(required_capability))
+}
+
+fn normalize_control_catalog_scopes(scopes: &[ControlCatalogScope]) -> Vec<ControlCatalogScope> {
+    let mut normalized = Vec::new();
+    for scope in [
+        ControlCatalogScope::Sessions,
+        ControlCatalogScope::Contexts,
+        ControlCatalogScope::Bindings,
+    ] {
+        if scopes.contains(&scope) {
+            normalized.push(scope);
+        }
+    }
+    normalized
+}
+
+fn current_control_catalog_revision(state: &Arc<ServerState>) -> u64 {
+    state.control_catalog_revision.load(Ordering::SeqCst)
+}
+
+fn emit_control_catalog_changed(
+    state: &Arc<ServerState>,
+    scopes: &[ControlCatalogScope],
+    full_resync: bool,
+) -> Result<()> {
+    let scopes = normalize_control_catalog_scopes(scopes);
+    if scopes.is_empty() {
+        return Ok(());
+    }
+    let revision = state
+        .control_catalog_revision
+        .fetch_add(1, Ordering::SeqCst)
+        .saturating_add(1);
+    emit_event(
+        state,
+        Event::ControlCatalogChanged {
+            revision,
+            scopes,
+            full_resync,
+        },
+    )
+}
+
+fn build_control_catalog_snapshot(state: &Arc<ServerState>) -> Result<ControlCatalogSnapshot> {
+    let revision = current_control_catalog_revision(state);
+    let sessions = state
+        .session_manager
+        .lock()
+        .map_err(|_| anyhow::anyhow!("session manager lock poisoned"))?
+        .list_sessions()
+        .into_iter()
+        .map(|session| SessionSummary {
+            id: session.id.0,
+            name: session.name,
+            client_count: session.client_count,
+        })
+        .collect::<Vec<_>>();
+
+    let (contexts, context_session_bindings) = {
+        let context_state = state
+            .context_state
+            .lock()
+            .map_err(|_| anyhow::anyhow!("context state lock poisoned"))?;
+        let mut contexts = context_state.list();
+        let context_session_bindings = context_state
+            .session_by_context
+            .iter()
+            .map(|(context_id, session_id)| ContextSessionBindingSummary {
+                context_id: *context_id,
+                session_id: session_id.0,
+            })
+            .collect::<Vec<_>>();
+        drop(context_state);
+        let binding_by_context = context_session_bindings
+            .iter()
+            .map(|binding| (binding.context_id, binding.session_id))
+            .collect::<BTreeMap<_, _>>();
+        for context in &mut contexts {
+            if let Some(session_id) = binding_by_context.get(&context.id) {
+                context.attributes.insert(
+                    CONTEXT_SESSION_ID_ATTRIBUTE.to_string(),
+                    session_id.to_string(),
+                );
+            }
+        }
+        (contexts, context_session_bindings)
+    };
+
+    Ok(ControlCatalogSnapshot {
+        revision,
+        sessions,
+        contexts,
+        context_session_bindings,
+    })
+}
+
 fn lag_recovery_attach_view_events_for_client(
     state: &Arc<ServerState>,
     client_id: ClientId,
@@ -5094,7 +5249,11 @@ fn lag_recovery_attach_view_events_for_client(
             .collect::<Vec<_>>()
     };
 
-    revisions
+    if revisions.is_empty() {
+        return Vec::new();
+    }
+
+    let mut events = revisions
         .into_iter()
         .map(|(session_id, revision)| Event::AttachViewChanged {
             context_id: current_context_id_for_session(state, session_id),
@@ -5107,7 +5266,19 @@ fn lag_recovery_attach_view_events_for_client(
                 AttachViewComponent::Status,
             ],
         })
-        .collect()
+        .collect::<Vec<_>>();
+
+    events.push(Event::ControlCatalogChanged {
+        revision: current_control_catalog_revision(state),
+        scopes: vec![
+            ControlCatalogScope::Sessions,
+            ControlCatalogScope::Contexts,
+            ControlCatalogScope::Bindings,
+        ],
+        full_resync: true,
+    });
+
+    events
 }
 
 fn emit_attach_view_changed(
@@ -6244,7 +6415,14 @@ async fn ensure_attach_session_exists(
         shutdown_runtime_handle(removed_runtime).await;
     }
 
-    let _ = prune_context_mappings_for_session(state, session_id)?;
+    let removed_context_ids = prune_context_mappings_for_session(state, session_id)?;
+    if !removed_context_ids.is_empty() {
+        emit_control_catalog_changed(
+            state,
+            &[ControlCatalogScope::Contexts, ControlCatalogScope::Bindings],
+            false,
+        )?;
+    }
 
     Ok(false)
 }
@@ -7048,6 +7226,10 @@ async fn handle_request(
                 .current_for_client(client_id);
             Response::Ok(ResponsePayload::CurrentContext { context })
         }
+        Request::ControlCatalogSnapshot { since_revision: _ } => {
+            let snapshot = build_control_catalog_snapshot(state)?;
+            Response::Ok(ResponsePayload::ControlCatalogSnapshot { snapshot })
+        }
         Request::KillSession {
             selector,
             force_local,
@@ -7276,7 +7458,15 @@ async fn handle_request(
                 Response::Ok(ResponsePayload::Attached { grant })
             } else {
                 drop(manager);
-                let _ = prune_context_mappings_for_session(state, next_session_id)?;
+                let removed_context_ids =
+                    prune_context_mappings_for_session(state, next_session_id)?;
+                if !removed_context_ids.is_empty() {
+                    emit_control_catalog_changed(
+                        state,
+                        &[ControlCatalogScope::Contexts, ControlCatalogScope::Bindings],
+                        false,
+                    )?;
+                }
                 Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
                     message: format!("session not found: {}", next_session_id.0),
@@ -7336,7 +7526,15 @@ async fn handle_request(
                 Response::Ok(ResponsePayload::Attached { grant })
             } else {
                 drop(manager);
-                let _ = prune_context_mappings_for_session(state, next_session_id)?;
+                let removed_context_ids =
+                    prune_context_mappings_for_session(state, next_session_id)?;
+                if !removed_context_ids.is_empty() {
+                    emit_control_catalog_changed(
+                        state,
+                        &[ControlCatalogScope::Contexts, ControlCatalogScope::Bindings],
+                        false,
+                    )?;
+                }
                 Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
                     message: format!("session not found: {}", next_session_id.0),
@@ -7881,11 +8079,21 @@ async fn handle_request(
             Response::Ok(ResponsePayload::EventsSubscribed)
         }
         Request::PollEvents { max_events } => {
+            let capabilities = state
+                .client_capabilities
+                .lock()
+                .map_err(|_| anyhow::anyhow!("client capability map lock poisoned"))?
+                .get(&client_id)
+                .cloned()
+                .unwrap_or_default();
             let mut hub = state
                 .event_hub
                 .lock()
                 .map_err(|_| anyhow::anyhow!("event hub lock poisoned"))?;
-            hub.poll(client_id, max_events).map_or_else(
+            hub.poll_with_filter(client_id, max_events, |event| {
+                event_supported_by_capability_set(&capabilities, event)
+            })
+            .map_or_else(
                 || {
                     Response::Err(ErrorResponse {
                         code: ErrorCode::InvalidRequest,
@@ -8533,6 +8741,40 @@ async fn handle_request(
     if let Response::Ok(ResponsePayload::AttachReady { session_id, .. }) = &response {
         emit_event(state, Event::ClientAttached { id: *session_id })?;
     }
+    if let Response::Ok(payload) = &response {
+        match payload {
+            ResponsePayload::SessionCreated { .. }
+            | ResponsePayload::ContextCreated { .. }
+            | ResponsePayload::ContextClosed { .. }
+            | ResponsePayload::SessionKilled { .. }
+            | ResponsePayload::PaneClosed {
+                session_closed: true,
+                ..
+            } => {
+                emit_control_catalog_changed(
+                    state,
+                    &[
+                        ControlCatalogScope::Sessions,
+                        ControlCatalogScope::Contexts,
+                        ControlCatalogScope::Bindings,
+                    ],
+                    false,
+                )?;
+            }
+            ResponsePayload::ServerSnapshotRestored { .. } => {
+                emit_control_catalog_changed(
+                    state,
+                    &[
+                        ControlCatalogScope::Sessions,
+                        ControlCatalogScope::Contexts,
+                        ControlCatalogScope::Bindings,
+                    ],
+                    true,
+                )?;
+            }
+            _ => {}
+        }
+    }
 
     if response_requires_snapshot(&response) {
         mark_snapshot_dirty(state)?;
@@ -8667,6 +8909,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::PollEvents { .. } => "poll_events",
         Request::EnableEventPush => "enable_event_push",
         Request::PaneDirectInput { .. } => "pane_direct_input",
+        Request::ControlCatalogSnapshot { .. } => "control_catalog_snapshot",
     }
 }
 
@@ -8947,6 +9190,7 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::EventsSubscribed => "events_subscribed",
         ResponsePayload::EventBatch { .. } => "event_batch",
         ResponsePayload::EventPushEnabled => "event_push_enabled",
+        ResponsePayload::ControlCatalogSnapshot { .. } => "control_catalog_snapshot",
     }
 }
 
@@ -9770,7 +10014,7 @@ fn record_to_all_runtimes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::path::PathBuf;
 
     async fn execute_request(
@@ -10620,6 +10864,175 @@ mod tests {
             }
             response => panic!("expected current context response, got {response:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn control_catalog_snapshot_includes_context_session_bindings() {
+        let server = BmuxServer::new(test_endpoint());
+        let client_id = ClientId::new();
+        let principal_id = Uuid::new_v4();
+        let mut selected_session = None;
+        let mut attached_stream_session = None;
+
+        let created = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::CreateContext {
+                name: Some("alpha".to_string()),
+                attributes: BTreeMap::new(),
+            },
+        )
+        .await;
+        let created_context_id = match created {
+            Response::Ok(ResponsePayload::ContextCreated { context }) => context.id,
+            response => panic!("expected context created response, got {response:?}"),
+        };
+
+        let snapshot_response = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::ControlCatalogSnapshot {
+                since_revision: None,
+            },
+        )
+        .await;
+
+        let snapshot = match snapshot_response {
+            Response::Ok(ResponsePayload::ControlCatalogSnapshot { snapshot }) => snapshot,
+            response => panic!("expected control catalog snapshot response, got {response:?}"),
+        };
+
+        assert!(
+            snapshot.revision >= 2,
+            "catalog revision should advance after context creation"
+        );
+        assert!(
+            snapshot
+                .contexts
+                .iter()
+                .any(|context| context.id == created_context_id),
+            "created context should be present in catalog snapshot"
+        );
+        assert!(
+            snapshot
+                .context_session_bindings
+                .iter()
+                .any(|binding| binding.context_id == created_context_id),
+            "created context should have a session binding in catalog snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_events_filters_control_catalog_events_without_capability() {
+        let server = BmuxServer::new(test_endpoint());
+        let client_id = ClientId::new();
+        let principal_id = Uuid::new_v4();
+        let mut selected_session = None;
+        let mut attached_stream_session = None;
+
+        {
+            let mut capabilities = server
+                .state
+                .client_capabilities
+                .lock()
+                .expect("client capability map lock should succeed");
+            capabilities.insert(client_id, BTreeSet::new());
+        }
+
+        let subscribed = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::SubscribeEvents,
+        )
+        .await;
+        assert_eq!(subscribed, Response::Ok(ResponsePayload::EventsSubscribed));
+
+        let _ = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::CreateContext {
+                name: Some("hidden-control-event".to_string()),
+                attributes: BTreeMap::new(),
+            },
+        )
+        .await;
+
+        let polled = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::PollEvents { max_events: 16 },
+        )
+        .await;
+        let events = match polled {
+            Response::Ok(ResponsePayload::EventBatch { events }) => events,
+            response => panic!("expected event batch response, got {response:?}"),
+        };
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::ControlCatalogChanged { .. })),
+            "poll_events should filter control catalog events without capability"
+        );
+
+        {
+            let mut capabilities = server
+                .state
+                .client_capabilities
+                .lock()
+                .expect("client capability map lock should succeed");
+            capabilities.insert(
+                client_id,
+                BTreeSet::from([CAPABILITY_CONTROL_CATALOG_SYNC.to_string()]),
+            );
+        }
+
+        let _ = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::CreateContext {
+                name: Some("visible-control-event".to_string()),
+                attributes: BTreeMap::new(),
+            },
+        )
+        .await;
+
+        let polled_with_capability = execute_request(
+            &server,
+            client_id,
+            principal_id,
+            &mut selected_session,
+            &mut attached_stream_session,
+            Request::PollEvents { max_events: 16 },
+        )
+        .await;
+        let events_with_capability = match polled_with_capability {
+            Response::Ok(ResponsePayload::EventBatch { events }) => events,
+            response => panic!("expected event batch response, got {response:?}"),
+        };
+        assert!(
+            events_with_capability
+                .iter()
+                .any(|event| matches!(event, Event::ControlCatalogChanged { .. })),
+            "poll_events should include control catalog events with capability"
+        );
     }
 
     #[tokio::test]

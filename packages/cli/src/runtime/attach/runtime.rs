@@ -5,9 +5,10 @@ use bmux_client::{
 };
 use bmux_config::{BmuxConfig, ConfigPaths, PaneRestoreMethod, ResolvedTimeout, StatusPosition};
 use bmux_ipc::{
-    AttachRect, AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, ContextSelector,
-    ContextSummary, InvokeServiceKind, PaneFocusDirection, PaneSelector, PaneSplitDirection,
-    SessionSelector, SessionSummary,
+    AttachRect, AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT,
+    CAPABILITY_CONTROL_CATALOG_SYNC, ContextSelector, ContextSessionBindingSummary, ContextSummary,
+    ControlCatalogSnapshot, InvokeServiceKind, PaneFocusDirection, PaneSelector,
+    PaneSplitDirection, SessionSelector, SessionSummary,
 };
 use bmux_keybind::{action_to_config_name, parse_action};
 use bmux_plugin_sdk::{
@@ -61,10 +62,9 @@ use super::state::{
 };
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 
-const ATTACH_CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
-const ATTACH_STATUS_CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
 const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
+const ATTACH_LEGACY_CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// Maximum wall-clock time the drain loop may spend waiting for an in-
 /// progress output burst to complete (e.g. when the server indicates
 /// `output_still_pending` or the inner application is mid-synchronized-
@@ -743,8 +743,10 @@ pub async fn run_session_attach_with_client(
 
     // Async terminal event stream — replaces spawn_blocking + poll(15ms).
     let mut terminal_stream = crossterm::event::EventStream::new();
-    let mut context_refresh_interval = tokio::time::interval(ATTACH_CONTEXT_REFRESH_INTERVAL);
-    context_refresh_interval.tick().await;
+    let supports_control_catalog_sync = client.supports_capability(CAPABILITY_CONTROL_CATALOG_SYNC);
+    let mut legacy_catalog_refresh_interval =
+        tokio::time::interval(ATTACH_LEGACY_CATALOG_REFRESH_INTERVAL);
+    legacy_catalog_refresh_interval.tick().await;
     let mut pane_output_pending = false;
     #[cfg(any(
         feature = "image-sixel",
@@ -943,32 +945,33 @@ pub async fn run_session_attach_with_client(
                 }
             }
 
-            // Periodic context refresh — safety net for rare context-session
-            // reassignment (e.g. snapshot restore).  Session removal is
-            // handled event-driven via SessionRemoved, so this only needs to
-            // catch the edge case where a context is rebound to a different
-            // session without the old session being removed.
-            _ = context_refresh_interval.tick() => {
-                let now = Instant::now();
-                let _ = view_state.clear_expired_transient_status(now);
-                if should_refresh_attached_session(&view_state, now)
-                    && let Err(error) =
-                        refresh_attached_session_from_context(&mut client, &mut view_state).await
+            _ = legacy_catalog_refresh_interval.tick(), if !supports_control_catalog_sync => {
+                if let Err(error) = refresh_attach_status_catalog(&mut client, &mut view_state).await {
+                    view_state.set_transient_status(
+                        format!(
+                            "legacy catalog refresh failed: {}",
+                            map_attach_client_error(error)
+                        ),
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                } else {
+                    if let Err(error) =
+                        reconcile_attached_session_from_catalog(&mut client, &mut view_state).await
                     {
                         view_state.set_transient_status(
                             format!(
-                                "context refresh delayed: {}",
+                                "legacy catalog reconcile failed: {}",
                                 map_attach_client_error(error)
                             ),
                             Instant::now(),
                             ATTACH_TRANSIENT_STATUS_TTL,
                         );
                     }
-
-                if should_refresh_attach_status_catalog(&view_state, now) {
-                    refresh_attach_status_catalog_best_effort(&mut client, &mut view_state).await;
+                    view_state.dirty.status_needs_redraw = true;
                 }
             }
+
         }
 
         // ── Post-event processing: layout, output fetch, render ──────
@@ -2034,13 +2037,13 @@ pub async fn handle_attach_ui_action(
             view_state.exit_scrollback();
         }
         RuntimeAction::SplitFocusedVertical => {
-            let selector = attached_session_selector(client, view_state).await?;
+            let selector = attached_session_selector(view_state);
             let _ = client
                 .split_pane(Some(selector), PaneSplitDirection::Vertical)
                 .await?;
         }
         RuntimeAction::SplitFocusedHorizontal => {
-            let selector = attached_session_selector(client, view_state).await?;
+            let selector = attached_session_selector(view_state);
             let _ = client
                 .split_pane(Some(selector), PaneSplitDirection::Horizontal)
                 .await?;
@@ -2059,7 +2062,7 @@ pub async fn handle_attach_ui_action(
             } else {
                 PaneFocusDirection::Next
             };
-            let selector = attached_session_selector(client, view_state).await?;
+            let selector = attached_session_selector(view_state);
             let _ = client.focus_pane(Some(selector), direction).await?;
         }
         RuntimeAction::IncreaseSplit
@@ -2078,7 +2081,7 @@ pub async fn handle_attach_ui_action(
             } else {
                 -1
             };
-            let selector = attached_session_selector(client, view_state).await?;
+            let selector = attached_session_selector(view_state);
             client.resize_pane(Some(selector), delta).await?;
         }
         RuntimeAction::CloseFocusedPane => {
@@ -2109,7 +2112,7 @@ pub async fn handle_attach_ui_action(
             );
         }
         RuntimeAction::ZoomPane => {
-            let selector = attached_session_selector(client, view_state).await?;
+            let selector = attached_session_selector(view_state);
             let (_pane_id, zoomed) = client.zoom_pane(Some(selector)).await?;
             let status = if zoomed { "Pane zoomed" } else { "Zoom exited" };
             view_state.set_transient_status(status, Instant::now(), ATTACH_TRANSIENT_STATUS_TTL);
@@ -2118,7 +2121,7 @@ pub async fn handle_attach_ui_action(
             handle_attach_runtime_action(client, action, view_state).await?;
         }
         RuntimeAction::RestartFocusedPane => {
-            let selector = attached_session_selector(client, view_state).await?;
+            let selector = attached_session_selector(view_state);
             let _ = client.restart_pane(Some(selector)).await?;
             view_state.set_transient_status(
                 "pane restarted",
@@ -2495,25 +2498,28 @@ pub async fn switch_attach_session_relative(
     view_state: &mut AttachViewState,
     step: isize,
 ) -> std::result::Result<(), ClientError> {
-    if let Some(current_context_id) = view_state.attached_context_id {
-        let contexts = client.list_contexts().await?;
-        if let Some(target_context_id) = relative_context_id(&contexts, current_context_id, step) {
-            let _ = client
-                .select_context(ContextSelector::ById(target_context_id))
-                .await?;
-            let attach_info = open_attach_for_context(client, target_context_id).await?;
-            view_state.attached_id = attach_info.session_id;
-            view_state.attached_context_id = attach_info.context_id.or(Some(target_context_id));
-            view_state.can_write = attach_info.can_write;
-            update_attach_viewport(client, view_state.attached_id, view_state.status_position)
-                .await?;
-            hydrate_attach_state_from_snapshot(client, view_state).await?;
-            return Ok(());
-        }
+    if view_state.cached_contexts.is_empty() && view_state.cached_sessions.is_empty() {
+        refresh_attach_status_catalog_best_effort(client, view_state).await;
     }
 
-    let sessions = client.list_sessions().await?;
-    let Some(target_session_id) = relative_session_id(&sessions, view_state.attached_id, step)
+    if let Some(current_context_id) = view_state.attached_context_id
+        && let Some(target_context_id) =
+            relative_context_id(&view_state.cached_contexts, current_context_id, step)
+    {
+        let _ = client
+            .select_context(ContextSelector::ById(target_context_id))
+            .await?;
+        let attach_info = open_attach_for_context(client, target_context_id).await?;
+        view_state.attached_id = attach_info.session_id;
+        view_state.attached_context_id = attach_info.context_id.or(Some(target_context_id));
+        view_state.can_write = attach_info.can_write;
+        update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
+        hydrate_attach_state_from_snapshot(client, view_state).await?;
+        return Ok(());
+    }
+
+    let Some(target_session_id) =
+        relative_session_id(&view_state.cached_sessions, view_state.attached_id, step)
     else {
         return Ok(());
     };
@@ -3399,92 +3405,118 @@ pub async fn open_attach_for_context(
     client.open_attach_stream_info(&grant).await
 }
 
-pub async fn attached_session_selector(
-    client: &mut StreamingBmuxClient,
-    view_state: &mut AttachViewState,
-) -> std::result::Result<SessionSelector, ClientError> {
-    refresh_attached_session_from_context(client, view_state).await?;
-    Ok(SessionSelector::ById(view_state.attached_id))
+pub const fn attached_session_selector(view_state: &AttachViewState) -> SessionSelector {
+    SessionSelector::ById(view_state.attached_id)
 }
 
-pub async fn refresh_attached_session_from_context(
-    client: &mut StreamingBmuxClient,
-    view_state: &mut AttachViewState,
-) -> std::result::Result<(), ClientError> {
-    if let Some(context_id) = view_state.attached_context_id {
-        trace!(
-            context_id = %context_id,
-            current_session_id = %view_state.attached_id,
-            "attach.context_refresh.start"
-        );
-        let started_at = Instant::now();
-        let grant = client
-            .attach_context_grant(ContextSelector::ById(context_id))
-            .await?;
-        let previous_session_id = view_state.attached_id;
+fn parse_context_session_id(context: &ContextSummary) -> Option<Uuid> {
+    context
+        .attributes
+        .get("bmux.session_id")
+        .and_then(|value| Uuid::parse_str(value).ok())
+}
 
-        if grant.session_id == previous_session_id {
-            view_state.attached_id = grant.session_id;
-        } else {
-            // The context now maps to a different session (e.g. after
-            // snapshot restore or context reassignment).  We must open a
-            // new attach stream so the server registers this client in the
-            // new session's `attached_clients`; without this the next
-            // `attach_layout` or `attach_pane_output_batch` call would
-            // fail with "client is not attached to session runtime".
-            let attach_info = client.open_attach_stream_info(&grant).await?;
-            view_state.attached_id = attach_info.session_id;
-            view_state.can_write = attach_info.can_write;
-
-            // Fully hydrate the new session: set the viewport so the
-            // server knows our terminal size, then fetch a snapshot.  The
-            // snapshot clears the server-side `output_dirty` flag for each
-            // pane, which allows the PTY reader to emit fresh
-            // `PaneOutputAvailable` events for subsequent output.  Without
-            // this, the flag stays permanently `true` (set when the pane
-            // first produced output before any client consumed it) and no
-            // events are ever broadcast — making the session appear frozen.
-            update_attach_viewport(client, view_state.attached_id, view_state.status_position)
-                .await?;
-            hydrate_attach_state_from_snapshot(client, view_state).await?;
-            refresh_attach_status_catalog_best_effort(client, view_state).await;
+fn apply_context_session_bindings_to_contexts(
+    contexts: &mut [ContextSummary],
+    bindings: &[ContextSessionBindingSummary],
+) {
+    let binding_by_context = bindings
+        .iter()
+        .map(|binding| (binding.context_id, binding.session_id))
+        .collect::<BTreeMap<_, _>>();
+    for context in contexts {
+        if let Some(session_id) = binding_by_context.get(&context.id) {
+            context
+                .attributes
+                .insert("bmux.session_id".to_string(), session_id.to_string());
         }
-        view_state.attached_context_id = grant.context_id.or(Some(context_id));
-
-        view_state.last_context_refresh_at = Some(Instant::now());
-        trace!(
-                context_id = ?view_state.attached_context_id,
-                previous_session_id = %previous_session_id,
-            refreshed_session_id = %view_state.attached_id,
-            elapsed_ms = started_at.elapsed().as_millis(),
-            "attach.context_refresh.done"
-        );
     }
-    Ok(())
 }
 
-pub fn should_refresh_attached_session(view_state: &AttachViewState, now: Instant) -> bool {
-    view_state
-        .last_context_refresh_at
-        .is_none_or(|last| now.duration_since(last) >= ATTACH_CONTEXT_REFRESH_INTERVAL)
+fn apply_control_catalog_snapshot(
+    view_state: &mut AttachViewState,
+    mut snapshot: ControlCatalogSnapshot,
+) {
+    apply_context_session_bindings_to_contexts(
+        &mut snapshot.contexts,
+        &snapshot.context_session_bindings,
+    );
+    view_state.cached_contexts = snapshot.contexts;
+    view_state.cached_sessions = snapshot.sessions;
+    view_state.control_catalog_revision = snapshot.revision;
+}
+
+pub async fn reconcile_attached_session_from_catalog(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+) -> std::result::Result<bool, ClientError> {
+    let Some(context_id) = view_state.attached_context_id else {
+        return Ok(false);
+    };
+
+    let Some(mapped_session_id) = view_state
+        .cached_contexts
+        .iter()
+        .find(|context| context.id == context_id)
+        .and_then(parse_context_session_id)
+    else {
+        return Ok(false);
+    };
+
+    if mapped_session_id == view_state.attached_id {
+        return Ok(false);
+    }
+
+    let started_at = Instant::now();
+    trace!(
+        context_id = %context_id,
+        previous_session_id = %view_state.attached_id,
+        mapped_session_id = %mapped_session_id,
+        "attach.catalog_reconcile.start"
+    );
+
+    let attach_info = open_attach_for_context(client, context_id).await?;
+    view_state.attached_id = attach_info.session_id;
+    view_state.attached_context_id = attach_info.context_id.or(Some(context_id));
+    view_state.can_write = attach_info.can_write;
+    update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
+    hydrate_attach_state_from_snapshot(client, view_state).await?;
+    view_state.ui_mode = AttachUiMode::Normal;
+    let status = attach_context_status_from_catalog(view_state);
+    set_attach_context_status(
+        view_state,
+        status,
+        Instant::now(),
+        ATTACH_TRANSIENT_STATUS_TTL,
+    );
+
+    trace!(
+        context_id = ?view_state.attached_context_id,
+        refreshed_session_id = %view_state.attached_id,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        "attach.catalog_reconcile.done"
+    );
+
+    Ok(true)
 }
 
 pub async fn refresh_attach_status_catalog(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
 ) -> std::result::Result<(), ClientError> {
-    let contexts = client.list_contexts().await?;
-    let sessions = client.list_sessions().await?;
-    view_state.cached_contexts = contexts;
-    view_state.cached_sessions = sessions;
-    view_state.last_status_catalog_refresh_at = Some(Instant::now());
+    if client.supports_capability(CAPABILITY_CONTROL_CATALOG_SYNC) {
+        let snapshot = client
+            .control_catalog_snapshot(Some(view_state.control_catalog_revision))
+            .await?;
+        apply_control_catalog_snapshot(view_state, snapshot);
+    } else {
+        let contexts = client.list_contexts().await?;
+        let sessions = client.list_sessions().await?;
+        view_state.cached_contexts = contexts;
+        view_state.cached_sessions = sessions;
+        view_state.control_catalog_revision = 0;
+    }
     Ok(())
-}
-
-pub fn should_refresh_attach_status_catalog(view_state: &AttachViewState, now: Instant) -> bool {
-    view_state
-        .last_status_catalog_refresh_at
-        .is_none_or(|last| now.duration_since(last) >= ATTACH_STATUS_CATALOG_REFRESH_INTERVAL)
 }
 
 async fn refresh_attach_status_catalog_best_effort(
@@ -4278,6 +4310,33 @@ pub async fn handle_attach_server_event(
         } if Some(former_leader_client_id) == follow_target_id => {
             println!("follow target disconnected; staying on current session");
         }
+        bmux_client::ServerEvent::ControlCatalogChanged {
+            revision,
+            full_resync,
+            ..
+        } => {
+            if full_resync || revision > view_state.control_catalog_revision {
+                if let Err(error) = refresh_attach_status_catalog(client, view_state).await {
+                    view_state.set_transient_status(
+                        format!("catalog refresh failed: {}", map_attach_client_error(error)),
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                } else if let Err(error) =
+                    reconcile_attached_session_from_catalog(client, view_state).await
+                {
+                    view_state.set_transient_status(
+                        format!(
+                            "catalog reconcile failed: {}",
+                            map_attach_client_error(error)
+                        ),
+                        Instant::now(),
+                        ATTACH_TRANSIENT_STATUS_TTL,
+                    );
+                }
+            }
+            view_state.dirty.status_needs_redraw = true;
+        }
         bmux_client::ServerEvent::AttachViewChanged {
             context_id,
             session_id,
@@ -4344,6 +4403,8 @@ pub async fn recover_attach_after_session_removed(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
 ) -> std::result::Result<bool, ClientError> {
+    refresh_attach_status_catalog_best_effort(client, view_state).await;
+
     if let Ok(Some(context)) = client.current_context().await
         && retarget_attach_to_context(client, view_state, context.id)
             .await
@@ -4352,46 +4413,41 @@ pub async fn recover_attach_after_session_removed(
         return Ok(true);
     }
 
-    if let Ok(contexts) = client.list_contexts().await {
-        for context in contexts {
-            if Some(context.id) == view_state.attached_context_id {
-                continue;
-            }
-            if retarget_attach_to_context(client, view_state, context.id)
-                .await
-                .is_ok()
-            {
-                return Ok(true);
-            }
+    for context in view_state.cached_contexts.clone() {
+        if Some(context.id) == view_state.attached_context_id {
+            continue;
+        }
+        if retarget_attach_to_context(client, view_state, context.id)
+            .await
+            .is_ok()
+        {
+            return Ok(true);
         }
     }
 
     let previous_session_id = view_state.attached_id;
-    if let Ok(sessions) = client.list_sessions().await {
-        for session in sessions {
-            if session.id == previous_session_id {
-                continue;
-            }
-            let Ok(attach_info) = open_attach_for_session(client, session.id).await else {
-                continue;
-            };
-            view_state.attached_id = attach_info.session_id;
-            view_state.attached_context_id = attach_info.context_id;
-            view_state.can_write = attach_info.can_write;
-            update_attach_viewport(client, view_state.attached_id, view_state.status_position)
-                .await?;
-            hydrate_attach_state_from_snapshot(client, view_state).await?;
-            refresh_attach_status_catalog_best_effort(client, view_state).await;
-            view_state.ui_mode = AttachUiMode::Normal;
-            let status = attach_context_status_from_catalog(view_state);
-            set_attach_context_status(
-                view_state,
-                status,
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
-            return Ok(true);
+    for session in view_state.cached_sessions.clone() {
+        if session.id == previous_session_id {
+            continue;
         }
+        let Ok(attach_info) = open_attach_for_session(client, session.id).await else {
+            continue;
+        };
+        view_state.attached_id = attach_info.session_id;
+        view_state.attached_context_id = attach_info.context_id;
+        view_state.can_write = attach_info.can_write;
+        update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
+        hydrate_attach_state_from_snapshot(client, view_state).await?;
+        refresh_attach_status_catalog_best_effort(client, view_state).await;
+        view_state.ui_mode = AttachUiMode::Normal;
+        let status = attach_context_status_from_catalog(view_state);
+        set_attach_context_status(
+            view_state,
+            status,
+            Instant::now(),
+            ATTACH_TRANSIENT_STATUS_TTL,
+        );
+        return Ok(true);
     }
 
     Ok(false)
@@ -4419,18 +4475,6 @@ pub async fn handle_attach_terminal_event(
     kernel_client_factory: Option<&KernelClientFactory>,
 ) -> Result<AttachLoopControl> {
     if matches!(terminal_event, Event::Resize(_, _)) {
-        if should_refresh_attached_session(view_state, Instant::now())
-            && let Err(error) = refresh_attached_session_from_context(client, view_state).await
-        {
-            view_state.set_transient_status(
-                format!(
-                    "context refresh delayed: {}",
-                    map_attach_client_error(error)
-                ),
-                Instant::now(),
-                ATTACH_TRANSIENT_STATUS_TTL,
-            );
-        }
         update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
     }
 
@@ -4486,19 +4530,6 @@ pub async fn handle_attach_terminal_event(
                     continue;
                 }
                 if view_state.can_write {
-                    if should_refresh_attached_session(view_state, Instant::now())
-                        && let Err(error) =
-                            refresh_attached_session_from_context(client, view_state).await
-                    {
-                        view_state.set_transient_status(
-                            format!(
-                                "context refresh delayed: {}",
-                                map_attach_client_error(error)
-                            ),
-                            Instant::now(),
-                            ATTACH_TRANSIENT_STATUS_TTL,
-                        );
-                    }
                     // Fire-and-forget: send input without waiting for the
                     // round-trip acknowledgement.  Critical failures
                     // (session removed, pane exited) are detected via
@@ -4642,7 +4673,7 @@ pub async fn handle_attach_prompt_completion(
         AttachPromptOrigin::Internal(action) => match action {
             AttachInternalPromptAction::QuitSession => {
                 if prompt_response_is_confirmed(&completion.response) {
-                    let selector = attached_session_selector(client, view_state).await?;
+                    let selector = attached_session_selector(view_state);
                     match client.kill_session(selector).await {
                         Ok(_) => return Ok(Some(AttachLoopControl::Break(AttachExitReason::Quit))),
                         Err(error) => {
@@ -4664,7 +4695,7 @@ pub async fn handle_attach_prompt_completion(
             }
             AttachInternalPromptAction::ClosePane { pane_id } => {
                 if prompt_response_is_confirmed(&completion.response) {
-                    let selector = attached_session_selector(client, view_state).await?;
+                    let selector = attached_session_selector(view_state);
                     let _ = client
                         .focus_pane_target(Some(selector.clone()), PaneSelector::ById(pane_id))
                         .await?;
@@ -5561,19 +5592,6 @@ pub async fn focus_attach_pane(
 ) -> std::result::Result<(), ClientError> {
     if view_state.mouse.last_focused_pane_id == Some(pane_id) {
         return Ok(());
-    }
-
-    if should_refresh_attached_session(view_state, Instant::now())
-        && let Err(error) = refresh_attached_session_from_context(client, view_state).await
-    {
-        view_state.set_transient_status(
-            format!(
-                "context refresh delayed: {}",
-                map_attach_client_error(error)
-            ),
-            Instant::now(),
-            ATTACH_TRANSIENT_STATUS_TTL,
-        );
     }
 
     client

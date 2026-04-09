@@ -968,6 +968,7 @@ pub(super) const fn plugin_event_kind_from_server_event(
         }
         bmux_client::ServerEvent::SessionCreated { .. }
         | bmux_client::ServerEvent::SessionRemoved { .. }
+        | bmux_client::ServerEvent::ControlCatalogChanged { .. }
         | bmux_client::ServerEvent::FollowStarted { .. }
         | bmux_client::ServerEvent::FollowStopped { .. }
         | bmux_client::ServerEvent::FollowTargetGone { .. }

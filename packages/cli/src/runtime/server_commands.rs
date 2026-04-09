@@ -332,6 +332,7 @@ pub(super) const fn server_event_name(event: &bmux_client::ServerEvent) -> &'sta
         bmux_client::ServerEvent::PerformanceSettingsUpdated { .. } => {
             "performance_settings_updated"
         }
+        bmux_client::ServerEvent::ControlCatalogChanged { .. } => "control_catalog_changed",
     }
 }
 

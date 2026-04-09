@@ -74,6 +74,7 @@ pub const CORE_CAPABILITY_ATTACH: &str = "core.attach";
 pub const CORE_CAPABILITY_PANE_IO: &str = "core.pane_io";
 pub const CORE_CAPABILITY_DETACH: &str = "core.detach";
 pub const CAPABILITY_ATTACH_PANE_SNAPSHOT: &str = "feature.attach_pane_snapshot";
+pub const CAPABILITY_CONTROL_CATALOG_SYNC: &str = "feature.control_catalog_sync";
 
 /// Core protocol capabilities required for baseline bmux operation.
 pub const CORE_PROTOCOL_CAPABILITIES: &[&str] = &[
@@ -165,6 +166,7 @@ pub fn default_supported_capabilities() -> Vec<String> {
         "feature.contexts".to_string(),
         "feature.attach_snapshot".to_string(),
         CAPABILITY_ATTACH_PANE_SNAPSHOT.to_string(),
+        CAPABILITY_CONTROL_CATALOG_SYNC.to_string(),
         "feature.recording.v4".to_string(),
     ];
     // Advertise compression capabilities when compiled in.
@@ -642,6 +644,12 @@ pub enum Request {
         client_name: String,
         principal_id: Uuid,
     },
+    /// Return a snapshot of control-plane catalog state used by attach UIs.
+    ControlCatalogSnapshot {
+        /// Optional last-known revision for future incremental semantics.
+        #[serde(default)]
+        since_revision: Option<u64>,
+    },
 }
 
 /// Attach grant returned by attach control-plane request.
@@ -669,6 +677,28 @@ pub struct ContextSummary {
     pub name: Option<String>,
     #[serde(default)]
     pub attributes: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlCatalogScope {
+    Sessions,
+    Contexts,
+    Bindings,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSessionBindingSummary {
+    pub context_id: Uuid,
+    pub session_id: Uuid,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ControlCatalogSnapshot {
+    pub revision: u64,
+    pub sessions: Vec<SessionSummary>,
+    pub contexts: Vec<ContextSummary>,
+    pub context_session_bindings: Vec<ContextSessionBindingSummary>,
 }
 
 /// Summary returned when listing panes in the active session runtime.
@@ -1312,6 +1342,9 @@ pub enum ResponsePayload {
     HelloIncompatible {
         reason: IncompatibilityReason,
     },
+    ControlCatalogSnapshot {
+        snapshot: ControlCatalogSnapshot,
+    },
 }
 
 /// Canonical error codes returned over IPC.
@@ -1442,6 +1475,14 @@ pub enum Event {
     /// Runtime performance telemetry settings changed.
     PerformanceSettingsUpdated {
         settings: PerformanceRuntimeSettings,
+    },
+    /// Control-plane catalog state changed (sessions/contexts/bindings).
+    /// Clients should refresh via `ControlCatalogSnapshot` and reconcile local caches.
+    ControlCatalogChanged {
+        revision: u64,
+        scopes: Vec<ControlCatalogScope>,
+        #[serde(default)]
+        full_resync: bool,
     },
 }
 
@@ -2123,6 +2164,12 @@ mod tests {
                 pane_id: id2,
                 data: vec![104, 101, 108, 108, 111],
             },
+            Request::ControlCatalogSnapshot {
+                since_revision: Some(7),
+            },
+            Request::ControlCatalogSnapshot {
+                since_revision: None,
+            },
         ];
 
         for (i, variant) in variants.iter().enumerate() {
@@ -2614,6 +2661,25 @@ mod tests {
             ResponsePayload::ServiceInvoked {
                 payload: vec![9, 8, 7],
             },
+            ResponsePayload::ControlCatalogSnapshot {
+                snapshot: ControlCatalogSnapshot {
+                    revision: 11,
+                    sessions: vec![SessionSummary {
+                        id,
+                        name: Some("dev".into()),
+                        client_count: 2,
+                    }],
+                    contexts: vec![ContextSummary {
+                        id: id2,
+                        name: Some("workspace".into()),
+                        attributes: BTreeMap::new(),
+                    }],
+                    context_session_bindings: vec![ContextSessionBindingSummary {
+                        context_id: id2,
+                        session_id: id,
+                    }],
+                },
+            },
         ];
 
         for (i, variant) in variants.iter().enumerate() {
@@ -2735,6 +2801,11 @@ mod tests {
             },
             Event::PerformanceSettingsUpdated {
                 settings: sample_performance_runtime_settings(),
+            },
+            Event::ControlCatalogChanged {
+                revision: 9,
+                scopes: vec![ControlCatalogScope::Sessions, ControlCatalogScope::Bindings],
+                full_resync: true,
             },
         ];
 
@@ -3112,6 +3183,18 @@ mod tests {
         ];
         for sel in &selectors {
             assert_roundtrip(sel);
+        }
+    }
+
+    #[test]
+    fn control_catalog_scope_all_variants_roundtrip() {
+        let scopes = [
+            ControlCatalogScope::Sessions,
+            ControlCatalogScope::Contexts,
+            ControlCatalogScope::Bindings,
+        ];
+        for scope in &scopes {
+            assert_roundtrip(scope);
         }
     }
 

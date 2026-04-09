@@ -959,6 +959,26 @@ impl BmuxClient {
         }
     }
 
+    /// Return a control-plane catalog snapshot for attach/cache synchronization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn control_catalog_snapshot(
+        &mut self,
+        since_revision: Option<u64>,
+    ) -> Result<bmux_ipc::ControlCatalogSnapshot> {
+        match self
+            .request(Request::ControlCatalogSnapshot { since_revision })
+            .await?
+        {
+            ResponsePayload::ControlCatalogSnapshot { snapshot } => Ok(snapshot),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected control catalog snapshot response",
+            )),
+        }
+    }
+
     /// Kill a session selected by name or UUID.
     ///
     /// # Errors
@@ -2216,6 +2236,26 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Return a control-plane catalog snapshot for attach/cache synchronization.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn control_catalog_snapshot(
+        &mut self,
+        since_revision: Option<u64>,
+    ) -> Result<bmux_ipc::ControlCatalogSnapshot> {
+        match self
+            .request(Request::ControlCatalogSnapshot { since_revision })
+            .await?
+        {
+            ResponsePayload::ControlCatalogSnapshot { snapshot } => Ok(snapshot),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected control catalog snapshot response",
+            )),
+        }
+    }
+
     /// Kill a session selected by name or UUID.
     ///
     /// # Errors
@@ -3040,6 +3080,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::PollEvents { .. } => "poll_events",
         Request::EnableEventPush => "enable_event_push",
         Request::PaneDirectInput { .. } => "pane_direct_input",
+        Request::ControlCatalogSnapshot { .. } => "control_catalog_snapshot",
     }
 }
 
@@ -3106,6 +3147,7 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::EventsSubscribed => "events_subscribed",
             ResponsePayload::EventBatch { .. } => "event_batch",
             ResponsePayload::EventPushEnabled => "event_push_enabled",
+            ResponsePayload::ControlCatalogSnapshot { .. } => "control_catalog_snapshot",
         },
         Response::Err(_) => "error",
     }
