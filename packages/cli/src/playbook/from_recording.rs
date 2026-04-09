@@ -581,6 +581,7 @@ fn request_to_dsl(
         | Request::AttachPaneOutputBatch { .. }
         | Request::Ping
         | Request::Hello { .. }
+        | Request::HelloV2 { .. }
         | Request::WhoAmI
         | Request::WhoAmIPrincipal
         | Request::ListSessions

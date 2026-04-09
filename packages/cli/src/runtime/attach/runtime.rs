@@ -5,10 +5,9 @@ use bmux_client::{
 };
 use bmux_config::{BmuxConfig, ConfigPaths, PaneRestoreMethod, ResolvedTimeout, StatusPosition};
 use bmux_ipc::{
-    AttachRect, AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT,
-    CAPABILITY_CONTROL_CATALOG_SYNC, ContextSelector, ContextSessionBindingSummary, ContextSummary,
-    ControlCatalogSnapshot, InvokeServiceKind, PaneFocusDirection, PaneSelector,
-    PaneSplitDirection, SessionSelector, SessionSummary,
+    AttachRect, AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, ContextSelector,
+    ContextSessionBindingSummary, ContextSummary, ControlCatalogSnapshot, InvokeServiceKind,
+    PaneFocusDirection, PaneSelector, PaneSplitDirection, SessionSelector, SessionSummary,
 };
 use bmux_keybind::{action_to_config_name, parse_action};
 use bmux_plugin_sdk::{
@@ -64,7 +63,6 @@ use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
 const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
-const ATTACH_LEGACY_CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// Maximum wall-clock time the drain loop may spend waiting for an in-
 /// progress output burst to complete (e.g. when the server indicates
 /// `output_still_pending` or the inner application is mid-synchronized-
@@ -743,10 +741,6 @@ pub async fn run_session_attach_with_client(
 
     // Async terminal event stream — replaces spawn_blocking + poll(15ms).
     let mut terminal_stream = crossterm::event::EventStream::new();
-    let supports_control_catalog_sync = client.supports_capability(CAPABILITY_CONTROL_CATALOG_SYNC);
-    let mut legacy_catalog_refresh_interval =
-        tokio::time::interval(ATTACH_LEGACY_CATALOG_REFRESH_INTERVAL);
-    legacy_catalog_refresh_interval.tick().await;
     let mut pane_output_pending = false;
     #[cfg(any(
         feature = "image-sixel",
@@ -942,33 +936,6 @@ pub async fn run_session_attach_with_client(
                             break;
                         }
                     }
-                }
-            }
-
-            _ = legacy_catalog_refresh_interval.tick(), if !supports_control_catalog_sync => {
-                if let Err(error) = refresh_attach_status_catalog(&mut client, &mut view_state).await {
-                    view_state.set_transient_status(
-                        format!(
-                            "legacy catalog refresh failed: {}",
-                            map_attach_client_error(error)
-                        ),
-                        Instant::now(),
-                        ATTACH_TRANSIENT_STATUS_TTL,
-                    );
-                } else {
-                    if let Err(error) =
-                        reconcile_attached_session_from_catalog(&mut client, &mut view_state).await
-                    {
-                        view_state.set_transient_status(
-                            format!(
-                                "legacy catalog reconcile failed: {}",
-                                map_attach_client_error(error)
-                            ),
-                            Instant::now(),
-                            ATTACH_TRANSIENT_STATUS_TTL,
-                        );
-                    }
-                    view_state.dirty.status_needs_redraw = true;
                 }
             }
 
@@ -3504,18 +3471,10 @@ pub async fn refresh_attach_status_catalog(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
 ) -> std::result::Result<(), ClientError> {
-    if client.supports_capability(CAPABILITY_CONTROL_CATALOG_SYNC) {
-        let snapshot = client
-            .control_catalog_snapshot(Some(view_state.control_catalog_revision))
-            .await?;
-        apply_control_catalog_snapshot(view_state, snapshot);
-    } else {
-        let contexts = client.list_contexts().await?;
-        let sessions = client.list_sessions().await?;
-        view_state.cached_contexts = contexts;
-        view_state.cached_sessions = sessions;
-        view_state.control_catalog_revision = 0;
-    }
+    let snapshot = client
+        .control_catalog_snapshot(Some(view_state.control_catalog_revision))
+        .await?;
+    apply_control_catalog_snapshot(view_state, snapshot);
     Ok(())
 }
 

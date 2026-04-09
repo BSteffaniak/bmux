@@ -82,6 +82,7 @@ pub const CORE_PROTOCOL_CAPABILITIES: &[&str] = &[
     CORE_CAPABILITY_ATTACH,
     CORE_CAPABILITY_PANE_IO,
     CORE_CAPABILITY_DETACH,
+    CAPABILITY_CONTROL_CATALOG_SYNC,
 ];
 
 // Compression capability strings (non-core, optional).
@@ -1790,6 +1791,7 @@ mod tests {
                 CORE_CAPABILITY_ATTACH.to_string(),
                 CORE_CAPABILITY_PANE_IO.to_string(),
                 CORE_CAPABILITY_DETACH.to_string(),
+                CAPABILITY_CONTROL_CATALOG_SYNC.to_string(),
                 "feature.recording.v4".to_string(),
             ],
         };

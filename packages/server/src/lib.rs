@@ -16,12 +16,11 @@ use bmux_ipc::{
     AttachFocusTarget, AttachGrant, AttachInputModeState, AttachLayer, AttachMouseProtocolEncoding,
     AttachMouseProtocolMode, AttachMouseProtocolState, AttachPaneChunk, AttachPaneInputMode,
     AttachPaneMouseProtocol, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
-    AttachViewComponent, CAPABILITY_CONTROL_CATALOG_SYNC, CORE_PROTOCOL_CAPABILITIES,
-    ClientSummary, ContextSelector, ContextSessionBindingSummary, ContextSummary,
-    ControlCatalogScope, ControlCatalogSnapshot, Envelope, EnvelopeKind, ErrorCode, ErrorResponse,
-    Event, IpcEndpoint, PaneFocusDirection, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector,
-    PaneSplitDirection, PaneState, PaneSummary, PerformanceRecordingLevel,
-    PerformanceRuntimeSettings, ProtocolContract, ProtocolVersion, RecordingEventKind,
+    AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, ClientSummary, ContextSelector,
+    ContextSessionBindingSummary, ContextSummary, ControlCatalogScope, ControlCatalogSnapshot,
+    Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, PaneFocusDirection,
+    PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection, PaneState, PaneSummary,
+    PerformanceRecordingLevel, PerformanceRuntimeSettings, ProtocolContract, RecordingEventKind,
     RecordingPayload, RecordingProfile, RecordingRollingClearReport, RecordingRollingStartOptions,
     RecordingRollingStatus, RecordingRollingUsage, RecordingSummary, Request, Response,
     ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary, decode,
@@ -301,7 +300,6 @@ struct ServerState {
     /// Broadcast channel for pushing events to streaming clients.
     event_broadcast: tokio::sync::broadcast::Sender<Event>,
     control_catalog_revision: AtomicU64,
-    client_capabilities: Mutex<BTreeMap<ClientId, BTreeSet<String>>>,
     client_principals: Mutex<BTreeMap<ClientId, Uuid>>,
     server_control_principal_id: Uuid,
     handshake_timeout: Duration,
@@ -500,24 +498,13 @@ impl EventHub {
         self.subscribers.remove(&client_id);
     }
 
-    fn poll_with_filter<F>(
-        &mut self,
-        client_id: ClientId,
-        max_events: usize,
-        mut include: F,
-    ) -> Option<Vec<Event>>
-    where
-        F: FnMut(&Event) -> bool,
-    {
+    fn poll(&mut self, client_id: ClientId, max_events: usize) -> Option<Vec<Event>> {
         let cursor = self.subscribers.get_mut(&client_id)?;
         let mut index = *cursor;
         let count = max_events.max(1);
         let mut events = Vec::new();
         while index < self.events.len() && events.len() < count {
-            let event = &self.events[index].event;
-            if include(event) {
-                events.push(event.clone());
-            }
+            events.push(self.events[index].event.clone());
             index = index.saturating_add(1);
         }
         *cursor = index;
@@ -4153,7 +4140,6 @@ impl BmuxServer {
                 event_hub: Mutex::new(EventHub::new(1024)),
                 event_broadcast: event_broadcast_tx,
                 control_catalog_revision: AtomicU64::new(1),
-                client_capabilities: Mutex::new(BTreeMap::new()),
                 client_principals: Mutex::new(BTreeMap::new()),
                 server_control_principal_id,
                 handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
@@ -4480,10 +4466,9 @@ async fn handle_connection(
     let client_principal_id: Uuid;
     let mut selected_session: Option<SessionId> = None;
     let mut attached_stream_session: Option<SessionId> = None;
-    let mut negotiated_frame_codec: Option<
+    let negotiated_frame_codec: Option<
         std::sync::Arc<dyn bmux_ipc::compression::CompressionCodec>,
-    > = None;
-    let mut negotiated_capabilities: Option<BTreeSet<String>> = None;
+    >;
 
     // ── Handshake (serial, before split) ─────────────────────────────────
 
@@ -4492,93 +4477,50 @@ async fn handle_connection(
         .context("handshake timed out")??;
 
     let handshake = parse_request(&first_envelope)?;
-    match handshake {
-        Request::Hello {
-            protocol_version,
-            client_name,
-            principal_id,
-        } => {
-            if protocol_version != ProtocolVersion::current() {
-                send_error(
+    if let Request::HelloV2 {
+        contract,
+        client_name,
+        principal_id,
+    } = handshake
+    {
+        let server_contract = ProtocolContract::current(default_supported_capabilities());
+        match negotiate_protocol(&contract, &server_contract, CORE_PROTOCOL_CAPABILITIES) {
+            Ok(negotiated) => {
+                client_principal_id = principal_id;
+                debug!(
+                    "accepted client handshake (v2): {client_name} revision={} caps={}",
+                    negotiated.revision,
+                    negotiated.capabilities.join(",")
+                );
+                // Resolve frame compression codec from negotiated capabilities.
+                negotiated_frame_codec =
+                    resolve_frame_codec_from_capabilities(&negotiated.capabilities);
+                send_ok(
                     &mut stream,
                     first_envelope.request_id,
-                    ErrorCode::VersionMismatch,
-                    format!(
-                        "unsupported protocol version {}; expected {}",
-                        protocol_version.0,
-                        ProtocolVersion::current().0
-                    ),
+                    ResponsePayload::HelloNegotiated { negotiated },
+                )
+                .await?;
+            }
+            Err(reason) => {
+                send_ok(
+                    &mut stream,
+                    first_envelope.request_id,
+                    ResponsePayload::HelloIncompatible { reason },
                 )
                 .await?;
                 return Ok(());
             }
-            client_principal_id = principal_id;
-            debug!("accepted client handshake (legacy): {client_name}");
-            let snapshot = snapshot_status(&state)?;
-            send_ok(
-                &mut stream,
-                first_envelope.request_id,
-                ResponsePayload::ServerStatus {
-                    running: true,
-                    snapshot,
-                    principal_id,
-                    server_control_principal_id: state.server_control_principal_id,
-                },
-            )
-            .await?;
         }
-        Request::HelloV2 {
-            contract,
-            client_name,
-            principal_id,
-        } => {
-            let server_contract = ProtocolContract::current(default_supported_capabilities());
-            match negotiate_protocol(&contract, &server_contract, CORE_PROTOCOL_CAPABILITIES) {
-                Ok(negotiated) => {
-                    client_principal_id = principal_id;
-                    negotiated_capabilities = Some(
-                        negotiated
-                            .capabilities
-                            .iter()
-                            .cloned()
-                            .collect::<BTreeSet<_>>(),
-                    );
-                    debug!(
-                        "accepted client handshake (v2): {client_name} revision={} caps={}",
-                        negotiated.revision,
-                        negotiated.capabilities.join(",")
-                    );
-                    // Resolve frame compression codec from negotiated capabilities.
-                    negotiated_frame_codec =
-                        resolve_frame_codec_from_capabilities(&negotiated.capabilities);
-                    send_ok(
-                        &mut stream,
-                        first_envelope.request_id,
-                        ResponsePayload::HelloNegotiated { negotiated },
-                    )
-                    .await?;
-                }
-                Err(reason) => {
-                    send_ok(
-                        &mut stream,
-                        first_envelope.request_id,
-                        ResponsePayload::HelloIncompatible { reason },
-                    )
-                    .await?;
-                    return Ok(());
-                }
-            }
-        }
-        _ => {
-            send_error(
-                &mut stream,
-                first_envelope.request_id,
-                ErrorCode::InvalidRequest,
-                "first request must be hello".to_string(),
-            )
-            .await?;
-            return Ok(());
-        }
+    } else {
+        send_error(
+            &mut stream,
+            first_envelope.request_id,
+            ErrorCode::InvalidRequest,
+            "first request must be hello_v2".to_string(),
+        )
+        .await?;
+        return Ok(());
     }
 
     {
@@ -4594,19 +4536,6 @@ async fn handle_connection(
             .lock()
             .map_err(|_| anyhow::anyhow!("client principal map lock poisoned"))?;
         principals.insert(client_id, client_principal_id);
-    }
-    let client_capabilities = negotiated_capabilities.unwrap_or_else(|| {
-        CORE_PROTOCOL_CAPABILITIES
-            .iter()
-            .map(|entry| (*entry).to_string())
-            .collect::<BTreeSet<_>>()
-    });
-    {
-        let mut capabilities = state
-            .client_capabilities
-            .lock()
-            .map_err(|_| anyhow::anyhow!("client capability map lock poisoned"))?;
-        capabilities.insert(client_id, client_capabilities.clone());
     }
 
     // ── Split stream for concurrent read/write ───────────────────────────
@@ -4810,7 +4739,6 @@ async fn handle_connection(
             let push_frame_codec = negotiated_frame_codec.clone();
             let push_state = Arc::clone(&state);
             let push_client_id = client_id;
-            let push_client_capabilities = client_capabilities.clone();
             event_push_task = Some(tokio::spawn(async move {
                 let push_perf_settings_state = Arc::clone(&push_state.performance_settings);
                 let mut push_perf_settings = push_perf_settings_state
@@ -4892,11 +4820,6 @@ async fn handle_connection(
                                 }
                                 other => other,
                             };
-
-                            if !event_supported_by_capability_set(&push_client_capabilities, &event)
-                            {
-                                continue;
-                            }
 
                             let Some(frame) =
                                 encode_event_frame(&event, push_frame_codec.as_deref())
@@ -5048,13 +4971,6 @@ async fn handle_connection(
             .map_err(|_| anyhow::anyhow!("client principal map lock poisoned"))?;
         principals.remove(&client_id);
     }
-    {
-        let mut capabilities = state
-            .client_capabilities
-            .lock()
-            .map_err(|_| anyhow::anyhow!("client capability map lock poisoned"))?;
-        capabilities.remove(&client_id);
-    }
     mark_snapshot_dirty(&state)?;
     maybe_flush_snapshot(&state, false)?;
     unsubscribe_events(&state, client_id)?;
@@ -5119,18 +5035,6 @@ fn encode_event_frame(
     } else {
         bmux_ipc::frame::encode_frame(&envelope).ok()
     }
-}
-
-const fn event_required_capability(event: &Event) -> Option<&'static str> {
-    match event {
-        Event::ControlCatalogChanged { .. } => Some(CAPABILITY_CONTROL_CATALOG_SYNC),
-        _ => None,
-    }
-}
-
-fn event_supported_by_capability_set(capabilities: &BTreeSet<String>, event: &Event) -> bool {
-    event_required_capability(event)
-        .is_none_or(|required_capability| capabilities.contains(required_capability))
 }
 
 fn normalize_control_catalog_scopes(scopes: &[ControlCatalogScope]) -> Vec<ControlCatalogScope> {
@@ -8079,21 +7983,11 @@ async fn handle_request(
             Response::Ok(ResponsePayload::EventsSubscribed)
         }
         Request::PollEvents { max_events } => {
-            let capabilities = state
-                .client_capabilities
-                .lock()
-                .map_err(|_| anyhow::anyhow!("client capability map lock poisoned"))?
-                .get(&client_id)
-                .cloned()
-                .unwrap_or_default();
             let mut hub = state
                 .event_hub
                 .lock()
                 .map_err(|_| anyhow::anyhow!("event hub lock poisoned"))?;
-            hub.poll_with_filter(client_id, max_events, |event| {
-                event_supported_by_capability_set(&capabilities, event)
-            })
-            .map_or_else(
+            hub.poll(client_id, max_events).map_or_else(
                 || {
                     Response::Err(ErrorResponse {
                         code: ErrorCode::InvalidRequest,
@@ -10014,7 +9908,7 @@ fn record_to_all_runtimes(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::{BTreeMap, BTreeSet};
+    use std::collections::BTreeMap;
     use std::path::PathBuf;
 
     async fn execute_request(
@@ -10929,21 +10823,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn poll_events_filters_control_catalog_events_without_capability() {
+    async fn poll_events_includes_control_catalog_changed() {
         let server = BmuxServer::new(test_endpoint());
         let client_id = ClientId::new();
         let principal_id = Uuid::new_v4();
         let mut selected_session = None;
         let mut attached_stream_session = None;
-
-        {
-            let mut capabilities = server
-                .state
-                .client_capabilities
-                .lock()
-                .expect("client capability map lock should succeed");
-            capabilities.insert(client_id, BTreeSet::new());
-        }
 
         let subscribed = execute_request(
             &server,
@@ -10963,7 +10848,7 @@ mod tests {
             &mut selected_session,
             &mut attached_stream_session,
             Request::CreateContext {
-                name: Some("hidden-control-event".to_string()),
+                name: Some("control-event".to_string()),
                 attributes: BTreeMap::new(),
             },
         )
@@ -10983,55 +10868,10 @@ mod tests {
             response => panic!("expected event batch response, got {response:?}"),
         };
         assert!(
-            !events
+            events
                 .iter()
                 .any(|event| matches!(event, Event::ControlCatalogChanged { .. })),
-            "poll_events should filter control catalog events without capability"
-        );
-
-        {
-            let mut capabilities = server
-                .state
-                .client_capabilities
-                .lock()
-                .expect("client capability map lock should succeed");
-            capabilities.insert(
-                client_id,
-                BTreeSet::from([CAPABILITY_CONTROL_CATALOG_SYNC.to_string()]),
-            );
-        }
-
-        let _ = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::CreateContext {
-                name: Some("visible-control-event".to_string()),
-                attributes: BTreeMap::new(),
-            },
-        )
-        .await;
-
-        let polled_with_capability = execute_request(
-            &server,
-            client_id,
-            principal_id,
-            &mut selected_session,
-            &mut attached_stream_session,
-            Request::PollEvents { max_events: 16 },
-        )
-        .await;
-        let events_with_capability = match polled_with_capability {
-            Response::Ok(ResponsePayload::EventBatch { events }) => events,
-            response => panic!("expected event batch response, got {response:?}"),
-        };
-        assert!(
-            events_with_capability
-                .iter()
-                .any(|event| matches!(event, Event::ControlCatalogChanged { .. })),
-            "poll_events should include control catalog events with capability"
+            "poll_events should include control catalog events"
         );
     }
 

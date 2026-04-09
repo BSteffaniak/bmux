@@ -16,10 +16,10 @@ use bmux_ipc::{
     ContextSelector, ContextSummary, Envelope, EnvelopeKind, ErrorCode, IncompatibilityReason,
     InvokeServiceKind, IpcEndpoint, NegotiatedProtocol, PaneFocusDirection, PaneLayoutNode,
     PaneSelector, PaneSplitDirection, PaneSummary, PerformanceRuntimeSettings, ProtocolContract,
-    ProtocolVersion, RecordingCaptureTarget, RecordingEventKind, RecordingProfile,
-    RecordingRollingClearReport, RecordingRollingStartOptions, RecordingRollingStatus,
-    RecordingStatus, RecordingSummary, Request, Response, ResponsePayload, ServerSnapshotStatus,
-    SessionSelector, SessionSummary, decode, default_supported_capabilities, encode,
+    RecordingCaptureTarget, RecordingEventKind, RecordingProfile, RecordingRollingClearReport,
+    RecordingRollingStartOptions, RecordingRollingStatus, RecordingStatus, RecordingSummary,
+    Request, Response, ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary,
+    decode, default_supported_capabilities, encode,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -285,21 +285,6 @@ impl BmuxClient {
             Ok(_) => Err(ClientError::UnexpectedResponse(
                 "handshake expected hello negotiation response",
             )),
-            Err(error) if should_fallback_to_legacy_hello(&error) => {
-                let hello_response = client
-                    .request(Request::Hello {
-                        protocol_version: ProtocolVersion::current(),
-                        client_name,
-                        principal_id,
-                    })
-                    .await?;
-                match hello_response {
-                    ResponsePayload::ServerStatus { running: true, .. } => Ok(client),
-                    _ => Err(ClientError::UnexpectedResponse(
-                        "handshake expected running server status",
-                    )),
-                }
-            }
             Err(error) => Err(error),
         }
     }
@@ -3185,16 +3170,6 @@ fn endpoint_from_paths(paths: &ConfigPaths) -> IpcEndpoint {
     {
         IpcEndpoint::windows_named_pipe(paths.server_named_pipe())
     }
-}
-
-const fn should_fallback_to_legacy_hello(error: &ClientError) -> bool {
-    matches!(
-        error,
-        ClientError::ServerError {
-            code: ErrorCode::InvalidRequest,
-            ..
-        } | ClientError::Serialization(_)
-    )
 }
 
 fn load_or_create_principal_id(paths: &ConfigPaths) -> Result<Uuid> {
