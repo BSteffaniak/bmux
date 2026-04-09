@@ -11,15 +11,15 @@ use bmux_ipc::transport::{
     IpcStreamWriter, IpcTransportError, LocalIpcStream,
 };
 use bmux_ipc::{
-    AttachGrant, AttachPaneChunk, AttachPaneImageDelta, AttachPaneMouseProtocol, AttachScene,
-    CORE_PROTOCOL_CAPABILITIES, ClientSummary, ContextSelector, ContextSummary, Envelope,
-    EnvelopeKind, ErrorCode, IncompatibilityReason, InvokeServiceKind, IpcEndpoint,
-    NegotiatedProtocol, PaneFocusDirection, PaneLayoutNode, PaneSelector, PaneSplitDirection,
-    PaneSummary, PerformanceRuntimeSettings, ProtocolContract, ProtocolVersion,
-    RecordingCaptureTarget, RecordingEventKind, RecordingProfile, RecordingRollingClearReport,
-    RecordingRollingStartOptions, RecordingRollingStatus, RecordingStatus, RecordingSummary,
-    Request, Response, ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary,
-    decode, default_supported_capabilities, encode,
+    AttachGrant, AttachPaneChunk, AttachPaneImageDelta, AttachPaneInputMode,
+    AttachPaneMouseProtocol, AttachScene, CORE_PROTOCOL_CAPABILITIES, ClientSummary,
+    ContextSelector, ContextSummary, Envelope, EnvelopeKind, ErrorCode, IncompatibilityReason,
+    InvokeServiceKind, IpcEndpoint, NegotiatedProtocol, PaneFocusDirection, PaneLayoutNode,
+    PaneSelector, PaneSplitDirection, PaneSummary, PerformanceRuntimeSettings, ProtocolContract,
+    ProtocolVersion, RecordingCaptureTarget, RecordingEventKind, RecordingProfile,
+    RecordingRollingClearReport, RecordingRollingStartOptions, RecordingRollingStatus,
+    RecordingStatus, RecordingSummary, Request, Response, ResponsePayload, ServerSnapshotStatus,
+    SessionSelector, SessionSummary, decode, default_supported_capabilities, encode,
 };
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -71,6 +71,7 @@ pub struct AttachSnapshotState {
     pub scene: AttachScene,
     pub chunks: Vec<AttachPaneChunk>,
     pub pane_mouse_protocols: Vec<AttachPaneMouseProtocol>,
+    pub pane_input_modes: Vec<AttachPaneInputMode>,
     pub zoomed: bool,
 }
 
@@ -78,6 +79,7 @@ pub struct AttachSnapshotState {
 pub struct AttachPaneSnapshotState {
     pub chunks: Vec<AttachPaneChunk>,
     pub pane_mouse_protocols: Vec<AttachPaneMouseProtocol>,
+    pub pane_input_modes: Vec<AttachPaneInputMode>,
 }
 
 /// Server status details returned by status RPC.
@@ -1583,6 +1585,7 @@ impl BmuxClient {
                 scene,
                 chunks,
                 pane_mouse_protocols,
+                pane_input_modes,
                 zoomed,
             } => Ok(AttachSnapshotState {
                 context_id,
@@ -1593,6 +1596,7 @@ impl BmuxClient {
                 scene,
                 chunks,
                 pane_mouse_protocols,
+                pane_input_modes,
                 zoomed,
             }),
             _ => Err(ClientError::UnexpectedResponse(
@@ -1623,9 +1627,11 @@ impl BmuxClient {
             ResponsePayload::AttachPaneSnapshot {
                 chunks,
                 pane_mouse_protocols,
+                pane_input_modes,
             } => Ok(AttachPaneSnapshotState {
                 chunks,
                 pane_mouse_protocols,
+                pane_input_modes,
             }),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected attach pane snapshot response",
@@ -2490,6 +2496,7 @@ impl StreamingBmuxClient {
                 scene,
                 chunks,
                 pane_mouse_protocols,
+                pane_input_modes,
                 zoomed,
             } => Ok(AttachSnapshotState {
                 context_id,
@@ -2500,6 +2507,7 @@ impl StreamingBmuxClient {
                 scene,
                 chunks,
                 pane_mouse_protocols,
+                pane_input_modes,
                 zoomed,
             }),
             _ => Err(ClientError::UnexpectedResponse(
@@ -2530,9 +2538,11 @@ impl StreamingBmuxClient {
             ResponsePayload::AttachPaneSnapshot {
                 chunks,
                 pane_mouse_protocols,
+                pane_input_modes,
             } => Ok(AttachPaneSnapshotState {
                 chunks,
                 pane_mouse_protocols,
+                pane_input_modes,
             }),
             _ => Err(ClientError::UnexpectedResponse(
                 "expected attach pane snapshot response",

@@ -565,6 +565,7 @@ fn snapshot_from_layout(layout: AttachLayoutState) -> AttachSnapshotState {
         scene: layout.scene,
         chunks: Vec::new(),
         pane_mouse_protocols: Vec::new(),
+        pane_input_modes: Vec::new(),
         zoomed: layout.zoomed,
     }
 }

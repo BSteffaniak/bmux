@@ -7,6 +7,7 @@ use bmux_config::{MAX_TIMEOUT_MS, MIN_TIMEOUT_MS};
 pub use bmux_keybind::RuntimeAction;
 use bmux_keybind::action_to_name;
 use bmux_keybind::{action_to_config_name, parse_action};
+use bmux_keyboard::encode::KeyEncodingModes;
 use bmux_keyboard::{KeyCode, KeyStroke};
 use crossterm::event::Event;
 use std::collections::BTreeMap;
@@ -67,6 +68,7 @@ pub struct InputProcessor {
     pending: Option<PendingChord>,
     scroll_mode: bool,
     enhanced: bool,
+    key_encoding_modes: KeyEncodingModes,
 }
 
 #[derive(Debug)]
@@ -387,6 +389,7 @@ impl InputProcessor {
             pending: None,
             scroll_mode: false,
             enhanced,
+            key_encoding_modes: KeyEncodingModes::default(),
         }
     }
 
@@ -414,7 +417,9 @@ impl InputProcessor {
             self.resolve_pending(&mut actions, true);
         }
 
-        let Some(input_event) = crossterm_event_to_input_event(&event, self.enhanced) else {
+        let Some(input_event) =
+            crossterm_event_to_input_event(&event, self.enhanced, self.key_encoding_modes)
+        else {
             return actions;
         };
         actions.extend(self.process_input_events(std::iter::once(input_event)));
@@ -566,6 +571,17 @@ impl InputProcessor {
 
     pub(crate) const fn set_scroll_mode(&mut self, enabled: bool) {
         self.scroll_mode = enabled;
+    }
+
+    pub(crate) const fn set_pane_input_mode(
+        &mut self,
+        application_cursor: bool,
+        application_keypad: bool,
+    ) {
+        self.key_encoding_modes = KeyEncodingModes {
+            application_cursor,
+            application_keypad,
+        };
     }
 }
 
@@ -1274,6 +1290,18 @@ mod tests {
         assert_eq!(
             processor.process_terminal_event(event),
             vec![RuntimeAction::ForwardToPane(vec![0x1b, b'[', b'A'])]
+        );
+    }
+
+    #[test]
+    fn terminal_event_adapter_respects_application_cursor_mode() {
+        let mut processor = new_processor(Keymap::default_runtime());
+        processor.set_pane_input_mode(true, false);
+        let event = key_event(KeyCode::Up, KeyModifiers::NONE);
+
+        assert_eq!(
+            processor.process_terminal_event(event),
+            vec![RuntimeAction::ForwardToPane(vec![0x1b, b'O', b'A'])]
         );
     }
 

@@ -18,6 +18,16 @@ use crate::types::{KeyCode, KeyStroke, Modifiers};
 /// - Other modifier combinations for special keys are silently lost
 #[must_use]
 pub fn encode(stroke: &KeyStroke) -> Option<Vec<u8>> {
+    encode_with_modes(stroke, false, false)
+}
+
+/// Encode a key stroke as legacy VT/xterm bytes with pane input-mode context.
+#[must_use]
+pub fn encode_with_modes(
+    stroke: &KeyStroke,
+    application_cursor: bool,
+    _application_keypad: bool,
+) -> Option<Vec<u8>> {
     let Modifiers {
         ctrl,
         alt,
@@ -78,12 +88,12 @@ pub fn encode(stroke: &KeyStroke) -> Option<Vec<u8>> {
             out.push(b' ');
             Some(out)
         }
-        KeyCode::Up => Some(arrow_encoding(shift, b'A')),
-        KeyCode::Down => Some(arrow_encoding(shift, b'B')),
-        KeyCode::Right => Some(arrow_encoding(shift, b'C')),
-        KeyCode::Left => Some(arrow_encoding(shift, b'D')),
-        KeyCode::Home => Some(vec![0x1b, b'[', b'H']),
-        KeyCode::End => Some(vec![0x1b, b'[', b'F']),
+        KeyCode::Up => Some(arrow_encoding(shift, application_cursor, b'A')),
+        KeyCode::Down => Some(arrow_encoding(shift, application_cursor, b'B')),
+        KeyCode::Right => Some(arrow_encoding(shift, application_cursor, b'C')),
+        KeyCode::Left => Some(arrow_encoding(shift, application_cursor, b'D')),
+        KeyCode::Home => Some(home_end_encoding(application_cursor, b'H')),
+        KeyCode::End => Some(home_end_encoding(application_cursor, b'F')),
         KeyCode::PageUp => Some(vec![0x1b, b'[', b'5', b'~']),
         KeyCode::PageDown => Some(vec![0x1b, b'[', b'6', b'~']),
         KeyCode::Insert => Some(vec![0x1b, b'[', b'2', b'~']),
@@ -98,9 +108,19 @@ pub fn encode(stroke: &KeyStroke) -> Option<Vec<u8>> {
     }
 }
 
-fn arrow_encoding(shift: bool, letter: u8) -> Vec<u8> {
+fn arrow_encoding(shift: bool, application_cursor: bool, letter: u8) -> Vec<u8> {
     if shift {
         vec![0x1b, b'[', b'1', b';', b'2', letter]
+    } else if application_cursor {
+        vec![0x1b, b'O', letter]
+    } else {
+        vec![0x1b, b'[', letter]
+    }
+}
+
+fn home_end_encoding(application_cursor: bool, letter: u8) -> Vec<u8> {
+    if application_cursor {
+        vec![0x1b, b'O', letter]
     } else {
         vec![0x1b, b'[', letter]
     }
@@ -157,6 +177,10 @@ pub struct LegacyDecodeResult {
 pub fn decode_escape(bytes: &[u8]) -> Option<LegacyDecodeResult> {
     #[allow(clippy::type_complexity)]
     let sequences: &[(&[u8], KeyStroke)] = &[
+        (b"\x1bOA", KeyStroke::simple(KeyCode::Up)),
+        (b"\x1bOB", KeyStroke::simple(KeyCode::Down)),
+        (b"\x1bOC", KeyStroke::simple(KeyCode::Right)),
+        (b"\x1bOD", KeyStroke::simple(KeyCode::Left)),
         (b"\x1b[A", KeyStroke::simple(KeyCode::Up)),
         (b"\x1b[B", KeyStroke::simple(KeyCode::Down)),
         (b"\x1b[C", KeyStroke::simple(KeyCode::Right)),
@@ -201,6 +225,8 @@ pub fn decode_escape(bytes: &[u8]) -> Option<LegacyDecodeResult> {
                 },
             ),
         ),
+        (b"\x1bOH", KeyStroke::simple(KeyCode::Home)),
+        (b"\x1bOF", KeyStroke::simple(KeyCode::End)),
         (b"\x1b[H", KeyStroke::simple(KeyCode::Home)),
         (b"\x1b[F", KeyStroke::simple(KeyCode::End)),
         (b"\x1b[2~", KeyStroke::simple(KeyCode::Insert)),
@@ -362,6 +388,12 @@ mod tests {
     }
 
     #[test]
+    fn encode_up_arrow_application_cursor() {
+        let stroke = KeyStroke::simple(KeyCode::Up);
+        assert_eq!(encode_with_modes(&stroke, true, false).unwrap(), b"\x1bOA");
+    }
+
+    #[test]
     fn encode_shift_left() {
         let stroke = KeyStroke::with_modifiers(
             KeyCode::Left,
@@ -431,6 +463,13 @@ mod tests {
     fn decode_escape_f1() {
         let result = decode_escape(b"\x1bOP").unwrap();
         assert_eq!(result.stroke, KeyStroke::simple(KeyCode::F(1)));
+        assert_eq!(result.consumed, 3);
+    }
+
+    #[test]
+    fn decode_escape_application_up_arrow() {
+        let result = decode_escape(b"\x1bOA").unwrap();
+        assert_eq!(result.stroke, KeyStroke::simple(KeyCode::Up));
         assert_eq!(result.consumed, 3);
     }
 

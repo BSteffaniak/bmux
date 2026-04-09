@@ -199,6 +199,13 @@ fn apply_attach_output_bytes(
             encoding: mouse_protocol_encoding_to_ipc(screen.mouse_protocol_encoding()),
         },
     );
+    view_state.pane_input_mode_hints.insert(
+        pane_id,
+        bmux_ipc::AttachInputModeState {
+            application_cursor: screen.application_cursor(),
+            application_keypad: screen.application_keypad(),
+        },
+    );
     view_state.dirty.pane_dirty_ids.insert(pane_id);
     *frame_needs_render = true;
 
@@ -3878,6 +3885,7 @@ async fn hydrate_attach_state_from_snapshot_mode(
         scene,
         chunks,
         pane_mouse_protocols,
+        pane_input_modes,
         zoomed,
     } = client
         .attach_snapshot(view_state.attached_id, ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE)
@@ -3895,12 +3903,16 @@ async fn hydrate_attach_state_from_snapshot_mode(
     if session_changed || full_resync {
         view_state.pane_buffers.clear();
         view_state.pane_mouse_protocol_hints.clear();
+        view_state.pane_input_mode_hints.clear();
     } else {
         view_state
             .pane_buffers
             .retain(|pane_id, _| active_pane_ids.contains(pane_id));
         view_state
             .pane_mouse_protocol_hints
+            .retain(|pane_id, _| active_pane_ids.contains(pane_id));
+        view_state
+            .pane_input_mode_hints
             .retain(|pane_id, _| active_pane_ids.contains(pane_id));
     }
     let retained_pane_ids = view_state
@@ -3925,6 +3937,13 @@ async fn hydrate_attach_state_from_snapshot_mode(
             view_state
                 .pane_mouse_protocol_hints
                 .insert(pane_protocol.pane_id, pane_protocol.protocol);
+        }
+    }
+    for pane_mode in pane_input_modes {
+        if active_pane_ids.contains(&pane_mode.pane_id) {
+            view_state
+                .pane_input_mode_hints
+                .insert(pane_mode.pane_id, pane_mode.mode);
         }
     }
 
@@ -3967,6 +3986,7 @@ async fn hydrate_attach_revealed_panes_from_snapshot(
     let AttachPaneSnapshotState {
         chunks,
         pane_mouse_protocols,
+        pane_input_modes,
     } = client
         .attach_pane_snapshot(
             view_state.attached_id,
@@ -4005,6 +4025,13 @@ async fn hydrate_attach_revealed_panes_from_snapshot(
             view_state
                 .pane_mouse_protocol_hints
                 .insert(pane_protocol.pane_id, pane_protocol.protocol);
+        }
+    }
+    for pane_mode in pane_input_modes {
+        if requested_pane_ids.contains(&pane_mode.pane_id) {
+            view_state
+                .pane_input_mode_hints
+                .insert(pane_mode.pane_id, pane_mode.mode);
         }
     }
 
@@ -4413,6 +4440,14 @@ pub async fn handle_attach_terminal_event(
         && handle_help_overlay_key_event(key, help_lines, view_state)
     {
         return Ok(AttachLoopControl::Continue);
+    }
+
+    if matches!(terminal_event, Event::Key(_)) {
+        let focused_input_mode = focused_attach_pane_input_mode(view_state);
+        attach_input_processor.set_pane_input_mode(
+            focused_input_mode.application_cursor,
+            focused_input_mode.application_keypad,
+        );
     }
 
     for attach_action in
@@ -4979,6 +5014,12 @@ pub struct AttachPaneMouseProtocol {
     pub encoding: vt100::MouseProtocolEncoding,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub struct AttachPaneInputMode {
+    pub application_cursor: bool,
+    pub application_keypad: bool,
+}
+
 pub const fn mouse_protocol_mode_to_ipc(
     mode: vt100::MouseProtocolMode,
 ) -> bmux_ipc::AttachMouseProtocolMode {
@@ -5054,6 +5095,44 @@ pub fn attach_pane_mouse_protocol(
         (None, Some(hint)) => Some(hint),
         (None, None) => None,
     }
+}
+
+pub fn attach_pane_input_mode(
+    view_state: &AttachViewState,
+    pane_id: Uuid,
+) -> Option<AttachPaneInputMode> {
+    let parser_mode = view_state.pane_buffers.get(&pane_id).map(|buffer| {
+        let screen = buffer.parser.screen();
+        AttachPaneInputMode {
+            application_cursor: screen.application_cursor(),
+            application_keypad: screen.application_keypad(),
+        }
+    });
+
+    let hint_mode =
+        view_state
+            .pane_input_mode_hints
+            .get(&pane_id)
+            .map(|hint| AttachPaneInputMode {
+                application_cursor: hint.application_cursor,
+                application_keypad: hint.application_keypad,
+            });
+
+    match (parser_mode, hint_mode) {
+        (Some(parser), Some(hint)) => Some(AttachPaneInputMode {
+            application_cursor: parser.application_cursor || hint.application_cursor,
+            application_keypad: parser.application_keypad || hint.application_keypad,
+        }),
+        (Some(parser), None) => Some(parser),
+        (None, Some(hint)) => Some(hint),
+        (None, None) => None,
+    }
+}
+
+pub fn focused_attach_pane_input_mode(view_state: &AttachViewState) -> AttachPaneInputMode {
+    focused_attach_pane_id(view_state)
+        .and_then(|pane_id| attach_pane_input_mode(view_state, pane_id))
+        .unwrap_or_default()
 }
 
 pub const fn mouse_protocol_mode_reports_event(
@@ -6156,6 +6235,39 @@ mod tests {
         let protocol = attach_pane_mouse_protocol(&view_state, pane_id).expect("pane protocol");
         assert_eq!(protocol.mode, vt100::MouseProtocolMode::AnyMotion);
         assert_eq!(protocol.encoding, vt100::MouseProtocolEncoding::Sgr);
+    }
+
+    #[test]
+    fn attach_pane_input_mode_reads_parser_state() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        let pane_id = focused_attach_pane_id(&view_state).expect("focused pane id");
+        let buffer = view_state
+            .pane_buffers
+            .get_mut(&pane_id)
+            .expect("pane render buffer");
+        append_pane_output(buffer, b"\x1b[?1h\x1b=");
+
+        let mode = attach_pane_input_mode(&view_state, pane_id).expect("pane mode");
+        assert!(mode.application_cursor);
+        assert!(mode.application_keypad);
+    }
+
+    #[test]
+    fn attach_pane_input_mode_uses_snapshot_hint_when_parser_mode_is_default() {
+        let mut view_state = attach_view_state_with_scrollback_fixture();
+        let pane_id = focused_attach_pane_id(&view_state).expect("focused pane id");
+
+        view_state.pane_input_mode_hints.insert(
+            pane_id,
+            bmux_ipc::AttachInputModeState {
+                application_cursor: true,
+                application_keypad: true,
+            },
+        );
+
+        let mode = attach_pane_input_mode(&view_state, pane_id).expect("pane mode");
+        assert!(mode.application_cursor);
+        assert!(mode.application_keypad);
     }
 
     #[test]

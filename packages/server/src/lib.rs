@@ -13,17 +13,18 @@ use bmux_config::{
 };
 use bmux_ipc::transport::{IpcTransportError, LocalIpcListener, LocalIpcStream};
 use bmux_ipc::{
-    AttachFocusTarget, AttachGrant, AttachLayer, AttachMouseProtocolEncoding,
-    AttachMouseProtocolMode, AttachMouseProtocolState, AttachPaneChunk, AttachPaneMouseProtocol,
-    AttachRect, AttachScene, AttachSurface, AttachSurfaceKind, AttachViewComponent,
-    CORE_PROTOCOL_CAPABILITIES, ClientSummary, ContextSelector, ContextSummary, Envelope,
-    EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint, PaneFocusDirection,
-    PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection, PaneState, PaneSummary,
-    PerformanceRecordingLevel, PerformanceRuntimeSettings, ProtocolContract, ProtocolVersion,
-    RecordingEventKind, RecordingPayload, RecordingProfile, RecordingRollingClearReport,
-    RecordingRollingStartOptions, RecordingRollingStatus, RecordingRollingUsage, RecordingSummary,
-    Request, Response, ResponsePayload, ServerSnapshotStatus, SessionSelector, SessionSummary,
-    decode, default_supported_capabilities, encode, negotiate_protocol,
+    AttachFocusTarget, AttachGrant, AttachInputModeState, AttachLayer, AttachMouseProtocolEncoding,
+    AttachMouseProtocolMode, AttachMouseProtocolState, AttachPaneChunk, AttachPaneInputMode,
+    AttachPaneMouseProtocol, AttachRect, AttachScene, AttachSurface, AttachSurfaceKind,
+    AttachViewComponent, CORE_PROTOCOL_CAPABILITIES, ClientSummary, ContextSelector,
+    ContextSummary, Envelope, EnvelopeKind, ErrorCode, ErrorResponse, Event, IpcEndpoint,
+    PaneFocusDirection, PaneLayoutNode as IpcPaneLayoutNode, PaneSelector, PaneSplitDirection,
+    PaneState, PaneSummary, PerformanceRecordingLevel, PerformanceRuntimeSettings,
+    ProtocolContract, ProtocolVersion, RecordingEventKind, RecordingPayload, RecordingProfile,
+    RecordingRollingClearReport, RecordingRollingStartOptions, RecordingRollingStatus,
+    RecordingRollingUsage, RecordingSummary, Request, Response, ResponsePayload,
+    ServerSnapshotStatus, SessionSelector, SessionSummary, decode, default_supported_capabilities,
+    encode, negotiate_protocol,
 };
 use bmux_session::{ClientId, Session, SessionId, SessionManager};
 use bmux_terminal_protocol::{ProtocolProfile, TerminalProtocolEngine, protocol_profile_for_term};
@@ -1256,9 +1257,10 @@ struct PaneRuntimeHandle {
     output_dirty: Arc<AtomicBool>,
     /// True while the inner application is inside a DEC mode 2026
     /// synchronized update (`\x1b[?2026h` seen, `\x1b[?2026l` not yet).
-    /// Set by the PTY reader thread via the `PaneMouseProtocolTracker`.
+    /// Set by the PTY reader thread via the terminal mode tracker.
     sync_update_in_progress: Arc<AtomicBool>,
     mouse_protocol_state: Arc<std::sync::Mutex<AttachMouseProtocolState>>,
+    input_mode_state: Arc<std::sync::Mutex<AttachInputModeState>>,
     #[cfg(feature = "image-registry")]
     image_registry: Arc<std::sync::Mutex<bmux_image::ImageRegistry>>,
     /// Cell pixel dimensions reported by the client (width, height).
@@ -1275,7 +1277,7 @@ enum PaneRuntimeCommand {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum MouseTrackerParseState {
+enum TerminalModeParseState {
     Ground,
     Esc,
     Csi,
@@ -1283,8 +1285,8 @@ enum MouseTrackerParseState {
 
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Debug)]
-struct PaneMouseProtocolTracker {
-    parse_state: MouseTrackerParseState,
+struct PaneTerminalModeTracker {
+    parse_state: TerminalModeParseState,
     csi_buffer: Vec<u8>,
     x10_mode: bool,
     press_release_mode: bool,
@@ -1292,15 +1294,17 @@ struct PaneMouseProtocolTracker {
     any_motion_mode: bool,
     utf8_encoding: bool,
     sgr_encoding: bool,
+    application_cursor: bool,
+    application_keypad: bool,
     /// DEC mode 2026: the inner application has begun a synchronized
     /// update (`\x1b[?2026h`) but has not yet ended it (`\x1b[?2026l`).
     sync_update: bool,
 }
 
-impl Default for PaneMouseProtocolTracker {
+impl Default for PaneTerminalModeTracker {
     fn default() -> Self {
         Self {
-            parse_state: MouseTrackerParseState::Ground,
+            parse_state: TerminalModeParseState::Ground,
             csi_buffer: Vec::new(),
             x10_mode: false,
             press_release_mode: false,
@@ -1308,35 +1312,43 @@ impl Default for PaneMouseProtocolTracker {
             any_motion_mode: false,
             utf8_encoding: false,
             sgr_encoding: false,
+            application_cursor: false,
+            application_keypad: false,
             sync_update: false,
         }
     }
 }
 
-impl PaneMouseProtocolTracker {
+impl PaneTerminalModeTracker {
     fn process(&mut self, bytes: &[u8]) {
         for byte in bytes {
             match self.parse_state {
-                MouseTrackerParseState::Ground => {
+                TerminalModeParseState::Ground => {
                     if *byte == 0x1b {
-                        self.parse_state = MouseTrackerParseState::Esc;
+                        self.parse_state = TerminalModeParseState::Esc;
                     }
                 }
-                MouseTrackerParseState::Esc => {
+                TerminalModeParseState::Esc => {
                     if *byte == b'[' {
-                        self.parse_state = MouseTrackerParseState::Csi;
+                        self.parse_state = TerminalModeParseState::Csi;
                         self.csi_buffer.clear();
+                    } else if *byte == b'=' {
+                        self.application_keypad = true;
+                        self.parse_state = TerminalModeParseState::Ground;
+                    } else if *byte == b'>' {
+                        self.application_keypad = false;
+                        self.parse_state = TerminalModeParseState::Ground;
                     } else if *byte == b'c' {
                         self.reset();
                     } else if *byte == 0x1b {
-                        self.parse_state = MouseTrackerParseState::Esc;
+                        self.parse_state = TerminalModeParseState::Esc;
                     } else {
-                        self.parse_state = MouseTrackerParseState::Ground;
+                        self.parse_state = TerminalModeParseState::Ground;
                     }
                 }
-                MouseTrackerParseState::Csi => {
+                TerminalModeParseState::Csi => {
                     if *byte == 0x1b {
-                        self.parse_state = MouseTrackerParseState::Esc;
+                        self.parse_state = TerminalModeParseState::Esc;
                         self.csi_buffer.clear();
                         continue;
                     }
@@ -1344,9 +1356,9 @@ impl PaneMouseProtocolTracker {
                     if (0x40..=0x7e).contains(byte) {
                         let sequence = std::mem::take(&mut self.csi_buffer);
                         self.apply_csi_sequence(&sequence);
-                        self.parse_state = MouseTrackerParseState::Ground;
+                        self.parse_state = TerminalModeParseState::Ground;
                     } else if self.csi_buffer.len() > 64 {
-                        self.parse_state = MouseTrackerParseState::Ground;
+                        self.parse_state = TerminalModeParseState::Ground;
                         self.csi_buffer.clear();
                     }
                 }
@@ -1378,8 +1390,15 @@ impl PaneMouseProtocolTracker {
         AttachMouseProtocolState { mode, encoding }
     }
 
+    const fn current_input_modes(&self) -> AttachInputModeState {
+        AttachInputModeState {
+            application_cursor: self.application_cursor,
+            application_keypad: self.application_keypad,
+        }
+    }
+
     fn reset(&mut self) {
-        self.parse_state = MouseTrackerParseState::Ground;
+        self.parse_state = TerminalModeParseState::Ground;
         self.csi_buffer.clear();
         self.x10_mode = false;
         self.press_release_mode = false;
@@ -1387,6 +1406,8 @@ impl PaneMouseProtocolTracker {
         self.any_motion_mode = false;
         self.utf8_encoding = false;
         self.sgr_encoding = false;
+        self.application_cursor = false;
+        self.application_keypad = false;
         self.sync_update = false;
     }
 
@@ -1420,6 +1441,7 @@ impl PaneMouseProtocolTracker {
 
     const fn apply_private_mode(&mut self, mode: u16, enable: bool) {
         match mode {
+            1 => self.application_cursor = enable,
             9 => self.x10_mode = enable,
             1000 => self.press_release_mode = enable,
             1002 => self.button_motion_mode = enable,
@@ -2131,12 +2153,14 @@ struct AttachSnapshotState {
     scene: AttachScene,
     chunks: Vec<AttachPaneChunk>,
     pane_mouse_protocols: Vec<AttachPaneMouseProtocol>,
+    pane_input_modes: Vec<AttachPaneInputMode>,
     zoomed: bool,
 }
 
 struct AttachPaneSnapshotState {
     chunks: Vec<AttachPaneChunk>,
     pane_mouse_protocols: Vec<AttachPaneMouseProtocol>,
+    pane_input_modes: Vec<AttachPaneInputMode>,
 }
 
 #[derive(Debug, Clone)]
@@ -2771,6 +2795,8 @@ impl SessionRuntimeManager {
         let mouse_protocol_state =
             Arc::new(std::sync::Mutex::new(AttachMouseProtocolState::default()));
         let mouse_protocol_state_for_reader = Arc::clone(&mouse_protocol_state);
+        let input_mode_state = Arc::new(std::sync::Mutex::new(AttachInputModeState::default()));
+        let input_mode_state_for_reader = Arc::clone(&input_mode_state);
 
         #[cfg(feature = "image-registry")]
         let image_registry = {
@@ -2909,7 +2935,7 @@ impl SessionRuntimeManager {
                         .map(|size| *size)
                         .unwrap_or((24, 80));
                     let mut cursor_tracker = PaneCursorTracker::new(initial_rows, initial_cols);
-                    let mut mouse_protocol_tracker = PaneMouseProtocolTracker::default();
+                    let mut terminal_mode_tracker = PaneTerminalModeTracker::default();
 
                     // Image interceptor: detects and extracts image escape sequences
                     // (Sixel, Kitty, iTerm2) from PTY output before they reach the
@@ -3031,19 +3057,20 @@ impl SessionRuntimeManager {
                                     }
                                 }
 
-                                // Update DEC private mode tracking (mouse protocol
-                                // and synchronized update) BEFORE making the chunk
-                                // visible in the output buffer.  This ensures the
-                                // per-pane `sync_update_in_progress` flag is always
-                                // consistent with or ahead of the buffered data, so
-                                // a client reading from the buffer will never see
-                                // partial-update bytes without the flag being set.
-                                mouse_protocol_tracker.process(chunk);
+                                // Update terminal mode tracking (mouse protocol,
+                                // cursor/keypad modes, synchronized update) BEFORE
+                                // making the chunk visible in the output buffer.
+                                // This ensures per-pane mode snapshots are always
+                                // consistent with or ahead of the buffered data.
+                                terminal_mode_tracker.process(chunk);
                                 if let Ok(mut protocol) = mouse_protocol_state_for_reader.lock() {
-                                    *protocol = mouse_protocol_tracker.current_protocol();
+                                    *protocol = terminal_mode_tracker.current_protocol();
+                                }
+                                if let Ok(mut mode_state) = input_mode_state_for_reader.lock() {
+                                    *mode_state = terminal_mode_tracker.current_input_modes();
                                 }
                                 sync_update_for_reader
-                                    .store(mouse_protocol_tracker.sync_update, Ordering::SeqCst);
+                                    .store(terminal_mode_tracker.sync_update, Ordering::SeqCst);
 
                                 if let Ok(mut output) = reader_output.lock() {
                                     output.push_chunk(chunk);
@@ -3201,6 +3228,7 @@ impl SessionRuntimeManager {
             output_dirty,
             sync_update_in_progress,
             mouse_protocol_state,
+            input_mode_state,
             #[cfg(feature = "image-registry")]
             image_registry,
             #[cfg(feature = "image-registry")]
@@ -3583,6 +3611,7 @@ impl SessionRuntimeManager {
 
         let mut chunks = Vec::new();
         let mut pane_mouse_protocols = Vec::new();
+        let mut pane_input_modes = Vec::new();
         let num_panes = pane_ids.len().max(1);
         let per_pane_budget = (RESPONSE_OUTPUT_BUDGET / num_panes).min(max_bytes_per_pane);
         let mut budget_remaining = RESPONSE_OUTPUT_BUDGET;
@@ -3596,6 +3625,12 @@ impl SessionRuntimeManager {
                 .map(|state| *state)
                 .unwrap_or_default();
             pane_mouse_protocols.push(AttachPaneMouseProtocol { pane_id, protocol });
+            let mode = pane
+                .input_mode_state
+                .lock()
+                .map(|state| *state)
+                .unwrap_or_default();
+            pane_input_modes.push(AttachPaneInputMode { pane_id, mode });
             let allowed = per_pane_budget.min(budget_remaining);
             let read = pane
                 .output_buffer
@@ -3622,6 +3657,7 @@ impl SessionRuntimeManager {
             scene,
             chunks,
             pane_mouse_protocols,
+            pane_input_modes,
             zoomed: session.zoomed_pane_id.is_some(),
         })
     }
@@ -3694,6 +3730,7 @@ impl SessionRuntimeManager {
         let mut budget_remaining = RESPONSE_OUTPUT_BUDGET;
         let mut chunks = Vec::new();
         let mut pane_mouse_protocols = Vec::new();
+        let mut pane_input_modes = Vec::new();
         let mut seen = BTreeSet::new();
 
         for pane_id in pane_ids {
@@ -3713,6 +3750,15 @@ impl SessionRuntimeManager {
             pane_mouse_protocols.push(AttachPaneMouseProtocol {
                 pane_id: *pane_id,
                 protocol,
+            });
+            let mode = pane
+                .input_mode_state
+                .lock()
+                .map(|state| *state)
+                .unwrap_or_default();
+            pane_input_modes.push(AttachPaneInputMode {
+                pane_id: *pane_id,
+                mode,
             });
 
             let allowed = per_pane_budget.min(budget_remaining);
@@ -3740,6 +3786,7 @@ impl SessionRuntimeManager {
         Ok(AttachPaneSnapshotState {
             chunks,
             pane_mouse_protocols,
+            pane_input_modes,
         })
     }
 
@@ -7574,6 +7621,7 @@ async fn handle_request(
                     scene: snapshot.scene,
                     chunks: snapshot.chunks,
                     pane_mouse_protocols: snapshot.pane_mouse_protocols,
+                    pane_input_modes: snapshot.pane_input_modes,
                     zoomed: snapshot.zoomed,
                 }),
                 Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
@@ -7620,6 +7668,7 @@ async fn handle_request(
                 Ok(snapshot) => Response::Ok(ResponsePayload::AttachPaneSnapshot {
                     chunks: snapshot.chunks,
                     pane_mouse_protocols: snapshot.pane_mouse_protocols,
+                    pane_input_modes: snapshot.pane_input_modes,
                 }),
                 Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
                     code: ErrorCode::NotFound,
@@ -9930,7 +9979,7 @@ mod tests {
 
     #[test]
     fn pane_mouse_protocol_tracker_tracks_dec_private_modes() {
-        let mut tracker = PaneMouseProtocolTracker::default();
+        let mut tracker = PaneTerminalModeTracker::default();
 
         assert_eq!(
             tracker.current_protocol().mode,
@@ -9974,7 +10023,7 @@ mod tests {
 
     #[test]
     fn pane_mouse_protocol_tracker_handles_sequences_split_across_chunks() {
-        let mut tracker = PaneMouseProtocolTracker::default();
+        let mut tracker = PaneTerminalModeTracker::default();
 
         tracker.process(b"\x1b[?10");
         tracker.process(b"03h\x1b[");
@@ -9991,7 +10040,7 @@ mod tests {
 
     #[test]
     fn pane_mouse_protocol_tracker_resets_on_terminal_resets() {
-        let mut tracker = PaneMouseProtocolTracker::default();
+        let mut tracker = PaneTerminalModeTracker::default();
 
         tracker.process(b"\x1b[?1002h\x1b[?1005h");
         assert_eq!(
@@ -10018,6 +10067,38 @@ mod tests {
         assert_eq!(
             tracker.current_protocol(),
             AttachMouseProtocolState::default()
+        );
+    }
+
+    #[test]
+    fn pane_terminal_mode_tracker_tracks_input_modes() {
+        let mut tracker = PaneTerminalModeTracker::default();
+
+        assert_eq!(
+            tracker.current_input_modes(),
+            AttachInputModeState::default()
+        );
+
+        tracker.process(b"\x1b[?1h\x1b=");
+        assert_eq!(
+            tracker.current_input_modes(),
+            AttachInputModeState {
+                application_cursor: true,
+                application_keypad: true,
+            }
+        );
+
+        tracker.process(b"\x1b[?1l\x1b>");
+        assert_eq!(
+            tracker.current_input_modes(),
+            AttachInputModeState::default()
+        );
+
+        tracker.process(b"\x1b[?1h\x1b=");
+        tracker.process(b"\x1bc");
+        assert_eq!(
+            tracker.current_input_modes(),
+            AttachInputModeState::default()
         );
     }
 

@@ -4,7 +4,7 @@
 //! representation, including both the logical `KeyStroke` (for keybind matching)
 //! and the raw byte encoding (for PTY forwarding).
 
-use bmux_keyboard::encode::encode_key;
+use bmux_keyboard::encode::{KeyEncodingModes, encode_key_with_modes};
 use bmux_keyboard::{KeyCode, KeyStroke, Modifiers};
 use crossterm::event::{
     Event, KeyCode as CrosstermKeyCode, KeyEvent as CrosstermKeyEvent, KeyEventKind, KeyModifiers,
@@ -13,9 +13,13 @@ use crossterm::event::{
 use super::{DecodedStroke, InputEvent};
 
 /// Convert a crossterm [`Event`] into an [`InputEvent`], if applicable.
-pub(super) fn crossterm_event_to_input_event(event: &Event, enhanced: bool) -> Option<InputEvent> {
+pub(super) fn crossterm_event_to_input_event(
+    event: &Event,
+    enhanced: bool,
+    modes: KeyEncodingModes,
+) -> Option<InputEvent> {
     match event {
-        Event::Key(key) => key_event_to_input_event(key, enhanced),
+        Event::Key(key) => key_event_to_input_event(key, enhanced, modes),
         _ => None,
     }
 }
@@ -24,13 +28,17 @@ pub(super) fn crossterm_event_to_input_event(event: &Event, enhanced: bool) -> O
 ///
 /// Filters out `Release` events. Produces both the logical `KeyStroke`
 /// (for keybind matching) and the raw byte encoding (for PTY forwarding).
-fn key_event_to_input_event(key: &CrosstermKeyEvent, enhanced: bool) -> Option<InputEvent> {
+fn key_event_to_input_event(
+    key: &CrosstermKeyEvent,
+    enhanced: bool,
+    modes: KeyEncodingModes,
+) -> Option<InputEvent> {
     if key.kind == KeyEventKind::Release {
         return None;
     }
 
     let stroke = key_event_to_stroke(key)?;
-    let raw = key_event_to_bytes(key, enhanced)?;
+    let raw = key_event_to_bytes(key, enhanced, modes)?;
     Some(InputEvent::Key(DecodedStroke { stroke, raw }))
 }
 
@@ -88,10 +96,14 @@ pub const fn key_event_to_stroke(key: &CrosstermKeyEvent) -> Option<KeyStroke> {
 
 /// Encode a crossterm `KeyEvent` to raw bytes for PTY forwarding.
 ///
-/// Delegates to `bmux_keyboard::encode::encode_key()` which uses CSI u
+/// Delegates to `bmux_keyboard::encode::encode_key_with_modes()` which uses CSI u
 /// encoding when `enhanced` is true and needed, or legacy VT encoding
 /// otherwise.
-fn key_event_to_bytes(key: &CrosstermKeyEvent, enhanced: bool) -> Option<Vec<u8>> {
+fn key_event_to_bytes(
+    key: &CrosstermKeyEvent,
+    enhanced: bool,
+    modes: KeyEncodingModes,
+) -> Option<Vec<u8>> {
     let stroke = key_event_to_stroke(key)?;
-    encode_key(&stroke, enhanced)
+    encode_key_with_modes(&stroke, enhanced, modes)
 }

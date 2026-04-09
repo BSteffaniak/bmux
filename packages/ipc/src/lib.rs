@@ -789,6 +789,21 @@ pub struct AttachPaneMouseProtocol {
     pub protocol: AttachMouseProtocolState,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct AttachInputModeState {
+    #[serde(default)]
+    pub application_cursor: bool,
+    #[serde(default)]
+    pub application_keypad: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AttachPaneInputMode {
+    pub pane_id: Uuid,
+    #[serde(default)]
+    pub mode: AttachInputModeState,
+}
+
 /// Summary returned when listing connected clients.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientSummary {
@@ -1223,12 +1238,16 @@ pub enum ResponsePayload {
         #[serde(default)]
         pane_mouse_protocols: Vec<AttachPaneMouseProtocol>,
         #[serde(default)]
+        pane_input_modes: Vec<AttachPaneInputMode>,
+        #[serde(default)]
         zoomed: bool,
     },
     AttachPaneSnapshot {
         chunks: Vec<AttachPaneChunk>,
         #[serde(default)]
         pane_mouse_protocols: Vec<AttachPaneMouseProtocol>,
+        #[serde(default)]
+        pane_input_modes: Vec<AttachPaneInputMode>,
     },
     EventsSubscribed,
     EventBatch {
@@ -2466,6 +2485,13 @@ mod tests {
                         encoding: AttachMouseProtocolEncoding::Sgr,
                     },
                 }],
+                pane_input_modes: vec![AttachPaneInputMode {
+                    pane_id,
+                    mode: AttachInputModeState {
+                        application_cursor: true,
+                        application_keypad: false,
+                    },
+                }],
                 zoomed: false,
             },
             ResponsePayload::AttachPaneSnapshot {
@@ -2482,6 +2508,13 @@ mod tests {
                     protocol: AttachMouseProtocolState {
                         mode: AttachMouseProtocolMode::PressRelease,
                         encoding: AttachMouseProtocolEncoding::Sgr,
+                    },
+                }],
+                pane_input_modes: vec![AttachPaneInputMode {
+                    pane_id,
+                    mode: AttachInputModeState {
+                        application_cursor: false,
+                        application_keypad: true,
                     },
                 }],
             },

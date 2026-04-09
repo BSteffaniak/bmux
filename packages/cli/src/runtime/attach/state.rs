@@ -2,7 +2,7 @@ use crate::input::RuntimeAction;
 use crate::status::AttachStatusLine;
 use bmux_client::AttachLayoutState;
 use bmux_config::{MouseBehaviorConfig, StatusPosition};
-use bmux_ipc::AttachMouseProtocolState;
+use bmux_ipc::{AttachInputModeState, AttachMouseProtocolState};
 use crossterm::event::MouseEvent;
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{Duration, Instant};
@@ -139,6 +139,7 @@ pub struct AttachViewState {
     pub cached_tab_order: Vec<Uuid>,
     pub pane_buffers: BTreeMap<Uuid, PaneRenderBuffer>,
     pub pane_mouse_protocol_hints: BTreeMap<Uuid, AttachMouseProtocolState>,
+    pub pane_input_mode_hints: BTreeMap<Uuid, AttachInputModeState>,
     pub status_position: StatusPosition,
     pub cached_status_line: Option<AttachStatusLine>,
     pub cached_layout_state: Option<AttachLayoutState>,
@@ -215,6 +216,7 @@ impl AttachViewState {
             cached_tab_order: Vec::new(),
             pane_buffers: BTreeMap::new(),
             pane_mouse_protocol_hints: BTreeMap::new(),
+            pane_input_mode_hints: BTreeMap::new(),
             status_position: StatusPosition::Bottom,
             cached_status_line: None,
             cached_layout_state: None,

@@ -10,6 +10,12 @@ use crate::legacy;
 use crate::types::KeyCode;
 use crate::types::KeyStroke;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct KeyEncodingModes {
+    pub application_cursor: bool,
+    pub application_keypad: bool,
+}
+
 /// Encode a key stroke to raw bytes for writing to a PTY.
 ///
 /// When `enhanced` is true and the key event has modifiers that cannot be
@@ -19,6 +25,17 @@ use crate::types::KeyStroke;
 /// Returns `None` if the key cannot be encoded.
 #[must_use]
 pub fn encode_key(stroke: &KeyStroke, enhanced: bool) -> Option<Vec<u8>> {
+    encode_key_with_modes(stroke, enhanced, KeyEncodingModes::default())
+}
+
+/// Encode a key stroke to raw bytes for writing to a PTY using terminal mode
+/// context from the attached pane.
+#[must_use]
+pub fn encode_key_with_modes(
+    stroke: &KeyStroke,
+    enhanced: bool,
+    modes: KeyEncodingModes,
+) -> Option<Vec<u8>> {
     #[cfg(feature = "csi-u")]
     if enhanced
         && needs_enhanced_encoding(stroke)
@@ -28,7 +45,7 @@ pub fn encode_key(stroke: &KeyStroke, enhanced: bool) -> Option<Vec<u8>> {
     }
 
     let _ = enhanced; // suppress unused warning when csi-u is disabled
-    legacy::encode(stroke)
+    legacy::encode_with_modes(stroke, modes.application_cursor, modes.application_keypad)
 }
 
 /// Determine whether a key stroke requires enhanced (CSI u) encoding.
@@ -205,6 +222,21 @@ mod tests {
             },
         );
         assert_eq!(encode_key(&stroke, false).unwrap(), b"\x1b[A");
+    }
+
+    #[test]
+    fn up_arrow_uses_application_cursor_when_enabled() {
+        let stroke = KeyStroke::simple(KeyCode::Up);
+        let encoded = encode_key_with_modes(
+            &stroke,
+            false,
+            KeyEncodingModes {
+                application_cursor: true,
+                application_keypad: false,
+            },
+        )
+        .expect("up arrow should encode");
+        assert_eq!(encoded, b"\x1bOA");
     }
 
     #[cfg(feature = "csi-u")]
