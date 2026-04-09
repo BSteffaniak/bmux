@@ -562,6 +562,12 @@ pub struct BehaviorConfig {
     /// Terminal type exposed to pane processes via the TERM environment
     /// variable. Common values: bmux-256color, xterm-256color, screen-256color.
     pub pane_term: String,
+    /// Enable per-shell runtime integration hooks that emit verbatim pane
+    /// command and prompt metadata for resurrection.
+    ///
+    /// When disabled, bmux does not inject shell wrapper config/rc files and
+    /// falls back to best-effort process inspection for command/cwd restore.
+    pub pane_shell_integration: bool,
     /// Enable protocol query/reply tracing in the runtime. Useful for
     /// debugging terminal protocol behavior with CSI/OSC/DCS sequences.
     pub protocol_trace_enabled: bool,
@@ -611,6 +617,7 @@ impl Default for BehaviorConfig {
             restore_last_layout: true,
             confirm_quit_destroy: true,
             pane_term: "bmux-256color".to_string(),
+            pane_shell_integration: true,
             protocol_trace_enabled: false,
             protocol_trace_capacity: 200,
             terminfo_auto_install: TerminfoAutoInstall::Never,
@@ -2679,6 +2686,38 @@ timeout_profile = "missing"
             config.behavior.pane_restore_method,
             crate::PaneRestoreMethod::Snapshot
         );
+    }
+
+    #[test]
+    fn pane_shell_integration_default_is_enabled() {
+        let config = BmuxConfig::default();
+        assert!(config.behavior.pane_shell_integration);
+    }
+
+    #[test]
+    fn pane_shell_integration_deserializes_false() {
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        std::fs::write(&path, "[behavior]\npane_shell_integration = false\n")
+            .expect("failed writing config fixture");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert!(!config.behavior.pane_shell_integration);
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn pane_shell_integration_defaults_when_missing_from_config() {
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        std::fs::write(&path, "[behavior]\nexit_empty = true\n")
+            .expect("failed writing config fixture");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert!(config.behavior.pane_shell_integration);
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
     }
 
     #[test]

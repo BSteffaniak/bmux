@@ -1069,6 +1069,12 @@ pub enum ServerCommand {
         /// Internal flag used by daemon launcher
         #[arg(long, hide = true)]
         foreground_internal: bool,
+        /// Force-enable pane shell integration hooks for this server start
+        #[arg(long, conflicts_with = "no_pane_shell_integration")]
+        pane_shell_integration: bool,
+        /// Disable pane shell integration hooks for this server start
+        #[arg(long, conflicts_with = "pane_shell_integration")]
+        no_pane_shell_integration: bool,
         /// Enable hidden rolling recording on server boot for this run
         #[arg(long, conflicts_with = "no_rolling_recording")]
         rolling_recording: bool,
@@ -1928,6 +1934,8 @@ mod tests {
             ServerCommand::Start {
                 daemon: false,
                 foreground_internal: false,
+                pane_shell_integration: false,
+                no_pane_shell_integration: false,
                 rolling_recording: false,
                 no_rolling_recording: false,
                 rolling_window_secs: None,
@@ -2126,6 +2134,36 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn parses_server_start_with_no_pane_shell_integration_flag() {
+        let cli = Cli::try_parse_from(["bmux", "server", "start", "--no-pane-shell-integration"])
+            .expect("valid CLI args");
+        let Some(Command::Server { command }) = cli.command else {
+            panic!("expected server subcommand");
+        };
+        assert!(matches!(
+            command,
+            ServerCommand::Start {
+                pane_shell_integration: false,
+                no_pane_shell_integration: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn rejects_conflicting_server_start_pane_shell_integration_flags() {
+        let error = Cli::try_parse_from([
+            "bmux",
+            "server",
+            "start",
+            "--pane-shell-integration",
+            "--no-pane-shell-integration",
+        ])
+        .expect_err("conflicting flags should fail");
+        assert!(error.to_string().contains("cannot be used"));
     }
 
     #[test]

@@ -525,6 +525,8 @@ pub(super) async fn dispatch_built_in_command(
                     ServerCommand::Start {
                         daemon,
                         foreground_internal,
+                        pane_shell_integration,
+                        no_pane_shell_integration,
                         rolling_recording,
                         no_rolling_recording,
                         rolling_window_secs,
@@ -550,6 +552,8 @@ pub(super) async fn dispatch_built_in_command(
             } else {
                 None
             };
+            let pane_shell_integration_override =
+                bool_override(*pane_shell_integration, *no_pane_shell_integration);
             let rolling_options = RecordingRollingStartOptions {
                 window_secs: *rolling_window_secs,
                 name: None,
@@ -580,6 +584,7 @@ pub(super) async fn dispatch_built_in_command(
                 *foreground_internal,
                 rolling_enabled_override,
                 rolling_options,
+                pane_shell_integration_override,
             )
             .await
         }

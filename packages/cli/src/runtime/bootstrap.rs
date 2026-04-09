@@ -153,7 +153,14 @@ pub(super) async fn ensure_server_running_for_default_attach(
         return Ok(());
     }
 
-    let _ = run_server_start(true, false, None, RecordingRollingStartOptions::default()).await?;
+    let _ = run_server_start(
+        true,
+        false,
+        None,
+        RecordingRollingStartOptions::default(),
+        None,
+    )
+    .await?;
     if !server_is_running(connection_context).await? {
         anyhow::bail!("bmux server failed to start for default attach")
     }
@@ -218,6 +225,7 @@ pub(super) async fn run_server_start(
     foreground_internal: bool,
     rolling_enabled_override: Option<bool>,
     rolling_options: RecordingRollingStartOptions,
+    pane_shell_integration_override: Option<bool>,
 ) -> Result<u8> {
     cleanup_stale_pid_file().await?;
     if server_is_running(ConnectionContext::default()).await? {
@@ -284,6 +292,7 @@ pub(super) async fn run_server_start(
             .args(rolling_start_override_args(
                 rolling_enabled_override,
                 &rolling_options,
+                pane_shell_integration_override,
             ))
             .env(
                 "BMUX_LOG_LEVEL",
@@ -315,11 +324,12 @@ pub(super) async fn run_server_start(
     let loaded_plugins = load_enabled_plugins(&config, &registry)?;
     activate_loaded_plugins(&loaded_plugins, &config, &paths)?;
     dispatch_loaded_plugin_event(&loaded_plugins, &plugin_system_event("server_starting"))?;
-    let server = BmuxServer::from_config_paths_with_rolling_options(
+    let server = BmuxServer::from_config_paths_with_start_options(
         &paths,
         effective_rolling_enabled,
         effective_rolling_settings.window_secs,
         &effective_rolling_settings.event_kinds,
+        pane_shell_integration_override,
     );
     register_plugin_service_handlers(&server, &config, &paths, &registry)?;
     write_server_pid_file(std::process::id())?;
@@ -360,6 +370,7 @@ pub(super) async fn run_server_start(
 fn rolling_start_override_args(
     rolling_enabled_override: Option<bool>,
     options: &RecordingRollingStartOptions,
+    pane_shell_integration_override: Option<bool>,
 ) -> Vec<String> {
     let mut args = Vec::new();
 
@@ -412,6 +423,12 @@ fn rolling_start_override_args(
         options.capture_images,
         "--rolling-capture-images",
         "--no-rolling-capture-images",
+    );
+    push_bool_override_flag(
+        &mut args,
+        pane_shell_integration_override,
+        "--pane-shell-integration",
+        "--no-pane-shell-integration",
     );
 
     args

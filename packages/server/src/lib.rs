@@ -4885,6 +4885,25 @@ impl BmuxServer {
         rolling_window_secs: u64,
         rolling_event_kinds: &[RecordingEventKind],
     ) -> Self {
+        Self::from_config_paths_with_start_options(
+            paths,
+            rolling_recording_auto_start,
+            rolling_window_secs,
+            rolling_event_kinds,
+            None,
+        )
+    }
+
+    /// Create a server with endpoint derived from config paths, explicit
+    /// rolling-recording boot options, and optional shell integration override.
+    #[must_use]
+    pub fn from_config_paths_with_start_options(
+        paths: &ConfigPaths,
+        rolling_recording_auto_start: bool,
+        rolling_window_secs: u64,
+        rolling_event_kinds: &[RecordingEventKind],
+        pane_shell_integration_override: Option<bool>,
+    ) -> Self {
         let config = BmuxConfig::load_from_path(&paths.config_file()).unwrap_or_default();
         #[cfg(unix)]
         let endpoint = IpcEndpoint::unix_socket(paths.server_socket());
@@ -4902,10 +4921,13 @@ impl BmuxServer {
             window_secs: rolling_window_secs,
             event_kinds: normalize_recording_event_kinds(rolling_event_kinds),
         };
+        let shell_integration_root = pane_shell_integration_override
+            .unwrap_or(config.behavior.pane_shell_integration)
+            .then(|| paths.state_dir().join("runtime").join("shell-integration"));
         Self::new_with_snapshot(
             endpoint,
             Some(snapshot_manager),
-            Some(paths.state_dir().join("runtime").join("shell-integration")),
+            shell_integration_root,
             server_control_principal_id,
             config.recordings_dir(paths),
             paths.rolling_recordings_dir(),
@@ -10969,6 +10991,71 @@ mod tests {
             ConfigPaths::new(config_dir, runtime_dir, data_dir, state_dir),
             root,
         )
+    }
+
+    fn shell_integration_root_for_server(server: &BmuxServer) -> Option<PathBuf> {
+        server
+            .state
+            .session_runtimes
+            .lock()
+            .expect("session runtime manager lock should succeed")
+            .shell_integration_root
+            .clone()
+    }
+
+    #[test]
+    fn start_options_enable_shell_integration_by_default() {
+        let (paths, root) = test_config_paths("shell-integration-default-enabled");
+
+        let server =
+            BmuxServer::from_config_paths_with_start_options(&paths, false, 120, &[], None);
+
+        assert_eq!(
+            shell_integration_root_for_server(&server),
+            Some(paths.state_dir().join("runtime").join("shell-integration"))
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn start_options_disable_shell_integration_when_config_sets_false() {
+        let (paths, root) = test_config_paths("shell-integration-config-disabled");
+        std::fs::write(
+            paths.config_file(),
+            "[behavior]\npane_shell_integration = false\n",
+        )
+        .expect("test config should be written");
+
+        let server =
+            BmuxServer::from_config_paths_with_start_options(&paths, false, 120, &[], None);
+
+        assert_eq!(shell_integration_root_for_server(&server), None);
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn start_options_cli_override_forces_shell_integration_setting() {
+        let (paths, root) = test_config_paths("shell-integration-cli-override");
+        std::fs::write(
+            paths.config_file(),
+            "[behavior]\npane_shell_integration = false\n",
+        )
+        .expect("test config should be written");
+
+        let enabled_server =
+            BmuxServer::from_config_paths_with_start_options(&paths, false, 120, &[], Some(true));
+        assert_eq!(
+            shell_integration_root_for_server(&enabled_server),
+            Some(paths.state_dir().join("runtime").join("shell-integration"))
+        );
+
+        let disabled_server =
+            BmuxServer::from_config_paths_with_start_options(&paths, false, 120, &[], Some(false));
+        assert_eq!(shell_integration_root_for_server(&disabled_server), None);
+
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
