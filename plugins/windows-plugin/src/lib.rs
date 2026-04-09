@@ -9,11 +9,12 @@ use bmux_plugin_sdk::{
     StorageSetRequest,
 };
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use uuid::Uuid;
 
 const ACTIVE_WINDOW_CONTEXT_KEY: &str = "windows.active_context_id";
 const PREVIOUS_WINDOW_CONTEXT_KEY: &str = "windows.previous_context_id";
+const WINDOW_ORDER_KEY: &str = "windows.order";
 
 #[derive(Default)]
 pub struct WindowsPlugin {
@@ -215,6 +216,7 @@ fn list_windows(
         .context_list()
         .map_err(|error| error.to_string())?
         .contexts;
+    let contexts = order_contexts_for_navigation(caller, contexts)?;
     let selected = if let Some(filter) = session_filter {
         let selector = parse_selector(filter)?;
         contexts
@@ -227,6 +229,7 @@ fn list_windows(
     } else {
         contexts
     };
+    let current_context = resolve_effective_current_context_with_contexts(caller, &selected)?;
 
     Ok(selected
         .into_iter()
@@ -236,7 +239,7 @@ fn list_windows(
             name: context
                 .name
                 .unwrap_or_else(|| format!("context-{}", index.saturating_add(1))),
-            active: index == 0,
+            active: current_context == Some(context.id),
         })
         .collect())
 }
@@ -346,6 +349,7 @@ fn cycle_window(
         .context_list()
         .map_err(|error| error.to_string())?
         .contexts;
+    let contexts = order_contexts_for_navigation(caller, contexts)?;
     if contexts.len() < 2 {
         return Err("no alternate window available".to_string());
     }
@@ -400,6 +404,7 @@ fn goto_window_by_index(
         .context_list()
         .map_err(|error| error.to_string())?
         .contexts;
+    let contexts = order_contexts_for_navigation(caller, contexts)?;
     if contexts.is_empty() {
         return Err("no windows available".to_string());
     }
@@ -427,6 +432,7 @@ fn close_current_window(
         .context_list()
         .map_err(|error| error.to_string())?
         .contexts;
+    let contexts = order_contexts_for_navigation(caller, contexts)?;
     let current_id = resolve_effective_current_context_with_contexts(caller, &contexts)?
         .ok_or_else(|| "no current window to close".to_string())?;
 
@@ -529,6 +535,103 @@ fn set_stored_context_id(
     caller
         .storage_set(&StorageSetRequest {
             key: key.to_string(),
+            value,
+        })
+        .map_err(|error| error.to_string())
+}
+
+fn order_contexts_for_navigation(
+    caller: &impl HostRuntimeApi,
+    contexts: Vec<bmux_plugin_sdk::ContextSummary>,
+) -> Result<Vec<bmux_plugin_sdk::ContextSummary>, String> {
+    let order_ids = resolve_window_order_ids(caller, &contexts)?;
+    let mut by_id = contexts
+        .into_iter()
+        .map(|context| (context.id, context))
+        .collect::<BTreeMap<_, _>>();
+    Ok(order_ids
+        .into_iter()
+        .filter_map(|id| by_id.remove(&id))
+        .collect())
+}
+
+fn resolve_window_order_ids(
+    caller: &impl HostRuntimeApi,
+    contexts: &[bmux_plugin_sdk::ContextSummary],
+) -> Result<Vec<Uuid>, String> {
+    let mut order_ids = get_stored_window_order_ids(caller)?;
+    let mut changed = false;
+
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::with_capacity(order_ids.len());
+    for id in order_ids {
+        if seen.insert(id) {
+            deduped.push(id);
+        } else {
+            changed = true;
+        }
+    }
+    order_ids = deduped;
+
+    let context_ids = contexts
+        .iter()
+        .map(|context| context.id)
+        .collect::<HashSet<_>>();
+    let retained_len = order_ids.len();
+    order_ids.retain(|id| context_ids.contains(id));
+    if order_ids.len() != retained_len {
+        changed = true;
+    }
+
+    let mut known_ids = order_ids.iter().copied().collect::<HashSet<_>>();
+    for context in contexts {
+        if known_ids.insert(context.id) {
+            order_ids.push(context.id);
+            changed = true;
+        }
+    }
+
+    if changed {
+        set_stored_window_order_ids(caller, &order_ids)?;
+    }
+
+    Ok(order_ids)
+}
+
+fn get_stored_window_order_ids(caller: &impl HostRuntimeApi) -> Result<Vec<Uuid>, String> {
+    let response = caller
+        .storage_get(&StorageGetRequest {
+            key: WINDOW_ORDER_KEY.to_string(),
+        })
+        .map_err(|error| error.to_string())?;
+    let Some(value) = response.value else {
+        return Ok(Vec::new());
+    };
+    if value.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let raw = serde_json::from_slice::<Vec<String>>(&value)
+        .map_err(|error| format!("failed parsing stored window order: {error}"))?;
+    raw.into_iter()
+        .map(|entry| {
+            Uuid::parse_str(entry.trim()).map_err(|error| {
+                format!("failed parsing stored window order UUID '{entry}': {error}")
+            })
+        })
+        .collect()
+}
+
+fn set_stored_window_order_ids(
+    caller: &impl HostRuntimeApi,
+    order_ids: &[Uuid],
+) -> Result<(), String> {
+    let payload = order_ids.iter().map(Uuid::to_string).collect::<Vec<_>>();
+    let value = serde_json::to_vec(&payload)
+        .map_err(|error| format!("failed encoding stored window order: {error}"))?;
+    caller
+        .storage_set(&StorageSetRequest {
+            key: WINDOW_ORDER_KEY.to_string(),
             value,
         })
         .map_err(|error| error.to_string())
@@ -867,6 +970,7 @@ mod tests {
         fail_current_client: bool,
         current_client_id: Uuid,
         selected_session_id: Mutex<Option<Uuid>>,
+        mru_context_ids: Mutex<Vec<Uuid>>,
         creates: Mutex<Vec<Option<String>>>,
         kills: Mutex<Vec<ContextCloseRequest>>,
         selects: Mutex<Vec<Uuid>>,
@@ -878,6 +982,7 @@ mod tests {
             Self {
                 current_client_id: Uuid::new_v4(),
                 selected_session_id: Mutex::new(sessions.first().map(|session| session.id)),
+                mru_context_ids: Mutex::new(sessions.iter().map(|session| session.id).collect()),
                 sessions,
                 fail_create: false,
                 fail_kill: false,
@@ -894,6 +999,7 @@ mod tests {
             Self {
                 current_client_id: Uuid::new_v4(),
                 selected_session_id: Mutex::new(sessions.first().map(|session| session.id)),
+                mru_context_ids: Mutex::new(sessions.iter().map(|session| session.id).collect()),
                 sessions,
                 fail_create: false,
                 fail_kill: false,
@@ -910,6 +1016,7 @@ mod tests {
             Self {
                 current_client_id: Uuid::new_v4(),
                 selected_session_id: Mutex::new(sessions.first().map(|session| session.id)),
+                mru_context_ids: Mutex::new(sessions.iter().map(|session| session.id).collect()),
                 sessions,
                 fail_create,
                 fail_kill,
@@ -933,9 +1040,27 @@ mod tests {
             payload: Vec<u8>,
         ) -> bmux_plugin_sdk::Result<Vec<u8>> {
             match (interface_id, operation) {
-                ("context-query/v1", "list") => encode_service_message(&ContextListResponse {
-                    contexts: self.sessions.clone(),
-                }),
+                ("context-query/v1", "list") => {
+                    let mru_ids = self
+                        .mru_context_ids
+                        .lock()
+                        .expect("mru context lock should succeed")
+                        .clone();
+                    let mut by_id = self
+                        .sessions
+                        .iter()
+                        .cloned()
+                        .map(|context| (context.id, context))
+                        .collect::<BTreeMap<_, _>>();
+                    let mut contexts = Vec::with_capacity(by_id.len());
+                    for context_id in mru_ids {
+                        if let Some(context) = by_id.remove(&context_id) {
+                            contexts.push(context);
+                        }
+                    }
+                    contexts.extend(by_id.into_values());
+                    encode_service_message(&ContextListResponse { contexts })
+                }
                 ("context-command/v1", "create") => {
                     if self.fail_create {
                         return Err(bmux_plugin_sdk::PluginError::ServiceProtocol {
@@ -995,6 +1120,14 @@ mod tests {
                         .selected_session_id
                         .lock()
                         .expect("selected session lock should succeed") = Some(selected);
+                    {
+                        let mut mru_context_ids = self
+                            .mru_context_ids
+                            .lock()
+                            .expect("mru context lock should succeed");
+                        mru_context_ids.retain(|id| *id != selected);
+                        mru_context_ids.insert(0, selected);
+                    }
                     self.selects
                         .lock()
                         .expect("select log lock should succeed")
@@ -1068,6 +1201,26 @@ mod tests {
             SessionSummary {
                 id: Uuid::new_v4(),
                 name: Some("beta".to_string()),
+                attributes: BTreeMap::new(),
+            },
+        ]
+    }
+
+    fn sample_sessions_three() -> Vec<SessionSummary> {
+        vec![
+            SessionSummary {
+                id: Uuid::new_v4(),
+                name: Some("alpha".to_string()),
+                attributes: BTreeMap::new(),
+            },
+            SessionSummary {
+                id: Uuid::new_v4(),
+                name: Some("beta".to_string()),
+                attributes: BTreeMap::new(),
+            },
+            SessionSummary {
+                id: Uuid::new_v4(),
+                name: Some("gamma".to_string()),
                 attributes: BTreeMap::new(),
             },
         ]
@@ -1288,6 +1441,92 @@ mod tests {
         assert!(ack.ok);
         let target_text = target_id.to_string();
         assert_eq!(ack.id.as_deref(), Some(target_text.as_str()));
+    }
+
+    #[test]
+    fn cycle_window_follows_stable_order_when_mru_updates() {
+        let sessions = sample_sessions_three();
+        let first_id = sessions[0].id;
+        let second_id = sessions[1].id;
+        let third_id = sessions[2].id;
+        let host = MockHost::with_sessions(sessions);
+        let mut last_selected_by_client = BTreeMap::new();
+
+        let next = cycle_window(
+            &host,
+            WindowCycleDirection::Next,
+            &mut last_selected_by_client,
+        )
+        .expect("next window should succeed");
+        let second_text = second_id.to_string();
+        assert_eq!(next.id.as_deref(), Some(second_text.as_str()));
+
+        let next_again = cycle_window(
+            &host,
+            WindowCycleDirection::Next,
+            &mut last_selected_by_client,
+        )
+        .expect("second next window should succeed");
+        let third_text = third_id.to_string();
+        assert_eq!(next_again.id.as_deref(), Some(third_text.as_str()));
+
+        let previous = cycle_window(
+            &host,
+            WindowCycleDirection::Previous,
+            &mut last_selected_by_client,
+        )
+        .expect("previous window should succeed");
+        assert_eq!(previous.id.as_deref(), Some(second_text.as_str()));
+
+        let selects = host
+            .selects
+            .lock()
+            .expect("select log lock should succeed")
+            .clone();
+        assert_eq!(selects, vec![second_id, third_id, second_id]);
+
+        let stored_order = get_stored_window_order_ids(&host).expect("order lookup should succeed");
+        assert_eq!(stored_order, vec![first_id, second_id, third_id]);
+    }
+
+    #[test]
+    fn list_windows_keeps_stable_order_after_switches() {
+        let sessions = sample_sessions_three();
+        let first_id = sessions[0].id;
+        let second_id = sessions[1].id;
+        let third_id = sessions[2].id;
+        let host = MockHost::with_sessions(sessions);
+        let mut last_selected_by_client = BTreeMap::new();
+
+        let _ = cycle_window(
+            &host,
+            WindowCycleDirection::Next,
+            &mut last_selected_by_client,
+        )
+        .expect("next window should succeed");
+
+        let windows = list_windows(&host, None).expect("list should succeed");
+        assert_eq!(windows.len(), 3);
+        let window_ids = windows
+            .iter()
+            .map(|window| window.id.as_str())
+            .collect::<Vec<_>>();
+        let first_text = first_id.to_string();
+        let second_text = second_id.to_string();
+        let third_text = third_id.to_string();
+        assert_eq!(
+            window_ids,
+            vec![
+                first_text.as_str(),
+                second_text.as_str(),
+                third_text.as_str()
+            ]
+        );
+        assert!(
+            windows
+                .iter()
+                .any(|window| window.active && window.id == second_text)
+        );
     }
 
     #[test]
