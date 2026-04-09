@@ -62,6 +62,7 @@ use super::state::{
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 
 const ATTACH_CONTEXT_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+const ATTACH_STATUS_CATALOG_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const ATTACH_OUTPUT_BATCH_MAX_BYTES: usize = 8 * 1024;
 const ATTACH_OUTPUT_DRAIN_MAX_ROUNDS: usize = 8;
 /// Maximum wall-clock time the drain loop may spend waiting for an in-
@@ -267,6 +268,25 @@ fn apply_attach_output_chunk(
     }
 
     AttachChunkApplyOutcome::Applied { had_data }
+}
+
+async fn recover_attach_output_desync_for_pane(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+    pane_id: Uuid,
+) -> std::result::Result<(), ClientError> {
+    if client.supports_capability(CAPABILITY_ATTACH_PANE_SNAPSHOT)
+        && let Some(layout_state) = view_state.cached_layout_state.clone()
+        && attach_layout_pane_id_set(&layout_state).contains(&pane_id)
+    {
+        hydrate_attach_revealed_panes_from_snapshot(client, view_state, &layout_state, &[pane_id])
+            .await?;
+        view_state.dirty.full_pane_redraw = true;
+        return Ok(());
+    }
+
+    hydrate_attach_state_from_snapshot_mode(client, view_state, SnapshotHydrationMode::FullResync)
+        .await
 }
 
 #[derive(Debug, Clone)]
@@ -665,6 +685,7 @@ pub async fn run_session_attach_with_client(
     )
     .await?;
     hydrate_attach_state_from_snapshot(&mut client, &mut view_state).await?;
+    refresh_attach_status_catalog_best_effort(&mut client, &mut view_state).await;
     view_state.set_transient_status(
         initial_attach_status(&attach_keymap, view_state.can_write),
         Instant::now(),
@@ -780,10 +801,10 @@ pub async fn run_session_attach_with_client(
                     ) {
                         AttachChunkApplyOutcome::Applied { .. } | AttachChunkApplyOutcome::Stale => {}
                         AttachChunkApplyOutcome::Desync => {
-                            hydrate_attach_state_from_snapshot_mode(
+                            recover_attach_output_desync_for_pane(
                                 &mut client,
                                 &mut view_state,
-                                SnapshotHydrationMode::FullResync,
+                                pane_id,
                             )
                             .await?;
                             pane_output_pending = false;
@@ -943,6 +964,10 @@ pub async fn run_session_attach_with_client(
                             ATTACH_TRANSIENT_STATUS_TTL,
                         );
                     }
+
+                if should_refresh_attach_status_catalog(&view_state, now) {
+                    refresh_attach_status_catalog_best_effort(&mut client, &mut view_state).await;
+                }
             }
         }
 
@@ -1077,8 +1102,7 @@ pub async fn run_session_attach_with_client(
                 &attach_help_lines,
                 help_scroll,
                 &mut display_capture,
-            )
-            .await?;
+            )?;
             let render_ms = duration_millis_u64(render_started_at.elapsed());
             perf_window.record_render_frame(render_ms);
             rendered_frame_count = rendered_frame_count.saturating_add(1);
@@ -1107,10 +1131,10 @@ pub async fn run_session_attach_with_client(
 
         resize_attach_parsers_for_scene(&mut view_state.pane_buffers, &layout_state.scene);
 
-        // Only fetch pane output when new pane bytes are pending or there are
-        // dirty panes that need fresh output (e.g. visible scene change).
-        // Overlay/status-only redraws should not trigger pane-output IPC.
-        if pane_output_pending || !view_state.dirty.pane_dirty_ids.is_empty() {
+        // Only fetch pane output when new pane bytes are pending.
+        // Pure redraw dirty flags (layout/status/overlay) must not trigger
+        // pane-output IPC on their own.
+        if pane_output_pending {
             let pane_ids = visible_scene_pane_ids(&layout_state.scene);
             let active_pane_ids = attach_layout_pane_id_set(&layout_state);
             view_state
@@ -1176,7 +1200,7 @@ pub async fn run_session_attach_with_client(
 
                 let mut had_data = false;
                 let mut any_sync_active = false;
-                let mut needs_resync = false;
+                let mut desynced_pane_id = None;
                 for chunk in result.chunks {
                     match apply_attach_output_chunk(
                         &mut view_state,
@@ -1198,17 +1222,17 @@ pub async fn run_session_attach_with_client(
                         }
                         AttachChunkApplyOutcome::Stale => {}
                         AttachChunkApplyOutcome::Desync => {
-                            needs_resync = true;
+                            desynced_pane_id = Some(chunk.pane_id);
                             break;
                         }
                     }
                 }
 
-                if needs_resync {
-                    hydrate_attach_state_from_snapshot_mode(
+                if let Some(desynced_pane_id) = desynced_pane_id {
+                    recover_attach_output_desync_for_pane(
                         &mut client,
                         &mut view_state,
-                        SnapshotHydrationMode::FullResync,
+                        desynced_pane_id,
                     )
                     .await?;
                     last_round_had_data = false;
@@ -1308,8 +1332,7 @@ pub async fn run_session_attach_with_client(
             &attach_help_lines,
             help_scroll,
             &mut display_capture,
-        )
-        .await?;
+        )?;
         let render_ms = duration_millis_u64(render_started_at.elapsed());
         perf_window.record_render_frame(render_ms);
         rendered_frame_count = rendered_frame_count.saturating_add(1);
@@ -1401,12 +1424,8 @@ pub async fn handle_attach_runtime_action(
             update_attach_viewport(client, view_state.attached_id, view_state.status_position)
                 .await?;
             hydrate_attach_state_from_snapshot(client, view_state).await?;
-            let status = attach_context_status(
-                client,
-                view_state.attached_context_id,
-                view_state.attached_id,
-            )
-            .await?;
+            refresh_attach_status_catalog_best_effort(client, view_state).await;
+            let status = attach_context_status_from_catalog(view_state);
             set_attach_context_status(
                 view_state,
                 status,
@@ -1473,13 +1492,9 @@ pub async fn retarget_attach_to_context(
     view_state.can_write = attach_info.can_write;
     update_attach_viewport(client, view_state.attached_id, view_state.status_position).await?;
     hydrate_attach_state_from_snapshot(client, view_state).await?;
+    refresh_attach_status_catalog_best_effort(client, view_state).await;
     view_state.ui_mode = AttachUiMode::Normal;
-    let status = attach_context_status(
-        client,
-        view_state.attached_context_id,
-        view_state.attached_id,
-    )
-    .await?;
+    let status = attach_context_status_from_catalog(view_state);
     set_attach_context_status(
         view_state,
         status,
@@ -1964,12 +1979,8 @@ pub async fn handle_attach_ui_action(
         RuntimeAction::SessionPrev => {
             view_state.exit_scrollback();
             switch_attach_session_relative(client, view_state, -1).await?;
-            let status = attach_context_status(
-                client,
-                view_state.attached_context_id,
-                view_state.attached_id,
-            )
-            .await?;
+            refresh_attach_status_catalog_best_effort(client, view_state).await;
+            let status = attach_context_status_from_catalog(view_state);
             set_attach_context_status(
                 view_state,
                 status,
@@ -1980,12 +1991,8 @@ pub async fn handle_attach_ui_action(
         RuntimeAction::SessionNext => {
             view_state.exit_scrollback();
             switch_attach_session_relative(client, view_state, 1).await?;
-            let status = attach_context_status(
-                client,
-                view_state.attached_context_id,
-                view_state.attached_id,
-            )
-            .await?;
+            refresh_attach_status_catalog_best_effort(client, view_state).await;
+            let status = attach_context_status_from_catalog(view_state);
             set_attach_context_status(
                 view_state,
                 status,
@@ -2569,8 +2576,8 @@ pub fn relative_context_id(
 }
 
 #[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
-pub async fn build_attach_status_line_for_draw(
-    client: &mut StreamingBmuxClient,
+pub fn build_attach_status_line_for_draw(
+    _client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     status_config: &bmux_config::StatusBarConfig,
     global_theme: &bmux_config::ThemeConfig,
@@ -2586,20 +2593,29 @@ pub async fn build_attach_status_line_for_draw(
     help_overlay_open: bool,
     transient_status: Option<&str>,
     keymap: &Keymap,
-) -> std::result::Result<AttachStatusLine, ClientError> {
+) -> AttachStatusLine {
     let (cols, _) = terminal::size().unwrap_or((0, 0));
     if cols == 0 {
-        return Ok(AttachStatusLine {
+        return AttachStatusLine {
             rendered: String::new(),
             tab_hitboxes: Vec::new(),
-        });
+        };
     }
 
-    let tabs = build_attach_tabs(client, view_state, status_config, context_id, session_id).await?;
+    let cached_contexts = view_state.cached_contexts.clone();
+    let cached_sessions = view_state.cached_sessions.clone();
+
+    let tabs = build_attach_tabs_from_catalog(
+        &cached_contexts,
+        view_state,
+        status_config,
+        context_id,
+        session_id,
+    );
     let (session_label, session_count) =
-        resolve_attach_session_label_and_count(client, session_id).await?;
+        resolve_attach_session_label_and_count_from_catalog(&cached_sessions, session_id);
     let current_context_label =
-        resolve_attach_context_label(client, context_id, session_id).await?;
+        resolve_attach_context_label_from_catalog(&cached_contexts, context_id, session_id);
     let tab_position_label = tabs
         .iter()
         .position(|tab| tab.active)
@@ -2640,7 +2656,7 @@ pub async fn build_attach_status_line_for_draw(
         attach_mode_hint(ui_mode, keymap)
     };
 
-    let status_line = build_attach_status_line(
+    build_attach_status_line(
         cols,
         status_config,
         global_theme,
@@ -2653,9 +2669,7 @@ pub async fn build_attach_status_line_for_draw(
         role_label,
         follow_label.as_deref(),
         &hint,
-    );
-
-    Ok(status_line)
+    )
 }
 
 pub fn attach_mode_hint(_ui_mode: AttachUiMode, keymap: &Keymap) -> String {
@@ -2997,7 +3011,7 @@ pub fn queue_attach_help_overlay(
 }
 
 #[allow(clippy::too_many_lines, clippy::too_many_arguments)]
-pub async fn render_attach_frame(
+pub fn render_attach_frame(
     client: &mut StreamingBmuxClient,
     view_state: &mut AttachViewState,
     layout_state: &AttachLayoutState,
@@ -3013,28 +3027,24 @@ pub async fn render_attach_frame(
     if view_state.dirty.status_needs_redraw {
         let now = Instant::now();
         let transient_status = view_state.transient_status_text(now).map(str::to_owned);
-        view_state.cached_status_line = Some(
-            build_attach_status_line_for_draw(
-                client,
-                view_state,
-                status_config,
-                global_theme,
-                view_state.attached_context_id,
-                view_state.attached_id,
-                view_state.can_write,
-                view_state.ui_mode,
-                view_state.scrollback_active,
-                follow_target_id,
-                follow_global,
-                view_state.prompt.is_active(),
-                view_state.prompt.active_hint(),
-                view_state.help_overlay_open,
-                transient_status.as_deref(),
-                keymap,
-            )
-            .await
-            .map_err(map_attach_client_error)?,
-        );
+        view_state.cached_status_line = Some(build_attach_status_line_for_draw(
+            client,
+            view_state,
+            status_config,
+            global_theme,
+            view_state.attached_context_id,
+            view_state.attached_id,
+            view_state.can_write,
+            view_state.ui_mode,
+            view_state.scrollback_active,
+            follow_target_id,
+            follow_global,
+            view_state.prompt.is_active(),
+            view_state.prompt.active_hint(),
+            view_state.help_overlay_open,
+            transient_status.as_deref(),
+            keymap,
+        ));
         view_state.dirty.status_needs_redraw = false;
     }
 
@@ -3197,24 +3207,25 @@ pub async fn render_attach_frame(
     Ok(())
 }
 
-pub async fn build_attach_tabs(
-    client: &mut StreamingBmuxClient,
+pub fn build_attach_tabs_from_catalog(
+    contexts: &[ContextSummary],
     view_state: &mut AttachViewState,
     status_config: &bmux_config::StatusBarConfig,
     context_id: Option<Uuid>,
     session_id: Uuid,
-) -> std::result::Result<Vec<AttachTab>, ClientError> {
-    let contexts = client.list_contexts().await?;
+) -> Vec<AttachTab> {
     if contexts.is_empty() {
-        return Ok(vec![AttachTab {
+        return vec![AttachTab {
             label: "terminal".to_string(),
             active: true,
             context_id: None,
-        }]);
+        }];
     }
 
     let tab_contexts = match status_config.tab_scope {
-        bmux_config::StatusTabScope::AllContexts | bmux_config::StatusTabScope::Mru => contexts,
+        bmux_config::StatusTabScope::AllContexts | bmux_config::StatusTabScope::Mru => {
+            contexts.to_vec()
+        }
         bmux_config::StatusTabScope::SessionContexts => {
             let filtered = contexts
                 .iter()
@@ -3227,7 +3238,7 @@ pub async fn build_attach_tabs(
                 .cloned()
                 .collect::<Vec<_>>();
             if filtered.is_empty() {
-                contexts
+                contexts.to_vec()
             } else {
                 filtered
             }
@@ -3254,15 +3265,14 @@ pub async fn build_attach_tabs(
             .map(|context| context.id)
     });
 
-    let tabs = tab_contexts
+    tab_contexts
         .into_iter()
         .map(|context| AttachTab {
             label: context_summary_label(&context),
             active: current_context_id == Some(context.id),
             context_id: Some(context.id),
         })
-        .collect();
-    Ok(tabs)
+        .collect()
 }
 
 pub fn stabilize_tab_order(
@@ -3287,16 +3297,15 @@ pub fn stabilize_tab_order(
         .collect()
 }
 
-pub async fn resolve_attach_context_label(
-    client: &mut StreamingBmuxClient,
+pub fn resolve_attach_context_label_from_catalog(
+    contexts: &[ContextSummary],
     context_id: Option<Uuid>,
     session_id: Uuid,
-) -> std::result::Result<String, ClientError> {
-    let contexts = client.list_contexts().await?;
+) -> String {
     if let Some(context_id) = context_id
         && let Some(context) = contexts.iter().find(|context| context.id == context_id)
     {
-        return Ok(context_summary_label(context));
+        return context_summary_label(context);
     }
 
     if let Some(context) = contexts.iter().find(|context| {
@@ -3305,10 +3314,10 @@ pub async fn resolve_attach_context_label(
             .get("bmux.session_id")
             .is_some_and(|value| value == &session_id.to_string())
     }) {
-        return Ok(context_summary_label(context));
+        return context_summary_label(context);
     }
 
-    Ok("terminal".to_string())
+    "terminal".to_string()
 }
 
 pub fn context_summary_label(context: &ContextSummary) -> String {
@@ -3322,28 +3331,19 @@ pub fn context_summary_label(context: &ContextSummary) -> String {
         )
 }
 
-pub async fn resolve_attach_session_label(
-    client: &mut StreamingBmuxClient,
+pub fn resolve_attach_session_label_and_count_from_catalog(
+    sessions: &[SessionSummary],
     session_id: Uuid,
-) -> std::result::Result<String, ClientError> {
-    let (label, _count) = resolve_attach_session_label_and_count(client, session_id).await?;
-    Ok(label)
-}
-
-pub async fn resolve_attach_session_label_and_count(
-    client: &mut StreamingBmuxClient,
-    session_id: Uuid,
-) -> std::result::Result<(String, usize), ClientError> {
-    let sessions = client.list_sessions().await?;
+) -> (String, usize) {
     let count = sessions.len();
     let label = sessions
-        .into_iter()
+        .iter()
         .find(|session| session.id == session_id)
         .map_or_else(
             || format!("session-{}", short_uuid(session_id)),
-            |session| session_summary_label(&session),
+            session_summary_label,
         );
-    Ok((label, count))
+    (label, count)
 }
 
 pub fn session_summary_label(session: &bmux_ipc::SessionSummary) -> String {
@@ -3353,16 +3353,17 @@ pub fn session_summary_label(session: &bmux_ipc::SessionSummary) -> String {
         .unwrap_or_else(|| format!("session-{}", short_uuid(session.id)))
 }
 
-pub async fn attach_context_status(
-    client: &mut StreamingBmuxClient,
-    context_id: Option<Uuid>,
-    session_id: Uuid,
-) -> std::result::Result<String, ClientError> {
-    let session_label = resolve_attach_session_label(client, session_id).await?;
-    let context_label = resolve_attach_context_label(client, context_id, session_id).await?;
-    Ok(format!(
-        "session: {session_label} | context: {context_label}"
-    ))
+pub fn attach_context_status_from_catalog(view_state: &AttachViewState) -> String {
+    let (session_label, _count) = resolve_attach_session_label_and_count_from_catalog(
+        &view_state.cached_sessions,
+        view_state.attached_id,
+    );
+    let context_label = resolve_attach_context_label_from_catalog(
+        &view_state.cached_contexts,
+        view_state.attached_context_id,
+        view_state.attached_id,
+    );
+    format!("session: {session_label} | context: {context_label}")
 }
 
 pub fn set_attach_context_status(
@@ -3446,6 +3447,7 @@ pub async fn refresh_attached_session_from_context(
             update_attach_viewport(client, view_state.attached_id, view_state.status_position)
                 .await?;
             hydrate_attach_state_from_snapshot(client, view_state).await?;
+            refresh_attach_status_catalog_best_effort(client, view_state).await;
         }
         view_state.attached_context_id = grant.context_id.or(Some(context_id));
 
@@ -3465,6 +3467,37 @@ pub fn should_refresh_attached_session(view_state: &AttachViewState, now: Instan
     view_state
         .last_context_refresh_at
         .is_none_or(|last| now.duration_since(last) >= ATTACH_CONTEXT_REFRESH_INTERVAL)
+}
+
+pub async fn refresh_attach_status_catalog(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+) -> std::result::Result<(), ClientError> {
+    let contexts = client.list_contexts().await?;
+    let sessions = client.list_sessions().await?;
+    view_state.cached_contexts = contexts;
+    view_state.cached_sessions = sessions;
+    view_state.last_status_catalog_refresh_at = Some(Instant::now());
+    Ok(())
+}
+
+pub fn should_refresh_attach_status_catalog(view_state: &AttachViewState, now: Instant) -> bool {
+    view_state
+        .last_status_catalog_refresh_at
+        .is_none_or(|last| now.duration_since(last) >= ATTACH_STATUS_CATALOG_REFRESH_INTERVAL)
+}
+
+async fn refresh_attach_status_catalog_best_effort(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
+) {
+    if let Err(error) = refresh_attach_status_catalog(client, view_state).await {
+        warn!(
+            attached_context_id = ?view_state.attached_context_id,
+            attached_session_id = %view_state.attached_id,
+            "attach.status_catalog.refresh_failed: {error:#}"
+        );
+    }
 }
 
 pub fn attach_keymap_from_config(config: &BmuxConfig) -> crate::input::Keymap {
@@ -4226,14 +4259,9 @@ pub async fn handle_attach_server_event(
             hydrate_attach_state_from_snapshot(client, view_state)
                 .await
                 .map_err(map_attach_client_error)?;
+            refresh_attach_status_catalog_best_effort(client, view_state).await;
             view_state.ui_mode = AttachUiMode::Normal;
-            let status = attach_context_status(
-                client,
-                view_state.attached_context_id,
-                view_state.attached_id,
-            )
-            .await
-            .map_err(map_attach_client_error)?;
+            let status = attach_context_status_from_catalog(view_state);
             set_attach_context_status(
                 view_state,
                 status,
@@ -4353,13 +4381,9 @@ pub async fn recover_attach_after_session_removed(
             update_attach_viewport(client, view_state.attached_id, view_state.status_position)
                 .await?;
             hydrate_attach_state_from_snapshot(client, view_state).await?;
+            refresh_attach_status_catalog_best_effort(client, view_state).await;
             view_state.ui_mode = AttachUiMode::Normal;
-            let status = attach_context_status(
-                client,
-                view_state.attached_context_id,
-                view_state.attached_id,
-            )
-            .await?;
+            let status = attach_context_status_from_catalog(view_state);
             set_attach_context_status(
                 view_state,
                 status,

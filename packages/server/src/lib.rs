@@ -1982,15 +1982,9 @@ impl OutputFanoutBuffer {
             }
         }
 
-        // Clamp client cursors that fell behind due to eviction.  Advance
-        // them to the nearest safe position so that the next
-        // `read_for_client` never returns bytes starting mid-sequence.
-        let safe_resume = self.first_safe_offset_at_or_after(self.start_offset);
-        for cursor in self.cursors.values_mut() {
-            if *cursor < self.start_offset {
-                *cursor = safe_resume;
-            }
-        }
+        // Do not mutate per-client cursors here.  `read_for_client` performs
+        // clamping and reports `stream_gap` so clients can recover parser
+        // continuity with explicit metadata.
     }
 
     fn read_for_client(&mut self, client_id: ClientId, max_bytes: usize) -> OutputRead {
@@ -3579,14 +3573,14 @@ impl SessionRuntimeManager {
 
     #[allow(clippy::cast_possible_truncation)]
     fn attach_snapshot_state(
-        &self,
+        &mut self,
         session_id: SessionId,
         client_id: ClientId,
         max_bytes_per_pane: usize,
     ) -> Result<AttachSnapshotState, SessionRuntimeError> {
         let session = self
             .runtimes
-            .get(&session_id)
+            .get_mut(&session_id)
             .ok_or(SessionRuntimeError::NotFound)?;
         if !session.attached_clients.contains(&client_id) {
             return Err(SessionRuntimeError::NotAttached);
@@ -3616,7 +3610,7 @@ impl SessionRuntimeManager {
         let per_pane_budget = (RESPONSE_OUTPUT_BUDGET / num_panes).min(max_bytes_per_pane);
         let mut budget_remaining = RESPONSE_OUTPUT_BUDGET;
         for pane_id in pane_ids {
-            let Some(pane) = session.panes.get(&pane_id) else {
+            let Some(pane) = session.panes.get_mut(&pane_id) else {
                 continue;
             };
             let protocol = pane
@@ -3632,12 +3626,16 @@ impl SessionRuntimeManager {
                 .unwrap_or_default();
             pane_input_modes.push(AttachPaneInputMode { pane_id, mode });
             let allowed = per_pane_budget.min(budget_remaining);
-            let read = pane
+            let mut output = pane
                 .output_buffer
                 .lock()
-                .map_err(|_| SessionRuntimeError::Closed)?
-                .read_recent_with_offsets(allowed);
+                .map_err(|_| SessionRuntimeError::Closed)?;
+            let read = output.read_recent_with_offsets(allowed);
+            output.advance_client_to_end(client_id);
+            drop(output);
+
             budget_remaining = budget_remaining.saturating_sub(read.bytes.len());
+            pane.output_dirty.store(false, Ordering::SeqCst);
             let sync_update_active = pane.sync_update_in_progress.load(Ordering::SeqCst);
             chunks.push(AttachPaneChunk {
                 pane_id,
@@ -4859,23 +4857,10 @@ async fn handle_connection(
                                 other => other,
                             };
 
-                            let Ok(payload) = encode(&event) else {
+                            let Some(frame) =
+                                encode_event_frame(&event, push_frame_codec.as_deref())
+                            else {
                                 continue;
-                            };
-                            let envelope = Envelope::new(0, EnvelopeKind::Event, payload);
-                            let frame = if push_frame_codec.is_some() {
-                                let Ok(f) = bmux_ipc::frame::encode_frame_compressed(
-                                    &envelope,
-                                    push_frame_codec.as_deref(),
-                                ) else {
-                                    continue;
-                                };
-                                f
-                            } else {
-                                let Ok(f) = bmux_ipc::frame::encode_frame(&envelope) else {
-                                    continue;
-                                };
-                                f
                             };
                             let frame_len = frame.len();
                             if push_frame_tx.send(frame).is_err() {
@@ -4960,6 +4945,36 @@ async fn handle_connection(
                                 push_window_lagged_receives =
                                     push_window_lagged_receives.saturating_add(1);
                             }
+
+                            let recovery_events = lag_recovery_attach_view_events_for_client(
+                                &push_state,
+                                push_client_id,
+                            );
+                            if !recovery_events.is_empty() {
+                                warn!(
+                                    "event push lag recovery scheduling {} attach view refresh events",
+                                    recovery_events.len()
+                                );
+                            }
+                            for recovery_event in recovery_events {
+                                let Some(frame) = encode_event_frame(
+                                    &recovery_event,
+                                    push_frame_codec.as_deref(),
+                                ) else {
+                                    continue;
+                                };
+                                let frame_len = frame.len();
+                                if push_frame_tx.send(frame).is_err() {
+                                    return;
+                                }
+                                if push_perf_settings.enabled() {
+                                    push_window_sent_events =
+                                        push_window_sent_events.saturating_add(1);
+                                    push_window_sent_bytes = push_window_sent_bytes.saturating_add(
+                                        u64::try_from(frame_len).unwrap_or(u64::MAX),
+                                    );
+                                }
+                            }
                         }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                             return; // server shutting down
@@ -5042,6 +5057,57 @@ fn emit_event(state: &Arc<ServerState>, event: Event) -> Result<()> {
         .map_err(|_| anyhow::anyhow!("event hub lock poisoned"))?
         .emit(event);
     Ok(())
+}
+
+fn encode_event_frame(
+    event: &Event,
+    frame_codec: Option<&dyn bmux_ipc::compression::CompressionCodec>,
+) -> Option<Vec<u8>> {
+    let payload = encode(event).ok()?;
+    let envelope = Envelope::new(0, EnvelopeKind::Event, payload);
+    if frame_codec.is_some() {
+        bmux_ipc::frame::encode_frame_compressed(&envelope, frame_codec).ok()
+    } else {
+        bmux_ipc::frame::encode_frame(&envelope).ok()
+    }
+}
+
+fn lag_recovery_attach_view_events_for_client(
+    state: &Arc<ServerState>,
+    client_id: ClientId,
+) -> Vec<Event> {
+    let revisions = {
+        let Ok(mut runtime_manager) = state.session_runtimes.lock() else {
+            return Vec::new();
+        };
+
+        runtime_manager
+            .runtimes
+            .iter_mut()
+            .filter_map(|(session_id, runtime)| {
+                if !runtime.attached_clients.contains(&client_id) {
+                    return None;
+                }
+                runtime.attach_view_revision = runtime.attach_view_revision.saturating_add(1);
+                Some((*session_id, runtime.attach_view_revision))
+            })
+            .collect::<Vec<_>>()
+    };
+
+    revisions
+        .into_iter()
+        .map(|(session_id, revision)| Event::AttachViewChanged {
+            context_id: current_context_id_for_session(state, session_id),
+            session_id: session_id.0,
+            revision,
+            components: vec![
+                AttachViewComponent::Scene,
+                AttachViewComponent::SurfaceContent,
+                AttachViewComponent::Layout,
+                AttachViewComponent::Status,
+            ],
+        })
+        .collect()
 }
 
 fn emit_attach_view_changed(
@@ -7582,33 +7648,11 @@ async fn handle_request(
             }
 
             let snapshot = {
-                let runtime_manager = state
+                let mut runtime_manager = state
                     .session_runtimes
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
-                let result = runtime_manager.attach_snapshot_state(
-                    session_id,
-                    client_id,
-                    max_bytes_per_pane,
-                );
-                // After reading snapshot data, advance this client's read
-                // cursors to the buffer end and clear output_dirty so the
-                // PTY reader can re-notify on new output.  Mirrors the
-                // cleanup in AttachPaneOutputBatch.
-                if let Ok(ref snapshot) = result
-                    && let Some(runtime) = runtime_manager.runtimes.get(&session_id)
-                {
-                    for chunk in &snapshot.chunks {
-                        if let Some(pane) = runtime.panes.get(&chunk.pane_id) {
-                            pane.output_dirty.store(false, Ordering::SeqCst);
-                            if let Ok(mut output) = pane.output_buffer.lock() {
-                                output.advance_client_to_end(client_id);
-                            }
-                        }
-                    }
-                }
-                drop(runtime_manager);
-                result
+                runtime_manager.attach_snapshot_state(session_id, client_id, max_bytes_per_pane)
             };
 
             match snapshot {
