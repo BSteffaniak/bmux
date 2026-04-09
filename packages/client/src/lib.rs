@@ -74,6 +74,12 @@ pub struct AttachSnapshotState {
     pub zoomed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttachPaneSnapshotState {
+    pub chunks: Vec<AttachPaneChunk>,
+    pub pane_mouse_protocols: Vec<AttachPaneMouseProtocol>,
+}
+
 /// Server status details returned by status RPC.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerStatusInfo {
@@ -1595,6 +1601,38 @@ impl BmuxClient {
         }
     }
 
+    /// Fetch recent output snapshots for specific panes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn attach_pane_snapshot(
+        &mut self,
+        session_id: Uuid,
+        pane_ids: Vec<Uuid>,
+        max_bytes_per_pane: usize,
+    ) -> Result<AttachPaneSnapshotState> {
+        match self
+            .request(Request::AttachPaneSnapshot {
+                session_id,
+                pane_ids,
+                max_bytes_per_pane,
+            })
+            .await?
+        {
+            ResponsePayload::AttachPaneSnapshot {
+                chunks,
+                pane_mouse_protocols,
+            } => Ok(AttachPaneSnapshotState {
+                chunks,
+                pane_mouse_protocols,
+            }),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attach pane snapshot response",
+            )),
+        }
+    }
+
     /// Retrieve runtime performance telemetry settings.
     ///
     /// # Errors
@@ -1696,6 +1734,7 @@ pub struct StreamingBmuxClient {
     timeout: Duration,
     next_request_id: u64,
     principal_id: Uuid,
+    negotiated_protocol: Option<NegotiatedProtocol>,
     pending: PendingMap,
     event_rx: tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
     _reader_task: tokio::task::JoinHandle<()>,
@@ -1806,10 +1845,26 @@ impl StreamingBmuxClient {
             timeout,
             next_request_id,
             principal_id,
+            negotiated_protocol,
             pending,
             event_rx,
             _reader_task: reader_task,
         })
+    }
+
+    #[must_use]
+    pub const fn negotiated_protocol(&self) -> Option<&NegotiatedProtocol> {
+        self.negotiated_protocol.as_ref()
+    }
+
+    #[must_use]
+    pub fn supports_capability(&self, capability: &str) -> bool {
+        self.negotiated_protocol.as_ref().is_some_and(|negotiated| {
+            negotiated
+                .capabilities
+                .iter()
+                .any(|supported| supported == capability)
+        }) || CORE_PROTOCOL_CAPABILITIES.contains(&capability)
     }
 
     /// Background reader loop that demuxes incoming envelopes.
@@ -2453,6 +2508,38 @@ impl StreamingBmuxClient {
         }
     }
 
+    /// Fetch recent output snapshots for specific panes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if request or response validation fails.
+    pub async fn attach_pane_snapshot(
+        &mut self,
+        session_id: Uuid,
+        pane_ids: Vec<Uuid>,
+        max_bytes_per_pane: usize,
+    ) -> Result<AttachPaneSnapshotState> {
+        match self
+            .request(Request::AttachPaneSnapshot {
+                session_id,
+                pane_ids,
+                max_bytes_per_pane,
+            })
+            .await?
+        {
+            ResponsePayload::AttachPaneSnapshot {
+                chunks,
+                pane_mouse_protocols,
+            } => Ok(AttachPaneSnapshotState {
+                chunks,
+                pane_mouse_protocols,
+            }),
+            _ => Err(ClientError::UnexpectedResponse(
+                "expected attach pane snapshot response",
+            )),
+        }
+    }
+
     /// Split the focused pane in the given direction.
     ///
     /// # Errors
@@ -2919,6 +3006,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::AttachOutput { .. } => "attach_output",
         Request::AttachLayout { .. } => "attach_layout",
         Request::AttachSnapshot { .. } => "attach_snapshot",
+        Request::AttachPaneSnapshot { .. } => "attach_pane_snapshot",
         Request::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
         Request::AttachPaneImages { .. } => "attach_pane_images",
         Request::RecordingStart { .. } => "recording_start",
@@ -2986,6 +3074,7 @@ const fn response_kind_name(response: &Response) -> &'static str {
             ResponsePayload::AttachOutput { .. } => "attach_output",
             ResponsePayload::AttachLayout { .. } => "attach_layout",
             ResponsePayload::AttachSnapshot { .. } => "attach_snapshot",
+            ResponsePayload::AttachPaneSnapshot { .. } => "attach_pane_snapshot",
             ResponsePayload::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
             ResponsePayload::AttachPaneImages { .. } => "attach_pane_images",
             ResponsePayload::RecordingStarted { .. } => "recording_started",

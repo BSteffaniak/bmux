@@ -2134,6 +2134,11 @@ struct AttachSnapshotState {
     zoomed: bool,
 }
 
+struct AttachPaneSnapshotState {
+    chunks: Vec<AttachPaneChunk>,
+    pane_mouse_protocols: Vec<AttachPaneMouseProtocol>,
+}
+
 #[derive(Debug, Clone)]
 enum PaneLayoutNode {
     Leaf {
@@ -3667,6 +3672,75 @@ impl SessionRuntimeManager {
         };
 
         Ok(chunks)
+    }
+
+    fn attach_pane_snapshot_state(
+        &mut self,
+        session_id: SessionId,
+        client_id: ClientId,
+        pane_ids: &[Uuid],
+        max_bytes_per_pane: usize,
+    ) -> Result<AttachPaneSnapshotState, SessionRuntimeError> {
+        let session = self
+            .runtimes
+            .get_mut(&session_id)
+            .ok_or(SessionRuntimeError::NotFound)?;
+        if !session.attached_clients.contains(&client_id) {
+            return Err(SessionRuntimeError::NotAttached);
+        }
+
+        let num_panes = pane_ids.len().max(1);
+        let per_pane_budget = (RESPONSE_OUTPUT_BUDGET / num_panes).min(max_bytes_per_pane);
+        let mut budget_remaining = RESPONSE_OUTPUT_BUDGET;
+        let mut chunks = Vec::new();
+        let mut pane_mouse_protocols = Vec::new();
+        let mut seen = BTreeSet::new();
+
+        for pane_id in pane_ids {
+            if !seen.insert(*pane_id) {
+                continue;
+            }
+
+            let Some(pane) = session.panes.get_mut(pane_id) else {
+                continue;
+            };
+
+            let protocol = pane
+                .mouse_protocol_state
+                .lock()
+                .map(|state| *state)
+                .unwrap_or_default();
+            pane_mouse_protocols.push(AttachPaneMouseProtocol {
+                pane_id: *pane_id,
+                protocol,
+            });
+
+            let allowed = per_pane_budget.min(budget_remaining);
+            let mut output = pane
+                .output_buffer
+                .lock()
+                .map_err(|_| SessionRuntimeError::Closed)?;
+            let read = output.read_recent_with_offsets(allowed);
+            output.advance_client_to_end(client_id);
+            drop(output);
+
+            budget_remaining = budget_remaining.saturating_sub(read.bytes.len());
+            pane.output_dirty.store(false, Ordering::SeqCst);
+            let sync_update_active = pane.sync_update_in_progress.load(Ordering::SeqCst);
+            chunks.push(AttachPaneChunk {
+                pane_id: *pane_id,
+                data: read.bytes,
+                stream_start: read.stream_start,
+                stream_end: read.stream_end,
+                stream_gap: read.stream_gap,
+                sync_update_active,
+            });
+        }
+
+        Ok(AttachPaneSnapshotState {
+            chunks,
+            pane_mouse_protocols,
+        })
     }
 
     fn remove_runtime(&mut self, session_id: SessionId) -> Result<RemovedRuntime> {
@@ -7516,6 +7590,51 @@ async fn handle_request(
                 }),
             }
         }
+        Request::AttachPaneSnapshot {
+            session_id,
+            pane_ids,
+            max_bytes_per_pane,
+        } => {
+            let session_id = SessionId(session_id);
+            if !ensure_attach_session_exists(state, session_id).await? {
+                return Ok(Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!("session runtime not found: {}", session_id.0),
+                }));
+            }
+
+            let pane_snapshot = {
+                let mut runtime_manager = state
+                    .session_runtimes
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session runtime manager lock poisoned"))?;
+                runtime_manager.attach_pane_snapshot_state(
+                    session_id,
+                    client_id,
+                    &pane_ids,
+                    max_bytes_per_pane,
+                )
+            };
+
+            match pane_snapshot {
+                Ok(snapshot) => Response::Ok(ResponsePayload::AttachPaneSnapshot {
+                    chunks: snapshot.chunks,
+                    pane_mouse_protocols: snapshot.pane_mouse_protocols,
+                }),
+                Err(SessionRuntimeError::NotFound) => Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: format!("session runtime not found: {}", session_id.0),
+                }),
+                Err(SessionRuntimeError::NotAttached) => Response::Err(ErrorResponse {
+                    code: ErrorCode::InvalidRequest,
+                    message: "client is not attached to session runtime".to_string(),
+                }),
+                Err(SessionRuntimeError::Closed) => Response::Err(ErrorResponse {
+                    code: ErrorCode::NotFound,
+                    message: "active pane is closed".to_string(),
+                }),
+            }
+        }
         Request::AttachPaneOutputBatch {
             session_id,
             pane_ids,
@@ -8431,6 +8550,7 @@ const fn request_kind_name(request: &Request) -> &'static str {
         Request::AttachOutput { .. } => "attach_output",
         Request::AttachLayout { .. } => "attach_layout",
         Request::AttachSnapshot { .. } => "attach_snapshot",
+        Request::AttachPaneSnapshot { .. } => "attach_pane_snapshot",
         Request::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
         Request::AttachPaneImages { .. } => "attach_pane_images",
         Request::RecordingStart { .. } => "recording_start",
@@ -8712,6 +8832,7 @@ const fn response_payload_kind_name(payload: &ResponsePayload) -> &'static str {
         ResponsePayload::AttachOutput { .. } => "attach_output",
         ResponsePayload::AttachLayout { .. } => "attach_layout",
         ResponsePayload::AttachSnapshot { .. } => "attach_snapshot",
+        ResponsePayload::AttachPaneSnapshot { .. } => "attach_pane_snapshot",
         ResponsePayload::AttachPaneOutputBatch { .. } => "attach_pane_output_batch",
         ResponsePayload::AttachPaneImages { .. } => "attach_pane_images",
         ResponsePayload::RecordingStarted { .. } => "recording_started",

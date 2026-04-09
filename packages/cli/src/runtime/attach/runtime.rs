@@ -1,9 +1,13 @@
 use anyhow::{Context, Result};
-use bmux_client::{AttachLayoutState, AttachSnapshotState, ClientError, StreamingBmuxClient};
+use bmux_client::{
+    AttachLayoutState, AttachPaneSnapshotState, AttachSnapshotState, ClientError,
+    StreamingBmuxClient,
+};
 use bmux_config::{BmuxConfig, ConfigPaths, PaneRestoreMethod, ResolvedTimeout, StatusPosition};
 use bmux_ipc::{
-    AttachRect, AttachViewComponent, ContextSelector, ContextSummary, InvokeServiceKind,
-    PaneFocusDirection, PaneSelector, PaneSplitDirection, SessionSelector, SessionSummary,
+    AttachRect, AttachViewComponent, CAPABILITY_ATTACH_PANE_SNAPSHOT, ContextSelector,
+    ContextSummary, InvokeServiceKind, PaneFocusDirection, PaneSelector, PaneSplitDirection,
+    SessionSelector, SessionSummary,
 };
 use bmux_keybind::{action_to_config_name, parse_action};
 use bmux_plugin_sdk::{
@@ -21,7 +25,7 @@ use crossterm::terminal::{BeginSynchronizedUpdate, Clear, ClearType, EndSynchron
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use futures::StreamExt;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -53,7 +57,7 @@ use super::render::{
 };
 use super::state::{
     AttachEventAction, AttachExitReason, AttachScrollbackCursor, AttachScrollbackPosition,
-    AttachUiMode, AttachViewState, PaneRect,
+    AttachUiMode, AttachViewState, PaneRect, PaneRenderBuffer,
 };
 use crate::status::{AttachStatusLine, AttachTab, build_attach_status_line};
 
@@ -971,17 +975,46 @@ pub async fn run_session_attach_with_client(
                     }
                     Some(previous) => {
                         if previous.scene != layout_state.scene {
+                            let revealed_pane_ids = attach_scene_revealed_pane_ids(
+                                &previous.scene,
+                                &layout_state.scene,
+                            );
                             if attach_config.behavior.pane_restore_method
                                 == PaneRestoreMethod::Snapshot
-                                && attach_layout_requires_snapshot_hydration(
+                            {
+                                if attach_layout_requires_snapshot_hydration(
                                     &previous,
                                     &layout_state,
-                                )
-                            {
-                                hydrate_attach_state_from_snapshot(&mut client, &mut view_state)
+                                ) {
+                                    hydrate_attach_state_from_snapshot(
+                                        &mut client,
+                                        &mut view_state,
+                                    )
                                     .await?;
-                                scene_hydrated = true;
-                            } else {
+                                    scene_hydrated = true;
+                                } else if !revealed_pane_ids.is_empty() {
+                                    if client.supports_capability(CAPABILITY_ATTACH_PANE_SNAPSHOT) {
+                                        let revealed =
+                                            revealed_pane_ids.into_iter().collect::<Vec<_>>();
+                                        hydrate_attach_revealed_panes_from_snapshot(
+                                            &mut client,
+                                            &mut view_state,
+                                            &layout_state,
+                                            &revealed,
+                                        )
+                                        .await?;
+                                    } else {
+                                        hydrate_attach_state_from_snapshot(
+                                            &mut client,
+                                            &mut view_state,
+                                        )
+                                        .await?;
+                                        scene_hydrated = true;
+                                    }
+                                }
+                            }
+
+                            if !scene_hydrated {
                                 view_state.dirty.full_pane_redraw = true;
                             }
                         } else if previous.focused_pane_id != layout_state.focused_pane_id {
@@ -3920,9 +3953,85 @@ async fn hydrate_attach_state_from_snapshot_mode(
     Ok(())
 }
 
-pub fn attach_layout_pane_id_set(
+async fn hydrate_attach_revealed_panes_from_snapshot(
+    client: &mut StreamingBmuxClient,
+    view_state: &mut AttachViewState,
     layout_state: &AttachLayoutState,
-) -> std::collections::BTreeSet<Uuid> {
+    pane_ids: &[Uuid],
+) -> std::result::Result<(), ClientError> {
+    if pane_ids.is_empty() {
+        return Ok(());
+    }
+
+    let requested_pane_ids = pane_ids.iter().copied().collect::<BTreeSet<_>>();
+    let AttachPaneSnapshotState {
+        chunks,
+        pane_mouse_protocols,
+    } = client
+        .attach_pane_snapshot(
+            view_state.attached_id,
+            pane_ids.to_vec(),
+            ATTACH_SNAPSHOT_MAX_BYTES_PER_PANE,
+        )
+        .await?;
+
+    for pane_id in pane_ids {
+        view_state
+            .pane_buffers
+            .insert(*pane_id, PaneRenderBuffer::default());
+    }
+    resize_attach_parsers_for_scene(&mut view_state.pane_buffers, &layout_state.scene);
+
+    let mut frame_needs_render = false;
+    for chunk in chunks {
+        if !requested_pane_ids.contains(&chunk.pane_id) {
+            continue;
+        }
+
+        let _ = apply_attach_output_bytes(
+            view_state,
+            chunk.pane_id,
+            &chunk.data,
+            &mut frame_needs_render,
+        );
+        if let Some(buffer) = view_state.pane_buffers.get_mut(&chunk.pane_id) {
+            buffer.sync_update_in_progress = chunk.sync_update_active;
+            buffer.expected_stream_start = Some(chunk.stream_end);
+        }
+    }
+
+    for pane_protocol in pane_mouse_protocols {
+        if requested_pane_ids.contains(&pane_protocol.pane_id) {
+            view_state
+                .pane_mouse_protocol_hints
+                .insert(pane_protocol.pane_id, pane_protocol.protocol);
+        }
+    }
+
+    for pane_id in pane_ids {
+        view_state.dirty.pane_dirty_ids.insert(*pane_id);
+    }
+
+    Ok(())
+}
+
+pub fn attach_scene_visible_pane_id_set(scene: &bmux_ipc::AttachScene) -> BTreeSet<Uuid> {
+    visible_scene_pane_ids(scene).into_iter().collect()
+}
+
+pub fn attach_scene_revealed_pane_ids(
+    previous: &bmux_ipc::AttachScene,
+    next: &bmux_ipc::AttachScene,
+) -> BTreeSet<Uuid> {
+    let previous_visible = attach_scene_visible_pane_id_set(previous);
+    let next_visible = attach_scene_visible_pane_id_set(next);
+    next_visible
+        .difference(&previous_visible)
+        .copied()
+        .collect()
+}
+
+pub fn attach_layout_pane_id_set(layout_state: &AttachLayoutState) -> BTreeSet<Uuid> {
     layout_state.panes.iter().map(|pane| pane.id).collect()
 }
 
@@ -5569,7 +5678,7 @@ mod tests {
         KeyEventKind as CrosstermKeyEventKind, KeyModifiers, MouseButton, MouseEvent,
         MouseEventKind,
     };
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use uuid::Uuid;
 
     fn attach_view_state_with_scrollback_fixture() -> AttachViewState {
@@ -6058,6 +6167,36 @@ mod tests {
 
         assert_ne!(previous.scene, next.scene);
         assert!(!attach_layout_requires_snapshot_hydration(&previous, &next));
+    }
+
+    #[test]
+    fn attach_scene_revealed_pane_ids_detects_zoom_focus_switch() {
+        let view_state = attach_view_state_with_scrollback_fixture();
+        let previous = view_state.cached_layout_state.expect("layout state");
+        let previous_pane_id = previous.panes[0].id;
+        let next_pane_id = Uuid::new_v4();
+        let mut next = previous.clone();
+        next.focused_pane_id = next_pane_id;
+        next.scene.focus = AttachFocusTarget::Pane {
+            pane_id: next_pane_id,
+        };
+        next.scene.surfaces[0].id = next_pane_id;
+        next.scene.surfaces[0].pane_id = Some(next_pane_id);
+
+        let revealed = attach_scene_revealed_pane_ids(&previous.scene, &next.scene);
+        assert_eq!(revealed, BTreeSet::from([next_pane_id]));
+        assert!(!revealed.contains(&previous_pane_id));
+    }
+
+    #[test]
+    fn attach_scene_revealed_pane_ids_ignores_focus_metadata_only_changes() {
+        let view_state = attach_view_state_with_scrollback_fixture();
+        let previous = view_state.cached_layout_state.expect("layout state");
+        let mut next = previous.clone();
+        next.scene.surfaces[0].cursor_owner = false;
+
+        let revealed = attach_scene_revealed_pane_ids(&previous.scene, &next.scene);
+        assert!(revealed.is_empty());
     }
 
     #[test]

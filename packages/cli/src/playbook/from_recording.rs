@@ -576,6 +576,7 @@ fn request_to_dsl(
         // Attach lifecycle is handled implicitly by the playbook engine.
         Request::AttachOutput { .. }
         | Request::AttachSnapshot { .. }
+        | Request::AttachPaneSnapshot { .. }
         | Request::AttachLayout { .. }
         | Request::AttachPaneOutputBatch { .. }
         | Request::Ping

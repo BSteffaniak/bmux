@@ -73,6 +73,7 @@ pub const CORE_CAPABILITY_SESSION: &str = "core.session";
 pub const CORE_CAPABILITY_ATTACH: &str = "core.attach";
 pub const CORE_CAPABILITY_PANE_IO: &str = "core.pane_io";
 pub const CORE_CAPABILITY_DETACH: &str = "core.detach";
+pub const CAPABILITY_ATTACH_PANE_SNAPSHOT: &str = "feature.attach_pane_snapshot";
 
 /// Core protocol capabilities required for baseline bmux operation.
 pub const CORE_PROTOCOL_CAPABILITIES: &[&str] = &[
@@ -163,6 +164,7 @@ pub fn default_supported_capabilities() -> Vec<String> {
         CORE_CAPABILITY_DETACH.to_string(),
         "feature.contexts".to_string(),
         "feature.attach_snapshot".to_string(),
+        CAPABILITY_ATTACH_PANE_SNAPSHOT.to_string(),
         "feature.recording.v4".to_string(),
     ];
     // Advertise compression capabilities when compiled in.
@@ -554,6 +556,11 @@ pub enum Request {
     },
     AttachSnapshot {
         session_id: Uuid,
+        max_bytes_per_pane: usize,
+    },
+    AttachPaneSnapshot {
+        session_id: Uuid,
+        pane_ids: Vec<Uuid>,
         max_bytes_per_pane: usize,
     },
     SubscribeEvents,
@@ -1217,6 +1224,11 @@ pub enum ResponsePayload {
         pane_mouse_protocols: Vec<AttachPaneMouseProtocol>,
         #[serde(default)]
         zoomed: bool,
+    },
+    AttachPaneSnapshot {
+        chunks: Vec<AttachPaneChunk>,
+        #[serde(default)]
+        pane_mouse_protocols: Vec<AttachPaneMouseProtocol>,
     },
     EventsSubscribed,
     EventBatch {
@@ -2001,6 +2013,11 @@ mod tests {
                 session_id: id,
                 max_bytes_per_pane: 8192,
             },
+            Request::AttachPaneSnapshot {
+                session_id: id,
+                pane_ids: vec![id, id2],
+                max_bytes_per_pane: 8192,
+            },
             Request::SubscribeEvents,
             Request::PollEvents { max_events: 100 },
             Request::RecordingStart {
@@ -2450,6 +2467,23 @@ mod tests {
                     },
                 }],
                 zoomed: false,
+            },
+            ResponsePayload::AttachPaneSnapshot {
+                chunks: vec![AttachPaneChunk {
+                    pane_id,
+                    data: vec![65, 66, 67],
+                    stream_start: 50,
+                    stream_end: 53,
+                    stream_gap: false,
+                    sync_update_active: false,
+                }],
+                pane_mouse_protocols: vec![AttachPaneMouseProtocol {
+                    pane_id,
+                    protocol: AttachMouseProtocolState {
+                        mode: AttachMouseProtocolMode::PressRelease,
+                        encoding: AttachMouseProtocolEncoding::Sgr,
+                    },
+                }],
             },
             ResponsePayload::EventsSubscribed,
             ResponsePayload::EventBatch {
