@@ -576,8 +576,9 @@ pub struct BehaviorConfig {
     /// terminfo installation
     pub terminfo_prompt_cooldown_days: u64,
     /// What to do when the running server was built from a different version
-    /// than the current CLI binary. error refuses to connect until the server
-    /// is restarted. warn connects with a warning message.
+    /// than the current CLI binary. ignore skips stale-build checks. warn
+    /// connects with a warning message. error refuses to connect until the
+    /// server is restarted.
     pub stale_build_action: StaleBuildAction,
     /// Enable the Kitty keyboard protocol for enhanced key reporting.
     /// When true, bmux negotiates enhanced keyboard mode with the outer
@@ -614,7 +615,7 @@ impl Default for BehaviorConfig {
             protocol_trace_capacity: 200,
             terminfo_auto_install: TerminfoAutoInstall::Never,
             terminfo_prompt_cooldown_days: 7,
-            stale_build_action: StaleBuildAction::Error,
+            stale_build_action: StaleBuildAction::Ignore,
             kitty_keyboard: true,
             pane_restore_method: PaneRestoreMethod::Snapshot,
             mouse: MouseBehaviorConfig::default(),
@@ -846,8 +847,9 @@ impl MouseBehaviorConfig {
 #[serde(rename_all = "snake_case")]
 pub enum StaleBuildAction {
     #[default]
-    Error,
+    Ignore,
     Warn,
+    Error,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq, ConfigDocEnum)]
@@ -1918,7 +1920,7 @@ mod tests {
     fn default_config_is_valid() {
         let config = BmuxConfig::default();
         assert!(config.validate().is_ok());
-        assert_eq!(config.behavior.stale_build_action, StaleBuildAction::Error);
+        assert_eq!(config.behavior.stale_build_action, StaleBuildAction::Ignore);
         assert!(config.plugins.enabled.is_empty());
         assert!(config.plugins.disabled.is_empty());
         assert!(config.plugins.routing.required_namespaces.is_empty());
@@ -2239,6 +2241,19 @@ timeout_profile = "missing"
 
         let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
         assert_eq!(config.behavior.stale_build_action, StaleBuildAction::Warn);
+
+        std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
+    }
+
+    #[test]
+    fn load_parses_ignore_stale_build_action() {
+        let path = temp_config_path();
+        let dir = path.parent().expect("temp dir").to_path_buf();
+        std::fs::write(&path, "[behavior]\nstale_build_action = \"ignore\"\n")
+            .expect("failed writing config fixture");
+
+        let config = BmuxConfig::load_from_path(&path).expect("failed loading config");
+        assert_eq!(config.behavior.stale_build_action, StaleBuildAction::Ignore);
 
         std::fs::remove_dir_all(&dir).expect("failed cleaning temp test directory");
     }

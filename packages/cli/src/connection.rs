@@ -608,6 +608,9 @@ pub fn evaluate_stale_build_policy(
     if scope == ConnectionPolicyScope::RecoveryInspection {
         return Ok(None);
     }
+    if action == StaleBuildAction::Ignore {
+        return Ok(None);
+    }
     let (Some(metadata), Some(current_build_id)) = (metadata, current_build_id) else {
         return Ok(None);
     };
@@ -617,6 +620,7 @@ pub fn evaluate_stale_build_policy(
 
     let message = format_stale_build_message(&metadata, &current_build_id, action);
     match action {
+        StaleBuildAction::Ignore => Ok(None),
         StaleBuildAction::Error => anyhow::bail!(message),
         StaleBuildAction::Warn => Ok(Some(ServerBuildPolicyEffect::Warn(message))),
     }
@@ -630,6 +634,7 @@ fn format_stale_build_message(
     format!(
         "bmux {}: running server build differs from current CLI build.\nserver build: {} ({})\ncli build: {}\nRestart with `bmux server stop` and retry.",
         match action {
+            StaleBuildAction::Ignore => "notice",
             StaleBuildAction::Error => "error",
             StaleBuildAction::Warn => "warning",
         },
@@ -784,7 +789,26 @@ mod tests {
     }
 
     #[test]
-    fn stale_build_policy_blocks_normal_commands_by_default() {
+    fn stale_build_policy_ignores_mismatch_when_configured() {
+        let effect = evaluate_stale_build_policy(
+            ConnectionPolicyScope::Normal,
+            StaleBuildAction::Ignore,
+            Some(ServerRuntimeMetadata {
+                pid: 1,
+                version: "0.0.1-alpha.0".to_string(),
+                build_id: "server-build".to_string(),
+                executable_path: "/tmp/bmux-server".to_string(),
+                started_at_epoch_ms: 0,
+            }),
+            Some("cli-build".to_string()),
+        )
+        .expect("ignore mode should continue without warning");
+
+        assert!(effect.is_none());
+    }
+
+    #[test]
+    fn stale_build_policy_blocks_when_configured_error() {
         let error = evaluate_stale_build_policy(
             ConnectionPolicyScope::Normal,
             StaleBuildAction::Error,
