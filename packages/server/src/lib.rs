@@ -287,7 +287,7 @@ struct ServerState {
     attach_tokens: Mutex<AttachTokenManager>,
     follow_state: Mutex<FollowState>,
     context_state: Mutex<ContextState>,
-    snapshot_runtime: Mutex<SnapshotRuntime>,
+    snapshot_runtime: Arc<Mutex<SnapshotRuntime>>,
     manual_recording_runtime: Arc<Mutex<RecordingRuntime>>,
     rolling_recording_runtime: Arc<Mutex<Option<RecordingRuntime>>>,
     rolling_recording_auto_start: bool,
@@ -1194,6 +1194,8 @@ struct SessionRuntimeManager {
     shell: String,
     pane_term: String,
     protocol_profile: ProtocolProfile,
+    snapshot_runtime: Arc<Mutex<SnapshotRuntime>>,
+    shell_integration_root: Option<std::path::PathBuf>,
     pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
     manual_recording_runtime: Arc<Mutex<RecordingRuntime>>,
     rolling_recording_runtime: Arc<Mutex<Option<RecordingRuntime>>>,
@@ -1238,11 +1240,74 @@ struct PaneRuntimeMeta {
     id: Uuid,
     name: Option<String>,
     shell: String,
+    resurrection: PaneResurrectionSnapshot,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PaneResurrectionSnapshot {
+    active_command: Option<String>,
+    active_command_source: Option<PaneCommandSource>,
+    last_known_cwd: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PaneCommandSource {
+    Verbatim,
+    Inspection,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PaneResurrectionRuntime {
+    active_command: Option<String>,
+    active_command_source: Option<PaneCommandSource>,
+    last_known_cwd: Option<String>,
+}
+
+impl PaneResurrectionRuntime {
+    fn from_snapshot(snapshot: &PaneResurrectionSnapshot) -> Self {
+        Self {
+            active_command: snapshot.active_command.clone(),
+            active_command_source: snapshot.active_command_source,
+            last_known_cwd: snapshot.last_known_cwd.clone(),
+        }
+    }
+
+    fn to_snapshot(&self) -> PaneResurrectionSnapshot {
+        PaneResurrectionSnapshot {
+            active_command: self.active_command.clone(),
+            active_command_source: self.active_command_source,
+            last_known_cwd: self.last_known_cwd.clone(),
+        }
+    }
+
+    fn apply_event(&mut self, event: PaneShellMetadataEvent) {
+        match event {
+            PaneShellMetadataEvent::CommandStart { command, cwd } => {
+                self.active_command = Some(command);
+                self.active_command_source = Some(PaneCommandSource::Verbatim);
+                self.last_known_cwd = Some(cwd);
+            }
+            PaneShellMetadataEvent::Prompt { cwd } => {
+                self.last_known_cwd = Some(cwd);
+                self.active_command = None;
+                self.active_command_source = None;
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PaneShellMetadataEvent {
+    CommandStart { command: String, cwd: String },
+    Prompt { cwd: String },
 }
 
 struct PaneRuntimeHandle {
     meta: PaneRuntimeMeta,
+    process_id: Arc<std::sync::Mutex<Option<u32>>>,
     process_group_id: Arc<std::sync::Mutex<Option<i32>>>,
+    resurrection_state: Arc<std::sync::Mutex<PaneResurrectionRuntime>>,
     exit_reason: Arc<std::sync::Mutex<Option<String>>>,
     stop_tx: Option<oneshot::Sender<()>>,
     task: JoinHandle<()>,
@@ -1732,6 +1797,491 @@ fn parse_private_mode_number(bytes: &[u8]) -> Option<u16> {
         value = value.checked_add(u16::from(*byte - b'0'))?;
     }
     Some(value)
+}
+
+const BMUX_SHELL_METADATA_PREFIX: &str = "633;bmux;";
+const MAX_SHELL_METADATA_PAYLOAD_BYTES: usize = 32 * 1024;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ShellKind {
+    Bash,
+    Zsh,
+    Fish,
+    Other,
+}
+
+#[derive(Debug, Default)]
+struct PaneShellMetadataParseOutput {
+    filtered: Vec<u8>,
+    events: Vec<PaneShellMetadataEvent>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneShellMetadataTerminator {
+    Bell,
+    StringTerminator,
+}
+
+#[derive(Debug, Default)]
+struct PaneShellMetadataParser {
+    state: PaneShellMetadataParserState,
+}
+
+#[derive(Debug, Default)]
+enum PaneShellMetadataParserState {
+    #[default]
+    Ground,
+    Escape,
+    Osc {
+        payload: Vec<u8>,
+        saw_escape: bool,
+    },
+}
+
+impl PaneShellMetadataParser {
+    fn process_chunk(&mut self, chunk: &[u8]) -> PaneShellMetadataParseOutput {
+        let mut out = PaneShellMetadataParseOutput {
+            filtered: Vec::with_capacity(chunk.len()),
+            events: Vec::new(),
+        };
+
+        for byte in chunk {
+            match &mut self.state {
+                PaneShellMetadataParserState::Ground => {
+                    if *byte == 0x1b {
+                        self.state = PaneShellMetadataParserState::Escape;
+                    } else {
+                        out.filtered.push(*byte);
+                    }
+                }
+                PaneShellMetadataParserState::Escape => {
+                    if *byte == b']' {
+                        self.state = PaneShellMetadataParserState::Osc {
+                            payload: Vec::new(),
+                            saw_escape: false,
+                        };
+                    } else {
+                        out.filtered.push(0x1b);
+                        if *byte == 0x1b {
+                            self.state = PaneShellMetadataParserState::Escape;
+                        } else {
+                            out.filtered.push(*byte);
+                            self.state = PaneShellMetadataParserState::Ground;
+                        }
+                    }
+                }
+                PaneShellMetadataParserState::Osc {
+                    payload,
+                    saw_escape,
+                } => {
+                    if *saw_escape {
+                        if *byte == b'\\' {
+                            let payload = std::mem::take(payload);
+                            if let Some(event) = decode_shell_metadata_payload(&payload) {
+                                out.events.push(event);
+                            } else {
+                                append_raw_osc_sequence(
+                                    &mut out.filtered,
+                                    &payload,
+                                    PaneShellMetadataTerminator::StringTerminator,
+                                );
+                            }
+                            self.state = PaneShellMetadataParserState::Ground;
+                            continue;
+                        }
+                        payload.push(0x1b);
+                        *saw_escape = false;
+                    }
+
+                    if *byte == 0x1b {
+                        *saw_escape = true;
+                    } else if *byte == 0x07 {
+                        let payload = std::mem::take(payload);
+                        if let Some(event) = decode_shell_metadata_payload(&payload) {
+                            out.events.push(event);
+                        } else {
+                            append_raw_osc_sequence(
+                                &mut out.filtered,
+                                &payload,
+                                PaneShellMetadataTerminator::Bell,
+                            );
+                        }
+                        self.state = PaneShellMetadataParserState::Ground;
+                    } else {
+                        payload.push(*byte);
+                        if payload.len() > MAX_SHELL_METADATA_PAYLOAD_BYTES {
+                            out.filtered.push(0x1b);
+                            out.filtered.push(b']');
+                            out.filtered.extend_from_slice(payload);
+                            self.state = PaneShellMetadataParserState::Ground;
+                        }
+                    }
+                }
+            }
+        }
+
+        out
+    }
+}
+
+fn append_raw_osc_sequence(
+    output: &mut Vec<u8>,
+    payload: &[u8],
+    terminator: PaneShellMetadataTerminator,
+) {
+    output.push(0x1b);
+    output.push(b']');
+    output.extend_from_slice(payload);
+    match terminator {
+        PaneShellMetadataTerminator::Bell => output.push(0x07),
+        PaneShellMetadataTerminator::StringTerminator => {
+            output.push(0x1b);
+            output.push(b'\\');
+        }
+    }
+}
+
+fn decode_shell_metadata_payload(payload: &[u8]) -> Option<PaneShellMetadataEvent> {
+    let payload = std::str::from_utf8(payload).ok()?;
+    let payload = payload.strip_prefix(BMUX_SHELL_METADATA_PREFIX)?;
+    let mut fields = payload.split(';');
+    let kind = fields.next()?;
+    match kind {
+        "start" => {
+            let command = decode_shell_metadata_field(fields.next()?)?;
+            let cwd = decode_shell_metadata_field(fields.next()?)?;
+            if fields.next().is_some() || command.trim().is_empty() || cwd.trim().is_empty() {
+                return None;
+            }
+            Some(PaneShellMetadataEvent::CommandStart { command, cwd })
+        }
+        "prompt" => {
+            let cwd = decode_shell_metadata_field(fields.next()?)?;
+            if fields.next().is_some() || cwd.trim().is_empty() {
+                return None;
+            }
+            Some(PaneShellMetadataEvent::Prompt { cwd })
+        }
+        _ => None,
+    }
+}
+
+fn decode_shell_metadata_field(value: &str) -> Option<String> {
+    let decoded = decode_base64(value)?;
+    String::from_utf8(decoded).ok()
+}
+
+fn decode_base64(value: &str) -> Option<Vec<u8>> {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+
+    let mut out = Vec::with_capacity((bytes.len() / 4) * 3);
+    let mut chunk_start = 0_usize;
+    while chunk_start < bytes.len() {
+        let a = decode_base64_value(bytes[chunk_start])?;
+        let b = decode_base64_value(bytes[chunk_start + 1])?;
+        let c_raw = bytes[chunk_start + 2];
+        let d_raw = bytes[chunk_start + 3];
+
+        let c = if c_raw == b'=' {
+            0
+        } else {
+            decode_base64_value(c_raw)?
+        };
+        let d = if d_raw == b'=' {
+            0
+        } else {
+            decode_base64_value(d_raw)?
+        };
+
+        let padding = usize::from(c_raw == b'=') + usize::from(d_raw == b'=');
+        if padding > 0 && chunk_start + 4 != bytes.len() {
+            return None;
+        }
+
+        out.push((a << 2) | (b >> 4));
+        if padding < 2 {
+            out.push((b << 4) | (c >> 2));
+        }
+        if padding == 0 {
+            out.push((c << 6) | d);
+        }
+
+        chunk_start += 4;
+    }
+
+    Some(out)
+}
+
+const fn decode_base64_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'A'..=b'Z' => Some(byte - b'A'),
+        b'a'..=b'z' => Some(byte - b'a' + 26),
+        b'0'..=b'9' => Some(byte - b'0' + 52),
+        b'+' => Some(62),
+        b'/' => Some(63),
+        _ => None,
+    }
+}
+
+fn shell_kind_for_path(shell: &str) -> ShellKind {
+    let basename = std::path::Path::new(shell)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(shell)
+        .trim_start_matches('-')
+        .to_ascii_lowercase();
+    match basename.as_str() {
+        "bash" => ShellKind::Bash,
+        "zsh" => ShellKind::Zsh,
+        "fish" => ShellKind::Fish,
+        _ => ShellKind::Other,
+    }
+}
+
+fn configure_shell_integration_command(
+    command: &mut CommandBuilder,
+    shell: &str,
+    integration_root: Option<&std::path::Path>,
+) -> Result<()> {
+    let Some(integration_root) = integration_root else {
+        return Ok(());
+    };
+
+    match shell_kind_for_path(shell) {
+        ShellKind::Bash => {
+            let rcfile_path = integration_root.join("bash").join("bmux.bashrc");
+            write_shell_integration_file(&rcfile_path, shell_integration_bash_rcfile())?;
+            command.arg("--rcfile");
+            command.arg(&rcfile_path);
+        }
+        ShellKind::Zsh => {
+            let zdotdir = integration_root.join("zsh");
+            let zshenv_path = zdotdir.join(".zshenv");
+            let zshrc_path = zdotdir.join(".zshrc");
+            write_shell_integration_file(&zshenv_path, shell_integration_zsh_env())?;
+            write_shell_integration_file(&zshrc_path, shell_integration_zsh_rc())?;
+            command.env("ZDOTDIR", zdotdir.as_os_str());
+            if let Ok(original_zdotdir) = std::env::var("ZDOTDIR")
+                && !original_zdotdir.trim().is_empty()
+            {
+                command.env("BMUX_ORIG_ZDOTDIR", original_zdotdir);
+            }
+        }
+        ShellKind::Fish => {
+            let xdg_config_home = integration_root.join("fish-xdg");
+            let fish_config_path = xdg_config_home.join("fish").join("config.fish");
+            write_shell_integration_file(&fish_config_path, shell_integration_fish_config())?;
+            command.env("XDG_CONFIG_HOME", xdg_config_home.as_os_str());
+            if let Ok(original_xdg_config_home) = std::env::var("XDG_CONFIG_HOME")
+                && !original_xdg_config_home.trim().is_empty()
+            {
+                command.env("BMUX_ORIG_XDG_CONFIG_HOME", original_xdg_config_home);
+            }
+        }
+        ShellKind::Other => {}
+    }
+
+    Ok(())
+}
+
+fn write_shell_integration_file(path: &std::path::Path, contents: &str) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("failed creating shell integration dir {}", parent.display())
+        })?;
+    }
+    if let Ok(existing) = std::fs::read_to_string(path)
+        && existing == contents
+    {
+        return Ok(());
+    }
+    std::fs::write(path, contents)
+        .with_context(|| format!("failed writing shell integration file {}", path.display()))
+}
+
+#[allow(clippy::literal_string_with_formatting_args)]
+const fn shell_integration_bash_rcfile() -> &'static str {
+    r#"if [[ -f "${HOME}/.bashrc" ]]; then
+  source "${HOME}/.bashrc"
+fi
+
+if [[ -z "${__BMUX_RESURRECTION_HOOK_INSTALLED:-}" ]]; then
+  __BMUX_RESURRECTION_HOOK_INSTALLED=1
+
+  __bmux_b64() {
+    printf '%s' "$1" | base64 | tr -d '\r\n'
+  }
+
+  __bmux_emit_start() {
+    local cmd_b64 cwd_b64
+    cmd_b64="$(__bmux_b64 "$1")"
+    cwd_b64="$(__bmux_b64 "$2")"
+    printf '\033]633;bmux;start;%s;%s\007' "$cmd_b64" "$cwd_b64"
+  }
+
+  __bmux_emit_prompt() {
+    local cwd_b64
+    cwd_b64="$(__bmux_b64 "$1")"
+    printf '\033]633;bmux;prompt;%s\007' "$cwd_b64"
+  }
+
+  __BMUX_READY_FOR_CMD=1
+
+  __bmux_preexec_trap() {
+    [[ -n "${__BMUX_EMIT_GUARD:-}" ]] && return
+    [[ "${__BMUX_READY_FOR_CMD:-0}" != "1" ]] && return
+    __BMUX_READY_FOR_CMD=0
+    __BMUX_EMIT_GUARD=1
+
+    local hist_line cmd
+    hist_line="$(HISTTIMEFORMAT= builtin history 1 2>/dev/null)"
+    cmd="$hist_line"
+    if [[ "$hist_line" =~ ^[[:space:]]*[0-9]+[[:space:]]+(.*)$ ]]; then
+      cmd="${BASH_REMATCH[1]}"
+    fi
+    if [[ -z "$cmd" && -n "${BASH_COMMAND:-}" ]]; then
+      cmd="${BASH_COMMAND}"
+    fi
+    if [[ -n "$cmd" ]]; then
+      __bmux_emit_start "$cmd" "$PWD"
+    fi
+
+    __BMUX_EMIT_GUARD=
+  }
+
+  __bmux_precmd_hook() {
+    [[ -n "${__BMUX_EMIT_GUARD:-}" ]] && return
+    __BMUX_EMIT_GUARD=1
+    __bmux_emit_prompt "$PWD"
+    __BMUX_READY_FOR_CMD=1
+    __BMUX_EMIT_GUARD=
+  }
+
+  trap '__bmux_preexec_trap' DEBUG
+  if [[ -n "${PROMPT_COMMAND:-}" ]]; then
+    PROMPT_COMMAND="__bmux_precmd_hook;${PROMPT_COMMAND}"
+  else
+    PROMPT_COMMAND="__bmux_precmd_hook"
+  fi
+fi
+"#
+}
+
+#[allow(clippy::literal_string_with_formatting_args)]
+const fn shell_integration_zsh_env() -> &'static str {
+    r#"if [[ -n "${BMUX_ORIG_ZDOTDIR:-}" ]]; then
+  __bmux_orig_zdotdir="${BMUX_ORIG_ZDOTDIR}"
+else
+  __bmux_orig_zdotdir="${HOME}"
+fi
+
+if [[ -f "${__bmux_orig_zdotdir}/.zshenv" ]]; then
+  source "${__bmux_orig_zdotdir}/.zshenv"
+fi
+"#
+}
+
+#[allow(clippy::literal_string_with_formatting_args)]
+const fn shell_integration_zsh_rc() -> &'static str {
+    r#"if [[ -n "${BMUX_ORIG_ZDOTDIR:-}" ]]; then
+  __bmux_orig_zdotdir="${BMUX_ORIG_ZDOTDIR}"
+else
+  __bmux_orig_zdotdir="${HOME}"
+fi
+
+if [[ -f "${__bmux_orig_zdotdir}/.zshrc" ]]; then
+  source "${__bmux_orig_zdotdir}/.zshrc"
+fi
+
+if [[ -z "${__BMUX_RESURRECTION_HOOK_INSTALLED:-}" ]]; then
+  __BMUX_RESURRECTION_HOOK_INSTALLED=1
+
+  __bmux_b64() {
+    printf '%s' "$1" | base64 | tr -d '\r\n'
+  }
+
+  __bmux_emit_start() {
+    local cmd_b64 cwd_b64
+    cmd_b64="$(__bmux_b64 "$1")"
+    cwd_b64="$(__bmux_b64 "$2")"
+    printf '\033]633;bmux;start;%s;%s\007' "$cmd_b64" "$cwd_b64"
+  }
+
+  __bmux_emit_prompt() {
+    local cwd_b64
+    cwd_b64="$(__bmux_b64 "$1")"
+    printf '\033]633;bmux;prompt;%s\007' "$cwd_b64"
+  }
+
+  function __bmux_preexec_hook() {
+    [[ -n "${__BMUX_EMIT_GUARD:-}" ]] && return
+    __BMUX_EMIT_GUARD=1
+    if [[ -n "$1" ]]; then
+      __bmux_emit_start "$1" "$PWD"
+    fi
+    __BMUX_EMIT_GUARD=
+  }
+
+  function __bmux_precmd_hook() {
+    [[ -n "${__BMUX_EMIT_GUARD:-}" ]] && return
+    __BMUX_EMIT_GUARD=1
+    __bmux_emit_prompt "$PWD"
+    __BMUX_EMIT_GUARD=
+  }
+
+  typeset -ga preexec_functions
+  typeset -ga precmd_functions
+  preexec_functions=(__bmux_preexec_hook ${preexec_functions:#__bmux_preexec_hook})
+  precmd_functions=(__bmux_precmd_hook ${precmd_functions:#__bmux_precmd_hook})
+fi
+"#
+}
+
+#[allow(clippy::literal_string_with_formatting_args)]
+const fn shell_integration_fish_config() -> &'static str {
+    r#"set -l __bmux_orig_xdg "$BMUX_ORIG_XDG_CONFIG_HOME"
+if test -z "$__bmux_orig_xdg"
+  set __bmux_orig_xdg "$HOME/.config"
+end
+
+set -l __bmux_orig_fish_config "$__bmux_orig_xdg/fish/config.fish"
+if test -f "$__bmux_orig_fish_config"
+  source "$__bmux_orig_fish_config"
+end
+
+if not set -q __bmux_resurrection_hook_installed
+  set -g __bmux_resurrection_hook_installed 1
+
+  function __bmux_b64 --argument-names value
+    printf '%s' "$value" | base64 | string replace -ra '\n|\r' ''
+  end
+
+  function __bmux_emit_start --argument-names cmd cwd
+    set -l cmd_b64 (__bmux_b64 "$cmd")
+    set -l cwd_b64 (__bmux_b64 "$cwd")
+    printf '\e]633;bmux;start;%s;%s\a' "$cmd_b64" "$cwd_b64"
+  end
+
+  function __bmux_emit_prompt --argument-names cwd
+    set -l cwd_b64 (__bmux_b64 "$cwd")
+    printf '\e]633;bmux;prompt;%s\a' "$cwd_b64"
+  end
+
+  function __bmux_preexec --on-event fish_preexec
+    set -l cmd (string join ' ' -- $argv)
+    if test -n "$cmd"
+      __bmux_emit_start "$cmd" "$PWD"
+    end
+  end
+
+  function __bmux_prompt --on-event fish_prompt
+    __bmux_emit_prompt "$PWD"
+  end
+end
+"#
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2653,10 +3203,13 @@ fn runtime_layout_from_snapshot(node: &PaneLayoutNodeSnapshotV2) -> PaneLayoutNo
 }
 
 impl SessionRuntimeManager {
+    #[allow(clippy::too_many_arguments)]
     const fn new(
         shell: String,
         pane_term: String,
         protocol_profile: ProtocolProfile,
+        snapshot_runtime: Arc<Mutex<SnapshotRuntime>>,
+        shell_integration_root: Option<std::path::PathBuf>,
         pane_exit_tx: mpsc::UnboundedSender<PaneExitEvent>,
         manual_recording_runtime: Arc<Mutex<RecordingRuntime>>,
         rolling_recording_runtime: Arc<Mutex<Option<RecordingRuntime>>>,
@@ -2667,6 +3220,8 @@ impl SessionRuntimeManager {
             shell,
             pane_term,
             protocol_profile,
+            snapshot_runtime,
+            shell_integration_root,
             pane_exit_tx,
             manual_recording_runtime,
             rolling_recording_runtime,
@@ -2684,6 +3239,7 @@ impl SessionRuntimeManager {
             id: first_pane_id,
             name: Some("pane-1".to_string()),
             shell: self.shell.clone(),
+            resurrection: PaneResurrectionSnapshot::default(),
         };
         let first_pane = self.spawn_pane_runtime(session_id, pane_meta);
         let mut panes = BTreeMap::new();
@@ -2769,12 +3325,23 @@ impl SessionRuntimeManager {
         let pane_term = self.pane_term.clone();
         let protocol_profile = self.protocol_profile;
         let pane_id = pane_meta.id;
+        let replay_command = pane_meta.resurrection.active_command.clone();
+        let initial_cwd = pane_meta.resurrection.last_known_cwd.clone();
         let pane_exit_tx = self.pane_exit_tx.clone();
         let manual_recording_runtime = Arc::clone(&self.manual_recording_runtime);
         let rolling_recording_runtime = Arc::clone(&self.rolling_recording_runtime);
+        let snapshot_runtime_for_reader = Arc::clone(&self.snapshot_runtime);
+        let shell_integration_root = self.shell_integration_root.clone();
         let output_buffer_for_reader = Arc::clone(&output_buffer);
+        let process_id = Arc::new(std::sync::Mutex::new(None));
+        let process_id_for_task = Arc::clone(&process_id);
         let process_group_id = Arc::new(std::sync::Mutex::new(None));
         let process_group_id_for_task = Arc::clone(&process_group_id);
+        let resurrection_state = Arc::new(std::sync::Mutex::new(
+            PaneResurrectionRuntime::from_snapshot(&pane_meta.resurrection),
+        ));
+        let resurrection_state_for_reader = Arc::clone(&resurrection_state);
+        let resurrection_state_for_waiter_seed = Arc::clone(&resurrection_state);
         let exit_reason = Arc::new(std::sync::Mutex::new(None::<String>));
         let exit_reason_for_task = Arc::clone(&exit_reason);
         let exited = Arc::new(AtomicBool::new(false));
@@ -2840,6 +3407,18 @@ impl SessionRuntimeManager {
 
             let mut command = CommandBuilder::new(&shell);
             command.env("TERM", &pane_term);
+            if let Some(cwd) = initial_cwd.as_deref()
+                && !cwd.is_empty()
+            {
+                command.cwd(cwd);
+            }
+            if let Err(error) = configure_shell_integration_command(
+                &mut command,
+                &shell,
+                shell_integration_root.as_deref(),
+            ) {
+                warn!("failed configuring shell integration for pane {pane_id}: {error:#}");
+            }
             let Ok(mut child) = pty_pair.slave.spawn_command(command) else {
                 if let Ok(mut reason) = exit_reason_for_task.lock() {
                     *reason = Some(format!("failed to spawn shell '{shell}'"));
@@ -2851,6 +3430,9 @@ impl SessionRuntimeManager {
                 exited_for_task.store(true, Ordering::SeqCst);
                 return;
             };
+            if let Ok(mut pid) = process_id_for_task.lock() {
+                *pid = child.process_id();
+            }
             if let Ok(mut pgid) = process_group_id_for_task.lock() {
                 *pgid = child
                     .process_id()
@@ -2887,10 +3469,21 @@ impl SessionRuntimeManager {
             };
             let writer = Arc::new(std::sync::Mutex::new(writer));
 
+            if let Some(command_text) = replay_command.as_deref()
+                && let Ok(mut writer_guard) = writer.lock()
+            {
+                let mut replay_bytes = command_text.as_bytes().to_vec();
+                replay_bytes.push(b'\n');
+                if writer_guard.write_all(&replay_bytes).is_ok() {
+                    let _ = writer_guard.flush();
+                }
+            }
+
             let (child_exit_tx, mut child_exit_rx) = mpsc::unbounded_channel::<()>();
             let exited_for_waiter = Arc::clone(&exited_for_task);
             let exit_reason_for_waiter = Arc::clone(&exit_reason_for_task);
             let output_buffer_for_waiter = Arc::clone(&output_buffer_for_reader);
+            let resurrection_state_for_waiter = Arc::clone(&resurrection_state_for_waiter_seed);
             let child_waiter = std::thread::Builder::new()
                 .name(format!("bmux-server-pane-{pane_id}-wait"))
                 .spawn(move || {
@@ -2903,6 +3496,10 @@ impl SessionRuntimeManager {
                             Ok(status) => format_pane_exit_reason(&status),
                             Err(error) => format!("process wait failed: {error}"),
                         });
+                    }
+                    if let Ok(mut resurrection) = resurrection_state_for_waiter.lock() {
+                        resurrection.active_command = None;
+                        resurrection.active_command_source = None;
                     }
                     push_pane_runtime_notice(
                         &output_buffer_for_waiter,
@@ -2929,6 +3526,7 @@ impl SessionRuntimeManager {
                         .unwrap_or((24, 80));
                     let mut cursor_tracker = PaneCursorTracker::new(initial_rows, initial_cols);
                     let mut terminal_mode_tracker = PaneTerminalModeTracker::default();
+                    let mut shell_metadata_parser = PaneShellMetadataParser::default();
 
                     // Image interceptor: detects and extracts image escape sequences
                     // (Sixel, Kitty, iTerm2) from PTY output before they reach the
@@ -3023,6 +3621,22 @@ impl SessionRuntimeManager {
                                     result.filtered
                                 };
                                 #[cfg(feature = "image-registry")]
+                                let chunk = chunk.as_slice();
+
+                                let metadata = shell_metadata_parser.process_chunk(chunk);
+                                if !metadata.events.is_empty() {
+                                    if let Ok(mut resurrection_state) =
+                                        resurrection_state_for_reader.lock()
+                                    {
+                                        for event in metadata.events {
+                                            resurrection_state.apply_event(event);
+                                        }
+                                    }
+                                    mark_snapshot_runtime_dirty_handle(
+                                        &snapshot_runtime_for_reader,
+                                    );
+                                }
+                                let chunk = metadata.filtered;
                                 let chunk = chunk.as_slice();
 
                                 // Detect screen-clearing CSI sequences (\e[2J, \e[3J)
@@ -3210,7 +3824,9 @@ impl SessionRuntimeManager {
 
         PaneRuntimeHandle {
             meta: pane_meta,
+            process_id,
             process_group_id,
+            resurrection_state,
             exit_reason,
             stop_tx: Some(stop_tx),
             task,
@@ -3270,6 +3886,7 @@ impl SessionRuntimeManager {
             id: pane_id,
             name: next_pane_name,
             shell,
+            resurrection: PaneResurrectionSnapshot::default(),
         };
         let handle = self.spawn_pane_runtime(session_id, pane_meta);
         for client_id in client_ids {
@@ -3414,10 +4031,20 @@ impl SessionRuntimeManager {
                 .panes
                 .get(&pane_id)
                 .ok_or_else(|| anyhow::anyhow!("target pane not found"))?;
+            let preserved_cwd = pane
+                .resurrection_state
+                .lock()
+                .ok()
+                .and_then(|state| state.last_known_cwd.clone());
             PaneRuntimeMeta {
                 id: pane_id,
                 name: pane.meta.name.clone(),
                 shell: pane.meta.shell.clone(),
+                resurrection: PaneResurrectionSnapshot {
+                    active_command: None,
+                    active_command_source: None,
+                    last_known_cwd: preserved_cwd,
+                },
             }
         };
 
@@ -4066,6 +4693,7 @@ impl BmuxServer {
     fn new_with_snapshot(
         endpoint: IpcEndpoint,
         snapshot_manager: Option<SnapshotManager>,
+        shell_integration_root: Option<std::path::PathBuf>,
         server_control_principal_id: Uuid,
         recordings_dir: std::path::PathBuf,
         rolling_recordings_dir: std::path::PathBuf,
@@ -4074,8 +4702,9 @@ impl BmuxServer {
         rolling_recording_auto_start: bool,
         rolling_recording_defaults: RollingRecordingSettings,
     ) -> Self {
-        let snapshot_runtime =
-            snapshot_manager.map_or_else(SnapshotRuntime::disabled, SnapshotRuntime::with_manager);
+        let snapshot_runtime = Arc::new(Mutex::new(
+            snapshot_manager.map_or_else(SnapshotRuntime::disabled, SnapshotRuntime::with_manager),
+        ));
 
         let config = BmuxConfig::load().unwrap_or_default();
         let shell = resolve_server_shell(&config);
@@ -4117,6 +4746,8 @@ impl BmuxServer {
                     shell,
                     pane_term,
                     protocol_profile,
+                    Arc::clone(&snapshot_runtime),
+                    shell_integration_root,
                     pane_exit_tx,
                     Arc::clone(&manual_recording_runtime),
                     Arc::clone(&rolling_recording_runtime),
@@ -4125,7 +4756,7 @@ impl BmuxServer {
                 attach_tokens: Mutex::new(AttachTokenManager::new(ATTACH_TOKEN_TTL)),
                 follow_state: Mutex::new(FollowState::default()),
                 context_state: Mutex::new(ContextState::default()),
-                snapshot_runtime: Mutex::new(snapshot_runtime),
+                snapshot_runtime,
                 manual_recording_runtime,
                 rolling_recording_runtime,
                 rolling_recording_auto_start: rolling_recording_auto_start
@@ -4161,6 +4792,7 @@ impl BmuxServer {
         let rolling_defaults = rolling_recording_settings_from_config(&config);
         Self::new_with_snapshot(
             endpoint,
+            None,
             None,
             Uuid::new_v4(),
             config.recordings_dir(&paths),
@@ -4214,6 +4846,7 @@ impl BmuxServer {
         Self::new_with_snapshot(
             endpoint,
             Some(snapshot_manager),
+            Some(paths.state_dir().join("runtime").join("shell-integration")),
             server_control_principal_id,
             config.recordings_dir(paths),
             paths.rolling_recordings_dir(),
@@ -4374,6 +5007,30 @@ impl BmuxServer {
                     }
                     changed = prune_shutdown_rx.changed() => {
                         if changed.is_ok() && *prune_shutdown_rx.borrow() {
+                            break;
+                        }
+                        if changed.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }
+        });
+
+        let snapshot_flush_state = Arc::clone(&self.state);
+        let mut snapshot_flush_shutdown_rx = self.shutdown_tx.subscribe();
+        let _snapshot_flush_task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_millis(200));
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if let Err(error) = maybe_flush_snapshot(&snapshot_flush_state, false) {
+                            warn!("snapshot flush tick failed: {error:#}");
+                        }
+                    }
+                    changed = snapshot_flush_shutdown_rx.changed() => {
+                        if changed.is_ok() && *snapshot_flush_shutdown_rx.borrow() {
                             break;
                         }
                         if changed.is_err() {
@@ -4971,7 +5628,7 @@ async fn handle_connection(
             .map_err(|_| anyhow::anyhow!("client principal map lock poisoned"))?;
         principals.remove(&client_id);
     }
-    mark_snapshot_dirty(&state)?;
+    mark_snapshot_dirty(&state);
     maybe_flush_snapshot(&state, false)?;
     unsubscribe_events(&state, client_id)?;
 
@@ -5404,17 +6061,17 @@ fn clear_selected_session_for_all(
     Ok(())
 }
 
-fn mark_snapshot_dirty(state: &Arc<ServerState>) -> Result<()> {
-    let mut runtime = state
-        .snapshot_runtime
-        .lock()
-        .map_err(|_| anyhow::anyhow!("snapshot runtime lock poisoned"))?;
-    if runtime.manager.is_some() {
+fn mark_snapshot_dirty(state: &Arc<ServerState>) {
+    mark_snapshot_runtime_dirty_handle(&state.snapshot_runtime);
+}
+
+fn mark_snapshot_runtime_dirty_handle(snapshot_runtime: &Arc<Mutex<SnapshotRuntime>>) {
+    if let Ok(mut runtime) = snapshot_runtime.lock()
+        && runtime.manager.is_some()
+    {
         runtime.dirty = true;
         runtime.last_marked_at = Some(Instant::now());
     }
-    drop(runtime);
-    Ok(())
 }
 
 fn maybe_flush_snapshot(state: &Arc<ServerState>, force: bool) -> Result<()> {
@@ -5536,15 +6193,69 @@ fn build_snapshot(state: &Arc<ServerState>) -> Result<SnapshotV4> {
                                 runtime
                                     .panes
                                     .get(&pane_id)
-                                    .map(|pane| PaneSnapshotV2 {
-                                        id: pane.meta.id,
-                                        name: pane.meta.name.clone(),
-                                        shell: pane.meta.shell.clone(),
-                                        process_group_id: pane
+                                    .map(|pane| {
+                                        let process_id =
+                                            pane.process_id.lock().ok().and_then(|value| *value);
+                                        let process_group_id = pane
                                             .process_group_id
                                             .lock()
                                             .ok()
-                                            .and_then(|value| *value),
+                                            .and_then(|value| *value);
+                                        let mut resurrection_runtime = pane
+                                            .resurrection_state
+                                            .lock()
+                                            .ok()
+                                            .map(|state| state.clone())
+                                            .unwrap_or_default();
+
+                                        if !pane.exited.load(Ordering::SeqCst)
+                                            && resurrection_runtime.active_command_source
+                                                != Some(PaneCommandSource::Verbatim)
+                                        {
+                                            match inspect_process_group_command_and_cwd(
+                                                process_group_id,
+                                                process_id,
+                                                &pane.meta.shell,
+                                            ) {
+                                                Some(inspection) => {
+                                                    resurrection_runtime.active_command =
+                                                        Some(inspection.command);
+                                                    resurrection_runtime.active_command_source =
+                                                        Some(PaneCommandSource::Inspection);
+                                                    if let Some(cwd) = inspection.cwd {
+                                                        resurrection_runtime.last_known_cwd =
+                                                            Some(cwd);
+                                                    }
+                                                }
+                                                None if resurrection_runtime
+                                                    .active_command_source
+                                                    == Some(PaneCommandSource::Inspection) =>
+                                                {
+                                                    resurrection_runtime.active_command = None;
+                                                    resurrection_runtime.active_command_source =
+                                                        None;
+                                                }
+                                                None => {}
+                                            }
+                                        }
+
+                                        if let Ok(mut state) = pane.resurrection_state.lock() {
+                                            *state = resurrection_runtime.clone();
+                                        }
+
+                                        let resurrection_snapshot =
+                                            resurrection_runtime.to_snapshot();
+
+                                        PaneSnapshotV2 {
+                                            id: pane.meta.id,
+                                            name: pane.meta.name.clone(),
+                                            shell: pane.meta.shell.clone(),
+                                            process_group_id,
+                                            active_command: resurrection_snapshot.active_command,
+                                            active_command_source: resurrection_snapshot
+                                                .active_command_source,
+                                            last_known_cwd: resurrection_snapshot.last_known_cwd,
+                                        }
                                     })
                                     .ok_or_else(|| {
                                         anyhow::anyhow!(
@@ -5975,6 +6686,11 @@ fn apply_snapshot_state(state: &Arc<ServerState>, snapshot: &SnapshotV4) -> Resu
                     id: pane.id,
                     name: pane.name.clone(),
                     shell: pane.shell.clone(),
+                    resurrection: PaneResurrectionSnapshot {
+                        active_command: pane.active_command.clone(),
+                        active_command_source: pane.active_command_source,
+                        last_known_cwd: pane.last_known_cwd.clone(),
+                    },
                 })
                 .collect::<Vec<_>>();
             let focused_pane_id = session_snapshot
@@ -6247,6 +6963,7 @@ fn reap_exited_pane(state: &Arc<ServerState>, session_id: SessionId, pane_id: Uu
         },
     )?;
     emit_attach_view_changed_for_layout(state, session_id)?;
+    mark_snapshot_dirty(state);
 
     Ok(())
 }
@@ -6378,7 +7095,7 @@ async fn handle_request(
             })
         }
         Request::ServerSave => {
-            mark_snapshot_dirty(state)?;
+            mark_snapshot_dirty(state);
             maybe_flush_snapshot(state, true)?;
             let status = snapshot_status(state)?;
             Response::Ok(ResponsePayload::ServerSnapshotSaved { path: status.path })
@@ -7576,6 +8293,12 @@ async fn handle_request(
             };
             match write_result {
                 Ok((bytes, focused_pane_id)) => {
+                    if captured_input
+                        .iter()
+                        .any(|byte| *byte == b'\n' || *byte == b'\r')
+                    {
+                        mark_snapshot_dirty(state);
+                    }
                     record_to_all_runtimes(
                         &state.manual_recording_runtime,
                         &state.rolling_recording_runtime,
@@ -8589,6 +9312,12 @@ async fn handle_request(
             };
             match write_result {
                 Ok(bytes) => {
+                    if captured_input
+                        .iter()
+                        .any(|byte| *byte == b'\n' || *byte == b'\r')
+                    {
+                        mark_snapshot_dirty(state);
+                    }
                     record_to_all_runtimes(
                         &state.manual_recording_runtime,
                         &state.rolling_recording_runtime,
@@ -8671,7 +9400,7 @@ async fn handle_request(
     }
 
     if response_requires_snapshot(&response) {
-        mark_snapshot_dirty(state)?;
+        mark_snapshot_dirty(state);
         maybe_flush_snapshot(state, false)?;
     }
 
@@ -9335,6 +10064,152 @@ fn resolve_snapshot_session_id(snapshot: &SnapshotV4, selector: &SessionSelector
     }
 }
 
+#[derive(Debug, Clone)]
+struct ProcessInspectionResult {
+    command: String,
+    cwd: Option<String>,
+}
+
+#[cfg(unix)]
+fn inspect_process_group_command_and_cwd(
+    process_group_id: Option<i32>,
+    shell_pid: Option<u32>,
+    shell_path: &str,
+) -> Option<ProcessInspectionResult> {
+    let process_group_id = process_group_id?;
+    if process_group_id <= 0 {
+        return None;
+    }
+
+    let output = std::process::Command::new("ps")
+        .arg("-o")
+        .arg("pid=,pgid=,state=,command=")
+        .arg("-g")
+        .arg(process_group_id.to_string())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+
+    let mut selected: Option<(u32, String)> = None;
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let mut parts = line.split_whitespace();
+        let Some(pid_raw) = parts.next() else {
+            continue;
+        };
+        let Some(_pgid_raw) = parts.next() else {
+            continue;
+        };
+        let Some(state) = parts.next() else {
+            continue;
+        };
+        let Ok(pid) = pid_raw.parse::<u32>() else {
+            continue;
+        };
+        let command = parts.collect::<Vec<_>>().join(" ");
+        if command.is_empty() || state.contains('Z') {
+            continue;
+        }
+        if shell_pid == Some(pid) || process_command_looks_like_shell(&command, shell_path) {
+            continue;
+        }
+        if selected
+            .as_ref()
+            .is_none_or(|(best_pid, _)| pid > *best_pid)
+        {
+            selected = Some((pid, command));
+        }
+    }
+
+    let (selected_pid, command) = selected?;
+    let cwd = resolve_process_working_directory(selected_pid)
+        .or_else(|| shell_pid.and_then(resolve_process_working_directory));
+    Some(ProcessInspectionResult { command, cwd })
+}
+
+#[cfg(not(unix))]
+fn inspect_process_group_command_and_cwd(
+    _process_group_id: Option<i32>,
+    _shell_pid: Option<u32>,
+    _shell_path: &str,
+) -> Option<ProcessInspectionResult> {
+    None
+}
+
+fn process_command_looks_like_shell(command: &str, shell_path: &str) -> bool {
+    let Some(first) = command.split_whitespace().next() else {
+        return false;
+    };
+    let name = std::path::Path::new(first)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(first)
+        .trim_start_matches('-')
+        .to_ascii_lowercase();
+    let shell_name = std::path::Path::new(shell_path)
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or(shell_path)
+        .trim_start_matches('-')
+        .to_ascii_lowercase();
+    name == shell_name
+        || matches!(
+            name.as_str(),
+            "sh" | "bash" | "zsh" | "fish" | "dash" | "ksh" | "mksh" | "csh" | "tcsh"
+        )
+}
+
+#[cfg(unix)]
+fn resolve_process_working_directory(pid: u32) -> Option<String> {
+    let proc_cwd = std::path::PathBuf::from(format!("/proc/{pid}/cwd"));
+    if let Ok(path) = std::fs::read_link(&proc_cwd)
+        && !path.as_os_str().is_empty()
+    {
+        return Some(path.to_string_lossy().to_string());
+    }
+
+    let lsof_output = std::process::Command::new("lsof")
+        .arg("-a")
+        .arg("-p")
+        .arg(pid.to_string())
+        .arg("-d")
+        .arg("cwd")
+        .arg("-Fn")
+        .output();
+    if let Ok(output) = lsof_output
+        && output.status.success()
+    {
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            if let Some(path) = line.strip_prefix('n')
+                && !path.trim().is_empty()
+            {
+                return Some(path.to_string());
+            }
+        }
+    }
+
+    let ps_output = std::process::Command::new("ps")
+        .arg("-o")
+        .arg("cwd=")
+        .arg("-p")
+        .arg(pid.to_string())
+        .output()
+        .ok()?;
+    if !ps_output.status.success() {
+        return None;
+    }
+    let cwd = String::from_utf8_lossy(&ps_output.stdout)
+        .trim()
+        .to_string();
+    (!cwd.is_empty()).then_some(cwd)
+}
+
+#[cfg(not(unix))]
+fn resolve_process_working_directory(_pid: u32) -> Option<String> {
+    None
+}
+
 fn kill_removed_snapshot_session_process_groups(
     snapshot: &SnapshotV4,
     removed_session_set: &BTreeSet<Uuid>,
@@ -9489,7 +10364,11 @@ fn acquire_offline_snapshot_lock(
     })?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("failed creating snapshot directory {}", parent.display()))?;
-    let lock_path = parent.join("server-snapshot-v1.lock");
+    let lock_name = snapshot_path.file_name().map_or_else(
+        || "server-snapshot.lock".to_string(),
+        |name| format!("{}.lock", name.to_string_lossy()),
+    );
+    let lock_path = parent.join(lock_name);
     let started = Instant::now();
 
     loop {
@@ -11669,6 +12548,55 @@ mod tests {
             phase = phase.advance(b'\\');
             assert_eq!(phase, EscSeqPhase::Ground);
         }
+    }
+
+    #[test]
+    fn shell_metadata_parser_strips_bell_marker() {
+        let mut parser = PaneShellMetadataParser::default();
+        let output =
+            parser.process_chunk(b"\x1b]633;bmux;start;ZWNobyBoaQ==;L3RtcA==\x07plain-output");
+
+        assert_eq!(output.filtered, b"plain-output");
+        assert_eq!(
+            output.events,
+            vec![PaneShellMetadataEvent::CommandStart {
+                command: "echo hi".to_string(),
+                cwd: "/tmp".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn shell_metadata_parser_handles_split_st_terminator() {
+        let mut parser = PaneShellMetadataParser::default();
+        let first = parser.process_chunk(b"\x1b]633;bmux;prompt;L3RtcA==\x1b");
+        assert!(first.filtered.is_empty());
+        assert!(first.events.is_empty());
+
+        let second = parser.process_chunk(b"\\after");
+        assert_eq!(second.filtered, b"after");
+        assert_eq!(
+            second.events,
+            vec![PaneShellMetadataEvent::Prompt {
+                cwd: "/tmp".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn resurrection_runtime_prompt_clears_command_and_preserves_cwd() {
+        let mut state = PaneResurrectionRuntime::default();
+        state.apply_event(PaneShellMetadataEvent::CommandStart {
+            command: "sleep 30".to_string(),
+            cwd: "/work".to_string(),
+        });
+        state.apply_event(PaneShellMetadataEvent::Prompt {
+            cwd: "/work".to_string(),
+        });
+
+        assert_eq!(state.active_command, None);
+        assert_eq!(state.active_command_source, None);
+        assert_eq!(state.last_known_cwd.as_deref(), Some("/work"));
     }
 
     // ---- OutputFanoutBuffer boundary safety tests ----

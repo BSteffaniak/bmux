@@ -1,20 +1,14 @@
 use bmux_config::ConfigPaths;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SNAPSHOT_VERSION_V3: u32 = 3;
-const SNAPSHOT_VERSION_V4: u32 = 4;
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SnapshotV3 {
-    pub sessions: Vec<SessionSnapshotV3>,
-    pub follows: Vec<FollowEdgeSnapshotV2>,
-    pub selected_sessions: Vec<ClientSelectedSessionSnapshotV2>,
-}
+const SNAPSHOT_VERSION_V5: u32 = 5;
+const MAX_SNAPSHOT_COMMAND_LEN: usize = 16 * 1024;
+const MAX_SNAPSHOT_CWD_LEN: usize = 4 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SnapshotV4 {
@@ -82,6 +76,12 @@ pub struct PaneSnapshotV2 {
     pub shell: String,
     #[serde(default)]
     pub process_group_id: Option<i32>,
+    #[serde(default)]
+    pub active_command: Option<String>,
+    #[serde(default)]
+    pub active_command_source: Option<crate::PaneCommandSource>,
+    #[serde(default)]
+    pub last_known_cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -119,13 +119,6 @@ pub struct ClientSelectedSessionSnapshotV2 {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-struct SnapshotEnvelopeV3 {
-    version: u32,
-    checksum: u64,
-    snapshot: SnapshotV3,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct SnapshotEnvelopeV4 {
     version: u32,
     checksum: u64,
@@ -155,7 +148,7 @@ impl SnapshotManager {
             path: paths
                 .data_dir
                 .join("runtime")
-                .join("server-snapshot-v1.json"),
+                .join("server-snapshot-v2.json"),
         }
     }
 
@@ -174,7 +167,7 @@ impl SnapshotManager {
         validate_snapshot_v4(snapshot)?;
         let checksum = snapshot_checksum_v4(snapshot).map_err(SnapshotError::Encode)?;
         let envelope = SnapshotEnvelopeV4 {
-            version: SNAPSHOT_VERSION_V4,
+            version: SNAPSHOT_VERSION_V5,
             checksum,
             snapshot: snapshot.clone(),
         };
@@ -190,7 +183,7 @@ impl SnapshotManager {
 
         #[allow(clippy::cast_possible_truncation)]
         match version as u32 {
-            SNAPSHOT_VERSION_V4 => {
+            SNAPSHOT_VERSION_V5 => {
                 let envelope: SnapshotEnvelopeV4 = serde_json::from_value(value)?;
                 let expected_checksum =
                     snapshot_checksum_v4(&envelope.snapshot).map_err(SnapshotError::Encode)?;
@@ -202,19 +195,6 @@ impl SnapshotManager {
                 let snapshot = normalize_snapshot_v4_numbering(envelope.snapshot);
                 validate_snapshot_v4(&snapshot)?;
                 Ok(snapshot)
-            }
-            SNAPSHOT_VERSION_V3 => {
-                let envelope: SnapshotEnvelopeV3 = serde_json::from_value(value)?;
-                let expected_checksum =
-                    snapshot_checksum_v3(&envelope.snapshot).map_err(SnapshotError::Encode)?;
-                if expected_checksum != envelope.checksum {
-                    return Err(SnapshotError::Validation(
-                        "snapshot checksum mismatch".to_string(),
-                    ));
-                }
-                let snapshot_v3 = normalize_snapshot_v3_numbering(envelope.snapshot);
-                validate_snapshot_v3(&snapshot_v3)?;
-                Ok(migrate_snapshot_v3_to_v4(snapshot_v3))
             }
             other => Err(SnapshotError::UnsupportedVersion(other)),
         }
@@ -268,11 +248,6 @@ impl SnapshotManager {
     }
 }
 
-fn snapshot_checksum_v3(snapshot: &SnapshotV3) -> Result<u64, serde_json::Error> {
-    let bytes = serde_json::to_vec(snapshot)?;
-    Ok(fnv1a64(&bytes))
-}
-
 fn snapshot_checksum_v4(snapshot: &SnapshotV4) -> Result<u64, serde_json::Error> {
     let bytes = serde_json::to_vec(snapshot)?;
     Ok(fnv1a64(&bytes))
@@ -287,12 +262,24 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn validate_snapshot_v3(snapshot: &SnapshotV3) -> Result<(), SnapshotError> {
+fn validate_session_snapshot_core(
+    sessions: &[SessionSnapshotV3],
+    follows: &[FollowEdgeSnapshotV2],
+    selected_sessions: &[ClientSelectedSessionSnapshotV2],
+) -> Result<(), SnapshotError> {
+    let session_ids = validate_session_entries(sessions)?;
+    validate_follow_edges(follows)?;
+    validate_selected_sessions(selected_sessions, &session_ids)
+}
+
+fn validate_session_entries(
+    sessions: &[SessionSnapshotV3],
+) -> Result<BTreeSet<Uuid>, SnapshotError> {
     let mut session_ids = BTreeSet::new();
     let mut all_pane_ids = BTreeSet::new();
     let mut surface_ids = BTreeSet::new();
 
-    for session in &snapshot.sessions {
+    for session in sessions {
         if !session_ids.insert(session.id) {
             return Err(SnapshotError::Validation(format!(
                 "duplicate session id {}",
@@ -311,20 +298,7 @@ fn validate_snapshot_v3(snapshot: &SnapshotV3) -> Result<(), SnapshotError> {
             .iter()
             .map(|pane| pane.id)
             .collect::<BTreeSet<_>>();
-        for pane in &session.panes {
-            if !all_pane_ids.insert(pane.id) {
-                return Err(SnapshotError::Validation(format!(
-                    "pane id {} reused across sessions",
-                    pane.id
-                )));
-            }
-            if pane.shell.trim().is_empty() {
-                return Err(SnapshotError::Validation(format!(
-                    "pane {} in session {} has empty shell",
-                    pane.id, session.id
-                )));
-            }
-        }
+        validate_panes(session, &mut all_pane_ids)?;
         if let Some(focused_pane_id) = session.focused_pane_id
             && !session_pane_ids.contains(&focused_pane_id)
         {
@@ -344,29 +318,114 @@ fn validate_snapshot_v3(snapshot: &SnapshotV3) -> Result<(), SnapshotError> {
             }
         }
 
-        for surface in &session.floating_surfaces {
-            if !surface_ids.insert(surface.id) {
-                return Err(SnapshotError::Validation(format!(
-                    "duplicate floating surface id {}",
-                    surface.id
-                )));
-            }
-            if !session_pane_ids.contains(&surface.pane_id) {
-                return Err(SnapshotError::Validation(format!(
-                    "floating surface {} references missing pane {} in session {}",
-                    surface.id, surface.pane_id, session.id
-                )));
-            }
-            if surface.w == 0 || surface.h == 0 {
-                return Err(SnapshotError::Validation(format!(
-                    "floating surface {} in session {} has zero-sized rect",
-                    surface.id, session.id
-                )));
-            }
+        validate_floating_surfaces(session, &session_pane_ids, &mut surface_ids)?;
+    }
+
+    Ok(session_ids)
+}
+
+fn validate_panes(
+    session: &SessionSnapshotV3,
+    all_pane_ids: &mut BTreeSet<Uuid>,
+) -> Result<(), SnapshotError> {
+    for pane in &session.panes {
+        if !all_pane_ids.insert(pane.id) {
+            return Err(SnapshotError::Validation(format!(
+                "pane id {} reused across sessions",
+                pane.id
+            )));
+        }
+        if pane.shell.trim().is_empty() {
+            return Err(SnapshotError::Validation(format!(
+                "pane {} in session {} has empty shell",
+                pane.id, session.id
+            )));
+        }
+        validate_pane_resurrection_fields(session.id, pane)?;
+    }
+
+    Ok(())
+}
+
+fn validate_pane_resurrection_fields(
+    session_id: Uuid,
+    pane: &PaneSnapshotV2,
+) -> Result<(), SnapshotError> {
+    if let Some(command) = pane.active_command.as_deref() {
+        if command.trim().is_empty() {
+            return Err(SnapshotError::Validation(format!(
+                "pane {} in session {} has empty active command",
+                pane.id, session_id
+            )));
+        }
+        if command.len() > MAX_SNAPSHOT_COMMAND_LEN {
+            return Err(SnapshotError::Validation(format!(
+                "pane {} in session {} active command exceeds {} bytes",
+                pane.id, session_id, MAX_SNAPSHOT_COMMAND_LEN
+            )));
+        }
+        if pane.active_command_source.is_none() {
+            return Err(SnapshotError::Validation(format!(
+                "pane {} in session {} missing active command source",
+                pane.id, session_id
+            )));
+        }
+    }
+    if pane.active_command_source.is_some() && pane.active_command.is_none() {
+        return Err(SnapshotError::Validation(format!(
+            "pane {} in session {} has command source without active command",
+            pane.id, session_id
+        )));
+    }
+    if let Some(cwd) = pane.last_known_cwd.as_deref() {
+        if cwd.trim().is_empty() {
+            return Err(SnapshotError::Validation(format!(
+                "pane {} in session {} has empty cwd",
+                pane.id, session_id
+            )));
+        }
+        if cwd.len() > MAX_SNAPSHOT_CWD_LEN {
+            return Err(SnapshotError::Validation(format!(
+                "pane {} in session {} cwd exceeds {} bytes",
+                pane.id, session_id, MAX_SNAPSHOT_CWD_LEN
+            )));
         }
     }
 
-    for follow in &snapshot.follows {
+    Ok(())
+}
+
+fn validate_floating_surfaces(
+    session: &SessionSnapshotV3,
+    session_pane_ids: &BTreeSet<Uuid>,
+    surface_ids: &mut BTreeSet<Uuid>,
+) -> Result<(), SnapshotError> {
+    for surface in &session.floating_surfaces {
+        if !surface_ids.insert(surface.id) {
+            return Err(SnapshotError::Validation(format!(
+                "duplicate floating surface id {}",
+                surface.id
+            )));
+        }
+        if !session_pane_ids.contains(&surface.pane_id) {
+            return Err(SnapshotError::Validation(format!(
+                "floating surface {} references missing pane {} in session {}",
+                surface.id, surface.pane_id, session.id
+            )));
+        }
+        if surface.w == 0 || surface.h == 0 {
+            return Err(SnapshotError::Validation(format!(
+                "floating surface {} in session {} has zero-sized rect",
+                surface.id, session.id
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_follow_edges(follows: &[FollowEdgeSnapshotV2]) -> Result<(), SnapshotError> {
+    for follow in follows {
         if follow.follower_client_id == follow.leader_client_id {
             return Err(SnapshotError::Validation(format!(
                 "follow edge cannot self-reference client {}",
@@ -374,7 +433,14 @@ fn validate_snapshot_v3(snapshot: &SnapshotV3) -> Result<(), SnapshotError> {
             )));
         }
     }
-    for selected in &snapshot.selected_sessions {
+    Ok(())
+}
+
+fn validate_selected_sessions(
+    selected_sessions: &[ClientSelectedSessionSnapshotV2],
+    session_ids: &BTreeSet<Uuid>,
+) -> Result<(), SnapshotError> {
+    for selected in selected_sessions {
         if let Some(session_id) = selected.session_id
             && !session_ids.contains(&session_id)
         {
@@ -388,11 +454,11 @@ fn validate_snapshot_v3(snapshot: &SnapshotV3) -> Result<(), SnapshotError> {
 }
 
 fn validate_snapshot_v4(snapshot: &SnapshotV4) -> Result<(), SnapshotError> {
-    validate_snapshot_v3(&SnapshotV3 {
-        sessions: snapshot.sessions.clone(),
-        follows: snapshot.follows.clone(),
-        selected_sessions: snapshot.selected_sessions.clone(),
-    })?;
+    validate_session_snapshot_core(
+        &snapshot.sessions,
+        &snapshot.follows,
+        &snapshot.selected_sessions,
+    )?;
 
     let session_ids = snapshot
         .sessions
@@ -478,50 +544,8 @@ fn collect_layout_pane_ids(
     Ok(())
 }
 
-const fn normalize_snapshot_v3_numbering(snapshot: SnapshotV3) -> SnapshotV3 {
-    snapshot
-}
-
 const fn normalize_snapshot_v4_numbering(snapshot: SnapshotV4) -> SnapshotV4 {
     snapshot
-}
-
-fn migrate_snapshot_v3_to_v4(snapshot: SnapshotV3) -> SnapshotV4 {
-    let mut contexts = Vec::with_capacity(snapshot.sessions.len());
-    let mut context_session_bindings = Vec::with_capacity(snapshot.sessions.len());
-    let mut mru_contexts = Vec::with_capacity(snapshot.sessions.len());
-
-    for session in &snapshot.sessions {
-        contexts.push(ContextSnapshotV1 {
-            id: session.id,
-            name: session.name.clone(),
-            attributes: BTreeMap::from([("bmux.session_id".to_string(), session.id.to_string())]),
-        });
-        context_session_bindings.push(ContextSessionBindingSnapshotV1 {
-            context_id: session.id,
-            session_id: session.id,
-        });
-        mru_contexts.push(session.id);
-    }
-
-    let selected_contexts = snapshot
-        .selected_sessions
-        .iter()
-        .map(|selected| ClientSelectedContextSnapshotV1 {
-            client_id: selected.client_id,
-            context_id: selected.session_id,
-        })
-        .collect::<Vec<_>>();
-
-    SnapshotV4 {
-        sessions: snapshot.sessions,
-        follows: snapshot.follows,
-        selected_sessions: snapshot.selected_sessions,
-        contexts,
-        context_session_bindings,
-        selected_contexts,
-        mru_contexts,
-    }
 }
 
 #[cfg(test)]
@@ -530,7 +554,7 @@ mod tests {
         ClientSelectedContextSnapshotV1, ClientSelectedSessionSnapshotV2,
         ContextSessionBindingSnapshotV1, ContextSnapshotV1, FollowEdgeSnapshotV2,
         PaneLayoutNodeSnapshotV2, PaneSnapshotV2, SessionSnapshotV3, SnapshotError,
-        SnapshotManager, SnapshotV3, SnapshotV4,
+        SnapshotManager, SnapshotV4,
     };
     use std::collections::BTreeMap;
     use uuid::Uuid;
@@ -551,6 +575,9 @@ mod tests {
                     name: Some("pane-1".to_string()),
                     shell: "/bin/sh".to_string(),
                     process_group_id: None,
+                    active_command: None,
+                    active_command_source: None,
+                    last_known_cwd: None,
                 }],
                 focused_pane_id: Some(window_id),
                 layout_root: Some(PaneLayoutNodeSnapshotV2::Leaf { pane_id: window_id }),
@@ -620,6 +647,9 @@ mod tests {
                     name: Some("pane-1".to_string()),
                     shell: "/bin/sh".to_string(),
                     process_group_id: None,
+                    active_command: None,
+                    active_command_source: None,
+                    last_known_cwd: None,
                 }],
                 focused_pane_id: None,
                 layout_root: None,
@@ -670,50 +700,46 @@ mod tests {
     }
 
     #[test]
-    fn decode_v3_migrates_sessions_to_contexts() {
+    fn encode_rejects_command_source_without_command() {
         let session_id = Uuid::new_v4();
-        let client_id = Uuid::new_v4();
-        let snapshot = SnapshotV3 {
+        let pane_id = Uuid::new_v4();
+        let snapshot = SnapshotV4 {
             sessions: vec![SessionSnapshotV3 {
                 id: session_id,
-                name: Some("legacy".to_string()),
+                name: Some("dev".to_string()),
                 panes: vec![PaneSnapshotV2 {
-                    id: Uuid::new_v4(),
+                    id: pane_id,
                     name: Some("pane-1".to_string()),
                     shell: "/bin/sh".to_string(),
                     process_group_id: None,
+                    active_command: None,
+                    active_command_source: Some(crate::PaneCommandSource::Verbatim),
+                    last_known_cwd: Some("/tmp".to_string()),
                 }],
-                focused_pane_id: None,
-                layout_root: None,
+                focused_pane_id: Some(pane_id),
+                layout_root: Some(PaneLayoutNodeSnapshotV2::Leaf { pane_id }),
                 floating_surfaces: vec![],
             }],
             follows: vec![],
-            selected_sessions: vec![ClientSelectedSessionSnapshotV2 {
-                client_id,
-                session_id: Some(session_id),
+            selected_sessions: vec![],
+            contexts: vec![ContextSnapshotV1 {
+                id: session_id,
+                name: Some("dev".to_string()),
+                attributes: BTreeMap::from([(
+                    "bmux.session_id".to_string(),
+                    session_id.to_string(),
+                )]),
             }],
+            context_session_bindings: vec![ContextSessionBindingSnapshotV1 {
+                context_id: session_id,
+                session_id,
+            }],
+            selected_contexts: vec![],
+            mru_contexts: vec![session_id],
         };
 
-        let snapshot_bytes = serde_json::to_vec(&snapshot).expect("snapshot bytes");
-        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
-        for byte in snapshot_bytes {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0100_0000_01b3);
-        }
-        let legacy_payload = serde_json::json!({
-            "version": 3,
-            "checksum": hash,
-            "snapshot": snapshot,
-        });
-
-        let bytes = serde_json::to_vec(&legacy_payload).expect("payload bytes");
-        let decoded = SnapshotManager::decode_snapshot(&bytes).expect("v3 snapshot should migrate");
-        assert_eq!(decoded.contexts.len(), 1);
-        assert_eq!(decoded.contexts[0].id, session_id);
-        assert_eq!(decoded.context_session_bindings.len(), 1);
-        assert_eq!(decoded.context_session_bindings[0].session_id, session_id);
-        assert_eq!(decoded.selected_contexts.len(), 1);
-        assert_eq!(decoded.selected_contexts[0].client_id, client_id);
-        assert_eq!(decoded.selected_contexts[0].context_id, Some(session_id));
+        let error = SnapshotManager::encode_snapshot(&snapshot)
+            .expect_err("source without command should fail validation");
+        assert!(matches!(error, SnapshotError::Validation(_)));
     }
 }
